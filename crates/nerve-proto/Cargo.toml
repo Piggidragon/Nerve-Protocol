@@ -1,0 +1,11 @@
+[package]
+name = "nerve-proto"
+description = "Nerve Protocol types and codecs: JSON-RPC framing, messages, descriptors, binary frames, pairing links. No I/O."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true

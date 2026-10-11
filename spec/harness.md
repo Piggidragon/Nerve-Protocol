@@ -17,7 +17,7 @@ entry:
 | Flag | Variable | Default | Meaning |
 |---|---|---|---|
 | `--state-dir` | `NERVE_STATE_DIR` | `$XDG_STATE_HOME/nerve-center`, `~/.local/state/nerve-center`, `%LOCALAPPDATA%\nerve-center` | identity, paired nodes, statistics |
-| `--name` | `NERVE_NAME` | the host name | center name shown to nodes |
+| `--name` | `NERVE_NAME` | `nerve-center` | center name shown to nodes |
 | `--listen` | `NERVE_LISTEN` | `0.0.0.0:7443` | where nodes connect |
 | `--public-url` | `NERVE_PUBLIC_URL` | `https://<host name>:<port>` | the URL put in pairing links |
 | `--plain-loopback` | `NERVE_PLAIN_LOOPBACK` | off | plain HTTP for nodes, only on a loopback `--listen` |

@@ -118,6 +118,9 @@ impl std::ops::Deref for Center {
     }
 }
 
+/// The name a new center gets when no `--name` is given.
+pub const DEFAULT_NAME: &str = "nerve-center";
+
 /// This machine's host name, for defaults.
 pub fn host_name() -> String {
     #[cfg(unix)]
@@ -164,7 +167,7 @@ impl Center {
         };
         let mut store = match Store::load(&dir).map_err(|e| e.to_string())? {
             Some(s) => s,
-            None => Store::new(util::random_id(), host_name()),
+            None => Store::new(util::random_id(), DEFAULT_NAME.into()),
         };
         if let Some(n) = opts.name {
             store.center_name = n;
@@ -1031,6 +1034,27 @@ pub fn wildcard_of(command: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn open(dir: &Path, name: Option<&str>) -> Center {
+        nerve_transport::init_crypto();
+        Center::open(Options {
+            state_dir: dir.to_path_buf(),
+            name: name.map(str::to_string),
+            public_url: "http://127.0.0.1:7443".into(),
+            call_wait: Duration::from_secs(1),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn a_new_center_is_named_nerve_center_unless_told_otherwise() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(open(dir.path(), None).name(), "nerve-center");
+        // The name is kept across restarts and a flag renames it.
+        assert_eq!(open(dir.path(), None).name(), "nerve-center");
+        assert_eq!(open(dir.path(), Some("lab")).name(), "lab");
+        assert_eq!(open(dir.path(), None).name(), "lab");
+    }
 
     #[test]
     fn allow_means_never_ask_and_rules_move_between_lists() {

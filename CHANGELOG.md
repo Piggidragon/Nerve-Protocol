@@ -18,7 +18,7 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
   keeps their links and offers their capabilities as MCP tools. Its web UI
   has a login page (the harness token logs in; `--ui-no-login` on loopback
   turns it off) and shows nodes, the audit log,
-  statistics and the settings of nodes that granted write access
-  (`spec/harness.md`).
+  statistics, a help page with the node's commands and the settings of nodes
+  that granted write access (`spec/harness.md`).
 - Conformance suite with a center part and a node part; the harness part is a
   skeleton (`spec/conformance.md`).

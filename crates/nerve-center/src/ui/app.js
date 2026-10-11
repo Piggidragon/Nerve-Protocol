@@ -32,7 +32,8 @@ const ICONS = {
   wait: "<path d=\"M5 22h14\"/><path d=\"M5 2h14\"/><path d=\"M17 22v-4.172a2 2 0 0 0-.586-1.414L12 12l-4.414 4.414A2 2 0 0 0 7 17.828V22\"/><path d=\"M7 2v4.172a2 2 0 0 0 .586 1.414L12 12l4.414-4.414A2 2 0 0 0 17 6.172V2\"/>",
   plug: "<path d=\"M12 22v-5\"/><path d=\"M9 8V2\"/><path d=\"M15 8V2\"/><path d=\"M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z\"/>",
   info: "<circle cx=\"12\" cy=\"12\" r=\"10\"/><path d=\"M12 16v-4\"/><path d=\"M12 8h.01\"/>",
-  chev: "<path d=\"m6 9 6 6 6-6\"/>"
+  chev: "<path d=\"m6 9 6 6 6-6\"/>",
+  help: "<circle cx=\"12\" cy=\"12\" r=\"10\"/><path d=\"M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3\"/><path d=\"M12 17h.01\"/>"
 };
 
 const SVG = "http://www.w3.org/2000/svg";
@@ -40,6 +41,7 @@ const PAGES = {
   overview: { title: "Overview", view: pageOverview },
   stats: { title: "Statistics", view: pageStats },
   audit: { title: "Audit", view: pageAudit },
+  help: { title: "Help", view: pageHelp },
   settings: { title: "Settings", view: pageSettings },
 };
 
@@ -48,7 +50,7 @@ let lastSig = null;
 let busy = false;
 let down = false;
 let settingsRun = 0;
-const state = { overview: null, stats: null, audit: null, pairing: null, settings: null, newToken: null };
+const state = { overview: null, stats: null, audit: null, help: null, pairing: null, settings: null, newToken: null };
 
 const $ = (id) => document.getElementById(id);
 
@@ -216,6 +218,28 @@ function pill(kind, text) {
 
 function btn(label, kind, onclick, ic) {
   return el("button", { type: "button", class: "btn sm " + (kind || ""), onclick }, ic ? icon(ic, "sm") : null, label);
+}
+
+// ---- Help ----
+
+// The node commands, as the node's own CLI definition lists them: the center
+// sends that list (/api/help), nothing here names a command.
+function pageHelp() {
+  const h = state.help && state.help.node;
+  if (!h) return [empty("Loading…")];
+  const rows = (args) => el("div", { class: "rows" }, args.map((a) =>
+    el("div", {}, el("code", {}, a.name), el("span", { class: "v" }, a.about))));
+  return [
+    head("help", "Help", "The commands of nerve-node, the program that links a machine to its centers. Run them in a shell on that machine.",
+      [[h.commands.length, "commands"]]),
+    el("div", { class: "list" },
+      h.global.length ? el("div", { class: "card" }, el("p", { class: "meta" }, "Every command takes"), rows(h.global)) : null,
+      h.commands.map((c) => el("div", { class: "card", id: "cmd-" + c.name.replace(/ /g, "-") },
+        el("div", { class: "card-top" }, el("span", { class: "name mono" }, c.name)),
+        el("p", { class: "meta" }, c.about),
+        el("code", { class: "code" }, c.usage),
+        c.args.length ? rows(c.args) : null))),
+  ];
 }
 
 // ---- Overview ----
@@ -486,7 +510,7 @@ function current() {
 
 function signature(page) {
   const minute = Math.floor(Date.now() / 60000);
-  return JSON.stringify([page, state.overview, page === "stats" ? state.stats : page === "audit" ? state.audit : null, state.pairing, minute]);
+  return JSON.stringify([page, state.overview, page === "stats" ? state.stats : page === "audit" ? state.audit : page === "help" ? !!state.help : null, state.pairing, minute]);
 }
 
 function draw(force) {
@@ -509,10 +533,13 @@ async function tick() {
     const jobs = [api("GET", "/api/overview")];
     if (page === "stats") jobs.push(api("GET", "/api/stats"));
     if (page === "audit") jobs.push(api("GET", "/api/audit"));
+    // The command list does not change while the center runs: ask once.
+    if (page === "help" && !state.help) jobs.push(api("GET", "/api/help"));
     const [o, extra] = await Promise.all(jobs);
     state.overview = o;
     if (page === "stats") state.stats = extra;
     if (page === "audit") state.audit = extra;
+    if (page === "help" && extra) state.help = extra;
     if (down) notify("Connected to the center again.");
     down = false;
     draw(false);

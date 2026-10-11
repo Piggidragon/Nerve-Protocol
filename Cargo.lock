@@ -558,6 +558,7 @@ dependencies = [
  "clap",
  "futures-util",
  "libc",
+ "nerve-node",
  "nerve-proto",
  "nerve-transport",
  "ring",

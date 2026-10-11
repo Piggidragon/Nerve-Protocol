@@ -13,6 +13,8 @@ path = "src/main.rs"
 [dependencies]
 nerve-proto.workspace = true
 nerve-transport.workspace = true
+# The help page reads the node's command list from its CLI definition.
+nerve-node.workspace = true
 # io-std for MCP over stdio; a feature of the existing tokio, no new crate.
 tokio = { workspace = true, features = ["io-std"] }
 tokio-tungstenite.workspace = true

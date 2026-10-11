@@ -9,7 +9,7 @@ Two programs:
 - **`nerve-center`**, the center. A harness starts it as an MCP server; it pairs
   nodes, keeps their links and offers their capabilities as MCP tools. Its web
   UI (loopback, port 7480 by default) shows nodes, the audit log,
-  statistics and pairing links.
+  statistics and pairing links, and lists the node's commands on a help page.
 - **`nerve-node`**, the node. A daemon on each machine plus a headless CLI for
   pairing, policy and the audit log.
 

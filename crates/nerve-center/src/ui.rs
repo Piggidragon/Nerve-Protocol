@@ -301,6 +301,8 @@ impl Ui {
             })),
             ("GET", "/api/stats") => Ok(c.stats_json()),
             ("GET", "/api/audit") => Ok(json!({"decisions": c.audit()})),
+            // The node's own command list, read from its CLI definition.
+            ("GET", "/api/help") => Ok(json!({"node": nerve_node::cli::help()})),
             ("POST", "/api/pair") => Ok(c.new_pairing()),
             ("POST", "/api/nodes/rename") => c
                 .rename(&s("id"), &s("name"))
@@ -502,6 +504,71 @@ mod tests {
     fn set_cookie(r: &Response) -> String {
         let v = &r.headers.iter().find(|(k, _)| k == "Set-Cookie").unwrap().1;
         v.split(';').next().unwrap().to_string()
+    }
+
+    /// Every command and sub-command of the node CLI, by the words after
+    /// `nerve-node`, with its explanation, read straight from clap's tree.
+    fn node_commands(cmd: &clap::Command, prefix: &str, out: &mut Vec<(String, String)>) {
+        for sub in cmd.get_subcommands() {
+            if sub.get_name() == "help" {
+                continue;
+            }
+            let name = format!("{prefix}{}", sub.get_name());
+            let about = sub.get_about().map(ToString::to_string).unwrap_or_default();
+            node_commands(sub, &format!("{name} "), out);
+            out.push((name, about));
+        }
+    }
+
+    #[tokio::test]
+    async fn the_help_page_lists_every_node_command() {
+        use clap::CommandFactory;
+        let d = tempfile::tempdir().unwrap();
+        let ui = Ui::new(&center(d.path()), None, false, false);
+        let h = ("Host", "127.0.0.1:7480");
+        let session = ui.request(req("GET", "/api/session", &[h], "")).await;
+        let ck = set_cookie(&session);
+        // The page: a tab in the menu, drawn from /api/help.
+        let index = ui.request(req("GET", "/", &[h, ("Cookie", &ck)], "")).await;
+        let index = String::from_utf8(index.body).unwrap();
+        assert!(index.contains("href=\"#help\""), "no Help tab in the menu");
+        let js = ui
+            .request(req("GET", "/app.js", &[h, ("Cookie", &ck)], ""))
+            .await;
+        let js = String::from_utf8(js.body).unwrap();
+        assert!(js.contains("\"/api/help\"") && js.contains("pageHelp"));
+        // The data: every command of the CLI definition, with its words.
+        let r = ui
+            .request(req("GET", "/api/help", &[h, ("Cookie", &ck)], ""))
+            .await;
+        assert_eq!(r.status, 200);
+        let body: Value = serde_json::from_slice(&r.body).unwrap();
+        let listed: Vec<(String, String)> = body["node"]["commands"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| {
+                (
+                    c["name"].as_str().unwrap().to_string(),
+                    c["about"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        let mut cli = Vec::new();
+        node_commands(&nerve_node::cli::Cli::command(), "", &mut cli);
+        assert!(cli.len() > 20, "{cli:?}");
+        for (name, about) in &cli {
+            assert!(!about.is_empty(), "`{name}` has no explanation");
+            assert!(
+                listed.contains(&(name.clone(), about.clone())),
+                "`{name}` is not on the help page: {listed:?}"
+            );
+        }
+        assert_eq!(listed.len(), cli.len());
+        // The help is for a signed-in browser like every other API.
+        let ui = Ui::new(&center(d.path()), Some("nrv_x".into()), true, false);
+        let r = ui.request(req("GET", "/api/help", &[h], "")).await;
+        assert_eq!(r.status, 401);
     }
 
     #[test]

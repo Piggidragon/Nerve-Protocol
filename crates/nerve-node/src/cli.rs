@@ -6,7 +6,8 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand};
+use serde::Serialize;
 use serde_json::{Value, json};
 
 use nerve_policy::audit::AuditLog;
@@ -38,6 +39,7 @@ pub struct Cli {
 /// Picks one paired center; required when several are paired.
 #[derive(Debug, Args, Clone, Default)]
 pub struct CenterArg {
+    /// The paired center this is about (needed when several are paired).
     #[arg(long)]
     pub center: Option<String>,
 }
@@ -48,6 +50,7 @@ pub enum Cmd {
     Run,
     /// Pair with a center from its pairing link.
     Pair {
+        /// The pairing link the center showed.
         link: String,
         /// The local name for the center (default: the center's own name).
         #[arg(long)]
@@ -64,7 +67,9 @@ pub enum Cmd {
     Status,
     /// Set a center's mode: folder or user (user ends after --hours, at most 8).
     Mode {
+        /// `folder` or `user`.
         mode: String,
+        /// How long user mode lasts, in hours (default and maximum: 8).
         #[arg(long)]
         hours: Option<u64>,
         #[command(flatten)]
@@ -75,14 +80,18 @@ pub enum Cmd {
     Folder(FolderCmd),
     /// Set a capability or action (`fs`, `exec.run`) to on, off or hidden.
     Caps {
+        /// The capability (`fs`) or action (`exec.run`).
         cap: String,
+        /// `on`, `off` or `hidden`.
         setting: String,
         #[command(flatten)]
         center: CenterArg,
     },
     /// Let a center change settings (`settings off|write`).
     Grant {
+        /// What to grant; only `settings` exists.
         what: String,
+        /// `off` or `write`.
         value: String,
         #[command(flatten)]
         center: CenterArg,
@@ -92,6 +101,7 @@ pub enum Cmd {
     Config(ConfigCmd),
     /// Forbid a command (`deny <command> [--wildcard]`).
     Deny {
+        /// The command line to forbid.
         command: String,
         /// Match every command that starts with the same program.
         #[arg(long)]
@@ -101,7 +111,9 @@ pub enum Cmd {
     },
     /// Allow a command in every mode (a tainted call still cannot run it).
     Allow {
+        /// The command line to allow.
         command: String,
+        /// Match every command that starts with the same program.
         #[arg(long)]
         wildcard: bool,
         #[command(flatten)]
@@ -113,6 +125,7 @@ pub enum Cmd {
     Unlock,
     /// Show the local audit log.
     Audit {
+        /// Keep running and print new entries as they arrive.
         #[arg(long)]
         follow: bool,
         /// Only denied and forbidden calls.
@@ -126,11 +139,13 @@ pub enum Cmd {
     Install,
     /// Set up the machine (not done in 0.0.1).
     Setup {
+        /// Create a dedicated user for the node.
         #[arg(long)]
         create_user: bool,
     },
     /// Elevation rules (not done in 0.0.1).
     Sudo {
+        /// The elevation command and its arguments.
         #[arg(trailing_var_arg = true)]
         args: Vec<String>,
     },
@@ -142,16 +157,22 @@ pub enum Cmd {
 
 #[derive(Debug, Subcommand)]
 pub enum FolderCmd {
+    /// Let a center use a folder (read-only unless `--rw`).
     Add {
+        /// The folder.
         path: PathBuf,
+        /// Allow writing, not only reading.
         #[arg(long)]
         rw: bool,
+        /// Allow running programs from the folder.
         #[arg(long)]
         execute: bool,
         #[command(flatten)]
         center: CenterArg,
     },
+    /// Take a folder away from a center.
     Remove {
+        /// The folder.
         path: PathBuf,
         #[command(flatten)]
         center: CenterArg,
@@ -160,37 +181,149 @@ pub enum FolderCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum ConfigCmd {
+    /// Print one setting.
     Get {
+        /// The dotted key, for example `center.<name>.policy.mode`.
         key: String,
     },
+    /// Change one setting.
     Set {
+        /// The dotted key.
         key: String,
+        /// The new value.
         value: String,
     },
+    /// Remove one setting (its default applies again).
     Unset {
+        /// The dotted key.
         key: String,
     },
     /// Append a value to a list.
     Add {
+        /// The dotted key of the list.
         key: String,
+        /// The value to append.
         value: String,
     },
     /// Remove a value from a list.
     Remove {
+        /// The dotted key of the list.
         key: String,
+        /// The value to remove.
         value: String,
     },
 }
 
 #[derive(Debug, Subcommand)]
 pub enum ProxyCmd {
+    /// Reach centers through this HTTP proxy.
     Set {
+        /// The proxy URL.
         url: String,
         /// A header for the CONNECT request, `Name: value`.
         #[arg(long = "header")]
         headers: Vec<String>,
     },
+    /// Reach centers directly again.
     Clear,
+}
+
+/// The command list as `nerve-node --help` has it, for anything that shows
+/// the commands elsewhere (the center's help page). It is read from the
+/// [`Cli`] definition above, so a new command or flag shows up there by
+/// being written once.
+#[derive(Debug, Clone, Serialize)]
+pub struct Help {
+    /// What the node is.
+    pub about: String,
+    /// Options every command takes.
+    pub global: Vec<ArgHelp>,
+    /// Every command and sub-command, in the order `--help` lists them.
+    pub commands: Vec<CommandHelp>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CommandHelp {
+    /// The words after `nerve-node`: `status`, `folder add`.
+    pub name: String,
+    /// The usage line, for example `nerve-node folder add [OPTIONS] <PATH>`.
+    pub usage: String,
+    /// The explanation: the doc comment of the command.
+    pub about: String,
+    /// Its own arguments and flags, without the global ones.
+    pub args: Vec<ArgHelp>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ArgHelp {
+    /// How it is written: `--hours <HOURS>`, `<PATH>`, `--rw`.
+    pub name: String,
+    /// The explanation; empty when the argument has none.
+    pub about: String,
+}
+
+/// Reads [`Help`] from the [`Cli`] definition.
+pub fn help() -> Help {
+    let mut root = Cli::command();
+    root.build();
+    let mut commands = Vec::new();
+    collect_help(&root, "", &mut commands);
+    Help {
+        about: root
+            .get_about()
+            .map(ToString::to_string)
+            .unwrap_or_default(),
+        global: root
+            .get_arguments()
+            .filter(|a| a.is_global_set())
+            .map(arg_help)
+            .collect(),
+        commands,
+    }
+}
+
+fn collect_help(parent: &clap::Command, prefix: &str, out: &mut Vec<CommandHelp>) {
+    for sub in parent.get_subcommands() {
+        // clap adds a `help` sub-command of its own to every level.
+        if sub.get_name() == "help" || sub.is_hide_set() {
+            continue;
+        }
+        let name = if prefix.is_empty() {
+            sub.get_name().to_string()
+        } else {
+            format!("{prefix} {}", sub.get_name())
+        };
+        let usage = sub.clone().render_usage().to_string();
+        out.push(CommandHelp {
+            usage: usage.strip_prefix("Usage: ").unwrap_or(&usage).to_string(),
+            about: sub.get_about().map(ToString::to_string).unwrap_or_default(),
+            args: sub
+                .get_arguments()
+                .filter(|a| {
+                    !a.is_global_set() && !matches!(a.get_id().as_str(), "help" | "version")
+                })
+                .map(arg_help)
+                .collect(),
+            name: name.clone(),
+        });
+        collect_help(sub, &name, out);
+    }
+}
+
+fn arg_help(a: &clap::Arg) -> ArgHelp {
+    let value = a
+        .get_value_names()
+        .and_then(|v| v.first())
+        .map_or_else(|| a.get_id().as_str().to_uppercase(), ToString::to_string);
+    let name = match a.get_long() {
+        Some(long) if a.get_action().takes_values() => format!("--{long} <{value}>"),
+        Some(long) => format!("--{long}"),
+        None => format!("<{value}>"),
+    };
+    ArgHelp {
+        name,
+        about: a.get_help().map(ToString::to_string).unwrap_or_default(),
+    }
 }
 
 /// Reads the config: from the daemon when it runs, else from the file.
@@ -994,6 +1127,65 @@ mod tests {
     fn command_rules() {
         assert_eq!(command_rule("git push origin", true).unwrap(), "git *");
         assert_eq!(command_rule(" ls ", false).unwrap(), "ls");
+    }
+
+    /// Every command and sub-command name of the clap definition, walked
+    /// here on its own so the test does not trust [`help`] to find them.
+    fn all_names(cmd: &clap::Command, prefix: &str, out: &mut Vec<String>) {
+        for sub in cmd.get_subcommands() {
+            if sub.get_name() == "help" {
+                continue;
+            }
+            let name = format!("{prefix}{}", sub.get_name());
+            all_names(sub, &format!("{name} "), out);
+            out.push(name);
+        }
+    }
+
+    #[test]
+    fn help_lists_every_command_with_an_explanation() {
+        let mut names = Vec::new();
+        all_names(&Cli::command(), "", &mut names);
+        assert!(names.len() > 20, "{names:?}");
+        let h = help();
+        for name in &names {
+            let c = h
+                .commands
+                .iter()
+                .find(|c| &c.name == name)
+                .unwrap_or_else(|| panic!("`{name}` is missing from the help"));
+            assert!(!c.about.is_empty(), "`{name}` has no explanation");
+            assert!(
+                c.usage.starts_with(&format!("nerve-node {name}")),
+                "{}",
+                c.usage
+            );
+        }
+        assert_eq!(h.commands.len(), names.len());
+        let add = h.commands.iter().find(|c| c.name == "folder add").unwrap();
+        assert!(
+            add.args
+                .iter()
+                .any(|a| a.name == "--rw" && !a.about.is_empty())
+        );
+        assert!(add.args.iter().any(|a| a.name == "<PATH>"));
+        // The options every command takes are listed once, not per command.
+        assert!(h.global.iter().any(|a| a.name.starts_with("--config-dir")));
+        assert!(add.args.iter().all(|a| !a.name.starts_with("--config-dir")));
+    }
+
+    #[test]
+    fn every_argument_is_explained() {
+        for c in help().commands {
+            for a in c.args {
+                assert!(
+                    !a.about.is_empty(),
+                    "`{}` {} has no explanation",
+                    c.name,
+                    a.name
+                );
+            }
+        }
     }
 
     #[test]

@@ -118,8 +118,10 @@ Served by `nerve-center` itself at `--ui`. Tabs: overview (alerts,
 machines, pairing, sessions), statistics, audit (Allow, Allow as wildcard,
 Deny for commands, only with the node's settings grant; Allow puts the rule
 on the node's `policy.commands.permit`, Deny on `deny`, and each takes it
-off the other list), settings (center
-name, retention, harness tokens, per-node settings). The pages,
+off the other list), help (the node's commands, each with its
+usage and a short explanation; the center reads the list from the node's own
+CLI definition, `GET /api/help`, so it cannot differ from `nerve-node --help`),
+settings (center name, retention, harness tokens, per-node settings). The pages,
 scripts and styles are built into the binary; nothing is loaded from another
 host.
 

@@ -460,6 +460,7 @@ Commands the node runs for a center cannot change the node's settings through th
 - Package: one binary, Linux and Windows. Headless; everything through the CLI in 0.0.1.
 - `nerve-node install` (user service), `nerve-node setup --create-user nerve` (servers: dedicated user, system unit with `Delegate=yes`, folder grants printed as `setfacl` lines).
 - Terminal: `pair`, `unpair`, `centers`, `status`, `mode`, `folder`, `caps`, `grant settings`, `config get|set|unset|add|remove`, `panic`, `unlock`, `sudo on|off|status` (`on` asks for the sudo password; the node verifies it and refuses a wrong one; `off` asks for none), `proxy`, `update`, `uninstall [--purge]`. Every per-center command takes `--center <name>` and refuses to guess when there are several.
+- In 0.0.1 the commands `install`, `setup`, `update` and `uninstall` exist but only answer "not done in 0.0.1"; the node is started by hand until they land.
 - Pairing is confirmed in the terminal; a `nerve://` link handler and dialogs come with the Slint setup GUI later.
 
 ### 8.3 One source of truth

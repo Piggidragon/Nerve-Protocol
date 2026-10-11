@@ -2,7 +2,7 @@
 
 Nerve lets an agent harness reach the machines of its owner: read and write
 files, run commands, with the owner deciding on each machine what is allowed
-and what is allowed at all: everything else is refused. Version 0.0.1 is the first pre-release of the rewrite.
+and what is allowed at all: everything else is refused.
 
 Two programs:
 
@@ -84,14 +84,4 @@ CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static" \
    `nerve-node --help` lists every command; [`spec/node-local.md`](spec/node-local.md)
    explains the policy.
 
-## Not in 0.0.1
-
-Service install, `setup --create-user`, sudo rules and updates
-(`nerve-node install|setup|sudo|update|uninstall` say so); cgroup limits and
-the Windows job object; the Windows control socket (the CLI edits `node.toml`
-directly there); streams (`stream.open` answers `unavailable`); the harness
-part of the conformance suite.
-
-Harnesses integrate through MCP only; native plugins are a backlog item.
-
-Open point, not decided: the mode names (p04).
+Harnesses integrate through MCP.

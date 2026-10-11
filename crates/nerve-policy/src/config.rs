@@ -523,7 +523,7 @@ impl CenterPolicy {
 mod tests {
     use super::*;
 
-    const SAMPLE: &str = r#"
+    const SAMPLE_TEMPLATE: &str = r#"
 [node]
 name = "laptop"
 
@@ -548,7 +548,7 @@ approvals = "local"
 
 [center.policy]
 mode = "folders"
-folders = [{ path = "/home/u/proj", access = "rw", execute = true }]
+folders = [{ path = "FOLDER", access = "rw", execute = true }]
 deny = ["~/private"]
 caps = { exec = "ask", "fs.write" = "off" }
 
@@ -560,9 +560,20 @@ timeout_s = 30
 on_timeout = "allow"
 "#;
 
+    /// An absolute folder on the platform the tests run on.
+    const FOLDER: &str = if cfg!(windows) {
+        "C:/u/proj"
+    } else {
+        "/home/u/proj"
+    };
+
+    fn sample() -> String {
+        SAMPLE_TEMPLATE.replace("FOLDER", FOLDER)
+    }
+
     #[test]
     fn parses_round_trips_and_defaults() {
-        let c = NodeConfig::parse(SAMPLE).unwrap();
+        let c = NodeConfig::parse(&sample()).unwrap();
         assert_eq!(c.limits.max_running, 4);
         assert_eq!(c.limits.output_cap_bytes, 16 * 1024 * 1024);
         let home = c.center("home").unwrap();
@@ -598,19 +609,20 @@ on_timeout = "allow"
             assert!(e.contains(why), "{bad}: {e}");
         }
         let with = |extra: &str| {
-            SAMPLE.replace(
+            sample().replace(
                 "[center.policy.commands]",
                 &format!("{extra}\n[center.policy.commands]"),
             )
         };
         assert!(NodeConfig::parse(&with("full_until = 1\nfoo = 1")).is_err());
-        let full = SAMPLE.replace("mode = \"folders\"", "mode = \"full\"");
+        let full = sample().replace("mode = \"folders\"", "mode = \"full\"");
         assert!(NodeConfig::parse(&full).unwrap_err().contains("full_until"));
-        let rel = SAMPLE.replace("/home/u/proj", "proj");
+        let rel = sample().replace(FOLDER, "proj");
         assert!(NodeConfig::parse(&rel).unwrap_err().contains("absolute"));
+        let sample = sample();
         let two = format!(
-            "{SAMPLE}\n{}",
-            &SAMPLE[SAMPLE.find("[[center]]").unwrap()..]
+            "{sample}\n{}",
+            &sample[sample.find("[[center]]").unwrap()..]
         );
         assert!(NodeConfig::parse(&two).unwrap_err().contains("two centers"));
     }
@@ -631,7 +643,7 @@ on_timeout = "allow"
         let d = tempfile::tempdir().unwrap();
         let path = d.path().join("cfg/node.toml");
         assert_eq!(NodeConfig::load(&path).unwrap(), NodeConfig::default());
-        let c = NodeConfig::parse(SAMPLE).unwrap();
+        let c = NodeConfig::parse(&sample()).unwrap();
         c.save(&path).unwrap();
         assert_eq!(NodeConfig::load(&path).unwrap(), c);
         #[cfg(unix)]

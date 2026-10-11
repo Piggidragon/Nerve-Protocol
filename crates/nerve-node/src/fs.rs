@@ -511,11 +511,16 @@ mod tests {
         FsCall::parse(action, &args(v))?.run(&|_| false)
     }
 
+    /// A local path the way the center sends it (`/c/...` on Windows).
+    fn wire(p: &Path) -> String {
+        nerve_policy::paths::to_wire(p)
+    }
+
     #[test]
     fn read_write_conflict() {
         let d = tempfile::tempdir().unwrap();
-        let f = d.path().join("a.txt");
-        let p = f.to_str().unwrap();
+        let f = wire(&d.path().join("a.txt"));
+        let p = f.as_str();
         let w = run("write", json!({"path": p, "content": "hello\nworld\n"})).unwrap();
         let r = run("read", json!({"path": p})).unwrap();
         assert_eq!(r["content"], "hello\nworld\n");
@@ -548,7 +553,8 @@ mod tests {
         std::fs::write(d.path().join("sub/one.rs"), "fn main() {}\nneedle here\n").unwrap();
         std::fs::write(d.path().join("sub/secret/two.rs"), "needle\n").unwrap();
         std::fs::write(d.path().join("three.txt"), "needle too\n").unwrap();
-        let root = d.path().to_str().unwrap();
+        let root = wire(d.path());
+        let root = root.as_str();
         let secret = d.path().join("sub/secret");
         let skip = |p: &Path| p.starts_with(&secret);
         let g = FsCall::parse("grep", &args(json!({"path": root, "pattern": "needle"})))

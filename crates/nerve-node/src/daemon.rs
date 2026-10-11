@@ -11,10 +11,12 @@ use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc, watch};
 use tokio::task::JoinHandle;
 
+#[cfg(unix)]
+use nerve_policy::SetError;
 use nerve_policy::approvals::{Ask, By, Queue, Resolved};
 use nerve_policy::audit::{AuditLog, Entry};
 use nerve_policy::config::OnTimeout;
-use nerve_policy::{Choice, Grants, NodeConfig, SetError, SettingsStore};
+use nerve_policy::{Choice, Grants, NodeConfig, SettingsStore};
 use nerve_proto::Message;
 use nerve_proto::msg::{Topic, method};
 use nerve_sandbox::Confinement;
@@ -313,8 +315,10 @@ impl Shared {
         }
     }
 
+    // Only the Unix control socket asks these two; Windows has none yet.
     /// Whether `pid` runs below a command the node started for a center: such
     /// a process must not change the node's settings or answer approvals.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn below_command(&self, pid: Option<u32>) -> bool {
         let commands = lock(&self.commands);
         if commands.is_empty() {
@@ -367,6 +371,7 @@ impl Shared {
     }
 
     /// Answers an approval as the owner.
+    #[cfg_attr(not(unix), allow(dead_code))]
     pub fn answer_local(
         &self,
         center: Option<&str>,
@@ -601,6 +606,7 @@ async fn start_ctl(_shared: Arc<Shared>) -> Result<JoinHandle<()>, String> {
 }
 
 /// Methods that change something: refused from below a center's command.
+#[cfg(unix)]
 const MUTATING: &[&str] = &["config.write", "approvals.answer", "reload"];
 
 /// One control-socket request.

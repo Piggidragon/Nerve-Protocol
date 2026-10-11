@@ -289,6 +289,7 @@ pub async fn run(
     let status = status
         .expect("set unless timed out")
         .map_err(|e| RpcError::internal(format!("waiting for the command: {e}")))?;
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut result = json!({
         "exit_code": status.code(),
         "stdout": String::from_utf8_lossy(&out.0),

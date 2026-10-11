@@ -24,7 +24,12 @@ fn options(root: &Path) -> NodeOptions {
     let mut o = NodeOptions::new(NodePaths::new(root.join("config"), root.join("state")));
     o.home = root.join("home");
     std::fs::create_dir_all(&o.home).unwrap();
-    o.exe = Some(env!("CARGO_BIN_EXE_nerve-node").into());
+    // NERVE_NODE_BIN lets the built tests run on another machine.
+    o.exe = Some(
+        std::env::var_os("NERVE_NODE_BIN")
+            .map(Into::into)
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_nerve-node").into()),
+    );
     o
 }
 
@@ -76,7 +81,7 @@ async fn handshake_describe_and_an_approved_read() {
     let id = conn
         .request(
             "invoke",
-            json!({"cap": "fs", "action": "read", "args": {"path": file.display().to_string()}}),
+            json!({"cap": "fs", "action": "read", "args": {"path": nerve_policy::paths::to_wire(&file)}}),
         )
         .await
         .unwrap();
@@ -145,6 +150,8 @@ async fn handshake_describe_and_an_approved_read() {
     );
 }
 
+// The control socket is Unix-only in 0.0.1.
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_denied_read_fails_with_denied() {
     let dir = tempdir();
@@ -156,7 +163,7 @@ async fn a_denied_read_fails_with_denied() {
     let id = conn
         .request(
             "invoke",
-            json!({"cap": "fs", "action": "read", "args": {"path": file.display().to_string()}}),
+            json!({"cap": "fs", "action": "read", "args": {"path": nerve_policy::paths::to_wire(&file)}}),
         )
         .await
         .unwrap();

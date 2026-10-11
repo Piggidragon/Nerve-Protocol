@@ -742,6 +742,7 @@ async fn answer_approval(
     }
 }
 
+#[cfg(unix)]
 fn approval_line(v: &Value) -> String {
     let s = |k: &str| v[k].as_str().unwrap_or_default().to_string();
     let reasons: Vec<&str> = v["reasons"]
@@ -1095,7 +1096,7 @@ mod tests {
         assert!(run(&paths, &["mode", "full", "--hours", "9"]).is_err());
         let cfg = load(&paths);
         let c = cfg.center("home").unwrap();
-        let real = std::fs::canonicalize(&folder).unwrap();
+        let real = nerve_policy::paths::resolve(&folder).unwrap();
         assert_eq!(c.policy.folders[0].path, real.display().to_string());
         assert_eq!(c.policy.folders[0].access, Access::Rw);
         assert_eq!(c.policy.caps["exec.run"], CapSetting::Off);

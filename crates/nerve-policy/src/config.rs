@@ -331,12 +331,9 @@ pub struct CenterDocument {
 }
 
 impl NodeConfig {
-    /// Parses and checks `node.toml`. Files written while a call could still
-    /// ask the owner are read as the model without asking: see [`migrate`].
+    /// Parses and checks `node.toml`; unknown keys are errors.
     pub fn parse(text: &str) -> Result<NodeConfig, String> {
-        let mut table: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
-        migrate(&mut table);
-        let c: NodeConfig = table.try_into().map_err(|e| e.to_string())?;
+        let c: NodeConfig = toml::from_str(text).map_err(|e| e.to_string())?;
         c.validate()?;
         Ok(c)
     }
@@ -412,72 +409,6 @@ impl NodeConfig {
                 .map_err(|e| format!("center {}: {e}", c.name))?;
         }
         Ok(())
-    }
-}
-
-/// Reads an older `node.toml` as today's model. Nothing waits for an answer
-/// any more, so everything that asked now refuses, never allows:
-///
-/// - mode `ask` becomes mode `folder` without its folders (the folders of an
-///   `ask` center were not in force, and must not start to be);
-/// - a capability set to `ask` becomes `off`;
-/// - command rules `always_ask` join `deny`, and `never_ask` is `permit`;
-/// - the modes `folders` and `full` are `folder` and `user` (`full_until` is
-///   `user_until`).
-fn migrate(doc: &mut toml::Table) {
-    use toml::Value;
-    // `machine.elevation` was a placeholder that never did anything; the
-    // sudo switch replaces it and starts off.
-    if let Some(Value::Table(m)) = doc.get_mut("machine") {
-        m.remove("elevation");
-    }
-    let Some(Value::Array(centers)) = doc.get_mut("center") else {
-        return;
-    };
-    for c in centers.iter_mut().filter_map(Value::as_table_mut) {
-        // Old files carry an `approvals` key; the strict parser would refuse it.
-        c.remove("approvals");
-        let Some(Value::Table(p)) = c.get_mut("policy") else {
-            continue;
-        };
-        p.remove("approvals");
-        match p.get("mode").and_then(Value::as_str) {
-            Some("ask") => {
-                p.insert("mode".into(), "folder".into());
-                p.remove("folders");
-                p.remove("full_until");
-            }
-            Some("folders") => {
-                p.insert("mode".into(), "folder".into());
-            }
-            Some("full") => {
-                p.insert("mode".into(), "user".into());
-            }
-            _ => {}
-        }
-        if let Some(until) = p.remove("full_until") {
-            p.insert("user_until".into(), until);
-        }
-        if let Some(Value::Table(caps)) = p.get_mut("caps") {
-            for (_, v) in caps.iter_mut() {
-                if v.as_str() == Some("ask") {
-                    *v = "off".into();
-                }
-            }
-        }
-        if let Some(Value::Table(rules)) = p.get_mut("commands") {
-            if let Some(Value::Array(ask)) = rules.remove("always_ask") {
-                match rules.get_mut("deny") {
-                    Some(Value::Array(deny)) => deny.extend(ask),
-                    _ => {
-                        rules.insert("deny".into(), Value::Array(ask));
-                    }
-                }
-            }
-            if let Some(never) = rules.remove("never_ask") {
-                rules.insert("permit".into(), never);
-            }
-        }
     }
 }
 
@@ -643,81 +574,34 @@ permit = ["git status"]
         assert_eq!(p.mode_at(1000), Mode::Folder);
     }
 
-    /// A file written while a call could ask the owner.
-    fn old_file(mode: &str, extra: &str) -> String {
-        format!(
-            r#"
-[[center]]
-name = "home"
-url = "https://center.example:8443"
-center_id = "c1"
-node_id = "n1"
-
-[center.policy]
-mode = "{mode}"
-{extra}
-folders = [{{ path = "{FOLDER}", access = "rw", execute = true }}]
-caps = {{ exec = "ask", fs = "on" }}
-
-[center.policy.commands]
-deny = ["rm -rf *"]
-always_ask = ["git push*"]
-never_ask = ["ls*"]
-"#
-        )
-    }
-
-    #[test]
-    fn an_old_ask_value_loads_as_deny() {
-        let c = NodeConfig::parse(&old_file("ask", "")).unwrap();
-        let p = &c.center("home").unwrap().policy;
-        // Mode ask allowed nothing; it must not start to allow the folders.
-        assert_eq!(p.mode, Mode::Folder);
-        assert!(p.folders.is_empty());
-        // A capability set to ask is refused.
-        assert_eq!(p.cap_setting("exec", None), Some(CapSetting::Off));
-        assert_eq!(p.cap_setting("fs", None), Some(CapSetting::On));
-        // always_ask is a deny, never_ask the permit list.
-        assert_eq!(p.commands.deny, ["rm -rf *", "git push*"]);
-        assert_eq!(p.commands.permit, ["ls*"]);
-        let text = c.to_toml();
-        assert!(!text.contains("ask"), "{text}");
-        assert_eq!(NodeConfig::parse(&text).unwrap(), c);
-    }
-
-    #[test]
-    fn an_old_approvals_key_is_ignored() {
-        let old = old_file("folder", "approvals = \"both\"")
-            .replace("[center.policy]", "approvals = \"both\"\n[center.policy]\n");
-        let text = NodeConfig::parse(&old).unwrap().to_toml();
-        assert!(!text.contains("approvals"), "{text}");
-    }
-
-    #[test]
-    fn old_mode_names_load_as_the_new_ones() {
-        let c = NodeConfig::parse(&old_file("folders", "")).unwrap();
-        let p = &c.center("home").unwrap().policy;
-        assert_eq!(p.mode, Mode::Folder);
-        assert_eq!(p.folders.len(), 1);
-        let c = NodeConfig::parse(&old_file("full", "full_until = 5")).unwrap();
-        let p = &c.center("home").unwrap().policy;
-        assert_eq!((p.mode, p.user_until), (Mode::User, Some(5)));
-    }
-
     #[test]
     fn a_file_without_the_sudo_switch_loads_as_off() {
         let none = NodeConfig::parse("[machine]\nshell = \"/bin/sh\"\n").unwrap();
         assert_eq!(none.machine.sudo, Sudo::Off);
-        // The old placeholder key is dropped, whatever it said.
-        for old in ["off", "sudo"] {
-            let c = NodeConfig::parse(&format!("[machine]\nelevation = \"{old}\"\n")).unwrap();
-            assert_eq!(c.machine.sudo, Sudo::Off);
-            assert!(!c.to_toml().contains("elevation"));
-        }
         let on =
             NodeConfig::parse("[machine]\nsudo = \"on\"\nsudo_path = \"/usr/bin/sudo\"\n").unwrap();
         assert_eq!(on.machine.sudo, Sudo::On);
         assert_eq!(NodeConfig::parse(&on.to_toml()).unwrap(), on);
+    }
+
+    #[test]
+    fn keys_and_values_of_earlier_builds_are_errors() {
+        let center = |policy: &str| {
+            format!(
+                "[[center]]\nname = \"home\"\nurl = \"https://c.example:8443\"\ncenter_id = \"c\"\nnode_id = \"n\"\n[center.policy]\n{policy}\n"
+            )
+        };
+        for bad in [
+            "mode = \"ask\"",
+            "mode = \"full\"",
+            "approvals = \"both\"",
+            "full_until = 5",
+            "caps = { exec = \"ask\" }",
+            "[center.policy.commands]\nalways_ask = [\"x\"]",
+        ] {
+            assert!(NodeConfig::parse(&center(bad)).is_err(), "{bad}");
+        }
+        assert!(NodeConfig::parse("[machine]\nelevation = \"off\"\n").is_err());
     }
 
     #[test]

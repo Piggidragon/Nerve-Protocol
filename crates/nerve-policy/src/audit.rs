@@ -37,8 +37,7 @@ impl Entry {
     }
 
     pub fn is_refusal(&self) -> bool {
-        // `denied` is what older logs call a refusal the owner answered.
-        matches!(self.decision.as_str(), "denied" | "forbidden")
+        self.decision == "forbidden"
     }
 }
 

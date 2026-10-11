@@ -12,7 +12,7 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
 - `nerve-node`: the node daemon and its headless CLI. Policy per center:
   default deny, the modes folder and user, capability switches, protected and
   denied paths and allow and deny rules with wildcards. A call that no rule
-  allows is refused at once; there are no approvals. The settings grant, panic and unlock, and a
+  allows is refused at once. The settings grant, panic and unlock, and a
   local audit log (`spec/node-local.md`).
 - The sudo switch per node, off by default: off, no command runs with sudo
   even when a rule permits it; on, a sudo command runs only when a permit rule

@@ -183,15 +183,4 @@ mod tests {
         assert_eq!(days.len(), 1);
         assert_eq!(days[&100].links, 2);
     }
-
-    #[test]
-    fn a_state_file_with_the_old_effect_rules_still_loads() {
-        // Older centers stored `center_policy` with on, ask or off per effect.
-        // The rule is gone; the node decides, and a node denies by default.
-        let old = r#"{"center_id":"c","center_name":"home",
-            "center_policy":{"effects":{"execute":"ask","actuate":"off","read":"on"}}}"#;
-        let s: Store = serde_json::from_str(old).unwrap();
-        assert_eq!(s.center_name, "home");
-        assert!(!serde_json::to_string(&s).unwrap().contains("center_policy"));
-    }
 }

@@ -62,8 +62,7 @@ allow = []                  # when not empty, only these run at all
 permit = []                 # run in any mode unless the call is tainted
 ```
 
-Unknown keys are refused, with one exception: a `node.toml` written by an
-earlier build is migrated when it is read (§3.1). Two centers with one name are refused. Folder paths
+Unknown keys are refused. Two centers with one name are refused. Folder paths
 are absolute in the platform's own form; on the wire they travel as
 `/c/Users/...` on Windows (protocol §7.2).
 
@@ -96,17 +95,6 @@ answer. For each call the node takes the center's policy and, in this order:
 
 A command whose first word is `sudo` is decided by the sudo switch as well
 (§4). Every refusal names its reasons in the error and in the audit log.
-
-### 3.1 Older files
-
-An earlier build had a mode `ask` and asked the owner. A `node.toml` or a
-settings document that still has the old values loads, and everything that
-asked now refuses: mode `ask` becomes `folder` without its folders, a
-capability `ask` becomes `off`, `always_ask` rules join `deny`, `never_ask`
-is `permit`, `folders` is `folder`, `full` is `user` (`full_until` is
-`user_until`), and the `approvals` entries are dropped. The placeholder
-`machine.elevation` is dropped; a file without `machine.sudo` has the switch
-off.
 
 ## 4. The sudo switch
 

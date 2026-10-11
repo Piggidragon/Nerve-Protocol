@@ -930,7 +930,7 @@ async fn audit(
             let Ok(v) = serde_json::from_str::<Value>(line) else {
                 continue;
             };
-            let refused = matches!(v["decision"].as_str(), Some("denied" | "forbidden"));
+            let refused = v["decision"].as_str() == Some("forbidden");
             if denied && !refused {
                 continue;
             }
@@ -1142,11 +1142,8 @@ mod tests {
         run(&paths, &["mode", "user", "--center", "b"]).unwrap();
         assert_eq!(load(&paths).center("b").unwrap().policy.mode, Mode::User);
         assert_eq!(load(&paths).center("a").unwrap().policy.mode, Mode::Folder);
-        // `ask` is gone, and so are the old names.
-        for old in ["ask", "folders", "full"] {
-            let e = run(&paths, &["mode", old, "--center", "a"]).unwrap_err();
-            assert!(e.contains("unknown mode"), "{e}");
-        }
+        let e = run(&paths, &["mode", "ask", "--center", "a"]).unwrap_err();
+        assert!(e.contains("unknown mode"), "{e}");
         let e = run(&paths, &["caps", "fs", "ask", "--center", "a"]).unwrap_err();
         assert!(e.contains("unknown setting"), "{e}");
     }

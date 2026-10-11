@@ -19,5 +19,5 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
   has a login page (with `--ui-password`) and shows nodes, pending approvals,
   statistics and the settings of nodes that granted write access
   (`spec/harness.md`).
-- Conformance suite with a center part and a node part; the plugin part is a
+- Conformance suite with a center part and a node part; the harness part is a
   skeleton (`spec/conformance.md`).

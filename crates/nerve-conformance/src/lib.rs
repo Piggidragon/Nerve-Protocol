@@ -5,8 +5,8 @@
 //! - [`center_part`] checks a center over the wire, acting as a node (the
 //!   [`echo`] node).
 //! - [`node_part`] checks a node, acting as a center ([`fake_center`]).
-//! - [`plugin_part`] will check harness plugins; in 0.0.1 it is a skeleton,
-//!   because the harness integration form (plugin or MCP) is still open.
+//! - [`harness_part`] will check the MCP server surface a harness sees; in
+//!   0.0.1 it is a skeleton.
 //!
 //! There is no runner binary in 0.0.1 (the workspace ships exactly
 //! `nerve-mcp` and `nerve-node`); the parts run from `cargo test` in this
@@ -15,8 +15,8 @@
 pub mod center_part;
 pub mod echo;
 pub mod fake_center;
+pub mod harness_part;
 pub mod node_part;
-pub mod plugin_part;
 pub mod wire;
 
 use std::fmt;

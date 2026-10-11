@@ -4,10 +4,10 @@
 server; nodes connect to it as [protocol.md](protocol.md) describes. This page
 is what a harness, and whoever writes its MCP entry, can rely on.
 
-> **Open point.** Whether harnesses get Nerve through a plugin or through MCP
-> is not decided. 0.0.1 ships the MCP server only. A Pithagoras adapter and a
-> generic example adapter are not part of 0.0.1. Approvals are answered on
-> the node or in the center web UI; MCP elicitation is not used.
+> **Integration.** Harnesses get Nerve through MCP only: the MCP server is the
+> whole integration surface in 0.0.1. Native plugins for harnesses are a
+> backlog item. Approvals are answered on the node or in the center web UI;
+> MCP elicitation is not used.
 
 ## 1. Starting it
 

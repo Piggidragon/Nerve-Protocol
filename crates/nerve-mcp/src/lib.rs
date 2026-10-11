@@ -5,9 +5,8 @@
 //! center web UI. It has no subcommands: everything is set by flags or
 //! `NERVE_*` variables in the harness's MCP entry, or in the web UI.
 //
-// OPEN POINT: whether harnesses get Nerve through a plugin or through MCP is
-// not decided. 0.0.1 ships the MCP server only; the Pithagoras adapter and a
-// generic MCP example adapter are left out.
+// Harnesses get Nerve through MCP only: this MCP server is the whole
+// integration surface in 0.0.1. Native plugins are a backlog item.
 
 pub mod attach;
 pub mod center;

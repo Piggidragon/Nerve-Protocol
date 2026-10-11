@@ -7,7 +7,7 @@ use std::time::Duration;
 use nerve_conformance::echo::{self, Echo};
 use nerve_conformance::fake_center::FakeCenter;
 use nerve_conformance::wire::Recv;
-use nerve_conformance::{center_part, node_part, plugin_part};
+use nerve_conformance::{center_part, harness_part, node_part};
 use nerve_proto::msg::method;
 
 #[tokio::test]
@@ -45,8 +45,8 @@ async fn node_part_passes_against_the_echo_node() {
 }
 
 #[test]
-fn plugin_part_reports_every_check_as_not_run() {
-    let report = plugin_part::run();
-    assert_eq!(report.outcomes.len(), plugin_part::PLANNED.len());
+fn harness_part_reports_every_check_as_not_run() {
+    let report = harness_part::run();
+    assert_eq!(report.outcomes.len(), harness_part::PLANNED.len());
     assert!(!report.ok());
 }

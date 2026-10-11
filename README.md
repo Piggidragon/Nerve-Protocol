@@ -89,9 +89,10 @@ CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static" \
 Service install, `setup --create-user`, sudo rules and updates
 (`nerve-node install|setup|sudo|update|uninstall` say so); cgroup limits and
 the Windows job object; the Windows control socket (the CLI edits `node.toml`
-directly there); streams (`stream.open` answers `unavailable`); the plugin
+directly there); streams (`stream.open` answers `unavailable`); the harness
 part of the conformance suite.
 
-Open points, not decided: whether harnesses integrate through plugins or MCP
-(so there is no harness adapter yet), approvals through MCP elicitation (0.0.1
+Harnesses integrate through MCP only; native plugins are a backlog item.
+
+Open points, not decided: approvals through MCP elicitation (0.0.1
 keeps them in the node's queue), and the mode names (p04).

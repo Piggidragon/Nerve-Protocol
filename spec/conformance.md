@@ -8,10 +8,10 @@ so a failure points at the rule that was broken.
 |---|---|---|---|
 | center | a center | the echo node | runs |
 | node | a node | a fake center | runs |
-| plugin | a harness plugin | a center | skeleton: lists its checks, runs none |
+| harness | the MCP server surface a harness sees | a center | skeleton: lists its checks, runs none |
 
-The plugin part waits for the open decision whether harnesses integrate
-through plugins of their own or through MCP (architecture §11).
+Harnesses integrate through MCP only in 0.0.1, so the harness part checks the
+MCP server surface. Native plugins are a backlog item.
 
 ## Running it
 

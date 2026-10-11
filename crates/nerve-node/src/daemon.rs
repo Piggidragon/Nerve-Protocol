@@ -161,6 +161,10 @@ pub(crate) struct Shared {
     /// Commands running now, over all centers (`limits.max_running`).
     pub running: AtomicUsize,
     pub stop: watch::Sender<bool>,
+    /// The checked sudo password while the switch is on (crate::sudo).
+    pub sudo: Mutex<Option<crate::sudo::Secret>>,
+    /// Open sudo offers by center; each is opened at most once.
+    pub sudo_offers: Mutex<HashMap<String, nerve_transport::sudo::Pending>>,
 }
 
 impl Shared {
@@ -199,6 +203,10 @@ impl Shared {
     /// Records a decision in the local log and tells the center (if it
     /// subscribed to `audit/decision`).
     pub fn audit(&self, e: &Entry) {
+        let mut e = e.clone();
+        e.target = self.scrub(e.target);
+        e.decision = self.scrub(e.decision);
+        let e = &e;
         if let Err(err) = lock(&self.store).audit().decision(e) {
             tracing::warn!("cannot write the audit log: {err}");
         }
@@ -267,6 +275,7 @@ impl Shared {
             "locked": cfg.locked,
             "confinement": self.confinement.describe(),
             "running": self.running.load(Ordering::Relaxed),
+            "sudo": if self.sudo_on() { "on" } else { "off" },
             "centers": centers,
         })
     }
@@ -316,7 +325,11 @@ impl Daemon {
             commands: Mutex::default(),
             running: AtomicUsize::new(0),
             stop,
+            sudo: Mutex::new(None),
+            sudo_offers: Mutex::default(),
         });
+        // The password lives in memory only: a file that says on starts off.
+        shared.settle_sudo();
         let ctl = if opts.ctl {
             Some(start_ctl(shared.clone()).await?)
         } else {
@@ -407,6 +420,8 @@ async fn supervise(shared: Arc<Shared>) {
             Ok(false) => {}
             Err(e) => tracing::warn!("the config file does not load, the old one stays: {e}"),
         }
+        // An edited file may say on without a password, or off.
+        shared.settle_sudo();
         let cfg = shared.config();
         tasks.retain(|_, t| !t.is_finished());
         if !cfg.locked {
@@ -442,35 +457,27 @@ async fn start_ctl(shared: Arc<Shared>) -> Result<JoinHandle<()>, String> {
     let listener = nerve_transport::ctl::bind(&path)
         .await
         .map_err(|e| format!("{}: {e}", path.display()))?;
-    drop(listener);
     let s = shared.clone();
-    let p = path.clone();
     let task = tokio::spawn(async move {
-        let r = nerve_transport::ctl::serve(&p, move |req, peer| {
+        let r = nerve_transport::ctl::serve_on(listener, move |req, peer| {
             let s = s.clone();
-            async move { control(&s, req.method.as_str(), req.params, peer.pid) }
+            async move {
+                match req.method.as_str() {
+                    // Checking the password runs `sudo -v`, so it cannot
+                    // block inside `control`.
+                    "sudo.on" => sudo_on(&s, req.params, peer.pid).await,
+                    m => control(&s, m, req.params, peer.pid),
+                }
+            }
         })
         .await;
         if let Err(e) = r {
             tracing::warn!("the control socket stopped: {e}");
         }
     });
-    // `serve` binds again in its task; wait until it answers, so a CLI
-    // started right after finds the daemon.
-    for _ in 0..200 {
-        if tokio::net::UnixStream::connect(&path).await.is_ok() {
-            return Ok(task);
-        }
-        if task.is_finished() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    task.abort();
-    Err(format!(
-        "{}: the control socket did not come up",
-        path.display()
-    ))
+    // The socket is bound already, so a CLI started right after finds the
+    // daemon.
+    Ok(task)
 }
 
 #[cfg(not(unix))]
@@ -481,7 +488,33 @@ async fn start_ctl(_shared: Arc<Shared>) -> Result<JoinHandle<()>, String> {
 
 /// Methods that change something: refused from below a center's command.
 #[cfg(unix)]
-const MUTATING: &[&str] = &["config.write", "reload"];
+const MUTATING: &[&str] = &["config.write", "reload", "sudo.on", "sudo.off"];
+
+/// `sudo.on {password}`: the CLI on this machine turns the switch on. The
+/// socket is the owner's only, so the password travels in the clear here.
+#[cfg(unix)]
+async fn sudo_on(
+    shared: &Arc<Shared>,
+    params: Value,
+    pid: Option<u32>,
+) -> nerve_transport::ctl::Reply {
+    use nerve_transport::ctl::Reply;
+    if shared.below_command(pid) {
+        return Reply::Err(
+            "refused: this request comes from a command the node runs for a center".into(),
+        );
+    }
+    let Some(password) = params.get("password").and_then(Value::as_str) else {
+        return Reply::Err("password is missing".into());
+    };
+    match shared
+        .sudo_switch_on(nerve_policy::Writer::Local, password.to_string())
+        .await
+    {
+        Ok(v) => Reply::Ok(json!({"sudo": "on", "version": v})),
+        Err(e) => Reply::Err(e.to_string()),
+    }
+}
 
 /// One control-socket request.
 #[cfg(unix)]
@@ -500,6 +533,11 @@ pub(crate) fn control(
     let str_of = |k: &str| params.get(k).and_then(Value::as_str).map(str::to_string);
     match method {
         "status" => Reply::Ok(shared.status()),
+        "sudo.status" => Reply::Ok(json!({"sudo": if shared.sudo_on() { "on" } else { "off" }})),
+        "sudo.off" => match shared.sudo_switch_off(nerve_policy::Writer::Local) {
+            Ok(v) => Reply::Ok(json!({"sudo": "off", "version": v})),
+            Err(e) => Reply::Err(e.to_string()),
+        },
         "config.read" => {
             let s = lock(&shared.store);
             Reply::Ok(json!({"config": s.config().to_toml(), "version": s.version()}))
@@ -513,7 +551,14 @@ pub(crate) fn control(
                 Err(e) => return Reply::Err(e),
             };
             let if_version = params.get("if_version").and_then(Value::as_u64);
-            let r = lock(&shared.store).set_local(new, if_version);
+            let mut store = lock(&shared.store);
+            if new.machine.sudo != store.config().machine.sudo {
+                return Reply::Err(
+                    "machine.sudo changes only through nerve-node sudo on|off".into(),
+                );
+            }
+            let r = store.set_local(new, if_version);
+            drop(store);
             match r {
                 Ok(v) => {
                     shared.bump();

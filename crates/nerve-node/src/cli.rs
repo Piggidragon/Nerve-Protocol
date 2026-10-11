@@ -143,16 +143,25 @@ pub enum Cmd {
         #[arg(long)]
         create_user: bool,
     },
-    /// Elevation rules (not done in 0.0.1).
-    Sudo {
-        /// The elevation command and its arguments.
-        #[arg(trailing_var_arg = true)]
-        args: Vec<String>,
-    },
+    /// The sudo switch: whether permitted sudo commands may run.
+    #[command(subcommand)]
+    Sudo(SudoCmd),
     /// Update the node (not done in 0.0.1).
     Update,
     /// Remove the node (not done in 0.0.1).
     Uninstall,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SudoCmd {
+    /// Turn sudo on: asks for the sudo password, which the node checks with
+    /// `sudo -v` and keeps in memory only. Only commands a permit rule names
+    /// run with sudo.
+    On,
+    /// Turn sudo off and drop the password.
+    Off,
+    /// Show whether sudo is on.
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -734,14 +743,114 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
             w(out, "no proxy".into());
             Ok(())
         }
-        // Not done in 0.0.1: service install, a dedicated user, elevation,
-        // self-update and removal (architecture §6, §8).
+        Cmd::Sudo(c) => sudo_cmd(&paths, c, out).await,
+        // Not done in 0.0.1: service install, a dedicated user, self-update
+        // and removal (architecture §6, §8).
         Cmd::Install => Err(format!("install: {NOT_DONE}")),
         Cmd::Setup { .. } => Err(format!("setup: {NOT_DONE}")),
-        Cmd::Sudo { .. } => Err(format!("sudo: {NOT_DONE}")),
         Cmd::Update => Err(format!("update: {NOT_DONE}")),
         Cmd::Uninstall => Err(format!("uninstall: {NOT_DONE}")),
     }
+}
+
+/// `nerve-node sudo on|off|status`. The password lives in the running
+/// daemon only, so `on` needs one; `off` without a daemon edits the file.
+async fn sudo_cmd(paths: &NodePaths, c: SudoCmd, out: &mut dyn Write) -> Result<(), String> {
+    let w = |out: &mut dyn Write, s: &str| {
+        let _ = writeln!(out, "{s}");
+    };
+    #[cfg(unix)]
+    {
+        use nerve_transport::ctl::{NOT_RUNNING, call};
+        let sock = paths.ctl_socket();
+        match c {
+            SudoCmd::On => {
+                // Fail before asking for the password when nothing can take it.
+                match call(&sock, "status", json!({})).await {
+                    Ok(_) => {}
+                    Err(e) if e == NOT_RUNNING => {
+                        return Err(
+                            "sudo on needs the running daemon: it keeps the password in memory only"
+                                .into(),
+                        );
+                    }
+                    Err(e) => return Err(e),
+                }
+                let password = read_password(out, "sudo password: ")?;
+                call(&sock, "sudo.on", json!({"password": password})).await?;
+                w(
+                    out,
+                    "sudo: on (only commands a permit rule names run with sudo)",
+                );
+            }
+            SudoCmd::Off => {
+                match call(&sock, "sudo.off", json!({})).await {
+                    Ok(_) => {}
+                    Err(e) if e == NOT_RUNNING => {
+                        edit(paths, |c| {
+                            c.machine.sudo = nerve_policy::config::Sudo::Off;
+                            Ok(())
+                        })
+                        .await?;
+                    }
+                    Err(e) => return Err(e),
+                }
+                w(out, "sudo: off");
+            }
+            SudoCmd::Status => {
+                let on = match call(&sock, "sudo.status", json!({})).await {
+                    Ok(v) => v["sudo"] == "on",
+                    // A node that does not run holds no password.
+                    Err(e) if e == NOT_RUNNING => false,
+                    Err(e) => return Err(e),
+                };
+                w(out, if on { "sudo: on" } else { "sudo: off" });
+            }
+        }
+        Ok(())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (paths, out, w);
+        match c {
+            SudoCmd::Status => Ok(()),
+            _ => Err("the sudo switch works on Linux only".into()),
+        }
+    }
+}
+
+/// Reads a password: from the terminal without echo, else one line of stdin.
+#[cfg(unix)]
+fn read_password(out: &mut dyn Write, prompt: &str) -> Result<String, String> {
+    use std::os::fd::AsRawFd;
+    let stdin = std::io::stdin();
+    let fd = stdin.as_raw_fd();
+    // SAFETY: plain termios calls on stdin with a zeroed struct to fill.
+    let mut old: libc::termios = unsafe { std::mem::zeroed() };
+    let tty = unsafe { libc::isatty(fd) == 1 && libc::tcgetattr(fd, &mut old) == 0 };
+    if tty {
+        let _ = write!(out, "{prompt}");
+        let _ = out.flush();
+        let mut quiet = old;
+        quiet.c_lflag &= !libc::ECHO;
+        // SAFETY: as above; restored below.
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &quiet) };
+    }
+    let mut line = String::new();
+    let r = stdin.lock().read_line(&mut line);
+    if tty {
+        // SAFETY: restores what tcgetattr returned.
+        unsafe { libc::tcsetattr(fd, libc::TCSANOW, &old) };
+        let _ = writeln!(out);
+    }
+    r.map_err(|e| e.to_string())?;
+    let password = line.strip_suffix('\n').unwrap_or(&line);
+    let password = password.strip_suffix('\r').unwrap_or(password).to_string();
+    line.clear();
+    if password.is_empty() {
+        return Err("no password given".into());
+    }
+    Ok(password)
 }
 
 fn confirm(out: &mut dyn Write) -> Result<bool, String> {
@@ -1114,7 +1223,6 @@ mod tests {
         for cmd in [
             &["install"][..],
             &["setup", "--create-user"],
-            &["sudo", "x"],
             &["update"],
             &["uninstall"],
         ] {

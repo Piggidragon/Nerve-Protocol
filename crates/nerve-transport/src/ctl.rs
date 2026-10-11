@@ -91,7 +91,17 @@ mod unix {
         F: Fn(CtlRequest, Peer) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Reply> + Send + 'static,
     {
-        let listener = bind(path).await?;
+        serve_on(bind(path).await?, handler).await
+    }
+
+    /// Like [`serve`], on a socket [`bind`] made already. Binding once
+    /// matters: a socket dropped and bound again can look in use while a
+    /// child forked meanwhile still holds the old one.
+    pub async fn serve_on<F, Fut>(listener: UnixListener, handler: F) -> std::io::Result<()>
+    where
+        F: Fn(CtlRequest, Peer) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Reply> + Send + 'static,
+    {
         let handler = Arc::new(handler);
         let me = crate::net::euid();
         loop {
@@ -303,4 +313,4 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub use unix::{NOT_RUNNING, Reply, bind, call, follow, serve};
+pub use unix::{NOT_RUNNING, Reply, bind, call, follow, serve, serve_on};

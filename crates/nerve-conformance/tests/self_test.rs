@@ -38,7 +38,8 @@ async fn node_part_passes_against_the_echo_node() {
             // The echo node never redials: one link, served until it ends.
             echo::serve(&mut c, &d, Duration::from_secs(60)).await;
         });
-        Ok(())
+        // The echo node has no fs, exec or settings: no profile checks.
+        Ok(node_part::Setup::default())
     })
     .await;
     assert!(report.ok(), "{report}");

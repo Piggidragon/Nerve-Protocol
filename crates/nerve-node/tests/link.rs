@@ -201,7 +201,7 @@ async fn passes_the_conformance_node_checks() {
         nerve_node::pair::pair(&o.paths, &link, None).await?;
         let d = Daemon::start(o).await?;
         *keep.lock().unwrap() = Some(d);
-        Ok(())
+        Ok(nerve_conformance::node_part::Setup::default())
     })
     .await;
     let d = running.lock().unwrap().take();

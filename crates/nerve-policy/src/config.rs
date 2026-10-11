@@ -59,19 +59,37 @@ pub struct Machine {
     /// Whether the node may run as root at all.
     #[serde(default)]
     pub allow_root: bool,
+    /// The node's sudo switch (one per node, not per center). The password
+    /// is never in this file; the node keeps it in memory while the switch
+    /// is on, so a restarted node starts with the switch off.
     #[serde(default)]
-    pub elevation: Elevation,
+    pub sudo: Sudo,
+    /// The `sudo` program; `sudo` from `PATH` when unset. Only the owner
+    /// sets it: a fake `sudo` would catch the password.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sudo_path: Option<String>,
     #[serde(default)]
     pub secret_storage: SecretStorage,
 }
 
+/// The sudo switch. Off, no command runs through `sudo`, whatever the rules
+/// say. On, a `sudo` command runs only when an explicit `permit` rule names
+/// it, in either mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
-pub enum Elevation {
+pub enum Sudo {
     #[default]
     Off,
-    /// Not done in 0.0.1 (see `nerve_sandbox::elevation`).
-    Sudo,
+    On,
+}
+
+impl Sudo {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Sudo::Off => "off",
+            Sudo::On => "on",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -409,6 +427,11 @@ impl NodeConfig {
 ///   `user_until`).
 fn migrate(doc: &mut toml::Table) {
     use toml::Value;
+    // `machine.elevation` was a placeholder that never did anything; the
+    // sudo switch replaces it and starts off.
+    if let Some(Value::Table(m)) = doc.get_mut("machine") {
+        m.remove("elevation");
+    }
     let Some(Value::Array(centers)) = doc.get_mut("center") else {
         return;
     };
@@ -517,7 +540,7 @@ name = "laptop"
 
 [machine]
 shell = "/bin/bash"
-elevation = "off"
+sudo = "off"
 
 [limits]
 max_running = 4
@@ -585,7 +608,7 @@ permit = ["git status"]
             ("[node]\nname = \"Bad Name\"\n", "node.name"),
             ("[limits]\nmax_running = 0\n", "max_running"),
             ("[connection]\nproxy = \"https://p:1\"\n", "proxy"),
-            ("[machine]\nelevation = \"doas\"\n", "unknown variant"),
+            ("[machine]\nsudo = \"doas\"\n", "unknown variant"),
         ] {
             let e = NodeConfig::parse(bad).unwrap_err();
             assert!(e.contains(why), "{bad}: {e}");
@@ -679,6 +702,22 @@ on_timeout = "allow"
         let c = NodeConfig::parse(&old_file("full", "full_until = 5")).unwrap();
         let p = &c.center("home").unwrap().policy;
         assert_eq!((p.mode, p.user_until), (Mode::User, Some(5)));
+    }
+
+    #[test]
+    fn a_file_without_the_sudo_switch_loads_as_off() {
+        let none = NodeConfig::parse("[machine]\nshell = \"/bin/sh\"\n").unwrap();
+        assert_eq!(none.machine.sudo, Sudo::Off);
+        // The old placeholder key is dropped, whatever it said.
+        for old in ["off", "sudo"] {
+            let c = NodeConfig::parse(&format!("[machine]\nelevation = \"{old}\"\n")).unwrap();
+            assert_eq!(c.machine.sudo, Sudo::Off);
+            assert!(!c.to_toml().contains("elevation"));
+        }
+        let on =
+            NodeConfig::parse("[machine]\nsudo = \"on\"\nsudo_path = \"/usr/bin/sudo\"\n").unwrap();
+        assert_eq!(on.machine.sudo, Sudo::On);
+        assert_eq!(NodeConfig::parse(&on.to_toml()).unwrap(), on);
     }
 
     #[test]

@@ -136,6 +136,48 @@ pub struct RunOptions {
     /// The `nerve-node` binary that hosts the shim.
     pub exe: PathBuf,
     pub output_cap: usize,
+    /// Set only for a permitted `sudo` command (already rewritten with
+    /// [`sudo_line`]): sudo reads this password from stdin. Every other
+    /// command runs with no_new_privs (Linux), so a `sudo` the rules did not
+    /// see (`ls; sudo x`) cannot gain privileges.
+    pub sudo_password: Option<String>,
+}
+
+/// Quotes `s` for a POSIX shell.
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// The command line that runs `args` (what followed `sudo`) through
+/// `sudo_path`, reading the password from stdin. `-k` makes sudo ask every
+/// time, so the password line is always consumed by sudo, never left for the
+/// command; `-p ''` keeps the prompt out of stderr.
+pub fn sudo_line(sudo_path: &str, args: &str) -> String {
+    format!("{} -S -k -p '' {args}", sh_quote(sudo_path))
+}
+
+/// Checks `password` with `sudo -S -k -v`, which runs nothing and caches
+/// nothing; its output is discarded.
+pub async fn sudo_check(sudo_path: &str, password: &str) -> Result<(), String> {
+    let mut child = Command::new(sudo_path)
+        .args(["-S", "-k", "-v", "-p", ""])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|e| format!("cannot run {sudo_path}: {e}"))?;
+    let mut stdin = child.stdin.take().expect("piped");
+    // sudo may exit before reading (no such user in sudoers); the exit
+    // status says what matters.
+    let _ = stdin.write_all(format!("{password}\n").as_bytes()).await;
+    drop(stdin);
+    match tokio::time::timeout(Duration::from_secs(30), child.wait()).await {
+        Ok(Ok(s)) if s.success() => Ok(()),
+        Ok(Ok(_)) => Err("the sudo password is wrong (sudo -v refused it)".into()),
+        Ok(Err(e)) => Err(format!("waiting for sudo: {e}")),
+        Err(_) => Err("sudo -v did not answer within 30 s".into()),
+    }
 }
 
 /// Kills the command's whole process group when dropped: a cancelled call, a
@@ -236,10 +278,26 @@ pub async fn run(
         }
         None => {
             let mut c = Command::new(&program);
-            c.args(&args).stdin(Stdio::null());
+            c.args(&args).stdin(if opts.sudo_password.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            });
             c
         }
     };
+    #[cfg(target_os = "linux")]
+    if opts.sudo_password.is_none() {
+        // SAFETY: prctl is async-signal-safe and touches only this process.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     cmd.current_dir(&call.cwd)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -257,6 +315,11 @@ pub async fn run(
             .write_all(&json)
             .await
             .map_err(|e| RpcError::internal(format!("cannot hand the shim its spec: {e}")))?;
+        drop(stdin);
+    } else if let Some(pw) = &opts.sudo_password {
+        let mut stdin = child.stdin.take().expect("piped");
+        // A sudo that fails early closes the pipe; its exit code tells.
+        let _ = stdin.write_all(format!("{pw}\n").as_bytes()).await;
         drop(stdin);
     }
     if let Some(pid) = child.id() {
@@ -322,6 +385,7 @@ mod tests {
             landlock: None,
             exe: PathBuf::from("/nonexistent"),
             output_cap: cap,
+            sudo_password: None,
         }
     }
 
@@ -347,6 +411,31 @@ mod tests {
             .unwrap();
         assert_eq!(r["stdout"].as_str().unwrap().len(), 100);
         assert_eq!(r["truncated"], true);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn only_a_sudo_command_may_gain_privileges() {
+        let probe = "read l; echo got=$l; grep NoNewPrivs /proc/self/status";
+        let r = run(&call(probe), &opts(1024), |_| {}).await.unwrap();
+        let out = r["stdout"].as_str().unwrap();
+        assert!(out.contains("got=\n"), "{out}");
+        assert!(out.contains("NoNewPrivs:\t1"), "{out}");
+        let mut o = opts(1024);
+        o.sudo_password = Some("pw".into());
+        let r = run(&call(probe), &o, |_| {}).await.unwrap();
+        let out = r["stdout"].as_str().unwrap();
+        assert!(out.contains("got=pw\n"), "{out}");
+        assert!(!out.contains("NoNewPrivs:\t1"), "{out}");
+    }
+
+    #[test]
+    fn sudo_line_quotes_the_program() {
+        assert_eq!(
+            sudo_line("/opt/my sudo", "apt update"),
+            "'/opt/my sudo' -S -k -p '' apt update"
+        );
+        assert_eq!(sudo_line("a'b", "x"), "'a'\\''b' -S -k -p '' x");
     }
 
     #[tokio::test]

@@ -11,7 +11,9 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::audit::{AuditLog, diff};
-use crate::config::{CapSetting, CenterDocument, Mode, NodeConfig, SettingsGrant, USER_MAX_MS};
+use crate::config::{
+    CapSetting, CenterDocument, Mode, NodeConfig, SettingsGrant, Sudo, USER_MAX_MS,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SetError {
@@ -182,6 +184,26 @@ impl SettingsStore {
         self.commit(Writer::Center(center), cfg)
     }
 
+    /// Sets the node's sudo switch: the one machine setting a center with the
+    /// `write` grant may change. The caller has checked the password before
+    /// it turns the switch on.
+    pub fn set_sudo(&mut self, by: Writer, sudo: Sudo) -> Result<u64, SetError> {
+        if let Writer::Center(center) = by {
+            let entry = self
+                .config
+                .center(center)
+                .ok_or_else(|| SetError::Forbidden(format!("no center {center}")))?;
+            if entry.settings != SettingsGrant::Write {
+                return Err(SetError::Forbidden(
+                    "this node does not let this center change its settings".into(),
+                ));
+            }
+        }
+        let mut cfg = self.config.clone();
+        cfg.machine.sudo = sudo;
+        self.commit(by, cfg)
+    }
+
     fn commit(&mut self, by: Writer, mut new: NodeConfig) -> Result<u64, SetError> {
         new.version = self.config.version;
         new.validate().map_err(SetError::Invalid)?;
@@ -274,6 +296,29 @@ mod tests {
 
     fn doc(s: &SettingsStore) -> Value {
         serde_json::to_value(s.center_document("home").unwrap()).unwrap()
+    }
+
+    #[test]
+    fn only_a_writing_center_switches_sudo() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = store(d.path(), SettingsGrant::Off);
+        assert!(matches!(
+            s.set_sudo(Writer::Center("home"), Sudo::On),
+            Err(SetError::Forbidden(_))
+        ));
+        assert_eq!(s.config().machine.sudo, Sudo::Off);
+        s.set_sudo(Writer::Local, Sudo::On).unwrap();
+        assert_eq!(s.config().machine.sudo, Sudo::On);
+        let mut s = store(&d.path().join("w"), SettingsGrant::Write);
+        let v = s.set_sudo(Writer::Center("home"), Sudo::On).unwrap();
+        assert_eq!(s.version(), v);
+        let log = s.audit().read().unwrap();
+        let last = log.last().unwrap();
+        assert_eq!(last["by"], "center home");
+        assert!(
+            last["changes"].to_string().contains("machine.sudo"),
+            "{last}"
+        );
     }
 
     #[test]

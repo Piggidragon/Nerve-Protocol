@@ -311,17 +311,19 @@ async fn session(
     // One writer owns the sink; everyone else queues (spec §5.5).
     let (tx, mut rx) = mpsc::channel::<WsMessage>(limits::SEND_QUEUE);
     let (done_tx, mut done_rx) = oneshot::channel::<()>();
+    // Every frame leaves through here, so the sudo password never does.
+    let scrubber = shared.clone();
     let writer = tokio::spawn(async move {
         loop {
             tokio::select! {
                 m = rx.recv() => match m {
-                    Some(m) => if sink.send(m).await.is_err() { return; },
+                    Some(m) => if sink.send(scrub(&scrubber, m)).await.is_err() { return; },
                     None => break,
                 },
                 _ = &mut done_rx => {
                     // Flush what is queued (the bye), then close.
                     while let Ok(m) = rx.try_recv() {
-                        if sink.send(m).await.is_err() {
+                        if sink.send(scrub(&scrubber, m)).await.is_err() {
                             return;
                         }
                     }
@@ -646,7 +648,7 @@ impl Link {
         let all: &[&str] = match g.cap.as_str() {
             "node" => &["status"],
             "exec" => &["shell", "confinement"],
-            "settings" => &["document", "version"],
+            "settings" => &["document", "version", "sudo"],
             _ => &[],
         };
         let keys: Vec<String> = if g.keys.is_empty() {
@@ -670,6 +672,7 @@ impl Link {
                     let doc = lock(&self.shared.store).center_document(&self.name);
                     serde_json::to_value(doc).map_err(|e| RpcError::internal(e.to_string()))?
                 }
+                "sudo" => json!(if self.shared.sudo_on() { "on" } else { "off" }),
                 _ => json!(lock(&self.shared.store).version()),
             };
             out.insert(k, v);
@@ -779,6 +782,8 @@ impl Link {
         match (inv.cap.as_str(), inv.action.as_str()) {
             ("settings", "set") => self.settings_set(&inv.args),
             ("settings", "pause") => self.settings_pause(),
+            ("settings", "sudo_offer") => self.sudo_offer(&entry),
+            ("settings", "sudo") => self.settings_sudo(&inv.args).await,
             ("exec", "signal") => self.signal(&inv.args),
             ("exec", "run") => self.exec_run(id, &cfg, &entry, effect, &inv).await,
             ("fs", a) => {
@@ -858,6 +863,7 @@ impl Link {
                 home: &self.shared.home,
                 protected: &protected,
                 confined: self.shared.confined(),
+                sudo: self.shared.sudo_on(),
             };
             nerve_policy::decide(&entry.policy, &env, &call)
         };
@@ -921,6 +927,55 @@ impl Link {
         settings_result(r).map(|_| json!({}))
     }
 
+    /// `settings.sudo_offer`: a fresh one-shot key for the sealed password,
+    /// signed with this node's key for the center. A new offer replaces the
+    /// open one.
+    fn sudo_offer(&self, entry: &CenterEntry) -> Result<Value, RpcError> {
+        let pending =
+            nerve_transport::sudo::Pending::new(crate::now_ms()).map_err(RpcError::internal)?;
+        let key = load_key(&self.shared, &self.name).map_err(RpcError::internal)?;
+        let center_id = entry.center_id.clone();
+        let offer = pending.offer().clone();
+        let sig = key.sign_sudo_offer(&center_id, &offer);
+        lock(&self.shared.sudo_offers).insert(self.name.clone(), pending);
+        Ok(json!({"offer": offer.offer, "key": offer.key, "ts": offer.ts, "sig": sig}))
+    }
+
+    /// `settings.sudo`: on with a sealed password the node checks with
+    /// `sudo -v`, or off.
+    async fn settings_sudo(&self, args: &Map<String, Value>) -> Result<Value, RpcError> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct SudoArgs {
+            on: bool,
+            #[serde(default)]
+            sealed: Option<nerve_transport::sudo::Sealed>,
+        }
+        let a: SudoArgs = params(args)?;
+        let by = nerve_policy::Writer::Center(&self.name);
+        if !a.on {
+            if a.sealed.is_some() {
+                return Err(RpcError::invalid_args("off takes no sealed password"));
+            }
+            return settings_result(self.shared.sudo_switch_off(by))
+                .map(|_| json!({"sudo": "off"}));
+        }
+        let sealed = a
+            .sealed
+            .ok_or_else(|| RpcError::invalid_args("on needs a sealed password"))?;
+        // Taken out before it is opened: an offer opens once, right or wrong.
+        let pending = lock(&self.shared.sudo_offers)
+            .remove(&self.name)
+            .ok_or_else(|| {
+                RpcError::invalid_args("no open sudo offer; ask settings.sudo_offer for one")
+            })?;
+        let password = pending
+            .open(&sealed, crate::now_ms())
+            .map_err(RpcError::invalid_args)?;
+        settings_result(self.shared.sudo_switch_on(by, password).await)
+            .map(|_| json!({"sudo": "on"}))
+    }
+
     fn signal(&self, args: &Map<String, Value>) -> Result<Value, RpcError> {
         let s: SignalArgs = params(args)?;
         let sig = Sig::parse(&s.signal)
@@ -954,8 +1009,22 @@ impl Link {
             Some(&rc.cwd),
             target,
         )?;
+        // The policy let a sudo command through only with the switch on and
+        // a permit rule naming it. It runs the node's sudo, with the password
+        // on stdin and without Landlock, which would keep sudo from rising.
+        let mut rc = rc;
+        let mut sudo_password = None;
+        if let Some(args) = nerve_policy::sudo_command(&rc.command) {
+            let password = self
+                .shared
+                .sudo_password()
+                .ok_or_else(|| RpcError::forbidden("sudo is off on this node"))?;
+            rc.command = exec::sudo_line(&self.shared.sudo_path(), args);
+            sudo_password = Some(password);
+        }
         let guard = Running::start(self, id.clone(), cfg.limits.max_running as usize)?;
-        let landlock = (entry.policy.mode_at(crate::now_ms()) == Mode::Folder
+        let landlock = (sudo_password.is_none()
+            && entry.policy.mode_at(crate::now_ms()) == Mode::Folder
             && self.shared.confined())
         .then(|| exec::landlock_spec(&entry.policy, &self.shared.home));
         let opts = RunOptions {
@@ -963,6 +1032,7 @@ impl Link {
             landlock,
             exe: self.shared.exe.clone().unwrap_or_default(),
             output_cap: (cfg.limits.output_cap_bytes as usize).min(exec::OUTPUT_HARD_CAP),
+            sudo_password,
         };
         let r = exec::run(&rc, &opts, |pid| guard.started(pid)).await;
         drop(guard);
@@ -974,6 +1044,14 @@ impl Link {
             );
         }
         r
+    }
+}
+
+/// `m` without the sudo password (crate::sudo).
+fn scrub(shared: &Shared, m: WsMessage) -> WsMessage {
+    match m {
+        WsMessage::Text(t) => WsMessage::text(shared.scrub(t.to_string())),
+        other => other,
     }
 }
 

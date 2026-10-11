@@ -55,7 +55,26 @@ pub struct Env<'a> {
     /// Whether commands run in `folder` mode can be confined (Landlock). When
     /// they cannot, a command in an execute folder is refused.
     pub confined: bool,
+    /// The node's sudo switch: on only while the node holds a sudo password
+    /// it has checked.
+    pub sudo: bool,
 }
+
+/// The arguments of a command that runs through `sudo`: its first word is
+/// `sudo` (or a path ending in `/sudo`). Anything else (`env sudo`, `ls;
+/// sudo x`) is not a sudo command here; the node runs those so that sudo
+/// cannot gain privileges at all.
+pub fn sudo_command(command: &str) -> Option<&str> {
+    let command = command.trim_start();
+    let end = command
+        .find(|c: char| c.is_ascii_whitespace())
+        .unwrap_or(command.len());
+    let (first, rest) = command.split_at(end);
+    (first == "sudo" || first.ends_with("/sudo")).then_some(rest.trim_start())
+}
+
+/// Characters that chain, substitute or redirect in a shell.
+const SHELL_CONTROL: &[char] = &[';', '&', '|', '$', '`', '(', ')', '<', '>', '\n', '\r'];
 
 fn matcher(globs: &[String]) -> Vec<GlobMatcher> {
     globs
@@ -109,6 +128,23 @@ pub fn decide(policy: &CenterPolicy, env: &Env, call: &Call) -> Decision {
             return Decision::Forbidden(format!("the command {cmd:?} is not on the allow list"));
         }
     }
+    // The switch is checked before any rule: off, no permit makes a sudo
+    // command run, because the node has no password to give it.
+    let sudo = call.command.is_some_and(|c| sudo_command(c).is_some());
+    if sudo && !env.sudo {
+        return Decision::Forbidden("sudo is off on this node".into());
+    }
+    // A permit rule names one command; `sudo apt update; rm -rf /` must not
+    // slip through a `sudo apt *` rule with a second command.
+    if sudo
+        && call
+            .command
+            .is_some_and(|c| c.trim().contains(SHELL_CONTROL))
+    {
+        return Decision::Forbidden(
+            "a sudo command is one simple command (no ; & | $ ` ( ) < > or line breaks)".into(),
+        );
+    }
 
     let mode = policy.mode_at(call.now_ms);
     let mut reasons = Vec::new();
@@ -134,6 +170,11 @@ pub fn decide(policy: &CenterPolicy, env: &Env, call: &Call) -> Decision {
                     .is_some_and(|f| !t.write || f.access == Access::Rw)
             }),
         },
+        // No mode allows sudo; only a permit rule below does.
+        Effect::Execute if sudo => {
+            reasons.push("a sudo command runs only when a permit rule names it".into());
+            false
+        }
         Effect::Execute => match mode {
             Mode::User => true,
             Mode::Folder => {
@@ -240,6 +281,7 @@ mod tests {
                 home: Path::new("/h"),
                 protected: &self.prot,
                 confined,
+                sudo: false,
             }
         }
     }
@@ -478,5 +520,62 @@ mod tests {
         let mut c = call(Effect::Read, &r, None);
         c.tainted = true;
         assert_eq!(short(&decide(&p, &env, &c)), "allow");
+    }
+
+    #[test]
+    fn sudo_needs_the_switch_and_a_permit_rule() {
+        let x = T::new();
+        let off = x.env(true);
+        let on = Env {
+            sudo: true,
+            ..x.env(true)
+        };
+        let e = t("/w/rw", false);
+        for mode in [Mode::Folder, Mode::User] {
+            let mut p = policy(mode);
+            p.commands.permit.push("sudo apt update".into());
+            // Off, even an explicit permit rule does not run it.
+            let d = decide(
+                &p,
+                &off,
+                &call(Effect::Execute, &e, Some("sudo apt update")),
+            );
+            assert_eq!(d, Decision::Forbidden("sudo is off on this node".into()));
+            // On, only what a permit rule names, in either mode.
+            let ok = call(Effect::Execute, &e, Some("sudo apt update"));
+            assert_eq!(short(&decide(&p, &on, &ok)), "allow", "{mode:?}");
+            for other in ["sudo rm -rf /", "/usr/bin/sudo apt upgrade", "  sudo -i"] {
+                let c = call(Effect::Execute, &e, Some(other));
+                assert_eq!(short(&decide(&p, &on, &c)), "refused", "{mode:?} {other}");
+            }
+            // Taint and the deny list still narrow.
+            let mut c = call(Effect::Execute, &e, Some("sudo apt update"));
+            c.tainted = true;
+            assert_eq!(short(&decide(&p, &on, &c)), "refused");
+            // A permit rule never covers a second command.
+            p.commands.permit.push("sudo apt *".into());
+            for chained in [
+                "sudo apt x; id",
+                "sudo apt $(id)",
+                "sudo apt x > /etc/y",
+                "sudo apt x\nid",
+            ] {
+                let c = call(Effect::Execute, &e, Some(chained));
+                assert_eq!(short(&decide(&p, &on, &c)), "refused", "{chained}");
+            }
+            p.commands.deny.push("sudo apt*".into());
+            let c = call(Effect::Execute, &e, Some("sudo apt update"));
+            assert_eq!(short(&decide(&p, &on, &c)), "refused");
+        }
+    }
+
+    #[test]
+    fn what_counts_as_a_sudo_command() {
+        assert_eq!(sudo_command("sudo apt update"), Some("apt update"));
+        assert_eq!(sudo_command("  /usr/bin/sudo -n true"), Some("-n true"));
+        assert_eq!(sudo_command("sudo"), Some(""));
+        for not in ["sudoedit x", "ls; sudo x", "env sudo x", "echo sudo"] {
+            assert_eq!(sudo_command(not), None, "{not}");
+        }
     }
 }

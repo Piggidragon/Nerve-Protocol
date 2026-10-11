@@ -315,7 +315,36 @@ concurrently.
 - actions: `set {document, if_version}` → `{version}` (effect `write`); a stale
   `if_version` fails with `conflict`; a change to a client-only field refuses
   the whole document with `forbidden` and names the field. `pause {}` → `{}`.
+- `get` key `sudo` → `{sudo: "on" | "off"}`: the node's sudo switch.
 - event (implicit): `changed {version}`.
+
+### 7.4.1 The sudo switch
+
+A center with the settings grant `write` may switch the node's sudo switch
+(node-local §4) on and off; it is the only machine setting a center may
+change. The password travels sealed end to end from the client (the owner's
+browser or tool) to the node; the center only relays it.
+
+- `sudo_offer {}` → `{offer, key, ts, sig}` (effect `write`): `offer` is 16
+  random bytes and `key` a fresh X25519 public key, both base64; `ts` is the
+  node's clock in ms; `sig` is the hex Ed25519 signature, with the node's key
+  for this center (§2.2), of the UTF-8 bytes
+  `"nerve-sudo-offer\n" + center_id + "\n" + offer + "\n" + key + "\n" + ts`.
+  A client checks it against the key the node paired with. A new offer
+  replaces the center's open one.
+- The client makes its own X25519 key, derives a key with HKDF-SHA256 (salt
+  `"nerve-sudo-v1"`, info `offer`) from the shared secret, and seals the JSON
+  `{password, offer, ts}` (its own clock in `ts`) with AES-256-GCM, a random
+  12-byte nonce `iv` and `offer` as associated data.
+- `sudo {on: true, sealed: {offer, key, iv, ct}}` → `{sudo: "on"}` (effect
+  `write`; `key`, `iv` and `ct` base64). The node opens an offer at most once,
+  right or wrong, and only within 60 s of making it; the inner `offer` must
+  match and the inner `ts` be within 60 s of the node's clock. A replayed,
+  late, tampered or foreign box is `invalid_args`, and so is a password that
+  `sudo -v` refuses (the message says the password is wrong); the switch then
+  stays as it was.
+- `sudo {on: false}` → `{sudo: "off"}` drops the password.
+- The password never appears in a frame the node sends.
 
 ### 7.5 `audit`
 

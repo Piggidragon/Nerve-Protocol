@@ -28,6 +28,15 @@ To check another implementation, call `center_part::run(&pair_link)` with a
 fresh pairing link of that center, or `node_part::run(start)` with a closure
 that pairs the node under test with the link it is handed and starts it.
 
+The closure returns a `Setup`. With `folder` (an empty folder on the node, in
+wire form) and the settings grant `write` for the fake center, the node part
+also checks the profiles: it writes its own policy with `settings.set` (that
+folder read-write, two exact `permit` rules) and checks fs, exec, the audit
+event and the sudo switch. The sudo switch must be off when the part starts.
+It sends one wrong sudo password, so a node with a real `sudo` logs one failed
+attempt; with `sudo_password` it also turns sudo on and off once. The e2e test
+points the node at a fake `sudo` (`machine.sudo_path`) for this.
+
 ## Center part
 
 | § | Check |
@@ -59,6 +68,34 @@ that pairs the node under test with the link it is handed and starts it.
 | 5.3 | invoke of an unknown capability is `unknown_capability` |
 | 5.2 | an unknown ctx field is `invalid_args` |
 | 4.5 | after `bye revoked` the node does not dial again |
+
+With a `Setup::folder`, before `bye revoked`:
+
+| § | Check |
+|---|---|
+| 7.4 | settings get returns document and version |
+| 7.4 | settings set with a stale `if_version` is `conflict` |
+| 7.4 | settings set applies a document |
+| 7.2 | fs read returns what fs write wrote, with the same etag |
+| 7.2 | fs read outside every granted folder is `forbidden` |
+| 7.3 | exec run of a command a permit rule names runs |
+| 7.3 | exec run of a command nothing allows is `forbidden` |
+| 7.5 | a refusal emits `audit` `decision` `forbidden` |
+| 7.4.1 | sudo is off at first |
+| 7.4.1 | with sudo off, a permitted sudo command is `forbidden` |
+| 7.4.1 | `sudo_offer` is signed with the node's key for this center |
+| 7.4.1 | a wrong sudo password is `invalid_args` and sudo stays off |
+
+With a `Setup::sudo_password` as well:
+
+| § | Check |
+|---|---|
+| 7.4.1 | the right sudo password turns sudo on |
+| 7.4.1 | with sudo on, a permitted sudo command runs |
+| 7.4.1 | with sudo on, a sudo command no permit rule names is `forbidden` |
+| 7.4.1 | sudo off turns sudo off |
+| 7.4.1 | a replayed sealed password is `invalid_args` and sudo stays off |
+| 7.4.1 | no frame the node sent carries the sudo password |
 
 ## Not covered yet
 

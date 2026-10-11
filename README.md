@@ -85,6 +85,20 @@ CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static" \
    nerve-node panic                  # end every link; `unlock` undoes it
    ```
 
+   Sudo is a switch per machine, off by default. While it is off, no command
+   runs with sudo, whatever the rules say. Switched on (the node checks the
+   password with `sudo -v` and keeps it in memory only), a sudo command runs
+   only when an `allow` rule names it:
+
+   ```sh
+   nerve-node allow 'sudo apt update'
+   nerve-node sudo on                # asks for the password
+   nerve-node sudo off               # drops it
+   ```
+
+   A center the machine granted settings write may switch it as well; the
+   password then travels sealed from the browser to the node.
+
    `nerve-node --help` lists every command; [`spec/node-local.md`](spec/node-local.md)
    explains the policy.
 

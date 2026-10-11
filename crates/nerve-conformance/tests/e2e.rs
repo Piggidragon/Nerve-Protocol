@@ -225,12 +225,30 @@ fn node_part_passes_against_nerve_node() {
             if !ok {
                 return Err(format!("pair failed: {out}{err}"));
             }
+            // The profile checks write the policy through settings.set and
+            // try one wrong sudo password: on a fake sudo, not this machine's.
+            let (ok, out, err) = node.cli(&["grant", "settings", "write"]);
+            if !ok {
+                return Err(format!("grant failed: {out}{err}"));
+            }
+            let password = "conformance-right-password";
+            node.use_fake_sudo(password);
+            let folder = node.home.join("work");
+            std::fs::create_dir_all(&folder).unwrap();
             node.start();
-            Ok(())
+            Ok(node_part::Setup {
+                folder: Some(folder.display().to_string()),
+                sudo_password: Some(password.into()),
+            })
         })
         .await
         .map_err(|e| e.to_string())?
     }));
     assert!(report.ok(), "{report}");
+    let profiles = report
+        .outcomes
+        .iter()
+        .filter(|o| o.section.starts_with('7'));
+    assert_eq!(profiles.count(), 18, "{report}");
     drop(node);
 }

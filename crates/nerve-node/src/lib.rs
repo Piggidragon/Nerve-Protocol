@@ -14,6 +14,7 @@ pub mod fs;
 mod link;
 pub mod pair;
 pub mod paths;
+mod sudo;
 
 pub use daemon::{Daemon, NodeOptions};
 pub use paths::NodePaths;

@@ -313,9 +313,39 @@ fn settings_cap() -> Capability {
             obj(json!({}), &[]),
         ),
     );
+    c.actions.insert(
+        "sudo_offer".into(),
+        action(
+            Effect::Write,
+            "A one-shot key to seal the sudo password for this node (spec §7.4.1).",
+            obj(json!({}), &[]),
+            obj(
+                json!({"offer": {"type": "string"}, "key": {"type": "string"},
+                       "ts": {"type": "integer"}, "sig": {"type": "string"}}),
+                &["offer", "key", "ts", "sig"],
+            ),
+        ),
+    );
+    c.actions.insert(
+        "sudo".into(),
+        action(
+            Effect::Write,
+            "Turns the sudo switch on (with the sealed password) or off.",
+            obj(
+                json!({"on": {"type": "boolean"},
+                       "sealed": {"type": "object", "properties": {
+                           "offer": {"type": "string"}, "key": {"type": "string"},
+                           "iv": {"type": "string"}, "ct": {"type": "string"}},
+                        "required": ["offer", "key", "iv", "ct"]}}),
+                &["on"],
+            ),
+            obj(json!({"sudo": {"enum": ["on", "off"]}}), &["sudo"]),
+        ),
+    );
     c.state = obj(
-        json!({"document": {"type": "object"}, "version": {"type": "integer"}}),
-        &["document", "version"],
+        json!({"document": {"type": "object"}, "version": {"type": "integer"},
+               "sudo": {"enum": ["on", "off"]}}),
+        &["document", "version", "sudo"],
     );
     c.events.insert(
         "changed".into(),

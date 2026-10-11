@@ -424,6 +424,36 @@ impl Node {
         }
     }
 
+    /// Points `machine.sudo_path` at a script that acts like `sudo -S`
+    /// with `right` as the only password, so no test asks this machine's
+    /// sudo.
+    pub fn use_fake_sudo(&self, right: &str) {
+        let script = self.config.parent().unwrap().join("fake-sudo");
+        let body = format!(
+            "#!/bin/sh\nv=\nwhile [ $# -gt 0 ]; do case \"$1\" in -S|-k) shift ;; -p) shift 2 ;; \
+             -v) v=1; shift ;; *) break ;; esac; done\nIFS= read -r pw\n\
+             [ \"$pw\" = '{right}' ] || {{ echo 'Sorry, try again.' >&2; exit 1; }}\n\
+             [ -n \"$v\" ] && exit 0\nexec \"$@\"\n"
+        );
+        std::fs::write(&script, body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let file = self.config.join("node.toml");
+        let text = std::fs::read_to_string(&file).unwrap();
+        let line = format!("sudo_path = {:?}\n", script.display().to_string());
+        let text = match text.find("[machine]\n") {
+            Some(i) => {
+                let at = i + "[machine]\n".len();
+                format!("{}{line}{}", &text[..at], &text[at..])
+            }
+            None => format!("{text}\n[machine]\n{line}"),
+        };
+        std::fs::write(&file, text).unwrap();
+    }
+
     /// Whether the daemon has exited by itself.
     pub fn daemon_exited(&mut self) -> bool {
         self.daemon

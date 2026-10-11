@@ -61,12 +61,33 @@ impl NodeKey {
             .sign(&nerve_proto::connect_message(center_id, nonce))
             .as_ref())
     }
+
+    /// The `sig` of a `settings.sudo_offer` result: hex Ed25519 over
+    /// [`crate::sudo::Offer::message`].
+    pub fn sign_sudo_offer(&self, center_id: &str, offer: &crate::sudo::Offer) -> String {
+        hex(self.pair.sign(&offer.message(center_id)).as_ref())
+    }
 }
 
 /// A node id: base32 of the first 16 bytes of sha256 of the public key.
 pub fn node_id(public_key: &[u8]) -> String {
     let d = ring::digest::digest(&ring::digest::SHA256, public_key);
     nerve_proto::base32::encode(&d.as_ref()[..16])
+}
+
+/// Checks a sudo offer's signature against a node's stored public key (hex).
+pub fn verify_sudo_offer(
+    public_hex: &str,
+    center_id: &str,
+    offer: &crate::sudo::Offer,
+    sig_hex: &str,
+) -> bool {
+    let (Some(pk), Some(sig)) = (unhex(public_hex), unhex(sig_hex)) else {
+        return false;
+    };
+    UnparsedPublicKey::new(&ED25519, pk)
+        .verify(&offer.message(center_id), &sig)
+        .is_ok()
 }
 
 /// Checks a `hello` signature against a node's stored public key (hex).
@@ -109,6 +130,18 @@ pub fn random_token(n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sudo_offers_are_signed_for_one_center() {
+        let k = NodeKey::generate().unwrap();
+        let p = crate::sudo::Pending::new(5).unwrap();
+        let sig = k.sign_sudo_offer("c1", p.offer());
+        assert!(verify_sudo_offer(&k.public_hex(), "c1", p.offer(), &sig));
+        assert!(!verify_sudo_offer(&k.public_hex(), "c2", p.offer(), &sig));
+        let mut other = p.offer().clone();
+        other.ts += 1;
+        assert!(!verify_sudo_offer(&k.public_hex(), "c1", &other, &sig));
+    }
 
     #[test]
     fn sign_and_verify() {

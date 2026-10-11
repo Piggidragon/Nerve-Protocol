@@ -9,5 +9,5 @@ pub mod protected;
 pub mod settings;
 
 pub use config::{CenterDocument, CenterEntry, CenterPolicy, Mode, NodeConfig};
-pub use decide::{Call, Decision, Env, Target, decide};
+pub use decide::{Call, Decision, Env, Target, decide, sudo_command};
 pub use settings::{SetError, SettingsStore, Writer};

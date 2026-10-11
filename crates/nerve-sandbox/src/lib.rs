@@ -310,11 +310,6 @@ pub mod stubs {
     pub fn dedicated_user() -> Result<(), String> {
         Err(format!("dedicated user: {NOT_DONE}"))
     }
-
-    /// Elevation through sudo.
-    pub fn elevation() -> Result<(), String> {
-        Err(format!("elevation (sudo): {NOT_DONE}"))
-    }
 }
 
 #[cfg(test)]
@@ -327,7 +322,6 @@ mod tests {
             stubs::cgroup(),
             stubs::job_object(),
             stubs::dedicated_user(),
-            stubs::elevation(),
         ] {
             assert!(r.unwrap_err().ends_with(stubs::NOT_DONE));
         }

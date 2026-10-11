@@ -26,7 +26,8 @@ name = "laptop"             # shown to centers; the host name by default
 [machine]
 shell = "/bin/bash"         # for exec.run; the platform shell by default
 allow_root = false
-elevation = "off"           # not done in 0.0.1
+sudo = "off"                # off | on: the sudo switch (§4); off when missing
+sudo_path = "/usr/bin/sudo" # optional; `sudo` from PATH by default
 
 [limits]
 max_running = 4             # commands at once, per node
@@ -93,8 +94,8 @@ answer. For each call the node takes the center's policy and, in this order:
    in that session) is refused for any write or command, whatever allowed it.
    Protected paths stay refused in `user` mode too.
 
-There is no sudo mode in 0.0.1. Every refusal names its reasons in the error
-and in the audit log.
+A command whose first word is `sudo` is decided by the sudo switch as well
+(§4). Every refusal names its reasons in the error and in the audit log.
 
 ### 3.1 Older files
 
@@ -103,7 +104,38 @@ settings document that still has the old values loads, and everything that
 asked now refuses: mode `ask` becomes `folder` without its folders, a
 capability `ask` becomes `off`, `always_ask` rules join `deny`, `never_ask`
 is `permit`, `folders` is `folder`, `full` is `user` (`full_until` is
-`user_until`), and the `approvals` entries are dropped.
+`user_until`), and the `approvals` entries are dropped. The placeholder
+`machine.elevation` is dropped; a file without `machine.sudo` has the switch
+off.
+
+## 4. The sudo switch
+
+Sudo is a switch per node, not a mode: the modes stay `folder` and `user`.
+
+- **Off** (the default): the node holds no sudo password, and a command whose
+  first word is `sudo` (or a path ending in `/sudo`) is refused with
+  `forbidden`, even when a `permit` rule names it.
+- **On**: such a command runs only when a `permit` rule names it, in either
+  mode; no mode allows it by itself, and `deny`, protected paths and taint
+  still refuse it. A sudo command must be one simple command: one with
+  `; & | $ \` ( ) < >` or a line break is refused. The node runs it as
+  `sudo -S -k -p '' …` with the password on its stdin and without Landlock
+  (which would stop sudo from gaining privileges).
+- Every other command runs with `no_new_privs` (Linux), so a `sudo` later in
+  a command line, or any setuid program, cannot gain privileges.
+
+The switch is never on without a working password. Turning it on takes the
+password from a client: `nerve-node sudo on` (it asks on the terminal) or a
+center with the settings grant `write` (protocol §7.4.1, sealed end to end so
+the center cannot read it). The node checks it with `sudo -S -k -v` (output
+discarded) and refuses a wrong one with `invalid_args`; the switch then stays
+as it was. Turning it off drops the password. The password is kept in memory
+only (`secret_storage` at rest is not done in 0.0.1), so a restarted node, or
+a `node.toml` that says `on` without a password held, has the switch off. It
+never reaches a center: the node replaces every copy in an outgoing frame and
+in the audit log with `[redacted]`. `machine.sudo` changes only through the
+switch, never through `config.write`. The switch works on Linux only in
+0.0.1.
 
 ## 5. Control socket
 
@@ -120,8 +152,11 @@ or root may talk to it. Methods:
 | `config.read` | | `node.toml` and its `version` |
 | `config.write` | `config`, `if_version` | replaces it when the version matches |
 | `reload` | | rereads `node.toml` |
+| `sudo.status` | | `{sudo: "on"|"off"}` |
+| `sudo.on` | `password` | checks it with `sudo -v` and turns the switch on (§4) |
+| `sudo.off` | | turns the switch off and drops the password |
 
-`config.write` and `reload` are refused from a process that runs below a
+`config.write`, `reload`, `sudo.on` and `sudo.off` are refused from a process that runs below a
 command the node started for a center, so an agent cannot change its own
 policy.
 

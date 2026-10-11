@@ -1,0 +1,19 @@
+[package]
+name = "nerve-conformance"
+description = "Conformance runner of the Nerve Protocol: center part, node part, echo node; plugin part is a skeleton."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+nerve-proto.workspace = true
+nerve-transport.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+tokio-tungstenite.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

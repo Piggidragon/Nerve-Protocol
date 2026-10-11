@@ -1,0 +1,94 @@
+//! Conformance runner of the Nerve Protocol (spec/conformance.md).
+//!
+//! Three parts, each a library call that returns a [`Report`]:
+//!
+//! - [`center_part`] checks a center over the wire, acting as a node (the
+//!   [`echo`] node).
+//! - [`node_part`] checks a node, acting as a center ([`fake_center`]).
+//! - [`plugin_part`] will check harness plugins; in 0.0.1 it is a skeleton,
+//!   because the harness integration form (plugin or MCP) is still open.
+//!
+//! There is no runner binary in 0.0.1 (the workspace ships exactly
+//! `nerve-mcp` and `nerve-node`); the parts run from `cargo test` in this
+//! crate, against the echo node, the fake center and the real binaries.
+
+pub mod center_part;
+pub mod echo;
+pub mod fake_center;
+pub mod node_part;
+pub mod plugin_part;
+pub mod wire;
+
+use std::fmt;
+
+/// The result of one check.
+#[derive(Debug, Clone)]
+pub struct Outcome {
+    /// The section of spec/protocol.md the check tests, like "4.2".
+    pub section: &'static str,
+    pub name: &'static str,
+    pub result: Result<(), String>,
+}
+
+/// What a part found.
+#[derive(Debug, Clone)]
+pub struct Report {
+    pub part: &'static str,
+    pub outcomes: Vec<Outcome>,
+}
+
+impl Report {
+    pub fn new(part: &'static str) -> Report {
+        Report {
+            part,
+            outcomes: Vec::new(),
+        }
+    }
+
+    pub fn check(&mut self, section: &'static str, name: &'static str, result: Result<(), String>) {
+        self.outcomes.push(Outcome {
+            section,
+            name,
+            result,
+        });
+    }
+
+    /// Records a check that could not run because an earlier step failed.
+    pub fn skip(&mut self, section: &'static str, name: &'static str, why: &str) {
+        self.check(section, name, Err(format!("not run: {why}")));
+    }
+
+    pub fn failed(&self) -> Vec<&Outcome> {
+        self.outcomes.iter().filter(|o| o.result.is_err()).collect()
+    }
+
+    pub fn ok(&self) -> bool {
+        self.failed().is_empty() && !self.outcomes.is_empty()
+    }
+}
+
+impl fmt::Display for Report {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let failed = self.failed().len();
+        writeln!(
+            f,
+            "{} part: {} checks, {} passed, {} failed",
+            self.part,
+            self.outcomes.len(),
+            self.outcomes.len() - failed,
+            failed
+        )?;
+        for o in &self.outcomes {
+            match &o.result {
+                Ok(()) => writeln!(f, "  ok   §{} {}", o.section, o.name)?,
+                Err(e) => writeln!(f, "  FAIL §{} {}: {e}", o.section, o.name)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+/// `Err(msg)` unless `cond`.
+pub(crate) fn ensure(cond: bool, msg: impl Into<String>) -> Result<(), String> {
+    if cond { Ok(()) } else { Err(msg.into()) }
+}

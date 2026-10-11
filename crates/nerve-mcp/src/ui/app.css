@@ -1,0 +1,29 @@
+:root { --bg: #fafafa; --fg: #1d1d1f; --muted: #6b6b70; --line: #ddd; --accent: #2f5bd3; --bad: #b3261e; --card: #fff; }
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #151517; --fg: #ececf0; --muted: #9a9aa2; --line: #333; --accent: #7aa2ff; --bad: #ff8a80; --card: #1f1f23; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; font: 15px/1.45 system-ui, sans-serif; background: var(--bg); color: var(--fg); }
+header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+h1 { font-size: 18px; margin: 0; flex: 1; }
+h2 { font-size: 16px; margin: 24px 0 8px; }
+main { max-width: 980px; margin: 0 auto; padding: 0 16px 48px; }
+button { font: inherit; padding: 5px 11px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--fg); cursor: pointer; }
+button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+button.danger { color: var(--bad); }
+button:disabled { opacity: .5; cursor: not-allowed; }
+.tab.on { border-color: var(--accent); color: var(--accent); }
+input, textarea, select { font: inherit; padding: 5px 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--card); color: var(--fg); }
+textarea { width: 100%; min-height: 220px; font-family: ui-monospace, monospace; font-size: 13px; }
+label { display: block; margin: 8px 0; }
+fieldset { border: 1px solid var(--line); border-radius: 6px; margin: 8px 0; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; margin: 8px 0; }
+.row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.muted { color: var(--muted); }
+.error, .alert { color: var(--bad); }
+.mono { font-family: ui-monospace, monospace; word-break: break-all; }
+.dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--muted); margin-right: 6px; }
+.dot.on { background: #2e9d4f; }
+table { border-collapse: collapse; width: 100%; }
+td, th { text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.scroll { overflow-x: auto; }

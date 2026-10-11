@@ -1,0 +1,34 @@
+[package]
+name = "nerve-mcp"
+description = "The Nerve center as an MCP server: pairs nodes, holds their links, maps their capabilities to MCP tools, serves the center web UI."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "nerve-mcp"
+path = "src/main.rs"
+
+[dependencies]
+nerve-proto.workspace = true
+nerve-transport.workspace = true
+# io-std for MCP over stdio; a feature of the existing tokio, no new crate.
+tokio = { workspace = true, features = ["io-std"] }
+tokio-tungstenite.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+futures-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# `env` lets every flag come from the MCP client entry's environment as well.
+clap = { workspace = true, features = ["env"] }
+tracing.workspace = true
+tracing-subscriber.workspace = true
+ring.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

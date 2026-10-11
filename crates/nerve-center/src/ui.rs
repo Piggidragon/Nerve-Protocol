@@ -330,6 +330,15 @@ impl Ui {
                 )
                 .await
                 .map_err(refused),
+            ("POST", "/api/nodes/sudo/offer") => c.node_sudo_offer(&s("id")).await.map_err(refused),
+            ("POST", "/api/nodes/sudo") => c
+                .set_node_sudo(
+                    &s("id"),
+                    b.get("on").and_then(Value::as_bool).unwrap_or(false),
+                    b.get("sealed").cloned().filter(|v| !v.is_null()),
+                )
+                .await
+                .map_err(refused),
             ("POST", "/api/audit/rule") => {
                 let command = s("command");
                 if command.trim().is_empty() {

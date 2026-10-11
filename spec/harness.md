@@ -121,7 +121,11 @@ on the node's `policy.commands.permit`, Deny on `deny`, and each takes it
 off the other list), help (the node's commands, each with its
 usage and a short explanation; the center reads the list from the node's own
 CLI definition, `GET /api/help`, so it cannot differ from `nerve-node --help`),
-settings (center name, retention, harness tokens, per-node settings). The pages,
+settings (center name, retention, harness tokens, per-node settings and the
+node's sudo switch). The sudo password is sealed in the browser for the
+node's signed offer (protocol §7.4.1); the center checks the offer's
+signature against the paired node key, relays the sealed box
+(`POST /api/nodes/sudo/offer`, `POST /api/nodes/sudo`) and keeps no copy. The pages,
 scripts and styles are built into the binary; nothing is loaded from another
 host.
 

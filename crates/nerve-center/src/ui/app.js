@@ -446,6 +446,51 @@ function drawTokens() {
       : el("p", { class: "meta" }, "No tokens yet.")].flat().filter(Boolean));
 }
 
+// The sudo password is sealed here, in the browser, for a one-shot offer the
+// machine signed (spec/protocol.md §7.4.1): X25519, HKDF-SHA256, AES-256-GCM.
+// The center relays the sealed box and cannot open it.
+const b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
+const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+async function sealSudo(offer, password) {
+  const enc = new TextEncoder();
+  const subtle = crypto.subtle;
+  const mine = await subtle.generateKey({ name: "X25519" }, false, ["deriveBits"]);
+  const theirs = await subtle.importKey("raw", unb64(offer.key), { name: "X25519" }, false, []);
+  const shared = await subtle.deriveBits({ name: "X25519", public: theirs }, mine.privateKey, 256);
+  const hkdf = await subtle.importKey("raw", shared, "HKDF", false, ["deriveKey"]);
+  const key = await subtle.deriveKey(
+    { name: "HKDF", hash: "SHA-256", salt: enc.encode("nerve-sudo-v1"), info: enc.encode(offer.offer) },
+    hkdf, { name: "AES-GCM", length: 256 }, false, ["encrypt"]);
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plain = enc.encode(JSON.stringify({ password, offer: offer.offer, ts: Date.now() }));
+  const ct = await subtle.encrypt({ name: "AES-GCM", iv, additionalData: enc.encode(offer.offer) }, key, plain);
+  const pub = await subtle.exportKey("raw", mine.publicKey);
+  return { offer: offer.offer, key: b64(pub), iv: b64(iv), ct: b64(ct) };
+}
+
+// The machine's sudo switch: on only with a password its `sudo -v` accepts.
+function sudoSwitch(n) {
+  const label = el("span", { class: "meta" }, "Sudo: …");
+  const pw = el("input", { type: "password", class: "input", autocomplete: "off", placeholder: "sudo password", "aria-label": `Sudo password of ${n.name}` });
+  const show = (on) => { label.textContent = on === "on" ? "Sudo: on" : "Sudo: off"; };
+  const on = btn("Turn sudo on", "", act(async () => {
+    const password = pw.value;
+    pw.value = "";
+    if (!password) { notify("Enter the machine's sudo password first.", "error"); return; }
+    const offer = await api("POST", "/api/nodes/sudo/offer", { id: n.id });
+    const sealed = await sealSudo(offer, password);
+    const r = await api("POST", "/api/nodes/sudo", { id: n.id, on: true, sealed });
+    show(r.sudo);
+    notify(`Sudo is on for ${n.name}: permitted sudo commands run.`);
+  }));
+  const off = btn("Turn sudo off", "", act(async () => {
+    const r = await api("POST", "/api/nodes/sudo", { id: n.id, on: false });
+    show(r.sudo);
+    notify(`Sudo is off for ${n.name}.`);
+  }));
+  return { show, row: el("div", { class: "actions" }, label, pw, on, off) };
+}
+
 // A machine's own settings are fetched when its card is opened, so the page
 // does not ask every machine up front.
 function nodeSettings(n) {
@@ -464,14 +509,16 @@ function nodeSettings(n) {
   }
   const area = el("textarea", { class: "json", spellcheck: "false", "aria-label": `Settings of ${n.name}` });
   const msg = el("p", { class: "meta" });
+  const sudo = sudoSwitch(n);
   let version = null;
   const load = async () => {
     const s = await api("GET", `/api/nodes/settings?id=${encodeURIComponent(n.id)}`);
     area.value = JSON.stringify(s.document, null, 2);
     version = s.version;
     msg.textContent = `Version ${version}.`;
+    sudo.show(s.sudo);
   };
-  body.append(area, msg, el("div", { class: "actions" },
+  body.append(sudo.row, area, msg, el("div", { class: "actions" },
     btn("Reload", "", act(load), "refresh"),
     btn("Save", "primary", act(async () => {
       let doc;

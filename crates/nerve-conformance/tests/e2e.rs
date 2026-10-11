@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use common::{Mcp, Node, text_of};
 use nerve_conformance::{center_part, node_part};
 use nerve_proto::link::PairLink;
+use nerve_transport::sudo::{Offer, seal};
 use serde_json::{Value, json};
 
 fn block_on<F: Future>(f: F) -> F::Output {
@@ -67,8 +68,37 @@ fn with(mut args: Value, more: Value) -> Value {
     args
 }
 
+const SUDO_PW: &str = "e2e-right-sudo-pw";
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+/// Fails when a file below `dir` contains `secret`.
+fn assert_no_file_holds(dir: &std::path::Path, secret: &str) {
+    for e in std::fs::read_dir(dir).unwrap().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            assert_no_file_holds(&p, secret);
+        } else if let Ok(bytes) = std::fs::read(&p) {
+            let found = bytes.windows(secret.len()).any(|w| w == secret.as_bytes());
+            // The fake sudo script names the right password, as /etc/shadow
+            // would hold its hash.
+            assert!(
+                !found || p.ends_with("fake-sudo"),
+                "{} holds it",
+                p.display()
+            );
+        }
+    }
+}
+
 /// The whole path through both binaries: pairing, the link, tools, the
-/// a folder and a rule on the node deciding calls (allowed at once, or
+/// the sudo switch relayed by the center, a folder and a rule on the node
+/// deciding calls (allowed at once, or
 /// refused at once), a rule from the audit view landing in the node's
 /// settings, the node's audit log, and removing the node.
 #[test]
@@ -82,6 +112,7 @@ fn nerve_center_and_nerve_node_work_together() {
     let out = node.ok(&["pair", &link, "--yes"]);
     assert!(out.contains("e2e-center"), "{out}");
     assert!(node.ok(&["centers"]).contains("e2e-center"));
+    node.use_fake_sudo(SUDO_PW);
     node.start();
     let ov = mcp.wait_overview("the node comes online", |v| {
         v["nodes"][0]["online"] == json!(true)
@@ -116,6 +147,53 @@ fn nerve_center_and_nerve_node_work_together() {
         Value::Null,
     );
     assert_eq!(status, 200, "{v}");
+    assert_eq!(v["sudo"], "off", "{v}");
+
+    // The sudo switch from the web UI: the center checks that the node
+    // signed the offer and relays a password sealed for it. The browser
+    // seals; here the test does.
+    let sealed_for = |mcp: &mut Mcp, password: &str| {
+        let (status, v) = mcp.api("POST", "/api/nodes/sudo/offer", json!({"id": node_id}));
+        assert_eq!(status, 200, "{v}");
+        let offer: Offer = serde_json::from_value(v).unwrap();
+        seal(&offer, password, now_ms()).unwrap()
+    };
+    let wrong = sealed_for(&mut mcp, "wrong");
+    let (status, v) = mcp.api(
+        "POST",
+        "/api/nodes/sudo",
+        json!({"id": node_id, "on": true, "sealed": wrong}),
+    );
+    assert_eq!(status, 409, "{v}");
+    assert!(
+        v["error"].as_str().unwrap().contains("password is wrong"),
+        "{v}"
+    );
+    let right = sealed_for(&mut mcp, SUDO_PW);
+    let (status, v) = mcp.api(
+        "POST",
+        "/api/nodes/sudo",
+        json!({"id": node_id, "on": true, "sealed": right}),
+    );
+    assert_eq!((status, &v["sudo"]), (200, &json!("on")), "{v}");
+    // The node says so too. Running sudo commands is the node part's and
+    // nerve-node's own tests' job: here one exec taints the MCP session.
+    let (_, v) = mcp.api(
+        "GET",
+        &format!("/api/nodes/settings?id={node_id}"),
+        Value::Null,
+    );
+    assert_eq!(v["sudo"], "on", "{v}");
+    assert!(node.ok(&["sudo", "status"]).contains("on"));
+    let (status, v) = mcp.api(
+        "POST",
+        "/api/nodes/sudo",
+        json!({"id": node_id, "on": false}),
+    );
+    assert_eq!((status, &v["sudo"]), (200, &json!("off")), "{v}");
+    assert!(node.ok(&["sudo", "status"]).contains("off"));
+    // Neither the center's files nor the node's hold the password.
+    assert_no_file_holds(root.path(), SUDO_PW);
 
     // Allow from the audit view: the command lands on the node's permit list.
     let (status, v) = mcp.api(

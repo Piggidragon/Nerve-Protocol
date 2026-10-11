@@ -711,7 +711,7 @@ impl Center {
             .ok_or_else(|| RpcError::new(ErrorCode::Unavailable, "the node is offline"))?;
         link.call(
             msg::method::GET,
-            json!({"cap": "settings", "keys": ["document", "version"]}),
+            json!({"cap": "settings", "keys": ["document", "version", "sudo"]}),
             Some(SHORT_CALL),
         )
         .await
@@ -729,6 +729,60 @@ impl Center {
         link.call(
             msg::method::INVOKE,
             json!({"cap": "settings", "action": "set", "args": {"document": document, "if_version": if_version}, "ctx": {}}),
+            Some(SHORT_CALL),
+        )
+        .await
+    }
+
+    /// A one-shot offer to seal the node's sudo password for (spec/protocol.md
+    /// §7.4.1). The center checks that the paired node signed it for this
+    /// center, so a client seals only for that node.
+    pub async fn node_sudo_offer(&self, node_id: &str) -> Result<Value, RpcError> {
+        let link = self
+            .link(node_id)
+            .ok_or_else(|| RpcError::new(ErrorCode::Unavailable, "the node is offline"))?;
+        let public = self
+            .public_key(node_id)
+            .ok_or_else(|| RpcError::new(ErrorCode::Unavailable, "the node is not paired"))?;
+        let v = link
+            .call(
+                msg::method::INVOKE,
+                json!({"cap": "settings", "action": "sudo_offer", "args": {}, "ctx": {}}),
+                Some(SHORT_CALL),
+            )
+            .await?;
+        let offer: nerve_transport::sudo::Offer = serde_json::from_value(json!({
+            "offer": v["offer"], "key": v["key"], "ts": v["ts"],
+        }))
+        .map_err(|e| RpcError::internal(format!("the node's sudo offer: {e}")))?;
+        let sig = v["sig"].as_str().unwrap_or_default();
+        if !nerve_transport::keys::verify_sudo_offer(&public, &self.id(), &offer, sig) {
+            return Err(RpcError::internal(
+                "the node's sudo offer is not signed with its paired key",
+            ));
+        }
+        Ok(json!({"offer": offer.offer, "key": offer.key, "ts": offer.ts}))
+    }
+
+    /// Switches the node's sudo on (with a password sealed for one of its
+    /// offers) or off. The center only relays the sealed box; it cannot
+    /// open it and keeps no copy.
+    pub async fn set_node_sudo(
+        &self,
+        node_id: &str,
+        on: bool,
+        sealed: Option<Value>,
+    ) -> Result<Value, RpcError> {
+        let link = self
+            .link(node_id)
+            .ok_or_else(|| RpcError::new(ErrorCode::Unavailable, "the node is offline"))?;
+        let mut args = json!({"on": on});
+        if let Some(sealed) = sealed {
+            args["sealed"] = sealed;
+        }
+        link.call(
+            msg::method::INVOKE,
+            json!({"cap": "settings", "action": "sudo", "args": args, "ctx": {}}),
             Some(SHORT_CALL),
         )
         .await

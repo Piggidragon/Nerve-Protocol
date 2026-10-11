@@ -190,21 +190,108 @@ fn nerve_center_and_nerve_node_work_together() {
     // Neither the center's files nor the node's hold the password.
     assert_no_file_holds(root.path(), SUDO_PW);
 
-    // Allow from the audit view: the command lands on the node's permit list.
-    let (status, v) = mcp.api(
-        "POST",
-        "/api/audit/rule",
-        json!({"node_id": node_id, "command": "echo hi", "list": "allow"}),
+    // The four buttons of the audit view, for a command, a path and another
+    // action: each one adds a rule to its list on the node and takes none off.
+    let center_policy = format!("center.{}.policy", "e2e-center");
+    let list =
+        |name: &str| -> String { node.ok(&["config", "get", &format!("{center_policy}.{name}")]) };
+    let button = |mcp: &Mcp, body: Value| mcp.api("POST", "/api/audit/rule", body);
+    let click = |mcp: &Mcp, list: &str, cap: &str, action: &str, target: &str, wildcard: bool| {
+        let (status, v) = button(
+            mcp,
+            json!({"node_id": node_id, "list": list, "cap": cap, "action": action,
+                   "target": target, "wildcard": wildcard}),
+        );
+        assert_eq!(status, 200, "{v}");
+        v["rule"].as_str().unwrap().to_string()
+    };
+    assert_eq!(
+        click(&mcp, "allow", "exec", "run", "echo hi", false),
+        "exec.run:echo hi"
     );
-    assert_eq!(status, 200, "{v}");
-    let toml = std::fs::read_to_string(node.config.join("node.toml")).unwrap();
+    assert_eq!(
+        click(&mcp, "allow", "exec", "run", "echo hi", true),
+        "exec.run:echo *"
+    );
+    assert_eq!(
+        click(&mcp, "deny", "exec", "run", "rm -rf x", false),
+        "exec.run:rm -rf x"
+    );
+    assert_eq!(
+        click(&mcp, "deny", "exec", "run", "rm -rf x", true),
+        "exec.run:rm *"
+    );
+    assert_eq!(
+        click(&mcp, "allow", "fs", "read", "/nerve-e2e/a.txt", false),
+        "fs.read:/nerve-e2e/a.txt"
+    );
+    assert_eq!(
+        click(&mcp, "deny", "fs", "write", "/nerve-e2e/a.txt", true),
+        "fs.write:/nerve-e2e/*"
+    );
+    assert_eq!(
+        click(&mcp, "allow", "camera", "snap", "camera.snap", false),
+        "camera.snap"
+    );
+    assert_eq!(
+        click(&mcp, "deny", "camera", "snap", "camera.snap", true),
+        "camera"
+    );
+    assert_eq!(
+        click(&mcp, "sudo", "exec", "run", "sudo apt update", false),
+        "sudo apt update"
+    );
+    assert_eq!(
+        click(&mcp, "sudo", "exec", "run", "sudo apt update", true),
+        "sudo apt *"
+    );
+    // A repeat adds nothing.
+    click(&mcp, "allow", "exec", "run", "echo hi", false);
+    let allow = list("allow");
+    for want in [
+        "exec.run:echo hi",
+        "exec.run:echo *",
+        "fs.read:/nerve-e2e/a.txt",
+        "camera.snap",
+    ] {
+        assert!(allow.contains(want), "{allow}");
+    }
+    assert_eq!(allow.matches("exec.run:echo hi").count(), 1, "{allow}");
+    assert!(!allow.contains("rm"), "{allow}");
+    let deny = list("deny");
+    for want in [
+        "exec.run:rm -rf x",
+        "exec.run:rm *",
+        "fs.write:/nerve-e2e/*",
+        "camera",
+    ] {
+        assert!(deny.contains(want), "{deny}");
+    }
+    assert!(!deny.contains("echo"), "{deny}");
+    let sudo = list("sudo_allow");
     assert!(
-        toml.contains("permit") && toml.contains("echo hi"),
-        "{toml}"
+        sudo.contains("sudo apt update") && sudo.contains("sudo apt *"),
+        "{sudo}"
     );
+    // A bad list, a missing target and a sudo list for a plain command are
+    // refused before the node sees them.
+    for body in [
+        json!({"list": "permit", "cap": "exec", "action": "run", "target": "ls"}),
+        json!({"list": "allow", "cap": "exec", "action": "run", "target": " "}),
+        json!({"list": "allow", "cap": "exec", "action": "run"}),
+        json!({"list": "allow", "cap": "fs", "action": "read", "target": "relative"}),
+        json!({"list": "sudo", "cap": "exec", "action": "run", "target": "ls"}),
+        json!({"list": "sudo", "cap": "fs", "action": "read", "target": "/a"}),
+        json!({"list": "allow", "cap": "", "action": "run", "target": "ls"}),
+    ] {
+        let body = with(body, json!({"node_id": node_id}));
+        let (status, v) = button(&mcp, body.clone());
+        assert_eq!(status, 400, "{body} {v}");
+    }
+    assert_eq!(list("allow"), allow);
 
     // exec.run goes straight to the node: the center holds no call back, and
-    // the node lets it run (the permit rule above).
+    // the node lets it run (the allow rule above).
     let (run, args) = tool(&tools, "exec", "run", &node_name);
     let r = mcp.call(&run, with(args, json!({"command": "echo hi"})));
     let text = text_of(&r);
@@ -214,8 +301,8 @@ fn nerve_center_and_nerve_node_work_together() {
         "{text}"
     );
 
-    // fs.read: nothing is allowed until the node names a folder, and a call
-    // no rule allows is refused at once instead of waiting for anybody.
+    // fs.read: nothing is allowed until a rule or a mode allows it, and a
+    // call no rule allows is refused at once instead of waiting for anybody.
     std::fs::write(node.home.join("notes.txt"), "hello from the node").unwrap();
     let path = node.home.join("notes.txt").to_string_lossy().to_string();
     let (read, args) = tool(&tools, "fs", "read", &node_name);
@@ -225,8 +312,11 @@ fn nerve_center_and_nerve_node_work_together() {
     assert_eq!(r["isError"], json!(true), "{r}");
     assert!(text_of(&r).contains("forbidden"), "{r}");
 
-    // A folder on the node allows the read.
+    // A folder counts in folder mode only: in default deny it allows nothing.
     node.ok(&["folder", "add", &node.home.to_string_lossy()]);
+    let r = mcp.call(&read, with(args.clone(), json!({"path": path})));
+    assert_eq!(r["isError"], json!(true), "{r}");
+    node.ok(&["mode", "folder"]);
     let r = mcp.call(&read, with(args.clone(), json!({"path": path})));
     assert_eq!(r["isError"], json!(false), "{r}");
     assert!(text_of(&r).contains("hello from the node"), "{r}");
@@ -322,6 +412,6 @@ fn node_part_passes_against_nerve_node() {
         .outcomes
         .iter()
         .filter(|o| o.section.starts_with('7'));
-    assert_eq!(profiles.count(), 18, "{report}");
+    assert_eq!(profiles.count(), 19, "{report}");
     drop(node);
 }

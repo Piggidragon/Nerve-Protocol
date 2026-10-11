@@ -30,7 +30,7 @@ pub fn preview(link: &PairLink, name: Option<&str>) -> String {
     }
     s.push_str(
         "Defaults for this center:\n  \
-         mode folder (nothing is allowed until you add a folder or a rule)\n  \
+         mode allowlist (nothing is allowed until you add an allow rule or choose a mode)\n  \
          settings off (the center cannot change this node's settings)\n",
     );
     s

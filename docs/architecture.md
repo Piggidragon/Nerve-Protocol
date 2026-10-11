@@ -134,7 +134,7 @@ There is no bearer token for nodes. A copied config without the private key cann
 
 1. On the center: `nerve-center pair new [--name laptop]` (or "Add node" in the web UI) creates a one-time code (10 minutes, 10 tries, single use) and shows a link as text and QR:
    `nerve://pair?center=<pct-encoded https URL>&code=<code>&pin=<spki>`
-2. On the node: `nerve-node pair '<link>'`. The link is parsed strictly (unknown or doubled keys, bad escapes, paths with `.`/`..` segments, user info, query or fragment in the URL, and links over 4 KiB are refused). The owner sees the parsed center URL, the center name after step 3, and the policy and grant the new center entry starts with (Folder mode with no folder granted, so every call is refused until a rule allows it, and `settings = off`, §5.1, §5.2), and confirms. Nothing is stored before the confirmation.
+2. On the node: `nerve-node pair '<link>'`. The link is parsed strictly (unknown or doubled keys, bad escapes, paths with `.`/`..` segments, user info, query or fragment in the URL, and links over 4 KiB are refused). The owner sees the parsed center URL, the center name after step 3, and the policy and grant the new center entry starts with (default deny, so every call is refused until an allow rule or a mode allows it, and `settings = off`, §5.1, §5.2), and confirms. Nothing is stored before the confirmation.
 3. The node generates the key pair for this center and sends `POST {center}/nerve/v0/pair` with `{code, name, platform, arch, public_key}` over TLS checked against the pin.
 4. The center answers `{center_id, center_name, node_id}` and stores the public key. The node shows the center name and stores the pairing.
 
@@ -250,7 +250,7 @@ Shared and device-only are the machine settings (§5.3) and the limits that prot
 | `actuate` | Acts on the outside world or injects input | send a signal, click, type |
 | `execute` | Runs code the center chose | run a command |
 
-The node's policy maps modes and rules onto effects (Folder mode allows `read` and `write` inside granted folders and `execute` in folders marked `execute`; `sense` and `actuate` are refused unless a rule permits them, in every mode). The center MAY refuse effects per harness by its own rules (§5.5).
+The node's policy maps modes and rules onto effects (Folder mode allows `read` and `write` inside granted folders and `execute` in folders marked `execute`; `sense` and `actuate` are refused in Folder and User mode unless the owner set the action `on`, and in default deny unless an allow rule names them). The center MAY refuse effects per harness by its own rules (§5.5).
 
 ### 4.5 Messages
 
@@ -317,11 +317,12 @@ Profiles for the desktop add-on (computer use, notifications, audio) are defined
 
 Node policy per center entry:
 
-- `mode`: `folder` (the default: file calls inside granted folders; commands only in folders marked `execute`; shell under Landlock) or `user` (what the user can do, protections still on). Sudo is not a mode; it is a separate switch below. `user` expires at `user_until` (default 8 h after it is switched on).
-- `folders`: path, `ro`/`rw`, `execute`.
+- `mode`: `allowlist` (the default: default deny, a call runs only when an allow rule lets it through), `folder` (full access inside the granted folders and below; commands only in folders marked `execute`; shell under Landlock) or `user` (full access as the user, protections still on). Folder and User are the full-access modes. Sudo is not a mode; it is a separate switch below. `user` expires at `user_until` (default 8 h after it is switched on) and falls back to `folder`.
+- `folders`: path, `ro`/`rw`, `execute`. They count in Folder mode.
 - `caps.<cap>[.<action>] = "on" | "off" | "hidden"`: switches per capability and action, derived from the descriptor.
-- protected paths (built in plus `extra`, minus `permit`), deny paths, command rules (`deny`, `permit`), hours.
-- the sudo switch, one per node, not per center entry (Linux): `off` or `on`. Off, the agent cannot run `sudo`, even if explicit `permit` rules for sudo commands exist, because the node has no sudo password. On, the agent may run `sudo <command>` only for commands an explicit `permit` rule names, in either mode. The password is entered when the switch is turned on and stored on the node (memory by default, or encrypted at rest per `machine.secret_storage`); the agent never sees it and it is scrubbed from every outgoing frame. Turning the switch on sends the password once from the client that sets it (CLI on the node, or a center with `write`, §5.2) to the node, encrypted end to end with the node's key from pairing, with nonce and timestamp against replay (§11); a center relays only the ciphertext and keeps no copy. The node checks the password against the real system password with a non-destructive `sudo` check it runs itself (for example `sudo -S -v`, output discarded), and refuses to switch on if it is wrong (`invalid_args`, the message says the password is wrong): a wrong password would give the agent nothing, so the switch never shows `on` without a working password. Switching off needs no password and drops the stored one.
+- `allow` and `deny` rules for every action, as globs over the call's target: the command line of `exec.run`, the path of an `fs` action, `<cap>.<action>` for any other (node-local §2). A rule adds only; the four buttons of the center's audit view write them (allow, allow as wildcard, deny, deny as wildcard), and they can be written by hand. Allow rules count in default deny only; in Folder and User mode they change nothing. Deny rules count in every mode, and a matching deny wins over everything.
+- protected paths (built in plus `extra`, minus the ones the owner released), hours.
+- the sudo switch, one per node, not per center entry (Linux): `off` or `on`. Off, the agent cannot run `sudo`, even if the sudo allow list names the command, because the node has no sudo password. On, the agent may run `sudo <command>` only for commands the sudo allow list (`sudo_allow`, separate from the normal allow list) names, in every mode; deny rules still apply to it. The password is entered when the switch is turned on and stored on the node (memory by default, or encrypted at rest per `machine.secret_storage`); the agent never sees it and it is scrubbed from every outgoing frame. Turning the switch on sends the password once from the client that sets it (CLI on the node, or a center with `write`, §5.2) to the node, encrypted end to end with the node's key from pairing, with nonce and timestamp against replay (§11); a center relays only the ciphertext and keeps no copy. The node checks the password against the real system password with a non-destructive `sudo` check it runs itself (for example `sudo -S -v`, output discarded), and refuses to switch on if it is wrong (`invalid_args`, the message says the password is wrong): a wrong password would give the agent nothing, so the switch never shows `on` without a working password. Switching off needs no password and drops the stored one.
 - the `settings` grant (§5.2).
 
 The node and the center allow only through rules, and the default is deny. A decision is allowed or forbidden, nothing else: a call that no rule allows is refused at once (§5.4).
@@ -362,10 +363,10 @@ Decided and executed on the node only. They are not in any document a center rea
 
 Every invoke from center C, session S is decided by the node's policy for C, and the answer is **allowed** or **forbidden**. There is no third outcome: nothing is held for a person to answer.
 
-1. The policy looks for a rule that allows the call (mode, folder, capability switch, `permit` rule). Finding none, the node refuses at once with `forbidden`. A rule that denies (`deny`, protected path, deny path) wins over any rule that allows.
+1. The policy looks for what allows the call: in default deny an allow rule, in Folder and User mode the mode itself (folders, the user's reach), for a sudo command the sudo allow list. Finding none, the node refuses at once with `forbidden`. A rule that denies (a `deny` rule, a protected path) wins over any rule that allows.
 2. The `message` of the refusal says what is missing and what to do next. The harness shows it to the model; the owner adds the rule and the model tries again.
 3. Every decision, allowed and refused, is audited on the node with center and session, and reaches a subscribed center as an `audit/decision` event.
-4. Rules are added on the node (`nerve-node folder`, `caps`, `config add`) or, for a center with `settings = write`, through the center (the audit tab buttons, §11 item 9a).
+4. Rules are added on the node (`nerve-node allow`, `deny`, `folder`, `caps`, `config add`) or, for a center with `settings = write`, through the center (the four audit tab buttons, §11 item 9a).
 
 The center decides the same way for its own rules (§5.5): it refuses a call before sending it, and never allows what the node would not.
 
@@ -373,7 +374,7 @@ The center decides the same way for its own rules (§5.5): it refuses a call bef
 
 - **Session grants**: a harness session sees only nodes granted to it (by the harness, the owner in the center UI, or a harness default set in the center). Tools for other nodes are not offered and calls for them are refused at the center.
 - **Center rules per effect and harness**: e.g. `execute` from a given harness is refused at the center unless a center rule permits it. These rules apply at the center only and never reach the node.
-- **User mode is never a default**: the node starts every center entry in Folder mode with no folder granted; nothing a center or harness does changes that without the owner (directly, or through a `write` grant the owner gave).
+- **Full access is never a default**: the node starts every center entry in default deny (mode `allowlist`, no rule); nothing a center or harness does changes that without the owner (directly, or through a `write` grant the owner gave).
 
 ## 6. Harness integration
 
@@ -438,7 +439,7 @@ The node's control socket (unix socket in the user's state folder, mode 0600, pe
 
 In 0.0.1 its only client is `nerve-node` itself (the CLI). Nodes get no web UI. Later clients, on the same socket, with no change to the node link:
 
-- the Slint setup GUI (pairing confirmation, settings, status, audit tab with Allow and Deny buttons for its own node);
+- the Slint setup GUI (pairing confirmation, settings, status, audit tab with the four rule buttons for its own node);
 - the Nerve Desktop add-on, which attaches as a capability provider: its capabilities are merged into the node's descriptor with `provider: "nerve-desktop"`, the node applies its own policy per center to every invoke before forwarding it, and nothing of the desktop add-on talks to a center directly.
 
 Commands the node runs for a center cannot change the node's settings through this socket (process-ancestry check on Linux; Windows open, as before).
@@ -456,7 +457,7 @@ Commands the node runs for a center cannot change the node's settings through th
 
 - Package: one binary, Linux and Windows. Headless; everything through the CLI in 0.0.1.
 - `nerve-node install` (user service), `nerve-node setup --create-user nerve` (servers: dedicated user, system unit with `Delegate=yes`, folder grants printed as `setfacl` lines).
-- Terminal: `pair`, `unpair`, `centers`, `status`, `mode`, `folder`, `caps`, `grant settings`, `config get|set|unset|add|remove`, `panic`, `unlock`, `sudo on|off|status` (`on` asks for the sudo password; the node verifies it and refuses a wrong one; `off` asks for none), `proxy`, `update`, `uninstall [--purge]`. Every per-center command takes `--center <name>` and refuses to guess when there are several.
+- Terminal: `pair`, `unpair`, `centers`, `status`, `mode`, `folder`, `caps`, `allow`, `deny`, `grant settings`, `config get|set|unset|add|remove`, `panic`, `unlock`, `sudo on|off|status` (`on` asks for the sudo password; the node verifies it and refuses a wrong one; `off` asks for none), `proxy`, `update`, `uninstall [--purge]`. Every per-center command takes `--center <name>` and refuses to guess when there are several.
 - In 0.0.1 the commands `install`, `setup`, `update` and `uninstall` exist but only answer "not done in 0.0.1"; the node is started by hand until they land.
 - Pairing is confirmed in the terminal; a `nerve://` link handler and dialogs come with the Slint setup GUI later.
 
@@ -493,7 +494,7 @@ pin = "…"
 settings = "off"       # off | write
 
 [center.policy]
-mode = "folder"         # folder | user
+mode = "allowlist"      # allowlist | folder | user
 folders = [{ path = "~/src", access = "rw", execute = true }]
 caps = { exec = "on" }
 ```
@@ -529,7 +530,7 @@ Simpler than 0.0.x: no `profile` setting, no `token_storage` (no token), no pi t
 | The portal's per-chat `ctx` and pi tool labels | `ctx {session}` | "Chat" and pi tool names are harness vocabulary |
 | `policy.tools.read|write|edit|bash|grep|find|ls` | `caps.<cap>.<action>` switches | Derived from the descriptor, not from one harness's tools |
 | `portal_policy = off|read|write` | Per-center `settings = off|write` | Per trust domain |
-| Modes Ask, Folders, Full and the methods around them | Modes Folder and User; sudo is a separate per-node switch (§5.1), not a mode; a call is allowed by a rule or `forbidden` | Nothing waits for a person; rules decide, default deny |
+| Modes Ask, Folders, Full and the methods around them | Modes Allowlist (default deny), Folder and User; sudo is a separate per-node switch (§5.1) with its own allow list, not a mode; a call is allowed by a rule or a mode, or `forbidden` | Nothing waits for a person; rules decide, default deny |
 | `policy.get`, `policy.set`, `policy.changed` | `nerve:settings/1` | Generic; same document as the config file |
 | `audit` notification | `nerve:audit/1` event, subscribed | A center that wants it asks |
 | `grant.end` | `session.end` | Harness-neutral name |
@@ -556,10 +557,10 @@ Kept in substance (re-implemented, not copied): the policy engine's folders, pro
 4. **The node is the only component that talks to a center.** Local add-ons (setup GUI, desktop) attach to the node through its local interface (§7.2).
 5. **Several centers per node** in 0.0.1, each a separate trust domain (§3.7).
 6. **Permissions**: the node's policy per center entry is the only authority; no scopes (§5.1, D9).
-7. **Decisions**: allowed or forbidden only. The node and the center allow only through rules, default deny; a call no rule allows is refused at once. Modes: Folder (default) and User; sudo is a per-node switch, not a mode (§5.1, §5.4).
+7. **Decisions**: allowed or forbidden only. The node and the center allow only through rules, default deny; a call no rule allows is refused at once. Modes: Allowlist (default, default deny), Folder and User; Folder and User give full access in their area, deny rules narrow it; sudo is a per-node switch with its own allow list, not a mode (§5.1, §5.4).
 8. **No resume** in 0.0.1: a dropped link ends its calls (§3.5).
 9. **No media streams** in 0.0.1; voice belongs to the desktop add-on (§4.6).
-9a. **Audit in 0.0.1**: the center web UI has an audit tab for all its nodes. Denied calls there get buttons Allow, Allow as wildcard and Deny (Deny also as wildcard, for rules that allow). The buttons write to the node only where the center has write right (§5.2); without it they do nothing and the entry says so. The node has no UI in 0.0.1; its own audit is `nerve-node audit` in the CLI.
+9a. **Audit in 0.0.1**: the center web UI has an audit tab for all its nodes. Every entry with a known target (a command, a path, another action) gets four buttons: Allow, Allow as wildcard, Deny and Deny as wildcard. Each only adds a rule, to the allow list (the sudo allow list for a sudo command) or the deny list. The buttons write to the node only where the center has write right (§5.2); without it they do nothing and the entry says so. The node has no UI in 0.0.1; its own audit is `nerve-node audit` in the CLI.
 10. **Capability model**: #31 rewritten fresh in Nerve-Protocol, keeping the self-describing descriptor, actions/events/state/streams, profiles, effect classes and conformance levels (§4.1, §4.2).
 11. **Harness integration is MCP only.** The center exposes the protocol as an MCP server (§6.3), part of 0.0.1, and any MCP-capable harness plugs it in as is. Native harness plugins are a backlog item for the communities (see Later). We provide the spec, the conformance suite and the MCP server surface. No portal in the design (§1, §6).
 12. **Fresh start** at 0.0.1, no compatibility with Pithagoras-Sync (§9).
@@ -570,8 +571,8 @@ Kept in substance (re-implemented, not copied): the policy engine's folders, pro
 |---|---|---|
 | Resume after a dropped link | later | Reconnect and continue running commands and event streams where they stopped: 30 s grace period on the node plus event replay by `seq` (§3.5) |
 | Node as proxy (jump node → node) | later | Transport binding below the message layer, end-to-end TLS and signature, CONNECT only to centers the jump node is paired with (§3.6) |
-| Node setup GUI in Slint | later | Client of the node's local interface: pairing confirmation and `nerve://` handler, settings, status, audit tab with Allow and Deny buttons for its own node (§7.2) |
-| Permission modes Folder and User (layer 1) | first, version open | Default deny after setup. Folder (the default): full access below one path, explicit denies, optional allow-only. User: full access as the user; as root a warning and one confirmation. Sudo is not a mode: a per-node sudo switch (password entered when turned on) plus an explicit `permit` rule per command |
+| Node setup GUI in Slint | later | Client of the node's local interface: pairing confirmation and `nerve://` handler, settings, status, audit tab with the four rule buttons for its own node (§7.2) |
+| Permission modes Folder and User (layer 1) | first, version open | Default deny after setup (mode Allowlist, with allow rules). Folder: full access below one path, explicit denies. User: full access as the user; as root a warning and one confirmation. Sudo is not a mode: a per-node sudo switch (password entered when turned on) plus the sudo allow list |
 | Action checker on the server (layer 2) | later version | Small local decision model plus a command filter: `rm` default deny, `rm -rf /*` hard deny. Saved allow rules apply automatically |
 | Harness plugins (native integration instead of MCP) | backlog | Written and owned by the harness communities, not by us. 0.0.1 knows only the MCP form (§6) |
 | Capability provider attach on the local interface | later, with Nerve Desktop | Provider capabilities merged into the node's descriptor under the node's policy (§7.2); conformance part "provider" |

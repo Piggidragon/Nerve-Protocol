@@ -2,7 +2,6 @@
 //! center's requests (spec §4, §5, §7).
 
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -16,6 +15,7 @@ use tokio::task::AbortHandle;
 use nerve_policy::audit::Entry;
 use nerve_policy::config::{Mode, SettingsGrant};
 use nerve_policy::protected::Protected;
+use nerve_policy::rules::RuleSet;
 use nerve_policy::{Call, CenterEntry, Decision, Env, NodeConfig, SetError, Target};
 use nerve_proto::descriptor::{Detail, Effect, Exposure};
 use nerve_proto::frame::{Frame, FrameError};
@@ -798,12 +798,15 @@ impl Link {
                     call.target_text(),
                 )?;
                 let protected = self.protected(&entry);
-                let deny = self.deny_paths(&entry);
+                let deny = RuleSet::new(&entry.policy.deny, &self.shared.home);
                 let folders = entry.policy.folders.clone();
+                let action = inv.action.clone();
                 tokio::task::spawn_blocking(move || {
                     let skip = |p: &std::path::Path| {
                         protected.check(p, false, &folders).is_some()
-                            || deny.iter().any(|d| nerve_policy::paths::within(p, d))
+                            || deny
+                                .find("fs", &action, &nerve_policy::paths::to_wire(p))
+                                .is_some()
                     };
                     call.run(&skip)
                 })
@@ -823,15 +826,6 @@ impl Link {
             &self.shared.paths.own(),
             &entry.policy.protected,
         )
-    }
-
-    fn deny_paths(&self, entry: &CenterEntry) -> Vec<PathBuf> {
-        entry
-            .policy
-            .deny
-            .iter()
-            .filter_map(|d| nerve_policy::protected::expand(&self.shared.home, d))
-            .collect()
     }
 
     /// Runs the policy for one call: it either runs or is refused at once.
@@ -1009,8 +1003,9 @@ impl Link {
             target,
         )?;
         // The policy let a sudo command through only with the switch on and
-        // a permit rule naming it. It runs the node's sudo, with the password
-        // on stdin and without Landlock, which would keep sudo from rising.
+        // the sudo allow list naming it. It runs the node's sudo, with the
+        // password on stdin and without Landlock, which would keep sudo from
+        // rising.
         let mut rc = rc;
         let mut sudo_password = None;
         if let Some(args) = nerve_policy::sudo_command(&rc.command) {

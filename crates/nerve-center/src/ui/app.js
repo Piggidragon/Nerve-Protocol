@@ -371,15 +371,20 @@ function auditRow(d, n) {
   const write = n && n.settings_write;
   const why = !n ? "The machine is no longer paired." : !write ? "This machine did not give this center the settings grant." : "";
   const rule = (list, wildcard) => act(async () => {
-    const r = await api("POST", "/api/audit/rule", { node_id: d.node_id, list, command: d.target, wildcard });
-    notify(`Added ${list} rule: ${r.pattern}`);
+    const r = await api("POST", "/api/audit/rule", { node_id: d.node_id, list, cap: d.cap, action: d.action, target: d.target || "", wildcard });
+    notify(`Added to the ${list === "sudo" ? "sudo allow" : list} list: ${r.rule}`);
   });
   const ruleBtn = (label, kind, list, wildcard) => {
     const b = btn(label, kind, rule(list, wildcard));
     if (!write) { b.disabled = true; b.title = why; }
     return b;
   };
-  const cmd = d.cap === "exec" && d.target;
+  // A rule needs the entry's target: a command line or a path. Any other
+  // action is its own target.
+  const known = d.cap && d.action && (d.target || !["exec", "fs"].includes(d.cap));
+  // A sudo command has its own allow list; deny rules take it as any other.
+  const sudo = d.cap === "exec" && d.action === "run" && /^\s*(\S*\/)?sudo(\s|$)/.test(d.target || "");
+  const allow = sudo ? "sudo" : "allow";
   return el("div", { class: "card audit-row" },
     el("div", { class: "line" },
       el("span", { class: "tone-" + k.tone }, icon(k.ic)),
@@ -387,8 +392,10 @@ function auditRow(d, n) {
       pill(k.pill, d.decision + (d.by ? ` by ${d.by}` : "") + (d.code ? ` [${d.code}]` : "")),
       el("span", { class: "when", title: when(d.ts) }, ago(d.ts))),
     d.target ? el("code", { class: "target mono" }, d.target) : null,
-    cmd ? el("div", { class: "actions" }, ruleBtn("Allow", "", "allow", false), ruleBtn("Allow as wildcard", "", "allow", true), ruleBtn("Deny", "danger", "deny", false)) : null,
-    cmd && !write ? el("p", { class: "meta" }, why) : null);
+    known ? el("div", { class: "actions" },
+      ruleBtn("Allow", "", allow, false), ruleBtn("Allow as wildcard", "", allow, true),
+      ruleBtn("Deny", "danger", "deny", false), ruleBtn("Deny as wildcard", "danger", "deny", true)) : null,
+    known && !write ? el("p", { class: "meta" }, why) : null);
 }
 
 // ---- Settings ----
@@ -481,7 +488,7 @@ function sudoSwitch(n) {
     const sealed = await sealSudo(offer, password);
     const r = await api("POST", "/api/nodes/sudo", { id: n.id, on: true, sealed });
     show(r.sudo);
-    notify(`Sudo is on for ${n.name}: permitted sudo commands run.`);
+    notify(`Sudo is on for ${n.name}: sudo commands on the sudo allow list run.`);
   }));
   const off = btn("Turn sudo off", "", act(async () => {
     const r = await api("POST", "/api/nodes/sudo", { id: n.id, on: false });

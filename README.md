@@ -72,26 +72,31 @@ CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static" \
    nerve-node run
    ```
 
-   A new center starts in `folder` mode with no folder and no rule, so every
-   call is refused at once: nothing waits for an answer. Allow what you want
-   on the machine:
+   A new center starts in `allowlist` mode (default deny) with no rule, so
+   every call is refused at once: nothing waits for an answer. Either allow
+   what you want, or give it full access and deny what you do not want:
 
    ```sh
-   nerve-node folder add ~/proj --rw --execute   # allow inside a folder
-   nerve-node allow 'git status'     # a command that runs in any mode
-   nerve-node deny 'rm *'            # a command that never runs
-   nerve-node mode user --hours 2    # for a while: as the user may
+   nerve-node allow 'git status'     # allowlist mode: this command may run
+   nerve-node allow 'git status' --wildcard   # ... and `git` with anything after
+   nerve-node config add center.home.policy.allow 'fs.read:~/notes/*'   # a path
+   nerve-node mode folder            # or: full access in the folders below
+   nerve-node folder add ~/proj --rw --execute
+   nerve-node mode user --hours 2    # or: for a while, as the user may
+   nerve-node deny 'rm *' --wildcard # in every mode: never, and wins over allow
    nerve-node audit                  # what was allowed and refused
    nerve-node panic                  # end every link; `unlock` undoes it
    ```
 
+   Allow rules count in `allowlist` mode only; deny rules count in every mode.
+
    Sudo is a switch per machine, off by default. While it is off, no command
    runs with sudo, whatever the rules say. Switched on (the node checks the
    password with `sudo -v` and keeps it in memory only), a sudo command runs
-   only when an `allow` rule names it:
+   only when the sudo allow list names it, in every mode:
 
    ```sh
-   nerve-node allow 'sudo apt update'
+   nerve-node allow 'sudo apt update'   # a sudo command goes on its own list
    nerve-node sudo on                # asks for the password
    nerve-node sudo off               # drops it
    ```

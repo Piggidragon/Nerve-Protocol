@@ -6,6 +6,7 @@ pub mod config;
 pub mod decide;
 pub mod paths;
 pub mod protected;
+pub mod rules;
 pub mod settings;
 
 pub use config::{CenterDocument, CenterEntry, CenterPolicy, Mode, NodeConfig};

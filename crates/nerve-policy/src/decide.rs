@@ -1,20 +1,23 @@
 //! The decision engine: whether one call of one center may run (architecture
-//! §5.1, spec §7).
+//! §5.1, spec node-local §3).
 //!
 //! There are two outcomes, allowed and refused; nothing waits for an answer.
-//! The order only ever narrows: an `off` capability is disabled; a denied path
-//! or command is forbidden; then the mode and the rules allow or not. A call
-//! no mode and no rule allows is refused at once, and so is one that touches a
+//! The order only ever narrows: an `off` capability is disabled; a sudo
+//! command with the sudo switch off, and anything a deny rule matches, is
+//! forbidden whatever else says; then a sudo command needs the sudo allow
+//! list, and any other call the mode: allow rules in `allowlist` mode, the
+//! folders in `folder` mode, the user's own reach in `user` mode. A call no
+//! mode and no rule allows is refused at once, and so is one that touches a
 //! protected path, whatever allowed it.
 
 use std::path::{Path, PathBuf};
 
-use globset::{Glob, GlobMatcher};
 use nerve_proto::Effect;
 
 use crate::config::{Access, CapSetting, CenterPolicy, Folder, Mode};
-use crate::paths::within;
-use crate::protected::{Protected, expand};
+use crate::paths::{to_wire, within};
+use crate::protected::Protected;
+use crate::rules::{RuleSet, command_matches};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
@@ -75,25 +78,33 @@ pub fn sudo_command(command: &str) -> Option<&str> {
 /// Characters that chain, substitute or redirect in a shell.
 const SHELL_CONTROL: &[char] = &[';', '&', '|', '$', '`', '(', ')', '<', '>', '\n', '\r'];
 
-fn matcher(globs: &[String]) -> Vec<GlobMatcher> {
-    globs
-        .iter()
-        .filter_map(|g| Glob::new(g).ok())
-        .map(|g| g.compile_matcher())
-        .collect()
-}
-
-fn matches(globs: &[String], command: &str) -> bool {
-    let command = command.trim();
-    matcher(globs).iter().any(|m| m.is_match(command))
-}
-
 fn inside_folder<'f>(folders: &'f [Folder], path: &Path) -> Option<&'f Folder> {
     // The deepest folder wins, so an ro folder inside an rw one stays ro.
     folders
         .iter()
         .filter(|f| within(path, Path::new(&f.path)))
         .max_by_key(|f| f.path.len())
+}
+
+/// The strings rules are tried on (`rules`): the command line of `exec.run`,
+/// the paths of an `fs` call, else the action itself.
+fn rule_targets(call: &Call) -> Vec<String> {
+    if let Some(cmd) = call.command {
+        vec![cmd.trim().to_string()]
+    } else if call.targets.is_empty() {
+        vec![format!("{}.{}", call.cap, call.action)]
+    } else {
+        call.targets.iter().map(|t| to_wire(&t.path)).collect()
+    }
+}
+
+/// How a refusal names a rule target.
+fn name(call: &Call, target: &str) -> String {
+    if call.command.is_some() {
+        format!("the command {target:?}")
+    } else {
+        target.to_string()
+    }
 }
 
 /// Decides `call` under `policy`.
@@ -103,102 +114,33 @@ pub fn decide(policy: &CenterPolicy, env: &Env, call: &Call) -> Decision {
         return Decision::Disabled(format!("{}.{} is off", call.cap, call.action));
     }
 
-    // Denied paths and commands: forbidden in every mode.
-    let deny: Vec<PathBuf> = policy
-        .deny
-        .iter()
-        .filter_map(|d| expand(env.home, d))
-        .collect();
-    for t in call.targets {
-        if let Some(d) = deny.iter().find(|d| within(&t.path, d)) {
-            return Decision::Forbidden(format!(
-                "{} is denied ({})",
-                t.path.display(),
-                d.display()
-            ));
-        }
-    }
-    let rules = &policy.commands;
-    if let Some(cmd) = call.command {
-        if matches(&rules.deny, cmd) {
-            return Decision::Forbidden(format!("the command {cmd:?} is denied"));
-        }
-        if !rules.allow.is_empty() && !matches(&rules.allow, cmd) {
-            return Decision::Forbidden(format!("the command {cmd:?} is not on the allow list"));
-        }
-    }
-    // The switch is checked before any rule: off, no permit makes a sudo
-    // command run, because the node has no password to give it.
+    // The switch is checked before any rule: off, no sudo allow entry makes a
+    // sudo command run, because the node has no password to give it.
     let sudo = call.command.is_some_and(|c| sudo_command(c).is_some());
     if sudo && !env.sudo {
         return Decision::Forbidden("sudo is off on this node".into());
     }
-    // A permit rule names one command; `sudo apt update; rm -rf /` must not
-    // slip through a `sudo apt *` rule with a second command.
-    if sudo
-        && call
-            .command
-            .is_some_and(|c| c.trim().contains(SHELL_CONTROL))
-    {
-        return Decision::Forbidden(
-            "a sudo command is one simple command (no ; & | $ ` ( ) < > or line breaks)".into(),
-        );
+
+    // Deny rules: forbidden in every mode, and they win over any allow.
+    let targets = rule_targets(call);
+    let deny = RuleSet::new(&policy.deny, env.home);
+    for t in &targets {
+        if let Some(rule) = deny.find(call.cap, call.action, t) {
+            return Decision::Forbidden(format!("{} is denied ({rule})", name(call, t)));
+        }
     }
 
     let mode = policy.mode_at(call.now_ms);
     let mut reasons = Vec::new();
-
-    // What the mode, or an explicit `on`, allows.
-    let mut allowed = match call.effect {
-        // No mode allows these; only the owner's `on` does.
-        Effect::Sense | Effect::Actuate => {
-            if setting != Some(CapSetting::On) {
-                reasons.push(format!(
-                    "{} is allowed only where {}.{} is set to on",
-                    call.effect.as_str(),
-                    call.cap,
-                    call.action
-                ));
-            }
-            setting == Some(CapSetting::On)
-        }
-        Effect::Read | Effect::Write => match mode {
-            Mode::User => true,
-            Mode::Folder => call.targets.iter().all(|t| {
-                inside_folder(&policy.folders, &t.path)
-                    .is_some_and(|f| !t.write || f.access == Access::Rw)
-            }),
-        },
-        // No mode allows sudo; only a permit rule below does.
-        Effect::Execute if sudo => {
-            reasons.push("a sudo command runs only when a permit rule names it".into());
-            false
-        }
-        Effect::Execute => match mode {
-            Mode::User => true,
-            Mode::Folder => {
-                let in_exec = call
-                    .cwd
-                    .and_then(|c| inside_folder(&policy.folders, c))
-                    .is_some_and(|f| f.execute);
-                if in_exec && !env.confined {
-                    reasons.push("commands cannot be confined on this machine".into());
-                }
-                in_exec && env.confined
-            }
-        },
+    let mut allowed = if sudo {
+        by_sudo_list(policy, call, &mut reasons)
+    } else if mode == Mode::Allowlist {
+        by_allow_rules(policy, env, call, &targets, &mut reasons)
+    } else {
+        by_mode(policy, env, call, mode, &mut reasons)
     };
     if !allowed && reasons.is_empty() {
-        reasons.push(match call.effect {
-            Effect::Execute => "the working directory is not in an execute folder".into(),
-            Effect::Write => "outside the read-write folders".into(),
-            _ => "outside the folders".into(),
-        });
-    }
-    if call.effect == Effect::Execute && call.command.is_some_and(|cmd| matches(&rules.permit, cmd))
-    {
-        allowed = true;
-        reasons.clear();
+        reasons.push("not allowed".into());
     }
 
     // Narrowing that holds in every mode.
@@ -225,13 +167,125 @@ pub fn decide(policy: &CenterPolicy, env: &Env, call: &Call) -> Decision {
     }
 }
 
+/// A sudo command runs only when the sudo allow list names it, in every mode.
+fn by_sudo_list(policy: &CenterPolicy, call: &Call, reasons: &mut Vec<String>) -> bool {
+    let cmd = call.command.unwrap_or_default();
+    // An entry names one command; `sudo apt update; rm -rf /` must not slip
+    // through a `sudo apt *` entry with a second command.
+    if cmd.trim().contains(SHELL_CONTROL) {
+        reasons.push(
+            "a sudo command is one simple command (no ; & | $ ` ( ) < > or line breaks)".into(),
+        );
+        return false;
+    }
+    let ok = command_matches(&policy.sudo_allow, cmd);
+    if !ok {
+        reasons.push("a sudo command runs only when the sudo allow list names it".into());
+    }
+    ok
+}
+
+/// `allowlist` mode: every target needs an allow rule.
+fn by_allow_rules(
+    policy: &CenterPolicy,
+    env: &Env,
+    call: &Call,
+    targets: &[String],
+    reasons: &mut Vec<String>,
+) -> bool {
+    let allow = RuleSet::new(&policy.allow, env.home);
+    for t in targets {
+        // Commands run unconfined here, so a wildcard must not cover a second
+        // command chained on: only a rule that names the line exactly does.
+        let chained = call.command.is_some() && t.contains(SHELL_CONTROL);
+        let found = if chained {
+            allow.find_exact(call.cap, call.action, t)
+        } else {
+            allow.find(call.cap, call.action, t)
+        };
+        if found.is_none() {
+            reasons.push(if chained && allow.find(call.cap, call.action, t).is_some() {
+                format!(
+                    "{} chains commands (; & | $ ` ( ) < > or a line break); only an allow rule that names it exactly covers that",
+                    name(call, t)
+                )
+            } else {
+                format!("no allow rule matches {}", name(call, t))
+            });
+            return false;
+        }
+    }
+    true
+}
+
+/// `folder` and `user` mode: what the mode itself allows. Allow rules are not
+/// looked at.
+fn by_mode(
+    policy: &CenterPolicy,
+    env: &Env,
+    call: &Call,
+    mode: Mode,
+    reasons: &mut Vec<String>,
+) -> bool {
+    match call.effect {
+        // No mode allows these; only the owner's `on` does.
+        Effect::Sense | Effect::Actuate => {
+            let on = policy.cap_setting(call.cap, Some(call.action)) == Some(CapSetting::On);
+            if !on {
+                reasons.push(format!(
+                    "{} is allowed only where {}.{} is set to on",
+                    call.effect.as_str(),
+                    call.cap,
+                    call.action
+                ));
+            }
+            on
+        }
+        Effect::Read | Effect::Write => {
+            let ok = match mode {
+                Mode::User => true,
+                Mode::Folder => call.targets.iter().all(|t| {
+                    inside_folder(&policy.folders, &t.path)
+                        .is_some_and(|f| !t.write || f.access == Access::Rw)
+                }),
+                // The allow rules decide there (`by_allow_rules`).
+                Mode::Allowlist => false,
+            };
+            if !ok {
+                reasons.push(match call.effect {
+                    Effect::Write => "outside the read-write folders".into(),
+                    _ => "outside the folders".into(),
+                });
+            }
+            ok
+        }
+        Effect::Execute => match mode {
+            Mode::User => true,
+            Mode::Allowlist => false,
+            Mode::Folder => {
+                let in_exec = call
+                    .cwd
+                    .and_then(|c| inside_folder(&policy.folders, c))
+                    .is_some_and(|f| f.execute);
+                if in_exec && !env.confined {
+                    reasons.push("commands cannot be confined on this machine".into());
+                } else if !in_exec {
+                    reasons.push("the working directory is not in an execute folder".into());
+                }
+                in_exec && env.confined
+            }
+        },
+    }
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::config::{CommandRules, ProtectedOptions};
+    use crate::config::ProtectedOptions;
 
     const NOW: u64 = 1_000_000;
 
+    /// `mode` with two folders, a denied path and two denied commands.
     fn policy(mode: Mode) -> CenterPolicy {
         CenterPolicy {
             mode,
@@ -248,15 +302,16 @@ mod tests {
                     execute: true,
                 },
             ],
-            deny: vec!["/w/rw/secret".into()],
-            commands: CommandRules {
-                deny: vec!["rm -rf /*".into(), "git push*".into()],
-                permit: vec!["ls*".into()],
-                ..Default::default()
-            },
+            deny: vec![
+                "fs:/w/rw/secret/*".into(),
+                "exec.run:rm -rf /*".into(),
+                "exec.run:git push*".into(),
+            ],
             ..Default::default()
         }
     }
+
+    const MODES: [Mode; 3] = [Mode::Allowlist, Mode::Folder, Mode::User];
 
     struct T {
         prot: Protected,
@@ -275,6 +330,13 @@ mod tests {
                 protected: &self.prot,
                 confined,
                 sudo: false,
+            }
+        }
+
+        fn sudo_on(&self) -> Env<'_> {
+            Env {
+                sudo: true,
+                ..self.env(true)
             }
         }
     }
@@ -299,6 +361,19 @@ mod tests {
         }
     }
 
+    /// A call of another capability, with no path and no command.
+    fn action<'a>(effect: Effect, cap: &'a str, action: &'a str) -> Call<'a> {
+        Call {
+            cap,
+            action,
+            effect,
+            targets: &[],
+            command: None,
+            cwd: None,
+            now_ms: NOW,
+        }
+    }
+
     fn t(p: &str, write: bool) -> Vec<Target> {
         vec![Target {
             path: p.into(),
@@ -314,8 +389,16 @@ mod tests {
         }
     }
 
+    fn run(p: &CenterPolicy, env: &Env, c: &Call) -> &'static str {
+        short(&decide(p, env, c))
+    }
+
+    fn rules(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
-    fn mode_matrix() {
+    fn folder_and_user_mode_matrix() {
         let x = T::new();
         let env = x.env(true);
         let inside_ro = t("/w/ro/a", false);
@@ -355,7 +438,7 @@ mod tests {
             (Mode::User, Effect::Execute, &exec_ro, Some("make"), "allow"),
             (Mode::User, Effect::Sense, &[], None, "refused"),
             (Mode::User, Effect::Actuate, &[], None, "refused"),
-            // Command rules.
+            // Deny rules on commands.
             (
                 Mode::User,
                 Effect::Execute,
@@ -366,9 +449,9 @@ mod tests {
             (
                 Mode::Folder,
                 Effect::Execute,
-                &exec_ro,
-                Some("ls -la"),
-                "allow",
+                &exec_in,
+                Some("git push origin"),
+                "refused",
             ),
             (
                 Mode::User,
@@ -379,6 +462,7 @@ mod tests {
             ),
             // Denied paths, in every mode.
             (Mode::User, Effect::Read, &denied, None, "refused"),
+            (Mode::Folder, Effect::Read, &denied, None, "refused"),
             // Protected paths are refused, also in user mode.
             (Mode::User, Effect::Read, &key, None, "refused"),
             (Mode::User, Effect::Write, &hook, None, "refused"),
@@ -403,18 +487,18 @@ mod tests {
         let mut p = policy(Mode::User);
         p.user_until = Some(NOW);
         assert_eq!(
-            short(&decide(&p, &env, &call(Effect::Read, &outside, None))),
+            run(&p, &env, &call(Effect::Read, &outside, None)),
             "refused"
         );
     }
 
     #[test]
-    fn a_call_no_rule_allows_is_refused_at_once() {
+    fn default_deny_refuses_without_a_rule() {
         let x = T::new();
         let env = x.env(true);
-        // The default policy has no folder and no rule: nothing is allowed.
+        // A new center: allowlist mode, no folder, no rule.
         let p = CenterPolicy::default();
-        assert_eq!(p.mode, Mode::Folder);
+        assert_eq!(p.mode, Mode::Allowlist);
         let r = t("/w/rw/a", false);
         let w = t("/w/rw/a", true);
         let e = t("/w/rw", false);
@@ -422,8 +506,9 @@ mod tests {
             call(Effect::Read, &r, None),
             call(Effect::Write, &w, None),
             call(Effect::Execute, &e, Some("make")),
-            call(Effect::Sense, &[], None),
-            call(Effect::Actuate, &[], None),
+            action(Effect::Sense, "camera", "snap"),
+            action(Effect::Actuate, "lamp", "on"),
+            action(Effect::Read, "notes", "list"),
         ] {
             let d = decide(&p, &env, &c);
             assert!(
@@ -432,17 +517,253 @@ mod tests {
                 c.effect
             );
         }
-        // One explicit allow changes only what it names.
-        let mut p = CenterPolicy::default();
-        p.commands.permit = vec!["make".into()];
+        // Folders do not count in allowlist mode, and neither does `on`.
+        let mut p = policy(Mode::Allowlist);
+        p.caps.insert("camera".into(), CapSetting::On);
+        assert_eq!(run(&p, &env, &call(Effect::Read, &r, None)), "refused");
         assert_eq!(
-            short(&decide(&p, &env, &call(Effect::Execute, &e, Some("make")))),
+            run(&p, &env, &call(Effect::Execute, &e, Some("make"))),
+            "refused"
+        );
+        assert_eq!(
+            run(&p, &env, &action(Effect::Sense, "camera", "snap")),
+            "refused"
+        );
+    }
+
+    #[test]
+    fn an_allow_rule_lets_a_matching_call_through_in_allowlist_mode() {
+        let x = T::new();
+        let env = x.env(true);
+        let mut p = policy(Mode::Allowlist);
+        p.allow = rules(&["exec.run:make", "fs.read:/elsewhere/a", "fs.write:/w/rw/*"]);
+        let e = t("/w/ro", false);
+        let c = |cmd| call(Effect::Execute, &e, Some(cmd));
+        assert_eq!(run(&p, &env, &c("make")), "allow");
+        // The rule names one command.
+        assert_eq!(run(&p, &env, &c("make all")), "refused");
+        assert_eq!(run(&p, &env, &c("cargo build")), "refused");
+        let read = t("/elsewhere/a", false);
+        assert_eq!(run(&p, &env, &call(Effect::Read, &read, None)), "allow");
+        let other = t("/elsewhere/b", false);
+        assert_eq!(run(&p, &env, &call(Effect::Read, &other, None)), "refused");
+        // A rule of one action does not cover its sibling.
+        let write = t("/w/rw/a/b", true);
+        assert_eq!(run(&p, &env, &call(Effect::Write, &write, None)), "allow");
+        let read_there = t("/w/rw/a/b", false);
+        assert_eq!(
+            run(&p, &env, &call(Effect::Read, &read_there, None)),
+            "refused"
+        );
+        // A path rule is no command rule and the other way round.
+        let mut q = policy(Mode::Allowlist);
+        q.allow = rules(&["fs:/w/*"]);
+        assert_eq!(
+            run(&q, &env, &call(Effect::Execute, &e, Some("/w/tool"))),
+            "refused"
+        );
+        q.allow = rules(&["exec.run:/w/*"]);
+        assert_eq!(
+            run(&q, &env, &call(Effect::Read, &t("/w/a", false), None)),
+            "refused"
+        );
+        // Other capabilities: by action, or with a wildcard by capability.
+        let mut q = policy(Mode::Allowlist);
+        q.allow = rules(&["camera.snap"]);
+        assert_eq!(
+            run(&q, &env, &action(Effect::Sense, "camera", "snap")),
             "allow"
         );
         assert_eq!(
-            short(&decide(&p, &env, &call(Effect::Execute, &e, Some("cargo")))),
+            run(&q, &env, &action(Effect::Sense, "camera", "record")),
             "refused"
         );
+        assert_eq!(
+            run(&q, &env, &action(Effect::Actuate, "lamp", "on")),
+            "refused"
+        );
+        q.allow = rules(&["camera"]);
+        assert_eq!(
+            run(&q, &env, &action(Effect::Sense, "camera", "record")),
+            "allow"
+        );
+        // A capability that is off stays off.
+        q.caps.insert("camera".into(), CapSetting::Off);
+        assert_eq!(
+            run(&q, &env, &action(Effect::Sense, "camera", "snap")),
+            "disabled"
+        );
+        // Protected paths are refused whatever allowed them.
+        let mut q = policy(Mode::Allowlist);
+        q.allow = rules(&["fs:/h/*"]);
+        let key = t("/h/.ssh/id_rsa", false);
+        assert_eq!(run(&q, &env, &call(Effect::Read, &key, None)), "refused");
+        let ok = t("/h/notes", false);
+        assert_eq!(run(&q, &env, &call(Effect::Read, &ok, None)), "allow");
+    }
+
+    #[test]
+    fn wildcard_rules_match() {
+        let x = T::new();
+        let env = x.env(true);
+        let e = t("/w/ro", false);
+        let c = |cmd| call(Effect::Execute, &e, Some(cmd));
+        let mut p = policy(Mode::Allowlist);
+        p.allow = rules(&["exec.run:git *", "fs.read:/notes/*"]);
+        for cmd in ["git status", "git log -n 3", "git", "  git status  "] {
+            assert_eq!(run(&p, &env, &c(cmd)), "allow", "{cmd}");
+        }
+        for cmd in ["gitk", "echo git status", "cat git"] {
+            assert_eq!(run(&p, &env, &c(cmd)), "refused", "{cmd}");
+        }
+        for path in ["/notes/a", "/notes/a/b/c", "/notes"] {
+            let r = t(path, false);
+            assert_eq!(
+                run(&p, &env, &call(Effect::Read, &r, None)),
+                "allow",
+                "{path}"
+            );
+        }
+        for path in ["/notes2/a", "/other"] {
+            let r = t(path, false);
+            assert_eq!(
+                run(&p, &env, &call(Effect::Read, &r, None)),
+                "refused",
+                "{path}"
+            );
+        }
+        // The same forms deny, in a mode that otherwise allows.
+        let mut u = policy(Mode::User);
+        u.deny = rules(&["exec.run:docker *", "fs:/notes/*"]);
+        assert_eq!(run(&u, &env, &c("docker run x")), "refused");
+        assert_eq!(run(&u, &env, &c("dockerd")), "allow");
+        let r = t("/notes/a/b", false);
+        assert_eq!(run(&u, &env, &call(Effect::Read, &r, None)), "refused");
+        // The refusal names the rule.
+        assert!(matches!(
+            decide(&u, &env, &c("docker run x")),
+            Decision::Forbidden(m) if m.contains("docker *")
+        ));
+    }
+
+    #[test]
+    fn a_deny_rule_wins_over_an_allow_rule() {
+        let x = T::new();
+        let env = x.env(true);
+        let e = t("/w/ro", false);
+        let mut p = policy(Mode::Allowlist);
+        p.allow = rules(&["exec.run:git *", "fs:/w/*", "camera"]);
+        p.deny = rules(&["exec.run:git push*", "fs.write:/w/secret/*", "camera.snap"]);
+        assert_eq!(
+            run(&p, &env, &call(Effect::Execute, &e, Some("git status"))),
+            "allow"
+        );
+        assert_eq!(
+            run(&p, &env, &call(Effect::Execute, &e, Some("git push -f"))),
+            "refused"
+        );
+        let r = t("/w/secret/k", false);
+        let w = t("/w/secret/k", true);
+        assert_eq!(run(&p, &env, &call(Effect::Read, &r, None)), "allow");
+        assert_eq!(run(&p, &env, &call(Effect::Write, &w, None)), "refused");
+        assert_eq!(
+            run(&p, &env, &action(Effect::Sense, "camera", "snap")),
+            "refused"
+        );
+        assert_eq!(
+            run(&p, &env, &action(Effect::Sense, "camera", "record")),
+            "allow"
+        );
+        // The exact same rule on both lists: deny.
+        p.allow = rules(&["exec.run:make"]);
+        p.deny = rules(&["exec.run:make"]);
+        assert_eq!(
+            run(&p, &env, &call(Effect::Execute, &e, Some("make"))),
+            "refused"
+        );
+    }
+
+    #[test]
+    fn allow_rules_change_nothing_in_folder_and_user_mode() {
+        let x = T::new();
+        let env = x.env(true);
+        let outside = t("/elsewhere/a", false);
+        let ro_w = t("/w/ro/a", true);
+        let exec_ro = t("/w/ro", false);
+        let everything = rules(&["fs", "exec", "camera", "lamp.on"]);
+        // What folder mode refuses stays refused, rule or not.
+        let mut p = policy(Mode::Folder);
+        p.allow = everything.clone();
+        assert_eq!(
+            run(&p, &env, &call(Effect::Read, &outside, None)),
+            "refused"
+        );
+        assert_eq!(run(&p, &env, &call(Effect::Write, &ro_w, None)), "refused");
+        assert_eq!(
+            run(&p, &env, &call(Effect::Execute, &exec_ro, Some("make"))),
+            "refused"
+        );
+        assert_eq!(
+            run(&p, &env, &action(Effect::Sense, "camera", "snap")),
+            "refused"
+        );
+        assert_eq!(
+            run(&p, &env, &action(Effect::Actuate, "lamp", "on")),
+            "refused"
+        );
+        // What user mode allows is allowed without one.
+        let mut p = policy(Mode::User);
+        assert_eq!(run(&p, &env, &call(Effect::Read, &outside, None)), "allow");
+        assert_eq!(
+            run(&p, &env, &call(Effect::Execute, &exec_ro, Some("make"))),
+            "allow"
+        );
+        p.allow = everything;
+        assert_eq!(run(&p, &env, &call(Effect::Read, &outside, None)), "allow");
+        // ... and sense and actuate still need `on`, not an allow rule.
+        assert_eq!(
+            run(&p, &env, &action(Effect::Sense, "camera", "snap")),
+            "refused"
+        );
+        p.caps.insert("camera".into(), CapSetting::On);
+        assert_eq!(
+            run(&p, &env, &action(Effect::Sense, "camera", "snap")),
+            "allow"
+        );
+    }
+
+    #[test]
+    fn a_deny_rule_refuses_in_every_mode() {
+        let x = T::new();
+        let env = x.env(true);
+        let secret = t("/w/rw/secret/k", false);
+        let fine = t("/w/rw/a", false);
+        let exec = t("/w/rw", false);
+        for mode in MODES {
+            let mut p = policy(mode);
+            p.allow = rules(&["fs:/w/*", "exec.run:*"]);
+            assert_eq!(
+                run(&p, &env, &call(Effect::Read, &secret, None)),
+                "refused",
+                "{mode:?}"
+            );
+            assert_eq!(
+                run(&p, &env, &call(Effect::Execute, &exec, Some("git push"))),
+                "refused",
+                "{mode:?}"
+            );
+            let d = decide(&p, &env, &call(Effect::Read, &secret, None));
+            assert!(
+                matches!(&d, Decision::Forbidden(m) if m.contains("denied")),
+                "{d:?}"
+            );
+            // The same call outside the denied path is allowed in all three.
+            assert_eq!(
+                run(&p, &env, &call(Effect::Read, &fine, None)),
+                "allow",
+                "{mode:?}"
+            );
+        }
     }
 
     #[test]
@@ -453,81 +774,124 @@ mod tests {
         let mut p = policy(Mode::Folder);
         p.caps.insert("fs".into(), CapSetting::Off);
         assert_eq!(
-            short(&decide(&p, &env, &call(Effect::Read, &inside, None))),
+            run(&p, &env, &call(Effect::Read, &inside, None)),
             "disabled"
         );
         // An action's own setting wins over its capability's.
         p.caps.insert("fs.read".into(), CapSetting::On);
-        assert_eq!(
-            short(&decide(&p, &env, &call(Effect::Read, &inside, None))),
-            "allow"
-        );
+        assert_eq!(run(&p, &env, &call(Effect::Read, &inside, None)), "allow");
         // `on` does not widen what the mode refuses.
         let outside = t("/elsewhere/a", false);
         assert_eq!(
-            short(&decide(&p, &env, &call(Effect::Read, &outside, None))),
+            run(&p, &env, &call(Effect::Read, &outside, None)),
             "refused"
         );
     }
 
     #[test]
-    fn sense_and_actuate_need_an_explicit_on() {
+    fn sense_and_actuate_need_an_explicit_on_in_folder_and_user_mode() {
         let x = T::new();
         let env = x.env(true);
         for effect in [Effect::Sense, Effect::Actuate] {
             for mode in [Mode::Folder, Mode::User] {
                 let mut p = policy(mode);
-                let mut c = call(effect, &[], None);
-                c.cap = "camera";
-                c.action = "snap";
-                assert_eq!(short(&decide(&p, &env, &c)), "refused");
+                let c = action(effect, "camera", "snap");
+                assert_eq!(run(&p, &env, &c), "refused");
                 p.caps.insert("camera".into(), CapSetting::On);
-                assert_eq!(short(&decide(&p, &env, &c)), "allow");
+                assert_eq!(run(&p, &env, &c), "allow");
             }
         }
     }
 
     #[test]
-    fn sudo_needs_the_switch_and_a_permit_rule() {
+    fn sudo_needs_the_switch_and_a_sudo_allow_entry_in_every_mode() {
         let x = T::new();
         let off = x.env(true);
-        let on = Env {
-            sudo: true,
-            ..x.env(true)
-        };
+        let on = x.sudo_on();
         let e = t("/w/rw", false);
-        for mode in [Mode::Folder, Mode::User] {
+        let sudo = |cmd| call(Effect::Execute, &e, Some(cmd));
+        for mode in MODES {
             let mut p = policy(mode);
-            p.commands.permit.push("sudo apt update".into());
-            // Off, even an explicit permit rule does not run it.
-            let d = decide(
-                &p,
-                &off,
-                &call(Effect::Execute, &e, Some("sudo apt update")),
+            // No entry: refused in every mode, and no normal allow rule helps.
+            p.allow = rules(&["exec.run:sudo *", "exec"]);
+            let d = decide(&p, &on, &sudo("sudo apt update"));
+            assert!(
+                matches!(&d, Decision::Forbidden(m) if m.contains("sudo allow list")),
+                "{mode:?}: {d:?}"
             );
-            assert_eq!(d, Decision::Forbidden("sudo is off on this node".into()));
-            // On, only what a permit rule names, in either mode.
-            let ok = call(Effect::Execute, &e, Some("sudo apt update"));
-            assert_eq!(short(&decide(&p, &on, &ok)), "allow", "{mode:?}");
+            // An entry, the switch on: it runs, in every mode.
+            p.sudo_allow.push("sudo apt update".into());
+            assert_eq!(run(&p, &on, &sudo("sudo apt update")), "allow", "{mode:?}");
+            // Off, even an entry does not run it.
+            assert_eq!(
+                decide(&p, &off, &sudo("sudo apt update")),
+                Decision::Forbidden("sudo is off on this node".into()),
+                "{mode:?}"
+            );
+            // Only what the list names.
             for other in ["sudo rm -rf /", "/usr/bin/sudo apt upgrade", "  sudo -i"] {
-                let c = call(Effect::Execute, &e, Some(other));
-                assert_eq!(short(&decide(&p, &on, &c)), "refused", "{mode:?} {other}");
+                assert_eq!(run(&p, &on, &sudo(other)), "refused", "{mode:?} {other}");
             }
-            // A permit rule never covers a second command.
-            p.commands.permit.push("sudo apt *".into());
+            // An entry never covers a second command.
+            p.sudo_allow.push("sudo apt *".into());
             for chained in [
                 "sudo apt x; id",
                 "sudo apt $(id)",
                 "sudo apt x > /etc/y",
                 "sudo apt x\nid",
             ] {
-                let c = call(Effect::Execute, &e, Some(chained));
-                assert_eq!(short(&decide(&p, &on, &c)), "refused", "{chained}");
+                assert_eq!(run(&p, &on, &sudo(chained)), "refused", "{chained}");
             }
-            p.commands.deny.push("sudo apt*".into());
-            let c = call(Effect::Execute, &e, Some("sudo apt update"));
-            assert_eq!(short(&decide(&p, &on, &c)), "refused");
+            assert_eq!(run(&p, &on, &sudo("sudo apt upgrade -y")), "allow");
+            // Deny rules still apply to a sudo command.
+            p.deny.push("exec.run:sudo apt*".into());
+            assert_eq!(
+                run(&p, &on, &sudo("sudo apt update")),
+                "refused",
+                "{mode:?}"
+            );
         }
+        // The sudo list is for sudo commands: without `sudo`, it allows nothing.
+        let mut p = policy(Mode::Allowlist);
+        p.sudo_allow = rules(&["apt *", "sudo apt *"]);
+        assert_eq!(run(&p, &on, &sudo("apt update")), "refused");
+        // A sudo command in a protected working directory is refused as well.
+        p.sudo_allow = rules(&["sudo id"]);
+        let key = t("/h/.ssh", false);
+        let c = call(Effect::Execute, &key, Some("sudo id"));
+        assert_eq!(run(&p, &on, &c), "refused");
+    }
+
+    #[test]
+    fn a_wildcard_allow_does_not_cover_a_chained_command() {
+        let x = T::new();
+        let env = x.env(true);
+        let e = t("/w/ro", false);
+        let c = |cmd| call(Effect::Execute, &e, Some(cmd));
+        let mut p = policy(Mode::Allowlist);
+        p.allow = rules(&["exec.run:git *"]);
+        for chained in [
+            "git status; rm -rf ~",
+            "git status && id",
+            "git log | sh",
+            "git $(id)",
+            "git status\nid",
+        ] {
+            let d = decide(&p, &env, &c(chained));
+            assert!(
+                matches!(&d, Decision::Forbidden(m) if m.contains("chains")),
+                "{chained}: {d:?}"
+            );
+        }
+        // A rule that names the whole line covers it.
+        p.allow
+            .push(crate::rules::rule_for("exec", "run", "git log | head", false).unwrap());
+        assert_eq!(run(&p, &env, &c("git log | head")), "allow");
+        assert_eq!(run(&p, &env, &c("git log | sh")), "refused");
+        // A literal `*` in the line is not a wildcard.
+        p.allow = vec![crate::rules::rule_for("exec", "run", "rm *", false).unwrap()];
+        assert_eq!(run(&p, &env, &c("rm *")), "allow");
+        assert_eq!(run(&p, &env, &c("rm -rf /")), "refused");
     }
 
     #[test]

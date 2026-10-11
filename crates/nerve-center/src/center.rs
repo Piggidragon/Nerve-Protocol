@@ -780,26 +780,16 @@ impl Center {
         .await
     }
 
-    /// Adds a command rule from the audit tab (design §11 9a) to this
-    /// center's entry of the node's settings: `allow` puts `pattern` on
-    /// `permit`, `deny` on `deny`. The node checks and may refuse the
-    /// document.
-    pub async fn add_command_rule(
-        &self,
-        node_id: &str,
-        list: &str,
-        pattern: &str,
-    ) -> Result<Value, RpcError> {
-        if !matches!(list, "allow" | "deny") {
-            return Err(RpcError::invalid_args("the rule is allow or deny"));
-        }
+    /// Adds `rule` to one list of this center's policy on the node, from the
+    /// audit tab (design §11 9a): `allow`, `deny`, or `sudo` for the sudo
+    /// allow list. A button only adds; it never takes a rule off the other
+    /// list. The node checks and may refuse the document.
+    pub async fn add_rule(&self, node_id: &str, list: &str, rule: &str) -> Result<Value, RpcError> {
+        let key = policy_list(list)?;
         let cur = self.node_settings(node_id).await?;
         let mut doc = cur.get("document").cloned().unwrap_or_else(|| json!({}));
         let version = cur.get("version").cloned().unwrap_or(Value::Null);
-        let rules = command_rules(&mut doc).ok_or_else(|| {
-            RpcError::invalid_args("the node's settings document has no room for command rules")
-        })?;
-        put_rule(rules, list == "allow", pattern)?;
+        put_rule(&mut doc, key, rule)?;
         self.set_node_settings(node_id, doc, version).await
     }
 
@@ -910,52 +900,56 @@ pub fn settings_write(d: &Descriptor) -> bool {
         .is_some_and(|c| c.exposure != Exposure::Off)
 }
 
-/// The command rule lists of a center entry's settings document:
-/// `policy.commands`, created when missing.
-// The settings document is the node's center entry (nerve-policy), with the
-// command rules under `policy.commands.{deny,allow,permit}`. A
-// node with another layout refuses the document and the web UI shows why.
-fn command_rules(doc: &mut Value) -> Option<&mut Map<String, Value>> {
-    let policy = doc
-        .as_object_mut()?
-        .entry("policy")
-        .or_insert_with(|| json!({}));
-    let commands = policy
-        .as_object_mut()?
-        .entry("commands")
-        .or_insert_with(|| json!({}));
-    commands.as_object_mut()
+/// The key of the policy list a button writes to. The settings document is
+/// the node's center entry (nerve-policy): `policy.allow`, `policy.deny` and
+/// `policy.sudo_allow`. A node with another layout refuses the document and
+/// the web UI shows why.
+fn policy_list(list: &str) -> Result<&'static str, RpcError> {
+    match list {
+        "allow" => Ok("allow"),
+        "deny" => Ok("deny"),
+        "sudo" => Ok("sudo_allow"),
+        _ => Err(RpcError::invalid_args("the list is allow, deny or sudo")),
+    }
 }
 
-/// Puts `pattern` on the list an audit answer means. The node's `allow` list
-/// is an allowlist that blocks every other command, so "Allow" means "run in
-/// any mode" (`permit`). A rule moves: it leaves the opposite list.
-fn put_rule(rules: &mut Map<String, Value>, allow: bool, pattern: &str) -> Result<(), RpcError> {
-    let (add, drop) = if allow {
-        ("permit", "deny")
-    } else {
-        ("deny", "permit")
-    };
-    if let Some(arr) = rules.get_mut(drop).and_then(Value::as_array_mut) {
-        arr.retain(|v| v != pattern);
-    }
-    let arr = rules
-        .entry(add)
+/// Puts `rule` on `policy.<key>` of a settings document, unless it is there.
+fn put_rule(doc: &mut Value, key: &str, rule: &str) -> Result<(), RpcError> {
+    let no_room = || RpcError::invalid_args("the node's settings document has no room for rules");
+    let list = doc
+        .as_object_mut()
+        .ok_or_else(no_room)?
+        .entry("policy")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .ok_or_else(no_room)?
+        .entry(key)
         .or_insert_with(|| json!([]))
         .as_array_mut()
-        .ok_or_else(|| RpcError::invalid_args("the node's command rules are not lists"))?;
-    if !arr.iter().any(|v| v == pattern) {
-        arr.push(json!(pattern));
+        .ok_or_else(|| RpcError::invalid_args("the node's rules are not lists"))?;
+    if !list.iter().any(|v| v == rule) {
+        list.push(json!(rule));
     }
     Ok(())
 }
 
-/// The wildcard rule the audit tab offers for a command: its first word and
-/// anything after it.
-pub fn wildcard_of(command: &str) -> String {
-    match command.split_whitespace().next() {
-        Some(w) => format!("{w} *"),
-        None => "*".into(),
+/// The list and the rule an audit button means: the entry's `cap`, `action`
+/// and `target`, the list (`allow`, `deny`, or `sudo` for a sudo command) and
+/// whether it is the wildcard form.
+pub fn audit_rule(
+    list: &str,
+    cap: &str,
+    action: &str,
+    target: &str,
+    wildcard: bool,
+) -> Result<String, String> {
+    match list {
+        "allow" | "deny" => nerve_policy::rules::rule_for(cap, action, target, wildcard),
+        "sudo" if (cap, action) == ("exec", "run") => {
+            nerve_policy::rules::sudo_rule_for(target, wildcard)
+        }
+        "sudo" => Err("the sudo list is for sudo commands".into()),
+        _ => Err("the list is allow, deny or sudo".into()),
     }
 }
 
@@ -984,31 +978,83 @@ mod tests {
     }
 
     #[test]
-    fn allow_means_permit_and_rules_move_between_lists() {
-        let mut d = json!({"policy": {"commands": {"deny": ["git *"], "allow": ["ls"]}}});
-        let rules = command_rules(&mut d).unwrap();
-        put_rule(rules, true, "git *").unwrap();
-        put_rule(rules, true, "git *").unwrap();
-        // The allowlist is left alone: one entry there would block the rest.
+    fn a_button_only_adds_a_rule_to_its_list() {
+        let mut d = json!({"policy": {"deny": ["exec.run:git push*"], "allow": ["exec.run:ls"]}});
+        put_rule(&mut d, "allow", "exec.run:git *").unwrap();
+        put_rule(&mut d, "allow", "exec.run:git *").unwrap();
+        put_rule(&mut d, "deny", "exec.run:git *").unwrap();
+        put_rule(&mut d, "sudo_allow", "sudo apt update").unwrap();
+        // Nothing leaves the other list; a repeat adds nothing.
         assert_eq!(
-            d["policy"]["commands"],
-            json!({"deny": [], "allow": ["ls"], "permit": ["git *"]})
+            d["policy"],
+            json!({
+                "allow": ["exec.run:ls", "exec.run:git *"],
+                "deny": ["exec.run:git push*", "exec.run:git *"],
+                "sudo_allow": ["sudo apt update"],
+            })
         );
-        let rules = command_rules(&mut d).unwrap();
-        put_rule(rules, false, "git *").unwrap();
-        assert_eq!(d["policy"]["commands"]["deny"], json!(["git *"]));
-        assert_eq!(d["policy"]["commands"]["permit"], json!([]));
+        // A document without a policy gets one.
+        let mut d = json!({});
+        put_rule(&mut d, "deny", "camera").unwrap();
+        assert_eq!(d["policy"]["deny"], json!(["camera"]));
+        assert!(put_rule(&mut json!([]), "deny", "x").is_err());
+        assert!(put_rule(&mut json!({"policy": {"deny": 1}}), "deny", "x").is_err());
+        assert_eq!(policy_list("sudo").unwrap(), "sudo_allow");
+        assert!(policy_list("permit").is_err());
     }
 
     #[test]
-    fn wildcards_and_rule_lists() {
-        assert_eq!(wildcard_of("git status --short"), "git *");
-        assert_eq!(wildcard_of("  "), "*");
-        let mut d = json!({"mode": "folder"});
-        command_rules(&mut d)
-            .unwrap()
-            .insert("allow".into(), json!(["ls"]));
-        assert_eq!(d["policy"]["commands"]["allow"], json!(["ls"]));
-        assert!(command_rules(&mut json!([])).is_none());
+    fn audit_buttons_write_rules_for_every_action() {
+        let rule = |list, cap, action, target, wild| audit_rule(list, cap, action, target, wild);
+        assert_eq!(
+            rule("allow", "exec", "run", "git status", false).unwrap(),
+            "exec.run:git status"
+        );
+        assert_eq!(
+            rule("allow", "exec", "run", "git status", true).unwrap(),
+            "exec.run:git *"
+        );
+        assert_eq!(
+            rule("deny", "exec", "run", "rm -rf /tmp/x", true).unwrap(),
+            "exec.run:rm *"
+        );
+        assert_eq!(
+            rule("allow", "fs", "read", "/home/u/a.txt", false).unwrap(),
+            "fs.read:/home/u/a.txt"
+        );
+        assert_eq!(
+            rule("deny", "fs", "write", "/home/u/a.txt", true).unwrap(),
+            "fs.write:/home/u/*"
+        );
+        assert_eq!(
+            rule("allow", "camera", "snap", "camera.snap", false).unwrap(),
+            "camera.snap"
+        );
+        assert_eq!(
+            rule("deny", "camera", "snap", "camera.snap", true).unwrap(),
+            "camera"
+        );
+        assert_eq!(
+            rule("sudo", "exec", "run", "sudo apt update", false).unwrap(),
+            "sudo apt update"
+        );
+        assert_eq!(
+            rule("sudo", "exec", "run", "sudo apt update", true).unwrap(),
+            "sudo apt *"
+        );
+        for (list, cap, action, target) in [
+            ("permit", "exec", "run", "ls"),
+            ("allow", "exec", "run", "  "),
+            ("allow", "fs", "read", ""),
+            ("allow", "fs", "read", "relative/path"),
+            ("sudo", "exec", "run", "ls"),
+            ("sudo", "fs", "read", "/a"),
+            ("allow", "", "run", "ls"),
+        ] {
+            assert!(
+                rule(list, cap, action, target, false).is_err(),
+                "{list} {cap}.{action} {target:?}"
+            );
+        }
     }
 }

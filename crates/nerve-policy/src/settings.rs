@@ -250,6 +250,16 @@ fn client_only(
             ));
         }
     }
+    // An allow rule would let a sense capability through in allowlist mode,
+    // whatever `caps` says; so adding one for it is the owner's call as well.
+    for rule in n.allow.iter().filter(|r| !o.allow.contains(r)) {
+        let scope = rule.split(':').next().unwrap_or(rule);
+        if is_sense(scope.split('.').next().unwrap_or(scope)) {
+            return Err(format!(
+                "policy.allow {rule}: only the owner can turn sensing on"
+            ));
+        }
+    }
     if n.protected.allow != o.protected.allow {
         // Releasing a protected path is the owner's call; adding more is fine.
         return Err("policy.protected.allow: only the owner can release protected paths".into());
@@ -363,6 +373,18 @@ mod tests {
             .set_center_document("home", new, v, 0, |c| c == "camera")
             .unwrap_err();
         assert!(matches!(&e, SetError::Forbidden(m) if m.contains("policy.caps.camera")));
+        // An allow rule is no way round that.
+        let mut new = doc(&s);
+        new["policy"]["allow"] = json!(["camera.snap"]);
+        let e = s
+            .set_center_document("home", new, v, 0, |c| c == "camera")
+            .unwrap_err();
+        assert!(matches!(&e, SetError::Forbidden(m) if m.contains("policy.allow")));
+        let mut new = doc(&s);
+        new["policy"]["allow"] = json!(["fs.read:/a/*", "exec.run:ls"]);
+        s.set_center_document("home", new, v, 0, |c| c == "camera")
+            .unwrap();
+        let v = s.version();
         let mut new = doc(&s);
         new["policy"]["protected"] = json!({"allow": ["~/.ssh"]});
         assert!(matches!(

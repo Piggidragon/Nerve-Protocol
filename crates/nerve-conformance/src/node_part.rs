@@ -7,8 +7,8 @@
 //!
 //! With a [`Setup::folder`] and the settings grant `write` for the fake
 //! center, the part also checks the profiles (§7.2 to §7.5): it writes its own
-//! policy with `settings.set` and checks fs, exec permit rules, the audit event
-//! and the sudo switch. The sudo checks send one wrong password, so a node with
+//! policy with `settings.set` and checks fs, exec, allow and deny rules, the
+//! audit event and the sudo switch. The sudo checks send one wrong password, so a node with
 //! a real `sudo` logs one failed attempt.
 
 use std::future::Future;
@@ -31,11 +31,12 @@ const WAIT: Duration = Duration::from_secs(15);
 /// What the caller says about the node it started.
 #[derive(Debug, Clone, Default)]
 pub struct Setup {
-    /// An empty folder on the node, in wire form, that the part may grant
-    /// itself and write in. Without it the profile checks do not run.
+    /// An empty folder on the node, in wire form, that the part may allow
+    /// itself to read and write in. Without it the profile checks do not run.
     pub folder: Option<String>,
     /// The node's sudo password. With it the part also turns sudo on, runs
-    /// a permitted sudo command, turns sudo off and replays the password.
+    /// a sudo command on the sudo allow list, turns sudo off and replays the
+    /// password.
     pub sudo_password: Option<String>,
 }
 
@@ -206,14 +207,18 @@ const PROFILE_CHECKS: &[(&str, &str)] = &[
         "7.2",
         "fs read returns what fs write wrote, with the same etag",
     ),
-    ("7.2", "fs read outside every granted folder is forbidden"),
-    ("7.3", "exec run of a command a permit rule names runs"),
+    ("7.2", "fs read outside the allowed folder is forbidden"),
+    ("7.3", "exec run of a command an allow rule names runs"),
+    (
+        "7.3",
+        "a deny rule wins over an allow rule from the next call on",
+    ),
     ("7.3", "exec run of a command nothing allows is forbidden"),
     ("7.5", "a refusal emits audit decision forbidden"),
     ("7.4.1", "sudo is off at first"),
     (
         "7.4.1",
-        "with sudo off, a permitted sudo command is forbidden",
+        "with sudo off, a sudo command on the sudo allow list is forbidden",
     ),
     (
         "7.4.1",
@@ -228,10 +233,13 @@ const PROFILE_CHECKS: &[(&str, &str)] = &[
 /// The sudo checks that need the node's sudo password.
 const SUDO_ON_CHECKS: &[(&str, &str)] = &[
     ("7.4.1", "the right sudo password turns sudo on"),
-    ("7.4.1", "with sudo on, a permitted sudo command runs"),
     (
         "7.4.1",
-        "with sudo on, a sudo command no permit rule names is forbidden",
+        "with sudo on, a sudo command on the sudo allow list runs",
+    ),
+    (
+        "7.4.1",
+        "with sudo on, a sudo command the sudo allow list does not name is forbidden",
     ),
     ("7.4.1", "sudo off turns sudo off"),
     (
@@ -241,8 +249,8 @@ const SUDO_ON_CHECKS: &[(&str, &str)] = &[
     ("7.4.1", "no frame the node sent carries the sudo password"),
 ];
 
-const PERMITTED: &str = "echo nerve-conformance-permit";
-const SUDO_PERMITTED: &str = "sudo echo nerve-conformance-sudo";
+const ALLOWED: &str = "echo nerve-conformance-allowed";
+const SUDO_ALLOWED: &str = "sudo echo nerve-conformance-sudo";
 
 type Conn = crate::wire::Conn<tokio::net::TcpStream>;
 
@@ -255,6 +263,19 @@ async fn call_seen(
 ) -> Result<Result<Value, nerve_proto::RpcError>, String> {
     let id = conn.request(method, params).await?;
     conn.answer(id, WAIT, events).await
+}
+
+/// `s` as a glob that matches exactly `s`.
+fn literal(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if matches!(c, '*' | '?' | '[' | ']' | '{' | '}' | '\\') {
+            out.extend(['[', c, ']']);
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 async fn invoke(
@@ -372,27 +393,31 @@ async fn profile_steps(
     };
     step(Ok(()))?;
 
-    // A policy of its own: one read-write folder, no execute folder, and
-    // permit rules for two exact commands.
+    // A policy of its own, in default deny: allow rules for the folder and
+    // one exact command, and the sudo allow list for another.
     let policy = &mut doc["policy"];
-    policy["mode"] = json!("folder");
+    policy["mode"] = json!("allowlist");
     if let Some(p) = policy.as_object_mut() {
         p.remove("user_until");
     }
-    policy["folders"] = json!([{"path": folder, "access": "rw", "execute": false}]);
-    policy["commands"] = json!({"permit": [PERMITTED, SUDO_PERMITTED]});
+    policy["folders"] = json!([]);
+    policy["allow"] = json!([
+        format!("fs:{}/*", literal(folder.trim_end_matches('/'))),
+        format!("exec.run:{ALLOWED}"),
+    ]);
+    policy["deny"] = json!([]);
+    policy["sudo_allow"] = json!([SUDO_ALLOWED]);
     let set = |if_version: u64| json!({"document": doc.clone(), "if_version": if_version});
 
     step(expect_code(
         invoke(conn, "settings", "set", set(version + 1000)).await,
         ErrorCode::Other("conflict".into()),
     ))?;
+    let mut now = version;
     step(
         ok(invoke(conn, "settings", "set", set(version)).await).and_then(|v| {
-            ensure(
-                v["version"].as_u64().is_some_and(|n| n > version),
-                format!("got {v}"),
-            )
+            now = v["version"].as_u64().unwrap_or(0);
+            ensure(now > version, format!("got {v}"))
         }),
     )?;
 
@@ -433,13 +458,34 @@ async fn profile_steps(
     ))?;
 
     step(
-        ok(invoke(conn, "exec", "run", json!({"command": PERMITTED})).await).and_then(|v| {
+        ok(invoke(conn, "exec", "run", json!({"command": ALLOWED})).await).and_then(|v| {
             ensure(
                 v["exit_code"] == 0
-                    && v["stdout"].as_str().map(str::trim) == Some("nerve-conformance-permit"),
+                    && v["stdout"].as_str().map(str::trim) == Some("nerve-conformance-allowed"),
                 format!("got {v}"),
             )
         }),
+    )?;
+
+    // A rule edit counts from the next call on, and a deny rule wins over
+    // the allow rule for the same command.
+    let mut denied = doc.clone();
+    denied["policy"]["deny"] = json!([format!("exec.run:{ALLOWED}")]);
+    step(
+        async {
+            ok(invoke(
+                conn,
+                "settings",
+                "set",
+                json!({"document": denied, "if_version": now}),
+            )
+            .await)?;
+            expect_code(
+                invoke(conn, "exec", "run", json!({"command": ALLOWED})).await,
+                ErrorCode::Forbidden,
+            )
+        }
+        .await,
     )?;
 
     let mut events = Vec::new();
@@ -485,7 +531,7 @@ async fn profile_steps(
             .and_then(|s| ensure(s == "off", format!("sudo is {s}"))),
     )?;
     step(expect_code(
-        invoke(conn, "exec", "run", json!({"command": SUDO_PERMITTED})).await,
+        invoke(conn, "exec", "run", json!({"command": SUDO_ALLOWED})).await,
         ErrorCode::Forbidden,
     ))?;
 
@@ -542,7 +588,7 @@ async fn profile_steps(
             .and_then(|v| ensure(v["sudo"] == "on", format!("got {v}")))
             .and(state.and_then(|s| ensure(s == "on", format!("sudo is {s}")))),
     )?;
-    let ran = ok(call(conn, "exec", "run", json!({"command": SUDO_PERMITTED})).await);
+    let ran = ok(call(conn, "exec", "run", json!({"command": SUDO_ALLOWED})).await);
     step(ran.and_then(|v| {
         ensure(
             v["exit_code"] == 0

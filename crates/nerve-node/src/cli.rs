@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 
 use nerve_policy::audit::AuditLog;
 use nerve_policy::config::{Access, CapSetting, Folder, SettingsGrant, USER_MAX_MS};
-use nerve_policy::{Mode, NodeConfig, SetError, SettingsStore};
+use nerve_policy::{Mode, NodeConfig, SetError, SettingsStore, rules, sudo_command};
 use nerve_proto::link::PairLink;
 use nerve_sandbox::stubs::NOT_DONE;
 
@@ -65,9 +65,11 @@ pub enum Cmd {
     Centers,
     /// Show the daemon and its links.
     Status,
-    /// Set a center's mode: folder or user (user ends after --hours, at most 8).
+    /// Set a center's mode: allowlist, folder or user (user ends after
+    /// --hours, at most 8).
     Mode {
-        /// `folder` or `user`.
+        /// `allowlist` (only allow rules let a call through), `folder` (full
+        /// access in its folders) or `user` (full access as the user).
         mode: String,
         /// How long user mode lasts, in hours (default and maximum: 8).
         #[arg(long)]
@@ -99,7 +101,8 @@ pub enum Cmd {
     /// Read or change node.toml by dotted key (`center.<name>.policy.mode`).
     #[command(subcommand)]
     Config(ConfigCmd),
-    /// Forbid a command (`deny <command> [--wildcard]`).
+    /// Add a deny rule for a command (`deny <command> [--wildcard]`). It
+    /// refuses in every mode and wins over any allow rule.
     Deny {
         /// The command line to forbid.
         command: String,
@@ -109,7 +112,10 @@ pub enum Cmd {
         #[command(flatten)]
         center: CenterArg,
     },
-    /// Allow a command in every mode.
+    /// Add an allow rule for a command (`allow <command> [--wildcard]`); a
+    /// `sudo` command goes on the sudo allow list. Allow rules count in
+    /// allowlist mode only. Rules for files and other actions go in with
+    /// `config add center.<name>.policy.allow <rule>`.
     Allow {
         /// The command line to allow.
         command: String,
@@ -143,7 +149,7 @@ pub enum Cmd {
         #[arg(long)]
         create_user: bool,
     },
-    /// The sudo switch: whether permitted sudo commands may run.
+    /// The sudo switch: whether commands on the sudo allow list may run.
     #[command(subcommand)]
     Sudo(SudoCmd),
     /// Update the node (not done in 0.0.1).
@@ -155,8 +161,8 @@ pub enum Cmd {
 #[derive(Debug, Subcommand)]
 pub enum SudoCmd {
     /// Turn sudo on: asks for the sudo password, which the node checks with
-    /// `sudo -v` and keeps in memory only. Only commands a permit rule names
-    /// run with sudo.
+    /// `sudo -v` and keeps in memory only. Only commands the sudo allow list
+    /// names run with sudo.
     On,
     /// Turn sudo off and drop the password.
     Off,
@@ -420,18 +426,9 @@ async fn edit_center(
     Ok(name)
 }
 
-/// A command rule: the command itself, or with `--wildcard` its program
-/// followed by anything.
-fn command_rule(command: &str, wildcard: bool) -> Result<String, String> {
-    let command = command.trim();
-    if command.is_empty() {
-        return Err("the command is empty".into());
-    }
-    if wildcard {
-        let program = command.split_whitespace().next().unwrap_or(command);
-        Ok(format!("{program} *"))
-    } else {
-        Ok(command.to_string())
+fn push_unique(list: &mut Vec<String>, rule: &str) {
+    if !list.iter().any(|r| r == rule) {
+        list.push(rule.to_string());
     }
 }
 
@@ -556,9 +553,12 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
             center,
         } => {
             let m = match mode.as_str() {
+                "allowlist" => Mode::Allowlist,
                 "folder" => Mode::Folder,
                 "user" => Mode::User,
-                other => return Err(format!("unknown mode {other} (folder or user)")),
+                other => {
+                    return Err(format!("unknown mode {other} (allowlist, folder or user)"));
+                }
             };
             if hours.is_some() && m != Mode::User {
                 return Err("--hours only goes with user".into());
@@ -586,6 +586,7 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
             center,
         }) => {
             let real = resolve_folder(&path)?;
+            let mode = std::cell::Cell::new(Mode::Folder);
             let name = edit_center(&paths, &center, |e| {
                 e.policy.folders.retain(|f| f.path != real);
                 e.policy.folders.push(Folder {
@@ -593,10 +594,21 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
                     access: if rw { Access::Rw } else { Access::Ro },
                     execute,
                 });
+                mode.set(e.policy.mode);
                 Ok(())
             })
             .await?;
             w(out, format!("{name}: folder {}", resolve_folder(&path)?));
+            let mode = mode.get();
+            if mode != Mode::Folder {
+                w(
+                    out,
+                    format!(
+                        "note: folders count in folder mode; {name} is in {} mode (`nerve-node mode folder`)",
+                        mode.as_str()
+                    ),
+                );
+            }
             Ok(())
         }
         Cmd::Folder(FolderCmd::Remove { path, center }) => {
@@ -656,19 +668,15 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
             wildcard,
             center,
         } => {
-            let rule = command_rule(&command, wildcard)?;
+            let rule = rules::rule_for("exec", "run", &command, wildcard)?;
             let name = edit_center(&paths, &center, |e| {
-                let r = &mut e.policy.commands;
-                r.permit.retain(|c| c != &rule);
-                if !r.deny.contains(&rule) {
-                    r.deny.push(rule.clone());
-                }
+                push_unique(&mut e.policy.deny, &rule);
                 Ok(())
             })
             .await?;
             w(
                 out,
-                format!("{name}: commands matching {rule:?} are forbidden"),
+                format!("{name}: deny rule {rule:?}; commands it matches are forbidden"),
             );
             Ok(())
         }
@@ -677,20 +685,29 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
             wildcard,
             center,
         } => {
-            let rule = command_rule(&command, wildcard)?;
+            // A sudo command has its own list, whatever the mode.
+            let sudo = sudo_command(&command).is_some();
+            let rule = if sudo {
+                rules::sudo_rule_for(&command, wildcard)?
+            } else {
+                rules::rule_for("exec", "run", &command, wildcard)?
+            };
             let name = edit_center(&paths, &center, |e| {
-                let r = &mut e.policy.commands;
-                r.deny.retain(|c| c != &rule);
-                if !r.permit.contains(&rule) {
-                    r.permit.push(rule.clone());
-                }
+                let list = if sudo {
+                    &mut e.policy.sudo_allow
+                } else {
+                    &mut e.policy.allow
+                };
+                push_unique(list, &rule);
                 Ok(())
             })
             .await?;
-            w(
-                out,
-                format!("{name}: commands matching {rule:?} are allowed"),
-            );
+            let list = if sudo {
+                "sudo allow list"
+            } else {
+                "allow rule (allowlist mode)"
+            };
+            w(out, format!("{name}: {list} {rule:?}"));
             Ok(())
         }
         Cmd::Panic => {
@@ -780,7 +797,7 @@ async fn sudo_cmd(paths: &NodePaths, c: SudoCmd, out: &mut dyn Write) -> Result<
                 call(&sock, "sudo.on", json!({"password": password})).await?;
                 w(
                     out,
-                    "sudo: on (only commands a permit rule names run with sudo)",
+                    "sudo: on (only commands the sudo allow list names run with sudo)",
                 );
             }
             SudoCmd::Off => {
@@ -1141,7 +1158,18 @@ mod tests {
         assert!(e.contains("--center"), "{e}");
         run(&paths, &["mode", "user", "--center", "b"]).unwrap();
         assert_eq!(load(&paths).center("b").unwrap().policy.mode, Mode::User);
+        // A new center is in default deny.
+        assert_eq!(
+            load(&paths).center("a").unwrap().policy.mode,
+            Mode::Allowlist
+        );
+        run(&paths, &["mode", "folder", "--center", "a"]).unwrap();
         assert_eq!(load(&paths).center("a").unwrap().policy.mode, Mode::Folder);
+        run(&paths, &["mode", "allowlist", "--center", "a"]).unwrap();
+        assert_eq!(
+            load(&paths).center("a").unwrap().policy.mode,
+            Mode::Allowlist
+        );
         let e = run(&paths, &["mode", "ask", "--center", "a"]).unwrap_err();
         assert!(e.contains("unknown mode"), "{e}");
         let e = run(&paths, &["caps", "fs", "ask", "--center", "a"]).unwrap_err();
@@ -1153,10 +1181,13 @@ mod tests {
         let (d, paths) = setup(&["home"]);
         let folder = d.path().join("work");
         std::fs::create_dir(&folder).unwrap();
-        run(&paths, &["folder", "add", folder.to_str().unwrap(), "--rw"]).unwrap();
+        let note = run(&paths, &["folder", "add", folder.to_str().unwrap(), "--rw"]).unwrap();
+        assert!(note.contains("folders count in folder mode"), "{note}");
         run(&paths, &["caps", "exec.run", "off"]).unwrap();
         run(&paths, &["grant", "settings", "write"]).unwrap();
         run(&paths, &["allow", "git status --short", "--wildcard"]).unwrap();
+        run(&paths, &["allow", "sudo apt update"]).unwrap();
+        run(&paths, &["deny", "rm -rf /"]).unwrap();
         run(&paths, &["deny", "rm -rf /"]).unwrap();
         run(&paths, &["mode", "user", "--hours", "2"]).unwrap();
         assert!(run(&paths, &["mode", "user", "--hours", "9"]).is_err());
@@ -1167,8 +1198,9 @@ mod tests {
         assert_eq!(c.policy.folders[0].access, Access::Rw);
         assert_eq!(c.policy.caps["exec.run"], CapSetting::Off);
         assert_eq!(c.settings, SettingsGrant::Write);
-        assert_eq!(c.policy.commands.permit, vec!["git *".to_string()]);
-        assert_eq!(c.policy.commands.deny, vec!["rm -rf /".to_string()]);
+        assert_eq!(c.policy.allow, vec!["exec.run:git *".to_string()]);
+        assert_eq!(c.policy.sudo_allow, vec!["sudo apt update".to_string()]);
+        assert_eq!(c.policy.deny, vec!["exec.run:rm -rf /".to_string()]);
         assert_eq!(c.policy.mode, Mode::User);
         assert!(c.policy.user_until.is_some());
         let log = std::fs::read_to_string(paths.audit_log()).unwrap();
@@ -1195,16 +1227,21 @@ mod tests {
         );
         run(
             &paths,
-            &["config", "add", "center.home.policy.deny", "~/secret"],
+            &["config", "add", "center.home.policy.deny", "fs:~/secret/*"],
         )
         .unwrap();
         assert_eq!(
             load(&paths).centers[0].policy.deny,
-            vec!["~/secret".to_string()]
+            vec!["fs:~/secret/*".to_string()]
         );
         run(
             &paths,
-            &["config", "remove", "center.home.policy.deny", "~/secret"],
+            &[
+                "config",
+                "remove",
+                "center.home.policy.deny",
+                "fs:~/secret/*",
+            ],
         )
         .unwrap();
         assert!(load(&paths).centers[0].policy.deny.is_empty());
@@ -1229,9 +1266,39 @@ mod tests {
     }
 
     #[test]
-    fn command_rules() {
-        assert_eq!(command_rule("git push origin", true).unwrap(), "git *");
-        assert_eq!(command_rule(" ls ", false).unwrap(), "ls");
+    fn allow_and_deny_only_add_a_rule() {
+        let (_d, paths) = setup(&["home"]);
+        run(&paths, &["allow", "git status"]).unwrap();
+        run(&paths, &["deny", "git status"]).unwrap();
+        run(&paths, &["deny", "rm *", "--wildcard"]).unwrap();
+        run(&paths, &["allow", "sudo apt update", "--wildcard"]).unwrap();
+        let p = &load(&paths).centers[0].policy;
+        // Neither list loses a rule to the other; deny wins when they meet.
+        assert_eq!(p.allow, ["exec.run:git status"]);
+        assert_eq!(p.deny, ["exec.run:git status", "exec.run:rm *"]);
+        assert_eq!(p.sudo_allow, ["sudo apt *"]);
+        assert!(run(&paths, &["allow", "  "]).is_err());
+        // A command with a glob character in it is allowed as itself.
+        run(&paths, &["allow", "rm *"]).unwrap();
+        assert!(load(&paths).centers[0].policy.allow[1].contains("[*]"));
+        // Rules for other actions go in through `config add`.
+        run(
+            &paths,
+            &[
+                "config",
+                "add",
+                "center.home.policy.allow",
+                "fs.read:~/notes/*",
+            ],
+        )
+        .unwrap();
+        assert!(
+            run(
+                &paths,
+                &["config", "add", "center.home.policy.allow", "~/notes"]
+            )
+            .is_err()
+        );
     }
 
     /// Every command and sub-command name of the clap definition, walked

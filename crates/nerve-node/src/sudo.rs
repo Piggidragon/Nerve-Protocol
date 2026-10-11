@@ -65,7 +65,7 @@ impl Shared {
         held && store.config().machine.sudo == Sudo::On
     }
 
-    /// The password for one permitted sudo command, while the switch is on.
+    /// The password for one allowed sudo command, while the switch is on.
     pub fn sudo_password(&self) -> Option<String> {
         let store = lock(&self.store);
         if store.config().machine.sudo != Sudo::On {

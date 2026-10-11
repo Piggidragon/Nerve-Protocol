@@ -106,16 +106,19 @@ gets `session.end`. The web UI can end a session.
 The center holds no rule of its own and never holds a call back for a person.
 Every call goes to its node, whose policy decides: what no mode and no rule
 allows is refused at once with `error forbidden: <reasons>`, and nothing is
-run. The owner allows more on the node (`nerve-node folder add`, `allow`) or,
-with the settings grant, from the audit tab.
+run. The owner allows more on the node (`nerve-node allow`, `mode`, `folder
+add`) or, with the settings grant, from the audit tab.
 
 ## 7. Web UI
 
 Served by `nerve-center` itself at `--ui`. Tabs: overview (alerts,
-machines, pairing, sessions), statistics, audit (Allow, Allow as wildcard,
-Deny for commands, only with the node's settings grant; Allow puts the rule
-on the node's `policy.commands.permit`, Deny on `deny`, and each takes it
-off the other list), help (the node's commands, each with its
+machines, pairing, sessions), statistics, audit (for every entry with a known
+target, a command, a path or another action: Allow, Allow as wildcard, Deny
+and Deny as wildcard, only with the node's settings grant; each only adds a
+rule to the node's `policy.allow` or `policy.deny`, a sudo command's allow to
+`policy.sudo_allow`; `POST /api/audit/rule` takes `node_id`, `list` (`allow`,
+`deny` or `sudo`), the entry's `cap`, `action` and `target`, and `wildcard`),
+help (the node's commands, each with its
 usage and a short explanation; the center reads the list from the node's own
 CLI definition, `GET /api/help`, so it cannot differ from `nerve-node --help`),
 settings (center name, retention, harness tokens, per-node settings and the

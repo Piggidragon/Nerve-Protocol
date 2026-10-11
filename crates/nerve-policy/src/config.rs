@@ -73,8 +73,8 @@ pub struct Machine {
 }
 
 /// The sudo switch. Off, no command runs through `sudo`, whatever the rules
-/// say. On, a `sudo` command runs only when an explicit `permit` rule names
-/// it, in either mode.
+/// say. On, a `sudo` command runs only when the sudo allow list names it, in
+/// every mode.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Sudo {
@@ -184,24 +184,27 @@ impl CenterEntry {
 }
 
 /// The permission modes (architecture §5.1). A call no mode and no rule
-/// allows is refused at once; nothing waits for an answer.
+/// allows is refused at once; nothing waits for an answer. Deny rules work in
+/// every mode and win over everything else; allow rules count only in
+/// `allowlist`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
-    /// Allowed inside the folders by their access, refused outside. With no
-    /// folders nothing is allowed: the default.
+    /// Default deny: a call runs only when an allow rule lets it through.
+    /// What a new center starts in.
     #[default]
-    #[serde(alias = "folders")]
+    Allowlist,
+    /// Full access inside the folders, by their access: the folders and
+    /// everything below them, commands in the `execute` folders.
     Folder,
-    /// Allowed everywhere except protected and denied paths, until
-    /// `user_until`.
-    #[serde(alias = "full")]
+    /// Full access as the user, protected paths aside, until `user_until`.
     User,
 }
 
 impl Mode {
     pub fn as_str(self) -> &'static str {
         match self {
+            Mode::Allowlist => "allowlist",
             Mode::Folder => "folder",
             Mode::User => "user",
         }
@@ -263,21 +266,6 @@ pub struct ProtectedOptions {
     pub allow: Vec<String>,
 }
 
-/// Command rules: globs over the whole command line.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CommandRules {
-    /// Never run.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub deny: Vec<String>,
-    /// When not empty, only matching commands run at all.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub allow: Vec<String>,
-    /// Run in any mode.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub permit: Vec<String>,
-}
-
 /// What one center may do on this node.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -295,11 +283,17 @@ pub struct CenterPolicy {
     pub caps: BTreeMap<String, CapSetting>,
     #[serde(default)]
     pub protected: ProtectedOptions,
-    /// Paths nothing may touch.
+    /// Allow rules (`crate::rules`). They count only in `allowlist` mode.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
+    /// Deny rules: they refuse in every mode and win over any allow.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deny: Vec<String>,
-    #[serde(default)]
-    pub commands: CommandRules,
+    /// Globs over the whole command line of a `sudo` command. A sudo command
+    /// runs only when one matches, in every mode (and only with the sudo
+    /// switch on); the normal allow list does not count for it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sudo_allow: Vec<String>,
 }
 
 impl CenterPolicy {
@@ -429,10 +423,11 @@ impl CenterPolicy {
                 return Err(format!("folder {:?} is not absolute", f.path));
             }
         }
-        for d in &self.deny {
-            if !(Path::new(d).is_absolute() || d.starts_with("~/") || d == "~") {
-                return Err(format!("deny path {d:?} is neither absolute nor ~/..."));
-            }
+        for rule in self.allow.iter().chain(&self.deny) {
+            crate::rules::validate(rule)?;
+        }
+        for glob in &self.sudo_allow {
+            crate::rules::validate_command_glob(glob)?;
         }
         for p in self.protected.extra.iter().chain(&self.protected.allow) {
             if !(Path::new(p).is_absolute() || p.starts_with("~/")) {
@@ -442,20 +437,9 @@ impl CenterPolicy {
             }
         }
         for key in self.caps.keys() {
-            let ok = !key.is_empty()
-                && key.split('.').count() <= 2
-                && key.split('.').all(|s| {
-                    !s.is_empty()
-                        && s.bytes()
-                            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-                });
-            if !ok {
+            if !crate::rules::valid_scope(key) {
                 return Err(format!("caps key {key:?}: `cap` or `cap.action`"));
             }
-        }
-        let c = &self.commands;
-        for g in c.deny.iter().chain(&c.allow).chain(&c.permit) {
-            globset::Glob::new(g).map_err(|e| format!("command rule {g:?}: {e}"))?;
         }
         Ok(())
     }
@@ -490,12 +474,10 @@ settings = "write"
 [center.policy]
 mode = "folder"
 folders = [{ path = "FOLDER", access = "rw", execute = true }]
-deny = ["~/private"]
 caps = { exec = "on", "fs.write" = "off" }
-
-[center.policy.commands]
-deny = ["rm -rf *"]
-permit = ["git status"]
+allow = ["exec.run:git status", "fs.read:~/notes/*"]
+deny = ["fs:~/private/*", "exec.run:rm -rf *"]
+sudo_allow = ["sudo apt update"]
 "#;
 
     /// An absolute folder on the platform the tests run on.
@@ -517,7 +499,12 @@ permit = ["git status"]
         let home = c.center("home").unwrap();
         assert_eq!(home.settings, SettingsGrant::Write);
         assert_eq!(home.policy.mode, Mode::Folder);
-        assert_eq!(home.policy.commands.permit, ["git status"]);
+        assert_eq!(
+            home.policy.allow,
+            ["exec.run:git status", "fs.read:~/notes/*"]
+        );
+        assert_eq!(home.policy.deny.len(), 2);
+        assert_eq!(home.policy.sudo_allow, ["sudo apt update"]);
         assert_eq!(
             home.policy.cap_setting("fs", Some("write")),
             Some(CapSetting::Off)
@@ -544,12 +531,7 @@ permit = ["git status"]
             let e = NodeConfig::parse(bad).unwrap_err();
             assert!(e.contains(why), "{bad}: {e}");
         }
-        let with = |extra: &str| {
-            sample().replace(
-                "[center.policy.commands]",
-                &format!("{extra}\n[center.policy.commands]"),
-            )
-        };
+        let with = |extra: &str| format!("{}{extra}\n", sample());
         assert!(NodeConfig::parse(&with("user_until = 1\nfoo = 1")).is_err());
         let user = sample().replace("mode = \"folder\"", "mode = \"user\"");
         assert!(NodeConfig::parse(&user).unwrap_err().contains("user_until"));
@@ -561,6 +543,37 @@ permit = ["git status"]
             &sample[sample.find("[[center]]").unwrap()..]
         );
         assert!(NodeConfig::parse(&two).unwrap_err().contains("two centers"));
+        // A rule must say what it is about; a bare path or command is no rule.
+        for bad in [
+            "deny = [\"~/private\"]",
+            "allow = [\"git status\"]",
+            "allow = [\"fs:/a/[\"]",
+            "sudo_allow = [\"sudo [\"]",
+            "caps = { \"a.b.c\" = \"on\" }",
+        ] {
+            assert!(NodeConfig::parse(&center(bad)).is_err(), "{bad}");
+        }
+        assert!(NodeConfig::parse(&center("allow = [\"fs:/a/*\"]")).is_ok());
+    }
+
+    /// A config with one center whose policy is `policy`.
+    fn center(policy: &str) -> String {
+        format!(
+            "[[center]]\nname = \"home\"\nurl = \"https://c.example:8443\"\ncenter_id = \"c\"\nnode_id = \"n\"\n[center.policy]\n{policy}\n"
+        )
+    }
+
+    #[test]
+    fn a_new_center_starts_in_allowlist_mode_with_no_rule() {
+        let p = CenterPolicy::default();
+        assert_eq!(p.mode, Mode::Allowlist);
+        assert!(p.allow.is_empty() && p.deny.is_empty() && p.sudo_allow.is_empty());
+        let c = NodeConfig::parse(&center("")).unwrap();
+        assert_eq!(c.centers[0].policy.mode, Mode::Allowlist);
+        for m in [Mode::Allowlist, Mode::Folder, Mode::User] {
+            let json = serde_json::json!(m.as_str());
+            assert_eq!(serde_json::from_value::<Mode>(json).unwrap(), m);
+        }
     }
 
     #[test]
@@ -586,14 +599,12 @@ permit = ["git status"]
 
     #[test]
     fn keys_and_values_of_earlier_builds_are_errors() {
-        let center = |policy: &str| {
-            format!(
-                "[[center]]\nname = \"home\"\nurl = \"https://c.example:8443\"\ncenter_id = \"c\"\nnode_id = \"n\"\n[center.policy]\n{policy}\n"
-            )
-        };
         for bad in [
             "mode = \"ask\"",
             "mode = \"full\"",
+            "mode = \"folders\"",
+            "[center.policy.commands]\npermit = [\"x\"]",
+            "[center.policy.commands]\nallow = [\"x\"]",
             "approvals = \"both\"",
             "full_until = 5",
             "caps = { exec = \"ask\" }",

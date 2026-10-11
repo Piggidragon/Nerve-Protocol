@@ -49,64 +49,103 @@ revoked = false             # the center sent `bye revoked`
 unknown = false             # the center answered 401
 
 [center.policy]
-mode = "folder"             # folder | user (the default is folder)
+mode = "allowlist"          # allowlist | folder | user (the default is allowlist)
 user_until = 0              # required with user: falls back to folder then
-folders = [{ path = "/home/u/proj", access = "rw", execute = true }]
+folders = [{ path = "/home/u/proj", access = "rw", execute = true }]  # folder mode
 caps = { "fs.write" = "off" }   # on | off | hidden
-deny = ["~/private"]        # paths nothing may touch
 protected = { extra = [], allow = [] }
-
-[center.policy.commands]    # globs over the whole command line
-deny = []                   # never run
-allow = []                  # when not empty, only these run at all
-permit = []                 # run in any mode
+allow = ["exec.run:git status", "fs.read:~/notes/*"]   # allowlist mode only
+deny = ["fs:~/private/*", "exec.run:rm *"]             # every mode
+sudo_allow = ["sudo apt update"]                       # sudo commands, every mode
 ```
 
-Unknown keys are refused. Two centers with one name are refused. Folder paths
-are absolute in the platform's own form; on the wire they travel as
-`/c/Users/...` on Windows (protocol §7.2).
+Unknown keys are refused, and so is a rule that does not parse. Two centers
+with one name are refused. Folder paths are absolute in the platform's own
+form; on the wire they travel as `/c/Users/...` on Windows (protocol §7.2).
+
+### Modes
+
+- **allowlist** (the default after pairing): default deny. A call runs only
+  when an `allow` rule lets it through. `folders` do not count.
+- **folder**: full access inside the `folders` (and everything below them),
+  by their access; commands run in `execute` folders, confined where the
+  platform can confine them. `allow` rules do not count.
+- **user**: full access as the user, protected paths aside, until
+  `user_until` (at most 8 hours), then the center is back in `folder`.
+  `allow` rules do not count.
+
+`deny` rules count in every mode and a matching deny always wins. Sense and
+actuate actions are allowed by no full-access mode, only by the owner's
+`caps` entry `on`; in `allowlist` mode an allow rule allows them (a center
+may not add one for a sense capability itself).
+
+### Rules
+
+A rule in `allow` and `deny` is `<scope>` or `<scope>:<pattern>`. The scope is
+a capability or `cap.action`, as in `caps`. The pattern is a glob over the
+call's target: the whole command line for `exec.run`, the resolved path for
+every `fs` action (in the center's form, `/c/Users/x` on Windows; `~/` is the
+owner's home), and
+`<cap>.<action>` for any other action. `*` matches across `/` and spaces. A
+rule without a pattern covers every target of its scope. A pattern ending in
+` *` also matches the bare program, one ending in `/*` the folder itself.
+Commands and paths never mix: `fs:/tmp/*` is no command rule.
+
+| Rule | Covers |
+|---|---|
+| `exec.run:git status` | that command line, exactly |
+| `exec.run:git *` | `git` and anything after it |
+| `fs.read:/home/u/notes/*` | reading the folder and below (the action, not `list` or `grep`) |
+| `fs:~/private/*` | every fs action on the folder and below |
+| `camera.snap`, `camera` | that action, or every action of the capability |
+
+The four buttons of the center's audit view and `nerve-node allow|deny
+[--wildcard]` write exactly these forms: exact (`exec.run:git status`) or
+wildcard (`exec.run:git *`, `fs.read:/home/u/notes/*` for the folder of the
+path, the capability for another action). They only add a rule to a list;
+rules can be written by hand as well (`nerve-node config add
+center.<name>.policy.allow '<rule>'`).
+
+In `allowlist` mode a command with `; & | $ \` ( ) < >` or a line break is
+covered only by an allow rule that names the whole line, never by a wildcard:
+such commands run unconfined, and `git *` must not cover `git x; rm -rf ~`.
 
 ## 3. Deciding a call
 
-The default is deny. A call runs only when the mode or a rule allows it;
+The default is deny. A call runs only when the mode and the rules allow it;
 otherwise it is refused at once with `forbidden`, and nothing waits for an
 answer. For each call the node takes the center's policy and, in this order:
 
 1. A `locked` node (after `panic`) keeps no links and runs nothing; a paused,
    revoked or unknown center is not dialled.
-2. The capability setting: `off` refuses (`forbidden`), `hidden` leaves it
+2. The capability setting: `off` refuses (`disabled`), `hidden` leaves it
    out of the descriptor.
-3. Protected paths (keys, shell profiles, the node's own folders and the
-   built-in list) and `deny` paths: `forbidden`, in every mode.
-4. Command rules, with wildcards over the whole command line: a command
-   matching `deny` is refused; when `allow` is not empty, only commands
-   matching it run at all.
-5. The mode. `folder` (the default) allows a read inside a folder, a write
-   inside a folder with `rw` access, and a command whose working directory is
-   in a folder with `execute` (confined where the platform can confine it);
-   with no folder it allows nothing. `user` allows reads, writes and commands
-   everywhere the user could, until `user_until` (at most 8 hours), then the
-   center is back in `folder`. Actions with the effect `sense` or `actuate`
-   are allowed by no mode: only the owner's `caps` entry `on` allows them.
-6. `permit` allows a command in any mode.
-7. Protected paths are refused whatever allowed the call, `user` mode too.
+3. A sudo command (§4) with the sudo switch off: `forbidden`.
+4. A matching `deny` rule: `forbidden`, in every mode.
+5. A sudo command is allowed only when `sudo_allow` names it, in every mode.
+6. Any other call in `allowlist` mode is allowed only when an `allow` rule
+   matches (every path of the call needs one).
+7. In `folder` and `user` mode the mode itself decides (§Modes). `allow`
+   rules are not looked at.
+8. Protected paths (keys, shell profiles, the node's own folders and the
+   built-in list) are refused whatever allowed the call, `user` mode too.
 
-A command whose first word is `sudo` is decided by the sudo switch as well
-(§4). Every refusal names its reasons in the error and in the audit log.
+Every refusal names its reasons in the error and in the audit log.
 
 ## 4. The sudo switch
 
-Sudo is a switch per node, not a mode: the modes stay `folder` and `user`.
+Sudo is a switch per node, not a mode, and its commands have an allow list of
+their own, `sudo_allow`: globs over the whole command line (`sudo apt *`).
+The normal `allow` list does not count for them.
 
 - **Off** (the default): the node holds no sudo password, and a command whose
   first word is `sudo` (or a path ending in `/sudo`) is refused with
-  `forbidden`, even when a `permit` rule names it.
-- **On**: such a command runs only when a `permit` rule names it, in either
-  mode; no mode allows it by itself, and `deny` and protected paths
-  still refuse it. A sudo command must be one simple command: one with
-  `; & | $ \` ( ) < >` or a line break is refused. The node runs it as
-  `sudo -S -k -p '' …` with the password on its stdin and without Landlock
-  (which would stop sudo from gaining privileges).
+  `forbidden`, even when `sudo_allow` names it.
+- **On**: such a command runs only when `sudo_allow` names it, in every
+  mode; `deny` rules and protected paths still refuse it. A sudo command must
+  be one simple command: one with `; & | $ \` ( ) < >` or a line break is
+  refused. The node runs it as `sudo -S -k -p '' …` with the password on its
+  stdin and without Landlock (which would stop sudo from gaining privileges).
 - Every other command runs with `no_new_privs` (Linux), so a `sudo` later in
   a command line, or any setuid program, cannot gain privileges.
 

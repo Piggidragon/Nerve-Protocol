@@ -1,6 +1,7 @@
 //! A real node daemon against the conformance fake center, in process:
-//! pairing, handshake, describe, an `fs.read` that a folder allows and one
-//! that no rule allows, the 401 stop, and the conformance node checks.
+//! pairing, handshake, describe, an `fs.read` that an allow rule lets through
+//! and one that no rule allows, folder mode where allow rules do not count,
+//! the 401 stop, and the conformance node checks.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -74,12 +75,11 @@ async fn handshake_describe_and_an_allowed_read() {
     let home = dir.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
     let home = std::fs::canonicalize(&home).unwrap();
+    // A new center is in default deny: an allow rule lets the read through.
     let node = paired_node_with(dir.path(), &center, |p| {
-        p.folders.push(nerve_policy::config::Folder {
-            path: home.display().to_string(),
-            access: nerve_policy::config::Access::Ro,
-            execute: false,
-        });
+        assert_eq!(p.mode, nerve_policy::Mode::Allowlist);
+        p.allow
+            .push(format!("fs.read:{}/*", nerve_policy::paths::to_wire(&home)));
     })
     .await;
     let mut conn = linked(&mut center).await;
@@ -110,6 +110,18 @@ async fn handshake_describe_and_an_allowed_read() {
         .expect("the folder allows the read");
     assert_eq!(read["content"], "hello center");
     assert_eq!(read["encoding"], "utf8");
+    // The rule is for reads; the write is a call no rule allows.
+    let e = conn
+        .call(
+            "invoke",
+            json!({"cap": "fs", "action": "write",
+                   "args": {"path": nerve_policy::paths::to_wire(&file), "content": "x"}}),
+            WAIT,
+        )
+        .await
+        .unwrap()
+        .expect_err("no rule allows the write");
+    assert_eq!(nerve_conformance::wire::code_of(&e), "forbidden");
 
     // The local audit log names the center and the decision.
     let log = std::fs::read_to_string(node.paths().audit_log()).unwrap();
@@ -148,6 +160,58 @@ async fn a_call_no_rule_allows_is_refused_immediately() {
     let log = std::fs::read_to_string(node.paths().audit_log()).unwrap();
     assert!(log.contains("\"forbidden\""), "{log}");
     assert!(!log.contains("\"asked\""), "{log}");
+    node.stop().await;
+}
+
+/// In folder mode the folders give full access and allow rules change
+/// nothing; a deny rule still refuses.
+#[tokio::test(flavor = "multi_thread")]
+async fn allow_rules_do_not_count_in_folder_mode_and_deny_rules_do() {
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let home = std::fs::canonicalize(&home).unwrap();
+    let inside = home.join("in");
+    let elsewhere = dir.path().join("elsewhere");
+    std::fs::create_dir_all(&inside).unwrap();
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    let elsewhere = std::fs::canonicalize(&elsewhere).unwrap();
+    for (d, name) in [
+        (&inside, "a.txt"),
+        (&inside, "secret.txt"),
+        (&elsewhere, "b.txt"),
+    ] {
+        std::fs::write(d.join(name), "x").unwrap();
+    }
+    let wire = |p: &Path| nerve_policy::paths::to_wire(p);
+    let node = paired_node_with(dir.path(), &center, |p| {
+        p.mode = nerve_policy::Mode::Folder;
+        p.folders.push(nerve_policy::config::Folder {
+            path: inside.display().to_string(),
+            access: nerve_policy::config::Access::Ro,
+            execute: false,
+        });
+        p.allow.push(format!("fs:{}/*", wire(&elsewhere)));
+        p.deny
+            .push(format!("fs:{}", wire(&inside.join("secret.txt"))));
+    })
+    .await;
+    let mut conn = linked(&mut center).await;
+    let mut read = async |p: &Path| {
+        conn.call(
+            "invoke",
+            json!({"cap": "fs", "action": "read", "args": {"path": wire(p)}}),
+            WAIT,
+        )
+        .await
+        .unwrap()
+    };
+    assert!(read(&inside.join("a.txt")).await.is_ok(), "the folder");
+    let e = read(&elsewhere.join("b.txt")).await.unwrap_err();
+    assert_eq!(nerve_conformance::wire::code_of(&e), "forbidden");
+    let e = read(&inside.join("secret.txt")).await.unwrap_err();
+    assert_eq!(nerve_conformance::wire::code_of(&e), "forbidden");
     node.stop().await;
 }
 
@@ -232,7 +296,6 @@ async fn folder_mode_confines_commands_to_their_folders() {
         access: nerve_policy::config::Access::Rw,
         execute: true,
     });
-    p.commands.permit.push("sh *".into());
     cfg.save(&file).unwrap();
     let node = Daemon::start(o).await.unwrap();
     let mut conn = linked(&mut center).await;

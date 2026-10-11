@@ -49,8 +49,8 @@ nerve://pair?center=<percent-encoded center URL>&code=<code>&pin=<pin>
 - A parser MUST refuse: unknown keys, a key given twice, bad percent escapes, a
   fragment, a link longer than 4096 bytes.
 - The node MUST show the owner the center URL and the defaults it will store
-  (mode `folder` with no folder and no rule, so every call is refused until the
-  owner allows something; settings grant `off`) and store nothing before the
+  (mode `allowlist` with no rule, so every call is refused until the owner
+  allows something; settings grant `off`) and store nothing before the
   owner confirms.
 
 ### 3.2 Pair request

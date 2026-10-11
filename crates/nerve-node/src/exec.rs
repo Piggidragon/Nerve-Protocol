@@ -136,7 +136,7 @@ pub struct RunOptions {
     /// The `nerve-node` binary that hosts the shim.
     pub exe: PathBuf,
     pub output_cap: usize,
-    /// Set only for a permitted `sudo` command (already rewritten with
+    /// Set only for a `sudo` command the sudo allow list names (already rewritten with
     /// [`sudo_line`]): sudo reads this password from stdin. Every other
     /// command runs with no_new_privs (Linux), so a `sudo` the rules did not
     /// see (`ls; sudo x`) cannot gain privileges.

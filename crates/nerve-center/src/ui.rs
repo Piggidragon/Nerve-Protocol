@@ -24,7 +24,7 @@ use nerve_proto::RpcError;
 use nerve_transport::http::{self, Request, Response};
 use nerve_transport::net::BoxIo;
 
-use crate::center::{Center, Change, wildcard_of};
+use crate::center::{Center, Change, audit_rule};
 use crate::listen::Server;
 use crate::store::TokenRecord;
 use crate::util::{self, now_ms};
@@ -339,19 +339,16 @@ impl Ui {
                 )
                 .await
                 .map_err(refused),
+            // The four buttons of an audit entry: `list` is allow, deny, or
+            // sudo for a sudo command; `cap`, `action` and `target` are the
+            // entry's own fields.
             ("POST", "/api/audit/rule") => {
-                let command = s("command");
-                if command.trim().is_empty() {
-                    return Err(bad("no command"));
-                }
-                let pattern = if b.get("wildcard").and_then(Value::as_bool) == Some(true) {
-                    wildcard_of(&command)
-                } else {
-                    command
-                };
-                c.add_command_rule(&s("node_id"), &s("list"), &pattern)
+                let wildcard = b.get("wildcard").and_then(Value::as_bool) == Some(true);
+                let rule = audit_rule(&s("list"), &s("cap"), &s("action"), &s("target"), wildcard)
+                    .map_err(bad)?;
+                c.add_rule(&s("node_id"), &s("list"), &rule)
                     .await
-                    .map(|v| json!({"pattern": pattern, "result": v}))
+                    .map(|v| json!({"rule": rule, "result": v}))
                     .map_err(refused)
             }
             ("GET", "/api/tokens") => Ok(c.read(|st| {

@@ -9,8 +9,8 @@ use std::time::Duration;
 use nerve_conformance::fake_center::{self, FakeCenter};
 use nerve_conformance::wire::Conn;
 use nerve_node::{Daemon, NodeOptions, NodePaths};
-use nerve_policy::NodeConfig;
 use nerve_policy::config::{SettingsGrant, Sudo};
+use nerve_policy::{NodeConfig, rules};
 use nerve_proto::{ErrorCode, Message, RpcError};
 use nerve_transport::sudo::{Offer, Sealed, seal};
 use serde_json::{Value, json};
@@ -18,6 +18,9 @@ use tokio::net::TcpStream;
 
 const WAIT: Duration = Duration::from_secs(15);
 const RIGHT: &str = "right-pw-7c1e";
+/// A command line with a sudo in the middle; the node runs it without sudo's
+/// help, and only an allow rule that names it exactly lets it start.
+const CHAINED: &str = "echo a; sudo echo b";
 
 /// Takes `-S -k -p ''` and `-v` like sudo; reads the password line from
 /// stdin, refuses a wrong one, else runs the command (or just succeeds for
@@ -46,8 +49,9 @@ fn fake_sudo(dir: &Path) -> PathBuf {
     p
 }
 
-/// A node paired with `center` that lets it write settings, with permit
-/// rules for `sudo echo *` and `echo *`.
+/// A node paired with `center` that lets it write settings, with an allow
+/// rule for `echo *` (and one line that chains) and a sudo allow entry for
+/// `sudo echo *`.
 async fn node(root: &Path, center: &FakeCenter) -> Daemon {
     let mut o = NodeOptions::new(NodePaths::new(root.join("config"), root.join("state")));
     o.home = root.join("home");
@@ -64,9 +68,12 @@ async fn node(root: &Path, center: &FakeCenter) -> Daemon {
     let mut cfg = NodeConfig::load(&file).unwrap();
     cfg.machine.sudo_path = Some(fake_sudo(root).display().to_string());
     cfg.centers[0].settings = SettingsGrant::Write;
-    let permit = &mut cfg.centers[0].policy.commands.permit;
-    permit.push("sudo echo *".into());
-    permit.push("echo *".into());
+    let policy = &mut cfg.centers[0].policy;
+    policy.sudo_allow.push("sudo echo *".into());
+    policy.allow.push("exec.run:echo *".into());
+    policy
+        .allow
+        .push(rules::rule_for("exec", "run", CHAINED, false).unwrap());
     cfg.save(&file).unwrap();
     Daemon::start(o).await.expect("start")
 }
@@ -188,7 +195,7 @@ async fn the_sudo_switch() {
         .await
         .expect("sub");
 
-    // Off: a permit rule names the command, yet it is refused.
+    // Off: the sudo allow list names the command, yet it is refused.
     assert_eq!(seen.sudo_state(&mut conn).await, "off");
     let r = seen.run(&mut conn, "sudo echo hi").await;
     assert_eq!(code(&r), ErrorCode::Forbidden);
@@ -216,11 +223,8 @@ async fn the_sudo_switch() {
     assert_eq!(code(&r), ErrorCode::InvalidArgs);
     assert!(r.unwrap_err().message.contains("no open sudo offer"));
 
-    // On: what a permit rule names runs through sudo, nothing else.
-    let r = seen
-        .run(&mut conn, "sudo echo hi")
-        .await
-        .expect("permitted");
+    // On: what the sudo allow list names runs through sudo, nothing else.
+    let r = seen.run(&mut conn, "sudo echo hi").await.expect("allowed");
     assert_eq!(r["stdout"], "hi\n", "{r}");
     assert_eq!(r["exit_code"], 0);
     let r = seen.run(&mut conn, "sudo id").await;
@@ -228,11 +232,14 @@ async fn the_sudo_switch() {
     let r = seen.run(&mut conn, "sudo echo x; id").await;
     assert_eq!(code(&r), ErrorCode::Forbidden);
     // A sudo after the first word gets no password and cannot rise.
-    let r = seen
-        .run(&mut conn, "echo a; sudo echo b")
-        .await
-        .expect("runs");
+    let r = seen.run(&mut conn, CHAINED).await.expect("runs");
     assert_ne!(r["stdout"], "a\nb\n", "{r}");
+    // The `echo *` rule is no way to chain a command on.
+    let r = seen.run(&mut conn, "echo a; id").await;
+    assert_eq!(code(&r), ErrorCode::Forbidden);
+    // A normal allow rule does not allow a sudo command.
+    let r = seen.run(&mut conn, "sudo id").await;
+    assert_eq!(code(&r), ErrorCode::Forbidden);
 
     // A command that prints the password: the result, the audit event and
     // the local log carry no copy of it.

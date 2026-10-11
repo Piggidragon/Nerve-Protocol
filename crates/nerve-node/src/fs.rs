@@ -230,7 +230,7 @@ impl FsCall {
         }]
     }
 
-    /// The target as the audit log and approvals show it.
+    /// The target as the audit log shows it.
     pub fn target_text(&self) -> String {
         to_wire(&self.path().real)
     }

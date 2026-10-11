@@ -1,10 +1,6 @@
 //! The MCP server (protocol revision 2025-06-18, spec/harness.md): one
 //! engine for a session, served over stdio (newline-delimited JSON-RPC), over
 //! an attached process's socket, and over Streamable HTTP.
-//
-// OPEN POINT: approvals are not asked through MCP elicitation in 0.0.1. A
-// call that needs a person waits for the node's own approval or the center
-// web UI, and tells the model where it waits when the center stops waiting.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -60,7 +56,7 @@ impl Engine {
 
     /// The live session; a session ended from the web UI is replaced by a
     /// fresh one, so a long-running stdio harness keeps working with a clean
-    /// slate (no taint, no session approvals).
+    /// slate (no taint).
     fn live_session(&self) -> Arc<Session> {
         let mut s = self.session.lock().unwrap();
         if s.ended() {
@@ -240,14 +236,6 @@ impl Engine {
                 }
                 Ok(text_result(&t, true))
             }
-            Err(CallError::Pending { at, waited }) => Ok(text_result(
-                &format!(
-                    "error timeout: approval pending at {at}; nobody answered within {} s. \
-                     The call was not run. Ask the user to answer it there, then try again.",
-                    waited.as_secs()
-                ),
-                true,
-            )),
         }
     }
 }
@@ -386,8 +374,7 @@ where
         };
         let engine = engine.clone();
         let tx = tx.clone();
-        // Calls run side by side: one waiting for an approval must not hold
-        // up the others.
+        // Calls run side by side: a slow one must not hold up the others.
         tokio::spawn(async move {
             if let Some(r) = engine.handle(msg).await {
                 let _ = tx.send(r).await;

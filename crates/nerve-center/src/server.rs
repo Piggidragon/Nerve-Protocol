@@ -68,7 +68,6 @@ pub async fn start(args: &Args, lock: Lock) -> Result<Running, String> {
         state_dir: args.state_dir(),
         name: args.name.clone(),
         public_url: args.public_url(nodes.port()),
-        call_wait: args.call_wait(),
     })?;
     let mut tasks = Vec::new();
 

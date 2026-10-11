@@ -6,6 +6,7 @@
 mod common;
 
 use std::future::Future;
+use std::time::{Duration, Instant};
 
 use common::{Mcp, Node, text_of};
 use nerve_conformance::{center_part, node_part};
@@ -67,9 +68,9 @@ fn with(mut args: Value, more: Value) -> Value {
 }
 
 /// The whole path through both binaries: pairing, the link, tools, the
-/// center's approvals in the web UI, the node's approvals answered on the
-/// node and from the center, a rule from the audit view landing in the
-/// node's settings, the node's audit log, and removing the node.
+/// a folder and a rule on the node deciding calls (allowed at once, or
+/// refused at once), a rule from the audit view landing in the node's
+/// settings, the node's audit log, and removing the node.
 #[test]
 fn nerve_center_and_nerve_node_work_together() {
     let root = tempfile::tempdir().unwrap();
@@ -90,10 +91,9 @@ fn nerve_center_and_nerve_node_work_together() {
     });
     let node_id = ov["nodes"][0]["id"].as_str().unwrap().to_string();
     let node_name = ov["nodes"][0]["name"].as_str().unwrap().to_string();
-    assert_eq!(ov["nodes"][0]["approvals_answerable"], json!(true), "{ov}");
     assert_eq!(ov["nodes"][0]["settings_write"], json!(false), "{ov}");
 
-    // Tools: the device's capabilities, not its approvals or settings.
+    // Tools: the device's capabilities, not its settings.
     let tools = mcp.tools();
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(names.iter().any(|n| n.ends_with("fs__read")), "{names:?}");
@@ -117,7 +117,7 @@ fn nerve_center_and_nerve_node_work_together() {
     );
     assert_eq!(status, 200, "{v}");
 
-    // Allow from the audit view: the command lands on the node's never-ask list.
+    // Allow from the audit view: the command lands on the node's permit list.
     let (status, v) = mcp.api(
         "POST",
         "/api/audit/rule",
@@ -126,19 +126,14 @@ fn nerve_center_and_nerve_node_work_together() {
     assert_eq!(status, 200, "{v}");
     let toml = std::fs::read_to_string(node.config.join("node.toml")).unwrap();
     assert!(
-        toml.contains("never_ask") && toml.contains("echo hi"),
+        toml.contains("permit") && toml.contains("echo hi"),
         "{toml}"
     );
 
     // exec.run goes straight to the node: the center holds no call back, and
-    // the node lets it run without asking (the never-ask rule above).
+    // the node lets it run (the permit rule above).
     let (run, args) = tool(&tools, "exec", "run", &node_name);
     let r = mcp.call(&run, with(args, json!({"command": "echo hi"})));
-    let (status, ov) = mcp.api("GET", "/api/overview", Value::Null);
-    assert_eq!(status, 200, "{ov}");
-    assert!(ov.get("approvals").is_none(), "{ov}");
-    let (status, v) = mcp.api("POST", "/api/approvals/center", json!({}));
-    assert_eq!(status, 404, "{v}");
     let text = text_of(&r);
     assert_eq!(r["isError"], json!(false), "{r}");
     assert!(
@@ -146,53 +141,42 @@ fn nerve_center_and_nerve_node_work_together() {
         "{text}"
     );
 
-    // fs.read asks on the node (mode ask); the person answers on the node.
+    // fs.read: nothing is allowed until the node names a folder, and a call
+    // no rule allows is refused at once instead of waiting for anybody.
     std::fs::write(node.home.join("notes.txt"), "hello from the node").unwrap();
     let path = node.home.join("notes.txt").to_string_lossy().to_string();
     let (read, args) = tool(&tools, "fs", "read", &node_name);
-    let answer = std::thread::scope(|s| {
-        let h = s.spawn(|| {
-            let id = node.wait_approval("fs.read");
-            node.ok(&["approve", &id]);
-        });
-        let r = mcp.call(&read, with(args.clone(), json!({"path": path})));
-        h.join().unwrap();
-        r
-    });
-    assert_eq!(answer["isError"], json!(false), "{answer}");
-    assert!(text_of(&answer).contains("hello from the node"), "{answer}");
-
-    // The next read asks again; the center answers it (approvals = both)
-    // with a no, and the harness hears `denied`.
-    let ui = mcp.ui.clone();
-    let id = node_id.clone();
-    let answer = std::thread::spawn(move || {
-        let v = ui.wait_overview("a node approval at the center", |v| {
-            v["nodes"][0]["pending_approvals"]
-                .as_array()
-                .is_some_and(|a| !a.is_empty())
-        });
-        let a = &v["nodes"][0]["pending_approvals"][0];
-        let (status, r) = ui.api(
-            "POST",
-            "/api/approvals/node",
-            json!({"node_id": id, "id": a["id"], "answer": "deny"}),
-        );
-        assert_eq!(status, 200, "{r}");
-    });
-    let r = mcp.call(&read, with(args, json!({"path": path})));
-    answer.join().unwrap();
+    let started = Instant::now();
+    let r = mcp.call(&read, with(args.clone(), json!({"path": path})));
+    assert!(started.elapsed() < Duration::from_secs(10), "{r}");
     assert_eq!(r["isError"], json!(true), "{r}");
-    assert!(text_of(&r).contains("denied"), "{r}");
+    assert!(text_of(&r).contains("forbidden"), "{r}");
 
-    // The node's own audit log has all three decisions.
+    // A folder on the node allows the read.
+    node.ok(&["folder", "add", &node.home.to_string_lossy()]);
+    let r = mcp.call(&read, with(args.clone(), json!({"path": path})));
+    assert_eq!(r["isError"], json!(false), "{r}");
+    assert!(text_of(&r).contains("hello from the node"), "{r}");
+
+    // A file outside every folder is refused at once.
+    let outside = root.path().join("outside.txt");
+    std::fs::write(&outside, "not for the model").unwrap();
+    let r = mcp.call(
+        &read,
+        with(args, json!({"path": outside.to_string_lossy()})),
+    );
+    assert_eq!(r["isError"], json!(true), "{r}");
+    assert!(text_of(&r).contains("forbidden"), "{r}");
+    assert!(!text_of(&r).contains("not for the model"), "{r}");
+
+    // The node's own audit log has the decisions.
     let audit = node.ok(&["audit"]);
     assert!(
         audit.contains("exec.run") && audit.contains("allowed"),
         "{audit}"
     );
     assert!(
-        audit.contains("fs.read") && audit.contains("denied"),
+        audit.contains("fs.read") && audit.contains("forbidden"),
         "{audit}"
     );
     let denied = node.ok(&["audit", "--denied"]);

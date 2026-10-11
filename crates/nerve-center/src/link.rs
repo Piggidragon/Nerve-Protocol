@@ -2,7 +2,7 @@
 //! rule, requests to the node with their pending replies, and the reader that
 //! routes the node's results, events and state.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -37,13 +37,6 @@ enum Out {
     Bye(ByeReason),
 }
 
-/// An approval the node holds for this center (`approvals/requested`).
-#[derive(Debug, Clone)]
-pub struct NodeApproval {
-    pub data: Value,
-    pub received: Instant,
-}
-
 /// One authenticated, welcomed link.
 pub struct Link {
     pub node_id: String,
@@ -55,8 +48,6 @@ pub struct Link {
     next_id: AtomicU64,
     closed: AtomicBool,
     pong: Notify,
-    /// Approval id to the approval; withdrawn when the link ends.
-    pub approvals: Mutex<BTreeMap<String, NodeApproval>>,
     /// `node` state `status` (online, busy, paused).
     pub status: Mutex<String>,
     /// Sessions that called through this link, for `session.end`.
@@ -75,7 +66,6 @@ impl Link {
             next_id: AtomicU64::new(1),
             closed: AtomicBool::new(false),
             pong: Notify::new(),
-            approvals: Mutex::new(BTreeMap::new()),
             status: Mutex::new("online".into()),
             sessions: Mutex::new(Default::default()),
         }

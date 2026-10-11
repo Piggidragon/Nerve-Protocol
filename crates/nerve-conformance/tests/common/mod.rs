@@ -225,8 +225,7 @@ impl Drop for Mcp {
     }
 }
 
-/// The center's web UI API, usable from any thread (a tool call that waits
-/// for an approval blocks the harness side, so the answer comes from here).
+/// The center's web UI API, usable from any thread.
 #[derive(Clone)]
 pub struct Ui {
     pub addr: String,
@@ -422,19 +421,6 @@ impl Node {
                 "nerve-node run made no control socket"
             );
             std::thread::sleep(Duration::from_millis(50));
-        }
-    }
-
-    /// Waits for an open approval in `nerve-node approvals`; its id.
-    pub fn wait_approval(&self, what: &str) -> String {
-        let until = Instant::now() + Duration::from_secs(30);
-        loop {
-            let out = self.ok(&["approvals"]);
-            if let Some(line) = out.lines().find(|l| l.contains(what)) {
-                return line.split_whitespace().next().unwrap().to_string();
-            }
-            assert!(Instant::now() < until, "no approval for {what}: {out}");
-            std::thread::sleep(Duration::from_millis(200));
         }
     }
 

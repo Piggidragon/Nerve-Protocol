@@ -3,7 +3,7 @@
 
 use serde_json::Value;
 
-use nerve_policy::config::{ApprovalsGrant, SettingsGrant, valid_center_name};
+use nerve_policy::config::{SettingsGrant, valid_center_name};
 use nerve_policy::{CenterEntry, CenterPolicy};
 use nerve_proto::PAIR_PATH;
 use nerve_proto::link::{PairLink, PairRequest, PairResponse};
@@ -30,11 +30,8 @@ pub fn preview(link: &PairLink, name: Option<&str>) -> String {
     }
     s.push_str(
         "Defaults for this center:\n  \
-         mode ask (every read, write and command asks you first)\n  \
-         settings off (the center cannot change this node's settings)\n  \
-         approvals both (you or the center may answer the node's questions)\n\
-         Warning: a center that answers approvals can let its agents act on this \
-         machine; use `grant approvals local` to answer them only here.\n",
+         mode folder (nothing is allowed until you add a folder or a rule)\n  \
+         settings off (the center cannot change this node's settings)\n",
     );
     s
 }
@@ -102,7 +99,6 @@ pub async fn pair(
         center_id: r.center_id.clone(),
         node_id: r.node_id.clone(),
         settings: SettingsGrant::Off,
-        approvals: ApprovalsGrant::Both,
         paused: false,
         revoked: false,
         unknown: false,

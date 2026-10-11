@@ -139,15 +139,6 @@ pub struct DayStats {
     /// Error code to count.
     #[serde(default)]
     pub errors: BTreeMap<String, u64>,
-    #[serde(default)]
-    pub approvals_asked: u64,
-    /// Who answered (`center`, `local`, `timeout`, ...) to count.
-    #[serde(default)]
-    pub approvals_by: BTreeMap<String, u64>,
-    #[serde(default)]
-    pub approval_wait_ms: u64,
-    #[serde(default)]
-    pub approval_wait_max_ms: u64,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -173,12 +164,6 @@ impl DayStats {
         for (k, n) in &o.errors {
             *self.errors.entry(k.clone()).or_default() += n;
         }
-        self.approvals_asked += o.approvals_asked;
-        for (k, n) in &o.approvals_by {
-            *self.approvals_by.entry(k.clone()).or_default() += n;
-        }
-        self.approval_wait_ms += o.approval_wait_ms;
-        self.approval_wait_max_ms = self.approval_wait_max_ms.max(o.approval_wait_max_ms);
     }
 }
 
@@ -208,5 +193,14 @@ mod tests {
         let s: Store = serde_json::from_str(old).unwrap();
         assert_eq!(s.center_name, "home");
         assert!(!serde_json::to_string(&s).unwrap().contains("center_policy"));
+    }
+
+    #[test]
+    fn day_stats_with_the_old_approval_counters_still_load() {
+        let old = r#"{"online_ms":5,"links":1,"approvals_asked":3,
+            "approvals_by":{"center":2},"approval_wait_ms":10,"approval_wait_max_ms":7}"#;
+        let d: DayStats = serde_json::from_str(old).unwrap();
+        assert_eq!((d.online_ms, d.links), (5, 1));
+        assert!(!serde_json::to_string(&d).unwrap().contains("approval"));
     }
 }

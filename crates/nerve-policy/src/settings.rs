@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use crate::audit::{AuditLog, diff};
-use crate::config::{CapSetting, CenterDocument, FULL_MAX_MS, Mode, NodeConfig, SettingsGrant};
+use crate::config::{CapSetting, CenterDocument, Mode, NodeConfig, SettingsGrant, USER_MAX_MS};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SetError {
@@ -232,11 +232,11 @@ fn client_only(
         // Releasing a protected path is the owner's call; adding more is fine.
         return Err("policy.protected.allow: only the owner can release protected paths".into());
     }
-    if n.mode == Mode::Full
-        && n.full_until != o.full_until
-        && n.full_until.is_some_and(|u| u > now_ms + FULL_MAX_MS)
+    if n.mode == Mode::User
+        && n.user_until != o.user_until
+        && n.user_until.is_some_and(|u| u > now_ms + USER_MAX_MS)
     {
-        return Err("policy.full_until: at most 8 hours from now".into());
+        return Err("policy.user_until: at most 8 hours from now".into());
     }
     Ok(())
 }
@@ -261,7 +261,6 @@ mod tests {
                 center_id: "c".into(),
                 node_id: "n".into(),
                 settings: grant,
-                approvals: Default::default(),
                 paused: false,
                 revoked: false,
                 unknown: false,
@@ -283,15 +282,13 @@ mod tests {
         let mut s = store(d.path(), SettingsGrant::Write);
         let v = s.version();
         let mut new = doc(&s);
-        new["policy"]["mode"] = json!("folders");
+        new["policy"]["mode"] = json!("user");
+        new["policy"]["user_until"] = json!(1000);
         let v2 = s
             .set_center_document("home", new.clone(), v, 0, |_| false)
             .unwrap();
         assert_eq!(v2, v + 1);
-        assert_eq!(
-            s.config().center("home").unwrap().policy.mode,
-            Mode::Folders
-        );
+        assert_eq!(s.config().center("home").unwrap().policy.mode, Mode::User);
         // A stale version conflicts.
         assert_eq!(
             s.set_center_document("home", new, v, 0, |_| false),
@@ -328,8 +325,8 @@ mod tests {
             Err(SetError::Forbidden(_))
         ));
         let mut new = doc(&s);
-        new["policy"]["mode"] = json!("full");
-        new["policy"]["full_until"] = json!(FULL_MAX_MS + 1);
+        new["policy"]["mode"] = json!("user");
+        new["policy"]["user_until"] = json!(USER_MAX_MS + 1);
         assert!(matches!(
             s.set_center_document("home", new, v, 0, |_| false),
             Err(SetError::Forbidden(_))

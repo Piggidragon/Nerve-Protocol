@@ -10,8 +10,6 @@ use serde_json::{Map, Value};
 pub enum ErrorCode {
     InvalidArgs,
     Forbidden,
-    ConsentRequired,
-    Denied,
     Disabled,
     Unavailable,
     Busy,
@@ -34,8 +32,6 @@ impl ErrorCode {
         match self {
             ErrorCode::InvalidArgs => "invalid_args",
             ErrorCode::Forbidden => "forbidden",
-            ErrorCode::ConsentRequired => "consent_required",
-            ErrorCode::Denied => "denied",
             ErrorCode::Disabled => "disabled",
             ErrorCode::Unavailable => "unavailable",
             ErrorCode::Busy => "busy",
@@ -57,8 +53,6 @@ impl ErrorCode {
         match s {
             "invalid_args" => ErrorCode::InvalidArgs,
             "forbidden" => ErrorCode::Forbidden,
-            "consent_required" => ErrorCode::ConsentRequired,
-            "denied" => ErrorCode::Denied,
             "disabled" => ErrorCode::Disabled,
             "unavailable" => ErrorCode::Unavailable,
             "busy" => ErrorCode::Busy,
@@ -85,8 +79,6 @@ impl ErrorCode {
             ErrorCode::InvalidArgs => -32602,
             ErrorCode::Internal => -32603,
             ErrorCode::Forbidden => -32001,
-            ErrorCode::ConsentRequired => -32002,
-            ErrorCode::Denied => -32003,
             ErrorCode::Disabled => -32004,
             ErrorCode::Unavailable => -32005,
             ErrorCode::Busy => -32006,
@@ -183,7 +175,6 @@ mod tests {
     fn codes_round_trip() {
         for c in [
             ErrorCode::InvalidArgs,
-            ErrorCode::Denied,
             ErrorCode::ConnectionLost,
             ErrorCode::Other("conflict".into()),
         ] {
@@ -191,6 +182,6 @@ mod tests {
             assert_eq!(e.kind(), c);
         }
         assert!(ErrorCode::ConnectionLost.retryable());
-        assert!(!ErrorCode::Denied.retryable());
+        assert!(!ErrorCode::Forbidden.retryable());
     }
 }

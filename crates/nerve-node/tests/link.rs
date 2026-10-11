@@ -1,16 +1,15 @@
 //! A real node daemon against the conformance fake center, in process:
-//! pairing, handshake, describe, an `fs.read` that the center approves, the
-//! 401 stop, and the conformance node checks.
+//! pairing, handshake, describe, an `fs.read` that a folder allows and one
+//! that no rule allows, the 401 stop, and the conformance node checks.
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use nerve_conformance::fake_center::{self, FakeCenter};
-use nerve_conformance::wire::{Conn, Recv};
+use nerve_conformance::wire::Conn;
 use nerve_node::{Daemon, NodeOptions, NodePaths};
 use nerve_policy::NodeConfig;
-use nerve_proto::rpc::Message;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
 
@@ -35,10 +34,23 @@ fn options(root: &Path) -> NodeOptions {
 
 /// Pairs with `center` and starts the daemon.
 async fn paired_node(root: &Path, center: &FakeCenter) -> Daemon {
+    paired_node_with(root, center, |_| {}).await
+}
+
+/// Like [`paired_node`], with `policy` changed before the daemon starts.
+async fn paired_node_with(
+    root: &Path,
+    center: &FakeCenter,
+    policy: impl FnOnce(&mut nerve_policy::CenterPolicy),
+) -> Daemon {
     let o = options(root);
     nerve_node::pair::pair(&o.paths, &center.link(), Some("lab"))
         .await
         .expect("pair");
+    let file = o.paths.config_file();
+    let mut cfg = NodeConfig::load(&file).unwrap();
+    policy(&mut cfg.centers[0].policy);
+    cfg.save(&file).unwrap();
     Daemon::start(o).await.expect("start")
 }
 
@@ -56,13 +68,22 @@ async fn linked(center: &mut FakeCenter) -> Conn<TcpStream> {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn handshake_describe_and_an_approved_read() {
+async fn handshake_describe_and_an_allowed_read() {
     let dir = tempdir();
     let mut center = FakeCenter::start(false).await.unwrap();
-    let node = paired_node(dir.path(), &center).await;
+    let home = dir.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let home = std::fs::canonicalize(&home).unwrap();
+    let node = paired_node_with(dir.path(), &center, |p| {
+        p.folders.push(nerve_policy::config::Folder {
+            path: home.display().to_string(),
+            access: nerve_policy::config::Access::Ro,
+            execute: false,
+        });
+    })
+    .await;
     let mut conn = linked(&mut center).await;
 
-    // The descriptor in this center's view: ask mode, so fs asks.
     let d = conn
         .call("describe", json!({"detail": "full"}), WAIT)
         .await
@@ -70,77 +91,33 @@ async fn handshake_describe_and_an_approved_read() {
         .expect("describe");
     let caps = d["capabilities"].as_array().expect("caps");
     let cap = |id: &str| caps.iter().find(|c| c["id"] == id);
-    for c in ["node", "fs", "exec", "approvals", "audit"] {
+    for c in ["node", "fs", "exec", "audit"] {
         assert!(cap(c).is_some(), "missing {c}: {d}");
     }
+    assert!(
+        cap("approvals").is_none(),
+        "there is no approvals capability"
+    );
     assert!(cap("settings").is_none(), "settings needs the write grant");
-    assert_eq!(cap("fs").unwrap()["exposure"], "ask");
+    assert_eq!(cap("fs").unwrap()["exposure"], "on");
 
-    let file = dir.path().join("home").join("note.txt");
+    let file = home.join("note.txt");
     std::fs::write(&file, "hello center").unwrap();
-    let id = conn
-        .request(
-            "invoke",
-            json!({"cap": "fs", "action": "read", "args": {"path": nerve_policy::paths::to_wire(&file)}}),
-        )
-        .await
-        .unwrap();
-
-    // The node asks; the center answers through the approvals capability.
-    let requested = loop {
-        match conn.recv(WAIT).await {
-            Recv::Msg(Message::Notification { method, params })
-                if method == "event"
-                    && params["cap"] == "approvals"
-                    && params["name"] == "requested" =>
-            {
-                break params["data"].clone();
-            }
-            Recv::Msg(_) => {}
-            other => panic!("no approval request: {other:?}"),
-        }
-    };
-    assert_eq!(requested["cap"], "fs");
-    assert_eq!(requested["action"], "read");
-    let answer = conn
-        .request(
-            "invoke",
-            json!({"cap": "approvals", "action": "answer",
-                   "args": {"id": requested["id"], "answer": "once"}}),
-        )
-        .await
-        .unwrap();
-    let mut others = Vec::new();
-    conn.answer(answer, WAIT, &mut others)
-        .await
-        .unwrap()
-        .expect("answer accepted");
     let read = conn
-        .answer(id, WAIT, &mut others)
-        .await
-        .unwrap()
-        .expect("read allowed");
-    assert_eq!(read["content"], "hello center");
-    assert_eq!(read["encoding"], "utf8");
-
-    // A second answer to the same approval is refused: first answer wins.
-    let again = conn
         .call(
             "invoke",
-            json!({"cap": "approvals", "action": "answer",
-                   "args": {"id": requested["id"], "answer": "deny"}}),
+            json!({"cap": "fs", "action": "read", "args": {"path": nerve_policy::paths::to_wire(&file)}}),
             WAIT,
         )
         .await
-        .unwrap();
-    assert!(again.is_err());
+        .unwrap()
+        .expect("the folder allows the read");
+    assert_eq!(read["content"], "hello center");
+    assert_eq!(read["encoding"], "utf8");
 
-    // The local audit log names the center and the approval.
+    // The local audit log names the center and the decision.
     let log = std::fs::read_to_string(node.paths().audit_log()).unwrap();
-    assert!(
-        log.contains("\"asked\"") && log.contains("\"allowed\""),
-        "{log}"
-    );
+    assert!(log.contains("\"allowed\""), "{log}");
     assert!(log.contains("lab"), "{log}");
 
     node.stop().await;
@@ -150,47 +127,31 @@ async fn handshake_describe_and_an_approved_read() {
     );
 }
 
-// The control socket is Unix-only in 0.0.1.
-#[cfg(unix)]
+/// No folder and no rule allows the read, so the node refuses it at once: it
+/// does not wait for anyone, and nothing is asked.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_denied_read_fails_with_denied() {
+async fn a_call_no_rule_allows_is_refused_immediately() {
     let dir = tempdir();
     let mut center = FakeCenter::start(false).await.unwrap();
     let node = paired_node(dir.path(), &center).await;
     let mut conn = linked(&mut center).await;
     let file = dir.path().join("home").join("x.txt");
     std::fs::write(&file, "x").unwrap();
-    let id = conn
-        .request(
+    // Well inside the 15 s a held call would take to time out the wait.
+    let e = conn
+        .call(
             "invoke",
             json!({"cap": "fs", "action": "read", "args": {"path": nerve_policy::paths::to_wire(&file)}}),
+            Duration::from_secs(5),
         )
         .await
-        .unwrap();
-    let req_id = loop {
-        match conn.recv(WAIT).await {
-            Recv::Msg(Message::Notification { params, .. }) if params["name"] == "requested" => {
-                break params["data"]["id"].clone();
-            }
-            Recv::Msg(_) => {}
-            other => panic!("no approval request: {other:?}"),
-        }
-    };
-    // The owner denies it locally over the control socket.
-    let r = nerve_transport::ctl::call(
-        &node.paths().ctl_socket(),
-        "approvals.answer",
-        json!({"id": req_id, "answer": "deny"}),
-    )
-    .await;
-    assert!(r.is_ok(), "{r:?}");
-    let mut others = Vec::new();
-    let e = conn
-        .answer(id, WAIT, &mut others)
-        .await
         .unwrap()
-        .unwrap_err();
-    assert_eq!(nerve_conformance::wire::code_of(&e), "denied");
+        .expect_err("no rule allows the read");
+    assert_eq!(nerve_conformance::wire::code_of(&e), "forbidden");
+
+    let log = std::fs::read_to_string(node.paths().audit_log()).unwrap();
+    assert!(log.contains("\"forbidden\""), "{log}");
+    assert!(!log.contains("\"asked\""), "{log}");
     node.stop().await;
 }
 
@@ -251,7 +212,7 @@ async fn passes_the_conformance_node_checks() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn folders_mode_confines_commands_to_their_folders() {
+async fn folder_mode_confines_commands_to_their_folders() {
     if !nerve_sandbox::Confinement::detect().available() {
         eprintln!("skipped: Landlock is not available here");
         return;
@@ -269,13 +230,13 @@ async fn folders_mode_confines_commands_to_their_folders() {
     let file = o.paths.config_file();
     let mut cfg = NodeConfig::load(&file).unwrap();
     let p = &mut cfg.centers[0].policy;
-    p.mode = nerve_policy::Mode::Folders;
+    p.mode = nerve_policy::Mode::Folder;
     p.folders.push(nerve_policy::config::Folder {
         path: work.display().to_string(),
         access: nerve_policy::config::Access::Rw,
         execute: true,
     });
-    p.commands.never_ask.push("sh *".into());
+    p.commands.permit.push("sh *".into());
     cfg.save(&file).unwrap();
     let node = Daemon::start(o).await.unwrap();
     let mut conn = linked(&mut center).await;

@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use serde_json::{Value, json};
 
 use nerve_policy::config::{CapSetting, SettingsGrant};
-use nerve_policy::{CenterEntry, Mode, NodeConfig};
+use nerve_policy::{CenterEntry, NodeConfig};
 use nerve_proto::descriptor::{
     Action, Capability, Descriptor, Direction, Effect, EventDecl, Exposure, NodeInfo, Software,
     StreamDecl, StreamKind,
@@ -16,7 +16,7 @@ pub const SOFTWARE: &str = "nerve-node";
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Capabilities whose events need no `sub` (spec §5.1).
-pub const IMPLICIT: &[&str] = &["node", "approvals", "settings"];
+pub const IMPLICIT: &[&str] = &["node", "settings"];
 
 /// The node's name: `[node] name`, else derived from the host name.
 pub fn node_name(cfg: &NodeConfig) -> String {
@@ -285,59 +285,6 @@ fn exec_cap(exposure: Exposure) -> Capability {
     c
 }
 
-fn approvals_cap() -> Capability {
-    let mut c = cap(
-        "approvals",
-        "approvals",
-        Exposure::On,
-        "Approvals this node asks for, and their answers.",
-    );
-    let choices = json!({"enum": ["once", "session", "time", "deny"]});
-    c.actions.insert(
-        "answer".into(),
-        action(
-            Effect::Actuate,
-            "Answers an open approval.",
-            obj(
-                json!({"id": {"type": "string"}, "answer": choices,
-                       "minutes": {"type": "integer", "minimum": 1}}),
-                &["id", "answer"],
-            ),
-            obj(json!({}), &[]),
-        ),
-    );
-    c.actions.insert(
-        "list".into(),
-        action(
-            Effect::Read,
-            "The open approvals.",
-            obj(json!({}), &[]),
-            obj(json!({"approvals": {"type": "array"}}), &["approvals"]),
-        ),
-    );
-    c.events.insert(
-        "requested".into(),
-        event(
-            "The node asks for an approval.",
-            true,
-            json!({"type": "object"}),
-        ),
-    );
-    c.events.insert(
-        "resolved".into(),
-        event(
-            "An approval was answered, timed out or withdrawn.",
-            true,
-            obj(
-                json!({"id": {"type": "string"}, "answer": choices,
-                       "by": {"enum": ["center", "local", "timeout", "pause", "withdrawn"]}}),
-                &["id", "answer", "by"],
-            ),
-        ),
-    );
-    c
-}
-
 fn settings_cap() -> Capability {
     let mut c = cap(
         "settings",
@@ -396,7 +343,7 @@ fn audit_cap() -> Capability {
             obj(
                 json!({"ts": {"type": "integer"}, "cap": {"type": "string"},
                        "action": {"type": "string"}, "target": {"type": "string"},
-                       "decision": {"enum": ["allowed", "asked", "denied", "forbidden"]},
+                       "decision": {"enum": ["allowed", "forbidden"]},
                        "code": {"type": "string"}, "by": {"type": "string"},
                        "session": {"type": "string"}}),
                 &["ts", "cap", "action", "target", "decision"],
@@ -406,19 +353,13 @@ fn audit_cap() -> Capability {
     c
 }
 
-/// How a policy-governed capability is offered: its own setting, else what
-/// the mode does without asking.
-fn exposure(entry: &CenterEntry, id: &str, now_ms: u64) -> Option<Exposure> {
-    let p = &entry.policy;
-    match p.cap_setting(id, None) {
+/// How a policy-governed capability is offered: on, unless its setting says
+/// off or hidden. What a call may do is decided per call, not here.
+fn exposure(entry: &CenterEntry, id: &str) -> Option<Exposure> {
+    match entry.policy.cap_setting(id, None) {
         Some(CapSetting::Hidden) => None,
         Some(CapSetting::Off) => Some(Exposure::Off),
-        Some(CapSetting::Ask) => Some(Exposure::Ask),
-        Some(CapSetting::On) => Some(Exposure::On),
-        None => Some(match p.mode_at(now_ms) {
-            Mode::Full => Exposure::On,
-            Mode::Ask | Mode::Folders => Exposure::Ask,
-        }),
+        Some(CapSetting::On) | None => Some(Exposure::On),
     }
 }
 
@@ -426,13 +367,12 @@ fn exposure(entry: &CenterEntry, id: &str, now_ms: u64) -> Option<Exposure> {
 /// changes exactly when the view changes.
 pub fn for_center(cfg: &NodeConfig, entry: &CenterEntry, now_ms: u64) -> Descriptor {
     let mut caps = vec![node_cap()];
-    if let Some(e) = exposure(entry, "fs", now_ms) {
+    if let Some(e) = exposure(entry, "fs") {
         caps.push(fs_cap(e));
     }
-    if let Some(e) = exposure(entry, "exec", now_ms) {
+    if let Some(e) = exposure(entry, "exec") {
         caps.push(exec_cap(e));
     }
-    caps.push(approvals_cap());
     if entry.settings == SettingsGrant::Write {
         caps.push(settings_cap());
     }
@@ -460,7 +400,7 @@ pub fn for_center(cfg: &NodeConfig, entry: &CenterEntry, now_ms: u64) -> Descrip
         },
         rev: 0,
         summary: format!(
-            "{platform} machine {name}: files, shell commands and approvals, under its owner's policy (mode {}).",
+            "{platform} machine {name}: files and shell commands, under its owner's policy (mode {}).",
             entry.policy.mode_at(now_ms).as_str()
         ),
         capabilities: caps,
@@ -492,7 +432,6 @@ mod tests {
             center_id: "c1".into(),
             node_id: "n1".into(),
             settings: SettingsGrant::Off,
-            approvals: Default::default(),
             paused: false,
             revoked: false,
             unknown: false,
@@ -506,9 +445,15 @@ mod tests {
         let mut e = entry();
         let d = for_center(&cfg, &e, 0);
         let ids: Vec<&str> = d.capabilities.iter().map(|c| c.id.as_str()).collect();
-        assert_eq!(ids, ["node", "fs", "exec", "approvals", "audit"]);
+        assert_eq!(ids, ["node", "fs", "exec", "audit"]);
         assert!(nerve_proto::descriptor::summary_words(&d.summary) < 60);
-        assert_eq!(d.capability("fs").unwrap().exposure, Exposure::Ask);
+        assert_eq!(d.capability("fs").unwrap().exposure, Exposure::On);
+
+        e.policy.caps.insert("fs".into(), CapSetting::Off);
+        assert_eq!(
+            for_center(&cfg, &e, 0).capability("fs").unwrap().exposure,
+            Exposure::Off
+        );
 
         e.policy.caps.insert("exec".into(), CapSetting::Hidden);
         e.policy.caps.insert("fs.write".into(), CapSetting::Hidden);

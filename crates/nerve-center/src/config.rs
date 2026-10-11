@@ -3,7 +3,6 @@
 //! subcommands.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use clap::{Parser, ValueEnum};
 
@@ -56,9 +55,6 @@ pub struct Args {
     /// web UI.
     #[arg(long, env = "NERVE_HARNESS_TOKEN", hide_env_values = true)]
     pub harness_token: Option<String>,
-    /// Seconds a call waits for an approval before the center gives up.
-    #[arg(long, env = "NERVE_CALL_WAIT", default_value_t = 120)]
-    pub call_wait: u64,
     /// The log level on stderr (error, warn, info, debug).
     #[arg(long, env = "NERVE_LOG", default_value = "info")]
     pub log: String,
@@ -67,10 +63,6 @@ pub struct Args {
 impl Args {
     pub fn state_dir(&self) -> PathBuf {
         self.state_dir.clone().unwrap_or_else(default_state_dir)
-    }
-
-    pub fn call_wait(&self) -> Duration {
-        Duration::from_secs(self.call_wait.clamp(1, 3600))
     }
 
     pub fn ui_off(&self) -> bool {

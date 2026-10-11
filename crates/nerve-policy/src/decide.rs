@@ -1,13 +1,12 @@
 //! The decision engine: whether one call of one center may run (architecture
 //! §5.1, spec §7).
 //!
-//! The order is fixed and only ever narrows: an `off` capability is disabled;
-//! a denied path or command is forbidden; then the mode decides, and protected
-//! paths, `always_ask` commands, sense and actuate effects and tainted calls
-//! turn an allow into an ask. A grant from an earlier approval turns an ask
-//! back into an allow, except for asks only a one-off answer may settle.
+//! There are two outcomes, allowed and refused; nothing waits for an answer.
+//! The order only ever narrows: an `off` capability is disabled; a denied path
+//! or command is forbidden; then the mode and the rules allow or not. A call
+//! no mode and no rule allows is refused at once, and so is one that touches a
+//! protected path or is tainted, whatever allowed it.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use globset::{Glob, GlobMatcher};
@@ -17,44 +16,10 @@ use crate::config::{Access, CapSetting, CenterPolicy, Folder, Mode};
 use crate::paths::within;
 use crate::protected::{Protected, expand};
 
-/// An answer the owner (or the center) may give to an approval.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Choice {
-    Once,
-    Session,
-    Time,
-    Deny,
-}
-
-impl Choice {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Choice::Once => "once",
-            Choice::Session => "session",
-            Choice::Time => "time",
-            Choice::Deny => "deny",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Choice> {
-        match s {
-            "once" => Some(Choice::Once),
-            "session" => Some(Choice::Session),
-            "time" => Some(Choice::Time),
-            "deny" => Some(Choice::Deny),
-            _ => None,
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Decision {
     Allow,
-    Ask {
-        reasons: Vec<String>,
-        choices: Vec<Choice>,
-    },
-    /// Policy refuses and no approval can change it.
+    /// Policy refuses the call.
     Forbidden(String),
     /// The capability or action is off.
     Disabled(String),
@@ -78,7 +43,6 @@ pub struct Call<'a> {
     /// `targets`).
     pub command: Option<&'a str>,
     pub cwd: Option<&'a Path>,
-    pub session: Option<&'a str>,
     pub tainted: bool,
     pub now_ms: u64,
 }
@@ -88,16 +52,10 @@ pub struct Call<'a> {
 pub struct Env<'a> {
     pub home: &'a Path,
     pub protected: &'a Protected,
-    /// Whether commands run in `folders` mode can be confined (Landlock). When
-    /// they cannot, a command in an execute folder asks instead.
+    /// Whether commands run in `folder` mode can be confined (Landlock). When
+    /// they cannot, a command in an execute folder is refused.
     pub confined: bool,
 }
-
-/// Every choice.
-const ALL: [Choice; 4] = [Choice::Once, Choice::Session, Choice::Time, Choice::Deny];
-/// Commands, protected paths and tainted calls: only this one time, or no
-/// (architecture §5.4).
-const STRICT: [Choice; 2] = [Choice::Once, Choice::Deny];
 
 fn matcher(globs: &[String]) -> Vec<GlobMatcher> {
     globs
@@ -120,15 +78,12 @@ fn inside_folder<'f>(folders: &'f [Folder], path: &Path) -> Option<&'f Folder> {
         .max_by_key(|f| f.path.len())
 }
 
-/// Decides `call` under `policy`; `grants` may turn an ask into an allow.
-pub fn decide(policy: &CenterPolicy, env: &Env, call: &Call, grants: &Grants) -> Decision {
-    match policy.cap_setting(call.cap, Some(call.action)) {
-        Some(CapSetting::Off | CapSetting::Hidden) => {
-            return Decision::Disabled(format!("{}.{} is off", call.cap, call.action));
-        }
-        Some(CapSetting::Ask) | Some(CapSetting::On) | None => {}
+/// Decides `call` under `policy`.
+pub fn decide(policy: &CenterPolicy, env: &Env, call: &Call) -> Decision {
+    let setting = policy.cap_setting(call.cap, Some(call.action));
+    if matches!(setting, Some(CapSetting::Off | CapSetting::Hidden)) {
+        return Decision::Disabled(format!("{}.{} is off", call.cap, call.action));
     }
-    let cap_ask = policy.cap_setting(call.cap, Some(call.action)) == Some(CapSetting::Ask);
 
     // Denied paths and commands: forbidden in every mode.
     let deny: Vec<PathBuf> = policy
@@ -157,26 +112,31 @@ pub fn decide(policy: &CenterPolicy, env: &Env, call: &Call, grants: &Grants) ->
 
     let mode = policy.mode_at(call.now_ms);
     let mut reasons = Vec::new();
-    let mut strict = false;
 
-    // What the mode says.
+    // What the mode, or an explicit `on`, allows.
     let mut allowed = match call.effect {
+        // No mode allows these; only the owner's `on` does.
         Effect::Sense | Effect::Actuate => {
-            reasons.push(format!("{} asks in every mode", call.effect.as_str()));
-            false
+            if setting != Some(CapSetting::On) {
+                reasons.push(format!(
+                    "{} is allowed only where {}.{} is set to on",
+                    call.effect.as_str(),
+                    call.cap,
+                    call.action
+                ));
+            }
+            setting == Some(CapSetting::On)
         }
         Effect::Read | Effect::Write => match mode {
-            Mode::Ask => false,
-            Mode::Full => true,
-            Mode::Folders => call.targets.iter().all(|t| {
+            Mode::User => true,
+            Mode::Folder => call.targets.iter().all(|t| {
                 inside_folder(&policy.folders, &t.path)
                     .is_some_and(|f| !t.write || f.access == Access::Rw)
             }),
         },
         Effect::Execute => match mode {
-            Mode::Ask => false,
-            Mode::Full => true,
-            Mode::Folders => {
+            Mode::User => true,
+            Mode::Folder => {
                 let in_exec = call
                     .cwd
                     .and_then(|c| inside_folder(&policy.folders, c))
@@ -189,36 +149,24 @@ pub fn decide(policy: &CenterPolicy, env: &Env, call: &Call, grants: &Grants) ->
         },
     };
     if !allowed && reasons.is_empty() {
-        reasons.push(match (mode, call.effect) {
-            (Mode::Ask, _) => format!("mode ask: {} asks", call.effect.as_str()),
-            (_, Effect::Execute) => "the working directory is not in an execute folder".into(),
-            (_, Effect::Write) => "outside the read-write folders".into(),
+        reasons.push(match call.effect {
+            Effect::Execute => "the working directory is not in an execute folder".into(),
+            Effect::Write => "outside the read-write folders".into(),
             _ => "outside the folders".into(),
         });
     }
-    if call.effect == Effect::Execute {
-        // Commands are only ever approved one at a time.
-        strict = true;
-        if let Some(cmd) = call.command {
-            if matches(&rules.always_ask, cmd) {
-                allowed = false;
-                reasons.push("the command is on the always-ask list".into());
-            } else if matches(&rules.never_ask, cmd) && !call.tainted {
-                allowed = true;
-                reasons.clear();
-            }
-        }
-    }
-    if cap_ask && allowed {
-        allowed = false;
-        reasons.push(format!("{}.{} is set to ask", call.cap, call.action));
+    if call.effect == Effect::Execute
+        && !call.tainted
+        && call.command.is_some_and(|cmd| matches(&rules.permit, cmd))
+    {
+        allowed = true;
+        reasons.clear();
     }
 
     // Narrowing that holds in every mode.
     for t in call.targets {
         if let Some(entry) = env.protected.check(&t.path, t.write, &policy.folders) {
             allowed = false;
-            strict = true;
             reasons.push(format!(
                 "{} is protected ({})",
                 t.path.display(),
@@ -228,130 +176,18 @@ pub fn decide(policy: &CenterPolicy, env: &Env, call: &Call, grants: &Grants) ->
             && let Some(tc) = env.protected.tool_config(&t.path)
         {
             allowed = false;
-            strict = true;
             reasons.push(format!("writes to {tc} run code later"));
         }
     }
     if call.tainted && matches!(call.effect, Effect::Write | Effect::Execute) && allowed {
         allowed = false;
-        strict = true;
         reasons.push("the call is tainted".into());
     }
 
     if allowed {
-        return Decision::Allow;
-    }
-    if !strict && grants.covers(call) {
-        return Decision::Allow;
-    }
-    Decision::Ask {
-        reasons,
-        choices: if strict {
-            STRICT.to_vec()
-        } else {
-            ALL.to_vec()
-        },
-    }
-}
-
-/// The scope a grant covers: the action, and for paths the folder the call
-/// touched (the parent of a file, the folder itself for listings).
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Scope {
-    pub cap: String,
-    pub action: String,
-    pub dirs: BTreeSet<PathBuf>,
-}
-
-impl Scope {
-    pub fn of(call: &Call) -> Scope {
-        let dirs = call
-            .targets
-            .iter()
-            .map(|t| {
-                if t.path.is_dir() {
-                    t.path.clone()
-                } else {
-                    t.path.parent().unwrap_or(&t.path).to_path_buf()
-                }
-            })
-            .collect();
-        Scope {
-            cap: call.cap.into(),
-            action: call.action.into(),
-            dirs,
-        }
-    }
-
-    fn covers(&self, call: &Call) -> bool {
-        self.cap == call.cap
-            && self.action == call.action
-            && call
-                .targets
-                .iter()
-                .all(|t| self.dirs.iter().any(|d| within(&t.path, d)))
-    }
-}
-
-#[derive(Debug, Clone)]
-struct Grant {
-    scope: Scope,
-    /// `Some` for a session grant.
-    session: Option<String>,
-    until_ms: u64,
-}
-
-/// What approvals answered with `session` or `time` allow from then on, for
-/// one center.
-#[derive(Debug, Clone, Default)]
-pub struct Grants {
-    list: Vec<Grant>,
-    now_ms: u64,
-}
-
-impl Grants {
-    /// Remembers a `session` answer (until the session ends, at most
-    /// `until_ms`) or a `time` answer (every session, until `until_ms`).
-    pub fn add(&mut self, scope: Scope, session: Option<String>, until_ms: u64) {
-        self.list.push(Grant {
-            scope,
-            session,
-            until_ms,
-        });
-    }
-
-    /// Drops what expired; the engine sees the grants as of `now_ms`.
-    pub fn at(&mut self, now_ms: u64) -> &Grants {
-        self.list.retain(|g| g.until_ms > now_ms);
-        self.now_ms = now_ms;
-        self
-    }
-
-    pub fn end_session(&mut self, session: &str) {
-        self.list.retain(|g| g.session.as_deref() != Some(session));
-    }
-
-    pub fn clear(&mut self) {
-        self.list.clear();
-    }
-
-    pub fn len(&self) -> usize {
-        self.list.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.list.is_empty()
-    }
-
-    fn covers(&self, call: &Call) -> bool {
-        self.list.iter().any(|g| {
-            g.until_ms > call.now_ms
-                && match &g.session {
-                    Some(s) => call.session == Some(s.as_str()),
-                    None => true,
-                }
-                && g.scope.covers(call)
-        })
+        Decision::Allow
+    } else {
+        Decision::Forbidden(reasons.join("; "))
     }
 }
 
@@ -365,7 +201,7 @@ mod tests {
     fn policy(mode: Mode) -> CenterPolicy {
         CenterPolicy {
             mode,
-            full_until: (mode == Mode::Full).then_some(NOW + 1000),
+            user_until: (mode == Mode::User).then_some(NOW + 1000),
             folders: vec![
                 Folder {
                     path: "/w/ro".into(),
@@ -380,9 +216,8 @@ mod tests {
             ],
             deny: vec!["/w/rw/secret".into()],
             commands: CommandRules {
-                deny: vec!["rm -rf /*".into()],
-                always_ask: vec!["git push*".into()],
-                never_ask: vec!["ls*".into()],
+                deny: vec!["rm -rf /*".into(), "git push*".into()],
+                permit: vec!["ls*".into()],
                 ..Default::default()
             },
             ..Default::default()
@@ -425,7 +260,6 @@ mod tests {
             targets,
             command,
             cwd: command.and(targets.first().map(|t| t.path.as_path())),
-            session: Some("s1"),
             tainted: false,
             now_ms: NOW,
         }
@@ -441,9 +275,7 @@ mod tests {
     fn short(d: &Decision) -> &'static str {
         match d {
             Decision::Allow => "allow",
-            Decision::Ask { choices, .. } if choices.len() == 2 => "ask1",
-            Decision::Ask { .. } => "ask",
-            Decision::Forbidden(_) => "forbidden",
+            Decision::Forbidden(_) => "refused",
             Decision::Disabled(_) => "disabled",
         }
     }
@@ -452,7 +284,6 @@ mod tests {
     fn mode_matrix() {
         let x = T::new();
         let env = x.env(true);
-        let g = Grants::default();
         let inside_ro = t("/w/ro/a", false);
         let inside_rw_w = t("/w/rw/a", true);
         let ro_w = t("/w/ro/a", true);
@@ -465,87 +296,118 @@ mod tests {
         // (mode, effect, targets, command, expected)
         type Case<'a> = (Mode, Effect, &'a [Target], Option<&'a str>, &'a str);
         let cases: Vec<Case> = vec![
-            (Mode::Ask, Effect::Read, &inside_ro, None, "ask"),
-            (Mode::Ask, Effect::Write, &inside_rw_w, None, "ask"),
-            (Mode::Ask, Effect::Execute, &exec_in, Some("make"), "ask1"),
-            (Mode::Ask, Effect::Sense, &[], None, "ask"),
-            (Mode::Ask, Effect::Actuate, &[], None, "ask"),
-            (Mode::Folders, Effect::Read, &inside_ro, None, "allow"),
-            (Mode::Folders, Effect::Read, &outside, None, "ask"),
-            (Mode::Folders, Effect::Write, &inside_rw_w, None, "allow"),
-            (Mode::Folders, Effect::Write, &ro_w, None, "ask"),
+            (Mode::Folder, Effect::Read, &inside_ro, None, "allow"),
+            (Mode::Folder, Effect::Read, &outside, None, "refused"),
+            (Mode::Folder, Effect::Write, &inside_rw_w, None, "allow"),
+            (Mode::Folder, Effect::Write, &ro_w, None, "refused"),
             (
-                Mode::Folders,
+                Mode::Folder,
                 Effect::Execute,
                 &exec_in,
                 Some("make"),
                 "allow",
             ),
             (
-                Mode::Folders,
+                Mode::Folder,
                 Effect::Execute,
                 &exec_ro,
                 Some("make"),
-                "ask1",
+                "refused",
             ),
-            (Mode::Folders, Effect::Sense, &[], None, "ask"),
-            (Mode::Folders, Effect::Actuate, &[], None, "ask"),
-            (Mode::Full, Effect::Read, &outside, None, "allow"),
-            (Mode::Full, Effect::Write, &ro_w, None, "allow"),
-            (Mode::Full, Effect::Execute, &exec_ro, Some("make"), "allow"),
-            (Mode::Full, Effect::Sense, &[], None, "ask"),
-            (Mode::Full, Effect::Actuate, &[], None, "ask"),
+            (Mode::Folder, Effect::Sense, &[], None, "refused"),
+            (Mode::Folder, Effect::Actuate, &[], None, "refused"),
+            (Mode::User, Effect::Read, &outside, None, "allow"),
+            (Mode::User, Effect::Write, &ro_w, None, "allow"),
+            (Mode::User, Effect::Execute, &exec_ro, Some("make"), "allow"),
+            (Mode::User, Effect::Sense, &[], None, "refused"),
+            (Mode::User, Effect::Actuate, &[], None, "refused"),
             // Command rules.
             (
-                Mode::Full,
+                Mode::User,
                 Effect::Execute,
                 &exec_in,
                 Some("git push origin"),
-                "ask1",
+                "refused",
             ),
             (
-                Mode::Ask,
+                Mode::Folder,
                 Effect::Execute,
                 &exec_ro,
                 Some("ls -la"),
                 "allow",
             ),
             (
-                Mode::Full,
+                Mode::User,
                 Effect::Execute,
                 &exec_in,
                 Some("rm -rf /home"),
-                "forbidden",
+                "refused",
             ),
             // Denied paths, in every mode.
-            (Mode::Full, Effect::Read, &denied, None, "forbidden"),
-            // Protected paths ask once, also in full.
-            (Mode::Full, Effect::Read, &key, None, "ask1"),
-            (Mode::Full, Effect::Write, &hook, None, "ask1"),
+            (Mode::User, Effect::Read, &denied, None, "refused"),
+            // Protected paths are refused, also in user mode.
+            (Mode::User, Effect::Read, &key, None, "refused"),
+            (Mode::User, Effect::Write, &hook, None, "refused"),
         ];
         for (mode, effect, targets, cmd, want) in cases {
             let p = policy(mode);
-            let d = decide(&p, &env, &call(effect, targets, cmd), &g);
+            let d = decide(&p, &env, &call(effect, targets, cmd));
             assert_eq!(
                 short(&d),
                 want,
                 "{mode:?} {effect:?} {targets:?} {cmd:?}: {d:?}"
             );
         }
-        // Folders mode without confinement asks for commands.
+        // Folder mode without confinement refuses commands.
         let d = decide(
-            &policy(Mode::Folders),
+            &policy(Mode::Folder),
             &x.env(false),
             &call(Effect::Execute, &exec_in, Some("make")),
-            &g,
         );
-        assert_eq!(short(&d), "ask1");
-        // Expired full is folders.
-        let mut p = policy(Mode::Full);
-        p.full_until = Some(NOW);
+        assert_eq!(short(&d), "refused");
+        // Expired user mode is folder mode.
+        let mut p = policy(Mode::User);
+        p.user_until = Some(NOW);
         assert_eq!(
-            short(&decide(&p, &env, &call(Effect::Read, &outside, None), &g)),
-            "ask"
+            short(&decide(&p, &env, &call(Effect::Read, &outside, None))),
+            "refused"
+        );
+    }
+
+    #[test]
+    fn a_call_no_rule_allows_is_refused_at_once() {
+        let x = T::new();
+        let env = x.env(true);
+        // The default policy has no folder and no rule: nothing is allowed.
+        let p = CenterPolicy::default();
+        assert_eq!(p.mode, Mode::Folder);
+        let r = t("/w/rw/a", false);
+        let w = t("/w/rw/a", true);
+        let e = t("/w/rw", false);
+        for c in [
+            call(Effect::Read, &r, None),
+            call(Effect::Write, &w, None),
+            call(Effect::Execute, &e, Some("make")),
+            call(Effect::Sense, &[], None),
+            call(Effect::Actuate, &[], None),
+        ] {
+            let d = decide(&p, &env, &c);
+            assert!(
+                matches!(&d, Decision::Forbidden(why) if !why.is_empty()),
+                "{:?}: {d:?}",
+                c.effect
+            );
+        }
+        // One explicit allow changes only what it names.
+        let mut p = CenterPolicy::default();
+        p.commands.permit = vec!["make".into()];
+        assert_eq!(
+            short(&decide(&p, &env, &call(Effect::Execute, &e, Some("make")))),
+            "allow"
+        );
+        assert_eq!(
+            short(&decide(&p, &env, &call(Effect::Execute, &e, Some("cargo")))),
+            "refused"
         );
     }
 
@@ -553,85 +415,68 @@ mod tests {
     fn caps_settings() {
         let x = T::new();
         let env = x.env(true);
-        let g = Grants::default();
         let inside = t("/w/ro/a", false);
-        let mut p = policy(Mode::Folders);
+        let mut p = policy(Mode::Folder);
         p.caps.insert("fs".into(), CapSetting::Off);
         assert_eq!(
-            short(&decide(&p, &env, &call(Effect::Read, &inside, None), &g)),
+            short(&decide(&p, &env, &call(Effect::Read, &inside, None))),
             "disabled"
         );
-        p.caps.insert("fs.read".into(), CapSetting::Ask);
+        // An action's own setting wins over its capability's.
+        p.caps.insert("fs.read".into(), CapSetting::On);
         assert_eq!(
-            short(&decide(&p, &env, &call(Effect::Read, &inside, None), &g)),
-            "ask"
+            short(&decide(&p, &env, &call(Effect::Read, &inside, None))),
+            "allow"
         );
+        // `on` does not widen what the mode refuses.
+        let outside = t("/elsewhere/a", false);
+        assert_eq!(
+            short(&decide(&p, &env, &call(Effect::Read, &outside, None))),
+            "refused"
+        );
+    }
+
+    #[test]
+    fn sense_and_actuate_need_an_explicit_on() {
+        let x = T::new();
+        let env = x.env(true);
+        for effect in [Effect::Sense, Effect::Actuate] {
+            for mode in [Mode::Folder, Mode::User] {
+                let mut p = policy(mode);
+                let mut c = call(effect, &[], None);
+                c.cap = "camera";
+                c.action = "snap";
+                assert_eq!(short(&decide(&p, &env, &c)), "refused");
+                p.caps.insert("camera".into(), CapSetting::On);
+                assert_eq!(short(&decide(&p, &env, &c)), "allow");
+                // Taint does not narrow reads or senses, only writes and commands.
+                c.tainted = true;
+                assert_eq!(short(&decide(&p, &env, &c)), "allow");
+            }
+        }
     }
 
     #[test]
     fn taint_narrows() {
         let x = T::new();
         let env = x.env(true);
-        let g = Grants::default();
-        let p = policy(Mode::Full);
+        let p = policy(Mode::User);
         let w = t("/w/rw/a", true);
         let mut c = call(Effect::Write, &w, None);
         c.tainted = true;
-        assert_eq!(short(&decide(&p, &env, &c, &g)), "ask1");
+        assert_eq!(short(&decide(&p, &env, &c)), "refused");
         let e = t("/w/rw", false);
+        let mut c = call(Effect::Execute, &e, Some("make"));
+        c.tainted = true;
+        assert_eq!(short(&decide(&p, &env, &c)), "refused");
+        // A permitted command is no exception.
         let mut c = call(Effect::Execute, &e, Some("ls"));
         c.tainted = true;
-        assert_eq!(short(&decide(&p, &env, &c, &g)), "ask1");
+        assert_eq!(short(&decide(&p, &env, &c)), "refused");
         // Reads are not narrowed by taint.
         let r = t("/x/a", false);
         let mut c = call(Effect::Read, &r, None);
         c.tainted = true;
-        assert_eq!(short(&decide(&p, &env, &c, &g)), "allow");
-    }
-
-    #[test]
-    fn grants_by_session_and_time() {
-        let x = T::new();
-        let env = x.env(true);
-        let p = policy(Mode::Ask);
-        let a = t("/x/d/a", false);
-        let c = call(Effect::Read, &a, None);
-        let mut g = Grants::default();
-        g.add(Scope::of(&c), Some("s1".into()), NOW + 10);
-        assert_eq!(short(&decide(&p, &env, &c, g.at(NOW))), "allow");
-        // Another file in the same folder, same session.
-        let b = t("/x/d/b", false);
-        assert_eq!(
-            short(&decide(&p, &env, &call(Effect::Read, &b, None), g.at(NOW))),
-            "allow"
-        );
-        // Another session, another folder, another action: ask.
-        let mut other = call(Effect::Read, &a, None);
-        other.session = Some("s2");
-        assert_eq!(short(&decide(&p, &env, &other, g.at(NOW))), "ask");
-        let elsewhere = t("/y/a", false);
-        assert_eq!(
-            short(&decide(
-                &p,
-                &env,
-                &call(Effect::Read, &elsewhere, None),
-                g.at(NOW)
-            )),
-            "ask"
-        );
-        g.end_session("s1");
-        assert_eq!(short(&decide(&p, &env, &c, g.at(NOW))), "ask");
-        // A time grant holds in every session until it expires.
-        g.add(Scope::of(&c), None, NOW + 10);
-        assert_eq!(short(&decide(&p, &env, &other, g.at(NOW))), "allow");
-        let mut late = other.clone();
-        late.now_ms = NOW + 10;
-        assert_eq!(short(&decide(&p, &env, &late, g.at(NOW + 10))), "ask");
-        assert!(g.is_empty());
-        // Grants never settle a protected path.
-        let k = t("/h/.ssh/k", false);
-        let ck = call(Effect::Read, &k, None);
-        g.add(Scope::of(&ck), None, NOW + 10);
-        assert_eq!(short(&decide(&p, &env, &ck, g.at(NOW))), "ask1");
+        assert_eq!(short(&decide(&p, &env, &c)), "allow");
     }
 }

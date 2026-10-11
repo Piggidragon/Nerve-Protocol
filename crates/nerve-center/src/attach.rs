@@ -1,7 +1,7 @@
 //! One center per state folder. The first `nerve-center` takes the lock and owns
 //! the center; a second one started by another harness on the same state
 //! folder attaches to it over `<state>/run/harness.sock` and only relays its
-//! stdio, so both harnesses share the nodes, links and approvals.
+//! stdio, so both harnesses share the nodes and links.
 //!
 //! The socket is mode 0600 in a 0700 folder, and the owner also checks the
 //! peer's uid. Windows has neither the lock nor the socket in 0.0.1: a second

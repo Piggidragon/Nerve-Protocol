@@ -12,8 +12,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-/// The longest `full` mode a center may set: 8 hours (architecture §5.1).
-pub const FULL_MAX_MS: u64 = 8 * 3600 * 1000;
+/// The longest `user` mode a center may set: 8 hours (architecture §5.1).
+pub const USER_MAX_MS: u64 = 8 * 3600 * 1000;
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -130,16 +130,6 @@ pub enum SettingsGrant {
     Write,
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum ApprovalsGrant {
-    /// The center and the node's owner may both answer.
-    #[default]
-    Both,
-    /// Only the owner on the node may answer.
-    Local,
-}
-
 /// One paired center.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -154,8 +144,6 @@ pub struct CenterEntry {
     pub node_id: String,
     #[serde(default)]
     pub settings: SettingsGrant,
-    #[serde(default)]
-    pub approvals: ApprovalsGrant,
     /// The node does not dial while paused (the center may pause, only the
     /// owner may unpause).
     #[serde(default, skip_serializing_if = "is_false")]
@@ -177,29 +165,27 @@ impl CenterEntry {
     }
 }
 
-/// The access modes (architecture §5.1).
-///
-/// Open point p04: the architecture names the modes `ask`, `folders` and
-/// `full`; issue p04 asks whether they should be named Folder/User/Sudo
-/// instead. Not decided; 0.0.1 keeps the architecture's names.
+/// The permission modes (architecture §5.1). A call no mode and no rule
+/// allows is refused at once; nothing waits for an answer.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
-    /// Every read, write and command asks.
+    /// Allowed inside the folders by their access, refused outside. With no
+    /// folders nothing is allowed: the default.
     #[default]
-    Ask,
-    /// Allowed inside the folders by their access, asks outside.
-    Folders,
-    /// Allowed everywhere except protected and denied paths, until `full_until`.
-    Full,
+    #[serde(alias = "folders")]
+    Folder,
+    /// Allowed everywhere except protected and denied paths, until
+    /// `user_until`.
+    #[serde(alias = "full")]
+    User,
 }
 
 impl Mode {
     pub fn as_str(self) -> &'static str {
         match self {
-            Mode::Ask => "ask",
-            Mode::Folders => "folders",
-            Mode::Full => "full",
+            Mode::Folder => "folder",
+            Mode::User => "user",
         }
     }
 }
@@ -228,8 +214,10 @@ pub struct Folder {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CapSetting {
+    /// Allows sense and actuate actions, which no mode allows; for the other
+    /// actions the mode still decides.
     On,
-    Ask,
+    /// Refused.
     Off,
     /// Absent from this center's descriptor.
     Hidden,
@@ -239,7 +227,6 @@ impl CapSetting {
     pub fn parse(s: &str) -> Option<CapSetting> {
         match s {
             "on" => Some(CapSetting::On),
-            "ask" => Some(CapSetting::Ask),
             "off" => Some(CapSetting::Off),
             "hidden" => Some(CapSetting::Hidden),
             _ => None,
@@ -268,57 +255,9 @@ pub struct CommandRules {
     /// When not empty, only matching commands run at all.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
-    /// Ask even where the mode would allow.
+    /// Run in any mode, unless the call is tainted.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub always_ask: Vec<String>,
-    /// Run without asking (unless the call is tainted).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub never_ask: Vec<String>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum OnTimeout {
-    #[default]
-    Deny,
-    /// Allow this one call.
-    Allow,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct ApprovalTiming {
-    #[serde(default = "d_timeout")]
-    pub timeout_s: u64,
-    #[serde(default)]
-    pub on_timeout: OnTimeout,
-    /// What a `session` answer is remembered for at most.
-    #[serde(default = "d_remember")]
-    pub remember_minutes: u32,
-    /// The longest `time` answer.
-    #[serde(default = "d_max_minutes")]
-    pub max_minutes: u32,
-}
-
-fn d_timeout() -> u64 {
-    120
-}
-fn d_remember() -> u32 {
-    480
-}
-fn d_max_minutes() -> u32 {
-    480
-}
-
-impl Default for ApprovalTiming {
-    fn default() -> ApprovalTiming {
-        ApprovalTiming {
-            timeout_s: d_timeout(),
-            on_timeout: OnTimeout::default(),
-            remember_minutes: d_remember(),
-            max_minutes: d_max_minutes(),
-        }
-    }
+    pub permit: Vec<String>,
 }
 
 /// What one center may do on this node.
@@ -327,10 +266,10 @@ impl Default for ApprovalTiming {
 pub struct CenterPolicy {
     #[serde(default)]
     pub mode: Mode,
-    /// Milliseconds since the Unix epoch at which `full` falls back to
-    /// `folders`. Required with `full`.
+    /// Milliseconds since the Unix epoch at which `user` falls back to
+    /// `folder`. Required with `user`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub full_until: Option<u64>,
+    pub user_until: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub folders: Vec<Folder>,
     /// `cap` or `cap.action` → setting; `cap.action` wins over `cap`.
@@ -343,15 +282,13 @@ pub struct CenterPolicy {
     pub deny: Vec<String>,
     #[serde(default)]
     pub commands: CommandRules,
-    #[serde(default)]
-    pub approvals: ApprovalTiming,
 }
 
 impl CenterPolicy {
-    /// The mode in force at `now_ms`: an expired `full` is `folders`.
+    /// The mode in force at `now_ms`: an expired `user` is `folder`.
     pub fn mode_at(&self, now_ms: u64) -> Mode {
         match self.mode {
-            Mode::Full if self.full_until.is_none_or(|u| u <= now_ms) => Mode::Folders,
+            Mode::User if self.user_until.is_none_or(|u| u <= now_ms) => Mode::Folder,
             m => m,
         }
     }
@@ -376,9 +313,12 @@ pub struct CenterDocument {
 }
 
 impl NodeConfig {
-    /// Parses and checks `node.toml`.
+    /// Parses and checks `node.toml`. Files written while a call could still
+    /// ask the owner are read as the model without asking: see [`migrate`].
     pub fn parse(text: &str) -> Result<NodeConfig, String> {
-        let c: NodeConfig = toml::from_str(text).map_err(|e| e.to_string())?;
+        let mut table: toml::Table = toml::from_str(text).map_err(|e| e.to_string())?;
+        migrate(&mut table);
+        let c: NodeConfig = table.try_into().map_err(|e| e.to_string())?;
         c.validate()?;
         Ok(c)
     }
@@ -457,6 +397,67 @@ impl NodeConfig {
     }
 }
 
+/// Reads an older `node.toml` as today's model. Nothing waits for an answer
+/// any more, so everything that asked now refuses, never allows:
+///
+/// - mode `ask` becomes mode `folder` without its folders (the folders of an
+///   `ask` center were not in force, and must not start to be);
+/// - a capability set to `ask` becomes `off`;
+/// - command rules `always_ask` join `deny`, and `never_ask` is `permit`;
+/// - the approvals grant and the approvals timing are dropped;
+/// - the modes `folders` and `full` are `folder` and `user` (`full_until` is
+///   `user_until`).
+fn migrate(doc: &mut toml::Table) {
+    use toml::Value;
+    let Some(Value::Array(centers)) = doc.get_mut("center") else {
+        return;
+    };
+    for c in centers.iter_mut().filter_map(Value::as_table_mut) {
+        c.remove("approvals");
+        let Some(Value::Table(p)) = c.get_mut("policy") else {
+            continue;
+        };
+        p.remove("approvals");
+        match p.get("mode").and_then(Value::as_str) {
+            Some("ask") => {
+                p.insert("mode".into(), "folder".into());
+                p.remove("folders");
+                p.remove("full_until");
+            }
+            Some("folders") => {
+                p.insert("mode".into(), "folder".into());
+            }
+            Some("full") => {
+                p.insert("mode".into(), "user".into());
+            }
+            _ => {}
+        }
+        if let Some(until) = p.remove("full_until") {
+            p.insert("user_until".into(), until);
+        }
+        if let Some(Value::Table(caps)) = p.get_mut("caps") {
+            for (_, v) in caps.iter_mut() {
+                if v.as_str() == Some("ask") {
+                    *v = "off".into();
+                }
+            }
+        }
+        if let Some(Value::Table(rules)) = p.get_mut("commands") {
+            if let Some(Value::Array(ask)) = rules.remove("always_ask") {
+                match rules.get_mut("deny") {
+                    Some(Value::Array(deny)) => deny.extend(ask),
+                    _ => {
+                        rules.insert("deny".into(), Value::Array(ask));
+                    }
+                }
+            }
+            if let Some(never) = rules.remove("never_ask") {
+                rules.insert("permit".into(), never);
+            }
+        }
+    }
+}
+
 /// A center's name as the CLI and the key file name use it.
 pub fn valid_center_name(s: &str) -> bool {
     (1..=64).contains(&s.len())
@@ -466,8 +467,8 @@ pub fn valid_center_name(s: &str) -> bool {
 
 impl CenterPolicy {
     pub fn validate(&self) -> Result<(), String> {
-        if self.mode == Mode::Full && self.full_until.is_none() {
-            return Err("mode full needs full_until".into());
+        if self.mode == Mode::User && self.user_until.is_none() {
+            return Err("mode user needs user_until".into());
         }
         for f in &self.folders {
             if !Path::new(&f.path).is_absolute() {
@@ -499,21 +500,8 @@ impl CenterPolicy {
             }
         }
         let c = &self.commands;
-        for g in c
-            .deny
-            .iter()
-            .chain(&c.allow)
-            .chain(&c.always_ask)
-            .chain(&c.never_ask)
-        {
+        for g in c.deny.iter().chain(&c.allow).chain(&c.permit) {
             globset::Glob::new(g).map_err(|e| format!("command rule {g:?}: {e}"))?;
-        }
-        let a = &self.approvals;
-        if a.timeout_s == 0 || a.timeout_s > 24 * 3600 {
-            return Err("approvals.timeout_s must be 1 to 86400".into());
-        }
-        if a.max_minutes == 0 {
-            return Err("approvals.max_minutes must be at least 1".into());
         }
         Ok(())
     }
@@ -544,20 +532,16 @@ pin = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
 center_id = "c1"
 node_id = "n1"
 settings = "write"
-approvals = "local"
 
 [center.policy]
-mode = "folders"
+mode = "folder"
 folders = [{ path = "FOLDER", access = "rw", execute = true }]
 deny = ["~/private"]
-caps = { exec = "ask", "fs.write" = "off" }
+caps = { exec = "on", "fs.write" = "off" }
 
 [center.policy.commands]
 deny = ["rm -rf *"]
-
-[center.policy.approvals]
-timeout_s = 30
-on_timeout = "allow"
+permit = ["git status"]
 "#;
 
     /// An absolute folder on the platform the tests run on.
@@ -578,10 +562,8 @@ on_timeout = "allow"
         assert_eq!(c.limits.output_cap_bytes, 16 * 1024 * 1024);
         let home = c.center("home").unwrap();
         assert_eq!(home.settings, SettingsGrant::Write);
-        assert_eq!(home.approvals, ApprovalsGrant::Local);
-        assert_eq!(home.policy.mode, Mode::Folders);
-        assert_eq!(home.policy.approvals.on_timeout, OnTimeout::Allow);
-        assert_eq!(home.policy.approvals.max_minutes, 480);
+        assert_eq!(home.policy.mode, Mode::Folder);
+        assert_eq!(home.policy.commands.permit, ["git status"]);
         assert_eq!(
             home.policy.cap_setting("fs", Some("write")),
             Some(CapSetting::Off)
@@ -589,7 +571,7 @@ on_timeout = "allow"
         assert_eq!(home.policy.cap_setting("fs", Some("read")), None);
         assert_eq!(
             home.policy.cap_setting("exec", Some("run")),
-            Some(CapSetting::Ask)
+            Some(CapSetting::On)
         );
         let again = NodeConfig::parse(&c.to_toml()).unwrap();
         assert_eq!(again, c);
@@ -614,9 +596,9 @@ on_timeout = "allow"
                 &format!("{extra}\n[center.policy.commands]"),
             )
         };
-        assert!(NodeConfig::parse(&with("full_until = 1\nfoo = 1")).is_err());
-        let full = sample().replace("mode = \"folders\"", "mode = \"full\"");
-        assert!(NodeConfig::parse(&full).unwrap_err().contains("full_until"));
+        assert!(NodeConfig::parse(&with("user_until = 1\nfoo = 1")).is_err());
+        let user = sample().replace("mode = \"folder\"", "mode = \"user\"");
+        assert!(NodeConfig::parse(&user).unwrap_err().contains("user_until"));
         let rel = sample().replace(FOLDER, "proj");
         assert!(NodeConfig::parse(&rel).unwrap_err().contains("absolute"));
         let sample = sample();
@@ -628,14 +610,84 @@ on_timeout = "allow"
     }
 
     #[test]
-    fn expired_full_is_folders() {
+    fn expired_user_is_folder() {
         let p = CenterPolicy {
-            mode: Mode::Full,
-            full_until: Some(1000),
+            mode: Mode::User,
+            user_until: Some(1000),
             ..Default::default()
         };
-        assert_eq!(p.mode_at(999), Mode::Full);
-        assert_eq!(p.mode_at(1000), Mode::Folders);
+        assert_eq!(p.mode_at(999), Mode::User);
+        assert_eq!(p.mode_at(1000), Mode::Folder);
+    }
+
+    /// A file written while a call could ask the owner.
+    fn old_file(mode: &str, extra: &str) -> String {
+        format!(
+            r#"
+[[center]]
+name = "home"
+url = "https://center.example:8443"
+center_id = "c1"
+node_id = "n1"
+approvals = "both"
+
+[center.policy]
+mode = "{mode}"
+{extra}
+folders = [{{ path = "{FOLDER}", access = "rw", execute = true }}]
+caps = {{ exec = "ask", fs = "on" }}
+
+[center.policy.commands]
+deny = ["rm -rf *"]
+always_ask = ["git push*"]
+never_ask = ["ls*"]
+
+[center.policy.approvals]
+timeout_s = 30
+on_timeout = "allow"
+"#
+        )
+    }
+
+    #[test]
+    fn an_old_ask_value_loads_as_deny() {
+        let c = NodeConfig::parse(&old_file("ask", "")).unwrap();
+        let p = &c.center("home").unwrap().policy;
+        // Mode ask allowed nothing; it must not start to allow the folders.
+        assert_eq!(p.mode, Mode::Folder);
+        assert!(p.folders.is_empty());
+        // A capability set to ask is refused.
+        assert_eq!(p.cap_setting("exec", None), Some(CapSetting::Off));
+        assert_eq!(p.cap_setting("fs", None), Some(CapSetting::On));
+        // always_ask is a deny, never_ask the permit list; approvals are gone.
+        assert_eq!(p.commands.deny, ["rm -rf *", "git push*"]);
+        assert_eq!(p.commands.permit, ["ls*"]);
+        let text = c.to_toml();
+        assert!(
+            !text.contains("ask") && !text.contains("approvals"),
+            "{text}"
+        );
+        assert_eq!(NodeConfig::parse(&text).unwrap(), c);
+    }
+
+    #[test]
+    fn old_mode_names_load_as_the_new_ones() {
+        let c = NodeConfig::parse(&old_file("folders", "")).unwrap();
+        let p = &c.center("home").unwrap().policy;
+        assert_eq!(p.mode, Mode::Folder);
+        assert_eq!(p.folders.len(), 1);
+        let c = NodeConfig::parse(&old_file("full", "full_until = 5")).unwrap();
+        let p = &c.center("home").unwrap().policy;
+        assert_eq!((p.mode, p.user_until), (Mode::User, Some(5)));
+    }
+
+    #[test]
+    fn ask_is_not_a_value_of_new_input() {
+        let ask = serde_json::json!({"mode": "ask"});
+        assert!(serde_json::from_value::<CenterPolicy>(ask).is_err());
+        let cap = serde_json::json!({"caps": {"fs": "ask"}});
+        assert!(serde_json::from_value::<CenterPolicy>(cap).is_err());
+        assert_eq!(CapSetting::parse("ask"), None);
     }
 
     #[test]

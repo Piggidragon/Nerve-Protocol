@@ -1,7 +1,7 @@
 //! Protected paths: places whose content gives away secrets or runs code later.
 //!
-//! They ask in every mode, also in `full`, unless the
-//! owner grants them by name: a folder grant at or inside the protected path, or an
+//! They are refused in every mode, also in `user`, unless the
+//! owner releases them by name: a folder grant at or inside the protected path, or an
 //! entry in `protected.allow`. A grant of a whole home does not release `~/.ssh`.
 //! Matching ignores case, so a case-insensitive filesystem cannot slip `~/.SSH` past.
 
@@ -169,7 +169,7 @@ const SYSTEM: &[&str] = &[
 #[cfg(windows)]
 const SYSTEM: &[&str] = &[];
 
-/// Inside any folder: whose content the user's tools run. Writes there ask.
+/// Inside any folder: whose content the user's tools run. Writes there are refused.
 pub const TOOL_CONFIG: &[&str] = &[".git", ".envrc", ".vscode", ".idea"];
 
 #[derive(Debug, Clone)]

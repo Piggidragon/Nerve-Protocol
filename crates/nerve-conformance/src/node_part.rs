@@ -146,31 +146,13 @@ where
         expect_code(
             conn.call(
                 method::INVOKE,
-                json!({"cap": "approvals", "action": "list", "args": {},
+                json!({"cap": "node", "action": "status", "args": {},
                        "ctx": {"session": "s1", "full_access": true}}),
                 WAIT,
             )
             .await,
             ErrorCode::InvalidArgs,
         ),
-    );
-
-    // §7.4: approvals list works on every node.
-    r.check(
-        "7.4",
-        "approvals.list answers with a list",
-        match conn
-            .call(
-                method::INVOKE,
-                json!({"cap": "approvals", "action": "list", "args": {}, "ctx": {}}),
-                WAIT,
-            )
-            .await
-        {
-            Ok(Ok(v)) => ensure(v["approvals"].is_array(), format!("got {v}")),
-            Ok(Err(e)) => Err(format!("error {}: {}", code_of(&e), e.message)),
-            Err(e) => Err(e),
-        },
     );
 
     // §4.5: after `revoked` the node stops dialling.
@@ -216,9 +198,7 @@ fn check_descriptor(v: &Value, node_id: &str, rev: u64) -> Result<(), String> {
         nerve_proto::descriptor::summary_words(&d.summary) < 60,
         "the summary has 60 words or more",
     )?;
-    for cap in ["node", "approvals"] {
-        ensure(d.capability(cap).is_some(), format!("no {cap} capability"))?;
-    }
+    ensure(d.capability("node").is_some(), "no node capability")?;
     let mut ids = std::collections::BTreeSet::new();
     for c in &d.capabilities {
         ensure(ids.insert(&c.id), format!("capability {} twice", c.id))?;

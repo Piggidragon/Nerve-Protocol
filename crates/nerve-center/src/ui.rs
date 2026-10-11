@@ -290,14 +290,12 @@ impl Ui {
             ("GET", "/api/stats") => Ok(c.stats_json()),
             ("GET", "/api/audit") => Ok(json!({"decisions": c.audit()})),
             ("POST", "/api/pair") => Ok(c.new_pairing()),
-            ("POST", "/api/nodes/rename") => c.rename(&s("id"), &s("name")).map(|_| json!({})).map_err(bad),
-            ("POST", "/api/nodes/remove") => c.remove(&s("id")).await.map(|_| json!({})).map_err(bad),
-            ("POST", "/api/approvals/node") => {
-                let minutes = b.get("minutes").and_then(Value::as_u64);
-                c.answer_node(&s("node_id"), &s("id"), &s("answer"), minutes)
-                    .await
-                    .map(|_| json!({}))
-                    .map_err(refused)
+            ("POST", "/api/nodes/rename") => c
+                .rename(&s("id"), &s("name"))
+                .map(|_| json!({}))
+                .map_err(bad),
+            ("POST", "/api/nodes/remove") => {
+                c.remove(&s("id")).await.map(|_| json!({})).map_err(bad)
             }
             ("POST", "/api/sessions/end") => {
                 if c.end_session(&s("id")).await {
@@ -311,7 +309,11 @@ impl Ui {
                 c.node_settings(&id).await.map_err(refused)
             }
             ("POST", "/api/nodes/settings") => c
-                .set_node_settings(&s("id"), b.get("document").cloned().unwrap_or(Value::Null), b.get("if_version").cloned().unwrap_or(Value::Null))
+                .set_node_settings(
+                    &s("id"),
+                    b.get("document").cloned().unwrap_or(Value::Null),
+                    b.get("if_version").cloned().unwrap_or(Value::Null),
+                )
                 .await
                 .map_err(refused),
             ("POST", "/api/audit/rule") => {
@@ -330,14 +332,23 @@ impl Ui {
                     .map_err(refused)
             }
             ("GET", "/api/tokens") => Ok(c.read(|st| {
-                json!(st.harness_tokens.iter().map(|t| json!({"id": t.id, "label": t.label, "created_ms": t.created_ms})).collect::<Vec<_>>())
+                json!(
+                    st.harness_tokens
+                        .iter()
+                        .map(|t| json!({"id": t.id, "label": t.label, "created_ms": t.created_ms}))
+                        .collect::<Vec<_>>()
+                )
             })),
             ("POST", "/api/tokens/create") => {
                 let label = util::clip(s("label").trim(), 60);
                 let token = format!("nrv_{}", nerve_transport::keys::random_token(40));
                 let rec = TokenRecord {
                     id: nerve_transport::keys::random_token(12),
-                    label: if label.is_empty() { "harness".into() } else { label },
+                    label: if label.is_empty() {
+                        "harness".into()
+                    } else {
+                        label
+                    },
                     hash: util::sha256_hex(token.as_bytes()),
                     created_ms: now_ms(),
                 };
@@ -351,11 +362,14 @@ impl Ui {
                 c.update(|st| st.harness_tokens.retain(|t| t.id != id));
                 Ok(json!({}))
             }
-            ("GET", "/api/center") => Ok(c.read(|st| {
-                json!({"name": st.center_name, "retention_days": st.retention_days, "call_wait_s": c.call_wait().as_secs()})
-            })),
+            ("GET", "/api/center") => Ok(
+                c.read(|st| json!({"name": st.center_name, "retention_days": st.retention_days}))
+            ),
             ("POST", "/api/center") => {
-                let name = b.get("name").and_then(Value::as_str).map(|n| n.trim().to_string());
+                let name = b
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(|n| n.trim().to_string());
                 if name.as_ref().is_some_and(|n| n.is_empty() || n.len() > 64) {
                     return Err(bad("a center name is 1 to 64 characters"));
                 }
@@ -469,7 +483,6 @@ mod tests {
             state_dir: dir.to_path_buf(),
             name: Some("test".into()),
             public_url: "http://127.0.0.1:1".into(),
-            call_wait: Duration::from_secs(1),
         })
         .unwrap()
     }

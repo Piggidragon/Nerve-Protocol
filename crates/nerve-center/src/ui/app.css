@@ -408,19 +408,6 @@ textarea.json {
   background: rgb(var(--accent));
 }
 
-.count {
-  margin-left: auto;
-  min-width: 18px;
-  padding: 0 6px;
-  border-radius: 999px;
-  background: rgb(var(--warn) / 0.15);
-  color: rgb(var(--warn));
-  font-size: 11px;
-  line-height: 18px;
-  text-align: center;
-  font-variant-numeric: tabular-nums;
-}
-
 .side-foot {
   display: flex;
   flex-direction: column;
@@ -676,11 +663,6 @@ textarea.json {
   border-radius: 12px;
   background: rgb(var(--raised) / 0.4);
   min-width: 0;
-}
-
-.card.attention {
-  border-color: rgb(var(--warn) / 0.35);
-  background: rgb(var(--warn) / 0.06);
 }
 
 .card-top {

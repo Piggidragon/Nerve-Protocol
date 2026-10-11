@@ -8,9 +8,9 @@
 //!   nodes, gets the node name as prefix: `<node>__<cap>__<action>`.
 //! - Names stay within `^[a-zA-Z0-9_-]{1,64}$`.
 //!
-//! The built-in capabilities `node`, `approvals`, `settings` and `audit` are
-//! never tools: they are the center's own business, and a harness that could
-//! call `approvals.answer` would let a model approve its own calls.
+//! The built-in capabilities `node`, `settings` and `audit` are never tools:
+//! they are the center's own business, and a harness that could call
+//! `settings.set` would let a model change its own permissions.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -21,7 +21,7 @@ use nerve_proto::{Descriptor, Effect, Exposure};
 /// The center's own tool listing the nodes.
 pub const NODES_TOOL: &str = "nerve__nodes";
 /// Capabilities that are never offered as tools.
-pub const RESERVED_CAPS: [&str; 4] = ["node", "approvals", "settings", "audit"];
+pub const RESERVED_CAPS: [&str; 3] = ["node", "settings", "audit"];
 /// The argument that picks the node of a shared tool.
 pub const NODE_ARG: &str = "node";
 pub const NAME_MAX: usize = 64;
@@ -292,7 +292,7 @@ mod tests {
             id: id.into(),
             profile: profile.into(),
             provider: "node".into(),
-            exposure: Exposure::Ask,
+            exposure: Exposure::On,
             summary: format!("{id} summary"),
             actions: actions
                 .iter()
@@ -347,11 +347,7 @@ mod tests {
             "laptop",
             vec![
                 cap("fs", "fs", &[("read", Effect::Read, path_schema())]),
-                cap(
-                    "approvals",
-                    "approvals",
-                    &[("answer", Effect::Actuate, json!({}))],
-                ),
+                cap("audit", "audit", &[("list", Effect::Read, json!({}))]),
                 cap("settings", "settings", &[("set", Effect::Write, json!({}))]),
             ],
         );

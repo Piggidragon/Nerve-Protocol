@@ -1,7 +1,6 @@
-//! The node's policy: its configuration, the decision engine, approvals,
-//! settings and the local audit log.
+//! The node's policy: its configuration, the decision engine, settings and
+//! the local audit log.
 
-pub mod approvals;
 pub mod audit;
 pub mod config;
 pub mod decide;
@@ -10,5 +9,5 @@ pub mod protected;
 pub mod settings;
 
 pub use config::{CenterDocument, CenterEntry, CenterPolicy, Mode, NodeConfig};
-pub use decide::{Call, Choice, Decision, Env, Grants, Scope, Target, decide};
+pub use decide::{Call, Decision, Env, Target, decide};
 pub use settings::{SetError, SettingsStore, Writer};

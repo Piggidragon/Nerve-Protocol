@@ -7,7 +7,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use serde_json::{Map, Value, json};
 use tokio::sync::broadcast;
@@ -17,7 +17,7 @@ use nerve_proto::msg::{self, ByeReason, Event, Hello};
 use nerve_proto::{Descriptor, ErrorCode, Exposure, RpcError};
 use nerve_transport::tls::ServerIdentity;
 
-use crate::link::{Link, NodeApproval, SHORT_CALL};
+use crate::link::{Link, SHORT_CALL};
 use crate::pairing::Codes;
 use crate::store::{NodeRecord, Store};
 use crate::tools::{self, Route, Tool};
@@ -33,7 +33,6 @@ const ALERTS_KEEP: usize = 50;
 pub enum Change {
     Tools,
     Nodes,
-    Approvals,
     Audit,
     Sessions,
 }
@@ -46,8 +45,6 @@ pub struct Options {
     pub name: Option<String>,
     /// The URL nodes reach the center at, put into pairing links.
     pub public_url: String,
-    /// How long a call waits for an approval before the center gives up on it.
-    pub call_wait: Duration,
 }
 
 #[derive(Clone)]
@@ -58,7 +55,6 @@ pub struct Inner {
     public_url: CenterUrl,
     pin: Option<String>,
     pub identity: ServerIdentity,
-    call_wait: Duration,
     store: Mutex<Store>,
     dirty: AtomicBool,
     codes: Mutex<Codes>,
@@ -97,12 +93,6 @@ impl Session {
 #[derive(Debug)]
 pub enum CallError {
     Rpc(RpcError),
-    /// An approval was still open when the center stopped waiting: `at` names
-    /// where (a node or the center).
-    Pending {
-        at: String,
-        waited: Duration,
-    },
 }
 
 impl From<RpcError> for CallError {
@@ -183,7 +173,6 @@ impl Center {
             public_url,
             pin,
             identity,
-            call_wait: opts.call_wait,
             store: Mutex::new(store),
             dirty: AtomicBool::new(false),
             codes: Mutex::new(Codes::default()),
@@ -469,7 +458,6 @@ impl Center {
                 links.remove(id);
             }
         }
-        let withdrawn = std::mem::take(&mut *link.approvals.lock().unwrap());
         let now = now_ms();
         let online = link.since.elapsed().as_millis() as u64;
         self.update_soon(|s| {
@@ -482,17 +470,10 @@ impl Center {
                 if !clean {
                     d.drops += 1;
                 }
-                if !withdrawn.is_empty() {
-                    *d.approvals_by.entry("withdrawn".into()).or_default() +=
-                        withdrawn.len() as u64;
-                }
             }
         });
         tracing::info!(node = %id, clean, "a node link ended");
         self.changed(Change::Nodes);
-        if !withdrawn.is_empty() {
-            self.changed(Change::Approvals);
-        }
     }
 
     /// Fetches the full descriptor and keeps it.
@@ -544,42 +525,6 @@ impl Center {
                     }
                 });
                 self.changed(Change::Nodes);
-            }
-            ("approvals", "requested") => {
-                let Some(id) = ev.data.get("id").and_then(Value::as_str) else {
-                    return;
-                };
-                link.approvals.lock().unwrap().insert(
-                    id.to_string(),
-                    NodeApproval {
-                        data: ev.data.clone(),
-                        received: Instant::now(),
-                    },
-                );
-                self.update_soon(|s| s.day(&node, now_ms()).approvals_asked += 1);
-                self.changed(Change::Approvals);
-            }
-            ("approvals", "resolved") => {
-                let Some(id) = ev.data.get("id").and_then(Value::as_str) else {
-                    return;
-                };
-                let by = ev
-                    .data
-                    .get("by")
-                    .and_then(Value::as_str)
-                    .unwrap_or("unknown")
-                    .to_string();
-                let gone = link.approvals.lock().unwrap().remove(id);
-                let wait = gone
-                    .map(|a| a.received.elapsed().as_millis() as u64)
-                    .unwrap_or(0);
-                self.update_soon(|s| {
-                    let d = s.day(&node, now_ms());
-                    *d.approvals_by.entry(util::clip(&by, 32)).or_default() += 1;
-                    d.approval_wait_ms += wait;
-                    d.approval_wait_max_ms = d.approval_wait_max_ms.max(wait);
-                });
-                self.changed(Change::Approvals);
             }
             ("settings", "changed") => self.changed(Change::Nodes),
             ("audit", "decision") => {
@@ -637,9 +582,6 @@ impl Center {
                                 .collect()
                         })
                         .unwrap_or_default();
-                    let approvals: Vec<Value> = link
-                        .map(|l| l.approvals.lock().unwrap().values().map(|a| a.data.clone()).collect())
-                        .unwrap_or_default();
                     let used_by: Vec<&str> = sessions
                         .iter()
                         .filter(|x| x.nodes.lock().unwrap().contains(&n.id))
@@ -659,10 +601,8 @@ impl Center {
                         "summary": d.map(|d| d.summary.clone()).unwrap_or_default(),
                         "software": d.map(|d| d.node.software.version.clone()),
                         "capabilities": caps,
-                        "pending_approvals": approvals,
                         "sessions": used_by,
                         "settings_write": d.is_some_and(settings_write),
-                        "approvals_answerable": d.is_some_and(approvals_answerable),
                     })
                 })
                 .collect()
@@ -714,8 +654,7 @@ impl Center {
         self.sessions.lock().unwrap().get(id).cloned()
     }
 
-    /// Ends a session: every node it used gets `session.end`, so approvals
-    /// given "for this session" stop there too.
+    /// Ends a session: every node it used gets `session.end`.
     pub async fn end_session(&self, id: &str) -> bool {
         let Some(s) = self.sessions.lock().unwrap().remove(id) else {
             return false;
@@ -764,30 +703,6 @@ impl Center {
         self.sessions.lock().unwrap().len()
     }
 
-    /// Answers an approval a node holds, through its `approvals.answer`.
-    pub async fn answer_node(
-        &self,
-        node_id: &str,
-        id: &str,
-        answer: &str,
-        minutes: Option<u64>,
-    ) -> Result<(), RpcError> {
-        let link = self
-            .link(node_id)
-            .ok_or_else(|| RpcError::new(ErrorCode::Unavailable, "the node is offline"))?;
-        let mut args = json!({"id": id, "answer": answer});
-        if let Some(m) = minutes {
-            args["minutes"] = json!(m);
-        }
-        link.call(
-            msg::method::INVOKE,
-            json!({"cap": "approvals", "action": "answer", "args": args, "ctx": {}}),
-            Some(SHORT_CALL),
-        )
-        .await
-        .map(|_| ())
-    }
-
     // ---- Settings (only with the node's `settings = write` grant) ----
 
     pub async fn node_settings(&self, node_id: &str) -> Result<Value, RpcError> {
@@ -821,7 +736,7 @@ impl Center {
 
     /// Adds a command rule from the audit tab (design §11 9a) to this
     /// center's entry of the node's settings: `allow` puts `pattern` on
-    /// `never_ask`, `deny` on `deny`. The node checks and may refuse the
+    /// `permit`, `deny` on `deny`. The node checks and may refuse the
     /// document.
     pub async fn add_command_rule(
         &self,
@@ -858,7 +773,6 @@ impl Center {
         let code = match &out {
             Ok(_) => None,
             Err(CallError::Rpc(e)) => Some(e.kind().as_str().to_string()),
-            Err(CallError::Pending { .. }) => Some("pending".to_string()),
         };
         self.update_soon(|s| {
             if !s.nodes.contains_key(&route.node_id) {
@@ -901,38 +815,20 @@ impl Center {
         }
         sess.nodes.lock().unwrap().insert(route.node_id.clone());
         link.sessions.lock().unwrap().insert(sess.id.clone());
-        let started = Instant::now();
-        let (id, rx) = link
+        let (_, rx) = link
             .start(
                 msg::method::INVOKE,
                 json!({"cap": route.cap, "action": route.action, "args": args, "ctx": ctx}),
             )
             .await?;
-        tokio::pin!(rx);
-        loop {
-            tokio::select! {
-                r = &mut rx => return r.unwrap_or_else(|_| Err(RpcError::new(ErrorCode::ConnectionLost, "the link to the node ended"))).map_err(CallError::Rpc),
-                _ = tokio::time::sleep(self.call_wait) => {
-                    // A call that waits for a person at the node is given up
-                    // after the wait, so the harness hears why instead of
-                    // timing out on its own. Other long calls keep running.
-                    let waiting = link.approvals.lock().unwrap().values().any(|a| {
-                        a.received >= started
-                            && a.data.get("session").and_then(Value::as_str) == Some(sess.id.as_str())
-                            && a.data.get("cap").and_then(Value::as_str) == Some(route.cap.as_str())
-                            && a.data.get("action").and_then(Value::as_str) == Some(route.action.as_str())
-                    });
-                    if waiting {
-                        link.cancel(id).await;
-                        return Err(CallError::Pending { at: format!("the node {}", route.node_name), waited: started.elapsed() });
-                    }
-                }
-            }
-        }
-    }
-
-    pub fn call_wait(&self) -> Duration {
-        self.call_wait
+        rx.await
+            .unwrap_or_else(|_| {
+                Err(RpcError::new(
+                    ErrorCode::ConnectionLost,
+                    "the link to the node ended",
+                ))
+            })
+            .map_err(CallError::Rpc)
     }
 
     /// Closes every link with `bye shutdown`.
@@ -974,18 +870,10 @@ pub fn settings_write(d: &Descriptor) -> bool {
         .is_some_and(|c| c.exposure != Exposure::Off)
 }
 
-/// The node lets this center answer its approvals (`approvals = both`): the
-/// `answer` action is offered and not off. A node with `local` may still list
-/// the action; then its answer fails with `forbidden` and the UI says so.
-pub fn approvals_answerable(d: &Descriptor) -> bool {
-    d.capability("approvals")
-        .is_some_and(|c| c.exposure != Exposure::Off && c.actions.contains_key("answer"))
-}
-
 /// The command rule lists of a center entry's settings document:
 /// `policy.commands`, created when missing.
 // The settings document is the node's center entry (nerve-policy), with the
-// command rules under `policy.commands.{deny,allow,always_ask,never_ask}`. A
+// command rules under `policy.commands.{deny,allow,permit}`. A
 // node with another layout refuses the document and the web UI shows why.
 fn command_rules(doc: &mut Value) -> Option<&mut Map<String, Value>> {
     let policy = doc
@@ -1000,13 +888,13 @@ fn command_rules(doc: &mut Value) -> Option<&mut Map<String, Value>> {
 }
 
 /// Puts `pattern` on the list an audit answer means. The node's `allow` list
-/// is an allowlist that blocks every other command, so "Allow" means "run
-/// without asking" (`never_ask`). A rule moves: it leaves the opposite list.
+/// is an allowlist that blocks every other command, so "Allow" means "run in
+/// any mode" (`permit`). A rule moves: it leaves the opposite list.
 fn put_rule(rules: &mut Map<String, Value>, allow: bool, pattern: &str) -> Result<(), RpcError> {
     let (add, drop) = if allow {
-        ("never_ask", "deny")
+        ("permit", "deny")
     } else {
-        ("deny", "never_ask")
+        ("deny", "permit")
     };
     if let Some(arr) = rules.get_mut(drop).and_then(Value::as_array_mut) {
         arr.retain(|v| v != pattern);
@@ -1041,7 +929,6 @@ mod tests {
             state_dir: dir.to_path_buf(),
             name: name.map(str::to_string),
             public_url: "http://127.0.0.1:7443".into(),
-            call_wait: Duration::from_secs(1),
         })
         .unwrap()
     }
@@ -1057,7 +944,7 @@ mod tests {
     }
 
     #[test]
-    fn allow_means_never_ask_and_rules_move_between_lists() {
+    fn allow_means_permit_and_rules_move_between_lists() {
         let mut d = json!({"policy": {"commands": {"deny": ["git *"], "allow": ["ls"]}}});
         let rules = command_rules(&mut d).unwrap();
         put_rule(rules, true, "git *").unwrap();
@@ -1065,19 +952,19 @@ mod tests {
         // The allowlist is left alone: one entry there would block the rest.
         assert_eq!(
             d["policy"]["commands"],
-            json!({"deny": [], "allow": ["ls"], "never_ask": ["git *"]})
+            json!({"deny": [], "allow": ["ls"], "permit": ["git *"]})
         );
         let rules = command_rules(&mut d).unwrap();
         put_rule(rules, false, "git *").unwrap();
         assert_eq!(d["policy"]["commands"]["deny"], json!(["git *"]));
-        assert_eq!(d["policy"]["commands"]["never_ask"], json!([]));
+        assert_eq!(d["policy"]["commands"]["permit"], json!([]));
     }
 
     #[test]
     fn wildcards_and_rule_lists() {
         assert_eq!(wildcard_of("git status --short"), "git *");
         assert_eq!(wildcard_of("  "), "*");
-        let mut d = json!({"mode": "ask"});
+        let mut d = json!({"mode": "folder"});
         command_rules(&mut d)
             .unwrap()
             .insert("allow".into(), json!(["ls"]));

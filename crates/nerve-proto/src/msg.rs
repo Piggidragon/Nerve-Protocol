@@ -120,8 +120,8 @@ pub struct Describe {
 }
 
 /// Context a center attaches to a call. It can only narrow what a node does:
-/// `tainted` makes a node ask where it would not, the session scopes
-/// approvals. Other fields are refused (D8).
+/// `tainted` makes a node refuse writes and commands it would allow. Other
+/// fields are refused (D8).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ctx {

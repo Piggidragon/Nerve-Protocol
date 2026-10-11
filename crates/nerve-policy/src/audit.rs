@@ -17,12 +17,10 @@ pub struct Entry {
     pub cap: String,
     pub action: String,
     pub target: String,
-    /// `allowed`, `asked`, `denied` or `forbidden`.
+    /// `allowed` or `forbidden`.
     pub decision: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub code: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub by: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
 }
@@ -39,6 +37,7 @@ impl Entry {
     }
 
     pub fn is_refusal(&self) -> bool {
+        // `denied` is what older logs call a refusal the owner answered.
         matches!(self.decision.as_str(), "denied" | "forbidden")
     }
 }
@@ -163,16 +162,15 @@ mod tests {
             cap: "fs".into(),
             action: "read".into(),
             target: "/x".into(),
-            decision: "denied".into(),
-            code: Some("denied".into()),
-            by: Some("local".into()),
+            decision: "forbidden".into(),
+            code: Some("forbidden".into()),
             session: None,
         };
         log.decision(&e).unwrap();
         log.settings(
             "center home",
             3,
-            &diff(&json!({"mode": "ask"}), &json!({"mode": "full"})),
+            &diff(&json!({"mode": "folder"}), &json!({"mode": "user"})),
         )
         .unwrap();
         let lines = log.read().unwrap();
@@ -180,7 +178,7 @@ mod tests {
         assert_eq!(lines[0]["center"], "home");
         assert_eq!(lines[1]["by"], "center home");
         assert_eq!(lines[1]["changes"][0]["key"], "mode");
-        assert_eq!(lines[1]["changes"][0]["new"], "full");
+        assert_eq!(lines[1]["changes"][0]["new"], "user");
         assert!(e.event_data().get("center").is_none());
         #[cfg(unix)]
         {

@@ -13,17 +13,16 @@ use serde_json::{Map, Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 
-use nerve_policy::approvals::{AnswerError, Ask, By};
 use nerve_policy::audit::Entry;
 use nerve_policy::config::{Mode, SettingsGrant};
 use nerve_policy::protected::Protected;
-use nerve_policy::{Call, CenterEntry, Choice, Decision, Env, NodeConfig, Scope, SetError, Target};
+use nerve_policy::{Call, CenterEntry, Decision, Env, NodeConfig, SetError, Target};
 use nerve_proto::descriptor::{Detail, Effect, Exposure};
 use nerve_proto::frame::{Frame, FrameError};
 use nerve_proto::link::CenterUrl;
 use nerve_proto::msg::{
-    self, Bye, ByeReason, Cancel, Challenge, Describe, Get, Hello, Invoke, SessionEnd, Topic,
-    Topics, Welcome, method,
+    self, Bye, ByeReason, Cancel, Challenge, Describe, Get, Hello, Invoke, Topic, Topics, Welcome,
+    method,
 };
 use nerve_proto::rpc::{Id, Message, params};
 use nerve_proto::{ErrorCode, PROTOCOL_VERSION, RpcError, limits};
@@ -349,13 +348,12 @@ async fn session(
     let outcome = link.serve(&mut stream).await;
 
     // The link is gone (spec §4.5): calls end, commands die with their
-    // process groups, open approvals are withdrawn.
+    // process groups.
     *lock(&cs.link) = None;
     let calls: Vec<AbortHandle> = lock(&link.calls).drain().map(|(_, h)| h).collect();
     for c in calls {
         c.abort();
     }
-    shared.withdraw_all(&entry.name, By::Withdrawn);
     let _ = done_tx.send(());
     let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
     if matches!(outcome, Outcome::Retry) {
@@ -459,7 +457,6 @@ impl Link {
                         return self.end(ByeReason::Unpaired, Outcome::Stop).await;
                     };
                     if cfg.locked || entry.paused {
-                        self.shared.withdraw_all(&self.name, By::Pause);
                         self.cs.set_status("paused");
                         return self.end(ByeReason::Paused, Outcome::Stop).await;
                     }
@@ -552,12 +549,8 @@ impl Link {
                 }
                 None
             }
-            method::SESSION_END => {
-                if let Ok(s) = params::<SessionEnd>(&p) {
-                    lock(&self.cs.grants).end_session(&s.session);
-                }
-                None
-            }
+            // The node keeps nothing per session, so there is nothing to end.
+            method::SESSION_END => None,
             method::BYE => {
                 let reason = params::<Bye>(&p).ok().map(|b| b.reason);
                 match reason {
@@ -697,7 +690,7 @@ impl Link {
     fn confinement(&self) -> String {
         let folders = self
             .entry()
-            .is_some_and(|(_, e)| e.policy.mode_at(crate::now_ms()) == Mode::Folders);
+            .is_some_and(|(_, e)| e.policy.mode_at(crate::now_ms()) == Mode::Folder);
         if folders && self.shared.confined() {
             self.shared.confinement.describe()
         } else {
@@ -705,8 +698,8 @@ impl Link {
         }
     }
 
-    /// Starts an `invoke` as its own task, so a slow call (or one waiting for
-    /// an approval) does not hold up the link.
+    /// Starts an `invoke` as its own task, so a slow call does not hold up the
+    /// link.
     async fn start_invoke(self: &Arc<Self>, id: Id, p: Map<String, Value>) {
         let inv = match params::<Invoke>(&p).and_then(|i| i.check().map(|()| i)) {
             Ok(i) => i,
@@ -784,18 +777,12 @@ impl Link {
             ));
         }
         match (inv.cap.as_str(), inv.action.as_str()) {
-            ("approvals", "list") => {
-                let list = lock(&self.cs.queue).list();
-                Ok(json!({"approvals": list}))
-            }
-            ("approvals", "answer") => self.answer(&entry, &inv.args),
             ("settings", "set") => self.settings_set(&inv.args),
             ("settings", "pause") => self.settings_pause(),
             ("exec", "signal") => self.signal(&inv.args),
             ("exec", "run") => self.exec_run(id, &cfg, &entry, effect, &inv).await,
             ("fs", a) => {
                 let call = FsCall::parse(a, &inv.args)?;
-                let preview = format!("{} {}", a, call.target_text());
                 self.gate(
                     &entry,
                     &inv,
@@ -804,9 +791,7 @@ impl Link {
                     None,
                     None,
                     call.target_text(),
-                    preview,
-                )
-                .await?;
+                )?;
                 let protected = self.protected(&entry);
                 let deny = self.deny_paths(&entry);
                 let folders = entry.policy.folders.clone();
@@ -844,11 +829,11 @@ impl Link {
             .collect()
     }
 
-    /// Runs the policy for one call: allows it, refuses it, or asks the owner
-    /// and waits. Every outcome lands in the audit log.
+    /// Runs the policy for one call: it either runs or is refused at once.
+    /// Every outcome lands in the audit log.
     #[allow(clippy::too_many_arguments)]
-    async fn gate(
-        self: &Arc<Self>,
+    fn gate(
+        &self,
         entry: &CenterEntry,
         inv: &Invoke,
         effect: Effect,
@@ -856,10 +841,7 @@ impl Link {
         command: Option<&str>,
         cwd: Option<&std::path::Path>,
         target: String,
-        preview: String,
     ) -> Result<(), RpcError> {
-        let now = crate::now_ms();
-        let session = inv.ctx.session.clone();
         let call = Call {
             cap: &inv.cap,
             action: &inv.action,
@@ -867,9 +849,8 @@ impl Link {
             targets,
             command,
             cwd,
-            session: session.as_deref(),
             tainted: inv.ctx.tainted,
-            now_ms: now,
+            now_ms: crate::now_ms(),
         };
         let decision = {
             let protected = self.protected(entry);
@@ -878,10 +859,9 @@ impl Link {
                 protected: &protected,
                 confined: self.shared.confined(),
             };
-            let mut grants = lock(&self.cs.grants);
-            nerve_policy::decide(&entry.policy, &env, &call, grants.at(now))
+            nerve_policy::decide(&entry.policy, &env, &call)
         };
-        let audit = |decision: &str, code: Option<&str>, by: Option<&str>| {
+        let audit = |decision: &str, code: Option<&str>| {
             self.shared.audit(&Entry {
                 ts: crate::now_ms(),
                 center: self.name.clone(),
@@ -890,99 +870,22 @@ impl Link {
                 target: target.clone(),
                 decision: decision.into(),
                 code: code.map(Into::into),
-                by: by.map(Into::into),
-                session: session.clone(),
+                session: inv.ctx.session.clone(),
             })
         };
         match decision {
             Decision::Allow => {
-                audit("allowed", None, None);
+                audit("allowed", None);
                 Ok(())
             }
             Decision::Disabled(why) => {
-                audit("forbidden", Some("disabled"), None);
+                audit("forbidden", Some("disabled"));
                 Err(RpcError::new(ErrorCode::Disabled, why))
             }
             Decision::Forbidden(why) => {
-                audit("forbidden", Some("forbidden"), None);
+                audit("forbidden", Some("forbidden"));
                 Err(RpcError::forbidden(why))
             }
-            Decision::Ask { reasons, choices } => {
-                audit("asked", None, None);
-                let timing = &entry.policy.approvals;
-                let ask = Ask {
-                    cap: inv.cap.clone(),
-                    action: inv.action.clone(),
-                    target: target.clone(),
-                    reasons,
-                    preview,
-                    choices,
-                    max_minutes: timing.max_minutes,
-                    expires_ms: now + timing.timeout_s * 1000,
-                    session: session.clone(),
-                };
-                let scope = Scope::of(&call);
-                let r = self
-                    .shared
-                    .ask(
-                        &self.cs,
-                        ask,
-                        Duration::from_secs(timing.timeout_s),
-                        timing.on_timeout,
-                    )
-                    .await;
-                let by = r.by.as_str();
-                if !r.allowed() {
-                    audit("denied", Some("denied"), Some(by));
-                    return Err(if r.by == By::Pause {
-                        RpcError::new(ErrorCode::Unavailable, "the node was paused")
-                    } else {
-                        RpcError::new(ErrorCode::Denied, "the owner denied this call")
-                    });
-                }
-                let now = crate::now_ms();
-                match r.choice() {
-                    Some(Choice::Session) if session.is_some() => {
-                        let until = now + u64::from(timing.remember_minutes) * 60_000;
-                        lock(&self.cs.grants).add(scope, session.clone(), until);
-                    }
-                    Some(Choice::Time) => {
-                        let minutes = r
-                            .minutes
-                            .unwrap_or(timing.max_minutes)
-                            .min(timing.max_minutes);
-                        lock(&self.cs.grants).add(scope, None, now + u64::from(minutes) * 60_000);
-                    }
-                    _ => {}
-                }
-                audit("allowed", None, Some(by));
-                Ok(())
-            }
-        }
-    }
-
-    fn answer(&self, entry: &CenterEntry, args: &Map<String, Value>) -> Result<Value, RpcError> {
-        #[derive(Deserialize)]
-        #[serde(deny_unknown_fields)]
-        struct Answer {
-            id: String,
-            answer: String,
-            #[serde(default)]
-            minutes: Option<u32>,
-        }
-        let a: Answer = params(args)?;
-        let choice = Choice::parse(&a.answer)
-            .ok_or_else(|| RpcError::invalid_args("answer must be once, session, time or deny"))?;
-        let r = lock(&self.cs.queue).answer(&a.id, choice, a.minutes, By::Center, entry.approvals);
-        match r {
-            Ok(_) => Ok(json!({})),
-            Err(AnswerError::Forbidden) => Err(RpcError::forbidden(
-                "this node takes answers only from its owner",
-            )),
-            Err(AnswerError::Unknown(_)) => {
-                Err(RpcError::invalid_args(format!("no open approval {}", a.id)))
-            }
-            Err(e) => Err(RpcError::invalid_args(e.to_string())),
         }
     }
 
@@ -1050,11 +953,9 @@ impl Link {
             Some(&rc.command),
             Some(&rc.cwd),
             target,
-            format!("$ {}  (in {})", rc.command, rc.cwd.display()),
-        )
-        .await?;
+        )?;
         let guard = Running::start(self, id.clone(), cfg.limits.max_running as usize)?;
-        let landlock = (entry.policy.mode_at(crate::now_ms()) == Mode::Folders
+        let landlock = (entry.policy.mode_at(crate::now_ms()) == Mode::Folder
             && self.shared.confined())
         .then(|| exec::landlock_spec(&entry.policy, &self.shared.home));
         let opts = RunOptions {

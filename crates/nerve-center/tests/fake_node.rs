@@ -1,6 +1,6 @@
 //! The center against a fake node in the same process: pairing, the link
-//! handshake, describe, MCP tools/call through to `invoke`, a center
-//! approval, an unknown node (401) and the one-link rule.
+//! handshake, describe, MCP tools/call through to `invoke`, an unknown node
+//! (401) and the one-link rule.
 
 use std::time::Duration;
 
@@ -36,8 +36,6 @@ async fn center(dir: &std::path::Path) -> Running {
         "127.0.0.1:0",
         "--mcp",
         "none",
-        "--call-wait",
-        "20",
     ])
     .unwrap();
     let lock = nerve_center::attach::try_lock(dir)

@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// What an action does to the world. The node's policy asks by effect.
+/// What an action does to the world. The node's policy decides by effect.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Effect {
@@ -35,7 +35,6 @@ impl Effect {
 #[serde(rename_all = "lowercase")]
 pub enum Exposure {
     On,
-    Ask,
     Off,
 }
 
@@ -220,7 +219,7 @@ mod tests {
             "rev": 3,
             "summary": "A test box.",
             "capabilities": [{
-                "id": "fs", "profile": "fs", "exposure": "ask", "summary": "Files.",
+                "id": "fs", "profile": "fs", "exposure": "off", "summary": "Files.",
                 "actions": {"read": {"effect": "read", "params": {"type": "object"},
                                       "result": {"type": "object"}}},
                 "x-future": 1

@@ -2,7 +2,7 @@
 //! owner's policy allows (architecture §3, §5, §7).
 //!
 //! The daemon ([`daemon::Daemon`]) keeps one link per paired center, runs the
-//! `fs`, `exec`, `approvals`, `settings` and `audit` capabilities, and serves
+//! `fs`, `exec`, `settings` and `audit` capabilities, and serves
 //! the control socket the CLI ([`cli`]) talks to. Tests start a daemon in
 //! process with [`daemon::Daemon::start`] and pair with [`pair::pair`].
 

@@ -1,5 +1,5 @@
 //! The echo node: the smallest node that follows the protocol. It offers the
-//! built-in `node` and `approvals` capabilities and one `echo` capability, and
+//! built-in `node` capability and one `echo` capability, and
 //! the center part of the conformance suite drives a center with it.
 
 use std::time::Duration;
@@ -28,10 +28,6 @@ pub fn descriptor(node_id: &str, name: &str) -> Descriptor {
         "capabilities": [
             {"id": "node", "profile": "node", "exposure": "on", "summary": "The node itself.",
              "events": {"descriptor_changed": {"implicit": true}, "going_away": {"implicit": true}}},
-            {"id": "approvals", "profile": "approvals", "exposure": "on",
-             "summary": "Approvals this node asks for.",
-             "actions": {"list": {"effect": "read", "params": {"type": "object"}},
-                         "answer": {"effect": "actuate", "params": {"type": "object"}}}},
             {"id": "echo", "exposure": "on", "summary": "Says back what it is sent.",
              "actions": {"say": {"effect": "read", "summary": "Return the text.",
                 "params": {"type": "object", "properties": {"text": {"type": "string"}},
@@ -197,10 +193,6 @@ pub fn handle(m: &str, p: &Map<String, Value>, d: &Descriptor) -> Result<Value, 
                     Some(t) if inv.args.len() == 1 => Ok(json!({"text": t})),
                     _ => Err(RpcError::invalid_args("say takes {text}")),
                 },
-                ("approvals", "list") => Ok(json!({"approvals": []})),
-                ("approvals", "answer") => {
-                    Err(RpcError::new(ErrorCode::InvalidArgs, "no such approval"))
-                }
                 (cap, _) if d.capability(cap).is_none() => Err(RpcError::new(
                     ErrorCode::UnknownCapability,
                     format!("no capability {cap}"),

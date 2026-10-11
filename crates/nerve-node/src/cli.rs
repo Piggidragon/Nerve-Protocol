@@ -10,9 +10,7 @@ use clap::{Args, Parser, Subcommand};
 use serde_json::{Value, json};
 
 use nerve_policy::audit::AuditLog;
-use nerve_policy::config::{
-    Access, ApprovalsGrant, CapSetting, FULL_MAX_MS, Folder, SettingsGrant,
-};
+use nerve_policy::config::{Access, CapSetting, Folder, SettingsGrant, USER_MAX_MS};
 use nerve_policy::{Mode, NodeConfig, SetError, SettingsStore};
 use nerve_proto::link::PairLink;
 use nerve_sandbox::stubs::NOT_DONE;
@@ -64,7 +62,7 @@ pub enum Cmd {
     Centers,
     /// Show the daemon and its links.
     Status,
-    /// Set a center's mode: ask, folders or full (full ends after --hours, at most 8).
+    /// Set a center's mode: folder or user (user ends after --hours, at most 8).
     Mode {
         mode: String,
         #[arg(long)]
@@ -75,14 +73,14 @@ pub enum Cmd {
     /// Add or remove a folder a center may use.
     #[command(subcommand)]
     Folder(FolderCmd),
-    /// Set a capability or action (`fs`, `exec.run`) to on, ask, off or hidden.
+    /// Set a capability or action (`fs`, `exec.run`) to on, off or hidden.
     Caps {
         cap: String,
         setting: String,
         #[command(flatten)]
         center: CenterArg,
     },
-    /// Let a center change settings (`settings off|write`) or answer approvals (`approvals both|local`).
+    /// Let a center change settings (`settings off|write`).
     Grant {
         what: String,
         value: String,
@@ -92,34 +90,16 @@ pub enum Cmd {
     /// Read or change node.toml by dotted key (`center.<name>.policy.mode`).
     #[command(subcommand)]
     Config(ConfigCmd),
-    /// List open approvals.
-    Approvals {
-        #[arg(long)]
-        follow: bool,
-    },
-    /// Allow an open approval (once, for the session, or for some minutes).
-    Approve {
-        id: String,
-        #[arg(long, conflicts_with = "minutes")]
-        session: bool,
-        #[arg(long)]
-        minutes: Option<u32>,
-        #[command(flatten)]
-        center: CenterArg,
-    },
-    /// Deny an open approval, or forbid a command (`deny <command> [--wildcard]`).
+    /// Forbid a command (`deny <command> [--wildcard]`).
     Deny {
-        what: String,
-        /// Treat `what` as a command even if it looks like an approval id.
-        #[arg(long)]
-        command: bool,
+        command: String,
         /// Match every command that starts with the same program.
         #[arg(long)]
         wildcard: bool,
         #[command(flatten)]
         center: CenterArg,
     },
-    /// Let a command run without asking.
+    /// Allow a command in every mode (a tainted call still cannot run it).
     Allow {
         command: String,
         #[arg(long)]
@@ -298,20 +278,6 @@ async fn edit_center(
     Ok(name)
 }
 
-/// Whether `s` looks like an approval id (`a<n>-<4 chars>`).
-fn is_approval_id(s: &str) -> bool {
-    let Some(rest) = s.strip_prefix('a') else {
-        return false;
-    };
-    let Some((n, tail)) = rest.split_once('-') else {
-        return false;
-    };
-    !n.is_empty()
-        && n.bytes().all(|b| b.is_ascii_digit())
-        && tail.len() == 4
-        && tail.bytes().all(|b| b.is_ascii_alphanumeric())
-}
-
 /// A command rule: the command itself, or with `--wildcard` its program
 /// followed by anything.
 fn command_rule(command: &str, wildcard: bool) -> Result<String, String> {
@@ -381,12 +347,11 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
                 w(
                     out,
                     format!(
-                        "{}  {}  mode {}  settings {}  approvals {}{}",
+                        "{}  {}  mode {}  settings {}{}",
                         c.name,
                         c.url,
                         c.policy.mode_at(now).as_str(),
                         enum_str(&c.settings),
-                        enum_str(&c.approvals),
                         if flags.is_empty() {
                             String::new()
                         } else {
@@ -418,11 +383,10 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
                         w(
                             out,
                             format!(
-                                "{}  {}  mode {}  {} open approvals",
+                                "{}  {}  mode {}",
                                 c["name"].as_str().unwrap_or_default(),
                                 c["status"].as_str().unwrap_or_default(),
                                 c["mode"].as_str().unwrap_or_default(),
-                                c["open_approvals"]
                             ),
                         );
                     }
@@ -450,24 +414,23 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
             center,
         } => {
             let m = match mode.as_str() {
-                "ask" => Mode::Ask,
-                "folders" => Mode::Folders,
-                "full" => Mode::Full,
-                other => return Err(format!("unknown mode {other} (ask, folders or full)")),
+                "folder" => Mode::Folder,
+                "user" => Mode::User,
+                other => return Err(format!("unknown mode {other} (folder or user)")),
             };
-            if hours.is_some() && m != Mode::Full {
-                return Err("--hours only goes with full".into());
+            if hours.is_some() && m != Mode::User {
+                return Err("--hours only goes with user".into());
             }
-            let until = (m == Mode::Full).then(|| {
-                let ms = hours.map_or(FULL_MAX_MS, |h| h.saturating_mul(3_600_000));
+            let until = (m == Mode::User).then(|| {
+                let ms = hours.map_or(USER_MAX_MS, |h| h.saturating_mul(3_600_000));
                 crate::now_ms() + ms
             });
-            if hours.is_some_and(|h| h.saturating_mul(3_600_000) > FULL_MAX_MS) {
-                return Err("full mode lasts at most 8 hours".into());
+            if hours.is_some_and(|h| h.saturating_mul(3_600_000) > USER_MAX_MS) {
+                return Err("user mode lasts at most 8 hours".into());
             }
             let name = edit_center(&paths, &center, |e| {
                 e.policy.mode = m;
-                e.policy.full_until = until;
+                e.policy.user_until = until;
                 Ok(())
             })
             .await?;
@@ -517,7 +480,7 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
             center,
         } => {
             let s = CapSetting::parse(&setting)
-                .ok_or_else(|| format!("unknown setting {setting} (on, ask, off or hidden)"))?;
+                .ok_or_else(|| format!("unknown setting {setting} (on, off or hidden)"))?;
             let name = edit_center(&paths, &center, |e| {
                 e.policy.caps.insert(cap.clone(), s);
                 Ok(())
@@ -540,53 +503,21 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
                     })
                     .await?
                 }
-                "approvals" => {
-                    let g: ApprovalsGrant = parse_enum(&value, "both or local")?;
-                    edit_center(&paths, &center, |e| {
-                        e.approvals = g;
-                        Ok(())
-                    })
-                    .await?
-                }
-                other => return Err(format!("unknown grant {other} (settings or approvals)")),
+                other => return Err(format!("unknown grant {other} (settings)")),
             };
             w(out, format!("{name}: {what} {value}"));
             Ok(())
         }
         Cmd::Config(c) => config_cmd(&paths, c, out).await,
-        Cmd::Approvals { follow } => approvals(&paths, follow, out).await,
-        Cmd::Approve {
-            id,
-            session,
-            minutes,
-            center,
-        } => {
-            let answer = if session {
-                "session"
-            } else if minutes.is_some() {
-                "time"
-            } else {
-                "once"
-            };
-            answer_approval(&paths, &center, &id, answer, minutes).await?;
-            w(out, format!("{id}: allowed ({answer})"));
-            Ok(())
-        }
         Cmd::Deny {
-            what,
             command,
             wildcard,
             center,
         } => {
-            if !command && !wildcard && is_approval_id(&what) {
-                answer_approval(&paths, &center, &what, "deny", None).await?;
-                w(out, format!("{what}: denied"));
-                return Ok(());
-            }
-            let rule = command_rule(&what, wildcard)?;
+            let rule = command_rule(&command, wildcard)?;
             let name = edit_center(&paths, &center, |e| {
                 let r = &mut e.policy.commands;
-                r.never_ask.retain(|c| c != &rule);
+                r.permit.retain(|c| c != &rule);
                 if !r.deny.contains(&rule) {
                     r.deny.push(rule.clone());
                 }
@@ -608,15 +539,15 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
             let name = edit_center(&paths, &center, |e| {
                 let r = &mut e.policy.commands;
                 r.deny.retain(|c| c != &rule);
-                if !r.never_ask.contains(&rule) {
-                    r.never_ask.push(rule.clone());
+                if !r.permit.contains(&rule) {
+                    r.permit.push(rule.clone());
                 }
                 Ok(())
             })
             .await?;
             w(
                 out,
-                format!("{name}: commands matching {rule:?} run without asking"),
+                format!("{name}: commands matching {rule:?} are allowed"),
             );
             Ok(())
         }
@@ -714,112 +645,6 @@ fn resolve_folder(p: &Path) -> Result<String, String> {
     Ok(real.display().to_string())
 }
 
-async fn answer_approval(
-    paths: &NodePaths,
-    center: &CenterArg,
-    id: &str,
-    answer: &str,
-    minutes: Option<u32>,
-) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        let params =
-            json!({"center": center.center, "id": id, "answer": answer, "minutes": minutes});
-        match nerve_transport::ctl::call(&paths.ctl_socket(), "approvals.answer", params).await {
-            Ok(_) => Ok(()),
-            Err(e) if e == nerve_transport::ctl::NOT_RUNNING => {
-                Err("no node daemon runs, so no approval is open".into())
-            }
-            Err(e) => Err(e),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (paths, center, id, answer, minutes);
-        Err(format!(
-            "answering from the CLI on this platform: {NOT_DONE}"
-        ))
-    }
-}
-
-#[cfg(unix)]
-fn approval_line(v: &Value) -> String {
-    let s = |k: &str| v[k].as_str().unwrap_or_default().to_string();
-    let reasons: Vec<&str> = v["reasons"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect();
-    let choices: Vec<&str> = v["choices"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect();
-    format!(
-        "{}  {}  {}.{}  {}  ({})  choices: {}",
-        s("id"),
-        s("center"),
-        s("cap"),
-        s("action"),
-        s("target"),
-        reasons.join("; "),
-        choices.join(", ")
-    )
-}
-
-async fn approvals(paths: &NodePaths, follow: bool, out: &mut dyn Write) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        let sock = paths.ctl_socket();
-        let list = match nerve_transport::ctl::call(&sock, "approvals.list", json!({})).await {
-            Ok(v) => v,
-            Err(e) if e == nerve_transport::ctl::NOT_RUNNING => {
-                let _ = writeln!(out, "no node daemon runs; no approvals are open");
-                return Ok(());
-            }
-            Err(e) => return Err(e),
-        };
-        let open = list["approvals"].as_array().cloned().unwrap_or_default();
-        if open.is_empty() && !follow {
-            let _ = writeln!(out, "no open approvals");
-        }
-        for a in &open {
-            let _ = writeln!(out, "{}", approval_line(a));
-        }
-        if follow {
-            nerve_transport::ctl::follow(&sock, "approvals.follow", json!({}), |v| {
-                let data = &v["data"];
-                let line = match v["name"].as_str() {
-                    Some("requested") => {
-                        let mut d = data.clone();
-                        d["center"] = v["center"].clone();
-                        format!("requested  {}", approval_line(&d))
-                    }
-                    _ => format!(
-                        "resolved   {}  {} by {}",
-                        data["id"].as_str().unwrap_or_default(),
-                        data["answer"].as_str().unwrap_or_default(),
-                        data["by"].as_str().unwrap_or_default()
-                    ),
-                };
-                let _ = writeln!(out, "{line}");
-                let _ = out.flush();
-            })
-            .await?;
-        }
-        Ok(())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (paths, follow, out);
-        Err(format!(
-            "approvals from the CLI on this platform: {NOT_DONE}"
-        ))
-    }
-}
-
 fn audit_line(v: &Value) -> String {
     let s = |k: &str| match &v[k] {
         Value::String(s) => s.clone(),
@@ -829,7 +654,7 @@ fn audit_line(v: &Value) -> String {
     if v.get("changes").is_some() {
         return format!("{}  settings v{} by {}", s("ts"), s("version"), s("by"));
     }
-    let mut line = format!(
+    format!(
         "{}  {}  {}.{}  {}  {}",
         s("ts"),
         s("center"),
@@ -837,11 +662,7 @@ fn audit_line(v: &Value) -> String {
         s("action"),
         s("target"),
         s("decision")
-    );
-    if !s("by").is_empty() {
-        line.push_str(&format!(" by {}", s("by")));
-    }
-    line
+    )
 }
 
 async fn audit(
@@ -1049,7 +870,6 @@ mod tests {
             center_id: format!("id-{name}"),
             node_id: "n".into(),
             settings: SettingsGrant::Off,
-            approvals: ApprovalsGrant::Both,
             paused: false,
             revoked: false,
             unknown: false,
@@ -1075,11 +895,18 @@ mod tests {
     #[test]
     fn per_center_commands_refuse_to_guess() {
         let (_d, paths) = setup(&["a", "b"]);
-        let e = run(&paths, &["mode", "folders"]).unwrap_err();
+        let e = run(&paths, &["mode", "user"]).unwrap_err();
         assert!(e.contains("--center"), "{e}");
-        run(&paths, &["mode", "folders", "--center", "b"]).unwrap();
-        assert_eq!(load(&paths).center("b").unwrap().policy.mode, Mode::Folders);
-        assert_eq!(load(&paths).center("a").unwrap().policy.mode, Mode::Ask);
+        run(&paths, &["mode", "user", "--center", "b"]).unwrap();
+        assert_eq!(load(&paths).center("b").unwrap().policy.mode, Mode::User);
+        assert_eq!(load(&paths).center("a").unwrap().policy.mode, Mode::Folder);
+        // `ask` is gone, and so are the old names.
+        for old in ["ask", "folders", "full"] {
+            let e = run(&paths, &["mode", old, "--center", "a"]).unwrap_err();
+            assert!(e.contains("unknown mode"), "{e}");
+        }
+        let e = run(&paths, &["caps", "fs", "ask", "--center", "a"]).unwrap_err();
+        assert!(e.contains("unknown setting"), "{e}");
     }
 
     #[test]
@@ -1092,8 +919,8 @@ mod tests {
         run(&paths, &["grant", "settings", "write"]).unwrap();
         run(&paths, &["allow", "git status --short", "--wildcard"]).unwrap();
         run(&paths, &["deny", "rm -rf /"]).unwrap();
-        run(&paths, &["mode", "full", "--hours", "2"]).unwrap();
-        assert!(run(&paths, &["mode", "full", "--hours", "9"]).is_err());
+        run(&paths, &["mode", "user", "--hours", "2"]).unwrap();
+        assert!(run(&paths, &["mode", "user", "--hours", "9"]).is_err());
         let cfg = load(&paths);
         let c = cfg.center("home").unwrap();
         let real = nerve_policy::paths::resolve(&folder).unwrap();
@@ -1101,10 +928,10 @@ mod tests {
         assert_eq!(c.policy.folders[0].access, Access::Rw);
         assert_eq!(c.policy.caps["exec.run"], CapSetting::Off);
         assert_eq!(c.settings, SettingsGrant::Write);
-        assert_eq!(c.policy.commands.never_ask, vec!["git *".to_string()]);
+        assert_eq!(c.policy.commands.permit, vec!["git *".to_string()]);
         assert_eq!(c.policy.commands.deny, vec!["rm -rf /".to_string()]);
-        assert_eq!(c.policy.mode, Mode::Full);
-        assert!(c.policy.full_until.is_some());
+        assert_eq!(c.policy.mode, Mode::User);
+        assert!(c.policy.user_until.is_some());
         let log = std::fs::read_to_string(paths.audit_log()).unwrap();
         assert!(log.contains("local"), "{log}");
         run(&paths, &["panic"]).unwrap();
@@ -1120,20 +947,11 @@ mod tests {
         assert_eq!(load(&paths).limits.max_running, 4);
         run(
             &paths,
-            &[
-                "config",
-                "set",
-                "center.home.policy.approvals.timeout_s",
-                "30",
-            ],
+            &["config", "set", "center.home.policy.user_until", "30"],
         )
         .unwrap();
         assert_eq!(
-            run(
-                &paths,
-                &["config", "get", "center.home.policy.approvals.timeout_s"]
-            )
-            .unwrap(),
+            run(&paths, &["config", "get", "center.home.policy.user_until"]).unwrap(),
             "30\n"
         );
         run(
@@ -1173,10 +991,7 @@ mod tests {
     }
 
     #[test]
-    fn approval_ids_and_rules() {
-        assert!(is_approval_id("a12-x9kq"));
-        assert!(!is_approval_id("apt-get"));
-        assert!(!is_approval_id("a1-toolong"));
+    fn command_rules() {
         assert_eq!(command_rule("git push origin", true).unwrap(), "git *");
         assert_eq!(command_rule(" ls ", false).unwrap(), "ls");
     }

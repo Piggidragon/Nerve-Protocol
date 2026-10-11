@@ -218,54 +218,24 @@ function btn(label, kind, onclick, ic) {
   return el("button", { type: "button", class: "btn sm " + (kind || ""), onclick }, ic ? icon(ic, "sm") : null, label);
 }
 
-function waitingCount(o) {
-  return o.nodes.reduce((n, x) => n + (x.pending_approvals || []).length, 0);
-}
-
 // ---- Overview ----
 
 function pageOverview() {
   const o = state.overview;
   if (!o) return [empty("Loading…")];
   const online = o.nodes.filter((n) => n.online).length;
-  const waiting = waitingCount(o);
   return [
     head("overview", o.center.name, o.center.url, [
       [`${online}/${o.nodes.length}`, "machines online", online ? "ok" : ""],
-      [waiting, "waiting for you", waiting ? "warn" : ""],
       [o.sessions.length, o.sessions.length === 1 ? "session" : "sessions"],
     ]),
     o.alerts.slice(-5).map((a) => banner("warn", "alert", `${when(a.ts)}: ${a.text}`)),
-    section("Waiting for you", "Calls that need an answer before they run.", null,
-      waiting ? el("div", { class: "list" }, o.nodes.flatMap((n) => (n.pending_approvals || []).map((a) => nodeApproval(n, a))))
-        : empty("Nothing is waiting.")),
     section("Machines", null, btn("Pair a machine", "primary", act(async () => { state.pairing = await api("POST", "/api/pair"); }), "plus"),
       state.pairing ? pairingCard(state.pairing) : null,
       o.nodes.length ? el("div", { class: "list" }, o.nodes.map(nodeCard)) : empty("No machines yet. Pair one to get started.")),
     section("Sessions", "Harnesses that are connected to this center.", null,
       o.sessions.length ? el("div", { class: "list" }, o.sessions.map(sessionCard)) : empty("No harness is connected.")),
   ];
-}
-
-function answer(label, kind, run) {
-  return el("button", { type: "button", class: "btn " + kind, onclick: act(run) }, label);
-}
-
-function nodeApproval(n, a) {
-  const label = { once: "Allow once", session: "Allow for this session", time: "Allow for a while", deny: "Deny" };
-  const choices = a.choices || ["once", "deny"];
-  const post = (c) => () => api("POST", "/api/approvals/node", {
-    node_id: n.id, id: a.id, answer: c,
-    minutes: c === "time" ? Math.min(a.max_minutes || 60, 60) : undefined,
-  });
-  return el("div", { class: "card attention" },
-    el("div", { class: "card-top" }, icon("wait"), el("span", { class: "name" }, `${n.name}: ${a.cap}.${a.action}`),
-      el("span", { class: "meta push" }, "held by the machine")),
-    a.target ? el("code", { class: "code" }, a.target) : null,
-    (a.reasons || []).length ? el("p", { class: "meta" }, a.reasons.join("; ")) : null,
-    n.approvals_answerable
-      ? el("div", { class: "actions" }, choices.map((c) => answer(label[c] || c, c === "deny" ? "danger" : c === "once" ? "primary" : "", post(c))))
-      : el("p", { class: "meta" }, "This machine answers its approvals only locally."));
 }
 
 function pairingCard(p) {
@@ -282,14 +252,12 @@ function pairingCard(p) {
 }
 
 function nodeCard(n) {
-  const pending = (n.pending_approvals || []).length;
   const caps = n.capabilities || [];
   return el("div", { class: "card" },
     el("div", { class: "card-top" },
       el("span", { class: "dot" + (n.online ? " up" : "") }),
       el("span", { class: "name" }, n.name),
       pill(n.online ? "up" : "down", n.online ? n.status || "online" : "offline"),
-      pending ? pill("warn", `${pending} waiting`) : null,
       el("span", { class: "meta push" }, `${n.platform}/${n.arch}`)),
     el("p", { class: "meta", title: when(n.online ? n.since_ms : n.last_seen_ms) },
       n.online ? `Since ${ago(n.since_ms)}` : `Last seen ${ago(n.last_seen_ms)}`),
@@ -337,29 +305,25 @@ function pageStats() {
 function dayCard(d, name) {
   const calls = Object.entries(d.calls || {}).sort((a, b) => b[1].count - a[1].count);
   const errors = Object.entries(d.errors || {}).sort((a, b) => b[1] - a[1]);
-  const by = Object.entries(d.approvals_by || {}).sort((a, b) => b[1] - a[1]);
   const total = calls.reduce((n, [, c]) => n + c.count, 0);
   const failed = calls.reduce((n, [, c]) => n + c.errors, 0);
   const metrics = [
     [duration(d.online_ms || 0), "Online"], [d.links || 0, "Links"], [d.drops || 0, "Drops"],
-    [total, "Calls"], [failed, "Failed calls"], [d.approvals_asked || 0, "Approvals asked"],
+    [total, "Calls"], [failed, "Failed calls"],
   ];
-  if (d.approvals_asked) metrics.push([duration(d.approval_wait_max_ms || 0), "Longest wait"]);
   const rows = (title, list, line) => list.length ? [el("p", { class: "meta" }, title), el("div", { class: "rows" }, list.map(([k, v]) =>
     el("div", {}, el("span", { class: "mono" }, k), el("span", { class: "v" }, line(v))))) ] : null;
   return el("div", { class: "card" },
     name ? el("div", { class: "card-top" }, icon("server"), el("span", { class: "name" }, name)) : null,
     el("div", { class: "metrics" }, metrics.map(([v, l]) => el("div", { class: "metric" }, el("b", {}, v.toLocaleString()), el("span", {}, l)))),
     rows("Calls", calls, (c) => `${c.count}${c.errors ? `, ${c.errors} failed` : ""}, avg ${c.count ? Math.round(c.total_ms / c.count) : 0} ms, max ${c.max_ms} ms`),
-    rows("Errors", errors, (n) => n),
-    rows("Approvals answered by", by, (n) => n));
+    rows("Errors", errors, (n) => n));
 }
 
 // ---- Audit ----
 
 const DECISIONS = {
   allowed: { ic: "ok", tone: "ok", pill: "up" },
-  asked: { ic: "wait", tone: "warn", pill: "warn" },
   denied: { ic: "ban", tone: "danger", pill: "down" },
   forbidden: { ic: "lock", tone: "danger", pill: "down" },
 };
@@ -537,15 +501,6 @@ function draw(force) {
   $("page").replaceChildren(...PAGES[page].view().flat());
 }
 
-function badge() {
-  const n = state.overview ? waitingCount(state.overview) : 0;
-  const b = $("badge");
-  b.hidden = n === 0;
-  b.textContent = n;
-  b.title = "Waiting for you";
-  document.title = (n ? `(${n}) ` : "") + "Nerve center";
-}
-
 async function tick() {
   if (busy || !csrf) return;
   busy = true;
@@ -560,7 +515,6 @@ async function tick() {
     if (page === "audit") state.audit = extra;
     if (down) notify("Connected to the center again.");
     down = false;
-    badge();
     draw(false);
   } catch (e) {
     if (!e.auth && !down) notify("Cannot reach the center. Trying again.", "error");

@@ -1,5 +1,5 @@
-//! The node daemon (`nerve-node run`): one link task per paired center, the
-//! approvals queues, and the control socket the CLI talks to.
+//! The node daemon (`nerve-node run`): one link task per paired center and
+//! the control socket the CLI talks to.
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -8,15 +8,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 #[cfg(unix)]
 use nerve_policy::SetError;
-use nerve_policy::approvals::{Ask, By, Queue, Resolved};
 use nerve_policy::audit::{AuditLog, Entry};
-use nerve_policy::config::OnTimeout;
-use nerve_policy::{Choice, Grants, NodeConfig, SettingsStore};
+use nerve_policy::{NodeConfig, SettingsStore};
 use nerve_proto::Message;
 use nerve_proto::msg::{Topic, method};
 use nerve_sandbox::Confinement;
@@ -30,7 +28,7 @@ use crate::paths::{NodePaths, home_dir};
 pub struct NodeOptions {
     pub paths: NodePaths,
     /// The `nerve-node` binary that hosts the exec shim. Without it commands
-    /// run unconfined (and `folders` mode asks before each one).
+    /// run unconfined (and `folder` mode refuses them).
     pub exe: Option<PathBuf>,
     /// The owner's home: the default `cwd` and the root of the protected list.
     pub home: PathBuf,
@@ -133,9 +131,6 @@ impl LinkHandle {
 
 /// What the node keeps per center across links.
 pub(crate) struct CenterState {
-    pub name: String,
-    pub queue: Mutex<Queue>,
-    pub grants: Mutex<Grants>,
     pub link: Mutex<Option<Arc<LinkHandle>>>,
     pub status: Mutex<String>,
 }
@@ -161,8 +156,6 @@ pub(crate) struct Shared {
     /// center, the supervisor its link tasks.
     pub changed: watch::Sender<u64>,
     pub centers: Mutex<HashMap<String, Arc<CenterState>>>,
-    /// Approval and audit events for control-socket followers.
-    pub local: broadcast::Sender<Value>,
     /// pid → center of every command running now.
     pub commands: Mutex<HashMap<u32, String>>,
     /// Commands running now, over all centers (`limits.max_running`).
@@ -189,9 +182,6 @@ impl Shared {
             .entry(name.to_string())
             .or_insert_with(|| {
                 Arc::new(CenterState {
-                    name: name.to_string(),
-                    queue: Mutex::default(),
-                    grants: Mutex::default(),
                     link: Mutex::new(None),
                     status: Mutex::new("not connected".into()),
                 })
@@ -199,11 +189,8 @@ impl Shared {
             .clone()
     }
 
-    /// Sends an event to `center`'s link and to local followers.
+    /// Sends an event to `center`'s link.
     pub fn emit(&self, center: &str, cap: &str, name: &str, data: Value) {
-        let _ = self
-            .local
-            .send(json!({"center": center, "cap": cap, "name": name, "data": data}));
         if let Some(l) = lock(&self.centers).get(center).and_then(|c| c.link()) {
             l.event(cap, name, data);
         }
@@ -231,93 +218,9 @@ impl Shared {
         self.bump();
     }
 
-    /// Opens an approval for `cs`, tells the center and local followers, and
-    /// waits for the first answer (or the timeout). Dropping the future
-    /// withdraws the approval.
-    pub async fn ask(
-        self: &Arc<Self>,
-        cs: &Arc<CenterState>,
-        ask: Ask,
-        timeout: Duration,
-        on_timeout: OnTimeout,
-    ) -> Resolved {
-        let (req, mut rx) = lock(&cs.queue).open(ask);
-        let id = req.id.clone();
-        self.emit(
-            &cs.name,
-            "approvals",
-            "requested",
-            serde_json::to_value(&req).unwrap_or_default(),
-        );
-
-        struct Withdraw<'a> {
-            shared: &'a Arc<Shared>,
-            cs: &'a Arc<CenterState>,
-            id: &'a str,
-        }
-        impl Drop for Withdraw<'_> {
-            fn drop(&mut self) {
-                let r = lock(&self.cs.queue).withdraw(self.id, By::Withdrawn);
-                if let Some(r) = r {
-                    self.shared.resolved(&self.cs.name, &r);
-                }
-            }
-        }
-        let _guard = Withdraw {
-            shared: self,
-            cs,
-            id: &id,
-        };
-
-        let r = match tokio::time::timeout(timeout, &mut rx).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(_)) => Resolved {
-                id: id.clone(),
-                answer: "deny",
-                minutes: None,
-                by: By::Withdrawn,
-            },
-            Err(_) => {
-                let expired = lock(&cs.queue).expire(&id, on_timeout);
-                match expired {
-                    Some(r) => r,
-                    // Answered in the same instant: that answer wins.
-                    None => rx.await.unwrap_or(Resolved {
-                        id: id.clone(),
-                        answer: "deny",
-                        minutes: None,
-                        by: By::Withdrawn,
-                    }),
-                }
-            }
-        };
-        self.resolved(&cs.name, &r);
-        r
-    }
-
-    pub fn resolved(&self, center: &str, r: &Resolved) {
-        self.emit(
-            center,
-            "approvals",
-            "resolved",
-            serde_json::to_value(r).unwrap_or_default(),
-        );
-    }
-
-    /// Withdraws every open approval of `center` (link gone, node paused).
-    pub fn withdraw_all(&self, center: &str, by: By) {
-        let Some(cs) = lock(&self.centers).get(center).cloned() else {
-            return;
-        };
-        let gone = lock(&cs.queue).withdraw_all(by);
-        for r in gone {
-            self.resolved(center, &r);
-        }
-    }
-
-    // Only the Unix control socket asks these two; Windows has none yet.
+    // Only the Unix control socket asks this; Windows has none yet.
     /// Whether `pid` runs below a command the node started for a center: such
-    /// a process must not change the node's settings or answer approvals.
+    /// a process must not change the node's settings.
     #[cfg_attr(not(unix), allow(dead_code))]
     pub fn below_command(&self, pid: Option<u32>) -> bool {
         let commands = lock(&self.commands);
@@ -342,22 +245,20 @@ impl Shared {
             .iter()
             .map(|c| {
                 let cs = lock(&self.centers).get(&c.name).cloned();
-                let (status, open) = match &cs {
-                    Some(cs) => (lock(&cs.status).clone(), lock(&cs.queue).list().len()),
-                    None => ("not connected".to_string(), 0),
+                let status = match &cs {
+                    Some(cs) => lock(&cs.status).clone(),
+                    None => "not connected".to_string(),
                 };
                 json!({
                     "name": c.name,
                     "url": c.url,
                     "status": status,
                     "mode": c.policy.mode_at(now).as_str(),
-                    "full_until": c.policy.full_until,
+                    "user_until": c.policy.user_until,
                     "settings": c.settings,
-                    "approvals": c.approvals,
                     "paused": c.paused,
                     "revoked": c.revoked,
                     "unknown": c.unknown,
-                    "open_approvals": open,
                 })
             })
             .collect();
@@ -368,31 +269,6 @@ impl Shared {
             "running": self.running.load(Ordering::Relaxed),
             "centers": centers,
         })
-    }
-
-    /// Answers an approval as the owner.
-    #[cfg_attr(not(unix), allow(dead_code))]
-    pub fn answer_local(
-        &self,
-        center: Option<&str>,
-        id: &str,
-        choice: Choice,
-        minutes: Option<u32>,
-    ) -> Result<(), String> {
-        let cfg = self.config();
-        let states: Vec<Arc<CenterState>> = lock(&self.centers).values().cloned().collect();
-        let cs = states
-            .into_iter()
-            .find(|cs| center.is_none_or(|c| c == cs.name) && lock(&cs.queue).get(id).is_some())
-            .ok_or_else(|| format!("no open approval {id}"))?;
-        let grant = cfg
-            .center(&cs.name)
-            .map(|c| c.approvals)
-            .unwrap_or_default();
-        lock(&cs.queue)
-            .answer(id, choice, minutes, By::Local, grant)
-            .map(|_| ())
-            .map_err(|e| e.to_string())
     }
 }
 
@@ -429,7 +305,6 @@ impl Daemon {
         }
         let (changed, _) = watch::channel(0);
         let (stop, _) = watch::channel(false);
-        let (local, _) = broadcast::channel(256);
         let shared = Arc::new(Shared {
             paths: paths.clone(),
             exe: opts.exe,
@@ -438,7 +313,6 @@ impl Daemon {
             store: Mutex::new(store),
             changed,
             centers: Mutex::default(),
-            local,
             commands: Mutex::default(),
             running: AtomicUsize::new(0),
             stop,
@@ -607,7 +481,7 @@ async fn start_ctl(_shared: Arc<Shared>) -> Result<JoinHandle<()>, String> {
 
 /// Methods that change something: refused from below a center's command.
 #[cfg(unix)]
-const MUTATING: &[&str] = &["config.write", "approvals.answer", "reload"];
+const MUTATING: &[&str] = &["config.write", "reload"];
 
 /// One control-socket request.
 #[cfg(unix)]
@@ -658,52 +532,6 @@ pub(crate) fn control(
                 Ok(changed) => Reply::Ok(json!({"changed": changed})),
                 Err(e) => Reply::Err(e),
             }
-        }
-        "approvals.list" => {
-            let states: Vec<Arc<CenterState>> = lock(&shared.centers).values().cloned().collect();
-            let mut list = Vec::new();
-            for cs in states {
-                for r in lock(&cs.queue).list() {
-                    let mut v = serde_json::to_value(&r).unwrap_or_default();
-                    v["center"] = cs.name.clone().into();
-                    list.push(v);
-                }
-            }
-            Reply::Ok(json!({"approvals": list}))
-        }
-        "approvals.answer" => {
-            let Some(id) = str_of("id") else {
-                return Reply::Err("id is missing".into());
-            };
-            let Some(choice) = str_of("answer").as_deref().and_then(Choice::parse) else {
-                return Reply::Err("answer must be once, session, time or deny".into());
-            };
-            let minutes = params
-                .get("minutes")
-                .and_then(Value::as_u64)
-                .map(|m| m.min(u32::MAX as u64) as u32);
-            match shared.answer_local(str_of("center").as_deref(), &id, choice, minutes) {
-                Ok(()) => Reply::Ok(json!({})),
-                Err(e) => Reply::Err(e),
-            }
-        }
-        "approvals.follow" => {
-            let mut rx = shared.local.subscribe();
-            let (tx, out) = mpsc::channel(64);
-            tokio::spawn(async move {
-                loop {
-                    match rx.recv().await {
-                        Ok(v) if v["cap"] == "approvals" => {
-                            if tx.send(v).await.is_err() {
-                                break;
-                            }
-                        }
-                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(broadcast::error::RecvError::Closed) => break,
-                    }
-                }
-            });
-            Reply::Follow(out)
         }
         other => Reply::Err(format!("unknown method {other}")),
     }

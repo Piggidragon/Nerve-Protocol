@@ -107,12 +107,12 @@ carry `ctx.tainted: true`. When a session ends, every node it used gets
 
 ## 6. Approvals
 
-The center has its own rule per effect (`on`, `ask`, `off`; by default
-`execute` and `actuate` ask). A call that asks waits for an answer in the web
-UI: once, for this session, or deny. Nodes keep their own approvals; the
-center shows them and, when the node's `approvals` grant is `both`, can
-answer them. If nobody answers within `--call-wait`, the call returns
-`error timeout: approval pending at <where>` and nothing is run.
+The center holds no approval of its own and has no rule per effect: it never
+holds a call back for a person. Every call goes to its node, whose policy
+decides, and what the node does not allow is refused. Nodes keep their own
+approvals; the center shows them and, when the node's `approvals` grant is
+`both`, can answer them. If nobody answers within `--call-wait`, the call
+returns `error timeout: approval pending at <where>` and nothing is run.
 
 ## 7. Web UI
 
@@ -121,7 +121,7 @@ machines, pairing, sessions), statistics, audit (Allow, Allow as wildcard,
 Deny for commands, only with the node's settings grant; Allow puts the rule
 on the node's `policy.commands.never_ask`, Deny on `deny`, and each takes it
 off the other list), settings (center
-name, retention, effect rules, harness tokens, per-node settings). The pages,
+name, retention, harness tokens, per-node settings). The pages,
 scripts and styles are built into the binary; nothing is loaded from another
 host.
 

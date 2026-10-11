@@ -2,7 +2,7 @@
 //!
 //! It holds what the center must remember across restarts: its id and name,
 //! the paired nodes with their public keys and last descriptor, the harness
-//! tokens (hashed), the center-side approval rules and the statistics. It never
+//! tokens (hashed) and the statistics. It never
 //! holds file contents, command output or secrets: the descriptor cache is the
 //! node's own description of itself, and the statistics are counts and timings.
 
@@ -26,8 +26,6 @@ pub struct Store {
     pub nodes: BTreeMap<String, NodeRecord>,
     #[serde(default)]
     pub harness_tokens: Vec<TokenRecord>,
-    #[serde(default)]
-    pub center_policy: CenterPolicy,
     #[serde(default = "d_retention")]
     pub retention_days: u32,
     #[serde(default)]
@@ -45,7 +43,6 @@ impl Store {
             center_name,
             nodes: BTreeMap::new(),
             harness_tokens: Vec::new(),
-            center_policy: CenterPolicy::default(),
             retention_days: RETENTION_DAYS,
             stats: BTreeMap::new(),
         }
@@ -117,43 +114,6 @@ pub struct TokenRecord {
     /// Hex SHA-256 of the token; the token itself is shown once and not kept.
     pub hash: String,
     pub created_ms: u64,
-}
-
-/// What the center does with a call of a given effect before it sends it to
-/// the node (§5.5 of the design): `on` passes it, `ask` holds it for a person
-/// in the web UI, `off` refuses it. The node's own policy applies on top.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Rule {
-    On,
-    Ask,
-    Off,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CenterPolicy {
-    /// Effect name to rule; an effect not listed is `on`.
-    pub effects: BTreeMap<String, Rule>,
-}
-
-impl Default for CenterPolicy {
-    /// A generic MCP harness cannot show approvals in its chat or see its own
-    /// context, so the effects that change the machine ask at the center.
-    fn default() -> CenterPolicy {
-        let mut effects = BTreeMap::new();
-        for e in ["read", "sense", "write"] {
-            effects.insert(e.to_string(), Rule::On);
-        }
-        effects.insert("execute".into(), Rule::Ask);
-        effects.insert("actuate".into(), Rule::Ask);
-        CenterPolicy { effects }
-    }
-}
-
-impl CenterPolicy {
-    pub fn rule(&self, effect: &str) -> Rule {
-        self.effects.get(effect).copied().unwrap_or(Rule::On)
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -240,11 +200,13 @@ mod tests {
     }
 
     #[test]
-    fn the_default_center_policy_asks_for_execute_and_actuate() {
-        let p = CenterPolicy::default();
-        assert_eq!(p.rule("execute"), Rule::Ask);
-        assert_eq!(p.rule("actuate"), Rule::Ask);
-        assert_eq!(p.rule("read"), Rule::On);
-        assert_eq!(p.rule("x-new"), Rule::On);
+    fn a_state_file_with_the_old_effect_rules_still_loads() {
+        // Older centers stored `center_policy` with on, ask or off per effect.
+        // The rule is gone; the node decides, and a node denies by default.
+        let old = r#"{"center_id":"c","center_name":"home",
+            "center_policy":{"effects":{"execute":"ask","actuate":"off","read":"on"}}}"#;
+        let s: Store = serde_json::from_str(old).unwrap();
+        assert_eq!(s.center_name, "home");
+        assert!(!serde_json::to_string(&s).unwrap().contains("center_policy"));
     }
 }

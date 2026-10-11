@@ -305,34 +305,6 @@ textarea.json {
   overflow: auto;
 }
 
-/* Choices (Pithagoras "Segments"): a row of pill buttons, one on. */
-.seg {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 4px;
-}
-
-.seg > button {
-  padding: 4px 10px;
-  border: 0;
-  border-radius: 8px;
-  background: rgb(var(--fg) / 0.05);
-  color: rgb(var(--fg-muted));
-  font-size: 12px;
-  transition: background-color 0.15s, color 0.15s;
-}
-
-.seg > button:hover {
-  background: rgb(var(--fg) / 0.1);
-}
-
-.seg > button[aria-checked="true"] {
-  background: rgb(var(--accent) / 0.12);
-  color: rgb(var(--accent));
-  box-shadow: inset 0 0 0 1px rgb(var(--accent) / 0.25);
-}
-
 /* ---- Shell ---- */
 
 .shell {
@@ -954,31 +926,6 @@ textarea.json {
   font-size: 11px;
   overflow-wrap: anywhere;
   word-break: break-all;
-}
-
-.effect {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-  padding: 8px 0;
-  border-bottom: 1px solid rgb(var(--line) / 0.6);
-}
-
-.effect:last-child {
-  border-bottom: 0;
-}
-
-.effect .k {
-  font-weight: 500;
-}
-
-.effect .d {
-  display: block;
-  color: rgb(var(--fg-faint));
-  font-size: 11px;
-  font-weight: 400;
 }
 
 .form-row {

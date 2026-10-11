@@ -1,5 +1,5 @@
 //! The center's core: paired nodes and their links, pairing, sessions and
-//! taint, the center-side approval rule, calls to nodes, the audit feed and
+//! taint, calls to nodes, the audit feed and
 //! the statistics. The MCP server, the node listener and the web UI are thin
 //! layers over this.
 
@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
-use tokio::sync::{broadcast, oneshot};
+use tokio::sync::broadcast;
 
 use nerve_proto::link::{CenterUrl, PairLink, PairRequest, PairResponse};
 use nerve_proto::msg::{self, ByeReason, Event, Hello};
@@ -19,7 +19,7 @@ use nerve_transport::tls::ServerIdentity;
 
 use crate::link::{Link, NodeApproval, SHORT_CALL};
 use crate::pairing::Codes;
-use crate::store::{NodeRecord, Rule, Store};
+use crate::store::{NodeRecord, Store};
 use crate::tools::{self, Route, Tool};
 use crate::util::{self, now_ms};
 
@@ -27,8 +27,6 @@ pub const IDENTITY_FILE: &str = "tls.pem";
 /// Recent audit decisions kept in memory for the web UI (never on disk).
 pub const AUDIT_KEEP: usize = 500;
 const ALERTS_KEEP: usize = 50;
-/// How long a session's center-side "allow for this session" lasts at most.
-const SESSION_ALLOW: Duration = Duration::from_secs(8 * 3600);
 
 /// What changed, for the MCP servers (tool lists) and the web UI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,43 +64,9 @@ pub struct Inner {
     codes: Mutex<Codes>,
     links: Mutex<BTreeMap<String, Arc<Link>>>,
     changes: broadcast::Sender<Change>,
-    approvals: Mutex<BTreeMap<String, CenterApproval>>,
     audit: Mutex<VecDeque<Value>>,
     alerts: Mutex<VecDeque<Value>>,
     sessions: Mutex<BTreeMap<String, Arc<Session>>>,
-}
-
-/// A call the center's own rule holds for a person (§5.5 of the design).
-pub struct CenterApproval {
-    pub id: String,
-    pub session: String,
-    pub node_id: String,
-    pub node_name: String,
-    pub cap: String,
-    pub action: String,
-    pub effect: String,
-    /// What the call would act on, shortened: the command or the path.
-    pub target: String,
-    pub created_ms: u64,
-    answer: Option<oneshot::Sender<Answer>>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Answer {
-    Once,
-    Session,
-    Deny,
-}
-
-impl Answer {
-    pub fn parse(s: &str) -> Option<Answer> {
-        match s {
-            "once" => Some(Answer::Once),
-            "session" => Some(Answer::Session),
-            "deny" => Some(Answer::Deny),
-            _ => None,
-        }
-    }
 }
 
 /// One harness session: an MCP client (stdio, an attached process, or an
@@ -117,8 +81,6 @@ pub struct Session {
     pub calls: AtomicU64,
     /// Nodes this session called, for `session.end`.
     nodes: Mutex<BTreeSet<String>>,
-    /// (node id, cap, action) the center rule allowed for the whole session.
-    allowed: Mutex<BTreeMap<(String, String, String), Instant>>,
 }
 
 impl Session {
@@ -128,20 +90,6 @@ impl Session {
 
     pub fn ended(&self) -> bool {
         self.ended.load(Ordering::SeqCst)
-    }
-
-    fn allows(&self, r: &Route) -> bool {
-        let key = (r.node_id.clone(), r.cap.clone(), r.action.clone());
-        self.allowed
-            .lock()
-            .unwrap()
-            .get(&key)
-            .is_some_and(|t| t.elapsed() < SESSION_ALLOW)
-    }
-
-    fn allow(&self, r: &Route) {
-        let key = (r.node_id.clone(), r.cap.clone(), r.action.clone());
-        self.allowed.lock().unwrap().insert(key, Instant::now());
     }
 }
 
@@ -238,7 +186,6 @@ impl Center {
             codes: Mutex::new(Codes::default()),
             links: Mutex::new(BTreeMap::new()),
             changes,
-            approvals: Mutex::new(BTreeMap::new()),
             audit: Mutex::new(VecDeque::new()),
             alerts: Mutex::new(VecDeque::new()),
             sessions: Mutex::new(BTreeMap::new()),
@@ -751,7 +698,6 @@ impl Center {
             ended: AtomicBool::new(false),
             calls: AtomicU64::new(0),
             nodes: Mutex::new(BTreeSet::new()),
-            allowed: Mutex::new(BTreeMap::new()),
         });
         self.sessions
             .lock()
@@ -778,17 +724,6 @@ impl Center {
                 l.notify(msg::method::SESSION_END, json!({"session": s.id}))
                     .await;
             }
-        }
-        let ids: Vec<String> = self
-            .approvals
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|a| a.session == s.id)
-            .map(|a| a.id.clone())
-            .collect();
-        for a in ids {
-            self.answer_center(&a, Answer::Deny);
         }
         self.changed(Change::Sessions);
         true
@@ -824,36 +759,6 @@ impl Center {
 
     pub fn session_count(&self) -> usize {
         self.sessions.lock().unwrap().len()
-    }
-
-    // ---- Center approvals ----
-
-    pub fn center_approvals(&self) -> Value {
-        let list: Vec<Value> = self
-            .approvals
-            .lock()
-            .unwrap()
-            .values()
-            .map(|a| {
-                json!({
-                    "id": a.id, "session": a.session, "node_id": a.node_id, "node": a.node_name,
-                    "cap": a.cap, "action": a.action, "effect": a.effect, "target": a.target,
-                    "created_ms": a.created_ms,
-                })
-            })
-            .collect();
-        json!(list)
-    }
-
-    /// Answers a center approval; false when it is gone.
-    pub fn answer_center(&self, id: &str, answer: Answer) -> bool {
-        let a = self.approvals.lock().unwrap().remove(id);
-        let ok = match a {
-            Some(mut a) => a.answer.take().is_some_and(|tx| tx.send(answer).is_ok()),
-            None => false,
-        };
-        self.changed(Change::Approvals);
-        ok
     }
 
     /// Answers an approval a node holds, through its `approvals.answer`.
@@ -936,7 +841,7 @@ impl Center {
 
     // ---- Calls ----
 
-    /// Runs a tool call on its node: the center rule first, then the node.
+    /// Runs a tool call on its node: the node's policy decides.
     pub async fn call(
         &self,
         sess: &Arc<Session>,
@@ -981,18 +886,6 @@ impl Center {
         route: &Route,
         args: Map<String, Value>,
     ) -> Result<Value, CallError> {
-        let rule = self.read(|s| s.center_policy.rule(route.effect.as_str()));
-        match rule {
-            Rule::Off => {
-                return Err(RpcError::forbidden(format!(
-                    "the center's rules turn off calls with the effect {}",
-                    route.effect.as_str()
-                ))
-                .into());
-            }
-            Rule::Ask if !sess.allows(route) => self.center_ask(sess, route, &args).await?,
-            _ => {}
-        }
         let link = self.link(&route.node_id).ok_or_else(|| {
             RpcError::new(
                 ErrorCode::Unavailable,
@@ -1031,60 +924,6 @@ impl Center {
                         return Err(CallError::Pending { at: format!("the node {}", route.node_name), waited: started.elapsed() });
                     }
                 }
-            }
-        }
-    }
-
-    /// Holds a call for a person in the web UI (the center's `ask` rule).
-    async fn center_ask(
-        &self,
-        sess: &Arc<Session>,
-        route: &Route,
-        args: &Map<String, Value>,
-    ) -> Result<(), CallError> {
-        let id = nerve_transport::keys::random_token(16);
-        let (tx, rx) = oneshot::channel();
-        let target = args
-            .get("command")
-            .or_else(|| args.get("path"))
-            .map(|v| {
-                v.as_str()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| v.to_string())
-            })
-            .unwrap_or_else(|| Value::Object(args.clone()).to_string());
-        self.approvals.lock().unwrap().insert(
-            id.clone(),
-            CenterApproval {
-                id: id.clone(),
-                session: sess.id.clone(),
-                node_id: route.node_id.clone(),
-                node_name: route.node_name.clone(),
-                cap: route.cap.clone(),
-                action: route.action.clone(),
-                effect: route.effect.as_str().to_string(),
-                target: util::clip(&target, 300),
-                created_ms: now_ms(),
-                answer: Some(tx),
-            },
-        );
-        self.changed(Change::Approvals);
-        match tokio::time::timeout(self.call_wait, rx).await {
-            Ok(Ok(Answer::Once)) => Ok(()),
-            Ok(Ok(Answer::Session)) => {
-                sess.allow(route);
-                Ok(())
-            }
-            Ok(Ok(Answer::Deny)) | Ok(Err(_)) => {
-                Err(RpcError::new(ErrorCode::Denied, "a person at the center said no").into())
-            }
-            Err(_) => {
-                self.approvals.lock().unwrap().remove(&id);
-                self.changed(Change::Approvals);
-                Err(CallError::Pending {
-                    at: "the center".into(),
-                    waited: self.call_wait,
-                })
             }
         }
     }

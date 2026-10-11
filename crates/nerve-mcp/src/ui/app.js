@@ -42,13 +42,6 @@ const PAGES = {
   audit: { title: "Audit", view: pageAudit },
   settings: { title: "Settings", view: pageSettings },
 };
-const EFFECTS = [
-  ["read", "Look at data without changing anything"],
-  ["sense", "Read sensors and live state"],
-  ["write", "Create or change files and data"],
-  ["actuate", "Act on the machine: signals, switches"],
-  ["execute", "Run commands and programs"],
-];
 
 let csrf = null;
 let lastSig = null;
@@ -226,7 +219,7 @@ function btn(label, kind, onclick, ic) {
 }
 
 function waitingCount(o) {
-  return o.approvals.length + o.nodes.reduce((n, x) => n + (x.pending_approvals || []).length, 0);
+  return o.nodes.reduce((n, x) => n + (x.pending_approvals || []).length, 0);
 }
 
 // ---- Overview ----
@@ -244,7 +237,7 @@ function pageOverview() {
     ]),
     o.alerts.slice(-5).map((a) => banner("warn", "alert", `${when(a.ts)}: ${a.text}`)),
     section("Waiting for you", "Calls that need an answer before they run.", null,
-      waiting ? el("div", { class: "list" }, o.approvals.map(centerApproval), o.nodes.flatMap((n) => (n.pending_approvals || []).map((a) => nodeApproval(n, a))))
+      waiting ? el("div", { class: "list" }, o.nodes.flatMap((n) => (n.pending_approvals || []).map((a) => nodeApproval(n, a))))
         : empty("Nothing is waiting.")),
     section("Machines", null, btn("Pair a machine", "primary", act(async () => { state.pairing = await api("POST", "/api/pair"); }), "plus"),
       state.pairing ? pairingCard(state.pairing) : null,
@@ -256,18 +249,6 @@ function pageOverview() {
 
 function answer(label, kind, run) {
   return el("button", { type: "button", class: "btn " + kind, onclick: act(run) }, label);
-}
-
-function centerApproval(a) {
-  const post = (answerValue) => () => api("POST", "/api/approvals/center", { id: a.id, answer: answerValue });
-  return el("div", { class: "card attention" },
-    el("div", { class: "card-top" }, icon("wait"), el("span", { class: "name" }, `${a.node}: ${a.cap}.${a.action}`),
-      pill("warn", a.effect), el("span", { class: "meta push" }, "held by this center")),
-    a.target ? el("code", { class: "code" }, a.target) : null,
-    el("div", { class: "actions" },
-      answer("Allow once", "primary", post("once")),
-      answer("Allow for this session", "", post("session")),
-      answer("Deny", "danger", post("deny"))));
 }
 
 function nodeApproval(n, a) {
@@ -437,10 +418,8 @@ function pageSettings() {
       el("div", { class: "form-row" },
         el("label", { class: "field" }, el("span", { class: "label" }, "Name"), name),
         el("label", { class: "field" }, el("span", { class: "label" }, "Keep statistics for (days)"), days)),
-      el("p", { class: "meta" }, "Effect rules: on lets a call run, ask waits for an answer here, off refuses it."),
-      el("div", {}, EFFECTS.map(([e, d]) => effectRow(s, e, d))),
       el("div", { class: "actions" }, el("button", { type: "button", class: "btn primary", onclick: act(async () => {
-        await api("POST", "/api/center", { name: name.value, retention_days: Number(days.value), effects: s.center.effects });
+        await api("POST", "/api/center", { name: name.value, retention_days: Number(days.value) });
         notify("Saved.");
       }) }, "Save")))),
     section("Harness tokens", "A token lets an AI harness call this center over HTTP.", null,
@@ -448,18 +427,6 @@ function pageSettings() {
     section("Machines", "Settings kept on each machine itself.", null,
       s.nodes.length ? el("div", { class: "list" }, s.nodes.map(nodeSettings)) : empty("No machines yet.")),
   ];
-}
-
-function effectRow(s, effect, text) {
-  const group = el("div", { class: "seg", role: "radiogroup", "aria-label": effect });
-  const paint = () => {
-    for (const b of group.children) b.setAttribute("aria-checked", String(b.dataset.rule === s.center.effects[effect]));
-  };
-  for (const rule of ["on", "ask", "off"]) {
-    group.append(el("button", { type: "button", role: "radio", "data-rule": rule, onclick: () => { s.center.effects[effect] = rule; paint(); } }, rule));
-  }
-  paint();
-  return el("div", { class: "effect" }, el("span", { class: "k" }, effect, el("span", { class: "d" }, text)), group);
 }
 
 function tokenForm() {
@@ -539,7 +506,6 @@ async function loadSettings() {
   try {
     const [center, tokens, overview] = await Promise.all([api("GET", "/api/center"), api("GET", "/api/tokens"), api("GET", "/api/overview")]);
     if (run !== settingsRun) return;
-    for (const [e] of EFFECTS) center.effects[e] = center.effects[e] || "on";
     state.settings = { center, tokens, nodes: overview.nodes, tokensBox: null };
     if (current() === "settings") draw(true);
   } catch (e) {

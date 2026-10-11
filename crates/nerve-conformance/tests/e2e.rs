@@ -130,25 +130,15 @@ fn nerve_mcp_and_nerve_node_work_together() {
         "{toml}"
     );
 
-    // exec.run asks at the center (execute asks there by default), the
-    // answer comes from the web UI; the node lets it run without asking.
+    // exec.run goes straight to the node: the center holds no call back, and
+    // the node lets it run without asking (the never-ask rule above).
     let (run, args) = tool(&tools, "exec", "run", &node_name);
-    let ui = mcp.ui.clone();
-    let answer = std::thread::spawn(move || {
-        let v = ui.wait_overview("a center approval", |v| {
-            v["approvals"].as_array().is_some_and(|a| !a.is_empty())
-        });
-        let a = &v["approvals"][0];
-        assert_eq!(a["effect"], "execute", "{a}");
-        let (status, r) = ui.api(
-            "POST",
-            "/api/approvals/center",
-            json!({"id": a["id"], "answer": "once"}),
-        );
-        assert_eq!(status, 200, "{r}");
-    });
     let r = mcp.call(&run, with(args, json!({"command": "echo hi"})));
-    answer.join().unwrap();
+    let (status, ov) = mcp.api("GET", "/api/overview", Value::Null);
+    assert_eq!(status, 200, "{ov}");
+    assert!(ov.get("approvals").is_none(), "{ov}");
+    let (status, v) = mcp.api("POST", "/api/approvals/center", json!({}));
+    assert_eq!(status, 404, "{v}");
     let text = text_of(&r);
     assert_eq!(r["isError"], json!(false), "{r}");
     assert!(

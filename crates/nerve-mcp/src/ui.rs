@@ -21,9 +21,9 @@ use nerve_proto::RpcError;
 use nerve_transport::http::{self, Request, Response};
 use nerve_transport::net::BoxIo;
 
-use crate::center::{Answer, Center, Change, wildcard_of};
+use crate::center::{Center, Change, wildcard_of};
 use crate::listen::Server;
-use crate::store::{Rule, TokenRecord};
+use crate::store::TokenRecord;
 use crate::util::{self, now_ms};
 
 const INDEX: &str = include_str!("ui/index.html");
@@ -285,7 +285,6 @@ impl Ui {
                 "center": {"id": c.id(), "name": c.name(), "url": c.public_url().to_string(), "pin": c.pin()},
                 "nodes": c.nodes_json(),
                 "alerts": c.alerts(),
-                "approvals": c.center_approvals(),
                 "sessions": c.sessions_json(),
             })),
             ("GET", "/api/stats") => Ok(c.stats_json()),
@@ -293,14 +292,6 @@ impl Ui {
             ("POST", "/api/pair") => Ok(c.new_pairing()),
             ("POST", "/api/nodes/rename") => c.rename(&s("id"), &s("name")).map(|_| json!({})).map_err(bad),
             ("POST", "/api/nodes/remove") => c.remove(&s("id")).await.map(|_| json!({})).map_err(bad),
-            ("POST", "/api/approvals/center") => {
-                let a = Answer::parse(&s("answer")).ok_or_else(|| bad("the answer is once, session or deny"))?;
-                if c.answer_center(&s("id"), a) {
-                    Ok(json!({}))
-                } else {
-                    Err(bad("this approval is no longer open"))
-                }
-            }
             ("POST", "/api/approvals/node") => {
                 let minutes = b.get("minutes").and_then(Value::as_u64);
                 c.answer_node(&s("node_id"), &s("id"), &s("answer"), minutes)
@@ -361,7 +352,7 @@ impl Ui {
                 Ok(json!({}))
             }
             ("GET", "/api/center") => Ok(c.read(|st| {
-                json!({"name": st.center_name, "retention_days": st.retention_days, "effects": st.center_policy.effects, "call_wait_s": c.call_wait().as_secs()})
+                json!({"name": st.center_name, "retention_days": st.retention_days, "call_wait_s": c.call_wait().as_secs()})
             })),
             ("POST", "/api/center") => {
                 let name = b.get("name").and_then(Value::as_str).map(|n| n.trim().to_string());
@@ -372,19 +363,12 @@ impl Ui {
                 if days.is_some_and(|d| !(1..=366).contains(&d)) {
                     return Err(bad("retention is 1 to 366 days"));
                 }
-                let effects: Option<Vec<(String, Rule)>> = match b.get("effects") {
-                    None => None,
-                    Some(e) => Some(parse_effects(e).map_err(bad)?),
-                };
                 c.update(|st| {
                     if let Some(n) = name {
                         st.center_name = n;
                     }
                     if let Some(d) = days {
                         st.retention_days = d as u32;
-                    }
-                    for (k, r) in effects.into_iter().flatten() {
-                        st.center_policy.effects.insert(k, r);
                     }
                 });
                 c.changed(Change::Nodes);
@@ -393,22 +377,6 @@ impl Ui {
             _ => Err((404, json!({"error": "unknown API call"}))),
         }
     }
-}
-
-const EFFECTS: [&str; 5] = ["read", "sense", "write", "actuate", "execute"];
-
-fn parse_effects(v: &Value) -> Result<Vec<(String, Rule)>, String> {
-    let m = v.as_object().ok_or("effects is an object")?;
-    m.iter()
-        .map(|(k, r)| {
-            if !EFFECTS.contains(&k.as_str()) {
-                return Err(format!("unknown effect {k}"));
-            }
-            let r: Rule = serde_json::from_value(r.clone())
-                .map_err(|_| format!("the rule for {k} is on, ask or off"))?;
-            Ok((k.clone(), r))
-        })
-        .collect()
 }
 
 fn bad(m: impl Into<String>) -> (u16, Value) {

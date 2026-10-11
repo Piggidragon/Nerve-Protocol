@@ -283,30 +283,15 @@ async fn pair_connect_describe_and_call() {
             .contains("box-1")
     );
 
-    // execute asks the center by default; the call waits for the answer.
-    let e2 = std::sync::Arc::new(e);
-    let caller = {
-        let e = e2.clone();
-        tokio::spawn(async move {
-            rpc(
-                &e,
-                5,
-                "tools/call",
-                json!({"name": "exec__run", "arguments": {"node": "box-1", "command": "uname"}}),
-            )
-            .await
-        })
-    };
-    let c = r.center.clone();
-    let id = wait_for(|| {
-        c.center_approvals()
-            .as_array()
-            .and_then(|a| a.first())
-            .map(|a| a["id"].as_str().unwrap().to_string())
-    })
+    // The center holds no call back: execute goes straight to the node,
+    // which decides.
+    let done = rpc(
+        &e,
+        5,
+        "tools/call",
+        json!({"name": "exec__run", "arguments": {"node": "box-1", "command": "uname"}}),
+    )
     .await;
-    assert!(r.center.answer_center(&id, nerve_mcp::center::Answer::Once));
-    let done = caller.await.unwrap();
     assert_ne!(done["result"]["isError"], true, "{done}");
     let Some(Seen::Invoke(inv)) = seen.recv().await else {
         panic!("no invoke")
@@ -318,7 +303,7 @@ async fn pair_connect_describe_and_call() {
     );
 
     // Ending the session tells the node.
-    e2.close().await;
+    e.close().await;
     let Some(Seen::SessionEnd(s)) = seen.recv().await else {
         panic!("no session.end")
     };

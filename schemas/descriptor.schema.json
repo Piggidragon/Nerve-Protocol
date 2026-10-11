@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Piggidragon/Nerve-Protocol/schemas/descriptor.schema.json",
+  "title": "Nerve node descriptor, protocol \"0\"",
+  "type": "object",
+  "required": ["nerve", "node", "rev", "capabilities"],
+  "properties": {
+    "nerve": {"const": "0"},
+    "node": {
+      "type": "object",
+      "required": ["id", "name", "platform", "arch", "software"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z2-7]{26}$"},
+        "name": {"type": "string", "pattern": "^[a-z0-9-]{1,32}$"},
+        "platform": {"type": "string"},
+        "arch": {"type": "string"},
+        "software": {
+          "type": "object",
+          "required": ["name", "version"],
+          "properties": {"name": {"type": "string"}, "version": {"type": "string"}}
+        }
+      }
+    },
+    "rev": {"type": "integer", "minimum": 0},
+    "summary": {"type": "string"},
+    "capabilities": {"type": "array", "items": {"$ref": "#/$defs/capability"}}
+  },
+  "$defs": {
+    "effect": {"enum": ["read", "sense", "write", "actuate", "execute"]},
+    "capability": {
+      "type": "object",
+      "required": ["id", "exposure"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,31}$"},
+        "profile": {"type": "string"},
+        "provider": {"type": "string", "default": "node"},
+        "exposure": {"enum": ["on", "ask", "off"]},
+        "summary": {"type": "string"},
+        "actions": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["effect"],
+            "properties": {
+              "effect": {"$ref": "#/$defs/effect"},
+              "summary": {"type": "string"},
+              "params": {"type": "object"},
+              "result": {"type": "object"}
+            }
+          }
+        },
+        "events": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "properties": {
+              "summary": {"type": "string"},
+              "implicit": {"type": "boolean"},
+              "data": {"type": "object"}
+            }
+          }
+        },
+        "state": {"type": ["object", "null"]},
+        "streams": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["kind", "direction"],
+            "properties": {
+              "kind": {"enum": ["reliable", "media"]},
+              "direction": {"enum": ["up", "down", "both"]},
+              "summary": {"type": "string"}
+            }
+          }
+        }
+      }
+    }
+  }
+}

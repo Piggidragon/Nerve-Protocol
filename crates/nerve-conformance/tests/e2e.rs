@@ -129,12 +129,7 @@ fn nerve_center_and_nerve_node_work_together() {
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
     assert!(names.iter().any(|n| n.ends_with("fs__read")), "{names:?}");
     assert!(names.iter().any(|n| n.ends_with("exec__run")), "{names:?}");
-    assert!(
-        !names
-            .iter()
-            .any(|n| n.contains("approvals__") || n.contains("settings__")),
-        "{names:?}"
-    );
+    assert!(!names.iter().any(|n| n.contains("settings__")), "{names:?}");
 
     // The settings grant, given on the node, reaches the center.
     node.ok(&["grant", "settings", "write"]);

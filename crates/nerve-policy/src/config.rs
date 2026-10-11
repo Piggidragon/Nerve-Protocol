@@ -422,7 +422,6 @@ impl NodeConfig {
 ///   `ask` center were not in force, and must not start to be);
 /// - a capability set to `ask` becomes `off`;
 /// - command rules `always_ask` join `deny`, and `never_ask` is `permit`;
-/// - the approvals grant and the approvals timing are dropped;
 /// - the modes `folders` and `full` are `folder` and `user` (`full_until` is
 ///   `user_until`).
 fn migrate(doc: &mut toml::Table) {
@@ -436,6 +435,7 @@ fn migrate(doc: &mut toml::Table) {
         return;
     };
     for c in centers.iter_mut().filter_map(Value::as_table_mut) {
+        // Old files carry an `approvals` key; the strict parser would refuse it.
         c.remove("approvals");
         let Some(Value::Table(p)) = c.get_mut("policy") else {
             continue;
@@ -652,7 +652,6 @@ name = "home"
 url = "https://center.example:8443"
 center_id = "c1"
 node_id = "n1"
-approvals = "both"
 
 [center.policy]
 mode = "{mode}"
@@ -664,10 +663,6 @@ caps = {{ exec = "ask", fs = "on" }}
 deny = ["rm -rf *"]
 always_ask = ["git push*"]
 never_ask = ["ls*"]
-
-[center.policy.approvals]
-timeout_s = 30
-on_timeout = "allow"
 "#
         )
     }
@@ -682,15 +677,20 @@ on_timeout = "allow"
         // A capability set to ask is refused.
         assert_eq!(p.cap_setting("exec", None), Some(CapSetting::Off));
         assert_eq!(p.cap_setting("fs", None), Some(CapSetting::On));
-        // always_ask is a deny, never_ask the permit list; approvals are gone.
+        // always_ask is a deny, never_ask the permit list.
         assert_eq!(p.commands.deny, ["rm -rf *", "git push*"]);
         assert_eq!(p.commands.permit, ["ls*"]);
         let text = c.to_toml();
-        assert!(
-            !text.contains("ask") && !text.contains("approvals"),
-            "{text}"
-        );
+        assert!(!text.contains("ask"), "{text}");
         assert_eq!(NodeConfig::parse(&text).unwrap(), c);
+    }
+
+    #[test]
+    fn an_old_approvals_key_is_ignored() {
+        let old = old_file("folder", "approvals = \"both\"")
+            .replace("[center.policy]", "approvals = \"both\"\n[center.policy]\n");
+        let text = NodeConfig::parse(&old).unwrap().to_toml();
+        assert!(!text.contains("approvals"), "{text}");
     }
 
     #[test]

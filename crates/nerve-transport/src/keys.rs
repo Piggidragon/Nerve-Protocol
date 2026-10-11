@@ -112,7 +112,7 @@ pub fn random_bytes(n: usize) -> Vec<u8> {
 }
 
 /// A random token of `n` characters from `a-z0-9` (pairing codes, harness
-/// tokens, approval ids), drawn without modulo bias.
+/// tokens), drawn without modulo bias.
 pub fn random_token(n: usize) -> String {
     const A: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
     let mut out = String::with_capacity(n);

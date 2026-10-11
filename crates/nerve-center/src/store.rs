@@ -194,13 +194,4 @@ mod tests {
         assert_eq!(s.center_name, "home");
         assert!(!serde_json::to_string(&s).unwrap().contains("center_policy"));
     }
-
-    #[test]
-    fn day_stats_with_the_old_approval_counters_still_load() {
-        let old = r#"{"online_ms":5,"links":1,"approvals_asked":3,
-            "approvals_by":{"center":2},"approval_wait_ms":10,"approval_wait_max_ms":7}"#;
-        let d: DayStats = serde_json::from_str(old).unwrap();
-        assert_eq!((d.online_ms, d.links), (5, 1));
-        assert!(!serde_json::to_string(&d).unwrap().contains("approval"));
-    }
 }

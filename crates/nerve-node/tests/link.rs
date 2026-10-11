@@ -94,10 +94,6 @@ async fn handshake_describe_and_an_allowed_read() {
     for c in ["node", "fs", "exec", "audit"] {
         assert!(cap(c).is_some(), "missing {c}: {d}");
     }
-    assert!(
-        cap("approvals").is_none(),
-        "there is no approvals capability"
-    );
     assert!(cap("settings").is_none(), "settings needs the write grant");
     assert_eq!(cap("fs").unwrap()["exposure"], "on");
 

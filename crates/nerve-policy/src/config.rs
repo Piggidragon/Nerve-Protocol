@@ -336,7 +336,9 @@ impl NodeConfig {
         toml::to_string_pretty(self).expect("the node config serializes")
     }
 
-    /// Reads `path`; a missing file is the default config.
+    /// Reads `path`; a missing file is the default config. The MAC line the
+    /// node writes is a comment here and is not checked: the daemon and the
+    /// CLI read the file through `SettingsStore`, which checks it.
     pub fn load(path: &Path) -> Result<NodeConfig, String> {
         match std::fs::read_to_string(path) {
             Ok(t) => NodeConfig::parse(&t).map_err(|e| format!("{}: {e}", path.display())),
@@ -345,7 +347,8 @@ impl NodeConfig {
         }
     }
 
-    /// Writes `path` atomically, 0600.
+    /// Writes `path` atomically, 0600, without a MAC: once the node has its
+    /// key it refuses such a file. The node writes through `SettingsStore`.
     pub fn save(&self, path: &Path) -> Result<(), String> {
         if let Some(dir) = path.parent() {
             nerve_transport::files::create_private_dir(dir)

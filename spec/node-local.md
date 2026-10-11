@@ -9,10 +9,42 @@ same way and so the owner knows what each setting does.
 | What | Default | Override |
 |---|---|---|
 | `node.toml` and one key per center | `~/.config/nerve` | `--config-dir`, `NERVE_CONFIG_DIR` |
-| control socket `run/ctl.sock`, audit log `audit.jsonl` | `~/.local/state/nerve` | `--state-dir`, `NERVE_STATE_DIR` |
+| control socket `run/ctl.sock`, audit log `audit.jsonl`, the config's MAC key `config.key` | `~/.local/state/nerve` | `--state-dir`, `NERVE_STATE_DIR` |
 
 `node.toml` is written private to the owner (mode 0600 on Unix). The daemon
 refuses to run as root unless `machine.allow_root = true`.
+
+These two folders are the node's own. No call of a center reaches them, in
+any mode and whatever the rules, folders or `protected.allow` say (§3), and
+no Landlock rule of a command covers them (§Modes).
+
+### Who writes `node.toml`
+
+Only the owner's path changes the config: the CLI (through the control
+socket while the daemon runs, §5, else on the file itself), and a center
+through `settings.set` within its grant. The daemon keeps the config in
+memory. It reads the file at start-up and when the owner asks for it
+(`SIGHUP`, the socket's `reload`); nothing rereads it on a timer.
+
+Every file the node writes is signed: its first line is
+`# mac hmac-sha256 <hex> (…)`, an HMAC over the rest of the file. The key is
+`<state>/config.key` (0600), made the first time the node opens its config.
+It sits in the state folder rather than beside `node.toml`, so the key does
+not hang on a setting of the file it checks, and whatever could read the
+config folder would still not hold it. `machine.secret_storage = "keyring"`
+is not done in 0.0.1, for this key as for the center keys.
+
+A file whose MAC is missing or does not match was changed outside the
+owner's path. It is refused and the refusal is audited (§6): at start-up the
+node does not start; on a reload the old config stays in force. A reload also
+refuses a signed file older than the one in force and one that sets a
+center's `user_until` more than 8 hours ahead. After looking at a refused
+file, the owner takes it as it is with `nerve-node config accept`; the node
+then signs it. A `node.toml` from before the node kept a MAC (no key yet, no
+MAC line) is taken once as it is and signed.
+
+On Windows there is no control socket in 0.0.1: the CLI writes the signed
+file itself, and a running node takes the change at its next start.
 
 ## 2. `node.toml`
 
@@ -69,7 +101,12 @@ form; on the wire they travel as `/c/Users/...` on Windows (protocol §7.2).
   when an `allow` rule lets it through. `folders` do not count.
 - **folder**: full access inside the `folders` (and everything below them),
   by their access; commands run in `execute` folders, confined where the
-  platform can confine them. `allow` rules do not count.
+  platform can confine them. `allow` rules do not count. On Linux a command
+  reads the system folders and its folders, writes its `rw` folders and runs
+  programs from the system folders and its `execute` folders (Landlock). The
+  node's own folders are in none of these sets: a folder that holds one is
+  granted as its other entries, level by level down to it, so the command
+  can neither list those levels nor make new entries right in them.
 - **user**: full access as the user, protected paths aside, until
   `user_until` (at most 8 hours), then the center is back in `folder`.
   `allow` rules do not count.
@@ -116,6 +153,14 @@ The default is deny. A call runs only when the mode and the rules allow it;
 otherwise it is refused at once with `forbidden`, and nothing waits for an
 answer. For each call the node takes the center's policy and, in this order:
 
+0. A call that touches the node's own folders (§1) is `forbidden` before
+   anything else is looked at; no rule, mode, folder or release lifts that.
+   It looks at every path of an `fs` call (resolved), at the working
+   directory of `exec.run`, and at paths the command line names plainly
+   (absolute, or from `~/`, `$HOME/`, `${HOME}/`). A path a command builds
+   at run time (`cd ~/.config; cat nerve/node.toml`) is not seen there; in
+   `folder` mode Landlock keeps the command out all the same, while a `user`
+   mode command runs as the user, unconfined.
 1. A `locked` node (after `panic`) keeps no links and runs nothing; a paused,
    revoked or unknown center is not dialled.
 2. The capability setting: `off` refuses (`disabled`), `hidden` leaves it
@@ -127,8 +172,8 @@ answer. For each call the node takes the center's policy and, in this order:
    matches (every path of the call needs one).
 7. In `folder` and `user` mode the mode itself decides (§Modes). `allow`
    rules are not looked at.
-8. Protected paths (keys, shell profiles, the node's own folders and the
-   built-in list) are refused whatever allowed the call, `user` mode too.
+8. Protected paths (keys, shell profiles and the built-in list) are refused
+   whatever allowed the call, `user` mode too.
 
 Every refusal names its reasons in the error and in the audit log.
 
@@ -164,8 +209,8 @@ switch, never through `config.write`. The switch works on Linux only in
 
 ## 5. Control socket
 
-`<state>/run/ctl.sock` (Unix only in 0.0.1; on Windows the CLI edits
-`node.toml` directly). One JSON object per line: the client sends
+`<state>/run/ctl.sock` (Unix only in 0.0.1; on Windows the CLI writes the
+signed `node.toml` itself, §1). One JSON object per line: the client sends
 `{"method", "params"}`, the server answers `{"ok": value}` or
 `{"error": "text"}`, or, for streaming methods, several `{"item": value}`
 lines until it closes. The socket is 0600 in a 0700 folder; only its own user
@@ -176,17 +221,20 @@ or root may talk to it. Methods:
 | `status` | | daemon and links |
 | `config.read` | | `node.toml` and its `version` |
 | `config.write` | `config`, `if_version` | replaces it when the version matches |
-| `reload` | | rereads `node.toml` |
+| `config.accept` | | takes `node.toml` as it is after it was refused, and signs it (§1) |
+| `reload` | | rereads `node.toml`; only a file the node signed is applied (§1) |
 | `sudo.status` | | `{sudo: "on"|"off"}` |
 | `sudo.on` | `password` | checks it with `sudo -v` and turns the switch on (§4) |
 | `sudo.off` | | turns the switch off and drops the password |
 
-`config.write`, `reload`, `sudo.on` and `sudo.off` are refused from a process that runs below a
+`config.write`, `config.accept`, `reload`, `sudo.on` and `sudo.off` are refused from a process that runs below a
 command the node started for a center, so an agent cannot change its own
 policy.
 
 ## 6. Audit log
 
-`<state>/audit.jsonl`, one JSON line per event: settings changes and calls allowed
-or forbidden. It holds targets (paths, command lines), never
+`<state>/audit.jsonl`, one JSON line per event: settings changes (with old
+and new value), calls allowed or forbidden, and what happened to the config
+file itself (`"kind": "config"`, `event` `refused`, `signed` or `accepted`,
+with the file and the reason). It holds targets (paths, command lines), never
 file content or output. `nerve-node audit [--denied] [--follow]` shows it.

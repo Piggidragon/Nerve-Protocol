@@ -1,5 +1,5 @@
-//! The local audit log: one JSON line per decision and per settings change,
-//! in the node's state directory. It is the owner's record and client-only: no
+//! The local audit log: one JSON line per decision, per settings change and
+//! per refused config file, in the node's state directory. It is the owner's record and client-only: no
 //! center can read or change the file (centers see their own decisions as
 //! `audit/decision` events at most).
 
@@ -93,6 +93,20 @@ impl AuditLog {
             "by": by,
             "version": version,
             "changes": changes,
+        }))
+    }
+
+    /// Something that happened to the config file itself: `refused` (it was
+    /// changed outside the owner's path and is not applied), `signed` (the
+    /// node signed a file from before it kept a MAC) or `accepted` (the owner
+    /// took a refused file as it is).
+    pub fn config(&self, event: &str, file: &Path, reason: &str) -> std::io::Result<()> {
+        self.append(&json!({
+            "ts": nerve_proto::msg::now_ms(),
+            "kind": "config",
+            "event": event,
+            "file": file.display().to_string(),
+            "reason": reason,
         }))
     }
 

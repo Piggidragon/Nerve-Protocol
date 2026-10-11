@@ -16,6 +16,12 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
   allow rules count in allowlist mode only. A call that no rule allows is
   refused at once. The settings grant, panic and unlock, and a local audit log
   (`spec/node-local.md`).
+- The node's config and state folders are its own: no call of a center
+  reaches them and no Landlock rule of a command covers them, whatever the
+  policy says. The node keeps its config in memory, signs `node.toml` with an
+  HMAC on every write, rereads it only when the owner asks, and refuses and
+  audits a file changed outside the owner's path (`nerve-node config accept`
+  takes it after a look).
 - The sudo switch per node, off by default: off, no command runs with sudo
   even when the sudo allow list names it; on, a sudo command runs only when
   that list names it, in every mode. `nerve-node sudo on|off|status`, or a

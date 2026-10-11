@@ -42,17 +42,26 @@ async fn paired_node(root: &Path, center: &FakeCenter) -> Daemon {
 async fn paired_node_with(
     root: &Path,
     center: &FakeCenter,
-    policy: impl FnOnce(&mut nerve_policy::CenterPolicy),
+    policy: impl Fn(&mut nerve_policy::CenterPolicy),
 ) -> Daemon {
     let o = options(root);
     nerve_node::pair::pair(&o.paths, &center.link(), Some("lab"))
         .await
         .expect("pair");
-    let file = o.paths.config_file();
-    let mut cfg = NodeConfig::load(&file).unwrap();
-    policy(&mut cfg.centers[0].policy);
-    cfg.save(&file).unwrap();
+    owner_edit(&o.paths, |c| policy(&mut c.centers[0].policy)).await;
     Daemon::start(o).await.expect("start")
+}
+
+/// Changes the config the way the owner does while no daemon runs: through
+/// the CLI's settings store, which signs the file. The node refuses a file it
+/// did not sign.
+async fn owner_edit(paths: &NodePaths, f: impl Fn(&mut NodeConfig)) {
+    nerve_node::cli::edit(paths, |c| {
+        f(c);
+        Ok(())
+    })
+    .await
+    .expect("the owner's edit");
 }
 
 /// Accepts the node's link and runs the handshake.
@@ -225,10 +234,8 @@ async fn an_unknown_node_answer_stops_dialling() {
         .unwrap();
     // A second center that never paired this node answers 401.
     let stranger = FakeCenter::start(false).await.unwrap();
-    let file = o.paths.config_file();
-    let mut cfg = NodeConfig::load(&file).unwrap();
-    cfg.centers[0].url = format!("http://{}", stranger.url.authority());
-    cfg.save(&file).unwrap();
+    let url = format!("http://{}", stranger.url.authority());
+    owner_edit(&o.paths, |c| c.centers[0].url = url.clone()).await;
 
     let node = Daemon::start(o).await.unwrap();
     let mut marked = false;
@@ -287,16 +294,16 @@ async fn folder_mode_confines_commands_to_their_folders() {
     std::fs::create_dir_all(&work).unwrap();
     let work = std::fs::canonicalize(&work).unwrap();
     let outside = dir.path().join("outside.txt");
-    let file = o.paths.config_file();
-    let mut cfg = NodeConfig::load(&file).unwrap();
-    let p = &mut cfg.centers[0].policy;
-    p.mode = nerve_policy::Mode::Folder;
-    p.folders.push(nerve_policy::config::Folder {
-        path: work.display().to_string(),
-        access: nerve_policy::config::Access::Rw,
-        execute: true,
-    });
-    cfg.save(&file).unwrap();
+    owner_edit(&o.paths, |c| {
+        let p = &mut c.centers[0].policy;
+        p.mode = nerve_policy::Mode::Folder;
+        p.folders.push(nerve_policy::config::Folder {
+            path: work.display().to_string(),
+            access: nerve_policy::config::Access::Rw,
+            execute: true,
+        });
+    })
+    .await;
     let node = Daemon::start(o).await.unwrap();
     let mut conn = linked(&mut center).await;
 

@@ -3,7 +3,8 @@
 use std::path::{Path, PathBuf};
 
 /// The node's config directory (`node.toml`, keys) and state directory
-/// (control socket, audit log). Tests point both at temporary folders.
+/// (control socket, audit log, the config's MAC key). Tests point both at
+/// temporary folders.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodePaths {
     pub config_dir: PathBuf,
@@ -54,7 +55,14 @@ impl NodePaths {
         self.state_dir.join("audit.jsonl")
     }
 
-    /// The node's own files: protected from every center.
+    /// The key of the MAC over `node.toml`. It is not beside the file it
+    /// signs: whatever could read the config folder would hold both, and the
+    /// key must not depend on a setting in the file it checks.
+    pub fn config_key(&self) -> PathBuf {
+        self.state_dir.join("config.key")
+    }
+
+    /// The node's own files: no center reaches them, whatever its policy.
     pub fn own(&self) -> Vec<PathBuf> {
         vec![self.config_dir.clone(), self.state_dir.clone()]
     }

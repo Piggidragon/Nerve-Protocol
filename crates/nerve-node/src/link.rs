@@ -1020,7 +1020,7 @@ impl Link {
         let landlock = (sudo_password.is_none()
             && entry.policy.mode_at(crate::now_ms()) == Mode::Folder
             && self.shared.confined())
-        .then(|| exec::landlock_spec(&entry.policy, &self.shared.home));
+        .then(|| exec::landlock_spec(&entry.policy, &self.shared.home, &self.shared.paths.own()));
         let opts = RunOptions {
             shell: cfg.machine.shell.clone(),
             landlock,

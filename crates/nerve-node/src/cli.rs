@@ -1,6 +1,6 @@
 //! The `nerve-node` command line (architecture §8). Commands talk to the
 //! running daemon over the control socket; when none runs they edit the
-//! config file directly through the same [`SettingsStore`].
+//! config file directly through the same [`SettingsStore`], which signs it.
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -227,6 +227,10 @@ pub enum ConfigCmd {
         /// The value to remove.
         value: String,
     },
+    /// Take node.toml as it is now, after the node refused it because it was
+    /// changed outside nerve-node. Look at the file first: whatever changed
+    /// it gets its way.
+    Accept,
 }
 
 #[derive(Debug, Subcommand)]
@@ -353,7 +357,10 @@ pub async fn read_config(paths: &NodePaths) -> Result<(NodeConfig, Option<u64>),
         Err(e) if e != nerve_transport::ctl::NOT_RUNNING => return Err(e),
         Err(_) => {}
     }
-    Ok((NodeConfig::load(&paths.config_file())?, None))
+    Ok((
+        SettingsStore::peek(&paths.config_file(), &paths.config_key())?,
+        None,
+    ))
 }
 
 /// Changes the config: through the daemon (retrying when someone else wrote
@@ -379,7 +386,11 @@ pub async fn edit(
             Err(e) => return Err(e),
         }
     }
-    let mut store = SettingsStore::open(paths.config_file(), AuditLog::new(paths.audit_log()))?;
+    let mut store = SettingsStore::open(
+        paths.config_file(),
+        paths.config_key(),
+        AuditLog::new(paths.audit_log()),
+    )?;
     match store.update(f) {
         Ok(_) => Ok(store.config().clone()),
         Err(SetError::Conflict { .. }) => Err("the config changed meanwhile; try again".into()),
@@ -534,7 +545,7 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
                 Err(e) if e != nerve_transport::ctl::NOT_RUNNING => return Err(e),
                 Err(_) => {}
             }
-            let cfg = NodeConfig::load(&paths.config_file())?;
+            let cfg = SettingsStore::peek(&paths.config_file(), &paths.config_key())?;
             w(out, "daemon: not running".into());
             if cfg.locked {
                 w(
@@ -913,6 +924,15 @@ fn audit_line(v: &Value) -> String {
     if v.get("changes").is_some() {
         return format!("{}  settings v{} by {}", s("ts"), s("version"), s("by"));
     }
+    if v["kind"] == "config" {
+        return format!(
+            "{}  config {}  {}: {}",
+            s("ts"),
+            s("event"),
+            s("file"),
+            s("reason")
+        );
+    }
     format!(
         "{}  {}  {}.{}  {}  {}",
         s("ts"),
@@ -947,7 +967,8 @@ async fn audit(
             let Ok(v) = serde_json::from_str::<Value>(line) else {
                 continue;
             };
-            let refused = v["decision"].as_str() == Some("forbidden");
+            let refused = v["decision"].as_str() == Some("forbidden")
+                || v["event"].as_str() == Some("refused");
             if denied && !refused {
                 continue;
             }
@@ -965,6 +986,11 @@ async fn audit(
 /// `config get|set|unset|add|remove` on dotted keys. `center.<name>` picks
 /// a `[[center]]` entry by its name.
 async fn config_cmd(paths: &NodePaths, c: ConfigCmd, out: &mut dyn Write) -> Result<(), String> {
+    if let ConfigCmd::Accept = c {
+        let v = accept(paths).await?;
+        let _ = writeln!(out, "accepted node.toml as version {v}");
+        return Ok(());
+    }
     if let ConfigCmd::Get { key } = &c {
         let (cfg, _) = read_config(paths).await?;
         let doc = as_table(&cfg)?;
@@ -976,7 +1002,7 @@ async fn config_cmd(paths: &NodePaths, c: ConfigCmd, out: &mut dyn Write) -> Res
     edit(paths, |cfg| {
         let mut doc = toml::Value::Table(as_table(cfg)?);
         match &c {
-            ConfigCmd::Get { .. } => {}
+            ConfigCmd::Get { .. } | ConfigCmd::Accept => {}
             ConfigCmd::Set { key, value } => {
                 let (parent, last) = split_key(key)?;
                 table_at(&mut doc, &parent, true)?.insert(last, literal(value));
@@ -1021,6 +1047,23 @@ async fn config_cmd(paths: &NodePaths, c: ConfigCmd, out: &mut dyn Write) -> Res
     .await?;
     let _ = writeln!(out, "saved");
     Ok(())
+}
+
+/// `config accept`: the running daemon takes the file, or, when none runs,
+/// the file is signed here.
+async fn accept(paths: &NodePaths) -> Result<u64, String> {
+    #[cfg(unix)]
+    match nerve_transport::ctl::call(&paths.ctl_socket(), "config.accept", json!({})).await {
+        Ok(v) => return Ok(v["version"].as_u64().unwrap_or_default()),
+        Err(e) if e != nerve_transport::ctl::NOT_RUNNING => return Err(e),
+        Err(_) => {}
+    }
+    let (_, v) = SettingsStore::open_accepting(
+        paths.config_file(),
+        paths.config_key(),
+        AuditLog::new(paths.audit_log()),
+    )?;
+    Ok(v)
 }
 
 fn as_table(cfg: &NodeConfig) -> Result<toml::Table, String> {

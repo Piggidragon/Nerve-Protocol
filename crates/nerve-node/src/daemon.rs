@@ -176,6 +176,23 @@ impl Shared {
         self.changed.send_modify(|v| *v += 1);
     }
 
+    /// Reads the config file again because the owner asked (SIGHUP, the
+    /// control socket). Nothing else rereads it: the node keeps its config
+    /// in memory, and a file it did not sign is refused.
+    pub fn reload(&self) -> Result<bool, String> {
+        let r = lock(&self.store).reload();
+        match &r {
+            Ok(true) => {
+                // A signed file may say sudo on without a password held.
+                self.settle_sudo();
+                self.bump();
+            }
+            Ok(false) => {}
+            Err(e) => tracing::warn!("reload refused, the old config stays: {e}"),
+        }
+        r
+    }
+
     /// Whether commands may run confined (Landlock and the shim's host).
     pub fn confined(&self) -> bool {
         self.confinement.available() && self.exe.is_some()
@@ -294,9 +311,17 @@ impl Daemon {
     pub async fn start(opts: NodeOptions) -> Result<Daemon, String> {
         nerve_transport::init_crypto();
         let paths = opts.paths.clone();
-        nerve_transport::files::create_private_dir(&paths.state_dir)
-            .map_err(|e| format!("{}: {e}", paths.state_dir.display()))?;
-        let store = SettingsStore::open(paths.config_file(), AuditLog::new(paths.audit_log()))?;
+        // Both exist before the first command runs, so Landlock can leave
+        // them out by their real paths.
+        for dir in [&paths.state_dir, &paths.config_dir] {
+            nerve_transport::files::create_private_dir(dir)
+                .map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        let store = SettingsStore::open(
+            paths.config_file(),
+            paths.config_key(),
+            AuditLog::new(paths.audit_log()),
+        )?;
         let cfg = store.config().clone();
         #[cfg(unix)]
         if nerve_transport::net::euid() == 0 && !cfg.machine.allow_root {
@@ -362,11 +387,10 @@ impl Daemon {
         self.shared.status()
     }
 
-    /// Reads the config file again (what SIGHUP does).
+    /// Reads the config file again (what SIGHUP does). Only a file the node
+    /// signed is applied; any other is refused and the old config stays.
     pub fn reload(&self) -> Result<bool, String> {
-        let r = lock(&self.shared.store).reload();
-        self.shared.bump();
-        r
+        self.shared.reload()
     }
 
     /// Ends every link with `bye shutdown` and stops.
@@ -392,9 +416,7 @@ impl Daemon {
                     _ = tokio::signal::ctrl_c() => break,
                     _ = term.recv() => break,
                     _ = hup.recv() => {
-                        if let Err(e) = d.reload() {
-                            tracing::warn!("reload failed, the old config stays: {e}");
-                        }
+                        let _ = d.reload();
                     }
                 }
             }
@@ -406,21 +428,15 @@ impl Daemon {
     }
 }
 
-/// Keeps one link task per center that should be linked, and picks up config
-/// edits made while the daemon runs.
+/// Keeps one link task per center that should be linked. It works from the
+/// config in memory: the file is not reread here, so a file changed behind
+/// the node's back changes nothing (only the owner's reload reads it).
 async fn supervise(shared: Arc<Shared>) {
     let mut tasks: HashMap<String, JoinHandle<()>> = HashMap::new();
     let mut changed = shared.changed.subscribe();
     let mut stop = shared.stop.subscribe();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     loop {
-        let reloaded = lock(&shared.store).reload();
-        match reloaded {
-            Ok(true) => shared.bump(),
-            Ok(false) => {}
-            Err(e) => tracing::warn!("the config file does not load, the old one stays: {e}"),
-        }
-        // An edited file may say on without a password, or off.
         shared.settle_sudo();
         let cfg = shared.config();
         tasks.retain(|_, t| !t.is_finished());
@@ -482,13 +498,20 @@ async fn start_ctl(shared: Arc<Shared>) -> Result<JoinHandle<()>, String> {
 
 #[cfg(not(unix))]
 async fn start_ctl(_shared: Arc<Shared>) -> Result<JoinHandle<()>, String> {
-    // Not done in 0.0.1: a named pipe; the CLI edits the files directly.
+    // Not done in 0.0.1: a named pipe. The CLI writes the signed file itself,
+    // and the running node takes it at its next start.
     Ok(tokio::spawn(async {}))
 }
 
 /// Methods that change something: refused from below a center's command.
 #[cfg(unix)]
-const MUTATING: &[&str] = &["config.write", "reload", "sudo.on", "sudo.off"];
+const MUTATING: &[&str] = &[
+    "config.write",
+    "config.accept",
+    "reload",
+    "sudo.on",
+    "sudo.off",
+];
 
 /// `sudo.on {password}`: the CLI on this machine turns the switch on. The
 /// socket is the owner's only, so the password travels in the clear here.
@@ -570,14 +593,21 @@ pub(crate) fn control(
                 Err(e) => Reply::Err(e.to_string()),
             }
         }
-        "reload" => {
-            let r = lock(&shared.store).reload();
-            shared.bump();
+        "config.accept" => {
+            let r = lock(&shared.store).accept();
             match r {
-                Ok(changed) => Reply::Ok(json!({"changed": changed})),
-                Err(e) => Reply::Err(e),
+                Ok(v) => {
+                    shared.settle_sudo();
+                    shared.bump();
+                    Reply::Ok(json!({"version": v}))
+                }
+                Err(e) => Reply::Err(e.to_string()),
             }
         }
+        "reload" => match shared.reload() {
+            Ok(changed) => Reply::Ok(json!({"changed": changed})),
+            Err(e) => Reply::Err(e),
+        },
         other => Reply::Err(format!("unknown method {other}")),
     }
 }

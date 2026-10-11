@@ -10,7 +10,7 @@ use nerve_conformance::fake_center::{self, FakeCenter};
 use nerve_conformance::wire::Conn;
 use nerve_node::{Daemon, NodeOptions, NodePaths};
 use nerve_policy::config::{SettingsGrant, Sudo};
-use nerve_policy::{NodeConfig, rules};
+use nerve_policy::rules;
 use nerve_proto::{ErrorCode, Message, RpcError};
 use nerve_transport::sudo::{Offer, Sealed, seal};
 use serde_json::{Value, json};
@@ -64,17 +64,21 @@ async fn node(root: &Path, center: &FakeCenter) -> Daemon {
     nerve_node::pair::pair(&o.paths, &center.link(), Some("lab"))
         .await
         .expect("pair");
-    let file = o.paths.config_file();
-    let mut cfg = NodeConfig::load(&file).unwrap();
-    cfg.machine.sudo_path = Some(fake_sudo(root).display().to_string());
-    cfg.centers[0].settings = SettingsGrant::Write;
-    let policy = &mut cfg.centers[0].policy;
-    policy.sudo_allow.push("sudo echo *".into());
-    policy.allow.push("exec.run:echo *".into());
-    policy
-        .allow
-        .push(rules::rule_for("exec", "run", CHAINED, false).unwrap());
-    cfg.save(&file).unwrap();
+    let sudo = fake_sudo(root).display().to_string();
+    // Through the owner's path: the node refuses a file it did not sign.
+    nerve_node::cli::edit(&o.paths, |cfg| {
+        cfg.machine.sudo_path = Some(sudo.clone());
+        cfg.centers[0].settings = SettingsGrant::Write;
+        let policy = &mut cfg.centers[0].policy;
+        policy.sudo_allow.push("sudo echo *".into());
+        policy.allow.push("exec.run:echo *".into());
+        policy
+            .allow
+            .push(rules::rule_for("exec", "run", CHAINED, false)?);
+        Ok(())
+    })
+    .await
+    .expect("the owner's edit");
     Daemon::start(o).await.expect("start")
 }
 
@@ -291,10 +295,13 @@ async fn a_restart_turns_sudo_off() {
     let node = node(dir.path(), &center).await;
     let paths = node.paths().clone();
     node.stop().await;
-    let file = paths.config_file();
-    let mut cfg = NodeConfig::load(&file).unwrap();
-    cfg.machine.sudo = Sudo::On;
-    cfg.save(&file).unwrap();
+    // The owner's path may write `on`; the password is still not there.
+    nerve_node::cli::edit(&paths, |cfg| {
+        cfg.machine.sudo = Sudo::On;
+        Ok(())
+    })
+    .await
+    .expect("the owner's edit");
     let mut o = NodeOptions::new(paths.clone());
     o.home = dir.path().join("home");
     let node = Daemon::start(o).await.expect("start");

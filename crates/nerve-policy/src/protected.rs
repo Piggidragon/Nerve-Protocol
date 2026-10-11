@@ -4,6 +4,10 @@
 //! owner releases them by name: a folder grant at or inside the protected path, or an
 //! entry in `protected.allow`. A grant of a whole home does not release `~/.ssh`.
 //! Matching ignores case, so a case-insensitive filesystem cannot slip `~/.SSH` past.
+//!
+//! The node's own folders (its config, keys, state and audit log) are refused
+//! harder still: nothing releases them, and `decide` looks at them before any
+//! rule or mode.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -176,6 +180,11 @@ pub const TOOL_CONFIG: &[&str] = &[".git", ".envrc", ".vscode", ".idea"];
 pub struct Protected {
     entries: Vec<PathBuf>,
     write_only: Vec<PathBuf>,
+    /// The node's own folders, folded and resolved; never released.
+    own: Vec<PathBuf>,
+    /// How a command line may name them: absolute, and `~/`, `$HOME/` or
+    /// `${HOME}/` for those in the home; folded.
+    own_names: Vec<(String, PathBuf)>,
 }
 
 fn fold(p: &Path) -> PathBuf {
@@ -211,7 +220,8 @@ fn finish(list: impl Iterator<Item = PathBuf>, allow: &[PathBuf]) -> Vec<PathBuf
 
 impl Protected {
     /// `own` are the node's own config and state directories: a command or a
-    /// write must not change the node's policy behind its back.
+    /// write must not change the node's policy behind its back, nor read the
+    /// keys there. No folder grant and no `protected.allow` releases them.
     pub fn new(home: &Path, own: &[PathBuf], opts: &ProtectedOptions) -> Protected {
         let allow: Vec<PathBuf> = opts
             .allow
@@ -223,17 +233,62 @@ impl Protected {
             .iter()
             .map(|r| home.join(r))
             .chain(SYSTEM.iter().map(PathBuf::from))
-            .chain(own.iter().cloned())
             .chain(opts.extra.iter().filter_map(|s| expand(home, s)));
         let write_only = HOME_WRITE_ONLY.iter().map(|r| home.join(r));
+        let own = finish(own.iter().cloned(), &[]);
+        let homes = finish(std::iter::once(home.to_path_buf()), &[]);
+        let mut own_names = Vec::new();
+        for o in &own {
+            own_names.push((o.to_string_lossy().into_owned(), o.clone()));
+            for h in &homes {
+                if let Ok(rel) = o.strip_prefix(h)
+                    && !rel.as_os_str().is_empty()
+                {
+                    let rel = rel.to_string_lossy();
+                    for prefix in ["~/", "$home/", "${home}/"] {
+                        own_names.push((format!("{prefix}{rel}"), o.clone()));
+                    }
+                }
+            }
+        }
         Protected {
             entries: finish(entries, &allow),
             write_only: finish(write_only, &allow),
+            own,
+            own_names,
         }
     }
 
-    /// The protected entry `path` falls in, unless a folder names it.
+    /// The node's own folder `path` falls in.
+    pub fn own(&self, path: &Path) -> Option<&Path> {
+        let folded = fold(path);
+        self.own
+            .iter()
+            .find(|o| within(&folded, o))
+            .map(PathBuf::as_path)
+    }
+
+    /// The node's own folder a command line names, as far as a plain look
+    /// can tell: an absolute path or one from the home (`~/`, `$HOME/`). A
+    /// path built at run time (`cd ~/.config; cat nerve/x`) is not seen here;
+    /// in `folder` mode Landlock still keeps the command out.
+    pub fn own_in_command(&self, command: &str) -> Option<&Path> {
+        let folded = command.to_lowercase();
+        let name_char = |c: char| c.is_alphanumeric() || matches!(c, '.' | '_' | '-');
+        self.own_names.iter().find_map(|(name, own)| {
+            let hit = folded
+                .match_indices(name.as_str())
+                .any(|(at, _)| !folded[at + name.len()..].starts_with(name_char));
+            hit.then_some(own.as_path())
+        })
+    }
+
+    /// The protected entry `path` falls in, unless a folder names it. The
+    /// node's own folders are never released.
     pub fn check(&self, path: &Path, write: bool, folders: &[Folder]) -> Option<&Path> {
+        if let Some(own) = self.own(path) {
+            return Some(own);
+        }
         let folded = fold(path);
         let mut write_only = self.write_only.iter().filter(|_| write);
         let entry = self

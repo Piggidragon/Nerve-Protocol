@@ -441,17 +441,9 @@ impl Node {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let file = self.config.join("node.toml");
-        let text = std::fs::read_to_string(&file).unwrap();
-        let line = format!("sudo_path = {:?}\n", script.display().to_string());
-        let text = match text.find("[machine]\n") {
-            Some(i) => {
-                let at = i + "[machine]\n".len();
-                format!("{}{line}{}", &text[..at], &text[at..])
-            }
-            None => format!("{text}\n[machine]\n{line}"),
-        };
-        std::fs::write(&file, text).unwrap();
+        // Through the CLI: the node refuses a node.toml it did not sign.
+        let path = script.display().to_string();
+        self.ok(&["config", "set", "machine.sudo_path", &path]);
     }
 
     /// Whether the daemon has exited by itself.

@@ -1,5 +1,6 @@
 //! The node's Ed25519 key per center, its node id, and the connect signature
-//! (spec/node-link.md §Identity).
+//! (spec/node-link.md §Identity); and the secret key of the MAC the node keeps
+//! over its own config file ([`MacKey`]).
 //!
 //! 0.0.1 keeps the key as a 0600 file next to the node's config. Keeping it in
 //! the system keyring (`machine.secret_storage = "keyring"`) is not done yet;
@@ -100,6 +101,64 @@ pub fn verify_connect(public_hex: &str, center_id: &str, nonce: &[u8], sig_hex: 
         .is_ok()
 }
 
+/// The node's secret for the MAC over its own config file (HMAC-SHA256).
+/// Whoever can read it can sign a config the node accepts, so it lives in a
+/// 0600 file in a folder no command of a center may reach.
+pub struct MacKey(ring::hmac::Key);
+
+impl MacKey {
+    /// The key at `path`; `None` when there is none yet.
+    pub fn load(path: &std::path::Path) -> Result<Option<MacKey>, String> {
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("{}: {e}", path.display())),
+        };
+        let raw = unhex(text.trim())
+            .filter(|r| r.len() == 32)
+            .ok_or_else(|| format!("{}: not a 32-byte hex key", path.display()))?;
+        Ok(Some(MacKey(ring::hmac::Key::new(
+            ring::hmac::HMAC_SHA256,
+            &raw,
+        ))))
+    }
+
+    /// The key at `path`, made and written there first when there is none.
+    /// An existing key is never replaced: it would turn every file it signed
+    /// into one the node refuses.
+    pub fn load_or_create(path: &std::path::Path) -> Result<MacKey, String> {
+        if let Some(k) = MacKey::load(path)? {
+            return Ok(k);
+        }
+        let raw = random_bytes(32);
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("key");
+        let tmp = path.with_file_name(format!(".{name}.{}.new", random_token(8)));
+        crate::files::write_private(&tmp, (hex(&raw) + "\n").as_bytes())
+            .map_err(|e| format!("{}: {e}", tmp.display()))?;
+        // A hard link fails when the name exists, so two processes that both
+        // found no key end up with the same one.
+        let linked = std::fs::hard_link(&tmp, path);
+        let _ = std::fs::remove_file(&tmp);
+        match linked {
+            Ok(()) => Ok(MacKey(ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &raw))),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                MacKey::load(path)?.ok_or_else(|| format!("{}: the key vanished", path.display()))
+            }
+            Err(e) => Err(format!("{}: {e}", path.display())),
+        }
+    }
+
+    /// The MAC over `data`, hex.
+    pub fn sign(&self, data: &[u8]) -> String {
+        hex(ring::hmac::sign(&self.0, data).as_ref())
+    }
+
+    /// Whether `mac_hex` is the MAC over `data` (compared in constant time).
+    pub fn verify(&self, data: &[u8], mac_hex: &str) -> bool {
+        unhex(mac_hex).is_some_and(|m| ring::hmac::verify(&self.0, data, &m).is_ok())
+    }
+}
+
 /// `n` random bytes from the system.
 pub fn random_bytes(n: usize) -> Vec<u8> {
     use ring::rand::SecureRandom;
@@ -157,6 +216,35 @@ mod tests {
         assert!(!verify_connect(&other.public_hex(), "c1", &nonce, &sig));
         assert!(!verify_connect("zz", "c1", &nonce, &sig));
         assert!(NodeKey::from_text("abcd").is_err());
+    }
+
+    #[test]
+    fn mac_keys_are_made_once_and_verify_only_their_own_macs() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("state/config.key");
+        assert!(MacKey::load(&path).unwrap().is_none());
+        let k = MacKey::load_or_create(&path).unwrap();
+        let mac = k.sign(b"node.toml");
+        // Made once: a second call reads the same key back.
+        let again = MacKey::load_or_create(&path).unwrap();
+        assert!(again.verify(b"node.toml", &mac));
+        assert!(!again.verify(b"node.toml!", &mac));
+        assert!(!again.verify(b"node.toml", "zz"));
+        let other = MacKey::load_or_create(&d.path().join("other.key")).unwrap();
+        assert!(!other.verify(b"node.toml", &mac));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        // Only the key is left in its folder.
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            1
+        );
+        std::fs::write(&path, "abcd\n").unwrap();
+        assert!(MacKey::load(&path).is_err());
     }
 
     #[test]

@@ -457,15 +457,16 @@ Commands the node runs for a center cannot change the node's settings through th
 
 - Package: one binary, Linux and Windows. Headless; everything through the CLI in 0.0.1.
 - `nerve-node install` (user service), `nerve-node setup --create-user nerve` (servers: dedicated user, system unit with `Delegate=yes`, folder grants printed as `setfacl` lines).
-- Terminal: `pair`, `unpair`, `centers`, `status`, `mode`, `folder`, `caps`, `allow`, `deny`, `grant settings`, `config get|set|unset|add|remove`, `panic`, `unlock`, `sudo on|off|status` (`on` asks for the sudo password; the node verifies it and refuses a wrong one; `off` asks for none), `proxy`, `update`, `uninstall [--purge]`. Every per-center command takes `--center <name>` and refuses to guess when there are several.
+- Terminal: `pair`, `unpair`, `centers`, `status`, `mode`, `folder`, `caps`, `allow`, `deny`, `grant settings`, `config get|set|unset|add|remove|accept`, `panic`, `unlock`, `sudo on|off|status` (`on` asks for the sudo password; the node verifies it and refuses a wrong one; `off` asks for none), `proxy`, `update`, `uninstall [--purge]`. Every per-center command takes `--center <name>` and refuses to guess when there are several.
 - In 0.0.1 the commands `install`, `setup`, `update` and `uninstall` exist but only answer "not done in 0.0.1"; the node is started by hand until they land.
 - Pairing is confirmed in the terminal; a `nerve://` link handler and dialogs come with the Slint setup GUI later.
 
 ### 8.3 One source of truth
 
 - Each daemon owns exactly one config file (`~/.config/nerve/node.toml`, `~/.config/nerve/center.toml`; `%APPDATA%\nerve\…` on Windows), described by a published JSON Schema.
-- Every writer goes through the daemon's settings API on its control socket: the CLI, (later) the setup GUI and the desktop add-on, and (through `nerve:settings/1`) a center with `write`. The API takes a whole document with `if_version`, validates it against the schema and the rules (client-only items), writes the file atomically, applies it at once, audits each change and notifies listeners. No component writes the file directly.
-- A hand edit is picked up on change (file watch, `SIGHUP`), validated the same way; a bad file is refused and the old settings stay.
+- Every writer goes through the daemon's settings API on its control socket: the CLI, (later) the setup GUI and the desktop add-on, and (through `nerve:settings/1`) a center with `write`. The API takes a whole document with `if_version`, validates it against the schema and the rules (client-only items), writes the file atomically, applies it at once, audits each change with old and new value and notifies listeners. No component writes the file directly; while no daemon runs, the CLI writes it through the same store.
+- The daemon keeps the config in memory and reads the file only at start-up and when the owner asks (`SIGHUP`, `reload` on the socket). Every file the node writes carries an HMAC over its content in its first line, keyed by a secret in the node's state folder (`config.key`, 0600). A file without a matching MAC, a hand edit included, was not written through the owner's path: it is refused and audited, and the old settings stay (at start-up the node does not start). The owner takes such a file after looking at it with `nerve-node config accept` (node-local §1).
+- The node's config and state folders are its own: no call of a center reaches them, whatever its rules, folders or released paths say, and a confined command's Landlock rules leave them out even when a granted folder holds them (node-local §3).
 - The settings document a center reads and the config file are the same structure, minus the client-only sections. There is no second format.
 
 Node config layout:

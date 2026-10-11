@@ -5,9 +5,15 @@
 //! Every change is whole-document with `if_version`, so two writers never
 //! overwrite each other unseen, is validated before it is saved, and lands in
 //! the audit log with its old and new values and who made it.
+//!
+//! The node keeps the config in memory and signs every file it writes with a
+//! MAC whose key no command of a center can read. The file is read at start-up
+//! and when the owner asks for it; a file the node did not sign (one a command
+//! rewrote, say) is refused, audited, and changes nothing.
 
 use std::path::{Path, PathBuf};
 
+use nerve_transport::keys::MacKey;
 use serde_json::Value;
 
 use crate::audit::{AuditLog, diff};
@@ -54,22 +60,156 @@ impl Writer<'_> {
     }
 }
 
+/// The first line of a `node.toml` the node wrote: the MAC over the rest of
+/// the file, then a note for whoever opens it.
+const MAC_LINE: &str = "# mac hmac-sha256 ";
+const MAC_NOTE: &str = " (nerve-node refuses this file once it is changed outside nerve-node)";
+
+/// Goes into the MAC before the text, so the key signs nothing but a config.
+const MAC_CONTEXT: &[u8] = b"nerve node.toml\n";
+
+fn mac_input(body: &str) -> Vec<u8> {
+    [MAC_CONTEXT, body.as_bytes()].concat()
+}
+
+/// The file the node writes for `c`: the MAC line, then the TOML.
+fn sealed(key: &MacKey, c: &NodeConfig) -> String {
+    let body = c.to_toml();
+    let mac = key.sign(&mac_input(&body));
+    format!("{MAC_LINE}{mac}{MAC_NOTE}\n{body}")
+}
+
+/// A file's MAC (when its first line is a MAC line) and the TOML after it.
+fn unseal(text: &str) -> (Option<&str>, &str) {
+    match text.strip_prefix(MAC_LINE) {
+        Some(rest) => {
+            let (line, body) = rest.split_once('\n').unwrap_or((rest, ""));
+            (Some(line.split(' ').next().unwrap_or_default()), body)
+        }
+        None => (None, text),
+    }
+}
+
+/// `text` as a config, when the node signed it with `key`.
+fn verified(text: &str, key: &MacKey) -> Result<NodeConfig, String> {
+    match unseal(text) {
+        (None, _) => Err("it carries no MAC, so nerve-node did not write it".into()),
+        (Some(mac), body) if !key.verify(&mac_input(body), mac) => {
+            Err("its MAC does not match, so it was changed outside nerve-node".into())
+        }
+        (Some(_), body) => NodeConfig::parse(body),
+    }
+}
+
+/// The file's text; `None` when there is no file.
+fn read_file(path: &Path) -> Result<Option<String>, String> {
+    match std::fs::read_to_string(path) {
+        Ok(t) => Ok(Some(t)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// A change may set a center's user mode at most 8 hours ahead, whoever
+/// makes it and whichever way it comes in (an owner's write, a reload, an
+/// accepted file).
+fn user_mode_in_reach(old: &NodeConfig, new: &NodeConfig, now_ms: u64) -> Result<(), String> {
+    for c in &new.centers {
+        let before = old.center(&c.name).and_then(|o| o.policy.user_until);
+        if c.policy.mode == Mode::User
+            && c.policy.user_until != before
+            && c.policy
+                .user_until
+                .is_some_and(|u| u > now_ms + USER_MAX_MS)
+        {
+            return Err(format!(
+                "center {}: policy.user_until is more than 8 hours from now",
+                c.name
+            ));
+        }
+    }
+    Ok(())
+}
+
 pub struct SettingsStore {
     path: PathBuf,
+    key: MacKey,
     audit: AuditLog,
     config: NodeConfig,
 }
 
 impl SettingsStore {
-    /// Loads `path` (a missing file is the default config).
-    pub fn open(path: impl Into<PathBuf>, audit: AuditLog) -> Result<SettingsStore, String> {
+    /// Loads `path` (a missing file is the default config) and checks its MAC
+    /// with the key at `key_path`. A file whose MAC does not match is refused
+    /// and audited. The key is made when there is none; a file from before
+    /// the node kept a MAC is then taken once, as it is, and signed.
+    pub fn open(
+        path: impl Into<PathBuf>,
+        key_path: impl AsRef<Path>,
+        audit: AuditLog,
+    ) -> Result<SettingsStore, String> {
         let path = path.into();
-        let config = NodeConfig::load(&path)?;
-        Ok(SettingsStore {
+        let text = read_file(&path)?;
+        let first = MacKey::load(key_path.as_ref())?.is_none();
+        let key = MacKey::load_or_create(key_path.as_ref())?;
+        let mut s = SettingsStore {
             path,
+            key,
             audit,
-            config,
-        })
+            config: NodeConfig::default(),
+        };
+        let Some(text) = text else {
+            return Ok(s);
+        };
+        if first && unseal(&text).0.is_none() {
+            let c = NodeConfig::parse(&text).map_err(|e| format!("{}: {e}", s.path.display()))?;
+            s.write(&c)?;
+            s.config = c;
+            let _ = s.audit.config(
+                "signed",
+                &s.path,
+                "written before the node kept a MAC; signed as it was",
+            );
+            return Ok(s);
+        }
+        s.config = verified(&text, &s.key).map_err(|why| s.refuse(&why))?;
+        Ok(s)
+    }
+
+    /// Opens the store for `nerve-node config accept` while no daemon runs:
+    /// the file is taken as it is ([`SettingsStore::accept`]).
+    pub fn open_accepting(
+        path: impl Into<PathBuf>,
+        key_path: impl AsRef<Path>,
+        audit: AuditLog,
+    ) -> Result<(SettingsStore, u64), String> {
+        let mut s = SettingsStore {
+            path: path.into(),
+            key: MacKey::load_or_create(key_path.as_ref())?,
+            audit,
+            config: NodeConfig::default(),
+        };
+        let v = s.accept().map_err(|e| e.to_string())?;
+        Ok((s, v))
+    }
+
+    /// The config at `path` as [`SettingsStore::open`] would take it, without
+    /// writing anything (what the CLI shows while no daemon runs).
+    pub fn peek(path: &Path, key_path: &Path) -> Result<NodeConfig, String> {
+        let Some(text) = read_file(path)? else {
+            return Ok(NodeConfig::default());
+        };
+        let refused = |why: String| format!("{} is refused: {why}", path.display());
+        match MacKey::load(key_path)? {
+            Some(key) => verified(&text, &key).map_err(refused),
+            // The node signs such a file the first time it opens it.
+            None if unseal(&text).0.is_none() => {
+                NodeConfig::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
+            }
+            None => Err(refused(
+                "it is signed with a key this node does not have".into(),
+            )),
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -88,13 +228,71 @@ impl SettingsStore {
         self.config.version
     }
 
-    /// Reads the file again (SIGHUP, or the CLI edited it while the daemon
-    /// ran). A file that does not validate leaves the old config in force.
+    /// Reads the file again because the owner asks (SIGHUP, the control
+    /// socket's `reload`). Only a file the node signed is applied, never an
+    /// older version than the one in force, and never one that sets user mode
+    /// more than 8 hours ahead; anything else is refused and audited, and the
+    /// old config stays in force.
     pub fn reload(&mut self) -> Result<bool, String> {
-        let fresh = NodeConfig::load(&self.path)?;
+        let text = read_file(&self.path)?.ok_or_else(|| self.refuse("the file is missing"))?;
+        let fresh = verified(&text, &self.key).map_err(|why| self.refuse(&why))?;
+        if fresh.version < self.config.version {
+            return Err(self.refuse(&format!(
+                "its version {} is older than the one in force ({})",
+                fresh.version, self.config.version
+            )));
+        }
+        user_mode_in_reach(&self.config, &fresh, nerve_proto::msg::now_ms())
+            .map_err(|why| self.refuse(&why))?;
         let changed = fresh != self.config;
         self.config = fresh;
         Ok(changed)
+    }
+
+    /// Takes the file as it is now, after the node refused it (`nerve-node
+    /// config accept`: the owner has looked at it). Its MAC is not checked;
+    /// it must still parse and validate, and the node signs it.
+    pub fn accept(&mut self) -> Result<u64, SetError> {
+        let missing = || SetError::Invalid(format!("{} is missing", self.path.display()));
+        let text = read_file(&self.path)
+            .map_err(SetError::Io)?
+            .ok_or_else(missing)?;
+        let mut new = NodeConfig::parse(unseal(&text).1)
+            .map_err(|e| SetError::Invalid(format!("{}: {e}", self.path.display())))?;
+        user_mode_in_reach(&self.config, &new, nerve_proto::msg::now_ms())
+            .map_err(SetError::Invalid)?;
+        new.version = self.config.version.max(new.version) + 1;
+        self.write(&new).map_err(SetError::Io)?;
+        let changes = diff(&to_json(&self.config), &to_json(&new));
+        let version = new.version;
+        self.config = new;
+        let _ = self
+            .audit
+            .config("accepted", &self.path, "the owner took the file as it was");
+        let _ = self
+            .audit
+            .settings(&Writer::Local.label(), version, &changes);
+        Ok(version)
+    }
+
+    /// Audits a refused file and says why it was refused.
+    fn refuse(&self, why: &str) -> String {
+        // The refusal stands even when the audit log cannot be written.
+        let _ = self.audit.config("refused", &self.path, why);
+        format!(
+            "{} is refused: {why}; check it, then `nerve-node config accept` takes it as it is",
+            self.path.display()
+        )
+    }
+
+    /// Writes `c` atomically, signed.
+    fn write(&self, c: &NodeConfig) -> Result<(), String> {
+        if let Some(dir) = self.path.parent() {
+            nerve_transport::files::create_private_dir(dir)
+                .map_err(|e| format!("{}: {e}", dir.display()))?;
+        }
+        nerve_transport::files::write_private(&self.path, sealed(&self.key, c).as_bytes())
+            .map_err(|e| format!("{}: {e}", self.path.display()))
     }
 
     /// Replaces the whole config as the owner; `if_version` guards against a
@@ -129,7 +327,7 @@ impl SettingsStore {
             return Ok(());
         }
         new.version = self.config.version + 1;
-        new.save(&self.path)?;
+        self.write(&new)?;
         self.config = new;
         Ok(())
     }
@@ -210,8 +408,10 @@ impl SettingsStore {
         if new == self.config {
             return Ok(self.config.version);
         }
+        user_mode_in_reach(&self.config, &new, nerve_proto::msg::now_ms())
+            .map_err(SetError::Invalid)?;
         new.version = self.config.version + 1;
-        new.save(&self.path).map_err(SetError::Io)?;
+        self.write(&new).map_err(SetError::Io)?;
         let changes = diff(&to_json(&self.config), &to_json(&new));
         let version = new.version;
         self.config = new;
@@ -282,6 +482,7 @@ mod tests {
     fn store(dir: &Path, grant: SettingsGrant) -> SettingsStore {
         let mut s = SettingsStore::open(
             dir.join("node.toml"),
+            dir.join("config.key"),
             AuditLog::new(dir.join("audit.jsonl")),
         )
         .unwrap();
@@ -352,6 +553,7 @@ mod tests {
         // Saved and reloaded.
         let again = SettingsStore::open(
             d.path().join("node.toml"),
+            d.path().join("config.key"),
             AuditLog::new(d.path().join("a")),
         )
         .unwrap();
@@ -424,6 +626,142 @@ mod tests {
             off.set_center_document("home", new, v, 0, |_| false),
             Err(SetError::Forbidden(_))
         ));
+    }
+
+    fn reopen(dir: &Path) -> Result<SettingsStore, String> {
+        SettingsStore::open(
+            dir.join("node.toml"),
+            dir.join("config.key"),
+            AuditLog::new(dir.join("audit.jsonl")),
+        )
+    }
+
+    fn refusals(s: &SettingsStore) -> usize {
+        let log = s.audit().read().unwrap();
+        log.iter().filter(|v| v["event"] == "refused").count()
+    }
+
+    #[test]
+    fn a_file_from_before_the_mac_is_signed_once() {
+        let d = tempfile::tempdir().unwrap();
+        let mut old = NodeConfig::default();
+        old.limits.max_running = 3;
+        old.save(&d.path().join("node.toml")).unwrap();
+        // Readable as it is before the node first opens it ...
+        let peeked = SettingsStore::peek(&d.path().join("node.toml"), &d.path().join("config.key"));
+        assert_eq!(peeked.unwrap(), old);
+        // ... and signed when it does.
+        let s = reopen(d.path()).unwrap();
+        assert_eq!(s.config(), &old);
+        let text = std::fs::read_to_string(s.path()).unwrap();
+        assert!(text.starts_with(MAC_LINE), "{text}");
+        let log = s.audit().read().unwrap();
+        assert_eq!(log.last().unwrap()["event"], "signed");
+        // Once there is a key, an unsigned file is refused.
+        old.save(s.path()).unwrap();
+        assert!(reopen(d.path()).err().unwrap().contains("refused"));
+        assert!(SettingsStore::peek(s.path(), &d.path().join("config.key")).is_err());
+    }
+
+    #[test]
+    fn reload_takes_only_a_newer_signed_file_in_reach() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = store(d.path(), SettingsGrant::Off);
+        let mut other = reopen(d.path()).unwrap();
+        // Signed by the owner's path elsewhere (the CLI while no socket
+        // answers): taken.
+        other
+            .update(|c| {
+                c.limits.max_running = 2;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(s.reload(), Ok(true));
+        assert_eq!(s.config().limits.max_running, 2);
+        assert_eq!(s.reload(), Ok(false));
+        // An older signed file is refused: it would undo owner changes.
+        let older = std::fs::read(s.path()).unwrap();
+        s.update(|c| {
+            c.limits.max_running = 5;
+            Ok(())
+        })
+        .unwrap();
+        std::fs::write(s.path(), older).unwrap();
+        assert!(s.reload().unwrap_err().contains("older"));
+        assert_eq!(s.config().limits.max_running, 5);
+        // A missing file changes nothing either.
+        std::fs::remove_file(s.path()).unwrap();
+        assert!(s.reload().is_err());
+        assert_eq!(s.config().limits.max_running, 5);
+        assert_eq!(refusals(&s), 2);
+    }
+
+    #[test]
+    fn user_mode_reaches_at_most_8_hours_ahead() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = store(d.path(), SettingsGrant::Off);
+        let now = nerve_proto::msg::now_ms();
+        let user = |until: u64| {
+            move |c: &mut NodeConfig| {
+                let p = &mut c.centers[0].policy;
+                p.mode = Mode::User;
+                p.user_until = Some(until);
+                Ok(())
+            }
+        };
+        assert!(matches!(
+            s.update(user(now + USER_MAX_MS + 60_000)),
+            Err(SetError::Invalid(m)) if m.contains("8 hours")
+        ));
+        s.update(user(now + 3_600_000)).unwrap();
+        // A signed file that reaches further is refused on reload as well.
+        let mut far = s.config().clone();
+        far.version += 1;
+        far.centers[0].policy.user_until = Some(now + 10 * USER_MAX_MS);
+        std::fs::write(s.path(), sealed(&s.key, &far)).unwrap();
+        assert!(s.reload().unwrap_err().contains("8 hours"));
+        assert_eq!(
+            s.config().centers[0].policy.user_until,
+            Some(now + 3_600_000)
+        );
+        assert_eq!(refusals(&s), 1);
+    }
+
+    #[test]
+    fn accept_takes_a_refused_file_and_signs_it() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = store(d.path(), SettingsGrant::Off);
+        let v = s.version();
+        let mut edited = s.config().clone();
+        edited.limits.max_running = 7;
+        edited.save(s.path()).unwrap();
+        assert!(s.reload().is_err());
+        assert_eq!(s.accept().unwrap(), v + 1);
+        assert_eq!(s.config().limits.max_running, 7);
+        assert_eq!(reopen(d.path()).unwrap().config(), s.config());
+        let log = s.audit().read().unwrap();
+        assert!(log.iter().any(|e| e["event"] == "accepted"));
+        assert!(
+            log.last().unwrap()["changes"]
+                .to_string()
+                .contains("max_running")
+        );
+        // Without a running store: the file is taken as it is.
+        let mut edited = s.config().clone();
+        edited.limits.max_running = 9;
+        edited.save(s.path()).unwrap();
+        assert!(reopen(d.path()).is_err());
+        let (t, v) = SettingsStore::open_accepting(
+            s.path(),
+            d.path().join("config.key"),
+            AuditLog::new(d.path().join("audit.jsonl")),
+        )
+        .unwrap();
+        assert_eq!(t.config().limits.max_running, 9);
+        assert_eq!(reopen(d.path()).unwrap().version(), v);
+        // What does not validate is not taken.
+        std::fs::write(s.path(), "[limits]\nmax_running = 0\n").unwrap();
+        assert!(matches!(s.accept(), Err(SetError::Invalid(_))));
     }
 
     #[test]

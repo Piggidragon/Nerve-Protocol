@@ -12,7 +12,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
 use nerve_policy::config::{Access, CenterPolicy};
-use nerve_policy::paths::to_wire;
+use nerve_policy::paths::{to_wire, within};
 use nerve_policy::{Target, protected::expand};
 use nerve_proto::rpc::params;
 use nerve_proto::{ErrorCode, RpcError};
@@ -106,8 +106,10 @@ pub fn shell_command(shell: Option<&str>, command: &str) -> (String, Vec<String>
 
 /// The Landlock rules for a command of a center in `folders` mode: it reads
 /// the system and its folders, writes its read-write folders, runs programs
-/// from the system and its execute folders.
-pub fn landlock_spec(policy: &CenterPolicy, home: &Path) -> LandlockSpec {
+/// from the system and its execute folders. The node's own folders (`own`:
+/// its config, keys and state) are in none of these sets, whatever the
+/// folders say ([`leave_out`]).
+pub fn landlock_spec(policy: &CenterPolicy, home: &Path, own: &[PathBuf]) -> LandlockSpec {
     let folders = |f: &dyn Fn(&nerve_policy::config::Folder) -> bool| -> Vec<PathBuf> {
         policy
             .folders
@@ -117,13 +119,72 @@ pub fn landlock_spec(policy: &CenterPolicy, home: &Path) -> LandlockSpec {
             .collect()
     };
     LandlockSpec {
-        read: [nerve_sandbox::system_dirs(), folders(&|_| true)].concat(),
-        write: [
-            nerve_sandbox::system_writable(),
-            folders(&|x| x.access == Access::Rw),
-        ]
-        .concat(),
-        exec: [nerve_sandbox::system_dirs(), folders(&|x| x.execute)].concat(),
+        read: leave_out(
+            &[nerve_sandbox::system_dirs(), folders(&|_| true)].concat(),
+            own,
+        ),
+        write: leave_out(
+            &[
+                nerve_sandbox::system_writable(),
+                folders(&|x| x.access == Access::Rw),
+            ]
+            .concat(),
+            own,
+        ),
+        exec: leave_out(
+            &[nerve_sandbox::system_dirs(), folders(&|x| x.execute)].concat(),
+            own,
+        ),
+    }
+}
+
+/// `paths` without the folders in `own`. A Landlock rule grants a folder and
+/// everything below it and nothing can carve a hole into it, so a path inside
+/// an own folder is dropped, and a path that holds one is replaced by its
+/// other entries, level by level down to the own folder. What the command
+/// loses there: listing those levels, and making new entries right in them.
+///
+/// Paths are compared resolved, because Landlock follows a symlink in a
+/// rule's path; an entry that is a symlink to or around an own folder is
+/// dropped as well.
+pub fn leave_out(paths: &[PathBuf], own: &[PathBuf]) -> Vec<PathBuf> {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let own: Vec<PathBuf> = own.iter().map(|o| real(o)).collect();
+    let mut out = Vec::new();
+    for p in paths {
+        let r = real(p);
+        if own.iter().any(|o| within(&r, o)) {
+            continue;
+        }
+        if own.iter().any(|o| within(o, &r)) {
+            split(&r, &own, &mut out);
+        } else {
+            out.push(p.clone());
+        }
+    }
+    out
+}
+
+/// Pushes the entries of `dir` (which holds an own folder) that hold none,
+/// and goes down into the ones that do.
+fn split(dir: &Path, own: &[PathBuf], out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for e in entries.flatten() {
+        let path = e.path();
+        let link = e.file_type().is_ok_and(|t| t.is_symlink());
+        let real = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let inside = own.iter().any(|o| within(&real, o));
+        let holds = own.iter().any(|o| within(o, &real));
+        if inside || (holds && link) {
+            continue;
+        }
+        if holds {
+            split(&real, own, out);
+        } else {
+            out.push(path);
+        }
     }
 }
 
@@ -449,6 +510,51 @@ mod tests {
         // SAFETY: signal 0 only checks whether the group exists.
         let alive = unsafe { libc::kill(-(pid as libc::pid_t), 0) } == 0;
         assert!(!alive, "the process group outlived the call");
+    }
+
+    #[test]
+    fn leaves_the_nodes_folders_out_of_every_set() {
+        let d = tempfile::tempdir().unwrap();
+        let w = std::fs::canonicalize(d.path()).unwrap();
+        for dir in ["a", "deep/cfg/keys", "deep/sib", "other"] {
+            std::fs::create_dir_all(w.join(dir)).unwrap();
+        }
+        std::fs::write(w.join("file.txt"), "x").unwrap();
+        std::os::unix::fs::symlink(w.join("deep"), w.join("link")).unwrap();
+        std::os::unix::fs::symlink(w.join("deep/cfg"), w.join("other/to-cfg")).unwrap();
+        let own = [w.join("deep/cfg")];
+        let mut got = leave_out(&[w.clone(), w.join("other")], &own);
+        got.sort();
+        got.dedup();
+        // The folder that holds `cfg` is replaced by its other entries, down
+        // to `cfg`; the symlink around it is gone; a folder beside it stays
+        // whole (a symlink deeper inside is no rule, and Landlock judges what
+        // it resolves to).
+        let want: Vec<PathBuf> = ["a", "deep/sib", "file.txt", "other"]
+            .iter()
+            .map(|p| w.join(p))
+            .collect();
+        assert_eq!(got, want);
+        assert!(leave_out(&[w.join("deep/cfg/keys")], &own).is_empty());
+        assert!(leave_out(&[w.join("link/cfg")], &own).is_empty());
+        // A symlink given as a folder is judged by where it leads.
+        let mut via_link = leave_out(&[w.join("link")], &own);
+        via_link.sort();
+        assert_eq!(via_link, [w.join("deep/sib")]);
+
+        let policy = CenterPolicy {
+            folders: vec![nerve_policy::config::Folder {
+                path: w.display().to_string(),
+                access: Access::Rw,
+                execute: true,
+            }],
+            ..Default::default()
+        };
+        let spec = landlock_spec(&policy, &w, &own);
+        for set in [&spec.read, &spec.write, &spec.exec] {
+            assert!(set.contains(&w.join("a")), "{set:?}");
+            assert!(!set.iter().any(|p| own[0].starts_with(p)), "{set:?}");
+        }
     }
 
     #[test]

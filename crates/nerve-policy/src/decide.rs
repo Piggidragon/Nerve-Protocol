@@ -2,7 +2,9 @@
 //! §5.1, spec node-local §3).
 //!
 //! There are two outcomes, allowed and refused; nothing waits for an answer.
-//! The order only ever narrows: an `off` capability is disabled; a sudo
+//! The order only ever narrows: a call that touches the node's own folders
+//! (config, keys, state) is forbidden before anything else is looked at, and
+//! nothing lifts that; an `off` capability is disabled; a sudo
 //! command with the sudo switch off, and anything a deny rule matches, is
 //! forbidden whatever else says; then a sudo command needs the sudo allow
 //! list, and any other call the mode: allow rules in `allowlist` mode, the
@@ -107,8 +109,28 @@ fn name(call: &Call, target: &str) -> String {
     }
 }
 
+/// The node's own folder `call` touches: one of its paths, its working
+/// directory, or a path its command line names plainly.
+fn own_folder<'p>(env: &'p Env, call: &Call) -> Option<&'p Path> {
+    call.targets
+        .iter()
+        .map(|t| t.path.as_path())
+        .chain(call.cwd)
+        .find_map(|p| env.protected.own(p))
+        .or_else(|| call.command.and_then(|c| env.protected.own_in_command(c)))
+}
+
 /// Decides `call` under `policy`.
 pub fn decide(policy: &CenterPolicy, env: &Env, call: &Call) -> Decision {
+    // The node's own folders hold the policy itself and the keys that sign
+    // it: no rule, mode or release reaches them, so they come first.
+    if let Some(own) = own_folder(env, call) {
+        return Decision::Forbidden(format!(
+            "{} belongs to the node itself; no rule or mode reaches it",
+            own.display()
+        ));
+    }
+
     let setting = policy.cap_setting(call.cap, Some(call.action));
     if matches!(setting, Some(CapSetting::Off | CapSetting::Hidden)) {
         return Decision::Disabled(format!("{}.{} is off", call.cap, call.action));

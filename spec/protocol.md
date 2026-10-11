@@ -49,9 +49,9 @@ nerve://pair?center=<percent-encoded center URL>&code=<code>&pin=<pin>
 - A parser MUST refuse: unknown keys, a key given twice, bad percent escapes, a
   fragment, a link longer than 4096 bytes.
 - The node MUST show the owner the center URL and the defaults it will store
-  (mode `ask`, settings grant `off`, approvals `both`, with the warning that
-  with `both` a compromised center can answer every approval) and store
-  nothing before the owner confirms.
+  (mode `folder` with no folder and no rule, so every call is refused until the
+  owner allows something; settings grant `off`) and store nothing before the
+  owner confirms.
 
 ### 3.2 Pair request
 
@@ -140,8 +140,7 @@ suspend, an address change) sends the event `node/going_away {reason}` first,
 so the center can show why it dropped.
 
 There is no resume. When a link ends, calls in flight on it fail with
-`connection_lost`, commands it started are killed, and its approvals are
-withdrawn (`approvals/resolved` with `by: "withdrawn"` is recorded locally).
+`connection_lost`, and commands it started are killed.
 
 ### 4.6 Reconnect
 
@@ -186,8 +185,8 @@ Errors carry a string code in `error.data.code` (§5.3).
 - `deadline_ms` is a duration in milliseconds from receipt; past it the node
   fails the call with `timeout`.
 - `progress.id` and `cancel.id` are the `invoke` request id.
-- Topics are `<cap>/<event>`, `<cap>/state` or `<cap>/*`. Events of the `node`,
-  `approvals` and `settings` capabilities are implicit: they are sent without
+- Topics are `<cap>/<event>`, `<cap>/state` or `<cap>/*`. Events of the `node`
+  and `settings` capabilities are implicit: they are sent without
   `sub`. Everything else needs one.
 - `seq` counts per capability from 1 within a link; `ts` is milliseconds since
   the Unix epoch.
@@ -203,9 +202,7 @@ tolerant of unknown fields a node sends, so newer nodes keep working.
 | Code | JSON-RPC code | Meaning |
 |---|---|---|
 | `invalid_args` | -32602 | arguments do not match the action |
-| `forbidden` | -32001 | policy refuses, no approval possible |
-| `consent_required` | -32002 | needs an approval the caller cannot get |
-| `denied` | -32003 | a person said no (or the approval timed out to no) |
+| `forbidden` | -32001 | policy refuses: no rule allows the call, or a rule forbids it |
 | `disabled` | -32004 | the capability or action is off |
 | `unavailable` | -32005 | the node or capability is not reachable now |
 | `busy` | -32006 | too many calls or commands running |
@@ -254,7 +251,7 @@ call over the call limit fails with `busy`.
  "rev": 7,
  "summary": "Linux laptop of the owner (under 60 words)",
  "capabilities": [
-   {"id": "fs", "profile": "fs", "provider": "node", "exposure": "ask",
+   {"id": "fs", "profile": "fs", "provider": "node", "exposure": "on",
     "summary": "…",
     "actions": {"read": {"effect": "read", "summary": "…",
                          "params": {JSON Schema}, "result": {JSON Schema}}},
@@ -262,7 +259,7 @@ call over the call limit fails with `busy`.
 ```
 
 - Effects: `read`, `sense`, `write`, `actuate`, `execute`.
-- Exposure: `on`, `ask`, `off`. A capability that is `hidden` for a center is
+- Exposure: `on`, `off`. A capability that is `hidden` for a center is
   absent from that center's descriptor; `off` is listed with exposure `off`.
 - The descriptor is filtered per center. `rev` changes whenever that center's
   view changes; the node then sends `node/descriptor_changed {rev}` and the
@@ -310,33 +307,20 @@ concurrently.
   `truncated` says it was cut. In 0.0.1 output comes in the result; the
   `output` reliable stream is declared for later versions.
 
-### 7.4 `approvals` (always present)
-
-- events (implicit):
-  - `requested {id, cap, action, target, reasons, preview, choices,
-    max_minutes, expires_ms, session?}`; `choices` is a subset of `once`,
-    `session`, `time`, `deny`.
-  - `resolved {id, answer, by}`; `by` is `center`, `local`, `timeout`, `pause`
-    or `withdrawn`.
-- actions: `answer {id, answer, minutes?}` → `{}` (effect `actuate`);
-  `list {}` → `{approvals: [requested…]}` (effect `read`).
-- With `approvals = "local"` for this center, `answer` fails with `forbidden`.
-  The first answer wins, whether from the center or from the node itself.
-
-### 7.5 `settings` (only with the settings grant `write`)
+### 7.4 `settings` (only with the settings grant `write`)
 
 - `get {cap: "settings", keys: ["document", "version"]}` → `{document,
   version}`; `document` is this center's entry of the node config (policy,
-  folders, caps, approvals timing).
+  folders, caps, command rules).
 - actions: `set {document, if_version}` → `{version}` (effect `write`); a stale
   `if_version` fails with `conflict`; a change to a client-only field refuses
   the whole document with `forbidden` and names the field. `pause {}` → `{}`.
 - event (implicit): `changed {version}`.
 
-### 7.6 `audit`
+### 7.5 `audit`
 
-- event `decision {ts, cap, action, target, decision, code?, by?, session?}`
-  (needs `sub`); `decision` is `allowed`, `asked`, `denied` or `forbidden`.
+- event `decision {ts, cap, action, target, decision, code?, session?}`
+  (needs `sub`); `decision` is `allowed` or `forbidden`.
 
 ## 8. Center side
 

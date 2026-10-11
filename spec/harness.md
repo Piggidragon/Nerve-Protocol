@@ -6,8 +6,8 @@ is what a harness, and whoever writes its MCP entry, can rely on.
 
 > **Integration.** Harnesses get Nerve through MCP only: the MCP server is the
 > whole integration surface in 0.0.1. Native plugins for harnesses are a
-> backlog item. Approvals are answered on the node or in the center web UI;
-> MCP elicitation is not used.
+> backlog item. Nothing waits for a person: a call the node's policy does not
+> allow is refused at once.
 
 ## 1. Starting it
 
@@ -26,7 +26,6 @@ entry:
 | `--mcp` | `NERVE_MCP` | `stdio` | `stdio`, `http`, or `none` (center only) |
 | `--mcp-listen` | `NERVE_MCP_LISTEN` | `127.0.0.1:7481` | HTTP MCP address |
 | `--harness-token` | `NERVE_HARNESS_TOKEN` | none | bearer token for HTTP MCP (more can be made in the UI) |
-| `--call-wait` | `NERVE_CALL_WAIT` | `120` | seconds a call waits for an approval |
 | `--log` | `NERVE_LOG` | `info` | log level; logs go to stderr only |
 
 Example entry:
@@ -77,8 +76,8 @@ that does not match `Host` are refused (403).
   nodes, becomes `<node>__<cap>__<action>`.
 - Names keep `[A-Za-z0-9_-]`; anything else becomes `_`. Names longer than 64
   are cut and get a short hash; clashes get `_2`, `_3`.
-- `node`, `approvals`, `settings` and `audit` are never tools, so a model
-  cannot answer its own approvals or change the policy that limits it.
+- `node`, `settings` and `audit` are never tools, so a model cannot change
+  the policy that limits it.
   Capabilities with exposure `off` are left out.
 - Tools of paired nodes that are offline stay listed; calling one returns
   `unavailable`.
@@ -105,21 +104,20 @@ outside content (`fs.read`, `fs.grep`, `exec.run`, and `read`, `sense` or
 carry `ctx.tainted: true`. When a session ends, every node it used gets
 `session.end`. The web UI can end a session.
 
-## 6. Approvals
+## 6. Refused calls
 
-The center holds no approval of its own and has no rule per effect: it never
-holds a call back for a person. Every call goes to its node, whose policy
-decides, and what the node does not allow is refused. Nodes keep their own
-approvals; the center shows them and, when the node's `approvals` grant is
-`both`, can answer them. If nobody answers within `--call-wait`, the call
-returns `error timeout: approval pending at <where>` and nothing is run.
+The center holds no rule of its own and never holds a call back for a person.
+Every call goes to its node, whose policy decides: what no mode and no rule
+allows is refused at once with `error forbidden: <reasons>`, and nothing is
+run. The owner allows more on the node (`nerve-node folder add`, `allow`) or,
+with the settings grant, from the audit tab.
 
 ## 7. Web UI
 
-Served by `nerve-center` itself at `--ui`. Tabs: overview (alerts, approvals,
+Served by `nerve-center` itself at `--ui`. Tabs: overview (alerts,
 machines, pairing, sessions), statistics, audit (Allow, Allow as wildcard,
 Deny for commands, only with the node's settings grant; Allow puts the rule
-on the node's `policy.commands.never_ask`, Deny on `deny`, and each takes it
+on the node's `policy.commands.permit`, Deny on `deny`, and each takes it
 off the other list), settings (center
 name, retention, harness tokens, per-node settings). The pages,
 scripts and styles are built into the binary; nothing is loaded from another

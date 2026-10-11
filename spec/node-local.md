@@ -1,4 +1,4 @@
-# The node's own side: config, policy, approvals, control socket
+# The node's own side: config, policy, control socket
 
 This part is not wire protocol: a center never sees it directly. It describes
 how `nerve-node` decides, so that other node implementations can behave the
@@ -43,79 +43,74 @@ pin = "<sha-256 of the center certificate, base64url>"
 center_id = "…"
 node_id = "…"
 settings = "off"            # off | write: may the center set this policy
-approvals = "both"          # both | local: who answers this node's questions
 paused = false              # the center may pause; only the owner unpauses
 revoked = false             # the center sent `bye revoked`
 unknown = false             # the center answered 401
 
 [center.policy]
-mode = "ask"                # ask | folders | full
-full_until = 0              # required with full: falls back to folders then
+mode = "folder"             # folder | user (the default is folder)
+user_until = 0              # required with user: falls back to folder then
 folders = [{ path = "/home/u/proj", access = "rw", execute = true }]
-caps = { exec = "ask", "fs.write" = "off" }   # on | ask | off | hidden
+caps = { "fs.write" = "off" }   # on | off | hidden
 deny = ["~/private"]        # paths nothing may touch
 protected = { extra = [], allow = [] }
 
 [center.policy.commands]    # globs over the whole command line
 deny = []                   # never run
 allow = []                  # when not empty, only these run at all
-always_ask = []
-never_ask = []              # run without asking unless the call is tainted
-
-[center.policy.approvals]
-timeout_s = 120
-on_timeout = "deny"         # deny | allow (this one call)
-remember_minutes = 480      # longest `session` answer
-max_minutes = 480           # longest `time` answer
+permit = []                 # run in any mode unless the call is tainted
 ```
 
-Unknown keys are refused. Two centers with one name are refused. Folder paths
+Unknown keys are refused, with one exception: a `node.toml` written by an
+earlier build is migrated when it is read (§3.1). Two centers with one name are refused. Folder paths
 are absolute in the platform's own form; on the wire they travel as
 `/c/Users/...` on Windows (protocol §7.2).
 
 ## 3. Deciding a call
 
-For each call the node takes the center's policy and, in this order:
+The default is deny. A call runs only when the mode or a rule allows it;
+otherwise it is refused at once with `forbidden`, and nothing waits for an
+answer. For each call the node takes the center's policy and, in this order:
 
 1. A `locked` node (after `panic`) keeps no links and runs nothing; a paused,
    revoked or unknown center is not dialled.
-2. Protected paths (keys, shell profiles, the node's own folders and the
-   built-in list) and `deny` paths: `denied`, in every mode.
-3. Command rules: `deny`, then `allow` when it is not empty: `denied`.
-4. The capability setting: `off` refuses, `hidden` leaves it out of the
-   descriptor, `ask` asks.
-5. The mode: `ask` asks for every read, write and command; `folders` allows
-   inside a folder by its access and asks outside; `full` allows everywhere
-   until `full_until`.
-6. `never_ask` allows a command in any mode; `always_ask` asks where the mode
-   would allow.
+2. The capability setting: `off` refuses (`forbidden`), `hidden` leaves it
+   out of the descriptor.
+3. Protected paths (keys, shell profiles, the node's own folders and the
+   built-in list) and `deny` paths: `forbidden`, in every mode.
+4. Command rules, with wildcards over the whole command line: a command
+   matching `deny` is refused; when `allow` is not empty, only commands
+   matching it run at all.
+5. The mode. `folder` (the default) allows a read inside a folder, a write
+   inside a folder with `rw` access, and a command whose working directory is
+   in a folder with `execute` (confined where the platform can confine it);
+   with no folder it allows nothing. `user` allows reads, writes and commands
+   everywhere the user could, until `user_until` (at most 8 hours), then the
+   center is back in `folder`. Actions with the effect `sense` or `actuate`
+   are allowed by no mode: only the owner's `caps` entry `on` allows them.
+6. `permit` allows a command in any mode.
 7. A call the center marks tainted (`ctx.tainted`, it has read device content
-   in that session) asks before any write or command, whatever allowed it.
+   in that session) is refused for any write or command, whatever allowed it.
+   Protected paths stay refused in `user` mode too.
 
-Execute answers are strict: a command can be allowed once or denied, never for
-a session.
+There is no sudo mode in 0.0.1. Every refusal names its reasons in the error
+and in the audit log.
 
-> **Open point p04.** The modes keep the architecture's names `ask`, `folders`
-> and `full`; whether they become Folder/User/Sudo is not decided.
+### 3.1 Older files
 
-## 4. Approvals
-
-A call that asks waits in the node's pending queue. With `approvals = "both"`
-the center hears `approvals.requested` and may answer; the owner may always
-answer locally (`nerve-node approve|deny <id>`). The first answer wins; later
-answers are refused. Answers: `once`, `session` (until `remember_minutes`),
-`time` (`--minutes`, at most `max_minutes`), `deny`. With no answer within
-`timeout_s`, `on_timeout` applies.
-
-> **Open point.** Approvals are a node-side queue in 0.0.1; they are not asked
-> through MCP elicitation.
+An earlier build had a mode `ask` and asked the owner. A `node.toml` or a
+settings document that still has the old values loads, and everything that
+asked now refuses: mode `ask` becomes `folder` without its folders, a
+capability `ask` becomes `off`, `always_ask` rules join `deny`, `never_ask`
+is `permit`, `folders` is `folder`, `full` is `user` (`full_until` is
+`user_until`), and the `approvals` entries are dropped.
 
 ## 5. Control socket
 
 `<state>/run/ctl.sock` (Unix only in 0.0.1; on Windows the CLI edits
 `node.toml` directly). One JSON object per line: the client sends
 `{"method", "params"}`, the server answers `{"ok": value}` or
-`{"error": "text"}`, or for `approvals.follow` several `{"item": value}`
+`{"error": "text"}`, or, for streaming methods, several `{"item": value}`
 lines until it closes. The socket is 0600 in a 0700 folder; only its own user
 or root may talk to it. Methods:
 
@@ -125,16 +120,13 @@ or root may talk to it. Methods:
 | `config.read` | | `node.toml` and its `version` |
 | `config.write` | `config`, `if_version` | replaces it when the version matches |
 | `reload` | | rereads `node.toml` |
-| `approvals.list` | | open approvals |
-| `approvals.answer` | `center?`, `id`, `answer`, `minutes?` | |
-| `approvals.follow` | | streams new approvals |
 
-`config.write`, `approvals.answer` and `reload` are refused from a process
-that runs below a command the node started for a center, so an agent cannot
-answer its own questions.
+`config.write` and `reload` are refused from a process that runs below a
+command the node started for a center, so an agent cannot change its own
+policy.
 
 ## 6. Audit log
 
-`<state>/audit.jsonl`, one JSON line per event: settings changes, calls asked,
-allowed or denied and by whom. It holds targets (paths, command lines), never
+`<state>/audit.jsonl`, one JSON line per event: settings changes and calls allowed
+or forbidden. It holds targets (paths, command lines), never
 file content or output. `nerve-node audit [--denied] [--follow]` shows it.

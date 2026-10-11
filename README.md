@@ -2,16 +2,16 @@
 
 Nerve lets an agent harness reach the machines of its owner: read and write
 files, run commands, with the owner deciding on each machine what is allowed
-and what asks first. Version 0.0.1 is the first pre-release of the rewrite.
+and what is allowed at all: everything else is refused. Version 0.0.1 is the first pre-release of the rewrite.
 
 Two programs:
 
 - **`nerve-center`**, the center. A harness starts it as an MCP server; it pairs
   nodes, keeps their links and offers their capabilities as MCP tools. Its web
-  UI (loopback, port 7480 by default) shows nodes, pending approvals,
+  UI (loopback, port 7480 by default) shows nodes, the audit log,
   statistics and pairing links.
 - **`nerve-node`**, the node. A daemon on each machine plus a headless CLI for
-  pairing, policy, approvals and the audit log.
+  pairing, policy and the audit log.
 
 The protocol is in [`spec/`](spec/README.md), JSON Schemas in `schemas/`, the
 conformance suite in `crates/nerve-conformance`.
@@ -68,16 +68,16 @@ CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static" \
    nerve-node run
    ```
 
-   A new center starts in `ask` mode: every read, write and command asks.
-   Answer in the web UI or on the machine:
+   A new center starts in `folder` mode with no folder and no rule, so every
+   call is refused at once: nothing waits for an answer. Allow what you want
+   on the machine:
 
    ```sh
-   nerve-node approvals              # open questions
-   nerve-node approve <id>           # or: deny <id>
-   nerve-node mode folders           # allow inside the folders you add
-   nerve-node folder add ~/proj --rw --execute
-   nerve-node allow 'git status'     # a command that never asks
-   nerve-node audit                  # what was asked, allowed and denied
+   nerve-node folder add ~/proj --rw --execute   # allow inside a folder
+   nerve-node allow 'git status'     # a command that runs in any mode
+   nerve-node deny 'rm *'            # a command that never runs
+   nerve-node mode user --hours 2    # for a while: as the user may
+   nerve-node audit                  # what was allowed and refused
    nerve-node panic                  # end every link; `unlock` undoes it
    ```
 
@@ -94,5 +94,4 @@ part of the conformance suite.
 
 Harnesses integrate through MCP only; native plugins are a backlog item.
 
-Open points, not decided: approvals through MCP elicitation (0.0.1
-keeps them in the node's queue), and the mode names (p04).
+Open point, not decided: the mode names (p04).

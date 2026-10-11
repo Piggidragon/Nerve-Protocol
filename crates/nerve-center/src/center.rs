@@ -864,7 +864,7 @@ impl Center {
 }
 
 /// The node gave this center `settings = write`: its descriptor carries the
-/// `settings` capability (spec §7.5).
+/// `settings` capability (spec §7.4).
 pub fn settings_write(d: &Descriptor) -> bool {
     d.capability("settings")
         .is_some_and(|c| c.exposure != Exposure::Off)

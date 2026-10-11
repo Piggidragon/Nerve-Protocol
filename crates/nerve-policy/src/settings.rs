@@ -1,6 +1,6 @@
 //! The settings store: `node.toml` with a version, written by the owner (CLI,
 //! control socket) and, with the settings grant `write`, by a center for its
-//! own [`CenterDocument`] (architecture §5.2, §5.3; spec §7.5).
+//! own [`CenterDocument`] (architecture §5.2, §5.3; spec §7.4).
 //!
 //! Every change is whole-document with `if_version`, so two writers never
 //! overwrite each other unseen, is validated before it is saved, and lands in

@@ -26,7 +26,7 @@ pub struct Entry {
 }
 
 impl Entry {
-    /// The `audit/decision` event's data (spec §7.6): the entry without the
+    /// The `audit/decision` event's data (spec §7.5): the entry without the
     /// center, which is the one the event goes to.
     pub fn event_data(&self) -> Value {
         let mut v = serde_json::to_value(self).expect("an audit entry serializes");

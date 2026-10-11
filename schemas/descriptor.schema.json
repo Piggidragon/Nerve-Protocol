@@ -34,7 +34,7 @@
         "id": {"type": "string", "pattern": "^[a-z][a-z0-9_-]{0,31}$"},
         "profile": {"type": "string"},
         "provider": {"type": "string", "default": "node"},
-        "exposure": {"enum": ["on", "ask", "off"]},
+        "exposure": {"enum": ["on", "off"]},
         "summary": {"type": "string"},
         "actions": {
           "type": "object",

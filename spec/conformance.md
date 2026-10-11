@@ -22,7 +22,7 @@ report, and `cargo test -p nerve-conformance` runs them:
   part against the echo node. These check the suite itself.
 - `tests/e2e.rs`: the center part against a real `nerve-center`, the node part
   against a real `nerve-node`, and `nerve-center` with `nerve-node` against each
-  other (pairing, link, tools over MCP, approvals, settings, audit).
+  other (pairing, link, tools over MCP, folders and rules, settings, audit).
 
 To check another implementation, call `center_part::run(&pair_link)` with a
 fresh pairing link of that center, or `node_part::run(start)` with a closure
@@ -58,7 +58,6 @@ that pairs the node under test with the link it is handed and starts it.
 | 5.2 | an unknown method is `method_not_found` |
 | 5.3 | invoke of an unknown capability is `unknown_capability` |
 | 5.2 | an unknown ctx field is `invalid_args` |
-| 7.4 | `approvals.list` answers with a list |
 | 4.5 | after `bye revoked` the node does not dial again |
 
 ## Not covered yet

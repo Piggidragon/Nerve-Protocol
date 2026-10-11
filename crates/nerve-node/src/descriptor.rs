@@ -344,7 +344,7 @@ fn audit_cap() -> Capability {
                 json!({"ts": {"type": "integer"}, "cap": {"type": "string"},
                        "action": {"type": "string"}, "target": {"type": "string"},
                        "decision": {"enum": ["allowed", "forbidden"]},
-                       "code": {"type": "string"}, "by": {"type": "string"},
+                       "code": {"type": "string"},
                        "session": {"type": "string"}}),
                 &["ts", "cap", "action", "target", "decision"],
             ),

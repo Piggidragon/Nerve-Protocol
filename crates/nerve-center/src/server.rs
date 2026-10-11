@@ -12,6 +12,7 @@ use crate::center::{Center, Options};
 use crate::config::{Args, McpMode, is_loopback};
 use crate::listen::{self, Server};
 use crate::mcp::HttpMcp;
+use crate::store::Store;
 use crate::ui::Ui;
 
 /// A running center. Dropping it stops its listeners; call
@@ -48,27 +49,41 @@ impl Drop for Running {
 /// starts its listeners. MCP over stdio is not started here; the caller
 /// runs [`crate::mcp::serve_stdio`] itself.
 pub async fn start(args: &Args, lock: Lock) -> Result<Running, String> {
-    // The UI refuses to serve beyond loopback without a password, and then
-    // only over TLS, since the password and the session cookie cross the
-    // network.
     let ui_addr = (!args.ui_off()).then(|| args.ui.clone());
-    let ui_password = args.ui_password.clone().filter(|p| !p.is_empty());
-    if let Some(a) = &ui_addr
-        && !is_loopback(a)
-        && ui_password.is_none()
-    {
-        return Err(format!(
-            "the web UI at {a} is beyond loopback; set --ui-password (NERVE_UI_PASSWORD) or use --ui 127.0.0.1:<port>"
-        ));
+    let token = args.harness_token.clone().filter(|t| !t.is_empty());
+    // The web UI logs in with a harness token. Beyond loopback it must, and
+    // then it also needs TLS, since the token and the session cookie cross the
+    // network. On loopback it does once a token exists, unless the owner
+    // switched the login off; a center without any token yet is open to this
+    // machine so that the first token can be made in the UI. All of this is
+    // settled before anything is bound or written.
+    let state = args.state_dir();
+    let has_token = token.is_some()
+        || Store::load(&state)
+            .map_err(|e| e.to_string())?
+            .is_some_and(|s| !s.harness_tokens.is_empty());
+    if let Some(a) = ui_addr.as_deref().filter(|a| !is_loopback(a)) {
+        if args.ui_no_login {
+            return Err(format!(
+                "the web UI at {a} is beyond loopback, where it always needs a login; drop --ui-no-login or use --ui 127.0.0.1:<port>"
+            ));
+        }
+        if !has_token {
+            return Err(format!(
+                "the web UI at {a} is beyond loopback and logs in with a harness token, but there is none; set --harness-token (NERVE_HARNESS_TOKEN) or use --ui 127.0.0.1:<port>"
+            ));
+        }
     }
+    let ui_login = has_token && !args.ui_no_login;
 
     let node_listener = listen::tcp(&args.listen).await?;
     let nodes = node_listener.local_addr().map_err(|e| e.to_string())?;
     let center = Center::open(Options {
-        state_dir: args.state_dir(),
+        state_dir: state,
         name: args.name.clone(),
         public_url: args.public_url(nodes.port()),
     })?;
+
     let mut tasks = Vec::new();
 
     let node_server = Server::from_listener(node_listener, &center, args.plain_loopback)?;
@@ -83,7 +98,7 @@ pub async fn start(args: &Args, lock: Lock) -> Result<Running, String> {
         let server = Server::bind(&a, &center, !tls).await?;
         ui = Some(server.local_addr());
         tasks.push(tokio::spawn(
-            Ui::new(&center, ui_password, tls).serve(server),
+            Ui::new(&center, token.clone(), ui_login, tls).serve(server),
         ));
     }
 
@@ -92,8 +107,7 @@ pub async fn start(args: &Args, lock: Lock) -> Result<Running, String> {
         let tls = !is_loopback(&args.mcp_listen);
         let server = Server::bind(&args.mcp_listen, &center, !tls).await?;
         mcp = Some(server.local_addr());
-        let token = args.harness_token.clone().filter(|t| !t.is_empty());
-        if token.is_none() && center.read(|s| s.harness_tokens.is_empty()) {
+        if !has_token {
             tracing::warn!(
                 "no harness token yet: the HTTP MCP endpoint refuses every client until one is made in the web UI or set with NERVE_HARNESS_TOKEN"
             );

@@ -604,7 +604,7 @@ async function start() {
     const s = await r.json();
     if (!s.logged_in) return location.replace("/login");
     csrf = s.csrf;
-    $("signout").hidden = !s.password;
+    $("signout").hidden = !s.login;
   } catch (_) {
     return $("page").replaceChildren(banner("", "alert", "Cannot reach the center. Reload to try again."));
   }

@@ -16,7 +16,8 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
   local audit log (`spec/node-local.md`).
 - `nerve-center`: the center, run by a harness as an MCP server. It pairs nodes,
   keeps their links and offers their capabilities as MCP tools. Its web UI
-  has a login page (with `--ui-password`) and shows nodes, the audit log,
+  has a login page (the harness token logs in; `--ui-no-login` on loopback
+  turns it off) and shows nodes, the audit log,
   statistics and the settings of nodes that granted write access
   (`spec/harness.md`).
 - Conformance suite with a center part and a node part; the harness part is a

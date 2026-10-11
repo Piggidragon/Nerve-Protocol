@@ -22,10 +22,10 @@ entry:
 | `--public-url` | `NERVE_PUBLIC_URL` | `https://<host name>:<port>` | the URL put in pairing links |
 | `--plain-loopback` | `NERVE_PLAIN_LOOPBACK` | off | plain HTTP for nodes, only on a loopback `--listen` |
 | `--ui` | `NERVE_UI` | `127.0.0.1:7480` | web UI address, or `off` |
-| `--ui-password` | `NERVE_UI_PASSWORD` | none | required when the UI listens beyond loopback |
+| `--ui-no-login` | `NERVE_UI_NO_LOGIN` | off | let the UI in without a login; refused when the UI listens beyond loopback |
 | `--mcp` | `NERVE_MCP` | `stdio` | `stdio`, `http`, or `none` (center only) |
 | `--mcp-listen` | `NERVE_MCP_LISTEN` | `127.0.0.1:7481` | HTTP MCP address |
-| `--harness-token` | `NERVE_HARNESS_TOKEN` | none | bearer token for HTTP MCP (more can be made in the UI) |
+| `--harness-token` | `NERVE_HARNESS_TOKEN` | none | the harness token: bearer token for HTTP MCP and the secret that logs in to the UI (more can be made in the UI) |
 | `--log` | `NERVE_LOG` | `info` | log level; logs go to stderr only |
 
 Example entry:
@@ -123,15 +123,32 @@ name, retention, harness tokens, per-node settings). The pages,
 scripts and styles are built into the binary; nothing is loaded from another
 host.
 
-Without a password the UI answers only for loopback hosts. With one, every
-page and API call but the login form and its assets needs a session: a
-browser without one is sent to `/login`, where the password is posted once as
-a form (never in a URL). A right password answers with the session cookie
-(`HttpOnly`, `SameSite=Strict`, `Secure` over TLS, 12 hours); `POST /logout`
-ends the session and clears the cookie. Five wrong passwords in a minute lock
-the login for the rest of that minute. Every change needs the CSRF header
-from `/api/session`. Pairing shows the link and the code; a QR code is not
-offered in 0.0.1.
+The UI logs in with a harness token, the same secret the HTTP endpoint
+takes (§3): the one from `--harness-token`, or one made in the settings tab.
+Nothing else is kept for the UI, so the token is set once, in the MCP entry.
+Whether there is a login is settled at start:
+
+- Beyond loopback (`--ui 0.0.0.0:7480` or any address that is not loopback)
+  a token must exist, from the flag or made earlier in the UI, and the login
+  cannot be switched off. The center refuses to start otherwise, and also with
+  `--ui-no-login`. The UI is then served over TLS.
+- On loopback the login is on as soon as a token exists, unless
+  `--ui-no-login` is given. A center without any token yet has no login, so
+  that the first token can be made in the UI; it then answers only for
+  loopback host names.
+
+With a login, every page and API call but the login form and its assets needs
+a session: a browser without one is sent to `/login`, where the token is
+posted once as a form (never in a URL). A right token answers with the
+session cookie (`HttpOnly`, `SameSite=Strict`, `Secure` over TLS, 12 hours);
+`POST /logout` ends the session and clears the cookie. Tokens are compared in
+constant time, a wrong one is answered after 300 ms, and five wrong tokens in
+a minute lock the login for the rest of that minute (429). A session ends
+with its token: deleting the token in the UI stops the cookie that logged in
+with it. A token that is lost is replaced by starting once with
+`--ui-no-login` on loopback and making a new one. Every change needs the CSRF
+header from `/api/session`. Pairing shows the link and the code; a QR code is
+not offered in 0.0.1.
 
 ## 8. What the center keeps
 

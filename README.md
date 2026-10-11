@@ -59,7 +59,11 @@ CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static" \
    pairing link pins). `nerve-center --help` and [`spec/harness.md`](spec/harness.md)
    list every setting, including MCP over HTTP (`--mcp http`).
 
-2. Open the web UI at `http://127.0.0.1:7480` and make a pairing link.
+2. Open the web UI at `http://127.0.0.1:7480` and make a pairing link. The UI
+   logs in with the harness token (`NERVE_HARNESS_TOKEN`, or one made in its
+   settings); a center without a token yet is open to this machine. Beyond
+   loopback (`--ui 0.0.0.0:7480`) a token is required; on loopback
+   `--ui-no-login` turns the login off.
 
 3. On the machine, as a normal user:
 

@@ -42,17 +42,18 @@ pub struct Args {
     /// The web UI address, or `off`.
     #[arg(long, env = "NERVE_UI", default_value = "127.0.0.1:7480")]
     pub ui: String,
-    /// The web UI password; required when the UI listens beyond loopback.
-    #[arg(long, env = "NERVE_UI_PASSWORD", hide_env_values = true)]
-    pub ui_password: Option<String>,
+    /// Let the web UI in without a login. It logs in with a harness token
+    /// otherwise; only for a UI on loopback, a UI beyond it always needs one.
+    #[arg(long, env = "NERVE_UI_NO_LOGIN")]
+    pub ui_no_login: bool,
     /// How harnesses talk to the center.
     #[arg(long, env = "NERVE_MCP", value_enum, default_value = "stdio")]
     pub mcp: McpMode,
     /// The HTTP MCP address (with `--mcp http`).
     #[arg(long, env = "NERVE_MCP_LISTEN", default_value = "127.0.0.1:7481")]
     pub mcp_listen: String,
-    /// A bearer token for the HTTP MCP endpoint, besides tokens made in the
-    /// web UI.
+    /// A harness token: the bearer token of the HTTP MCP endpoint and the
+    /// secret that logs in to the web UI, besides tokens made in the web UI.
     #[arg(long, env = "NERVE_HARNESS_TOKEN", hide_env_values = true)]
     pub harness_token: Option<String>,
     /// The log level on stderr (error, warn, info, debug).
@@ -127,6 +128,12 @@ mod tests {
         .unwrap();
         assert_eq!(a.public_url(9), "http://127.0.0.1:9");
         assert!(a.ui_off());
+        // The web UI logs in with the harness token; there is no password of
+        // its own, and the login is switched off by a flag alone.
+        assert!(!a.ui_no_login);
+        assert!(Args::try_parse_from(["nerve-center", "--ui-password", "x"]).is_err());
+        let a = Args::try_parse_from(["nerve-center", "--ui-no-login"]).unwrap();
+        assert!(a.ui_no_login);
         // No subcommands: anything positional is refused.
         assert!(Args::try_parse_from(["nerve-center", "pair"]).is_err());
         assert!(

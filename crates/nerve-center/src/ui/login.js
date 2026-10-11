@@ -1,4 +1,4 @@
-// The login form works without this file; this only shows that the password
+// The login form works without this file; this only shows that the token
 // is being checked and undoes that when the browser brings the page back
 // from its cache.
 "use strict";

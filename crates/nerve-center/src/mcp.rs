@@ -441,20 +441,25 @@ pub async fn serve_stdio(center: Center) {
     serve_lines(center, stdin, tokio::io::stdout(), "stdio").await;
 }
 
-/// Who may use the HTTP MCP endpoint: the token from the environment, and
-/// the tokens made in the web UI (stored hashed).
-fn token_ok(center: &Center, env_token: Option<&str>, given: &str) -> bool {
-    if let Some(t) = env_token
-        && !t.is_empty()
-        && util::ct_eq(t.as_bytes(), given.as_bytes())
+/// Whether `given` is a harness token: the one from the environment or a flag,
+/// or one made in the web UI (stored hashed). The HTTP MCP endpoint and the
+/// web UI's login both ask this, so one secret opens both.
+pub(crate) fn token_ok(center: &Center, env_token: Option<&str>, given: &str) -> bool {
+    token_hash_ok(center, env_token, &util::sha256_hex(given.as_bytes()))
+}
+
+/// [`token_ok`] for a token that is only known by its SHA-256 (hex), which is
+/// what a web UI session keeps to notice that its token was deleted.
+pub(crate) fn token_hash_ok(center: &Center, env_token: Option<&str>, hash: &str) -> bool {
+    if let Some(t) = env_token.filter(|t| !t.is_empty())
+        && util::ct_eq(util::sha256_hex(t.as_bytes()).as_bytes(), hash.as_bytes())
     {
         return true;
     }
-    let h = util::sha256_hex(given.as_bytes());
     center.read(|s| {
         s.harness_tokens
             .iter()
-            .any(|t| util::ct_eq(t.hash.as_bytes(), h.as_bytes()))
+            .any(|t| util::ct_eq(t.hash.as_bytes(), hash.as_bytes()))
     })
 }
 

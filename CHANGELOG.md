@@ -16,7 +16,8 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
   (`spec/node-local.md`).
 - `nerve-mcp`: the center, run by a harness as an MCP server. It pairs nodes,
   keeps their links and offers their capabilities as MCP tools. Its web UI
-  shows nodes, pending approvals, statistics and the settings of nodes that
-  granted write access (`spec/harness.md`).
+  has a login page (with `--ui-password`) and shows nodes, pending approvals,
+  statistics and the settings of nodes that granted write access
+  (`spec/harness.md`).
 - Conformance suite with a center part and a node part; the plugin part is a
   skeleton (`spec/conformance.md`).

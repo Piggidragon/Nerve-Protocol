@@ -2,75 +2,54 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, interactive-widget=resizes-content">
+<meta name="color-scheme" content="dark light">
+<meta name="theme-color" content="#0a0a0c">
+<meta name="robots" content="noindex">
 <title>Nerve center</title>
+<link rel="icon" href="/icon.svg" type="image/svg+xml">
+<script src="/theme-init.js"></script>
 <link rel="stylesheet" href="/app.css">
 </head>
 <body>
-<header>
-  <h1 id="center-name">Nerve center</h1>
-  <nav>
-    <button data-tab="overview" class="tab on">Overview</button>
-    <button data-tab="stats" class="tab">Statistics</button>
-    <button data-tab="audit" class="tab">Audit</button>
-    <button data-tab="settings" class="tab">Settings</button>
-  </nav>
-</header>
-<main>
-  <section id="login" hidden>
-    <h2>Log in</h2>
-    <form id="login-form">
-      <input type="password" id="password" autocomplete="current-password" placeholder="Password" required>
-      <button type="submit">Log in</button>
-    </form>
-    <p class="error" id="login-error"></p>
-  </section>
-
-  <section id="overview" class="pane">
-    <div id="alerts"></div>
-    <h2>Waiting for you</h2>
-    <div id="approvals"><p class="muted">Nothing is waiting.</p></div>
-    <h2>Machines</h2>
-    <div class="row"><button id="pair">Pair a machine</button></div>
-    <div id="pairing" hidden></div>
-    <div id="nodes"></div>
-    <h2>Sessions</h2>
-    <div id="sessions"></div>
-  </section>
-
-  <section id="stats" class="pane" hidden>
-    <h2>Statistics</h2>
-    <p class="muted">Counts and timings only. Nothing a machine sent is kept.</p>
-    <div id="stats-body"></div>
-  </section>
-
-  <section id="audit" class="pane" hidden>
-    <h2>Recent decisions on the machines</h2>
-    <p class="muted">Rules can be added from here only on machines that gave this center the settings grant.</p>
-    <div id="audit-body"></div>
-  </section>
-
-  <section id="settings" class="pane" hidden>
-    <h2>Center</h2>
-    <form id="center-form">
-      <label>Name <input id="c-name" maxlength="64"></label>
-      <label>Keep statistics for <input id="c-days" type="number" min="1" max="366"> days</label>
-      <fieldset><legend>Before a call reaches a machine</legend><div id="c-effects"></div></fieldset>
-      <button type="submit">Save</button>
-      <span id="c-saved" class="muted"></span>
-    </form>
-    <h2>Harness tokens</h2>
-    <p class="muted">For harnesses that use the HTTP endpoint. A token is shown once.</p>
-    <form id="token-form" class="row">
-      <input id="t-label" placeholder="Label" maxlength="60">
-      <button type="submit">Create token</button>
-    </form>
-    <p id="t-new" class="mono"></p>
-    <div id="tokens"></div>
-    <h2>Machine settings</h2>
-    <div id="node-settings"></div>
-  </section>
-</main>
+<div class="shell" id="shell">
+  <aside class="side" id="side" aria-label="Menu">
+    <div class="side-head">
+      <img class="mark" src="/icon.svg" alt="" width="24" height="24">
+      <h1>Nerve</h1>
+      <span class="tag">center</span>
+      <button type="button" class="btn ghost icon sm side-close" id="nav-close" aria-label="Close menu"><svg class="ico" data-icon="x"></svg></button>
+    </div>
+    <nav class="nav" aria-label="Pages">
+      <a href="#overview" data-page="overview"><svg class="ico" data-icon="overview"></svg><span>Overview</span><span class="count" id="badge" hidden></span></a>
+      <a href="#stats" data-page="stats"><svg class="ico" data-icon="stats"></svg><span>Statistics</span></a>
+      <a href="#audit" data-page="audit"><svg class="ico" data-icon="audit"></svg><span>Audit</span></a>
+    </nav>
+    <div class="side-foot">
+      <a href="#settings" data-page="settings"><svg class="ico" data-icon="settings"></svg><span>Settings</span></a>
+      <div class="foot-row">
+        <div class="theme" id="theme" role="radiogroup" aria-label="Theme">
+          <button type="button" role="radio" aria-checked="false" data-theme-choice="light" title="Light" aria-label="Light"><svg class="ico" data-icon="sun"></svg></button>
+          <button type="button" role="radio" aria-checked="false" data-theme-choice="dark" title="Dark" aria-label="Dark"><svg class="ico" data-icon="moon"></svg></button>
+          <button type="button" role="radio" aria-checked="false" data-theme-choice="system" title="System" aria-label="System"><svg class="ico" data-icon="monitor"></svg></button>
+        </div>
+        <form id="signout" method="post" action="/logout" hidden>
+          <button type="submit" class="btn ghost"><svg class="ico" data-icon="logout"></svg>Sign out</button>
+        </form>
+      </div>
+    </div>
+  </aside>
+  <div class="scrim" id="scrim"></div>
+  <div class="content">
+    <header class="topbar">
+      <button type="button" class="btn ghost icon" id="nav-open" aria-label="Open menu" aria-controls="side" aria-expanded="false"><svg class="ico lg" data-icon="menu"></svg></button>
+      <h2 id="top-title">Overview</h2>
+    </header>
+    <main class="scroll" id="scroll"><div class="page" id="page"></div></main>
+  </div>
+</div>
+<dialog class="dlg" id="dlg"></dialog>
+<div class="toasts" id="toasts" role="status" aria-live="polite"></div>
 <script src="/app.js"></script>
 </body>
 </html>

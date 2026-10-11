@@ -4,8 +4,11 @@
 //! Access: on loopback without a password the page is open to this machine
 //! only, and the `Host` header must name loopback so a DNS-rebound page
 //! cannot reach it. Beyond loopback a password is required and the UI is
-//! served over TLS. Every state change needs the session cookie
-//! (HttpOnly, SameSite=Strict), the `X-Nerve-CSRF` header from
+//! served over TLS. With a password every page but the login form and its
+//! assets answers an unknown browser with a redirect to `/login`; the form
+//! posts the password once and gets the session cookie (HttpOnly,
+//! SameSite=Strict, Secure over TLS), and `POST /logout` ends it. Every
+//! state change needs that cookie, the `X-Nerve-CSRF` header from
 //! `GET /api/session`, and a matching `Origin` when the browser sends one.
 
 use std::collections::HashMap;
@@ -26,6 +29,13 @@ use crate::util::{self, now_ms};
 const INDEX: &str = include_str!("ui/index.html");
 const APP_JS: &str = include_str!("ui/app.js");
 const APP_CSS: &str = include_str!("ui/app.css");
+const LOGIN: &str = include_str!("ui/login.html");
+const LOGIN_JS: &str = include_str!("ui/login.js");
+const THEME_JS: &str = include_str!("ui/theme-init.js");
+const ICON: &str = include_str!("ui/icon.svg");
+
+const WRONG_PASSWORD: &str = "Wrong password.";
+const TOO_MANY: &str = "Too many wrong passwords. Wait a minute and try again.";
 
 pub const COOKIE: &str = "nerve_ui";
 pub const CSRF_HEADER: &str = "x-nerve-csrf";
@@ -82,18 +92,17 @@ impl Ui {
         if self.password.is_none() && !host_is_loopback(req.header("host")) {
             return Response::text(403, "this UI answers only to a loopback host name");
         }
+        // What the login form needs to draw itself is public.
         match (req.method.as_str(), req.path.as_str()) {
-            ("GET", "/") | ("GET", "/index.html") => {
-                return Response::new(200, "text/html; charset=utf-8", INDEX);
-            }
-            ("GET", "/app.js") => {
-                return Response::new(200, "text/javascript; charset=utf-8", APP_JS);
-            }
             ("GET", "/app.css") => return Response::new(200, "text/css; charset=utf-8", APP_CSS),
+            ("GET", "/theme-init.js") => {
+                return Response::new(200, "text/javascript; charset=utf-8", THEME_JS);
+            }
+            ("GET", "/login.js") => {
+                return Response::new(200, "text/javascript; charset=utf-8", LOGIN_JS);
+            }
+            ("GET", "/icon.svg") => return Response::new(200, "image/svg+xml", ICON),
             _ => {}
-        }
-        if !req.path.starts_with("/api/") {
-            return Response::text(404, "not found");
         }
         if req.method == "POST"
             && let Some(o) = req.header("origin")
@@ -102,11 +111,28 @@ impl Ui {
             return Response::text(403, "cross-origin requests are refused");
         }
         match (req.method.as_str(), req.path.as_str()) {
+            ("GET", "/login") => return self.login_page(&req),
+            ("POST", "/login") => return self.login(&req).await,
+            ("POST", "/logout") => return self.logout(&req),
             ("GET", "/api/session") => return self.session_info(&req),
-            ("POST", "/api/login") => return self.login(&req).await,
             _ => {}
         }
-        let Some(token) = self.session_of(&req) else {
+        let session = self.session_of(&req);
+        if !req.path.starts_with("/api/") {
+            if req.method != "GET" {
+                return Response::text(404, "not found");
+            }
+            // Not signed in: whatever was asked for, the answer is the login.
+            if self.password.is_some() && session.is_none() {
+                return see_other("/login");
+            }
+            return match req.path.as_str() {
+                "/" | "/index.html" => Response::new(200, "text/html; charset=utf-8", INDEX),
+                "/app.js" => Response::new(200, "text/javascript; charset=utf-8", APP_JS),
+                _ => Response::text(404, "not found"),
+            };
+        }
+        let Some(token) = session else {
             return Response::json(401, &json!({"error": "log in first"}));
         };
         if req.method == "POST" {
@@ -132,7 +158,7 @@ impl Ui {
                 Err(e) => return Response::json(400, &json!({"error": format!("bad JSON: {e}")})),
             }
         };
-        match self.api(&req, &token, &body).await {
+        match self.api(&req, &body).await {
             Ok(v) => Response::json(200, &v),
             Err((status, v)) => Response::json(status, &v),
         }
@@ -166,6 +192,13 @@ impl Ui {
         )
     }
 
+    fn clear_cookie(&self) -> String {
+        format!(
+            "{COOKIE}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0{}",
+            if self.secure { "; Secure" } else { "" }
+        )
+    }
+
     fn session_info(&self, req: &Request) -> Response {
         if let Some(t) = self.session_of(req) {
             let csrf = self
@@ -192,9 +225,21 @@ impl Ui {
         .with_header("Set-Cookie", &self.set_cookie(&token))
     }
 
+    /// The login form, or the page itself when there is nothing to log in to
+    /// or the browser is in already.
+    fn login_page(&self, req: &Request) -> Response {
+        if self.password.is_none() || self.session_of(req).is_some() {
+            return see_other("/");
+        }
+        login_form(200, None)
+    }
+
+    /// Checks the password the login form posted. The form is a plain
+    /// browser post, so the answer is a redirect with the cookie, or the form
+    /// again with the reason; the password never appears in a URL or a log.
     async fn login(&self, req: &Request) -> Response {
         let Some(want) = &self.password else {
-            return Response::json(400, &json!({"error": "this UI has no password"}));
+            return see_other("/");
         };
         {
             let mut f = self.failures.lock().unwrap();
@@ -202,44 +247,40 @@ impl Ui {
                 *f = (0, Instant::now());
             }
             if f.0 >= LOGIN_TRIES {
-                return Response::json(
-                    429,
-                    &json!({"error": "too many wrong passwords; wait a minute"}),
-                );
+                return login_form(429, Some(TOO_MANY)).with_header("Retry-After", "60");
             }
         }
-        let given = serde_json::from_slice::<Value>(&req.body)
-            .ok()
-            .and_then(|v| {
-                v.get("password")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
-            .unwrap_or_default();
+        let given = req.form_param("password").unwrap_or_default();
         if !util::ct_eq(
             util::sha256_hex(want.as_bytes()).as_bytes(),
             util::sha256_hex(given.as_bytes()).as_bytes(),
         ) {
             self.failures.lock().unwrap().0 += 1;
             tokio::time::sleep(Duration::from_millis(300)).await;
-            return Response::json(403, &json!({"error": "wrong password"}));
+            return login_form(401, Some(WRONG_PASSWORD));
         }
-        let (token, csrf) = self.new_session();
-        Response::json(
-            200,
-            &json!({"password": true, "logged_in": true, "csrf": csrf}),
-        )
-        .with_header("Set-Cookie", &self.set_cookie(&token))
+        let (token, _) = self.new_session();
+        see_other("/").with_header("Set-Cookie", &self.set_cookie(&token))
     }
 
-    async fn api(&self, req: &Request, token: &str, b: &Value) -> Result<Value, (u16, Value)> {
+    /// Ends the browser's session and clears its cookie.
+    fn logout(&self, req: &Request) -> Response {
+        if let Some(t) = self.session_of(req) {
+            self.sessions.lock().unwrap().remove(&t);
+        }
+        // Without a password the UI has no login to go back to.
+        let back = if self.password.is_some() {
+            "/login"
+        } else {
+            "/"
+        };
+        see_other(back).with_header("Set-Cookie", &self.clear_cookie())
+    }
+
+    async fn api(&self, req: &Request, b: &Value) -> Result<Value, (u16, Value)> {
         let c = &self.center;
         let s = |k: &str| b.get(k).and_then(Value::as_str).unwrap_or("").to_string();
         match (req.method.as_str(), req.path.as_str()) {
-            ("POST", "/api/logout") => {
-                self.sessions.lock().unwrap().remove(token);
-                Ok(json!({}))
-            }
             ("GET", "/api/overview") => Ok(json!({
                 "center": {"id": c.id(), "name": c.name(), "url": c.public_url().to_string(), "pin": c.pin()},
                 "nodes": c.nodes_json(),
@@ -382,6 +423,25 @@ fn refused(e: RpcError) -> (u16, Value) {
     )
 }
 
+fn see_other(to: &str) -> Response {
+    Response::new(303, "text/plain; charset=utf-8", Vec::new()).with_header("Location", to)
+}
+
+/// The login page, with the reason for a refusal when there is one.
+fn login_form(status: u16, error: Option<&str>) -> Response {
+    let (invalid, error) = match error {
+        Some(e) => (
+            " aria-invalid=\"true\" aria-describedby=\"login-error\"",
+            format!("<p id=\"login-error\" class=\"login-error\" role=\"alert\">{e}</p>"),
+        ),
+        None => ("", String::new()),
+    };
+    let page = LOGIN
+        .replace("{{INVALID}}", invalid)
+        .replace("{{ERROR}}", &error);
+    Response::new(status, "text/html; charset=utf-8", page)
+}
+
 fn cookie(req: &Request, name: &str) -> Option<String> {
     req.header("cookie")?.split(';').find_map(|p| {
         let (k, v) = p.trim().split_once('=')?;
@@ -403,10 +463,13 @@ pub fn host_is_loopback(host: Option<&str>) -> bool {
     )
 }
 
+/// `Referrer-Policy: no-referrer` would make a browser send `Origin: null`
+/// with the login form (and any other post), which the origin check refuses.
+/// `same-origin` sends the real origin to this server and nothing elsewhere.
 fn with_security_headers(r: Response) -> Response {
     r.with_header("X-Frame-Options", "DENY")
         .with_header("X-Content-Type-Options", "nosniff")
-        .with_header("Referrer-Policy", "no-referrer")
+        .with_header("Referrer-Policy", "same-origin")
         .with_header(
             "Content-Security-Policy",
             "default-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
@@ -521,59 +584,285 @@ mod tests {
         assert!(v["link"].as_str().unwrap().starts_with("nerve://pair?"));
     }
 
+    const PASSWORD: &str = "hunter2-long";
+    const HOST: (&str, &str) = ("Host", "center.example:7480");
+
+    fn locked(dir: &std::path::Path, tls: bool) -> Arc<Ui> {
+        Ui::new(&center(dir), Some(PASSWORD.into()), tls)
+    }
+
+    fn header<'a>(r: &'a Response, name: &str) -> Option<&'a str> {
+        r.headers
+            .iter()
+            .find(|(k, _)| k == name)
+            .map(|(_, v)| v.as_str())
+    }
+
+    fn body(r: &Response) -> String {
+        String::from_utf8_lossy(&r.body).into_owned()
+    }
+
+    /// Posts the login form and returns the answer.
+    async fn sign_in(ui: &Ui, password: &str) -> Response {
+        ui.request(req(
+            "POST",
+            "/login",
+            &[HOST, ("Content-Type", "application/x-www-form-urlencoded")],
+            &format!("password={password}"),
+        ))
+        .await
+    }
+
     #[tokio::test]
-    async fn password_login_and_throttle() {
+    async fn without_a_session_every_page_leads_to_the_login() {
         let d = tempfile::tempdir().unwrap();
-        let ui = Ui::new(&center(d.path()), Some("hunter2-long".into()), true);
-        let h = ("Host", "center.example:7480");
-        let r = ui.request(req("GET", "/api/session", &[h], "")).await;
+        let ui = locked(d.path(), true);
+        for path in ["/", "/index.html", "/app.js", "/missing"] {
+            let r = ui.request(req("GET", path, &[HOST], "")).await;
+            assert_eq!(r.status, 303, "{path}");
+            assert_eq!(header(&r, "Location"), Some("/login"), "{path}");
+            assert!(r.body.is_empty());
+        }
+        for path in ["/api/overview", "/api/stats", "/api/audit", "/api/tokens"] {
+            let r = ui.request(req("GET", path, &[HOST], "")).await;
+            assert_eq!(r.status, 401, "{path}");
+        }
+        let r = ui.request(req("POST", "/api/pair", &[HOST], "")).await;
+        assert_eq!(r.status, 401);
+        let r = ui.request(req("GET", "/api/session", &[HOST], "")).await;
+        let v: Value = serde_json::from_slice(&r.body).unwrap();
         assert_eq!(
-            serde_json::from_slice::<Value>(&r.body).unwrap()["logged_in"],
-            false
+            (v["password"].clone(), v["logged_in"].clone()),
+            (true.into(), false.into())
         );
-        assert!(r.headers.iter().all(|(k, _)| k != "Set-Cookie"));
-        assert_eq!(
-            ui.request(req("GET", "/api/overview", &[h], ""))
-                .await
-                .status,
-            401
-        );
+        assert!(header(&r, "Set-Cookie").is_none());
+        // The login form and what it is drawn with stay reachable.
+        let r = ui.request(req("GET", "/login", &[HOST], "")).await;
+        assert_eq!(r.status, 200);
+        assert!(body(&r).contains(r#"action="/login""#));
+        assert!(!body(&r).contains("login-error"));
+        for (path, kind) in [
+            ("/app.css", "text/css"),
+            ("/login.js", "text/javascript"),
+            ("/theme-init.js", "text/javascript"),
+            ("/icon.svg", "image/svg+xml"),
+        ] {
+            let r = ui.request(req("GET", path, &[HOST], "")).await;
+            assert_eq!(r.status, 200, "{path}");
+            assert!(header(&r, "Content-Type").unwrap().starts_with(kind));
+        }
+    }
+
+    #[tokio::test]
+    async fn wrong_password_is_refused_without_echoing_it() {
+        let d = tempfile::tempdir().unwrap();
+        let ui = locked(d.path(), true);
+        let r = sign_in(&ui, "not-the-secret").await;
+        assert_eq!(r.status, 401);
+        assert!(header(&r, "Set-Cookie").is_none());
+        assert!(header(&r, "Location").is_none());
+        let page = body(&r);
+        assert!(page.contains(WRONG_PASSWORD));
+        assert!(page.contains(r#"aria-invalid="true""#));
+        assert!(!page.contains("not-the-secret"));
+        // An empty post is no better.
+        let r = sign_in(&ui, "").await;
+        assert_eq!(r.status, 401);
+        assert!(header(&r, "Set-Cookie").is_none());
+        let r = ui.request(req("POST", "/login", &[HOST], "")).await;
+        assert_eq!(r.status, 401);
+        // The password is not accepted in a URL or as JSON either.
+        let mut q = req("POST", "/login", &[HOST], "");
+        q.query = format!("password={PASSWORD}");
+        assert_eq!(ui.request(q).await.status, 401);
         let r = ui
             .request(req(
                 "POST",
-                "/api/login",
-                &[h],
-                r#"{"password":"hunter2-long"}"#,
+                "/login",
+                &[HOST],
+                &format!(r#"{{"password":"{PASSWORD}"}}"#),
             ))
             .await;
-        assert_eq!(r.status, 200);
+        assert_eq!(r.status, 401);
+    }
+
+    #[tokio::test]
+    async fn correct_password_sets_the_session_cookie() {
+        let d = tempfile::tempdir().unwrap();
+        let ui = locked(d.path(), true);
+        let r = sign_in(&ui, PASSWORD).await;
+        assert_eq!(r.status, 303);
+        assert_eq!(header(&r, "Location"), Some("/"));
+        let cookie = header(&r, "Set-Cookie").unwrap().to_string();
+        for part in [
+            "HttpOnly",
+            "SameSite=Strict",
+            "Max-Age=43200",
+            "Secure",
+            "Path=/",
+        ] {
+            assert!(cookie.contains(part), "{part} missing in {cookie}");
+        }
+        assert!(!cookie.contains(PASSWORD));
         let ck = set_cookie(&r);
-        assert!(
-            r.headers
-                .iter()
-                .any(|(k, v)| k == "Set-Cookie" && v.contains("Secure"))
-        );
+        let with = [HOST, ("Cookie", ck.as_str())];
+        for path in ["/", "/app.js"] {
+            assert_eq!(ui.request(req("GET", path, &with, "")).await.status, 200);
+        }
         assert_eq!(
-            ui.request(req("GET", "/api/overview", &[h, ("Cookie", &ck)], ""))
+            ui.request(req("GET", "/api/overview", &with, ""))
                 .await
                 .status,
             200
         );
-        for _ in 0..LOGIN_TRIES {
-            let r = ui
-                .request(req("POST", "/api/login", &[h], r#"{"password":"nope"}"#))
-                .await;
-            assert_eq!(r.status, 403);
+        let r = ui.request(req("GET", "/api/session", &with, "")).await;
+        let v: Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(v["logged_in"], true);
+        assert!(v["csrf"].as_str().is_some_and(|c| !c.is_empty()));
+        // Signed in, the login form has nothing left to do.
+        let r = ui.request(req("GET", "/login", &with, "")).await;
+        assert_eq!((r.status, header(&r, "Location")), (303, Some("/")));
+        // Over plain HTTP (loopback) the cookie is not marked Secure.
+        let plain = locked(d.path(), false);
+        let r = sign_in(&plain, PASSWORD).await;
+        assert!(!header(&r, "Set-Cookie").unwrap().contains("Secure"));
+    }
+
+    #[tokio::test]
+    async fn the_password_is_read_from_the_form_encoding() {
+        let d = tempfile::tempdir().unwrap();
+        let ui = Ui::new(&center(d.path()), Some("p&w=d x%".into()), true);
+        let r = sign_in(&ui, "p%26w%3Dd+x%25").await;
+        assert_eq!(r.status, 303);
+        assert!(header(&r, "Set-Cookie").is_some());
+        // The raw text is not the password.
+        assert_eq!(sign_in(&ui, "p&w=d x%").await.status, 401);
+    }
+
+    #[tokio::test]
+    async fn logout_clears_the_cookie_and_ends_the_session() {
+        let d = tempfile::tempdir().unwrap();
+        let ui = locked(d.path(), true);
+        let ck = set_cookie(&sign_in(&ui, PASSWORD).await);
+        let with = [HOST, ("Cookie", ck.as_str())];
+        let r = ui.request(req("POST", "/logout", &with, "")).await;
+        assert_eq!(r.status, 303);
+        assert_eq!(header(&r, "Location"), Some("/login"));
+        let cleared = header(&r, "Set-Cookie").unwrap();
+        for part in [
+            "nerve_ui=;",
+            "Max-Age=0",
+            "HttpOnly",
+            "SameSite=Strict",
+            "Secure",
+        ] {
+            assert!(cleared.contains(part), "{part} missing in {cleared}");
         }
+        // The old cookie is dead on the server too, not just in the browser.
+        assert_eq!(
+            ui.request(req("GET", "/api/overview", &with, ""))
+                .await
+                .status,
+            401
+        );
+        let r = ui.request(req("GET", "/", &with, "")).await;
+        assert_eq!((r.status, header(&r, "Location")), (303, Some("/login")));
+        // Logging out twice, or without a cookie, is harmless.
+        let r = ui.request(req("POST", "/logout", &[HOST], "")).await;
+        assert_eq!(r.status, 303);
+        // Only a post logs out: a link someone else planted does not.
+        let ck = set_cookie(&sign_in(&ui, PASSWORD).await);
+        let with = [HOST, ("Cookie", ck.as_str())];
+        assert_eq!(
+            ui.request(req("GET", "/logout", &with, "")).await.status,
+            404
+        );
+        assert_eq!(
+            ui.request(req("GET", "/api/overview", &with, ""))
+                .await
+                .status,
+            200
+        );
+    }
+
+    #[tokio::test]
+    async fn login_and_logout_refuse_other_origins() {
+        let d = tempfile::tempdir().unwrap();
+        let ui = locked(d.path(), true);
+        let own = format!("https://{}", HOST.1);
+        for origin in ["https://evil.example", "null", "http://center.example:1"] {
+            let r = ui
+                .request(req(
+                    "POST",
+                    "/login",
+                    &[HOST, ("Origin", origin)],
+                    &format!("password={PASSWORD}"),
+                ))
+                .await;
+            assert_eq!(r.status, 403, "{origin}");
+            assert!(header(&r, "Set-Cookie").is_none());
+        }
+        // The browser's own post names this host.
         let r = ui
             .request(req(
                 "POST",
-                "/api/login",
-                &[h],
-                r#"{"password":"hunter2-long"}"#,
+                "/login",
+                &[HOST, ("Origin", &own)],
+                &format!("password={PASSWORD}"),
             ))
             .await;
+        assert_eq!(r.status, 303);
+        let ck = set_cookie(&r);
+        let r = ui
+            .request(req(
+                "POST",
+                "/logout",
+                &[HOST, ("Cookie", &ck), ("Origin", "https://evil.example")],
+                "",
+            ))
+            .await;
+        assert_eq!(r.status, 403);
+        let r = ui
+            .request(req("GET", "/api/overview", &[HOST, ("Cookie", &ck)], ""))
+            .await;
+        assert_eq!(r.status, 200);
+    }
+
+    #[tokio::test]
+    async fn repeated_wrong_passwords_are_throttled() {
+        let d = tempfile::tempdir().unwrap();
+        let ui = locked(d.path(), true);
+        for _ in 0..LOGIN_TRIES {
+            assert_eq!(sign_in(&ui, "nope").await.status, 401);
+        }
+        // Even the right password waits until the minute is over.
+        let r = sign_in(&ui, PASSWORD).await;
         assert_eq!(r.status, 429);
+        assert_eq!(header(&r, "Retry-After"), Some("60"));
+        assert!(header(&r, "Set-Cookie").is_none());
+        assert!(body(&r).contains(TOO_MANY));
+    }
+
+    #[tokio::test]
+    async fn an_open_ui_has_no_login() {
+        let d = tempfile::tempdir().unwrap();
+        let ui = Ui::new(&center(d.path()), None, false);
+        let h = ("Host", "127.0.0.1:7480");
+        let r = ui.request(req("GET", "/", &[h], "")).await;
+        assert_eq!(r.status, 200);
+        let r = ui.request(req("GET", "/login", &[h], "")).await;
+        assert_eq!((r.status, header(&r, "Location")), (303, Some("/")));
+        let r = ui.request(req("POST", "/login", &[h], "password=x")).await;
+        assert_eq!((r.status, header(&r, "Location")), (303, Some("/")));
+        assert!(header(&r, "Set-Cookie").is_none());
+        let r = ui.request(req("POST", "/logout", &[h], "")).await;
+        assert_eq!((r.status, header(&r, "Location")), (303, Some("/")));
+    }
+
+    #[test]
+    fn same_origin_posts_carry_their_origin() {
+        let r = with_security_headers(Response::text(200, ""));
+        assert_eq!(header(&r, "Referrer-Policy"), Some("same-origin"));
     }
 
     #[tokio::test]

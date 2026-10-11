@@ -121,11 +121,19 @@ machines, pairing, sessions), statistics, audit (Allow, Allow as wildcard,
 Deny for commands, only with the node's settings grant; Allow puts the rule
 on the node's `policy.commands.never_ask`, Deny on `deny`, and each takes it
 off the other list), settings (center
-name, retention, effect rules, harness tokens, per-node settings). Without a
-password the UI answers only for loopback hosts; with one it uses a login
-and an HttpOnly, SameSite=Strict cookie, and every change needs the CSRF
-header from `/api/session`. Pairing shows the link and the code; a QR code is
-not offered in 0.0.1.
+name, retention, effect rules, harness tokens, per-node settings). The pages,
+scripts and styles are built into the binary; nothing is loaded from another
+host.
+
+Without a password the UI answers only for loopback hosts. With one, every
+page and API call but the login form and its assets needs a session: a
+browser without one is sent to `/login`, where the password is posted once as
+a form (never in a URL). A right password answers with the session cookie
+(`HttpOnly`, `SameSite=Strict`, `Secure` over TLS, 12 hours); `POST /logout`
+ends the session and clears the cookie. Five wrong passwords in a minute lock
+the login for the rest of that minute. Every change needs the CSRF header
+from `/api/session`. Pairing shows the link and the code; a QR code is not
+offered in 0.0.1.
 
 ## 8. What the center keeps
 

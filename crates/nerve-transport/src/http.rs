@@ -35,10 +35,13 @@ impl Request {
 
     /// The value of `key` in the query string, percent-decoded.
     pub fn query_param(&self, key: &str) -> Option<String> {
-        self.query.split('&').find_map(|p| {
-            let (k, v) = p.split_once('=').unwrap_or((p, ""));
-            (k == key).then(|| pct_decode(v))
-        })
+        param(&self.query, key)
+    }
+
+    /// The value of `key` in an `application/x-www-form-urlencoded` body,
+    /// decoded the same way.
+    pub fn form_param(&self, key: &str) -> Option<String> {
+        param(&String::from_utf8_lossy(&self.body), key)
     }
 
     /// The bearer token of `Authorization`, if any.
@@ -54,6 +57,13 @@ impl Request {
         self.header("upgrade")
             .is_some_and(|u| u.eq_ignore_ascii_case("websocket"))
     }
+}
+
+fn param(encoded: &str, key: &str) -> Option<String> {
+    encoded.split('&').find_map(|p| {
+        let (k, v) = p.split_once('=').unwrap_or((p, ""));
+        (k == key).then(|| pct_decode(v))
+    })
 }
 
 fn pct_decode(s: &str) -> String {
@@ -226,6 +236,7 @@ pub fn reason(status: u16) -> &'static str {
         200 => "OK",
         202 => "Accepted",
         204 => "No Content",
+        303 => "See Other",
         400 => "Bad Request",
         401 => "Unauthorized",
         403 => "Forbidden",
@@ -371,5 +382,11 @@ mod tests {
             .insert("authorization".into(), "Bearer  tok ".into());
         assert_eq!(r.bearer(), Some("tok"));
         assert_eq!(r.query_param("a").as_deref(), Some("A%zz b"));
+        // A form body decodes like a query string.
+        r.body = b"password=p%26w%3Dd+x&next=%2F".to_vec();
+        assert_eq!(r.form_param("password").as_deref(), Some("p&w=d x"));
+        assert_eq!(r.form_param("next").as_deref(), Some("/"));
+        assert_eq!(r.form_param("missing"), None);
+        assert_eq!(reason(303), "See Other");
     }
 }

@@ -180,8 +180,8 @@ Errors carry a string code in `error.data.code` (§5.3).
 | `bye` | notification | either | `{reason}` | |
 
 - `detail` is `summary`, `capability` (needs `cap`) or `full`.
-- `ctx` is `{session?, tainted}`: `session` is at most 256 bytes, `tainted` a
-  boolean. Other fields are refused. Context can only narrow what a call may do.
+- `ctx` is `{session?}`: `session` is at most 256 bytes. Other fields are
+  refused. There is no field for "allowed", a mode or a folder.
 - `deadline_ms` is a duration in milliseconds from receipt; past it the node
   fails the call with `timeout`.
 - `progress.id` and `cancel.id` are the `invoke` request id.
@@ -354,5 +354,4 @@ browser or tool) to the node; the center only relays it.
 ## 8. Center side
 
 The center serves harnesses. In 0.0.1 `nerve-center` is an MCP server (spec
-§[harness.md](harness.md)). It maps capabilities to tools, holds sessions and
-taint, and never stores file contents, command output or secrets.
+§[harness.md](harness.md)). It maps capabilities to tools, holds sessions, and never stores file contents, command output or secrets.

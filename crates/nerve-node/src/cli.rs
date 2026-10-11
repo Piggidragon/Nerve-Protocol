@@ -109,7 +109,7 @@ pub enum Cmd {
         #[command(flatten)]
         center: CenterArg,
     },
-    /// Allow a command in every mode (a tainted call still cannot run it).
+    /// Allow a command in every mode.
     Allow {
         /// The command line to allow.
         command: String,

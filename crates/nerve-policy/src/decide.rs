@@ -5,7 +5,7 @@
 //! The order only ever narrows: an `off` capability is disabled; a denied path
 //! or command is forbidden; then the mode and the rules allow or not. A call
 //! no mode and no rule allows is refused at once, and so is one that touches a
-//! protected path or is tainted, whatever allowed it.
+//! protected path, whatever allowed it.
 
 use std::path::{Path, PathBuf};
 
@@ -43,7 +43,6 @@ pub struct Call<'a> {
     /// `targets`).
     pub command: Option<&'a str>,
     pub cwd: Option<&'a Path>,
-    pub tainted: bool,
     pub now_ms: u64,
 }
 
@@ -196,9 +195,7 @@ pub fn decide(policy: &CenterPolicy, env: &Env, call: &Call) -> Decision {
             _ => "outside the folders".into(),
         });
     }
-    if call.effect == Effect::Execute
-        && !call.tainted
-        && call.command.is_some_and(|cmd| matches(&rules.permit, cmd))
+    if call.effect == Effect::Execute && call.command.is_some_and(|cmd| matches(&rules.permit, cmd))
     {
         allowed = true;
         reasons.clear();
@@ -219,10 +216,6 @@ pub fn decide(policy: &CenterPolicy, env: &Env, call: &Call) -> Decision {
             allowed = false;
             reasons.push(format!("writes to {tc} run code later"));
         }
-    }
-    if call.tainted && matches!(call.effect, Effect::Write | Effect::Execute) && allowed {
-        allowed = false;
-        reasons.push("the call is tainted".into());
     }
 
     if allowed {
@@ -302,7 +295,6 @@ mod tests {
             targets,
             command,
             cwd: command.and(targets.first().map(|t| t.path.as_path())),
-            tainted: false,
             now_ms: NOW,
         }
     }
@@ -491,35 +483,8 @@ mod tests {
                 assert_eq!(short(&decide(&p, &env, &c)), "refused");
                 p.caps.insert("camera".into(), CapSetting::On);
                 assert_eq!(short(&decide(&p, &env, &c)), "allow");
-                // Taint does not narrow reads or senses, only writes and commands.
-                c.tainted = true;
-                assert_eq!(short(&decide(&p, &env, &c)), "allow");
             }
         }
-    }
-
-    #[test]
-    fn taint_narrows() {
-        let x = T::new();
-        let env = x.env(true);
-        let p = policy(Mode::User);
-        let w = t("/w/rw/a", true);
-        let mut c = call(Effect::Write, &w, None);
-        c.tainted = true;
-        assert_eq!(short(&decide(&p, &env, &c)), "refused");
-        let e = t("/w/rw", false);
-        let mut c = call(Effect::Execute, &e, Some("make"));
-        c.tainted = true;
-        assert_eq!(short(&decide(&p, &env, &c)), "refused");
-        // A permitted command is no exception.
-        let mut c = call(Effect::Execute, &e, Some("ls"));
-        c.tainted = true;
-        assert_eq!(short(&decide(&p, &env, &c)), "refused");
-        // Reads are not narrowed by taint.
-        let r = t("/x/a", false);
-        let mut c = call(Effect::Read, &r, None);
-        c.tainted = true;
-        assert_eq!(short(&decide(&p, &env, &c)), "allow");
     }
 
     #[test]
@@ -548,10 +513,6 @@ mod tests {
                 let c = call(Effect::Execute, &e, Some(other));
                 assert_eq!(short(&decide(&p, &on, &c)), "refused", "{mode:?} {other}");
             }
-            // Taint and the deny list still narrow.
-            let mut c = call(Effect::Execute, &e, Some("sudo apt update"));
-            c.tainted = true;
-            assert_eq!(short(&decide(&p, &on, &c)), "refused");
             // A permit rule never covers a second command.
             p.commands.permit.push("sudo apt *".into());
             for chained in [

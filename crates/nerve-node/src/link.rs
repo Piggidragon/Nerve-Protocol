@@ -854,7 +854,6 @@ impl Link {
             targets,
             command,
             cwd,
-            tainted: inv.ctx.tainted,
             now_ms: crate::now_ms(),
         };
         let decision = {

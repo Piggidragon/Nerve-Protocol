@@ -261,9 +261,7 @@ async fn pair_connect_describe_and_call() {
     assert_eq!(inv["cap"], "fs");
     assert_eq!(inv["action"], "read");
     assert_eq!(inv["args"], json!({"path": "/etc/hostname"}));
-    assert_ne!(inv["ctx"]["tainted"], true, "nothing was read before");
     let session = inv["ctx"]["session"].as_str().unwrap().to_string();
-    assert!(e.session().tainted(), "a read taints the session");
 
     // An unknown node name is refused with the names that exist.
     let bad = rpc(
@@ -295,10 +293,7 @@ async fn pair_connect_describe_and_call() {
         panic!("no invoke")
     };
     assert_eq!(inv["cap"], "exec");
-    assert_eq!(
-        inv["ctx"]["tainted"], true,
-        "the session read device content before"
-    );
+    assert_eq!(inv["ctx"]["session"], session.as_str());
 
     // Ending the session tells the node.
     e.close().await;

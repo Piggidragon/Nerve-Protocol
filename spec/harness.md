@@ -95,14 +95,11 @@ plus `structuredContent` when the result is an object. A refusal or failure
 is `isError: true` with `error <code>: <message>`, the code from
 [protocol.md](protocol.md) §5.
 
-## 5. Sessions and taint
+## 5. Sessions
 
 Each MCP connection (stdio, attached, or HTTP session) is one session with an
-id the center sends as `ctx.session`. After the first result that carries
-outside content (`fs.read`, `fs.grep`, `exec.run`, and `read`, `sense` or
-`execute` actions without a profile) the session is tainted and later calls
-carry `ctx.tainted: true`. When a session ends, every node it used gets
-`session.end`. The web UI can end a session.
+id the center sends as `ctx.session`. When a session ends, every node it used
+gets `session.end`. The web UI can end a session.
 
 ## 6. Refused calls
 

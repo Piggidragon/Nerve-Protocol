@@ -55,8 +55,7 @@ impl Engine {
     }
 
     /// The live session; a session ended from the web UI is replaced by a
-    /// fresh one, so a long-running stdio harness keeps working with a clean
-    /// slate (no taint).
+    /// fresh one, so a long-running stdio harness keeps working.
     fn live_session(&self) -> Arc<Session> {
         let mut s = self.session.lock().unwrap();
         if s.ended() {

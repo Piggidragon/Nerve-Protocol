@@ -119,16 +119,13 @@ pub struct Describe {
     pub cap: Option<String>,
 }
 
-/// Context a center attaches to a call. It can only narrow what a node does:
-/// `tainted` makes a node refuse writes and commands it would allow. Other
-/// fields are refused (D8).
+/// Context a center attaches to a call: the session id and nothing else.
+/// Other fields are refused (D8).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ctx {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub tainted: bool,
 }
 
 /// The longest session id a node accepts.
@@ -344,10 +341,10 @@ mod tests {
     fn invoke_is_strict() {
         let ok: Invoke = serde_json::from_value(json!({
             "cap": "fs", "action": "read", "args": {"path": "/x"},
-            "ctx": {"session": "s1", "tainted": true}
+            "ctx": {"session": "s1"}
         }))
         .unwrap();
-        assert!(ok.ctx.tainted);
+        assert_eq!(ok.ctx.session.as_deref(), Some("s1"));
         assert!(ok.check().is_ok());
         assert!(
             serde_json::from_value::<Invoke>(json!({
@@ -362,7 +359,6 @@ mod tests {
         let long = Invoke {
             ctx: Ctx {
                 session: Some("s".repeat(257)),
-                tainted: false,
             },
             ..ok
         };

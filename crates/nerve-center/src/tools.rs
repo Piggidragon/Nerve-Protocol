@@ -269,18 +269,6 @@ fn unique(name: &str, taken: &BTreeSet<String>) -> String {
     unreachable!()
 }
 
-/// Whether a result of this call carries content from outside the harness
-/// (file contents, search hits, command output): after one, the session is
-/// tainted (spec/harness.md §4). Actions of capabilities without a known
-/// profile count when they read or run something, to stay on the safe side.
-pub fn taints(r: &Route) -> bool {
-    match r.profile.as_str() {
-        "fs" => matches!(r.action.as_str(), "read" | "grep"),
-        "exec" => r.action == "run",
-        _ => matches!(r.effect, Effect::Read | Effect::Sense | Effect::Execute),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,25 +472,5 @@ mod tests {
             descriptor: &d,
         }]);
         assert_eq!(names(&t), ["a__fs__read"]);
-    }
-
-    #[test]
-    fn what_taints() {
-        let r = |profile: &str, action: &str, effect| Route {
-            node_id: String::new(),
-            node_name: String::new(),
-            cap: String::new(),
-            action: action.into(),
-            profile: profile.into(),
-            effect,
-        };
-        assert!(taints(&r("fs", "read", Effect::Read)));
-        assert!(taints(&r("fs", "grep", Effect::Read)));
-        assert!(!taints(&r("fs", "stat", Effect::Read)));
-        assert!(!taints(&r("fs", "write", Effect::Write)));
-        assert!(taints(&r("exec", "run", Effect::Execute)));
-        assert!(!taints(&r("exec", "signal", Effect::Actuate)));
-        assert!(taints(&r("", "look", Effect::Sense)));
-        assert!(!taints(&r("", "on", Effect::Actuate)));
     }
 }

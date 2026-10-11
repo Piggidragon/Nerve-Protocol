@@ -273,7 +273,7 @@ pub struct CommandRules {
     /// When not empty, only matching commands run at all.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allow: Vec<String>,
-    /// Run in any mode, unless the call is tainted.
+    /// Run in any mode.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub permit: Vec<String>,
 }

@@ -304,7 +304,7 @@ function nodeCard(n) {
 function sessionCard(s) {
   return el("div", { class: "card" },
     el("div", { class: "card-top" }, icon("plug"), el("span", { class: "name" }, s.client || "Unknown client"),
-      pill("", s.transport), s.tainted ? pill("warn", "has read device content") : null,
+      pill("", s.transport),
       el("span", { class: "push" }, btn("End", "danger", act(() => api("POST", "/api/sessions/end", { id: s.id }))))),
     el("p", { class: "meta" }, `Since ${ago(s.started_ms)}, ${plural(s.calls, "call")}`),
     s.nodes.length ? el("div", { class: "chips" }, s.nodes.map((n) => el("span", { class: "chip" }, n))) : null,

@@ -22,7 +22,6 @@ pub const PLANNED: &[(&str, &str)] = &[
         "harness 3",
         "results are passed on as device content, not instructions",
     ),
-    ("harness 5", "taint.mark is sent after outside content"),
     (
         "harness 6",
         "session.end is sent when the harness session ends",

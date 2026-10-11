@@ -172,7 +172,7 @@ fn nerve_center_and_nerve_node_work_together() {
     );
     assert_eq!((status, &v["sudo"]), (200, &json!("on")), "{v}");
     // The node says so too. Running sudo commands is the node part's and
-    // nerve-node's own tests' job: here one exec taints the MCP session.
+    // nerve-node's own tests' job.
     let (_, v) = mcp.api(
         "GET",
         &format!("/api/nodes/settings?id={node_id}"),

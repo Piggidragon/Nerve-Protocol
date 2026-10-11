@@ -1,6 +1,5 @@
-//! The center's core: paired nodes and their links, pairing, sessions and
-//! taint, calls to nodes, the audit feed and
-//! the statistics. The MCP server, the node listener and the web UI are thin
+//! The center's core: paired nodes and their links, pairing, sessions, calls
+//! to nodes, the audit feed and the statistics. The MCP server, the node listener and the web UI are thin
 //! layers over this.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -72,7 +71,6 @@ pub struct Session {
     pub transport: String,
     pub client: Mutex<String>,
     pub started_ms: u64,
-    tainted: AtomicBool,
     ended: AtomicBool,
     pub calls: AtomicU64,
     /// Nodes this session called, for `session.end`.
@@ -80,10 +78,6 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn tainted(&self) -> bool {
-        self.tainted.load(Ordering::SeqCst)
-    }
-
     pub fn ended(&self) -> bool {
         self.ended.load(Ordering::SeqCst)
     }
@@ -637,7 +631,6 @@ impl Center {
             transport: transport.to_string(),
             client: Mutex::new(String::new()),
             started_ms: now_ms(),
-            tainted: AtomicBool::new(false),
             ended: AtomicBool::new(false),
             calls: AtomicU64::new(0),
             nodes: Mutex::new(BTreeSet::new()),
@@ -690,7 +683,6 @@ impl Center {
                     "transport": s.transport,
                     "client": s.client.lock().unwrap().clone(),
                     "started_ms": s.started_ms,
-                    "tainted": s.tainted(),
                     "calls": s.calls.load(Ordering::SeqCst),
                     "nodes": nodes,
                 })
@@ -845,9 +837,6 @@ impl Center {
                 *d.errors.entry(code.clone()).or_default() += 1;
             }
         });
-        if out.is_ok() && tools::taints(route) && !sess.tainted.swap(true, Ordering::SeqCst) {
-            self.changed(Change::Sessions);
-        }
         out
     }
 
@@ -863,10 +852,7 @@ impl Center {
                 format!("the node {} is offline", route.node_name),
             )
         })?;
-        let mut ctx = json!({"session": sess.id});
-        if sess.tainted() {
-            ctx["tainted"] = json!(true);
-        }
+        let ctx = json!({"session": sess.id});
         sess.nodes.lock().unwrap().insert(route.node_id.clone());
         link.sessions.lock().unwrap().insert(sess.id.clone());
         let (_, rx) = link

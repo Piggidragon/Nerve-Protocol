@@ -53,7 +53,7 @@ Two network-facing interfaces in 0.0.1, one message layer (§4.5):
 | Interface | Between | Carries |
 |---|---|---|
 | Node link | node → center, over the network | descriptor, invokes, events, state, reliable streams, settings |
-| Harness interface | harness → center's MCP server, local | tools from descriptors, session grants, taint |
+| Harness interface | harness → center's MCP server, local | tools from descriptors, session grants |
 
 The node's local interface (§7.2) is part of the node, not of the wire spec, in 0.0.1. When the desktop add-on comes, its attach part becomes a third interface in the spec (§11).
 
@@ -65,7 +65,7 @@ Conformance suite (0.0.1):
 |---|---|---|
 | node | any node | handshake, describe at three levels, schema validation, deadlines, cancel, errors, events and implicit events, reliable streams, limits, strict parsing of center input, per-center isolation |
 | center | any center | pairing, challenge auth, one live link per node, descriptor cache by `rev`, center-side rules (a refused call is never sent), refusal to send fields only the node may set, session end |
-| harness | the center's MCP server surface | one session per connection, `session.end`, taint marking, tool generation from descriptors |
+| harness | the center's MCP server surface | one session per connection, `session.end`, tool generation from descriptors |
 
 An `echo` node with toy capabilities (every member kind, no hardware) gives the suite something to run against, and a matching `echo` harness drives the center part. Conformance levels: **Core** (describe, invoke, errors), **Reactive** (events, state, subscriptions) in 0.0.1; **Media** (media streams) later with the desktop add-on.
 
@@ -78,7 +78,7 @@ One daemon, `nerve-center`, written once in Rust: the center is the gate for rem
 - pairing codes;
 - the registered harnesses and their tokens;
 - its own rules (§5.5);
-- sessions: which harness session may use which nodes (grants), and the center's taint per session;
+- sessions: which harness session may use which nodes (grants);
 - statistics per node, counts and timings only (§7.1);
 - for each node that gave it write rights, a copy of that node's settings document (§5.2).
 
@@ -172,7 +172,7 @@ A node acting as proxy for other nodes (jump node → node) is later (§11). It 
 
 ### 3.7 Several centers
 
-A node MAY be paired with any number of centers (0.0.1). Each pairing is a **center entry** with its own key, link, backoff, policy and grants. **A center is a trust domain** and the node MUST keep apart, per center: policy and its grant, sessions, the node's taint, audit records (each names its center), the descriptor it is shown, and settings reads and writes. A center cannot learn whether other centers exist.
+A node MAY be paired with any number of centers (0.0.1). Each pairing is a **center entry** with its own key, link, backoff, policy and grants. **A center is a trust domain** and the node MUST keep apart, per center: policy and its grant, sessions, audit records (each names its center), the descriptor it is shown, and settings reads and writes. A center cannot learn whether other centers exist.
 
 Shared and device-only are the machine settings (§5.3) and the limits that protect the machine: running commands, output caps and audit log size are one pool, split fairly so one busy center does not starve another. `panic` and `unlock` act on all centers at once.
 
@@ -203,10 +203,10 @@ Shared and device-only are the machine settings (§5.3) and the limits that prot
 | D5 | 6-byte binary header, blob and lossy stream | 10-byte header; blob and reliable stream in 0.0.1, media frame kind reserved (§4.6) | Command output and large file content are ordered, reliable and of unknown length |
 | D6 | Four effects | Five: `execute` added | Running a command subsumes every other effect; policies treat it apart (no standing permission for a shell) |
 | D7 | Nothing pushed before `sub` | `node` and `settings` events are implicit; the rest needs `sub` | A center that forgets to subscribe must still learn when the node's descriptor or settings change |
-| D8 | No per-call context | `ctx {session, tainted}` on `invoke`, narrow-only | Taint is per session; the node needs the id, and the center must never be able to send "allowed" |
+| D8 | No per-call context | `ctx {session}` on `invoke` | The node needs the id to tell sessions apart in its audit records, and the center must never be able to send "allowed" |
 | D9 | Scopes per token | No scopes; the node's policy per center entry is the only authority, and the descriptor a center sees is filtered by it | One authority instead of two that can disagree; scopes stay in the backlog (§11) |
 | D10 | `ask`: a person decides per call at the node | Rules only: allow or deny, with wildcards, default deny; a call no rule allows is refused at once (§5.4) | Nothing waits for a person; the owner adds the rule that is missing |
-| D11 | No center-to-node messages besides requests | `session.end` notification, settings actions (when granted) | A session's end must clear its taint on the node |
+| D11 | No center-to-node messages besides requests | `session.end` notification, settings actions (when granted) | The nodes a session used learn that it ended; a node keeps nothing per session in 0.0.1, so it only accepts the message |
 | D12 | Session resume, `idem` | Not in 0.0.1, later | §3.5 |
 | D13 | HTTP binding, CBOR, center-dials | Left out | No node listens; no constrained node exists yet |
 | D14 | Nodes MAY accept several centers, no isolation rules | MUST isolate per center (§3.7) | Several centers are only safe as separate trust domains |
@@ -268,12 +268,12 @@ JSON-RPC 2.0, one object per text frame, integer or string ids, `params` always 
 | `event {cap, name, seq, ts, data}` (n) | n→c | Something happened |
 | `state {cap, seq, ts, changed}` (n) | n→c | State changed |
 | `stream.open {cap, stream, params}`, `stream.close {sid, reason}` | c→n, both | Reliable streams (media streams later) |
-| `session.end {session}` (n) | c→n | A harness session ended: the node drops its taint |
+| `session.end {session}` (n) | c→n | A harness session ended |
 | `bye {reason}` (n) | both | Clean close |
 
 Errors carry the JSON-RPC numeric code and, in `data.code`, a string code (`invalid_args`, `forbidden`, `disabled`, `unavailable`, `busy`, `timeout`, `cancelled`, `too_large`, `unknown_capability`, `unknown_member`, `connection_lost`, `internal`), plus capability-specific codes from profiles (`conflict`, `bad_path`, `io`). `message` is for people and models and says what to do next.
 
-`ctx` holds `session` (an opaque id the center chose, at most 256 bytes, namespaced per center on the node) and `tainted` (only ever added to the node's own taint for that session; `false` clears nothing). Any other field is refused. There is no field for "allowed", a mode or a folder.
+`ctx` holds `session` (an opaque id the center chose, at most 256 bytes, namespaced per center on the node). Any other field is refused. There is no field for "allowed", a mode or a folder.
 
 ### 4.6 Binary frames
 
@@ -373,7 +373,6 @@ The center decides the same way for its own rules (§5.5): it refuses a call bef
 
 - **Session grants**: a harness session sees only nodes granted to it (by the harness, the owner in the center UI, or a harness default set in the center). Tools for other nodes are not offered and calls for them are refused at the center.
 - **Center rules per effect and harness**: e.g. `execute` from a given harness is refused at the center unless a center rule permits it. These rules apply at the center only and never reach the node.
-- **Taint**: the center marks a session tainted when its harness says so (`taint.mark`, or by itself on the MCP surface, §6.3); `ctx.tainted` carries it to nodes, whose policy refuses more for tainted sessions (User mode included, unless the owner switched that off).
 - **User mode is never a default**: the node starts every center entry in Folder mode with no folder granted; nothing a center or harness does changes that without the owner (directly, or through a `write` grant the owner gave).
 
 ## 6. Harness integration
@@ -391,7 +390,6 @@ Methods the center offers to a harness:
 | `describe {node, cap}` | Full detail for one capability |
 | `invoke {node, cap, action, args, session}` | Run an action; the center adds `ctx`, applies its own policy, forwards to the node |
 | `session.grant {session, nodes}`, `session.end {session}` | Grants per harness session; `end` reaches every node used |
-| `taint.mark {session}` | The session has seen untrusted content |
 | event `nodes.changed` | So the client can refresh tools |
 
 The reverse direction (a harness offering sessions, prompts and replies for a chat window or voice) is not in 0.0.1. It comes with the desktop add-on (§11).
@@ -410,7 +408,6 @@ The center exposes the protocol as an MCP server. Any MCP-capable harness connec
 
 - one session per MCP connection (the surface cannot see the harness's chats);
 - a call that no rule allows is refused at once with `forbidden` and a message the model can pass on;
-- taint: the surface cannot see the harness context, so it marks the session tainted after the first result that carries outside content (file content, command output) — conservative, and the reason native harness plugins are on the backlog (§11);
 - the center's default for such a harness: `execute` and `actuate` are refused at the center until a center rule permits them.
 
 ### 6.4 What an MCP client must do
@@ -529,7 +526,7 @@ Simpler than 0.0.x: no `profile` setting, no `token_storage` (no token), no pi t
 | `device.info` | Descriptor + state of `exec`, `settings` | Self-describing |
 | `device.probe` (`pithagoras-probe-*` temp file, same-machine check) | Removed | Portal-specific; a center does not need to know whether it shares a host |
 | `fs.*`, `exec.start`, `exec.signal`, `exec.exit` methods | `invoke` on `nerve:fs/1`, `nerve:exec/1` | Generic capability model |
-| `ctx {chat, tainted, tool}`, pi tool labels | `ctx {session, tainted}` | "Chat" and pi tool names are harness vocabulary |
+| The portal's per-chat `ctx` and pi tool labels | `ctx {session}` | "Chat" and pi tool names are harness vocabulary |
 | `policy.tools.read|write|edit|bash|grep|find|ls` | `caps.<cap>.<action>` switches | Derived from the descriptor, not from one harness's tools |
 | `portal_policy = off|read|write` | Per-center `settings = off|write` | Per trust domain |
 | Modes Ask, Folders, Full and the methods around them | Modes Folder and User; sudo is a separate per-node switch (§5.1), not a mode; a call is allowed by a rule or `forbidden` | Nothing waits for a person; rules decide, default deny |
@@ -547,7 +544,7 @@ Simpler than 0.0.x: no `profile` setting, no `token_storage` (no token), no pi t
 | `profile = headless|desktop`, `token_storage` | Gone; no token | Fewer settings |
 | GUI installer and `zenity`/`kdialog` dialogs as the client's GUI | CLI in 0.0.1; Slint setup GUI later | Headless first |
 
-Kept in substance (re-implemented, not copied): the policy engine's folders, protected paths and command rules; Landlock, cgroup scope, exec shim, Job Object, dedicated user; strict parsing of center input; the sudo password on the node with scrubbing (now behind a per-node switch); per-chat (now per-session) taint that only adds; backoff and liveness numbers; limits; strict pairing-link parsing; signed updates.
+Kept in substance (re-implemented, not copied): the policy engine's folders, protected paths and command rules; Landlock, cgroup scope, exec shim, Job Object, dedicated user; strict parsing of center input; the sudo password on the node with scrubbing (now behind a per-node switch); backoff and liveness numbers; limits; strict pairing-link parsing; signed updates.
 
 ## 11. Decided and later
 

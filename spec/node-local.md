@@ -59,7 +59,7 @@ protected = { extra = [], allow = [] }
 [center.policy.commands]    # globs over the whole command line
 deny = []                   # never run
 allow = []                  # when not empty, only these run at all
-permit = []                 # run in any mode unless the call is tainted
+permit = []                 # run in any mode
 ```
 
 Unknown keys are refused. Two centers with one name are refused. Folder paths
@@ -89,9 +89,7 @@ answer. For each call the node takes the center's policy and, in this order:
    center is back in `folder`. Actions with the effect `sense` or `actuate`
    are allowed by no mode: only the owner's `caps` entry `on` allows them.
 6. `permit` allows a command in any mode.
-7. A call the center marks tainted (`ctx.tainted`, it has read device content
-   in that session) is refused for any write or command, whatever allowed it.
-   Protected paths stay refused in `user` mode too.
+7. Protected paths are refused whatever allowed the call, `user` mode too.
 
 A command whose first word is `sudo` is decided by the sudo switch as well
 (§4). Every refusal names its reasons in the error and in the audit log.
@@ -104,7 +102,7 @@ Sudo is a switch per node, not a mode: the modes stay `folder` and `user`.
   first word is `sudo` (or a path ending in `/sudo`) is refused with
   `forbidden`, even when a `permit` rule names it.
 - **On**: such a command runs only when a `permit` rule names it, in either
-  mode; no mode allows it by itself, and `deny`, protected paths and taint
+  mode; no mode allows it by itself, and `deny` and protected paths
   still refuse it. A sudo command must be one simple command: one with
   `; & | $ \` ( ) < >` or a line break is refused. The node runs it as
   `sudo -S -k -p '' …` with the password on its stdin and without Landlock

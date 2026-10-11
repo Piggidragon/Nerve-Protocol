@@ -1,6 +1,6 @@
 //! The Nerve center as an MCP server (spec/harness.md).
 //!
-//! `nerve-mcp` is started by a harness like any MCP server. It pairs nodes,
+//! `nerve-center` is started by a harness like any MCP server. It pairs nodes,
 //! holds their links, maps their capabilities to MCP tools and serves the
 //! center web UI. It has no subcommands: everything is set by flags or
 //! `NERVE_*` variables in the harness's MCP entry, or in the web UI.

@@ -6,7 +6,7 @@ members = [
     "crates/nerve-policy",
     "crates/nerve-sandbox",
     "crates/nerve-node",
-    "crates/nerve-mcp",
+    "crates/nerve-center",
     "crates/nerve-conformance",
 ]
 
@@ -22,7 +22,7 @@ nerve-transport = { path = "crates/nerve-transport", version = "0.0.1" }
 nerve-policy = { path = "crates/nerve-policy", version = "0.0.1" }
 nerve-sandbox = { path = "crates/nerve-sandbox", version = "0.0.1" }
 nerve-node = { path = "crates/nerve-node", version = "0.0.1" }
-nerve-mcp = { path = "crates/nerve-mcp", version = "0.0.1" }
+nerve-center = { path = "crates/nerve-center", version = "0.0.1" }
 
 # Every crate below is one Pithagoras-Sync already uses; 0.0.1 adds none.
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "time", "sync", "signal", "fs"] }

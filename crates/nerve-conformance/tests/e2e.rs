@@ -1,4 +1,4 @@
-//! End-to-end tests: the real `nerve-mcp` and `nerve-node` binaries, against
+//! End-to-end tests: the real `nerve-center` and `nerve-node` binaries, against
 //! the conformance parts and against each other.
 
 #![cfg(unix)]
@@ -30,17 +30,17 @@ fn center_part_against(tls: bool) {
     assert!(report.ok(), "{report}");
     assert!(
         mcp.finish(),
-        "nerve-mcp did not exit after its harness left"
+        "nerve-center did not exit after its harness left"
     );
 }
 
 #[test]
-fn center_part_passes_against_nerve_mcp_over_plain_loopback() {
+fn center_part_passes_against_nerve_center_over_plain_loopback() {
     center_part_against(false);
 }
 
 #[test]
-fn center_part_passes_against_nerve_mcp_over_pinned_tls() {
+fn center_part_passes_against_nerve_center_over_pinned_tls() {
     center_part_against(true);
 }
 
@@ -71,7 +71,7 @@ fn with(mut args: Value, more: Value) -> Value {
 /// node and from the center, a rule from the audit view landing in the
 /// node's settings, the node's audit log, and removing the node.
 #[test]
-fn nerve_mcp_and_nerve_node_work_together() {
+fn nerve_center_and_nerve_node_work_together() {
     let root = tempfile::tempdir().unwrap();
     let mut mcp = Mcp::start(&root.path().join("center"), true, &[]);
     let mut node = Node::new(&root.path().join("node"));

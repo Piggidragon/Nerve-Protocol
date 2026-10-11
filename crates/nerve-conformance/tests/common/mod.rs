@@ -1,7 +1,7 @@
-//! Running the real `nerve-mcp` and `nerve-node` binaries for the end-to-end
+//! Running the real `nerve-center` and `nerve-node` binaries for the end-to-end
 //! tests.
 //!
-//! The binaries come from `NERVE_MCP_BIN` and `NERVE_NODE_BIN` when set (that
+//! The binaries come from `NERVE_CENTER_BIN` and `NERVE_NODE_BIN` when set (that
 //! is how the tests run on another machine), otherwise they are built with
 //! the cargo that runs the tests.
 
@@ -27,12 +27,19 @@ pub fn bin(name: &str) -> PathBuf {
     BUILT.get_or_init(|| {
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
         let ok = Command::new(cargo)
-            .args(["build", "--offline", "-p", "nerve-mcp", "-p", "nerve-node"])
+            .args([
+                "build",
+                "--offline",
+                "-p",
+                "nerve-center",
+                "-p",
+                "nerve-node",
+            ])
             .current_dir(env!("CARGO_MANIFEST_DIR"))
             .status()
             .expect("cargo runs")
             .success();
-        assert!(ok, "building nerve-mcp and nerve-node failed");
+        assert!(ok, "building nerve-center and nerve-node failed");
     });
     // tests run from target/<profile>/deps/<test>; the binaries sit one up.
     let exe = std::env::current_exe().unwrap();
@@ -49,7 +56,7 @@ pub fn free_port() -> u16 {
         .port()
 }
 
-/// A `nerve-mcp` started the way a harness starts it: MCP over stdio.
+/// A `nerve-center` started the way a harness starts it: MCP over stdio.
 pub struct Mcp {
     child: Child,
     stdin: Option<ChildStdin>,
@@ -66,7 +73,7 @@ impl Mcp {
     /// through the link) over plain HTTP on loopback.
     pub fn start(state: &Path, tls: bool, extra: &[(&str, &str)]) -> Mcp {
         let node_port = free_port();
-        let mut cmd = Command::new(bin("nerve-mcp"));
+        let mut cmd = Command::new(bin("nerve-center"));
         cmd.env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", state)
@@ -90,7 +97,7 @@ impl Mcp {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .expect("nerve-mcp starts");
+            .expect("nerve-center starts");
         let stdin = child.stdin.take();
         let (tx, out) = channel();
         let stdout = child.stdout.take().unwrap();
@@ -102,7 +109,7 @@ impl Mcp {
                             break;
                         }
                     }
-                    Err(e) => eprintln!("nerve-mcp stdout is not JSON ({e}): {line}"),
+                    Err(e) => eprintln!("nerve-center stdout is not JSON ({e}): {line}"),
                 }
             }
         });
@@ -111,7 +118,7 @@ impl Mcp {
         std::thread::spawn(move || {
             let mut sent = false;
             for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                eprintln!("[nerve-mcp] {line}");
+                eprintln!("[nerve-center] {line}");
                 if !sent && let Some(i) = line.find("web UI at http://") {
                     let addr = line[i + "web UI at http://".len()..]
                         .split_whitespace()
@@ -125,7 +132,7 @@ impl Mcp {
         });
         let ui = ui_rx
             .recv_timeout(Duration::from_secs(60))
-            .expect("nerve-mcp names its web UI address");
+            .expect("nerve-center names its web UI address");
         let mut m = Mcp {
             child,
             stdin,
@@ -143,7 +150,7 @@ impl Mcp {
             json!({"protocolVersion": "2025-06-18", "capabilities": {},
                    "clientInfo": {"name": "e2e", "version": "0.0.1"}}),
         );
-        assert_eq!(r["result"]["serverInfo"]["name"], "nerve-mcp", "{r}");
+        assert_eq!(r["result"]["serverInfo"]["name"], "nerve-center", "{r}");
         m.notify("notifications/initialized", json!({}));
         m
     }
@@ -174,7 +181,7 @@ impl Mcp {
                 Ok(v) if v.get("id") == Some(&json!(id)) => return v,
                 Ok(v) => self.notes.push(v),
                 Err(RecvTimeoutError::Timeout) => panic!("no reply to {method} within {wait:?}"),
-                Err(RecvTimeoutError::Disconnected) => panic!("nerve-mcp closed stdout"),
+                Err(RecvTimeoutError::Disconnected) => panic!("nerve-center closed stdout"),
             }
         }
     }

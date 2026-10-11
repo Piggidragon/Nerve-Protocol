@@ -6,9 +6,9 @@ use std::time::Duration;
 
 use clap::Parser;
 use futures_util::{SinkExt, StreamExt};
-use nerve_mcp::config::Args;
-use nerve_mcp::mcp::Engine;
-use nerve_mcp::server::{self, Running};
+use nerve_center::config::Args;
+use nerve_center::mcp::Engine;
+use nerve_center::server::{self, Running};
 use nerve_proto::link::{CenterUrl, PairLink};
 use nerve_proto::msg::{self, method};
 use nerve_proto::rpc::Message;
@@ -24,7 +24,7 @@ const MAX: usize = 4 * 1024 * 1024;
 async fn center(dir: &std::path::Path) -> Running {
     nerve_transport::init_crypto();
     let args = Args::try_parse_from([
-        "nerve-mcp",
+        "nerve-center",
         "--state-dir",
         dir.to_str().unwrap(),
         "--name",
@@ -40,7 +40,7 @@ async fn center(dir: &std::path::Path) -> Running {
         "20",
     ])
     .unwrap();
-    let lock = nerve_mcp::attach::try_lock(dir)
+    let lock = nerve_center::attach::try_lock(dir)
         .unwrap()
         .expect("the lock is free");
     server::start(&args, lock).await.unwrap()
@@ -377,7 +377,7 @@ fn http(method: &str, headers: &[(&str, &str)], body: Value) -> nerve_transport:
 async fn http_mcp_needs_a_token_and_a_session() {
     let dir = tempfile::tempdir().unwrap();
     let r = center(dir.path()).await;
-    let h = nerve_mcp::mcp::HttpMcp::new(&r.center, Some("secret-token".into()));
+    let h = nerve_center::mcp::HttpMcp::new(&r.center, Some("secret-token".into()));
     let init = json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
         "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}});
     assert_eq!(h.request(http("POST", &[], init.clone())).await.status, 401);

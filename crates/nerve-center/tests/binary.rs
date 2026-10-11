@@ -1,4 +1,4 @@
-//! The `nerve-mcp` binary as a harness starts it: MCP over stdio, and a
+//! The `nerve-center` binary as a harness starts it: MCP over stdio, and a
 //! second instance on the same state folder that attaches to the first.
 
 #![cfg(unix)]
@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 fn spawn(state: &std::path::Path) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_nerve-mcp"))
+    Command::new(env!("CARGO_BIN_EXE_nerve-center"))
         .env_clear()
         .env("NERVE_STATE_DIR", state)
         .env("NERVE_LISTEN", "127.0.0.1:0")
@@ -40,7 +40,7 @@ fn init(child: &mut Child, out: &mut BufReader<std::process::ChildStdout>) {
         json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
             "protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "1"}}}),
     );
-    assert_eq!(r["result"]["serverInfo"]["name"], "nerve-mcp", "{r}");
+    assert_eq!(r["result"]["serverInfo"]["name"], "nerve-center", "{r}");
     let stdin = child.stdin.as_mut().unwrap();
     writeln!(
         stdin,

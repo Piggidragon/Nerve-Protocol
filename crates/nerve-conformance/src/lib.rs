@@ -9,7 +9,7 @@
 //!   0.0.1 it is a skeleton.
 //!
 //! There is no runner binary in 0.0.1 (the workspace ships exactly
-//! `nerve-mcp` and `nerve-node`); the parts run from `cargo test` in this
+//! `nerve-center` and `nerve-node`); the parts run from `cargo test` in this
 //! crate, against the echo node, the fake center and the real binaries.
 
 pub mod center_part;

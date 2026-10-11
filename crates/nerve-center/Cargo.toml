@@ -1,5 +1,5 @@
 [package]
-name = "nerve-mcp"
+name = "nerve-center"
 description = "The Nerve center as an MCP server: pairs nodes, holds their links, maps their capabilities to MCP tools, serves the center web UI."
 version.workspace = true
 edition.workspace = true
@@ -7,7 +7,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [[bin]]
-name = "nerve-mcp"
+name = "nerve-center"
 path = "src/main.rs"
 
 [dependencies]

@@ -3,7 +3,7 @@
 //!
 //! Harnesses integrate through MCP only (spec/harness.md); native plugins are
 //! a backlog item. This part only lists the checks it will run, and reports
-//! each as not run. `nerve-mcp`'s MCP side is tested by its own tests and the
+//! each as not run. `nerve-center`'s MCP side is tested by its own tests and the
 //! end-to-end tests of this crate.
 
 use crate::Report;

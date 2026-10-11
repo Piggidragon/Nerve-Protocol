@@ -143,16 +143,16 @@ pub async fn start(args: &Args, lock: Lock) -> Result<Running, String> {
     })
 }
 
-/// Runs `nerve-mcp` as `main` does: owner or attached, until stdin ends or
+/// Runs `nerve-center` as `main` does: owner or attached, until stdin ends or
 /// a signal.
 pub async fn run(args: Args) -> Result<(), String> {
     nerve_transport::init_crypto();
     let state = args.state_dir();
     let Some(lock) = crate::attach::try_lock(&state)? else {
-        // Another nerve-mcp owns this state folder.
+        // Another nerve-center owns this state folder.
         if args.mcp != McpMode::Stdio {
             return Err(format!(
-                "another nerve-mcp already runs the center in {}; only a --mcp stdio instance can attach to it",
+                "another nerve-center already runs the center in {}; only a --mcp stdio instance can attach to it",
                 state.display()
             ));
         }
@@ -163,7 +163,7 @@ pub async fn run(args: Args) -> Result<(), String> {
         }
         #[cfg(not(unix))]
         return Err(format!(
-            "another nerve-mcp already runs the center in {}",
+            "another nerve-center already runs the center in {}",
             state.display()
         ));
     };

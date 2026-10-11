@@ -1,4 +1,4 @@
-//! Flags and `NERVE_*` variables. A harness starts `nerve-mcp` from its MCP
+//! Flags and `NERVE_*` variables. A harness starts `nerve-center` from its MCP
 //! entry, so every setting is a flag or a variable there; there are no
 //! subcommands.
 
@@ -19,7 +19,7 @@ pub enum McpMode {
 
 #[derive(Debug, Clone, Parser)]
 #[command(
-    name = "nerve-mcp",
+    name = "nerve-center",
     version,
     about = "The Nerve center as an MCP server. Start it from a harness's MCP configuration."
 )]
@@ -89,21 +89,21 @@ impl Args {
     }
 }
 
-/// `$XDG_STATE_HOME/nerve-mcp`, `~/.local/state/nerve-mcp`, or on Windows
-/// `%LOCALAPPDATA%\nerve-mcp`.
+/// `$XDG_STATE_HOME/nerve-center`, `~/.local/state/nerve-center`, or on Windows
+/// `%LOCALAPPDATA%\nerve-center`.
 pub fn default_state_dir() -> PathBuf {
     if cfg!(windows)
         && let Some(d) = std::env::var_os("LOCALAPPDATA")
     {
-        return PathBuf::from(d).join("nerve-mcp");
+        return PathBuf::from(d).join("nerve-center");
     }
     if let Some(d) = std::env::var_os("XDG_STATE_HOME").filter(|d| !d.is_empty()) {
-        return PathBuf::from(d).join("nerve-mcp");
+        return PathBuf::from(d).join("nerve-center");
     }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".local/state/nerve-mcp")
+    home.join(".local/state/nerve-center")
 }
 
 /// Whether an address like `127.0.0.1:7480` or `[::1]:7480` is loopback.
@@ -120,12 +120,12 @@ mod tests {
 
     #[test]
     fn flags_and_defaults() {
-        let a = Args::try_parse_from(["nerve-mcp"]).unwrap();
+        let a = Args::try_parse_from(["nerve-center"]).unwrap();
         assert_eq!(a.mcp, McpMode::Stdio);
         assert_eq!(a.listen, "0.0.0.0:7443");
         assert!(!a.ui_off());
         let a = Args::try_parse_from([
-            "nerve-mcp",
+            "nerve-center",
             "--plain-loopback",
             "--ui",
             "off",
@@ -136,7 +136,7 @@ mod tests {
         assert_eq!(a.public_url(9), "http://127.0.0.1:9");
         assert!(a.ui_off());
         // No subcommands: anything positional is refused.
-        assert!(Args::try_parse_from(["nerve-mcp", "pair"]).is_err());
+        assert!(Args::try_parse_from(["nerve-center", "pair"]).is_err());
         assert!(
             is_loopback("127.0.0.1:7480") && is_loopback("[::1]:1") && !is_loopback("0.0.0.0:7480")
         );

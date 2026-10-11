@@ -1,6 +1,6 @@
-# The harness side: `nerve-mcp`
+# The harness side: `nerve-center`
 
-`nerve-mcp` is the center. A harness (any MCP client) starts it like any MCP
+`nerve-center` is the center. A harness (any MCP client) starts it like any MCP
 server; nodes connect to it as [protocol.md](protocol.md) describes. This page
 is what a harness, and whoever writes its MCP entry, can rely on.
 
@@ -16,7 +16,7 @@ entry:
 
 | Flag | Variable | Default | Meaning |
 |---|---|---|---|
-| `--state-dir` | `NERVE_STATE_DIR` | `$XDG_STATE_HOME/nerve-mcp`, `~/.local/state/nerve-mcp`, `%LOCALAPPDATA%\nerve-mcp` | identity, paired nodes, statistics |
+| `--state-dir` | `NERVE_STATE_DIR` | `$XDG_STATE_HOME/nerve-center`, `~/.local/state/nerve-center`, `%LOCALAPPDATA%\nerve-center` | identity, paired nodes, statistics |
 | `--name` | `NERVE_NAME` | the host name | center name shown to nodes |
 | `--listen` | `NERVE_LISTEN` | `0.0.0.0:7443` | where nodes connect |
 | `--public-url` | `NERVE_PUBLIC_URL` | `https://<host name>:<port>` | the URL put in pairing links |
@@ -32,7 +32,7 @@ entry:
 Example entry:
 
 ```json
-{"mcpServers": {"nerve": {"command": "nerve-mcp", "env": {"NERVE_NAME": "lab"}}}}
+{"mcpServers": {"nerve": {"command": "nerve-center", "env": {"NERVE_NAME": "lab"}}}}
 ```
 
 Listeners beyond loopback use TLS with the center's self-signed certificate;
@@ -41,7 +41,7 @@ plain HTTP on loopback only.
 
 ## 2. One center per state folder
 
-The first `nerve-mcp` on a state folder takes `<state>/center.lock` and owns
+The first `nerve-center` on a state folder takes `<state>/center.lock` and owns
 the center. A second one with `--mcp stdio` finds the lock held and attaches:
 it relays its stdio over `<state>/run/harness.sock` (mode 0600 in a 0700
 folder; the owner also checks the peer's uid) and each harness gets its own
@@ -116,7 +116,7 @@ returns `error timeout: approval pending at <where>` and nothing is run.
 
 ## 7. Web UI
 
-Served by `nerve-mcp` itself at `--ui`. Tabs: overview (alerts, approvals,
+Served by `nerve-center` itself at `--ui`. Tabs: overview (alerts, approvals,
 machines, pairing, sessions), statistics, audit (Allow, Allow as wildcard,
 Deny for commands, only with the node's settings grant; Allow puts the rule
 on the node's `policy.commands.never_ask`, Deny on `deny`, and each takes it

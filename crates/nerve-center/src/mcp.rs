@@ -143,7 +143,7 @@ impl Engine {
             json!({
                 "protocolVersion": version,
                 "capabilities": {"tools": {"listChanged": true}},
-                "serverInfo": {"name": "nerve-mcp", "title": "Nerve", "version": env!("CARGO_PKG_VERSION")},
+                "serverInfo": {"name": "nerve-center", "title": "Nerve", "version": env!("CARGO_PKG_VERSION")},
                 "instructions": INSTRUCTIONS,
             }),
         )

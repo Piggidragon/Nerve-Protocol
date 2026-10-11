@@ -14,7 +14,7 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
   paths, command rules, approvals (answered at the center, locally, or both),
   the settings grant, panic and unlock, and a local audit log
   (`spec/node-local.md`).
-- `nerve-mcp`: the center, run by a harness as an MCP server. It pairs nodes,
+- `nerve-center`: the center, run by a harness as an MCP server. It pairs nodes,
   keeps their links and offers their capabilities as MCP tools. Its web UI
   has a login page (with `--ui-password`) and shows nodes, pending approvals,
   statistics and the settings of nodes that granted write access

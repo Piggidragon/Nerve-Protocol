@@ -6,7 +6,7 @@ and what asks first. Version 0.0.1 is the first pre-release of the rewrite.
 
 Two programs:
 
-- **`nerve-mcp`**, the center. A harness starts it as an MCP server; it pairs
+- **`nerve-center`**, the center. A harness starts it as an MCP server; it pairs
   nodes, keeps their links and offers their capabilities as MCP tools. Its web
   UI (loopback, port 7480 by default) shows nodes, pending approvals,
   statistics and pairing links.
@@ -22,7 +22,7 @@ Rust 1.88 or newer.
 
 ```sh
 cargo build --release
-# target/release/nerve-mcp and target/release/nerve-node
+# target/release/nerve-center and target/release/nerve-node
 ```
 
 Checks:
@@ -52,11 +52,11 @@ CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static" \
 1. Add the center to the harness's MCP configuration:
 
    ```json
-   {"mcpServers": {"nerve": {"command": "nerve-mcp", "env": {"NERVE_NAME": "lab"}}}}
+   {"mcpServers": {"nerve": {"command": "nerve-center", "env": {"NERVE_NAME": "lab"}}}}
    ```
 
    Nodes reach it on port 7443 (TLS with a self-signed certificate that the
-   pairing link pins). `nerve-mcp --help` and [`spec/harness.md`](spec/harness.md)
+   pairing link pins). `nerve-center --help` and [`spec/harness.md`](spec/harness.md)
    list every setting, including MCP over HTTP (`--mcp http`).
 
 2. Open the web UI at `http://127.0.0.1:7480` and make a pairing link.

@@ -20,8 +20,8 @@ report, and `cargo test -p nerve-conformance` runs them:
 
 - `tests/self_test.rs`: the center part against the fake center and the node
   part against the echo node. These check the suite itself.
-- `tests/e2e.rs`: the center part against a real `nerve-mcp`, the node part
-  against a real `nerve-node`, and `nerve-mcp` with `nerve-node` against each
+- `tests/e2e.rs`: the center part against a real `nerve-center`, the node part
+  against a real `nerve-node`, and `nerve-center` with `nerve-node` against each
   other (pairing, link, tools over MCP, approvals, settings, audit).
 
 To check another implementation, call `center_part::run(&pair_link)` with a

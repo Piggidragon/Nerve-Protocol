@@ -552,20 +552,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nerve-conformance"
-version = "0.0.1"
-dependencies = [
- "futures-util",
- "nerve-proto",
- "nerve-transport",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-tungstenite",
-]
-
-[[package]]
-name = "nerve-mcp"
+name = "nerve-center"
 version = "0.0.1"
 dependencies = [
  "clap",
@@ -583,6 +570,19 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "nerve-conformance"
+version = "0.0.1"
+dependencies = [
+ "futures-util",
+ "nerve-proto",
+ "nerve-transport",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

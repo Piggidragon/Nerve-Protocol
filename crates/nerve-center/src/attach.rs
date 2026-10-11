@@ -1,4 +1,4 @@
-//! One center per state folder. The first `nerve-mcp` takes the lock and owns
+//! One center per state folder. The first `nerve-center` takes the lock and owns
 //! the center; a second one started by another harness on the same state
 //! folder attaches to it over `<state>/run/harness.sock` and only relays its
 //! stdio, so both harnesses share the nodes, links and approvals.
@@ -124,7 +124,7 @@ mod unix {
         let path = super::socket_path(state);
         let mut s = UnixStream::connect(&path).await.map_err(|e| {
             format!(
-                "another nerve-mcp holds {} but its harness socket {} does not answer: {e}",
+                "another nerve-center holds {} but its harness socket {} does not answer: {e}",
                 state.display(),
                 path.display()
             )

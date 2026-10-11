@@ -2,7 +2,7 @@
 
 This is the wire protocol between a **node** (a machine that offers
 capabilities) and a **center** (the server harnesses plug into). The
-implementations in this repository are `nerve-node` and `nerve-mcp`. The
+implementations in this repository are `nerve-node` and `nerve-center`. The
 conformance suite in `crates/nerve-conformance` checks the rules below; each
 check names the section it tests.
 
@@ -340,6 +340,6 @@ concurrently.
 
 ## 8. Center side
 
-The center serves harnesses. In 0.0.1 `nerve-mcp` is an MCP server (spec
+The center serves harnesses. In 0.0.1 `nerve-center` is an MCP server (spec
 §[harness.md](harness.md)). It maps capabilities to tools, holds sessions and
 taint, and never stores file contents, command output or secrets.

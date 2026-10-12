@@ -275,9 +275,14 @@ answer. For each call the node takes the center's policy and, in this order:
    folder `%ProgramData%\Microsoft\Windows\Start Menu\Programs\StartUp`,
    Windows PowerShell's home `%SystemRoot%\System32\WindowsPowerShell\v1.0`
    (and its SysWOW64 twin) with the all-users profiles, and the user's
-   `NTUSER.DAT`. Protected paths apply to the file actions and to the
-   working directory of a command, not to what a command reads; in `user`
-   mode a command runs as the user without a sandbox (issue #22).
+   `NTUSER.DAT`. It also holds `%ProgramFiles%\PowerShell` (and
+   `%ProgramFiles(x86)%\PowerShell` where that is set), PowerShell 7's home
+   `$PSHOME` with its profiles and modules as the MSI and winget install it;
+   a PowerShell 7 unpacked from the zip, installed as a .NET tool or into a
+   folder of the user's choice is not covered. Protected paths apply to the
+   file actions and to the working directory of a command, not to what a
+   command reads; in `user` mode a command runs as the user without a
+   sandbox (issue #22).
 
 Every refusal names its reasons in the error and in the audit log.
 

@@ -91,3 +91,4 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
 - An audit log rotation that fails no longer drops the entry: it is written past the 10 MiB bound and the failure is logged once.
 - `exec.signal` is offered only where the policy can allow it: by an allow rule in allowlist mode, and in folder and user mode only with `caps.exec.signal = on`.
 - On Windows the protected list also holds the all-users Startup folder (`%ProgramData%\Microsoft\Windows\Start Menu\Programs\StartUp`) and Windows PowerShell's home with the all-users profiles (`%SystemRoot%\System32\WindowsPowerShell\v1.0` and its SysWOW64 twin).
+- On Windows the protected list also holds PowerShell 7's home with its profiles and modules (`%ProgramFiles%\PowerShell`, and `%ProgramFiles(x86)%\PowerShell` where that is set), where the MSI and winget install it.

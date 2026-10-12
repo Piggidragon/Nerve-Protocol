@@ -192,6 +192,13 @@ const WIN_SYSTEM_ROOT: &[&str] = &[
     "SysWOW64/WindowsPowerShell/v1.0",
 ];
 
+/// Relative to `%ProgramFiles%` (and its x86 twin), likewise.
+const WIN_PROGRAM_FILES: &[&str] = &[
+    // PowerShell 7's home (`$PSHOME`, `PowerShell\7`) and its all-users
+    // modules: it runs the profiles and loads the modules there at every start.
+    "PowerShell",
+];
+
 /// Which platform's lists and path rules a [`Protected`] follows. The node
 /// passes the one it runs on; a test may pass either.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -209,6 +216,8 @@ pub struct WinFolders {
     pub program_data: Vec<PathBuf>,
     /// `%SystemRoot%`, the Windows folder.
     pub system_root: Vec<PathBuf>,
+    /// `%ProgramFiles%`, and `%ProgramFiles(x86)%` where there is one.
+    pub program_files: Vec<PathBuf>,
 }
 
 impl Platform {
@@ -537,6 +546,7 @@ impl Protected {
                 };
                 let mut system = below(&f.program_data, WIN_PROGRAM_DATA);
                 system.extend(below(&f.system_root, WIN_SYSTEM_ROOT));
+                system.extend(below(&f.program_files, WIN_PROGRAM_FILES));
                 (WIN_HOME, system)
             }
         };
@@ -735,6 +745,10 @@ mod tests {
         let folders = WinFolders {
             program_data: vec![PathBuf::from("C:\\ProgramData")],
             system_root: vec![PathBuf::from("C:\\Windows")],
+            program_files: vec![
+                PathBuf::from("C:\\Program Files"),
+                PathBuf::from("C:\\Program Files (x86)"),
+            ],
         };
         Protected::new(
             &Platform::Windows(folders),
@@ -862,6 +876,38 @@ mod tests {
         for path in [
             "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Accessories\\x.lnk",
             "C:\\Windows\\System32\\WindowsPowerShell\\v1.0x\\profile.ps1",
+        ] {
+            assert!(p.check(Path::new(path), true, &[]).is_none(), "{path}");
+        }
+    }
+
+    /// PowerShell 7's home, `%ProgramFiles%\PowerShell\7`: it runs the
+    /// all-users profiles and loads the modules there at every start, so a
+    /// write there plants code in every PowerShell 7 session (code review 2,
+    /// WinFolders had no `%ProgramFiles%`).
+    #[test]
+    fn protects_the_powershell_7_install_folder() {
+        let p = win_prot();
+        for path in [
+            "C:\\Program Files\\PowerShell\\7\\profile.ps1",
+            "C:\\Program Files\\PowerShell\\7\\Microsoft.PowerShell_profile.ps1",
+            "C:\\Program Files\\PowerShell\\7\\Modules\\x\\x.psm1",
+            "C:\\Program Files\\PowerShell\\Modules\\x\\x.psm1",
+            "C:\\Program Files\\PowerShell\\7-preview\\profile.ps1",
+            "c:/program files/powershell/7/PROFILE.PS1",
+            "C:\\Program Files (x86)\\PowerShell\\7\\profile.ps1",
+        ] {
+            for write in [false, true] {
+                assert!(
+                    p.check(Path::new(path), write, &[]).is_some(),
+                    "{path} {write}"
+                );
+            }
+        }
+        for path in [
+            "C:\\Program Files\\Some App\\x.exe",
+            "C:\\Program Files\\PowerShellx\\profile.ps1",
+            "C:\\Program Files (x86)\\Some App\\x.exe",
         ] {
             assert!(p.check(Path::new(path), true, &[]).is_none(), "{path}");
         }

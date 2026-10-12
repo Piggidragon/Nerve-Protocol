@@ -1178,6 +1178,7 @@ mod tests {
         let folders = WinFolders {
             program_data: vec!["C:\\ProgramData".into()],
             system_root: vec!["C:\\Windows".into()],
+            program_files: vec!["C:\\Program Files".into()],
         };
         let prot = Protected::new(
             &Platform::Windows(folders),
@@ -1198,6 +1199,18 @@ mod tests {
             matches!(&d, Decision::Forbidden(m) if m.contains("is protected")),
             "{d:?}"
         );
+        // PowerShell 7's profile and modules, which it runs at every start.
+        for path in [
+            "C:\\Program Files\\PowerShell\\7\\profile.ps1",
+            "C:\\Program Files\\PowerShell\\7\\Modules\\x\\x.psm1",
+        ] {
+            let w = t(path, true);
+            assert_eq!(
+                run(&p, &env, &call(Effect::Write, &w, None)),
+                "refused",
+                "{path}"
+            );
+        }
         for path in [
             "C:\\ProgramData\\ssh\\sshd_config",
             "C:\\Windows\\System32\\config\\SAM",
@@ -1218,6 +1231,8 @@ mod tests {
         // What lies beside them stays the user's.
         let notes = t("C:\\Users\\u\\notes\\a.txt", true);
         assert_eq!(run(&p, &env, &call(Effect::Write, &notes, None)), "allow");
+        let app = t("C:\\Program Files\\Some App\\x.exe", true);
+        assert_eq!(run(&p, &env, &call(Effect::Write, &app, None)), "allow");
         let cwd = t("C:\\Users\\u", false);
         assert_eq!(
             run(&p, &env, &call(Effect::Execute, &cwd, Some("dir"))),

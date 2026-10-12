@@ -91,27 +91,39 @@ pub fn platform() -> Platform {
     }
 }
 
-/// `%ProgramData%` and `%SystemRoot%` as `var` reads them, each with its
-/// usual place as well: a center does not set the node's environment, but an
-/// odd one must not leave `C:\ProgramData\ssh` unprotected.
+/// `%ProgramData%`, `%SystemRoot%` and `%ProgramFiles%` as `var` reads them,
+/// each with its usual place as well: a center does not set the node's
+/// environment, but an odd one must not leave `C:\ProgramData\ssh`
+/// unprotected.
 pub fn windows_folders(var: impl Fn(&str) -> Option<OsString>) -> WinFolders {
     let all = |names: &[&str], usual: &str| -> Vec<PathBuf> {
-        let mut out: Vec<PathBuf> = names
+        let mut out: Vec<PathBuf> = Vec::new();
+        for p in names
             .iter()
             .filter_map(|n| var(n))
             .filter(|v| !v.is_empty())
             .map(PathBuf::from)
             .chain(std::iter::once(PathBuf::from(usual)))
-            .collect();
-        out.dedup_by(|a, b| {
-            a.to_string_lossy()
-                .eq_ignore_ascii_case(&b.to_string_lossy())
-        });
+        {
+            let same = |o: &PathBuf| {
+                o.to_string_lossy()
+                    .eq_ignore_ascii_case(&p.to_string_lossy())
+            };
+            if !out.iter().any(same) {
+                out.push(p);
+            }
+        }
         out
     };
     WinFolders {
         program_data: all(&["ProgramData", "ALLUSERSPROFILE"], "C:\\ProgramData"),
         system_root: all(&["SystemRoot", "windir"], "C:\\Windows"),
+        // A 32-bit process sees the x86 folder as `ProgramFiles` and the
+        // 64-bit one as `ProgramW6432`; both hold a PowerShell 7 of their own.
+        program_files: all(
+            &["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"],
+            "C:\\Program Files",
+        ),
     }
 }
 
@@ -132,6 +144,9 @@ mod tests {
             ("ProgramData", "D:\\ProgramData"),
             ("SystemRoot", "D:\\WINDOWS"),
             ("windir", "D:\\WINDOWS"),
+            ("ProgramFiles", "D:\\Program Files"),
+            ("ProgramW6432", "D:\\Program Files"),
+            ("ProgramFiles(x86)", "D:\\Program Files (x86)"),
         ]));
         assert_eq!(
             f.program_data,
@@ -141,10 +156,32 @@ mod tests {
             f.system_root,
             [PathBuf::from("D:\\WINDOWS"), "C:\\Windows".into()]
         );
+        assert_eq!(
+            f.program_files,
+            [
+                PathBuf::from("D:\\Program Files"),
+                "D:\\Program Files (x86)".into(),
+                "C:\\Program Files".into()
+            ]
+        );
+        // A 32-bit process: each folder once, however often it is named.
+        let f = windows_folders(env(&[
+            ("ProgramFiles", "C:\\Program Files (x86)"),
+            ("ProgramW6432", "C:\\Program Files"),
+            ("ProgramFiles(x86)", "C:\\Program Files (x86)"),
+        ]));
+        assert_eq!(
+            f.program_files,
+            [
+                PathBuf::from("C:\\Program Files (x86)"),
+                "C:\\Program Files".into()
+            ]
+        );
         // An empty or missing environment still protects the usual places.
         let f = windows_folders(env(&[("ProgramData", "")]));
         assert_eq!(f.program_data, [PathBuf::from("C:\\ProgramData")]);
         assert_eq!(f.system_root, [PathBuf::from("C:\\Windows")]);
+        assert_eq!(f.program_files, [PathBuf::from("C:\\Program Files")]);
         let f = windows_folders(env(&[("SystemRoot", "c:\\windows")]));
         assert_eq!(f.system_root, [PathBuf::from("c:\\windows")]);
         assert_eq!(platform() == Platform::Unix, cfg!(not(windows)));

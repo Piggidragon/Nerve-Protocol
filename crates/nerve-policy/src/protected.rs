@@ -1974,7 +1974,11 @@ mod tests {
         let command = format!("type {}node-config", "..\\".repeat(2001));
         let deep = Path::new(&win_deep);
         assert!(win_prot().own_in_command(&command, Some(deep)).is_some());
-        let command = format!("type {}c:{}node-config", "c:".repeat(n), "..\\".repeat(2001));
+        let command = format!(
+            "type {}c:{}node-config",
+            "c:".repeat(n),
+            "..\\".repeat(2001)
+        );
         assert!(win_prot().own_in_command(&command, Some(deep)).is_some());
         let command = format!("type {}.config/nerve", "../".repeat(2000));
         let deep = format!("/home/u{}", "/d".repeat(2000));

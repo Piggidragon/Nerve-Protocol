@@ -12,6 +12,8 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::paths::within;
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
@@ -441,7 +443,7 @@ impl NodeConfig {
     /// Parses and checks `node.toml`; unknown keys are errors.
     pub fn parse(text: &str) -> Result<NodeConfig, String> {
         refuse_proxy_secrets(text)?;
-        let c: NodeConfig = toml::from_str(text).map_err(|e| e.to_string())?;
+        let mut c: NodeConfig = toml::from_str(text).map_err(|e| e.to_string())?;
         c.validate()?;
         Ok(c)
     }
@@ -480,8 +482,9 @@ impl NodeConfig {
         self.centers.iter_mut().find(|c| c.name == name)
     }
 
-    /// The checks serde cannot do.
-    pub fn validate(&self) -> Result<(), String> {
+    /// The checks serde cannot do. Folder paths are put in the form the
+    /// policy keeps ([`CenterPolicy::validate`]).
+    pub fn validate(&mut self) -> Result<(), String> {
         if let Some(n) = &self.node.name
             && !nerve_proto::valid_node_name(n)
         {
@@ -513,14 +516,14 @@ impl NodeConfig {
             }
         }
         let mut names = std::collections::BTreeSet::new();
-        for c in &self.centers {
+        for c in &mut self.centers {
             if !valid_center_name(&c.name) {
                 return Err(format!(
                     "center name {:?}: 1 to 64 characters of a-z, A-Z, 0-9, - and _",
                     c.name
                 ));
             }
-            if !names.insert(c.name.as_str()) {
+            if !names.insert(c.name.clone()) {
                 return Err(format!("two centers are named {:?}", c.name));
             }
             nerve_proto::link::CenterUrl::parse(&c.url)
@@ -573,12 +576,39 @@ pub fn valid_center_name(s: &str) -> bool {
 }
 
 impl CenterPolicy {
-    pub fn validate(&self) -> Result<(), String> {
+    /// Checks the policy and puts its folder paths in the one form the
+    /// policy keeps ([`crate::paths::normal_folder`]): the same place spelled
+    /// twice is then one folder, or refused when the two give it different
+    /// access, so no spelling decides which folder holds a path.
+    pub fn validate(&mut self) -> Result<(), String> {
+        let mut folders: Vec<Folder> = Vec::with_capacity(self.folders.len());
         for f in &self.folders {
             if !Path::new(&f.path).is_absolute() {
                 return Err(format!("folder {:?} is not absolute", f.path));
             }
+            let path = crate::paths::normal_folder(&f.path)?;
+            let same = |g: &&Folder| {
+                let (p, q) = (Path::new(&path), Path::new(&g.path));
+                within(p, q) && within(q, p)
+            };
+            match folders.iter().find(same) {
+                Some(g) if g.access == f.access => {}
+                Some(g) => {
+                    return Err(format!(
+                        "folders {:?} ({}) and {:?} ({}) are the same place with different access; keep one",
+                        g.path,
+                        g.access.to_chmod(),
+                        f.path,
+                        f.access.to_chmod()
+                    ));
+                }
+                None => folders.push(Folder {
+                    path,
+                    access: f.access,
+                }),
+            }
         }
+        self.folders = folders;
         for rule in self.allow.iter().chain(&self.deny) {
             crate::rules::validate(rule)?;
         }
@@ -862,6 +892,52 @@ sudo_allow = ["sudo apt update"]
         let bare = format!("folders = [{{ path = \"{FOLDER}\" }}]");
         let p: CenterPolicy = toml::from_str(&bare).unwrap();
         assert!(p.folders[0].access.is_none());
+    }
+
+    /// Folders are kept in one form, so one place is never two folders
+    /// (security review 3 of PR #19, finding 1).
+    #[cfg(not(windows))]
+    #[test]
+    fn a_folder_list_names_each_place_once_in_one_form() {
+        let folders = |list: &[(&str, &str)]| CenterPolicy {
+            folders: list
+                .iter()
+                .map(|(p, a)| Folder {
+                    path: p.to_string(),
+                    access: Access::parse(a).unwrap(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let mut p = folders(&[("/home/u//proj/./", "rw"), ("/", "r")]);
+        p.validate().unwrap();
+        assert_eq!(p.folders[0].path, "/home/u/proj");
+        assert_eq!(p.folders[1].path, "/");
+        // The same place twice with other flags is refused, with both.
+        let mut p = folders(&[("/home/u/.ssh", "r"), ("/home/u/.ssh/", "rw")]);
+        let e = p.validate().unwrap_err();
+        assert!(
+            e.contains("/home/u/.ssh") && e.contains("same place"),
+            "{e}"
+        );
+        // With the same flags it is one folder.
+        let mut p = folders(&[("/home/u/proj", "r"), ("/home/u/./proj", "r")]);
+        p.validate().unwrap();
+        assert_eq!(p.folders.len(), 1);
+        // `..` could name another place once a symlink is on the way.
+        let mut p = folders(&[("/home/u/x/../.ssh", "rw")]);
+        assert!(p.validate().unwrap_err().contains(".."));
+        // The owner's file is held to the same.
+        let twice = center(
+            "folders = [{ path = \"/a\", access = \"r\" }, { path = \"/a/\", access = \"rw\" }]",
+        );
+        assert!(
+            NodeConfig::parse(&twice)
+                .unwrap_err()
+                .contains("same place")
+        );
+        let tidy = NodeConfig::parse(&center("folders = [{ path = \"/a//b/\", access = \"r\" }]"));
+        assert_eq!(tidy.unwrap().centers[0].policy.folders[0].path, "/a/b");
     }
 
     #[test]

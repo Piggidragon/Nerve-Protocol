@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use nerve_proto::Effect;
 
 use crate::config::{CapSetting, CenterPolicy, Folder, Mode};
-use crate::paths::{to_wire, within};
+use crate::paths::{depth, to_wire, within};
 use crate::protected::Protected;
 use crate::rules::{RuleSet, command_matches};
 
@@ -137,11 +137,12 @@ fn plain_command(line: &str) -> bool {
 
 fn inside_folder<'f>(folders: &'f [Folder], path: &Path) -> Option<&'f Folder> {
     // The deepest folder wins, so a read-only folder inside a read-write one
-    // stays read-only.
+    // stays read-only. Deepest by components, as `within` counts them: a
+    // longer spelling of the same place (`/a/b/`) is no deeper.
     folders
         .iter()
         .filter(|f| within(path, Path::new(&f.path)))
-        .max_by_key(|f| f.path.len())
+        .max_by_key(|f| depth(Path::new(&f.path)))
 }
 
 /// Whether the folders let `path` be read (or written): the deepest folder
@@ -414,6 +415,25 @@ mod tests {
 
     fn acc(s: &str) -> Access {
         Access::parse(s).unwrap()
+    }
+
+    /// The deepest folder is the one with the most components, not the
+    /// longest spelling (security review 3 of PR #19, finding 1).
+    #[test]
+    fn the_deepest_folder_goes_by_components_not_by_length() {
+        let folders = [
+            Folder {
+                path: "/w/a///".into(),
+                access: acc("rw"),
+            },
+            Folder {
+                path: "/w/a/b".into(),
+                access: acc("r"),
+            },
+        ];
+        assert!(!folder_reach(&folders, Path::new("/w/a/b/x"), true));
+        assert!(folder_reach(&folders, Path::new("/w/a/b/x"), false));
+        assert!(folder_reach(&folders, Path::new("/w/a/c"), true));
     }
 
     const MODES: [Mode; 3] = [Mode::Allowlist, Mode::Folder, Mode::User];

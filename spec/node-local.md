@@ -102,7 +102,9 @@ sudo_allow = ["sudo apt update"]                       # sudo commands, every mo
 
 Unknown keys are refused, and so is a rule that does not parse. Two centers
 with one name are refused. Folder paths are absolute in the platform's own
-form; on the wire they travel as `/c/Users/...` on Windows (protocol §7.2).
+form, kept without a doubled or trailing separator or a `.` part; a path with
+`..`, and one place named twice with different access, are refused. On the
+wire they travel as `/c/Users/...` on Windows (protocol §7.2).
 
 ### Commands
 
@@ -282,7 +284,10 @@ answer. For each call the node takes the center's policy and, in this order:
    folder of the user's choice is not covered. Protected paths apply to the
    file actions and to the working directory of a command, not to what a
    command reads; in `user` mode a command runs as the user without a
-   sandbox (issue #22).
+   sandbox (issue #22). A center's folder at or inside a protected entry is
+   judged by the access the owner's folders give that place, and may set no
+   flag the deepest of them lacks; the spellings of one place
+   (`/home/u/.ssh/`, `/home/u/.ssh`) are compared by path, not as text.
 
 Every refusal names its reasons in the error and in the audit log.
 

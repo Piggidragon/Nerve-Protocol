@@ -713,6 +713,28 @@ impl Protected {
         if named { None } else { Some(entry) }
     }
 
+    /// Whether `path` is `base` or inside it, by this list's path rules.
+    pub fn holds(&self, base: &Path, path: &Path) -> bool {
+        self.inside(&fold(path), &fold(base))
+    }
+
+    /// The deepest of `folders` that holds `path`, by this list's path rules
+    /// and by components, as the decision picks it (`decide::inside_folder`).
+    pub fn deepest<'f>(&self, folders: &'f [Folder], path: &Path) -> Option<&'f Folder> {
+        let depth = |f: &Folder| {
+            let p = fold(Path::new(&f.path));
+            if self.windows {
+                win::depth(&p.to_string_lossy())
+            } else {
+                p.components().count()
+            }
+        };
+        folders
+            .iter()
+            .filter(|f| self.holds(Path::new(&f.path), path))
+            .max_by_key(|f| depth(f))
+    }
+
     /// The tool-config component (`.git`, `.envrc`, ...) a write to `path` touches.
     pub fn tool_config(&self, path: &Path) -> Option<&'static str> {
         let windows = self.windows;

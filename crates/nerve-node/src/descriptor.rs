@@ -398,18 +398,31 @@ fn exposure(entry: &CenterEntry, id: &str) -> Option<Exposure> {
 /// checked), and for `exec.run` also when the sudo allow list has an entry,
 /// since a sudo command runs by that list alone. In `folder` and `user` mode
 /// the allow rules do not count, so the action is offered, except `exec` in
-/// `folder` mode on a machine that cannot confine a command. An action set to
-/// off stays, and fails `disabled`.
-fn offered(policy: &CenterPolicy, view: View, cap: &str, action: &str) -> bool {
+/// `folder` mode on a machine that cannot confine a command, and an action
+/// that senses or actuates (`exec.signal`), which no mode allows unless the
+/// owner set it to on. An action set to off stays, and fails `disabled`.
+fn offered(policy: &CenterPolicy, view: View, cap: &str, action: &str, effect: Effect) -> bool {
     let View {
         mode,
         by_rules,
         confined,
     } = view;
-    match policy.cap_setting(cap, Some(action)) {
+    let setting = policy.cap_setting(cap, Some(action));
+    match setting {
         Some(CapSetting::Hidden) => return false,
         Some(CapSetting::Off) => return true,
         _ => {}
+    }
+    // Only the policy-governed capabilities are decided by rules and modes;
+    // `settings.pause` actuates as well and is no policy's business.
+    let governed = matches!(cap, "fs" | "exec");
+    if by_rules
+        && governed
+        && mode != Mode::Allowlist
+        && matches!(effect, Effect::Sense | Effect::Actuate)
+        && setting != Some(CapSetting::On)
+    {
+        return false;
     }
     // Folder mode refuses every command it cannot confine, so it offers none;
     // a sudo command still runs by the sudo allow list.
@@ -421,8 +434,7 @@ fn offered(policy: &CenterPolicy, view: View, cap: &str, action: &str) -> bool {
     {
         return false;
     }
-    // Only the policy-governed capabilities are decided by rules.
-    if !by_rules || mode != Mode::Allowlist || !matches!(cap, "fs" | "exec") {
+    if !by_rules || mode != Mode::Allowlist || !governed {
         return true;
     }
     rules::offers(&policy.allow, cap, action)
@@ -489,7 +501,7 @@ fn build(
     for c in &mut caps {
         let id = c.id.clone();
         c.actions
-            .retain(|a, _| offered(&entry.policy, view, &id, a));
+            .retain(|a, decl| offered(&entry.policy, view, &id, a, decl.effect));
     }
     caps.retain(|c| !(matches!(c.id.as_str(), "fs" | "exec") && c.actions.is_empty()));
     let name = node_name(cfg);
@@ -656,7 +668,8 @@ mod tests {
         for mode in [Mode::Folder, Mode::User] {
             e.policy.mode = mode;
             let d = for_center(&cfg, &e, 0, true);
-            assert_eq!(actions(&d, "exec"), ["run", "signal"]);
+            // `signal` actuates, which no mode allows by itself.
+            assert_eq!(actions(&d, "exec"), ["run"]);
             assert_eq!(actions(&d, "fs").len(), 6);
         }
         // A folder or user mode that ran out is allowlist again.
@@ -679,19 +692,74 @@ mod tests {
         assert_eq!(actions(&d, "fs").len(), 6);
         // Confined, as on Linux with Landlock: offered.
         let d = for_center(&cfg, &e, 0, true);
-        assert_eq!(actions(&d, "exec"), ["run", "signal"]);
+        assert_eq!(actions(&d, "exec"), ["run"]);
         // User mode runs commands unconfined anyway.
         e.policy.mode = Mode::User;
         let d = for_center(&cfg, &e, 0, false);
-        assert_eq!(actions(&d, "exec"), ["run", "signal"]);
+        assert_eq!(actions(&d, "exec"), ["run"]);
         // A sudo entry runs by its list in every mode.
         e.policy.mode = Mode::Folder;
         e.policy.sudo_allow = rules(&["sudo apt *"]);
         let d = for_center(&cfg, &e, 0, false);
-        assert_eq!(actions(&d, "exec"), ["run", "signal"]);
+        assert_eq!(actions(&d, "exec"), ["run"]);
         // A call still reaches the policy, which refuses and audits it.
         e.policy.sudo_allow.clear();
         assert!(for_call(&cfg, &e, 0).capability("exec").is_some());
+    }
+
+    /// `exec.signal` actuates: the descriptor offers it exactly where the
+    /// policy lets a signal through, in folder and user mode only with
+    /// `caps.exec.signal = on`, in allowlist mode by an allow rule (code
+    /// review 2 of PR #19, finding 4).
+    #[test]
+    fn exec_signal_is_offered_where_the_policy_allows_it() {
+        use nerve_policy::protected::{Platform, Protected};
+        use nerve_policy::{Call, Decision, Env, decide};
+        let home = std::path::Path::new("/h");
+        let prot = Protected::new(&Platform::Unix, home, &[], &Default::default());
+        let env = Env {
+            home,
+            protected: &prot,
+            confined: true,
+            sudo: false,
+        };
+        let call = Call {
+            cap: "exec",
+            action: "signal",
+            effect: Effect::Actuate,
+            targets: &[],
+            command: None,
+            cwd: None,
+            now_ms: 0,
+        };
+        let cfg = NodeConfig::default();
+        let mut offered = Vec::new();
+        for mode in [Mode::Allowlist, Mode::Folder, Mode::User] {
+            for on in [false, true] {
+                for allow in [&[][..], &["exec.signal"][..], &["exec"][..]] {
+                    let mut e = entry();
+                    e.policy.mode = mode;
+                    e.policy.allow = rules(allow);
+                    if on {
+                        e.policy.caps.insert("exec.signal".into(), CapSetting::On);
+                    }
+                    let shown = actions(&for_center(&cfg, &e, 0, true), "exec")
+                        .contains(&"signal".to_string());
+                    let allowed = decide(&e.policy, &env, &call) == Decision::Allow;
+                    assert_eq!(shown, allowed, "{mode:?} on={on} allow={allow:?}");
+                    if shown && mode != Mode::Allowlist {
+                        offered.push(mode);
+                    }
+                }
+            }
+        }
+        // Both modes offer it once the owner set it on.
+        assert!(offered.contains(&Mode::Folder) && offered.contains(&Mode::User));
+        // `settings.pause` actuates too, and is not the policy's.
+        let mut e = entry();
+        e.settings = SettingsGrant::Write;
+        e.policy.mode = Mode::User;
+        assert!(actions(&for_center(&cfg, &e, 0, true), "settings").contains(&"pause".to_string()));
     }
 
     #[test]

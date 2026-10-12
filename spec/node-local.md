@@ -286,7 +286,9 @@ without a `:<pattern>`. The pattern is not looked at there; a rule may allow
 only some paths or commands, and each call is still decided as above.
 `exec.run` is also shown when `sudo_allow` has an entry, since a sudo command
 runs by that list alone. In `folder` and `user` mode the actions are shown as
-before and allow rules do not matter; deny rules never hide an action.
+before and allow rules do not matter, except a sense or actuate action such
+as `exec.signal`, which is shown there only when the owner set it to `on`;
+deny rules never hide an action.
 `off` actions stay listed (exposure `off`), `hidden` ones and the actions
 left out here are absent, and a capability with no action left is absent.
 `settings` and `audit` follow their own rules. The descriptor's `rev` follows

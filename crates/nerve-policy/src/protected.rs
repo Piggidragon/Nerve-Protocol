@@ -2,7 +2,9 @@
 //!
 //! They are refused in every mode, also in `user`, unless the
 //! owner releases them by name: a folder grant at or inside the protected path, or an
-//! entry in `protected.allow`. A grant of a whole home does not release `~/.ssh`.
+//! entry in `protected.allow`. A folder releases only what its flags give: `r`
+//! for reads, `w` for writes, `x` for commands run there. A grant of a whole
+//! home does not release `~/.ssh`.
 //! Matching ignores case, so a case-insensitive filesystem cannot slip `~/.SSH` past.
 //!
 //! The node's own folders (its config, keys, state and audit log) are refused
@@ -14,7 +16,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::config::{Folder, ProtectedOptions};
+use crate::config::{Access, Folder, ProtectedOptions};
 use crate::paths::{resolve, win};
 
 /// Relative to the home directory.
@@ -692,9 +694,27 @@ impl Protected {
         })
     }
 
-    /// The protected entry `path` falls in, unless a folder names it. The
-    /// node's own folders are never released.
+    /// The protected entry `path` falls in, unless a folder releases it for
+    /// a read (`r`) or a write (`w`) of `path`. The node's own folders are
+    /// never released.
     pub fn check(&self, path: &Path, write: bool, folders: &[Folder]) -> Option<&Path> {
+        let needs = |a: Access| if write { a.write } else { a.read };
+        self.check_for(path, write, folders, needs)
+    }
+
+    /// [`Protected::check`] for the working directory of a command: a
+    /// folder releases it only with `x`.
+    pub fn check_run(&self, path: &Path, folders: &[Folder]) -> Option<&Path> {
+        self.check_for(path, false, folders, |a| a.execute)
+    }
+
+    fn check_for(
+        &self,
+        path: &Path,
+        write: bool,
+        folders: &[Folder],
+        needs: impl Fn(Access) -> bool,
+    ) -> Option<&Path> {
         if let Some(own) = self.own(path) {
             return Some(own);
         }
@@ -705,12 +725,49 @@ impl Protected {
             .iter()
             .find(|e| self.inside(&folded, e))
             .or_else(|| write_only.find(|e| self.inside(&folded, e)))?;
-        // Granted by name: a folder at or inside the protected entry that holds `path`.
-        let named = folders.iter().any(|g| {
-            let gf = fold(Path::new(&g.path));
-            self.inside(&gf, entry) && self.inside(&folded, &gf)
-        });
-        if named { None } else { Some(entry) }
+        // Released by name and by flag: the deepest folder that holds `path`
+        // lies at or inside the protected entry and gives what the call
+        // needs. A folder with `r` there releases reads only, and the rest
+        // of the place stays protected in every mode, `user` too.
+        let released = self
+            .deepest(folders, path)
+            .is_some_and(|g| self.holds(entry, Path::new(&g.path)) && needs(g.access));
+        if released { None } else { Some(entry) }
+    }
+
+    /// Where `folder` really is: its path resolved through the links on it.
+    /// Landlock follows a link in a rule's path, so a folder that is, or
+    /// passes through, a link into a protected entry would give a command
+    /// that entry. Such a folder is refused (`Err`, with the reason) unless
+    /// `folders` release the place it leads to for each flag it sets, by
+    /// name, as [`Protected::check`] judges a call there. A folder that
+    /// does not exist yet is judged by the part of it that does; a dangling
+    /// link, or a path that cannot be resolved, is refused. Only a Unix node
+    /// resolves: Landlock is Linux's.
+    pub fn real_folder(&self, folder: &Folder, folders: &[Folder]) -> Result<PathBuf, String> {
+        let path = Path::new(&folder.path);
+        if self.windows || !cfg!(unix) {
+            return Ok(path.to_path_buf());
+        }
+        let real =
+            resolve(path).map_err(|e| format!("{} cannot be resolved: {e}", path.display()))?;
+        let a = folder.access;
+        let unreleased = [
+            ("r", a.read, self.check(&real, false, folders)),
+            ("w", a.write, self.check(&real, true, folders)),
+            ("x", a.execute, self.check_run(&real, folders)),
+        ]
+        .into_iter()
+        .find_map(|(flag, set, entry)| entry.filter(|_| set).map(|e| (flag, e)));
+        match unreleased {
+            Some((flag, entry)) => Err(format!(
+                "{} leads to {}, which is protected ({}) and not released there with {flag}",
+                path.display(),
+                real.display(),
+                entry.display()
+            )),
+            None => Ok(real),
+        }
     }
 
     /// Whether `path` is `base` or inside it, by this list's path rules.
@@ -951,6 +1008,43 @@ mod tests {
                 .is_none()
         );
         assert!(p.check(Path::new("/home/u/secret/x"), false, &[]).is_some());
+    }
+
+    /// A folder at a protected entry releases it only for what its flags
+    /// give: `r` on `~/.ssh` lets a call read there, not write
+    /// `authorized_keys`, and the deepest folder decides for what it holds.
+    #[test]
+    fn a_release_gives_only_the_access_of_its_folder() {
+        let p = prot();
+        let with = |path: &str, access: &str| Folder {
+            path: path.into(),
+            access: Access::parse(access).unwrap(),
+        };
+        let keys = Path::new("/home/u/.ssh/authorized_keys");
+        let ro = [with("/home/u/.ssh", "r")];
+        assert!(p.check(keys, false, &ro).is_none());
+        assert!(p.check(keys, true, &ro).is_some());
+        let wo = [with("/home/u/.ssh", "w")];
+        assert!(p.check(keys, true, &wo).is_none());
+        assert!(p.check(keys, false, &wo).is_some());
+        assert!(p.check(keys, true, &[folder("/home/u/.ssh")]).is_none());
+        let nested = [folder("/home/u/.ssh"), with("/home/u/.ssh/keep", "r")];
+        assert!(
+            p.check(Path::new("/home/u/.ssh/keep/x"), true, &nested)
+                .is_some()
+        );
+        assert!(p.check(keys, true, &nested).is_none());
+        // A folder around the entry gives it nothing, whatever its flags.
+        let around = [folder("/home/u"), with("/home/u/.ssh", "r")];
+        assert!(p.check(keys, true, &around).is_some());
+        // A command there needs `x`.
+        let ssh = Path::new("/home/u/.ssh");
+        assert!(p.check_run(ssh, &[folder("/home/u/.ssh")]).is_some());
+        assert!(p.check_run(ssh, &[with("/home/u/.ssh", "x")]).is_none());
+        assert!(
+            p.check_run(Path::new("/home/u/proj"), &[with("/home/u/.ssh", "r")])
+                .is_none()
+        );
     }
 
     #[test]

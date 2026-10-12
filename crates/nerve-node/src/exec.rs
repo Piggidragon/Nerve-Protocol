@@ -14,8 +14,9 @@ use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
-use nerve_policy::config::CenterPolicy;
+use nerve_policy::config::{Access, CenterPolicy, Folder};
 use nerve_policy::paths::{to_wire, within};
+use nerve_policy::protected::{Platform, Protected};
 use nerve_policy::{Target, protected::expand};
 use nerve_proto::rpc::params;
 use nerve_proto::{ErrorCode, RpcError};
@@ -162,30 +163,49 @@ fn decode(bytes: &[u8], cut: bool) -> String {
 /// files there can be read by name. The node's own folders
 /// (`own`: its config, keys and state) are in none of these sets, whatever
 /// the folders say ([`leave_out`]).
+///
+/// Each folder is resolved again here, since it may have become a link
+/// after it was added and Landlock follows a link in a rule's path: one
+/// that now leads into a protected entry the folders do not release with
+/// its flags is left out and the reason logged (`Protected::real_folder`).
+/// The others go in by their real path, the place that was judged.
 pub fn landlock_spec(policy: &CenterPolicy, home: &Path, own: &[PathBuf]) -> LandlockSpec {
-    let folders = |f: &dyn Fn(&nerve_policy::config::Folder) -> bool| -> Vec<PathBuf> {
-        policy
-            .folders
-            .iter()
-            .filter(|x| f(x))
-            .filter_map(|x| expand(home, &x.path))
+    // Landlock is Linux's, so the list is the Unix one.
+    let protected = Protected::new(&Platform::Unix, home, own, &policy.protected);
+    let real: Vec<(Access, PathBuf)> = policy
+        .folders
+        .iter()
+        .filter_map(|x| {
+            let folder = Folder {
+                path: expand(home, &x.path)?.display().to_string(),
+                access: x.access,
+            };
+            match protected.real_folder(&folder, &policy.folders) {
+                Ok(path) => Some((x.access, path)),
+                Err(why) => {
+                    tracing::warn!("folder {} left out of the command's sandbox: {why}", x.path);
+                    None
+                }
+            }
+        })
+        .collect();
+    let folders = |f: &dyn Fn(Access) -> bool| -> Vec<PathBuf> {
+        real.iter()
+            .filter(|(a, _)| f(*a))
+            .map(|(_, p)| p.clone())
             .collect()
     };
     LandlockSpec {
         read: leave_out(
-            &[nerve_sandbox::system_dirs(), folders(&|x| x.access.read)].concat(),
+            &[nerve_sandbox::system_dirs(), folders(&|a| a.read)].concat(),
             own,
         ),
         write: leave_out(
-            &[
-                nerve_sandbox::system_writable(),
-                folders(&|x| x.access.write),
-            ]
-            .concat(),
+            &[nerve_sandbox::system_writable(), folders(&|a| a.write)].concat(),
             own,
         ),
         exec: leave_out(
-            &[nerve_sandbox::system_dirs(), folders(&|x| x.access.execute)].concat(),
+            &[nerve_sandbox::system_dirs(), folders(&|a| a.execute)].concat(),
             own,
         ),
     }
@@ -889,6 +909,53 @@ mod tests {
             assert!(set.contains(&w.join("a")), "{set:?}");
             assert!(!set.iter().any(|p| own[0].starts_with(p)), "{set:?}");
         }
+    }
+
+    /// A folder that is, or since became, a link into a protected entry is
+    /// left out of every set, unless the folders release that place with its
+    /// flags. The protected entry is the `.ssh` of a home in a temp dir.
+    #[test]
+    fn leaves_a_link_into_a_protected_entry_out() {
+        let d = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(d.path()).unwrap().join("home");
+        let ssh = home.join(".ssh");
+        let work = home.join("work");
+        std::fs::create_dir_all(&ssh).unwrap();
+        std::fs::create_dir_all(work.join("plain")).unwrap();
+        std::os::unix::fs::symlink(&ssh, work.join("link")).unwrap();
+        let folder = |p: &Path, access: &str| nerve_policy::config::Folder {
+            path: p.display().to_string(),
+            access: Access::parse(access).unwrap(),
+        };
+        let mut policy = CenterPolicy {
+            folders: vec![
+                folder(&work.join("link"), "rwx"),
+                folder(&work.join("plain"), "rwx"),
+            ],
+            ..Default::default()
+        };
+        let reaches = |spec: &LandlockSpec, p: &Path| {
+            [&spec.read, &spec.write, &spec.exec]
+                .iter()
+                .any(|set| set.iter().any(|s| s.starts_with(p)))
+        };
+        let spec = landlock_spec(&policy, &home, &[]);
+        assert!(!reaches(&spec, &ssh), "{spec:?}");
+        assert!(!reaches(&spec, &work.join("link")), "{spec:?}");
+        for set in [&spec.read, &spec.write, &spec.exec] {
+            assert!(set.contains(&work.join("plain")), "{set:?}");
+        }
+        // The plain folder becomes a link after it was added.
+        std::fs::remove_dir(work.join("plain")).unwrap();
+        std::os::unix::fs::symlink(&ssh, work.join("plain")).unwrap();
+        let spec = landlock_spec(&policy, &home, &[]);
+        assert!(!reaches(&spec, &ssh), "{spec:?}");
+        assert!(!reaches(&spec, &work.join("plain")), "{spec:?}");
+        // The owner released `.ssh` for reading: a link there reads it.
+        policy.folders = vec![folder(&ssh, "r"), folder(&work.join("link"), "r")];
+        let spec = landlock_spec(&policy, &home, &[]);
+        assert!(spec.read.contains(&ssh), "{spec:?}");
+        assert!(!spec.write.iter().any(|s| s.starts_with(&ssh)), "{spec:?}");
     }
 
     /// Every combination of the three flags puts a folder in exactly the

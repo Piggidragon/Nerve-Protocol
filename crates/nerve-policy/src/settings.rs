@@ -492,6 +492,27 @@ fn client_only(
             to_wire(entry)
         ));
     }
+    // Landlock follows a link, so a folder is also judged where it really
+    // leads: a new or wider one that is, or passes through, a link into a
+    // protected entry needs the owner's folders to release that place with
+    // its flags. A folder the old document had with the same or more
+    // access changes nothing here; one that became a link since is left
+    // out of the command's sandbox (`exec::landlock_spec`).
+    for f in &n.folders {
+        let kept = o
+            .folders
+            .iter()
+            .any(|g| g.path == f.path && !widens(g.access, f.access));
+        if kept {
+            continue;
+        }
+        if let Err(why) = prot.real_folder(f, &o.folders) {
+            return Err(format!(
+                "policy.folders {}: {why}; only the owner can release protected paths",
+                f.path
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1127,6 +1148,51 @@ mod tests {
         // What does not validate is not taken.
         std::fs::write(s.path(), "[limits]\nmax_running = 0\n").unwrap();
         assert!(matches!(s.accept(), Err(SetError::Invalid(_))));
+    }
+
+    /// A folder that is a link into a protected entry, or passes through
+    /// one, is judged where it leads, since Landlock follows the link: a
+    /// center may add it only where the owner's folders release that place
+    /// with its flags. The protected entry is the `.ssh` of a home in a temp
+    /// dir.
+    #[cfg(unix)]
+    #[test]
+    fn a_center_cannot_reach_a_protected_path_through_a_link() {
+        let d = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(d.path()).unwrap().join("home");
+        let ssh = home.join(".ssh");
+        let work = home.join("work");
+        std::fs::create_dir_all(&ssh).unwrap();
+        std::fs::create_dir_all(work.join("plain")).unwrap();
+        std::os::unix::fs::symlink(&ssh, work.join("link")).unwrap();
+        let at = |p: &Path| p.display().to_string();
+        let prot =
+            |o: &ProtectedOptions| Protected::new(&crate::protected::Platform::Unix, &home, &[], o);
+        let mut s = owner_folders(d.path(), &[]);
+        let refused = |s: &mut SettingsStore, path: &Path, access: &str| {
+            let new = with_folders(s, json!([{"path": at(path), "access": access}]));
+            let e = s.set_center_document("home", new, s.version(), |_| false, prot);
+            matches!(&e, Err(SetError::Forbidden(m))
+                if m.contains("policy.folders") && m.contains(&at(&ssh)))
+        };
+        assert!(refused(&mut s, &work.join("link"), "rw"));
+        assert!(refused(&mut s, &work.join("link"), "r"));
+        assert!(refused(&mut s, &work.join("link/not-yet"), "x"));
+        assert!(!refused(&mut s, &work.join("plain"), "rwx"));
+        // The owner released `.ssh` for reading: a link there may read, and
+        // no more.
+        s.update(|c| {
+            c.center_mut("home").unwrap().policy.folders = vec![folder(&at(&ssh), "r")];
+            Ok(())
+        })
+        .unwrap();
+        let owner = json!({"path": at(&ssh), "access": "r"});
+        for (access, ok) in [("r", true), ("rw", false), ("rx", false)] {
+            let link = json!({"path": at(&work.join("link")), "access": access});
+            let new = with_folders(&s, json!([owner.clone(), link]));
+            let e = s.set_center_document("home", new, s.version(), |_| false, prot);
+            assert_eq!(e.is_ok(), ok, "{access}: {e:?}");
+        }
     }
 
     #[test]

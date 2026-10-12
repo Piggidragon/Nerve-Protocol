@@ -288,6 +288,13 @@ answer. For each call the node takes the center's policy and, in this order:
    judged by the access the owner's folders give that place, and may set no
    flag the deepest of them lacks; the spellings of one place
    (`/home/u/.ssh/`, `/home/u/.ssh`) are compared by path, not as text.
+   A folder releases a protected entry only for the access the call needs
+   there, in every mode: a read needs `r`, a write `w`, a command run in it
+   `x`, so an owner's `~/.ssh` with `r` lets no write through in `user`
+   mode. A center's folder that is, or passes through, a link into a
+   protected entry is refused unless the owner's folders release the place
+   it leads to with its flags, and a folder that has become such a link
+   since is left out of a command's Landlock rules.
 
 Every refusal names its reasons in the error and in the audit log.
 

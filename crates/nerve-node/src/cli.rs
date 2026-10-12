@@ -1405,7 +1405,7 @@ fn audit_line(v: &Value) -> String {
             s("reason")
         );
     }
-    format!(
+    let line = format!(
         "{}  {}  {}.{}  {}  {}",
         s("ts"),
         s("center"),
@@ -1413,7 +1413,11 @@ fn audit_line(v: &Value) -> String {
         s("action"),
         s("target"),
         s("decision")
-    )
+    );
+    match v["reason"].as_str() {
+        Some(reason) => format!("{line}: {reason}"),
+        None => line,
+    }
 }
 
 /// `audit`: the log through [`AuditLog::lines`], the rotated file first.

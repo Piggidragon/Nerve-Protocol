@@ -930,7 +930,7 @@ impl Link {
             };
             nerve_policy::decide(&entry.policy, &env, &call)
         };
-        let audit = |decision: &str, code: Option<&str>| {
+        let audit = |decision: &str, code: Option<&str>, reason: Option<&str>| {
             self.shared.audit(&Entry {
                 ts: crate::now_ms(),
                 center: self.name.clone(),
@@ -940,19 +940,20 @@ impl Link {
                 decision: decision.into(),
                 code: code.map(Into::into),
                 session: inv.ctx.session.clone(),
+                reason: reason.map(Into::into),
             })
         };
         match decision {
             Decision::Allow => {
-                audit("allowed", None);
+                audit("allowed", None, None);
                 Ok(())
             }
             Decision::Disabled(why) => {
-                audit("forbidden", Some("disabled"));
+                audit("forbidden", Some("disabled"), Some(&why));
                 Err(RpcError::new(ErrorCode::Disabled, why))
             }
             Decision::Forbidden(why) => {
-                audit("forbidden", Some("forbidden"));
+                audit("forbidden", Some("forbidden"), Some(&why));
                 Err(RpcError::forbidden(why))
             }
         }

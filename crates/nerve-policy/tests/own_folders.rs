@@ -229,3 +229,40 @@ fn a_windows_command_line_reaches_no_own_folder() {
     let d = decide(&p, &env, &run("Get-Content ..\\notes\\a.txt", &proj));
     assert_eq!(d, Decision::Allow);
 }
+
+/// A Windows node checks a long command line of drive letters (`a:a:…`)
+/// at once, and refuses one past the length it checks before it looks for
+/// its own folders, with no grant at all (code review 3 of PR #19,
+/// finding 1).
+#[test]
+fn a_long_windows_command_line_is_checked_at_once() {
+    let own = [PathBuf::from("C:\\Users\\u\\nerve-test\\node-config")];
+    let prot = Protected::new(
+        &Platform::Windows(WinFolders::default()),
+        Path::new("C:\\Users\\u"),
+        &own,
+        &ProtectedOptions::default(),
+    );
+    let env = Env {
+        home: Path::new("C:\\Users\\u"),
+        protected: &prot,
+        confined: true,
+        sudo: false,
+    };
+    let proj = at("C:\\Users\\u\\nerve-test\\proj", false);
+    let open = wide_open(Mode::User);
+    let d = decide(&open, &env, &run(&"a:".repeat(16 * 1024), &proj));
+    assert_eq!(d, Decision::Allow);
+    let named = format!(
+        "{}c:/users/u/nerve-test/node-config/x",
+        "a:".repeat(16 * 1024)
+    );
+    assert!(own_refusal(&decide(&open, &env, &run(&named, &proj))));
+    for p in [CenterPolicy::default(), open] {
+        let d = decide(&p, &env, &run(&"a:".repeat(64 * 1024), &proj));
+        assert!(
+            matches!(&d, Decision::Forbidden(why) if why.contains("longer than")),
+            "{d:?}"
+        );
+    }
+}

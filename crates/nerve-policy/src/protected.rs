@@ -309,6 +309,7 @@ fn admin_shares(s: &str) -> String {
 /// 8.3 short name (`NODE-S~1`, a `~` and a digit) may stand for any name,
 /// since the node does not know which short name the file system gave.
 fn segment_matches(pattern: &str, name: &str, windows: bool) -> bool {
+    work(pattern.len());
     let short = |p: &str| {
         p.char_indices()
             .any(|(at, c)| c == '~' && p[at + 1..].starts_with(|d: char| d.is_ascii_digit()))
@@ -322,6 +323,21 @@ fn segment_matches(pattern: &str, name: &str, windows: bool) -> bool {
     glob(pattern, name)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The characters the own-folder check looked at, so a test can tell
+    /// that the work grows with the line, not with its square.
+    static WORK: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn work(n: usize) {
+    WORK.with(|w| w.set(w.get() + n));
+}
+
+#[cfg(not(test))]
+fn work(_: usize) {}
+
 /// One piece of a wildcard pattern.
 enum Piece {
     Any,
@@ -334,45 +350,42 @@ enum Piece {
 /// "not", and ranges) and literal characters, in time linear in both for
 /// each `*`, so a long line from the center cannot make it slow.
 fn glob(pattern: &str, name: &str) -> bool {
+    glob_closed(pattern, name, pattern.rfind(']'))
+}
+
+/// [`glob`], told where the last `]` of `pattern` is (a byte index), so a
+/// `[` that nothing closes is known as plain at once. Every piece but `*`
+/// takes one character of `name`, so the pattern is read only as far as
+/// `name` is long: the own-folder check tries the tail of one long word
+/// from each drive letter in it, and each such try reads no more than the
+/// start of its tail.
+fn glob_closed(pattern: &str, name: &str, last_close: Option<usize>) -> bool {
+    let name: Vec<char> = name.chars().collect();
     let mut pieces = Vec::new();
-    let chars: Vec<char> = pattern.chars().collect();
+    let mut single = 0;
     let mut i = 0;
-    while i < chars.len() {
-        match chars[i] {
+    while let Some(c) = pattern[i..].chars().next() {
+        work(1);
+        if c != '*' {
+            if single == name.len() {
+                return false;
+            }
+            single += 1;
+        }
+        i += c.len_utf8();
+        match c {
             '*' => pieces.push(Piece::Any),
             '?' => pieces.push(Piece::One),
-            '[' if chars[i + 1..].contains(&']') => {
-                let mut j = i + 1;
-                let not = matches!(chars.get(j), Some('!' | '^'));
-                if not {
-                    j += 1;
-                }
-                let mut set = Vec::new();
-                // A `]` right after the `[` is a member, not the end.
-                let first = j;
-                while j < chars.len() && (chars[j] != ']' || j == first) {
-                    if chars.get(j + 1) == Some(&'-') && chars.get(j + 2).is_some_and(|c| *c != ']')
-                    {
-                        let (a, b) = (chars[j], chars[j + 2]);
-                        set.extend((a..=b).take(256));
-                        j += 3;
-                    } else {
-                        set.push(chars[j]);
-                        j += 1;
-                    }
-                }
-                if j >= chars.len() {
-                    pieces.push(Piece::Lit('['));
-                } else {
+            '[' if last_close.is_some_and(|l| l > i) => match class(&pattern[i..]) {
+                Some((set, not, len)) => {
                     pieces.push(Piece::Class(set, not));
-                    i = j;
+                    i += len;
                 }
-            }
+                None => pieces.push(Piece::Lit('[')),
+            },
             c => pieces.push(Piece::Lit(c)),
         }
-        i += 1;
     }
-    let name: Vec<char> = name.chars().collect();
     let one = |p: &Piece, c: char| match p {
         Piece::One => true,
         Piece::Class(set, not) => set.contains(&c) != *not,
@@ -382,6 +395,7 @@ fn glob(pattern: &str, name: &str) -> bool {
     let (mut p, mut n) = (0, 0);
     let mut star: Option<(usize, usize)> = None;
     while n < name.len() {
+        work(1);
         if p < pieces.len() && matches!(pieces[p], Piece::Any) {
             star = Some((p, n));
             p += 1;
@@ -397,6 +411,35 @@ fn glob(pattern: &str, name: &str) -> bool {
         }
     }
     pieces[p..].iter().all(|x| matches!(x, Piece::Any))
+}
+
+/// The class a `[` opens, from what follows the `[`: its members, whether
+/// it is "not", and the bytes it takes up to and with its `]`; `None` when
+/// no `]` closes it. A `]` right after the `[` is a member, not the end.
+fn class(s: &str) -> Option<(Vec<char>, bool, usize)> {
+    let mut it = s.char_indices().peekable();
+    let not = matches!(it.peek(), Some((_, '!' | '^')));
+    if not {
+        it.next();
+    }
+    let mut set = Vec::new();
+    let mut first = true;
+    while let Some((at, c)) = it.next() {
+        work(1);
+        if c == ']' && !first {
+            return Some((set, not, at + 1));
+        }
+        first = false;
+        let mut ahead = it.clone();
+        match (ahead.next(), ahead.next()) {
+            (Some((_, '-')), Some((_, d))) if d != ']' => {
+                set.extend((c..=d).take(256));
+                it = ahead;
+            }
+            _ => set.push(c),
+        }
+    }
+    None
 }
 
 /// Folds `//` and `/./` into one `/`.
@@ -519,6 +562,126 @@ fn finish(list: impl Iterator<Item = PathBuf>, allow: &[PathBuf]) -> Vec<PathBuf
     all
 }
 
+/// A character that goes on a file name: `nerve-notes` is not `nerve`.
+fn name_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '.' | '_' | '-')
+}
+
+/// Where `name` first ends in `text` followed by no more of a file name,
+/// trying it at every place, also where one try overlaps another.
+fn named_end(text: &str, name: &str) -> Option<usize> {
+    text.char_indices().find_map(|(at, _)| {
+        work(1);
+        let end = at + name.len();
+        (text[at..].starts_with(name) && !text[end..].starts_with(name_char)).then_some(end)
+    })
+}
+
+/// The working directory, normalised, as the own-folder check joins a
+/// relative word to it: `fold_dotdot(tidy("{text}/{word}"))`. A word's
+/// `..` only takes segments off the end of the directory, so what a joined
+/// path holds of it is one of its prefixes. What each prefix names is
+/// worked out here once, so each word costs only its own length, however
+/// long the directory and however many words the line has (code review 3
+/// of PR #19, finding 1).
+struct Base<'c> {
+    text: &'c str,
+    /// `None` for a directory that `fold_dotdot` would change, or with a
+    /// `.`, `..` or empty segment where a `..` could take it off; no
+    /// resolved path is such a directory. Each word is then joined to it in
+    /// full.
+    at: Option<Prefixes>,
+}
+
+struct Prefixes {
+    /// Where each `/` segment of the directory ends.
+    ends: Vec<usize>,
+    /// The segment with the last break of the directory in it (a space, as
+    /// in `program files`), else the first: [`fold_dotdot`] folds within a
+    /// word, so a `..` takes off only the segments after this one.
+    first: usize,
+    /// For each own name, where it first ends in the directory, so that
+    /// each prefix as long or longer holds it.
+    named: Vec<Option<usize>>,
+    /// For each own name, how many of the directory's first segments match
+    /// its own, with [`segment_matches`].
+    leading: Vec<usize>,
+}
+
+impl<'c> Base<'c> {
+    fn new(p: &Protected, text: &'c str) -> Base<'c> {
+        let mut ends: Vec<usize> = text.match_indices('/').map(|(at, _)| at).collect();
+        ends.push(text.len());
+        let first = text
+            .rfind(breaks)
+            .map_or(0, |b| ends.iter().position(|e| *e >= b).unwrap_or(0));
+        let seg = |i: usize| &text[if i == 0 { 0 } else { ends[i - 1] + 1 }..ends[i]];
+        work(text.len());
+        let plain = (first + 1..ends.len()).all(|i| !matches!(seg(i), "" | "." | ".."));
+        if !plain || fold_dotdot(text) != text {
+            return Base { text, at: None };
+        }
+        let named = p
+            .own_names
+            .iter()
+            .map(|(name, _)| named_end(text, name))
+            .collect();
+        let leading = p
+            .own_names
+            .iter()
+            .map(|(name, _)| {
+                name.split('/')
+                    .zip(0..ends.len())
+                    .take_while(|(w, i)| segment_matches(seg(*i), w, p.windows))
+                    .count()
+            })
+            .collect();
+        Base {
+            text,
+            at: Some(Prefixes {
+                ends,
+                first,
+                named,
+                leading,
+            }),
+        }
+    }
+
+    /// The relative `word` joined to the directory, in full.
+    fn slow_join(&self, word: &str) -> String {
+        fold_dotdot(&tidy(&format!("{}/{word}", self.text)))
+    }
+}
+
+impl Prefixes {
+    /// The relative `word` joined to the directory as
+    /// [`Base::slow_join`] would: how many of the directory's segments
+    /// stay, and the word's segments after them.
+    fn join<'w>(&self, word: &'w str) -> (usize, Vec<&'w str>) {
+        // `tidy` takes the `/./` out that a leading `./` makes.
+        let word = word.strip_prefix("./").unwrap_or(word);
+        let mut kept = self.ends.len();
+        let mut rest: Vec<&str> = Vec::new();
+        for seg in word.split('/') {
+            work(seg.len() + 1);
+            // As `fold_dotdot`: a `..` takes off a plain name before it,
+            // never the first of a word; the directory's segments after
+            // `first` are all plain.
+            let pop = seg == ".."
+                && match rest.last() {
+                    Some(t) => !matches!(*t, "" | "." | ".."),
+                    None => kept - 1 > self.first,
+                };
+            if !pop {
+                rest.push(seg);
+            } else if rest.pop().is_none() {
+                kept -= 1;
+            }
+        }
+        (kept, rest)
+    }
+}
+
 impl Protected {
     /// `own` are the node's own config and state directories: a command or a
     /// write must not change the node's policy behind its back, nor read the
@@ -614,6 +777,7 @@ impl Protected {
                 .trim_end_matches('/')
                 .to_string()
         });
+        let base = cwd.as_deref().map(|c| Base::new(self, c));
         let absolute =
             |w: &str| w.starts_with('/') || (self.windows && w.as_bytes().get(1) == Some(&b':'));
         for home in &self.homes {
@@ -622,15 +786,14 @@ impl Protected {
                 return Some(own);
             }
             for word in text.split(breaks).filter(|w| !w.is_empty()) {
-                if let Some(own) = self.globs_own(word, cwd.as_deref()) {
+                if let Some(own) = self.globs_own(word, base.as_ref()) {
                     return Some(own);
                 }
-                let Some(cwd) = &cwd else { continue };
+                let Some(base) = &base else { continue };
                 if absolute(word) {
                     continue;
                 }
-                let path = fold_dotdot(&tidy(&format!("{cwd}/{word}")));
-                if let Some(own) = self.names_own(&path) {
+                if let Some(own) = self.joined_names_own(base, word) {
                     return Some(own);
                 }
             }
@@ -643,32 +806,154 @@ impl Protected {
     /// after a prefix such as `filesystem::`, and one without a drive, which
     /// the shell takes on its current drive), else the word as a path from
     /// `cwd`.
-    fn globs_own(&self, word: &str, cwd: Option<&str>) -> Option<&Path> {
-        let mut paths = Vec::new();
+    fn globs_own(&self, word: &str, base: Option<&Base>) -> Option<&Path> {
+        let mut drives = false;
         if self.windows {
-            let b = word.as_bytes();
-            for at in 0..b.len().saturating_sub(1) {
-                let starts = at == 0 || !b[at - 1].is_ascii_alphanumeric();
-                if starts && b[at].is_ascii_alphabetic() && b[at + 1] == b':' {
-                    paths.push(word[at..].to_string());
+            let (own, any) = self.drives_own(word);
+            if own.is_some() {
+                return own;
+            }
+            drives = any;
+        }
+        let path = if word.starts_with('/') {
+            if self.windows {
+                // Any drive: `?` matches the drive's letter.
+                format!("?:{word}")
+            } else {
+                word.to_string()
+            }
+        } else if drives {
+            return None;
+        } else {
+            return self.joined_globs_own(base?, word);
+        };
+        let path = fold_dotdot(&tidy(&path));
+        let segs: Vec<&str> = path.split('/').collect();
+        self.own_names.iter().find_map(|(name, own)| {
+            let want: Vec<&str> = name.split('/').collect();
+            let hit = segs.len() >= want.len()
+                && want
+                    .iter()
+                    .zip(&segs)
+                    .all(|(w, s)| segment_matches(s, w, self.windows));
+            hit.then_some(own.as_path())
+        })
+    }
+
+    /// The own folder a path from a drive letter in `word` names (`c:/...`,
+    /// also after a prefix such as `filesystem::`), and whether `word` has a
+    /// drive letter at all. Each drive letter starts a path that runs to the
+    /// end of the word. `word` is normalised already, and so is each such
+    /// tail; the tails that start in the same segment share every segment
+    /// after it, which is matched once for all of them, and the part of the
+    /// segment each starts with is matched with what the segment holds
+    /// looked up once. So a word of drive letters (`a:a:a:...`) takes work
+    /// that grows with its length, not with its square (code review 3 of
+    /// PR #19, finding 1).
+    fn drives_own(&self, word: &str) -> (Option<&Path>, bool) {
+        let b = word.as_bytes();
+        let mut segs = Vec::new();
+        let mut start = 0;
+        for (at, _) in word.match_indices('/') {
+            segs.push((start, at));
+            start = at + 1;
+        }
+        segs.push((start, word.len()));
+        let mut any = false;
+        for (k, &(start, end)) in segs.iter().enumerate() {
+            let drives: Vec<usize> = (start..end.saturating_sub(1))
+                .filter(|&at| {
+                    (at == 0 || !b[at - 1].is_ascii_alphanumeric())
+                        && b[at].is_ascii_alphabetic()
+                        && b[at + 1] == b':'
+                })
+                .collect();
+            work(end - start);
+            if drives.is_empty() {
+                continue;
+            }
+            any = true;
+            let seg = &word[start..end];
+            // Where in the segment the last short name, wildcard and `]`
+            // are: a tail from a drive letter holds one when it starts at or
+            // before it.
+            let short = seg
+                .char_indices()
+                .rev()
+                .find(|(at, c)| {
+                    *c == '~' && seg[at + 1..].starts_with(|d: char| d.is_ascii_digit())
+                })
+                .map(|(at, _)| start + at);
+            let wild = seg.rfind(['*', '?', '[']).map(|at| start + at);
+            let close = seg.rfind(']').map(|at| start + at);
+            let after = &segs[k + 1..];
+            for (name, own) in &self.own_names {
+                let mut want = name.split('/');
+                let first = want.next().unwrap_or_default();
+                let rest: Vec<&str> = want.collect();
+                if after.len() < rest.len() {
+                    continue;
+                }
+                let starts = drives.iter().any(|&at| {
+                    work(1);
+                    let part = &word[at..end];
+                    if short.is_some_and(|s| s >= at) {
+                        true
+                    } else if wild.is_none_or(|w| w < at) {
+                        part == first
+                    } else {
+                        glob_closed(part, first, close.and_then(|c| c.checked_sub(at)))
+                    }
+                });
+                let hit = starts
+                    && rest
+                        .iter()
+                        .zip(after)
+                        .all(|(w, &(s, e))| segment_matches(&word[s..e], w, true));
+                if hit {
+                    return (Some(own.as_path()), true);
                 }
             }
-            if word.starts_with('/') {
-                // Any drive: `?` matches the drive's letter.
-                paths.push(format!("?:{word}"));
-            }
-        } else if word.starts_with('/') {
-            paths.push(word.to_string());
         }
-        if paths.is_empty()
-            && let Some(cwd) = cwd
-        {
-            paths.push(format!("{cwd}/{word}"));
-        }
-        paths.iter().find_map(|path| {
-            let path = fold_dotdot(&tidy(path));
+        (None, any)
+    }
+
+    /// [`names_own`](Self::names_own) of the relative `word` joined to the
+    /// working directory.
+    fn joined_names_own(&self, base: &Base, word: &str) -> Option<&Path> {
+        let Some(at) = &base.at else {
+            return self.names_own(&base.slow_join(word));
+        };
+        let (kept, rest) = at.join(word);
+        let end = at.ends[kept - 1];
+        let tail = if rest.is_empty() {
+            String::new()
+        } else {
+            format!("/{}", rest.join("/"))
+        };
+        self.own_names
+            .iter()
+            .zip(&at.named)
+            .find_map(|((name, own), named)| {
+                // A name in the part of the directory that stays, or one that
+                // reaches into what the word adds.
+                let mut from = end.saturating_sub(name.len());
+                while !base.text.is_char_boundary(from) {
+                    from -= 1;
+                }
+                let near = format!("{}{tail}", &base.text[from..end]);
+                let hit = named.is_some_and(|n| n <= end) || named_end(&near, name).is_some();
+                hit.then_some(own.as_path())
+            })
+    }
+
+    /// [`globs_own`](Self::globs_own) of the relative `word` joined to the
+    /// working directory.
+    fn joined_globs_own(&self, base: &Base, word: &str) -> Option<&Path> {
+        let Some(at) = &base.at else {
+            let path = base.slow_join(word);
             let segs: Vec<&str> = path.split('/').collect();
-            self.own_names.iter().find_map(|(name, own)| {
+            return self.own_names.iter().find_map(|(name, own)| {
                 let want: Vec<&str> = name.split('/').collect();
                 let hit = segs.len() >= want.len()
                     && want
@@ -676,14 +961,28 @@ impl Protected {
                         .zip(&segs)
                         .all(|(w, s)| segment_matches(s, w, self.windows));
                 hit.then_some(own.as_path())
+            });
+        };
+        let (kept, rest) = at.join(word);
+        self.own_names
+            .iter()
+            .zip(&at.leading)
+            .find_map(|((name, own), &leading)| {
+                let want: Vec<&str> = name.split('/').collect();
+                let from_base = kept.min(want.len());
+                let hit = kept + rest.len() >= want.len()
+                    && leading >= from_base
+                    && want[from_base..]
+                        .iter()
+                        .zip(&rest)
+                        .all(|(w, s)| segment_matches(s, w, self.windows));
+                hit.then_some(own.as_path())
             })
-        })
     }
 
     /// The own folder whose name `text` holds, followed by anything but
     /// more of a file name (`nerve-notes` is not `nerve`).
     fn names_own(&self, text: &str) -> Option<&Path> {
-        let name_char = |c: char| c.is_alphanumeric() || matches!(c, '.' | '_' | '-');
         self.own_names.iter().find_map(|(name, own)| {
             let hit = text
                 .match_indices(name.as_str())
@@ -1193,6 +1492,59 @@ mod tests {
         ] {
             assert!(p.own_in_command(command, Some(home)).is_none(), "{command}");
         }
+    }
+
+    /// A word of many drive letters (`a:a:a:…`) or many brackets, or many
+    /// words from a deep working directory, are looked at in work that
+    /// grows with their length, not with its square or with words times
+    /// directory: no copy and no new pass per drive letter or per word
+    /// (code review 3 of PR #19, finding 1).
+    #[test]
+    fn long_lines_take_linear_work() {
+        let n = 16 * 1024;
+        let tail = "/users/u/nerve-test/other/x";
+        let win_deep = format!("C:\\Users\\u\\nerve-test\\proj{}", "\\d".repeat(2000));
+        let unix_deep = format!("/home/u/a b{}", "/d".repeat(2000));
+        let cases = [
+            (win_prot(), "a:".repeat(n), "/x"),
+            (win_prot(), format!("{}{tail}", "c:".repeat(n)), "/x"),
+            (win_prot(), "a:*".repeat(n), "/x"),
+            (win_prot(), "a:[".repeat(n), "/x"),
+            (win_prot(), "a:~1".repeat(n), "/x"),
+            (win_prot(), format!("/{}{tail}", "[".repeat(2 * n)), "/x"),
+            (prot(), format!("/{}/a/b/c/d", "[".repeat(2 * n)), "/x"),
+            (win_prot(), "a ".repeat(n), &win_deep),
+            (win_prot(), "..\\..\\x ".repeat(n / 4), &win_deep),
+            (prot(), "a ".repeat(n), &unix_deep),
+            (prot(), "../../x ".repeat(n / 4), &unix_deep),
+        ];
+        for (p, line, cwd) in cases {
+            WORK.with(|w| w.set(0));
+            let command = format!("type {line}");
+            assert!(p.own_in_command(&command, Some(Path::new(cwd))).is_none());
+            let work = WORK.with(std::cell::Cell::get);
+            assert!(
+                work <= 64 * (command.len() + cwd.len()),
+                "{work} for {} bytes in {} bytes: {}",
+                command.len(),
+                cwd.len(),
+                &line[..12]
+            );
+        }
+        // Still seen behind the drive letters, and back up from the deep
+        // directory.
+        let command = format!("type {}c:/users/u/nerve-test/node-config/x", "a:".repeat(n));
+        assert!(win_prot().own_in_command(&command, None).is_some());
+        let command = format!("type {}node-config", "..\\".repeat(2001));
+        let deep = Path::new(&win_deep);
+        assert!(win_prot().own_in_command(&command, Some(deep)).is_some());
+        let command = format!("type {}.config/nerve", "../".repeat(2000));
+        let deep = format!("/home/u{}", "/d".repeat(2000));
+        assert!(
+            prot()
+                .own_in_command(&command, Some(Path::new(&deep)))
+                .is_some()
+        );
     }
 
     #[test]

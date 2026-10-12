@@ -245,6 +245,38 @@ async fn a_call_no_rule_allows_is_refused_immediately() {
     node.stop().await;
 }
 
+/// A command line longer than the node checks is refused, also with no
+/// grant at all, and the audit log says why (code review 3 of PR #19,
+/// finding 1).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_overlong_command_line_is_refused_and_audited_with_the_reason() {
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let node = paired_node(dir.path(), &center).await;
+    let mut conn = linked(&mut center).await;
+    let command = "a:".repeat(nerve_policy::COMMAND_MAX_BYTES / 2 + 1);
+    let e = conn
+        .call(
+            "invoke",
+            json!({"cap": "exec", "action": "run", "args": {"command": command}}),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap()
+        .expect_err("the command line is too long");
+    assert_eq!(nerve_conformance::wire::code_of(&e), "forbidden");
+    let log = std::fs::read_to_string(node.paths().audit_log()).unwrap();
+    let line: Value = log
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .find(|v: &Value| v["action"] == "run")
+        .unwrap_or_else(|| panic!("no audit line for the run: {log}"));
+    assert_eq!(line["decision"], "forbidden", "{line}");
+    let reason = line["reason"].as_str().unwrap_or_default();
+    assert!(reason.contains("longer than"), "{line}");
+    node.stop().await;
+}
+
 /// In folder mode the folders give full access and allow rules change
 /// nothing; a deny rule still refuses.
 #[tokio::test(flavor = "multi_thread")]

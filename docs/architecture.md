@@ -404,6 +404,7 @@ The reverse direction (a harness offering sessions, prompts and replies for a ch
 - Results: JSON as text, blobs as content where the harness supports it, otherwise saved by the center and referenced by a short-lived handle the harness can read.
 - Every tool result is marked as content from a device, not instructions.
 - Tool lists change with descriptors; the center notifies (`nodes.changed`).
+- A node the owner disabled in the center is left out of the tool list, and the center refuses a call to it before anything reaches the node (`unavailable`, "the node X is disabled in the center"). The `nodes` tool still lists it, marked as disabled. The link and the node are untouched.
 
 ### 6.3 MCP server surface (0.0.1)
 
@@ -429,7 +430,7 @@ A harness carries no Nerve security logic: the node decides, the center routes. 
 
 Served by `nerve-center` itself (assets built into the binary, no extra runtime or package), on `127.0.0.1:<port>` by default. Exposing it beyond loopback needs a password set with `nerve-center ui password`; remote use is meant through an SSH tunnel or a reverse proxy. Three areas:
 
-- **Node overview**: every paired node with online state, last seen, `going_away` reason, platform, the descriptor summary and per-capability exposure as this center sees it, sessions using the node, and "Add node" (pairing code, link and QR), rename, remove.
+- **Node overview**: every paired node with online state, last seen, `going_away` reason, platform, the descriptor summary and per-capability exposure as this center sees it, sessions using the node, and "Add node" (pairing code, link and QR), rename, disable or enable (a disabled node stays paired and connected but is hidden from the agent: no tools, no calls), remove.
 - **Statistics**: per node and in total, counts and timings only, never content: online time, link drops and reconnects, calls per capability and action, errors by code, calls allowed and refused, call latency. Kept in the center's state file, with a retention the center's config sets.
 - **Settings**: only for nodes whose center entry gives this center `settings = write`. It renders the node's settings document (`nerve:settings/1`), validates against the published schema, sends whole documents with `if_version` and shows the node's refusal reasons. Nodes without `write` show no settings page. The center's own settings (harness tokens, center-side rules, statistics retention) are a separate page.
 

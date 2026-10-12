@@ -329,6 +329,7 @@ impl Center {
                     last_seen_ms: 0,
                     going_away: None,
                     descriptor: None,
+                    disabled: false,
                 },
             );
             Ok(PairResponse {
@@ -364,6 +365,18 @@ impl Center {
             let n = s.nodes.get_mut(node_id).ok_or("no such node")?;
             n.name = name.to_string();
             Ok(())
+        })?;
+        self.changed(Change::Nodes);
+        self.changed(Change::Tools);
+        Ok(())
+    }
+
+    /// Switches a node off or on for the agent. The link stays as it is;
+    /// only the tool list and the call path look at the flag.
+    pub fn set_disabled(&self, node_id: &str, disabled: bool) -> Result<(), String> {
+        self.update(|s| {
+            s.nodes.get_mut(node_id).ok_or("no such node")?.disabled = disabled;
+            Ok::<(), String>(())
         })?;
         self.changed(Change::Nodes);
         self.changed(Change::Tools);
@@ -596,6 +609,7 @@ impl Center {
                         "last_seen_ms": n.last_seen_ms,
                         "paired_ms": n.paired_ms,
                         "going_away": n.going_away,
+                        "disabled": n.disabled,
                         "summary": d.map(|d| d.summary.clone()).unwrap_or_default(),
                         "software": d.map(|d| d.node.software.version.clone()),
                         "capabilities": caps,
@@ -615,6 +629,8 @@ impl Center {
             let views: Vec<tools::NodeView> = s
                 .nodes
                 .values()
+                // A disabled node offers the agent nothing.
+                .filter(|n| !n.disabled)
                 .filter_map(|n| {
                     n.descriptor.as_ref().map(|d| tools::NodeView {
                         id: &n.id,
@@ -840,6 +856,16 @@ impl Center {
         route: &Route,
         args: Map<String, Value>,
     ) -> Result<Value, CallError> {
+        // Checked first: nothing is sent to a disabled node, not even the
+        // session mark. A call can still arrive here from a tool list that
+        // was read before the switch.
+        if self.read(|s| s.nodes.get(&route.node_id).is_some_and(|n| n.disabled)) {
+            return Err(RpcError::new(
+                ErrorCode::Unavailable,
+                format!("the node {} is disabled in the center", route.node_name),
+            )
+            .into());
+        }
         let link = self.link(&route.node_id).ok_or_else(|| {
             RpcError::new(
                 ErrorCode::Unavailable,

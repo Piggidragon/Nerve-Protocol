@@ -308,6 +308,14 @@ impl Ui {
                 .rename(&s("id"), &s("name"))
                 .map(|_| json!({}))
                 .map_err(bad),
+            ("POST", "/api/nodes/disable") => {
+                let Some(disabled) = b.get("disabled").and_then(Value::as_bool) else {
+                    return Err(bad("disabled must be true or false"));
+                };
+                c.set_disabled(&s("id"), disabled)
+                    .map(|_| json!({"disabled": disabled}))
+                    .map_err(|e| (404, json!({"error": e})))
+            }
             ("POST", "/api/nodes/remove") => {
                 c.remove(&s("id")).await.map(|_| json!({})).map_err(bad)
             }
@@ -1085,5 +1093,76 @@ mod tests {
         let state = std::fs::read_to_string(d.path().join(crate::store::FILE)).unwrap();
         assert!(!state.contains(&token));
         assert!(state.contains(&util::sha256_hex(token.as_bytes())));
+    }
+
+    #[tokio::test]
+    async fn the_disable_switch_takes_a_boolean_and_a_known_node() {
+        let d = tempfile::tempdir().unwrap();
+        let c = center(d.path());
+        c.update(|s| {
+            s.nodes.insert(
+                "n1".into(),
+                crate::store::NodeRecord {
+                    id: "n1".into(),
+                    name: "box".into(),
+                    public_key: "00".into(),
+                    platform: "linux".into(),
+                    arch: "x86_64".into(),
+                    paired_ms: 0,
+                    disabled: false,
+                    last_seen_ms: 0,
+                    going_away: None,
+                    descriptor: None,
+                },
+            );
+        });
+        let ui = Ui::new(&c, None, false, false);
+        let h = ("Host", "127.0.0.1:7480");
+        let r = ui.request(req("GET", "/api/session", &[h], "")).await;
+        let ck = set_cookie(&r);
+        let csrf = serde_json::from_slice::<Value>(&r.body).unwrap()["csrf"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let post = |body: &'static str| {
+            ui.request(req(
+                "POST",
+                "/api/nodes/disable",
+                &[h, ("Cookie", &ck), ("X-Nerve-CSRF", &csrf)],
+                body,
+            ))
+        };
+        let json = |r: &Response| serde_json::from_slice::<Value>(&r.body).unwrap();
+
+        // A missing or non-boolean flag is refused and changes nothing.
+        for b in [
+            r#"{"id":"n1"}"#,
+            r#"{"id":"n1","disabled":"true"}"#,
+            r#"{"id":"n1","disabled":1}"#,
+        ] {
+            let r = post(b).await;
+            assert_eq!(r.status, 400, "{b}");
+            assert!(
+                json(&r)["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("true or false")
+            );
+        }
+        assert_eq!(c.nodes_json()[0]["disabled"], false);
+
+        // An unknown node is a 404 with a text.
+        let r = post(r#"{"id":"nope","disabled":true}"#).await;
+        assert_eq!(r.status, 404);
+        assert_eq!(json(&r)["error"], "no such node");
+
+        // The answer is the new state, and the overview shows it.
+        let r = post(r#"{"id":"n1","disabled":true}"#).await;
+        assert_eq!(r.status, 200);
+        assert_eq!(json(&r), json!({"disabled": true}));
+        assert_eq!(c.nodes_json()[0]["disabled"], true);
+        let r = post(r#"{"id":"n1","disabled":false}"#).await;
+        assert_eq!(json(&r), json!({"disabled": false}));
+        assert_eq!(c.nodes_json()[0]["disabled"], false);
     }
 }

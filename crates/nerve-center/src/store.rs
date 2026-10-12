@@ -97,6 +97,11 @@ pub struct NodeRecord {
     pub platform: String,
     pub arch: String,
     pub paired_ms: u64,
+    /// The owner switched the node off in the center: it stays paired and
+    /// connected, but the agent is offered none of its tools and no call
+    /// reaches it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub disabled: bool,
     #[serde(default)]
     pub last_seen_ms: u64,
     /// Why the node said it was going away before its last link dropped.
@@ -182,5 +187,41 @@ mod tests {
         let days = &s.stats["n"].days;
         assert_eq!(days.len(), 1);
         assert_eq!(days[&100].links, 2);
+    }
+
+    fn record(id: &str) -> NodeRecord {
+        NodeRecord {
+            id: id.into(),
+            name: id.into(),
+            public_key: "00".into(),
+            platform: "linux".into(),
+            arch: "x86_64".into(),
+            paired_ms: 1,
+            disabled: false,
+            last_seen_ms: 0,
+            going_away: None,
+            descriptor: None,
+        }
+    }
+
+    #[test]
+    fn the_disabled_flag_survives_a_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut s = Store::new("c".into(), "home".into());
+        s.nodes.insert("a".into(), record("a"));
+        s.nodes.insert("b".into(), record("b"));
+        s.nodes.get_mut("b").unwrap().disabled = true;
+        s.save(dir.path()).unwrap();
+        let back = Store::load(dir.path()).unwrap().unwrap();
+        assert!(!back.nodes["a"].disabled);
+        assert!(back.nodes["b"].disabled);
+    }
+
+    #[test]
+    fn an_old_state_file_reads_a_node_as_enabled() {
+        let old = r#"{"center_id":"c","center_name":"home","nodes":{"a":{"id":"a","name":"a",
+            "public_key":"00","platform":"linux","arch":"x86_64","paired_ms":1}}}"#;
+        let s: Store = serde_json::from_str(old).unwrap();
+        assert!(!s.nodes["a"].disabled);
     }
 }

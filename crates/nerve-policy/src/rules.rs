@@ -113,6 +113,20 @@ pub fn command_matches(patterns: &[String], command: &str) -> bool {
         .any(|p| matchers(p, false).iter().any(|m| m.is_match(command)))
 }
 
+/// Whether an allow rule of `rules` covers `cap.action` for some target: the
+/// scope decides, the pattern does not. The rule may allow only some paths or
+/// commands, so an action it covers is offered and each call is still checked.
+/// A rule that does not parse covers nothing, as in [`RuleSet::new`].
+pub fn offers(rules: &[String], cap: &str, action: &str) -> bool {
+    rules.iter().any(|text| {
+        validate(text).is_ok()
+            && split(text).is_ok_and(|(scope, _)| match scope.split_once('.') {
+                Some((c, a)) => c == cap && a == action,
+                None => scope == cap,
+            })
+    })
+}
+
 struct Compiled {
     text: String,
     cap: String,
@@ -406,6 +420,22 @@ mod tests {
                 assert!(set(&[&rule]).find(cap, action, target).is_some(), "{rule}");
             }
         }
+    }
+
+    #[test]
+    fn rules_offer_actions_by_scope() {
+        let r = |rules: &[&str]| rules.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(!offers(&r(&[]), "fs", "read"));
+        // The pattern is not looked at; the scope is.
+        assert!(offers(&r(&["fs:~/notes/*"]), "fs", "write"));
+        assert!(offers(&r(&["fs.read:/a/*"]), "fs", "read"));
+        assert!(!offers(&r(&["fs.read:/a/*"]), "fs", "write"));
+        assert!(offers(&r(&["exec"]), "exec", "signal"));
+        assert!(offers(&r(&["exec.run"]), "exec", "run"));
+        assert!(!offers(&r(&["exec.run"]), "exec", "signal"));
+        assert!(!offers(&r(&["execute:x", "fs"]), "exec", "run"));
+        // Not a rule: nothing is covered.
+        assert!(!offers(&r(&["fs:", "fs.read:[", "a.b.c"]), "fs", "read"));
     }
 
     #[test]

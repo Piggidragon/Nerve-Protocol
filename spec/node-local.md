@@ -219,6 +219,22 @@ answer. For each call the node takes the center's policy and, in this order:
 
 Every refusal names its reasons in the error and in the audit log.
 
+What the center is shown follows the same policy, so that its harness builds
+no tool the node would refuse. In `allowlist` mode an `fs` or `exec` action
+is in the descriptor only when an `allow` rule covers it by scope: `<cap>`
+covers every action of the capability, `<cap>.<action>` that action, with or
+without a `:<pattern>`. The pattern is not looked at there; a rule may allow
+only some paths or commands, and each call is still decided as above.
+`exec.run` is also shown when `sudo_allow` has an entry, since a sudo command
+runs by that list alone. In `folder` and `user` mode the actions are shown as
+before and allow rules do not matter; deny rules never hide an action.
+`off` actions stay listed (exposure `off`), `hidden` ones and the actions
+left out here are absent, and a capability with no action left is absent.
+`settings` and `audit` follow their own rules. The descriptor's `rev` follows
+its content, so adding or removing a rule that changes the set sends
+`node/descriptor_changed`; a call naming an action that is not shown still
+reaches the policy and is refused and audited.
+
 ## 4. The sudo switch
 
 Sudo is a switch per node, not a mode, and its commands have an allow list of

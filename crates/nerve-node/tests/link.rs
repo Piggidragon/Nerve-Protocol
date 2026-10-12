@@ -8,9 +8,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use nerve_conformance::fake_center::{self, FakeCenter};
-use nerve_conformance::wire::Conn;
+use nerve_conformance::wire::{Conn, Recv};
 use nerve_node::{Daemon, NodeOptions, NodePaths};
 use nerve_policy::NodeConfig;
+use nerve_proto::rpc::Message;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
 
@@ -100,9 +101,13 @@ async fn handshake_describe_and_an_allowed_read() {
         .expect("describe");
     let caps = d["capabilities"].as_array().expect("caps");
     let cap = |id: &str| caps.iter().find(|c| c["id"] == id);
-    for c in ["node", "fs", "exec", "audit"] {
+    // Only what a rule can allow is offered: a rule for reads shows no exec.
+    for c in ["node", "fs", "audit"] {
         assert!(cap(c).is_some(), "missing {c}: {d}");
     }
+    assert!(cap("exec").is_none(), "no rule covers exec: {d}");
+    let fs_actions = cap("fs").unwrap()["actions"].as_object().unwrap();
+    assert_eq!(fs_actions.keys().collect::<Vec<_>>(), ["read"]);
     assert!(cap("settings").is_none(), "settings needs the write grant");
     assert_eq!(cap("fs").unwrap()["exposure"], "on");
 
@@ -142,6 +147,67 @@ async fn handshake_describe_and_an_allowed_read() {
         conn.ends_within(WAIT).await.is_some(),
         "stop ends the link with bye"
     );
+}
+
+/// The next `node.descriptor_changed` on `conn`: its rev.
+async fn changed_rev(conn: &mut Conn<TcpStream>) -> u64 {
+    loop {
+        match conn.recv(WAIT).await {
+            Recv::Msg(Message::Notification { method: m, params }) if m == "event" => {
+                if params["cap"] == "node" && params["name"] == "descriptor_changed" {
+                    return params["data"]["rev"].as_u64().expect("a rev");
+                }
+            }
+            Recv::Msg(_) => {}
+            other => panic!("no descriptor_changed: {other:?}"),
+        }
+    }
+}
+
+/// The tools a center can build: `cap.action` of the full descriptor.
+async fn offered(conn: &mut Conn<TcpStream>) -> (u64, Vec<String>) {
+    let d = conn
+        .call("describe", json!({"detail": "full"}), WAIT)
+        .await
+        .unwrap()
+        .expect("describe");
+    let mut out = Vec::new();
+    for c in d["capabilities"].as_array().unwrap() {
+        if matches!(c["id"].as_str(), Some("fs" | "exec")) {
+            for a in c["actions"].as_object().unwrap().keys() {
+                out.push(format!("{}.{a}", c["id"].as_str().unwrap()));
+            }
+        }
+    }
+    (d["rev"].as_u64().expect("a rev"), out)
+}
+
+/// Under default deny the center is shown only the actions a rule covers;
+/// an added or removed rule moves the rev and the node tells the center.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rule_edit_changes_what_the_center_is_offered() {
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let node = paired_node(dir.path(), &center).await;
+    let mut conn = linked(&mut center).await;
+    let (rev0, tools) = offered(&mut conn).await;
+    assert!(tools.is_empty(), "{tools:?}");
+
+    owner_edit(node.paths(), |c| {
+        c.centers[0].policy.allow = vec!["exec.run:git *".into()];
+    })
+    .await;
+    let rev1 = changed_rev(&mut conn).await;
+    assert_ne!(rev1, rev0);
+    assert_eq!(offered(&mut conn).await, (rev1, vec!["exec.run".into()]));
+
+    owner_edit(node.paths(), |c| {
+        c.centers[0].policy.allow.clear();
+    })
+    .await;
+    assert_eq!(changed_rev(&mut conn).await, rev0);
+    assert_eq!(offered(&mut conn).await, (rev0, vec![]));
+    node.stop().await;
 }
 
 /// No folder and no rule allows the read, so the node refuses it at once: it

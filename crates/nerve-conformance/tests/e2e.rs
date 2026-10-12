@@ -124,11 +124,12 @@ fn nerve_center_and_nerve_node_work_together() {
     let node_name = ov["nodes"][0]["name"].as_str().unwrap().to_string();
     assert_eq!(ov["nodes"][0]["settings_write"], json!(false), "{ov}");
 
-    // Tools: the device's capabilities, not its settings.
+    // Tools: none for files and commands while no allow rule could let a
+    // call through, and never one for the node's settings.
     let tools = mcp.tools();
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
-    assert!(names.iter().any(|n| n.ends_with("fs_read")), "{names:?}");
-    assert!(names.iter().any(|n| n.ends_with("exec_run")), "{names:?}");
+    assert!(!names.iter().any(|n| n.ends_with("fs_read")), "{names:?}");
+    assert!(!names.iter().any(|n| n.ends_with("exec_run")), "{names:?}");
     assert!(!names.iter().any(|n| n.contains("settings_")), "{names:?}");
 
     // The settings grant, given on the node, reaches the center.
@@ -289,6 +290,26 @@ fn nerve_center_and_nerve_node_work_together() {
         assert_eq!(status, 400, "{body} {v}");
     }
     assert_eq!(list("allow"), allow);
+
+    // The allow rules above made the tools appear: the node announced a new
+    // descriptor and the center built them.
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let tools = loop {
+        let tools = mcp.tools();
+        let has = |suffix: &str| {
+            tools
+                .iter()
+                .any(|t| t["name"].as_str().is_some_and(|n| n.ends_with(suffix)))
+        };
+        if has("fs_read") && has("exec_run") {
+            break tools;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the tools did not appear: {tools:?}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
 
     // exec.run goes straight to the node: the center holds no call back, and
     // the node lets it run (the allow rule above).

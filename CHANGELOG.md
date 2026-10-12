@@ -16,6 +16,9 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
   allow rules count in allowlist mode only. A call that no rule allows is
   refused at once. The settings grant, panic and unlock, and a local audit log
   (`spec/node-local.md`).
+- In default deny the center gets tools only for the `fs` and `exec` actions
+  an allow rule covers (and `exec.run` when the sudo list has an entry); the
+  node sends a new descriptor when a rule is added or removed.
 - Folder and user mode have no time limit unless the owner sets one
   (`mode set user --for N`); when a limit runs out the center falls back to
   allowlist.

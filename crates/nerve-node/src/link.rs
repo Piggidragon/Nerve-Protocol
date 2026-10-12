@@ -835,6 +835,7 @@ impl Link {
 
     fn protected(&self, entry: &CenterEntry) -> Protected {
         Protected::new(
+            &self.shared.platform,
             &self.shared.home,
             &self.shared.paths.own(),
             &entry.policy.protected,

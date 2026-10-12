@@ -128,14 +128,15 @@ async fn a_command_cannot_write_the_config_or_read_its_key() {
     let before = std::fs::read(&file).unwrap();
     let key_text = std::fs::read_to_string(paths.state_dir.join("config.key")).unwrap_or_default();
 
-    // A command in the home: decide lets it run, Landlock keeps it out of
-    // the node's folders while the rest of the home stays writable.
+    // A command in the home that reaches the node's folders by a path it
+    // builds at run time: decide cannot see that and lets it run, Landlock
+    // keeps it out while the rest of the home stays writable.
     let r = conn
         .call(
             "invoke",
             json!({"cap": "exec", "action": "run", "args": {
-                "command": "echo in > work/inside.txt; echo pwned >> .config/nerve/node.toml; \
-                            cat .local/state/nerve/config.key",
+                "command": "echo in > work/inside.txt; cd .config && echo pwned >> nerve/node.toml; \
+                            cd ../.local/state && cat nerve/config.key",
                 "cwd": wire(&home)}}),
             WAIT,
         )

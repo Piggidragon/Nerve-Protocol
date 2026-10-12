@@ -67,3 +67,8 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
 - A pairing code pairs one node also when several requests send it at the same moment.
 - A center with the settings grant `write` can add protected paths to `protected.extra` but not remove the owner's.
 - The node's audit log logs at most 512 characters of a target and moves to `audit.jsonl.1` at 10 MiB, keeping one old file.
+- On Windows the protected list also holds `%ProgramData%\ssh` (OpenSSH server config, host keys, `administrators_authorized_keys`), `%SystemRoot%\System32\config` (the registry hives) and the user's `NTUSER.DAT`, in every mode.
+- The own-folder check on command lines also sees `C:/…`, `~\`, `$HOME\`, `$env:USERPROFILE\`, `%USERPROFILE%\`, quoted names, `seg/..` and paths relative to the working directory (`..\node-config`).
+- The policy tests (decision, rules, protected paths, path parsing) run on Windows too; the one link test that needs the control socket is Unix only.
+- After a change no running node was told of (no daemon, or Windows, which has no control socket), the CLI says it takes effect at the next start of the node, and `status` on Windows no longer claims the node is not running.
+- A command rule with a `\` matches on Windows: before, globset turned the command's `\` into `/` and the rule's not, so such a deny rule denied nothing.

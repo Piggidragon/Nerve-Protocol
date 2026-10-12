@@ -861,13 +861,60 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
     Ok(())
 }
 
-/// Runs one command line, writing what it shows to `out`.
+/// When a change that only the file holds counts.
+const NEXT_START: &str = "takes effect at the next start of the node";
+
+/// Runs one command line, writing what it shows to `out`. A change made
+/// while no daemon answers on the control socket (none runs, or Windows,
+/// which has no socket in 0.0.1) is only in the file, so the output says
+/// when it counts.
 pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
     let paths = NodePaths::from_args(cli.config_dir, cli.state_dir);
+    // The daemon writes the file itself while it runs.
+    let before = (!matches!(cli.cmd, Cmd::Run)).then(|| std::fs::read(paths.config_file()).ok());
+    let r = command(paths.clone(), cli.cmd, out).await;
+    if r.is_ok()
+        && let Some(before) = before
+        && std::fs::read(paths.config_file()).ok() != before
+        && !daemon_answers(&paths).await
+    {
+        let _ = writeln!(out, "the change is in node.toml; it {NEXT_START}");
+    }
+    r
+}
+
+/// Whether a daemon answers on the control socket; it then took every
+/// change at once.
+async fn daemon_answers(paths: &NodePaths) -> bool {
+    #[cfg(unix)]
+    {
+        nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({}))
+            .await
+            .is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = paths;
+        false
+    }
+}
+
+/// What `status` says when no daemon answered. With a control socket
+/// (Unix) that means none runs; without one a running node cannot be told
+/// apart from a stopped one.
+fn no_daemon_status(socket: bool) -> String {
+    if socket {
+        "daemon: not running".into()
+    } else {
+        format!("daemon: not known (no control socket on Windows); a change {NEXT_START}")
+    }
+}
+
+async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), String> {
     let w = |out: &mut dyn Write, s: String| {
         let _ = writeln!(out, "{s}");
     };
-    match cli.cmd {
+    match cmd {
         Cmd::Run => {
             let mut opts = NodeOptions::new(paths);
             opts.exe = std::env::current_exe().ok();
@@ -985,7 +1032,7 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
                 Err(_) => {}
             }
             let cfg = SettingsStore::peek(&paths.config_file(), &paths.config_key())?;
-            w(out, "daemon: not running".into());
+            w(out, no_daemon_status(cfg!(unix)));
             if cfg.locked {
                 w(
                     out,
@@ -1836,6 +1883,33 @@ mod tests {
         assert_eq!(policy().until, None);
     }
 
+    /// Without a control socket to tell (no daemon, or Windows, which has
+    /// none), a change lands in the file only, and the CLI says when it
+    /// counts; what changes nothing says nothing of the kind.
+    #[test]
+    fn a_change_no_running_node_was_told_of_says_when_it_takes_effect() {
+        let (d, paths) = setup(&["home"]);
+        let folder = d.path().join("work");
+        std::fs::create_dir(&folder).unwrap();
+        let next = "takes effect at the next start of the node";
+        let line = format!("the change is in node.toml; it {next}");
+        for args in [
+            &["folder", "add", folder.to_str().unwrap(), "+r"][..],
+            &["mode", "set", "user"],
+            &["rule", "add", "deny", "rm -rf /"],
+        ] {
+            let out = run(&paths, args).unwrap();
+            assert_eq!(out.lines().last(), Some(line.as_str()), "{args:?}: {out}");
+            assert_eq!(out.matches(next).count(), 1, "{args:?}: {out}");
+        }
+        for args in [&["status"][..], &["center", "ls"], &["folder", "ls"]] {
+            let out = run(&paths, args).unwrap();
+            assert!(!out.contains(&line), "{args:?}: {out}");
+        }
+        // A command that fails changed nothing.
+        assert!(run(&paths, &["mode", "set", "ask"]).is_err());
+    }
+
     #[test]
     fn edits_without_a_daemon_land_in_the_file_and_the_audit_log() {
         let (d, paths) = setup(&["home"]);
@@ -2298,7 +2372,10 @@ mod tests {
         assert!(ls.contains("header X-Key\n"), "{ls}");
         assert!(ls.contains(&format!("no entry {entry}")), "{ls}");
         let rm = run(&paths, &["proxy", "rm"]).unwrap();
-        assert_eq!(rm, "no proxy\n");
+        assert_eq!(
+            rm,
+            format!("no proxy\nthe change is in node.toml; it {NEXT_START}\n")
+        );
         assert_eq!(load(&paths).connection, Default::default());
 
         // A proxy without headers never needs the keyring, reachable or not.
@@ -2307,9 +2384,13 @@ mod tests {
         let ls = run(&paths, &["proxy", "ls"]);
         let rm = run(&paths, &["proxy", "rm"]);
         crate::secrets::store::set_unreachable(false);
-        assert_eq!(plain.unwrap(), "proxy http://127.0.0.1:3128\n");
+        let next = format!("the change is in node.toml; it {NEXT_START}\n");
+        assert_eq!(
+            plain.unwrap(),
+            format!("proxy http://127.0.0.1:3128\n{next}")
+        );
         assert_eq!(ls.unwrap(), "proxy http://127.0.0.1:3128\n");
-        assert_eq!(rm.unwrap(), "no proxy\n");
+        assert_eq!(rm.unwrap(), format!("no proxy\n{next}"));
     }
 
     #[test]
@@ -2428,6 +2509,8 @@ mod tests {
             daemon.config().connection.headers,
             ["X-Key", PROXY_AUTHORIZATION]
         );
+        // The running node took the change at once.
+        assert!(!out.contains("next start"), "{out}");
         rt.block_on(daemon.stop());
         drop(rt);
         let audit = std::fs::read_to_string(paths.audit_log()).unwrap();

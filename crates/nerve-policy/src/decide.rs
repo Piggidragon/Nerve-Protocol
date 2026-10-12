@@ -118,7 +118,10 @@ fn own_folder<'p>(env: &'p Env, call: &Call) -> Option<&'p Path> {
         .map(|t| t.path.as_path())
         .chain(call.cwd)
         .find_map(|p| env.protected.own(p))
-        .or_else(|| call.command.and_then(|c| env.protected.own_in_command(c)))
+        .or_else(|| {
+            call.command
+                .and_then(|c| env.protected.own_in_command(c, call.cwd))
+        })
 }
 
 /// Decides `call` under `policy`.
@@ -310,10 +313,11 @@ fn by_mode(
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{Access, ProtectedOptions};
+    use crate::protected::{Platform, WinFolders};
 
     const NOW: u64 = 1_000_000;
 
@@ -353,7 +357,12 @@ mod tests {
     impl T {
         fn new() -> T {
             T {
-                prot: Protected::new(Path::new("/h"), &[], &ProtectedOptions::default()),
+                prot: Protected::new(
+                    &Platform::Unix,
+                    Path::new("/h"),
+                    &[],
+                    &ProtectedOptions::default(),
+                ),
             }
         }
 
@@ -1026,6 +1035,61 @@ mod tests {
         p.allow = vec![crate::rules::rule_for("exec", "run", "rm *", false).unwrap()];
         assert_eq!(run(&p, &env, &c("rm *")), "allow");
         assert_eq!(run(&p, &env, &c("rm -rf /")), "refused");
+    }
+
+    /// A Windows node in `user` mode: the OpenSSH server's key list and the
+    /// registry hives are refused to `fs` calls and as a command's working
+    /// directory (Windows review of PR #19, finding 1).
+    #[test]
+    fn windows_system_files_are_refused_in_user_mode() {
+        let folders = WinFolders {
+            program_data: vec!["C:\\ProgramData".into()],
+            system_root: vec!["C:\\Windows".into()],
+        };
+        let prot = Protected::new(
+            &Platform::Windows(folders),
+            Path::new("C:\\Users\\u"),
+            &[],
+            &ProtectedOptions::default(),
+        );
+        let env = Env {
+            home: Path::new("C:\\Users\\u"),
+            protected: &prot,
+            confined: false,
+            sudo: false,
+        };
+        let p = policy(Mode::User);
+        let keys = t("C:\\ProgramData\\ssh\\administrators_authorized_keys", true);
+        let d = decide(&p, &env, &call(Effect::Write, &keys, None));
+        assert!(
+            matches!(&d, Decision::Forbidden(m) if m.contains("is protected")),
+            "{d:?}"
+        );
+        for path in [
+            "C:\\ProgramData\\ssh\\sshd_config",
+            "C:\\Windows\\System32\\config\\SAM",
+            "C:\\Users\\u\\NTUSER.DAT",
+        ] {
+            let r = t(path, false);
+            assert_eq!(
+                run(&p, &env, &call(Effect::Read, &r, None)),
+                "refused",
+                "{path}"
+            );
+        }
+        let cwd = t("C:\\Windows\\System32\\config", false);
+        assert_eq!(
+            run(&p, &env, &call(Effect::Execute, &cwd, Some("dir"))),
+            "refused"
+        );
+        // What lies beside them stays the user's.
+        let notes = t("C:\\Users\\u\\notes\\a.txt", true);
+        assert_eq!(run(&p, &env, &call(Effect::Write, &notes, None)), "allow");
+        let cwd = t("C:\\Users\\u", false);
+        assert_eq!(
+            run(&p, &env, &call(Effect::Execute, &cwd, Some("dir"))),
+            "allow"
+        );
     }
 
     #[test]

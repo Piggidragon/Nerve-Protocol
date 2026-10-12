@@ -55,7 +55,16 @@ fn is_path_scope(scope: &str) -> bool {
 }
 
 fn build(pattern: &str, path: bool) -> Result<GlobMatcher, globset::Error> {
-    GlobBuilder::new(pattern)
+    // globset matches every target as a path and on Windows turns its `\`
+    // into `/` first, so the pattern must too: else a rule with a `\` (most
+    // Windows command lines have one) never matches, and a deny rule denies
+    // nothing.
+    let pattern = if cfg!(windows) {
+        pattern.replace('\\', "/")
+    } else {
+        pattern.to_string()
+    };
+    GlobBuilder::new(&pattern)
         // NTFS ignores case; a Windows path rule must too.
         .case_insensitive(path && cfg!(windows))
         .build()
@@ -298,7 +307,7 @@ pub fn sudo_rule_for(command: &str, wildcard: bool) -> Result<String, String> {
     Ok(format!("{} *", escape(&words.join(" "))))
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -383,6 +392,22 @@ mod tests {
         let s = set(&[&rule]);
         assert!(s.find("exec", "run", "rm *").is_some());
         assert!(s.find("exec", "run", "rm -rf /").is_none());
+    }
+
+    /// Windows command lines name paths with `\`; a rule for them matches
+    /// (a `\` is an escape in a Unix glob, so this is Windows only).
+    #[cfg(windows)]
+    #[test]
+    fn a_command_rule_with_backslashes_matches_on_windows() {
+        let s = set(&["exec.run:Remove-Item C:\\data\\*"]);
+        assert!(s.find("exec", "run", "Remove-Item C:\\data\\x").is_some());
+        assert!(s.find("exec", "run", "Remove-Item C:\\other\\x").is_none());
+        let exact = rule_for("exec", "run", "type C:\\x\\a.txt", false).unwrap();
+        assert!(
+            set(&[&exact])
+                .find("exec", "run", "type C:\\x\\a.txt")
+                .is_some()
+        );
     }
 
     #[test]

@@ -43,7 +43,9 @@ then signs it. A `node.toml` from before the node kept a MAC (no key yet, no
 MAC line) is taken once as it is and signed.
 
 On Windows there is no control socket in 0.0.1: the CLI writes the signed
-file itself, and a running node takes the change at its next start.
+file itself, and a running node takes the change at its next start. After
+a change no daemon answered for, the CLI says so in one line ("takes effect
+at the next start of the node").
 
 ## 2. `node.toml`
 
@@ -199,10 +201,14 @@ answer. For each call the node takes the center's policy and, in this order:
    anything else is looked at; no rule, mode, folder or release lifts that.
    It looks at every path of an `fs` call (resolved), at the working
    directory of `exec.run`, and at paths the command line names plainly
-   (absolute, or from `~/`, `$HOME/`, `${HOME}/`). A path a command builds
-   at run time (`cd ~/.config; cat nerve/node.toml`) is not seen there; in
-   `folder` mode Landlock keeps the command out all the same, while a `user`
-   mode command runs as the user, unconfined.
+   (absolute, or from `~/`, `$HOME/`, `${HOME}/`). The line is compared
+   without case, with `\` and `/` alike on Windows, with `seg/..` and
+   doubled separators folded, with the home in each shell's spelling (also
+   `$env:USERPROFILE` and `%USERPROFILE%` on Windows) and with relative
+   words taken from the working directory (`..\node-config`). A path a
+   command builds at run time (`cd ~/.config; cat nerve/node.toml`) is not
+   seen there; in `folder` mode Landlock keeps the command out all the
+   same, while a `user` mode command runs as the user, unconfined.
 1. A `locked` node (after `panic`) keeps no links and runs nothing; a paused,
    revoked or unknown center is not dialled.
 2. The capability setting: `off` refuses (`disabled`), `hidden` leaves it
@@ -215,7 +221,11 @@ answer. For each call the node takes the center's policy and, in this order:
 7. In `folder` and `user` mode the mode itself decides (§Modes). `allow`
    rules are not looked at.
 8. Protected paths (keys, shell profiles and the built-in list) are refused
-   whatever allowed the call, `user` mode too.
+   whatever allowed the call, `user` mode too. On Windows the built-in list
+   also holds `%ProgramData%\ssh` (the OpenSSH server's config, host keys
+   and `administrators_authorized_keys`), `%SystemRoot%\System32\config`
+   (the registry hives with the password hashes) and the user's
+   `NTUSER.DAT`.
 
 Every refusal names its reasons in the error and in the audit log.
 

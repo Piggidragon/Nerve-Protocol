@@ -254,7 +254,7 @@ function pageHelp() {
   return [
     head("help", "Help", "The commands of nerve-node, the program that links a machine to its centers. Run them in a shell on that machine, and write nerve-node before each line.",
       [[count, "commands"]]),
-    h.global.length || h.common.length ? el("div", { class: "card" },
+    h.global.length || h.common.length ? el("div", { class: "card sec" },
       h.global.length ? [el("p", { class: "meta" }, "Every command takes"), rows(h.global)] : null,
       h.common.length ? [el("p", { class: "meta" }, "Commands that work on one center also take"), rows(h.common)] : null) : null,
     h.sections.map((s) => section(s.name, s.about, null,

@@ -116,8 +116,7 @@ async fn a_command_cannot_write_the_config_or_read_its_key() {
         for path in [&home, &config_dir] {
             p.folders.push(nerve_policy::config::Folder {
                 path: path.display().to_string(),
-                access: nerve_policy::config::Access::Rw,
-                execute: true,
+                access: nerve_policy::config::Access::ALL,
             });
         }
     })
@@ -258,7 +257,7 @@ async fn a_file_with_a_wrong_mac_is_refused_at_start_up() {
     let refused = config_events(&o, "refused");
     assert_eq!(refused.len(), 1, "{refused:?}");
     // The CLI refuses to work on it as well ...
-    assert!(cli(&o.paths, &["centers"]).await.is_err());
+    assert!(cli(&o.paths, &["center", "ls"]).await.is_err());
     // ... until the owner looks at it and takes it.
     cli(&o.paths, &["config", "accept"]).await.unwrap();
     assert_eq!(config_events(&o, "accepted").len(), 1);
@@ -285,10 +284,10 @@ async fn an_owner_change_through_the_local_interface_is_applied_and_signed() {
 
     // The CLI reaches the running node over its control socket; the change
     // is in force at once, with no file watch and no tick.
-    cli(&o.paths, &["folder", "add", work.to_str().unwrap(), "--rw"])
+    cli(&o.paths, &["folder", "add", work.to_str().unwrap(), "+rw"])
         .await
         .unwrap();
-    cli(&o.paths, &["mode", "folder"]).await.unwrap();
+    cli(&o.paths, &["mode", "set", "folder"]).await.unwrap();
     let cfg = node.config();
     assert_eq!(cfg.centers[0].policy.mode, nerve_policy::Mode::Folder);
     assert_eq!(cfg.centers[0].policy.folders.len(), 1);

@@ -332,8 +332,7 @@ mod tests {
     fn folder(p: &str) -> Folder {
         Folder {
             path: p.into(),
-            access: Access::Rw,
-            execute: false,
+            access: Access::parse("rw").unwrap(),
         }
     }
 

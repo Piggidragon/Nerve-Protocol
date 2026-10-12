@@ -134,13 +134,13 @@ There is no bearer token for nodes. A copied config without the private key cann
 
 1. On the center: `nerve-center pair new [--name laptop]` (or "Add node" in the web UI) creates a one-time code (10 minutes, 10 tries, single use) and shows a link as text and QR:
    `nerve://pair?center=<pct-encoded https URL>&code=<code>&pin=<spki>`
-2. On the node: `nerve-node pair '<link>'`. The link is parsed strictly (unknown or doubled keys, bad escapes, paths with `.`/`..` segments, user info, query or fragment in the URL, and links over 4 KiB are refused). The owner sees the parsed center URL, the center name after step 3, and the policy and grant the new center entry starts with (default deny, so every call is refused until an allow rule or a mode allows it, and `settings = off`, §5.1, §5.2), and confirms. Nothing is stored before the confirmation.
+2. On the node: `nerve-node center add '<link>'`. The link is parsed strictly (unknown or doubled keys, bad escapes, paths with `.`/`..` segments, user info, query or fragment in the URL, and links over 4 KiB are refused). The owner sees the parsed center URL, the center name after step 3, and the policy and grant the new center entry starts with (default deny, so every call is refused until an allow rule or a mode allows it, and `settings = off`, §5.1, §5.2), and confirms. Nothing is stored before the confirmation.
 3. The node generates the key pair for this center and sends `POST {center}/nerve/v0/pair` with `{code, name, platform, arch, public_key}` over TLS checked against the pin.
 4. The center answers `{center_id, center_name, node_id}` and stores the public key. The node shows the center name and stores the pairing.
 
 `pin` is optional: without it the system roots and the usual name checks apply (a center behind a reverse proxy with a public certificate). `http://` is accepted only for loopback, with a same-user listener check on Linux.
 
-Unpairing works from both sides. `nerve-node unpair <center>` tells the center (`bye` reason `unpaired`) and deletes the key; `nerve-center node remove <node>` closes the link with `revoked` and drops the key; a node told `revoked` stops dialling that center.
+Unpairing works from both sides. `nerve-node center rm` tells the center (`bye` reason `unpaired`) and deletes the key; `nerve-center node remove <node>` closes the link with `revoked` and drops the key; a node told `revoked` stops dialling that center.
 
 ### 3.3 Who dials
 
@@ -223,7 +223,7 @@ Shared and device-only are the machine settings (§5.3) and the limits that prot
   "summary": "Linux laptop, user alice, bash. Files and commands under Folder mode (~/src rw).",
   "capabilities": [
     { "id": "exec", "profile": "nerve:exec/1", "provider": "node", "exposure": "open",
-      "summary": "Runs bash commands as alice, in folders marked execute.",
+      "summary": "Runs bash commands as alice, in folders flagged x.",
       "actions": { "run": { "effect": "execute", "params": {…}, "result": {…} },
                    "signal": { "effect": "actuate", "params": {…} } },
       "events": { "exit": { "schema": {…} } },
@@ -250,7 +250,7 @@ Shared and device-only are the machine settings (§5.3) and the limits that prot
 | `actuate` | Acts on the outside world or injects input | send a signal, click, type |
 | `execute` | Runs code the center chose | run a command |
 
-The node's policy maps modes and rules onto effects (Folder mode allows `read` and `write` inside granted folders and `execute` in folders marked `execute`; `sense` and `actuate` are refused in Folder and User mode unless the owner set the action `on`, and in default deny unless an allow rule names them). The center MAY refuse effects per harness by its own rules (§5.5).
+The node's policy maps modes and rules onto effects (Folder mode allows `read` inside folders flagged `r`, `write` inside folders flagged `w` and `execute` in folders flagged `x`; `sense` and `actuate` are refused in Folder and User mode unless the owner set the action `on`, and in default deny unless an allow rule names them). The center MAY refuse effects per harness by its own rules (§5.5).
 
 ### 4.5 Messages
 
@@ -317,8 +317,8 @@ Profiles for the desktop add-on (computer use, notifications, audio) are defined
 
 Node policy per center entry:
 
-- `mode`: `allowlist` (the default: default deny, a call runs only when an allow rule lets it through), `folder` (full access inside the granted folders and below; commands only in folders marked `execute`; shell under Landlock) or `user` (full access as the user, protections still on). Folder and User are the full-access modes. Sudo is not a mode; it is a separate switch below. Folder and User have no time limit by default: once set they stay until the owner changes them. A limit is opt-in (`until`, a time; `nerve-node mode user --hours N`): when it runs out, the center falls back to `allowlist`, the default deny mode, not to `folder`.
-- `folders`: path, `ro`/`rw`, `execute`. They count in Folder mode.
+- `mode`: `allowlist` (the default: default deny, a call runs only when an allow rule lets it through), `folder` (full access inside the granted folders and below; commands only in folders flagged `x`; shell under Landlock) or `user` (full access as the user, protections still on). Folder and User are the full-access modes. Sudo is not a mode; it is a separate switch below. Folder and User have no time limit by default: once set they stay until the owner changes them. A limit is opt-in (`until`, a time; `nerve-node mode set user --for HOURS`): when it runs out, the center falls back to `allowlist`, the default deny mode, not to `folder`.
+- `folders`: a path and `access`, three independent flags `r` (read), `w` (write) and `x` (run commands from the folder), in any combination: `access = "rx"`, `""` for none. `r` and `w` decide the `fs` actions (a write needs `w` and no `r`, a read `r` and no `w`); `x` decides where a command may run and which programs the sandbox lets it start. The deepest folder that holds a path decides for it. They count in Folder mode. On Linux each flag has its own Landlock set; a `w` folder is writable but not readable or listable, and Landlock cannot run a file it may not read, so an `x` folder also lets a command read its files by name (it still cannot list the folder; node-local §3).
 - `caps.<cap>[.<action>] = "on" | "off" | "hidden"`: switches per capability and action, derived from the descriptor.
 - `allow` and `deny` rules for every action, as globs over the call's target: the command line of `exec.run`, the path of an `fs` action, `<cap>.<action>` for any other (node-local §2). A rule adds only; the four buttons of the center's audit view write them (allow, allow as wildcard, deny, deny as wildcard), and they can be written by hand. Allow rules count in default deny only; in Folder and User mode they change nothing. Deny rules count in every mode, and a matching deny wins over everything.
 - protected paths (built in plus `extra`, minus the ones the owner released).
@@ -366,7 +366,7 @@ Every invoke from center C, session S is decided by the node's policy for C, and
 1. The policy looks for what allows the call: in default deny an allow rule, in Folder and User mode the mode itself (folders, the user's reach), for a sudo command the sudo allow list. Finding none, the node refuses at once with `forbidden`. A rule that denies (a `deny` rule, a protected path) wins over any rule that allows.
 2. The `message` of the refusal says what is missing and what to do next. The harness shows it to the model; the owner adds the rule and the model tries again.
 3. Every decision, allowed and refused, is audited on the node with center and session, and reaches a subscribed center as an `audit/decision` event.
-4. Rules are added on the node (`nerve-node allow`, `deny`, `folder`, `caps`, `config add`) or, for a center with `settings = write`, through the center (the four audit tab buttons, §11 item 9a).
+4. Rules are added on the node (`nerve-node rule allow|deny|sudo add`, `folder`, `cap set`, `config add`) or, for a center with `settings = write`, through the center (the four audit tab buttons, §11 item 9a).
 
 The center decides the same way for its own rules (§5.5): it refuses a call before sending it, and never allows what the node would not.
 
@@ -457,12 +457,13 @@ Commands the node runs for a center cannot change the node's settings through th
 
 - Package: one binary, Linux and Windows. Headless; everything through the CLI in 0.0.1.
 - `nerve-node install` (user service), `nerve-node setup --create-user nerve` (servers: dedicated user, system unit with `Delegate=yes`, folder grants printed as `setfacl` lines).
-- Terminal: `pair`, `unpair`, `centers`, `status`, `mode`, `folder`, `caps`, `allow`, `deny`, `grant settings`, `config get|set|unset|add|remove|accept`, `panic`, `unlock`, `sudo on|off|status` (`on` asks for the sudo password; the node verifies it and refuses a wrong one; `off` asks for none), `proxy`, `update`, `uninstall [--purge]`. Every per-center command takes `--center <name>` and refuses to guess when there are several.
+- Terminal, noun then verb like docker: `center add|rm|ls|pause|resume|grant settings`, `folder add|set|rm|ls`, `mode set allowlist|folder|user [--for HOURS]`, `rule allow|deny|sudo add|rm|ls [--wildcard]`, `cap set|ls`, `sudo on|off|status` (`on` asks for the sudo password; the node verifies it and refuses a wrong one; `off` asks for none), `proxy set|rm|ls`, `config get|set|unset|add|remove|accept`, and on their own `run`, `status`, `audit [--denied] [--follow]`, `panic`, `unlock`, `install`, `setup`, `update`, `uninstall`. Folder rights are written like chmod: `folder add <path> +r +w +x` (at least one right is required), `folder set <path> =rw -w +x` (changes apply left to right). Every per-center command takes `--center <name>` and refuses to guess when there are several.
 - In 0.0.1 the commands `install`, `setup`, `update` and `uninstall` exist but only answer "not done in 0.0.1"; the node is started by hand until they land.
 - Pairing is confirmed in the terminal; a `nerve://` link handler and dialogs come with the Slint setup GUI later.
 
 ### 8.3 One source of truth
 
+- Every CLI command that changes a setting (the list is in §8.2) is one of these writers; none edits the file on its own.
 - Each daemon owns exactly one config file (`~/.config/nerve/node.toml`, `~/.config/nerve/center.toml`; `%APPDATA%\nerve\…` on Windows), described by a published JSON Schema.
 - Every writer goes through the daemon's settings API on its control socket: the CLI, (later) the setup GUI and the desktop add-on, and (through `nerve:settings/1`) a center with `write`. The API takes a whole document with `if_version`, validates it against the schema and the rules (client-only items), writes the file atomically, applies it at once, audits each change with old and new value and notifies listeners. No component writes the file directly; while no daemon runs, the CLI writes it through the same store.
 - The daemon keeps the config in memory and reads the file only at start-up and when the owner asks (`SIGHUP`, `reload` on the socket). Every file the node writes carries an HMAC over its content in its first line, keyed by a secret in the node's state folder (`config.key`, 0600). A file without a matching MAC, a hand edit included, was not written through the owner's path: it is refused and audited, and the old settings stay (at start-up the node does not start). The owner takes such a file after looking at it with `nerve-node config accept` (node-local §1).
@@ -496,7 +497,7 @@ settings = "off"       # off | write
 
 [center.policy]
 mode = "allowlist"      # allowlist | folder | user
-folders = [{ path = "~/src", access = "rw", execute = true }]
+folders = [{ path = "~/src", access = "rwx" }]    # r read, w write, x run commands
 caps = { exec = "on" }
 ```
 

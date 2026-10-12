@@ -26,8 +26,7 @@ fn wide_open(mode: Mode) -> CenterPolicy {
     for path in ["/h", CONFIG, STATE] {
         p.folders.push(Folder {
             path: path.into(),
-            access: Access::Rw,
-            execute: true,
+            access: Access::ALL,
         });
     }
     p.protected.allow = vec!["~/.config/nerve".into(), "~/.local/state/nerve".into()];

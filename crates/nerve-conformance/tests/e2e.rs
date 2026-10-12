@@ -109,9 +109,9 @@ fn nerve_center_and_nerve_node_work_together() {
 
     // Pairing from the web UI's link, confirmed on the node.
     let link = mcp.pair_link();
-    let out = node.ok(&["pair", &link, "--yes"]);
+    let out = node.ok(&["center", "add", &link, "--yes"]);
     assert!(out.contains("e2e-center"), "{out}");
-    assert!(node.ok(&["centers"]).contains("e2e-center"));
+    assert!(node.ok(&["center", "ls"]).contains("e2e-center"));
     node.use_fake_sudo(SUDO_PW);
     node.start();
     let ov = mcp.wait_overview("the node comes online", |v| {
@@ -132,7 +132,7 @@ fn nerve_center_and_nerve_node_work_together() {
     assert!(!names.iter().any(|n| n.contains("settings__")), "{names:?}");
 
     // The settings grant, given on the node, reaches the center.
-    node.ok(&["grant", "settings", "write"]);
+    node.ok(&["center", "grant", "settings", "write"]);
     mcp.wait_overview("the settings grant reaches the center", |v| {
         v["nodes"][0]["settings_write"] == json!(true)
     });
@@ -313,10 +313,10 @@ fn nerve_center_and_nerve_node_work_together() {
     assert!(text_of(&r).contains("forbidden"), "{r}");
 
     // A folder counts in folder mode only: in default deny it allows nothing.
-    node.ok(&["folder", "add", &node.home.to_string_lossy()]);
+    node.ok(&["folder", "add", &node.home.to_string_lossy(), "+r"]);
     let r = mcp.call(&read, with(args.clone(), json!({"path": path})));
     assert_eq!(r["isError"], json!(true), "{r}");
-    node.ok(&["mode", "folder"]);
+    node.ok(&["mode", "set", "folder"]);
     let r = mcp.call(&read, with(args.clone(), json!({"path": path})));
     assert_eq!(r["isError"], json!(false), "{r}");
     assert!(text_of(&r).contains("hello from the node"), "{r}");
@@ -384,13 +384,13 @@ fn node_part_passes_against_nerve_node() {
         let node = n;
         tokio::task::spawn_blocking(move || {
             let mut node = node.lock().unwrap();
-            let (ok, out, err) = node.cli(&["pair", &link, "--yes"]);
+            let (ok, out, err) = node.cli(&["center", "add", &link, "--yes"]);
             if !ok {
                 return Err(format!("pair failed: {out}{err}"));
             }
             // The profile checks write the policy through settings.set and
             // try one wrong sudo password: on a fake sudo, not this machine's.
-            let (ok, out, err) = node.cli(&["grant", "settings", "write"]);
+            let (ok, out, err) = node.cli(&["center", "grant", "settings", "write"]);
             if !ok {
                 return Err(format!("grant failed: {out}{err}"));
             }

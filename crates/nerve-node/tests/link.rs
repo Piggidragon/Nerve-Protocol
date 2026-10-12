@@ -198,8 +198,7 @@ async fn allow_rules_do_not_count_in_folder_mode_and_deny_rules_do() {
         p.mode = nerve_policy::Mode::Folder;
         p.folders.push(nerve_policy::config::Folder {
             path: inside.display().to_string(),
-            access: nerve_policy::config::Access::Ro,
-            execute: false,
+            access: nerve_policy::config::Access::parse("r").unwrap(),
         });
         p.allow.push(format!("fs:{}/*", wire(&elsewhere)));
         p.deny
@@ -299,8 +298,7 @@ async fn folder_mode_confines_commands_to_their_folders() {
         p.mode = nerve_policy::Mode::Folder;
         p.folders.push(nerve_policy::config::Folder {
             path: work.display().to_string(),
-            access: nerve_policy::config::Access::Rw,
-            execute: true,
+            access: nerve_policy::config::Access::ALL,
         });
     })
     .await;

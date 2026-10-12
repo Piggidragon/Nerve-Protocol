@@ -1,8 +1,8 @@
 //! Confinement for the commands a node runs (architecture §5.1, §7).
 //!
 //! 0.0.1 confines with Landlock on Linux, in `folders` mode: a command reads
-//! the system directories and its center's folders, writes only the read-write
-//! folders, and runs programs only from the system directories and the execute
+//! the system directories and the folders flagged `r`, writes only the `w`
+//! folders, and runs programs only from the system directories and the `x`
 //! folders. The rules are applied in a small shim, `nerve-node __exec-shim`,
 //! which the node starts per command: Landlock restricts the calling process,
 //! and doing that between `fork` and `exec` of a multi-threaded async node is
@@ -23,9 +23,11 @@ pub const SHIM_ARG: &str = "__exec-shim";
 #[serde(deny_unknown_fields)]
 pub struct LandlockSpec {
     pub read: Vec<PathBuf>,
-    /// Writable, and readable.
+    /// Writable, and nothing more: a folder that is also to be read is in
+    /// `read` as well.
     pub write: Vec<PathBuf>,
-    /// Programs below these may run.
+    /// Programs below these may run. The files there can be read by name too
+    /// (see `landlock_rules::prepare`), the folders not listed.
     pub exec: Vec<PathBuf>,
 }
 
@@ -243,10 +245,16 @@ pub mod landlock_rules {
     pub fn prepare(spec: &LandlockSpec) -> Result<RulesetCreated, String> {
         let e = |e: landlock::RulesetError| e.to_string();
         // Running a program is its own right, granted only where `exec` says.
+        // The kernel opens a program for reading as well as for execution, so
+        // Landlock refuses the exec of a file it may not read: an `exec`
+        // folder therefore also lets a command read the files in it by name.
+        // It cannot list the folder (no ReadDir), and `read` stays the set
+        // that grants whole trees.
         let mut read = AccessFs::from_read(ABI_WANTED);
         read.remove(AccessFs::Execute);
-        let mut write = AccessFs::from_all(ABI_WANTED);
-        write.remove(AccessFs::Execute);
+        // Only the write rights, so a folder that may be written but not read
+        // (`w` without `r`) stays unreadable; reading is the `read` set's.
+        let write = AccessFs::from_write(ABI_WANTED);
         let mut rs = Ruleset::default()
             .handle_access(AccessFs::from_all(ABI_WANTED))
             .map_err(e)?;
@@ -259,7 +267,10 @@ pub mod landlock_rules {
             .map_err(e)?
             .add_rules(path_beneath_rules(&spec.write, write))
             .map_err(e)?
-            .add_rules(path_beneath_rules(&spec.exec, AccessFs::Execute))
+            .add_rules(path_beneath_rules(
+                &spec.exec,
+                AccessFs::Execute | AccessFs::ReadFile,
+            ))
             .map_err(e)
     }
 
@@ -344,12 +355,29 @@ mod tests {
         assert!(!c.available());
     }
 
+    /// Runs `script` in `/bin/sh` under `spec`; whether it succeeded.
+    #[cfg(target_os = "linux")]
+    fn confined_sh(spec: &LandlockSpec, script: &str) -> bool {
+        use std::os::unix::process::CommandExt;
+        let mut rs = Some(landlock_rules::prepare(spec).unwrap());
+        let mut cmd = std::process::Command::new("/bin/sh");
+        cmd.arg("-c").arg(script);
+        // SAFETY: the closure only makes the Landlock syscalls on a ruleset
+        // built before the fork.
+        unsafe {
+            cmd.pre_exec(move || match rs.take() {
+                Some(r) => landlock_rules::enforce(r),
+                None => Ok(()),
+            });
+        }
+        cmd.status().unwrap().success()
+    }
+
     /// The rules hold in a real child: writes inside the read-write folder
     /// work, writes elsewhere fail. Skipped where the kernel has no Landlock.
     #[cfg(target_os = "linux")]
     #[test]
     fn landlock_confines_writes() {
-        use std::os::unix::process::CommandExt;
         if landlock_rules::abi_version().is_none() {
             eprintln!("no Landlock here; skipped");
             return;
@@ -363,22 +391,62 @@ mod tests {
             exec: system_dirs(),
         };
         let run = |target: &std::path::Path| {
-            let mut rs = Some(landlock_rules::prepare(&spec).unwrap());
-            let mut cmd = std::process::Command::new("/bin/sh");
-            cmd.arg("-c").arg(format!("echo x > {}", target.display()));
-            // SAFETY: the closure only makes the Landlock syscalls on a ruleset
-            // built before the fork.
-            unsafe {
-                cmd.pre_exec(move || match rs.take() {
-                    Some(r) => landlock_rules::enforce(r),
-                    None => Ok(()),
-                });
-            }
-            cmd.status().unwrap().success()
+            confined_sh(&spec, &format!("echo x > {}", target.display()))
         };
         assert!(run(&rw.path().join("ok")));
         assert!(rw.path().join("ok").exists());
         assert!(!run(&other.path().join("no")));
         assert!(!other.path().join("no").exists());
+    }
+
+    /// The flags are independent in the kernel too: a folder in `write` alone
+    /// can be written and not read or listed, and one in `exec` alone can run
+    /// its program and not be read.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn landlock_write_without_read_and_execute_without_read() {
+        if landlock_rules::abi_version().is_none() {
+            eprintln!("no Landlock here; skipped");
+            return;
+        }
+        let tmp = std::env::temp_dir();
+        let wo = tempfile::tempdir_in(&tmp).unwrap();
+        let xo = tempfile::tempdir_in(&tmp).unwrap();
+        std::fs::write(wo.path().join("old"), "old").unwrap();
+        std::fs::copy("/bin/true", xo.path().join("tool")).unwrap();
+        let spec = LandlockSpec {
+            read: system_dirs(),
+            write: [system_writable(), vec![wo.path().into()]].concat(),
+            exec: [system_dirs(), vec![xo.path().into()]].concat(),
+        };
+        let d = |p: &std::path::Path| p.display().to_string();
+        assert!(confined_sh(
+            &spec,
+            &format!("echo x > {}/new", d(wo.path()))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(wo.path().join("new")).unwrap(),
+            "x\n"
+        );
+        assert!(!confined_sh(&spec, &format!("cat {}/old", d(wo.path()))));
+        assert!(!confined_sh(&spec, &format!("ls {}", d(wo.path()))));
+        assert!(confined_sh(&spec, &format!("{}/tool", d(xo.path()))));
+        // Not listed, not written; a file can be read by name only because
+        // Landlock cannot run what it may not read.
+        assert!(!confined_sh(&spec, &format!("ls {}", d(xo.path()))));
+        assert!(confined_sh(
+            &spec,
+            &format!("cat {}/tool > /dev/null", d(xo.path()))
+        ));
+        assert!(!confined_sh(
+            &spec,
+            &format!("echo x > {}/no", d(xo.path()))
+        ));
+        // Without the exec right the same program does not start.
+        let none = LandlockSpec {
+            exec: system_dirs(),
+            ..spec.clone()
+        };
+        assert!(!confined_sh(&none, &format!("{}/tool", d(xo.path()))));
     }
 }

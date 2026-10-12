@@ -11,7 +11,7 @@ use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
-use nerve_policy::config::{Access, CenterPolicy};
+use nerve_policy::config::CenterPolicy;
 use nerve_policy::paths::{to_wire, within};
 use nerve_policy::{Target, protected::expand};
 use nerve_proto::rpc::params;
@@ -67,7 +67,7 @@ impl RunCall {
     }
 
     /// The working directory is judged as a read; the command itself by the
-    /// command rules and the execute folders.
+    /// command rules and the folders that allow running.
     pub fn targets(&self) -> Vec<Target> {
         vec![Target {
             path: self.cwd.clone(),
@@ -105,10 +105,16 @@ pub fn shell_command(shell: Option<&str>, command: &str) -> (String, Vec<String>
 }
 
 /// The Landlock rules for a command of a center in `folders` mode: it reads
-/// the system and its folders, writes its read-write folders, runs programs
-/// from the system and its execute folders. The node's own folders (`own`:
-/// its config, keys and state) are in none of these sets, whatever the
-/// folders say ([`leave_out`]).
+/// the system and its `r` folders, writes its `w` folders, runs programs from
+/// the system and its `x` folders. The three flags are independent, so each
+/// set takes the folders with its own flag and nothing else: a folder with
+/// only `w` is in `write` alone, and the write rule carries no read right
+/// (the command can put files there but not list or read them), and a folder
+/// with only `x` can run its programs but not be listed: Landlock refuses to
+/// run a file it may not read, so the `exec` rule carries ReadFile and the
+/// files there can be read by name. The node's own folders
+/// (`own`: its config, keys and state) are in none of these sets, whatever
+/// the folders say ([`leave_out`]).
 pub fn landlock_spec(policy: &CenterPolicy, home: &Path, own: &[PathBuf]) -> LandlockSpec {
     let folders = |f: &dyn Fn(&nerve_policy::config::Folder) -> bool| -> Vec<PathBuf> {
         policy
@@ -120,19 +126,19 @@ pub fn landlock_spec(policy: &CenterPolicy, home: &Path, own: &[PathBuf]) -> Lan
     };
     LandlockSpec {
         read: leave_out(
-            &[nerve_sandbox::system_dirs(), folders(&|_| true)].concat(),
+            &[nerve_sandbox::system_dirs(), folders(&|x| x.access.read)].concat(),
             own,
         ),
         write: leave_out(
             &[
                 nerve_sandbox::system_writable(),
-                folders(&|x| x.access == Access::Rw),
+                folders(&|x| x.access.write),
             ]
             .concat(),
             own,
         ),
         exec: leave_out(
-            &[nerve_sandbox::system_dirs(), folders(&|x| x.execute)].concat(),
+            &[nerve_sandbox::system_dirs(), folders(&|x| x.access.execute)].concat(),
             own,
         ),
     }
@@ -439,6 +445,7 @@ pub async fn run(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use nerve_policy::config::Access;
 
     fn opts(cap: usize) -> RunOptions {
         RunOptions {
@@ -545,8 +552,7 @@ mod tests {
         let policy = CenterPolicy {
             folders: vec![nerve_policy::config::Folder {
                 path: w.display().to_string(),
-                access: Access::Rw,
-                execute: true,
+                access: Access::ALL,
             }],
             ..Default::default()
         };
@@ -554,6 +560,40 @@ mod tests {
         for set in [&spec.read, &spec.write, &spec.exec] {
             assert!(set.contains(&w.join("a")), "{set:?}");
             assert!(!set.iter().any(|p| own[0].starts_with(p)), "{set:?}");
+        }
+    }
+
+    /// Every combination of the three flags puts a folder in exactly the
+    /// sets of its flags: `w` without `r` is in `write` only.
+    #[test]
+    fn each_folder_flag_puts_it_in_its_own_set() {
+        let w = std::env::temp_dir();
+        for bits in 0..8u8 {
+            let access = Access {
+                read: bits & 1 != 0,
+                write: bits & 2 != 0,
+                execute: bits & 4 != 0,
+            };
+            let policy = CenterPolicy {
+                folders: vec![nerve_policy::config::Folder {
+                    path: w.display().to_string(),
+                    access,
+                }],
+                ..Default::default()
+            };
+            let spec = landlock_spec(&policy, &w, &[]);
+            let label = access.to_chmod();
+            assert_eq!(spec.read.contains(&w), access.read, "read set of {label}");
+            assert_eq!(
+                spec.write.contains(&w),
+                access.write,
+                "write set of {label}"
+            );
+            assert_eq!(
+                spec.exec.contains(&w),
+                access.execute,
+                "exec set of {label}"
+            );
         }
     }
 

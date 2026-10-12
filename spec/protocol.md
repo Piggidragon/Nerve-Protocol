@@ -81,7 +81,7 @@ Unknown fields are refused. Answers:
   is up, deletes its key, and the center forgets the node when it sees that bye.
 - The center owner removes a node: the center sends `bye {reason: "revoked"}`
   and closes; the node stops dialling that center (it keeps its key so the
-  owner can see what happened, until `unpair`).
+  owner can see what happened, until `center rm`).
 
 ## 4. Link
 

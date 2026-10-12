@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 
 use nerve_proto::Effect;
 
-use crate::config::{Access, CapSetting, CenterPolicy, Folder, Mode};
+use crate::config::{CapSetting, CenterPolicy, Folder, Mode};
 use crate::paths::{to_wire, within};
 use crate::protected::Protected;
 use crate::rules::{RuleSet, command_matches};
@@ -57,7 +57,7 @@ pub struct Env<'a> {
     pub home: &'a Path,
     pub protected: &'a Protected,
     /// Whether commands run in `folder` mode can be confined (Landlock). When
-    /// they cannot, a command in an execute folder is refused.
+    /// they cannot, a command in a folder that allows running is refused.
     pub confined: bool,
     /// The node's sudo switch: on only while the node holds a sudo password
     /// it has checked.
@@ -81,7 +81,8 @@ pub fn sudo_command(command: &str) -> Option<&str> {
 const SHELL_CONTROL: &[char] = &[';', '&', '|', '$', '`', '(', ')', '<', '>', '\n', '\r'];
 
 fn inside_folder<'f>(folders: &'f [Folder], path: &Path) -> Option<&'f Folder> {
-    // The deepest folder wins, so an ro folder inside an rw one stays ro.
+    // The deepest folder wins, so a read-only folder inside a read-write one
+    // stays read-only.
     folders
         .iter()
         .filter(|f| within(path, Path::new(&f.path)))
@@ -266,17 +267,24 @@ fn by_mode(
         Effect::Read | Effect::Write => {
             let ok = match mode {
                 Mode::User => true,
+                // Each flag stands alone: writing needs `w` and no `r`, reading
+                // needs `r` and no `w`.
                 Mode::Folder => call.targets.iter().all(|t| {
-                    inside_folder(&policy.folders, &t.path)
-                        .is_some_and(|f| !t.write || f.access == Access::Rw)
+                    inside_folder(&policy.folders, &t.path).is_some_and(|f| {
+                        if t.write {
+                            f.access.write
+                        } else {
+                            f.access.read
+                        }
+                    })
                 }),
                 // The allow rules decide there (`by_allow_rules`).
                 Mode::Allowlist => false,
             };
             if !ok {
                 reasons.push(match call.effect {
-                    Effect::Write => "outside the read-write folders".into(),
-                    _ => "outside the folders".into(),
+                    Effect::Write => "outside the folders that allow writing".into(),
+                    _ => "outside the folders that allow reading".into(),
                 });
             }
             ok
@@ -288,11 +296,13 @@ fn by_mode(
                 let in_exec = call
                     .cwd
                     .and_then(|c| inside_folder(&policy.folders, c))
-                    .is_some_and(|f| f.execute);
+                    .is_some_and(|f| f.access.execute);
                 if in_exec && !env.confined {
                     reasons.push("commands cannot be confined on this machine".into());
                 } else if !in_exec {
-                    reasons.push("the working directory is not in an execute folder".into());
+                    reasons.push(
+                        "the working directory is not in a folder that allows running".into(),
+                    );
                 }
                 in_exec && env.confined
             }
@@ -303,7 +313,7 @@ fn by_mode(
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use crate::config::ProtectedOptions;
+    use crate::config::{Access, ProtectedOptions};
 
     const NOW: u64 = 1_000_000;
 
@@ -314,13 +324,11 @@ mod tests {
             folders: vec![
                 Folder {
                     path: "/w/ro".into(),
-                    access: Access::Ro,
-                    execute: false,
+                    access: acc("r"),
                 },
                 Folder {
                     path: "/w/rw".into(),
-                    access: Access::Rw,
-                    execute: true,
+                    access: acc("rwx"),
                 },
             ],
             deny: vec![
@@ -330,6 +338,10 @@ mod tests {
             ],
             ..Default::default()
         }
+    }
+
+    fn acc(s: &str) -> Access {
+        Access::parse(s).unwrap()
     }
 
     const MODES: [Mode; 3] = [Mode::Allowlist, Mode::Folder, Mode::User];
@@ -516,6 +528,102 @@ mod tests {
             p.allow = vec!["fs:/w/ro/*".into()];
             assert_eq!(run(&p, &env, &read), "allow", "{mode:?}");
         }
+    }
+
+    /// All eight combinations of the three flags, in folder mode: a read
+    /// needs `r` only, a write `w` only, a command `x` only.
+    #[test]
+    fn each_folder_flag_decides_its_own_calls() {
+        let x = T::new();
+        let env = x.env(true);
+        for bits in 0..8u8 {
+            let access = Access {
+                read: bits & 1 != 0,
+                write: bits & 2 != 0,
+                execute: bits & 4 != 0,
+            };
+            let mut p = policy(Mode::Folder);
+            p.folders = vec![Folder {
+                path: "/w/f".into(),
+                access,
+            }];
+            let read = t("/w/f/a", false);
+            let write = t("/w/f/a", true);
+            let cwd = t("/w/f", false);
+            let want = |on: bool| if on { "allow" } else { "refused" };
+            let label = access.to_chmod();
+            assert_eq!(
+                run(&p, &env, &call(Effect::Read, &read, None)),
+                want(access.read),
+                "read in {label}"
+            );
+            assert_eq!(
+                run(&p, &env, &call(Effect::Write, &write, None)),
+                want(access.write),
+                "write in {label}"
+            );
+            assert_eq!(
+                run(&p, &env, &call(Effect::Execute, &cwd, Some("ls"))),
+                want(access.execute),
+                "run in {label}"
+            );
+            // Outside the folder nothing is allowed, whatever the flags.
+            let out = t("/w/other/a", false);
+            assert_eq!(run(&p, &env, &call(Effect::Read, &out, None)), "refused");
+        }
+    }
+
+    #[test]
+    fn write_without_read_and_execute_without_read() {
+        let x = T::new();
+        let env = x.env(true);
+        let mut p = policy(Mode::Folder);
+        p.folders = vec![
+            Folder {
+                path: "/w/drop".into(),
+                access: acc("w"),
+            },
+            Folder {
+                path: "/w/bin".into(),
+                access: acc("x"),
+            },
+        ];
+        let w = t("/w/drop/a", true);
+        let r = t("/w/drop/a", false);
+        assert_eq!(run(&p, &env, &call(Effect::Write, &w, None)), "allow");
+        assert_eq!(run(&p, &env, &call(Effect::Read, &r, None)), "refused");
+        let cwd = t("/w/bin", false);
+        assert_eq!(
+            run(&p, &env, &call(Effect::Execute, &cwd, Some("./tool"))),
+            "allow"
+        );
+        assert_eq!(
+            run(
+                &p,
+                &env,
+                &call(Effect::Read, &t("/w/bin/tool", false), None)
+            ),
+            "refused"
+        );
+        // A folder with no flag grants nothing at all.
+        p.folders[0].access = Access::NONE;
+        assert_eq!(run(&p, &env, &call(Effect::Write, &w, None)), "refused");
+        // A narrower folder inside a wider one decides for its own tree.
+        p.folders = vec![
+            Folder {
+                path: "/w/all".into(),
+                access: acc("rwx"),
+            },
+            Folder {
+                path: "/w/all/sealed".into(),
+                access: acc("r"),
+            },
+        ];
+        let sealed = t("/w/all/sealed/a", true);
+        assert_eq!(
+            run(&p, &env, &call(Effect::Write, &sealed, None)),
+            "refused"
+        );
     }
 
     #[test]

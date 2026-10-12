@@ -191,8 +191,9 @@ pub enum Mode {
     /// What a new center starts in.
     #[default]
     Allowlist,
-    /// Full access inside the folders, by their access: the folders and
-    /// everything below them, commands in the `execute` folders.
+    /// Full access inside the folders, by their flags: reading where `r` is
+    /// set, writing where `w` is, commands where `x` is, in the folders and
+    /// everything below them.
     Folder,
     /// Full access as the user, protected paths aside.
     User,
@@ -208,12 +209,120 @@ impl Mode {
     }
 }
 
+/// What a center may do with a folder: three independent flags, every
+/// combination allowed. In the config it is the string of the letters that
+/// are set, `"rx"` (`""` for none).
+///
+/// - `read`: read the files and list the directories (fs read actions).
+/// - `write`: create, change and delete (fs write actions).
+/// - `execute`: run commands with a working directory in it, and run the
+///   programs it holds.
+///
+/// A write-only folder is legal: the sandbox grants the write rights without
+/// the read rights, so a command can put files there but not read them back
+/// or list the folder.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Access {
-    #[default]
-    Ro,
-    Rw,
+#[serde(try_from = "String", into = "String")]
+pub struct Access {
+    pub read: bool,
+    pub write: bool,
+    pub execute: bool,
+}
+
+impl Access {
+    pub const NONE: Access = Access {
+        read: false,
+        write: false,
+        execute: false,
+    };
+    pub const ALL: Access = Access {
+        read: true,
+        write: true,
+        execute: true,
+    };
+
+    /// `r`, `w` or `x`, each at most once, in any order; `""` is none.
+    pub fn parse(s: &str) -> Result<Access, String> {
+        let mut a = Access::NONE;
+        for c in s.chars() {
+            let flag = match c {
+                'r' => &mut a.read,
+                'w' => &mut a.write,
+                'x' => &mut a.execute,
+                other => {
+                    return Err(format!("{s:?}: {other:?} is not a folder flag (r, w or x)"));
+                }
+            };
+            if std::mem::replace(flag, true) {
+                return Err(format!("{s:?}: {c:?} is given twice"));
+            }
+        }
+        Ok(a)
+    }
+
+    /// One chmod-style change: `=rwx` replaces all three flags with the
+    /// letters after it (`=` alone clears them), `+x` sets the flags named and
+    /// `-w` clears them; the others stay.
+    pub fn change(self, spec: &str) -> Result<Access, String> {
+        let (op, letters) = match spec.chars().next() {
+            Some(op @ ('=' | '+' | '-')) => (op, &spec[1..]),
+            _ => return Err(format!("{spec:?}: start with =, + or - (=rwx, +x, -w)")),
+        };
+        if letters.is_empty() && op != '=' {
+            return Err(format!("{spec:?}: name at least one of r, w, x after {op}"));
+        }
+        let named = Access::parse(letters).map_err(|e| format!("{spec:?}: {e}"))?;
+        Ok(match op {
+            '=' => named,
+            '+' => Access {
+                read: self.read || named.read,
+                write: self.write || named.write,
+                execute: self.execute || named.execute,
+            },
+            _ => Access {
+                read: self.read && !named.read,
+                write: self.write && !named.write,
+                execute: self.execute && !named.execute,
+            },
+        })
+    }
+
+    pub fn is_none(self) -> bool {
+        self == Access::NONE
+    }
+
+    /// The flags that are set, as `ls -l` shows them: `rw-`, `r-x`, `---`.
+    pub fn to_chmod(self) -> String {
+        [(self.read, 'r'), (self.write, 'w'), (self.execute, 'x')]
+            .iter()
+            .map(|(on, c)| if *on { *c } else { '-' })
+            .collect()
+    }
+}
+
+/// The config form: the letters that are set, `rwx` order.
+impl std::fmt::Display for Access {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (on, c) in [(self.read, 'r'), (self.write, 'w'), (self.execute, 'x')] {
+            if on {
+                write!(f, "{c}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl TryFrom<String> for Access {
+    type Error = String;
+    fn try_from(s: String) -> Result<Access, String> {
+        Access::parse(&s)
+    }
+}
+
+impl From<Access> for String {
+    fn from(a: Access) -> String {
+        a.to_string()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -221,11 +330,9 @@ pub enum Access {
 pub struct Folder {
     /// Absolute, in this platform's form.
     pub path: String,
+    /// Without it the folder grants nothing.
     #[serde(default)]
     pub access: Access,
-    /// Commands may run with a working directory inside it.
-    #[serde(default)]
-    pub execute: bool,
 }
 
 /// A capability's or an action's exposure, as the owner sets it.
@@ -473,7 +580,7 @@ settings = "write"
 
 [center.policy]
 mode = "folder"
-folders = [{ path = "FOLDER", access = "rw", execute = true }]
+folders = [{ path = "FOLDER", access = "rwx" }]
 caps = { exec = "on", "fs.write" = "off" }
 allow = ["exec.run:git status", "fs.read:~/notes/*"]
 deny = ["fs:~/private/*", "exec.run:rm -rf *"]
@@ -630,6 +737,77 @@ sudo_allow = ["sudo apt update"]
             assert!(NodeConfig::parse(&center(bad)).is_err(), "{bad}");
         }
         assert!(NodeConfig::parse("[machine]\nelevation = \"off\"\n").is_err());
+    }
+
+    #[test]
+    fn folder_access_is_three_independent_flags() {
+        // Every combination parses, prints back as the letters in rwx order
+        // and survives the config file.
+        for bits in 0..8u8 {
+            let a = Access {
+                read: bits & 1 != 0,
+                write: bits & 2 != 0,
+                execute: bits & 4 != 0,
+            };
+            let text = a.to_string();
+            assert_eq!(Access::parse(&text).unwrap(), a, "{text:?}");
+            let policy = CenterPolicy {
+                folders: vec![Folder {
+                    path: FOLDER.into(),
+                    access: a,
+                }],
+                ..Default::default()
+            };
+            let toml = toml::to_string(&policy).unwrap();
+            assert!(toml.contains(&format!("access = \"{text}\"")), "{toml}");
+            assert_eq!(toml::from_str::<CenterPolicy>(&toml).unwrap(), policy);
+        }
+        // Any order is read; the letters come back in rwx order.
+        assert_eq!(Access::parse("xr").unwrap().to_string(), "rx");
+        assert_eq!(Access::parse("").unwrap(), Access::NONE);
+        assert_eq!(Access::ALL.to_chmod(), "rwx");
+        assert_eq!(Access::parse("wx").unwrap().to_chmod(), "-wx");
+        assert_eq!(Access::NONE.to_chmod(), "---");
+        // A folder without the key grants nothing.
+        let bare = format!("folders = [{{ path = \"{FOLDER}\" }}]");
+        let p: CenterPolicy = toml::from_str(&bare).unwrap();
+        assert!(p.folders[0].access.is_none());
+    }
+
+    #[test]
+    fn folder_access_changes_apply_in_order() {
+        let start = Access::parse("r").unwrap();
+        let steps = |specs: &[&str]| {
+            specs
+                .iter()
+                .try_fold(start, |a, s| a.change(s))
+                .map(|a| a.to_string())
+        };
+        assert_eq!(steps(&["+x"]).unwrap(), "rx");
+        assert_eq!(steps(&["+rw"]).unwrap(), "rw");
+        assert_eq!(steps(&["-r"]).unwrap(), "");
+        assert_eq!(steps(&["=rwx"]).unwrap(), "rwx");
+        assert_eq!(steps(&["="]).unwrap(), "");
+        // Left to right: the later change sees the earlier one.
+        assert_eq!(steps(&["=rwx", "-w"]).unwrap(), "rx");
+        assert_eq!(steps(&["-w", "=w", "+x"]).unwrap(), "wx");
+        assert_eq!(steps(&["+w", "-w"]).unwrap(), "r");
+        assert_eq!(steps(&["=x", "+w", "-x", "+r"]).unwrap(), "rw");
+        for bad in ["rw", "+", "-", "+q", "-rr", "*r", ""] {
+            assert!(start.change(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn folder_access_refuses_anything_but_r_w_x_once() {
+        for bad in ["ro", "rw+", "rr", "RW", "r w", "all", "true"] {
+            assert!(Access::parse(bad).is_err(), "{bad:?}");
+            let text = format!("folders = [{{ path = \"{FOLDER}\", access = \"{bad}\" }}]");
+            assert!(toml::from_str::<CenterPolicy>(&text).is_err(), "{bad:?}");
+        }
+        // The two keys of earlier builds are gone.
+        let old = format!("folders = [{{ path = \"{FOLDER}\", access = \"rw\", execute = true }}]");
+        assert!(toml::from_str::<CenterPolicy>(&old).is_err());
     }
 
     #[test]

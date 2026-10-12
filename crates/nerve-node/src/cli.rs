@@ -39,59 +39,90 @@ pub struct Cli {
 /// Picks one paired center; required when several are paired.
 #[derive(Debug, Args, Clone, Default)]
 pub struct CenterArg {
-    /// The paired center this is about (needed when several are paired).
+    /// Which center, when more than one is paired.
     #[arg(long)]
     pub center: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum Cmd {
-    /// Run the node daemon.
+    /// Pair this machine with centers and decide what each one may change.
+    #[command(subcommand)]
+    Center(CenterCmd),
+    /// Choose the folders a center may use and what it may do in each.
+    #[command(subcommand)]
+    Folder(FolderCmd),
+    /// Choose how much a center may do on its own.
+    #[command(subcommand)]
+    Mode(ModeCmd),
+    /// Keep the lists of commands that are allowed, forbidden or run with sudo.
+    #[command(subcommand)]
+    Rule(RuleCmd),
+    /// Turn capabilities and single actions on or off.
+    #[command(subcommand)]
+    Cap(CapCmd),
+    /// Switch sudo on or off for the commands on the sudo list.
+    #[command(subcommand)]
+    Sudo(SudoCmd),
+    /// Choose the proxy the node uses to reach centers.
+    #[command(subcommand)]
+    Proxy(ProxyCmd),
+    /// Read or change any setting in node.toml by its name.
+    #[command(subcommand)]
+    Config(ConfigCmd),
+    /// Run the node in the foreground.
     Run,
-    /// Pair with a center from its pairing link.
-    Pair {
-        /// The pairing link the center showed.
+    /// Show whether the node runs and which centers it is paired with.
+    Status,
+    /// Show what the node allowed and refused.
+    Audit {
+        /// Keep running and print new entries as they arrive.
+        #[arg(long)]
+        follow: bool,
+        /// Show only the calls that were refused.
+        #[arg(long)]
+        denied: bool,
+    },
+    /// Stop everything at once; nothing runs until `unlock`.
+    Panic,
+    /// Let the node work again after `panic`.
+    Unlock,
+    /// Install the node as a service (not done in 0.0.1).
+    Install,
+    /// Set up this machine for the node (not done in 0.0.1).
+    Setup {
+        /// Create a dedicated user for the node.
+        #[arg(long)]
+        create_user: bool,
+    },
+    /// Update the node (not done in 0.0.1).
+    Update,
+    /// Remove the node from this machine (not done in 0.0.1).
+    Uninstall,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CenterCmd {
+    /// Pair this machine with a center, using the pairing link it showed.
+    Add {
+        /// The pairing link.
         link: String,
-        /// The local name for the center (default: the center's own name).
+        /// The name to use for the center here (the center's own name if left out).
         #[arg(long)]
         name: Option<String>,
-        /// Confirm without asking.
+        /// Do not ask before pairing.
         #[arg(long)]
         yes: bool,
     },
-    /// Forget a center and its key.
-    Unpair(CenterArg),
-    /// List the paired centers.
-    Centers,
-    /// Show the daemon and its links.
-    Status,
-    /// Set a center's mode: allowlist, folder or user. Folder and user stay
-    /// until you change them; --hours sets a limit, after which the center
-    /// is back in allowlist.
-    Mode {
-        /// `allowlist` (only allow rules let a call through), `folder` (full
-        /// access in its folders) or `user` (full access as the user).
-        mode: String,
-        /// Limit folder or user mode to this many hours, then back to
-        /// allowlist (default: no limit).
-        #[arg(long)]
-        hours: Option<u64>,
-        #[command(flatten)]
-        center: CenterArg,
-    },
-    /// Add or remove a folder a center may use.
-    #[command(subcommand)]
-    Folder(FolderCmd),
-    /// Set a capability or action (`fs`, `exec.run`) to on, off or hidden.
-    Caps {
-        /// The capability (`fs`) or action (`exec.run`).
-        cap: String,
-        /// `on`, `off` or `hidden`.
-        setting: String,
-        #[command(flatten)]
-        center: CenterArg,
-    },
-    /// Let a center change settings (`settings off|write`).
+    /// Forget a center and delete its key.
+    Rm(CenterArg),
+    /// List the paired centers and how they are set.
+    Ls,
+    /// Stop the link to a center until you resume it.
+    Pause(CenterArg),
+    /// Link to a paused center again.
+    Resume(CenterArg),
+    /// Let a center change its own settings, or take that right away.
     Grant {
         /// What to grant; only `settings` exists.
         what: String,
@@ -100,73 +131,90 @@ pub enum Cmd {
         #[command(flatten)]
         center: CenterArg,
     },
-    /// Read or change node.toml by dotted key (`center.<name>.policy.mode`).
-    #[command(subcommand)]
-    Config(ConfigCmd),
-    /// Add a deny rule for a command (`deny <command> [--wildcard]`). It
-    /// refuses in every mode and wins over any allow rule.
-    Deny {
-        /// The command line to forbid.
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ModeCmd {
+    /// Set how much the center may do on its own.
+    Set {
+        /// `allowlist` (only listed commands run), `folder` (anything inside
+        /// its folders) or `user` (anything you could do yourself).
+        mode: String,
+        /// Go back to allowlist after this many hours (folder and user mode
+        /// otherwise stay until you change them).
+        #[arg(long = "for", value_name = "HOURS")]
+        for_hours: Option<u64>,
+        #[command(flatten)]
+        center: CenterArg,
+    },
+}
+
+/// One of the three lists of commands: `allow`, `deny` or `sudo`.
+#[derive(Debug, Subcommand)]
+pub enum ListCmd {
+    /// Put a command on the list.
+    Add {
+        /// The command line.
         command: String,
-        /// Match every command that starts with the same program.
+        /// Cover every command that starts with the same program.
         #[arg(long)]
         wildcard: bool,
         #[command(flatten)]
         center: CenterArg,
     },
-    /// Add an allow rule for a command (`allow <command> [--wildcard]`); a
-    /// `sudo` command goes on the sudo allow list. Allow rules count in
-    /// allowlist mode only. Rules for files and other actions go in with
-    /// `config add center.<name>.policy.allow <rule>`.
-    Allow {
-        /// The command line to allow.
+    /// Take a command off the list.
+    Rm {
+        /// The command line, or an entry as `ls` shows it.
         command: String,
-        /// Match every command that starts with the same program.
+        /// The entry was added with --wildcard.
         #[arg(long)]
         wildcard: bool,
         #[command(flatten)]
         center: CenterArg,
     },
-    /// Stop everything: every link ends, nothing runs until `unlock`.
-    Panic,
-    /// Undo `panic`.
-    Unlock,
-    /// Show the local audit log.
-    Audit {
-        /// Keep running and print new entries as they arrive.
-        #[arg(long)]
-        follow: bool,
-        /// Only denied and forbidden calls.
-        #[arg(long)]
-        denied: bool,
+    /// Show everything on the list.
+    Ls {
+        #[command(flatten)]
+        center: CenterArg,
     },
-    /// Set or clear the HTTP proxy used to reach centers.
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RuleCmd {
+    /// The commands that may run in allowlist mode.
     #[command(subcommand)]
-    Proxy(ProxyCmd),
-    /// Install as a service (not done in 0.0.1).
-    Install,
-    /// Set up the machine (not done in 0.0.1).
-    Setup {
-        /// Create a dedicated user for the node.
-        #[arg(long)]
-        create_user: bool,
+    Allow(ListCmd),
+    /// The commands that never run, in any mode.
+    #[command(subcommand)]
+    Deny(ListCmd),
+    /// The commands that may run with sudo while sudo is on.
+    #[command(subcommand)]
+    Sudo(ListCmd),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum CapCmd {
+    /// Set a capability (`fs`) or one action (`exec.run`) to on, off or hidden.
+    Set {
+        /// The capability (`fs`) or action (`exec.run`).
+        cap: String,
+        /// `on`, `off` or `hidden`.
+        setting: String,
+        #[command(flatten)]
+        center: CenterArg,
     },
-    /// The sudo switch: whether commands on the sudo allow list may run.
-    #[command(subcommand)]
-    Sudo(SudoCmd),
-    /// Update the node (not done in 0.0.1).
-    Update,
-    /// Remove the node (not done in 0.0.1).
-    Uninstall,
+    /// Show the capabilities and actions you set.
+    Ls {
+        #[command(flatten)]
+        center: CenterArg,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 pub enum SudoCmd {
-    /// Turn sudo on: asks for the sudo password, which the node checks with
-    /// `sudo -v` and keeps in memory only. Only commands the sudo allow list
-    /// names run with sudo.
+    /// Turn sudo on; asks for your sudo password and keeps it in memory only.
     On,
-    /// Turn sudo off and drop the password.
+    /// Turn sudo off and forget the password.
     Off,
     /// Show whether sudo is on.
     Status,
@@ -174,23 +222,41 @@ pub enum SudoCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum FolderCmd {
-    /// Let a center use a folder (read-only unless `--rw`).
+    /// Let a center use a folder; name at least one right: +r, +w or +x.
     Add {
         /// The folder.
         path: PathBuf,
-        /// Allow writing, not only reading.
-        #[arg(long)]
-        rw: bool,
-        /// Allow running programs from the folder.
-        #[arg(long)]
-        execute: bool,
+        /// The rights: +r reads, +w writes, +x runs commands (`+r +x`, `+rw`).
+        #[arg(value_name = "+r|+w|+x")]
+        rights: Vec<String>,
+        #[command(flatten)]
+        center: CenterArg,
+    },
+    /// Change what a center may do in a folder it already has.
+    Set {
+        /// The folder.
+        path: PathBuf,
+        /// The changes, applied left to right: `=rwx` sets exactly these
+        /// rights, `+x` adds one, `-w` takes one away.
+        #[arg(
+            value_name = "=rwx|+x|-w",
+            required = true,
+            num_args = 1..,
+            allow_hyphen_values = true
+        )]
+        changes: Vec<String>,
         #[command(flatten)]
         center: CenterArg,
     },
     /// Take a folder away from a center.
-    Remove {
+    Rm {
         /// The folder.
         path: PathBuf,
+        #[command(flatten)]
+        center: CenterArg,
+    },
+    /// Show a center's folders and their rights.
+    Ls {
         #[command(flatten)]
         center: CenterArg,
     },
@@ -237,16 +303,18 @@ pub enum ConfigCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum ProxyCmd {
-    /// Reach centers through this HTTP proxy.
+    /// Reach centers through an HTTP proxy.
     Set {
         /// The proxy URL.
         url: String,
-        /// A header for the CONNECT request, `Name: value`.
+        /// A header for the proxy request, `Name: value`; can be given more than once.
         #[arg(long = "header")]
         headers: Vec<String>,
     },
     /// Reach centers directly again.
-    Clear,
+    Rm,
+    /// Show the proxy that is set, if any.
+    Ls,
 }
 
 /// The command list as `nerve-node --help` has it, for anything that shows
@@ -259,7 +327,21 @@ pub struct Help {
     pub about: String,
     /// Options every command takes.
     pub global: Vec<ArgHelp>,
-    /// Every command and sub-command, in the order `--help` lists them.
+    /// The commands by their noun (`folder`, `rule`), in the order `--help`
+    /// lists them, then the commands that stand alone.
+    pub groups: Vec<Group>,
+}
+
+/// The commands that share a noun, or, with an empty `name`, the commands
+/// that have none.
+#[derive(Debug, Clone, Serialize)]
+pub struct Group {
+    /// The noun: `folder`, `rule`; empty for the commands without one.
+    pub name: String,
+    /// What the group is for, in one sentence.
+    pub about: String,
+    /// Its commands, in the order `--help` lists them. A command that only
+    /// holds more commands (`rule allow`) is in the list too, before them.
     pub commands: Vec<CommandHelp>,
 }
 
@@ -271,62 +353,95 @@ pub struct CommandHelp {
     pub usage: String,
     /// The explanation: the doc comment of the command.
     pub about: String,
+    /// Whether it only holds more commands and does nothing by itself.
+    pub holds_commands: bool,
     /// Its own arguments and flags, without the global ones.
     pub args: Vec<ArgHelp>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct ArgHelp {
-    /// How it is written: `--hours <HOURS>`, `<PATH>`, `--rw`.
+    /// How it is written: `--for <HOURS>`, `<PATH>`, `--wildcard`.
     pub name: String,
     /// The explanation; empty when the argument has none.
     pub about: String,
+    /// Whether it can be left out.
+    pub optional: bool,
+}
+
+impl Help {
+    /// Every command, group by group.
+    pub fn commands(&self) -> impl Iterator<Item = &CommandHelp> {
+        self.groups.iter().flat_map(|g| g.commands.iter())
+    }
 }
 
 /// Reads [`Help`] from the [`Cli`] definition.
 pub fn help() -> Help {
     let mut root = Cli::command();
     root.build();
-    let mut commands = Vec::new();
-    collect_help(&root, "", &mut commands);
+    let mut groups = Vec::new();
+    let mut alone = Vec::new();
+    for sub in root.get_subcommands() {
+        if sub.get_name() == "help" || sub.is_hide_set() {
+            continue;
+        }
+        if sub.has_subcommands() {
+            let mut commands = Vec::new();
+            collect_help(sub, sub.get_name(), &mut commands);
+            groups.push(Group {
+                name: sub.get_name().to_string(),
+                about: about_of(sub),
+                commands,
+            });
+        } else {
+            alone.push(command_help(sub, sub.get_name()));
+        }
+    }
+    groups.push(Group {
+        name: String::new(),
+        about: "Commands that stand on their own.".into(),
+        commands: alone,
+    });
     Help {
-        about: root
-            .get_about()
-            .map(ToString::to_string)
-            .unwrap_or_default(),
+        about: about_of(&root),
         global: root
             .get_arguments()
             .filter(|a| a.is_global_set())
             .map(arg_help)
             .collect(),
-        commands,
+        groups,
     }
 }
 
+fn about_of(c: &clap::Command) -> String {
+    c.get_about().map(ToString::to_string).unwrap_or_default()
+}
+
+fn command_help(sub: &clap::Command, name: &str) -> CommandHelp {
+    let usage = sub.clone().render_usage().to_string();
+    CommandHelp {
+        name: name.to_string(),
+        usage: usage.strip_prefix("Usage: ").unwrap_or(&usage).to_string(),
+        about: about_of(sub),
+        holds_commands: sub.has_subcommands(),
+        args: sub
+            .get_arguments()
+            .filter(|a| !a.is_global_set() && !matches!(a.get_id().as_str(), "help" | "version"))
+            .map(arg_help)
+            .collect(),
+    }
+}
+
+/// The commands below `parent`, each after the one that holds it.
 fn collect_help(parent: &clap::Command, prefix: &str, out: &mut Vec<CommandHelp>) {
     for sub in parent.get_subcommands() {
         // clap adds a `help` sub-command of its own to every level.
         if sub.get_name() == "help" || sub.is_hide_set() {
             continue;
         }
-        let name = if prefix.is_empty() {
-            sub.get_name().to_string()
-        } else {
-            format!("{prefix} {}", sub.get_name())
-        };
-        let usage = sub.clone().render_usage().to_string();
-        out.push(CommandHelp {
-            usage: usage.strip_prefix("Usage: ").unwrap_or(&usage).to_string(),
-            about: sub.get_about().map(ToString::to_string).unwrap_or_default(),
-            args: sub
-                .get_arguments()
-                .filter(|a| {
-                    !a.is_global_set() && !matches!(a.get_id().as_str(), "help" | "version")
-                })
-                .map(arg_help)
-                .collect(),
-            name: name.clone(),
-        });
+        let name = format!("{prefix} {}", sub.get_name());
+        out.push(command_help(sub, &name));
         collect_help(sub, &name, out);
     }
 }
@@ -344,6 +459,7 @@ fn arg_help(a: &clap::Arg) -> ArgHelp {
     ArgHelp {
         name,
         about: a.get_help().map(ToString::to_string).unwrap_or_default(),
+        optional: !a.is_required_set(),
     }
 }
 
@@ -439,10 +555,161 @@ async fn edit_center(
     Ok(name)
 }
 
+/// `folder set` takes changes that start with `-`, so clap hands it every
+/// word after the path, `--center` included. This takes the flag out again.
+fn take_center_flag(
+    words: Vec<String>,
+    mut center: CenterArg,
+) -> Result<(Vec<String>, CenterArg), String> {
+    let mut changes = Vec::new();
+    let mut words = words.into_iter();
+    while let Some(word) = words.next() {
+        let given = if word == "--center" {
+            Some(words.next().ok_or("--center needs a name")?)
+        } else {
+            word.strip_prefix("--center=").map(str::to_string)
+        };
+        match given {
+            Some(name) if center.center.is_none() => center.center = Some(name),
+            Some(_) => return Err("--center is given twice".into()),
+            None if word.starts_with("--") => return Err(format!("unknown option {word}")),
+            None => changes.push(word),
+        }
+    }
+    if changes.is_empty() {
+        return Err("name what to change: =rwx, +x or -w".into());
+    }
+    Ok((changes, center))
+}
+
 fn push_unique(list: &mut Vec<String>, rule: &str) {
     if !list.iter().any(|r| r == rule) {
         list.push(rule.to_string());
     }
+}
+
+/// `center pause` and `center resume`: the owner's switch, the only way a
+/// pause ends (a center can pause itself, never unpause).
+async fn pause_center(
+    paths: &NodePaths,
+    center: &CenterArg,
+    pause: bool,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    let name = edit_center(paths, center, |e| {
+        e.paused = pause;
+        Ok(())
+    })
+    .await?;
+    let _ = writeln!(out, "{name}: {}", if pause { "paused" } else { "resumed" });
+    Ok(())
+}
+
+/// The three lists of commands in a center's policy.
+#[derive(Debug, Clone, Copy)]
+enum List {
+    Allow,
+    Deny,
+    Sudo,
+}
+
+impl List {
+    fn of(self, p: &mut nerve_policy::CenterPolicy) -> &mut Vec<String> {
+        match self {
+            List::Allow => &mut p.allow,
+            List::Deny => &mut p.deny,
+            List::Sudo => &mut p.sudo_allow,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            List::Allow => "allow rule (allowlist mode)",
+            List::Deny => "deny rule",
+            List::Sudo => "sudo allow list",
+        }
+    }
+
+    /// The entry a command line stands for. The allow and deny lists hold
+    /// `exec.run` rules; the sudo list holds the sudo command lines, and takes
+    /// the command with or without the `sudo` in front.
+    fn entry(self, command: &str, wildcard: bool) -> Result<String, String> {
+        match self {
+            List::Allow if sudo_command(command).is_some() => {
+                Err("a sudo command goes on the sudo list: `nerve-node rule sudo add`".into())
+            }
+            List::Allow | List::Deny => rules::rule_for("exec", "run", command, wildcard),
+            List::Sudo if sudo_command(command).is_some() => {
+                rules::sudo_rule_for(command, wildcard)
+            }
+            List::Sudo => rules::sudo_rule_for(&format!("sudo {}", command.trim()), wildcard),
+        }
+    }
+}
+
+/// `rule allow|deny|sudo add|rm|ls`.
+async fn rule_cmd(
+    paths: &NodePaths,
+    list: List,
+    c: ListCmd,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    match c {
+        ListCmd::Add {
+            command,
+            wildcard,
+            center,
+        } => {
+            let rule = list.entry(&command, wildcard)?;
+            let name = edit_center(paths, &center, |e| {
+                push_unique(list.of(&mut e.policy), &rule);
+                Ok(())
+            })
+            .await?;
+            let note = match list {
+                List::Deny => "; commands it matches are forbidden",
+                _ => "",
+            };
+            let _ = writeln!(out, "{name}: {} {rule:?}{note}", list.label());
+        }
+        ListCmd::Rm {
+            command,
+            wildcard,
+            center,
+        } => {
+            let name = edit_center(paths, &center, |e| {
+                let l = list.of(&mut e.policy);
+                // An entry copied from `ls` goes as it is, so rules for
+                // files and other actions can be removed too.
+                let rule = if l.contains(&command) {
+                    command.clone()
+                } else {
+                    list.entry(&command, wildcard)?
+                };
+                let before = l.len();
+                l.retain(|r| *r != rule);
+                if l.len() == before {
+                    return Err(format!("{rule:?} is not on the {}", list.label()));
+                }
+                Ok(())
+            })
+            .await?;
+            let _ = writeln!(out, "{name}: removed from the {}", list.label());
+        }
+        ListCmd::Ls { center } => {
+            let (cfg, _) = read_config(paths).await?;
+            let name = pick_center(&cfg, &center)?;
+            let mut policy = cfg.center(&name).expect("picked").policy.clone();
+            let entries = list.of(&mut policy);
+            if entries.is_empty() {
+                let _ = writeln!(out, "{name}: nothing on the {}", list.label());
+            }
+            for r in entries.iter() {
+                let _ = writeln!(out, "{r}");
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Runs one command line, writing what it shows to `out`.
@@ -457,7 +724,7 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
             opts.exe = std::env::current_exe().ok();
             Daemon::run(opts).await
         }
-        Cmd::Pair { link, name, yes } => {
+        Cmd::Center(CenterCmd::Add { link, name, yes }) => {
             let link = PairLink::parse(&link)?;
             w(out, crate::pair::preview(&link, name.as_deref()));
             if !yes && !confirm(out)? {
@@ -467,7 +734,7 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
             w(out, format!("paired with {} as {}", e.url, e.name));
             Ok(())
         }
-        Cmd::Unpair(center) => {
+        Cmd::Center(CenterCmd::Rm(center)) => {
             let (cfg, _) = read_config(&paths).await?;
             let name = pick_center(&cfg, &center)?;
             edit(&paths, |c| {
@@ -479,7 +746,7 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
             w(out, format!("unpaired {name}"));
             Ok(())
         }
-        Cmd::Centers => {
+        Cmd::Center(CenterCmd::Ls) => {
             let (cfg, _) = read_config(&paths).await?;
             if cfg.centers.is_empty() {
                 w(out, "no center is paired".into());
@@ -512,6 +779,27 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
                     ),
                 );
             }
+            Ok(())
+        }
+        Cmd::Center(CenterCmd::Pause(center)) => pause_center(&paths, &center, true, out).await,
+        Cmd::Center(CenterCmd::Resume(center)) => pause_center(&paths, &center, false, out).await,
+        Cmd::Center(CenterCmd::Grant {
+            what,
+            value,
+            center,
+        }) => {
+            let name = match what.as_str() {
+                "settings" => {
+                    let g: SettingsGrant = parse_enum(&value, "off or write")?;
+                    edit_center(&paths, &center, |e| {
+                        e.settings = g;
+                        Ok(())
+                    })
+                    .await?
+                }
+                other => return Err(format!("unknown grant {other} (settings)")),
+            };
+            w(out, format!("{name}: {what} {value}"));
             Ok(())
         }
         Cmd::Status => {
@@ -560,11 +848,11 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
             }
             Ok(())
         }
-        Cmd::Mode {
+        Cmd::Mode(ModeCmd::Set {
             mode,
-            hours,
+            for_hours,
             center,
-        } => {
+        }) => {
             let m = match mode.as_str() {
                 "allowlist" => Mode::Allowlist,
                 "folder" => Mode::Folder,
@@ -573,20 +861,20 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
                     return Err(format!("unknown mode {other} (allowlist, folder or user)"));
                 }
             };
-            if hours.is_some() && m == Mode::Allowlist {
-                return Err("--hours only goes with folder or user".into());
+            if for_hours.is_some() && m == Mode::Allowlist {
+                return Err("--for only goes with folder or user".into());
             }
-            // No --hours: no limit, and an old one is cleared. The end is a
+            // No --for: no limit, and an old one is cleared. The end is a
             // millisecond count that the config file (a TOML integer) holds.
-            let until = hours
+            let until = for_hours
                 .map(|h| {
                     if h == 0 {
-                        return Err("--hours must be at least 1".to_string());
+                        return Err("--for must be at least 1 hour".to_string());
                     }
                     h.checked_mul(3_600_000)
                         .and_then(|ms| crate::now_ms().checked_add(ms))
                         .filter(|t| i64::try_from(*t).is_ok())
-                        .ok_or_else(|| "--hours is too large".to_string())
+                        .ok_or_else(|| "--for is too large".to_string())
                 })
                 .transpose()?;
             let name = edit_center(&paths, &center, |e| {
@@ -600,37 +888,82 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
         }
         Cmd::Folder(FolderCmd::Add {
             path,
-            rw,
-            execute,
+            rights,
             center,
         }) => {
+            // Nothing is the default, and a folder that grants nothing is
+            // never what was meant, so it is refused.
+            let access = rights.iter().try_fold(Access::NONE, |a, r| {
+                if r.starts_with('+') {
+                    a.change(r)
+                } else {
+                    Err(format!("{r:?}: a new folder takes +r, +w or +x"))
+                }
+            })?;
+            if access.is_none() {
+                return Err(
+                    "name what the center may do in the folder: +r (read), +w (write), +x (run commands)"
+                        .into(),
+                );
+            }
             let real = resolve_folder(&path)?;
             let mode = std::cell::Cell::new(Mode::Folder);
             let name = edit_center(&paths, &center, |e| {
                 e.policy.folders.retain(|f| f.path != real);
                 e.policy.folders.push(Folder {
                     path: real.clone(),
-                    access: if rw { Access::Rw } else { Access::Ro },
-                    execute,
+                    access,
                 });
                 mode.set(e.policy.mode);
                 Ok(())
             })
             .await?;
-            w(out, format!("{name}: folder {}", resolve_folder(&path)?));
+            w(out, format!("{name}: folder {real} {}", access.to_chmod()));
             let mode = mode.get();
             if mode != Mode::Folder {
                 w(
                     out,
                     format!(
-                        "note: folders count in folder mode; {name} is in {} mode (`nerve-node mode folder`)",
+                        "note: folders count in folder mode; {name} is in {} mode (`nerve-node mode set folder`)",
                         mode.as_str()
                     ),
                 );
             }
             Ok(())
         }
-        Cmd::Folder(FolderCmd::Remove { path, center }) => {
+        Cmd::Folder(FolderCmd::Set {
+            path,
+            changes,
+            center,
+        }) => {
+            let (changes, center) = take_center_flag(changes, center)?;
+            let real = resolve_folder(&path)?;
+            let given = path.display().to_string();
+            let access = std::cell::Cell::new(Access::NONE);
+            let name = edit_center(&paths, &center, |e| {
+                let f = e
+                    .policy
+                    .folders
+                    .iter_mut()
+                    .find(|f| f.path == real || f.path == given)
+                    .ok_or_else(|| format!("{real} is not a folder of this center"))?;
+                f.access = changes.iter().try_fold(f.access, |a, c| a.change(c))?;
+                access.set(f.access);
+                Ok(())
+            })
+            .await?;
+            let access = access.get();
+            w(out, format!("{name}: folder {real} {}", access.to_chmod()));
+            if access.is_none() {
+                w(
+                    out,
+                    "note: the folder grants nothing now (`nerve-node folder rm` removes it)"
+                        .into(),
+                );
+            }
+            Ok(())
+        }
+        Cmd::Folder(FolderCmd::Rm { path, center }) => {
             let real = resolve_folder(&path)?;
             let given = path.display().to_string();
             let name = edit_center(&paths, &center, |e| {
@@ -647,11 +980,23 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
             w(out, format!("{name}: removed {real}"));
             Ok(())
         }
-        Cmd::Caps {
+        Cmd::Folder(FolderCmd::Ls { center }) => {
+            let (cfg, _) = read_config(&paths).await?;
+            let name = pick_center(&cfg, &center)?;
+            let folders = &cfg.center(&name).expect("picked").policy.folders;
+            if folders.is_empty() {
+                w(out, format!("{name}: no folders"));
+            }
+            for f in folders {
+                w(out, format!("{}  {}", f.access.to_chmod(), f.path));
+            }
+            Ok(())
+        }
+        Cmd::Cap(CapCmd::Set {
             cap,
             setting,
             center,
-        } => {
+        }) => {
             let s = CapSetting::parse(&setting)
                 .ok_or_else(|| format!("unknown setting {setting} (on, off or hidden)"))?;
             let name = edit_center(&paths, &center, |e| {
@@ -662,73 +1007,22 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
             w(out, format!("{name}: {cap} {setting}"));
             Ok(())
         }
-        Cmd::Grant {
-            what,
-            value,
-            center,
-        } => {
-            let name = match what.as_str() {
-                "settings" => {
-                    let g: SettingsGrant = parse_enum(&value, "off or write")?;
-                    edit_center(&paths, &center, |e| {
-                        e.settings = g;
-                        Ok(())
-                    })
-                    .await?
-                }
-                other => return Err(format!("unknown grant {other} (settings)")),
-            };
-            w(out, format!("{name}: {what} {value}"));
+        Cmd::Cap(CapCmd::Ls { center }) => {
+            let (cfg, _) = read_config(&paths).await?;
+            let name = pick_center(&cfg, &center)?;
+            let caps = &cfg.center(&name).expect("picked").policy.caps;
+            if caps.is_empty() {
+                w(out, format!("{name}: no capability was set"));
+            }
+            for (cap, setting) in caps {
+                w(out, format!("{cap}  {}", enum_str(setting)));
+            }
             Ok(())
         }
         Cmd::Config(c) => config_cmd(&paths, c, out).await,
-        Cmd::Deny {
-            command,
-            wildcard,
-            center,
-        } => {
-            let rule = rules::rule_for("exec", "run", &command, wildcard)?;
-            let name = edit_center(&paths, &center, |e| {
-                push_unique(&mut e.policy.deny, &rule);
-                Ok(())
-            })
-            .await?;
-            w(
-                out,
-                format!("{name}: deny rule {rule:?}; commands it matches are forbidden"),
-            );
-            Ok(())
-        }
-        Cmd::Allow {
-            command,
-            wildcard,
-            center,
-        } => {
-            // A sudo command has its own list, whatever the mode.
-            let sudo = sudo_command(&command).is_some();
-            let rule = if sudo {
-                rules::sudo_rule_for(&command, wildcard)?
-            } else {
-                rules::rule_for("exec", "run", &command, wildcard)?
-            };
-            let name = edit_center(&paths, &center, |e| {
-                let list = if sudo {
-                    &mut e.policy.sudo_allow
-                } else {
-                    &mut e.policy.allow
-                };
-                push_unique(list, &rule);
-                Ok(())
-            })
-            .await?;
-            let list = if sudo {
-                "sudo allow list"
-            } else {
-                "allow rule (allowlist mode)"
-            };
-            w(out, format!("{name}: {list} {rule:?}"));
-            Ok(())
-        }
+        Cmd::Rule(RuleCmd::Allow(c)) => rule_cmd(&paths, List::Allow, c, out).await,
+        Cmd::Rule(RuleCmd::Deny(c)) => rule_cmd(&paths, List::Deny, c, out).await,
+        Cmd::Rule(RuleCmd::Sudo(c)) => rule_cmd(&paths, List::Sudo, c, out).await,
         Cmd::Panic => {
             edit(&paths, |c| {
                 c.locked = true;
@@ -769,7 +1063,7 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
             w(out, format!("proxy {url}"));
             Ok(())
         }
-        Cmd::Proxy(ProxyCmd::Clear) => {
+        Cmd::Proxy(ProxyCmd::Rm) => {
             edit(&paths, |c| {
                 c.connection.proxy = None;
                 c.connection.headers.clear();
@@ -777,6 +1071,20 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
             })
             .await?;
             w(out, "no proxy".into());
+            Ok(())
+        }
+        Cmd::Proxy(ProxyCmd::Ls) => {
+            let (cfg, _) = read_config(&paths).await?;
+            match &cfg.connection.proxy {
+                Some(url) => {
+                    w(out, format!("proxy {url}"));
+                    // A header often carries a credential, so only its name.
+                    for h in cfg.connection.headers.keys() {
+                        w(out, format!("header {h}"));
+                    }
+                }
+                None => w(out, "no proxy".into()),
+            }
             Ok(())
         }
         Cmd::Sudo(c) => sudo_cmd(&paths, c, out).await,
@@ -1205,25 +1513,25 @@ mod tests {
     #[test]
     fn per_center_commands_refuse_to_guess() {
         let (_d, paths) = setup(&["a", "b"]);
-        let e = run(&paths, &["mode", "user"]).unwrap_err();
+        let e = run(&paths, &["mode", "set", "user"]).unwrap_err();
         assert!(e.contains("--center"), "{e}");
-        run(&paths, &["mode", "user", "--center", "b"]).unwrap();
+        run(&paths, &["mode", "set", "user", "--center", "b"]).unwrap();
         assert_eq!(load(&paths).center("b").unwrap().policy.mode, Mode::User);
         // A new center is in default deny.
         assert_eq!(
             load(&paths).center("a").unwrap().policy.mode,
             Mode::Allowlist
         );
-        run(&paths, &["mode", "folder", "--center", "a"]).unwrap();
+        run(&paths, &["mode", "set", "folder", "--center", "a"]).unwrap();
         assert_eq!(load(&paths).center("a").unwrap().policy.mode, Mode::Folder);
-        run(&paths, &["mode", "allowlist", "--center", "a"]).unwrap();
+        run(&paths, &["mode", "set", "allowlist", "--center", "a"]).unwrap();
         assert_eq!(
             load(&paths).center("a").unwrap().policy.mode,
             Mode::Allowlist
         );
-        let e = run(&paths, &["mode", "ask", "--center", "a"]).unwrap_err();
+        let e = run(&paths, &["mode", "set", "ask", "--center", "a"]).unwrap_err();
         assert!(e.contains("unknown mode"), "{e}");
-        let e = run(&paths, &["caps", "fs", "ask", "--center", "a"]).unwrap_err();
+        let e = run(&paths, &["cap", "set", "fs", "ask", "--center", "a"]).unwrap_err();
         assert!(e.contains("unknown setting"), "{e}");
     }
 
@@ -1232,31 +1540,38 @@ mod tests {
         let (_d, paths) = setup(&["home"]);
         let policy = || load(&paths).centers[0].policy.clone();
         for mode in ["user", "folder"] {
-            run(&paths, &["mode", mode]).unwrap();
+            run(&paths, &["mode", "set", mode]).unwrap();
             assert_eq!(policy().until, None, "{mode}");
         }
-        // --hours sets a limit of any length, on folder as on user.
+        // --for sets a limit of any length, on folder as on user.
         let before = crate::now_ms();
-        run(&paths, &["mode", "folder", "--hours", "1000"]).unwrap();
+        run(&paths, &["mode", "set", "folder", "--for", "1000"]).unwrap();
         let until = policy().until.unwrap();
         assert!(until >= before + 1000 * 3_600_000, "{until}");
         assert_eq!(policy().mode_at(before), Mode::Folder);
         assert_eq!(policy().mode_at(until), Mode::Allowlist);
-        run(&paths, &["mode", "user", "--hours", "9"]).unwrap();
+        run(&paths, &["mode", "set", "user", "--for", "9"]).unwrap();
         assert_eq!(policy().mode, Mode::User);
-        // Setting the mode again without --hours drops the old limit.
-        run(&paths, &["mode", "user"]).unwrap();
+        // Setting the mode again without --for drops the old limit.
+        run(&paths, &["mode", "set", "user"]).unwrap();
         assert_eq!(policy().until, None);
         // Allowlist has nothing to limit; nonsense hours are refused.
-        run(&paths, &["mode", "folder", "--hours", "1"]).unwrap();
-        let e = run(&paths, &["mode", "allowlist", "--hours", "1"]).unwrap_err();
-        assert!(e.contains("--hours"), "{e}");
-        let e = run(&paths, &["mode", "user", "--hours", "0"]).unwrap_err();
+        run(&paths, &["mode", "set", "folder", "--for", "1"]).unwrap();
+        let e = run(&paths, &["mode", "set", "allowlist", "--for", "1"]).unwrap_err();
+        assert!(e.contains("--for"), "{e}");
+        let e = run(&paths, &["mode", "set", "user", "--for", "0"]).unwrap_err();
         assert!(e.contains("at least 1"), "{e}");
-        let e = run(&paths, &["mode", "user", "--hours", "18446744073709551615"]).unwrap_err();
+        let e = run(
+            &paths,
+            &["mode", "set", "user", "--for", "18446744073709551615"],
+        )
+        .unwrap_err();
         assert!(e.contains("too large"), "{e}");
+        let e = run(&paths, &["mode", "set", "user", "--for", "soon"]).unwrap_err();
+        assert!(e.contains("invalid value"), "{e}");
+        // A refused change leaves the mode as it was.
         assert_eq!(policy().mode, Mode::Folder);
-        run(&paths, &["mode", "allowlist"]).unwrap();
+        run(&paths, &["mode", "set", "allowlist"]).unwrap();
         assert_eq!(policy().until, None);
     }
 
@@ -1265,20 +1580,28 @@ mod tests {
         let (d, paths) = setup(&["home"]);
         let folder = d.path().join("work");
         std::fs::create_dir(&folder).unwrap();
-        let note = run(&paths, &["folder", "add", folder.to_str().unwrap(), "--rw"]).unwrap();
+        let note = run(
+            &paths,
+            &["folder", "add", folder.to_str().unwrap(), "+rw", "+x"],
+        )
+        .unwrap();
         assert!(note.contains("folders count in folder mode"), "{note}");
-        run(&paths, &["caps", "exec.run", "off"]).unwrap();
-        run(&paths, &["grant", "settings", "write"]).unwrap();
-        run(&paths, &["allow", "git status --short", "--wildcard"]).unwrap();
-        run(&paths, &["allow", "sudo apt update"]).unwrap();
-        run(&paths, &["deny", "rm -rf /"]).unwrap();
-        run(&paths, &["deny", "rm -rf /"]).unwrap();
-        run(&paths, &["mode", "user", "--hours", "2"]).unwrap();
+        run(&paths, &["cap", "set", "exec.run", "off"]).unwrap();
+        run(&paths, &["center", "grant", "settings", "write"]).unwrap();
+        run(
+            &paths,
+            &["rule", "allow", "add", "git status --short", "--wildcard"],
+        )
+        .unwrap();
+        run(&paths, &["rule", "sudo", "add", "sudo apt update"]).unwrap();
+        run(&paths, &["rule", "deny", "add", "rm -rf /"]).unwrap();
+        run(&paths, &["rule", "deny", "add", "rm -rf /"]).unwrap();
+        run(&paths, &["mode", "set", "user", "--for", "2"]).unwrap();
         let cfg = load(&paths);
         let c = cfg.center("home").unwrap();
         let real = nerve_policy::paths::resolve(&folder).unwrap();
         assert_eq!(c.policy.folders[0].path, real.display().to_string());
-        assert_eq!(c.policy.folders[0].access, Access::Rw);
+        assert_eq!(c.policy.folders[0].access, Access::ALL);
         assert_eq!(c.policy.caps["exec.run"], CapSetting::Off);
         assert_eq!(c.settings, SettingsGrant::Write);
         assert_eq!(c.policy.allow, vec!["exec.run:git *".to_string()]);
@@ -1292,6 +1615,124 @@ mod tests {
         assert!(load(&paths).locked);
         run(&paths, &["unlock"]).unwrap();
         assert!(!load(&paths).locked);
+    }
+
+    #[test]
+    fn folder_add_needs_a_right_and_takes_only_plus() {
+        let (d, paths) = setup(&["home"]);
+        let dir = d.path().join("work");
+        std::fs::create_dir(&dir).unwrap();
+        let dir = dir.to_str().unwrap();
+        let folders = || load(&paths).centers[0].policy.folders.clone();
+        // No sign at all: refused, nothing stored.
+        let e = run(&paths, &["folder", "add", dir]).unwrap_err();
+        assert!(e.contains("+r"), "{e}");
+        assert!(folders().is_empty());
+        // The old flags and the other signs are no rights of a new folder.
+        for bad in [
+            &["--rw"][..],
+            &["--execute"],
+            &["--ro"],
+            &["rw"],
+            &["-w"],
+            &["=r"],
+            &["+"],
+            &["+q"],
+        ] {
+            let mut args = vec!["folder", "add", dir];
+            args.extend(bad);
+            assert!(run(&paths, &args).is_err(), "{bad:?}");
+        }
+        assert!(folders().is_empty());
+        // Each right alone, and several in one word or in several.
+        for (rights, want) in [
+            (&["+r"][..], "r"),
+            (&["+w"], "w"),
+            (&["+x"], "x"),
+            (&["+r", "+x"], "rx"),
+            (&["+wx"], "wx"),
+            (&["+r", "+w", "+x"], "rwx"),
+        ] {
+            let mut args = vec!["folder", "add", dir];
+            args.extend(rights);
+            run(&paths, &args).unwrap();
+            assert_eq!(folders().len(), 1, "added again, not twice");
+            assert_eq!(folders()[0].access.to_string(), want, "{rights:?}");
+        }
+    }
+
+    #[test]
+    fn folder_set_applies_its_changes_left_to_right() {
+        let (d, paths) = setup(&["home"]);
+        let dir = d.path().join("work");
+        std::fs::create_dir(&dir).unwrap();
+        let dir = dir.to_str().unwrap();
+        let access = || load(&paths).centers[0].policy.folders[0].access.to_string();
+        // A folder that is not the center's is an error.
+        assert!(run(&paths, &["folder", "set", dir, "+x"]).is_err());
+        run(&paths, &["folder", "add", dir, "+r"]).unwrap();
+        for (change, want) in [
+            (&["+x"][..], "rx"),
+            (&["-r"], "x"),
+            (&["=rwx"], "rwx"),
+            (&["-w"], "rx"),
+            (&["+rw"], "rwx"),
+            (&["-rw"], "x"),
+            (&["=w"], "w"),
+            (&["=rwx", "-x", "+x", "-r"], "wx"),
+            (&["=r", "+w", "-r"], "w"),
+            (&["="], ""),
+        ] {
+            let mut args = vec!["folder", "set", dir];
+            args.extend(change);
+            run(&paths, &args).unwrap();
+            assert_eq!(access(), want, "{change:?}");
+        }
+        // A bad change anywhere in the list changes nothing.
+        run(&paths, &["folder", "set", dir, "=rx"]).unwrap();
+        for bad in [&["+w", "rw"][..], &["+q"], &["+"], &["=rr"]] {
+            let mut args = vec!["folder", "set", dir];
+            args.extend(bad);
+            assert!(run(&paths, &args).is_err(), "{bad:?}");
+            assert_eq!(access(), "rx", "{bad:?}");
+        }
+        // --center still works after hyphen-led changes.
+        run(&paths, &["folder", "set", dir, "-w", "--center", "home"]).unwrap();
+        run(&paths, &["folder", "set", dir, "+w", "--center=home"]).unwrap();
+        run(&paths, &["folder", "set", "--center", "home", dir, "-w"]).unwrap();
+        assert_eq!(access(), "rx");
+        for bad in [
+            &["--center", "nobody", "-w"][..],
+            &["-w", "--center"],
+            &["-w", "--bogus"],
+            &["--center", "home"],
+        ] {
+            let mut args = vec!["folder", "set", dir];
+            args.extend(bad);
+            assert!(run(&paths, &args).is_err(), "{bad:?}");
+        }
+        assert_eq!(access(), "rx");
+        let out = run(&paths, &["folder", "ls"]).unwrap();
+        assert!(out.starts_with("r-x  "), "{out}");
+        run(&paths, &["folder", "rm", dir]).unwrap();
+        assert!(load(&paths).centers[0].policy.folders.is_empty());
+        assert!(run(&paths, &["folder", "rm", dir]).is_err());
+    }
+
+    #[test]
+    fn centers_pause_and_resume_by_the_owner() {
+        let (_d, paths) = setup(&["a", "b"]);
+        assert!(run(&paths, &["center", "pause"]).is_err());
+        run(&paths, &["center", "pause", "--center", "a"]).unwrap();
+        let cfg = load(&paths);
+        assert!(cfg.center("a").unwrap().paused);
+        assert!(!cfg.center("b").unwrap().paused);
+        let ls = run(&paths, &["center", "ls"]).unwrap();
+        assert!(ls.contains("[paused]"), "{ls}");
+        run(&paths, &["center", "resume", "--center", "a"]).unwrap();
+        assert!(!load(&paths).center("a").unwrap().paused);
+        run(&paths, &["center", "rm", "--center", "b"]).unwrap();
+        assert!(load(&paths).center("b").is_none());
     }
 
     #[test]
@@ -1345,22 +1786,31 @@ mod tests {
     }
 
     #[test]
-    fn allow_and_deny_only_add_a_rule() {
+    fn the_three_lists_add_remove_and_show() {
         let (_d, paths) = setup(&["home"]);
-        run(&paths, &["allow", "git status"]).unwrap();
-        run(&paths, &["deny", "git status"]).unwrap();
-        run(&paths, &["deny", "rm *", "--wildcard"]).unwrap();
-        run(&paths, &["allow", "sudo apt update", "--wildcard"]).unwrap();
-        let p = &load(&paths).centers[0].policy;
+        run(&paths, &["rule", "allow", "add", "git status"]).unwrap();
+        run(&paths, &["rule", "deny", "add", "git status"]).unwrap();
+        run(&paths, &["rule", "deny", "add", "rm *", "--wildcard"]).unwrap();
+        run(
+            &paths,
+            &["rule", "sudo", "add", "sudo apt update", "--wildcard"],
+        )
+        .unwrap();
+        // The sudo list takes the command without the sudo as well.
+        run(&paths, &["rule", "sudo", "add", "systemctl restart nginx"]).unwrap();
+        let p = load(&paths).centers[0].policy.clone();
         // Neither list loses a rule to the other; deny wins when they meet.
         assert_eq!(p.allow, ["exec.run:git status"]);
         assert_eq!(p.deny, ["exec.run:git status", "exec.run:rm *"]);
-        assert_eq!(p.sudo_allow, ["sudo apt *"]);
-        assert!(run(&paths, &["allow", "  "]).is_err());
+        assert_eq!(p.sudo_allow, ["sudo apt *", "sudo systemctl restart nginx"]);
+        assert!(run(&paths, &["rule", "allow", "add", "  "]).is_err());
+        // A sudo command is not an allow rule.
+        let e = run(&paths, &["rule", "allow", "add", "sudo apt update"]).unwrap_err();
+        assert!(e.contains("rule sudo add"), "{e}");
         // A command with a glob character in it is allowed as itself.
-        run(&paths, &["allow", "rm *"]).unwrap();
+        run(&paths, &["rule", "allow", "add", "rm *"]).unwrap();
         assert!(load(&paths).centers[0].policy.allow[1].contains("[*]"));
-        // Rules for other actions go in through `config add`.
+        // Rules for other actions go in through `config add` and show in `ls`.
         run(
             &paths,
             &[
@@ -1378,6 +1828,123 @@ mod tests {
             )
             .is_err()
         );
+        let ls = run(&paths, &["rule", "allow", "ls"]).unwrap();
+        assert_eq!(ls.lines().count(), 3, "{ls}");
+        assert!(ls.contains("fs.read:~/notes/*"), "{ls}");
+        // rm takes the command like add, or an entry as ls shows it.
+        run(&paths, &["rule", "allow", "rm", "git status"]).unwrap();
+        run(&paths, &["rule", "allow", "rm", "fs.read:~/notes/*"]).unwrap();
+        run(&paths, &["rule", "deny", "rm", "rm *", "--wildcard"]).unwrap();
+        run(&paths, &["rule", "sudo", "rm", "apt update", "--wildcard"]).unwrap();
+        let p = load(&paths).centers[0].policy.clone();
+        assert_eq!(p.allow.len(), 1, "{:?}", p.allow);
+        assert_eq!(p.deny, ["exec.run:git status"]);
+        assert_eq!(p.sudo_allow, ["sudo systemctl restart nginx"]);
+        // Something that is not on the list is an error.
+        let e = run(&paths, &["rule", "deny", "rm", "ls"]).unwrap_err();
+        assert!(e.contains("not on the deny rule"), "{e}");
+        let ls = run(&paths, &["rule", "sudo", "ls"]).unwrap();
+        assert_eq!(ls, "sudo systemctl restart nginx\n");
+        run(&paths, &["rule", "sudo", "rm", "systemctl restart nginx"]).unwrap();
+        let ls = run(&paths, &["rule", "sudo", "ls"]).unwrap();
+        assert!(ls.contains("nothing on the sudo allow list"), "{ls}");
+    }
+
+    #[test]
+    fn caps_and_proxy_show_what_is_set() {
+        let (_d, paths) = setup(&["home"]);
+        assert!(
+            run(&paths, &["cap", "ls"])
+                .unwrap()
+                .contains("no capability")
+        );
+        run(&paths, &["cap", "set", "exec", "hidden"]).unwrap();
+        assert_eq!(run(&paths, &["cap", "ls"]).unwrap(), "exec  hidden\n");
+        assert_eq!(run(&paths, &["proxy", "ls"]).unwrap(), "no proxy\n");
+        run(
+            &paths,
+            &[
+                "proxy",
+                "set",
+                "http://127.0.0.1:3128",
+                "--header",
+                "X-Key: secret",
+            ],
+        )
+        .unwrap();
+        let ls = run(&paths, &["proxy", "ls"]).unwrap();
+        assert!(
+            ls.contains("http://127.0.0.1:3128") && ls.contains("X-Key"),
+            "{ls}"
+        );
+        assert!(!ls.contains("secret"), "{ls}");
+        run(&paths, &["proxy", "rm"]).unwrap();
+        assert_eq!(run(&paths, &["proxy", "ls"]).unwrap(), "no proxy\n");
+    }
+
+    /// The names of the commands, noun then verb; the first column is what
+    /// parses, the second what each one was called before.
+    #[test]
+    fn the_commands_are_noun_then_verb_and_the_old_names_are_gone() {
+        let parses = |args: &[&str]| {
+            let mut argv = vec!["nerve-node"];
+            argv.extend(args);
+            Cli::try_parse_from(argv).is_ok()
+        };
+        for ok in [
+            &["center", "add", "nerve://x"][..],
+            &["center", "rm"],
+            &["center", "ls"],
+            &["center", "pause"],
+            &["center", "resume"],
+            &["center", "grant", "settings", "write"],
+            &["folder", "add", "/p", "+r"],
+            &["folder", "set", "/p", "=rwx", "-w"],
+            &["folder", "rm", "/p"],
+            &["folder", "ls"],
+            &["mode", "set", "user", "--for", "2"],
+            &["rule", "allow", "add", "ls", "--wildcard"],
+            &["rule", "deny", "rm", "ls"],
+            &["rule", "sudo", "ls"],
+            &["cap", "set", "fs", "on"],
+            &["cap", "ls"],
+            &["proxy", "set", "http://p:1"],
+            &["proxy", "rm"],
+            &["proxy", "ls"],
+            &["config", "get", "limits"],
+            &["sudo", "on"],
+            &["sudo", "off"],
+            &["sudo", "status"],
+            &["audit", "--denied"],
+            &["panic"],
+            &["unlock"],
+            &["status"],
+            &["run"],
+        ] {
+            assert!(parses(ok), "{ok:?}");
+        }
+        for old in [
+            &["pair", "nerve://x"][..],
+            &["unpair"],
+            &["centers"],
+            &["caps", "fs", "on"],
+            &["grant", "settings", "write"],
+            &["allow", "ls"],
+            &["deny", "ls"],
+            &["mode", "user"],
+            &["mode", "user", "--hours", "2"],
+            &["mode", "set", "user", "--hours", "2"],
+            &["folder", "add", "/p", "--rw"],
+            &["folder", "add", "/p", "--execute"],
+            &["folder", "add", "/p", "--ro"],
+            &["folder", "remove", "/p"],
+            &["proxy", "clear"],
+            &["sudo", "rule", "add", "x"],
+            &["rule", "add", "x"],
+            &["rule", "allow", "ls", "x", "extra"],
+        ] {
+            assert!(!parses(old), "{old:?}");
+        }
     }
 
     /// Every command and sub-command name of the clap definition, walked
@@ -1397,29 +1964,62 @@ mod tests {
     fn help_lists_every_command_with_an_explanation() {
         let mut names = Vec::new();
         all_names(&Cli::command(), "", &mut names);
-        assert!(names.len() > 20, "{names:?}");
+        assert!(names.len() > 40, "{names:?}");
         let h = help();
-        for name in &names {
-            let c = h
-                .commands
-                .iter()
-                .find(|c| &c.name == name)
-                .unwrap_or_else(|| panic!("`{name}` is missing from the help"));
-            assert!(!c.about.is_empty(), "`{name}` has no explanation");
+        // A group is a noun with its sentence, and holds the commands below
+        // it; the commands that stand alone are the group without a name.
+        let mut listed: Vec<String> = Vec::new();
+        for g in &h.groups {
+            assert!(!g.about.is_empty(), "group `{}` has no sentence", g.name);
+            if !g.name.is_empty() {
+                listed.push(g.name.clone());
+                assert!(
+                    g.commands.iter().all(|c| c.name.starts_with(&g.name)),
+                    "{}",
+                    g.name
+                );
+            }
+            listed.extend(g.commands.iter().map(|c| c.name.clone()));
+        }
+        let mut want = names.clone();
+        want.sort();
+        listed.sort();
+        assert_eq!(listed, want);
+        for c in h.commands() {
+            assert!(!c.about.is_empty(), "`{}` has no explanation", c.name);
             assert!(
-                c.usage.starts_with(&format!("nerve-node {name}")),
+                c.usage.starts_with(&format!("nerve-node {}", c.name)),
                 "{}",
                 c.usage
             );
         }
-        assert_eq!(h.commands.len(), names.len());
-        let add = h.commands.iter().find(|c| c.name == "folder add").unwrap();
+        // The nouns, in the order of `--help`, and the loose commands last.
+        let nouns: Vec<&str> = h.groups.iter().map(|g| g.name.as_str()).collect();
+        assert_eq!(
+            nouns,
+            [
+                "center", "folder", "mode", "rule", "cap", "sudo", "proxy", "config", ""
+            ]
+        );
+        let rule = h.groups.iter().find(|g| g.name == "rule").unwrap();
+        let rule_names: Vec<&str> = rule.commands.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(rule_names[..2], ["rule allow", "rule allow add"]);
+        assert!(rule.commands[0].holds_commands && !rule.commands[1].holds_commands);
+        let add = h.commands().find(|c| c.name == "folder add").unwrap();
         assert!(
             add.args
                 .iter()
-                .any(|a| a.name == "--rw" && !a.about.is_empty())
+                .any(|a| a.name == "<+r|+w|+x>" && !a.about.is_empty())
         );
-        assert!(add.args.iter().any(|a| a.name == "<PATH>"));
+        assert!(add.args.iter().any(|a| a.name == "<PATH>" && !a.optional));
+        // What can be left out says so.
+        let mode = h.commands().find(|c| c.name == "mode set").unwrap();
+        assert!(
+            mode.args
+                .iter()
+                .any(|a| a.name == "--for <HOURS>" && a.optional)
+        );
+        assert!(mode.args.iter().any(|a| a.name == "<MODE>" && !a.optional));
         // The options every command takes are listed once, not per command.
         assert!(h.global.iter().any(|a| a.name.starts_with("--config-dir")));
         assert!(add.args.iter().all(|a| !a.name.starts_with("--config-dir")));
@@ -1427,8 +2027,8 @@ mod tests {
 
     #[test]
     fn every_argument_is_explained() {
-        for c in help().commands {
-            for a in c.args {
+        for c in help().commands() {
+            for a in &c.args {
                 assert!(
                     !a.about.is_empty(),
                     "`{}` {} has no explanation",

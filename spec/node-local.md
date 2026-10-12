@@ -82,7 +82,7 @@ unknown = false             # the center answered 401
 [center.policy]
 mode = "allowlist"          # allowlist | folder | user (the default is allowlist)
 until = 1790000000000  # optional, folder and user: ms since the epoch; then allowlist
-folders = [{ path = "/home/u/proj", access = "rw", execute = true }]  # folder mode
+folders = [{ path = "/home/u/proj", access = "rwx" }]  # folder mode; r w x in any mix, "" for none
 caps = { "fs.write" = "off" }   # on | off | hidden
 protected = { extra = [], allow = [] }
 allow = ["exec.run:git status", "fs.read:~/notes/*"]   # allowlist mode only
@@ -99,19 +99,30 @@ form; on the wire they travel as `/c/Users/...` on Windows (protocol §7.2).
 - **allowlist** (the default after pairing): default deny. A call runs only
   when an `allow` rule lets it through. `folders` do not count.
 - **folder**: full access inside the `folders` (and everything below them),
-  by their access; commands run in `execute` folders, confined where the
+  by their flags. `access` is three independent flags, any combination
+  (`"r"`, `"w"`, `"x"`, `"rw"`, `"rx"`, `"wx"`, `"rwx"`, `""` for none; the
+  letters in any order, each once). `r` allows the read actions of `fs`
+  inside it, `w` the write actions, `x` commands with a working directory in
+  it. The flags do not imply each other: a write needs `w` and no `r`, a read
+  `r` and no `w`, a command `x` and no `r`. Where folders nest, the deepest
+  one that holds a path decides for it. Commands are confined where the
   platform can confine them. `allow` rules do not count. On Linux a command
-  reads the system folders and its folders, writes its `rw` folders and runs
-  programs from the system folders and its `execute` folders (Landlock). The
-  node's own folders are in none of these sets: a folder that holds one is
-  granted as its other entries, level by level down to it, so the command
-  can neither list those levels nor make new entries right in them.
+  reads the system folders and its `r` folders, writes its `w` folders and
+  runs programs from the system folders and its `x` folders (Landlock), each
+  flag with its own rule. A folder with `w` and not `r` can be written but
+  not read or listed by the command: its rule carries the write rights only.
+  Landlock cannot run a file it may not read, so the rule of an `x` folder
+  carries the right to read files by name (no listing); the `fs` actions of
+  the center stay decided by `r`. The node's own folders are in none of these
+  sets: a folder that holds one is granted as its other entries, level by
+  level down to it, so the command can neither list those levels nor make
+  new entries right in them.
 - **user**: full access as the user, protected paths aside. `allow` rules
   do not count.
 
 Folder and user have no time limit by default: once set, they stay until the
-owner changes them. A limit is opt-in (`until`, or `nerve-node mode user
---hours N`). When it runs out, the center is back in `allowlist`, the default
+owner changes them. A limit is opt-in (`until`, or `nerve-node mode set user
+--for HOURS`). When it runs out, the center is back in `allowlist`, the default
 deny mode, not in `folder`.
 
 `deny` rules count in every mode and a matching deny always wins. Sense and
@@ -139,7 +150,7 @@ Commands and paths never mix: `fs:/tmp/*` is no command rule.
 | `fs:~/private/*` | every fs action on the folder and below |
 | `camera.snap`, `camera` | that action, or every action of the capability |
 
-The four buttons of the center's audit view and `nerve-node allow|deny
+The four buttons of the center's audit view and `nerve-node rule allow|deny|sudo add
 [--wildcard]` write exactly these forms: exact (`exec.run:git status`) or
 wildcard (`exec.run:git *`, `fs.read:/home/u/notes/*` for the folder of the
 path, the capability for another action). They only add a rule to a list;

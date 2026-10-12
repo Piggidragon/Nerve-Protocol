@@ -543,26 +543,30 @@ mod tests {
             .await;
         let js = String::from_utf8(js.body).unwrap();
         assert!(js.contains("\"/api/help\"") && js.contains("pageHelp"));
-        // The data: every command of the CLI definition, with its words.
+        // The data: every command of the CLI definition, with its words, in
+        // groups by noun. A group is the noun's own command plus the ones
+        // below it.
         let r = ui
             .request(req("GET", "/api/help", &[h, ("Cookie", &ck)], ""))
             .await;
         assert_eq!(r.status, 200);
         let body: Value = serde_json::from_slice(&r.body).unwrap();
-        let listed: Vec<(String, String)> = body["node"]["commands"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|c| {
-                (
+        let mut listed: Vec<(String, String)> = Vec::new();
+        for g in body["node"]["groups"].as_array().unwrap() {
+            let name = g["name"].as_str().unwrap();
+            if !name.is_empty() {
+                listed.push((name.to_string(), g["about"].as_str().unwrap().to_string()));
+            }
+            for c in g["commands"].as_array().unwrap() {
+                listed.push((
                     c["name"].as_str().unwrap().to_string(),
                     c["about"].as_str().unwrap().to_string(),
-                )
-            })
-            .collect();
+                ));
+            }
+        }
         let mut cli = Vec::new();
         node_commands(&nerve_node::cli::Cli::command(), "", &mut cli);
-        assert!(cli.len() > 20, "{cli:?}");
+        assert!(cli.len() > 40, "{cli:?}");
         for (name, about) in &cli {
             assert!(!about.is_empty(), "`{name}` has no explanation");
             assert!(

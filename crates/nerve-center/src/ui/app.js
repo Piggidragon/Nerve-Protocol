@@ -223,22 +223,25 @@ function btn(label, kind, onclick, ic) {
 // ---- Help ----
 
 // The node commands, as the node's own CLI definition lists them: the center
-// sends that list (/api/help), nothing here names a command.
+// sends that list (/api/help), nothing here names a command. The commands
+// come in groups by noun, each group with a sentence on what it is for.
 function pageHelp() {
   const h = state.help && state.help.node;
   if (!h) return [empty("Loading…")];
+  const all = h.groups.flatMap((g) => g.commands);
   const rows = (args) => el("div", { class: "rows" }, args.map((a) =>
-    el("div", {}, el("code", {}, a.name), el("span", { class: "v" }, a.about))));
+    el("div", {}, el("code", {}, a.name), el("span", { class: "v" }, (a.optional ? "Optional. " : "") + a.about))));
+  const card = (c) => el("div", { class: "card", id: "cmd-" + c.name.replace(/ /g, "-") },
+    el("div", { class: "card-top" }, el("span", { class: "name mono" }, c.name)),
+    el("p", { class: "meta" }, c.about),
+    c.holds_commands ? null : el("code", { class: "code" }, c.usage),
+    c.args.length ? rows(c.args) : null);
   return [
     head("help", "Help", "The commands of nerve-node, the program that links a machine to its centers. Run them in a shell on that machine.",
-      [[h.commands.length, "commands"]]),
-    el("div", { class: "list" },
-      h.global.length ? el("div", { class: "card" }, el("p", { class: "meta" }, "Every command takes"), rows(h.global)) : null,
-      h.commands.map((c) => el("div", { class: "card", id: "cmd-" + c.name.replace(/ /g, "-") },
-        el("div", { class: "card-top" }, el("span", { class: "name mono" }, c.name)),
-        el("p", { class: "meta" }, c.about),
-        el("code", { class: "code" }, c.usage),
-        c.args.length ? rows(c.args) : null))),
+      [[all.filter((c) => !c.holds_commands).length, "commands"]]),
+    h.global.length ? el("div", { class: "card" }, el("p", { class: "meta" }, "Every command takes"), rows(h.global)) : null,
+    h.groups.map((g) => section(g.name ? "nerve-node " + g.name : "Other commands", g.about, null,
+      el("div", { class: "list" }, g.commands.map(card)))),
   ];
 }
 
@@ -263,7 +266,7 @@ function pageOverview() {
 }
 
 function pairingCard(p) {
-  const command = `nerve-node pair '${p.link}'`;
+  const command = `nerve-node center add '${p.link}'`;
   return el("div", { class: "card", id: "pairing" },
     el("div", { class: "card-top" }, icon("link"), el("span", { class: "name" }, "Pair a machine"),
       el("button", { type: "button", class: "btn ghost icon sm push", "aria-label": "Dismiss", onclick: () => { state.pairing = null; draw(true); } }, icon("x", "sm"))),

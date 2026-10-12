@@ -19,6 +19,8 @@ conformance suite in `crates/nerve-conformance`.
 
 ## Build
 
+If you're searching for pre-build binaries that work straight out of the box head to [Releases](https://github.com/Piggidragon/Nerve-Protocol/releases).
+
 Rust 1.88 or newer.
 
 ```sh
@@ -48,18 +50,21 @@ CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static" \
   cargo xwin build --release --target x86_64-pc-windows-msvc
 ```
 
-## Release
-
-Releases (static Linux x86_64 and aarch64 binaries, Windows x86_64 programs,
-`SHA256SUMS`) are made by the `Release` workflow, started by hand with the
-branch and pre-release or release: see [`docs/releasing.md`](docs/releasing.md).
-
 ## Run
 
 1. Add the center to the harness's MCP configuration:
 
    ```json
-   {"mcpServers": {"nerve": {"command": "nerve-center", "env": {"NERVE_NAME": "lab"}}}}
+    {
+      "mcpServers": {
+        "nerve": {
+          "command": "nerve-center",
+          "env": {
+            "NERVE_NAME": "lab"
+          }
+        }
+      }
+    }
    ```
 
    Nodes reach it on port 7443 (TLS with a self-signed certificate that the
@@ -80,8 +85,7 @@ branch and pre-release or release: see [`docs/releasing.md`](docs/releasing.md).
    nerve-node run      # stays in the foreground; run the commands below in another shell
    ```
 
-   On Windows the node has no control socket, no sudo switch and no sandbox in
-   0.0.1, so a command the node runs can change its policy (see
+   On Windows the node has no control socket, no sudo switch and no sandbox, so a command the node runs can change its policy (see
    [`spec/node-local.md`](spec/node-local.md) §5).
 
    A new center starts in `allowlist` mode (default deny) with no rule, so
@@ -122,7 +126,6 @@ branch and pre-release or release: see [`docs/releasing.md`](docs/releasing.md).
    ```sh
    nerve-node rule add sudo 'sudo apt update'   # a sudo command goes on its own list
    nerve-node sudo on                # asks for the password; needs nerve-node run (Linux only)
-   nerve-node sudo off               # drops it
    ```
 
    A center the machine granted settings write may switch it as well; the
@@ -138,5 +141,3 @@ branch and pre-release or release: see [`docs/releasing.md`](docs/releasing.md).
 
    `nerve-node --help` lists every command; [`spec/node-local.md`](spec/node-local.md)
    explains the policy.
-
-Harnesses integrate through MCP.

@@ -6,6 +6,8 @@
 use std::borrow::Cow;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -55,6 +57,14 @@ pub struct Change {
 /// The size at which `audit.jsonl` is moved aside to `audit.jsonl.1`, which
 /// replaces the older one: the log never takes more than twice this.
 pub const AUDIT_MAX_BYTES: u64 = 10 * 1024 * 1024;
+/// The most of a full `audit.jsonl` that refused calls may take before the
+/// oldest of them are dropped instead of the file being moved aside. A
+/// center can make refused calls as fast as the link allows; with this it
+/// never rotates the log by itself, and an entry of what the node allowed or
+/// changed leaves the log only after at least this much newer such entries.
+pub const REFUSED_MAX_BYTES: u64 = AUDIT_MAX_BYTES / 2;
+/// How much of its newest refusals the file keeps when it drops the older.
+const REFUSED_KEEP_BYTES: u64 = REFUSED_MAX_BYTES / 2;
 /// The most characters of a target (a command line, a path) one decision
 /// logs; a longer one is cut and says so.
 pub const TARGET_MAX_CHARS: usize = 512;
@@ -94,11 +104,17 @@ pub fn is_cut_target(target: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct AuditLog {
     path: PathBuf,
+    /// Whether the log could not be kept within its bound and said so; it
+    /// says so once until it can again.
+    unbounded: Arc<AtomicBool>,
 }
 
 impl AuditLog {
     pub fn new(path: impl Into<PathBuf>) -> AuditLog {
-        AuditLog { path: path.into() }
+        AuditLog {
+            path: path.into(),
+            unbounded: Arc::default(),
+        }
     }
 
     pub fn path(&self) -> &Path {
@@ -106,7 +122,7 @@ impl AuditLog {
     }
 
     /// The one older file the log keeps.
-    fn old_path(&self) -> PathBuf {
+    pub fn old_path(&self) -> PathBuf {
         let mut p = self.path.clone().into_os_string();
         p.push(".1");
         p.into()
@@ -119,12 +135,17 @@ impl AuditLog {
         let mut line = v.to_string();
         line.push('\n');
         // A center can make refused calls as fast as the link allows, and
-        // each is logged; so the log is bounded.
+        // each is logged; so the log is bounded. When it cannot be (a rename
+        // that fails), the entry is written all the same.
+        let mut unbounded = None;
         if let Ok(m) = std::fs::metadata(&self.path)
             && m.len() > 0
             && m.len() + line.len() as u64 > AUDIT_MAX_BYTES
         {
-            std::fs::rename(&self.path, self.old_path())?;
+            match self.make_room(line.len() as u64) {
+                Ok(()) => self.unbounded.store(false, Ordering::SeqCst),
+                Err(e) => unbounded = Some(e),
+            }
         }
         let mut o = std::fs::OpenOptions::new();
         o.create(true).append(true);
@@ -135,7 +156,51 @@ impl AuditLog {
         }
         let mut f = o.open(&self.path)?;
         // One write per line, so concurrent appends do not interleave.
-        f.write_all(line.as_bytes())
+        f.write_all(line.as_bytes())?;
+        match unbounded {
+            Some(e) if !self.unbounded.swap(true, Ordering::SeqCst) => Err(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "the audit log could not be rotated ({e}); the entry was written, past the \
+                     log's {} MiB bound, and so is every next one until it can be",
+                    AUDIT_MAX_BYTES / (1024 * 1024)
+                ),
+            )),
+            _ => Ok(()),
+        }
+    }
+
+    /// Makes room in the full current file for a line of `len` bytes. When
+    /// refused calls take more than [`REFUSED_MAX_BYTES`] of it, its oldest
+    /// refusals are dropped, so they cannot push the older file out;
+    /// otherwise, or when that is not room enough, the file is moved aside.
+    fn make_room(&self, len: u64) -> std::io::Result<()> {
+        let text = std::fs::read(&self.path)?;
+        let refusal = |l: &[u8]| {
+            serde_json::from_slice::<Value>(l)
+                .is_ok_and(|v| v["decision"].as_str() == Some("forbidden"))
+        };
+        let refused: u64 = text
+            .split_inclusive(|b| *b == b'\n')
+            .filter(|l| refusal(l))
+            .map(|l| l.len() as u64)
+            .sum();
+        if refused > REFUSED_MAX_BYTES {
+            let mut extra = refused - REFUSED_KEEP_BYTES;
+            let mut kept = Vec::with_capacity(text.len());
+            for l in text.split_inclusive(|b| *b == b'\n') {
+                if extra > 0 && refusal(l) {
+                    extra = extra.saturating_sub(l.len() as u64);
+                } else {
+                    kept.extend_from_slice(l);
+                }
+            }
+            nerve_transport::files::write_private(&self.path, &kept)?;
+            if kept.len() as u64 + len <= AUDIT_MAX_BYTES {
+                return Ok(());
+            }
+        }
+        std::fs::rename(&self.path, self.old_path())
     }
 
     pub fn decision(&self, e: &Entry) -> std::io::Result<()> {
@@ -172,10 +237,24 @@ impl AuditLog {
     /// Every line, oldest first, the older file's included; lines that do
     /// not parse are skipped.
     pub fn read(&self) -> std::io::Result<Vec<Value>> {
+        Ok(self
+            .lines()?
+            .iter()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect())
+    }
+
+    /// Every whole line as it is written, oldest first: the older file's,
+    /// then the current one's. A last line still being written is left out.
+    pub fn lines(&self) -> std::io::Result<Vec<String>> {
         let mut out = Vec::new();
         for p in [self.old_path(), self.path.clone()] {
-            match std::fs::read_to_string(&p) {
-                Ok(t) => out.extend(t.lines().filter_map(|l| serde_json::from_str(l).ok())),
+            match std::fs::read(&p) {
+                Ok(t) => {
+                    let whole = t.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+                    let t = String::from_utf8_lossy(&t[..whole]);
+                    out.extend(t.lines().map(str::to_string));
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
             }
@@ -352,6 +431,124 @@ mod tests {
             versions.windows(2).all(|w| w[1] == w[0] + 1),
             "{versions:?}"
         );
+    }
+
+    fn refusal(ts: u64, target: String) -> Entry {
+        Entry {
+            ts,
+            center: "lab".into(),
+            cap: "exec".into(),
+            action: "run".into(),
+            target,
+            decision: "forbidden".into(),
+            code: Some("forbidden".into()),
+            session: None,
+        }
+    }
+
+    /// A center that makes refused calls as fast as it can does not push
+    /// what the node allowed or changed out of the log: refusals have half of
+    /// a file, and past that the oldest refusals go first. The log stays
+    /// within twice its size limit and keeps the newest refusals (code
+    /// review 2 of PR #19, finding 3).
+    #[test]
+    fn refusals_do_not_push_out_what_was_allowed() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("audit.jsonl");
+        let log = AuditLog::new(&path);
+        for ts in 0..3 {
+            log.decision(&Entry {
+                decision: "allowed".into(),
+                code: None,
+                ..refusal(ts, format!("allowed {ts}"))
+            })
+            .unwrap();
+        }
+        log.settings("center lab", 7, &diff(&json!({"m": 1}), &json!({"m": 2})))
+            .unwrap();
+        // 30 MiB of refusals, three times the size limit.
+        let long = "x".repeat(600);
+        let n = 3 * AUDIT_MAX_BYTES / 700;
+        for ts in 10..10 + n {
+            log.decision(&refusal(ts, format!("{ts} {long}"))).unwrap();
+        }
+        let read = log.read().unwrap();
+        let allowed: Vec<&Value> = read.iter().filter(|l| l["decision"] == "allowed").collect();
+        assert_eq!(allowed.len(), 3, "allowed entries were pushed out");
+        assert!(
+            read.iter().any(|l| l["kind"] == "settings"),
+            "the settings entry was pushed out"
+        );
+        let last = read.last().unwrap();
+        assert!(
+            last["target"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("{} ", 9 + n)),
+            "the newest refusal is not the last line"
+        );
+        let refused = read.iter().filter(|l| l["decision"] == "forbidden").count() as u64;
+        assert!(refused > 1000, "only {refused} refusals kept");
+        let size = |p: &Path| std::fs::metadata(p).map_or(0, |m| m.len());
+        let old = d.path().join("audit.jsonl.1");
+        assert!(size(&path) <= AUDIT_MAX_BYTES, "{}", size(&path));
+        assert!(size(&old) <= AUDIT_MAX_BYTES, "{}", size(&old));
+        // The refusals kept are the newest, in order.
+        let ts: Vec<u64> = read
+            .iter()
+            .filter(|l| l["decision"] == "forbidden")
+            .filter_map(|l| l["ts"].as_u64())
+            .collect();
+        assert!(ts.windows(2).all(|w| w[0] < w[1]), "out of order");
+    }
+
+    /// A rotation that fails (here `audit.jsonl.1` is a directory, so the
+    /// rename cannot replace it) does not drop the entry: it is written past
+    /// the bound, and the failure is reported once (code review 2 of PR #19,
+    /// finding 5).
+    #[test]
+    fn a_failed_rotation_still_writes_the_entry() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("audit.jsonl");
+        let log = AuditLog::new(&path);
+        let big = json!("x".repeat(1024 * 1024));
+        let change = |v: u64| {
+            log.settings(
+                "center home",
+                v,
+                &[Change {
+                    key: "k".into(),
+                    old: Value::Null,
+                    new: big.clone(),
+                }],
+            )
+        };
+        for v in 0..9 {
+            change(v).unwrap();
+        }
+        let blocker = d.path().join("audit.jsonl.1");
+        std::fs::create_dir(&blocker).unwrap();
+        std::fs::write(blocker.join("x"), "").unwrap();
+        let first = change(9);
+        let second = change(10);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let versions: Vec<u64> = text
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<Value>(l).unwrap()["version"]
+                    .as_u64()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(versions, (0..11).collect::<Vec<u64>>());
+        let e = first.unwrap_err();
+        assert!(e.to_string().contains("was written"), "{e}");
+        assert!(second.is_ok(), "the failure was reported twice: {second:?}");
+        // Once the rotation works again, the log is bounded again.
+        std::fs::remove_dir_all(&blocker).unwrap();
+        change(11).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().len() < AUDIT_MAX_BYTES);
+        assert!(blocker.is_file());
     }
 
     #[test]

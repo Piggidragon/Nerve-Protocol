@@ -227,7 +227,7 @@ impl Shared {
         e.decision = self.scrub(e.decision);
         let e = &e;
         if let Err(err) = lock(&self.store).audit().decision(e) {
-            tracing::warn!("cannot write the audit log: {err}");
+            tracing::warn!("audit log: {err}");
         }
         self.emit(&e.center, "audit", "decision", e.event_data());
     }

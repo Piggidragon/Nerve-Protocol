@@ -1416,26 +1416,37 @@ fn audit_line(v: &Value) -> String {
     )
 }
 
+/// `audit`: the log through [`AuditLog::lines`], the rotated file first.
+/// `--follow` looks again every 500 ms and shows the lines after the last one
+/// it showed, wherever that line is now: in `audit.jsonl.1` after a rotation,
+/// so the old file is finished before the new one, or further up after the
+/// log dropped old refusals.
 async fn audit(
     paths: &NodePaths,
     follow: bool,
     denied: bool,
     out: &mut dyn Write,
 ) -> Result<(), String> {
-    let path = paths.audit_log();
-    let mut done = 0usize;
+    let log = AuditLog::new(paths.audit_log());
+    let mut shown = Shown::default();
+    let mut stamp = None;
     loop {
-        let text = match std::fs::read_to_string(&path) {
-            Ok(t) => t,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => return Err(format!("{}: {e}", path.display())),
-        };
-        // Only whole lines; a line still being written waits for the next look.
-        let whole = text.rfind('\n').map_or(0, |i| i + 1);
-        if whole < done {
-            done = 0;
+        // Both files as they are now; the same as at the last look is
+        // nothing new, and is not read again.
+        let now = [log.path().to_path_buf(), log.old_path()].map(|p| {
+            std::fs::metadata(p)
+                .ok()
+                .map(|m| (m.len(), m.modified().ok()))
+        });
+        if stamp.as_ref() == Some(&now) {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            continue;
         }
-        for line in text[done..whole].lines() {
+        stamp = Some(now);
+        let lines = log
+            .lines()
+            .map_err(|e| format!("{}: {e}", log.path().display()))?;
+        for line in &lines[shown.next(&lines)..] {
             let Ok(v) = serde_json::from_str::<Value>(line) else {
                 continue;
             };
@@ -1446,13 +1457,64 @@ async fn audit(
             }
             let _ = writeln!(out, "{}", audit_line(&v));
         }
-        done = whole;
+        shown.saw(&lines);
         if !follow {
             return Ok(());
         }
         let _ = out.flush();
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+/// Where `audit --follow` is: the last line it looked at, how many copies
+/// of it ended what it saw, and its time.
+#[derive(Default)]
+struct Shown {
+    last: Option<(String, usize, u64)>,
+}
+
+impl Shown {
+    /// The index in `lines` of the first line not looked at yet.
+    fn next(&self, lines: &[String]) -> usize {
+        let Some((last, copies, ts)) = &self.last else {
+            return 0;
+        };
+        match lines.iter().rposition(|l| l == last) {
+            Some(end) => {
+                let run = lines[..=end]
+                    .iter()
+                    .rev()
+                    .take_while(|l| *l == last)
+                    .count();
+                // The copies seen began the run; the rest are new.
+                if run > *copies {
+                    end + 1 - run + copies
+                } else {
+                    end + 1
+                }
+            }
+            // The log dropped that line meanwhile (a refusal, or two
+            // rotations): what came after it is newer.
+            None => lines
+                .iter()
+                .position(|l| line_ts(l) > *ts)
+                .unwrap_or(lines.len()),
+        }
+    }
+
+    fn saw(&mut self, lines: &[String]) {
+        if let Some(last) = lines.last() {
+            let copies = lines.iter().rev().take_while(|l| *l == last).count();
+            self.last = Some((last.clone(), copies, line_ts(last)));
+        }
+    }
+}
+
+fn line_ts(line: &str) -> u64 {
+    serde_json::from_str::<Value>(line)
+        .ok()
+        .and_then(|v| v["ts"].as_u64())
+        .unwrap_or(0)
 }
 
 /// `config get|set|unset|add|remove` on dotted keys. `center.<name>` picks
@@ -2778,5 +2840,154 @@ mod tests {
     fn the_shim_is_not_a_command() {
         let e = Cli::try_parse_from(["nerve-node", "__exec-shim"]).unwrap_err();
         assert!(e.to_string().contains("__exec-shim"));
+    }
+
+    /// An audit line of a decision.
+    fn decided(ts: u64, cap: &str, action: &str, target: &str, decision: &str) -> String {
+        format!(
+            "{}\n",
+            serde_json::json!({"ts": ts, "center": "lab", "cap": cap, "action": action,
+                "target": target, "decision": decision})
+        )
+    }
+
+    /// After a rotation the older entries are in `audit.jsonl.1`; `audit`
+    /// shows them before the current file's (code review 2 of PR #19,
+    /// finding 3).
+    #[test]
+    fn audit_shows_the_rotated_file_too() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("c"), d.path().join("s"));
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        let old = paths.state_dir.join("audit.jsonl.1");
+        std::fs::write(
+            &old,
+            decided(1, "fs", "read", "~/.ssh/id_ed25519", "allowed")
+                + &decided(2, "exec", "run", "curl -d @~/notes x", "allowed"),
+        )
+        .unwrap();
+        std::fs::write(
+            paths.audit_log(),
+            decided(3, "exec", "run", "ls", "forbidden"),
+        )
+        .unwrap();
+        let out = run(&paths, &["audit"]).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3, "{out}");
+        assert!(
+            lines[0].contains("fs.read  ~/.ssh/id_ed25519  allowed"),
+            "{out}"
+        );
+        assert!(lines[1].contains("curl -d @~/notes x  allowed"), "{out}");
+        assert!(lines[2].contains("exec.run  ls  forbidden"), "{out}");
+        let out = run(&paths, &["audit", "--denied"]).unwrap();
+        assert_eq!(out.lines().count(), 1, "{out}");
+        assert!(out.contains("ls  forbidden"), "{out}");
+    }
+
+    /// Output that a test reads while `audit --follow` writes it.
+    #[derive(Clone, Default)]
+    struct Seen(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl Write for Seen {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Seen {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+        }
+
+        async fn until(&self, what: &str) {
+            for _ in 0..100 {
+                if self.text().contains(what) {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            panic!("{what:?} was not shown: {}", self.text());
+        }
+    }
+
+    /// `--follow` goes on after the line it looked at last: also when the
+    /// log dropped lines before it (old refusals), when the same line came
+    /// again, and by time when that line itself was dropped.
+    #[test]
+    fn audit_follow_goes_on_after_the_last_line_it_saw() {
+        let l = |ts: u64, t: &str| {
+            decided(ts, "exec", "run", t, "forbidden")
+                .trim()
+                .to_string()
+        };
+        let mut shown = Shown::default();
+        let first = vec![l(1, "a"), l(2, "b"), l(3, "c"), l(3, "c")];
+        assert_eq!(shown.next(&first), 0);
+        shown.saw(&first);
+        // `a` and `b` were dropped; one more `c` and a `d` came.
+        let now = vec![l(3, "c"), l(3, "c"), l(3, "c"), l(4, "d")];
+        assert_eq!(&now[shown.next(&now)..], &now[2..]);
+        shown.saw(&now);
+        // `d` itself was dropped: what is newer than it is new.
+        let now = vec![l(3, "c"), l(5, "e")];
+        assert_eq!(&now[shown.next(&now)..], &now[1..]);
+        shown.saw(&now);
+        assert_eq!(shown.next(&now), now.len());
+    }
+
+    /// `--follow` finishes the old file after a rotation before it reads the
+    /// new one: a line written right before the rotation is shown, and each
+    /// line once.
+    #[tokio::test]
+    async fn audit_follow_finishes_the_old_file_after_a_rotation() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("c"), d.path().join("s"));
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        let log = paths.audit_log();
+        let append = |line: String| {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&log)
+                .unwrap();
+            f.write_all(line.as_bytes()).unwrap();
+        };
+        append(decided(1, "fs", "read", "first", "allowed"));
+        let seen = Seen::default();
+        let mut out = seen.clone();
+        let follow = audit(&paths, true, false, &mut out);
+        let writer = async {
+            seen.until("first").await;
+            append(decided(2, "fs", "read", "before-the-rotation", "allowed"));
+            std::fs::rename(&log, paths.state_dir.join("audit.jsonl.1")).unwrap();
+            append(decided(3, "fs", "read", "after-the-rotation", "allowed"));
+            seen.until("after-the-rotation").await;
+            // One more look, which must show nothing twice.
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+        };
+        tokio::select! {
+            r = follow => panic!("follow ended: {r:?}"),
+            () = writer => {}
+        }
+        let text = seen.text();
+        let shown: Vec<&str> = text
+            .lines()
+            .map(|l| l.split("fs.read  ").nth(1).unwrap_or(l))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                "first  allowed",
+                "before-the-rotation  allowed",
+                "after-the-rotation  allowed"
+            ],
+            "{text}"
+        );
     }
 }

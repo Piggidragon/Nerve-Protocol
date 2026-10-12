@@ -365,5 +365,11 @@ file content or output; a target longer than 512 characters is cut there
 and says so; the `audit/decision` event carries the same cut target, and the
 center cuts what it gets the same way and keeps at most 500 decisions and
 1 MiB of them. When the file would pass 10 MiB it is moved to `audit.jsonl.1`,
-replacing the older one, so the log keeps at most about 20 MiB.
-`nerve-node audit [--denied] [--follow]` shows it.
+replacing the older one, so the log keeps at most about 20 MiB; when the
+move fails the entry is still written, past that bound, and the node logs the
+failure once. Refused calls get at most half of a full file: past that the
+oldest refusals are dropped instead of the file being moved, so a center
+that makes refused calls cannot push out what the node allowed or changed.
+`nerve-node audit [--denied] [--follow]` shows both files, `audit.jsonl.1`
+first, and `--follow` finishes the old file after a move before it reads the
+new one.

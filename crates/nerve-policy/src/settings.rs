@@ -858,11 +858,12 @@ mod tests {
     }
 
     /// The decision on writing `file` under the center's policy now.
-    fn write_to(s: &SettingsStore, file: &str) -> crate::decide::Decision {
+    fn write_to(s: &SettingsStore, file: &Path) -> crate::decide::Decision {
         let policy = &s.config().center("home").unwrap().policy;
-        let prot = unix(&policy.protected);
+        let prot = host(&policy.protected);
+        let home = host_home();
         let env = crate::decide::Env {
-            home: Path::new("/home/u"),
+            home: &home,
             protected: &prot,
             confined: true,
             sudo: false,
@@ -889,66 +890,84 @@ mod tests {
         new
     }
 
+    /// `rel` (with `/`) below [`host_home`], as the string a folder is
+    /// given by. These tests use this platform's own paths, so the check
+    /// under test runs on Windows as well (Windows final round, finding 1).
+    fn home_str(rel: &str) -> String {
+        at_home(rel).to_string_lossy().into_owned()
+    }
+
     /// The owner released `~/.ssh` read-only; another spelling of that
     /// folder gives a center no more (security review 3 of PR #19,
     /// finding 1).
     #[test]
     fn a_center_cannot_widen_a_protected_folder_by_another_spelling() {
         let d = tempfile::tempdir().unwrap();
-        let mut s = owner_folders(d.path(), &[("/home/u/.ssh", "r")]);
-        let keys = "/home/u/.ssh/authorized_keys";
+        let ssh = home_str(".ssh");
+        let mut s = owner_folders(d.path(), &[(&ssh, "r")]);
+        let keys = at_home(".ssh/authorized_keys");
         assert!(matches!(
-            write_to(&s, keys),
+            write_to(&s, &keys),
             crate::decide::Decision::Forbidden(_)
         ));
         let v = s.version();
-        for spelling in ["/home/u/.ssh/", "/home/u//.ssh", "/home/u/./.ssh"] {
+        let home = host_home().to_string_lossy().into_owned();
+        let mut spellings = vec![format!("{home}/.ssh/"), format!("{home}//.ssh")];
+        if cfg!(windows) {
+            // Windows ignores case and takes either separator; it refuses a
+            // `.` part as a name that ends in a dot.
+            spellings.push("c:/users/u/.SSH".into());
+        } else {
+            spellings.push(format!("{home}/./.ssh"));
+        }
+        for spelling in &spellings {
             // Next to the owner's folder ...
-            let both = json!([{"path": "/home/u/.ssh", "access": "r"},
+            let both = json!([{"path": ssh, "access": "r"},
                 {"path": spelling, "access": "rw"}]);
-            let e = s.set_center_document("home", with_folders(&s, both), v, |_| false, unix);
+            let e = s.set_center_document("home", with_folders(&s, both), v, |_| false, host);
             assert!(e.is_err(), "{spelling}: {e:?}");
             // ... or in its place.
             let only = json!([{"path": spelling, "access": "rw"}]);
-            let e = s.set_center_document("home", with_folders(&s, only), v, |_| false, unix);
+            let e = s.set_center_document("home", with_folders(&s, only), v, |_| false, host);
             assert!(
-                matches!(&e, Err(SetError::Forbidden(m)) if m.contains("/home/u/.ssh")),
+                matches!(&e, Err(SetError::Forbidden(m)) if m.to_lowercase().contains(&ssh.to_lowercase())),
                 "{spelling}: {e:?}"
             );
         }
         assert_eq!(s.version(), v);
         assert!(matches!(
-            write_to(&s, keys),
+            write_to(&s, &keys),
             crate::decide::Decision::Forbidden(_)
         ));
         // A folder elsewhere is the center's to add, in any spelling; it is
         // kept in one form, and the protected file stays refused.
-        let elsewhere = json!([{"path": "/home/u/.ssh", "access": "r"},
-            {"path": "/home/u/work/", "access": "rw"}]);
+        let work = home_str("work");
+        let elsewhere = json!([{"path": ssh, "access": "r"},
+            {"path": format!("{work}/"), "access": "rw"}]);
         let v = s
-            .set_center_document("home", with_folders(&s, elsewhere), v, |_| false, unix)
+            .set_center_document("home", with_folders(&s, elsewhere), v, |_| false, host)
             .unwrap();
         let folders = &s.config().center("home").unwrap().policy.folders;
-        assert_eq!(folders[1].path, "/home/u/work");
+        assert_eq!(folders[1].path, work);
         assert_eq!(
-            write_to(&s, "/home/u/work/a"),
+            write_to(&s, &at_home("work/a")),
             crate::decide::Decision::Allow
         );
         assert!(matches!(
-            write_to(&s, keys),
+            write_to(&s, &keys),
             crate::decide::Decision::Forbidden(_)
         ));
         // The owner may widen it, in their own spelling.
         s.update(|c| {
             let p = &mut c.center_mut("home").unwrap().policy;
-            p.folders[0] = folder("/home/u/.ssh/", "rw");
+            p.folders[0] = folder(&format!("{ssh}/"), "rw");
             Ok(())
         })
         .unwrap();
         assert!(s.version() > v);
         let folders = &s.config().center("home").unwrap().policy.folders;
-        assert_eq!(folders[0].path, "/home/u/.ssh");
-        assert_eq!(write_to(&s, keys), crate::decide::Decision::Allow);
+        assert_eq!(folders[0].path, ssh);
+        assert_eq!(write_to(&s, &keys), crate::decide::Decision::Allow);
     }
 
     /// A folder inside the owner's read-only `~/.ssh` gets no flag the
@@ -956,29 +975,31 @@ mod tests {
     #[test]
     fn a_center_cannot_widen_a_protected_folder_by_an_inner_one() {
         let d = tempfile::tempdir().unwrap();
-        let mut s = owner_folders(d.path(), &[("/home/u/.ssh", "r")]);
+        let (ssh, inner) = (home_str(".ssh"), home_str(".ssh/inner"));
+        let mut s = owner_folders(d.path(), &[(&ssh, "r")]);
         let v = s.version();
         for access in ["rwx", "rw", "w", "x", "rx"] {
-            let inner = json!([{"path": "/home/u/.ssh", "access": "r"},
-                {"path": "/home/u/.ssh/inner", "access": access}]);
-            let e = s.set_center_document("home", with_folders(&s, inner), v, |_| false, unix);
+            let wider = json!([{"path": ssh, "access": "r"},
+                {"path": inner, "access": access}]);
+            let e = s.set_center_document("home", with_folders(&s, wider), v, |_| false, host);
+            let named = format!("policy.folders {inner}");
             assert!(
-                matches!(&e, Err(SetError::Forbidden(m)) if m.contains("policy.folders /home/u/.ssh/inner")),
+                matches!(&e, Err(SetError::Forbidden(m)) if m.contains(&named)),
                 "{access}: {e:?}"
             );
         }
         assert_eq!(s.version(), v);
         assert!(matches!(
-            write_to(&s, "/home/u/.ssh/inner/x"),
+            write_to(&s, &at_home(".ssh/inner/x")),
             crate::decide::Decision::Forbidden(_)
         ));
         // As narrow as the owner's folder, or narrower, is fine.
-        let inner = json!([{"path": "/home/u/.ssh", "access": "r"},
-            {"path": "/home/u/.ssh/inner/", "access": "r"}]);
-        s.set_center_document("home", with_folders(&s, inner), v, |_| false, unix)
+        let narrow = json!([{"path": ssh, "access": "r"},
+            {"path": format!("{inner}/"), "access": "r"}]);
+        s.set_center_document("home", with_folders(&s, narrow), v, |_| false, host)
             .unwrap();
         assert!(matches!(
-            write_to(&s, "/home/u/.ssh/inner/x"),
+            write_to(&s, &at_home(".ssh/inner/x")),
             crate::decide::Decision::Forbidden(_)
         ));
     }
@@ -988,24 +1009,23 @@ mod tests {
     #[test]
     fn a_center_cannot_widen_a_protected_place_by_dropping_a_folder() {
         let d = tempfile::tempdir().unwrap();
-        let mut s = owner_folders(
-            d.path(),
-            &[("/home/u/.ssh", "rw"), ("/home/u/.ssh/keys", "r")],
-        );
+        let (ssh, keys) = (home_str(".ssh"), home_str(".ssh/keys"));
+        let mut s = owner_folders(d.path(), &[(&ssh, "rw"), (&keys, "r")]);
         let v = s.version();
-        let dropped = json!([{"path": "/home/u/.ssh", "access": "rw"}]);
-        let e = s.set_center_document("home", with_folders(&s, dropped), v, |_| false, unix);
+        let dropped = json!([{"path": ssh, "access": "rw"}]);
+        let e = s.set_center_document("home", with_folders(&s, dropped), v, |_| false, host);
+        let named = format!("policy.folders {keys}");
         assert!(
-            matches!(&e, Err(SetError::Forbidden(m)) if m.contains("policy.folders /home/u/.ssh/keys")),
+            matches!(&e, Err(SetError::Forbidden(m)) if m.contains(&named)),
             "{e:?}"
         );
         assert!(matches!(
-            write_to(&s, "/home/u/.ssh/keys/id"),
+            write_to(&s, &at_home(".ssh/keys/id")),
             crate::decide::Decision::Forbidden(_)
         ));
         // Dropping the outer one narrows.
-        let outer = json!([{"path": "/home/u/.ssh/keys", "access": "r"}]);
-        s.set_center_document("home", with_folders(&s, outer), v, |_| false, unix)
+        let outer = json!([{"path": keys, "access": "r"}]);
+        s.set_center_document("home", with_folders(&s, outer), v, |_| false, host)
             .unwrap();
     }
 

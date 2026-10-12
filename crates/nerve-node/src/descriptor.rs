@@ -124,6 +124,18 @@ fn path_param(windows: bool) -> Value {
     json!({"type": "string", "description": text})
 }
 
+/// The `cwd` argument of `exec.run`: it takes the same wire form as an `fs`
+/// path, so a Windows node says so here as well (Windows final round,
+/// finding 2). A Unix node's stays as it was.
+fn cwd_param(windows: bool) -> Value {
+    if windows {
+        json!({"type": "string",
+               "description": "working folder, the drive as a folder: /c/Users/x for C:\\Users\\x"})
+    } else {
+        json!({"type": "string"})
+    }
+}
+
 fn fs_cap(exposure: Exposure) -> Capability {
     let mut c = cap(
         "fs",
@@ -232,7 +244,7 @@ fn fs_cap(exposure: Exposure) -> Capability {
     c
 }
 
-fn exec_cap(exposure: Exposure, shell: Option<&str>) -> Capability {
+fn exec_cap(exposure: Exposure, shell: Option<&str>, windows: bool) -> Capability {
     let mut c = cap(
         "exec",
         "exec",
@@ -245,7 +257,7 @@ fn exec_cap(exposure: Exposure, shell: Option<&str>) -> Capability {
             Effect::Execute,
             &crate::exec::shell_summary(shell),
             obj(
-                json!({"command": {"type": "string"}, "cwd": {"type": "string"},
+                json!({"command": {"type": "string"}, "cwd": cwd_param(windows),
                        "timeout_ms": {"type": "integer", "minimum": 1}}),
                 &["command"],
             ),
@@ -495,7 +507,7 @@ fn build(
         caps.push(fs_cap(e));
     }
     if let Some(e) = exposure(entry, "exec") {
-        caps.push(exec_cap(e, cfg.machine.shell.as_deref()));
+        caps.push(exec_cap(e, cfg.machine.shell.as_deref(), cfg!(windows)));
     }
     if entry.settings == SettingsGrant::Write {
         caps.push(settings_cap());
@@ -805,6 +817,26 @@ mod tests {
                 fs.actions[a].params["properties"]["path"],
                 path_param(cfg!(windows)),
                 "{a}"
+            );
+        }
+    }
+
+    /// `exec.run`'s `cwd` shows the same form on a Windows node, and stays
+    /// a bare string on a Unix one.
+    #[test]
+    fn a_windows_node_shows_the_wire_form_of_a_working_folder() {
+        let win = cwd_param(true);
+        let text = win["description"].as_str().unwrap();
+        assert!(
+            text.contains("/c/Users/x") && text.contains("C:\\Users\\x"),
+            "{text}"
+        );
+        assert_eq!(cwd_param(false), json!({"type": "string"}));
+        for windows in [true, false] {
+            let exec = exec_cap(Exposure::On, None, windows);
+            assert_eq!(
+                exec.actions["run"].params["properties"]["cwd"],
+                cwd_param(windows)
             );
         }
     }

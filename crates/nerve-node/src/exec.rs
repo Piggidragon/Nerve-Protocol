@@ -169,6 +169,12 @@ fn decode(bytes: &[u8], cut: bool) -> String {
 /// that now leads into a protected entry the folders do not release with
 /// its flags is left out and the reason logged (`Protected::real_folder`).
 /// The others go in by their real path, the place that was judged.
+///
+/// A folder that holds a protected entry gives none of it either: it is
+/// replaced by its other entries, level by level down to the protected one,
+/// as the own folders are ([`leave_protected_out`]). The write set leaves
+/// out the entries protected for writes as well. The system folders are not
+/// cut: what a command reads there is the system's to guard.
 pub fn landlock_spec(policy: &CenterPolicy, home: &Path, own: &[PathBuf]) -> LandlockSpec {
     // Landlock is Linux's, so the list is the Unix one.
     let protected = Protected::new(&Platform::Unix, home, own, &policy.protected);
@@ -189,23 +195,29 @@ pub fn landlock_spec(policy: &CenterPolicy, home: &Path, own: &[PathBuf]) -> Lan
             }
         })
         .collect();
-    let folders = |f: &dyn Fn(Access) -> bool| -> Vec<PathBuf> {
-        real.iter()
+    let folders = |f: &dyn Fn(Access) -> bool, write: bool| -> Vec<PathBuf> {
+        let granted: Vec<PathBuf> = real
+            .iter()
             .filter(|(a, _)| f(*a))
             .map(|(_, p)| p.clone())
-            .collect()
+            .collect();
+        leave_protected_out(&granted, &protected, write)
     };
     LandlockSpec {
         read: leave_out(
-            &[nerve_sandbox::system_dirs(), folders(&|a| a.read)].concat(),
+            &[nerve_sandbox::system_dirs(), folders(&|a| a.read, false)].concat(),
             own,
         ),
         write: leave_out(
-            &[nerve_sandbox::system_writable(), folders(&|a| a.write)].concat(),
+            &[
+                nerve_sandbox::system_writable(),
+                folders(&|a| a.write, true),
+            ]
+            .concat(),
             own,
         ),
         exec: leave_out(
-            &[nerve_sandbox::system_dirs(), folders(&|a| a.execute)].concat(),
+            &[nerve_sandbox::system_dirs(), folders(&|a| a.execute, false)].concat(),
             own,
         ),
     }
@@ -230,7 +242,9 @@ pub fn leave_out(paths: &[PathBuf], own: &[PathBuf]) -> Vec<PathBuf> {
             continue;
         }
         if own.iter().any(|o| within(o, &r)) {
-            split(&r, &own, &mut out);
+            let inside = |p: &Path| own.iter().any(|o| within(p, o));
+            let holds = |p: &Path| own.iter().any(|o| within(o, p));
+            split(&r, &inside, &holds, &mut out);
         } else {
             out.push(p.clone());
         }
@@ -238,9 +252,37 @@ pub fn leave_out(paths: &[PathBuf], own: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
-/// Pushes the entries of `dir` (which holds an own folder) that hold none,
-/// and goes down into the ones that do.
-fn split(dir: &Path, own: &[PathBuf], out: &mut Vec<PathBuf>) {
+/// `paths` without the protected entries (with `write`, also those
+/// protected for writes) that lie strictly inside one of them: such a path
+/// is replaced by its other entries, level by level down to the protected
+/// one, like an own folder in [`leave_out`]. A path at or inside an entry
+/// stays whole: it is a folder the owner released there, and
+/// `Protected::real_folder` has judged it for its flags.
+pub fn leave_protected_out(paths: &[PathBuf], protected: &Protected, write: bool) -> Vec<PathBuf> {
+    let inside = |p: &Path| protected.in_entry(p, write);
+    let holds = |p: &Path| protected.holds_entry(p, write);
+    let mut out = Vec::new();
+    for p in paths {
+        let r = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+        if !inside(&r) && holds(&r) {
+            split(&r, &inside, &holds, &mut out);
+        } else {
+            out.push(p.clone());
+        }
+    }
+    out
+}
+
+/// Pushes the entries of `dir` (which holds a folder to leave out) that hold
+/// none, and goes down into the ones that do. `inside` says whether a
+/// resolved path is such a folder or inside one, `holds` whether one lies
+/// below it.
+fn split(
+    dir: &Path,
+    inside: &dyn Fn(&Path) -> bool,
+    holds: &dyn Fn(&Path) -> bool,
+    out: &mut Vec<PathBuf>,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -248,13 +290,12 @@ fn split(dir: &Path, own: &[PathBuf], out: &mut Vec<PathBuf>) {
         let path = e.path();
         let link = e.file_type().is_ok_and(|t| t.is_symlink());
         let real = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        let inside = own.iter().any(|o| within(&real, o));
-        let holds = own.iter().any(|o| within(o, &real));
-        if inside || (holds && link) {
+        let held = holds(&real);
+        if inside(&real) || (held && link) {
             continue;
         }
-        if holds {
-            split(&real, own, out);
+        if held {
+            split(&real, inside, holds, out);
         } else {
             out.push(path);
         }
@@ -958,11 +999,58 @@ mod tests {
         assert!(!spec.write.iter().any(|s| s.starts_with(&ssh)), "{spec:?}");
     }
 
+    /// A folder that holds a protected entry gives none of it: Landlock
+    /// cannot deny inside a rule, so the folder is replaced by its other
+    /// entries, level by level down to the protected one, in each set. The
+    /// protected entries are those of a home in a temp dir.
+    #[test]
+    fn a_folder_around_a_protected_entry_leaves_it_out() {
+        let d = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(d.path()).unwrap().join("home");
+        let ssh = home.join(".ssh");
+        for dir in [".ssh", "other", ".local/bin"] {
+            std::fs::create_dir_all(home.join(dir)).unwrap();
+        }
+        std::os::unix::fs::symlink(&ssh, home.join("to-ssh")).unwrap();
+        let folder = |p: &Path, access: &str| nerve_policy::config::Folder {
+            path: p.display().to_string(),
+            access: Access::parse(access).unwrap(),
+        };
+        let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        // No rule is the entry, inside it, around it, or a link into it.
+        let grants = |set: &[PathBuf], p: &Path| {
+            set.iter()
+                .any(|s| p.starts_with(s) || s.starts_with(p) || real(s).starts_with(p))
+        };
+        let mut policy = CenterPolicy {
+            folders: vec![folder(&home, "rwx")],
+            ..Default::default()
+        };
+        let spec = landlock_spec(&policy, &home, &[]);
+        for set in [&spec.read, &spec.write, &spec.exec] {
+            assert!(!grants(set, &ssh), "{set:?}");
+            assert!(set.contains(&home.join("other")), "{set:?}");
+        }
+        // `.local/bin` is protected for writes only.
+        let bin = home.join(".local/bin");
+        assert!(!grants(&spec.write, &bin), "{:?}", spec.write);
+        assert!(spec.read.contains(&bin), "{:?}", spec.read);
+        // The owner's own folder at the entry still gives it what it says.
+        policy.folders.push(folder(&ssh, "r"));
+        let spec = landlock_spec(&policy, &home, &[]);
+        assert!(spec.read.contains(&ssh), "{:?}", spec.read);
+        assert!(!grants(&spec.write, &ssh), "{:?}", spec.write);
+        assert!(!grants(&spec.exec, &ssh), "{:?}", spec.exec);
+    }
+
     /// Every combination of the three flags puts a folder in exactly the
     /// sets of its flags: `w` without `r` is in `write` only.
     #[test]
     fn each_folder_flag_puts_it_in_its_own_set() {
-        let w = std::env::temp_dir();
+        // A home beside the folder, so that the folder holds none of its
+        // protected entries.
+        let (d, h) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let w = std::fs::canonicalize(d.path()).unwrap();
         for bits in 0..8u8 {
             let access = Access {
                 read: bits & 1 != 0,
@@ -976,7 +1064,7 @@ mod tests {
                 }],
                 ..Default::default()
             };
-            let spec = landlock_spec(&policy, &w, &[]);
+            let spec = landlock_spec(&policy, h.path(), &[]);
             let label = access.to_chmod();
             assert_eq!(spec.read.contains(&w), access.read, "read set of {label}");
             assert_eq!(

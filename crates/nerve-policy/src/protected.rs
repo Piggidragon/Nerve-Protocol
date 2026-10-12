@@ -775,6 +775,28 @@ impl Protected {
         self.inside(&fold(path), &fold(base))
     }
 
+    /// The entries a read (or, with `write`, a write) is refused in.
+    fn listed(&self, write: bool) -> impl Iterator<Item = &PathBuf> {
+        let write_only = self.write_only.iter().filter(move |_| write);
+        self.entries.iter().chain(write_only)
+    }
+
+    /// Whether `path` is a protected entry or inside one, whatever a folder
+    /// releases; with `write` the entries protected for writes count too.
+    pub fn in_entry(&self, path: &Path, write: bool) -> bool {
+        let folded = fold(path);
+        self.listed(write).any(|e| self.inside(&folded, e))
+    }
+
+    /// Whether a protected entry lies strictly inside `dir` (with `write`,
+    /// one protected for writes counts too), so that a Landlock rule for
+    /// `dir` would grant it.
+    pub fn holds_entry(&self, dir: &Path, write: bool) -> bool {
+        let folded = fold(dir);
+        self.listed(write)
+            .any(|e| self.inside(e, &folded) && !self.inside(&folded, e))
+    }
+
     /// The deepest of `folders` that holds `path`, by this list's path rules
     /// and by components, as the decision picks it (`decide::inside_folder`).
     pub fn deepest<'f>(&self, folders: &'f [Folder], path: &Path) -> Option<&'f Folder> {

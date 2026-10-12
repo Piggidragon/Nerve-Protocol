@@ -1,7 +1,7 @@
 # Nerve developer docs
 
 How Nerve is built, and why. Start with [architecture](architecture.md). The
-wire format and the exact rules are in the [spec](../../spec/README.md); these
+wire format and the exact rules are in the [spec](spec/README.md); these
 pages explain the design and link to the spec for detail.
 
 ## Design
@@ -27,9 +27,9 @@ pages explain the design and link to the spec for detail.
 
 | Where | Covers |
 |---|---|
-| [spec/protocol.md](../../spec/protocol.md) | Versions, identity, pairing, the node link, messages, descriptor, built-in profiles |
-| [spec/node-local.md](../../spec/node-local.md) | The node's config, policy, sudo switch, control socket, audit log |
-| [spec/harness.md](../../spec/harness.md) | The center as an MCP server |
-| [spec/conformance.md](../../spec/conformance.md) | What the conformance suite checks and how to run it |
+| [spec/protocol.md](spec/protocol.md) | Versions, identity, pairing, the node link, messages, descriptor, built-in profiles |
+| [spec/node-local.md](spec/node-local.md) | The node's config, policy, sudo switch, control socket, audit log |
+| [spec/harness.md](spec/harness.md) | The center as an MCP server |
+| [spec/conformance.md](spec/conformance.md) | What the conformance suite checks and how to run it |
 | [schemas/](../../schemas) | JSON Schemas of the descriptor and the pair request |
 | [crates/nerve-conformance](../../crates/nerve-conformance) | The conformance suite |

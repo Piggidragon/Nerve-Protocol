@@ -1,7 +1,7 @@
 # Settings and config
 
 The node has one config file and one way to change it. Details:
-[spec/node-local.md](../../spec/node-local.md) §1, §2, §5 and §6.
+[spec/node-local.md](spec/node-local.md) §1, §2, §5 and §6.
 
 ## One file, one store
 

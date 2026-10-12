@@ -1,6 +1,6 @@
 # Identity and pairing
 
-Exact formats are in [spec/protocol.md](../../spec/protocol.md) §2 and §3.
+Exact formats are in [spec/protocol.md](spec/protocol.md) §2 and §3.
 
 ## Identities
 

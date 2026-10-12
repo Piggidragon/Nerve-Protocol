@@ -1,4 +1,4 @@
-//! Types and codecs of the Nerve Protocol (spec/), without any I/O.
+//! Types and codecs of the Nerve Protocol (docs/dev/spec/), without any I/O.
 //!
 //! Everything a node, a center or a harness binding puts on the wire is defined
 //! here once, so both ends of a link share one definition. Parameters a center

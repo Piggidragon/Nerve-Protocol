@@ -21,7 +21,7 @@ The release workflow runs the same three with `--locked --workspace` before it
 builds anything ([releasing](releasing.md)).
 
 `cargo test` runs the unit tests, the integration tests and the
-[conformance suite](../../spec/conformance.md). The end-to-end tests, which
+[conformance suite](spec/conformance.md). The end-to-end tests, which
 start the real `nerve-center` and `nerve-node`, run on Unix. To run only the
 suite:
 

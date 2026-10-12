@@ -1,7 +1,7 @@
 # Capabilities
 
 A node describes what it can do in a **descriptor**. The center builds tools
-from it. Exact shapes: [spec/protocol.md](../../spec/protocol.md) §5 to §7.
+from it. Exact shapes: [spec/protocol.md](spec/protocol.md) §5 to §7.
 
 ## Capabilities
 

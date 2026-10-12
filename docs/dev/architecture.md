@@ -70,7 +70,7 @@ No call of any center reaches these two folders. See
 
 | Path | Contains |
 |---|---|
-| `spec/` | The protocol, the node's local rules, the harness side, the conformance suite |
+| `docs/dev/spec/` | The protocol, the node's local rules, the harness side, the conformance suite |
 | `schemas/` | JSON Schemas of the descriptor and the pair request |
 | `crates/nerve-proto` | Wire types and codecs, no I/O |
 | `crates/nerve-transport` | TLS with pinning, `CONNECT` proxies, WebSocket, the node's Ed25519 identity, the sealed sudo password, a small HTTP/1.1 server, local control sockets |

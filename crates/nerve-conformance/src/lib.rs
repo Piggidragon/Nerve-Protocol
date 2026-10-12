@@ -1,4 +1,4 @@
-//! Conformance runner of the Nerve Protocol (spec/conformance.md).
+//! Conformance runner of the Nerve Protocol (docs/dev/spec/conformance.md).
 //!
 //! Three parts, each a library call that returns a [`Report`]:
 //!
@@ -24,7 +24,7 @@ use std::fmt;
 /// The result of one check.
 #[derive(Debug, Clone)]
 pub struct Outcome {
-    /// The section of spec/protocol.md the check tests, like "4.2".
+    /// The section of docs/dev/spec/protocol.md the check tests, like "4.2".
     pub section: &'static str,
     pub name: &'static str,
     pub result: Result<(), String>,

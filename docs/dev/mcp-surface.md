@@ -2,7 +2,7 @@
 
 `nerve-center` is an MCP server. Any MCP client plugs in as it is. This page
 explains the design; the exact rules are in
-[spec/harness.md](../../spec/harness.md).
+[spec/harness.md](spec/harness.md).
 
 ## What a client must do
 

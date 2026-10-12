@@ -1,7 +1,7 @@
 # The node link
 
 The node dials the center and keeps one link open. Exact rules:
-[spec/protocol.md](../../spec/protocol.md) §4 and §5.
+[spec/protocol.md](spec/protocol.md) §4 and §5.
 
 ## Connect
 

@@ -18,7 +18,7 @@ pub const AUDIT_MAX_BYTES: usize = 1024 * 1024;
 /// The most bytes of a field other than the target (cap, action, code,
 /// session, node name).
 const FIELD_MAX: usize = 200;
-/// The fields an entry keeps: the event's (spec/protocol.md §7.5), `by`,
+/// The fields an entry keeps: the event's (docs/dev/spec/protocol.md §7.5), `by`,
 /// which the web UI shows, and the node the center adds. Anything else a
 /// node sends is dropped, so no other field can make an entry large.
 const FIELDS: [&str; 10] = [

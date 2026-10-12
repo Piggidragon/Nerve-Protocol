@@ -1,7 +1,7 @@
 # The policy engine
 
 The node decides every call. The engine is `crates/nerve-policy/src/decide.rs`.
-The exact rules are in [spec/node-local.md](../../spec/node-local.md) §2 to §4.
+The exact rules are in [spec/node-local.md](spec/node-local.md) §2 to §4.
 For how it looks to an owner, see the user guide ([modes](../user/modes.md),
 [rules](../user/rules.md)).
 
@@ -140,7 +140,7 @@ password.
   a key with HKDF-SHA256 and seals the password with AES-256-GCM. The center
   only relays the ciphertext. The node opens an offer once, within 60
   seconds. The exact steps are in
-  [spec/protocol.md](../../spec/protocol.md) §7.4.1.
+  [spec/protocol.md](spec/protocol.md) §7.4.1.
 - A tampered center web UI could capture the password before it is sealed,
   because the center serves the form. The node-side guarantees hold anyway.
 

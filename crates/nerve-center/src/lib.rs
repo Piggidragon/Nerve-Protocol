@@ -1,4 +1,4 @@
-//! The Nerve center as an MCP server (spec/harness.md).
+//! The Nerve center as an MCP server (docs/dev/spec/harness.md).
 //!
 //! `nerve-center` is started by a harness like any MCP server. It pairs nodes,
 //! holds their links, maps their capabilities to MCP tools and serves the

@@ -42,4 +42,4 @@ Get the programs from
 |---|---|
 | Running Nerve: install, pairing, rules and modes, the web UI, troubleshooting | [docs/user/](docs/user/README.md) |
 | Building, changing and releasing Nerve: architecture, policy engine, checks | [docs/dev/](docs/dev/README.md) |
-| The protocol and the conformance suite | [spec/](spec/README.md), [schemas/](schemas), [crates/nerve-conformance](crates/nerve-conformance) |
+| The protocol and the conformance suite | [docs/dev/spec/](docs/dev/spec/README.md), [schemas/](schemas), [crates/nerve-conformance](crates/nerve-conformance) |

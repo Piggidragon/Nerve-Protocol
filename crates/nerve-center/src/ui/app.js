@@ -489,7 +489,7 @@ function drawTokens() {
 }
 
 // The sudo password is sealed here, in the browser, for a one-shot offer the
-// machine signed (spec/protocol.md §7.4.1): X25519, HKDF-SHA256, AES-256-GCM.
+// machine signed (docs/dev/spec/protocol.md §7.4.1): X25519, HKDF-SHA256, AES-256-GCM.
 // The center relays the sealed box and cannot open it.
 const b64 = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)));
 const unb64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));

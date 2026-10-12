@@ -261,7 +261,7 @@ call over the call limit fails with `busy`.
 
 - Capability ids and action names use ASCII letters, digits and `-`, never
   `_`: a harness joins node, capability and action with `_` into one tool
-  name (`spec/harness.md`), and a `_` inside a part would make that name
+  name (`docs/dev/spec/harness.md`), and a `_` inside a part would make that name
   ambiguous. A center ignores a descriptor with a name outside that set.
 - Effects: `read`, `sense`, `write`, `actuate`, `execute`.
 - Exposure: `on`, `off`. A capability that is `hidden` for a center is

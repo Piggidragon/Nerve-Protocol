@@ -228,20 +228,37 @@ function btn(label, kind, onclick, ic) {
 function pageHelp() {
   const h = state.help && state.help.node;
   if (!h) return [empty("Loading…")];
-  const all = h.groups.flatMap((g) => g.commands);
+  const cards = h.sections.flatMap((s) => s.cards);
+  const count = cards.reduce((n, c) => n + c.verbs.length, 0);
+  // The lines start after `nerve-node`, which the page says once.
+  const words = (usage) => usage.replace(/^nerve-node /, "").replace(" [OPTIONS]", "");
+  const argText = (a) => (a.optional ? "Optional. " : "") + a.about;
   const rows = (args) => el("div", { class: "rows" }, args.map((a) =>
-    el("div", {}, el("code", {}, a.name), el("span", { class: "v" }, (a.optional ? "Optional. " : "") + a.about))));
-  const card = (c) => el("div", { class: "card", id: "cmd-" + c.name.replace(/ /g, "-") },
-    el("div", { class: "card-top" }, el("span", { class: "name mono" }, c.name)),
-    el("p", { class: "meta" }, c.about),
-    c.holds_commands ? null : el("code", { class: "code" }, c.usage),
-    c.args.length ? rows(c.args) : null);
+    el("div", {}, el("code", {}, a.name), el("span", { class: "v" }, argText(a)))));
+  const verb = (v) => el("div", { class: "verb" },
+    el("code", {}, words(v.usage)),
+    el("span", { class: "v" }, v.about),
+    v.args.length ? el("div", { class: "sub" }, v.args.map((a) =>
+      el("div", {}, el("code", {}, a.name), " ", argText(a)))) : null);
+  const card = (c) => {
+    // A command that stands alone has no verbs to list: its own line is the card.
+    const alone = c.verbs.length === 1 && c.verbs[0].name === c.name ? c.verbs[0] : null;
+    return el("div", { class: "card", id: "cmd-" + c.name.replace(/[^\w]+/g, "-") },
+      el("div", { class: "card-top" }, el("span", { class: "name mono" }, c.name)),
+      c.about || alone ? el("p", { class: "meta" }, c.about || alone.about) : null,
+      alone ? (words(alone.usage) === c.name ? null : el("code", { class: "code" }, words(alone.usage))) : el("div", { class: "rows" }, c.verbs.map(verb)),
+      alone ? (alone.args.length ? rows(alone.args) : null) : null,
+      c.shared_args.length ? el("p", { class: "meta" }, "Several of these take:") : null,
+      c.shared_args.length ? rows(c.shared_args) : null);
+  };
   return [
-    head("help", "Help", "The commands of nerve-node, the program that links a machine to its centers. Run them in a shell on that machine.",
-      [[all.filter((c) => !c.holds_commands).length, "commands"]]),
-    h.global.length ? el("div", { class: "card" }, el("p", { class: "meta" }, "Every command takes"), rows(h.global)) : null,
-    h.groups.map((g) => section(g.name ? "nerve-node " + g.name : "Other commands", g.about, null,
-      el("div", { class: "list" }, g.commands.map(card)))),
+    head("help", "Help", "The commands of nerve-node, the program that links a machine to its centers. Run them in a shell on that machine, and write nerve-node before each line.",
+      [[count, "commands"]]),
+    h.global.length || h.common.length ? el("div", { class: "card" },
+      h.global.length ? [el("p", { class: "meta" }, "Every command takes"), rows(h.global)] : null,
+      h.common.length ? [el("p", { class: "meta" }, "Commands that work on one center also take"), rows(h.common)] : null) : null,
+    h.sections.map((s) => section(s.name, s.about, null,
+      el("div", { class: "list" }, s.cards.map(card)))),
   ];
 }
 

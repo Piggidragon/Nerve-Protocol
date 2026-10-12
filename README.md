@@ -77,15 +77,15 @@ CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static" \
    what you want, or give it full access and deny what you do not want:
 
    ```sh
-   nerve-node rule allow add 'git status'     # allowlist mode: this command may run
-   nerve-node rule allow add 'git status' --wildcard   # ... and `git` with anything after
+   nerve-node rule add allow 'git status'     # allowlist mode: this command may run
+   nerve-node rule add allow 'git status' --wildcard   # ... and `git` with anything after
    nerve-node config add center.home.policy.allow 'fs.read:~/notes/*'   # a path
    nerve-node mode set folder        # or: full access in the folders below
    nerve-node folder add ~/proj +r +w +x   # read, write, run commands; any mix
    nerve-node folder set ~/proj -w   # chmod style: =rwx, +x, -w, left to right
    nerve-node mode set user          # or: full access as the user (--for N: only for N hours)
-   nerve-node rule deny add 'rm *' --wildcard # in every mode: never, and wins over allow
-   nerve-node rule allow ls          # what is on a list (also deny, sudo; rm takes one off)
+   nerve-node rule add deny 'rm *' --wildcard # in every mode: never, and wins over allow
+   nerve-node rule ls allow          # what is on a list (also deny, sudo; no list shows all; rm takes one off)
    nerve-node audit                  # what was allowed and refused
    nerve-node panic                  # end every link; `unlock` undoes it
    ```
@@ -98,7 +98,7 @@ CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static" \
    only when the sudo allow list names it, in every mode:
 
    ```sh
-   nerve-node rule sudo add 'sudo apt update'   # a sudo command goes on its own list
+   nerve-node rule add sudo 'sudo apt update'   # a sudo command goes on its own list
    nerve-node sudo on                # asks for the password
    nerve-node sudo off               # drops it
    ```

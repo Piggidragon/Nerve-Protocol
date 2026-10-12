@@ -22,8 +22,8 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
 - Folder access is three independent flags, read, write and execute, in any
   combination (`access = "rx"`), and the `nerve-node` CLI is noun then verb
   (`center add`, `folder add <path> +r +x`, `folder set <path> -w`,
-  `rule allow add`, `mode set`), with the Help page of the center grouped the
-  same way.
+  `rule add allow`, `mode set`), with the Help page of the center grouped by what a
+  person wants to do, one card per noun.
 - The node's config and state folders are its own: no call of a center
   reaches them and no Landlock rule of a command covers them, whatever the
   policy says. The node keeps its config in memory, signs `node.toml` with an

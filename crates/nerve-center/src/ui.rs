@@ -543,25 +543,33 @@ mod tests {
             .await;
         let js = String::from_utf8(js.body).unwrap();
         assert!(js.contains("\"/api/help\"") && js.contains("pageHelp"));
-        // The data: every command of the CLI definition, with its words, in
-        // groups by noun. A group is the noun's own command plus the ones
-        // below it.
+        // The data: every command of the CLI definition, with its words, on
+        // cards in sections. A noun's own command is in its card's `holds`.
         let r = ui
             .request(req("GET", "/api/help", &[h, ("Cookie", &ck)], ""))
             .await;
         assert_eq!(r.status, 200);
         let body: Value = serde_json::from_slice(&r.body).unwrap();
         let mut listed: Vec<(String, String)> = Vec::new();
-        for g in body["node"]["groups"].as_array().unwrap() {
-            let name = g["name"].as_str().unwrap();
-            if !name.is_empty() {
-                listed.push((name.to_string(), g["about"].as_str().unwrap().to_string()));
-            }
-            for c in g["commands"].as_array().unwrap() {
-                listed.push((
-                    c["name"].as_str().unwrap().to_string(),
-                    c["about"].as_str().unwrap().to_string(),
-                ));
+        for s in body["node"]["sections"].as_array().unwrap() {
+            assert!(!s["about"].as_str().unwrap().is_empty());
+            for c in s["cards"].as_array().unwrap() {
+                for held in c["holds"].as_array().unwrap() {
+                    // Its sentence is the card's.
+                    let held = held.as_str().unwrap().to_string();
+                    let about = if c["name"] == held.as_str() {
+                        c["about"].as_str().unwrap().to_string()
+                    } else {
+                        String::new()
+                    };
+                    listed.push((held, about));
+                }
+                for v in c["verbs"].as_array().unwrap() {
+                    listed.push((
+                        v["name"].as_str().unwrap().to_string(),
+                        v["about"].as_str().unwrap().to_string(),
+                    ));
+                }
             }
         }
         let mut cli = Vec::new();

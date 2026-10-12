@@ -61,7 +61,7 @@ pub enum Cmd {
     /// Turn capabilities and single actions on or off.
     #[command(subcommand)]
     Cap(CapCmd),
-    /// Switch sudo on or off for the commands on the sudo list.
+    /// Use sudo for the commands on the sudo list.
     #[command(subcommand)]
     Sudo(SudoCmd),
     /// Choose the proxy the node uses to reach centers.
@@ -87,17 +87,17 @@ pub enum Cmd {
     Panic,
     /// Let the node work again after `panic`.
     Unlock,
-    /// Install the node as a service (not done in 0.0.1).
+    /// Install the node as a service.
     Install,
-    /// Set up this machine for the node (not done in 0.0.1).
+    /// Set up this machine for the node.
     Setup {
         /// Create a dedicated user for the node.
         #[arg(long)]
         create_user: bool,
     },
-    /// Update the node (not done in 0.0.1).
+    /// Update the node.
     Update,
-    /// Remove the node from this machine (not done in 0.0.1).
+    /// Remove the node from this machine.
     Uninstall,
 }
 
@@ -135,7 +135,7 @@ pub enum CenterCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum ModeCmd {
-    /// Set how much the center may do on its own.
+    /// Pick allowlist, folder or user mode.
     Set {
         /// `allowlist` (only listed commands run), `folder` (anything inside
         /// its folders) or `user` (anything you could do yourself).
@@ -149,11 +149,21 @@ pub enum ModeCmd {
     },
 }
 
-/// One of the three lists of commands: `allow`, `deny` or `sudo`.
+/// The three lists of commands in a center's policy.
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum List {
+    Allow,
+    Deny,
+    Sudo,
+}
+
 #[derive(Debug, Subcommand)]
-pub enum ListCmd {
-    /// Put a command on the list.
+pub enum RuleCmd {
+    /// Put a command on a list.
     Add {
+        /// The list: `allow` (may run in allowlist mode), `deny` (never runs,
+        /// in any mode) or `sudo` (may run with sudo while sudo is on).
+        list: List,
         /// The command line.
         command: String,
         /// Cover every command that starts with the same program.
@@ -162,8 +172,10 @@ pub enum ListCmd {
         #[command(flatten)]
         center: CenterArg,
     },
-    /// Take a command off the list.
+    /// Take a command off a list.
     Rm {
+        /// The list: `allow`, `deny` or `sudo`.
+        list: List,
         /// The command line, or an entry as `ls` shows it.
         command: String,
         /// The entry was added with --wildcard.
@@ -172,24 +184,13 @@ pub enum ListCmd {
         #[command(flatten)]
         center: CenterArg,
     },
-    /// Show everything on the list.
+    /// Show one list, or all three.
     Ls {
+        /// The list; all three if left out.
+        list: Option<List>,
         #[command(flatten)]
         center: CenterArg,
     },
-}
-
-#[derive(Debug, Subcommand)]
-pub enum RuleCmd {
-    /// The commands that may run in allowlist mode.
-    #[command(subcommand)]
-    Allow(ListCmd),
-    /// The commands that never run, in any mode.
-    #[command(subcommand)]
-    Deny(ListCmd),
-    /// The commands that may run with sudo while sudo is on.
-    #[command(subcommand)]
-    Sudo(ListCmd),
 }
 
 #[derive(Debug, Subcommand)]
@@ -266,38 +267,37 @@ pub enum FolderCmd {
 pub enum ConfigCmd {
     /// Print one setting.
     Get {
-        /// The dotted key, for example `center.<name>.policy.mode`.
+        /// The dotted key of the setting, like `center.<name>.policy.mode`.
         key: String,
     },
     /// Change one setting.
     Set {
-        /// The dotted key.
+        /// The dotted key of the setting, like `center.<name>.policy.mode`.
         key: String,
         /// The new value.
         value: String,
     },
     /// Remove one setting (its default applies again).
     Unset {
-        /// The dotted key.
+        /// The dotted key of the setting, like `center.<name>.policy.mode`.
         key: String,
     },
     /// Append a value to a list.
     Add {
-        /// The dotted key of the list.
+        /// The dotted key of the setting, like `center.<name>.policy.mode`.
         key: String,
         /// The value to append.
         value: String,
     },
     /// Remove a value from a list.
     Remove {
-        /// The dotted key of the list.
+        /// The dotted key of the setting, like `center.<name>.policy.mode`.
         key: String,
         /// The value to remove.
         value: String,
     },
-    /// Take node.toml as it is now, after the node refused it because it was
-    /// changed outside nerve-node. Look at the file first: whatever changed
-    /// it gets its way.
+    /// Trust node.toml as it is now, after the node refused it for a change
+    /// made outside nerve-node. Read the file first.
     Accept,
 }
 
@@ -320,46 +320,94 @@ pub enum ProxyCmd {
 /// The command list as `nerve-node --help` has it, for anything that shows
 /// the commands elsewhere (the center's help page). It is read from the
 /// [`Cli`] definition above, so a new command or flag shows up there by
-/// being written once.
+/// being written once; [`SECTIONS`] only says where on the page it goes.
 #[derive(Debug, Clone, Serialize)]
 pub struct Help {
     /// What the node is.
     pub about: String,
     /// Options every command takes.
     pub global: Vec<ArgHelp>,
-    /// The commands by their noun (`folder`, `rule`), in the order `--help`
-    /// lists them, then the commands that stand alone.
-    pub groups: Vec<Group>,
+    /// Arguments that cards on different places take alike (`--center`),
+    /// said once here and left out of the cards.
+    pub common: Vec<ArgHelp>,
+    /// The cards, grouped by what a person wants to do, in reading order.
+    pub sections: Vec<Section>,
 }
 
-/// The commands that share a noun, or, with an empty `name`, the commands
-/// that have none.
+/// Where each command stands on the help page: the heading, the sentence
+/// under it, and the cards. A card is the commands named in one slice: a
+/// noun with its verbs (`["folder"]`), or loose commands that belong
+/// together (`["panic", "unlock"]`). A command missing here still shows up,
+/// in a section of its own, and a test fails until it is placed.
+const SECTIONS: &[(&str, &str, &[&[&str]])] = &[
+    (
+        "Pair and connect",
+        "Link this machine to centers and choose how it reaches them.",
+        &[&["center"], &["proxy"]],
+    ),
+    (
+        "What a center may do",
+        "Every center has its own rights on this machine. `config` reaches any setting by its name.",
+        &[
+            &["mode"],
+            &["folder"],
+            &["rule"],
+            &["cap"],
+            &["sudo"],
+            &["config"],
+        ],
+    ),
+    (
+        "Run and watch",
+        "Start the node, see what it did, and stop it.",
+        &[&["run"], &["status"], &["audit"], &["panic", "unlock"]],
+    ),
+    (
+        "Not done yet",
+        "These answer \"not done in 0.0.1\" and change nothing.",
+        &[&["install", "setup", "update", "uninstall"]],
+    ),
+];
+
+/// A heading with its sentence, and the cards below it.
 #[derive(Debug, Clone, Serialize)]
-pub struct Group {
-    /// The noun: `folder`, `rule`; empty for the commands without one.
+pub struct Section {
     pub name: String,
-    /// What the group is for, in one sentence.
+    /// What the section is for, said once for all its cards.
     pub about: String,
-    /// Its commands, in the order `--help` lists them. A command that only
-    /// holds more commands (`rule allow`) is in the list too, before them.
-    pub commands: Vec<CommandHelp>,
+    pub cards: Vec<Card>,
 }
 
+/// One thing a person looks up: a noun with its verbs, or loose commands
+/// that go together.
 #[derive(Debug, Clone, Serialize)]
-pub struct CommandHelp {
+pub struct Card {
+    /// `folder`, `panic / unlock`.
+    pub name: String,
+    /// What it is for; empty when its commands say it themselves.
+    pub about: String,
+    /// The commands that only hold more commands (`folder`), which the card
+    /// covers without a line of their own.
+    pub holds: Vec<String>,
+    /// Arguments that two or more verbs take in the same way, said once.
+    pub shared_args: Vec<ArgHelp>,
+    pub verbs: Vec<Verb>,
+}
+
+/// A command that does something.
+#[derive(Debug, Clone, Serialize)]
+pub struct Verb {
     /// The words after `nerve-node`: `status`, `folder add`.
     pub name: String,
     /// The usage line, for example `nerve-node folder add [OPTIONS] <PATH>`.
     pub usage: String,
     /// The explanation: the doc comment of the command.
     pub about: String,
-    /// Whether it only holds more commands and does nothing by itself.
-    pub holds_commands: bool,
-    /// Its own arguments and flags, without the global ones.
+    /// Its own arguments and flags, without the global and the shared ones.
     pub args: Vec<ArgHelp>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ArgHelp {
     /// How it is written: `--for <HOURS>`, `<PATH>`, `--wildcard`.
     pub name: String,
@@ -370,39 +418,59 @@ pub struct ArgHelp {
 }
 
 impl Help {
-    /// Every command, group by group.
-    pub fn commands(&self) -> impl Iterator<Item = &CommandHelp> {
-        self.groups.iter().flat_map(|g| g.commands.iter())
+    /// Every verb, card by card.
+    pub fn verbs(&self) -> impl Iterator<Item = &Verb> {
+        self.sections
+            .iter()
+            .flat_map(|s| &s.cards)
+            .flat_map(|c| &c.verbs)
     }
+
+    /// Every command the page covers: the verbs and the commands that only
+    /// hold more commands.
+    pub fn command_names(&self) -> Vec<&str> {
+        let cards = self.sections.iter().flat_map(|s| &s.cards);
+        let holds = cards.clone().flat_map(|c| &c.holds).map(String::as_str);
+        let verbs = self.verbs().map(|v| v.name.as_str());
+        holds.chain(verbs).collect()
+    }
+}
+
+fn visible(c: &clap::Command) -> bool {
+    // clap adds a `help` sub-command of its own to every level.
+    c.get_name() != "help" && !c.is_hide_set()
 }
 
 /// Reads [`Help`] from the [`Cli`] definition.
 pub fn help() -> Help {
     let mut root = Cli::command();
     root.build();
-    let mut groups = Vec::new();
-    let mut alone = Vec::new();
-    for sub in root.get_subcommands() {
-        if sub.get_name() == "help" || sub.is_hide_set() {
-            continue;
+    let mut left: Vec<&clap::Command> = root.get_subcommands().filter(|c| visible(c)).collect();
+    let mut sections = Vec::new();
+    for (name, about, cards) in SECTIONS {
+        let mut out = Vec::new();
+        for names in *cards {
+            let cmds: Vec<&clap::Command> = names
+                .iter()
+                .filter_map(|n| root.find_subcommand(n))
+                .collect();
+            left.retain(|c| !names.contains(&c.get_name()));
+            out.extend(cards_of(&cmds));
         }
-        if sub.has_subcommands() {
-            let mut commands = Vec::new();
-            collect_help(sub, sub.get_name(), &mut commands);
-            groups.push(Group {
-                name: sub.get_name().to_string(),
-                about: about_of(sub),
-                commands,
-            });
-        } else {
-            alone.push(command_help(sub, sub.get_name()));
-        }
+        sections.push(Section {
+            name: (*name).into(),
+            about: (*about).into(),
+            cards: out,
+        });
     }
-    groups.push(Group {
-        name: String::new(),
-        about: "Commands that stand on their own.".into(),
-        commands: alone,
-    });
+    if !left.is_empty() {
+        sections.push(Section {
+            name: "Other commands".into(),
+            about: String::new(),
+            cards: left.into_iter().flat_map(|c| cards_of(&[c])).collect(),
+        });
+    }
+    let common = hoist_common(&mut sections);
     Help {
         about: about_of(&root),
         global: root
@@ -410,39 +478,109 @@ pub fn help() -> Help {
             .filter(|a| a.is_global_set())
             .map(arg_help)
             .collect(),
-        groups,
+        common,
+        sections,
     }
+}
+
+/// Takes the arguments that two or more cards have alike out of the cards.
+fn hoist_common(sections: &mut [Section]) -> Vec<ArgHelp> {
+    let args_of = |c: &Card| -> Vec<ArgHelp> {
+        let own = c.verbs.iter().flat_map(|v| &v.args);
+        c.shared_args.iter().chain(own).cloned().collect()
+    };
+    let mut common: Vec<ArgHelp> = Vec::new();
+    for a in sections.iter().flat_map(|s| &s.cards).flat_map(args_of) {
+        let on = sections
+            .iter()
+            .flat_map(|s| &s.cards)
+            .filter(|c| args_of(c).contains(&a))
+            .count();
+        if on > 1 && !common.contains(&a) {
+            common.push(a);
+        }
+    }
+    for c in sections.iter_mut().flat_map(|s| &mut s.cards) {
+        c.shared_args.retain(|a| !common.contains(a));
+        for v in &mut c.verbs {
+            v.args.retain(|a| !common.contains(a));
+        }
+    }
+    common
 }
 
 fn about_of(c: &clap::Command) -> String {
     c.get_about().map(ToString::to_string).unwrap_or_default()
 }
 
-fn command_help(sub: &clap::Command, name: &str) -> CommandHelp {
+fn cards_of(cmds: &[&clap::Command]) -> Vec<Card> {
+    if let [one] = cmds
+        && one.has_subcommands()
+    {
+        return noun_cards(one, one.get_name());
+    }
+    let verbs = cmds.iter().map(|c| verb(c, c.get_name())).collect();
+    let names: Vec<&str> = cmds.iter().map(|c| c.get_name()).collect();
+    vec![card(&names.join(" / "), String::new(), Vec::new(), verbs)]
+}
+
+fn card(name: &str, about: String, holds: Vec<String>, mut verbs: Vec<Verb>) -> Card {
+    // An argument that two verbs take alike is said once, on the card.
+    let mut shared: Vec<ArgHelp> = Vec::new();
+    for a in verbs.iter().flat_map(|v| &v.args) {
+        if !shared.contains(a) && verbs.iter().filter(|v| v.args.contains(a)).count() > 1 {
+            shared.push(a.clone());
+        }
+    }
+    for v in &mut verbs {
+        v.args.retain(|a| !shared.contains(a));
+    }
+    Card {
+        name: name.into(),
+        about,
+        holds,
+        shared_args: shared,
+        verbs,
+    }
+}
+
+/// The cards of a noun (`folder`): its verbs on one card, and a card for
+/// each sub-noun below it.
+fn noun_cards(noun: &clap::Command, name: &str) -> Vec<Card> {
+    let (holders, leaves): (Vec<_>, Vec<_>) = noun
+        .get_subcommands()
+        .filter(|c| visible(c))
+        .partition(|c| c.has_subcommands());
+    let mut out = Vec::new();
+    if !leaves.is_empty() {
+        let verbs = leaves
+            .iter()
+            .map(|c| verb(c, &format!("{name} {}", c.get_name())))
+            .collect();
+        out.push(card(name, about_of(noun), vec![name.into()], verbs));
+    }
+    for h in &holders {
+        out.extend(noun_cards(h, &format!("{name} {}", h.get_name())));
+    }
+    if !out.iter().any(|c| c.holds.iter().any(|h| h == name))
+        && let Some(first) = out.first_mut()
+    {
+        first.holds.insert(0, name.into());
+    }
+    out
+}
+
+fn verb(sub: &clap::Command, name: &str) -> Verb {
     let usage = sub.clone().render_usage().to_string();
-    CommandHelp {
-        name: name.to_string(),
+    Verb {
+        name: name.into(),
         usage: usage.strip_prefix("Usage: ").unwrap_or(&usage).to_string(),
         about: about_of(sub),
-        holds_commands: sub.has_subcommands(),
         args: sub
             .get_arguments()
             .filter(|a| !a.is_global_set() && !matches!(a.get_id().as_str(), "help" | "version"))
             .map(arg_help)
             .collect(),
-    }
-}
-
-/// The commands below `parent`, each after the one that holds it.
-fn collect_help(parent: &clap::Command, prefix: &str, out: &mut Vec<CommandHelp>) {
-    for sub in parent.get_subcommands() {
-        // clap adds a `help` sub-command of its own to every level.
-        if sub.get_name() == "help" || sub.is_hide_set() {
-            continue;
-        }
-        let name = format!("{prefix} {}", sub.get_name());
-        out.push(command_help(sub, &name));
-        collect_help(sub, &name, out);
     }
 }
 
@@ -605,20 +743,20 @@ async fn pause_center(
     Ok(())
 }
 
-/// The three lists of commands in a center's policy.
-#[derive(Debug, Clone, Copy)]
-enum List {
-    Allow,
-    Deny,
-    Sudo,
-}
-
 impl List {
     fn of(self, p: &mut nerve_policy::CenterPolicy) -> &mut Vec<String> {
         match self {
             List::Allow => &mut p.allow,
             List::Deny => &mut p.deny,
             List::Sudo => &mut p.sudo_allow,
+        }
+    }
+
+    fn word(self) -> &'static str {
+        match self {
+            List::Allow => "allow",
+            List::Deny => "deny",
+            List::Sudo => "sudo",
         }
     }
 
@@ -636,7 +774,7 @@ impl List {
     fn entry(self, command: &str, wildcard: bool) -> Result<String, String> {
         match self {
             List::Allow if sudo_command(command).is_some() => {
-                Err("a sudo command goes on the sudo list: `nerve-node rule sudo add`".into())
+                Err("a sudo command goes on the sudo list: `nerve-node rule add sudo`".into())
             }
             List::Allow | List::Deny => rules::rule_for("exec", "run", command, wildcard),
             List::Sudo if sudo_command(command).is_some() => {
@@ -647,15 +785,11 @@ impl List {
     }
 }
 
-/// `rule allow|deny|sudo add|rm|ls`.
-async fn rule_cmd(
-    paths: &NodePaths,
-    list: List,
-    c: ListCmd,
-    out: &mut dyn Write,
-) -> Result<(), String> {
+/// `rule add|rm|ls`.
+async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<(), String> {
     match c {
-        ListCmd::Add {
+        RuleCmd::Add {
+            list,
             command,
             wildcard,
             center,
@@ -672,7 +806,8 @@ async fn rule_cmd(
             };
             let _ = writeln!(out, "{name}: {} {rule:?}{note}", list.label());
         }
-        ListCmd::Rm {
+        RuleCmd::Rm {
+            list,
             command,
             wildcard,
             center,
@@ -696,16 +831,30 @@ async fn rule_cmd(
             .await?;
             let _ = writeln!(out, "{name}: removed from the {}", list.label());
         }
-        ListCmd::Ls { center } => {
+        RuleCmd::Ls { list, center } => {
             let (cfg, _) = read_config(paths).await?;
             let name = pick_center(&cfg, &center)?;
             let mut policy = cfg.center(&name).expect("picked").policy.clone();
-            let entries = list.of(&mut policy);
-            if entries.is_empty() {
-                let _ = writeln!(out, "{name}: nothing on the {}", list.label());
-            }
-            for r in entries.iter() {
-                let _ = writeln!(out, "{r}");
+            if let Some(list) = list {
+                let entries = list.of(&mut policy);
+                if entries.is_empty() {
+                    let _ = writeln!(out, "{name}: nothing on the {}", list.label());
+                }
+                for r in entries.iter() {
+                    let _ = writeln!(out, "{r}");
+                }
+            } else {
+                // All three: each line says which list it is on.
+                let mut any = false;
+                for list in [List::Allow, List::Deny, List::Sudo] {
+                    for r in list.of(&mut policy).iter() {
+                        any = true;
+                        let _ = writeln!(out, "{}  {r}", list.word());
+                    }
+                }
+                if !any {
+                    let _ = writeln!(out, "{name}: nothing on any rule list");
+                }
             }
         }
     }
@@ -1020,9 +1169,7 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
             Ok(())
         }
         Cmd::Config(c) => config_cmd(&paths, c, out).await,
-        Cmd::Rule(RuleCmd::Allow(c)) => rule_cmd(&paths, List::Allow, c, out).await,
-        Cmd::Rule(RuleCmd::Deny(c)) => rule_cmd(&paths, List::Deny, c, out).await,
-        Cmd::Rule(RuleCmd::Sudo(c)) => rule_cmd(&paths, List::Sudo, c, out).await,
+        Cmd::Rule(c) => rule_cmd(&paths, c, out).await,
         Cmd::Panic => {
             edit(&paths, |c| {
                 c.locked = true;
@@ -1590,12 +1737,12 @@ mod tests {
         run(&paths, &["center", "grant", "settings", "write"]).unwrap();
         run(
             &paths,
-            &["rule", "allow", "add", "git status --short", "--wildcard"],
+            &["rule", "add", "allow", "git status --short", "--wildcard"],
         )
         .unwrap();
-        run(&paths, &["rule", "sudo", "add", "sudo apt update"]).unwrap();
-        run(&paths, &["rule", "deny", "add", "rm -rf /"]).unwrap();
-        run(&paths, &["rule", "deny", "add", "rm -rf /"]).unwrap();
+        run(&paths, &["rule", "add", "sudo", "sudo apt update"]).unwrap();
+        run(&paths, &["rule", "add", "deny", "rm -rf /"]).unwrap();
+        run(&paths, &["rule", "add", "deny", "rm -rf /"]).unwrap();
         run(&paths, &["mode", "set", "user", "--for", "2"]).unwrap();
         let cfg = load(&paths);
         let c = cfg.center("home").unwrap();
@@ -1788,27 +1935,27 @@ mod tests {
     #[test]
     fn the_three_lists_add_remove_and_show() {
         let (_d, paths) = setup(&["home"]);
-        run(&paths, &["rule", "allow", "add", "git status"]).unwrap();
-        run(&paths, &["rule", "deny", "add", "git status"]).unwrap();
-        run(&paths, &["rule", "deny", "add", "rm *", "--wildcard"]).unwrap();
+        run(&paths, &["rule", "add", "allow", "git status"]).unwrap();
+        run(&paths, &["rule", "add", "deny", "git status"]).unwrap();
+        run(&paths, &["rule", "add", "deny", "rm *", "--wildcard"]).unwrap();
         run(
             &paths,
-            &["rule", "sudo", "add", "sudo apt update", "--wildcard"],
+            &["rule", "add", "sudo", "sudo apt update", "--wildcard"],
         )
         .unwrap();
         // The sudo list takes the command without the sudo as well.
-        run(&paths, &["rule", "sudo", "add", "systemctl restart nginx"]).unwrap();
+        run(&paths, &["rule", "add", "sudo", "systemctl restart nginx"]).unwrap();
         let p = load(&paths).centers[0].policy.clone();
         // Neither list loses a rule to the other; deny wins when they meet.
         assert_eq!(p.allow, ["exec.run:git status"]);
         assert_eq!(p.deny, ["exec.run:git status", "exec.run:rm *"]);
         assert_eq!(p.sudo_allow, ["sudo apt *", "sudo systemctl restart nginx"]);
-        assert!(run(&paths, &["rule", "allow", "add", "  "]).is_err());
+        assert!(run(&paths, &["rule", "add", "allow", "  "]).is_err());
         // A sudo command is not an allow rule.
-        let e = run(&paths, &["rule", "allow", "add", "sudo apt update"]).unwrap_err();
-        assert!(e.contains("rule sudo add"), "{e}");
+        let e = run(&paths, &["rule", "add", "allow", "sudo apt update"]).unwrap_err();
+        assert!(e.contains("rule add sudo"), "{e}");
         // A command with a glob character in it is allowed as itself.
-        run(&paths, &["rule", "allow", "add", "rm *"]).unwrap();
+        run(&paths, &["rule", "add", "allow", "rm *"]).unwrap();
         assert!(load(&paths).centers[0].policy.allow[1].contains("[*]"));
         // Rules for other actions go in through `config add` and show in `ls`.
         run(
@@ -1828,25 +1975,32 @@ mod tests {
             )
             .is_err()
         );
-        let ls = run(&paths, &["rule", "allow", "ls"]).unwrap();
+        let ls = run(&paths, &["rule", "ls", "allow"]).unwrap();
         assert_eq!(ls.lines().count(), 3, "{ls}");
         assert!(ls.contains("fs.read:~/notes/*"), "{ls}");
         // rm takes the command like add, or an entry as ls shows it.
-        run(&paths, &["rule", "allow", "rm", "git status"]).unwrap();
-        run(&paths, &["rule", "allow", "rm", "fs.read:~/notes/*"]).unwrap();
-        run(&paths, &["rule", "deny", "rm", "rm *", "--wildcard"]).unwrap();
-        run(&paths, &["rule", "sudo", "rm", "apt update", "--wildcard"]).unwrap();
+        run(&paths, &["rule", "rm", "allow", "git status"]).unwrap();
+        run(&paths, &["rule", "rm", "allow", "fs.read:~/notes/*"]).unwrap();
+        run(&paths, &["rule", "rm", "deny", "rm *", "--wildcard"]).unwrap();
+        run(&paths, &["rule", "rm", "sudo", "apt update", "--wildcard"]).unwrap();
         let p = load(&paths).centers[0].policy.clone();
         assert_eq!(p.allow.len(), 1, "{:?}", p.allow);
         assert_eq!(p.deny, ["exec.run:git status"]);
         assert_eq!(p.sudo_allow, ["sudo systemctl restart nginx"]);
         // Something that is not on the list is an error.
-        let e = run(&paths, &["rule", "deny", "rm", "ls"]).unwrap_err();
+        let e = run(&paths, &["rule", "rm", "deny", "ls"]).unwrap_err();
         assert!(e.contains("not on the deny rule"), "{e}");
-        let ls = run(&paths, &["rule", "sudo", "ls"]).unwrap();
+        let ls = run(&paths, &["rule", "ls", "sudo"]).unwrap();
         assert_eq!(ls, "sudo systemctl restart nginx\n");
-        run(&paths, &["rule", "sudo", "rm", "systemctl restart nginx"]).unwrap();
-        let ls = run(&paths, &["rule", "sudo", "ls"]).unwrap();
+        // Without a list, `ls` shows all three, each line with its list.
+        let all = run(&paths, &["rule", "ls"]).unwrap();
+        assert!(all.contains("deny  exec.run:git status\n"), "{all}");
+        assert!(
+            all.contains("sudo  sudo systemctl restart nginx\n"),
+            "{all}"
+        );
+        run(&paths, &["rule", "rm", "sudo", "systemctl restart nginx"]).unwrap();
+        let ls = run(&paths, &["rule", "ls", "sudo"]).unwrap();
         assert!(ls.contains("nothing on the sudo allow list"), "{ls}");
     }
 
@@ -1903,9 +2057,9 @@ mod tests {
             &["folder", "rm", "/p"],
             &["folder", "ls"],
             &["mode", "set", "user", "--for", "2"],
-            &["rule", "allow", "add", "ls", "--wildcard"],
-            &["rule", "deny", "rm", "ls"],
-            &["rule", "sudo", "ls"],
+            &["rule", "add", "allow", "ls", "--wildcard"],
+            &["rule", "rm", "deny", "ls"],
+            &["rule", "ls", "sudo"],
             &["cap", "set", "fs", "on"],
             &["cap", "ls"],
             &["proxy", "set", "http://p:1"],
@@ -1941,7 +2095,12 @@ mod tests {
             &["proxy", "clear"],
             &["sudo", "rule", "add", "x"],
             &["rule", "add", "x"],
-            &["rule", "allow", "ls", "x", "extra"],
+            &["rule", "allow", "add", "x"],
+            &["rule", "deny", "rm", "x"],
+            &["rule", "sudo", "ls"],
+            &["rule", "add", "allow"],
+            &["rule", "add", "bogus", "x"],
+            &["rule", "ls", "allow", "extra"],
         ] {
             assert!(!parses(old), "{old:?}");
         }
@@ -1966,54 +2125,85 @@ mod tests {
         all_names(&Cli::command(), "", &mut names);
         assert!(names.len() > 40, "{names:?}");
         let h = help();
-        // A group is a noun with its sentence, and holds the commands below
-        // it; the commands that stand alone are the group without a name.
-        let mut listed: Vec<String> = Vec::new();
-        for g in &h.groups {
-            assert!(!g.about.is_empty(), "group `{}` has no sentence", g.name);
-            if !g.name.is_empty() {
-                listed.push(g.name.clone());
-                assert!(
-                    g.commands.iter().all(|c| c.name.starts_with(&g.name)),
-                    "{}",
-                    g.name
-                );
-            }
-            listed.extend(g.commands.iter().map(|c| c.name.clone()));
-        }
+        // Every command is on a card, once: the ones that do something as a
+        // verb, the ones that only hold more commands in the card's `holds`.
+        let mut listed: Vec<String> = h.command_names().iter().map(|n| n.to_string()).collect();
         let mut want = names.clone();
         want.sort();
         listed.sort();
         assert_eq!(listed, want);
-        for c in h.commands() {
-            assert!(!c.about.is_empty(), "`{}` has no explanation", c.name);
+        for s in &h.sections {
+            assert!(!s.about.is_empty(), "section `{}` has no sentence", s.name);
+            assert!(!s.cards.is_empty(), "section `{}` is empty", s.name);
+        }
+        for v in h.verbs() {
+            assert!(!v.about.is_empty(), "`{}` has no explanation", v.name);
             assert!(
-                c.usage.starts_with(&format!("nerve-node {}", c.name)),
+                v.usage.starts_with(&format!("nerve-node {}", v.name)),
                 "{}",
-                c.usage
+                v.usage
             );
         }
-        // The nouns, in the order of `--help`, and the loose commands last.
-        let nouns: Vec<&str> = h.groups.iter().map(|g| g.name.as_str()).collect();
+        // Every command is placed in SECTIONS, none in the catch-all.
+        let names: Vec<&str> = h.sections.iter().map(|s| s.name.as_str()).collect();
         assert_eq!(
-            nouns,
+            names,
             [
-                "center", "folder", "mode", "rule", "cap", "sudo", "proxy", "config", ""
+                "Pair and connect",
+                "What a center may do",
+                "Run and watch",
+                "Not done yet"
             ]
         );
-        let rule = h.groups.iter().find(|g| g.name == "rule").unwrap();
-        let rule_names: Vec<&str> = rule.commands.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(rule_names[..2], ["rule allow", "rule allow add"]);
-        assert!(rule.commands[0].holds_commands && !rule.commands[1].holds_commands);
-        let add = h.commands().find(|c| c.name == "folder add").unwrap();
+        // A noun is one card with its verbs; `rule` has the three lists as
+        // an argument, not as three sub-trees.
+        let card = |n: &str| {
+            h.sections
+                .iter()
+                .flat_map(|s| &s.cards)
+                .find(|c| c.name == n)
+                .unwrap_or_else(|| panic!("no card `{n}`"))
+        };
+        let rule = card("rule");
+        let rule_verbs: Vec<&str> = rule.verbs.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(rule_verbs, ["rule add", "rule rm", "rule ls"]);
+        assert_eq!(rule.holds, ["rule"]);
+        assert!(
+            rule.verbs[0].usage.contains("<LIST>"),
+            "{}",
+            rule.verbs[0].usage
+        );
+        assert!(
+            rule.verbs[2].usage.contains("[LIST]"),
+            "{}",
+            rule.verbs[2].usage
+        );
+        assert_eq!(card("panic / unlock").verbs.len(), 2);
+        assert_eq!(card("install / setup / update / uninstall").verbs.len(), 4);
+        // What several verbs take alike is said once, on the card, and what
+        // several cards take alike once on the page.
+        let folder = card("folder");
+        assert!(folder.shared_args.iter().any(|a| a.name == "<PATH>"));
+        assert!(h.common.iter().any(|a| a.name == "--center <CENTER>"));
+        let cards: Vec<&Card> = h.sections.iter().flat_map(|s| &s.cards).collect();
+        for a in &h.common {
+            assert!(cards.iter().all(|c| !c.shared_args.contains(a)));
+            assert!(h.verbs().all(|v| !v.args.contains(a)));
+        }
+        let key = card("config");
+        assert!(key.shared_args.iter().any(|a| a.name == "<KEY>"));
+        assert_eq!(
+            key.shared_args.iter().filter(|a| a.name == "<KEY>").count(),
+            1
+        );
+        let add = h.verbs().find(|v| v.name == "folder add").unwrap();
         assert!(
             add.args
                 .iter()
                 .any(|a| a.name == "<+r|+w|+x>" && !a.about.is_empty())
         );
-        assert!(add.args.iter().any(|a| a.name == "<PATH>" && !a.optional));
         // What can be left out says so.
-        let mode = h.commands().find(|c| c.name == "mode set").unwrap();
+        let mode = h.verbs().find(|v| v.name == "mode set").unwrap();
         assert!(
             mode.args
                 .iter()
@@ -2023,16 +2213,41 @@ mod tests {
         // The options every command takes are listed once, not per command.
         assert!(h.global.iter().any(|a| a.name.starts_with("--config-dir")));
         assert!(add.args.iter().all(|a| !a.name.starts_with("--config-dir")));
+        // No usage line, and no explanation of a verb, is on the page twice.
+        let mut usages: Vec<&str> = h.verbs().map(|v| v.usage.as_str()).collect();
+        usages.sort();
+        usages.dedup();
+        assert_eq!(usages.len(), h.verbs().count());
+        let mut abouts: Vec<&str> = h.verbs().map(|v| v.about.as_str()).collect();
+        abouts.sort();
+        let n = abouts.len();
+        abouts.dedup();
+        assert_eq!(abouts.len(), n, "two commands say the same");
     }
 
     #[test]
     fn every_argument_is_explained() {
-        for c in help().commands() {
-            for a in &c.args {
+        let h = help();
+        let cards = h.sections.iter().flat_map(|s| &s.cards);
+        for a in &h.common {
+            assert!(!a.about.is_empty(), "{} has no explanation", a.name);
+        }
+        for c in cards.clone() {
+            for a in &c.shared_args {
                 assert!(
                     !a.about.is_empty(),
                     "`{}` {} has no explanation",
                     c.name,
+                    a.name
+                );
+            }
+        }
+        for v in h.verbs() {
+            for a in &v.args {
+                assert!(
+                    !a.about.is_empty(),
+                    "`{}` {} has no explanation",
+                    v.name,
                     a.name
                 );
             }

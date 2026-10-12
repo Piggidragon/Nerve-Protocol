@@ -884,6 +884,19 @@ textarea.json {
   padding-bottom: 0;
 }
 
+.rows + .meta {
+  margin-top: 12px;
+}
+
+.rows .sub {
+  flex-basis: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding-left: 12px;
+  color: rgb(var(--fg-subtle));
+}
+
 .rows .v {
   color: rgb(var(--fg-subtle));
   font-variant-numeric: tabular-nums;

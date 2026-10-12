@@ -150,8 +150,8 @@ Commands and paths never mix: `fs:/tmp/*` is no command rule.
 | `fs:~/private/*` | every fs action on the folder and below |
 | `camera.snap`, `camera` | that action, or every action of the capability |
 
-The four buttons of the center's audit view and `nerve-node rule allow|deny|sudo add
-[--wildcard]` write exactly these forms: exact (`exec.run:git status`) or
+The four buttons of the center's audit view and `nerve-node rule add allow|deny|sudo
+<command> [--wildcard]` write exactly these forms: exact (`exec.run:git status`) or
 wildcard (`exec.run:git *`, `fs.read:/home/u/notes/*` for the folder of the
 path, the capability for another action). They only add a rule to a list;
 rules can be written by hand as well (`nerve-node config add

@@ -366,7 +366,7 @@ Every invoke from center C, session S is decided by the node's policy for C, and
 1. The policy looks for what allows the call: in default deny an allow rule, in Folder and User mode the mode itself (folders, the user's reach), for a sudo command the sudo allow list. Finding none, the node refuses at once with `forbidden`. A rule that denies (a `deny` rule, a protected path) wins over any rule that allows.
 2. The `message` of the refusal says what is missing and what to do next. The harness shows it to the model; the owner adds the rule and the model tries again.
 3. Every decision, allowed and refused, is audited on the node with center and session, and reaches a subscribed center as an `audit/decision` event.
-4. Rules are added on the node (`nerve-node rule allow|deny|sudo add`, `folder`, `cap set`, `config add`) or, for a center with `settings = write`, through the center (the four audit tab buttons, §11 item 9a).
+4. Rules are added on the node (`nerve-node rule add allow|deny|sudo`, `folder`, `cap set`, `config add`) or, for a center with `settings = write`, through the center (the four audit tab buttons, §11 item 9a).
 
 The center decides the same way for its own rules (§5.5): it refuses a call before sending it, and never allows what the node would not.
 
@@ -457,7 +457,7 @@ Commands the node runs for a center cannot change the node's settings through th
 
 - Package: one binary, Linux and Windows. Headless; everything through the CLI in 0.0.1.
 - `nerve-node install` (user service), `nerve-node setup --create-user nerve` (servers: dedicated user, system unit with `Delegate=yes`, folder grants printed as `setfacl` lines).
-- Terminal, noun then verb like docker: `center add|rm|ls|pause|resume|grant settings`, `folder add|set|rm|ls`, `mode set allowlist|folder|user [--for HOURS]`, `rule allow|deny|sudo add|rm|ls [--wildcard]`, `cap set|ls`, `sudo on|off|status` (`on` asks for the sudo password; the node verifies it and refuses a wrong one; `off` asks for none), `proxy set|rm|ls`, `config get|set|unset|add|remove|accept`, and on their own `run`, `status`, `audit [--denied] [--follow]`, `panic`, `unlock`, `install`, `setup`, `update`, `uninstall`. Folder rights are written like chmod: `folder add <path> +r +w +x` (at least one right is required), `folder set <path> =rw -w +x` (changes apply left to right). Every per-center command takes `--center <name>` and refuses to guess when there are several.
+- Terminal, noun then verb like docker: `center add|rm|ls|pause|resume|grant settings`, `folder add|set|rm|ls`, `mode set allowlist|folder|user [--for HOURS]`, `rule add|rm allow|deny|sudo <command> [--wildcard]`, `rule ls [allow|deny|sudo]` (no list shows all three), `cap set|ls`, `sudo on|off|status` (`on` asks for the sudo password; the node verifies it and refuses a wrong one; `off` asks for none), `proxy set|rm|ls`, `config get|set|unset|add|remove|accept`, and on their own `run`, `status`, `audit [--denied] [--follow]`, `panic`, `unlock`, `install`, `setup`, `update`, `uninstall`. Folder rights are written like chmod: `folder add <path> +r +w +x` (at least one right is required), `folder set <path> =rw -w +x` (changes apply left to right). Every per-center command takes `--center <name>` and refuses to guess when there are several.
 - In 0.0.1 the commands `install`, `setup`, `update` and `uninstall` exist but only answer "not done in 0.0.1"; the node is started by hand until they land.
 - Pairing is confirmed in the terminal; a `nerve://` link handler and dialogs come with the Slint setup GUI later.
 

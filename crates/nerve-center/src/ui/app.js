@@ -10,7 +10,6 @@ const ICONS = {
   stats: "<path d=\"M3 3v16a2 2 0 0 0 2 2h16\"/><path d=\"M18 17V9\"/><path d=\"M13 17V5\"/><path d=\"M8 17v-3\"/>",
   audit: "<path d=\"M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z\"/><path d=\"m9 12 2 2 4-4\"/>",
   settings: "<path d=\"M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z\"/><circle cx=\"12\" cy=\"12\" r=\"3\"/>",
-  server: "<rect width=\"20\" height=\"8\" x=\"2\" y=\"2\" rx=\"2\" ry=\"2\"/><rect width=\"20\" height=\"8\" x=\"2\" y=\"14\" rx=\"2\" ry=\"2\"/><line x1=\"6\" x2=\"6.01\" y1=\"6\" y2=\"6\"/><line x1=\"6\" x2=\"6.01\" y1=\"18\" y2=\"18\"/>",
   menu: "<line x1=\"4\" x2=\"20\" y1=\"12\" y2=\"12\"/><line x1=\"4\" x2=\"20\" y1=\"6\" y2=\"6\"/><line x1=\"4\" x2=\"20\" y1=\"18\" y2=\"18\"/>",
   x: "<path d=\"M18 6 6 18\"/><path d=\"m6 6 12 12\"/>",
   plus: "<path d=\"M5 12h14\"/><path d=\"M12 5v14\"/>",
@@ -50,7 +49,7 @@ let lastSig = null;
 let busy = false;
 let down = false;
 let settingsRun = 0;
-const state = { overview: null, stats: null, audit: null, help: null, pairing: null, settings: null, newToken: null };
+const state = { overview: null, stats: null, statsNode: null, audit: null, help: null, pairing: null, settings: null, newToken: null };
 
 const $ = (id) => document.getElementById(id);
 
@@ -342,22 +341,160 @@ function sessionCard(s) {
     el("p", { class: "meta faint mono" }, s.id));
 }
 
+// ---- Searchable list ----
+
+let pickers = 0;
+
+// A list to pick one entry from, with a search field, for when a <select>
+// would be too long to read. A button shows the choice and opens a panel with
+// the search field above a list of fixed height. The keys follow the combobox
+// pattern: Down opens it, Up and Down move, Enter picks, Escape closes.
+// `items` are { value, text }; `onpick` gets the value of the entry picked.
+function picker(o) {
+  const n = ++pickers;
+  const ids = { label: `pick-${n}-label`, button: `pick-${n}-button`, list: `pick-${n}-list` };
+  let items = [];
+  let chosen = null;
+  let shown = [];
+  let active = -1;
+  let open = false;
+
+  const current = el("span", {});
+  const button = el("button", {
+    type: "button", class: "input picker-btn", id: ids.button, "aria-haspopup": "listbox", "aria-expanded": "false",
+    "aria-controls": ids.list, "aria-labelledby": `${ids.label} ${ids.button}`,
+  }, current, icon("chev", "sm chev"));
+  const search = el("input", {
+    class: "input", type: "text", role: "combobox", placeholder: "Search…", "aria-label": o.search, "aria-controls": ids.list,
+    "aria-expanded": "true", "aria-autocomplete": "list", autocomplete: "off", spellcheck: "false",
+  });
+  // tabindex -1: a list that scrolls is a stop for Tab in some browsers, and the keys work on the search field.
+  const list = el("ul", { class: "picker-list", id: ids.list, role: "listbox", tabindex: "-1", "aria-labelledby": ids.label });
+  const none = el("p", { class: "picker-none", role: "status" });
+  const panel = el("div", { class: "picker-panel", hidden: true }, search, list, none);
+  const root = el("div", { class: "field picker" }, el("span", { class: "label", id: ids.label }, o.label), button, panel);
+
+  // Marks the entry the keys act on; `reveal` scrolls the list to it.
+  function mark(k, reveal) {
+    active = k;
+    for (const [j, li] of Array.from(list.children).entries()) li.classList.toggle("active", j === k);
+    const li = list.children[k];
+    if (!li) return search.removeAttribute("aria-activedescendant");
+    search.setAttribute("aria-activedescendant", li.id);
+    if (!reveal) return;
+    if (li.offsetTop < list.scrollTop) list.scrollTop = li.offsetTop;
+    else if (li.offsetTop + li.offsetHeight > list.scrollTop + list.clientHeight) list.scrollTop = li.offsetTop + li.offsetHeight - list.clientHeight;
+  }
+
+  // Lists the entries that contain the search text, and marks the one with
+  // value `keep`, or else the first.
+  function render(keep) {
+    const q = search.value.trim().toLowerCase();
+    shown = items.filter((i) => i.text.toLowerCase().includes(q));
+    list.replaceChildren(...shown.map((i, k) => el("li", {
+      id: `${ids.list}-${k}`, role: "option", class: "opt", title: i.text, "aria-selected": String(i.value === chosen),
+      // A scroll under a still pointer sends a move of no distance: not a choice.
+      onmousemove: (ev) => { if ((ev.movementX || ev.movementY) && k !== active) mark(k, false); },
+      onclick: () => pick(i),
+    }, el("span", {}, i.text), i.value === chosen ? icon("check", "sm") : null)));
+    none.textContent = shown.length ? "" : o.none;
+    mark(shown.length ? Math.max(0, shown.findIndex((i) => i.value === keep)) : -1, true);
+  }
+
+  function show(on, refocus) {
+    if (on === open) return;
+    open = on;
+    panel.hidden = !on;
+    button.setAttribute("aria-expanded", String(on));
+    if (on) {
+      search.value = "";
+      render(chosen);
+      search.focus();
+    } else if (refocus) {
+      button.focus();
+    }
+  }
+
+  function pick(item) {
+    show(false, true);
+    if (item.value !== chosen) o.onpick(item.value);
+  }
+
+  button.addEventListener("click", () => show(!open, true));
+  // Safari does not focus a button on click: keep the focus in the search
+  // field, so the click closes the panel instead of reopening it.
+  button.addEventListener("mousedown", (ev) => { if (open) ev.preventDefault(); });
+  button.addEventListener("keydown", (ev) => {
+    if (ev.key === "ArrowDown" || ev.key === "ArrowUp") { ev.preventDefault(); show(true, true); }
+  });
+  search.addEventListener("input", () => render(search.value.trim() ? undefined : chosen));
+  search.addEventListener("keydown", (ev) => {
+    const arrow = { ArrowDown: 1, ArrowUp: -1 }[ev.key];
+    const page = { PageDown: 6, PageUp: -6 }[ev.key];
+    if (arrow || page) {
+      ev.preventDefault();
+      const last = shown.length - 1;
+      if (last >= 0) mark(arrow ? (active + arrow + shown.length) % shown.length : Math.min(last, Math.max(0, active + page)), true);
+    } else if (ev.key === "Enter") {
+      ev.preventDefault();
+      if (shown[active]) pick(shown[active]);
+    } else if (ev.key === "Escape") {
+      ev.preventDefault();
+      ev.stopPropagation();
+      show(false, true);
+    }
+  });
+  // A click on the panel that is not on the search field must not take the
+  // focus off it, or the panel would close before the click lands.
+  panel.addEventListener("mousedown", (ev) => { if (ev.target !== search) ev.preventDefault(); });
+  root.addEventListener("focusout", (ev) => { if (open && !root.contains(ev.relatedTarget)) show(false, false); });
+
+  return {
+    root,
+    close: () => show(false, false),
+    // New entries and the value now chosen, while the panel may be open.
+    set(next, value) {
+      // The same entries again (the poll): leave the list as it is, with its scroll.
+      const same = value === chosen && next.length === items.length && next.every((i, k) => i.value === items[k].value);
+      items = next;
+      chosen = value;
+      const at = items.find((i) => i.value === value);
+      current.textContent = at ? at.text : "";
+      if (open && !same) render(shown[active] ? shown[active].value : undefined);
+    },
+  };
+}
+
 // ---- Statistics ----
 
+// The picker and the boxes around it are made once and kept: draw() leaves
+// them in place when the numbers change, so a search typed into the picker
+// is not cut off by the next poll.
+const statsPicker = picker({
+  label: "Machine", search: "Search machines", none: "No machine matches.",
+  onpick: (name) => { state.statsNode = name; draw(true); },
+});
+const statsParts = { head: el("div"), pick: el("div", { class: "picker-row" }, statsPicker.root), body: el("div") };
+
+// The numbers of all machines together, or of the one picked from the list.
 function pageStats() {
   const s = state.stats;
   if (!s) return [empty("Loading…")];
-  const names = Object.keys(s.nodes);
-  return [
-    head("stats", "Statistics", `Kept for ${plural(s.retention_days, "day")}.`, [[names.length, names.length === 1 ? "machine" : "machines"]]),
-    section("All machines", null, null, dayCard(s.total || {})),
-    section("Per machine", null, null, names.length
-      ? el("div", { class: "list" }, names.map((n) => dayCard(s.nodes[n], n)))
-      : empty("No machines yet.")),
-  ];
+  const paired = state.overview ? state.overview.nodes.map((n) => n.name) : [];
+  const names = [...new Set([...paired, ...Object.keys(s.nodes)])].sort((a, b) => a.localeCompare(b));
+  // A machine that was removed or renamed has no numbers under that name.
+  if (state.statsNode !== null && !names.includes(state.statsNode)) state.statsNode = null;
+  const one = state.statsNode;
+  const title = `Statistics: ${one === null ? "all machines" : one}`;
+  $("top-title").textContent = title;
+  statsPicker.set([{ value: null, text: "All machines" }, ...names.map((m) => ({ value: m, text: m }))], one);
+  statsParts.head.replaceChildren(head("stats", title, `Kept for ${plural(s.retention_days, "day")}.`, [[names.length, names.length === 1 ? "machine" : "machines"]]));
+  statsParts.pick.hidden = !names.length;
+  statsParts.body.replaceChildren(names.length ? dayCard((one === null ? s.total : s.nodes[one]) || {}) : empty("No machines yet."));
+  return [statsParts.head, statsParts.pick, statsParts.body];
 }
 
-function dayCard(d, name) {
+function dayCard(d) {
   const calls = Object.entries(d.calls || {}).sort((a, b) => b[1].count - a[1].count);
   const errors = Object.entries(d.errors || {}).sort((a, b) => b[1] - a[1]);
   const total = calls.reduce((n, [, c]) => n + c.count, 0);
@@ -369,7 +506,6 @@ function dayCard(d, name) {
   const rows = (title, list, line) => list.length ? [el("p", { class: "meta" }, title), el("div", { class: "rows" }, list.map(([k, v]) =>
     el("div", {}, el("span", { class: "mono" }, k), el("span", { class: "v" }, line(v))))) ] : null;
   return el("div", { class: "card" },
-    name ? el("div", { class: "card-top" }, icon("server"), el("span", { class: "name" }, name)) : null,
     el("div", { class: "metrics" }, metrics.map(([v, l]) => el("div", { class: "metric" }, el("b", {}, v.toLocaleString()), el("span", {}, l)))),
     rows("Calls", calls, (c) => `${c.count}${c.errors ? `, ${c.errors} failed` : ""}, avg ${c.count ? Math.round(c.total_ms / c.count) : 0} ms, max ${c.max_ms} ms`),
     rows("Errors", errors, (n) => n));
@@ -611,7 +747,12 @@ function draw(force) {
   const sig = signature(page);
   if (!force && sig === lastSig) return;
   lastSig = sig;
-  $("page").replaceChildren(...PAGES[page].view().flat());
+  const parts = PAGES[page].view().flat();
+  // A page that keeps its parts between redraws (the statistics picker) has
+  // updated them in place: moving them would take the focus off the picker.
+  const shown = Array.from($("page").children);
+  if (parts.length === shown.length && parts.every((p, i) => p === shown[i])) return;
+  $("page").replaceChildren(...parts);
 }
 
 // The pairing card shows a one-time code. Once the center no longer has it
@@ -667,6 +808,7 @@ function setNav(open) {
 
 function go() {
   const page = current();
+  statsPicker.close();
   for (const a of document.querySelectorAll("[data-page]")) {
     if (a.dataset.page === page) a.setAttribute("aria-current", "page");
     else a.removeAttribute("aria-current");

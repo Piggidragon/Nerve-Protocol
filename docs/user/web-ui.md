@@ -45,10 +45,28 @@ and calls to it are refused.
 
 ### Statistics
 
-For all machines and for each one: time online, links, drops, calls, failed
+The numbers of all machines together: time online, links, drops, calls, failed
 calls, then calls per action with the average and the longest time, and errors
 by code. Only counts and times are kept, never content. They are kept for the
 number of days set in Settings.
+
+To see one machine, open the **Machine** list under the page header and pick it.
+The header then names the machine ("Statistics: web-1") and the page shows its
+numbers alone.
+
+- Type in the search field to narrow the list to the entries whose name
+  contains what you typed, in any letter case. The list shows a few entries at a
+  time and scrolls, so it stays short with many machines.
+- With the keyboard: **Down** or **Up** on the list's button opens it, **Down**
+  and **Up** move through the entries (**Page Down** and **Page Up** by six),
+  **Enter** picks the marked one and **Escape** closes the list without a
+  change.
+- **All machines**, the first entry, goes back to the numbers of all machines
+  together. It is filtered like the others: clear the search field to see it.
+
+The list names every paired machine, also one that has no numbers yet. Its
+numbers are then zero. When a picked machine is removed or renamed, the page
+goes back to all machines. The choice lasts until you reload the page.
 
 ### Audit
 

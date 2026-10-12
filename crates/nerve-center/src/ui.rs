@@ -740,6 +740,64 @@ mod tests {
         assert!(js[ask..poll].contains("state.pairing = null"));
     }
 
+    #[tokio::test]
+    async fn the_statistics_page_has_a_picker_and_the_numbers_it_picks_from() {
+        use crate::store::{CallStats, NodeRecord, Store};
+        let d = tempfile::tempdir().unwrap();
+        let mut store = Store::new("c".into(), "home".into());
+        for (id, name, count) in [("n1", "alpha", 3), ("n2", "beta", 4)] {
+            store.nodes.insert(
+                id.into(),
+                NodeRecord {
+                    id: id.into(),
+                    name: name.into(),
+                    public_key: "00".repeat(32),
+                    platform: "linux".into(),
+                    arch: "x86_64".into(),
+                    paired_ms: 1,
+                    disabled: false,
+                    last_seen_ms: 0,
+                    going_away: None,
+                    descriptor: None,
+                },
+            );
+            let day = store.day(id, crate::util::now_ms());
+            day.calls.insert(
+                "fs.read".into(),
+                CallStats {
+                    count,
+                    errors: 0,
+                    total_ms: 10,
+                    max_ms: 5,
+                },
+            );
+        }
+        store.save(d.path()).unwrap();
+        let ui = Ui::new(&center(d.path()), None, false, false);
+        let h = ("Host", "127.0.0.1:7480");
+        let session = ui.request(req("GET", "/api/session", &[h], "")).await;
+        let ck = set_cookie(&session);
+        // The page draws overall numbers, and one machine's from a searchable
+        // list of its own: a button and a search field, not a <select>.
+        let js = ui
+            .request(req("GET", "/app.js", &[h, ("Cookie", &ck)], ""))
+            .await;
+        let js = String::from_utf8(js.body).unwrap();
+        for part in ["statsPicker", "role: \"combobox\"", "\"All machines\""] {
+            assert!(js.contains(part), "the page has no {part}");
+        }
+        assert!(!js.contains("createElement(\"select\")") && !js.contains("el(\"select\""));
+        // The data: the total, and each paired machine's own numbers by name.
+        let r = ui
+            .request(req("GET", "/api/stats", &[h, ("Cookie", &ck)], ""))
+            .await;
+        assert_eq!(r.status, 200);
+        let v: Value = serde_json::from_slice(&r.body).unwrap();
+        assert_eq!(v["total"]["calls"]["fs.read"]["count"], 7);
+        assert_eq!(v["nodes"]["alpha"]["calls"]["fs.read"]["count"], 3);
+        assert_eq!(v["nodes"]["beta"]["calls"]["fs.read"]["count"], 4);
+    }
+
     async fn center_settings(ui: &Ui, body: Option<Value>) -> Result<Value, (u16, Value)> {
         match body {
             Some(b) => ui.api(&req("POST", "/api/center", &[], ""), &b).await,

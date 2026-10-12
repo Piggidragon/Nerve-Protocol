@@ -91,7 +91,7 @@ mode = "allowlist"          # allowlist | folder | user (the default is allowlis
 until = 1790000000000  # optional, folder and user: ms since the epoch; then allowlist
 folders = [{ path = "/home/u/proj", access = "rwx" }]  # folder mode; r w x in any mix, "" for none
 caps = { "fs.write" = "off" }   # on | off | hidden
-protected = { extra = [], allow = [] }
+protected = { extra = [], allow = [] }  # a center may add to extra; only the owner removes or releases
 allow = ["exec.run:git status", "fs.read:~/notes/*"]   # allowlist mode only
 deny = ["fs:~/private/*", "exec.run:rm *"]             # every mode
 sudo_allow = ["sudo apt update"]                       # sudo commands, every mode
@@ -255,8 +255,11 @@ The normal `allow` list does not count for them.
 - **On**: such a command runs only when `sudo_allow` names it, in every
   mode; `deny` rules and protected paths still refuse it. A sudo command must
   be one simple command: one with `; & | $ \` ( ) < >` or a line break is
-  refused. The node runs it as `sudo -S -k -p '' …` with the password on its
-  stdin and without Landlock (which would stop sudo from gaining privileges).
+  refused. The node runs it as `sudo -S -k -p <prompt> …` without Landlock
+  (which would stop sudo from gaining privileges), with a random prompt per
+  command. It writes the password to stdin only after sudo printed that
+  prompt; when sudo asks for none (a `NOPASSWD` entry, root), the command
+  finds no password on its stdin.
 - Every other command runs with `no_new_privs` (Linux), so a `sudo` later in
   a command line, or any setuid program, cannot gain privileges.
 
@@ -307,4 +310,7 @@ centers you would also give `settings = write`.
 and new value), calls allowed or forbidden, and what happened to the config
 file itself (`"kind": "config"`, `event` `refused`, `signed` or `accepted`,
 with the file and the reason). It holds targets (paths, command lines), never
-file content or output. `nerve-node audit [--denied] [--follow]` shows it.
+file content or output; a target longer than 512 characters is cut there
+and says so. When the file would pass 10 MiB it is moved to `audit.jsonl.1`,
+replacing the older one, so the log keeps at most about 20 MiB.
+`nerve-node audit [--denied] [--follow]` shows it.

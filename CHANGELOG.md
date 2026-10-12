@@ -66,3 +66,9 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
   (`spec/harness.md`).
 - The owner sets how long a pairing code is valid, 1 to 1440 minutes (24 hours), in Settings, Center; 10 minutes unless changed, and a code keeps the lifetime it was made with.
 - `fs.grep`, `fs.find` and `fs.list` in folder mode leave out what a direct read would refuse, such as a folder without `r` inside one with `r`; `grep` and `find` still reach a folder with `r` inside a sealed one.
+- `exec.signal` is decided by the policy and audited like every other action, so a deny rule refuses it.
+- The sudo password goes to sudo only after its prompt; a command sudo runs without asking (NOPASSWD, root) never finds it on its stdin.
+- `fs.read` and `fs.write` open their path without following a symlink (Unix), so a symlink swapped in after the policy check fails the call.
+- A pairing code pairs one node also when several requests send it at the same moment.
+- A center with the settings grant `write` can add protected paths to `protected.extra` but not remove the owner's.
+- The node's audit log logs at most 512 characters of a target and moves to `audit.jsonl.1` at 10 MiB, keeping one old file.

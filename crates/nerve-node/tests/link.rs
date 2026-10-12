@@ -289,6 +289,198 @@ async fn allow_rules_do_not_count_in_folder_mode_and_deny_rules_do() {
     node.stop().await;
 }
 
+/// Starts `sleep 2` under `policy`, sends `exec.signal kill` for it and
+/// returns the signal's answer, the run's answer and the audit log.
+#[cfg(unix)]
+async fn signal_a_sleep(
+    policy: impl Fn(&mut nerve_policy::CenterPolicy),
+) -> (Result<Value, String>, Value, String) {
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let node = paired_node_with(dir.path(), &center, policy).await;
+    let mut conn = linked(&mut center).await;
+    let run = conn
+        .request(
+            "invoke",
+            json!({"cap": "exec", "action": "run", "args": {"command": "sleep 2"}}),
+        )
+        .await
+        .unwrap();
+    // Long enough for the command to start and be known by its call id.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let signal = conn
+        .call(
+            "invoke",
+            json!({"cap": "exec", "action": "signal", "args": {"call": run, "signal": "kill"}}),
+            WAIT,
+        )
+        .await
+        .unwrap()
+        .map_err(|e| nerve_conformance::wire::code_of(&e));
+    let mut others = Vec::new();
+    let ran = conn
+        .answer(run, WAIT, &mut others)
+        .await
+        .unwrap()
+        .expect("the command ran");
+    let log = std::fs::read_to_string(node.paths().audit_log()).unwrap();
+    node.stop().await;
+    (signal, ran, log)
+}
+
+/// `exec.signal` goes through the policy like every other action: a deny
+/// rule refuses it and the refusal is audited.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deny_rule_refuses_exec_signal_and_the_audit_says_so() {
+    let (signal, ran, log) = signal_a_sleep(|p| {
+        p.allow.push("exec.run:sleep *".into());
+        p.deny.push("exec.signal".into());
+    })
+    .await;
+    assert_eq!(signal, Err("forbidden".into()), "{log}");
+    assert_eq!(ran["exit_code"], 0, "the command was not killed: {ran}");
+    let line = log
+        .lines()
+        .find(|l| l.contains("\"signal\""))
+        .unwrap_or_else(|| panic!("no audit line for the signal: {log}"));
+    assert!(line.contains("\"forbidden\""), "{line}");
+
+    // An allow rule lets it through, and that is audited too.
+    let (signal, ran, log) = signal_a_sleep(|p| {
+        p.allow.push("exec.run:sleep *".into());
+        p.allow.push("exec.signal".into());
+    })
+    .await;
+    assert_eq!(signal, Ok(json!({})), "{log}");
+    assert_eq!(ran["signal"], "kill", "{ran}");
+    let line = log
+        .lines()
+        .find(|l| l.contains("\"signal\""))
+        .unwrap_or_else(|| panic!("no audit line for the signal: {log}"));
+    assert!(line.contains("\"allowed\""), "{line}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unknown_node_answer_stops_dialling() {
+    let dir = tempdir();
+    let center = FakeCenter::start(false).await.unwrap();
+    let o = options(dir.path());
+    nerve_node::pair::pair(&o.paths, &center.link(), Some("lab"))
+        .await
+        .unwrap();
+    // A second center that never paired this node answers 401.
+    let stranger = FakeCenter::start(false).await.unwrap();
+    let url = format!("http://{}", stranger.url.authority());
+    owner_edit(&o.paths, |c| c.centers[0].url = url.clone()).await;
+
+    let node = Daemon::start(o).await.unwrap();
+    let mut marked = false;
+    for _ in 0..100 {
+        if node.config().centers[0].unknown {
+            marked = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        marked,
+        "the node marks the center and stops: {}",
+        node.status()
+    );
+    let status = node.status();
+    let c: &Value = &status["centers"][0];
+    assert_eq!(c["unknown"], true);
+    node.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn passes_the_conformance_node_checks() {
+    let dir = tempdir();
+    let root = dir.path().to_path_buf();
+    let running: Arc<Mutex<Option<Daemon>>> = Arc::default();
+    let keep = running.clone();
+    let report = nerve_conformance::node_part::run(move |link| async move {
+        let o = options(&root);
+        nerve_node::pair::pair(&o.paths, &link, None).await?;
+        let d = Daemon::start(o).await?;
+        *keep.lock().unwrap() = Some(d);
+        Ok(nerve_conformance::node_part::Setup::default())
+    })
+    .await;
+    let d = running.lock().unwrap().take();
+    if let Some(d) = d {
+        d.stop().await;
+    }
+    assert!(report.ok(), "{report}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn folder_mode_confines_commands_to_their_folders() {
+    if !nerve_sandbox::Confinement::detect().available() {
+        eprintln!("skipped: Landlock is not available here");
+        return;
+    }
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let o = options(dir.path());
+    nerve_node::pair::pair(&o.paths, &center.link(), Some("lab"))
+        .await
+        .unwrap();
+    let work = dir.path().join("home").join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let work = std::fs::canonicalize(&work).unwrap();
+    let outside = dir.path().join("outside.txt");
+    owner_edit(&o.paths, |c| {
+        let p = &mut c.centers[0].policy;
+        p.mode = nerve_policy::Mode::Folder;
+        p.folders.push(nerve_policy::config::Folder {
+            path: work.display().to_string(),
+            access: nerve_policy::config::Access::ALL,
+        });
+    })
+    .await;
+    let node = Daemon::start(o).await.unwrap();
+    let mut conn = linked(&mut center).await;
+
+    let state = conn
+        .call("get", json!({"cap": "exec", "keys": ["confinement"]}), WAIT)
+        .await
+        .unwrap()
+        .expect("get");
+    assert!(
+        state["confinement"]
+            .as_str()
+            .unwrap()
+            .starts_with("landlock"),
+        "{state}"
+    );
+    let command = format!(
+        "sh -c 'echo in > inside.txt; echo out > {}'",
+        outside.display()
+    );
+    let r = conn
+        .call(
+            "invoke",
+            json!({"cap": "exec", "action": "run",
+                   "args": {"command": command, "cwd": work.display().to_string()}}),
+            WAIT,
+        )
+        .await
+        .unwrap()
+        .expect("the command runs");
+    assert_ne!(r["exit_code"], 0, "{r}");
+    assert_eq!(
+        std::fs::read_to_string(work.join("inside.txt")).unwrap(),
+        "in\n"
+    );
+    assert!(
+        !outside.exists(),
+        "the write outside the folder was blocked"
+    );
+    node.stop().await;
+}
+
 /// A walk (`grep`, `find`, `list`) leaves out what a direct read would refuse:
 /// a folder inside a readable one that has no `r` stays sealed, while the
 /// readable files beside it are still found.
@@ -421,125 +613,5 @@ async fn walks_reach_a_readable_folder_inside_a_sealed_one() {
         .await
         .expect("list");
     assert_eq!(l["entries"], json!([]), "{l}");
-    node.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn an_unknown_node_answer_stops_dialling() {
-    let dir = tempdir();
-    let center = FakeCenter::start(false).await.unwrap();
-    let o = options(dir.path());
-    nerve_node::pair::pair(&o.paths, &center.link(), Some("lab"))
-        .await
-        .unwrap();
-    // A second center that never paired this node answers 401.
-    let stranger = FakeCenter::start(false).await.unwrap();
-    let url = format!("http://{}", stranger.url.authority());
-    owner_edit(&o.paths, |c| c.centers[0].url = url.clone()).await;
-
-    let node = Daemon::start(o).await.unwrap();
-    let mut marked = false;
-    for _ in 0..100 {
-        if node.config().centers[0].unknown {
-            marked = true;
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert!(
-        marked,
-        "the node marks the center and stops: {}",
-        node.status()
-    );
-    let status = node.status();
-    let c: &Value = &status["centers"][0];
-    assert_eq!(c["unknown"], true);
-    node.stop().await;
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn passes_the_conformance_node_checks() {
-    let dir = tempdir();
-    let root = dir.path().to_path_buf();
-    let running: Arc<Mutex<Option<Daemon>>> = Arc::default();
-    let keep = running.clone();
-    let report = nerve_conformance::node_part::run(move |link| async move {
-        let o = options(&root);
-        nerve_node::pair::pair(&o.paths, &link, None).await?;
-        let d = Daemon::start(o).await?;
-        *keep.lock().unwrap() = Some(d);
-        Ok(nerve_conformance::node_part::Setup::default())
-    })
-    .await;
-    let d = running.lock().unwrap().take();
-    if let Some(d) = d {
-        d.stop().await;
-    }
-    assert!(report.ok(), "{report}");
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn folder_mode_confines_commands_to_their_folders() {
-    if !nerve_sandbox::Confinement::detect().available() {
-        eprintln!("skipped: Landlock is not available here");
-        return;
-    }
-    let dir = tempdir();
-    let mut center = FakeCenter::start(false).await.unwrap();
-    let o = options(dir.path());
-    nerve_node::pair::pair(&o.paths, &center.link(), Some("lab"))
-        .await
-        .unwrap();
-    let work = dir.path().join("home").join("work");
-    std::fs::create_dir_all(&work).unwrap();
-    let work = std::fs::canonicalize(&work).unwrap();
-    let outside = dir.path().join("outside.txt");
-    owner_edit(&o.paths, |c| {
-        let p = &mut c.centers[0].policy;
-        p.mode = nerve_policy::Mode::Folder;
-        p.folders.push(nerve_policy::config::Folder {
-            path: work.display().to_string(),
-            access: nerve_policy::config::Access::ALL,
-        });
-    })
-    .await;
-    let node = Daemon::start(o).await.unwrap();
-    let mut conn = linked(&mut center).await;
-
-    let state = conn
-        .call("get", json!({"cap": "exec", "keys": ["confinement"]}), WAIT)
-        .await
-        .unwrap()
-        .expect("get");
-    assert!(
-        state["confinement"]
-            .as_str()
-            .unwrap()
-            .starts_with("landlock"),
-        "{state}"
-    );
-    let command = format!(
-        "sh -c 'echo in > inside.txt; echo out > {}'",
-        outside.display()
-    );
-    let r = conn
-        .call(
-            "invoke",
-            json!({"cap": "exec", "action": "run",
-                   "args": {"command": command, "cwd": work.display().to_string()}}),
-            WAIT,
-        )
-        .await
-        .unwrap()
-        .expect("the command runs");
-    assert_ne!(r["exit_code"], 0, "{r}");
-    assert_eq!(
-        std::fs::read_to_string(work.join("inside.txt")).unwrap(),
-        "in\n"
-    );
-    assert!(
-        !outside.exists(),
-        "the write outside the folder was blocked"
-    );
     node.stop().await;
 }

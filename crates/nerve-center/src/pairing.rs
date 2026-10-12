@@ -25,6 +25,11 @@ struct Open {
     tries: u32,
 }
 
+/// A code [`Codes::take`] took out: used up unless given back with
+/// [`Codes::fail`].
+#[derive(Debug)]
+pub struct Taken(Open);
+
 #[derive(Debug, Default)]
 pub struct Codes {
     open: Vec<Open>,
@@ -58,24 +63,39 @@ impl Codes {
         {
             return Ok(());
         }
+        Err(self.miss(now))
+    }
+
+    /// A wrong code: every open code loses one try.
+    fn miss(&mut self, now: Instant) -> CodeError {
         for o in &mut self.open {
             o.tries += 1;
         }
         self.prune(now);
-        Err(CodeError::Refused)
+        CodeError::Refused
     }
 
-    /// A right code whose pairing failed anyway (a taken name): it costs that
-    /// code one try.
-    pub fn fail(&mut self, code: &str) {
-        for o in self.open.iter_mut().filter(|o| o.code == code) {
-            o.tries += 1;
+    /// Takes `code` out for one pairing: checking and using it up are one
+    /// step, so a second request with the same code finds it gone, however
+    /// close together they come. A wrong code costs every open code one try.
+    pub fn take(&mut self, code: &str, now: Instant) -> Result<Taken, CodeError> {
+        self.prune(now);
+        match self
+            .open
+            .iter()
+            .position(|o| crate::util::ct_eq(o.code.as_bytes(), code.as_bytes()))
+        {
+            Some(i) => Ok(Taken(self.open.swap_remove(i))),
+            None => Err(self.miss(now)),
         }
     }
 
-    /// Uses `code` up after a successful pairing.
-    pub fn consume(&mut self, code: &str) {
-        self.open.retain(|o| o.code != code);
+    /// A right code whose pairing failed anyway (a taken name): it is open
+    /// again, with one try less.
+    pub fn fail(&mut self, taken: Taken) {
+        let mut o = taken.0;
+        o.tries += 1;
+        self.open.push(o);
     }
 
     pub fn open_count(&mut self, now: Instant) -> usize {
@@ -98,8 +118,8 @@ mod tests {
         let code = c.create(now, TEN_MINUTES);
         assert_eq!(code.len(), CODE_LEN);
         assert!(nerve_proto::link::valid_code(&code));
-        assert_eq!(c.check(&code, now), Ok(()));
-        c.consume(&code);
+        assert!(c.take(&code, now).is_ok());
+        assert!(c.take(&code, now).is_err());
         assert_eq!(c.check(&code, now), Err(CodeError::Refused));
     }
 
@@ -163,8 +183,8 @@ mod tests {
         let now = Instant::now();
         let code = c.create(now, TEN_MINUTES);
         for _ in 0..TRIES {
-            assert_eq!(c.check(&code, now), Ok(()));
-            c.fail(&code);
+            let taken = c.take(&code, now).expect("open");
+            c.fail(taken);
         }
         assert_eq!(c.check(&code, now), Err(CodeError::Refused));
     }

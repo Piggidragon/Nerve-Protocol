@@ -302,12 +302,14 @@ impl Center {
             }
         };
         let now = Instant::now();
-        if self.codes.lock().unwrap().check(&req.code, now).is_err() {
+        // Taken out in the same step as the check: the code is used up from
+        // here on, and given back only if this pairing fails.
+        let Ok(taken) = self.codes.lock().unwrap().take(&req.code, now) else {
             return err(
                 403,
                 "the pairing code is unknown, used, expired or out of tries",
             );
-        }
+        };
         let node_id = nerve_transport::keys::node_id(&pk);
         let out = self.update(|s| {
             if s.nodes.contains_key(&node_id)
@@ -341,13 +343,12 @@ impl Center {
         });
         match out {
             Ok(resp) => {
-                self.codes.lock().unwrap().consume(&req.code);
                 tracing::info!(node = %node_id, name = %req.name, "a node paired");
                 self.changed(Change::Nodes);
                 (200, serde_json::to_value(resp).unwrap_or_default())
             }
             Err(why) => {
-                self.codes.lock().unwrap().fail(&req.code);
+                self.codes.lock().unwrap().fail(taken);
                 err(409, why)
             }
         }
@@ -1006,6 +1007,42 @@ mod tests {
         assert_eq!(open(dir.path(), None).name(), "nerve-center");
         assert_eq!(open(dir.path(), Some("lab")).name(), "lab");
         assert_eq!(open(dir.path(), None).name(), "lab");
+    }
+
+    /// One code is good for one pairing, also when several nodes send it at
+    /// the same moment.
+    #[test]
+    fn one_code_pairs_one_node_however_many_send_it_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let center = open(dir.path(), None);
+        let code = center.new_pairing()["code"].as_str().unwrap().to_string();
+        let start = std::sync::Barrier::new(8);
+        let statuses: Vec<u16> = std::thread::scope(|s| {
+            let tries: Vec<_> = (0..8u8)
+                .map(|i| {
+                    let (center, code, start) = (&center, &code, &start);
+                    s.spawn(move || {
+                        let body = json!({
+                            "code": code,
+                            "name": format!("node-{i}"),
+                            "platform": "linux",
+                            "arch": "x86_64",
+                            "public_key": msg::hex(&[i + 1; 32]),
+                        });
+                        start.wait();
+                        center.pair(body.to_string().as_bytes()).0
+                    })
+                })
+                .collect();
+            tries.into_iter().map(|t| t.join().unwrap()).collect()
+        });
+        let paired = statuses.iter().filter(|s| **s == 200).count();
+        assert_eq!(paired, 1, "statuses {statuses:?}");
+        assert_eq!(center.read(|st| st.nodes.len()), 1);
+        assert!(
+            statuses.iter().all(|s| matches!(s, 200 | 403)),
+            "{statuses:?}"
+        );
     }
 
     #[test]

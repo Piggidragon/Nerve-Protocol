@@ -430,8 +430,8 @@ impl Node {
     pub fn use_fake_sudo(&self, right: &str) {
         let script = self.config.parent().unwrap().join("fake-sudo");
         let body = format!(
-            "#!/bin/sh\nv=\nwhile [ $# -gt 0 ]; do case \"$1\" in -S|-k) shift ;; -p) shift 2 ;; \
-             -v) v=1; shift ;; *) break ;; esac; done\nIFS= read -r pw\n\
+            "#!/bin/sh\nv=\nwhile [ $# -gt 0 ]; do case \"$1\" in -S|-k) shift ;; -p) p=\"$2\"; shift 2 ;; \
+             -v) v=1; shift ;; *) break ;; esac; done\nprintf %s \"$p\" >&2\nIFS= read -r pw\n\
              [ \"$pw\" = '{right}' ] || {{ echo 'Sorry, try again.' >&2; exit 1; }}\n\
              [ -n \"$v\" ] && exit 0\nexec \"$@\"\n"
         );

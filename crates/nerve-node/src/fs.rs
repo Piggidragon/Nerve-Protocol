@@ -314,11 +314,15 @@ fn list(path: &Path, skip: &dyn Fn(&Path, bool) -> bool) -> Result<Value, RpcErr
 
 /// The hex SHA-256 of a file's bytes.
 pub fn etag_of(path: &Path) -> std::io::Result<String> {
-    let mut f = std::fs::File::open(path)?;
+    digest(&mut std::fs::File::open(path)?)
+}
+
+/// The hex SHA-256 of what `r` reads.
+fn digest(r: &mut impl Read) -> std::io::Result<String> {
     let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        let n = f.read(&mut buf)?;
+        let n = r.read(&mut buf)?;
         if n == 0 {
             break;
         }
@@ -327,19 +331,48 @@ pub fn etag_of(path: &Path) -> std::io::Result<String> {
     Ok(nerve_proto::msg::hex(ctx.finish().as_ref()))
 }
 
+/// An error opening `path`. A symlink, or a file where a folder was, means
+/// the path changed after the policy judged it (it judged the resolved path,
+/// which has neither).
+fn open_error(path: &Path, e: std::io::Error) -> RpcError {
+    #[cfg(unix)]
+    if matches!(e.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) {
+        return io_error(format!(
+            "{}: the path changed after the policy checked it (a symlink or a file is in it now)",
+            path.display()
+        ));
+    }
+    io_error(format!("{}: {e}", path.display()))
+}
+
+/// The folder and the name of `path`.
+fn split(path: &Path) -> Result<(&Path, &std::ffi::OsStr), RpcError> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| bad_path("the root is not a file"))?;
+    let name = path.file_name().ok_or_else(|| bad_path("no file name"))?;
+    Ok((dir, name))
+}
+
 fn read(path: &Path, offset: u64, length: Option<u64>) -> Result<Value, RpcError> {
-    let m = std::fs::metadata(path).map_err(io_error)?;
+    let (dir, name) = split(path)?;
+    let dir = Dir::open(dir).map_err(|e| open_error(path, e))?;
+    let mut f = dir.open_file(name).map_err(|e| open_error(path, e))?;
+    let m = f.metadata().map_err(io_error)?;
     if !m.is_file() {
         return Err(io_error(format!("{} is not a file", path.display())));
     }
     let size = m.len();
     let want = length.unwrap_or(u64::MAX).min(READ_MAX);
-    let mut f = std::fs::File::open(path).map_err(io_error)?;
     f.seek(SeekFrom::Start(offset.min(size)))
         .map_err(io_error)?;
     let mut bytes = Vec::new();
-    f.take(want).read_to_end(&mut bytes).map_err(io_error)?;
-    let etag = etag_of(path).map_err(io_error)?;
+    (&mut f)
+        .take(want)
+        .read_to_end(&mut bytes)
+        .map_err(io_error)?;
+    f.seek(SeekFrom::Start(0)).map_err(io_error)?;
+    let etag = digest(&mut f).map_err(io_error)?;
     let (content, encoding) = match String::from_utf8(bytes) {
         Ok(s) => (s, "utf8"),
         Err(e) => (B64.encode(e.into_bytes()), "base64"),
@@ -454,49 +487,180 @@ fn find(
 }
 
 fn write(path: &Path, content: &[u8], if_match: Option<&str>) -> Result<Value, RpcError> {
-    let current = match etag_of(path) {
-        Ok(t) => Some(t),
+    let (dir, name) = split(path)?;
+    let dir = Dir::open(dir).map_err(|e| open_error(path, e))?;
+    let current = match dir.open_file(name) {
+        Ok(mut f) => {
+            let perm = f.metadata().map_err(io_error)?.permissions();
+            Some((digest(&mut f).map_err(io_error)?, perm))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-        Err(e) => return Err(io_error(e)),
+        Err(e) => return Err(open_error(path, e)),
     };
+    let etag = current.as_ref().map(|(t, _)| t.as_str());
     if let Some(want) = if_match
-        && current.as_deref() != Some(want)
+        && etag != Some(want)
     {
         return Err(
             conflict(format!("{} changed since it was read", path.display()))
-                .with("etag", current.map(Value::from).unwrap_or(Value::Null)),
+                .with("etag", etag.map(Value::from).unwrap_or(Value::Null)),
         );
     }
-    let dir = path
-        .parent()
-        .ok_or_else(|| bad_path("cannot write the root"))?;
-    let name = path
-        .file_name()
-        .ok_or_else(|| bad_path("no file name"))?
-        .to_string_lossy();
     // Written aside and renamed over, so a reader never sees half a file.
-    let tmp = dir.join(format!(
-        ".{name}.nerve-{}",
+    let tmp = std::ffi::OsString::from(format!(
+        ".{}.nerve-{}",
+        name.to_string_lossy(),
         nerve_transport::keys::random_token(6)
     ));
     let result = (|| {
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&tmp)?;
+        let mut f = dir.create_new(&tmp)?;
         f.write_all(content)?;
         f.sync_all()?;
-        if let Ok(m) = std::fs::metadata(path) {
-            std::fs::set_permissions(&tmp, m.permissions())?;
+        if let Some((_, perm)) = current {
+            f.set_permissions(perm)?;
         }
-        std::fs::rename(&tmp, path)
+        dir.rename(&tmp, name)
     })();
     if let Err(e) = result {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(io_error(e));
+        let _ = dir.remove(&tmp);
+        return Err(open_error(path, e));
     }
     let h = ring::digest::digest(&ring::digest::SHA256, content);
     Ok(json!({"etag": nerve_proto::msg::hex(h.as_ref()), "size": content.len()}))
+}
+
+/// The folder a `read` or `write` works in. On Unix it is opened one
+/// component at a time from `/` without following a symlink, and every later
+/// step works relative to that handle, never through a symlink either: the
+/// policy judged the resolved path, so a symlink swapped in after that check
+/// fails the call instead of moving it out of the folder.
+struct Dir {
+    #[cfg(unix)]
+    fd: std::os::fd::OwnedFd,
+    #[cfg(not(unix))]
+    path: PathBuf,
+}
+
+#[cfg(unix)]
+impl Dir {
+    /// Directories are only searched: `O_PATH` (Linux) needs no read right,
+    /// as walking a path does not.
+    #[cfg(target_os = "linux")]
+    const SEARCH: libc::c_int = libc::O_PATH;
+    #[cfg(not(target_os = "linux"))]
+    const SEARCH: libc::c_int = libc::O_RDONLY;
+
+    fn at(
+        dir: Option<&std::os::fd::OwnedFd>,
+        name: &std::ffi::OsStr,
+        flags: libc::c_int,
+    ) -> std::io::Result<std::os::fd::OwnedFd> {
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(name.as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        let base = dir.map_or(libc::AT_FDCWD, |d| d.as_raw_fd());
+        // SAFETY: `name` is a valid C string and `base` an open folder (or
+        // AT_FDCWD); the new descriptor is owned below.
+        let fd = unsafe {
+            libc::openat(
+                base,
+                name.as_ptr(),
+                flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                0o666 as libc::c_uint,
+            )
+        };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        // SAFETY: openat returned a fresh descriptor nothing else owns.
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+    }
+
+    fn open(path: &Path) -> std::io::Result<Dir> {
+        use std::path::Component;
+        let mut fd = Dir::at(None, "/".as_ref(), libc::O_DIRECTORY | Dir::SEARCH)?;
+        for c in path.components() {
+            match c {
+                Component::RootDir => {}
+                Component::Normal(n) => {
+                    fd = Dir::at(Some(&fd), n, libc::O_DIRECTORY | Dir::SEARCH)?;
+                }
+                // The policy judged a resolved path; this is not one.
+                _ => return Err(std::io::Error::from_raw_os_error(libc::ENOTDIR)),
+            }
+        }
+        Ok(Dir { fd })
+    }
+
+    /// `name` for reading. Non-blocking, so a FIFO put there cannot hold the
+    /// call; a regular file reads the same either way.
+    fn open_file(&self, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+        Dir::at(Some(&self.fd), name, libc::O_RDONLY | libc::O_NONBLOCK).map(Into::into)
+    }
+
+    fn create_new(&self, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+        let flags = libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL;
+        Dir::at(Some(&self.fd), name, flags).map(Into::into)
+    }
+
+    fn rename(&self, from: &std::ffi::OsStr, to: &std::ffi::OsStr) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let c = |s: &std::ffi::OsStr| {
+            std::ffi::CString::new(s.as_bytes())
+                .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))
+        };
+        let (from, to) = (c(from)?, c(to)?);
+        let fd = self.fd.as_raw_fd();
+        // SAFETY: both names are valid C strings in the folder `fd` holds.
+        // rename replaces a symlink at `to` and never follows it.
+        if unsafe { libc::renameat(fd, from.as_ptr(), fd, to.as_ptr()) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn remove(&self, name: &std::ffi::OsStr) -> std::io::Result<()> {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let name = std::ffi::CString::new(name.as_bytes())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+        // SAFETY: `name` is a valid C string in the folder the handle holds.
+        if unsafe { libc::unlinkat(self.fd.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+}
+
+/// Not done on Windows in 0.0.1: the steps go by path, as resolved.
+#[cfg(not(unix))]
+impl Dir {
+    fn open(path: &Path) -> std::io::Result<Dir> {
+        Ok(Dir {
+            path: path.to_path_buf(),
+        })
+    }
+
+    fn open_file(&self, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+        std::fs::File::open(self.path.join(name))
+    }
+
+    fn create_new(&self, name: &std::ffi::OsStr) -> std::io::Result<std::fs::File> {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(self.path.join(name))
+    }
+
+    fn rename(&self, from: &std::ffi::OsStr, to: &std::ffi::OsStr) -> std::io::Result<()> {
+        std::fs::rename(self.path.join(from), self.path.join(to))
+    }
+
+    fn remove(&self, name: &std::ffi::OsStr) -> std::io::Result<()> {
+        std::fs::remove_file(self.path.join(name))
+    }
 }
 
 #[cfg(test)]
@@ -577,6 +741,61 @@ mod tests {
         let s = run("stat", json!({"path": format!("{root}/three.txt")})).unwrap();
         assert_eq!(s["type"], "file");
         assert_eq!(s["size"], 11);
+    }
+
+    /// The policy judged the path as it was at parse time; a folder swapped
+    /// for a symlink before the call runs must not move the call out.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_swapped_in_after_the_check_fails_the_call() {
+        let d = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let (work, outside) = (root.join("work"), root.join("outside"));
+        std::fs::create_dir_all(work.join("d")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(work.join("d/note"), "inside").unwrap();
+        std::fs::write(outside.join("note"), "outside secret").unwrap();
+        let swap = |p: &Path| {
+            std::fs::rename(p, work.join("d.old")).unwrap();
+            std::os::unix::fs::symlink(&outside, p).unwrap();
+        };
+        let path = wire(&work.join("d/authorized_keys"));
+        let write = FsCall::parse(
+            "write",
+            &args(json!({"path": path, "content": "ssh-ed25519 AAAA attacker"})),
+        )
+        .unwrap();
+        let read =
+            FsCall::parse("read", &args(json!({"path": wire(&work.join("d/note"))}))).unwrap();
+        assert_eq!(read.targets()[0].path, work.join("d/note"));
+        swap(&work.join("d"));
+        assert!(
+            write.run(&|_| false).is_err(),
+            "the write followed the link"
+        );
+        assert!(!outside.join("authorized_keys").exists());
+        let r = read.run(&|_| false);
+        assert!(r.is_err(), "the read followed the link: {r:?}");
+
+        // A last component swapped for a symlink fails the same way.
+        std::fs::remove_file(work.join("d")).unwrap();
+        std::fs::rename(work.join("d.old"), work.join("d")).unwrap();
+        let note = work.join("d/note");
+        let read = FsCall::parse("read", &args(json!({"path": wire(&note)}))).unwrap();
+        let write =
+            FsCall::parse("write", &args(json!({"path": wire(&note), "content": "x"}))).unwrap();
+        std::fs::remove_file(&note).unwrap();
+        std::os::unix::fs::symlink(outside.join("note"), &note).unwrap();
+        let r = read.run(&|_| false);
+        assert!(r.is_err(), "the read followed the link: {r:?}");
+        assert!(
+            write.run(&|_| false).is_err(),
+            "the write followed the link"
+        );
+        assert_eq!(
+            std::fs::read_to_string(outside.join("note")).unwrap(),
+            "outside secret"
+        );
     }
 
     #[test]

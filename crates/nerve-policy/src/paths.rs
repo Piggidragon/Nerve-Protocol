@@ -4,9 +4,11 @@
 //! on Linux, `/c/Users/x` for `C:\Users\x` on Windows. The device refuses anything
 //! else instead of guessing (relative paths, untranslated drive letters, UNC and
 //! `\\?\` paths, NUL bytes, Windows device names and alternate data streams), then
-//! resolves symlinks and `..` so the policy sees where a call would really land. The
-//! open itself later checks again (`openat2` on Linux, the handle's final path on
-//! Windows), so a symlink that appears between check and use fails the call.
+//! resolves symlinks and `..` so the policy sees where a call would really land. On
+//! Unix the node's `fs.read` and `fs.write` then open that resolved path one
+//! component at a time without following a symlink, so a symlink that appears
+//! between check and use fails the call. The other `fs` actions, and every action
+//! on Windows, go by the resolved path as it is then (not done in 0.0.1).
 
 use std::fs;
 use std::io;

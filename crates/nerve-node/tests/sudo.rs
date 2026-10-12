@@ -22,19 +22,20 @@ const RIGHT: &str = "right-pw-7c1e";
 /// help, and only an allow rule that names it exactly lets it start.
 const CHAINED: &str = "echo a; sudo echo b";
 
-/// Takes `-S -k -p ''` and `-v` like sudo; reads the password line from
-/// stdin, refuses a wrong one, else runs the command (or just succeeds for
-/// `-v`).
+/// Takes `-S -k -p PROMPT` and `-v` like sudo; prints the prompt to stderr,
+/// reads the password line from stdin, refuses a wrong one, else runs the
+/// command (or just succeeds for `-v`).
 const FAKE_SUDO: &str = r#"#!/bin/sh
 v=
 while [ $# -gt 0 ]; do
   case "$1" in
     -S|-k) shift ;;
-    -p) shift 2 ;;
+    -p) p="$2"; shift 2 ;;
     -v) v=1; shift ;;
     *) break ;;
   esac
 done
+printf %s "$p" >&2
 IFS= read -r pw
 if [ "$pw" != "RIGHT" ]; then echo "Sorry, try again." >&2; exit 1; fi
 [ -n "$v" ] && exit 0

@@ -346,6 +346,8 @@ and new value), calls allowed or forbidden, and what happened to the config
 file itself (`"kind": "config"`, `event` `refused`, `signed` or `accepted`,
 with the file and the reason). It holds targets (paths, command lines), never
 file content or output; a target longer than 512 characters is cut there
-and says so. When the file would pass 10 MiB it is moved to `audit.jsonl.1`,
+and says so; the `audit/decision` event carries the same cut target, and the
+center cuts what it gets the same way and keeps at most 500 decisions and
+1 MiB of them. When the file would pass 10 MiB it is moved to `audit.jsonl.1`,
 replacing the older one, so the log keeps at most about 20 MiB.
 `nerve-node audit [--denied] [--follow]` shows it.

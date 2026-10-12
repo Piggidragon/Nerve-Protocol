@@ -9,6 +9,7 @@
 // integration surface in 0.0.1. Native plugins are a backlog item.
 
 pub mod attach;
+pub mod audit;
 pub mod center;
 pub mod config;
 pub mod link;

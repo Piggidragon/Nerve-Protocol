@@ -640,3 +640,121 @@ async fn a_disabled_node_offers_no_tools_and_gets_no_calls() {
     assert_eq!(inv["args"], json!({"path": "/x"}));
     r.stop().await;
 }
+
+/// A node's `audit/decision` events reach the center's audit feed with the
+/// target cut to 512 characters, as the node's own log keeps it; and many
+/// large ones neither grow the feed past its limit nor `/api/audit` with it
+/// (the refused 3 MiB commands of the second LXC run grew both to 190 MB).
+#[tokio::test]
+async fn audit_targets_are_cut_and_the_audit_feed_is_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    let key = NodeKey::generate().unwrap();
+    assert_eq!(pair(&r, &key, "box-1").await.0, 200);
+    let (mut ws, _) = handshake(&r, &key).await;
+    let mut d = descriptor(&key, "box-1");
+    d["capabilities"].as_array_mut().unwrap().push(json!(
+        {"id": "audit", "profile": "audit", "exposure": "on", "summary": "Audit.",
+         "actions": {"list": {"effect": "read"}}}
+    ));
+    // Answer describe and wait for the subscription to the decisions.
+    loop {
+        let Some(Message::Request {
+            id,
+            method: m,
+            params,
+        }) = text(&mut ws).await
+        else {
+            continue;
+        };
+        let sub = m == method::SUB;
+        if sub {
+            assert_eq!(params["topics"], json!(["audit/decision"]));
+        }
+        let result = if m == method::DESCRIBE {
+            d.clone()
+        } else {
+            json!({})
+        };
+        send(&mut ws, Message::result(id, result)).await;
+        if sub {
+            break;
+        }
+    }
+    let event = |seq: u64, target: String| {
+        Message::notification(
+            method::EVENT,
+            json!({"cap": "audit", "name": "decision", "seq": seq, "ts": 1, "data": {
+                "ts": 1, "cap": "exec", "action": "run", "target": target,
+                "decision": "forbidden", "code": "forbidden"}}),
+        )
+    };
+    let long = format!("echo {}", "ü".repeat(3000));
+    send(&mut ws, event(1, long.clone())).await;
+    let c = r.center.clone();
+    let first = wait_for(|| c.audit().first().cloned()).await;
+    let target = first["target"].as_str().unwrap();
+    let head: String = long.chars().take(512).collect();
+    assert!(
+        target == format!("{head}… [cut at 512 of 3005 characters]"),
+        "the center keeps a target of {} characters",
+        target.chars().count()
+    );
+    assert_eq!(first["node"], "box-1");
+
+    // Many refused calls with large targets: the feed keeps its count and
+    // its size, and the web UI's answer stays as small.
+    let calls = 600;
+    for seq in 2..=calls {
+        send(&mut ws, event(seq, format!("{seq} {}", "x".repeat(4096)))).await;
+    }
+    let last = format!("{calls} ");
+    wait_for(|| {
+        c.audit()
+            .last()
+            .is_some_and(|e| e["target"].as_str().unwrap().starts_with(&last))
+            .then_some(())
+    })
+    .await;
+    let feed = c.audit();
+    assert!(
+        feed.len() <= nerve_center::center::AUDIT_KEEP,
+        "{}",
+        feed.len()
+    );
+    // The UI without a login hands out a session to the page.
+    let ui = nerve_center::ui::Ui::new(&r.center, None, false, false);
+    let mut req = http("GET", &[("host", "127.0.0.1:1")], Value::Null);
+    req.path = "/api/session".into();
+    let resp = ui.request(req).await;
+    let (_, cookie) = resp
+        .headers
+        .iter()
+        .find(|(k, _)| k == "Set-Cookie")
+        .expect("a session cookie");
+    let cookie = cookie.split(';').next().unwrap();
+    let mut req = http(
+        "GET",
+        &[("host", "127.0.0.1:1"), ("cookie", cookie)],
+        Value::Null,
+    );
+    req.path = "/api/audit".into();
+    let resp = ui.request(req).await;
+    assert_eq!(resp.status, 200);
+    // The feed holds at most 1 MiB of entries (center::AUDIT_MAX_BYTES).
+    assert!(
+        resp.body.len() <= 1024 * 1024 + 4096,
+        "/api/audit answered {} bytes",
+        resp.body.len()
+    );
+    let served: Value = serde_json::from_slice(&resp.body).unwrap();
+    let served = served["decisions"].as_array().unwrap();
+    assert_eq!(served.len(), feed.len());
+    assert!(
+        served
+            .iter()
+            .all(|e| e["target"].as_str().unwrap().contains("… [cut at 512 of ")),
+        "every large target is served cut"
+    );
+    r.stop().await;
+}

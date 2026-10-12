@@ -411,8 +411,9 @@ function auditRow(d, n) {
     return b;
   };
   // A rule needs the entry's target: a command line or a path. Any other
-  // action is its own target.
-  const known = d.cap && d.action && (d.target || !["exec", "fs"].includes(d.cap));
+  // action is its own target. A target cut to its start names no call.
+  const cut = /… \[cut at \d+ of \d+ characters\]$/.test(d.target || "");
+  const known = d.cap && d.action && !cut && (d.target || !["exec", "fs"].includes(d.cap));
   // A sudo command has its own allow list; deny rules take it as any other.
   const sudo = d.cap === "exec" && d.action === "run" && /^\s*(\S*\/)?sudo(\s|$)/.test(d.target || "");
   const allow = sudo ? "sudo" : "allow";
@@ -426,7 +427,8 @@ function auditRow(d, n) {
     known ? el("div", { class: "actions" },
       ruleBtn("Allow", "", allow, false), ruleBtn("Allow as wildcard", "", allow, true),
       ruleBtn("Deny", "danger", "deny", false), ruleBtn("Deny as wildcard", "danger", "deny", true)) : null,
-    known && !write ? el("p", { class: "meta" }, why) : null);
+    known && !write ? el("p", { class: "meta" }, why) : null,
+    cut ? el("p", { class: "meta" }, "The target was cut to its start, so no rule can name it.") : null);
 }
 
 // ---- Settings ----

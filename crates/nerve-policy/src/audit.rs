@@ -3,6 +3,7 @@
 //! center can read or change the file (centers see their own decisions as
 //! `audit/decision` events at most).
 
+use std::borrow::Cow;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -27,12 +28,14 @@ pub struct Entry {
 
 impl Entry {
     /// The `audit/decision` event's data (spec §7.5): the entry without the
-    /// center, which is the one the event goes to.
+    /// center, which is the one the event goes to. The target is cut as the
+    /// log cuts it, so a huge command line never crosses the link.
     pub fn event_data(&self) -> Value {
         let mut v = serde_json::to_value(self).expect("an audit entry serializes");
         if let Some(o) = v.as_object_mut() {
             o.remove("center");
         }
+        v["target"] = cut_target(&self.target).into();
         v
     }
 
@@ -55,6 +58,38 @@ pub const AUDIT_MAX_BYTES: u64 = 10 * 1024 * 1024;
 /// The most characters of a target (a command line, a path) one decision
 /// logs; a longer one is cut and says so.
 pub const TARGET_MAX_CHARS: usize = 512;
+
+/// `target` as an audit record keeps it: its first [`TARGET_MAX_CHARS`]
+/// characters and how long it was. The node's log, its `audit/decision`
+/// event and the center's audit feed all cut with this. A target cut once
+/// stays as it is, so the center can cut what a node already cut.
+pub fn cut_target(target: &str) -> Cow<'_, str> {
+    let Some((end, _)) = target.char_indices().nth(TARGET_MAX_CHARS) else {
+        return Cow::Borrowed(target);
+    };
+    if is_cut_target(target) {
+        return Cow::Borrowed(target);
+    }
+    let n = TARGET_MAX_CHARS + target[end..].chars().count();
+    Cow::Owned(format!(
+        "{}… [cut at {TARGET_MAX_CHARS} of {n} characters]",
+        &target[..end]
+    ))
+}
+
+/// Whether `target` looks like what [`cut_target`] makes of a longer one.
+/// A call's own target can look like this only at that same short length,
+/// so one taken for cut is never longer than a cut one.
+pub fn is_cut_target(target: &str) -> bool {
+    let Some(rest) = target.strip_suffix(" characters]") else {
+        return false;
+    };
+    let Some((head, n)) = rest.rsplit_once(&format!("… [cut at {TARGET_MAX_CHARS} of ")) else {
+        return false;
+    };
+    head.chars().count() == TARGET_MAX_CHARS
+        && n.parse::<usize>().is_ok_and(|n| n > TARGET_MAX_CHARS)
+}
 
 #[derive(Debug, Clone)]
 pub struct AuditLog {
@@ -105,11 +140,7 @@ impl AuditLog {
 
     pub fn decision(&self, e: &Entry) -> std::io::Result<()> {
         let mut v = serde_json::to_value(e).expect("an audit entry serializes");
-        let n = e.target.chars().count();
-        if n > TARGET_MAX_CHARS {
-            let head: String = e.target.chars().take(TARGET_MAX_CHARS).collect();
-            v["target"] = format!("{head}… [cut at {TARGET_MAX_CHARS} of {n} characters]").into();
-        }
+        v["target"] = cut_target(&e.target).into();
         self.append(&v)
     }
 
@@ -255,6 +286,14 @@ mod tests {
             target.ends_with("[cut at 512 of 3000 characters]"),
             "{target}"
         );
+        // The event to the center carries the same cut target, so the full
+        // one never crosses the link.
+        let sent = e.event_data()["target"].as_str().unwrap().to_string();
+        assert!(
+            sent == target,
+            "the event carries {} characters",
+            sent.chars().count()
+        );
         // A short one stays as it is.
         log.decision(&Entry {
             target: "ls".into(),
@@ -262,6 +301,21 @@ mod tests {
         })
         .unwrap();
         assert_eq!(log.read().unwrap()[1]["target"], "ls");
+    }
+
+    /// Cutting twice changes nothing, and only a cut target reads as one.
+    #[test]
+    fn a_cut_target_is_cut_once() {
+        let long = "a".repeat(600);
+        let cut = cut_target(&long).into_owned();
+        assert!(cut.ends_with("… [cut at 512 of 600 characters]"), "{cut}");
+        assert!(is_cut_target(&cut));
+        assert_eq!(cut_target(&cut), cut);
+        assert_eq!(cut_target(&"a".repeat(512)), "a".repeat(512));
+        assert!(!is_cut_target(&"a".repeat(512)));
+        assert!(!is_cut_target("ls… [cut at 512 of 600 characters]"));
+        let short_head = format!("{}… [cut at 512 of 512 characters]", "a".repeat(512));
+        assert!(!is_cut_target(&short_head));
     }
 
     /// The log moves aside at its size limit, and only one old file is kept.

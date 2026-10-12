@@ -36,19 +36,7 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
-Static Linux binaries (needs the musl target and clang):
-
-```sh
-CC_x86_64_unknown_linux_musl=clang cargo build --release --target x86_64-unknown-linux-musl
-```
-
-Windows binaries from Linux with `cargo-xwin` (the static C runtime avoids a
-missing `vcruntime140.dll`):
-
-```sh
-CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static" \
-  cargo xwin build --release --target x86_64-pc-windows-msvc
-```
+Static Linux binaries and the Windows cross-build: [`docs/building.md`](docs/building.md).
 
 ## Run
 
@@ -72,72 +60,25 @@ CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static" \
    list every setting, including MCP over HTTP (`--mcp http`).
 
 2. Open the web UI at `http://127.0.0.1:7480` and make a pairing link (its
-   code is valid for 10 minutes; Settings, Center changes that). The UI
-   logs in with the harness token (`NERVE_HARNESS_TOKEN`, or one made in its
-   settings); a center without a token yet is open to this machine. Beyond
-   loopback (`--ui 0.0.0.0:7480`) a token is required; on loopback
-   `--ui-no-login` turns the login off.
+   code is valid for 10 minutes; Settings, Center changes that).
+
+   Login:
+
+   - The UI logs in with the harness token (`NERVE_HARNESS_TOKEN`, or one made
+     in its settings).
+   - A center without a token yet is open to this machine.
+   - Beyond loopback (`--ui 0.0.0.0:7480`) a token is required.
+   - On loopback, `--ui-no-login` turns the login off.
 
 3. On the machine, as a normal user:
 
    ```sh
    nerve-node center add 'nerve://pair?center=...&code=...&pin=...'
-   nerve-node run      # stays in the foreground; run the commands below in another shell
+   nerve-node run      # stays in the foreground; run other commands in another shell
    ```
 
-   On Windows the node has no control socket, no sudo switch and no sandbox, so a command the node runs can change its policy (see
-   [`spec/node-local.md`](spec/node-local.md) §5).
-
-   A new center starts in `allowlist` mode (default deny) with no rule, so
-   every call is refused at once: nothing waits for an answer. Either allow
-   what you want, or give it full access in some folders and deny the commands
-   you never want to see:
-
-   ```sh
-   nerve-node rule add allow 'git status'     # allowlist mode: this command may run
-   nerve-node rule add allow 'git status' --wildcard   # ... and `git` with anything after
-   nerve-node config add center.lab.policy.allow 'fs.read:~/notes/*'   # a path; lab is the center's name (center ls)
-   nerve-node mode set folder        # or: full access in the folders below
-   nerve-node folder add ~/proj +r +w +x   # read, write, run commands; any mix
-   nerve-node folder set ~/proj -w   # chmod style: =rwx, +x, -w, left to right
-   nerve-node mode set user          # or: full access as the user (--for N: only for N hours)
-   nerve-node rule add deny 'rm *' --wildcard # refuses command lines that start with rm, in every mode
-   nerve-node rule ls allow          # the allow list; rule ls shows all three, rule rm takes one off
-   nerve-node audit                  # what was allowed and refused
-   nerve-node panic                  # end every link; `unlock` undoes it
-   ```
-
-   Allow rules count in `allowlist` mode only; deny rules count in every mode.
-   A deny rule matches the whole command line. It does not see `rm` inside
-   `x; rm …`, `/bin/rm`, a script or another program that deletes files. In
-   folder and user mode it guards against mistakes; it is not a sandbox.
-
-   On Linux, folder mode runs commands under Landlock. On Windows commands
-   in `allowlist` and `user` mode run in Windows PowerShell 5.1, each owned
-   by a Job Object that ends all of its processes with it, but not confined
-   to folders: folder mode runs no command there until a file confinement
-   exists.
-
-   Sudo is a switch per machine, off by default. While it is off, no command
-   runs with sudo, whatever the rules say. Switched on (the node checks the
-   password with `sudo -v` and keeps it in memory only), a sudo command runs
-   only when the sudo allow list names it, in every mode:
-
-   ```sh
-   nerve-node rule add sudo 'sudo apt update'   # a sudo command goes on its own list
-   nerve-node sudo on                # asks for the password; needs nerve-node run (Linux only)
-   ```
-
-   A center the machine granted settings write may switch it as well; the
-   password then travels sealed from the browser to the node:
-
-   ```sh
-   nerve-node center grant settings write   # the center may now change this machine's rights for itself (up to user mode and sudo)
-   ```
-
-   Change settings with `nerve-node`, not in an editor: the node signs
-   node.toml and refuses a file changed by hand. After looking at such a file,
-   `nerve-node config accept` takes it.
-
-   `nerve-node --help` lists every command; [`spec/node-local.md`](spec/node-local.md)
-   explains the policy.
+A new center starts in `allowlist` mode with no rule, so every call is refused
+until you allow something. Rules, folders, modes, sudo, deny rules, panic, the
+audit log and the Windows and Landlock notes are in
+[`docs/policy.md`](docs/policy.md). `nerve-node --help` lists every command;
+[`spec/node-local.md`](spec/node-local.md) explains the policy.

@@ -201,6 +201,11 @@ const WIN_PROGRAM_FILES: &[&str] = &[
     "PowerShell",
 ];
 
+/// Relative to the user's Documents folder where it really is: PowerShell
+/// takes `$PROFILE` and the user's modules from there, and OneDrive's backup
+/// or a redirect moves that folder away from the profile.
+const WIN_DOCUMENTS: &[&str] = &["WindowsPowerShell", "PowerShell"];
+
 /// Which platform's lists and path rules a [`Protected`] follows. The node
 /// passes the one it runs on; a test may pass either.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -220,6 +225,9 @@ pub struct WinFolders {
     pub system_root: Vec<PathBuf>,
     /// `%ProgramFiles%`, and `%ProgramFiles(x86)%` where there is one.
     pub program_files: Vec<PathBuf>,
+    /// The user's Documents folder where it really is (OneDrive's backup
+    /// or a redirect moves it away from the profile).
+    pub documents: Vec<PathBuf>,
 }
 
 impl Platform {
@@ -260,15 +268,88 @@ fn breaks(c: char) -> bool {
 }
 
 /// A command line or a path the way the own-folder check compares them:
-/// lower case, `/` for `\` and no `\\?\` prefix on Windows, and no doubled
-/// separator or `/./`.
+/// lower case, `/` for `\`, no `\\?\` or `\\.\` prefix and no dot or space
+/// at the end of a name on Windows, and no doubled separator or `/./`.
 fn normalise(s: &str, windows: bool) -> String {
     let mut s = s.to_lowercase();
     if windows {
-        s = s.replace('\\', "/").replace("//?/unc/", "//");
-        s = admin_shares(&s.replace("//?/", "").replace("//./", ""));
+        s = s.replace('\\', "/");
+        s = trim_names(&admin_shares(&device_paths(&s)));
     }
     tidy(&s)
+}
+
+/// `\\?\` and `\\.\` paths (here `//?/` and `//./`) in the forms the rest
+/// of the check reads: a drive path as it is, `UNC\host\share` as
+/// `//host/share`, and a volume or device (`Volume{GUID}`,
+/// `GLOBALROOT\Device\HarddiskVolume3`), whose drive the node does not
+/// know, as a path without a drive, which stands for every drive.
+fn device_paths(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    loop {
+        let at = [rest.find("//?/"), rest.find("//./")]
+            .into_iter()
+            .flatten()
+            .min();
+        let Some(at) = at else { break };
+        out.push_str(&rest[..at]);
+        let mut after = &rest[at + 4..];
+        // `\\?\GLOBALROOT\??\C:\...` is the drive path again.
+        while let Some(r) = after
+            .strip_prefix("globalroot/")
+            .or_else(|| after.strip_prefix("??/"))
+        {
+            after = r;
+        }
+        let b = after.as_bytes();
+        if let Some(r) = after.strip_prefix("unc/") {
+            out.push_str("//");
+            rest = r;
+        } else if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+            rest = after;
+        } else {
+            let device = after.strip_prefix("device/").unwrap_or(after);
+            let name = device
+                .find(|c: char| c == '/' || breaks(c))
+                .unwrap_or(device.len());
+            rest = &device[name..];
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Without the dots Windows drops from the end of a name, so
+/// `node-state.\x` reads as `node-state/x`; `.` and `..` stay, and so
+/// does a dot inside a name (`a.txt`). Dots before a space go as well
+/// (`node-state. x`), but the space stays: it may end a word, and the name
+/// before it is seen either way, as Windows drops a trailing space too.
+fn trim_names(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    // Dots and spaces after a name, not yet written.
+    let mut run = String::new();
+    let mut after_name = false;
+    let flush = |run: &mut String, out: &mut String, name_follows: bool| {
+        match run.find(' ') {
+            Some(space) => out.push_str(&run[space..]),
+            None if name_follows => out.push_str(run),
+            None => {}
+        }
+        run.clear();
+    };
+    for c in s.chars() {
+        if after_name && matches!(c, '.' | ' ') {
+            run.push(c);
+            continue;
+        }
+        let ends_name = c == '/' || breaks(c);
+        flush(&mut run, &mut out, !ends_name);
+        after_name = !(ends_name || c == ':' || c == '.');
+        out.push(c);
+    }
+    flush(&mut run, &mut out, false);
+    out
 }
 
 /// `//host/c$/x` as `c:/x`: an admin share names a drive. Any host counts,
@@ -549,6 +630,7 @@ impl Protected {
                 let mut system = below(&f.program_data, WIN_PROGRAM_DATA);
                 system.extend(below(&f.system_root, WIN_SYSTEM_ROOT));
                 system.extend(below(&f.program_files, WIN_PROGRAM_FILES));
+                system.extend(below(&f.documents, WIN_DOCUMENTS));
                 (WIN_HOME, system)
             }
         };
@@ -644,15 +726,33 @@ impl Protected {
     /// [`segment_matches`]: an absolute path in it (on Windows also one
     /// after a prefix such as `filesystem::`, and one without a drive, which
     /// the shell takes on its current drive), else the word as a path from
-    /// `cwd`.
+    /// `cwd`. A drive-relative `c:name` is `name` from `cwd` when that is
+    /// on drive `c`, else from the root of `c`, where a new shell has it.
     fn globs_own(&self, word: &str, cwd: Option<&str>) -> Option<&Path> {
         let mut paths = Vec::new();
         if self.windows {
             let b = word.as_bytes();
+            let drive_of = |s: &str| {
+                s.as_bytes()
+                    .first()
+                    .copied()
+                    .filter(|_| s.get(1..2) == Some(":"))
+            };
             for at in 0..b.len().saturating_sub(1) {
                 let starts = at == 0 || !b[at - 1].is_ascii_alphanumeric();
-                if starts && b[at].is_ascii_alphabetic() && b[at + 1] == b':' {
+                if !(starts && b[at].is_ascii_alphabetic() && b[at + 1] == b':') {
+                    continue;
+                }
+                let rest = &word[at + 2..];
+                if rest.starts_with('/') {
                     paths.push(word[at..].to_string());
+                } else {
+                    match cwd {
+                        Some(cwd) if drive_of(cwd) == Some(b[at]) => {
+                            paths.push(format!("{cwd}/{rest}"));
+                        }
+                        _ => paths.push(format!("{}/{rest}", &word[at..at + 2])),
+                    }
                 }
             }
             if word.starts_with('/') {
@@ -850,6 +950,7 @@ mod tests {
                 PathBuf::from("C:\\Program Files"),
                 PathBuf::from("C:\\Program Files (x86)"),
             ],
+            documents: vec![],
         };
         Protected::new(
             &Platform::Windows(folders),
@@ -1233,6 +1334,130 @@ mod tests {
                 p.own_in_command(command, Some(cwd)).is_none(),
                 "{command} in {cwd:?}"
             );
+        }
+    }
+
+    /// The spellings of the Windows review of PR #19, round 3 (finding 2):
+    /// a trailing dot or space on a name, which Windows drops, a volume or
+    /// device path, and a drive-relative path (`C:name`) from the working
+    /// directory.
+    #[test]
+    fn sees_the_own_folders_with_trailing_dots_volumes_and_drive_relative_paths() {
+        let p = win_prot();
+        let test = Path::new("C:\\Users\\u\\nerve-test");
+        let proj = Path::new("C:\\Users\\u\\nerve-test\\proj");
+        let home = Path::new("C:\\Users\\u");
+        let other = Path::new("D:\\work");
+        for (command, cwd) in [
+            (
+                "type C:\\Users\\u\\nerve-test\\node-state.\\config.key",
+                home,
+            ),
+            ("type C:/Users/u/nerve-test/node-state./config.key", home),
+            (
+                "type C:\\Users\\u\\nerve-test\\node-config.\\node.toml",
+                home,
+            ),
+            (
+                "type C:\\Users\\u\\nerve-test\\node-config..\\node.toml",
+                home,
+            ),
+            (
+                "type 'C:\\Users\\u\\nerve-test\\node-state .\\config.key'",
+                home,
+            ),
+            (
+                "type C:\\Users\\u\\nerve-test.\\node-state\\config.key",
+                home,
+            ),
+            ("Remove-Item C:\\Users\\u\\nerve-test\\node-state.", home),
+            ("type node-state.\\config.key", test),
+            ("type ..\\node-state.\\config.key", proj),
+            (
+                "type \\\\?\\Volume{4803db6f-0000-0000-0000-100000000000}\\Users\\u\\nerve-test\\node-state\\config.key",
+                other,
+            ),
+            (
+                "type \\\\.\\Volume{4803db6f-0000-0000-0000-100000000000}\\Users\\u\\nerve-test\\node-config\\node.toml",
+                other,
+            ),
+            (
+                "type \\\\?\\GLOBALROOT\\Device\\HarddiskVolume3\\Users\\u\\nerve-test\\node-state\\config.key",
+                other,
+            ),
+            (
+                "type \\\\.\\UNC\\localhost\\C$\\Users\\u\\nerve-test\\node-state\\config.key",
+                other,
+            ),
+            ("type C:node-state\\config.key", test),
+            ("type c:node-config\\node.toml", test),
+            ("type C:nerve-test\\node-state\\config.key", home),
+            ("type C:..\\node-state\\config.key", proj),
+            ("type \"C:node-state\"", test),
+        ] {
+            assert!(
+                p.own_in_command(command, Some(cwd)).is_some(),
+                "{command} in {cwd:?}"
+            );
+        }
+        for (command, cwd) in [
+            ("type C:\\Users\\u\\nerve-test\\proj.\\a", home),
+            ("type C:\\Users\\u\\nerve-test\\node-state.bak\\a", home),
+            ("type C:\\Users\\u\\nerve-test\\node-state.txt", home),
+            ("echo node-state. done", proj),
+            (
+                "type \\\\?\\Volume{4803db6f-0000-0000-0000-100000000000}\\Users\\u\\nerve-test\\proj\\a",
+                other,
+            ),
+            ("type C:proj\\a", test),
+            ("type C:node-state\\config.key", other),
+            ("type D:nerve-test\\node-state\\config.key", home),
+            ("type C:.\\a", test),
+        ] {
+            assert!(
+                p.own_in_command(command, Some(cwd)).is_none(),
+                "{command} in {cwd:?}"
+            );
+        }
+    }
+
+    /// PowerShell takes `$PROFILE` and the user's modules from the Documents
+    /// known folder, which OneDrive's backup or a redirect moves away from
+    /// the profile: both places are protected (Windows review round 3,
+    /// finding 3).
+    #[test]
+    fn protects_the_powershell_profiles_in_a_moved_documents_folder() {
+        let folders = WinFolders {
+            documents: vec![PathBuf::from("D:\\OneDrive\\Documents")],
+            ..WinFolders::default()
+        };
+        let p = Protected::new(
+            &Platform::Windows(folders),
+            Path::new("C:\\Users\\u"),
+            &[],
+            &ProtectedOptions::default(),
+        );
+        for path in [
+            "D:\\OneDrive\\Documents\\WindowsPowerShell\\Microsoft.PowerShell_profile.ps1",
+            "D:\\OneDrive\\Documents\\PowerShell\\Microsoft.PowerShell_profile.ps1",
+            "d:/onedrive/documents/powershell/Modules/x/x.psm1",
+            "D:\\OneDrive\\Documents\\WindowsPowerShell",
+            "C:\\Users\\u\\Documents\\WindowsPowerShell\\profile.ps1",
+            "C:\\Users\\u\\Documents\\PowerShell\\profile.ps1",
+        ] {
+            for write in [false, true] {
+                assert!(
+                    p.check(Path::new(path), write, &[]).is_some(),
+                    "{path} {write}"
+                );
+            }
+        }
+        for path in [
+            "D:\\OneDrive\\Documents\\notes.txt",
+            "D:\\OneDrive\\Documents\\PowerShellx\\a",
+            "D:\\OneDrive\\WindowsPowerShell\\a",
+        ] {
+            assert!(p.check(Path::new(path), true, &[]).is_none(), "{path}");
         }
     }
 

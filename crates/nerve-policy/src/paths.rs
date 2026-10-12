@@ -40,7 +40,11 @@ impl std::fmt::Display for PathError {
         match self {
             PathError::Empty => write!(f, "empty path"),
             PathError::Relative => write!(f, "path must be absolute"),
-            PathError::DriveLetter => write!(f, "untranslated drive-letter path"),
+            PathError::DriveLetter => write!(
+                f,
+                "untranslated drive-letter path; use /c/... (the drive as a folder), \
+                 for example /c/Users/... for C:\\Users\\..."
+            ),
             PathError::Unc => write!(f, "UNC and device paths are not accepted"),
             PathError::Nul => write!(f, "path contains a NUL byte"),
             PathError::Reserved(c) => write!(f, "{c} is a Windows device name"),
@@ -521,6 +525,19 @@ mod tests {
             "/c/Users"
         };
         assert_eq!(parse_device_path("/c/Users").unwrap(), Path::new(native));
+    }
+
+    /// A model that sends `C:\...` for a Windows node is told the wire form
+    /// (Windows review round 3, finding 4).
+    #[test]
+    fn a_drive_letter_path_is_told_the_wire_form() {
+        for s in ["C:\\Users\\x\\a.txt", "c:/Users/x"] {
+            let e = parse_device_path(s).unwrap_err().to_string();
+            assert!(
+                e.contains("/c/...") && e.contains("/c/Users/... for C:\\Users\\..."),
+                "{s}: {e}"
+            );
+        }
     }
 
     #[test]

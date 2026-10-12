@@ -410,6 +410,52 @@ pub struct CenterPolicy {
     pub sudo_allow: Vec<String>,
 }
 
+/// Refuses a folder spelled so that it matches no path the node checks: a
+/// `..` segment, and on Windows an 8.3 short name (`PROGRA~1`) or a name
+/// that ends in a dot or space, which Windows drops. Folders are compared
+/// as they are written, so such a folder would grant and release nothing.
+fn folder_spelling(path: &str, windows: bool) -> Result<(), String> {
+    let refuse = |why: String| {
+        Err(format!(
+            "folder {path:?} is not a folder path: {why}; use the full name"
+        ))
+    };
+    let segs = path.split(|c| c == '/' || (windows && c == '\\'));
+    for seg in segs.filter(|s| !s.is_empty()) {
+        if seg == ".." {
+            return refuse("it has a \"..\" segment".into());
+        }
+        if !windows {
+            continue;
+        }
+        if seg.ends_with(['.', ' ']) {
+            return refuse(format!(
+                "{seg:?} ends in a dot or space, which Windows drops"
+            ));
+        }
+        if short_name(seg) {
+            return refuse(format!("{seg:?} is an 8.3 short name"));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `seg` has the shape of an 8.3 short name Windows makes for a
+/// long one (`PROGRA~1`, `NODE-~12.TXT`): at most eight characters ending
+/// in `~` and digits, then at most a three-letter extension.
+fn short_name(seg: &str) -> bool {
+    let (base, ext) = seg.split_once('.').unwrap_or((seg, ""));
+    let Some((stem, n)) = base.rsplit_once('~') else {
+        return false;
+    };
+    !stem.is_empty()
+        && !n.is_empty()
+        && n.bytes().all(|b| b.is_ascii_digit())
+        && base.len() <= 8
+        && ext.len() <= 3
+        && !ext.contains('.')
+}
+
 impl CenterPolicy {
     /// The mode in force at `now_ms`: a `folder` or `user` whose limit has
     /// passed is `allowlist`.
@@ -583,6 +629,7 @@ impl CenterPolicy {
     pub fn validate(&mut self) -> Result<(), String> {
         let mut folders: Vec<Folder> = Vec::with_capacity(self.folders.len());
         for f in &self.folders {
+            folder_spelling(&f.path, cfg!(windows))?;
             if !Path::new(&f.path).is_absolute() {
                 return Err(format!("folder {:?} is not absolute", f.path));
             }
@@ -750,6 +797,55 @@ sudo_allow = ["sudo apt update"]
         format!(
             "[[center]]\nname = \"home\"\nurl = \"https://c.example:8443\"\ncenter_id = \"c\"\nnode_id = \"n\"\n[center.policy]\n{policy}\n"
         )
+    }
+
+    /// A folder spelled so that it matches nothing at call time (an 8.3
+    /// name, a trailing dot or space, `x\..`) is refused, with Windows'
+    /// rules tested on every platform (Windows review round 3, finding 5).
+    #[test]
+    fn a_folder_spelling_that_names_no_folder_is_refused() {
+        for (path, why) in [
+            ("C:\\Users\\PIGGID~1\\.ssh", "8.3 short name"),
+            ("C:\\PROGRA~1\\PowerShell", "8.3 short name"),
+            ("C:\\Users\\u\\NODE-~12.TXT", "8.3 short name"),
+            ("C:\\Users\\u\\.ssh.", "dot or space"),
+            ("C:\\Users\\u\\.ssh \\x", "dot or space"),
+            ("C:/Users/u/proj./x", "dot or space"),
+            ("C:\\Users\\u\\x\\..\\.ssh", ".."),
+            ("C:\\Users\\u\\.", "dot or space"),
+        ] {
+            let e = folder_spelling(path, true).unwrap_err();
+            assert!(
+                e.contains(why) && e.contains("use the full name"),
+                "{path}: {e}"
+            );
+        }
+        for path in [
+            "C:\\Users\\u\\proj",
+            "C:\\Users\\u\\backup~old",
+            "C:\\Users\\u\\a~1b~2c~3d",
+            "C:\\Users\\u\\.ssh.d\\x",
+            "C:\\",
+            "\\\\?\\C:\\Users\\u",
+        ] {
+            assert_eq!(folder_spelling(path, true), Ok(()), "{path}");
+        }
+        // On Unix those are plain names; `..` is no folder there either.
+        for path in ["/home/u/x.", "/home/u/PROGRA~1", "/home/u/a "] {
+            assert_eq!(folder_spelling(path, false), Ok(()), "{path}");
+        }
+        assert!(folder_spelling("/home/u/x/../.ssh", false).is_err());
+        // The owner's own file is refused on load with the same message.
+        let odd = if cfg!(windows) {
+            "C:/Users/u/x/../.ssh"
+        } else {
+            "/home/u/x/../.ssh"
+        };
+        let text = center(&format!(
+            "folders = [{{ path = \"{odd}\", access = \"r\" }}]"
+        ));
+        let e = NodeConfig::parse(&text).unwrap_err();
+        assert!(e.contains("use the full name"), "{e}");
     }
 
     #[test]

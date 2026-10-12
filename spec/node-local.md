@@ -254,7 +254,10 @@ answer. For each call the node takes the center's policy and, in this order:
    (`node-st*`, `node-s?ate`, `[...]`); on Windows a segment with an 8.3
    short name (`NODE-S~1`) stands for any name, an admin share
    (`\\localhost\C$\...`, any host) for its drive, and a path without a
-   drive (`\Users\...`) for that path on every drive. A path a
+   drive (`\Users\...`) for that path on every drive, as does a volume or
+   device path (`\\?\Volume{...}\...`); a dot at the end of a name is
+   dropped as Windows drops it (`node-state.\`), and a drive-relative
+   `C:name` is taken from the working directory on that drive. A path a
    command builds at run time (`cd ~/.config; cat nerve/node.toml`) is not
    seen there; in `folder` mode Landlock keeps the command out all the
    same, while a `user` mode command runs as the user, unconfined.
@@ -281,7 +284,15 @@ answer. For each call the node takes the center's policy and, in this order:
    `%ProgramFiles(x86)%\PowerShell` where that is set), PowerShell 7's home
    `$PSHOME` with its profiles and modules as the MSI and winget install it;
    a PowerShell 7 unpacked from the zip, installed as a .NET tool or into a
-   folder of the user's choice is not covered. Protected paths apply to the
+   folder of the user's choice is not covered. The user's PowerShell
+   profiles and modules (`Documents\PowerShell`, `Documents\WindowsPowerShell`)
+   are protected below `%USERPROFILE%\Documents` and below the Documents
+   folder where Windows really has it (read with the known-folder API, so
+   OneDrive's backup or a redirect does not move them out of the list).
+   A folder spelled so that it matches nothing (a `..` segment, and on
+   Windows an 8.3 short name or a name ending in a dot or space) is refused,
+   from a center and in the owner's own `node.toml`; the full name is needed.
+   Protected paths apply to the
    file actions and to the working directory of a command, not to what a
    command reads; in `user` mode a command runs as the user without a
    sandbox (issue #22). A center's folder at or inside a protected entry is

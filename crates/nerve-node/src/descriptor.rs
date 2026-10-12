@@ -113,6 +113,17 @@ fn node_cap() -> Capability {
     c
 }
 
+/// The `path` argument of the `fs` actions. A Windows node says how its
+/// drives are written, so a model does not send `C:\...`, a `bad_path`.
+fn path_param(windows: bool) -> Value {
+    let text = if windows {
+        "absolute path, the drive as a folder: /c/Users/x for C:\\Users\\x"
+    } else {
+        "absolute path"
+    };
+    json!({"type": "string", "description": text})
+}
+
 fn fs_cap(exposure: Exposure) -> Capability {
     let mut c = cap(
         "fs",
@@ -120,7 +131,7 @@ fn fs_cap(exposure: Exposure) -> Capability {
         exposure,
         "Files on this machine: stat, list, read, grep, find and write.",
     );
-    let path = json!({"type": "string", "description": "absolute path"});
+    let path = path_param(cfg!(windows));
     let ty = json!({"enum": ["file", "dir", "link", "other"]});
     let a = &mut c.actions;
     a.insert(
@@ -775,6 +786,27 @@ mod tests {
         assert_eq!(d.capability("fs").unwrap().exposure, Exposure::Off);
         assert_eq!(actions(&d, "fs").len(), 6);
         assert_eq!(actions(&d, "exec"), ["run"]);
+    }
+
+    /// A Windows node's `fs` tools say how a drive is written on the wire,
+    /// so a model does not send `C:\...` (Windows review round 3, finding 4).
+    #[test]
+    fn a_windows_node_shows_the_wire_form_of_a_path() {
+        let win = path_param(true);
+        let text = win["description"].as_str().unwrap();
+        assert!(
+            text.contains("/c/Users/") && text.contains("C:\\Users\\"),
+            "{text}"
+        );
+        assert_eq!(path_param(false)["description"], "absolute path");
+        let fs = fs_cap(Exposure::On);
+        for a in ["stat", "list", "read", "write"] {
+            assert_eq!(
+                fs.actions[a].params["properties"]["path"],
+                path_param(cfg!(windows)),
+                "{a}"
+            );
+        }
     }
 
     #[test]

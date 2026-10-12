@@ -1257,6 +1257,7 @@ mod tests {
             program_data: vec!["C:\\ProgramData".into()],
             system_root: vec!["C:\\Windows".into()],
             program_files: vec!["C:\\Program Files".into()],
+            documents: vec![],
         };
         let prot = Protected::new(
             &Platform::Windows(folders),

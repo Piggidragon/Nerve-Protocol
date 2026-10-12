@@ -82,38 +82,101 @@ pub fn home_dir() -> PathBuf {
 }
 
 /// The platform the protected list follows: this one, on Windows with its
-/// system folders from the environment.
+/// system folders from the environment and the Documents folder from the
+/// known-folder API.
 pub fn platform() -> Platform {
     if cfg!(windows) {
-        Platform::Windows(windows_folders(|k| std::env::var_os(k)))
+        Platform::Windows(windows_folders(|k| std::env::var_os(k), documents()))
     } else {
         Platform::Unix
     }
 }
 
+/// The Documents folder as Windows has it, wherever OneDrive's backup or a
+/// redirect moved it; `None`, logged, when it cannot be read (the usual
+/// place below the profile is protected all the same).
+fn documents() -> Option<PathBuf> {
+    #[cfg(windows)]
+    {
+        let found = known_documents();
+        if found.is_none() {
+            tracing::warn!(
+                "cannot read the Documents known folder; protecting PowerShell's profiles below %USERPROFILE%\\Documents only"
+            );
+        }
+        found
+    }
+    #[cfg(not(windows))]
+    {
+        None
+    }
+}
+
+/// `SHGetKnownFolderPath(FOLDERID_Documents)`, which PowerShell's
+/// `$PROFILE` follows.
+#[cfg(windows)]
+fn known_documents() -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::UI::Shell::{
+        FOLDERID_Documents, KF_FLAG_DEFAULT, SHGetKnownFolderPath,
+    };
+
+    let mut raw: *mut u16 = std::ptr::null_mut();
+    // SAFETY: the GUID is a static, a null token means the calling user,
+    // and the call sets `raw` to a string it allocated (or to null).
+    let hr = unsafe {
+        SHGetKnownFolderPath(
+            &FOLDERID_Documents,
+            KF_FLAG_DEFAULT as u32,
+            std::ptr::null_mut(),
+            &mut raw,
+        )
+    };
+    let path = (hr >= 0 && !raw.is_null()).then(|| {
+        // SAFETY: on success `raw` is a NUL-terminated wide string.
+        let len = (0..).take_while(|&i| unsafe { *raw.add(i) } != 0).count();
+        let wide = unsafe { std::slice::from_raw_parts(raw, len) };
+        PathBuf::from(OsString::from_wide(wide))
+    });
+    // SAFETY: the string is freed with the allocator that made it, also
+    // after a failure, as the API asks; freeing null does nothing.
+    unsafe { CoTaskMemFree(raw as *const _) };
+    path.filter(|p| p.is_absolute())
+}
+
+/// Each path once, ignoring case as Windows does, in the order given.
+fn distinct(paths: impl Iterator<Item = PathBuf>) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    for p in paths {
+        let same = |o: &PathBuf| {
+            o.to_string_lossy()
+                .eq_ignore_ascii_case(&p.to_string_lossy())
+        };
+        if !out.iter().any(same) {
+            out.push(p);
+        }
+    }
+    out
+}
+
 /// `%ProgramData%`, `%SystemRoot%` and `%ProgramFiles%` as `var` reads them,
 /// each with its usual place as well: a center does not set the node's
 /// environment, but an odd one must not leave `C:\ProgramData\ssh`
-/// unprotected.
-pub fn windows_folders(var: impl Fn(&str) -> Option<OsString>) -> WinFolders {
+/// unprotected. Likewise `documents`, the Documents folder where Windows
+/// has it, and `%USERPROFILE%\Documents`.
+pub fn windows_folders(
+    var: impl Fn(&str) -> Option<OsString>,
+    documents: Option<PathBuf>,
+) -> WinFolders {
+    let var = |n: &str| var(n).filter(|v| !v.is_empty()).map(PathBuf::from);
     let all = |names: &[&str], usual: &str| -> Vec<PathBuf> {
-        let mut out: Vec<PathBuf> = Vec::new();
-        for p in names
-            .iter()
-            .filter_map(|n| var(n))
-            .filter(|v| !v.is_empty())
-            .map(PathBuf::from)
-            .chain(std::iter::once(PathBuf::from(usual)))
-        {
-            let same = |o: &PathBuf| {
-                o.to_string_lossy()
-                    .eq_ignore_ascii_case(&p.to_string_lossy())
-            };
-            if !out.iter().any(same) {
-                out.push(p);
-            }
-        }
-        out
+        distinct(
+            names
+                .iter()
+                .filter_map(|n| var(n))
+                .chain(std::iter::once(PathBuf::from(usual))),
+        )
     };
     WinFolders {
         program_data: all(&["ProgramData", "ALLUSERSPROFILE"], "C:\\ProgramData"),
@@ -124,6 +187,14 @@ pub fn windows_folders(var: impl Fn(&str) -> Option<OsString>) -> WinFolders {
             &["ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"],
             "C:\\Program Files",
         ),
+        // Joined with `\` as on Windows, also when a test runs elsewhere.
+        documents: distinct(documents.into_iter().chain(var("USERPROFILE").map(|h| {
+            let h = h
+                .to_string_lossy()
+                .trim_end_matches(['\\', '/'])
+                .to_string();
+            PathBuf::from(format!("{h}\\Documents"))
+        }))),
     }
 }
 
@@ -140,14 +211,17 @@ mod tests {
                     .map(|(_, v)| OsString::from(v))
             }
         };
-        let f = windows_folders(env(&[
-            ("ProgramData", "D:\\ProgramData"),
-            ("SystemRoot", "D:\\WINDOWS"),
-            ("windir", "D:\\WINDOWS"),
-            ("ProgramFiles", "D:\\Program Files"),
-            ("ProgramW6432", "D:\\Program Files"),
-            ("ProgramFiles(x86)", "D:\\Program Files (x86)"),
-        ]));
+        let f = windows_folders(
+            env(&[
+                ("ProgramData", "D:\\ProgramData"),
+                ("SystemRoot", "D:\\WINDOWS"),
+                ("windir", "D:\\WINDOWS"),
+                ("ProgramFiles", "D:\\Program Files"),
+                ("ProgramW6432", "D:\\Program Files"),
+                ("ProgramFiles(x86)", "D:\\Program Files (x86)"),
+            ]),
+            None,
+        );
         assert_eq!(
             f.program_data,
             [PathBuf::from("D:\\ProgramData"), "C:\\ProgramData".into()]
@@ -165,11 +239,14 @@ mod tests {
             ]
         );
         // A 32-bit process: each folder once, however often it is named.
-        let f = windows_folders(env(&[
-            ("ProgramFiles", "C:\\Program Files (x86)"),
-            ("ProgramW6432", "C:\\Program Files"),
-            ("ProgramFiles(x86)", "C:\\Program Files (x86)"),
-        ]));
+        let f = windows_folders(
+            env(&[
+                ("ProgramFiles", "C:\\Program Files (x86)"),
+                ("ProgramW6432", "C:\\Program Files"),
+                ("ProgramFiles(x86)", "C:\\Program Files (x86)"),
+            ]),
+            None,
+        );
         assert_eq!(
             f.program_files,
             [
@@ -178,12 +255,37 @@ mod tests {
             ]
         );
         // An empty or missing environment still protects the usual places.
-        let f = windows_folders(env(&[("ProgramData", "")]));
+        let f = windows_folders(env(&[("ProgramData", "")]), None);
         assert_eq!(f.program_data, [PathBuf::from("C:\\ProgramData")]);
         assert_eq!(f.system_root, [PathBuf::from("C:\\Windows")]);
         assert_eq!(f.program_files, [PathBuf::from("C:\\Program Files")]);
-        let f = windows_folders(env(&[("SystemRoot", "c:\\windows")]));
+        let f = windows_folders(env(&[("SystemRoot", "c:\\windows")]), None);
         assert_eq!(f.system_root, [PathBuf::from("c:\\windows")]);
         assert_eq!(platform() == Platform::Unix, cfg!(not(windows)));
+    }
+
+    /// The Documents folder where the known-folder API puts it (OneDrive's
+    /// backup, a redirect), and its usual place below the profile as well
+    /// (Windows review round 3, finding 3).
+    #[test]
+    fn the_documents_folder_comes_from_the_known_folder_and_the_profile() {
+        let env = |k: &str| (k == "USERPROFILE").then(|| OsString::from("C:\\Users\\u"));
+        let moved = PathBuf::from("C:\\Users\\u\\OneDrive\\Documents");
+        let f = windows_folders(env, Some(moved.clone()));
+        assert_eq!(f.documents, [moved, "C:\\Users\\u\\Documents".into()]);
+        // When the known folder cannot be read, the usual place is left.
+        let f = windows_folders(env, None);
+        assert_eq!(f.documents, [PathBuf::from("C:\\Users\\u\\Documents")]);
+        // Not moved: once.
+        let f = windows_folders(env, Some("c:\\users\\u\\documents".into()));
+        assert_eq!(f.documents, [PathBuf::from("c:\\users\\u\\documents")]);
+    }
+
+    /// The real known-folder read; only a Windows run reaches it.
+    #[cfg(windows)]
+    #[test]
+    fn the_known_documents_folder_is_read() {
+        let docs = known_documents().expect("the Documents known folder");
+        assert!(docs.is_absolute(), "{docs:?}");
     }
 }

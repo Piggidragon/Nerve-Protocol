@@ -722,6 +722,48 @@ textarea.json {
   user-select: all;
 }
 
+.pair-rows {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.pair-row {
+  display: grid;
+  grid-template-columns: 130px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+}
+
+.pair-label {
+  color: rgb(var(--fg-subtle));
+  font-size: 12px;
+}
+
+.pair-value {
+  min-width: 0;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: rgb(var(--canvas) / 0.6);
+  border: 1px solid rgb(var(--line));
+  font-size: 12px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+  word-break: break-all;
+  user-select: all;
+}
+
+@media (max-width: 600px) {
+  .pair-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+  }
+
+  .pair-label {
+    grid-column: 1 / -1;
+  }
+}
+
 .chips {
   display: flex;
   flex-wrap: wrap;

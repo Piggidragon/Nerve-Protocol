@@ -284,15 +284,23 @@ function pageOverview() {
 
 function pairingCard(p) {
   const command = `nerve-node center add '${p.link}'`;
+  // One line per value, each with its own copy button: a person copies the
+  // part they need, not the whole block.
+  const row = (label, value) => el("div", { class: "pair-row" },
+    el("span", { class: "pair-label" }, label),
+    el("code", { class: "pair-value mono" }, value),
+    btn("Copy", "ghost", () => copy(value), "copy"));
   return el("div", { class: "card", id: "pairing" },
     el("div", { class: "card-top" }, icon("link"), el("span", { class: "name" }, "Pair a machine"),
       el("button", { type: "button", class: "btn ghost icon sm push", "aria-label": "Dismiss", onclick: () => { state.pairing = null; draw(true); } }, icon("x", "sm"))),
-    el("p", { class: "meta" }, "On the machine, run:"),
-    el("code", { class: "code" }, command),
-    el("p", { class: "meta" }, `Code ${p.code}, valid until ${when(p.expires_ms)}, for one machine. ` +
-      (p.pin ? `Certificate pin ${p.pin}.` : "Plain HTTP on loopback, no pin.")),
-    el("p", { class: "meta faint" }, "A QR code is not offered yet."),
-    el("div", { class: "actions" }, btn("Copy command", "", () => copy(command), "copy")));
+    el("p", { class: "meta" }, "On the machine, run this command:"),
+    el("div", { class: "pair-rows" },
+      row("Command", command),
+      row("Center", p.center),
+      row("Code", p.code),
+      p.pin ? row("Certificate pin", p.pin) : null),
+    el("p", { class: "meta" }, `The code is valid until ${when(p.expires_ms)} and works for one machine.`),
+    el("p", { class: "meta faint" }, p.pin ? "A QR code is not offered yet." : "Plain HTTP on loopback, no certificate pin."));
 }
 
 function nodeCard(n) {

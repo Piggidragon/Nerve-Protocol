@@ -237,18 +237,95 @@ pub mod win {
         }
     }
 
+    /// The components `within` compares: by either separator, in lower case.
+    fn parts(s: &str) -> Vec<String> {
+        strip_verbatim(s)
+            .split(['\\', '/'])
+            .filter(|c| !c.is_empty())
+            .map(|c| c.to_lowercase())
+            .collect()
+    }
+
     /// `path` is `base` or inside it, by whole components and ignoring case, as NTFS
     /// does by default.
     pub fn within(path: &str, base: &str) -> bool {
-        let split = |s: &str| -> Vec<String> {
-            strip_verbatim(s)
-                .split(['\\', '/'])
-                .filter(|c| !c.is_empty())
-                .map(|c| c.to_lowercase())
-                .collect()
-        };
-        let (p, b) = (split(path), split(base));
+        let (p, b) = (parts(path), parts(base));
         p.len() >= b.len() && p[..b.len()] == b[..]
+    }
+
+    /// How many components `within` sees in `path`.
+    pub fn depth(path: &str) -> usize {
+        parts(path).len()
+    }
+
+    /// A folder path in the form the policy keeps it: `\` between the parts,
+    /// no `\\?\` prefix, no doubled separator, no `.` part and no separator
+    /// at the end (`C:\` keeps its one). Case stays as it was given. A path
+    /// that is not on a drive (a UNC path) stays as it is; no resolved path
+    /// is one, so such a folder holds nothing.
+    pub fn normal(path: &str) -> Result<String, String> {
+        let s = strip_verbatim(path);
+        let b = s.as_bytes();
+        if !(b.len() >= 3
+            && b[0].is_ascii_alphabetic()
+            && b[1] == b':'
+            && matches!(b[2], b'\\' | b'/'))
+        {
+            return Ok(s.to_string());
+        }
+        let mut out = format!("{}\\", &s[..2]);
+        let kept = super::kept_parts(&s[3..], &['\\', '/'], path)?;
+        out.push_str(&kept.join("\\"));
+        Ok(out)
+    }
+}
+
+/// The parts of `rest` between `seps`, without empty and `.` parts. `..` is
+/// refused: with a symlink on the way it names another place than the
+/// policy would see (`whole` is the path for the message).
+fn kept_parts<'a>(rest: &'a str, seps: &[char], whole: &str) -> Result<Vec<&'a str>, String> {
+    let mut kept = Vec::new();
+    for part in rest.split(seps).filter(|p| !p.is_empty() && *p != ".") {
+        if part == ".." {
+            return Err(format!(
+                "folder {whole:?} has a .. in it; give the folder's path without one"
+            ));
+        }
+        kept.push(part);
+    }
+    Ok(kept)
+}
+
+/// [`normal_folder`] for a Unix path: `/` between the parts, no doubled
+/// `/`, no `.` part and no `/` at the end (`/` itself stays).
+pub fn normal_unix(path: &str) -> Result<String, String> {
+    let rest = path.strip_prefix('/').unwrap_or(path);
+    Ok(format!("/{}", kept_parts(rest, &['/'], path)?.join("/")))
+}
+
+/// An absolute folder path in the one form the policy keeps, so that two
+/// spellings of one place are one string and compare as one folder.
+pub fn normal_folder(path: &str) -> Result<String, String> {
+    #[cfg(windows)]
+    {
+        win::normal(path)
+    }
+    #[cfg(not(windows))]
+    {
+        normal_unix(path)
+    }
+}
+
+/// How many components [`within`] compares in `path`: the deeper of two
+/// folders that both hold a path is the one with more.
+pub fn depth(path: &Path) -> usize {
+    #[cfg(windows)]
+    {
+        win::depth(&path.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        path.components().count()
     }
 }
 
@@ -391,6 +468,21 @@ mod win_tests {
     }
 
     #[test]
+    fn folders_are_kept_in_one_form() {
+        assert_eq!(normal("C:/u//proj/./").unwrap(), "C:\\u\\proj");
+        assert_eq!(normal("\\\\?\\C:\\Users\\x\\").unwrap(), "C:\\Users\\x");
+        assert_eq!(normal("c:\\Users\\X").unwrap(), "c:\\Users\\X");
+        assert_eq!(normal("C:\\").unwrap(), "C:\\");
+        assert_eq!(normal("C:/").unwrap(), "C:\\");
+        assert!(normal("C:\\a\\..\\b").unwrap_err().contains(".."));
+        // Two spellings of one place hold each other and are as deep.
+        let (a, b) = ("C:\\Users\\u\\.ssh", "c:/users/U/.ssh/");
+        assert!(within(a, b) && within(b, a));
+        assert_eq!(depth(a), depth(b));
+        assert!(depth("C:\\Users\\u\\.ssh\\inner") > depth(a));
+    }
+
+    #[test]
     fn within_ignores_case_and_verbatim_prefixes() {
         assert!(within("C:\\Users\\X\\Proj\\a", "c:\\users\\x\\proj"));
         assert!(within("\\\\?\\C:\\Users\\x\\proj", "C:\\Users\\x\\proj"));
@@ -429,6 +521,19 @@ mod tests {
             "/c/Users"
         };
         assert_eq!(parse_device_path("/c/Users").unwrap(), Path::new(native));
+    }
+
+    #[test]
+    fn unix_folders_are_kept_in_one_form() {
+        assert_eq!(normal_unix("/home/u//proj/./").unwrap(), "/home/u/proj");
+        assert_eq!(normal_unix("/").unwrap(), "/");
+        assert_eq!(normal_unix("//").unwrap(), "/");
+        assert!(normal_unix("/a/../b").unwrap_err().contains(".."));
+        #[cfg(not(windows))]
+        {
+            assert_eq!(depth(Path::new("/a/b/")), depth(Path::new("/a//b")));
+            assert!(depth(Path::new("/a/b/c")) > depth(Path::new("/a/b///")));
+        }
     }
 
     #[test]

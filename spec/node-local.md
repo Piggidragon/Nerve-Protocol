@@ -102,7 +102,9 @@ sudo_allow = ["sudo apt update"]                       # sudo commands, every mo
 
 Unknown keys are refused, and so is a rule that does not parse. Two centers
 with one name are refused. Folder paths are absolute in the platform's own
-form; on the wire they travel as `/c/Users/...` on Windows (protocol §7.2).
+form, kept without a doubled or trailing separator or a `.` part; a path with
+`..`, and one place named twice with different access, are refused. On the
+wire they travel as `/c/Users/...` on Windows (protocol §7.2).
 
 ### Commands
 
@@ -282,7 +284,21 @@ answer. For each call the node takes the center's policy and, in this order:
    folder of the user's choice is not covered. Protected paths apply to the
    file actions and to the working directory of a command, not to what a
    command reads; in `user` mode a command runs as the user without a
-   sandbox (issue #22).
+   sandbox (issue #22). A center's folder at or inside a protected entry is
+   judged by the access the owner's folders give that place, and may set no
+   flag the deepest of them lacks; the spellings of one place
+   (`/home/u/.ssh/`, `/home/u/.ssh`) are compared by path, not as text.
+   A folder releases a protected entry only for the access the call needs
+   there, in every mode: a read needs `r`, a write `w`, a command run in it
+   `x`, so an owner's `~/.ssh` with `r` lets no write through in `user`
+   mode. A center's folder that is, or passes through, a link into a
+   protected entry is refused unless the owner's folders release the place
+   it leads to with its flags, and a folder that has become such a link
+   since is left out of a command's Landlock rules. A folder that holds a
+   protected entry gives a command in `folder` mode none of it: its Landlock
+   rules take the folder's other entries, level by level down to the
+   protected one, in the read, write and run sets alike, so the command
+   cannot list those levels or make new entries right in them.
 
 Every refusal names its reasons in the error and in the audit log.
 

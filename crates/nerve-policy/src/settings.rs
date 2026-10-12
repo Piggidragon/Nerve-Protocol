@@ -18,7 +18,7 @@ use serde_json::Value;
 
 use crate::audit::{AuditLog, diff};
 use crate::config::{
-    Access, CapSetting, CenterDocument, NodeConfig, ProtectedOptions, SettingsGrant, Sudo,
+    Access, CapSetting, CenterDocument, Folder, NodeConfig, ProtectedOptions, SettingsGrant, Sudo,
 };
 use crate::paths::to_wire;
 use crate::protected::Protected;
@@ -348,7 +348,7 @@ impl SettingsStore {
                 current: self.config.version,
             });
         }
-        let new: CenterDocument =
+        let mut new: CenterDocument =
             serde_json::from_value(document).map_err(|e| SetError::Invalid(e.to_string()))?;
         new.policy
             .validate()
@@ -458,23 +458,58 @@ fn client_only(
         ));
     }
     // A folder at or inside a protected entry releases it (Protected::check),
-    // so a new one there is a release too, unless the old folders released
-    // that place already; and the access of a folder there stays the
-    // owner's to widen.
+    // and the deepest folder there gives that place its flags. So at every
+    // place where the access may change, each old and each new folder, the
+    // new folders may give a protected place no flag the old ones did not:
+    // no release where the old folders released nothing, and no wider access
+    // where they did. Places are compared by path with the list's own rules,
+    // so neither another spelling of the owner's folder, nor a folder inside
+    // it, nor dropping a narrower one inside it widens anything.
     let prot = protected(&n.protected);
-    for f in &n.folders {
-        let path = Path::new(&f.path);
-        let before = o.folders.iter().find(|g| g.path == f.path);
-        let entry = match before {
-            None => prot.check(path, true, &o.folders),
-            Some(g) if widens(g.access, f.access) => prot.check(path, true, &[]),
-            Some(_) => None,
+    for place in n.folders.iter().chain(&o.folders) {
+        let path = Path::new(&place.path);
+        let Some(entry) = prot.check(path, true, &[]) else {
+            continue;
         };
-        if let Some(entry) = entry {
+        // The flags the deepest folder at or inside the entry gives `path`.
+        let given = |folders: &[Folder]| {
+            prot.deepest(folders, path)
+                .filter(|f| prot.holds(entry, Path::new(&f.path)))
+                .map(|f| f.access)
+        };
+        // The node's own folders are never released, whatever a folder says.
+        let before = given(&o.folders).filter(|_| prot.own(path).is_none());
+        let why = match (before, given(&n.folders)) {
+            (None, Some(_)) => "only the owner can release protected paths",
+            (Some(old), Some(new)) if widens(old, new) => {
+                "only the owner can widen the access of a folder there"
+            }
+            _ => continue,
+        };
+        return Err(format!(
+            "policy.folders {}: {} is protected; {why}",
+            place.path,
+            to_wire(entry)
+        ));
+    }
+    // Landlock follows a link, so a folder is also judged where it really
+    // leads: a new or wider one that is, or passes through, a link into a
+    // protected entry needs the owner's folders to release that place with
+    // its flags. A folder the old document had with the same or more
+    // access changes nothing here; one that became a link since is left
+    // out of the command's sandbox (`exec::landlock_spec`).
+    for f in &n.folders {
+        let kept = o
+            .folders
+            .iter()
+            .any(|g| g.path == f.path && !widens(g.access, f.access));
+        if kept {
+            continue;
+        }
+        if let Err(why) = prot.real_folder(f, &o.folders) {
             return Err(format!(
-                "policy.folders {}: {} is protected; only the owner can release protected paths",
-                f.path,
-                to_wire(entry)
+                "policy.folders {}: {why}; only the owner can release protected paths",
+                f.path
             ));
         }
     }
@@ -748,6 +783,226 @@ mod tests {
         );
     }
 
+    fn acc(s: &str) -> Access {
+        Access::parse(s).unwrap()
+    }
+
+    fn folder(path: &str, access: &str) -> crate::config::Folder {
+        crate::config::Folder {
+            path: path.into(),
+            access: acc(access),
+        }
+    }
+
+    /// Folder mode, with the owner's `folders`.
+    fn owner_folders(dir: &Path, folders: &[(&str, &str)]) -> SettingsStore {
+        let mut s = store(dir, SettingsGrant::Write);
+        s.update(|c| {
+            let p = &mut c.center_mut("home").unwrap().policy;
+            p.mode = Mode::Folder;
+            p.folders = folders.iter().map(|(f, a)| folder(f, a)).collect();
+            Ok(())
+        })
+        .unwrap();
+        s
+    }
+
+    /// The decision on writing `file` under the center's policy now.
+    fn write_to(s: &SettingsStore, file: &str) -> crate::decide::Decision {
+        let policy = &s.config().center("home").unwrap().policy;
+        let prot = unix(&policy.protected);
+        let env = crate::decide::Env {
+            home: Path::new("/home/u"),
+            protected: &prot,
+            confined: true,
+            sudo: false,
+        };
+        let targets = [crate::decide::Target {
+            path: file.into(),
+            write: true,
+        }];
+        let call = crate::decide::Call {
+            cap: "fs",
+            action: "write",
+            effect: nerve_proto::Effect::Write,
+            targets: &targets,
+            command: None,
+            cwd: None,
+            now_ms: 0,
+        };
+        crate::decide::decide(policy, &env, &call)
+    }
+
+    fn with_folders(s: &SettingsStore, folders: Value) -> Value {
+        let mut new = doc(s);
+        new["policy"]["folders"] = folders;
+        new
+    }
+
+    /// The owner released `~/.ssh` read-only; another spelling of that
+    /// folder gives a center no more (security review 3 of PR #19,
+    /// finding 1).
+    #[test]
+    fn a_center_cannot_widen_a_protected_folder_by_another_spelling() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = owner_folders(d.path(), &[("/home/u/.ssh", "r")]);
+        let keys = "/home/u/.ssh/authorized_keys";
+        assert!(matches!(
+            write_to(&s, keys),
+            crate::decide::Decision::Forbidden(_)
+        ));
+        let v = s.version();
+        for spelling in ["/home/u/.ssh/", "/home/u//.ssh", "/home/u/./.ssh"] {
+            // Next to the owner's folder ...
+            let both = json!([{"path": "/home/u/.ssh", "access": "r"},
+                {"path": spelling, "access": "rw"}]);
+            let e = s.set_center_document("home", with_folders(&s, both), v, |_| false, unix);
+            assert!(e.is_err(), "{spelling}: {e:?}");
+            // ... or in its place.
+            let only = json!([{"path": spelling, "access": "rw"}]);
+            let e = s.set_center_document("home", with_folders(&s, only), v, |_| false, unix);
+            assert!(
+                matches!(&e, Err(SetError::Forbidden(m)) if m.contains("/home/u/.ssh")),
+                "{spelling}: {e:?}"
+            );
+        }
+        assert_eq!(s.version(), v);
+        assert!(matches!(
+            write_to(&s, keys),
+            crate::decide::Decision::Forbidden(_)
+        ));
+        // A folder elsewhere is the center's to add, in any spelling; it is
+        // kept in one form, and the protected file stays refused.
+        let elsewhere = json!([{"path": "/home/u/.ssh", "access": "r"},
+            {"path": "/home/u/work/", "access": "rw"}]);
+        let v = s
+            .set_center_document("home", with_folders(&s, elsewhere), v, |_| false, unix)
+            .unwrap();
+        let folders = &s.config().center("home").unwrap().policy.folders;
+        assert_eq!(folders[1].path, "/home/u/work");
+        assert_eq!(
+            write_to(&s, "/home/u/work/a"),
+            crate::decide::Decision::Allow
+        );
+        assert!(matches!(
+            write_to(&s, keys),
+            crate::decide::Decision::Forbidden(_)
+        ));
+        // The owner may widen it, in their own spelling.
+        s.update(|c| {
+            let p = &mut c.center_mut("home").unwrap().policy;
+            p.folders[0] = folder("/home/u/.ssh/", "rw");
+            Ok(())
+        })
+        .unwrap();
+        assert!(s.version() > v);
+        let folders = &s.config().center("home").unwrap().policy.folders;
+        assert_eq!(folders[0].path, "/home/u/.ssh");
+        assert_eq!(write_to(&s, keys), crate::decide::Decision::Allow);
+    }
+
+    /// A folder inside the owner's read-only `~/.ssh` gets no flag the
+    /// owner's folder lacks (security review 3 of PR #19, finding 1).
+    #[test]
+    fn a_center_cannot_widen_a_protected_folder_by_an_inner_one() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = owner_folders(d.path(), &[("/home/u/.ssh", "r")]);
+        let v = s.version();
+        for access in ["rwx", "rw", "w", "x", "rx"] {
+            let inner = json!([{"path": "/home/u/.ssh", "access": "r"},
+                {"path": "/home/u/.ssh/inner", "access": access}]);
+            let e = s.set_center_document("home", with_folders(&s, inner), v, |_| false, unix);
+            assert!(
+                matches!(&e, Err(SetError::Forbidden(m)) if m.contains("policy.folders /home/u/.ssh/inner")),
+                "{access}: {e:?}"
+            );
+        }
+        assert_eq!(s.version(), v);
+        assert!(matches!(
+            write_to(&s, "/home/u/.ssh/inner/x"),
+            crate::decide::Decision::Forbidden(_)
+        ));
+        // As narrow as the owner's folder, or narrower, is fine.
+        let inner = json!([{"path": "/home/u/.ssh", "access": "r"},
+            {"path": "/home/u/.ssh/inner/", "access": "r"}]);
+        s.set_center_document("home", with_folders(&s, inner), v, |_| false, unix)
+            .unwrap();
+        assert!(matches!(
+            write_to(&s, "/home/u/.ssh/inner/x"),
+            crate::decide::Decision::Forbidden(_)
+        ));
+    }
+
+    /// The owner's narrower folder inside a protected entry stays: dropping
+    /// it would hand that place the wider access of the folder around it.
+    #[test]
+    fn a_center_cannot_widen_a_protected_place_by_dropping_a_folder() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = owner_folders(
+            d.path(),
+            &[("/home/u/.ssh", "rw"), ("/home/u/.ssh/keys", "r")],
+        );
+        let v = s.version();
+        let dropped = json!([{"path": "/home/u/.ssh", "access": "rw"}]);
+        let e = s.set_center_document("home", with_folders(&s, dropped), v, |_| false, unix);
+        assert!(
+            matches!(&e, Err(SetError::Forbidden(m)) if m.contains("policy.folders /home/u/.ssh/keys")),
+            "{e:?}"
+        );
+        assert!(matches!(
+            write_to(&s, "/home/u/.ssh/keys/id"),
+            crate::decide::Decision::Forbidden(_)
+        ));
+        // Dropping the outer one narrows.
+        let outer = json!([{"path": "/home/u/.ssh/keys", "access": "r"}]);
+        s.set_center_document("home", with_folders(&s, outer), v, |_| false, unix)
+            .unwrap();
+    }
+
+    /// The same checks on Windows paths, which ignore case and take either
+    /// separator. `client_only` goes by the protected list's platform, so
+    /// this runs everywhere.
+    #[test]
+    fn windows_spellings_of_a_protected_folder_widen_nothing() {
+        let win = |opts: &ProtectedOptions| {
+            Protected::new(
+                &crate::protected::Platform::Windows(Default::default()),
+                Path::new("C:\\Users\\u"),
+                &[],
+                opts,
+            )
+        };
+        let policy = |folders: &[(&str, &str)]| CenterDocument {
+            paused: false,
+            policy: CenterPolicy {
+                mode: Mode::Folder,
+                folders: folders.iter().map(|(f, a)| folder(f, a)).collect(),
+                ..Default::default()
+            },
+        };
+        let old = policy(&[("C:\\Users\\u\\.ssh", "r")]);
+        let check = |new: &[(&str, &str)]| client_only(&old, &policy(new), &|_| false, &win);
+        for new in [
+            &[("C:\\Users\\u\\.ssh", "r"), ("C:\\Users\\u\\.ssh\\", "rw")][..],
+            &[("c:/users/u/.ssh", "rw")][..],
+            &[("C:\\Users\\u\\.SSH\\\\", "rw")][..],
+            &[
+                ("C:\\Users\\u\\.ssh", "r"),
+                ("c:\\users\\U\\.ssh\\inner", "rwx"),
+            ][..],
+        ] {
+            assert!(check(new).is_err(), "{new:?}");
+        }
+        assert_eq!(
+            check(&[("C:\\Users\\u\\.ssh", "r"), ("C:/Users/u/.ssh/inner", "r")]),
+            Ok(())
+        );
+        assert_eq!(
+            check(&[("C:\\Users\\u\\.ssh", "r"), ("C:\\Users\\u\\work", "rwx")]),
+            Ok(())
+        );
+    }
+
     fn reopen(dir: &Path) -> Result<SettingsStore, String> {
         SettingsStore::open(
             dir.join("node.toml"),
@@ -893,6 +1148,51 @@ mod tests {
         // What does not validate is not taken.
         std::fs::write(s.path(), "[limits]\nmax_running = 0\n").unwrap();
         assert!(matches!(s.accept(), Err(SetError::Invalid(_))));
+    }
+
+    /// A folder that is a link into a protected entry, or passes through
+    /// one, is judged where it leads, since Landlock follows the link: a
+    /// center may add it only where the owner's folders release that place
+    /// with its flags. The protected entry is the `.ssh` of a home in a temp
+    /// dir.
+    #[cfg(unix)]
+    #[test]
+    fn a_center_cannot_reach_a_protected_path_through_a_link() {
+        let d = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(d.path()).unwrap().join("home");
+        let ssh = home.join(".ssh");
+        let work = home.join("work");
+        std::fs::create_dir_all(&ssh).unwrap();
+        std::fs::create_dir_all(work.join("plain")).unwrap();
+        std::os::unix::fs::symlink(&ssh, work.join("link")).unwrap();
+        let at = |p: &Path| p.display().to_string();
+        let prot =
+            |o: &ProtectedOptions| Protected::new(&crate::protected::Platform::Unix, &home, &[], o);
+        let mut s = owner_folders(d.path(), &[]);
+        let refused = |s: &mut SettingsStore, path: &Path, access: &str| {
+            let new = with_folders(s, json!([{"path": at(path), "access": access}]));
+            let e = s.set_center_document("home", new, s.version(), |_| false, prot);
+            matches!(&e, Err(SetError::Forbidden(m))
+                if m.contains("policy.folders") && m.contains(&at(&ssh)))
+        };
+        assert!(refused(&mut s, &work.join("link"), "rw"));
+        assert!(refused(&mut s, &work.join("link"), "r"));
+        assert!(refused(&mut s, &work.join("link/not-yet"), "x"));
+        assert!(!refused(&mut s, &work.join("plain"), "rwx"));
+        // The owner released `.ssh` for reading: a link there may read, and
+        // no more.
+        s.update(|c| {
+            c.center_mut("home").unwrap().policy.folders = vec![folder(&at(&ssh), "r")];
+            Ok(())
+        })
+        .unwrap();
+        let owner = json!({"path": at(&ssh), "access": "r"});
+        for (access, ok) in [("r", true), ("rw", false), ("rx", false)] {
+            let link = json!({"path": at(&work.join("link")), "access": access});
+            let new = with_folders(&s, json!([owner.clone(), link]));
+            let e = s.set_center_document("home", new, s.version(), |_| false, prot);
+            assert_eq!(e.is_ok(), ok, "{access}: {e:?}");
+        }
     }
 
     #[test]

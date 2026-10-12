@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use nerve_proto::Effect;
 
 use crate::config::{CapSetting, CenterPolicy, Folder, Mode};
-use crate::paths::{to_wire, within};
+use crate::paths::{depth, to_wire, within};
 use crate::protected::Protected;
 use crate::rules::{RuleSet, command_matches};
 
@@ -137,11 +137,12 @@ fn plain_command(line: &str) -> bool {
 
 fn inside_folder<'f>(folders: &'f [Folder], path: &Path) -> Option<&'f Folder> {
     // The deepest folder wins, so a read-only folder inside a read-write one
-    // stays read-only.
+    // stays read-only. Deepest by components, as `within` counts them: a
+    // longer spelling of the same place (`/a/b/`) is no deeper.
     folders
         .iter()
         .filter(|f| within(path, Path::new(&f.path)))
-        .max_by_key(|f| f.path.len())
+        .max_by_key(|f| depth(Path::new(&f.path)))
 }
 
 /// Whether the folders let `path` be read (or written): the deepest folder
@@ -242,8 +243,15 @@ pub fn decide(policy: &CenterPolicy, env: &Env, call: &Call) -> Decision {
     }
 
     // Narrowing that holds in every mode.
+    // A folder releases a protected path only for the access the call needs
+    // there: a read `r`, a write `w`, a command in it `x`.
     for t in call.targets {
-        if let Some(entry) = env.protected.check(&t.path, t.write, &policy.folders) {
+        let entry = if call.effect == Effect::Execute && !t.write {
+            env.protected.check_run(&t.path, &policy.folders)
+        } else {
+            env.protected.check(&t.path, t.write, &policy.folders)
+        };
+        if let Some(entry) = entry {
             allowed = false;
             reasons.push(format!(
                 "{} is protected ({})",
@@ -414,6 +422,25 @@ mod tests {
 
     fn acc(s: &str) -> Access {
         Access::parse(s).unwrap()
+    }
+
+    /// The deepest folder is the one with the most components, not the
+    /// longest spelling (security review 3 of PR #19, finding 1).
+    #[test]
+    fn the_deepest_folder_goes_by_components_not_by_length() {
+        let folders = [
+            Folder {
+                path: "/w/a///".into(),
+                access: acc("rw"),
+            },
+            Folder {
+                path: "/w/a/b".into(),
+                access: acc("r"),
+            },
+        ];
+        assert!(!folder_reach(&folders, Path::new("/w/a/b/x"), true));
+        assert!(folder_reach(&folders, Path::new("/w/a/b/x"), false));
+        assert!(folder_reach(&folders, Path::new("/w/a/c"), true));
     }
 
     const MODES: [Mode; 3] = [Mode::Allowlist, Mode::Folder, Mode::User];
@@ -605,6 +632,57 @@ mod tests {
             p.allow = vec!["fs:/w/ro/*".into()];
             assert_eq!(run(&p, &env, &read), "allow", "{mode:?}");
         }
+    }
+
+    /// In user mode the owner's folder at a protected entry releases it only
+    /// for what its flags give: `r` on `~/.ssh` lets a call read there, but
+    /// neither write `authorized_keys` nor run a command in it.
+    #[test]
+    fn a_release_in_user_mode_gives_only_its_folders_access() {
+        let x = T::new();
+        let env = x.env(true);
+        let keys_w = t("/h/.ssh/authorized_keys", true);
+        let config_r = t("/h/.ssh/config", false);
+        let ssh = t("/h/.ssh", false);
+        let owner = |access: &str| CenterPolicy {
+            mode: Mode::User,
+            folders: vec![Folder {
+                path: "/h/.ssh".into(),
+                access: acc(access),
+            }],
+            ..Default::default()
+        };
+        let cases = [
+            ("r", call(Effect::Write, &keys_w, None), "refused"),
+            ("r", call(Effect::Read, &config_r, None), "allow"),
+            ("r", call(Effect::Execute, &ssh, Some("ls")), "refused"),
+            ("rw", call(Effect::Write, &keys_w, None), "allow"),
+            ("rw", call(Effect::Read, &config_r, None), "allow"),
+            ("w", call(Effect::Read, &config_r, None), "refused"),
+            ("rx", call(Effect::Execute, &ssh, Some("ls")), "allow"),
+        ];
+        for (access, c, want) in cases {
+            let d = decide(&owner(access), &env, &c);
+            assert_eq!(
+                short(&d),
+                want,
+                "{access} {} {:?}: {d:?}",
+                c.action,
+                c.targets
+            );
+        }
+        // The rest of the place stays protected: a narrower folder inside
+        // the release decides for what it holds.
+        let mut p = owner("rw");
+        p.folders.push(Folder {
+            path: "/h/.ssh/keep".into(),
+            access: acc("r"),
+        });
+        let keep_w = t("/h/.ssh/keep/x", true);
+        assert_eq!(
+            run(&p, &env, &call(Effect::Write, &keep_w, None)),
+            "refused"
+        );
     }
 
     /// All eight combinations of the three flags, in folder mode: a read

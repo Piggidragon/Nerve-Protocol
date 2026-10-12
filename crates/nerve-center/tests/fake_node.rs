@@ -482,3 +482,86 @@ async fn http_mcp_needs_a_token_and_a_session() {
     );
     r.stop().await;
 }
+
+#[tokio::test]
+async fn a_disabled_node_offers_no_tools_and_gets_no_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    let key = NodeKey::generate().unwrap();
+    assert_eq!(pair(&r, &key, "box-1").await.0, 200);
+    let (ws, _) = handshake(&r, &key).await;
+    let mut seen = serve(ws, descriptor(&key, "box-1"));
+    let c = r.center.clone();
+    wait_for(|| (!c.tools().is_empty()).then_some(())).await;
+    let e = Engine::new(&r.center, "test");
+    let names = |list: &Value| -> Vec<String> {
+        list["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let read = json!({"name": "fs_read", "arguments": {"node": "box-1", "path": "/x"}});
+    let id = key.node_id();
+
+    // Switched off: the tools are gone, `nodes` still lists the node and
+    // says why, and the link stays up.
+    c.set_disabled(&id, true).unwrap();
+    assert!(c.tools().is_empty());
+    assert_eq!(names(&rpc(&e, 1, "tools/list", json!({})).await), ["nodes"]);
+    let listed = rpc(
+        &e,
+        2,
+        "tools/call",
+        json!({"name": "nodes", "arguments": {}}),
+    )
+    .await;
+    let listed = listed["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        listed.contains("box-1") && listed.contains("online"),
+        "{listed}"
+    );
+    assert!(listed.contains("disabled in the center"), "{listed}");
+    assert!(!listed.contains("offers fs"), "{listed}");
+    assert!(c.link(&id).is_some());
+
+    // A call on a tool list read before the switch is refused by the center
+    // itself, before anything goes to the node.
+    let route = {
+        c.set_disabled(&id, false).unwrap();
+        let tools = c.tools();
+        c.set_disabled(&id, true).unwrap();
+        tools.iter().find(|t| t.name == "fs_read").unwrap().routes["box-1"].clone()
+    };
+    let sess = c.new_session("test");
+    let err = c
+        .call(&sess, &route, serde_json::Map::new())
+        .await
+        .unwrap_err();
+    let nerve_center::center::CallError::Rpc(err) = err;
+    assert_eq!(err.message, "the node box-1 is disabled in the center");
+    // By name through MCP it is an unknown tool.
+    let by_name = rpc(&e, 3, "tools/call", read.clone()).await;
+    assert!(by_name.get("error").is_some(), "{by_name}");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), seen.recv())
+            .await
+            .is_err(),
+        "the node received something"
+    );
+
+    // Switched on again: the tools are back and a call reaches the node.
+    c.set_disabled(&id, false).unwrap();
+    assert_eq!(
+        names(&rpc(&e, 4, "tools/list", json!({})).await),
+        ["nodes", "exec_run", "fs_read"]
+    );
+    let done = rpc(&e, 5, "tools/call", read).await;
+    assert_ne!(done["result"]["isError"], true, "{done}");
+    let Some(Seen::Invoke(inv)) = seen.recv().await else {
+        panic!("no invoke")
+    };
+    assert_eq!(inv["args"], json!({"path": "/x"}));
+    r.stop().await;
+}

@@ -310,10 +310,12 @@ function nodeCard(n) {
       el("span", { class: "dot" + (n.online ? " up" : "") }),
       el("span", { class: "name" }, n.name),
       pill(n.online ? "up" : "down", n.online ? n.status || "online" : "offline"),
+      n.disabled ? pill("warn", "disabled") : null,
       el("span", { class: "meta push" }, `${n.platform}/${n.arch}`)),
     el("p", { class: "meta", title: when(n.online ? n.since_ms : n.last_seen_ms) },
       n.online ? `Since ${ago(n.since_ms)}` : `Last seen ${ago(n.last_seen_ms)}`),
     n.going_away ? el("p", { class: "meta" }, `Going away: ${n.going_away}`) : null,
+    n.disabled ? el("p", { class: "meta" }, "Hidden from the agent: it is offered none of this machine's tools, and calls to it are refused.") : null,
     n.summary ? el("p", {}, n.summary) : null,
     caps.length
       ? el("div", { class: "chips" }, caps.map((c) => el("span", { class: "chip" + (c.exposure === "off" ? " off" : ""), title: `${c.summary || c.id} (${c.exposure})` }, c.id)))
@@ -323,6 +325,7 @@ function nodeCard(n) {
         const name = await modal({ title: `Rename ${n.name}`, confirm: "Rename", field: { label: "New name (a-z, 0-9 and -)", value: n.name, pattern: "[a-z0-9\\-]+" } });
         if (name && name !== n.name) await api("POST", "/api/nodes/rename", { id: n.id, name });
       }), "edit"),
+      btn(n.disabled ? "Enable" : "Disable", "ghost", act(() => api("POST", "/api/nodes/disable", { id: n.id, disabled: !n.disabled })), n.disabled ? "ok" : "ban"),
       btn("Remove", "ghost", act(async () => {
         const yes = await modal({ title: `Remove ${n.name}?`, message: "It has to be paired again to come back.", confirm: "Remove", danger: true });
         if (yes) await api("POST", "/api/nodes/remove", { id: n.id });

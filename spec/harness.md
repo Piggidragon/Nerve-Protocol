@@ -68,7 +68,8 @@ that does not match `Host` are refused (403).
 ## 4. Tools
 
 - `nodes` lists the paired nodes, whether they are online and what
-  they offer.
+  they offer. A node the owner disabled in the center is listed and marked as
+  disabled, with no offer.
 - A capability with a profile becomes one tool per action, `<cap>_<action>`,
   shared by every node that offers the same capability with the same
   arguments and effect. Its first, required argument `node` names the node.
@@ -82,6 +83,9 @@ that does not match `Host` are refused (403).
   clashes get `_2`, `_3`.
 - `node`, `settings` and `audit` are never tools, so a model cannot change
   the policy that limits it.
+  Capabilities with exposure `off` are left out, and so is every capability
+  of a disabled node: it stays paired and connected, but the center offers
+  none of its tools and refuses calls to it.
   Capabilities with exposure `off` are left out.
 - The node cuts the descriptor to what the policy can allow (node-local §3),
   so the center builds a tool only for an action a call may get through: in

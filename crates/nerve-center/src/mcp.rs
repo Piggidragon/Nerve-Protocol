@@ -260,8 +260,9 @@ fn nodes_text(center: &Center) -> String {
             .filter_map(|c| c["id"].as_str())
             .filter(|c| !tools::RESERVED_CAPS.contains(c))
             .collect();
+        let disabled = n["disabled"].as_bool() == Some(true);
         out.push_str(&format!(
-            "- {} ({}/{}): {}{}; offers {}\n",
+            "- {} ({}/{}): {}{}; {}\n",
             n["name"].as_str().unwrap_or(""),
             n["platform"].as_str().unwrap_or(""),
             n["arch"].as_str().unwrap_or(""),
@@ -275,10 +276,13 @@ fn nodes_text(center: &Center) -> String {
                 .filter(|s| !s.is_empty())
                 .map(|s| format!(", {s}"))
                 .unwrap_or_default(),
-            if caps.is_empty() {
-                "nothing yet".to_string()
+            if disabled {
+                "disabled in the center, so its tools are not offered and calls to it are refused"
+                    .to_string()
+            } else if caps.is_empty() {
+                "offers nothing yet".to_string()
             } else {
-                caps.join(", ")
+                format!("offers {}", caps.join(", "))
             },
         ));
     }

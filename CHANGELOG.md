@@ -44,6 +44,9 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
   the system keyring; `node.toml` keeps only the URL and the header names, and
   a file that still holds values is refused with a hint to run
   `nerve-node proxy set` again.
+- A node can be disabled in the center (web UI, `POST /api/nodes/disable`): it
+  stays paired and connected, but the agent is offered none of its tools and
+  calls to it are refused.
 - `nerve-center`: the center, run by a harness as an MCP server. It pairs nodes,
   keeps their links and offers their capabilities as MCP tools. Its web UI
   has a login page (the harness token logs in; `--ui-no-login` on loopback

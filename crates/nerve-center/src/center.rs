@@ -16,6 +16,7 @@ use nerve_proto::msg::{self, ByeReason, Event, Hello};
 use nerve_proto::{Descriptor, ErrorCode, Exposure, RpcError};
 use nerve_transport::tls::ServerIdentity;
 
+use crate::audit::AuditFeed;
 use crate::link::{Link, SHORT_CALL};
 use crate::pairing::Codes;
 use crate::store::{NodeRecord, Store};
@@ -23,8 +24,7 @@ use crate::tools::{self, Route, Tool};
 use crate::util::{self, now_ms};
 
 pub const IDENTITY_FILE: &str = "tls.pem";
-/// Recent audit decisions kept in memory for the web UI (never on disk).
-pub const AUDIT_KEEP: usize = 500;
+pub use crate::audit::{AUDIT_KEEP, AUDIT_MAX_BYTES};
 const ALERTS_KEEP: usize = 50;
 
 /// What changed, for the MCP servers (tool lists) and the web UI.
@@ -59,7 +59,7 @@ pub struct Inner {
     codes: Mutex<Codes>,
     links: Mutex<BTreeMap<String, Arc<Link>>>,
     changes: broadcast::Sender<Change>,
-    audit: Mutex<VecDeque<Value>>,
+    audit: Mutex<AuditFeed>,
     alerts: Mutex<VecDeque<Value>>,
     sessions: Mutex<BTreeMap<String, Arc<Session>>>,
 }
@@ -191,7 +191,7 @@ impl Center {
             codes: Mutex::new(Codes::default()),
             links: Mutex::new(BTreeMap::new()),
             changes,
-            audit: Mutex::new(VecDeque::new()),
+            audit: Mutex::new(AuditFeed::default()),
             alerts: Mutex::new(VecDeque::new()),
             sessions: Mutex::new(BTreeMap::new()),
         })))
@@ -567,12 +567,7 @@ impl Center {
                     o.insert("node".into(), json!(name));
                     o.entry("ts").or_insert(json!(ev.ts));
                 }
-                let mut a = self.audit.lock().unwrap();
-                a.push_back(e);
-                while a.len() > AUDIT_KEEP {
-                    a.pop_front();
-                }
-                drop(a);
+                self.audit.lock().unwrap().push(e);
                 self.changed(Change::Audit);
             }
             _ => {}
@@ -593,7 +588,7 @@ impl Center {
     }
 
     pub fn audit(&self) -> Vec<Value> {
-        self.audit.lock().unwrap().iter().cloned().collect()
+        self.audit.lock().unwrap().list()
     }
 
     /// The nodes as the web UI and `nodes` show them.
@@ -999,6 +994,10 @@ pub fn audit_rule(
     target: &str,
     wildcard: bool,
 ) -> Result<String, String> {
+    // A cut target is no longer the call's, so no rule can be made from it.
+    if nerve_policy::audit::is_cut_target(target) {
+        return Err("the target was cut to its start, so a rule cannot name it".into());
+    }
     match list {
         "allow" | "deny" => nerve_policy::rules::rule_for(cap, action, target, wildcard),
         "sudo" if (cap, action) == ("exec", "run") => {
@@ -1147,6 +1146,12 @@ mod tests {
                 rule(list, cap, action, target, false).is_err(),
                 "{list} {cap}.{action} {target:?}"
             );
+        }
+        // A target the audit cut is not the command any more.
+        let cut = nerve_policy::audit::cut_target(&"x".repeat(600)).into_owned();
+        for list in ["allow", "deny", "sudo"] {
+            assert!(rule(list, "exec", "run", &cut, false).is_err(), "{list}");
+            assert!(rule(list, "exec", "run", &cut, true).is_err(), "{list}");
         }
     }
 }

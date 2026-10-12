@@ -17,7 +17,11 @@ use nerve_transport::keys::MacKey;
 use serde_json::Value;
 
 use crate::audit::{AuditLog, diff};
-use crate::config::{CapSetting, CenterDocument, NodeConfig, SettingsGrant, Sudo};
+use crate::config::{
+    Access, CapSetting, CenterDocument, NodeConfig, ProtectedOptions, SettingsGrant, Sudo,
+};
+use crate::paths::to_wire;
+use crate::protected::Protected;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SetError {
@@ -320,12 +324,15 @@ impl SettingsStore {
     /// `settings.set` from `center`: the whole document, checked against
     /// `if_version`. `is_sense(cap)` says whether a capability senses
     /// (camera, microphone, screen): only the owner may turn those on.
+    /// `protected(opts)` is this node's protected list with a center's
+    /// options: only the owner may release an entry of it.
     pub fn set_center_document(
         &mut self,
         center: &str,
         document: Value,
         if_version: u64,
         is_sense: impl Fn(&str) -> bool,
+        protected: impl Fn(&ProtectedOptions) -> Protected,
     ) -> Result<u64, SetError> {
         let entry = self
             .config
@@ -350,7 +357,7 @@ impl SettingsStore {
             paused: entry.paused,
             policy: entry.policy.clone(),
         };
-        client_only(&old, &new, &is_sense).map_err(SetError::Forbidden)?;
+        client_only(&old, &new, &is_sense, &protected).map_err(SetError::Forbidden)?;
         let mut cfg = self.config.clone();
         let e = cfg.center_mut(center).expect("checked above");
         e.paused = new.paused;
@@ -410,6 +417,7 @@ fn client_only(
     old: &CenterDocument,
     new: &CenterDocument,
     is_sense: &dyn Fn(&str) -> bool,
+    protected: &dyn Fn(&ProtectedOptions) -> Protected,
 ) -> Result<(), String> {
     if old.paused && !new.paused {
         return Err("paused: only the owner can unpause".into());
@@ -449,7 +457,33 @@ fn client_only(
             "policy.protected.extra {gone}: only the owner can release protected paths"
         ));
     }
+    // A folder at or inside a protected entry releases it (Protected::check),
+    // so a new one there is a release too, unless the old folders released
+    // that place already; and the access of a folder there stays the
+    // owner's to widen.
+    let prot = protected(&n.protected);
+    for f in &n.folders {
+        let path = Path::new(&f.path);
+        let before = o.folders.iter().find(|g| g.path == f.path);
+        let entry = match before {
+            None => prot.check(path, true, &o.folders),
+            Some(g) if widens(g.access, f.access) => prot.check(path, true, &[]),
+            Some(_) => None,
+        };
+        if let Some(entry) = entry {
+            return Err(format!(
+                "policy.folders {}: {} is protected; only the owner can release protected paths",
+                f.path,
+                to_wire(entry)
+            ));
+        }
+    }
     Ok(())
+}
+
+/// Whether `new` sets a flag `old` does not.
+fn widens(old: Access, new: Access) -> bool {
+    (new.read && !old.read) || (new.write && !old.write) || (new.execute && !old.execute)
 }
 
 #[cfg(test)]
@@ -482,6 +516,16 @@ mod tests {
         })
         .unwrap();
         s
+    }
+
+    /// The protected list of a Unix node at `/home/u`.
+    fn unix(opts: &ProtectedOptions) -> Protected {
+        Protected::new(
+            &crate::protected::Platform::Unix,
+            Path::new("/home/u"),
+            &[],
+            opts,
+        )
     }
 
     fn doc(s: &SettingsStore) -> Value {
@@ -520,13 +564,13 @@ mod tests {
         new["policy"]["mode"] = json!("user");
         new["policy"]["until"] = json!(1000);
         let v2 = s
-            .set_center_document("home", new.clone(), v, |_| false)
+            .set_center_document("home", new.clone(), v, |_| false, unix)
             .unwrap();
         assert_eq!(v2, v + 1);
         assert_eq!(s.config().center("home").unwrap().policy.mode, Mode::User);
         // A stale version conflicts.
         assert_eq!(
-            s.set_center_document("home", new, v, |_| false),
+            s.set_center_document("home", new, v, |_| false, unix),
             Err(SetError::Conflict { current: v2 })
         );
         // Saved and reloaded.
@@ -551,41 +595,43 @@ mod tests {
         let mut new = doc(&s);
         new["policy"]["caps"] = json!({"camera": "on"});
         let e = s
-            .set_center_document("home", new, v, |c| c == "camera")
+            .set_center_document("home", new, v, |c| c == "camera", unix)
             .unwrap_err();
         assert!(matches!(&e, SetError::Forbidden(m) if m.contains("policy.caps.camera")));
         // An allow rule is no way round that.
         let mut new = doc(&s);
         new["policy"]["allow"] = json!(["camera.snap"]);
         let e = s
-            .set_center_document("home", new, v, |c| c == "camera")
+            .set_center_document("home", new, v, |c| c == "camera", unix)
             .unwrap_err();
         assert!(matches!(&e, SetError::Forbidden(m) if m.contains("policy.allow")));
         let mut new = doc(&s);
         new["policy"]["allow"] = json!(["fs.read:/a/*", "exec.run:ls"]);
-        s.set_center_document("home", new, v, |c| c == "camera")
+        s.set_center_document("home", new, v, |c| c == "camera", unix)
             .unwrap();
         let v = s.version();
         let mut new = doc(&s);
         new["policy"]["protected"] = json!({"allow": ["~/.ssh"]});
         assert!(matches!(
-            s.set_center_document("home", new, v, |_| false),
+            s.set_center_document("home", new, v, |_| false, unix),
             Err(SetError::Forbidden(_))
         ));
         let mut new = doc(&s);
         new["policy"]["nope"] = json!(1);
         assert!(matches!(
-            s.set_center_document("home", new, v, |_| false),
+            s.set_center_document("home", new, v, |_| false, unix),
             Err(SetError::Invalid(_))
         ));
         // The center may pause, not unpause.
         let mut new = doc(&s);
         new["paused"] = json!(true);
-        let v = s.set_center_document("home", new, v, |_| false).unwrap();
+        let v = s
+            .set_center_document("home", new, v, |_| false, unix)
+            .unwrap();
         let mut new = doc(&s);
         new["paused"] = json!(false);
         assert!(matches!(
-            s.set_center_document("home", new, v, |_| false),
+            s.set_center_document("home", new, v, |_| false, unix),
             Err(SetError::Forbidden(_))
         ));
         assert_eq!(s.version(), v);
@@ -595,7 +641,7 @@ mod tests {
         let v = off.version();
         let new = doc(&off);
         assert!(matches!(
-            off.set_center_document("home", new, v, |_| false),
+            off.set_center_document("home", new, v, |_| false, unix),
             Err(SetError::Forbidden(_))
         ));
     }
@@ -616,7 +662,7 @@ mod tests {
         let v = s.version();
         let mut new = doc(&s);
         new["policy"]["protected"]["extra"] = json!([]);
-        let e = s.set_center_document("home", new, v, |_| false);
+        let e = s.set_center_document("home", new, v, |_| false, unix);
         assert!(
             matches!(&e, Err(SetError::Forbidden(m)) if m.contains("policy.protected.extra")),
             "{e:?}"
@@ -628,10 +674,77 @@ mod tests {
         // Adding one more is fine.
         let mut new = doc(&s);
         new["policy"]["protected"]["extra"] = json!(["~/secret", "~/more"]);
-        s.set_center_document("home", new, v, |_| false).unwrap();
+        s.set_center_document("home", new, v, |_| false, unix)
+            .unwrap();
         assert_eq!(
             s.config().center("home").unwrap().policy.protected.extra,
             ["~/secret", "~/more"]
+        );
+    }
+
+    /// A folder at or inside a protected entry releases it, so adding one is
+    /// a release as well: a center may not, the owner may (code review 2 of
+    /// PR #19, finding 2).
+    #[test]
+    fn a_center_cannot_release_a_protected_path_by_adding_a_folder() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = store(d.path(), SettingsGrant::Write);
+        s.update(|c| {
+            let p = &mut c.center_mut("home").unwrap().policy;
+            p.mode = Mode::User;
+            p.protected.extra = vec!["~/secret".into()];
+            Ok(())
+        })
+        .unwrap();
+        let v = s.version();
+        for (path, entry) in [
+            ("/home/u/secret", "/home/u/secret"),
+            ("/home/u/secret/inner", "/home/u/secret"),
+            ("/home/u/.ssh", "/home/u/.ssh"),
+            ("/home/u/.local/bin", "/home/u/.local/bin"),
+        ] {
+            let mut new = doc(&s);
+            new["policy"]["folders"] = json!([{"path": path, "access": "r"}]);
+            let e = s.set_center_document("home", new, v, |_| false, unix);
+            assert!(
+                matches!(&e, Err(SetError::Forbidden(m))
+                    if m.contains("policy.folders") && m.contains(entry)),
+                "{path}: {e:?}"
+            );
+        }
+        assert!(s.config().center("home").unwrap().policy.folders.is_empty());
+        // A folder that holds a protected entry releases nothing.
+        let mut new = doc(&s);
+        new["policy"]["folders"] = json!([{"path": "/home/u", "access": "rw"}]);
+        s.set_center_document("home", new, v, |_| false, unix)
+            .unwrap();
+        // The owner may release it.
+        s.update(|c| {
+            let p = &mut c.center_mut("home").unwrap().policy;
+            p.folders.push(crate::config::Folder {
+                path: "/home/u/secret".into(),
+                access: crate::config::Access::parse("r").unwrap(),
+            });
+            Ok(())
+        })
+        .unwrap();
+        // Inside what the owner released a center may add a folder, but it
+        // may not widen the owner's folder there.
+        let v = s.version();
+        let mut new = doc(&s);
+        new["policy"]["folders"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"path": "/home/u/secret/inner", "access": "r"}));
+        let v = s
+            .set_center_document("home", new, v, |_| false, unix)
+            .unwrap();
+        let mut new = doc(&s);
+        new["policy"]["folders"][1]["access"] = json!("rw");
+        let e = s.set_center_document("home", new, v, |_| false, unix);
+        assert!(
+            matches!(&e, Err(SetError::Forbidden(m)) if m.contains("policy.folders /home/u/secret")),
+            "{e:?}"
         );
     }
 
@@ -737,7 +850,8 @@ mod tests {
         let mut new = doc(&s);
         new["policy"]["mode"] = json!("user");
         new["policy"]["until"] = json!(now + year);
-        s.set_center_document("home", new, v, |_| false).unwrap();
+        s.set_center_document("home", new, v, |_| false, unix)
+            .unwrap();
         // Once the limit has passed, the center is back in default deny.
         let past = s.config().centers[0].policy.clone();
         assert_eq!(past.mode_at(now + year), Mode::Allowlist);

@@ -885,11 +885,16 @@ impl Link {
     }
 
     fn protected(&self, entry: &CenterEntry) -> Protected {
+        self.protected_with(&entry.policy.protected)
+    }
+
+    /// This node's protected list with a center's options.
+    fn protected_with(&self, opts: &nerve_policy::config::ProtectedOptions) -> Protected {
         Protected::new(
             &self.shared.platform,
             &self.shared.home,
             &self.shared.paths.own(),
-            &entry.policy.protected,
+            opts,
         )
     }
 
@@ -967,6 +972,7 @@ impl Link {
             s.if_version,
             // This node offers no sense capabilities in 0.0.1.
             |_| false,
+            |opts| self.protected_with(opts),
         );
         settings_result(r)
     }
@@ -980,7 +986,13 @@ impl Link {
         let mut v = serde_json::to_value(doc).map_err(|e| RpcError::internal(e.to_string()))?;
         v["paused"] = Value::Bool(true);
         let version = store.version();
-        let r = store.set_center_document(&self.name, v, version, |_| false);
+        let r = store.set_center_document(
+            &self.name,
+            v,
+            version,
+            |_| false,
+            |opts| self.protected_with(opts),
+        );
         settings_result(r).map(|_| json!({}))
     }
 

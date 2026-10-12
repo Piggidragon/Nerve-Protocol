@@ -362,6 +362,7 @@ Decided and executed on the node only. They are not in any document a center rea
 8. Updates: channel, key, when to update (the node never updates on a center's request).
 9. Exposure of `sense` capabilities: a center can switch them off, never on. None is built in for 0.0.1; the rule is fixed now so that later providers inherit it.
 10. The local audit log and its retention.
+11. Releasing a protected path: a center may add to `protected.extra` but not remove from it or change `protected.allow`, and it may neither add a folder at or inside a protected entry the old folders did not release already nor widen the access of a folder there.
 
 ### 5.4 Decisions and refusals
 

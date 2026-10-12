@@ -93,7 +93,8 @@ mode = "allowlist"          # allowlist | folder | user (the default is allowlis
 until = 1790000000000  # optional, folder and user: ms since the epoch; then allowlist
 folders = [{ path = "/home/u/proj", access = "rwx" }]  # folder mode; r w x in any mix, "" for none
 caps = { "fs.write" = "off" }   # on | off | hidden
-protected = { extra = [], allow = [] }  # a center may add to extra; only the owner removes or releases
+protected = { extra = [], allow = [] }  # a center may add to extra; only the owner removes or releases,
+                                        # also by a folder at or inside an entry
 allow = ["exec.run:git status", "fs.read:~/notes/*"]   # allowlist mode only
 deny = ["fs:~/private/*", "exec.run:rm *"]             # every mode
 sudo_allow = ["sudo apt update"]                       # sudo commands, every mode

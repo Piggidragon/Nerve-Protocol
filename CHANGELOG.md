@@ -54,3 +54,4 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
   is part of the name, with one `_` as the only separator; node, capability
   and action names use letters, digits and `-`, and the center ignores a
   descriptor whose names have a `_` (`spec/harness.md`).
+- The owner sets how long a pairing code is valid, 1 to 1440 minutes (24 hours), in Settings, Center; 10 minutes unless changed, and a code keeps the lifetime it was made with.

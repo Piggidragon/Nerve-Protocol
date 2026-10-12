@@ -71,7 +71,8 @@ Unknown fields are refused. Answers:
 | 403 | `{"error"}` | code unknown, used, expired or out of tries |
 | 409 | `{"error"}` | another node already has this name or key |
 
-- A code is valid for 10 minutes, for one successful pairing, and for 10 tries
+- A code is valid for the lifetime the owner set when it was made (10 minutes
+  by default, at most 24 hours), for one successful pairing, and for 10 tries
   in all; a wrong code counts against every open code.
 - The center MUST compute `node_id` from `public_key` itself.
 

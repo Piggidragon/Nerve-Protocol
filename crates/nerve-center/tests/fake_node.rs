@@ -305,6 +305,26 @@ async fn pair_connect_describe_and_call() {
 }
 
 #[tokio::test]
+async fn the_pair_response_carries_the_codes_own_expiry() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    let near = |expires: u64, minutes: u64| {
+        let now = nerve_center::util::now_ms();
+        let want = minutes * 60_000;
+        assert!(
+            expires + 5_000 >= now + want && expires <= now + want + 5_000,
+            "{expires} is not {minutes} minutes from {now}"
+        );
+    };
+    // The default is ten minutes.
+    near(r.center.new_pairing()["expires_ms"].as_u64().unwrap(), 10);
+    r.center.update(|s| s.pair_code_minutes = 1440);
+    near(r.center.new_pairing()["expires_ms"].as_u64().unwrap(), 1440);
+    r.center.update(|s| s.pair_code_minutes = 1);
+    near(r.center.new_pairing()["expires_ms"].as_u64().unwrap(), 1);
+}
+
+#[tokio::test]
 async fn unknown_node_and_wrong_codes() {
     let dir = tempfile::tempdir().unwrap();
     let r = center(dir.path()).await;

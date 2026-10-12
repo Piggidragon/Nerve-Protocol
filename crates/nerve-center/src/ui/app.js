@@ -435,14 +435,16 @@ function pageSettings() {
   drawTokens();
   const name = el("input", { class: "input", type: "text", maxlength: "64", value: s.center.name, id: "c-name" });
   const days = el("input", { class: "input num", type: "number", min: "1", max: "366", value: s.center.retention_days, id: "c-days" });
+  const pairMinutes = el("input", { class: "input num", type: "number", min: "1", max: "1440", value: s.center.pair_code_minutes, id: "c-pair-minutes" });
   return [
     head("settings", "Settings", "The center, the tokens harnesses use, and each machine's own settings."),
     section("Center", null, null, el("div", { class: "card" },
       el("div", { class: "form-row" },
         el("label", { class: "field" }, el("span", { class: "label" }, "Name"), name),
-        el("label", { class: "field" }, el("span", { class: "label" }, "Keep statistics for (days)"), days)),
+        el("label", { class: "field" }, el("span", { class: "label" }, "Keep statistics for (days)"), days),
+        el("label", { class: "field" }, el("span", { class: "label" }, "Pairing code valid for (minutes, at most 1440)"), pairMinutes)),
       el("div", { class: "actions" }, el("button", { type: "button", class: "btn primary", onclick: act(async () => {
-        await api("POST", "/api/center", { name: name.value, retention_days: Number(days.value) });
+        await api("POST", "/api/center", { name: name.value, retention_days: Number(days.value), pair_code_minutes: Number(pairMinutes.value) });
         notify("Saved.");
       }) }, "Save")))),
     section("Harness tokens", "A token lets an AI harness call this center over HTTP.", null,

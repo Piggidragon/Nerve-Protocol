@@ -26,7 +26,7 @@ use nerve_transport::net::BoxIo;
 
 use crate::center::{Center, Change, audit_rule};
 use crate::listen::Server;
-use crate::store::TokenRecord;
+use crate::store::{PAIR_CODE_MAX_MINUTES, TokenRecord};
 use crate::util::{self, now_ms};
 
 const INDEX: &str = include_str!("ui/index.html");
@@ -382,9 +382,13 @@ impl Ui {
                 c.update(|st| st.harness_tokens.retain(|t| t.id != id));
                 Ok(json!({}))
             }
-            ("GET", "/api/center") => Ok(
-                c.read(|st| json!({"name": st.center_name, "retention_days": st.retention_days}))
-            ),
+            ("GET", "/api/center") => Ok(c.read(|st| {
+                json!({
+                    "name": st.center_name,
+                    "retention_days": st.retention_days,
+                    "pair_code_minutes": st.pair_code_minutes,
+                })
+            })),
             ("POST", "/api/center") => {
                 let name = b
                     .get("name")
@@ -397,12 +401,27 @@ impl Ui {
                 if days.is_some_and(|d| !(1..=366).contains(&d)) {
                     return Err(bad("retention is 1 to 366 days"));
                 }
+                // A value that is not a whole number is refused too, not skipped.
+                let minutes = match b.get("pair_code_minutes") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => match v.as_u64() {
+                        Some(m) if (1..=u64::from(PAIR_CODE_MAX_MINUTES)).contains(&m) => Some(m),
+                        _ => {
+                            return Err(bad(format!(
+                                "a pairing code is valid for 1 to {PAIR_CODE_MAX_MINUTES} minutes (24 hours)"
+                            )));
+                        }
+                    },
+                };
                 c.update(|st| {
                     if let Some(n) = name {
                         st.center_name = n;
                     }
                     if let Some(d) = days {
                         st.retention_days = d as u32;
+                    }
+                    if let Some(m) = minutes {
+                        st.pair_code_minutes = m as u32;
                     }
                 });
                 c.changed(Change::Nodes);
@@ -587,6 +606,65 @@ mod tests {
         let ui = Ui::new(&center(d.path()), Some("nrv_x".into()), true, false);
         let r = ui.request(req("GET", "/api/help", &[h], "")).await;
         assert_eq!(r.status, 401);
+    }
+
+    async fn center_settings(ui: &Ui, body: Option<Value>) -> Result<Value, (u16, Value)> {
+        match body {
+            Some(b) => ui.api(&req("POST", "/api/center", &[], ""), &b).await,
+            None => {
+                ui.api(&req("GET", "/api/center", &[], ""), &json!({}))
+                    .await
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_pairing_code_lifetime_is_a_setting_of_1_to_1440_minutes() {
+        let d = tempfile::tempdir().unwrap();
+        let c = center(d.path());
+        let ui = Ui::new(&c, None, false, false);
+        // Ten minutes unless the owner changes it.
+        let got = center_settings(&ui, None).await.unwrap();
+        assert_eq!(got["pair_code_minutes"], 10);
+        // Within the range it is stored, and the other settings stay.
+        center_settings(&ui, Some(json!({"pair_code_minutes": 1440})))
+            .await
+            .unwrap();
+        let got = center_settings(&ui, None).await.unwrap();
+        assert_eq!(got["pair_code_minutes"], 1440);
+        assert_eq!(got["retention_days"], 30);
+        // Outside it, or not a whole number, it is refused with a message and
+        // the stored value stays.
+        for bad_value in [json!(1441), json!(0), json!(-5), json!(1.5), json!("20")] {
+            let (status, body) =
+                center_settings(&ui, Some(json!({"pair_code_minutes": bad_value.clone()})))
+                    .await
+                    .unwrap_err();
+            assert_eq!(status, 400, "{bad_value}");
+            let msg = body["error"].as_str().unwrap();
+            assert!(msg.contains("1 to 1440 minutes"), "{msg}");
+            let got = center_settings(&ui, None).await.unwrap();
+            assert_eq!(got["pair_code_minutes"], 1440, "{bad_value}");
+        }
+        // A refused value changes nothing else in the same request.
+        let (status, _) = center_settings(
+            &ui,
+            Some(json!({"name": "other", "pair_code_minutes": 1441})),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, 400);
+        assert_eq!(center_settings(&ui, None).await.unwrap()["name"], "test");
+        // A save without the field leaves it alone, and it survives a restart.
+        center_settings(&ui, Some(json!({"retention_days": 5})))
+            .await
+            .unwrap();
+        drop(ui);
+        drop(c);
+        let ui = Ui::new(&center(d.path()), None, false, false);
+        let got = center_settings(&ui, None).await.unwrap();
+        assert_eq!(got["pair_code_minutes"], 1440);
+        assert_eq!(got["retention_days"], 5);
     }
 
     #[test]

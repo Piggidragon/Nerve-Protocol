@@ -16,6 +16,10 @@ use nerve_proto::Descriptor;
 pub const FILE: &str = "state.json";
 /// The default statistics retention.
 pub const RETENTION_DAYS: u32 = 30;
+/// The default lifetime of a pairing code, in minutes.
+pub const PAIR_CODE_MINUTES: u32 = 10;
+/// The longest lifetime the owner may set for a pairing code: 24 hours.
+pub const PAIR_CODE_MAX_MINUTES: u32 = 1440;
 const DAY_MS: u64 = 86_400_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -28,12 +32,19 @@ pub struct Store {
     pub harness_tokens: Vec<TokenRecord>,
     #[serde(default = "d_retention")]
     pub retention_days: u32,
+    /// How long a pairing code made from now on stays valid, in minutes.
+    #[serde(default = "d_pair_code_minutes")]
+    pub pair_code_minutes: u32,
     #[serde(default)]
     pub stats: BTreeMap<String, NodeStats>,
 }
 
 fn d_retention() -> u32 {
     RETENTION_DAYS
+}
+
+fn d_pair_code_minutes() -> u32 {
+    PAIR_CODE_MINUTES
 }
 
 impl Store {
@@ -44,6 +55,7 @@ impl Store {
             nodes: BTreeMap::new(),
             harness_tokens: Vec::new(),
             retention_days: RETENTION_DAYS,
+            pair_code_minutes: PAIR_CODE_MINUTES,
             stats: BTreeMap::new(),
         }
     }
@@ -170,6 +182,15 @@ impl DayStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pairing_code_lifetime_defaults_to_ten_minutes() {
+        assert_eq!(Store::new("c".into(), "home".into()).pair_code_minutes, 10);
+        // A state file from before the setting existed reads as ten minutes.
+        let old = r#"{"center_id": "c", "center_name": "home"}"#;
+        let s: Store = serde_json::from_str(old).unwrap();
+        assert_eq!(s.pair_code_minutes, 10);
+    }
 
     #[test]
     fn stats_are_pruned_by_retention() {

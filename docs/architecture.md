@@ -132,7 +132,7 @@ There is no bearer token for nodes. A copied config without the private key cann
 
 ### 3.2 Pairing
 
-1. On the center: `nerve-center pair new [--name laptop]` (or "Add node" in the web UI) creates a one-time code (10 minutes, 10 tries, single use) and shows a link as text and QR:
+1. On the center: `nerve-center pair new [--name laptop]` (or "Add node" in the web UI) creates a one-time code (10 minutes unless the owner set another lifetime up to 24 hours, 10 tries, single use) and shows a link as text and QR:
    `nerve://pair?center=<pct-encoded https URL>&code=<code>&pin=<spki>`
 2. On the node: `nerve-node center add '<link>'`. The link is parsed strictly (unknown or doubled keys, bad escapes, paths with `.`/`..` segments, user info, query or fragment in the URL, and links over 4 KiB are refused). The owner sees the parsed center URL, the center name after step 3, and the policy and grant the new center entry starts with (default deny, so every call is refused until an allow rule or a mode allows it, and `settings = off`, §5.1, §5.2), and confirms. Nothing is stored before the confirmation.
 3. The node generates the key pair for this center and sends `POST {center}/nerve/v0/pair` with `{code, name, platform, arch, public_key}` over TLS checked against the pin.

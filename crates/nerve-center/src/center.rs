@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde_json::{Map, Value, json};
 use tokio::sync::broadcast;
@@ -259,7 +259,8 @@ impl Center {
 
     /// A new pairing code and the link that carries it.
     pub fn new_pairing(&self) -> Value {
-        let code = self.codes.lock().unwrap().create(Instant::now());
+        let ttl = Duration::from_secs(u64::from(self.read(|st| st.pair_code_minutes)) * 60);
+        let code = self.codes.lock().unwrap().create(Instant::now(), ttl);
         let link = PairLink {
             center: self.public_url.clone(),
             code: code.clone(),
@@ -270,7 +271,7 @@ impl Center {
             "link": link.render(),
             "pin": self.pin,
             "center": self.public_url.to_string(),
-            "expires_ms": now_ms() + crate::pairing::CODE_TTL.as_millis() as u64,
+            "expires_ms": now_ms() + ttl.as_millis() as u64,
         })
     }
 

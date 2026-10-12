@@ -397,13 +397,29 @@ fn exposure(entry: &CenterEntry, id: &str) -> Option<Exposure> {
 /// mode only when an allow rule covers it (any pattern, each call is still
 /// checked), and for `exec.run` also when the sudo allow list has an entry,
 /// since a sudo command runs by that list alone. In `folder` and `user` mode
-/// the allow rules do not count, so the action is offered. An action set to
+/// the allow rules do not count, so the action is offered, except `exec` in
+/// `folder` mode on a machine that cannot confine a command. An action set to
 /// off stays, and fails `disabled`.
-fn offered(policy: &CenterPolicy, mode: Mode, by_rules: bool, cap: &str, action: &str) -> bool {
+fn offered(policy: &CenterPolicy, view: View, cap: &str, action: &str) -> bool {
+    let View {
+        mode,
+        by_rules,
+        confined,
+    } = view;
     match policy.cap_setting(cap, Some(action)) {
         Some(CapSetting::Hidden) => return false,
         Some(CapSetting::Off) => return true,
         _ => {}
+    }
+    // Folder mode refuses every command it cannot confine, so it offers none;
+    // a sudo command still runs by the sudo allow list.
+    if by_rules
+        && cap == "exec"
+        && mode == Mode::Folder
+        && !confined
+        && policy.sudo_allow.is_empty()
+    {
+        return false;
     }
     // Only the policy-governed capabilities are decided by rules.
     if !by_rules || mode != Mode::Allowlist || !matches!(cap, "fs" | "exec") {
@@ -413,21 +429,44 @@ fn offered(policy: &CenterPolicy, mode: Mode, by_rules: bool, cap: &str, action:
         || (cap == "exec" && action == "run" && !policy.sudo_allow.is_empty())
 }
 
+/// What decides which actions a descriptor offers besides the policy.
+#[derive(Debug, Clone, Copy)]
+struct View {
+    mode: Mode,
+    /// Cut by the allow rules and by what the node cannot do ([`for_center`]).
+    by_rules: bool,
+    /// Whether this machine confines commands in `folder` mode.
+    confined: bool,
+}
+
 /// The descriptor `entry` sees now; `rev` is derived from its content, so it
 /// changes exactly when the view changes. The center builds its tools from
-/// it, so an action the policy cannot allow is not in it.
-pub fn for_center(cfg: &NodeConfig, entry: &CenterEntry, now_ms: u64) -> Descriptor {
-    build(cfg, entry, now_ms, true)
+/// it, so an action the policy cannot allow is not in it. `confined` says
+/// whether this machine can confine a command in `folder` mode (Landlock);
+/// where it cannot, folder mode offers no command.
+pub fn for_center(
+    cfg: &NodeConfig,
+    entry: &CenterEntry,
+    now_ms: u64,
+    confined: bool,
+) -> Descriptor {
+    build(cfg, entry, now_ms, true, confined)
 }
 
 /// Every action a call may name: [`for_center`] without the cut by allow
 /// rules. A call for an action no rule covers still reaches the policy, which
 /// refuses it and writes the audit entry; only hidden ones are unknown.
 pub fn for_call(cfg: &NodeConfig, entry: &CenterEntry, now_ms: u64) -> Descriptor {
-    build(cfg, entry, now_ms, false)
+    build(cfg, entry, now_ms, false, true)
 }
 
-fn build(cfg: &NodeConfig, entry: &CenterEntry, now_ms: u64, by_rules: bool) -> Descriptor {
+fn build(
+    cfg: &NodeConfig,
+    entry: &CenterEntry,
+    now_ms: u64,
+    by_rules: bool,
+    confined: bool,
+) -> Descriptor {
     let mut caps = vec![node_cap()];
     if let Some(e) = exposure(entry, "fs") {
         caps.push(fs_cap(e));
@@ -442,11 +481,15 @@ fn build(cfg: &NodeConfig, entry: &CenterEntry, now_ms: u64, by_rules: bool) -> 
     // Actions the policy cannot allow are left out, so the center builds no
     // tool the node would refuse; off ones stay and fail `disabled`. A
     // capability with no action left goes too.
-    let mode = entry.policy.mode_at(now_ms);
+    let view = View {
+        mode: entry.policy.mode_at(now_ms),
+        by_rules,
+        confined,
+    };
     for c in &mut caps {
         let id = c.id.clone();
         c.actions
-            .retain(|a, _| offered(&entry.policy, mode, by_rules, &id, a));
+            .retain(|a, _| offered(&entry.policy, view, &id, a));
     }
     caps.retain(|c| !(matches!(c.id.as_str(), "fs" | "exec") && c.actions.is_empty()));
     let name = node_name(cfg);
@@ -487,6 +530,7 @@ fn rev_of(d: &Descriptor) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use nerve_policy::config::CenterPolicy;
 
     fn entry() -> CenterEntry {
@@ -510,7 +554,7 @@ mod tests {
         e.settings = SettingsGrant::Write;
         // Default deny shows no fs or exec tool; the names are checked on all.
         e.policy.mode = Mode::User;
-        let d = for_center(&NodeConfig::default(), &e, 0);
+        let d = for_center(&NodeConfig::default(), &e, 0, true);
         assert_eq!(d.check_names(), Ok(()));
         assert!(d.capabilities.len() >= 5);
     }
@@ -520,7 +564,7 @@ mod tests {
         let cfg = NodeConfig::default();
         let mut e = entry();
         e.policy.mode = Mode::User;
-        let d = for_center(&cfg, &e, 0);
+        let d = for_center(&cfg, &e, 0, true);
         let ids: Vec<&str> = d.capabilities.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, ["node", "fs", "exec", "audit"]);
         assert!(nerve_proto::descriptor::summary_words(&d.summary) < 60);
@@ -528,19 +572,22 @@ mod tests {
 
         e.policy.caps.insert("fs".into(), CapSetting::Off);
         assert_eq!(
-            for_center(&cfg, &e, 0).capability("fs").unwrap().exposure,
+            for_center(&cfg, &e, 0, true)
+                .capability("fs")
+                .unwrap()
+                .exposure,
             Exposure::Off
         );
 
         e.policy.caps.insert("exec".into(), CapSetting::Hidden);
         e.policy.caps.insert("fs.write".into(), CapSetting::Hidden);
         e.settings = SettingsGrant::Write;
-        let d2 = for_center(&cfg, &e, 0);
+        let d2 = for_center(&cfg, &e, 0, true);
         assert!(d2.capability("exec").is_none());
         assert!(d2.capability("settings").is_some());
         assert!(!d2.capability("fs").unwrap().actions.contains_key("write"));
         assert_ne!(d.rev, d2.rev);
-        assert_eq!(d2.rev, for_center(&cfg, &e, 0).rev);
+        assert_eq!(d2.rev, for_center(&cfg, &e, 0, true).rev);
     }
 
     fn actions(d: &Descriptor, cap: &str) -> Vec<String> {
@@ -557,7 +604,7 @@ mod tests {
     fn allowlist_without_rules_offers_no_tools() {
         let mut e = entry();
         e.settings = SettingsGrant::Write;
-        let d = for_center(&NodeConfig::default(), &e, 0);
+        let d = for_center(&NodeConfig::default(), &e, 0, true);
         assert!(d.capability("fs").is_none());
         assert!(d.capability("exec").is_none());
         assert!(d.capability("node").is_some());
@@ -570,23 +617,26 @@ mod tests {
         let cfg = NodeConfig::default();
         let mut e = entry();
         e.policy.allow = rules(&["exec.run:git *"]);
-        let d = for_center(&cfg, &e, 0);
+        let d = for_center(&cfg, &e, 0, true);
         assert_eq!(actions(&d, "exec"), ["run"]);
         assert!(d.capability("fs").is_none());
 
         // The scope decides, the pattern does not.
         e.policy.allow = rules(&["fs:~/notes/*"]);
-        let d = for_center(&cfg, &e, 0);
+        let d = for_center(&cfg, &e, 0, true);
         let mut fs = actions(&d, "fs");
         fs.sort();
         assert_eq!(fs, ["find", "grep", "list", "read", "stat", "write"]);
         assert!(d.capability("exec").is_none());
 
         e.policy.allow = rules(&["fs.read:/a/*"]);
-        assert_eq!(actions(&for_center(&cfg, &e, 0), "fs"), ["read"]);
+        assert_eq!(actions(&for_center(&cfg, &e, 0, true), "fs"), ["read"]);
 
         e.policy.allow = rules(&["exec"]);
-        assert_eq!(actions(&for_center(&cfg, &e, 0), "exec"), ["run", "signal"]);
+        assert_eq!(
+            actions(&for_center(&cfg, &e, 0, true), "exec"),
+            ["run", "signal"]
+        );
     }
 
     #[test]
@@ -594,7 +644,7 @@ mod tests {
         let cfg = NodeConfig::default();
         let mut e = entry();
         e.policy.sudo_allow = rules(&["sudo apt *"]);
-        let d = for_center(&cfg, &e, 0);
+        let d = for_center(&cfg, &e, 0, true);
         assert_eq!(actions(&d, "exec"), ["run"]);
         assert!(d.capability("fs").is_none());
     }
@@ -605,14 +655,43 @@ mod tests {
         let mut e = entry();
         for mode in [Mode::Folder, Mode::User] {
             e.policy.mode = mode;
-            let d = for_center(&cfg, &e, 0);
+            let d = for_center(&cfg, &e, 0, true);
             assert_eq!(actions(&d, "exec"), ["run", "signal"]);
             assert_eq!(actions(&d, "fs").len(), 6);
         }
         // A folder or user mode that ran out is allowlist again.
         e.policy.until = Some(10);
-        assert!(for_center(&cfg, &e, 9).capability("fs").is_some());
-        assert!(for_center(&cfg, &e, 10).capability("fs").is_none());
+        assert!(for_center(&cfg, &e, 9, true).capability("fs").is_some());
+        assert!(for_center(&cfg, &e, 10, true).capability("fs").is_none());
+    }
+
+    /// Where commands cannot be confined (Windows, Linux without Landlock),
+    /// folder mode refuses every command, so it offers no exec tool; a sudo
+    /// entry still runs by its list (Windows review of PR #19, round 2,
+    /// finding 3).
+    #[test]
+    fn folder_mode_offers_no_exec_where_commands_cannot_be_confined() {
+        let cfg = NodeConfig::default();
+        let mut e = entry();
+        e.policy.mode = Mode::Folder;
+        let d = for_center(&cfg, &e, 0, false);
+        assert!(d.capability("exec").is_none());
+        assert_eq!(actions(&d, "fs").len(), 6);
+        // Confined, as on Linux with Landlock: offered.
+        let d = for_center(&cfg, &e, 0, true);
+        assert_eq!(actions(&d, "exec"), ["run", "signal"]);
+        // User mode runs commands unconfined anyway.
+        e.policy.mode = Mode::User;
+        let d = for_center(&cfg, &e, 0, false);
+        assert_eq!(actions(&d, "exec"), ["run", "signal"]);
+        // A sudo entry runs by its list in every mode.
+        e.policy.mode = Mode::Folder;
+        e.policy.sudo_allow = rules(&["sudo apt *"]);
+        let d = for_center(&cfg, &e, 0, false);
+        assert_eq!(actions(&d, "exec"), ["run", "signal"]);
+        // A call still reaches the policy, which refuses and audits it.
+        e.policy.sudo_allow.clear();
+        assert!(for_call(&cfg, &e, 0).capability("exec").is_some());
     }
 
     #[test]
@@ -624,7 +703,7 @@ mod tests {
         e.policy
             .caps
             .insert("exec.signal".into(), CapSetting::Hidden);
-        let d = for_center(&cfg, &e, 0);
+        let d = for_center(&cfg, &e, 0, true);
         assert_eq!(d.capability("fs").unwrap().exposure, Exposure::Off);
         assert_eq!(actions(&d, "fs").len(), 6);
         assert_eq!(actions(&d, "exec"), ["run"]);
@@ -634,14 +713,14 @@ mod tests {
     fn a_rule_edit_changes_the_rev() {
         let cfg = NodeConfig::default();
         let mut e = entry();
-        let none = for_center(&cfg, &e, 0).rev;
+        let none = for_center(&cfg, &e, 0, true).rev;
         e.policy.allow = rules(&["exec.run:git *"]);
-        let one = for_center(&cfg, &e, 0).rev;
+        let one = for_center(&cfg, &e, 0, true).rev;
         // Another pattern of the same scope shows the same tools.
         e.policy.allow = rules(&["exec.run:ls *"]);
-        assert_eq!(for_center(&cfg, &e, 0).rev, one);
+        assert_eq!(for_center(&cfg, &e, 0, true).rev, one);
         e.policy.allow.clear();
-        assert_eq!(for_center(&cfg, &e, 0).rev, none);
+        assert_eq!(for_center(&cfg, &e, 0, true).rev, none);
         assert_ne!(none, one);
     }
 }

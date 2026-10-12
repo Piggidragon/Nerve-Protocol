@@ -248,9 +248,140 @@ fn breaks(c: char) -> bool {
 fn normalise(s: &str, windows: bool) -> String {
     let mut s = s.to_lowercase();
     if windows {
-        s = s.replace('\\', "/").replace("//?/", "").replace("//./", "");
+        s = s.replace('\\', "/").replace("//?/unc/", "//");
+        s = admin_shares(&s.replace("//?/", "").replace("//./", ""));
     }
     tidy(&s)
+}
+
+/// `//host/c$/x` as `c:/x`: an admin share names a drive. Any host counts,
+/// since the node cannot tell which names reach this machine; a share of
+/// another machine at the same path is refused as well, which costs nothing.
+fn admin_shares(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(at) = rest.find("//") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + 2..];
+        let host = after
+            .find(|c: char| c == '/' || breaks(c))
+            .unwrap_or(after.len());
+        let share = after[host..].strip_prefix('/').unwrap_or("");
+        let b = share.as_bytes();
+        let drive = host > 0
+            && b.len() >= 2
+            && b[0].is_ascii_alphabetic()
+            && b[1] == b'$'
+            && b.get(2).is_none_or(|c| *c == b'/' || breaks(*c as char));
+        if drive {
+            out.push(b[0] as char);
+            out.push(':');
+            rest = &share[2..];
+            if rest.is_empty() || !rest.starts_with('/') {
+                out.push('/');
+            }
+        } else {
+            out.push_str("//");
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Whether the path segment `pattern` of a command line may name `name`:
+/// a shell's wildcards (`*`, `?`, `[...]`) are matched, and on Windows an
+/// 8.3 short name (`NODE-S~1`, a `~` and a digit) may stand for any name,
+/// since the node does not know which short name the file system gave.
+fn segment_matches(pattern: &str, name: &str, windows: bool) -> bool {
+    let short = |p: &str| {
+        p.char_indices()
+            .any(|(at, c)| c == '~' && p[at + 1..].starts_with(|d: char| d.is_ascii_digit()))
+    };
+    if windows && short(pattern) {
+        return true;
+    }
+    if !pattern.contains(['*', '?', '[']) {
+        return pattern == name;
+    }
+    glob(pattern, name)
+}
+
+/// One piece of a wildcard pattern.
+enum Piece {
+    Any,
+    One,
+    Class(Vec<char>, bool),
+    Lit(char),
+}
+
+/// `name` against a pattern of `*`, `?`, `[...]` (with `!` or `^` for
+/// "not", and ranges) and literal characters, in time linear in both for
+/// each `*`, so a long line from the center cannot make it slow.
+fn glob(pattern: &str, name: &str) -> bool {
+    let mut pieces = Vec::new();
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            '*' => pieces.push(Piece::Any),
+            '?' => pieces.push(Piece::One),
+            '[' if chars[i + 1..].contains(&']') => {
+                let mut j = i + 1;
+                let not = matches!(chars.get(j), Some('!' | '^'));
+                if not {
+                    j += 1;
+                }
+                let mut set = Vec::new();
+                // A `]` right after the `[` is a member, not the end.
+                let first = j;
+                while j < chars.len() && (chars[j] != ']' || j == first) {
+                    if chars.get(j + 1) == Some(&'-') && chars.get(j + 2).is_some_and(|c| *c != ']')
+                    {
+                        let (a, b) = (chars[j], chars[j + 2]);
+                        set.extend((a..=b).take(256));
+                        j += 3;
+                    } else {
+                        set.push(chars[j]);
+                        j += 1;
+                    }
+                }
+                if j >= chars.len() {
+                    pieces.push(Piece::Lit('['));
+                } else {
+                    pieces.push(Piece::Class(set, not));
+                    i = j;
+                }
+            }
+            c => pieces.push(Piece::Lit(c)),
+        }
+        i += 1;
+    }
+    let name: Vec<char> = name.chars().collect();
+    let one = |p: &Piece, c: char| match p {
+        Piece::One => true,
+        Piece::Class(set, not) => set.contains(&c) != *not,
+        Piece::Lit(l) => *l == c,
+        Piece::Any => false,
+    };
+    let (mut p, mut n) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while n < name.len() {
+        if p < pieces.len() && matches!(pieces[p], Piece::Any) {
+            star = Some((p, n));
+            p += 1;
+        } else if p < pieces.len() && one(&pieces[p], name[n]) {
+            p += 1;
+            n += 1;
+        } else if let Some((sp, sn)) = star {
+            p = sp + 1;
+            n = sn + 1;
+            star = Some((sp, sn + 1));
+        } else {
+            return false;
+        }
+    }
+    pieces[p..].iter().all(|x| matches!(x, Piece::Any))
 }
 
 /// Folds `//` and `/./` into one `/`.
@@ -297,18 +428,31 @@ fn fold_dotdot(s: &str) -> String {
 /// `$env:USERPROFILE`, `${env:USERPROFILE}` and `%USERPROFILE%`. `text` is
 /// normalised already, so the names are in lower case.
 fn expand_home(text: &str, home: &str, windows: bool) -> String {
-    let mut vars = vec!["${home}", "$home"];
+    let mut vars: Vec<(&str, &str)> = vec![("${home}", home), ("$home", home)];
     if windows {
-        vars.extend(["${env:userprofile}", "$env:userprofile", "%userprofile%"]);
+        // `%HOMEDRIVE%%HOMEPATH%` is the profile as well, in two halves.
+        let (drive, path) = match home.as_bytes().get(1) {
+            Some(b':') => home.split_at(2),
+            _ => ("", home),
+        };
+        for (names, value) in [
+            (
+                ["${env:userprofile}", "$env:userprofile", "%userprofile%"],
+                home,
+            ),
+            (["${env:homedrive}", "$env:homedrive", "%homedrive%"], drive),
+            (["${env:homepath}", "$env:homepath", "%homepath%"], path),
+        ] {
+            vars.extend(names.into_iter().map(|n| (n, value)));
+        }
     }
     let ident = |c: char| c.is_alphanumeric() || c == '_';
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     let mut prev: Option<char> = None;
     while let Some(c) = rest.chars().next() {
-        let var = vars.iter().find(|v| {
-            rest.starts_with(**v)
-                && (v.ends_with(['}', '%']) || !rest[v.len()..].starts_with(ident))
+        let var = vars.iter().find(|(v, _)| {
+            rest.starts_with(*v) && (v.ends_with(['}', '%']) || !rest[v.len()..].starts_with(ident))
         });
         let tilde = c == '~'
             && prev.is_none_or(|p| breaks(p) || p == ':')
@@ -316,9 +460,9 @@ fn expand_home(text: &str, home: &str, windows: bool) -> String {
                 .chars()
                 .next()
                 .is_none_or(|n| n == '/' || breaks(n));
-        let len = match var {
-            Some(v) => v.len(),
-            None if tilde => 1,
+        let (len, value) = match var {
+            Some((v, value)) => (v.len(), *value),
+            None if tilde => (1, home),
             None => {
                 out.push(c);
                 prev = Some(c);
@@ -326,8 +470,8 @@ fn expand_home(text: &str, home: &str, windows: bool) -> String {
                 continue;
             }
         };
-        out.push_str(home);
-        prev = home.chars().last();
+        out.push_str(value);
+        prev = value.chars().last().or(prev);
         rest = &rest[len..];
     }
     out
@@ -461,8 +605,14 @@ impl Protected {
             if let Some(own) = self.names_own(&text) {
                 return Some(own);
             }
-            let Some(cwd) = &cwd else { continue };
-            for word in text.split(breaks).filter(|w| !w.is_empty() && !absolute(w)) {
+            for word in text.split(breaks).filter(|w| !w.is_empty()) {
+                if let Some(own) = self.globs_own(word, cwd.as_deref()) {
+                    return Some(own);
+                }
+                let Some(cwd) = &cwd else { continue };
+                if absolute(word) {
+                    continue;
+                }
                 let path = fold_dotdot(&tidy(&format!("{cwd}/{word}")));
                 if let Some(own) = self.names_own(&path) {
                     return Some(own);
@@ -470,6 +620,48 @@ impl Protected {
             }
         }
         None
+    }
+
+    /// The own folder one normalised word may name segment by segment, with
+    /// [`segment_matches`]: an absolute path in it (on Windows also one
+    /// after a prefix such as `filesystem::`, and one without a drive, which
+    /// the shell takes on its current drive), else the word as a path from
+    /// `cwd`.
+    fn globs_own(&self, word: &str, cwd: Option<&str>) -> Option<&Path> {
+        let mut paths = Vec::new();
+        if self.windows {
+            let b = word.as_bytes();
+            for at in 0..b.len().saturating_sub(1) {
+                let starts = at == 0 || !b[at - 1].is_ascii_alphanumeric();
+                if starts && b[at].is_ascii_alphabetic() && b[at + 1] == b':' {
+                    paths.push(word[at..].to_string());
+                }
+            }
+            if word.starts_with('/') {
+                // Any drive: `?` matches the drive's letter.
+                paths.push(format!("?:{word}"));
+            }
+        } else if word.starts_with('/') {
+            paths.push(word.to_string());
+        }
+        if paths.is_empty()
+            && let Some(cwd) = cwd
+        {
+            paths.push(format!("{cwd}/{word}"));
+        }
+        paths.iter().find_map(|path| {
+            let path = fold_dotdot(&tidy(path));
+            let segs: Vec<&str> = path.split('/').collect();
+            self.own_names.iter().find_map(|(name, own)| {
+                let want: Vec<&str> = name.split('/').collect();
+                let hit = segs.len() >= want.len()
+                    && want
+                        .iter()
+                        .zip(&segs)
+                        .all(|(w, s)| segment_matches(s, w, self.windows));
+                hit.then_some(own.as_path())
+            })
+        })
     }
 
     /// The own folder whose name `text` holds, followed by anything but
@@ -756,6 +948,139 @@ mod tests {
                 "{command} in {cwd:?}"
             );
         }
+    }
+
+    /// The spellings of the Windows review of PR #19, round 2 (finding 2):
+    /// 8.3 short names, a path without a drive, an admin share and
+    /// wildcards in a folder's name.
+    #[test]
+    fn sees_the_own_folders_in_short_unc_driveless_and_wildcard_spellings() {
+        let p = win_prot();
+        let proj = Path::new("C:\\Users\\u\\nerve-test\\proj");
+        let home = Path::new("C:\\Users\\u");
+        for (command, cwd) in [
+            ("type C:\\Users\\U~1\\NERVE-~1\\NODE-S~1\\config.key", home),
+            ("type C:\\Users\\u\\nerve-test\\NODE-S~1\\config.key", home),
+            (
+                "type C:\\PROGRA~1\\..\\Users\\u\\NERVE-~3\\node-state",
+                home,
+            ),
+            ("type /Users/u/nerve-test/node-state/config.key", proj),
+            ("type \\Users\\u\\nerve-test\\node-state\\config.key", proj),
+            (
+                "type \\\\localhost\\C$\\Users\\u\\nerve-test\\node-state\\config.key",
+                proj,
+            ),
+            (
+                "type \\\\127.0.0.1\\c$\\Users\\u\\nerve-test\\node-config\\node.toml",
+                proj,
+            ),
+            (
+                "type \\\\?\\UNC\\localhost\\C$\\Users\\u\\nerve-test\\node-state\\config.key",
+                proj,
+            ),
+            ("type C:/Users/u/nerve-test/node-st*/config.key", proj),
+            ("type C:/Users/u/nerve-test/node-s?ate/config.key", proj),
+            ("type C:/Users/u/nerve-test/node-*", proj),
+            ("type C:/Users/u/*/node-[s]tate/config.key", proj),
+            ("type C:/*/*/*/*/config.key", proj),
+            ("type ../node-st*/config.key", proj),
+            (
+                "type $env:HOMEDRIVE$env:HOMEPATH\\nerve-test\\node-state\\config.key",
+                proj,
+            ),
+            ("type %HOMEPATH%\\nerve-test\\node-state\\config.key", proj),
+        ] {
+            assert!(
+                p.own_in_command(command, Some(cwd)).is_some(),
+                "{command} in {cwd:?}"
+            );
+        }
+        for (command, cwd) in [
+            ("type C:/Users/u/nerve-test/proj*/a", home),
+            ("type C:/Users/u/nerve-test/node-c*x/a", home),
+            ("type C:/Users/u/*.txt", home),
+            ("type D:/Users/u/nerve-test/proj/node-st*", home),
+            (
+                "type \\\\localhost\\C$\\Users\\u\\nerve-test\\proj\\a",
+                proj,
+            ),
+            ("type C:\\PROGRA~1\\x\\y", home),
+            ("type /Users/u/nerve-test/proj/a", proj),
+        ] {
+            assert!(
+                p.own_in_command(command, Some(cwd)).is_none(),
+                "{command} in {cwd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn globs_match_like_the_shells() {
+        for (pattern, name) in [
+            ("node-*", "node-state"),
+            ("*", ""),
+            ("n*e", "node-state"),
+            ("*-*-*", "a-b-c"),
+            ("node-[!x]tate", "node-state"),
+            ("node-[a-z]tate", "node-state"),
+            ("[]a]", "]"),
+        ] {
+            assert!(glob(pattern, name), "{pattern} {name}");
+        }
+        for (pattern, name) in [
+            ("node-*x", "node-state"),
+            ("?", ""),
+            ("node-[^s]tate", "node-state"),
+            ("node-[s", "node-s"),
+        ] {
+            assert!(!glob(pattern, name), "{pattern} {name}");
+        }
+        assert!(glob("node-[s", "node-[s"));
+        assert!(segment_matches("node-s~1", "node-state", true));
+        assert!(!segment_matches("node-s~1", "node-state", false));
+        assert!(!segment_matches("node~x", "node-state", true));
+    }
+
+    /// The short name Windows gave a real folder reaches it as well (round
+    /// 2 of the Windows review of PR #19, finding 2). Volumes without 8.3
+    /// names give none, and the test then has nothing to check.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_short_name_names_the_own_folder() {
+        use std::os::windows::process::CommandExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let own = tmp.path().join("node-state-of-this-test");
+        std::fs::create_dir(&own).unwrap();
+        // cmd's `%~sI` prints the 8.3 form of a path.
+        let out = std::process::Command::new("cmd")
+            .raw_arg(format!(
+                "/c for %I in (\"{}\") do @echo %~sI",
+                own.display()
+            ))
+            .output()
+            .unwrap();
+        let short = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if short.is_empty() || short.eq_ignore_ascii_case(&own.to_string_lossy()) {
+            eprintln!("no 8.3 name for {own:?}, nothing to check");
+            return;
+        }
+        let p = Protected::new(
+            &Platform::Windows(WinFolders::default()),
+            tmp.path(),
+            std::slice::from_ref(&own),
+            &ProtectedOptions::default(),
+        );
+        let command = format!("Get-Content {short}\\config.key");
+        assert!(
+            p.own_in_command(&command, Some(tmp.path())).is_some(),
+            "{command}"
+        );
+        let beside = format!("Get-Content {}\\other", tmp.path().display());
+        assert!(
+            p.own_in_command(&beside, Some(tmp.path())).is_none(),
+            "{beside}"
+        );
     }
 
     /// The Unix shells' forms; the Windows ones mean nothing there.

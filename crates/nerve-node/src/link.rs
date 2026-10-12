@@ -273,7 +273,7 @@ async fn session(
                 "the center's id is not the paired one".to_string(),
             ));
         }
-        let rev = descriptor::for_center(&cfg, entry, crate::now_ms()).rev;
+        let rev = descriptor::for_center(&cfg, entry, crate::now_ms(), shared.confined()).rev;
         let hello = Hello {
             node_id: key.node_id(),
             auth: msg::Auth {
@@ -425,7 +425,8 @@ impl Link {
             Some(x) => x,
             None => return self.end(ByeReason::Unpaired, Outcome::Stop).await,
         };
-        let mut rev = descriptor::for_center(&cfg, &entry, crate::now_ms()).rev;
+        let mut rev =
+            descriptor::for_center(&cfg, &entry, crate::now_ms(), self.shared.confined()).rev;
         let mut version = cfg.version;
         loop {
             tokio::select! {
@@ -498,7 +499,8 @@ impl Link {
     /// Tells the center when its view of the node changed.
     fn check_rev(&self, rev: &mut u64) {
         if let Some((cfg, entry)) = self.entry() {
-            let now = descriptor::for_center(&cfg, &entry, crate::now_ms()).rev;
+            let now =
+                descriptor::for_center(&cfg, &entry, crate::now_ms(), self.shared.confined()).rev;
             if now != *rev {
                 *rev = now;
                 self.handle
@@ -631,7 +633,12 @@ impl Link {
         let (cfg, entry) = self
             .entry()
             .ok_or_else(|| RpcError::new(ErrorCode::Unavailable, "this center was removed"))?;
-        Ok(descriptor::for_center(&cfg, &entry, crate::now_ms()))
+        Ok(descriptor::for_center(
+            &cfg,
+            &entry,
+            crate::now_ms(),
+            self.shared.confined(),
+        ))
     }
 
     fn describe(&self, p: &Map<String, Value>) -> Result<Value, RpcError> {

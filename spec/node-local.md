@@ -166,7 +166,8 @@ again.
   `r` and no `w`, a command `x` and no `r`. Where folders nest, the deepest
   one that holds a path decides for it. Commands are confined where the
   platform can confine them. Windows has no file confinement for commands
-  yet, so there folder mode refuses every command, and only `allowlist` and
+  yet, so there folder mode refuses every command and offers no `exec`
+  action (unless the sudo allow list has an entry), and only `allowlist` and
   `user` run them, each owned by its Job Object but not confined. `allow` rules do not count. On Linux a command
   reads the system folders and its `r` folders, writes its `w` folders and
   runs programs from the system folders and its `x` folders (Landlock), each
@@ -220,9 +221,16 @@ path, the capability for another action). They only add a rule to a list;
 rules can be written by hand as well (`nerve-node config add
 center.<name>.policy.allow '<rule>'`).
 
-In `allowlist` mode a command with `; & | $ \` ( ) < >` or a line break is
-covered only by an allow rule that names the whole line, never by a wildcard:
-such commands run unconfined, and `git *` must not cover `git x; rm -rf ~`.
+In `allowlist` mode a command with `; & | $ \` ( ) < > @ { } % ' " # , \`,
+a line break or another control character, or with a word that starts
+another shell or runs a string as code (`powershell`, `pwsh`, `cmd`, `sh`,
+`bash`, `iex`, `Invoke-Expression`, `Invoke-Command`, `start`,
+`Start-Process`, `eval`, `-Command`, `-EncodedCommand`, `-File`, `/c`,
+`/k`, without case and `.exe`) is covered only by an allow rule that names
+the whole line, never by a wildcard: such commands run unconfined, `git *`
+must not cover `git x; rm -rf ~`, and `echo *` must not cover PowerShell's
+`echo @{a=<command>}`, which runs the command. A wildcard rule therefore
+covers plain words only; a Windows path with `\` needs an exact rule or `/`.
 
 ## 3. Deciding a call
 
@@ -237,8 +245,13 @@ answer. For each call the node takes the center's policy and, in this order:
    (absolute, or from `~/`, `$HOME/`, `${HOME}/`). The line is compared
    without case, with `\` and `/` alike on Windows, with `seg/..` and
    doubled separators folded, with the home in each shell's spelling (also
-   `$env:USERPROFILE` and `%USERPROFILE%` on Windows) and with relative
-   words taken from the working directory (`..\node-config`). A path a
+   `$env:USERPROFILE`, `%USERPROFILE%` and `%HOMEDRIVE%%HOMEPATH%` on
+   Windows) and with relative words taken from the working directory
+   (`..\node-config`). Each path segment is matched as a shell wildcard
+   (`node-st*`, `node-s?ate`, `[...]`); on Windows a segment with an 8.3
+   short name (`NODE-S~1`) stands for any name, an admin share
+   (`\\localhost\C$\...`, any host) for its drive, and a path without a
+   drive (`\Users\...`) for that path on every drive. A path a
    command builds at run time (`cd ~/.config; cat nerve/node.toml`) is not
    seen there; in `folder` mode Landlock keeps the command out all the
    same, while a `user` mode command runs as the user, unconfined.
@@ -258,7 +271,9 @@ answer. For each call the node takes the center's policy and, in this order:
    also holds `%ProgramData%\ssh` (the OpenSSH server's config, host keys
    and `administrators_authorized_keys`), `%SystemRoot%\System32\config`
    (the registry hives with the password hashes) and the user's
-   `NTUSER.DAT`.
+   `NTUSER.DAT`. Protected paths apply to the file actions and to the
+   working directory of a command, not to what a command reads; in `user`
+   mode a command runs as the user without a sandbox (issue #22).
 
 Every refusal names its reasons in the error and in the audit log.
 

@@ -80,6 +80,61 @@ pub fn sudo_command(command: &str) -> Option<&str> {
 /// Characters that chain, substitute or redirect in a shell.
 const SHELL_CONTROL: &[char] = &[';', '&', '|', '$', '`', '(', ')', '<', '>', '\n', '\r'];
 
+/// Characters besides [`SHELL_CONTROL`] that open an expression, a script
+/// block, a variable, a quote, a comment, an array or an escape in sh,
+/// PowerShell or cmd. A wildcard cannot tell what the shell makes of them
+/// (PowerShell runs the value of `@{a=...}`), so it does not cover a line
+/// with one of them.
+const EXPRESSION: &[char] = &['@', '{', '}', '%', '\'', '"', '#', ',', '\\'];
+
+/// Words that start another shell or run a string as code, compared without
+/// case and without a `.exe`: a wildcard on the rest of a line cannot say
+/// what such a word is handed.
+const INNER_COMMAND: &[&str] = &[
+    "powershell",
+    "pwsh",
+    "cmd",
+    "iex",
+    "invoke-expression",
+    "invoke-command",
+    "icm",
+    "start",
+    "start-process",
+    "saps",
+    "start-job",
+    "-command",
+    "-encodedcommand",
+    "-enc",
+    "-ec",
+    "-file",
+    "-commandwithargs",
+    "/c",
+    "/k",
+    "sh",
+    "bash",
+    "eval",
+];
+
+/// Whether a wildcard rule may cover the command line `line`: one plain
+/// command of printable characters, with no character of
+/// [`SHELL_CONTROL`] or [`EXPRESSION`] and no word of [`INNER_COMMAND`].
+/// Otherwise only a rule that names the line exactly covers it.
+fn plain_command(line: &str) -> bool {
+    // Control characters, the Unicode line breaks and the typographic quotes
+    // PowerShell reads as quotes.
+    let odd =
+        |c: char| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{2018}'..='\u{201F}');
+    if line.contains(SHELL_CONTROL) || line.contains(EXPRESSION) || line.contains(odd) {
+        return false;
+    }
+    !line.split_whitespace().any(|w| {
+        let w = w.to_lowercase();
+        let name = w.rsplit('/').next().unwrap_or(&w);
+        let name = name.strip_suffix(".exe").unwrap_or(name);
+        INNER_COMMAND.contains(&w.as_str()) || INNER_COMMAND.contains(&name)
+    })
+}
+
 fn inside_folder<'f>(folders: &'f [Folder], path: &Path) -> Option<&'f Folder> {
     // The deepest folder wins, so a read-only folder inside a read-write one
     // stays read-only.
@@ -239,8 +294,9 @@ fn by_allow_rules(
     let allow = RuleSet::new(&policy.allow, env.home);
     for t in targets {
         // Commands run unconfined here, so a wildcard must not cover a second
-        // command chained on: only a rule that names the line exactly does.
-        let chained = call.command.is_some() && t.contains(SHELL_CONTROL);
+        // command chained on or an expression the shell runs: only a rule
+        // that names the line exactly does.
+        let chained = call.command.is_some() && !plain_command(t);
         let found = if chained {
             allow.find_exact(call.cap, call.action, t)
         } else {
@@ -249,7 +305,7 @@ fn by_allow_rules(
         if found.is_none() {
             reasons.push(if chained && allow.find(call.cap, call.action, t).is_some() {
                 format!(
-                    "{} chains commands (; & | $ ` ( ) < > or a line break); only an allow rule that names it exactly covers that",
+                    "{} chains commands or holds an expression (; & | $ ` ( ) < > @ {{ }} % ' \" # , \\, a line break, or a word such as powershell, cmd, iex or -Command); only an allow rule that names it exactly covers that",
                     name(call, t)
                 )
             } else {
@@ -1047,6 +1103,71 @@ mod tests {
         p.allow = vec![crate::rules::rule_for("exec", "run", "rm *", false).unwrap()];
         assert_eq!(run(&p, &env, &c("rm *")), "allow");
         assert_eq!(run(&p, &env, &c("rm -rf /")), "refused");
+    }
+
+    /// The Windows review of PR #19, round 2, finding 1: a wildcard allow
+    /// covers one plain command only. Each character class that can open a
+    /// second command or a sub-expression in sh, PowerShell or cmd, and each
+    /// word that runs a string as code, needs a rule that names the line.
+    #[test]
+    fn a_wildcard_allow_covers_no_expression_or_inner_command() {
+        let x = T::new();
+        let env = x.env(true);
+        let e = t("/w/ro", false);
+        let c = |cmd| call(Effect::Execute, &e, Some(cmd));
+        let mut p = policy(Mode::Allowlist);
+        p.allow = rules(&["exec.run:echo *"]);
+        assert_eq!(run(&p, &env, &c("echo hello")), "allow");
+        assert_eq!(run(&p, &env, &c("echo hello world-2.txt")), "allow");
+        let refused = |cmd: &str| {
+            let d = decide(&p, &env, &call(Effect::Execute, &e, Some(cmd)));
+            assert!(
+                matches!(&d, Decision::Forbidden(m) if m.contains("exactly")),
+                "{cmd:?}: {d:?}"
+            );
+        };
+        // The report's payload.
+        refused("echo @{a=powershell -EncodedCommand AAAA}");
+        // One line per character class.
+        for cmd in [
+            "echo @{a=1}",
+            "echo @(1)",
+            "echo {a}",
+            "echo a}",
+            "echo %PATH%",
+            "echo 'a'",
+            "echo \"a\"",
+            "echo a #b",
+            "echo a,b",
+            "echo a\\b",
+            "echo a && b",
+            "echo a || b",
+            "echo $(a)",
+            "echo a\tb",
+            "echo a\u{2028}b",
+            "echo \u{201C}a\u{201D}",
+        ] {
+            refused(cmd);
+        }
+        // Words that start another shell or run a string as code.
+        for cmd in [
+            "echo powershell",
+            "echo -EncodedCommand AAAA",
+            "echo -Command x",
+            "echo -File x.ps1",
+            "echo iex",
+            "echo Invoke-Expression",
+            "echo start x",
+            "echo Start-Process x",
+            "echo cmd /c x",
+            "echo PWSH.EXE",
+        ] {
+            refused(cmd);
+        }
+        // A rule that names the line exactly still covers it.
+        p.allow
+            .push(crate::rules::rule_for("exec", "run", "echo @{a=1}", false).unwrap());
+        assert_eq!(run(&p, &env, &c("echo @{a=1}")), "allow");
     }
 
     /// A Windows node in `user` mode: the OpenSSH server's key list and the

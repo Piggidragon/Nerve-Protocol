@@ -78,5 +78,9 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
 - The own-folder check on command lines also sees `C:/…`, `~\`, `$HOME\`, `$env:USERPROFILE\`, `%USERPROFILE%\`, quoted names, `seg/..` and paths relative to the working directory (`..\node-config`).
 - The policy tests (decision, rules, protected paths, path parsing) run on Windows too; the one link test that needs the control socket is Unix only.
 - After a change no running node was told of (no daemon, or Windows, which has no control socket), the CLI says it takes effect at the next start of the node, and `status` on Windows no longer claims the node is not running.
+- A wildcard allow rule on `exec.run` no longer covers a line with `@ { } % ' " # , \`, a control character, or a word that starts another shell or runs a string as code (`powershell`, `cmd`, `iex`, `-EncodedCommand`, ...), so `echo *` cannot run `echo @{a=<command>}` in PowerShell; such a line needs an exact rule.
+- The own-folder check on command lines also sees wildcards in a name (`node-st*`, `node-s?ate`), and on Windows 8.3 short names (`NODE-S~1`), admin shares (`\\localhost\C$\...`), paths without a drive (`\Users\...`) and `%HOMEDRIVE%%HOMEPATH%`.
+- Folder mode on a machine that cannot confine commands (Windows) no longer offers `exec_run` and `exec_signal`, unless the sudo allow list has an entry.
+- The docs say that protected paths bind the file actions and a command's working directory, not what a `user` mode command reads (issue #22).
 - A command rule with a `\` matches on Windows: before, globset turned the command's `\` into `/` and the rule's not, so such a deny rule denied nothing.
 - On Windows each command runs in a Job Object of its own: a cancel, a timeout, `exec.signal`, the session's end or the node's own end ends every process the command started, however deep (not one WMI, a service or the task scheduler starts for it); folder mode still runs no command there.

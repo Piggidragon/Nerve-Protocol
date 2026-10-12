@@ -14,8 +14,8 @@ Two programs:
 - **`nerve-node`**, the node. A daemon on each machine plus a headless CLI for
   pairing, policy and the audit log.
 
-The protocol is in [`spec/`](spec/README.md), JSON Schemas in `schemas/`, the
-conformance suite in `crates/nerve-conformance`.
+The protocol is in [`spec/`](spec/README.md), JSON Schemas in [`schemas/`](schemas/), the
+conformance suite in [`crates/nerve-conformance`](crates/nerve-conformance).
 
 ## Build
 

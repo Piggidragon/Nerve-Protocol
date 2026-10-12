@@ -1,6 +1,6 @@
 # Nerve architecture
 
-Status: design for the rewrite, 2026-10-11. Nothing here is implemented. It replaces the Pithagoras-Sync design (`pithagoras-sync` 0.0.1 and 0.0.2, its `docs/protocol.md` and `docs/permissions.md`) as the basis of new work, and it takes no code, names or wire format from it unless this page says so.
+Status: the design behind 0.0.1, written before the code. Where this page and `spec/` differ, `spec/` describes what 0.0.1 does; the points that changed are marked "0.0.1:" below. It replaces the Pithagoras-Sync design (`pithagoras-sync` 0.0.1 and 0.0.2, its `docs/protocol.md` and `docs/permissions.md`) as the basis of new work, and it takes no code, names or wire format from it unless this page says so.
 
 The words MUST, SHOULD and MAY are used as in RFC 2119. Section 11 lists what is decided and what comes later, with its version.
 
@@ -53,21 +53,21 @@ Two network-facing interfaces in 0.0.1, one message layer (§4.5):
 | Interface | Between | Carries |
 |---|---|---|
 | Node link | node → center, over the network | descriptor, invokes, events, state, reliable streams, settings |
-| Harness interface | harness → center's MCP server, local | tools from descriptors, session grants |
+| Harness interface | harness → center's MCP server, local | tools from descriptors, session grants (0.0.1: no session grants, §5.5) |
 
 The node's local interface (§7.2) is part of the node, not of the wire spec, in 0.0.1. When the desktop add-on comes, its attach part becomes a third interface in the spec (§11).
 
-The spec is versioned as a whole (§9). Profiles (`nerve:fs/1`, `nerve:exec/1`, ...) are versioned one by one.
+The spec is versioned as a whole (§9). Profiles (`nerve:fs/1`, `nerve:exec/1`, ...) are versioned one by one. 0.0.1: the node names its profiles plainly (`fs`, `exec`, ...), with no version (spec/protocol.md §6).
 
 Conformance suite (0.0.1):
 
 | Part | Runs against | Checks |
 |---|---|---|
 | node | any node | handshake, describe at three levels, schema validation, deadlines, cancel, errors, events and implicit events, reliable streams, limits, strict parsing of center input, per-center isolation |
-| center | any center | pairing, challenge auth, one live link per node, descriptor cache by `rev`, center-side rules (a refused call is never sent), refusal to send fields only the node may set, session end |
+| center | any center | pairing, challenge auth, one live link per node, descriptor cache by `rev`, center-side rules (a refused call is never sent; 0.0.1: the center has none, §5.5), refusal to send fields only the node may set, session end |
 | harness | the center's MCP server surface | one session per connection, `session.end`, tool generation from descriptors |
 
-An `echo` node with toy capabilities (every member kind, no hardware) gives the suite something to run against, and a matching `echo` harness drives the center part. Conformance levels: **Core** (describe, invoke, errors), **Reactive** (events, state, subscriptions) in 0.0.1; **Media** (media streams) later with the desktop add-on.
+An `echo` node with toy capabilities (every member kind, no hardware) gives the suite something to run against, and a matching `echo` harness drives the center part. 0.0.1: the harness part is a skeleton that runs no check (spec/conformance.md). Conformance levels: **Core** (describe, invoke, errors), **Reactive** (events, state, subscriptions) in 0.0.1; **Media** (media streams) later with the desktop add-on.
 
 ### 2.2 Nerve center
 
@@ -77,12 +77,11 @@ One daemon, `nerve-center`, written once in Rust: the center is the gate for rem
 - the paired nodes: id, name, public key, last descriptor (cached by `id` + `rev`), online state;
 - pairing codes;
 - the registered harnesses and their tokens;
-- its own rules (§5.5);
-- sessions: which harness session may use which nodes (grants);
+- sessions;
 - statistics per node, counts and timings only (§7.1);
 - for each node that gave it write rights, a copy of that node's settings document (§5.2).
 
-It has a terminal (`nerve-center ...`) and a web UI it serves itself (§7.1). It never stores node secrets, command output or file content beyond what a call in flight needs.
+It has a web UI it serves itself (§7.1). 0.0.1: it has no subcommands; every setting is a flag or a variable (spec/harness.md §1). It never stores node secrets, command output or file content beyond what a call in flight needs.
 
 ### 2.3 Nerve node
 
@@ -91,9 +90,9 @@ One daemon, `nerve-node`, Rust, Linux and Windows first, macOS later. It holds:
 - one pairing per center (center URL, pin, center id, the node key for that center);
 - the policy per center entry and the machine settings (§5);
 - the built-in capabilities: `node`, `fs`, `exec`, `settings`, `audit`;
-- the sandbox (Landlock, cgroup scope and exec shim on Linux, Job Object on Windows, the dedicated-user install);
+- the sandbox (Landlock, cgroup scope and exec shim on Linux, Job Object on Windows, the dedicated-user install; 0.0.1: Landlock in the exec shim and `no_new_privs` on Linux only, no cgroup scope, no Job Object, no dedicated-user install);
 - the sudo password, while the sudo switch is on (§5.1);
-- the local interface: a control socket used by the CLI (§7.2).
+- the local interface: a control socket used by the CLI (§7.2; 0.0.1: Unix only).
 
 It runs headless: a server, an LXC, a CI box, a laptop. It is fully configurable on its own, without any center having write rights, and it declares no sensing capability of its own.
 
@@ -110,12 +109,12 @@ One repo, `Piggidragon/Nerve-Protocol`, all Rust:
 | `spec/` | core, node link, harness interface, profiles, conformance levels |
 | `schemas/` | descriptor, settings documents, config files, as JSON Schema |
 | `crates/nerve-proto` | types and codecs, no I/O, `no_std` + `alloc` capable |
-| `crates/nerve-transport` | WebSocket, unix socket and named pipe, stdio |
+| `crates/nerve-transport` | WebSocket, unix socket and named pipe, stdio (0.0.1: no named pipe) |
 | `crates/nerve-policy`, `crates/nerve-sandbox` | the node's policy engine and sandbox |
 | `crates/nerve-node`, `crates/nerve-center` | the two binaries (the center with its web UI built in, and its MCP server surface) |
-| `crates/nerve-conformance` | the conformance runner, `nodes/echo`, `harnesses/echo` |
+| `crates/nerve-conformance` | the conformance runner, `nodes/echo`, `harnesses/echo` (0.0.1: no runner binary; `cargo test -p nerve-conformance` runs the parts, spec/conformance.md) |
 
-A wire change, its spec text and both ends land in one PR. Ships: `nerve-center` package, `nerve-node` package, the conformance runner.
+A wire change, its spec text and both ends land in one PR. Ships: `nerve-center` package, `nerve-node` package, the conformance runner (0.0.1: no runner binary).
 
 `Piggidragon/Nerve-Desktop` is a later, separate repo (§11). It will depend on `nerve-proto` and `nerve-transport` by release tag and talk only to the local node.
 
@@ -123,16 +122,16 @@ A wire change, its spec text and both ends land in one PR. Ships: `nerve-center`
 
 ### 3.1 Identity
 
-- **Center**: a random id (UUID) and a name, both fixed at `nerve-center init`; its TLS key, whose SPKI sha256 (base64url, no padding) is the pin.
-- **Node**: an Ed25519 key pair **per center**, generated at pairing, kept in the OS keyring where one is usable and otherwise in a 0600 file. The node id a center knows is derived from that public key (base32 of the first 16 bytes of its sha256). Two centers see two unrelated ids for the same machine, so centers cannot correlate a node across trust domains.
+- **Center**: a random id (UUID) and a name, both made on its first start (0.0.1 has no `nerve-center init`; the name comes from `--name` and can be changed in the web UI); its TLS key, whose SPKI sha256 (base64url, no padding) is the pin.
+- **Node**: an Ed25519 key pair **per center**, generated at pairing, kept in a 0600 file (0.0.1: always `keys/<name>.key` in the config folder; the keyring is not done, spec/node-local.md §1). The node id a center knows is derived from that public key (base32 of the first 16 bytes of its sha256). Two centers see two unrelated ids for the same machine, so centers cannot correlate a node across trust domains.
 - **Node name**: chosen on the node (default from the host name, 1 to 32 of `a-z0-9-`), shown by the center; the center may give it a local display name, which never goes back to the node.
-- **Harness**: a name and a token issued by `nerve-center harness add <name>`; the token is local to the center host (§6.1).
+- **Harness**: a token, from `--harness-token` or made in the web UI's settings (0.0.1 has no `nerve-center harness add`); the token is local to the center host (§6.1).
 
 There is no bearer token for nodes. A copied config without the private key cannot connect, and a copied key is detected by the one-link rule (§3.4).
 
 ### 3.2 Pairing
 
-1. On the center: `nerve-center pair new [--name laptop]` (or "Add node" in the web UI) creates a one-time code (10 minutes unless the owner set another lifetime up to 24 hours, 10 tries, single use) and shows a link as text and QR:
+1. On the center: "Add node" in the web UI (0.0.1 has no `nerve-center pair new`) creates a one-time code (10 minutes unless the owner set another lifetime up to 24 hours, 10 tries, single use) and shows the link and the code as text (no QR code in 0.0.1):
    `nerve://pair?center=<pct-encoded https URL>&code=<code>&pin=<spki>`
 2. On the node: `nerve-node center add '<link>'`. The link is parsed strictly (unknown or doubled keys, bad escapes, paths with `.`/`..` segments, user info, query or fragment in the URL, and links over 4 KiB are refused). The owner sees the parsed center URL, the center name after step 3, and the policy and grant the new center entry starts with (default deny, so every call is refused until an allow rule or a mode allows it, and `settings = off`, §5.1, §5.2), and confirms. Nothing is stored before the confirmation.
 3. The node generates the key pair for this center and sends `POST {center}/nerve/v0/pair` with `{code, name, platform, arch, public_key}` over TLS checked against the pin.
@@ -140,7 +139,7 @@ There is no bearer token for nodes. A copied config without the private key cann
 
 `pin` is optional: without it the system roots and the usual name checks apply (a center behind a reverse proxy with a public certificate). `http://` is accepted only for loopback, with a same-user listener check on Linux.
 
-Unpairing works from both sides. `nerve-node center rm` tells the center (`bye` reason `unpaired`) and deletes the key; `nerve-center node remove <node>` closes the link with `revoked` and drops the key; a node told `revoked` stops dialling that center.
+Unpairing works from both sides. `nerve-node center rm` tells the center (`bye` reason `unpaired`) and deletes the key; removing the node in the center's web UI (0.0.1 has no `nerve-center node remove`) closes the link with `revoked` and drops the key; a node told `revoked` stops dialling that center.
 
 ### 3.3 Who dials
 
@@ -237,6 +236,7 @@ Shared and device-only are the machine settings (§5.3) and the limits that prot
 }
 ```
 
+- 0.0.1: `profile` is the plain name (`fs`, `exec`), `exposure` is `on` or `off`, and `rev` is an integer (spec/protocol.md §6).
 - `nerve` is the protocol version (§9). `provider` says which process serves the capability; in 0.0.1 always `node`. The field exists so later attached providers (desktop add-on) fit without a format change.
 - The descriptor a center receives is filtered by that center's policy: capabilities `hidden` for it are absent, `off` ones are listed with `exposure: "off"`. In default deny (`allowlist` mode) an `fs` or `exec` action is also absent unless an allow rule covers its capability and action (`exec.run` too when the sudo allow list has an entry), so the center builds no tool the node would refuse; `folder` and `user` mode show their actions as before.
 - The top-level `summary` is generated by the node from facts the model needs (user, shell, mode, folders) and stays under 60 words.
@@ -252,7 +252,7 @@ Shared and device-only are the machine settings (§5.3) and the limits that prot
 | `actuate` | Acts on the outside world or injects input | send a signal, click, type |
 | `execute` | Runs code the center chose | run a command |
 
-The node's policy maps modes and rules onto effects (Folder mode allows `read` inside folders flagged `r`, `write` inside folders flagged `w` and `execute` in folders flagged `x`; `sense` and `actuate` are refused in Folder and User mode unless the owner set the action `on`, and in default deny unless an allow rule names them). The center MAY refuse effects per harness by its own rules (§5.5).
+The node's policy maps modes and rules onto effects (Folder mode allows `read` inside folders flagged `r`, `write` inside folders flagged `w` and `execute` in folders flagged `x`; `sense` and `actuate` are refused in Folder and User mode unless the owner set the action `on`, and in default deny unless an allow rule names them). The center MAY refuse effects per harness by its own rules (§5.5; not in 0.0.1).
 
 ### 4.5 Messages
 
@@ -301,30 +301,32 @@ Big-endian integers. `seq` counts per id and direction from 0. Backpressure: eac
 | `settings` | `nerve:settings/1` | state `document`; action `set` (`write`, with `if_version`); present only for a center with `settings = write` (§5.2) |
 | `audit` | `nerve:audit/1` | event `decision` (needs `sub`) |
 
+0.0.1: the profile column is sent as the plain name (`node`, `fs`, `exec`, `settings`, `audit`).
+
 Profiles for the desktop add-on (computer use, notifications, audio) are defined with it, later.
 
 ### 4.8 How a center uses descriptors
 
-- On `welcome` it describes at `summary`, caches by id and `rev`, and subscribes to what its UI needs (`audit/*`).
+- On `welcome` it describes at `summary` (0.0.1: at `full`, spec/protocol.md §4.2), caches by id and `rev`, and subscribes to what its UI needs (`audit/*`).
 - It builds tools for harnesses from actions (§6): name, description from `summary`, input schema from `params`, a `node` argument when several nodes offer the same profile.
 - It keeps only summaries in a harness's context; full schemas are fetched when a tool is first called or listed in detail.
-- It uses `effect` for its own rules (§5.5) and `exposure` to tell a harness which capabilities are open or off for it.
+- It uses `effect` for its own rules (§5.5; 0.0.1: it has none, and `effect` sets `readOnlyHint`) and `exposure` to tell a harness which capabilities are open or off for it.
 - It does not interpret a profile it does not know: such capabilities are still offered from their schemas.
 
 ## 5. Permissions
 
 ### 5.1 Where policy lives
 
-**The node is the authority** for everything that runs on it. Every invoke is decided by the node's policy for the calling center entry, whatever the center says. The center holds a second, separate policy for its own side: which harness sessions may reach which nodes, and which effects it refuses before it even sends the call (§5.5). The center can make a call stricter; it can never make the node more permissive, except by changing node settings where the owner gave it write rights (§5.2).
+**The node is the authority** for everything that runs on it. Every invoke is decided by the node's policy for the calling center entry, whatever the center says. The center may later hold a second, separate policy for its own side: which harness sessions may reach which nodes, and which effects it refuses before it even sends the call (§5.5; 0.0.1: the center holds no policy of its own). The center can make a call stricter; it can never make the node more permissive, except by changing node settings where the owner gave it write rights (§5.2).
 
 Node policy per center entry:
 
 - `mode`: `allowlist` (the default: default deny, a call runs only when an allow rule lets it through), `folder` (full access inside the granted folders and below; commands only in folders flagged `x`; shell under Landlock) or `user` (full access as the user, protections still on). Folder and User are the full-access modes. Sudo is not a mode; it is a separate switch below. Folder and User have no time limit by default: once set they stay until the owner changes them. A limit is opt-in (`until`, a time; `nerve-node mode set user --for HOURS`): when it runs out, the center falls back to `allowlist`, the default deny mode, not to `folder`.
-- `folders`: a path and `access`, three independent flags `r` (read), `w` (write) and `x` (run commands from the folder), in any combination: `access = "rx"`, `""` for none. `r` and `w` decide the `fs` actions (a write needs `w` and no `r`, a read `r` and no `w`); `x` decides where a command may run and which programs the sandbox lets it start. The deepest folder that holds a path decides for it. They count in Folder mode. On Linux each flag has its own Landlock set; a `w` folder is writable but not readable or listable, and Landlock cannot run a file it may not read, so an `x` folder also lets a command read its files by name (it still cannot list the folder; node-local §3).
+- `folders`: a path and `access`, three independent flags `r` (read), `w` (write) and `x` (run commands from the folder), in any combination: `access = "rx"`, `""` for none. `r` and `w` decide the `fs` actions (a write needs `w` and no `r`, a read `r` and no `w`); `x` decides where a command may run and which programs the sandbox lets it start. The deepest folder that holds a path decides for it. They count in Folder mode. On Linux each flag has its own Landlock set; a `w` folder is writable but not readable or listable, and Landlock cannot run a file it may not read, so an `x` folder also lets a command read its files by name (it still cannot list the folder; node-local §2, Modes).
 - `caps.<cap>[.<action>] = "on" | "off" | "hidden"`: switches per capability and action, derived from the descriptor.
 - `allow` and `deny` rules for every action, as globs over the call's target: the command line of `exec.run`, the path of an `fs` action, `<cap>.<action>` for any other (node-local §2). A rule adds only; the four buttons of the center's audit view write them (allow, allow as wildcard, deny, deny as wildcard), and they can be written by hand. Allow rules count in default deny only; in Folder and User mode they change nothing. Deny rules count in every mode, and a matching deny wins over everything.
 - protected paths (built in plus `extra`, minus the ones the owner released).
-- the sudo switch, one per node, not per center entry (Linux): `off` or `on`. Off, the agent cannot run `sudo`, even if the sudo allow list names the command, because the node has no sudo password. On, the agent may run `sudo <command>` only for commands the sudo allow list (`sudo_allow`, separate from the normal allow list) names, in every mode; deny rules still apply to it. The password is entered when the switch is turned on and stored on the node (memory by default, or encrypted at rest per `machine.secret_storage`); the agent never sees it and it is scrubbed from every outgoing frame. Turning the switch on sends the password once from the client that sets it (CLI on the node, or a center with `write`, §5.2) to the node, encrypted end to end with the node's key from pairing, with nonce and timestamp against replay (§11); a center relays only the ciphertext and keeps no copy. The node checks the password against the real system password with a non-destructive `sudo` check it runs itself (for example `sudo -S -v`, output discarded), and refuses to switch on if it is wrong (`invalid_args`, the message says the password is wrong): a wrong password would give the agent nothing, so the switch never shows `on` without a working password. Switching off needs no password and drops the stored one.
+- the sudo switch, one per node, not per center entry (Linux): `off` or `on`. Off, the agent cannot run `sudo`, even if the sudo allow list names the command, because the node has no sudo password. On, the agent may run `sudo <command>` only for commands the sudo allow list (`sudo_allow`, separate from the normal allow list) names, in every mode; deny rules still apply to it. The password is entered when the switch is turned on and kept in the node's memory only (`secret_storage` at rest is not done in 0.0.1); the agent never sees it and it is scrubbed from every outgoing frame. Turning the switch on sends the password once from the client that sets it (CLI on the node, or a center with `write`, §5.2) to the node, sealed to a fresh X25519 key that the node signs with its pairing key, with nonce and timestamp against replay (spec/protocol.md §7.4.1, §11); a center relays only the ciphertext and keeps no copy. The node checks the password against the real system password with a non-destructive `sudo` check it runs itself (for example `sudo -S -v`, output discarded), and refuses to switch on if it is wrong (`invalid_args`, the message says the password is wrong): a wrong password would give the agent nothing, so the switch never shows `on` without a working password. Switching off needs no password and drops the stored one.
 - the `settings` grant (§5.2).
 
 The node and the center allow only through rules, and the default is deny. A decision is allowed or forbidden, nothing else: a call that no rule allows is refused at once (§5.4).
@@ -344,7 +346,7 @@ Only what the node owner granted, per center entry, on the node:
 
 A node is fully configurable without any center having `write`: every setting is reachable through the node's local interface (§7.2).
 
-`settings.set` takes the whole document and `if_version`; a stale version is `conflict`. Each changed setting is audited on the node with old and new value and "by center <name>". A change to a client-only item (§5.3) is refused as a whole. Remote writes never touch another center's entry or the machine settings, except the sudo switch above. Because `write` can widen the rules up to User mode, a compromised center with `write` is as strong as User mode on that node; the pairing confirmation says so (§3.2).
+`settings.set` takes the whole document and `if_version`; a stale version is `conflict`. Each changed setting is audited on the node with old and new value and "by center <name>". A change to a client-only item (§5.3) is refused as a whole. Remote writes never touch another center's entry or the machine settings, except the sudo switch above. Because `write` can widen the rules up to User mode, a compromised center with `write` is as strong as User mode on that node; `nerve-node center grant` should say so (0.0.1: it does not yet).
 
 ### 5.3 Client-only items
 
@@ -354,7 +356,7 @@ Decided and executed on the node only. They are not in any document a center rea
 2. The `settings` grant itself, per center entry.
 3. `panic` and `unlock` (a center with `write` may pause; only the node unlocks).
 4. The machine settings: `machine.shell`, `machine.allow_root`, `machine.sudo_path`, `machine.secret_storage`, the sandbox backend and confinement fallbacks.
-5. The sudo password: it is never in a document a center reads and never returned by any message. It is kept on the node (memory by default) and scrubbed from every outgoing frame. The only way a center takes part is turning the sudo switch on with the password, which the node verifies and the center does not keep (§5.1, §5.2; open point in §11), or turning it off.
+5. The sudo password: it is never in a document a center reads and never returned by any message. It is kept in the node's memory only (`secret_storage` at rest is not done in 0.0.1) and scrubbed from every outgoing frame. The only way a center takes part is turning the sudo switch on with the password, which the node verifies and the center does not keep (§5.1, §5.2; open point in §11), or turning it off.
 6. Key and secret storage (keyring or file).
 7. Proxy settings and proxy credentials.
 8. Updates: channel, key, when to update (the node never updates on a center's request).
@@ -370,19 +372,18 @@ Every invoke from center C, session S is decided by the node's policy for C, and
 3. Every decision, allowed and refused, is audited on the node with center and session, and reaches a subscribed center as an `audit/decision` event.
 4. Rules are added on the node (`nerve-node rule add allow|deny|sudo`, `folder`, `cap set`, `config add`) or, for a center with `settings = write`, through the center (the four audit tab buttons, §11 item 9a).
 
-The center decides the same way for its own rules (§5.5): it refuses a call before sending it, and never allows what the node would not.
+Later, the center decides the same way for its own rules (§5.5): it refuses a call before sending it, and never allows what the node would not. In 0.0.1 it has no such rules.
 
 ### 5.5 Center-side policy
 
-- **Session grants**: a harness session sees only nodes granted to it (by the harness, the owner in the center UI, or a harness default set in the center). Tools for other nodes are not offered and calls for them are refused at the center.
-- **Center rules per effect and harness**: e.g. `execute` from a given harness is refused at the center unless a center rule permits it. These rules apply at the center only and never reach the node.
-- **Full access is never a default**: the node starts every center entry in default deny (mode `allowlist`, no rule); nothing a center or harness does changes that without the owner (directly, or through a `write` grant the owner gave).
+- **Not in 0.0.1: session grants and center rules.** Every harness session sees every paired node that is not disabled, and the center sends every call on to the node, whose policy decides (spec/harness.md §6). Per-session grants and per-effect rules at the center come later (§11).
+- **Full access is never a default**: the node starts every center entry in default deny (mode `allowlist`, no rule). Nothing a center or harness does changes that unless the owner allows it directly, or through a `write` grant the owner gave.
 
 ## 6. Harness integration
 
 ### 6.1 Harness interface
 
-The integration form is MCP, and only MCP in 0.0.1 (decided). The center's MCP server surface (§6.3) is this interface as seen by an MCP client; Beneath the MCP surface the center keeps the harness role of the message layer, reached over a local binding: a unix socket (Linux, macOS) or named pipe (Windows) owned by the center's user, or a loopback WebSocket for harnesses in other environments. The same JSON-RPC message layer, role `harness`. Auth: a harness token from `nerve-center harness add <name>`, sent in `hello` together with the features the client implements (`tools`). A harness running on another host than the center is not in 0.0.1.
+The integration form is MCP, and only MCP in 0.0.1 (decided). The center's MCP server surface (§6.3) is this interface as seen by an MCP client; Beneath the MCP surface the center keeps the harness role of the message layer, reached over a local binding: a unix socket (Linux, macOS) or named pipe (Windows) owned by the center's user, or a loopback WebSocket for harnesses in other environments. The same JSON-RPC message layer, role `harness`. Auth: a harness token (`--harness-token`, or made in the web UI), sent in `hello` together with the features the client implements (`tools`). A harness on another host than the center reaches it over HTTP MCP with TLS and a token. 0.0.1: only the MCP surface exists (spec/harness.md); the message-layer methods below are the design behind it.
 
 Methods the center offers to a harness:
 
@@ -392,7 +393,7 @@ Methods the center offers to a harness:
 | `tools.list {session}` | Tools generated from descriptors for the nodes granted to the session (§6.2) |
 | `describe {node, cap}` | Full detail for one capability |
 | `invoke {node, cap, action, args, session}` | Run an action; the center adds `ctx`, applies its own policy, forwards to the node |
-| `session.grant {session, nodes}`, `session.end {session}` | Grants per harness session; `end` reaches every node used |
+| `session.grant {session, nodes}` (later), `session.end {session}` | Grants per harness session (later, §5.5); `end` reaches every node used |
 | event `nodes.changed` | So the client can refresh tools |
 
 The reverse direction (a harness offering sessions, prompts and replies for a chat window or voice) is not in 0.0.1. It comes with the desktop add-on (§11).
@@ -408,11 +409,11 @@ The reverse direction (a harness offering sessions, prompts and replies for a ch
 
 ### 6.3 MCP server surface (0.0.1)
 
-The center exposes the protocol as an MCP server. Any MCP-capable harness connects to it with a harness token (`nerve-center harness add <name>`) and needs no code of its own. It is part of `nerve-center`, not a separate process, and maps §6.2 onto MCP `tools/list`, `tools/call` and `tools/list_changed`. The transport (a local stdio launch of the center or a loopback HTTP endpoint) is settled in its issue. It is the lowest common denominator, with known limits:
+The center exposes the protocol as an MCP server. Any MCP-capable harness connects to it (it starts the center over stdio, or reaches it over HTTP with a harness token) and needs no code of its own. It is part of `nerve-center`, not a separate process, and maps §6.2 onto MCP `tools/list`, `tools/call` and `tools/list_changed`. The transport is a stdio launch of the center or an HTTP endpoint (`--mcp stdio|http`, spec/harness.md §3). It is the lowest common denominator, with known limits:
 
 - one session per MCP connection (the surface cannot see the harness's chats);
 - a call that no rule allows is refused at once with `forbidden` and a message the model can pass on;
-- the center's default for such a harness: `execute` and `actuate` are refused at the center until a center rule permits them.
+- the center refuses nothing of its own in 0.0.1; every refusal comes from the node's policy.
 
 ### 6.4 What an MCP client must do
 
@@ -428,38 +429,36 @@ A harness carries no Nerve security logic: the node decides, the center routes. 
 
 ### 7.1 Center web UI
 
-Served by `nerve-center` itself (assets built into the binary, no extra runtime or package), on `127.0.0.1:<port>` by default. Exposing it beyond loopback needs a password set with `nerve-center ui password`; remote use is meant through an SSH tunnel or a reverse proxy. Three areas:
+Served by `nerve-center` itself (assets built into the binary, no extra runtime or package), on `127.0.0.1:<port>` by default. Exposing it beyond loopback needs a harness token, which logs in, and then serves it over TLS (spec/harness.md §7); remote use is also possible through an SSH tunnel or a reverse proxy. Three areas:
 
-- **Node overview**: every paired node with online state, last seen, `going_away` reason, platform, the descriptor summary and per-capability exposure as this center sees it, sessions using the node, and "Add node" (pairing code, link and QR), rename, disable or enable (a disabled node stays paired and connected but is hidden from the agent: no tools, no calls), remove.
+- **Node overview**: every paired node with online state, last seen, `going_away` reason, platform, the descriptor summary and per-capability exposure as this center sees it, sessions using the node, and "Add node" (pairing code and link), rename, disable or enable (a disabled node stays paired and connected but is hidden from the agent: no tools, no calls), remove.
 - **Statistics**: per node and in total, counts and timings only, never content: online time, link drops and reconnects, calls per capability and action, errors by code, calls allowed and refused, call latency. Kept in the center's state file, with a retention the center's config sets.
-- **Settings**: only for nodes whose center entry gives this center `settings = write`. It renders the node's settings document (`nerve:settings/1`), validates against the published schema, sends whole documents with `if_version` and shows the node's refusal reasons. Nodes without `write` show no settings page. The center's own settings (harness tokens, center-side rules, statistics retention) are a separate page.
+- **Settings**: only for nodes whose center entry gives this center `settings = write`. It renders the node's settings document (`nerve:settings/1`), validates against the published schema, sends whole documents with `if_version` and shows the node's refusal reasons. Nodes without `write` show no settings page. The center's own settings (name, harness tokens, statistics retention, pairing code lifetime) are a separate page.
 
-The CLI covers the same ground (`node list`, `stats`, `settings <node> get|set`) for headless hosts.
+0.0.1: the center has no CLI for this; everything is in the web UI.
 
 ### 7.2 Node local interface
 
-The node's control socket (unix socket in the user's state folder, mode 0600, peer credentials checked; named pipe with an owner-only ACL on Windows). It is the node's only way in besides its center links. It offers the settings API (§8.3), status, pairing, `panic`/`unlock`.
+The node's control socket (unix socket in the user's state folder, mode 0600, peer credentials checked; named pipe with an owner-only ACL on Windows; 0.0.1: no named pipe, see below). It is the node's only way in besides its center links. It offers the settings API (§8.3), status, pairing, `panic`/`unlock` (0.0.1: its methods are in spec/node-local.md §5).
 
 In 0.0.1 its only client is `nerve-node` itself (the CLI). Nodes get no web UI. Later clients, on the same socket, with no change to the node link:
 
 - the Slint setup GUI (pairing confirmation, settings, status, audit tab with the four rule buttons for its own node);
 - the Nerve Desktop add-on, which attaches as a capability provider: its capabilities are merged into the node's descriptor with `provider: "nerve-desktop"`, the node applies its own policy per center to every invoke before forwarding it, and nothing of the desktop add-on talks to a center directly.
 
-Commands the node runs for a center cannot change the node's settings through this socket (process-ancestry check on Linux; Windows open, as before).
+Commands the node runs for a center cannot change the node's settings through this socket (process-ancestry check on Linux). 0.0.1: Windows has no socket and no sandbox; the CLI signs node.toml itself, so a command the node runs for a center can change the policy, and the change applies at the next start (spec/node-local.md §5).
 
 ## 8. Installation and configuration
 
 ### 8.1 Center
 
 - Package: one binary, Linux (x86_64, aarch64) and Windows; macOS later.
-- `nerve-center init [--public-url https://host:port]`: config, TLS key and self-signed certificate, center id; prints the pin. Behind a reverse proxy, `public_url` is the proxy's address and pairing links carry no pin (system roots) or the proxy's pin.
-- `nerve-center install`: user service (systemd user unit, Windows logon task) or `--system`.
-- Terminal: `pair new`, `node list|remove|rename`, `harness add|list|remove`, `session list|end`, `stats`, `audit`, `settings <node> get|set`, `ui password`, `status`.
+- 0.0.1: a harness starts it as an MCP server; there are no subcommands, every setting is a flag or a variable (spec/harness.md §1). The first start makes the TLS key, the self-signed certificate and the center id. Behind a reverse proxy, `--public-url` is the proxy's address. Everything else is in the web UI (§7.1).
 
 ### 8.2 Node
 
 - Package: one binary, Linux and Windows. Headless; everything through the CLI in 0.0.1.
-- `nerve-node install` (user service), `nerve-node setup --create-user nerve` (servers: dedicated user, system unit with `Delegate=yes`, folder grants printed as `setfacl` lines).
+- `nerve-node install` (user service), `nerve-node setup --create-user` (servers: dedicated user, system unit with `Delegate=yes`, folder grants printed as `setfacl` lines); not done in 0.0.1, see below.
 - Terminal, noun then verb like docker: `center add|rm|ls|pause|resume|grant settings`, `folder add|set|rm|ls`, `mode set allowlist|folder|user [--for HOURS]`, `rule add|rm allow|deny|sudo <command> [--wildcard]`, `rule ls [allow|deny|sudo]` (no list shows all three), `cap set|ls`, `sudo on|off|status` (`on` asks for the sudo password; the node verifies it and refuses a wrong one; `off` asks for none), `proxy set|rm|ls`, `config get|set|unset|add|remove|accept`, and on their own `run`, `status`, `audit [--denied] [--follow]`, `panic`, `unlock`, `install`, `setup`, `update`, `uninstall`. Folder rights are written like chmod: `folder add <path> +r +w +x` (at least one right is required), `folder set <path> =rw -w +x` (changes apply left to right). Every per-center command takes `--center <name>` and refuses to guess when there are several.
 - In 0.0.1 the commands `install`, `setup`, `update` and `uninstall` exist but only answer "not done in 0.0.1"; the node is started by hand until they land.
 - Pairing is confirmed in the terminal; a `nerve://` link handler and dialogs come with the Slint setup GUI later.
@@ -467,42 +466,13 @@ Commands the node runs for a center cannot change the node's settings through th
 ### 8.3 One source of truth
 
 - Every CLI command that changes a setting (the list is in §8.2) is one of these writers; none edits the file on its own.
-- Each daemon owns exactly one config file (`~/.config/nerve/node.toml`, `~/.config/nerve/center.toml`; `%APPDATA%\nerve\…` on Windows), described by a published JSON Schema.
+- Each daemon owns exactly one config file (`~/.config/nerve/node.toml`, `~/.config/nerve/center.toml`; `%APPDATA%\nerve\…` on Windows), described by a published JSON Schema. 0.0.1: the center keeps no config file, only `state.json` in its state folder (spec/harness.md §8).
 - Every writer goes through the daemon's settings API on its control socket: the CLI, (later) the setup GUI and the desktop add-on, and (through `nerve:settings/1`) a center with `write`. The API takes a whole document with `if_version`, validates it against the schema and the rules (client-only items), writes the file atomically, applies it at once, audits each change with old and new value and notifies listeners. No component writes the file directly; while no daemon runs, the CLI writes it through the same store.
-- The daemon keeps the config in memory and reads the file only at start-up and when the owner asks (`SIGHUP`, `reload` on the socket). Every file the node writes carries an HMAC over its content in its first line, keyed by a secret in the node's state folder (`config.key`, 0600). A file without a matching MAC, a hand edit included, was not written through the owner's path: it is refused and audited, and the old settings stay (at start-up the node does not start). The owner takes such a file after looking at it with `nerve-node config accept` (node-local §1).
-- The node's config and state folders are its own: no call of a center reaches them, whatever its rules, folders or released paths say, and a confined command's Landlock rules leave them out even when a granted folder holds them (node-local §3).
+- The daemon keeps the config in memory and reads the file only at start-up and when the owner asks (`SIGHUP`, `reload` on the socket). Every file the node writes carries an HMAC over its content in its first line, keyed by a secret in the node's state folder (`config.key`, 0600). A file without a matching MAC, a hand edit included, was not written through the owner's path: it is refused and audited, and the old settings stay (at start-up the node does not start). The owner takes such a file after looking at it with `nerve-node config accept` (node-local §1). The check holds while `config.key` does: a process that can delete or read it (a `user` mode command can) can have another file taken at the next start (node-local §1).
+- On Linux, the node's config and state folders are its own (0.0.1: on Windows see §7.2): no call of a center reaches them, whatever its rules, folders or released paths say, and a confined command's Landlock rules leave them out even when a granted folder holds them (node-local §3).
 - The settings document a center reads and the config file are the same structure, minus the client-only sections. There is no second format.
 
-Node config layout:
-
-```toml
-[node]
-name = "laptop"
-
-[machine]              # shared by all centers, client-only
-shell = "/bin/bash"
-allow_root = false
-sudo = "off"           # off | on; the password is never in this file
-secret_storage = "memory"
-
-[limits]
-max_running = 16
-output_cap_bytes = 16777216
-
-[connection]
-proxy = ""
-
-[[center]]
-name = "home"
-url = "https://center.example:8443"
-pin = "…"
-settings = "off"       # off | write
-
-[center.policy]
-mode = "allowlist"      # allowlist | folder | user
-folders = [{ path = "~/src", access = "rwx" }]    # r read, w write, x run commands
-caps = { exec = "on" }
-```
+Node config layout: spec/node-local.md §2, the full file with every key.
 
 Simpler than 0.0.x: no `profile` setting, no `token_storage` (no token), no pi tool switches (capability switches instead), no `portal_policy` (per-center grants), one file per daemon, one settings API.
 
@@ -584,9 +554,10 @@ Kept in substance (re-implemented, not copied): the policy engine's folders, pro
 | Media streams and conformance level Media | later, with Nerve Desktop | Frame kind 3 (§4.6) |
 | Harness session interface (sessions, prompts, replies, harness config) | later, with Nerve Desktop | Needed by the desktop chat window and voice (§6.1) |
 | Nerve Desktop add-on (`Piggidragon/Nerve-Desktop`) | later | Extension of the node: chat window and config, STT/TTS and voice-to-voice, optional computer-use MCP install. Talks only to the local node |
+| Session grants and center rules per effect | later | Which harness session may use which nodes, and effects the center refuses before it sends a call (§5.5) |
 | Scopes per token | backlog, not planned | Optional future work: rights bound to a token instead of the center entry. The node policy per center entry is the current model |
 
 ### Open points
 
-- **MCP server surface details**: transport (stdio launch or loopback HTTP), how sessions map to MCP connections, and what the first two MCP clients tested need. Settled in its issue.
-- **Sudo password in transit when a center enables sudo.** Decided: end-to-end encrypted to the node. The password is encrypted with the node's key from pairing and carries a nonce and timestamp against replay; the center only relays the ciphertext and never reads it. The node decrypts and verifies it with a non-destructive `sudo -S -v` and refuses a wrong one. A center with `write` may switch sudo on and off; the agent never sees the password (§5.1, §5.2). Known limit: the center's web UI serves the password form, so a tampered center UI could capture the password before it is encrypted. This is accepted for 0.0.1 and does not weaken the node-side guarantees.
+- **MCP server surface details**: transport (stdio launch or loopback HTTP), how sessions map to MCP connections, and what the first two MCP clients tested need. Settled in its issue (0.0.1: spec/harness.md §3 and §5).
+- **Sudo password in transit when a center enables sudo.** Decided: end-to-end encrypted to the node. The password is sealed to a fresh X25519 key that the node signs with its pairing key (spec/protocol.md §7.4.1) and carries a nonce and timestamp against replay; the center only relays the ciphertext and never reads it. The node decrypts and verifies it with a non-destructive `sudo -S -v` and refuses a wrong one. A center with `write` may switch sudo on and off; the agent never sees the password (§5.1, §5.2). Known limit: the center's web UI serves the password form, so a tampered center UI could capture the password before it is encrypted. This is accepted for 0.0.1 and does not weaken the node-side guarantees.

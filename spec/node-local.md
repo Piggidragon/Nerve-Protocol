@@ -42,6 +42,12 @@ file, the owner takes it as it is with `nerve-node config accept`; the node
 then signs it. A `node.toml` from before the node kept a MAC (no key yet, no
 MAC line) is taken once as it is and signed.
 
+The check stands on `config.key`. A process that can delete or read it, and a
+`user` mode command is one (it runs unconfined as the user), can make the node
+take another file at its next start: with the key gone, an unsigned file
+counts as one from before the MAC and is signed. The start-up audits that as
+`signed`. In `folder` mode Landlock keeps commands out of the state folder.
+
 On Windows there is no control socket in 0.0.1: the CLI writes the signed
 file itself, and a running node takes the change at its next start.
 
@@ -153,7 +159,9 @@ owner changes them. A limit is opt-in (`until`, or `nerve-node mode set user
 --for HOURS`). When it runs out, the center is back in `allowlist`, the default
 deny mode, not in `folder`.
 
-`deny` rules count in every mode and a matching deny always wins. Sense and
+`deny` rules count in every mode and a matching deny always wins. A rule
+matches the whole target: `exec.run:rm *` refuses `rm -rf x`, but not
+`git status; rm -rf x` or `/bin/rm -rf x`. Sense and
 actuate actions are allowed by no full-access mode, only by the owner's
 `caps` entry `on`; in `allowlist` mode an allow rule allows them (a center
 may not add one for a sense capability itself).
@@ -262,8 +270,8 @@ only (`secret_storage` at rest is not done in 0.0.1), so a restarted node, or
 a `node.toml` that says `on` without a password held, has the switch off. It
 never reaches a center: the node replaces every copy in an outgoing frame and
 in the audit log with `[redacted]`. `machine.sudo` changes only through the
-switch, never through `config.write`. The switch works on Linux only in
-0.0.1.
+switch; a value written into the file is turned off at start-up, since no
+password is held. The switch works on Linux only in 0.0.1.
 
 ## 5. Control socket
 
@@ -285,9 +293,13 @@ or root may talk to it. Methods:
 | `sudo.on` | `password` | checks it with `sudo -v` and turns the switch on (§4) |
 | `sudo.off` | | turns the switch off and drops the password |
 
-`config.write`, `config.accept`, `reload`, `sudo.on` and `sudo.off` are refused from a process that runs below a
-command the node started for a center, so an agent cannot change its own
-policy.
+`config.write`, `config.accept`, `reload`, `sudo.on` and `sudo.off` are
+refused from a process that runs below a command the node started for a
+center, so on Linux an agent cannot change its own policy through the socket.
+**Windows in 0.0.1 has no socket and no sandbox:** the CLI signs node.toml
+itself, so a command the node runs for a center can change the policy, and
+the change applies at the next start. On Windows, allow commands only to
+centers you would also give `settings = write`.
 
 ## 6. Audit log
 

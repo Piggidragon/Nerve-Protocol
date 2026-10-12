@@ -2,9 +2,10 @@
 //! §5.1, spec node-local §3).
 //!
 //! There are two outcomes, allowed and refused; nothing waits for an answer.
-//! The order only ever narrows: a call that touches the node's own folders
-//! (config, keys, state) is forbidden before anything else is looked at, and
-//! nothing lifts that; an `off` capability is disabled; a sudo
+//! The order only ever narrows: a command line too long to check is
+//! forbidden first; a call that touches the node's own folders (config,
+//! keys, state) is forbidden before anything else is looked at, and nothing
+//! lifts that; an `off` capability is disabled; a sudo
 //! command with the sudo switch off, and anything a deny rule matches, is
 //! forbidden whatever else says; then a sudo command needs the sudo allow
 //! list, and any other call the mode: allow rules in `allowlist` mode, the
@@ -76,6 +77,15 @@ pub fn sudo_command(command: &str) -> Option<&str> {
     let (first, rest) = command.split_at(end);
     (first == "sudo" || first.ends_with("/sudo")).then_some(rest.trim_start())
 }
+
+/// The longest command line, in bytes, that the node checks and runs. The
+/// checks read a line a few times over (own folders, rules, wildcards) and a
+/// center can send up to the 4 MiB message limit, so a longer line is
+/// refused before any of them; 64 KiB is far past what a person or a harness
+/// writes, Windows starts no process with a command line over 32 767
+/// characters, and Linux takes no single argument (`sh -c` gets the line as
+/// one) over 128 KiB.
+pub const COMMAND_MAX_BYTES: usize = 64 * 1024;
 
 /// Characters that chain, substitute or redirect in a shell.
 const SHELL_CONTROL: &[char] = &[';', '&', '|', '$', '`', '(', ')', '<', '>', '\n', '\r'];
@@ -199,6 +209,15 @@ fn own_folder<'p>(env: &'p Env, call: &Call) -> Option<&'p Path> {
 
 /// Decides `call` under `policy`.
 pub fn decide(policy: &CenterPolicy, env: &Env, call: &Call) -> Decision {
+    if let Some(c) = call.command
+        && c.len() > COMMAND_MAX_BYTES
+    {
+        return Decision::Forbidden(format!(
+            "the command line is {} bytes, longer than the {COMMAND_MAX_BYTES} a node checks",
+            c.len()
+        ));
+    }
+
     // The node's own folders hold the policy itself and the keys that sign
     // it: no rule, mode or release reaches them, so they come first.
     if let Some(own) = own_folder(env, call) {

@@ -101,3 +101,5 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
 - On Windows the user's PowerShell profiles and modules are protected in the Documents folder where Windows really has it (OneDrive's backup, a redirect), read with the known-folder API, as well as below `%USERPROFILE%\Documents`.
 - A drive-letter path in an `fs` call is refused with the wire form to use (`/c/Users/...` for `C:\Users\...`), and a Windows node's `fs` tools say it.
 - A folder spelled so that it matches nothing (a `..` segment, and on Windows an 8.3 short name or a name ending in a dot or space) is refused, from a center and in `node.toml`, with a message to use the full name.
+- An `exec.run` command line over 64 KiB is refused before the policy checks it, and the audit log records the refusal with its reason (as it now does for every refusal); before, a center could send a line of drive letters (`a:a:a:...`) that kept a Windows node's own-folder check busy for hours. The check now takes time linear in the line on every platform.
+- `nerve-node audit` and `--follow` no longer miss a whole file of entries when the log is moved aside between the reads of its two files.

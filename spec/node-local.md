@@ -241,8 +241,9 @@ The default is deny. A call runs only when the mode and the rules allow it;
 otherwise it is refused at once with `forbidden`, and nothing waits for an
 answer. For each call the node takes the center's policy and, in this order:
 
-0. A call that touches the node's own folders (§1) is `forbidden` before
-   anything else is looked at; no rule, mode, folder or release lifts that.
+0. An `exec.run` command line over 64 KiB is `forbidden` first, before
+   anything is checked. A call that touches the node's own folders (§1) is
+   `forbidden` before anything else is looked at; no rule, mode, folder or release lifts that.
    It looks at every path of an `fs` call (resolved), at the working
    directory of `exec.run`, and at paths the command line names plainly
    (absolute, or from `~/`, `$HOME/`, `${HOME}/`). The line is compared
@@ -395,7 +396,7 @@ centers you would also give `settings = write`.
 ## 6. Audit log
 
 `<state>/audit.jsonl`, one JSON line per event: settings changes (with old
-and new value), calls allowed or forbidden, and what happened to the config
+and new value), calls allowed or forbidden (a refusal with its reason), and what happened to the config
 file itself (`"kind": "config"`, `event` `refused`, `signed` or `accepted`,
 with the file and the reason). It holds targets (paths, command lines), never
 file content or output; a target longer than 512 characters is cut there

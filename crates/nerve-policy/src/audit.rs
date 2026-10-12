@@ -26,6 +26,9 @@ pub struct Entry {
     pub code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// Why a call was refused, as the error to the center says it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 impl Entry {
@@ -36,6 +39,9 @@ impl Entry {
         let mut v = serde_json::to_value(self).expect("an audit entry serializes");
         if let Some(o) = v.as_object_mut() {
             o.remove("center");
+            // The center has the reason in the error already, and the
+            // event's fields are fixed (spec/protocol.md §7.5).
+            o.remove("reason");
         }
         v["target"] = cut_target(&self.target).into();
         v
@@ -206,6 +212,10 @@ impl AuditLog {
     pub fn decision(&self, e: &Entry) -> std::io::Result<()> {
         let mut v = serde_json::to_value(e).expect("an audit entry serializes");
         v["target"] = cut_target(&e.target).into();
+        if let Some(reason) = &e.reason {
+            // A reason may quote the whole command line.
+            v["reason"] = cut_target(reason).into();
+        }
         self.append(&v)
     }
 
@@ -247,19 +257,52 @@ impl AuditLog {
     /// Every whole line as it is written, oldest first: the older file's,
     /// then the current one's. A last line still being written is left out.
     pub fn lines(&self) -> std::io::Result<Vec<String>> {
-        let mut out = Vec::new();
-        for p in [self.old_path(), self.path.clone()] {
-            match std::fs::read(&p) {
-                Ok(t) => {
-                    let whole = t.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
-                    let t = String::from_utf8_lossy(&t[..whole]);
-                    out.extend(t.lines().map(str::to_string));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
+        self.lines_with(|_| {})
+    }
+
+    /// [`lines`](Self::lines), with `before` called ahead of each file read
+    /// with the file it is about to read, where a test moves the log aside.
+    ///
+    /// A move (`audit.jsonl` to `.1`, dropping the older `.1`) between the
+    /// reads of the two files would leave out a whole file's entries, and
+    /// `audit --follow` would never show them, since it goes on after the
+    /// last line it saw. So `.1` is read before and after the current file,
+    /// and the reads count only when `.1` is the same both times: then no
+    /// move came in between, and the current file is the one after it.
+    fn lines_with(&self, mut before: impl FnMut(&Path)) -> std::io::Result<Vec<String>> {
+        let old_path = self.old_path();
+        let mut read = |p: &Path| {
+            before(p);
+            match std::fs::read(p) {
+                Ok(t) => Ok(Some(t)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e),
             }
+        };
+        let mut old = read(&old_path)?;
+        // The log moves at most once per 10 MiB written, so the second try
+        // finds it still; the bound only keeps a broken writer from holding
+        // the reader forever.
+        for _ in 0..100 {
+            let current = read(&self.path)?;
+            let again = read(&old_path)?;
+            if again == old {
+                let mut out = Vec::new();
+                for t in [old, current].into_iter().flatten() {
+                    let whole = t.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
+                    out.extend(
+                        String::from_utf8_lossy(&t[..whole])
+                            .lines()
+                            .map(str::to_string),
+                    );
+                }
+                return Ok(out);
+            }
+            old = again;
         }
-        Ok(out)
+        Err(std::io::Error::other(
+            "the audit log kept moving while it was read",
+        ))
     }
 }
 
@@ -318,6 +361,7 @@ mod tests {
             decision: "forbidden".into(),
             code: Some("forbidden".into()),
             session: None,
+            reason: None,
         };
         log.decision(&e).unwrap();
         log.settings(
@@ -355,6 +399,7 @@ mod tests {
             decision: "forbidden".into(),
             code: Some("forbidden".into()),
             session: None,
+            reason: Some(format!("the command {:?} is denied", "ü".repeat(3000))),
         };
         log.decision(&e).unwrap();
         let line = &log.read().unwrap()[0];
@@ -365,6 +410,10 @@ mod tests {
             target.ends_with("[cut at 512 of 3000 characters]"),
             "{target}"
         );
+        // The reason is cut the same way, and the event leaves it out.
+        let reason = line["reason"].as_str().unwrap();
+        assert!(reason.ends_with("characters]"), "{reason}");
+        assert!(e.event_data().get("reason").is_none());
         // The event to the center carries the same cut target, so the full
         // one never crosses the link.
         let sent = e.event_data()["target"].as_str().unwrap().to_string();
@@ -395,6 +444,50 @@ mod tests {
         assert!(!is_cut_target("ls… [cut at 512 of 600 characters]"));
         let short_head = format!("{}… [cut at 512 of 512 characters]", "a".repeat(512));
         assert!(!is_cut_target(&short_head));
+    }
+
+    /// A move of the log between the reads of its two files leaves no
+    /// entry out and shows none twice, wherever it lands (code review 3 of
+    /// PR #19, finding 2).
+    #[test]
+    fn a_move_between_the_reads_drops_no_entries() {
+        let lines = |r: std::ops::Range<u64>| -> String {
+            r.map(|ts| format!("{}\n", json!({"ts": ts}))).collect()
+        };
+        // Before each of the first three reads: `.1`, the current file, `.1`.
+        for at in 0..3 {
+            let d = tempfile::tempdir().unwrap();
+            let log = AuditLog::new(d.path().join("audit.jsonl"));
+            std::fs::write(log.old_path(), lines(0..3)).unwrap();
+            std::fs::write(log.path(), lines(3..6)).unwrap();
+            let mut reads = 0;
+            let read = log
+                .lines_with(|_| {
+                    if reads == at {
+                        // The writer appends, moves the file aside and
+                        // starts a new one.
+                        let mut f = std::fs::OpenOptions::new()
+                            .append(true)
+                            .open(log.path())
+                            .unwrap();
+                        f.write_all(lines(6..7).as_bytes()).unwrap();
+                        std::fs::rename(log.path(), log.old_path()).unwrap();
+                        std::fs::write(log.path(), lines(7..9)).unwrap();
+                    }
+                    reads += 1;
+                })
+                .unwrap();
+            let ts: Vec<u64> = read
+                .iter()
+                .map(|l| {
+                    serde_json::from_str::<Value>(l).unwrap()["ts"]
+                        .as_u64()
+                        .unwrap()
+                })
+                .collect();
+            // The move dropped 0..3 itself; all after it is there, once.
+            assert_eq!(ts, (3..9).collect::<Vec<_>>(), "a move before read {at}");
+        }
     }
 
     /// The log moves aside at its size limit, and only one old file is kept.
@@ -443,6 +536,7 @@ mod tests {
             decision: "forbidden".into(),
             code: Some("forbidden".into()),
             session: None,
+            reason: None,
         }
     }
 

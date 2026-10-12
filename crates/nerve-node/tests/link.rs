@@ -289,6 +289,78 @@ async fn allow_rules_do_not_count_in_folder_mode_and_deny_rules_do() {
     node.stop().await;
 }
 
+/// Starts `sleep 2` under `policy`, sends `exec.signal kill` for it and
+/// returns the signal's answer, the run's answer and the audit log.
+#[cfg(unix)]
+async fn signal_a_sleep(
+    policy: impl Fn(&mut nerve_policy::CenterPolicy),
+) -> (Result<Value, String>, Value, String) {
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let node = paired_node_with(dir.path(), &center, policy).await;
+    let mut conn = linked(&mut center).await;
+    let run = conn
+        .request(
+            "invoke",
+            json!({"cap": "exec", "action": "run", "args": {"command": "sleep 2"}}),
+        )
+        .await
+        .unwrap();
+    // Long enough for the command to start and be known by its call id.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let signal = conn
+        .call(
+            "invoke",
+            json!({"cap": "exec", "action": "signal", "args": {"call": run, "signal": "kill"}}),
+            WAIT,
+        )
+        .await
+        .unwrap()
+        .map_err(|e| nerve_conformance::wire::code_of(&e));
+    let mut others = Vec::new();
+    let ran = conn
+        .answer(run, WAIT, &mut others)
+        .await
+        .unwrap()
+        .expect("the command ran");
+    let log = std::fs::read_to_string(node.paths().audit_log()).unwrap();
+    node.stop().await;
+    (signal, ran, log)
+}
+
+/// `exec.signal` goes through the policy like every other action: a deny
+/// rule refuses it and the refusal is audited.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_deny_rule_refuses_exec_signal_and_the_audit_says_so() {
+    let (signal, ran, log) = signal_a_sleep(|p| {
+        p.allow.push("exec.run:sleep *".into());
+        p.deny.push("exec.signal".into());
+    })
+    .await;
+    assert_eq!(signal, Err("forbidden".into()), "{log}");
+    assert_eq!(ran["exit_code"], 0, "the command was not killed: {ran}");
+    let line = log
+        .lines()
+        .find(|l| l.contains("\"signal\""))
+        .unwrap_or_else(|| panic!("no audit line for the signal: {log}"));
+    assert!(line.contains("\"forbidden\""), "{line}");
+
+    // An allow rule lets it through, and that is audited too.
+    let (signal, ran, log) = signal_a_sleep(|p| {
+        p.allow.push("exec.run:sleep *".into());
+        p.allow.push("exec.signal".into());
+    })
+    .await;
+    assert_eq!(signal, Ok(json!({})), "{log}");
+    assert_eq!(ran["signal"], "kill", "{ran}");
+    let line = log
+        .lines()
+        .find(|l| l.contains("\"signal\""))
+        .unwrap_or_else(|| panic!("no audit line for the signal: {log}"));
+    assert!(line.contains("\"allowed\""), "{line}");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unknown_node_answer_stops_dialling() {
     let dir = tempdir();

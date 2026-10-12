@@ -432,6 +432,18 @@ fn client_only(
         // Releasing a protected path is the owner's call; adding more is fine.
         return Err("policy.protected.allow: only the owner can release protected paths".into());
     }
+    // Extra protected paths hold in User mode too: dropping one is a release
+    // as well.
+    if let Some(gone) = o
+        .protected
+        .extra
+        .iter()
+        .find(|p| !n.protected.extra.contains(p))
+    {
+        return Err(format!(
+            "policy.protected.extra {gone}: only the owner can release protected paths"
+        ));
+    }
     Ok(())
 }
 
@@ -581,6 +593,41 @@ mod tests {
             off.set_center_document("home", new, v, |_| false),
             Err(SetError::Forbidden(_))
         ));
+    }
+
+    /// The owner's extra protected paths hold in User mode too; a center may
+    /// add one but never take one away.
+    #[test]
+    fn a_center_cannot_drop_an_owner_protected_path() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = store(d.path(), SettingsGrant::Write);
+        s.update(|c| {
+            let p = &mut c.center_mut("home").unwrap().policy;
+            p.mode = Mode::User;
+            p.protected.extra = vec!["~/secret".into()];
+            Ok(())
+        })
+        .unwrap();
+        let v = s.version();
+        let mut new = doc(&s);
+        new["policy"]["protected"]["extra"] = json!([]);
+        let e = s.set_center_document("home", new, v, |_| false);
+        assert!(
+            matches!(&e, Err(SetError::Forbidden(m)) if m.contains("policy.protected.extra")),
+            "{e:?}"
+        );
+        assert_eq!(
+            s.config().center("home").unwrap().policy.protected.extra,
+            ["~/secret"]
+        );
+        // Adding one more is fine.
+        let mut new = doc(&s);
+        new["policy"]["protected"]["extra"] = json!(["~/secret", "~/more"]);
+        s.set_center_document("home", new, v, |_| false).unwrap();
+        assert_eq!(
+            s.config().center("home").unwrap().policy.protected.extra,
+            ["~/secret", "~/more"]
+        );
     }
 
     fn reopen(dir: &Path) -> Result<SettingsStore, String> {

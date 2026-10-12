@@ -49,6 +49,13 @@ pub struct Change {
     pub new: Value,
 }
 
+/// The size at which `audit.jsonl` is moved aside to `audit.jsonl.1`, which
+/// replaces the older one: the log never takes more than twice this.
+pub const AUDIT_MAX_BYTES: u64 = 10 * 1024 * 1024;
+/// The most characters of a target (a command line, a path) one decision
+/// logs; a longer one is cut and says so.
+pub const TARGET_MAX_CHARS: usize = 512;
+
 #[derive(Debug, Clone)]
 pub struct AuditLog {
     path: PathBuf,
@@ -63,9 +70,26 @@ impl AuditLog {
         &self.path
     }
 
+    /// The one older file the log keeps.
+    fn old_path(&self) -> PathBuf {
+        let mut p = self.path.clone().into_os_string();
+        p.push(".1");
+        p.into()
+    }
+
     fn append(&self, v: &Value) -> std::io::Result<()> {
         if let Some(dir) = self.path.parent() {
             nerve_transport::files::create_private_dir(dir)?;
+        }
+        let mut line = v.to_string();
+        line.push('\n');
+        // A center can make refused calls as fast as the link allows, and
+        // each is logged; so the log is bounded.
+        if let Ok(m) = std::fs::metadata(&self.path)
+            && m.len() > 0
+            && m.len() + line.len() as u64 > AUDIT_MAX_BYTES
+        {
+            std::fs::rename(&self.path, self.old_path())?;
         }
         let mut o = std::fs::OpenOptions::new();
         o.create(true).append(true);
@@ -75,14 +99,18 @@ impl AuditLog {
             o.mode(0o600);
         }
         let mut f = o.open(&self.path)?;
-        let mut line = v.to_string();
-        line.push('\n');
         // One write per line, so concurrent appends do not interleave.
         f.write_all(line.as_bytes())
     }
 
     pub fn decision(&self, e: &Entry) -> std::io::Result<()> {
-        self.append(&serde_json::to_value(e).expect("an audit entry serializes"))
+        let mut v = serde_json::to_value(e).expect("an audit entry serializes");
+        let n = e.target.chars().count();
+        if n > TARGET_MAX_CHARS {
+            let head: String = e.target.chars().take(TARGET_MAX_CHARS).collect();
+            v["target"] = format!("{head}… [cut at {TARGET_MAX_CHARS} of {n} characters]").into();
+        }
+        self.append(&v)
     }
 
     /// A settings change; `by` is `local` or `center <name>`.
@@ -110,16 +138,18 @@ impl AuditLog {
         }))
     }
 
-    /// Every line, oldest first; lines that do not parse are skipped.
+    /// Every line, oldest first, the older file's included; lines that do
+    /// not parse are skipped.
     pub fn read(&self) -> std::io::Result<Vec<Value>> {
-        match std::fs::read_to_string(&self.path) {
-            Ok(t) => Ok(t
-                .lines()
-                .filter_map(|l| serde_json::from_str(l).ok())
-                .collect()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-            Err(e) => Err(e),
+        let mut out = Vec::new();
+        for p in [self.old_path(), self.path.clone()] {
+            match std::fs::read_to_string(&p) {
+                Ok(t) => out.extend(t.lines().filter_map(|l| serde_json::from_str(l).ok())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
         }
+        Ok(out)
     }
 }
 
@@ -199,6 +229,75 @@ mod tests {
             let m = std::fs::metadata(log.path()).unwrap().permissions().mode();
             assert_eq!(m & 0o777, 0o600);
         }
+    }
+
+    /// A refused call with a huge command line logs only its start.
+    #[test]
+    fn a_long_target_is_cut() {
+        let d = tempfile::tempdir().unwrap();
+        let log = AuditLog::new(d.path().join("audit.jsonl"));
+        let e = Entry {
+            ts: 1,
+            center: "home".into(),
+            cap: "exec".into(),
+            action: "run".into(),
+            target: "ü".repeat(3000),
+            decision: "forbidden".into(),
+            code: Some("forbidden".into()),
+            session: None,
+        };
+        log.decision(&e).unwrap();
+        let line = &log.read().unwrap()[0];
+        let target = line["target"].as_str().unwrap();
+        assert!(target.starts_with(&"ü".repeat(512)), "{target}");
+        assert!(!target.starts_with(&"ü".repeat(513)), "{target}");
+        assert!(
+            target.ends_with("[cut at 512 of 3000 characters]"),
+            "{target}"
+        );
+        // A short one stays as it is.
+        log.decision(&Entry {
+            target: "ls".into(),
+            ..e
+        })
+        .unwrap();
+        assert_eq!(log.read().unwrap()[1]["target"], "ls");
+    }
+
+    /// The log moves aside at its size limit, and only one old file is kept.
+    #[test]
+    fn the_log_rotates_and_keeps_one_old_file() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("audit.jsonl");
+        let log = AuditLog::new(&path);
+        let big = json!("x".repeat(1024 * 1024));
+        let lines = 25;
+        for v in 0..lines {
+            let change = Change {
+                key: "k".into(),
+                old: Value::Null,
+                new: big.clone(),
+            };
+            log.settings("center home", v, &[change]).unwrap();
+        }
+        let size = |p: &Path| std::fs::metadata(p).map_or(0, |m| m.len());
+        let old = d.path().join("audit.jsonl.1");
+        assert!(size(&path) <= AUDIT_MAX_BYTES, "{}", size(&path));
+        assert!(size(&old) <= AUDIT_MAX_BYTES, "{}", size(&old));
+        assert!(size(&old) > 0, "no old file");
+        assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 2);
+        // Oldest first, newest last; the oldest lines are gone.
+        let read = log.read().unwrap();
+        assert!(read.len() < lines as usize, "{}", read.len());
+        assert_eq!(read.last().unwrap()["version"], lines - 1);
+        let versions: Vec<u64> = read
+            .iter()
+            .map(|l| l["version"].as_u64().unwrap())
+            .collect();
+        assert!(
+            versions.windows(2).all(|w| w[1] == w[0] + 1),
+            "{versions:?}"
+        );
     }
 
     #[test]

@@ -791,7 +791,13 @@ impl Link {
             ("settings", "pause") => self.settings_pause(),
             ("settings", "sudo-offer") => self.sudo_offer(&entry),
             ("settings", "sudo") => self.settings_sudo(&inv.args).await,
-            ("exec", "signal") => self.signal(&inv.args),
+            ("exec", "signal") => {
+                // Decided and audited like any other action; its rule target
+                // is the action itself.
+                let target = format!("{}.{}", inv.cap, inv.action);
+                self.gate(&entry, &inv, effect, &[], None, None, target)?;
+                self.signal(&inv.args)
+            }
             ("exec", "run") => self.exec_run(id, &cfg, &entry, effect, &inv).await,
             ("fs", a) => {
                 let call = FsCall::parse(a, &inv.args)?;
@@ -1010,20 +1016,21 @@ impl Link {
         )?;
         // The policy let a sudo command through only with the switch on and
         // the sudo allow list naming it. It runs the node's sudo, with the
-        // password on stdin and without Landlock, which would keep sudo from
-        // rising.
+        // password on stdin once sudo prompts for it, and without Landlock,
+        // which would keep sudo from rising.
         let mut rc = rc;
-        let mut sudo_password = None;
+        let mut sudo = None;
         if let Some(args) = nerve_policy::sudo_command(&rc.command) {
             let password = self
                 .shared
                 .sudo_password()
                 .ok_or_else(|| RpcError::forbidden("sudo is off on this node"))?;
-            rc.command = exec::sudo_line(&self.shared.sudo_path(), args);
-            sudo_password = Some(password);
+            let prompt = exec::sudo_prompt();
+            rc.command = exec::sudo_line(&self.shared.sudo_path(), args, &prompt);
+            sudo = Some(exec::SudoInput { password, prompt });
         }
         let guard = Running::start(self, id.clone(), cfg.limits.max_running as usize)?;
-        let landlock = (sudo_password.is_none()
+        let landlock = (sudo.is_none()
             && entry.policy.mode_at(crate::now_ms()) == Mode::Folder
             && self.shared.confined())
         .then(|| exec::landlock_spec(&entry.policy, &self.shared.home, &self.shared.paths.own()));
@@ -1032,7 +1039,7 @@ impl Link {
             landlock,
             exe: self.shared.exe.clone().unwrap_or_default(),
             output_cap: (cfg.limits.output_cap_bytes as usize).min(exec::OUTPUT_HARD_CAP),
-            sudo_password,
+            sudo,
         };
         let r = exec::run(&rc, &opts, |pid| guard.started(pid)).await;
         drop(guard);

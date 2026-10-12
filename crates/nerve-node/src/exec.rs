@@ -204,23 +204,54 @@ pub struct RunOptions {
     pub exe: PathBuf,
     pub output_cap: usize,
     /// Set only for a `sudo` command the sudo allow list names (already rewritten with
-    /// [`sudo_line`]): sudo reads this password from stdin. Every other
-    /// command runs with no_new_privs (Linux), so a `sudo` the rules did not
-    /// see (`ls; sudo x`) cannot gain privileges.
-    pub sudo_password: Option<String>,
+    /// [`sudo_line`]): the password goes to sudo's stdin once sudo shows the
+    /// prompt. Every other command runs with no_new_privs (Linux), so a
+    /// `sudo` the rules did not see (`ls; sudo x`) cannot gain privileges.
+    pub sudo: Option<SudoInput>,
 }
+
+/// What a sudo command needs: the password and the prompt sudo was told to
+/// show before it reads one ([`sudo_prompt`]).
+#[derive(Debug, Clone)]
+pub struct SudoInput {
+    pub password: String,
+    pub prompt: String,
+}
+
+/// How long a sudo command's stdin stays open for a prompt that has not come
+/// while sudo has not started the command either.
+const PROMPT_WAIT: Duration = Duration::from_secs(10);
+/// How often the node looks whether sudo started the command.
+const PROMPT_POLL: Duration = Duration::from_millis(25);
+/// Stderr a sudo prints before its prompt is short; past this much the
+/// prompt is not looked for any more.
+const PROMPT_SCAN_MAX: usize = 64 * 1024;
 
 /// Quotes `s` for a POSIX shell.
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
+/// A fresh prompt for one sudo command: random, so output that only happens
+/// to look like a prompt is not answered with the password. Letters, digits
+/// and `-` only, which sudo prints as they are.
+pub fn sudo_prompt() -> String {
+    format!("nerve-sudo-{}:", nerve_transport::keys::random_token(16))
+}
+
 /// The command line that runs `args` (what followed `sudo`) through
-/// `sudo_path`, reading the password from stdin. `-k` makes sudo ask every
-/// time, so the password line is always consumed by sudo, never left for the
-/// command; `-p ''` keeps the prompt out of stderr.
-pub fn sudo_line(sudo_path: &str, args: &str) -> String {
-    format!("{} -S -k -p '' {args}", sh_quote(sudo_path))
+/// `sudo_path`, reading the password from stdin. `-k` makes sudo ignore a
+/// cached credential; sudo still asks for nothing for a NOPASSWD entry or as
+/// root, so the node writes the password only after sudo printed `prompt`
+/// (`run`), and a command sudo starts without asking never gets it. The
+/// shell `exec`s sudo, so the process the node started is sudo itself and
+/// its first child is the command.
+pub fn sudo_line(sudo_path: &str, args: &str, prompt: &str) -> String {
+    format!(
+        "exec {} -S -k -p {} {args}",
+        sh_quote(sudo_path),
+        sh_quote(prompt)
+    )
 }
 
 /// Checks `password` with `sudo -S -k -v`, which runs nothing and caches
@@ -323,6 +354,96 @@ async fn capped(mut r: impl AsyncRead + Unpin, cap: usize) -> (Vec<u8>, bool) {
     (out, cut)
 }
 
+/// A sudo command's stderr, like [`capped`], and its stdin: the password is
+/// written only once sudo has printed `sudo.prompt`, then stdin is closed.
+/// When sudo asks for nothing (NOPASSWD, root) it starts the command right
+/// away; stdin is then closed without the password as soon as sudo has a
+/// child process, the process ends, or [`PROMPT_WAIT`] passes. The prompt is
+/// left out of the stderr returned.
+async fn sudo_stderr(
+    mut err: tokio::process::ChildStderr,
+    stdin: tokio::process::ChildStdin,
+    sudo: &SudoInput,
+    pid: Option<u32>,
+    cap: usize,
+) -> (Vec<u8>, bool) {
+    let prompt = sudo.prompt.as_bytes();
+    let mut stdin = Some(stdin);
+    let mut seen = Vec::new();
+    let mut buf = vec![0u8; 16 * 1024];
+    let until = tokio::time::Instant::now() + PROMPT_WAIT;
+    while stdin.is_some() {
+        match tokio::time::timeout(PROMPT_POLL, err.read(&mut buf)).await {
+            Ok(Ok(0) | Err(_)) => {
+                // Everything that held stderr is gone; so is the command.
+                stdin = None;
+            }
+            Ok(Ok(n)) => {
+                seen.extend_from_slice(&buf[..n]);
+                if seen.windows(prompt.len()).any(|w| w == prompt) {
+                    let mut s = stdin.take().expect("still open");
+                    // A sudo that fails early closes the pipe; its exit code tells.
+                    let _ = s.write_all(format!("{}\n", sudo.password).as_bytes()).await;
+                } else if seen.len() > PROMPT_SCAN_MAX {
+                    stdin = None;
+                }
+            }
+            Err(_) => {
+                if pid.is_some_and(has_child) || tokio::time::Instant::now() >= until {
+                    stdin = None;
+                }
+            }
+        }
+    }
+    let (rest, cut) = capped(err, cap).await;
+    seen.extend_from_slice(&rest);
+    let mut out = Vec::with_capacity(seen.len().min(cap));
+    let mut i = 0;
+    while i < seen.len() {
+        if seen[i..].starts_with(prompt) {
+            i += prompt.len();
+        } else {
+            out.push(seen[i]);
+            i += 1;
+        }
+    }
+    let cut = cut || out.len() > cap;
+    out.truncate(cap);
+    (out, cut)
+}
+
+/// Whether some process has `pid` as its parent: sudo forks the command it
+/// runs, so a child means sudo is past asking for a password. A shell that
+/// did not `exec` sudo has sudo as its child at once; stdin then closes
+/// early and a sudo that asks fails, which leaks nothing.
+#[cfg(target_os = "linux")]
+fn has_child(pid: u32) -> bool {
+    let Ok(dir) = std::fs::read_dir("/proc") else {
+        return false;
+    };
+    dir.flatten().any(|e| {
+        let name = e.file_name();
+        let Some(name) = name
+            .to_str()
+            .filter(|n| n.bytes().all(|b| b.is_ascii_digit()))
+        else {
+            return false;
+        };
+        // `pid (comm) state ppid ...`; comm may hold spaces and parentheses.
+        std::fs::read_to_string(format!("/proc/{name}/stat")).is_ok_and(|s| {
+            s.rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().nth(1)?.parse::<u32>().ok())
+                == Some(pid)
+        })
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn has_child(_pid: u32) -> bool {
+    // The sudo switch is Linux only; elsewhere the wait or the end decides.
+    false
+}
+
 /// Runs `call`. `started(pid)` hears the pid once the command runs (for
 /// `exec.signal` and the control socket's ancestry check).
 pub async fn run(
@@ -345,7 +466,7 @@ pub async fn run(
         }
         None => {
             let mut c = Command::new(&program);
-            c.args(&args).stdin(if opts.sudo_password.is_some() {
+            c.args(&args).stdin(if opts.sudo.is_some() {
                 Stdio::piped()
             } else {
                 Stdio::null()
@@ -354,7 +475,7 @@ pub async fn run(
         }
     };
     #[cfg(target_os = "linux")]
-    if opts.sudo_password.is_none() {
+    if opts.sudo.is_none() {
         // SAFETY: prctl is async-signal-safe and touches only this process.
         unsafe {
             cmd.pre_exec(|| {
@@ -375,6 +496,7 @@ pub async fn run(
         .spawn()
         .map_err(|e| RpcError::new(ErrorCode::Unavailable, format!("cannot start: {e}")))?;
     let group = Group(child.id());
+    let mut sudo_stdin = None;
     if let Some(spec) = shim {
         let mut stdin = child.stdin.take().expect("piped");
         let json = serde_json::to_vec(&spec).map_err(|e| RpcError::internal(e.to_string()))?;
@@ -383,20 +505,24 @@ pub async fn run(
             .await
             .map_err(|e| RpcError::internal(format!("cannot hand the shim its spec: {e}")))?;
         drop(stdin);
-    } else if let Some(pw) = &opts.sudo_password {
-        let mut stdin = child.stdin.take().expect("piped");
-        // A sudo that fails early closes the pipe; its exit code tells.
-        let _ = stdin.write_all(format!("{pw}\n").as_bytes()).await;
-        drop(stdin);
+    } else if let Some(sudo) = &opts.sudo {
+        sudo_stdin = Some((child.stdin.take().expect("piped"), sudo));
     }
-    if let Some(pid) = child.id() {
+    let pid = child.id();
+    if let Some(pid) = pid {
         started(pid);
     }
     let stdout = child.stdout.take().expect("piped");
     let stderr = child.stderr.take().expect("piped");
     let cap = opts.output_cap.min(OUTPUT_HARD_CAP);
+    let err = async {
+        match sudo_stdin {
+            Some((stdin, sudo)) => sudo_stderr(stderr, stdin, sudo, pid, cap).await,
+            None => capped(stderr, cap).await,
+        }
+    };
     let work = async {
-        let (o, e, st) = tokio::join!(capped(stdout, cap), capped(stderr, cap), child.wait());
+        let (o, e, st) = tokio::join!(capped(stdout, cap), err, child.wait());
         (o, e, st)
     };
     let (out, err, status, timed_out) = match call.timeout {
@@ -453,7 +579,7 @@ mod tests {
             landlock: None,
             exe: PathBuf::from("/nonexistent"),
             output_cap: cap,
-            sudo_password: None,
+            sudo: None,
         }
     }
 
@@ -481,29 +607,107 @@ mod tests {
         assert_eq!(r["truncated"], true);
     }
 
+    fn sudo_input(password: &str) -> Option<SudoInput> {
+        Some(SudoInput {
+            password: password.into(),
+            prompt: "nerve-sudo-test:".into(),
+        })
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn only_a_sudo_command_may_gain_privileges() {
-        let probe = "read l; echo got=$l; grep NoNewPrivs /proc/self/status";
+        // Like sudo, the probe asks with the prompt before it reads.
+        let probe = "printf %s nerve-sudo-test: >&2; read l; echo got=$l; \
+                     grep NoNewPrivs /proc/self/status";
         let r = run(&call(probe), &opts(1024), |_| {}).await.unwrap();
         let out = r["stdout"].as_str().unwrap();
         assert!(out.contains("got=\n"), "{out}");
         assert!(out.contains("NoNewPrivs:\t1"), "{out}");
         let mut o = opts(1024);
-        o.sudo_password = Some("pw".into());
+        o.sudo = sudo_input("pw");
         let r = run(&call(probe), &o, |_| {}).await.unwrap();
         let out = r["stdout"].as_str().unwrap();
         assert!(out.contains("got=pw\n"), "{out}");
         assert!(!out.contains("NoNewPrivs:\t1"), "{out}");
+        assert_eq!(r["stderr"], "", "the prompt is left out: {r}");
+    }
+
+    /// A fake sudo at `dir/sudo`: with `asks` it prints its `-p` prompt to
+    /// stderr and reads the password like `sudo -S`, else it asks for none
+    /// (NOPASSWD, root). Either way it runs the command as its child.
+    #[cfg(target_os = "linux")]
+    fn fake_sudo(dir: &Path, asks: bool) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let ask = if asks {
+            "printf %s \"$p\" >&2\nIFS= read -r pw\n[ \"$pw\" = right-pw ] || exit 1\n"
+        } else {
+            ""
+        };
+        let sudo = dir.join("sudo");
+        std::fs::write(
+            &sudo,
+            format!(
+                "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in -S|-k) shift ;; \
+                 -p) p=\"$2\"; shift 2 ;; *) break ;; esac; done\n{ask}\"$@\"\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        sudo.display().to_string()
+    }
+
+    /// A sudo that asks for no password: the command it starts finds no
+    /// password on its stdin, only its end.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_sudo_that_does_not_ask_leaves_the_command_no_password() {
+        let d = tempfile::tempdir().unwrap();
+        let sudo = fake_sudo(d.path(), false);
+        let mut o = opts(1024);
+        o.sudo = sudo_input("right-pw");
+        let prompt = o.sudo.as_ref().unwrap().prompt.clone();
+        let c = call(&sudo_line(&sudo, "cat", &prompt));
+        let started = std::time::Instant::now();
+        let r = run(&c, &o, |_| {}).await.unwrap();
+        assert_eq!(r["exit_code"], 0, "{r}");
+        assert_eq!(r["stdout"], "", "the command read the password: {r}");
+        // Closed once sudo started the command, not after PROMPT_WAIT.
+        assert!(
+            started.elapsed() < PROMPT_WAIT / 2,
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A sudo that asks gets the password after its prompt; the command
+    /// after it finds stdin at its end.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_sudo_that_asks_gets_the_password() {
+        let d = tempfile::tempdir().unwrap();
+        let sudo = fake_sudo(d.path(), true);
+        let mut o = opts(1024);
+        o.sudo = sudo_input("right-pw");
+        let prompt = o.sudo.as_ref().unwrap().prompt.clone();
+        let c = call(&sudo_line(&sudo, "cat", &prompt));
+        let r = run(&c, &o, |_| {}).await.unwrap();
+        assert_eq!(r["exit_code"], 0, "{r}");
+        assert_eq!(r["stdout"], "", "{r}");
+        assert_eq!(r["stderr"], "", "the prompt is left out: {r}");
     }
 
     #[test]
     fn sudo_line_quotes_the_program() {
         assert_eq!(
-            sudo_line("/opt/my sudo", "apt update"),
-            "'/opt/my sudo' -S -k -p '' apt update"
+            sudo_line("/opt/my sudo", "apt update", "p:"),
+            "exec '/opt/my sudo' -S -k -p 'p:' apt update"
         );
-        assert_eq!(sudo_line("a'b", "x"), "'a'\\''b' -S -k -p '' x");
+        assert_eq!(sudo_line("a'b", "x", "p"), "exec 'a'\\''b' -S -k -p 'p' x");
+        let p = sudo_prompt();
+        assert!(p.starts_with("nerve-sudo-") && p.ends_with(':'), "{p}");
+        assert!(!p.contains('%'), "sudo would expand it: {p}");
+        assert_ne!(p, sudo_prompt());
     }
 
     #[tokio::test]

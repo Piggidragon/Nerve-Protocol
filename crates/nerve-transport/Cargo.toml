@@ -1,0 +1,27 @@
+[package]
+name = "nerve-transport"
+description = "Nerve Protocol transport: TLS pinning, loopback rule, CONNECT proxies, WebSocket link, node keys, small HTTP, control sockets."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nerve-proto.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tokio-rustls.workspace = true
+rustls.workspace = true
+rustls-native-certs.workspace = true
+httparse.workspace = true
+ring.workspace = true
+base64.workspace = true
+rcgen.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

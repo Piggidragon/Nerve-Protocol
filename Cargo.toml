@@ -1,0 +1,58 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/nerve-proto",
+    "crates/nerve-transport",
+    "crates/nerve-policy",
+    "crates/nerve-sandbox",
+    "crates/nerve-node",
+    "crates/nerve-center",
+    "crates/nerve-conformance",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2024"
+repository = "https://github.com/Piggidragon/Nerve-Protocol"
+rust-version = "1.88"
+
+[workspace.dependencies]
+nerve-proto = { path = "crates/nerve-proto", version = "0.0.1" }
+nerve-transport = { path = "crates/nerve-transport", version = "0.0.1" }
+nerve-policy = { path = "crates/nerve-policy", version = "0.0.1" }
+nerve-sandbox = { path = "crates/nerve-sandbox", version = "0.0.1" }
+nerve-node = { path = "crates/nerve-node", version = "0.0.1" }
+nerve-center = { path = "crates/nerve-center", version = "0.0.1" }
+
+# Every crate below but keyring is one Pithagoras-Sync already uses.
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "time", "sync", "signal", "fs"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+httparse = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std", "ansi"] }
+ring = "0.17"
+base64 = "0.22"
+libc = "0.2"
+globset = "0.4"
+landlock = "0.4"
+rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
+tempfile = "3"
+# The one crate 0.0.1 adds: the system keyring (Keychain, Credential Manager,
+# Secret Service) for the proxy's header values and credentials.
+keyring = "4.2"
+# The Job Object a Windows command runs in (CreateJobObjectW and its limits),
+# the one binding the node does not declare itself.
+windows-sys = "0.61"
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = "symbols"

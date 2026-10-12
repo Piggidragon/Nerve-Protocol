@@ -1,0 +1,369 @@
+//! The center's base URL, the pairing link and the pairing request.
+//!
+//! Both are parsed by hand: they are small, and a strict parser that refuses user
+//! info, queries and odd schemes is easier to reason about than a general one.
+
+use std::fmt;
+
+use serde::{Deserialize, Serialize};
+
+/// `https://host[:port][/base]`, or `http://` for a center on the same machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CenterUrl {
+    pub tls: bool,
+    /// Host name or IP address, IPv6 without brackets.
+    pub host: String,
+    pub port: u16,
+    /// Path prefix when the center is served below `/`, without a trailing slash.
+    pub base: String,
+}
+
+impl CenterUrl {
+    pub fn parse(s: &str) -> Result<CenterUrl, String> {
+        let bad = |why: &str| format!("center URL {s:?}: {why}");
+        let (tls, rest) = if let Some(r) = strip_prefix_ci(s, "https://") {
+            (true, r)
+        } else if let Some(r) = strip_prefix_ci(s, "http://") {
+            (false, r)
+        } else {
+            return Err(bad(
+                "must start with https:// (or http:// for a center on the same machine)",
+            ));
+        };
+        if rest.contains(['?', '#']) {
+            return Err(bad("no query or fragment allowed"));
+        }
+        let (authority, path) = match rest.find('/') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, ""),
+        };
+        if authority.contains('@') {
+            return Err(bad("no user name or password allowed"));
+        }
+        let (host, port) = if let Some(v6) = authority.strip_prefix('[') {
+            let end = v6.find(']').ok_or_else(|| bad("unclosed ["))?;
+            let host = &v6[..end];
+            if host.parse::<std::net::Ipv6Addr>().is_err() {
+                return Err(bad("bad IPv6 address"));
+            }
+            let after = &v6[end + 1..];
+            let port = match after.strip_prefix(':') {
+                Some(p) => Some(p),
+                None if after.is_empty() => None,
+                None => return Err(bad("junk after the IPv6 address")),
+            };
+            (host.to_string(), port)
+        } else {
+            let (h, p) = match authority.rsplit_once(':') {
+                Some((h, p)) => (h, Some(p)),
+                None => (authority, None),
+            };
+            if h.contains(':') {
+                return Err(bad("an IPv6 address needs brackets"));
+            }
+            (h.to_ascii_lowercase(), p)
+        };
+        if host.is_empty()
+            || !host
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '_'))
+        {
+            return Err(bad("bad host"));
+        }
+        let port = match port {
+            Some(p) => p
+                .parse::<u16>()
+                .ok()
+                .filter(|p| *p != 0)
+                .ok_or_else(|| bad("bad port"))?,
+            None if tls => 443,
+            None => 80,
+        };
+        let base = path.trim_end_matches('/').to_string();
+        // The URL is shown to the owner before pairing: a path with spaces,
+        // quotes or other scripts could read as more text of the question.
+        if !plain_path(&base) {
+            return Err(bad(
+                "the path may hold only letters, digits, - . _ ~ / and %XX escapes",
+            ));
+        }
+        // Checked decoded: a server or proxy that decodes `%2e` or `%2f`
+        // would otherwise resolve the endpoints outside the path shown.
+        let decoded = pct_bytes(&base, false).ok_or_else(|| bad("bad escape in the path"))?;
+        if decoded
+            .split(|c| matches!(c, b'/' | b'\\'))
+            .any(|c| c == b".." || c == b".")
+        {
+            return Err(bad("no . or .. in the path, escaped or not"));
+        }
+        Ok(CenterUrl {
+            tls,
+            host,
+            port,
+            base,
+        })
+    }
+
+    /// `host[:port]` for the `Host` header, the port left out when it is the default.
+    pub fn authority(&self) -> String {
+        let host = if self.host.contains(':') {
+            format!("[{}]", self.host)
+        } else {
+            self.host.clone()
+        };
+        let default = if self.tls { 443 } else { 80 };
+        if self.port == default {
+            host
+        } else {
+            format!("{host}:{}", self.port)
+        }
+    }
+
+    /// The WebSocket URL of `path` (`/nerve/v0/connect`).
+    pub fn ws(&self, path: &str) -> String {
+        let scheme = if self.tls { "wss" } else { "ws" };
+        format!("{scheme}://{}{}{path}", self.authority(), self.base)
+    }
+}
+
+impl fmt::Display for CenterUrl {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let scheme = if self.tls { "https" } else { "http" };
+        write!(f, "{scheme}://{}{}", self.authority(), self.base)
+    }
+}
+
+/// ASCII letters, digits, `-._~/` and `%` with two hex digits.
+fn plain_path(p: &str) -> bool {
+    let b = p.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' if b
+                .get(i + 1..i + 3)
+                .is_some_and(|h| h.iter().all(u8::is_ascii_hexdigit)) =>
+            {
+                i += 3
+            }
+            c if c.is_ascii_alphanumeric() || matches!(c, b'-' | b'.' | b'_' | b'~' | b'/') => {
+                i += 1
+            }
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// `s` without `prefix`, matched ignoring ASCII case; `None` when it does not
+/// start with it.
+pub fn strip_prefix_ci<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    // `get`: the prefix's length may end inside a character of `s`.
+    match (s.get(..prefix.len()), s.get(prefix.len()..)) {
+        (Some(head), Some(rest)) if head.eq_ignore_ascii_case(prefix) => Some(rest),
+        _ => None,
+    }
+}
+
+/// `nerve://pair?center=<url>&code=<code>[&pin=<spki pin>]`, as `pair new` and
+/// the center's web UI show it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PairLink {
+    pub center: CenterUrl,
+    pub code: String,
+    /// base64url (no padding) sha256 of the center certificate's
+    /// SubjectPublicKeyInfo; `None` trusts the system roots.
+    pub pin: Option<String>,
+}
+
+/// The longest pairing link a node reads.
+pub const PAIR_LINK_BYTES: usize = 4096;
+
+impl PairLink {
+    pub fn parse(s: &str) -> Result<PairLink, String> {
+        let s = s.trim();
+        if s.len() > PAIR_LINK_BYTES {
+            return Err("the pairing link is longer than 4 KiB".into());
+        }
+        // Windows hands a link from the browser or the shell over with an empty
+        // path made `/` (`nerve://pair/?...`): that one form is taken too.
+        let query = strip_prefix_ci(s, "nerve://pair?")
+            .or_else(|| strip_prefix_ci(s, "nerve://pair/?"))
+            .ok_or("a pairing link starts with nerve://pair?")?;
+        if query.contains('#') {
+            return Err("no fragment allowed in the pairing link".into());
+        }
+        let (mut center, mut code, mut pin) = (None, None, None);
+        for pair in query.split('&').filter(|p| !p.is_empty()) {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            let v = pct_decode(v).ok_or_else(|| format!("bad escape in {k}"))?;
+            let slot = match k {
+                "center" => &mut center,
+                "code" => &mut code,
+                "pin" => &mut pin,
+                // Unknown keys are refused rather than ignored: a link from a newer
+                // center should fail loudly, not pair with half its meaning.
+                _ => return Err(format!("unknown key {k:?} in the pairing link")),
+            };
+            if slot.replace(v).is_some() {
+                return Err(format!("{k} given twice"));
+            }
+        }
+        let center = CenterUrl::parse(&center.ok_or("the pairing link has no center")?)?;
+        let code = code.ok_or("the pairing link has no code")?;
+        if !valid_code(&code) {
+            return Err("bad pairing code".into());
+        }
+        let pin = pin.filter(|p| !p.is_empty());
+        if let Some(p) = &pin
+            && !valid_pin(p)
+        {
+            return Err("bad pin: expected 43 base64url characters".into());
+        }
+        Ok(PairLink { center, code, pin })
+    }
+
+    /// The link's text form; `parse` reads it back.
+    pub fn render(&self) -> String {
+        let mut s = format!(
+            "nerve://pair?center={}&code={}",
+            pct_encode(&self.center.to_string()),
+            self.code
+        );
+        if let Some(p) = &self.pin {
+            s.push_str("&pin=");
+            s.push_str(p);
+        }
+        s
+    }
+}
+
+/// Pairing codes: 1 to 64 ASCII letters and digits.
+pub fn valid_code(code: &str) -> bool {
+    !code.is_empty() && code.len() <= 64 && code.chars().all(|c| c.is_ascii_alphanumeric())
+}
+
+/// A SPKI pin: sha256 in base64url without padding, 43 characters.
+pub fn valid_pin(p: &str) -> bool {
+    p.len() == 43
+        && p.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Escapes everything but unreserved characters.
+pub fn pct_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+fn pct_decode(s: &str) -> Option<String> {
+    String::from_utf8(pct_bytes(s, true)?).ok()
+}
+
+/// `s` with its `%XX` escapes decoded, and `+` as a space when `plus`.
+fn pct_bytes(s: &str, plus: bool) -> Option<Vec<u8>> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'%' => {
+                let h = std::str::from_utf8(b.get(i + 1..i + 3)?).ok()?;
+                out.push(u8::from_str_radix(h, 16).ok()?);
+                i += 3;
+            }
+            b'+' if plus => {
+                out.push(b' ');
+                i += 1;
+            }
+            c => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    Some(out)
+}
+
+/// `POST {center}/nerve/v0/pair` body.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PairRequest {
+    pub code: String,
+    pub name: String,
+    pub platform: String,
+    pub arch: String,
+    /// The node's Ed25519 public key for this center, lowercase hex.
+    pub public_key: String,
+}
+
+/// The center's answer to a pairing request.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PairResponse {
+    pub center_id: String,
+    pub center_name: String,
+    pub node_id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn center_urls() {
+        let u = CenterUrl::parse("HTTPS://Center.example:8443/nerve/").unwrap();
+        assert_eq!(u.to_string(), "https://center.example:8443/nerve");
+        assert_eq!(
+            u.ws("/nerve/v0/connect"),
+            "wss://center.example:8443/nerve/nerve/v0/connect"
+        );
+        assert_eq!(CenterUrl::parse("https://[::1]").unwrap().port, 443);
+        for bad in [
+            "ftp://x",
+            "https://u@x",
+            "https://x?q",
+            "https://x#f",
+            "https://x/%2e%2e/y",
+            "https://x/a b",
+            "https://x:0",
+            "https://::1",
+        ] {
+            assert!(CenterUrl::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn pair_links() {
+        let pin = "A".repeat(43);
+        let s = format!("nerve://pair?center=https%3A%2F%2Fc.example%3A7443&code=abc123&pin={pin}");
+        let l = PairLink::parse(&s).unwrap();
+        assert_eq!(l.center.port, 7443);
+        assert_eq!(l.pin.as_deref(), Some(pin.as_str()));
+        assert_eq!(PairLink::parse(&l.render()).unwrap(), l);
+        assert!(PairLink::parse("nerve://pair/?center=https%3A%2F%2Fc&code=a").is_ok());
+        for bad in [
+            "nerve://pair?center=https%3A%2F%2Fc&code=a&x=1",
+            "nerve://pair?center=https%3A%2F%2Fc&code=a&code=b",
+            "nerve://pair?center=https%3A%2F%2Fc&code=a%zz",
+            "nerve://pair?center=https%3A%2F%2Fc&code=a-b",
+            "nerve://pair?center=https%3A%2F%2Fc&code=a&pin=short",
+            "nerve://pair?center=https%3A%2F%2Fc%2F..&code=a",
+            "nerve://pair?code=a",
+            "nerve://pair?center=https%3A%2F%2Fc&code=a#frag",
+            "pithagoras-sync://pair?portal=x",
+        ] {
+            assert!(PairLink::parse(bad).is_err(), "{bad}");
+        }
+        let long = format!(
+            "nerve://pair?center=https%3A%2F%2Fc&code=a&{}",
+            "x".repeat(5000)
+        );
+        assert!(PairLink::parse(&long).unwrap_err().contains("4 KiB"));
+    }
+}

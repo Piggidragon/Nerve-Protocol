@@ -1,0 +1,48 @@
+[package]
+name = "nerve-node"
+description = "The Nerve node: links a machine to its centers under the owner's policy."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "nerve-node"
+path = "src/main.rs"
+
+[dependencies]
+nerve-proto.workspace = true
+nerve-transport.workspace = true
+nerve-policy.workspace = true
+nerve-sandbox.workspace = true
+tokio.workspace = true
+futures-util.workspace = true
+tokio-tungstenite.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+globset.workspace = true
+ring.workspace = true
+base64.workspace = true
+keyring.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+] }
+
+[dev-dependencies]
+tempfile.workspace = true
+# The conformance suite's fake center drives the link tests.
+nerve-conformance = { path = "../nerve-conformance" }

@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/Piggidragon/Nerve-Protocol/schemas/pair-request.schema.json",
+  "title": "POST /nerve/v0/pair body",
+  "type": "object",
+  "required": ["code", "name", "platform", "arch", "public_key"],
+  "additionalProperties": false,
+  "properties": {
+    "code": {"type": "string", "pattern": "^[A-Za-z0-9]{1,64}$"},
+    "name": {"type": "string", "pattern": "^[a-z0-9-]{1,32}$"},
+    "platform": {"type": "string"},
+    "arch": {"type": "string"},
+    "public_key": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

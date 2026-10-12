@@ -1,0 +1,660 @@
+//! The node part: checks a node, acting as a center ([`FakeCenter`]).
+//!
+//! The caller gets a pairing link and must pair the node under test with it
+//! and start it (`start`). The node must then dial the fake center; the part
+//! drives that link and ends with `bye revoked`, after which the node must not
+//! dial again.
+//!
+//! With a [`Setup::folder`] and the settings grant `write` for the fake
+//! center, the part also checks the profiles (§7.2 to §7.5): it writes its own
+//! policy with `settings.set` and checks fs, exec, allow and deny rules, the
+//! audit event and the sudo switch. The sudo checks send one wrong password, so a node with
+//! a real `sudo` logs one failed attempt.
+
+use std::future::Future;
+use std::time::Duration;
+
+use serde_json::{Value, json};
+
+use nerve_proto::link::PairLink;
+use nerve_proto::msg::method;
+use nerve_proto::{Descriptor, ErrorCode, PROTOCOL_VERSION};
+
+use nerve_transport::sudo::{Offer, seal};
+
+use crate::fake_center::{self, FakeCenter};
+use crate::wire::code_of;
+use crate::{Report, ensure};
+
+const WAIT: Duration = Duration::from_secs(15);
+
+/// What the caller says about the node it started.
+#[derive(Debug, Clone, Default)]
+pub struct Setup {
+    /// An empty folder on the node, in wire form, that the part may allow
+    /// itself to read and write in. Without it the profile checks do not run.
+    pub folder: Option<String>,
+    /// The node's sudo password. With it the part also turns sudo on, runs
+    /// a sudo command on the sudo allow list, turns sudo off and replays the
+    /// password.
+    pub sudo_password: Option<String>,
+}
+
+/// Runs every node check. `start` pairs the node under test with the link it
+/// is given and starts it.
+pub async fn run<F, Fut>(start: F) -> Report
+where
+    F: FnOnce(PairLink) -> Fut,
+    Fut: Future<Output = Result<Setup, String>>,
+{
+    let mut r = Report::new("node");
+    let mut center = match FakeCenter::start(false).await {
+        Ok(c) => c,
+        Err(e) => {
+            r.check("4.1", "the fake center starts", Err(e.to_string()));
+            return r;
+        }
+    };
+    let setup = match start(center.link()).await {
+        Ok(s) => s,
+        Err(e) => {
+            r.check("3.2", "the node pairs", Err(e));
+            return r;
+        }
+    };
+    let Some(paired) = center.paired() else {
+        r.check(
+            "3.2",
+            "the node pairs",
+            Err("no pair request arrived".into()),
+        );
+        return r;
+    };
+    r.check("3.2", "the node pairs", Ok(()));
+    let req = &paired.request;
+    r.check(
+        "2.2",
+        "the node name is 1 to 32 of a-z, 0-9 and -",
+        ensure(nerve_proto::valid_node_name(&req.name), req.name.clone()),
+    );
+
+    let Some(mut link) = center.next_link(Duration::from_secs(30)).await else {
+        r.check(
+            "4.1",
+            "the node dials the center",
+            Err("no link within 30 s".into()),
+        );
+        return r;
+    };
+    r.check("4.1", "the node dials the center", Ok(()));
+    r.check(
+        "4.1",
+        "the Nerve-Node header names the paired node id",
+        ensure(
+            link.node_header == paired.node_id,
+            format!("header {}", link.node_header),
+        ),
+    );
+    let conn = &mut link.conn;
+    let hello = match fake_center::handshake(conn, &center.center_id, &paired).await {
+        Ok(h) => h,
+        Err(e) => {
+            r.check("4.2", "the hello is signed and names version \"0\"", Err(e));
+            return r;
+        }
+    };
+    r.check(
+        "4.2",
+        "the hello is signed and names version \"0\"",
+        ensure(
+            hello.versions.iter().any(|v| v == PROTOCOL_VERSION),
+            "no version 0",
+        ),
+    );
+
+    // §6: the descriptor.
+    let d = conn
+        .call(method::DESCRIBE, json!({"detail": "full"}), WAIT)
+        .await;
+    r.check(
+        "6",
+        "describe full returns a well-formed descriptor",
+        match &d {
+            Ok(Ok(v)) => check_descriptor(v, &paired.node_id, hello.rev),
+            Ok(Err(e)) => Err(format!("error {}", e.message)),
+            Err(e) => Err(e.clone()),
+        },
+    );
+
+    // §5.1: `capability` detail needs a cap.
+    r.check(
+        "5.1",
+        "describe capability without cap is invalid_args",
+        expect_code(
+            conn.call(method::DESCRIBE, json!({"detail": "capability"}), WAIT)
+                .await,
+            ErrorCode::InvalidArgs,
+        ),
+    );
+
+    // §5.2: unknown methods are refused.
+    r.check(
+        "5.2",
+        "an unknown method is method_not_found",
+        expect_code(
+            conn.call("frobnicate", json!({}), WAIT).await,
+            ErrorCode::MethodNotFound,
+        ),
+    );
+
+    // §5.3: unknown capabilities.
+    r.check(
+        "5.3",
+        "invoke of an unknown capability is unknown_capability",
+        expect_code(
+            conn.call(
+                method::INVOKE,
+                json!({"cap": "no-such-cap", "action": "x", "args": {}, "ctx": {}}),
+                WAIT,
+            )
+            .await,
+            ErrorCode::UnknownCapability,
+        ),
+    );
+
+    // §5.2: unknown fields in ctx are refused, so context can only narrow.
+    r.check(
+        "5.2",
+        "an unknown ctx field is invalid_args",
+        expect_code(
+            conn.call(
+                method::INVOKE,
+                json!({"cap": "node", "action": "status", "args": {},
+                       "ctx": {"session": "s1", "full_access": true}}),
+                WAIT,
+            )
+            .await,
+            ErrorCode::InvalidArgs,
+        ),
+    );
+
+    if let Some(folder) = &setup.folder {
+        let key = &paired.request.public_key;
+        let pw = setup.sudo_password.as_deref();
+        profiles(&mut r, conn, &center, key, folder, pw).await;
+    }
+
+    // §4.5: after `revoked` the node stops dialling.
+    conn.bye("revoked").await;
+    drop(link);
+    r.check(
+        "4.5",
+        "after bye revoked the node does not dial again",
+        match center.next_link(Duration::from_secs(4)).await {
+            None => Ok(()),
+            Some(_) => Err("the node dialled again".into()),
+        },
+    );
+    r
+}
+
+/// The profile checks, in order; each needs the ones before it.
+const PROFILE_CHECKS: &[(&str, &str)] = &[
+    ("7.4", "settings get returns document and version"),
+    ("7.4", "settings set with a stale if_version is conflict"),
+    ("7.4", "settings set applies a document"),
+    (
+        "7.2",
+        "fs read returns what fs write wrote, with the same etag",
+    ),
+    ("7.2", "fs read outside the allowed folder is forbidden"),
+    ("7.3", "exec run of a command an allow rule names runs"),
+    (
+        "7.3",
+        "a deny rule wins over an allow rule from the next call on",
+    ),
+    ("7.3", "exec run of a command nothing allows is forbidden"),
+    ("7.5", "a refusal emits audit decision forbidden"),
+    ("7.4.1", "sudo is off at first"),
+    (
+        "7.4.1",
+        "with sudo off, a sudo command on the sudo allow list is forbidden",
+    ),
+    (
+        "7.4.1",
+        "sudo-offer is signed with the node's key for this center",
+    ),
+    (
+        "7.4.1",
+        "a wrong sudo password is invalid_args and sudo stays off",
+    ),
+];
+
+/// The sudo checks that need the node's sudo password.
+const SUDO_ON_CHECKS: &[(&str, &str)] = &[
+    ("7.4.1", "the right sudo password turns sudo on"),
+    (
+        "7.4.1",
+        "with sudo on, a sudo command on the sudo allow list runs",
+    ),
+    (
+        "7.4.1",
+        "with sudo on, a sudo command the sudo allow list does not name is forbidden",
+    ),
+    ("7.4.1", "sudo off turns sudo off"),
+    (
+        "7.4.1",
+        "a replayed sealed password is invalid_args and sudo stays off",
+    ),
+    ("7.4.1", "no frame the node sent carries the sudo password"),
+];
+
+const ALLOWED: &str = "echo nerve-conformance-allowed";
+const SUDO_ALLOWED: &str = "sudo echo nerve-conformance-sudo";
+
+type Conn = crate::wire::Conn<tokio::net::TcpStream>;
+
+/// One request; events that arrive meanwhile go to `events`.
+async fn call_seen(
+    conn: &mut Conn,
+    method: &str,
+    params: Value,
+    events: &mut Vec<nerve_proto::Message>,
+) -> Result<Result<Value, nerve_proto::RpcError>, String> {
+    let id = conn.request(method, params).await?;
+    conn.answer(id, WAIT, events).await
+}
+
+/// `s` as a glob that matches exactly `s`.
+fn literal(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars() {
+        if matches!(c, '*' | '?' | '[' | ']' | '{' | '}' | '\\') {
+            out.extend(['[', c, ']']);
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+async fn invoke(
+    conn: &mut Conn,
+    cap: &str,
+    action: &str,
+    args: Value,
+) -> Result<Result<Value, nerve_proto::RpcError>, String> {
+    conn.call(
+        method::INVOKE,
+        json!({"cap": cap, "action": action, "args": args, "ctx": {}}),
+        WAIT,
+    )
+    .await
+}
+
+fn ok(got: Result<Result<Value, nerve_proto::RpcError>, String>) -> Result<Value, String> {
+    match got {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(format!("error {} ({})", code_of(&e), e.message)),
+        Err(e) => Err(e),
+    }
+}
+
+async fn sudo_state(conn: &mut Conn) -> Result<String, String> {
+    let v = ok(conn
+        .call(
+            method::GET,
+            json!({"cap": "settings", "keys": ["sudo"]}),
+            WAIT,
+        )
+        .await)?;
+    Ok(v["sudo"].as_str().unwrap_or_default().to_string())
+}
+
+async fn profiles(
+    r: &mut Report,
+    conn: &mut Conn,
+    center: &FakeCenter,
+    key: &str,
+    folder: &str,
+    password: Option<&str>,
+) {
+    let mut checks = PROFILE_CHECKS.to_vec();
+    if password.is_some() {
+        checks.extend_from_slice(SUDO_ON_CHECKS);
+    }
+    let mut done = 0;
+    let out = profile_steps(conn, center, key, folder, password, &mut |res| {
+        let (section, name) = checks[done];
+        done += 1;
+        r.check(section, name, res);
+    })
+    .await;
+    if let Err(why) = out {
+        for (section, name) in &checks[done..] {
+            r.skip(section, name, &why);
+        }
+    }
+}
+
+async fn sudo_offer(conn: &mut Conn, center: &FakeCenter, key: &str) -> Result<Offer, String> {
+    let v = ok(invoke(conn, "settings", "sudo-offer", json!({})).await)?;
+    let offer = Offer {
+        offer: v["offer"].as_str().unwrap_or_default().into(),
+        key: v["key"].as_str().unwrap_or_default().into(),
+        ts: v["ts"].as_u64().unwrap_or_default(),
+    };
+    let sig = v["sig"].as_str().unwrap_or_default();
+    ensure(
+        nerve_transport::keys::verify_sudo_offer(key, &center.center_id, &offer, sig),
+        format!("the signature does not verify: {v}"),
+    )?;
+    Ok(offer)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64)
+}
+
+/// Runs the profile checks in [`PROFILE_CHECKS`] order, giving each result
+/// to `check`; stops at the first failure.
+async fn profile_steps(
+    conn: &mut Conn,
+    center: &FakeCenter,
+    key: &str,
+    folder: &str,
+    password: Option<&str>,
+    check: &mut dyn FnMut(Result<(), String>),
+) -> Result<(), String> {
+    let mut step = |res: Result<(), String>| {
+        let failed = res
+            .as_ref()
+            .err()
+            .map(|e| format!("an earlier check failed: {e}"));
+        check(res);
+        failed.map_or(Ok(()), Err)
+    };
+
+    let got = ok(conn
+        .call(
+            method::GET,
+            json!({"cap": "settings", "keys": ["document", "version"]}),
+            WAIT,
+        )
+        .await);
+    let (mut doc, version) = match got {
+        Ok(v) if v["document"].is_object() && v["version"].is_u64() => {
+            (v["document"].clone(), v["version"].as_u64().unwrap_or(0))
+        }
+        Ok(v) => return step(Err(format!("got {v}"))),
+        Err(e) => return step(Err(e)),
+    };
+    step(Ok(()))?;
+
+    // A policy of its own, in default deny: allow rules for the folder and
+    // one exact command, and the sudo allow list for another.
+    let policy = &mut doc["policy"];
+    policy["mode"] = json!("allowlist");
+    if let Some(p) = policy.as_object_mut() {
+        p.remove("until");
+    }
+    policy["folders"] = json!([]);
+    policy["allow"] = json!([
+        format!("fs:{}/*", literal(folder.trim_end_matches('/'))),
+        format!("exec.run:{ALLOWED}"),
+    ]);
+    policy["deny"] = json!([]);
+    policy["sudo_allow"] = json!([SUDO_ALLOWED]);
+    let set = |if_version: u64| json!({"document": doc.clone(), "if_version": if_version});
+
+    step(expect_code(
+        invoke(conn, "settings", "set", set(version + 1000)).await,
+        ErrorCode::Other("conflict".into()),
+    ))?;
+    let mut now = version;
+    step(
+        ok(invoke(conn, "settings", "set", set(version)).await).and_then(|v| {
+            now = v["version"].as_u64().unwrap_or(0);
+            ensure(now > version, format!("got {v}"))
+        }),
+    )?;
+
+    let path = format!("{}/nerve-conformance.txt", folder.trim_end_matches('/'));
+    let content = "nerve conformance\n";
+    step(
+        async {
+            let w = ok(invoke(
+                conn,
+                "fs",
+                "write",
+                json!({"path": path, "content": content}),
+            )
+            .await)?;
+            let r = ok(invoke(conn, "fs", "read", json!({"path": path})).await)?;
+            ensure(r["content"] == content, format!("read {r}"))?;
+            let etag = w["etag"].as_str().unwrap_or_default();
+            ensure(
+                etag.len() == 64 && r["etag"] == etag,
+                format!("etag {etag} vs {}", r["etag"]),
+            )
+        }
+        .await,
+    )?;
+    let parent = folder
+        .trim_end_matches('/')
+        .rsplit_once('/')
+        .map_or("", |(p, _)| p);
+    step(expect_code(
+        invoke(
+            conn,
+            "fs",
+            "read",
+            json!({"path": format!("{parent}/nerve-conformance-outside")}),
+        )
+        .await,
+        ErrorCode::Forbidden,
+    ))?;
+
+    step(
+        ok(invoke(conn, "exec", "run", json!({"command": ALLOWED})).await).and_then(|v| {
+            ensure(
+                v["exit_code"] == 0
+                    && v["stdout"].as_str().map(str::trim) == Some("nerve-conformance-allowed"),
+                format!("got {v}"),
+            )
+        }),
+    )?;
+
+    // A rule edit counts from the next call on, and a deny rule wins over
+    // the allow rule for the same command.
+    let mut denied = doc.clone();
+    denied["policy"]["deny"] = json!([format!("exec.run:{ALLOWED}")]);
+    step(
+        async {
+            ok(invoke(
+                conn,
+                "settings",
+                "set",
+                json!({"document": denied, "if_version": now}),
+            )
+            .await)?;
+            expect_code(
+                invoke(conn, "exec", "run", json!({"command": ALLOWED})).await,
+                ErrorCode::Forbidden,
+            )
+        }
+        .await,
+    )?;
+
+    let mut events = Vec::new();
+    step(expect_code(
+        call_seen(
+            conn,
+            method::SUB,
+            json!({"topics": ["audit/decision"]}),
+            &mut events,
+        )
+        .await
+        .and(
+            call_seen(
+                conn,
+                method::INVOKE,
+                json!({"cap": "exec", "action": "run",
+                       "args": {"command": "echo nerve-conformance-other"}, "ctx": {}}),
+                &mut events,
+            )
+            .await,
+        ),
+        ErrorCode::Forbidden,
+    ))?;
+    // An event sent right before the answer may trail it on a busy link.
+    let _ = call_seen(conn, method::GET, json!({"cap": "node"}), &mut events).await;
+    step(ensure(
+        events.iter().any(|m| match m {
+            nerve_proto::Message::Notification { method: m, params } => {
+                m == method::EVENT
+                    && params["cap"] == "audit"
+                    && params["name"] == "decision"
+                    && params["data"]["cap"] == "exec"
+                    && params["data"]["decision"] == "forbidden"
+            }
+            _ => false,
+        }),
+        "no audit decision event for the refused run",
+    ))?;
+
+    step(
+        sudo_state(conn)
+            .await
+            .and_then(|s| ensure(s == "off", format!("sudo is {s}"))),
+    )?;
+    step(expect_code(
+        invoke(conn, "exec", "run", json!({"command": SUDO_ALLOWED})).await,
+        ErrorCode::Forbidden,
+    ))?;
+
+    let offer = match sudo_offer(conn, center, key).await {
+        Ok(o) => {
+            step(Ok(()))?;
+            o
+        }
+        Err(e) => return step(Err(e)),
+    };
+    let sealed = seal(&offer, "nerve-conformance-wrong-password", now_ms())?;
+    let wrong = expect_code(
+        invoke(
+            conn,
+            "settings",
+            "sudo",
+            json!({"on": true, "sealed": sealed}),
+        )
+        .await,
+        ErrorCode::InvalidArgs,
+    );
+    let state = sudo_state(conn).await;
+    step(wrong.and(state.and_then(|s| ensure(s == "off", format!("sudo is {s}")))))?;
+
+    let Some(password) = password else {
+        return Ok(());
+    };
+    // Every frame from here on, to look for the password in.
+    let mut seen: Vec<String> = Vec::new();
+    let mut call = async |conn: &mut Conn, cap: &str, action: &str, args: Value| {
+        let mut others = Vec::new();
+        let got = call_seen(
+            conn,
+            method::INVOKE,
+            json!({"cap": cap, "action": action, "args": args, "ctx": {}}),
+            &mut others,
+        )
+        .await;
+        seen.extend(others.iter().map(nerve_proto::Message::encode));
+        if let Ok(r) = &got {
+            seen.push(match r {
+                Ok(v) => v.to_string(),
+                Err(e) => serde_json::to_string(e).unwrap_or_default(),
+            });
+        }
+        got
+    };
+    let offer = sudo_offer(conn, center, key).await?;
+    let on = json!({"on": true, "sealed": seal(&offer, password, now_ms())?});
+    let turned = ok(call(conn, "settings", "sudo", on.clone()).await);
+    let state = sudo_state(conn).await;
+    step(
+        turned
+            .and_then(|v| ensure(v["sudo"] == "on", format!("got {v}")))
+            .and(state.and_then(|s| ensure(s == "on", format!("sudo is {s}")))),
+    )?;
+    let ran = ok(call(conn, "exec", "run", json!({"command": SUDO_ALLOWED})).await);
+    step(ran.and_then(|v| {
+        ensure(
+            v["exit_code"] == 0
+                && v["stdout"].as_str().map(str::trim) == Some("nerve-conformance-sudo"),
+            format!("got {v}"),
+        )
+    }))?;
+    step(expect_code(
+        call(
+            conn,
+            "exec",
+            "run",
+            json!({"command": "sudo echo nerve-conformance-other"}),
+        )
+        .await,
+        ErrorCode::Forbidden,
+    ))?;
+    let off = ok(call(conn, "settings", "sudo", json!({"on": false})).await);
+    let state = sudo_state(conn).await;
+    step(off.and(state.and_then(|s| ensure(s == "off", format!("sudo is {s}")))))?;
+    let replay = expect_code(
+        call(conn, "settings", "sudo", on).await,
+        ErrorCode::InvalidArgs,
+    );
+    let state = sudo_state(conn).await;
+    step(replay.and(state.and_then(|s| ensure(s == "off", format!("sudo is {s}")))))?;
+    step(ensure(
+        !seen.iter().any(|f| f.contains(password)),
+        "a frame carries the sudo password",
+    ))
+}
+
+fn expect_code(
+    got: Result<Result<Value, nerve_proto::RpcError>, String>,
+    want: ErrorCode,
+) -> Result<(), String> {
+    match got {
+        Ok(Err(e)) => ensure(
+            e.kind() == want,
+            format!(
+                "got {} ({}), expected {}",
+                code_of(&e),
+                e.message,
+                want.as_str()
+            ),
+        ),
+        Ok(Ok(v)) => Err(format!("succeeded with {v}")),
+        Err(e) => Err(e),
+    }
+}
+
+fn check_descriptor(v: &Value, node_id: &str, rev: u64) -> Result<(), String> {
+    let d: Descriptor =
+        serde_json::from_value(v.clone()).map_err(|e| format!("not a descriptor: {e}"))?;
+    ensure(d.nerve == PROTOCOL_VERSION, format!("nerve {:?}", d.nerve))?;
+    ensure(d.node.id == node_id, format!("node.id {}", d.node.id))?;
+    ensure(d.rev == rev, format!("rev {} but hello said {rev}", d.rev))?;
+    ensure(
+        nerve_proto::descriptor::summary_words(&d.summary) < 60,
+        "the summary has 60 words or more",
+    )?;
+    ensure(d.capability("node").is_some(), "no node capability")?;
+    d.check_names()?;
+    let mut ids = std::collections::BTreeSet::new();
+    for c in &d.capabilities {
+        ensure(ids.insert(&c.id), format!("capability {} twice", c.id))?;
+    }
+    Ok(())
+}

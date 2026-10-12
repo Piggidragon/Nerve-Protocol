@@ -90,3 +90,4 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
 - `nerve-node audit` shows `audit.jsonl.1` before `audit.jsonl`, and `--follow` finishes the old file after a rotation; refused calls take at most half of a full log file, past that the oldest refusals are dropped, so a center's refused calls no longer push what the node allowed or changed out of the log.
 - An audit log rotation that fails no longer drops the entry: it is written past the 10 MiB bound and the failure is logged once.
 - `exec.signal` is offered only where the policy can allow it: by an allow rule in allowlist mode, and in folder and user mode only with `caps.exec.signal = on`.
+- On Windows the protected list also holds the all-users Startup folder (`%ProgramData%\Microsoft\Windows\Start Menu\Programs\StartUp`) and Windows PowerShell's home with the all-users profiles (`%SystemRoot%\System32\WindowsPowerShell\v1.0` and its SysWOW64 twin).

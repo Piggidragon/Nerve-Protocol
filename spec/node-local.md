@@ -271,7 +271,10 @@ answer. For each call the node takes the center's policy and, in this order:
    whatever allowed the call, `user` mode too. On Windows the built-in list
    also holds `%ProgramData%\ssh` (the OpenSSH server's config, host keys
    and `administrators_authorized_keys`), `%SystemRoot%\System32\config`
-   (the registry hives with the password hashes) and the user's
+   (the registry hives with the password hashes), the all-users Startup
+   folder `%ProgramData%\Microsoft\Windows\Start Menu\Programs\StartUp`,
+   Windows PowerShell's home `%SystemRoot%\System32\WindowsPowerShell\v1.0`
+   (and its SysWOW64 twin) with the all-users profiles, and the user's
    `NTUSER.DAT`. Protected paths apply to the file actions and to the
    working directory of a command, not to what a command reads; in `user`
    mode a command runs as the user without a sandbox (issue #22).

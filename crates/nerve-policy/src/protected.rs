@@ -177,6 +177,8 @@ const WIN_PROGRAM_DATA: &[&str] = &[
     // `administrators_authorized_keys`, the key list of every administrator
     // account; a line there opens the machine, a broken file locks it.
     "ssh",
+    // The all-users Startup folder: what lies there runs at every user's logon.
+    "Microsoft/Windows/Start Menu/Programs/StartUp",
 ];
 
 /// Relative to the Windows folder (`%SystemRoot%`), likewise.
@@ -184,6 +186,10 @@ const WIN_SYSTEM_ROOT: &[&str] = &[
     // The registry hives: SAM and SECURITY hold the password hashes and the
     // LSA secrets, SYSTEM the key that opens them.
     "System32/config",
+    // Windows PowerShell's home: its all-users profiles run in every session,
+    // its modules load on use; SysWOW64 holds the 32-bit one's.
+    "System32/WindowsPowerShell/v1.0",
+    "SysWOW64/WindowsPowerShell/v1.0",
 ];
 
 /// Which platform's lists and path rules a [`Protected`] follows. The node
@@ -828,6 +834,37 @@ mod tests {
             Some(".git")
         );
         assert_eq!(p.tool_config(Path::new("C:\\w\\src\\git.rs")), None);
+    }
+
+    /// The all-users Startup folder and the all-users PowerShell profiles run
+    /// code at every user's logon or in every PowerShell session, like
+    /// `/etc/xdg/autostart` and `/etc/profile` (code review 2 of PR #19,
+    /// finding 6).
+    #[test]
+    fn protects_the_windows_all_users_start_up_and_profiles() {
+        let p = win_prot();
+        for path in [
+            "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\StartUp\\x.cmd",
+            "c:\\programdata\\microsoft\\windows\\start menu\\programs\\startup",
+            "C:/ProgramData/Microsoft/Windows/Start Menu/Programs/StartUp/x.lnk",
+            "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\profile.ps1",
+            "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\Microsoft.PowerShell_profile.ps1",
+            "C:\\WINDOWS\\system32\\windowspowershell\\V1.0\\Modules\\x\\x.psm1",
+            "C:\\Windows\\SysWOW64\\WindowsPowerShell\\v1.0\\profile.ps1",
+        ] {
+            for write in [false, true] {
+                assert!(
+                    p.check(Path::new(path), write, &[]).is_some(),
+                    "{path} {write}"
+                );
+            }
+        }
+        for path in [
+            "C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Accessories\\x.lnk",
+            "C:\\Windows\\System32\\WindowsPowerShell\\v1.0x\\profile.ps1",
+        ] {
+            assert!(p.check(Path::new(path), true, &[]).is_none(), "{path}");
+        }
     }
 
     #[test]

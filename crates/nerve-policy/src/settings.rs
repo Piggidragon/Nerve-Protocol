@@ -17,9 +17,7 @@ use nerve_transport::keys::MacKey;
 use serde_json::Value;
 
 use crate::audit::{AuditLog, diff};
-use crate::config::{
-    CapSetting, CenterDocument, Mode, NodeConfig, SettingsGrant, Sudo, USER_MAX_MS,
-};
+use crate::config::{CapSetting, CenterDocument, NodeConfig, SettingsGrant, Sudo};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SetError {
@@ -108,27 +106,6 @@ fn read_file(path: &Path) -> Result<Option<String>, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!("{}: {e}", path.display())),
     }
-}
-
-/// A change may set a center's user mode at most 8 hours ahead, whoever
-/// makes it and whichever way it comes in (an owner's write, a reload, an
-/// accepted file).
-fn user_mode_in_reach(old: &NodeConfig, new: &NodeConfig, now_ms: u64) -> Result<(), String> {
-    for c in &new.centers {
-        let before = old.center(&c.name).and_then(|o| o.policy.user_until);
-        if c.policy.mode == Mode::User
-            && c.policy.user_until != before
-            && c.policy
-                .user_until
-                .is_some_and(|u| u > now_ms + USER_MAX_MS)
-        {
-            return Err(format!(
-                "center {}: policy.user_until is more than 8 hours from now",
-                c.name
-            ));
-        }
-    }
-    Ok(())
 }
 
 pub struct SettingsStore {
@@ -229,10 +206,9 @@ impl SettingsStore {
     }
 
     /// Reads the file again because the owner asks (SIGHUP, the control
-    /// socket's `reload`). Only a file the node signed is applied, never an
-    /// older version than the one in force, and never one that sets user mode
-    /// more than 8 hours ahead; anything else is refused and audited, and the
-    /// old config stays in force.
+    /// socket's `reload`). Only a file the node signed is applied, and never
+    /// an older version than the one in force; anything else is refused and
+    /// audited, and the old config stays in force.
     pub fn reload(&mut self) -> Result<bool, String> {
         let text = read_file(&self.path)?.ok_or_else(|| self.refuse("the file is missing"))?;
         let fresh = verified(&text, &self.key).map_err(|why| self.refuse(&why))?;
@@ -242,8 +218,6 @@ impl SettingsStore {
                 fresh.version, self.config.version
             )));
         }
-        user_mode_in_reach(&self.config, &fresh, nerve_proto::msg::now_ms())
-            .map_err(|why| self.refuse(&why))?;
         let changed = fresh != self.config;
         self.config = fresh;
         Ok(changed)
@@ -259,8 +233,6 @@ impl SettingsStore {
             .ok_or_else(missing)?;
         let mut new = NodeConfig::parse(unseal(&text).1)
             .map_err(|e| SetError::Invalid(format!("{}: {e}", self.path.display())))?;
-        user_mode_in_reach(&self.config, &new, nerve_proto::msg::now_ms())
-            .map_err(SetError::Invalid)?;
         new.version = self.config.version.max(new.version) + 1;
         self.write(&new).map_err(SetError::Io)?;
         let changes = diff(&to_json(&self.config), &to_json(&new));
@@ -348,7 +320,6 @@ impl SettingsStore {
         center: &str,
         document: Value,
         if_version: u64,
-        now_ms: u64,
         is_sense: impl Fn(&str) -> bool,
     ) -> Result<u64, SetError> {
         let entry = self
@@ -374,7 +345,7 @@ impl SettingsStore {
             paused: entry.paused,
             policy: entry.policy.clone(),
         };
-        client_only(&old, &new, now_ms, &is_sense).map_err(SetError::Forbidden)?;
+        client_only(&old, &new, &is_sense).map_err(SetError::Forbidden)?;
         let mut cfg = self.config.clone();
         let e = cfg.center_mut(center).expect("checked above");
         e.paused = new.paused;
@@ -408,8 +379,6 @@ impl SettingsStore {
         if new == self.config {
             return Ok(self.config.version);
         }
-        user_mode_in_reach(&self.config, &new, nerve_proto::msg::now_ms())
-            .map_err(SetError::Invalid)?;
         new.version = self.config.version + 1;
         self.write(&new).map_err(SetError::Io)?;
         let changes = diff(&to_json(&self.config), &to_json(&new));
@@ -435,7 +404,6 @@ fn to_json(c: &NodeConfig) -> Value {
 fn client_only(
     old: &CenterDocument,
     new: &CenterDocument,
-    now_ms: u64,
     is_sense: &dyn Fn(&str) -> bool,
 ) -> Result<(), String> {
     if old.paused && !new.paused {
@@ -464,19 +432,13 @@ fn client_only(
         // Releasing a protected path is the owner's call; adding more is fine.
         return Err("policy.protected.allow: only the owner can release protected paths".into());
     }
-    if n.mode == Mode::User
-        && n.user_until != o.user_until
-        && n.user_until.is_some_and(|u| u > now_ms + USER_MAX_MS)
-    {
-        return Err("policy.user_until: at most 8 hours from now".into());
-    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{CenterEntry, CenterPolicy};
+    use crate::config::{CenterEntry, CenterPolicy, Mode};
     use serde_json::json;
 
     fn store(dir: &Path, grant: SettingsGrant) -> SettingsStore {
@@ -539,15 +501,15 @@ mod tests {
         let v = s.version();
         let mut new = doc(&s);
         new["policy"]["mode"] = json!("user");
-        new["policy"]["user_until"] = json!(1000);
+        new["policy"]["until"] = json!(1000);
         let v2 = s
-            .set_center_document("home", new.clone(), v, 0, |_| false)
+            .set_center_document("home", new.clone(), v, |_| false)
             .unwrap();
         assert_eq!(v2, v + 1);
         assert_eq!(s.config().center("home").unwrap().policy.mode, Mode::User);
         // A stale version conflicts.
         assert_eq!(
-            s.set_center_document("home", new, v, 0, |_| false),
+            s.set_center_document("home", new, v, |_| false),
             Err(SetError::Conflict { current: v2 })
         );
         // Saved and reloaded.
@@ -572,48 +534,41 @@ mod tests {
         let mut new = doc(&s);
         new["policy"]["caps"] = json!({"camera": "on"});
         let e = s
-            .set_center_document("home", new, v, 0, |c| c == "camera")
+            .set_center_document("home", new, v, |c| c == "camera")
             .unwrap_err();
         assert!(matches!(&e, SetError::Forbidden(m) if m.contains("policy.caps.camera")));
         // An allow rule is no way round that.
         let mut new = doc(&s);
         new["policy"]["allow"] = json!(["camera.snap"]);
         let e = s
-            .set_center_document("home", new, v, 0, |c| c == "camera")
+            .set_center_document("home", new, v, |c| c == "camera")
             .unwrap_err();
         assert!(matches!(&e, SetError::Forbidden(m) if m.contains("policy.allow")));
         let mut new = doc(&s);
         new["policy"]["allow"] = json!(["fs.read:/a/*", "exec.run:ls"]);
-        s.set_center_document("home", new, v, 0, |c| c == "camera")
+        s.set_center_document("home", new, v, |c| c == "camera")
             .unwrap();
         let v = s.version();
         let mut new = doc(&s);
         new["policy"]["protected"] = json!({"allow": ["~/.ssh"]});
         assert!(matches!(
-            s.set_center_document("home", new, v, 0, |_| false),
-            Err(SetError::Forbidden(_))
-        ));
-        let mut new = doc(&s);
-        new["policy"]["mode"] = json!("user");
-        new["policy"]["user_until"] = json!(USER_MAX_MS + 1);
-        assert!(matches!(
-            s.set_center_document("home", new, v, 0, |_| false),
+            s.set_center_document("home", new, v, |_| false),
             Err(SetError::Forbidden(_))
         ));
         let mut new = doc(&s);
         new["policy"]["nope"] = json!(1);
         assert!(matches!(
-            s.set_center_document("home", new, v, 0, |_| false),
+            s.set_center_document("home", new, v, |_| false),
             Err(SetError::Invalid(_))
         ));
         // The center may pause, not unpause.
         let mut new = doc(&s);
         new["paused"] = json!(true);
-        let v = s.set_center_document("home", new, v, 0, |_| false).unwrap();
+        let v = s.set_center_document("home", new, v, |_| false).unwrap();
         let mut new = doc(&s);
         new["paused"] = json!(false);
         assert!(matches!(
-            s.set_center_document("home", new, v, 0, |_| false),
+            s.set_center_document("home", new, v, |_| false),
             Err(SetError::Forbidden(_))
         ));
         assert_eq!(s.version(), v);
@@ -623,7 +578,7 @@ mod tests {
         let v = off.version();
         let new = doc(&off);
         assert!(matches!(
-            off.set_center_document("home", new, v, 0, |_| false),
+            off.set_center_document("home", new, v, |_| false),
             Err(SetError::Forbidden(_))
         ));
     }
@@ -697,34 +652,43 @@ mod tests {
     }
 
     #[test]
-    fn user_mode_reaches_at_most_8_hours_ahead() {
+    fn a_time_limit_is_the_owners_choice_and_has_no_cap() {
         let d = tempfile::tempdir().unwrap();
-        let mut s = store(d.path(), SettingsGrant::Off);
+        let mut s = store(d.path(), SettingsGrant::Write);
         let now = nerve_proto::msg::now_ms();
-        let user = |until: u64| {
+        let year = 365 * 24 * 3_600_000;
+        let set = |mode: Mode, until: Option<u64>| {
             move |c: &mut NodeConfig| {
                 let p = &mut c.centers[0].policy;
-                p.mode = Mode::User;
-                p.user_until = Some(until);
+                p.mode = mode;
+                p.until = until;
                 Ok(())
             }
         };
-        assert!(matches!(
-            s.update(user(now + USER_MAX_MS + 60_000)),
-            Err(SetError::Invalid(m)) if m.contains("8 hours")
-        ));
-        s.update(user(now + 3_600_000)).unwrap();
-        // A signed file that reaches further is refused on reload as well.
+        // User mode with no limit, and with one a year ahead, are both fine.
+        s.update(set(Mode::User, None)).unwrap();
+        s.update(set(Mode::User, Some(now + year))).unwrap();
+        s.update(set(Mode::Folder, Some(now + 10 * year))).unwrap();
+        // A signed file that reaches far ahead is applied on reload as well.
         let mut far = s.config().clone();
         far.version += 1;
-        far.centers[0].policy.user_until = Some(now + 10 * USER_MAX_MS);
+        far.centers[0].policy.mode = Mode::User;
+        far.centers[0].policy.until = Some(now + 10 * year);
         std::fs::write(s.path(), sealed(&s.key, &far)).unwrap();
-        assert!(s.reload().unwrap_err().contains("8 hours"));
-        assert_eq!(
-            s.config().centers[0].policy.user_until,
-            Some(now + 3_600_000)
-        );
-        assert_eq!(refusals(&s), 1);
+        assert_eq!(s.reload(), Ok(true));
+        let p = &s.config().centers[0].policy;
+        assert_eq!(p.until, Some(now + 10 * year));
+        assert_eq!(p.mode_at(now), Mode::User);
+        // A center may set the limit in its own document too.
+        let v = s.version();
+        let mut new = doc(&s);
+        new["policy"]["mode"] = json!("user");
+        new["policy"]["until"] = json!(now + year);
+        s.set_center_document("home", new, v, |_| false).unwrap();
+        // Once the limit has passed, the center is back in default deny.
+        let past = s.config().centers[0].policy.clone();
+        assert_eq!(past.mode_at(now + year), Mode::Allowlist);
+        assert_eq!(refusals(&s), 0);
     }
 
     #[test]

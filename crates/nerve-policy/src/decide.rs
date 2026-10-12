@@ -311,7 +311,6 @@ mod tests {
     fn policy(mode: Mode) -> CenterPolicy {
         CenterPolicy {
             mode,
-            user_until: (mode == Mode::User).then_some(NOW + 1000),
             folders: vec![
                 Folder {
                     path: "/w/ro".into(),
@@ -505,13 +504,18 @@ mod tests {
             &call(Effect::Execute, &exec_in, Some("make")),
         );
         assert_eq!(short(&d), "refused");
-        // Expired user mode is folder mode.
-        let mut p = policy(Mode::User);
-        p.user_until = Some(NOW);
-        assert_eq!(
-            run(&p, &env, &call(Effect::Read, &outside, None)),
-            "refused"
-        );
+        // A limit that is still running changes nothing; one that has run out
+        // leaves default deny, so a read in a folder needs a rule again.
+        for mode in [Mode::Folder, Mode::User] {
+            let mut p = policy(mode);
+            p.until = Some(NOW + 1);
+            let read = call(Effect::Read, &inside_ro, None);
+            assert_eq!(run(&p, &env, &read), "allow", "{mode:?}");
+            p.until = Some(NOW);
+            assert_eq!(run(&p, &env, &read), "refused", "{mode:?}");
+            p.allow = vec!["fs:/w/ro/*".into()];
+            assert_eq!(run(&p, &env, &read), "allow", "{mode:?}");
+        }
     }
 
     #[test]

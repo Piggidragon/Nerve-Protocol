@@ -11,7 +11,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use nerve_policy::audit::AuditLog;
-use nerve_policy::config::{Access, CapSetting, Folder, SettingsGrant, USER_MAX_MS};
+use nerve_policy::config::{Access, CapSetting, Folder, SettingsGrant};
 use nerve_policy::{Mode, NodeConfig, SetError, SettingsStore, rules, sudo_command};
 use nerve_proto::link::PairLink;
 use nerve_sandbox::stubs::NOT_DONE;
@@ -65,13 +65,15 @@ pub enum Cmd {
     Centers,
     /// Show the daemon and its links.
     Status,
-    /// Set a center's mode: allowlist, folder or user (user ends after
-    /// --hours, at most 8).
+    /// Set a center's mode: allowlist, folder or user. Folder and user stay
+    /// until you change them; --hours sets a limit, after which the center
+    /// is back in allowlist.
     Mode {
         /// `allowlist` (only allow rules let a call through), `folder` (full
         /// access in its folders) or `user` (full access as the user).
         mode: String,
-        /// How long user mode lasts, in hours (default and maximum: 8).
+        /// Limit folder or user mode to this many hours, then back to
+        /// allowlist (default: no limit).
         #[arg(long)]
         hours: Option<u64>,
         #[command(flatten)]
@@ -571,19 +573,25 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
                     return Err(format!("unknown mode {other} (allowlist, folder or user)"));
                 }
             };
-            if hours.is_some() && m != Mode::User {
-                return Err("--hours only goes with user".into());
+            if hours.is_some() && m == Mode::Allowlist {
+                return Err("--hours only goes with folder or user".into());
             }
-            let until = (m == Mode::User).then(|| {
-                let ms = hours.map_or(USER_MAX_MS, |h| h.saturating_mul(3_600_000));
-                crate::now_ms() + ms
-            });
-            if hours.is_some_and(|h| h.saturating_mul(3_600_000) > USER_MAX_MS) {
-                return Err("user mode lasts at most 8 hours".into());
-            }
+            // No --hours: no limit, and an old one is cleared. The end is a
+            // millisecond count that the config file (a TOML integer) holds.
+            let until = hours
+                .map(|h| {
+                    if h == 0 {
+                        return Err("--hours must be at least 1".to_string());
+                    }
+                    h.checked_mul(3_600_000)
+                        .and_then(|ms| crate::now_ms().checked_add(ms))
+                        .filter(|t| i64::try_from(*t).is_ok())
+                        .ok_or_else(|| "--hours is too large".to_string())
+                })
+                .transpose()?;
             let name = edit_center(&paths, &center, |e| {
                 e.policy.mode = m;
-                e.policy.user_until = until;
+                e.policy.until = until;
                 Ok(())
             })
             .await?;
@@ -1220,6 +1228,39 @@ mod tests {
     }
 
     #[test]
+    fn folder_and_user_mode_have_no_limit_unless_asked_for() {
+        let (_d, paths) = setup(&["home"]);
+        let policy = || load(&paths).centers[0].policy.clone();
+        for mode in ["user", "folder"] {
+            run(&paths, &["mode", mode]).unwrap();
+            assert_eq!(policy().until, None, "{mode}");
+        }
+        // --hours sets a limit of any length, on folder as on user.
+        let before = crate::now_ms();
+        run(&paths, &["mode", "folder", "--hours", "1000"]).unwrap();
+        let until = policy().until.unwrap();
+        assert!(until >= before + 1000 * 3_600_000, "{until}");
+        assert_eq!(policy().mode_at(before), Mode::Folder);
+        assert_eq!(policy().mode_at(until), Mode::Allowlist);
+        run(&paths, &["mode", "user", "--hours", "9"]).unwrap();
+        assert_eq!(policy().mode, Mode::User);
+        // Setting the mode again without --hours drops the old limit.
+        run(&paths, &["mode", "user"]).unwrap();
+        assert_eq!(policy().until, None);
+        // Allowlist has nothing to limit; nonsense hours are refused.
+        run(&paths, &["mode", "folder", "--hours", "1"]).unwrap();
+        let e = run(&paths, &["mode", "allowlist", "--hours", "1"]).unwrap_err();
+        assert!(e.contains("--hours"), "{e}");
+        let e = run(&paths, &["mode", "user", "--hours", "0"]).unwrap_err();
+        assert!(e.contains("at least 1"), "{e}");
+        let e = run(&paths, &["mode", "user", "--hours", "18446744073709551615"]).unwrap_err();
+        assert!(e.contains("too large"), "{e}");
+        assert_eq!(policy().mode, Mode::Folder);
+        run(&paths, &["mode", "allowlist"]).unwrap();
+        assert_eq!(policy().until, None);
+    }
+
+    #[test]
     fn edits_without_a_daemon_land_in_the_file_and_the_audit_log() {
         let (d, paths) = setup(&["home"]);
         let folder = d.path().join("work");
@@ -1233,7 +1274,6 @@ mod tests {
         run(&paths, &["deny", "rm -rf /"]).unwrap();
         run(&paths, &["deny", "rm -rf /"]).unwrap();
         run(&paths, &["mode", "user", "--hours", "2"]).unwrap();
-        assert!(run(&paths, &["mode", "user", "--hours", "9"]).is_err());
         let cfg = load(&paths);
         let c = cfg.center("home").unwrap();
         let real = nerve_policy::paths::resolve(&folder).unwrap();
@@ -1245,7 +1285,7 @@ mod tests {
         assert_eq!(c.policy.sudo_allow, vec!["sudo apt update".to_string()]);
         assert_eq!(c.policy.deny, vec!["exec.run:rm -rf /".to_string()]);
         assert_eq!(c.policy.mode, Mode::User);
-        assert!(c.policy.user_until.is_some());
+        assert!(c.policy.until.is_some());
         let log = std::fs::read_to_string(paths.audit_log()).unwrap();
         assert!(log.contains("local"), "{log}");
         run(&paths, &["panic"]).unwrap();
@@ -1259,13 +1299,9 @@ mod tests {
         let (_d, paths) = setup(&["home"]);
         run(&paths, &["config", "set", "limits.max_running", "4"]).unwrap();
         assert_eq!(load(&paths).limits.max_running, 4);
-        run(
-            &paths,
-            &["config", "set", "center.home.policy.user_until", "30"],
-        )
-        .unwrap();
+        run(&paths, &["config", "set", "center.home.policy.until", "30"]).unwrap();
         assert_eq!(
-            run(&paths, &["config", "get", "center.home.policy.user_until"]).unwrap(),
+            run(&paths, &["config", "get", "center.home.policy.until"]).unwrap(),
             "30\n"
         );
         run(

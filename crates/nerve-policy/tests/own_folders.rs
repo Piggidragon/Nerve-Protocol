@@ -21,7 +21,6 @@ const STATE: &str = "/h/.local/state/nerve";
 fn wide_open(mode: Mode) -> CenterPolicy {
     let mut p = CenterPolicy {
         mode,
-        user_until: (mode == Mode::User).then_some(NOW + 1000),
         ..Default::default()
     };
     for path in ["/h", CONFIG, STATE] {

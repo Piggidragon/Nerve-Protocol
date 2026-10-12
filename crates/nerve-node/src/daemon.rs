@@ -279,7 +279,7 @@ impl Shared {
                     "url": c.url,
                     "status": status,
                     "mode": c.policy.mode_at(now).as_str(),
-                    "user_until": c.policy.user_until,
+                    "until": c.policy.until,
                     "settings": c.settings,
                     "paused": c.paused,
                     "revoked": c.revoked,

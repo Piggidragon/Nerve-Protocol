@@ -12,9 +12,6 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
-/// The longest `user` mode a center may set: 8 hours (architecture §5.1).
-pub const USER_MAX_MS: u64 = 8 * 3600 * 1000;
-
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NodeConfig {
@@ -197,7 +194,7 @@ pub enum Mode {
     /// Full access inside the folders, by their access: the folders and
     /// everything below them, commands in the `execute` folders.
     Folder,
-    /// Full access as the user, protected paths aside, until `user_until`.
+    /// Full access as the user, protected paths aside.
     User,
 }
 
@@ -272,10 +269,12 @@ pub struct ProtectedOptions {
 pub struct CenterPolicy {
     #[serde(default)]
     pub mode: Mode,
-    /// Milliseconds since the Unix epoch at which `user` falls back to
-    /// `folder`. Required with `user`.
+    /// An opt-in time limit for `folder` and `user`: milliseconds since the
+    /// Unix epoch at which the mode runs out and the center falls back to
+    /// `allowlist`. None means no limit: the mode stays until the owner
+    /// changes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user_until: Option<u64>,
+    pub until: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub folders: Vec<Folder>,
     /// `cap` or `cap.action` → setting; `cap.action` wins over `cap`.
@@ -297,10 +296,11 @@ pub struct CenterPolicy {
 }
 
 impl CenterPolicy {
-    /// The mode in force at `now_ms`: an expired `user` is `folder`.
+    /// The mode in force at `now_ms`: a `folder` or `user` whose limit has
+    /// passed is `allowlist`.
     pub fn mode_at(&self, now_ms: u64) -> Mode {
         match self.mode {
-            Mode::User if self.user_until.is_none_or(|u| u <= now_ms) => Mode::Folder,
+            Mode::Folder | Mode::User if self.until.is_some_and(|u| u <= now_ms) => Mode::Allowlist,
             m => m,
         }
     }
@@ -418,9 +418,6 @@ pub fn valid_center_name(s: &str) -> bool {
 
 impl CenterPolicy {
     pub fn validate(&self) -> Result<(), String> {
-        if self.mode == Mode::User && self.user_until.is_none() {
-            return Err("mode user needs user_until".into());
-        }
         for f in &self.folders {
             if !Path::new(&f.path).is_absolute() {
                 return Err(format!("folder {:?} is not absolute", f.path));
@@ -535,9 +532,12 @@ sudo_allow = ["sudo apt update"]
             assert!(e.contains(why), "{bad}: {e}");
         }
         let with = |extra: &str| format!("{}{extra}\n", sample());
-        assert!(NodeConfig::parse(&with("user_until = 1\nfoo = 1")).is_err());
+        assert!(NodeConfig::parse(&with("until = 1\nfoo = 1")).is_err());
+        // User mode needs no limit; none is the default.
         let user = sample().replace("mode = \"folder\"", "mode = \"user\"");
-        assert!(NodeConfig::parse(&user).unwrap_err().contains("user_until"));
+        let c = NodeConfig::parse(&user).unwrap();
+        assert_eq!(c.centers[0].policy.until, None);
+        assert_eq!(c.centers[0].policy.mode_at(u64::MAX), Mode::User);
         let rel = sample().replace(FOLDER, "proj");
         assert!(NodeConfig::parse(&rel).unwrap_err().contains("absolute"));
         let sample = sample();
@@ -580,14 +580,28 @@ sudo_allow = ["sudo apt update"]
     }
 
     #[test]
-    fn expired_user_is_folder() {
-        let p = CenterPolicy {
-            mode: Mode::User,
-            user_until: Some(1000),
-            ..Default::default()
-        };
-        assert_eq!(p.mode_at(999), Mode::User);
-        assert_eq!(p.mode_at(1000), Mode::Folder);
+    fn a_mode_without_a_limit_never_runs_out() {
+        for mode in [Mode::Allowlist, Mode::Folder, Mode::User] {
+            let p = CenterPolicy {
+                mode,
+                ..Default::default()
+            };
+            assert_eq!(p.mode_at(0), mode);
+            assert_eq!(p.mode_at(u64::MAX), mode);
+        }
+    }
+
+    #[test]
+    fn an_expired_limit_falls_back_to_allowlist() {
+        for mode in [Mode::Folder, Mode::User] {
+            let p = CenterPolicy {
+                mode,
+                until: Some(1000),
+                ..Default::default()
+            };
+            assert_eq!(p.mode_at(999), mode);
+            assert_eq!(p.mode_at(1000), Mode::Allowlist);
+        }
     }
 
     #[test]

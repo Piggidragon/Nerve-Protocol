@@ -900,7 +900,6 @@ impl Link {
             &self.name,
             s.document,
             s.if_version,
-            crate::now_ms(),
             // This node offers no sense capabilities in 0.0.1.
             |_| false,
         );
@@ -916,7 +915,7 @@ impl Link {
         let mut v = serde_json::to_value(doc).map_err(|e| RpcError::internal(e.to_string()))?;
         v["paused"] = Value::Bool(true);
         let version = store.version();
-        let r = store.set_center_document(&self.name, v, version, crate::now_ms(), |_| false);
+        let r = store.set_center_document(&self.name, v, version, |_| false);
         settings_result(r).map(|_| json!({}))
     }
 

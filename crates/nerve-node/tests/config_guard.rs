@@ -199,7 +199,6 @@ async fn a_file_changed_behind_the_node_is_refused_and_audited() {
     let widen = |c: &mut NodeConfig| {
         let p = &mut c.centers[0].policy;
         p.mode = nerve_policy::Mode::User;
-        p.user_until = Some(nerve_node::now_ms() + 3_600_000);
         c.centers[0].settings = nerve_policy::config::SettingsGrant::Write;
     };
 

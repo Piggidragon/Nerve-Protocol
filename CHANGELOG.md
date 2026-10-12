@@ -16,6 +16,8 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
   allow rules count in allowlist mode only. A call that no rule allows is
   refused at once. The settings grant, panic and unlock, and a local audit log
   (`spec/node-local.md`).
+- Folder and user mode have no time limit unless the owner sets one
+  (`--hours N`); when a limit runs out the center falls back to allowlist.
 - The node's config and state folders are its own: no call of a center
   reaches them and no Landlock rule of a command covers them, whatever the
   policy says. The node keeps its config in memory, signs `node.toml` with an

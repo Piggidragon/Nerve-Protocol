@@ -37,8 +37,7 @@ is not done in 0.0.1, for this key as for the center keys.
 A file whose MAC is missing or does not match was changed outside the
 owner's path. It is refused and the refusal is audited (§6): at start-up the
 node does not start; on a reload the old config stays in force. A reload also
-refuses a signed file older than the one in force and one that sets a
-center's `user_until` more than 8 hours ahead. After looking at a refused
+refuses a signed file older than the one in force. After looking at a refused
 file, the owner takes it as it is with `nerve-node config accept`; the node
 then signs it. A `node.toml` from before the node kept a MAC (no key yet, no
 MAC line) is taken once as it is and signed.
@@ -82,7 +81,7 @@ unknown = false             # the center answered 401
 
 [center.policy]
 mode = "allowlist"          # allowlist | folder | user (the default is allowlist)
-user_until = 0              # required with user: falls back to folder then
+until = 1790000000000  # optional, folder and user: ms since the epoch; then allowlist
 folders = [{ path = "/home/u/proj", access = "rw", execute = true }]  # folder mode
 caps = { "fs.write" = "off" }   # on | off | hidden
 protected = { extra = [], allow = [] }
@@ -107,9 +106,13 @@ form; on the wire they travel as `/c/Users/...` on Windows (protocol §7.2).
   node's own folders are in none of these sets: a folder that holds one is
   granted as its other entries, level by level down to it, so the command
   can neither list those levels nor make new entries right in them.
-- **user**: full access as the user, protected paths aside, until
-  `user_until` (at most 8 hours), then the center is back in `folder`.
-  `allow` rules do not count.
+- **user**: full access as the user, protected paths aside. `allow` rules
+  do not count.
+
+Folder and user have no time limit by default: once set, they stay until the
+owner changes them. A limit is opt-in (`until`, or `nerve-node mode user
+--hours N`). When it runs out, the center is back in `allowlist`, the default
+deny mode, not in `folder`.
 
 `deny` rules count in every mode and a matching deny always wins. Sense and
 actuate actions are allowed by no full-access mode, only by the owner's

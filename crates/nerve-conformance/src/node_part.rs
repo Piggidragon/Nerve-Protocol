@@ -398,7 +398,7 @@ async fn profile_steps(
     let policy = &mut doc["policy"];
     policy["mode"] = json!("allowlist");
     if let Some(p) = policy.as_object_mut() {
-        p.remove("user_until");
+        p.remove("until");
     }
     policy["folders"] = json!([]);
     policy["allow"] = json!([

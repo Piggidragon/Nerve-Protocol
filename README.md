@@ -82,7 +82,7 @@ CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static" \
    nerve-node config add center.home.policy.allow 'fs.read:~/notes/*'   # a path
    nerve-node mode folder            # or: full access in the folders below
    nerve-node folder add ~/proj --rw --execute
-   nerve-node mode user --hours 2    # or: for a while, as the user may
+   nerve-node mode user              # or: full access as the user (--hours N: only for N hours)
    nerve-node deny 'rm *' --wildcard # in every mode: never, and wins over allow
    nerve-node audit                  # what was allowed and refused
    nerve-node panic                  # end every link; `unlock` undoes it

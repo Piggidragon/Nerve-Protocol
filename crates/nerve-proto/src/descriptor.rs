@@ -1,5 +1,5 @@
 //! The descriptor a node publishes: what it is and what it offers one center
-//! (spec/core.md §Descriptor).
+//! (docs/dev/spec/protocol.md §6).
 
 use std::collections::BTreeMap;
 

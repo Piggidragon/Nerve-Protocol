@@ -22,7 +22,7 @@ pub use descriptor::{Capability, Descriptor, Detail, Effect, Exposure};
 pub use error::{ErrorCode, RpcError};
 pub use rpc::{Id, Message};
 
-/// The protocol version of all of 0.0.x and 0.x (spec/core.md §Versioning).
+/// The protocol version of all of 0.0.x and 0.x (docs/dev/spec/protocol.md §1).
 pub const PROTOCOL_VERSION: &str = "0";
 
 /// The HTTP path a node pairs on.
@@ -44,7 +44,7 @@ pub fn connect_message(center_id: &str, nonce: &[u8]) -> Vec<u8> {
     m
 }
 
-/// Default limits (spec/node-link.md §Limits): what a side receives unless it
+/// Default limits (docs/dev/spec/protocol.md §5.5): what a side receives unless it
 /// announces otherwise.
 pub mod limits {
     pub const MESSAGE_BYTES: u64 = 4 * 1024 * 1024;
@@ -55,7 +55,7 @@ pub mod limits {
     pub const SEND_QUEUE: usize = 64;
 }
 
-/// Node names: 1 to 32 of `a-z0-9-` (spec/node-link.md §Identity).
+/// Node names: 1 to 32 of `a-z0-9-` (docs/dev/spec/protocol.md §2.2).
 pub fn valid_node_name(name: &str) -> bool {
     (1..=32).contains(&name.len())
         && name

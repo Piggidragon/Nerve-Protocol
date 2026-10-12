@@ -1,5 +1,5 @@
 //! The node's Ed25519 key per center, its node id, and the connect signature
-//! (spec/node-link.md §Identity); and the secret key of the MAC the node keeps
+//! (docs/dev/spec/protocol.md §2 and §4.2); and the secret key of the MAC the node keeps
 //! over its own config file ([`MacKey`]).
 //!
 //! 0.0.1 keeps the key as a 0600 file next to the node's config. Keeping it in

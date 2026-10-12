@@ -1,4 +1,4 @@
-//! Reconnect waits (spec/node-link.md §Reconnect): 1 s doubling to 60 s, up to
+//! Reconnect waits (docs/dev/spec/protocol.md §4.6): 1 s doubling to 60 s, up to
 //! a tenth taken off at random so many nodes do not dial in step, reset once a
 //! link lasted 60 s.
 

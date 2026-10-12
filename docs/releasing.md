@@ -22,7 +22,8 @@ which the owner starts by hand: **Actions → Release → Run workflow**. Leave
   before pre-releasing the work after it.
 - The version must equal the one in `Cargo.toml`.
 - A release needs a `## <version>` section in `CHANGELOG.md`, which becomes its
-  release notes. A pre-release uses that section when there is one.
+  release notes. A pre-release never reads `CHANGELOG.md`: its release text is
+  one plain line about the binaries and their checksums.
 - The run builds the commit the branch is at when it starts, and tags that
   commit in its last job, after the checks and every build passed. A failed run
   leaves no tag and no release: it deletes the draft release and the tag it made
@@ -38,7 +39,7 @@ which the owner starts by hand: **Actions → Release → Run workflow**. Leave
 
 ## What a run does
 
-1. Checks the inputs, the version, the tag and the changelog, then
+1. Checks the inputs, the version, the tag and (for a release) the changelog, then
    `cargo fmt --check`, `cargo clippy --locked --workspace --all-targets -- -D warnings`
    and `cargo test --locked --workspace` with the pinned toolchain.
 2. Builds `nerve-center` and `nerve-node` for `x86_64-unknown-linux-musl` and

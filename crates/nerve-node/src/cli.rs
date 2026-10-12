@@ -23,7 +23,8 @@ use crate::paths::NodePaths;
 #[command(
     name = "nerve-node",
     version,
-    about = "Links this machine to its Nerve centers."
+    about = "Links this machine to its Nerve centers.",
+    after_help = "install, setup, update and uninstall are not done in 0.0.1: they only say so. Start the node by hand with `nerve-node run`."
 )]
 pub struct Cli {
     /// Where node.toml and the keys live [env: NERVE_CONFIG_DIR] [default: ~/.config/nerve]
@@ -52,7 +53,7 @@ pub enum Cmd {
     /// Choose the folders a center may use and what it may do in each.
     #[command(subcommand)]
     Folder(FolderCmd),
-    /// Choose how much a center may do on its own.
+    /// Choose how much a center may do: only what allow rules name, what each folder allows, or all you can do.
     #[command(subcommand)]
     Mode(ModeCmd),
     /// Keep the lists of commands that are allowed, forbidden or run with sudo.
@@ -122,11 +123,11 @@ pub enum CenterCmd {
     Pause(CenterArg),
     /// Link to a paused center again.
     Resume(CenterArg),
-    /// Let a center change its own settings, or take that right away.
+    /// Let a center change its own rights on this machine, up to user mode and sudo, or take that right away.
     Grant {
         /// What to grant; only `settings` exists.
         what: String,
-        /// `off` or `write`.
+        /// `off`, or `write`: the center may then set everything this machine lets it do.
         value: String,
         #[command(flatten)]
         center: CenterArg,
@@ -137,8 +138,9 @@ pub enum CenterCmd {
 pub enum ModeCmd {
     /// Pick allowlist, folder or user mode.
     Set {
-        /// `allowlist` (only listed commands run), `folder` (anything inside
-        /// its folders) or `user` (anything you could do yourself).
+        /// `allowlist` (only what an allow rule names), `folder` (what each
+        /// folder's rights allow) or `user` (anything you could do yourself,
+        /// protected files aside).
         mode: String,
         /// Go back to allowlist after this many hours (folder and user mode
         /// otherwise stay until you change them).
@@ -161,8 +163,9 @@ pub enum List {
 pub enum RuleCmd {
     /// Put a command on a list.
     Add {
-        /// The list: `allow` (may run in allowlist mode), `deny` (never runs,
-        /// in any mode) or `sudo` (may run with sudo while sudo is on).
+        /// The list: `allow` (may run in allowlist mode), `deny` (a command
+        /// line that matches never runs, in any mode) or `sudo` (may run with
+        /// sudo while sudo is on).
         list: List,
         /// The command line.
         command: String,
@@ -228,7 +231,7 @@ pub enum FolderCmd {
         /// The folder.
         path: PathBuf,
         /// The rights: +r reads, +w writes, +x runs commands (`+r +x`, `+rw`).
-        #[arg(value_name = "+r|+w|+x")]
+        #[arg(value_name = "+r|+w|+x", required = true, num_args = 1..)]
         rights: Vec<String>,
         #[command(flatten)]
         center: CenterArg,
@@ -284,14 +287,14 @@ pub enum ConfigCmd {
     },
     /// Append a value to a list.
     Add {
-        /// The dotted key of the setting, like `center.<name>.policy.mode`.
+        /// The dotted key of a list, like `center.<name>.policy.allow`.
         key: String,
         /// The value to append.
         value: String,
     },
     /// Remove a value from a list.
     Remove {
-        /// The dotted key of the setting, like `center.<name>.policy.mode`.
+        /// The dotted key of a list, like `center.<name>.policy.allow`.
         key: String,
         /// The value to remove.
         value: String,
@@ -308,7 +311,7 @@ pub enum ProxyCmd {
         /// The proxy, http://host:port, or http://user:password@host:port when it wants a login.
         url: String,
         /// A header for the proxy, `Name: value`; can be given more than once. The value goes into the system keyring.
-        #[arg(long = "header")]
+        #[arg(long = "header", value_name = "NAME: VALUE")]
         headers: Vec<String>,
     },
     /// Reach centers directly again, and delete the proxy's values from the system keyring.
@@ -2597,17 +2600,31 @@ mod tests {
             assert!(cards.iter().all(|c| !c.shared_args.contains(a)));
             assert!(h.verbs().all(|v| !v.args.contains(a)));
         }
+        // `config add` and `remove` take the key of a list, the other verbs
+        // the key of any setting; each text is said once on the card.
         let key = card("config");
-        assert!(key.shared_args.iter().any(|a| a.name == "<KEY>"));
-        assert_eq!(
-            key.shared_args.iter().filter(|a| a.name == "<KEY>").count(),
-            1
+        let keys: Vec<&str> = key
+            .shared_args
+            .iter()
+            .filter(|a| a.name == "<KEY>")
+            .map(|a| a.about.as_str())
+            .collect();
+        assert_eq!(keys.len(), 2, "{keys:?}");
+        assert!(
+            keys.iter()
+                .any(|k| k.contains("of a list") && k.contains(".policy.allow")),
+            "{keys:?}"
         );
+        assert!(keys.iter().any(|k| k.contains(".policy.mode")), "{keys:?}");
+        // The rights of `folder add` are required, so the page does not call
+        // them optional.
         let add = h.verbs().find(|v| v.name == "folder add").unwrap();
         assert!(
             add.args
                 .iter()
-                .any(|a| a.name == "<+r|+w|+x>" && !a.about.is_empty())
+                .any(|a| a.name == "<+r|+w|+x>" && !a.about.is_empty() && !a.optional),
+            "{:?}",
+            add.args
         );
         // What can be left out says so.
         let mode = h.verbs().find(|v| v.name == "mode set").unwrap();
@@ -2630,6 +2647,15 @@ mod tests {
         let n = abouts.len();
         abouts.dedup();
         assert_eq!(abouts.len(), n, "two commands say the same");
+    }
+
+    #[test]
+    fn the_root_help_says_which_commands_are_not_done() {
+        let text = Cli::command().render_help().to_string();
+        assert!(
+            text.contains("install, setup, update and uninstall are not done in 0.0.1"),
+            "{text}"
+        );
     }
 
     #[test]

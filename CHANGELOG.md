@@ -27,12 +27,15 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
   (`center add`, `folder add <path> +r +x`, `folder set <path> -w`,
   `rule add allow`, `mode set`), with the Help page of the center grouped by what a
   person wants to do, one card per noun.
-- The node's config and state folders are its own: no call of a center
-  reaches them and no Landlock rule of a command covers them, whatever the
-  policy says. The node keeps its config in memory, signs `node.toml` with an
-  HMAC on every write, rereads it only when the owner asks, and refuses and
-  audits a file changed outside the owner's path (`nerve-node config accept`
-  takes it after a look).
+- On Linux, the node's config and state folders are its own: no call of a
+  center reaches them and no Landlock rule of a command covers them, whatever
+  the policy says; on Windows 0.0.1 has neither the socket nor a sandbox, see
+  `spec/node-local.md` §5. The node keeps its config in memory, signs
+  `node.toml` with an HMAC on every write, rereads it only when the owner
+  asks, and refuses and audits a file changed outside the owner's path
+  (`nerve-node config accept` takes it after a look). The check holds while
+  `config.key` does: a process that can delete it can have another file taken
+  at the next start (`spec/node-local.md` §1).
 - The sudo switch per node, off by default: off, no command runs with sudo
   even when the sudo allow list names it; on, a sudo command runs only when
   that list names it, in every mode. `nerve-node sudo on|off|status`, or a
@@ -56,8 +59,9 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
 - Conformance suite with a center part and a node part (pairing, link,
   descriptor, fs, exec, allow and deny rules, audit and the sudo switch); the
   harness part is a skeleton (`spec/conformance.md`).
-- MCP tool names are `<cap>_<action>`, or `<node>_<cap>_<action>` when the node
-  is part of the name, with one `_` as the only separator; node, capability
-  and action names use letters, digits and `-`, and the center ignores a
-  descriptor whose names have a `_` (`spec/harness.md`).
+- MCP tool names are `<cap>_<action>` (one tool for all nodes, with a `node`
+  argument) or `<node>_<cap>_<action>`, plus the `nodes` tool; `_` separates
+  the parts, so node, capability and action names use letters, digits and `-`
+  only, and the center ignores a descriptor whose names have a `_`
+  (`spec/harness.md`).
 - The owner sets how long a pairing code is valid, 1 to 1440 minutes (24 hours), in Settings, Center; 10 minutes unless changed, and a code keeps the lifetime it was made with.

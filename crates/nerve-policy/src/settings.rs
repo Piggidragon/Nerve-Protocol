@@ -176,7 +176,12 @@ impl SettingsStore {
         let Some(text) = read_file(path)? else {
             return Ok(NodeConfig::default());
         };
-        let refused = |why: String| format!("{} is refused: {why}", path.display());
+        let refused = |why: String| {
+            format!(
+                "{} is refused: {why}; check it, then `nerve-node config accept` takes it as it is",
+                path.display()
+            )
+        };
         match MacKey::load(key_path)? {
             Some(key) => verified(&text, &key).map_err(refused),
             // The node signs such a file the first time it opens it.
@@ -615,7 +620,8 @@ mod tests {
         // Once there is a key, an unsigned file is refused.
         old.save(s.path()).unwrap();
         assert!(reopen(d.path()).err().unwrap().contains("refused"));
-        assert!(SettingsStore::peek(s.path(), &d.path().join("config.key")).is_err());
+        let e = SettingsStore::peek(s.path(), &d.path().join("config.key")).unwrap_err();
+        assert!(e.contains("nerve-node config accept"), "{e}");
     }
 
     #[test]

@@ -34,9 +34,10 @@ Example entry:
 {"mcpServers": {"nerve": {"command": "nerve-center", "env": {"NERVE_NAME": "lab"}}}}
 ```
 
-Listeners beyond loopback use TLS with the center's self-signed certificate;
-nodes pin it through the pairing link. The web UI and the HTTP endpoint are
-plain HTTP on loopback only.
+Every listener uses TLS with the center's self-signed certificate when it is
+bound beyond loopback; nodes pin it through the pairing link. On loopback the
+web UI and the HTTP MCP endpoint are plain HTTP. HTTP MCP beyond loopback
+works (`--mcp-listen 0.0.0.0:7481`), always with the bearer token.
 
 ## 2. One center per state folder
 
@@ -83,10 +84,9 @@ that does not match `Host` are refused (403).
   clashes get `_2`, `_3`.
 - `node`, `settings` and `audit` are never tools, so a model cannot change
   the policy that limits it.
-  Capabilities with exposure `off` are left out, and so is every capability
+- Capabilities with exposure `off` are left out, and so is every capability
   of a disabled node: it stays paired and connected, but the center offers
   none of its tools and refuses calls to it.
-  Capabilities with exposure `off` are left out.
 - The node cuts the descriptor to what the policy can allow (node-local §3),
   so the center builds a tool only for an action a call may get through: in
   default deny, `fs` and `exec` actions without a covering allow rule are
@@ -124,8 +124,10 @@ add`) or, with the settings grant, from the audit tab.
 
 ## 7. Web UI
 
-Served by `nerve-center` itself at `--ui`. Tabs: overview (alerts,
-machines, pairing, sessions), statistics, audit (for every entry with a known
+Served by `nerve-center` itself at `--ui`. Tabs: overview (alerts, machines
+with rename, disable and remove, pairing, sessions). A disabled machine stays
+paired and connected, but the agent is offered none of its tools and calls to
+it are refused (`POST /api/nodes/disable`, §4). Further tabs: statistics, audit (for every entry with a known
 target, a command, a path or another action: Allow, Allow as wildcard, Deny
 and Deny as wildcard, only with the node's settings grant; each only adds a
 rule to the node's `policy.allow` or `policy.deny`, a sudo command's allow to
@@ -133,9 +135,10 @@ rule to the node's `policy.allow` or `policy.deny`, a sudo command's allow to
 `deny` or `sudo`), the entry's `cap`, `action` and `target`, and `wildcard`),
 help (the node's commands, each with its
 usage and a short explanation; the center reads the list from the node's own
-CLI definition, `GET /api/help`, so it cannot differ from `nerve-node --help`),
-settings (center name, retention, harness tokens, per-node settings and the
-node's sudo switch). The sudo password is sealed in the browser for the
+CLI definition, `GET /api/help`, so it matches `nerve-node --help` of the
+same version), settings (center name, statistics retention, how long a
+pairing code is valid: 1 to 1440 minutes, 10 by default, harness tokens,
+per-node settings and the node's sudo switch). The sudo password is sealed in the browser for the
 node's signed offer (protocol §7.4.1); the center checks the offer's
 signature against the paired node key, relays the sealed box
 (`POST /api/nodes/sudo/offer`, `POST /api/nodes/sudo`) and keeps no copy. The pages,
@@ -172,6 +175,6 @@ not offered in 0.0.1.
 ## 8. What the center keeps
 
 `<state>/tls.pem` (identity), `<state>/state.json` (center id and name, nodes
-with their public keys and last descriptors, hashed harness tokens, effect
-rules, daily statistics: counts and timings, kept `retention_days`). It never
+with their public keys and last descriptors, hashed harness tokens, daily
+statistics: counts and timings, kept `retention_days`). It never
 stores file contents, command output, arguments or secrets.

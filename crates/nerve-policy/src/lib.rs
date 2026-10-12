@@ -10,5 +10,5 @@ pub mod rules;
 pub mod settings;
 
 pub use config::{CenterDocument, CenterEntry, CenterPolicy, Mode, NodeConfig};
-pub use decide::{Call, Decision, Env, Target, decide, sudo_command};
+pub use decide::{Call, Decision, Env, Target, decide, folder_reach, readable_below, sudo_command};
 pub use settings::{SetError, SettingsStore, Writer};

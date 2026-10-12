@@ -89,6 +89,23 @@ fn inside_folder<'f>(folders: &'f [Folder], path: &Path) -> Option<&'f Folder> {
         .max_by_key(|f| f.path.len())
 }
 
+/// Whether the folders let `path` be read (or written): the deepest folder
+/// that holds it decides, by its flag. `folder` mode asks this of every
+/// target, and a walk (`grep`, `find`, `list`) asks it of every entry, so the
+/// two cannot disagree.
+pub fn folder_reach(folders: &[Folder], path: &Path, write: bool) -> bool {
+    inside_folder(folders, path).is_some_and(|f| if write { f.access.write } else { f.access.read })
+}
+
+/// Whether a folder with `r` lies strictly inside `dir`: a walk passes
+/// through a sealed folder to reach it, and reads only what is readable.
+pub fn readable_below(folders: &[Folder], dir: &Path) -> bool {
+    folders.iter().any(|f| {
+        let path = Path::new(&f.path);
+        f.access.read && within(path, dir) && !within(dir, path)
+    })
+}
+
 /// The strings rules are tried on (`rules`): the command line of `exec.run`,
 /// the paths of an `fs` call, else the action itself.
 fn rule_targets(call: &Call) -> Vec<String> {
@@ -269,15 +286,10 @@ fn by_mode(
                 Mode::User => true,
                 // Each flag stands alone: writing needs `w` and no `r`, reading
                 // needs `r` and no `w`.
-                Mode::Folder => call.targets.iter().all(|t| {
-                    inside_folder(&policy.folders, &t.path).is_some_and(|f| {
-                        if t.write {
-                            f.access.write
-                        } else {
-                            f.access.read
-                        }
-                    })
-                }),
+                Mode::Folder => call
+                    .targets
+                    .iter()
+                    .all(|t| folder_reach(&policy.folders, &t.path, t.write)),
                 // The allow rules decide there (`by_allow_rules`).
                 Mode::Allowlist => false,
             };

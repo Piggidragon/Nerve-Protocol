@@ -795,6 +795,10 @@ impl Link {
             ("exec", "run") => self.exec_run(id, &cfg, &entry, effect, &inv).await,
             ("fs", a) => {
                 let call = FsCall::parse(a, &inv.args)?;
+                // Taken before the gate: whenever the gate judged by the
+                // folders, the walk below does too, even if `until` passes
+                // in between.
+                let by_folders = entry.policy.mode_at(crate::now_ms()) == Mode::Folder;
                 self.gate(
                     &entry,
                     &inv,
@@ -809,11 +813,19 @@ impl Link {
                 let folders = entry.policy.folders.clone();
                 let action = inv.action.clone();
                 tokio::task::spawn_blocking(move || {
-                    let skip = |p: &std::path::Path| {
+                    // An entry the direct read would refuse stays out of the
+                    // walk, so a folder without `r` inside one with `r` is
+                    // sealed to grep, find and list too. A walk still passes
+                    // through such a folder to a folder with `r` inside it,
+                    // and finds only the files there.
+                    let skip = |p: &std::path::Path, through: bool| {
                         protected.check(p, false, &folders).is_some()
                             || deny
                                 .find("fs", &action, &nerve_policy::paths::to_wire(p))
                                 .is_some()
+                            || by_folders
+                                && !nerve_policy::folder_reach(&folders, p, false)
+                                && !(through && nerve_policy::readable_below(&folders, p))
                     };
                     call.run(&skip)
                 })

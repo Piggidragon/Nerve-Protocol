@@ -289,6 +289,141 @@ async fn allow_rules_do_not_count_in_folder_mode_and_deny_rules_do() {
     node.stop().await;
 }
 
+/// A walk (`grep`, `find`, `list`) leaves out what a direct read would refuse:
+/// a folder inside a readable one that has no `r` stays sealed, while the
+/// readable files beside it are still found.
+#[tokio::test(flavor = "multi_thread")]
+async fn walks_skip_a_nested_folder_without_the_read_flag() {
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let data = dir.path().join("home").join("data");
+    let private = data.join("private");
+    std::fs::create_dir_all(private.join("deep")).unwrap();
+    let data = std::fs::canonicalize(&data).unwrap();
+    let private = data.join("private");
+    std::fs::write(data.join("open.txt"), "token: public\n").unwrap();
+    std::fs::write(private.join("creds.txt"), "token: classified\n").unwrap();
+    std::fs::write(private.join("deep/more.txt"), "token: classified too\n").unwrap();
+    let wire = |p: &Path| nerve_policy::paths::to_wire(p);
+    let node = paired_node_with(dir.path(), &center, |p| {
+        p.mode = nerve_policy::Mode::Folder;
+        for (path, access) in [(&data, "r"), (&private, "")] {
+            p.folders.push(nerve_policy::config::Folder {
+                path: path.display().to_string(),
+                access: nerve_policy::config::Access::parse(access).unwrap(),
+            });
+        }
+    })
+    .await;
+    let mut conn = linked(&mut center).await;
+    let mut call = async |action: &str, args: Value| {
+        conn.call(
+            "invoke",
+            json!({"cap": "fs", "action": action, "args": args}),
+            WAIT,
+        )
+        .await
+        .unwrap()
+    };
+
+    // The direct read is refused, which is the decision the walks must follow.
+    let e = call("read", json!({"path": wire(&private.join("creds.txt"))}))
+        .await
+        .unwrap_err();
+    assert_eq!(nerve_conformance::wire::code_of(&e), "forbidden");
+
+    let g = call("grep", json!({"path": wire(&data), "pattern": "token"}))
+        .await
+        .expect("grep");
+    let text = g.to_string();
+    assert!(text.contains("open.txt") && text.contains("public"), "{g}");
+    assert!(
+        !text.contains("classified") && !text.contains("private"),
+        "grep reached the sealed folder: {g}"
+    );
+
+    let f = call("find", json!({"path": wire(&data), "glob": "**/*.txt"}))
+        .await
+        .expect("find");
+    let text = f.to_string();
+    assert!(text.contains("open.txt"), "{f}");
+    assert!(
+        !text.contains("creds") && !text.contains("more.txt") && !text.contains("private"),
+        "find reached the sealed folder: {f}"
+    );
+
+    let l = call("list", json!({"path": wire(&data)}))
+        .await
+        .expect("list");
+    let names: Vec<_> = l["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["open.txt"], "{l}");
+    node.stop().await;
+}
+
+/// A walk passes through a sealed folder to a folder with `r` inside it and
+/// finds the files there, but nothing of the sealed folder's own.
+#[tokio::test(flavor = "multi_thread")]
+async fn walks_reach_a_readable_folder_inside_a_sealed_one() {
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let data = dir.path().join("home").join("data");
+    std::fs::create_dir_all(data.join("private/pub")).unwrap();
+    let data = std::fs::canonicalize(&data).unwrap();
+    let private = data.join("private");
+    let public = private.join("pub");
+    std::fs::write(private.join("creds.txt"), "token: classified\n").unwrap();
+    std::fs::write(public.join("note.txt"), "token: shared\n").unwrap();
+    let wire = |p: &Path| nerve_policy::paths::to_wire(p);
+    let node = paired_node_with(dir.path(), &center, |p| {
+        p.mode = nerve_policy::Mode::Folder;
+        for (path, access) in [(&data, "r"), (&private, ""), (&public, "r")] {
+            p.folders.push(nerve_policy::config::Folder {
+                path: path.display().to_string(),
+                access: nerve_policy::config::Access::parse(access).unwrap(),
+            });
+        }
+    })
+    .await;
+    let mut conn = linked(&mut center).await;
+    let mut call = async |action: &str, args: Value| {
+        conn.call(
+            "invoke",
+            json!({"cap": "fs", "action": action, "args": args}),
+            WAIT,
+        )
+        .await
+        .unwrap()
+    };
+
+    let g = call("grep", json!({"path": wire(&data), "pattern": "token"}))
+        .await
+        .expect("grep");
+    let paths: Vec<_> = g["matches"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["path"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(paths, [wire(&public.join("note.txt"))], "{g}");
+
+    let f = call("find", json!({"path": wire(&data), "glob": "**/*.txt"}))
+        .await
+        .expect("find");
+    assert_eq!(f["paths"], json!([wire(&public.join("note.txt"))]), "{f}");
+
+    // A listing names its folders, so the sealed one stays out of it.
+    let l = call("list", json!({"path": wire(&data)}))
+        .await
+        .expect("list");
+    assert_eq!(l["entries"], json!([]), "{l}");
+    node.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unknown_node_answer_stops_dialling() {
     let dir = tempdir();

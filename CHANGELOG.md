@@ -61,3 +61,4 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
   and action names use letters, digits and `-`, and the center ignores a
   descriptor whose names have a `_` (`spec/harness.md`).
 - The owner sets how long a pairing code is valid, 1 to 1440 minutes (24 hours), in Settings, Center; 10 minutes unless changed, and a code keeps the lifetime it was made with.
+- `fs.grep`, `fs.find` and `fs.list` in folder mode leave out what a direct read would refuse, such as a folder without `r` inside one with `r`; `grep` and `find` still reach a folder with `r` inside a sealed one.

@@ -235,10 +235,12 @@ impl FsCall {
         to_wire(&self.path().real)
     }
 
-    /// Runs the call. `skip(path)` says which paths a walk leaves out (the
-    /// protected and denied ones), so `grep` and `find` below an allowed
-    /// folder never reveal what the policy hides.
-    pub fn run(self, skip: &dyn Fn(&Path) -> bool) -> Result<Value, RpcError> {
+    /// Runs the call. `skip(path, through)` says which paths a walk leaves out
+    /// (the protected, denied and, in folder mode, unreadable ones), so `grep`,
+    /// `find` and `list` below an allowed folder never reveal what the policy
+    /// hides. `through` is true for a folder `grep` and `find` would only pass
+    /// through, which they may still do to reach a readable folder inside it.
+    pub fn run(self, skip: &dyn Fn(&Path, bool) -> bool) -> Result<Value, RpcError> {
         match self {
             FsCall::Stat(p) => stat(&p.given),
             FsCall::List(p) => list(&p.real, skip),
@@ -288,11 +290,12 @@ fn stat(path: &Path) -> Result<Value, RpcError> {
     Ok(json!({"type": type_of(m.file_type()), "size": m.len(), "mtime_ms": mtime_ms(&m)}))
 }
 
-fn list(path: &Path, skip: &dyn Fn(&Path) -> bool) -> Result<Value, RpcError> {
+fn list(path: &Path, skip: &dyn Fn(&Path, bool) -> bool) -> Result<Value, RpcError> {
     let mut entries = Vec::new();
     for e in std::fs::read_dir(path).map_err(io_error)? {
         let e = e.map_err(io_error)?;
-        if skip(&e.path()) {
+        // A listed folder shows its name, so it is judged like a read.
+        if skip(&e.path(), false) {
             continue;
         }
         let m = e.metadata().map_err(io_error)?;
@@ -349,7 +352,7 @@ fn read(path: &Path, offset: u64, length: Option<u64>) -> Result<Value, RpcError
 /// stop. Returns whether the walk was cut short.
 fn walk(
     root: &Path,
-    skip: &dyn Fn(&Path) -> bool,
+    skip: &dyn Fn(&Path, bool) -> bool,
     each: &mut dyn FnMut(&Path) -> bool,
 ) -> Result<bool, RpcError> {
     let m = std::fs::metadata(root).map_err(io_error)?;
@@ -372,12 +375,9 @@ fn walk(
                 return Ok(true);
             }
             let p = e.path();
-            if skip(&p) {
-                continue;
-            }
             match e.file_type() {
-                Ok(t) if t.is_dir() => stack.push(p),
-                Ok(t) if t.is_file() => files.push(p),
+                Ok(t) if t.is_dir() && !skip(&p, true) => stack.push(p),
+                Ok(t) if t.is_file() && !skip(&p, false) => files.push(p),
                 _ => {}
             }
         }
@@ -400,7 +400,7 @@ fn grep(
     pattern: &str,
     glob: Option<&GlobMatcher>,
     max: usize,
-    skip: &dyn Fn(&Path) -> bool,
+    skip: &dyn Fn(&Path, bool) -> bool,
 ) -> Result<Value, RpcError> {
     let mut matches = Vec::new();
     let mut truncated = false;
@@ -436,7 +436,7 @@ fn find(
     root: &Path,
     glob: &GlobMatcher,
     max: usize,
-    skip: &dyn Fn(&Path) -> bool,
+    skip: &dyn Fn(&Path, bool) -> bool,
 ) -> Result<Value, RpcError> {
     let mut paths = Vec::new();
     let mut truncated = false;
@@ -508,7 +508,7 @@ mod tests {
     }
 
     fn run(action: &str, v: Value) -> Result<Value, RpcError> {
-        FsCall::parse(action, &args(v))?.run(&|_| false)
+        FsCall::parse(action, &args(v))?.run(&|_, _| false)
     }
 
     /// A local path the way the center sends it (`/c/...` on Windows).
@@ -556,7 +556,7 @@ mod tests {
         let root = wire(d.path());
         let root = root.as_str();
         let secret = d.path().join("sub/secret");
-        let skip = |p: &Path| p.starts_with(&secret);
+        let skip = |p: &Path, _| p.starts_with(&secret);
         let g = FsCall::parse("grep", &args(json!({"path": root, "pattern": "needle"})))
             .unwrap()
             .run(&skip)

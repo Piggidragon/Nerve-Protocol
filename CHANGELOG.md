@@ -2,8 +2,6 @@
 
 ## 0.0.1
 
-First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
-
 - Pair a node with a center using a one-time code; the node pins the center's certificate and the two talk over a signed link.
 - `nerve-node` runs on a machine and offers files (`fs`) and commands (`exec`) to the center, with a headless CLI to manage it.
 - `nerve-center` runs as an MCP server for an agent harness and offers every paired node's capabilities as MCP tools.
@@ -13,4 +11,3 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
 - Commands run with sudo only if the owner turns sudo on for the node. The password is kept in memory and never logged.
 - The node keeps a local audit log of every decision, and can be locked with panic and unlock.
 - A web UI for the center shows nodes, the audit log (with one-click rules), statistics and help, and lets you disable a node.
-- Releases ship static binaries for Linux (x86_64, aarch64) and Windows (x86_64) with checksums.

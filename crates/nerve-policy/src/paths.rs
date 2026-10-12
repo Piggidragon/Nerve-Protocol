@@ -400,10 +400,9 @@ mod win_tests {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
 
     #[test]
     fn refuses_what_it_cannot_interpret() {
@@ -423,11 +422,30 @@ mod tests {
             Err(PathError::Unc)
         ));
         assert!(matches!(parse_device_path("/a\0b"), Err(PathError::Nul)));
-        assert_eq!(
-            parse_device_path("/c/Users").unwrap(),
-            Path::new("/c/Users")
-        );
+        // The wire form is the native one on Unix; Windows reads a drive.
+        let native = if cfg!(windows) {
+            "C:\\Users"
+        } else {
+            "/c/Users"
+        };
+        assert_eq!(parse_device_path("/c/Users").unwrap(), Path::new(native));
     }
+
+    #[test]
+    fn within_compares_components() {
+        assert!(within(Path::new("/a/b"), Path::new("/a/b")));
+        assert!(within(Path::new("/a/b/c"), Path::new("/a/b")));
+        assert!(!within(Path::new("/a/bc"), Path::new("/a/b")));
+        assert!(!within(Path::new("/a"), Path::new("/a/b")));
+    }
+}
+
+/// Needs real symlinks, which a Windows test run may not create (they take
+/// developer mode or the privilege to create them).
+#[cfg(all(test, unix))]
+mod unix_tests {
+    use super::*;
+    use std::os::unix::fs::symlink;
 
     #[test]
     fn resolves_symlinks_and_dotdot() {
@@ -461,13 +479,5 @@ mod tests {
             resolve(&root.join("granted/dangling/y")),
             Err(PathError::DanglingSymlink(_))
         ));
-    }
-
-    #[test]
-    fn within_compares_components() {
-        assert!(within(Path::new("/a/b"), Path::new("/a/b")));
-        assert!(within(Path::new("/a/b/c"), Path::new("/a/b")));
-        assert!(!within(Path::new("/a/bc"), Path::new("/a/b")));
-        assert!(!within(Path::new("/a"), Path::new("/a/b")));
     }
 }

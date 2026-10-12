@@ -8,10 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use nerve_conformance::fake_center::{self, FakeCenter};
-use nerve_conformance::wire::{Conn, Recv};
+use nerve_conformance::wire::Conn;
 use nerve_node::{Daemon, NodeOptions, NodePaths};
 use nerve_policy::NodeConfig;
-use nerve_proto::rpc::Message;
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
 
@@ -150,7 +149,10 @@ async fn handshake_describe_and_an_allowed_read() {
 }
 
 /// The next `node.descriptor_changed` on `conn`: its rev.
+#[cfg(unix)]
 async fn changed_rev(conn: &mut Conn<TcpStream>) -> u64 {
+    use nerve_conformance::wire::Recv;
+    use nerve_proto::rpc::Message;
     loop {
         match conn.recv(WAIT).await {
             Recv::Msg(Message::Notification { method: m, params }) if m == "event" => {
@@ -165,6 +167,7 @@ async fn changed_rev(conn: &mut Conn<TcpStream>) -> u64 {
 }
 
 /// The tools a center can build: `cap.action` of the full descriptor.
+#[cfg(unix)]
 async fn offered(conn: &mut Conn<TcpStream>) -> (u64, Vec<String>) {
     let d = conn
         .call("describe", json!({"detail": "full"}), WAIT)
@@ -184,6 +187,10 @@ async fn offered(conn: &mut Conn<TcpStream>) -> (u64, Vec<String>) {
 
 /// Under default deny the center is shown only the actions a rule covers;
 /// an added or removed rule moves the rev and the node tells the center.
+/// Unix only: the rule reaches the running daemon through its control
+/// socket, and Windows has none in 0.0.1 (the CLI writes the file and the
+/// node takes it at its next start, spec/node-local.md §1).
+#[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rule_edit_changes_what_the_center_is_offered() {
     let dir = tempdir();

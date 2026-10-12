@@ -1,13 +1,14 @@
 //! The node's own folders (config, keys, state) are refused before any rule
 //! or mode, and nothing the owner or a center writes into a policy lifts that
 //! (issue #20).
-
-#![cfg(unix)]
+//!
+//! Pure logic: the Unix and the Windows rules are both tested on every
+//! platform.
 
 use std::path::{Path, PathBuf};
 
-use nerve_policy::config::{Access, Folder};
-use nerve_policy::protected::Protected;
+use nerve_policy::config::{Access, Folder, ProtectedOptions};
+use nerve_policy::protected::{Platform, Protected, WinFolders};
 use nerve_policy::{Call, CenterPolicy, Decision, Env, Mode, Target, decide};
 use nerve_proto::Effect;
 
@@ -37,6 +38,7 @@ fn wide_open(mode: Mode) -> CenterPolicy {
 
 fn protected(p: &CenterPolicy) -> Protected {
     Protected::new(
+        &Platform::Unix,
         Path::new("/h"),
         &[PathBuf::from(CONFIG), PathBuf::from(STATE)],
         &p.protected,
@@ -135,4 +137,95 @@ fn nothing_reaches_the_nodes_own_folders() {
         decide(&p, &env, &fs(Effect::Write, &notes)),
         Decision::Allow
     );
+}
+
+/// The same folders named in ways a plain substring of the absolute path
+/// misses: from the working directory, with `..`, doubled or `.` separators,
+/// and quoted (issue: Windows review of PR #19, finding 2).
+#[test]
+fn the_nodes_own_folders_are_seen_in_every_plain_spelling() {
+    for mode in [Mode::Allowlist, Mode::Folder, Mode::User] {
+        let p = wide_open(mode);
+        let prot = protected(&p);
+        let env = Env {
+            home: Path::new("/h"),
+            protected: &prot,
+            confined: true,
+            sudo: true,
+        };
+        let home = at("/h", false);
+        let proj = at("/h/proj", false);
+        for (named, cwd) in [
+            ("cat ../.config/nerve/node.toml", &proj),
+            ("cat ./.config/nerve/node.toml", &home),
+            ("cat .config/nerve/node.toml", &home),
+            ("cat '.local/state/nerve/config.key'", &home),
+            ("cat /h//.config/nerve/node.toml", &home),
+            ("cat /h/./.config/nerve/node.toml", &home),
+            ("cat /h/proj/../.config/nerve/node.toml", &home),
+            ("cat $HOME/proj/../.config/nerve/node.toml", &home),
+            ("cat \"~/.config/nerve/node.toml\"", &home),
+            ("cat '~/.local/state/nerve/config.key'", &home),
+            ("cp x --target=~/.config/nerve", &home),
+        ] {
+            let d = decide(&p, &env, &run(named, cwd));
+            assert!(own_refusal(&d), "{mode:?} {named:?} in {cwd:?}: {d:?}");
+        }
+        // Beside them, and names that only look alike, are not theirs.
+        for (named, cwd) in [
+            ("cat ../notes/a", &proj),
+            ("cat .config/nerve-notes/a", &home),
+            ("cat /h/proj/../notes/.config/nerve", &home),
+            ("cat nerve/node.toml", &home),
+        ] {
+            let d = decide(&p, &env, &run(named, cwd));
+            assert!(!own_refusal(&d), "{mode:?} {named:?} in {cwd:?}: {d:?}");
+        }
+    }
+}
+
+/// A Windows node whose folders sit beside a project, as on the review VM of
+/// PR #19: the spellings a PowerShell line names them by are refused in
+/// every mode, through the whole decision.
+#[test]
+fn a_windows_command_line_reaches_no_own_folder() {
+    let own = [
+        PathBuf::from("C:\\Users\\u\\nerve-test\\node-config"),
+        PathBuf::from("C:\\Users\\u\\nerve-test\\node-state"),
+    ];
+    let prot = Protected::new(
+        &Platform::Windows(WinFolders::default()),
+        Path::new("C:\\Users\\u"),
+        &own,
+        &ProtectedOptions::default(),
+    );
+    let env = Env {
+        home: Path::new("C:\\Users\\u"),
+        protected: &prot,
+        confined: true,
+        sudo: false,
+    };
+    let proj = at("C:\\Users\\u\\nerve-test\\proj", false);
+    for mode in [Mode::Allowlist, Mode::Folder, Mode::User] {
+        let mut p = wide_open(mode);
+        p.folders.push(Folder {
+            path: "C:\\Users\\u".into(),
+            access: Access::ALL,
+        });
+        for named in [
+            "Get-Content C:/Users/u/nerve-test/node-state/config.key",
+            "Get-Content ~/nerve-test/node-config/node.toml",
+            "Get-Content $HOME/nerve-test/node-config/node.toml",
+            "Get-Content ~\\nerve-test\\node-config\\node.toml",
+            "Get-Content $env:USERPROFILE\\nerve-test\\node-config\\node.toml",
+            "Get-Content ..\\node-config\\node.toml",
+            "Get-Content \"..\\node-state\\config.key\"",
+        ] {
+            let d = decide(&p, &env, &run(named, &proj));
+            assert!(own_refusal(&d), "{mode:?} {named:?}: {d:?}");
+        }
+    }
+    let p = wide_open(Mode::User);
+    let d = decide(&p, &env, &run("Get-Content ..\\notes\\a.txt", &proj));
+    assert_eq!(d, Decision::Allow);
 }

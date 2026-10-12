@@ -150,6 +150,8 @@ pub(crate) struct Shared {
     pub paths: NodePaths,
     pub exe: Option<PathBuf>,
     pub home: PathBuf,
+    /// Which protected list applies, and where its system folders are.
+    pub platform: nerve_policy::protected::Platform,
     pub confinement: Confinement,
     pub store: Mutex<SettingsStore>,
     /// Ticks whenever the config may have changed; links re-check their
@@ -343,6 +345,7 @@ impl Daemon {
             paths: paths.clone(),
             exe: opts.exe,
             home: opts.home,
+            platform: crate::paths::platform(),
             confinement: Confinement::detect(),
             store: Mutex::new(store),
             changed,

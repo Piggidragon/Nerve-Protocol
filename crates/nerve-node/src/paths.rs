@@ -1,6 +1,10 @@
-//! Where a node keeps its files.
+//! Where a node keeps its files, and the system folders its protected list
+//! hangs off.
 
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+
+use nerve_policy::protected::{Platform, WinFolders};
 
 /// The node's config directory (`node.toml`, keys) and state directory
 /// (control socket, audit log, the config's MAC key). Tests point both at
@@ -75,4 +79,74 @@ pub fn home_dir() -> PathBuf {
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| Path::new("/").to_path_buf())
+}
+
+/// The platform the protected list follows: this one, on Windows with its
+/// system folders from the environment.
+pub fn platform() -> Platform {
+    if cfg!(windows) {
+        Platform::Windows(windows_folders(|k| std::env::var_os(k)))
+    } else {
+        Platform::Unix
+    }
+}
+
+/// `%ProgramData%` and `%SystemRoot%` as `var` reads them, each with its
+/// usual place as well: a center does not set the node's environment, but an
+/// odd one must not leave `C:\ProgramData\ssh` unprotected.
+pub fn windows_folders(var: impl Fn(&str) -> Option<OsString>) -> WinFolders {
+    let all = |names: &[&str], usual: &str| -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = names
+            .iter()
+            .filter_map(|n| var(n))
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .chain(std::iter::once(PathBuf::from(usual)))
+            .collect();
+        out.dedup_by(|a, b| {
+            a.to_string_lossy()
+                .eq_ignore_ascii_case(&b.to_string_lossy())
+        });
+        out
+    };
+    WinFolders {
+        program_data: all(&["ProgramData", "ALLUSERSPROFILE"], "C:\\ProgramData"),
+        system_root: all(&["SystemRoot", "windir"], "C:\\Windows"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_folders_come_from_the_environment_and_their_usual_place() {
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                vars.iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| OsString::from(v))
+            }
+        };
+        let f = windows_folders(env(&[
+            ("ProgramData", "D:\\ProgramData"),
+            ("SystemRoot", "D:\\WINDOWS"),
+            ("windir", "D:\\WINDOWS"),
+        ]));
+        assert_eq!(
+            f.program_data,
+            [PathBuf::from("D:\\ProgramData"), "C:\\ProgramData".into()]
+        );
+        assert_eq!(
+            f.system_root,
+            [PathBuf::from("D:\\WINDOWS"), "C:\\Windows".into()]
+        );
+        // An empty or missing environment still protects the usual places.
+        let f = windows_folders(env(&[("ProgramData", "")]));
+        assert_eq!(f.program_data, [PathBuf::from("C:\\ProgramData")]);
+        assert_eq!(f.system_root, [PathBuf::from("C:\\Windows")]);
+        let f = windows_folders(env(&[("SystemRoot", "c:\\windows")]));
+        assert_eq!(f.system_root, [PathBuf::from("c:\\windows")]);
+        assert_eq!(platform() == Platform::Unix, cfg!(not(windows)));
+    }
 }

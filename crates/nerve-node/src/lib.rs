@@ -1,5 +1,5 @@
 //! The Nerve node: links this machine to its centers and serves them what the
-//! owner's policy allows (architecture §3, §5, §7).
+//! owner's policy allows (docs/dev/).
 //!
 //! The daemon ([`daemon::Daemon`]) keeps one link per paired center, runs the
 //! `fs`, `exec`, `settings` and `audit` capabilities, and serves

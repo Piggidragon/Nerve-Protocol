@@ -1,5 +1,5 @@
-//! The decision engine: whether one call of one center may run (architecture
-//! §5.1, spec node-local §3).
+//! The decision engine: whether one call of one center may run
+//! (docs/dev/policy-engine.md, spec node-local §3).
 //!
 //! There are two outcomes, allowed and refused; nothing waits for an answer.
 //! The order only ever narrows: a command line too long to check is

@@ -1,4 +1,4 @@
-//! The node's configuration, `node.toml` (architecture §8.3).
+//! The node's configuration, `node.toml` (docs/dev/settings-and-config.md).
 //!
 //! Every table is parsed with `deny_unknown_fields`: a misspelt key in a policy
 //! file must be an error, not a rule that silently does nothing.
@@ -188,7 +188,7 @@ impl CenterEntry {
     }
 }
 
-/// The permission modes (architecture §5.1). A call no mode and no rule
+/// The permission modes (docs/dev/policy-engine.md). A call no mode and no rule
 /// allows is refused at once; nothing waits for an answer. Deny rules work in
 /// every mode and win over everything else; allow rules count only in
 /// `allowlist`.

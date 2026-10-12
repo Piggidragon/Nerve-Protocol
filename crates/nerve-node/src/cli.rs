@@ -1,4 +1,4 @@
-//! The `nerve-node` command line (architecture §8). Commands talk to the
+//! The `nerve-node` command line (docs/dev/settings-and-config.md). Commands talk to the
 //! running daemon over the control socket; when none runs they edit the
 //! config file directly through the same [`SettingsStore`], which signs it.
 
@@ -1245,7 +1245,7 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
         Cmd::Proxy(c) => proxy_cmd(&paths, c, out).await,
         Cmd::Sudo(c) => sudo_cmd(&paths, c, out).await,
         // Not done in 0.0.1: service install, a dedicated user, self-update
-        // and removal (architecture §6, §8).
+        // and removal.
         Cmd::Install => Err(format!("install: {NOT_DONE}")),
         Cmd::Setup { .. } => Err(format!("setup: {NOT_DONE}")),
         Cmd::Update => Err(format!("update: {NOT_DONE}")),

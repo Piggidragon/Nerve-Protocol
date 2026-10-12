@@ -1,6 +1,6 @@
 # A release of Nerve, started by hand: Actions, Release, Run workflow, with the
 # branch to build from, the kind (pre-release or release) and the version
-# (docs/releasing.md).
+# (docs/dev/releasing.md).
 #
 # `check` stops a bad run before anything is built: a release from any branch
 # but main, a version that is not the one in Cargo.toml, a release whose tag
@@ -317,7 +317,7 @@ jobs:
               prerelease=true
               ;;
           esac
-          footer="Static Linux binaries (x86_64, aarch64) and Windows x86_64 programs of \`nerve-center\` and \`nerve-node\`, built from $SHA. SHA256SUMS lists their checksums. They are not signed: Nerve has no update channel yet (docs/releasing.md)."
+          footer="Static Linux binaries (x86_64, aarch64) and Windows x86_64 programs of \`nerve-center\` and \`nerve-node\`, built from $SHA. SHA256SUMS lists their checksums. They are not signed: Nerve has no update channel yet (docs/dev/releasing.md)."
           # A pre-release's body is the footer alone.
           if [ "$KIND" = release ]; then
             { cat notes/changelog.md; echo; echo "$footer"; } > release-notes.md

@@ -4,12 +4,12 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use nerve_transport::http::{self, Request, Response};
 use nerve_transport::net::BoxIo;
@@ -38,6 +38,11 @@ pub struct Engine {
     transport: String,
     session: Mutex<Arc<Session>>,
     initialized: AtomicBool,
+    /// Tool calls in flight by their request id (as JSON text), each with a
+    /// number of its own so a reused id cannot stop the wrong call, and the
+    /// sender that cancels it.
+    calls: Mutex<HashMap<String, (u64, oneshot::Sender<()>)>>,
+    next_call: AtomicU64,
 }
 
 impl Engine {
@@ -47,6 +52,8 @@ impl Engine {
             transport: transport.to_string(),
             session: Mutex::new(center.new_session(transport)),
             initialized: AtomicBool::new(false),
+            calls: Mutex::new(HashMap::new()),
+            next_call: AtomicU64::new(0),
         }
     }
 
@@ -97,21 +104,45 @@ impl Engine {
             return None;
         };
         let Some(id) = id else {
-            if method == "notifications/initialized" {
-                self.initialized.store(true, Ordering::SeqCst);
+            match method {
+                "notifications/initialized" => self.initialized.store(true, Ordering::SeqCst),
+                // The call stops waiting, which cancels it on its node.
+                "notifications/cancelled" => {
+                    if let Some(req) = params.get("requestId")
+                        && let Some((_, stop)) = self.calls.lock().unwrap().remove(&req.to_string())
+                    {
+                        let _ = stop.send(());
+                    }
+                }
+                _ => {}
             }
-            // notifications/cancelled is not acted on: a call runs to its end
-            // on the node, and the reply is dropped by the client.
             return None;
         };
         Some(match method {
             "initialize" => self.initialize(id, &params),
             "ping" => result(id, json!({})),
             "tools/list" => result(id, json!({"tools": self.list()})),
-            "tools/call" => match self.call(&params).await {
-                Ok(r) => result(id, r),
-                Err((code, m)) => error(id, code, &m),
-            },
+            "tools/call" => {
+                let key = id.to_string();
+                let n = self.next_call.fetch_add(1, Ordering::SeqCst);
+                let (stop, stopped) = oneshot::channel();
+                self.calls.lock().unwrap().insert(key.clone(), (n, stop));
+                let out = tokio::select! {
+                    r = self.call(&params) => Some(r),
+                    Ok(()) = stopped => None,
+                };
+                let mut calls = self.calls.lock().unwrap();
+                if calls.get(&key).is_some_and(|(m, _)| *m == n) {
+                    calls.remove(&key);
+                }
+                drop(calls);
+                match out {
+                    Some(Ok(r)) => result(id, r),
+                    Some(Err((code, m))) => error(id, code, &m),
+                    // A cancelled request gets no response (MCP cancellation).
+                    None => return None,
+                }
+            }
             _ => error(id, -32601, &format!("unknown method {method}")),
         })
     }

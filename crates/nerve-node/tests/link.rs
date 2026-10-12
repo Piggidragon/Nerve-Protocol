@@ -613,5 +613,92 @@ async fn walks_reach_a_readable_folder_inside_a_sealed_one() {
         .await
         .expect("list");
     assert_eq!(l["entries"], json!([]), "{l}");
+
+/// Whether process `pid` still runs (a zombie does not count).
+#[cfg(target_os = "linux")]
+fn running(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
+        s.rsplit_once(')')
+            .is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z'))
+    })
+}
+
+/// The pid a command wrote to `file`, once it is there.
+#[cfg(target_os = "linux")]
+async fn pid_in(file: &Path) -> u32 {
+    for _ in 0..200 {
+        if let Ok(t) = std::fs::read_to_string(file)
+            && let Ok(pid) = t.trim().parse()
+        {
+            return pid;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("no pid in {}", file.display())
+}
+
+/// `session.end` stops the commands of that session the way a timeout does:
+/// the call fails `cancelled` and its processes are gone within seconds. A
+/// command of another session keeps running until its own cancel.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_end_stops_the_commands_of_that_session() {
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let node = paired_node_with(dir.path(), &center, |p| {
+        p.mode = nerve_policy::Mode::User;
+    })
+    .await;
+    let mut conn = linked(&mut center).await;
+    let home = dir.path().join("home");
+    let run = |session: &str, file: &str| {
+        json!({"cap": "exec", "action": "run",
+               "args": {"command": format!("sleep 30 & echo $! > {file}; wait")},
+               "ctx": {"session": session}})
+    };
+    let ended = conn
+        .request("invoke", run("s-ended", "ended.pid"))
+        .await
+        .unwrap();
+    let other = conn
+        .request("invoke", run("s-other", "other.pid"))
+        .await
+        .unwrap();
+    let ended_pid = pid_in(&home.join("ended.pid")).await;
+    let other_pid = pid_in(&home.join("other.pid")).await;
+
+    conn.notify("session.end", json!({"session": "s-ended"}))
+        .await
+        .unwrap();
+    let mut others = Vec::new();
+    let e = conn
+        .answer(ended, WAIT, &mut others)
+        .await
+        .unwrap()
+        .expect_err("the session's call ends");
+    assert_eq!(nerve_conformance::wire::code_of(&e), "cancelled");
+    let gone = |pid| async move {
+        for _ in 0..100 {
+            if !running(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    };
+    assert!(gone(ended_pid).await, "the session's command outlived it");
+    assert!(running(other_pid), "another session's command was stopped");
+
+    conn.notify("cancel", json!({"id": other})).await.unwrap();
+    let e = conn
+        .answer(other, WAIT, &mut others)
+        .await
+        .unwrap()
+        .expect_err("cancelled");
+    assert_eq!(nerve_conformance::wire::code_of(&e), "cancelled");
+    assert!(
+        gone(other_pid).await,
+        "a cancelled command outlived its call"
+    );
     node.stop().await;
 }

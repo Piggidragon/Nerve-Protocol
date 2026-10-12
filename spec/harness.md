@@ -112,7 +112,9 @@ is `isError: true` with `error <code>: <message>`, the code from
 
 Each MCP connection (stdio, attached, or HTTP session) is one session with an
 id the center sends as `ctx.session`. When a session ends, every node it used
-gets `session.end`. The web UI can end a session.
+gets `session.end` and cancels that session's calls, which stops their
+commands. The web UI can end a session. A `notifications/cancelled` cancels
+its call on the node, and the cancelled request gets no response.
 
 ## 6. Refused calls
 

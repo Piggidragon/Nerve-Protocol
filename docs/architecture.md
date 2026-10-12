@@ -90,7 +90,7 @@ One daemon, `nerve-node`, Rust, Linux and Windows first, macOS later. It holds:
 - one pairing per center (center URL, pin, center id, the node key for that center);
 - the policy per center entry and the machine settings (§5);
 - the built-in capabilities: `node`, `fs`, `exec`, `settings`, `audit`;
-- the sandbox (Landlock, cgroup scope and exec shim on Linux, Job Object on Windows, the dedicated-user install; 0.0.1: Landlock in the exec shim and `no_new_privs` on Linux only, no cgroup scope, no Job Object, no dedicated-user install);
+- the sandbox (Landlock, cgroup scope and exec shim on Linux, Job Object on Windows (not in 0.0.1: folder mode runs no command there), the dedicated-user install);
 - the sudo password, while the sudo switch is on (§5.1);
 - the local interface: a control socket used by the CLI (§7.2; 0.0.1: Unix only).
 
@@ -207,7 +207,7 @@ Shared and device-only are the machine settings (§5.3) and the limits that prot
 | D8 | No per-call context | `ctx {session}` on `invoke` | The node needs the id to tell sessions apart in its audit records, and the center must never be able to send "allowed" |
 | D9 | Scopes per token | No scopes; the node's policy per center entry is the only authority, and the descriptor a center sees is filtered by it | One authority instead of two that can disagree; scopes stay in the backlog (§11) |
 | D10 | `ask`: a person decides per call at the node | Rules only: allow or deny, with wildcards, default deny; a call no rule allows is refused at once (§5.4) | Nothing waits for a person; the owner adds the rule that is missing |
-| D11 | No center-to-node messages besides requests | `session.end` notification, settings actions (when granted) | The nodes a session used learn that it ended; a node keeps nothing per session in 0.0.1, so it only accepts the message |
+| D11 | No center-to-node messages besides requests | `session.end` notification, settings actions (when granted) | The nodes a session used learn that it ended and cancel that session's calls, so its commands stop; an MCP `notifications/cancelled` becomes `cancel` for its call |
 | D12 | Session resume, `idem` | Not in 0.0.1, later | §3.5 |
 | D13 | HTTP binding, CBOR, center-dials | Left out | No node listens; no constrained node exists yet |
 | D14 | Nodes MAY accept several centers, no isolation rules | MUST isolate per center (§3.7) | Several centers are only safe as separate trust domains |
@@ -297,7 +297,7 @@ Big-endian integers. `seq` counts per id and direction from 0. Backpressure: eac
 |---|---|---|
 | `node` | `nerve:node/1` | state `status` (`online`, `busy`, `paused`); events `descriptor_changed`, `going_away`, `capability_changed` (implicit) |
 | `fs` | `nerve:fs/1` | actions `stat`, `list`, `read`, `grep`, `find` (`read`), `write` (`write`, with `if_match`); one path form on every platform (`/c/Users/…` on Windows) |
-| `exec` | `nerve:exec/1` | action `run` (`execute`), `signal` (`actuate`); stream `output` (reliable); event `exit`; state `shell`, `confinement` |
+| `exec` | `nerve:exec/1` | action `run` (`execute`), `signal` (`actuate`); stream `output` (reliable); event `exit`; state `shell`, `confinement`. The `run` text names the shell (Windows PowerShell 5.1 on Windows). A timeout, `cancel` or `session.end` kills the command's process group; Windows has none and no Job Object in 0.0.1, so there the node ends the processes it saw below the shell (polled), best effort |
 | `settings` | `nerve:settings/1` | state `document`; action `set` (`write`, with `if_version`); present only for a center with `settings = write` (§5.2) |
 | `audit` | `nerve:audit/1` | event `decision` (needs `sub`) |
 

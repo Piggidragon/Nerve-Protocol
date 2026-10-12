@@ -102,6 +102,25 @@ impl std::ops::Deref for Center {
     }
 }
 
+/// An `invoke` whose reply has not come. Dropped before it comes (the
+/// harness cancelled the call), it tells the node to cancel the request, so
+/// a command does not run on for nobody.
+struct Waiting {
+    link: Option<Arc<Link>>,
+    id: u64,
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        if let Some(link) = self.link.take()
+            && let Ok(rt) = tokio::runtime::Handle::try_current()
+        {
+            let id = self.id;
+            rt.spawn(async move { link.cancel(id).await });
+        }
+    }
+}
+
 /// The name a new center gets when no `--name` is given.
 pub const DEFAULT_NAME: &str = "nerve-center";
 
@@ -877,20 +896,25 @@ impl Center {
         let ctx = json!({"session": sess.id});
         sess.nodes.lock().unwrap().insert(route.node_id.clone());
         link.sessions.lock().unwrap().insert(sess.id.clone());
-        let (_, rx) = link
+        let (id, rx) = link
             .start(
                 msg::method::INVOKE,
                 json!({"cap": route.cap, "action": route.action, "args": args, "ctx": ctx}),
             )
             .await?;
-        rx.await
-            .unwrap_or_else(|_| {
-                Err(RpcError::new(
-                    ErrorCode::ConnectionLost,
-                    "the link to the node ended",
-                ))
-            })
-            .map_err(CallError::Rpc)
+        let mut waiting = Waiting {
+            link: Some(link),
+            id,
+        };
+        let r = rx.await;
+        waiting.link = None;
+        r.unwrap_or_else(|_| {
+            Err(RpcError::new(
+                ErrorCode::ConnectionLost,
+                "the link to the node ended",
+            ))
+        })
+        .map_err(CallError::Rpc)
     }
 
     /// Closes every link with `bye shutdown`.

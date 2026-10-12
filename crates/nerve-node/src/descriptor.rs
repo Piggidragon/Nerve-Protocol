@@ -221,7 +221,7 @@ fn fs_cap(exposure: Exposure) -> Capability {
     c
 }
 
-fn exec_cap(exposure: Exposure) -> Capability {
+fn exec_cap(exposure: Exposure, shell: Option<&str>) -> Capability {
     let mut c = cap(
         "exec",
         "exec",
@@ -232,7 +232,7 @@ fn exec_cap(exposure: Exposure) -> Capability {
         "run".into(),
         action(
             Effect::Execute,
-            "Runs a command in the node's shell.",
+            &crate::exec::shell_summary(shell),
             obj(
                 json!({"command": {"type": "string"}, "cwd": {"type": "string"},
                        "timeout_ms": {"type": "integer", "minimum": 1}}),
@@ -433,7 +433,7 @@ fn build(cfg: &NodeConfig, entry: &CenterEntry, now_ms: u64, by_rules: bool) -> 
         caps.push(fs_cap(e));
     }
     if let Some(e) = exposure(entry, "exec") {
-        caps.push(exec_cap(e));
+        caps.push(exec_cap(e, cfg.machine.shell.as_deref()));
     }
     if entry.settings == SettingsGrant::Write {
         caps.push(settings_cap());

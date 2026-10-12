@@ -1,6 +1,8 @@
 //! The `exec` capability (spec §7.3): shell commands, each in its own
 //! process group so the whole tree can be signalled and is killed when the
-//! call ends or the link drops.
+//! call ends or the link drops. Windows has no process groups; there the node
+//! records the processes below the shell while it runs (crate::tree), which
+//! is best effort until a Job Object holds the tree.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -102,6 +104,50 @@ pub fn shell_command(shell: Option<&str>, command: &str) -> (String, Vec<String>
     let mut args = flag;
     args.push(command.into());
     (sh, args)
+}
+
+/// What the `exec.run` action says about the shell, so a model writes the
+/// syntax of the shell that runs it: Windows PowerShell 5.1 is the default
+/// on Windows, and cmd's `a & b` is a parser error there.
+pub fn shell_summary(shell: Option<&str>) -> String {
+    let (sh, mut args) = shell_command(shell, "");
+    args.pop();
+    let line = format!("`{sh} {}`", args.join(" "));
+    let lower = sh.to_lowercase();
+    if lower.contains("pwsh") {
+        format!("Runs a command in PowerShell 7 ({line}): PowerShell syntax, not cmd or sh.")
+    } else if lower.contains("powershell") {
+        format!(
+            "Runs a command in Windows PowerShell 5.1 ({line}): PowerShell syntax, not cmd or sh. \
+             Chain commands with `;`; `&&` and `a & b` are parser errors there."
+        )
+    } else if args == ["/C"] {
+        format!("Runs a command in cmd ({line}): cmd syntax.")
+    } else {
+        format!("Runs a command with {line}.")
+    }
+}
+
+/// Command output as text. UTF-8 is taken as it is, also when the cap cut
+/// its last character (`cut`); other bytes are decoded by `other`, the code
+/// page the shell wrote in (Windows PowerShell 5.1 writes the console code
+/// page, not UTF-8), and what neither reads is replaced.
+pub fn output_text(bytes: &[u8], cut: bool, other: impl Fn(&[u8]) -> Option<String>) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(e) if cut && e.error_len().is_none() => String::from_utf8_lossy(bytes).into_owned(),
+        Err(_) => other(bytes).unwrap_or_else(|| String::from_utf8_lossy(bytes).into_owned()),
+    }
+}
+
+/// [`output_text`] with this platform's other encoding: the console code
+/// page on Windows, none elsewhere.
+fn decode(bytes: &[u8], cut: bool) -> String {
+    #[cfg(windows)]
+    let other = |b: &[u8]| crate::win::code_page_text(crate::win::console_code_page(), b);
+    #[cfg(not(windows))]
+    let other = |_: &[u8]| None;
+    output_text(bytes, cut, other)
 }
 
 /// The Landlock rules for a command of a center in `folders` mode: it reads
@@ -279,13 +325,26 @@ pub async fn sudo_check(sudo_path: &str, password: &str) -> Result<(), String> {
 }
 
 /// Kills the command's whole process group when dropped: a cancelled call, a
-/// dropped link and a finished command all leave nothing behind.
+/// dropped link and a finished command all leave nothing behind. On Windows
+/// that is the processes recorded below the shell (crate::tree).
 struct Group(Option<u32>);
+
+impl Group {
+    fn start(pid: Option<u32>) -> Group {
+        #[cfg(windows)]
+        if let Some(pid) = pid {
+            crate::tree::watch(pid);
+        }
+        Group(pid)
+    }
+}
 
 impl Drop for Group {
     fn drop(&mut self) {
         if let Some(pid) = self.0 {
             kill_group(pid, Sig::Kill);
+            #[cfg(windows)]
+            crate::tree::forget(pid);
         }
     }
 }
@@ -322,16 +381,16 @@ pub fn kill_group(pid: u32, sig: Sig) {
     }
 }
 
-#[cfg(not(unix))]
+/// Ends the shell `pid` and every process recorded or found below it; every
+/// signal ends them. Best effort: a Job Object would hold the whole tree,
+/// and this misses what crate::tree cannot see.
+#[cfg(windows)]
 pub fn kill_group(pid: u32, _sig: Sig) {
-    // Not done in 0.0.1: a Job Object would hold the whole tree; this ends
-    // the shell and what taskkill finds below it.
-    let _ = std::process::Command::new("taskkill")
-        .args(["/T", "/F", "/PID", &pid.to_string()])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
+    crate::tree::kill(pid);
 }
+
+#[cfg(not(any(unix, windows)))]
+pub fn kill_group(_pid: u32, _sig: Sig) {}
 
 /// Reads up to `cap` bytes and drains the rest, so the command never blocks
 /// on a full pipe. Returns the bytes and whether some were dropped.
@@ -495,7 +554,7 @@ pub async fn run(
     let mut child = cmd
         .spawn()
         .map_err(|e| RpcError::new(ErrorCode::Unavailable, format!("cannot start: {e}")))?;
-    let group = Group(child.id());
+    let group = Group::start(child.id());
     let mut sudo_stdin = None;
     if let Some(spec) = shim {
         let mut stdin = child.stdin.take().expect("piped");
@@ -548,8 +607,8 @@ pub async fn run(
     #[cfg_attr(not(unix), allow(unused_mut))]
     let mut result = json!({
         "exit_code": status.code(),
-        "stdout": String::from_utf8_lossy(&out.0),
-        "stderr": String::from_utf8_lossy(&err.0),
+        "stdout": decode(&out.0, out.1),
+        "stderr": decode(&err.0, err.1),
         "truncated": out.1 || err.1,
     });
     #[cfg(unix)]
@@ -813,5 +872,177 @@ mod tests {
             .clone();
         assert!(RunCall::parse(&bad, &home).is_err());
         assert_eq!(shell_command(None, "ls").1, ["-c", "ls"]);
+    }
+}
+
+/// The shell's text and the output decoding: plain logic, on every platform.
+#[cfg(test)]
+mod text_tests {
+    use super::*;
+
+    /// A stand-in for code page 850 with the two letters the tests use.
+    fn cp850(b: &[u8]) -> Option<String> {
+        b.iter()
+            .map(|c| match c {
+                0x81 => Some('ü'),
+                0xE1 => Some('ß'),
+                c if c.is_ascii() => Some(*c as char),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Windows PowerShell 5.1 wrote a German error in the console code page:
+    /// it comes back with its umlauts, not as replacement characters.
+    #[test]
+    fn output_in_another_code_page_is_decoded_with_it() {
+        let oem = b"Gr\x81\xE1e: Fehler beim Ausf\x81hren";
+        assert_eq!(
+            output_text(oem, false, cp850),
+            "Grüße: Fehler beim Ausführen"
+        );
+        // UTF-8 stays UTF-8, and the code page is not asked.
+        assert_eq!(output_text("Grüße".as_bytes(), false, |_| None), "Grüße");
+        // The cap cut the last character: still UTF-8, not the code page.
+        let cut = &"Grüß".as_bytes()[..5];
+        assert_eq!(output_text(cut, true, cp850), "Grü\u{FFFD}");
+        // Neither reads it: replaced.
+        assert_eq!(output_text(b"a\xFFb", false, |_| None), "a\u{FFFD}b");
+    }
+
+    /// The `exec.run` text names the shell and, for Windows PowerShell 5.1,
+    /// how to chain commands there.
+    #[test]
+    fn the_run_action_names_its_shell() {
+        assert_eq!(
+            shell_summary(Some("powershell.exe")),
+            "Runs a command in Windows PowerShell 5.1 (`powershell.exe -NoProfile -Command`): \
+             PowerShell syntax, not cmd or sh. Chain commands with `;`; `&&` and `a & b` are \
+             parser errors there."
+        );
+        assert_eq!(
+            shell_summary(Some(r"C:\Program Files\PowerShell\7\pwsh.exe")),
+            "Runs a command in PowerShell 7 (`C:\\Program Files\\PowerShell\\7\\pwsh.exe \
+             -NoProfile -Command`): PowerShell syntax, not cmd or sh."
+        );
+        assert_eq!(
+            shell_summary(Some("cmd.exe")),
+            "Runs a command in cmd (`cmd.exe /C`): cmd syntax."
+        );
+        assert_eq!(
+            shell_summary(Some("/bin/bash")),
+            "Runs a command with `/bin/bash -c`."
+        );
+        let default = shell_summary(None);
+        if cfg!(windows) {
+            assert!(default.contains("Windows PowerShell 5.1"), "{default}");
+        } else {
+            assert_eq!(default, "Runs a command with `/bin/sh -c`.");
+        }
+    }
+}
+
+/// Windows only: the real shell, code pages and process table. The owner
+/// runs these on a Windows machine.
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    fn opts() -> RunOptions {
+        RunOptions {
+            shell: None,
+            landlock: None,
+            exe: PathBuf::from("nerve-node.exe"),
+            output_cap: 64 * 1024,
+            sudo: None,
+        }
+    }
+
+    fn call(cmd: &str, cwd: &Path, timeout: Duration) -> RunCall {
+        RunCall {
+            command: cmd.into(),
+            cwd: cwd.to_path_buf(),
+            timeout: Some(timeout),
+        }
+    }
+
+    #[test]
+    fn code_pages_decode() {
+        assert_eq!(
+            crate::win::code_page_text(850, b"Gr\x81\xE1e").as_deref(),
+            Some("Grüße")
+        );
+        assert_eq!(
+            crate::win::code_page_text(1252, b"Gr\xFC\xDFe").as_deref(),
+            Some("Grüße")
+        );
+        assert_ne!(crate::win::console_code_page(), 0);
+    }
+
+    /// What Windows PowerShell 5.1 prints, on stdout and stderr, comes back
+    /// with its umlauts whatever the console code page is.
+    #[tokio::test]
+    async fn powershell_output_keeps_its_umlauts() {
+        let d = tempfile::tempdir().unwrap();
+        let c = call(
+            "Write-Output 'Grüße'; [Console]::Error.WriteLine('Größe')",
+            d.path(),
+            Duration::from_secs(60),
+        );
+        let r = run(&c, &opts(), |_| {}).await.unwrap();
+        assert_eq!(r["stdout"].as_str().unwrap().trim_end(), "Grüße", "{r}");
+        assert_eq!(r["stderr"].as_str().unwrap().trim_end(), "Größe", "{r}");
+    }
+
+    /// The pid a process wrote to `file`, once it is there.
+    async fn pid_in(file: &Path) -> u32 {
+        for _ in 0..600 {
+            if let Ok(t) = std::fs::read_to_string(file)
+                && let Ok(pid) = t.trim().parse()
+            {
+                return pid;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("no pid in {}", file.display())
+    }
+
+    async fn gone(pid: u32) -> bool {
+        for _ in 0..100 {
+            if !crate::win::running(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        false
+    }
+
+    /// A timeout ends a child of the shell and a grandchild whose parent
+    /// exited long before (the parent lives 1.5 s, so the poll sees it).
+    #[tokio::test]
+    async fn a_timeout_ends_a_grandchild_whose_parent_exited() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("inner.ps1"),
+            "$p = Start-Process ping -ArgumentList '-n','120','127.0.0.1' -WindowStyle Hidden -PassThru\r\n\
+             Set-Content -Path grandchild.pid -Value $p.Id\r\n\
+             Start-Sleep -Milliseconds 1500\r\n",
+        )
+        .unwrap();
+        let command = "$c = Start-Process ping -ArgumentList '-n','120','127.0.0.1' -WindowStyle Hidden -PassThru; \
+             Set-Content -Path child.pid -Value $c.Id; \
+             Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','inner.ps1' -WindowStyle Hidden; \
+             Start-Sleep 120";
+        let c = call(command, d.path(), Duration::from_secs(15));
+        let task = tokio::spawn(async move { run(&c, &opts(), |_| {}).await });
+        let child = pid_in(&d.path().join("child.pid")).await;
+        let grandchild = pid_in(&d.path().join("grandchild.pid")).await;
+        let e = task.await.unwrap().unwrap_err();
+        assert_eq!(e.kind(), ErrorCode::Timeout);
+        assert!(gone(child).await, "the shell's child outlived the timeout");
+        assert!(
+            gone(grandchild).await,
+            "the orphaned grandchild outlived the timeout"
+        );
     }
 }

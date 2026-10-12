@@ -72,3 +72,6 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
 - A pairing code pairs one node also when several requests send it at the same moment.
 - A center with the settings grant `write` can add protected paths to `protected.extra` but not remove the owner's.
 - The node's audit log logs at most 512 characters of a target and moves to `audit.jsonl.1` at 10 MiB, keeping one old file.
+- Ending an MCP session (stdio closed, `DELETE /mcp`, the web UI) stops the commands it started: the node acts on `session.end` like on `cancel`, and an MCP `notifications/cancelled` cancels the call on its node.
+- On Windows, command output that is not UTF-8 is decoded from the console code page Windows PowerShell wrote it in, so umlauts no longer come back as replacement characters, and the `exec.run` text names the shell (Windows PowerShell 5.1: chain with `;`, not `&`).
+- On Windows, a cancelled or timed-out command also ends the processes recorded below its shell while it ran, such as a grandchild whose parent already exited; best effort without a Job Object, it misses processes started through WMI or a service.

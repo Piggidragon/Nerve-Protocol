@@ -394,6 +394,101 @@ fn nerve_center_and_nerve_node_work_together() {
     assert!(mcp.finish());
 }
 
+/// Whether process `pid` still runs (a zombie does not count).
+#[cfg(target_os = "linux")]
+fn running(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
+        s.rsplit_once(')')
+            .is_some_and(|(_, rest)| !rest.trim_start().starts_with('Z'))
+    })
+}
+
+/// Waits up to `secs` for `f`.
+fn within(secs: u64, mut f: impl FnMut() -> bool) -> bool {
+    let until = Instant::now() + Duration::from_secs(secs);
+    while Instant::now() < until {
+        if f() {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+/// A command stops when its MCP call is cancelled and when its session is
+/// ended in the web UI, within a few seconds, without a timeout.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_cancelled_call_and_an_ended_session_stop_their_command() {
+    let root = tempfile::tempdir().unwrap();
+    let mut mcp = Mcp::start(&root.path().join("center"), false, &[]);
+    let mut node = Node::new(&root.path().join("node"));
+    node.ok(&["center", "add", &mcp.pair_link(), "--yes"]);
+    node.ok(&["mode", "set", "user"]);
+    node.start();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let tools = loop {
+        let tools = mcp.tools();
+        if tools
+            .iter()
+            .any(|t| t["name"].as_str().is_some_and(|n| n.ends_with("exec_run")))
+        {
+            break tools;
+        }
+        assert!(Instant::now() < deadline, "no exec_run tool: {tools:?}");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let ov = mcp.wait_overview("the node is online", |v| {
+        v["nodes"][0]["online"] == json!(true)
+    });
+    let name = ov["nodes"][0]["name"].as_str().unwrap().to_string();
+    let (run, args) = tool(&tools, "exec", "run", &name);
+    let start = |mcp: &mut Mcp, id: &str| -> u32 {
+        let file = node.home.join(format!("{id}.pid"));
+        let command = format!("sleep 30 & echo $! > {}; wait", file.display());
+        mcp.send(
+            id,
+            "tools/call",
+            json!({"name": run, "arguments": with(args.clone(), json!({"command": command}))}),
+        );
+        let mut pid = 0;
+        assert!(
+            within(15, || {
+                pid = std::fs::read_to_string(&file)
+                    .ok()
+                    .and_then(|t| t.trim().parse().ok())
+                    .unwrap_or(0);
+                pid != 0
+            }),
+            "the command did not start"
+        );
+        pid
+    };
+
+    let pid = start(&mut mcp, "cancelled-call");
+    mcp.notify(
+        "notifications/cancelled",
+        json!({"requestId": "cancelled-call"}),
+    );
+    assert!(
+        within(5, || !running(pid)),
+        "a cancelled call's command runs on"
+    );
+
+    let pid = start(&mut mcp, "ended-session");
+    let ov = mcp.wait_overview("the session is listed", |v| {
+        v["sessions"].as_array().is_some_and(|s| !s.is_empty())
+    });
+    let session = ov["sessions"][0]["id"].as_str().unwrap().to_string();
+    let (status, v) = mcp.api("POST", "/api/sessions/end", json!({"id": session}));
+    assert_eq!(status, 200, "{v}");
+    assert!(
+        within(5, || !running(pid)),
+        "an ended session's command runs on"
+    );
+    assert!(mcp.finish());
+}
+
 /// The node part of the conformance runner against the real binary.
 #[test]
 fn node_part_passes_against_nerve_node() {

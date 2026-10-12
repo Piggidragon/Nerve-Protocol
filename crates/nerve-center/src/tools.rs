@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use nerve_proto::{Descriptor, Effect, Exposure};
 
 /// The center's own tool listing the nodes.
-pub const NODES_TOOL: &str = "nerve__nodes";
+pub const NODES_TOOL: &str = "nodes";
 /// Capabilities that are never offered as tools.
 pub const RESERVED_CAPS: [&str; 3] = ["node", "settings", "audit"];
 /// The argument that picks the node of a shared tool.
@@ -81,7 +81,7 @@ struct Entry<'a> {
     def: &'a nerve_proto::descriptor::Action,
 }
 
-/// All tools for `nodes`, sorted by name. `nerve__nodes` is not among them.
+/// All tools for `nodes`, sorted by name. `nodes` is not among them.
 pub fn build(nodes: &[NodeView]) -> Vec<Tool> {
     // (profile, cap, action) to the nodes that offer it.
     let mut shared: BTreeMap<(String, String, String), Vec<Entry>> = BTreeMap::new();

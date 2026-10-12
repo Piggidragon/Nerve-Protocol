@@ -73,7 +73,7 @@ fn stdio_and_a_second_instance_that_attaches() {
         json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
     );
     assert_eq!(
-        tools["result"]["tools"][0]["name"], "nerve__nodes",
+        tools["result"]["tools"][0]["name"], "nodes",
         "{tools}"
     );
 
@@ -84,7 +84,7 @@ fn stdio_and_a_second_instance_that_attaches() {
     let nodes = ask(
         &mut second,
         &mut second_out,
-        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "nerve__nodes", "arguments": {}}}),
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {"name": "nodes", "arguments": {}}}),
     );
     assert_ne!(nodes["result"]["isError"], true, "{nodes}");
 

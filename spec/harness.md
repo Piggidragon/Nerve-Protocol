@@ -67,7 +67,7 @@ that does not match `Host` are refused (403).
 
 ## 4. Tools
 
-- `nerve__nodes` lists the paired nodes, whether they are online and what
+- `nodes` lists the paired nodes, whether they are online and what
   they offer.
 - A capability with a profile becomes one tool per action, `<cap>__<action>`,
   shared by every node that offers the same capability with the same
@@ -106,7 +106,7 @@ gets `session.end`. The web UI can end a session.
 The center holds no rule of its own and never holds a call back for a person.
 Every call goes to its node, whose policy decides: what no mode and no rule
 allows is refused at once with `error forbidden: <reasons>`, and nothing is
-run. The owner allows more on the node (`nerve-node allow`, `mode`, `folder
+run. The owner allows more on the node (`nerve-node rule allow add`, `mode set`, `folder
 add`) or, with the settings grant, from the audit tab.
 
 ## 7. Web UI

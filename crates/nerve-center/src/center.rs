@@ -558,7 +558,7 @@ impl Center {
         self.audit.lock().unwrap().iter().cloned().collect()
     }
 
-    /// The nodes as the web UI and `nerve__nodes` show them.
+    /// The nodes as the web UI and `nodes` show them.
     pub fn nodes_json(&self) -> Value {
         let links: BTreeMap<String, Arc<Link>> = self.links.lock().unwrap().clone();
         let sessions: Vec<Arc<Session>> = self.sessions.lock().unwrap().values().cloned().collect();

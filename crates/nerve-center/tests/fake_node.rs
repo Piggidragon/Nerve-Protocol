@@ -238,7 +238,7 @@ async fn pair_connect_describe_and_call() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["nerve__nodes", "exec__run", "fs__read"]);
+    assert_eq!(names, ["nodes", "exec__run", "fs__read"]);
 
     // A read goes straight through and is marked as device content.
     let call = rpc(
@@ -420,7 +420,7 @@ async fn http_mcp_needs_a_token_and_a_session() {
         .await;
     assert_eq!(resp.status, 200);
     let v: Value = serde_json::from_slice(&resp.body).unwrap();
-    assert_eq!(v["result"]["tools"][0]["name"], "nerve__nodes");
+    assert_eq!(v["result"]["tools"][0]["name"], "nodes");
     assert_eq!(
         h.request(http(
             "DELETE",

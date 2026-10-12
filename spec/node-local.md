@@ -103,11 +103,20 @@ chains commands, `&` does not); the action's text in the descriptor names the
 shell. Output that is not UTF-8 is read in the console code page (Windows).
 A command is killed with its process group when its call ends: on
 `timeout_ms`, `cancel`, `session.end` of the session that started it, a
-dropped link, and when the call returns. Windows has no process groups: the
-node records the processes below the shell every 25 ms and ends those and
-what is below them then, best effort that misses a process started through
-WMI, a service or the task scheduler, and the child of a parent that lived
-less than one poll.
+dropped link, and when the call returns. Windows has no process groups:
+there each command runs in a Job Object of its own. The shell starts
+suspended, is put in the job, and only then runs, so every process it starts
+is in the job, however deep and also when its parent has exited; ending the
+job ends them all, and the job closes with the node, so a node that dies
+leaves no command running. Where the node runs in a job already (a service,
+the task scheduler), the command's job is nested in it; when Windows cannot
+put the shell in its job, the command is not run and the call says why. A
+process started on the command's request by another program, such as WMI
+(`Win32_Process.Create`), a service or the task scheduler, is that program's
+child and not in the job. Only when Windows makes no job at all does the node
+fall back to recording the processes below the shell every 25 ms, best
+effort. A Job Object does not restrict file access: it is no confinement
+(see folder mode below).
 
 ### Proxy
 
@@ -148,9 +157,9 @@ again.
   it. The flags do not imply each other: a write needs `w` and no `r`, a read
   `r` and no `w`, a command `x` and no `r`. Where folders nest, the deepest
   one that holds a path decides for it. Commands are confined where the
-  platform can confine them; Windows cannot yet (no Job Object in 0.0.1), so
-  there folder mode refuses every command, and only `allowlist` and `user`
-  run commands, unconfined. `allow` rules do not count. On Linux a command
+  platform can confine them. Windows has no file confinement for commands
+  yet, so there folder mode refuses every command, and only `allowlist` and
+  `user` run them, each owned by its Job Object but not confined. `allow` rules do not count. On Linux a command
   reads the system folders and its `r` folders, writes its `w` folders and
   runs programs from the system folders and its `x` folders (Landlock), each
   flag with its own rule. A folder with `w` and not `r` can be written but

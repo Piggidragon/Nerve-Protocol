@@ -1,15 +1,26 @@
 //! The few Win32 calls the node makes itself: the process table and ending a
-//! process (crate::tree), and the console code page that command output is
-//! written in (crate::exec). Declared here against kernel32, which every
-//! Windows program links, rather than through a bindings crate.
+//! process (crate::tree), the job object a command runs in (crate::job), and
+//! the console code page that command output is written in (crate::exec).
+//! Declared here against kernel32, which every Windows program links; only
+//! the job object comes from windows-sys, whose limit structures are too
+//! easy to get wrong by hand.
 
 use std::ffi::c_void;
+use std::io;
+
+use windows_sys::Win32::System::JobObjects::{
+    AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+    SetInformationJobObject, TerminateJobObject,
+};
+use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
 
 use crate::tree::Proc;
 
-type Handle = *mut c_void;
+pub type Handle = *mut c_void;
 
 const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+const TH32CS_SNAPTHREAD: u32 = 0x0000_0004;
 const PROCESS_TERMINATE: u32 = 0x0001;
 const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 #[cfg(test)]
@@ -31,6 +42,18 @@ struct ProcessEntry32W {
 }
 
 #[repr(C)]
+#[derive(Default)]
+struct ThreadEntry32 {
+    size: u32,
+    usage: u32,
+    tid: u32,
+    owner_pid: u32,
+    base_pri: i32,
+    delta_pri: i32,
+    flags: u32,
+}
+
+#[repr(C)]
 #[derive(Default, Clone, Copy)]
 struct FileTime {
     low: u32,
@@ -42,6 +65,8 @@ unsafe extern "system" {
     fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> Handle;
     fn Process32FirstW(snapshot: Handle, entry: *mut ProcessEntry32W) -> i32;
     fn Process32NextW(snapshot: Handle, entry: *mut ProcessEntry32W) -> i32;
+    fn Thread32First(snapshot: Handle, entry: *mut ThreadEntry32) -> i32;
+    fn Thread32Next(snapshot: Handle, entry: *mut ThreadEntry32) -> i32;
     fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
     fn GetProcessTimes(
         process: Handle,
@@ -146,6 +171,127 @@ pub fn running(pid: u32) -> bool {
     let mut code = 0u32;
     // SAFETY: the handle is open and the pointer valid.
     unsafe { GetExitCodeProcess(p.0, &mut code) != 0 && code == STILL_ACTIVE }
+}
+
+/// A job object of the node's own, closed when dropped. Its limit
+/// JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE ends every process still in it when
+/// the last handle closes, so a node that dies leaves no command behind. It
+/// allows no breakaway: a process in it cannot start a child outside it.
+pub struct Job(Handle);
+
+// SAFETY: a job handle may be used and closed from any thread.
+unsafe impl Send for Job {}
+// SAFETY: as above; the calls on a job handle are thread safe.
+unsafe impl Sync for Job {}
+
+impl Job {
+    /// A new, empty, unnamed job.
+    pub fn new() -> io::Result<Job> {
+        // SAFETY: no security attributes and no name are valid arguments.
+        let h = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if h.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let job = Job(h);
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: the job is open and the structure is the one this class
+        // takes, with its size.
+        let ok = unsafe {
+            SetInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        } != 0;
+        if !ok {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(job)
+    }
+
+    /// Puts `process` (a handle with PROCESS_SET_QUOTA and PROCESS_TERMINATE,
+    /// as a process the node started has) in the job. On Windows 8 and later
+    /// a process already in a job (the node's, under a service or the task
+    /// scheduler) gets this one nested inside that one.
+    pub fn assign(&self, process: Handle) -> io::Result<()> {
+        // SAFETY: both handles are open.
+        if unsafe { AssignProcessToJobObject(self.0, process) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Ends every process in the job; whether Windows did.
+    pub fn terminate(&self) -> bool {
+        // SAFETY: the job is open.
+        unsafe { TerminateJobObject(self.0, 1) != 0 }
+    }
+}
+
+impl Drop for Job {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from CreateJobObjectW and is closed once.
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// Whether `process` is in some job already; `None` when Windows cannot say.
+pub fn in_job(process: Handle) -> Option<bool> {
+    let mut r = 0;
+    // SAFETY: the process handle is open; a null job asks about any job.
+    let ok = unsafe { IsProcessInJob(process, std::ptr::null_mut(), &mut r) } != 0;
+    ok.then_some(r != 0)
+}
+
+/// Resumes the threads of process `pid`, which was started suspended: a
+/// suspended new process has only its main thread. An error when none was
+/// resumed.
+pub fn resume(pid: u32) -> io::Result<()> {
+    // SAFETY: a thread snapshot takes plain values; the result is checked.
+    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if snap == INVALID_HANDLE_VALUE || snap.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let mut e = ThreadEntry32 {
+        size: std::mem::size_of::<ThreadEntry32>() as u32,
+        ..Default::default()
+    };
+    let mut resumed = 0;
+    let mut failed = None;
+    // SAFETY: the snapshot is open and the entry valid for writes, its size
+    // set as Thread32First requires.
+    let mut more = unsafe { Thread32First(snap, &mut e) } != 0;
+    while more {
+        if e.owner_pid == pid {
+            // SAFETY: OpenThread takes plain values and returns null on failure.
+            let t = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, e.tid) };
+            if t.is_null() {
+                failed = Some(io::Error::last_os_error());
+            } else {
+                // SAFETY: the thread handle is open with THREAD_SUSPEND_RESUME,
+                // and closed once.
+                unsafe {
+                    if ResumeThread(t) == u32::MAX {
+                        failed = Some(io::Error::last_os_error());
+                    } else {
+                        resumed += 1;
+                    }
+                    CloseHandle(t);
+                }
+            }
+        }
+        // SAFETY: as above.
+        more = unsafe { Thread32Next(snap, &mut e) } != 0;
+    }
+    // SAFETY: the snapshot handle is closed once.
+    unsafe { CloseHandle(snap) };
+    match (resumed, failed) {
+        (0, Some(e)) => Err(e),
+        (0, None) => Err(io::Error::other("the process has no thread")),
+        _ => Ok(()),
+    }
 }
 
 /// The code page a console program started by the node writes in: the

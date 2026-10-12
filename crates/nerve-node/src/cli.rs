@@ -2366,10 +2366,13 @@ mod tests {
         out
     }
 
-    /// A buffer the test's log subscriber writes into.
+    /// A buffer the test's log subscriber writes into (the one test that
+    /// reads it is Unix only).
+    #[cfg(unix)]
     #[derive(Clone, Default)]
     struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
 
+    #[cfg(unix)]
     impl std::io::Write for LogBuf {
         fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
             self.0.lock().unwrap().extend_from_slice(b);
@@ -2383,6 +2386,7 @@ mod tests {
     /// Everything the test process logs, from every thread. A subscriber
     /// for one thread or one test misses lines: tracing caches per call site
     /// whether anyone listens, and other tests' threads reach the same sites.
+    #[cfg(unix)]
     fn process_logs() -> LogBuf {
         static LOGS: std::sync::OnceLock<LogBuf> = std::sync::OnceLock::new();
         LOGS.get_or_init(|| {

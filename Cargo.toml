@@ -24,7 +24,7 @@ nerve-sandbox = { path = "crates/nerve-sandbox", version = "0.0.1" }
 nerve-node = { path = "crates/nerve-node", version = "0.0.1" }
 nerve-center = { path = "crates/nerve-center", version = "0.0.1" }
 
-# Every crate below is one Pithagoras-Sync already uses; 0.0.1 adds none.
+# Every crate below but keyring is one Pithagoras-Sync already uses.
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "time", "sync", "signal", "fs"] }
 tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
@@ -45,6 +45,9 @@ globset = "0.4"
 landlock = "0.4"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
 tempfile = "3"
+# The one crate 0.0.1 adds: the system keyring (Keychain, Credential Manager,
+# Secret Service) for the proxy's header values and credentials.
+keyring = "4.2"
 
 [profile.release]
 lto = "thin"

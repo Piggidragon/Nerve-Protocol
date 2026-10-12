@@ -166,7 +166,9 @@ The node always dials the center. A node never listens for centers, which keeps 
 
 ### 3.6 HTTP proxy
 
-Per center entry or for all, `connection.proxy = "http://host:port"` (credentials in the keyring, never in links or logs); `HTTPS_PROXY` and `NO_PROXY` apply when nothing is set. The node opens the TLS link to the center inside a CONNECT tunnel; pin and name checks apply to that inner TLS, so the proxy sees only TLS records. Extra upgrade headers (`connection.headers`) serve authenticating reverse proxies. No fallback to a direct route when a configured proxy is down (fail closed).
+Per center entry or for all, `connection.proxy = "http://host:port"`; `HTTPS_PROXY` and `NO_PROXY` apply when nothing is set. The node opens the TLS link to the center inside a CONNECT tunnel; pin and name checks apply to that inner TLS, so the proxy sees only TLS records. Extra header lines on the CONNECT request (`connection.headers`) serve authenticating proxies. No fallback to a direct route when a configured proxy is down (fail closed).
+
+The secrets live in the operating system's keyring (Keychain, Credential Manager, Secret Service), one entry per node under the service `nerve`: the header values, and a user name and password given in the proxy URL, which become a `Proxy-Authorization` header. `node.toml` holds only the URL without credentials and the header names. No secret is in a link, a log, an error text or the audit log. Without a reachable keyring (a headless Linux) `nerve-node proxy set` refuses a header or a password instead of writing it to a file, and a missing entry stops the link rather than dialling directly (spec/node-local.md §2, Proxy).
 
 A node acting as proxy for other nodes (jump node → node) is later (§11). It will be a transport binding below the message layer, with TLS, pin and signature end to end between the far node and the center, so 0.0.1 needs nothing for it beyond keeping the transport layer separate from messages.
 

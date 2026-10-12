@@ -37,6 +37,10 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
   AES-GCM) without being able to read it. The node checks the password with
   `sudo -v`, keeps it in memory only and scrubs it from every frame and the
   audit log. Every other command runs with `no_new_privs`. Linux only.
+- Proxy header values, and a user name and password in the proxy URL, live in
+  the system keyring; `node.toml` keeps only the URL and the header names, and
+  a file that still holds values is refused with a hint to run
+  `nerve-node proxy set` again.
 - `nerve-center`: the center, run by a harness as an MCP server. It pairs nodes,
   keeps their links and offers their capabilities as MCP tools. Its web UI
   has a login page (the harness token logs in; `--ui-no-login` on loopback

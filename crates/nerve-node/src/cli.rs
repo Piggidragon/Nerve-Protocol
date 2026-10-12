@@ -303,17 +303,17 @@ pub enum ConfigCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum ProxyCmd {
-    /// Reach centers through an HTTP proxy.
+    /// Reach centers through an HTTP proxy. Header values and a password are kept in the system keyring, never in node.toml.
     Set {
-        /// The proxy URL.
+        /// The proxy, http://host:port, or http://user:password@host:port when it wants a login.
         url: String,
-        /// A header for the proxy request, `Name: value`; can be given more than once.
+        /// A header for the proxy, `Name: value`; can be given more than once. The value goes into the system keyring.
         #[arg(long = "header")]
         headers: Vec<String>,
     },
-    /// Reach centers directly again.
+    /// Reach centers directly again, and delete the proxy's values from the system keyring.
     Rm,
-    /// Show the proxy that is set, if any.
+    /// Show the proxy that is set and the names of its headers, never their values.
     Ls,
 }
 
@@ -1192,48 +1192,7 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
             Ok(())
         }
         Cmd::Audit { follow, denied } => audit(&paths, follow, denied, out).await,
-        Cmd::Proxy(ProxyCmd::Set { url, headers }) => {
-            let mut hs = Vec::new();
-            for h in &headers {
-                let (k, v) = h
-                    .split_once(':')
-                    .ok_or_else(|| format!("header {h:?} is not `Name: value`"))?;
-                hs.push((k.trim().to_string(), v.trim().to_string()));
-            }
-            nerve_transport::net::Proxy::parse(&url, hs.clone())?;
-            edit(&paths, |c| {
-                c.connection.proxy = Some(url.clone());
-                c.connection.headers = hs.iter().cloned().collect();
-                Ok(())
-            })
-            .await?;
-            w(out, format!("proxy {url}"));
-            Ok(())
-        }
-        Cmd::Proxy(ProxyCmd::Rm) => {
-            edit(&paths, |c| {
-                c.connection.proxy = None;
-                c.connection.headers.clear();
-                Ok(())
-            })
-            .await?;
-            w(out, "no proxy".into());
-            Ok(())
-        }
-        Cmd::Proxy(ProxyCmd::Ls) => {
-            let (cfg, _) = read_config(&paths).await?;
-            match &cfg.connection.proxy {
-                Some(url) => {
-                    w(out, format!("proxy {url}"));
-                    // A header often carries a credential, so only its name.
-                    for h in cfg.connection.headers.keys() {
-                        w(out, format!("header {h}"));
-                    }
-                }
-                None => w(out, "no proxy".into()),
-            }
-            Ok(())
-        }
+        Cmd::Proxy(c) => proxy_cmd(&paths, c, out).await,
         Cmd::Sudo(c) => sudo_cmd(&paths, c, out).await,
         // Not done in 0.0.1: service install, a dedicated user, self-update
         // and removal (architecture §6, §8).
@@ -1510,6 +1469,161 @@ async fn config_cmd(paths: &NodePaths, c: ConfigCmd, out: &mut dyn Write) -> Res
     .await?;
     let _ = writeln!(out, "saved");
     Ok(())
+}
+
+/// `proxy set|rm|ls`. The header values, and a user name and password given
+/// in the URL, go into the system keyring ([`crate::secrets`]); `node.toml`
+/// keeps the URL without them and the header names. Nothing here prints,
+/// logs or audits a value.
+async fn proxy_cmd(paths: &NodePaths, c: ProxyCmd, out: &mut dyn Write) -> Result<(), String> {
+    match c {
+        ProxyCmd::Set { url, headers } => {
+            let mut hs: Vec<(String, String)> = Vec::new();
+            for (i, h) in headers.iter().enumerate() {
+                // Not echoed: without its colon the whole line may be the secret.
+                let (k, v) = h
+                    .split_once(':')
+                    .ok_or_else(|| format!("--header number {} is not `Name: value`", i + 1))?;
+                let k = k.trim().to_string();
+                if hs.iter().any(|(n, _)| n.eq_ignore_ascii_case(&k)) {
+                    return Err(format!("the header {k} is given twice"));
+                }
+                hs.push((k, v.trim().to_string()));
+            }
+            let (url, login) = split_credentials(&url)?;
+            if let Some((user, password)) = login {
+                if hs
+                    .iter()
+                    .any(|(n, _)| n.eq_ignore_ascii_case(PROXY_AUTHORIZATION))
+                {
+                    return Err(format!(
+                        "give the proxy's user name and password either in the URL or as a {PROXY_AUTHORIZATION} header, not both"
+                    ));
+                }
+                use base64::Engine;
+                let basic =
+                    base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
+                hs.push((PROXY_AUTHORIZATION.into(), format!("Basic {basic}")));
+            }
+            nerve_transport::net::Proxy::parse(&url, hs.clone())?;
+            let names: Vec<String> = hs.iter().map(|(k, _)| k.clone()).collect();
+            // The keyring first: when it cannot take the values, node.toml
+            // stays as it was rather than name headers nobody can send. A
+            // proxy without headers leaves the keyring alone, unless the one
+            // before had some: their entry would only linger.
+            if !hs.is_empty() {
+                crate::secrets::store_proxy_headers(paths, &hs)?;
+            } else if !read_config(paths).await?.0.connection.headers.is_empty() {
+                let _ = crate::secrets::remove_proxy_headers(paths);
+            }
+            edit(paths, |c| {
+                c.connection.proxy = Some(url.clone());
+                c.connection.headers = names.clone();
+                Ok(())
+            })
+            .await?;
+            let _ = writeln!(out, "proxy {url}");
+            for n in &names {
+                let _ = writeln!(out, "header {n} (its value is in the system keyring)");
+            }
+            Ok(())
+        }
+        ProxyCmd::Rm => {
+            let (cfg, _) = read_config(paths).await?;
+            edit(paths, |c| {
+                c.connection.proxy = None;
+                c.connection.headers.clear();
+                Ok(())
+            })
+            .await?;
+            let _ = writeln!(out, "no proxy");
+            // A proxy without headers has no entry; where there is no
+            // keyring, asking for one would only fail.
+            if cfg.connection.headers.is_empty() {
+                return Ok(());
+            }
+            match crate::secrets::remove_proxy_headers(paths) {
+                Ok(true) => {
+                    let _ = writeln!(out, "deleted the header values from the system keyring");
+                }
+                Ok(false) => {}
+                Err(e) => return Err(format!("the proxy is removed, but {e}")),
+            }
+            Ok(())
+        }
+        ProxyCmd::Ls => {
+            let (cfg, _) = read_config(paths).await?;
+            let Some(url) = &cfg.connection.proxy else {
+                let _ = writeln!(out, "no proxy");
+                return Ok(());
+            };
+            let _ = writeln!(out, "proxy {url}");
+            // The keyring is asked whether it holds every value; only the
+            // names are shown.
+            let names = &cfg.connection.headers;
+            match crate::secrets::proxy_headers(paths, names) {
+                Ok(_) => {
+                    for n in names {
+                        let _ = writeln!(out, "header {n} (its value is in the system keyring)");
+                    }
+                }
+                Err(e) => {
+                    for n in names {
+                        let _ = writeln!(out, "header {n}");
+                    }
+                    let _ = writeln!(out, "the link cannot use this proxy: {e}");
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+const PROXY_AUTHORIZATION: &str = "Proxy-Authorization";
+
+/// Splits a user name and password off a proxy URL
+/// (`http://user:pass@host:port`), percent-escapes decoded. Errors never quote
+/// the URL once it holds an `@`.
+fn split_credentials(url: &str) -> Result<(String, Option<(String, String)>), String> {
+    let Some(at) = url.rfind('@') else {
+        return Ok((url.to_string(), None));
+    };
+    let scheme_end = url
+        .find("://")
+        .filter(|i| *i < at)
+        .ok_or("a proxy URL with a user name starts with http://")?;
+    let (scheme, info, rest) = (
+        &url[..scheme_end + 3],
+        &url[scheme_end + 3..at],
+        &url[at + 1..],
+    );
+    let (user, password) = info.split_once(':').unwrap_or((info, ""));
+    let decode = |s: &str| {
+        pct_decode(s).ok_or("the user name or password in the proxy URL has a bad %-escape")
+    };
+    let (user, password) = (decode(user)?, decode(password)?);
+    if user.is_empty() || user.contains(':') {
+        return Err("the proxy URL has an empty or bad user name".into());
+    }
+    Ok((format!("{scheme}{rest}"), Some((user, password))))
+}
+
+/// `%XX` escapes decoded; `None` for a broken escape or text that is not UTF-8.
+fn pct_decode(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' {
+            let hex = std::str::from_utf8(b.get(i + 1..i + 3)?).ok()?;
+            out.push(u8::from_str_radix(hex, 16).ok()?);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// `config accept`: the running daemon takes the file, or, when none runs,
@@ -2022,7 +2136,7 @@ mod tests {
                 "set",
                 "http://127.0.0.1:3128",
                 "--header",
-                "X-Key: secret",
+                "X-Key: s3cret-value",
             ],
         )
         .unwrap();
@@ -2031,9 +2145,302 @@ mod tests {
             ls.contains("http://127.0.0.1:3128") && ls.contains("X-Key"),
             "{ls}"
         );
-        assert!(!ls.contains("secret"), "{ls}");
+        assert!(!ls.contains("s3cret"), "{ls}");
         run(&paths, &["proxy", "rm"]).unwrap();
         assert_eq!(run(&paths, &["proxy", "ls"]).unwrap(), "no proxy\n");
+    }
+
+    /// What the test keyring holds for the node at `paths`.
+    fn keyring_entry(paths: &NodePaths) -> Option<String> {
+        let entry = crate::secrets::Entry::proxy(paths);
+        crate::secrets::store::get(entry.account()).unwrap()
+    }
+
+    #[test]
+    fn proxy_set_keeps_header_values_in_the_keyring_not_in_node_toml() {
+        let (_d, paths) = setup(&["home"]);
+        let out = run(
+            &paths,
+            &[
+                "proxy",
+                "set",
+                "http://127.0.0.1:3128",
+                "--header",
+                "X-Key: s3cret-value",
+                "--header",
+                "X-Other:  two words ",
+            ],
+        )
+        .unwrap();
+        assert!(
+            out.contains("header X-Key") && out.contains("header X-Other"),
+            "{out}"
+        );
+        assert!(!out.contains("s3cret"), "{out}");
+        let file = std::fs::read_to_string(paths.config_file()).unwrap();
+        assert!(
+            !file.contains("s3cret") && !file.contains("two words"),
+            "{file}"
+        );
+        let cfg = load(&paths);
+        assert_eq!(
+            cfg.connection.proxy.as_deref(),
+            Some("http://127.0.0.1:3128")
+        );
+        assert_eq!(cfg.connection.headers, ["X-Key", "X-Other"]);
+        let held: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&keyring_entry(&paths).unwrap()).unwrap();
+        assert_eq!(held["X-Key"], "s3cret-value");
+        assert_eq!(held["X-Other"], "two words");
+        // A proxy without headers needs no entry; the old one goes.
+        run(&paths, &["proxy", "set", "http://127.0.0.1:3129"]).unwrap();
+        assert_eq!(keyring_entry(&paths), None);
+        assert!(load(&paths).connection.headers.is_empty());
+    }
+
+    #[test]
+    fn a_user_and_password_in_the_url_go_to_the_keyring() {
+        let (_d, paths) = setup(&["home"]);
+        let out = run(
+            &paths,
+            &["proxy", "set", "http://alice:pa%40ss-w0rd@127.0.0.1:3128"],
+        )
+        .unwrap();
+        assert!(!out.contains("pa%40ss") && !out.contains("alice"), "{out}");
+        let file = std::fs::read_to_string(paths.config_file()).unwrap();
+        assert!(
+            !file.contains("alice") && !file.contains("pa%40ss"),
+            "{file}"
+        );
+        let cfg = load(&paths);
+        assert_eq!(
+            cfg.connection.proxy.as_deref(),
+            Some("http://127.0.0.1:3128")
+        );
+        assert_eq!(cfg.connection.headers, [PROXY_AUTHORIZATION]);
+        use base64::Engine;
+        let basic = base64::engine::general_purpose::STANDARD.encode("alice:pa@ss-w0rd");
+        assert!(!file.contains(&basic), "{file}");
+        let held: std::collections::BTreeMap<String, String> =
+            serde_json::from_str(&keyring_entry(&paths).unwrap()).unwrap();
+        assert_eq!(held[PROXY_AUTHORIZATION], format!("Basic {basic}"));
+        // Both ways at once is refused, and so is a bad URL, without quoting it.
+        let both = [
+            "proxy",
+            "set",
+            "http://alice:s3cret@127.0.0.1:3128",
+            "--header",
+            "proxy-authorization: Basic x",
+        ];
+        assert!(run(&paths, &both).unwrap_err().contains("not both"));
+        for bad in [
+            "alice:s3cret@127.0.0.1:3128",
+            "http://alice:s3cret@127.0.0.1:3128/path",
+            "https://alice:s3cret@127.0.0.1:3128",
+            "http://alice:s3cr%zzet@127.0.0.1:3128",
+        ] {
+            let e = run(&paths, &["proxy", "set", bad]).unwrap_err();
+            assert!(!e.contains("s3cr"), "{bad}: {e}");
+        }
+        // A --header without its colon is not quoted either.
+        let e = run(
+            &paths,
+            &["proxy", "set", "http://127.0.0.1:1", "--header", "s3cret"],
+        )
+        .unwrap_err();
+        assert!(!e.contains("s3cret"), "{e}");
+    }
+
+    #[test]
+    fn a_node_toml_with_header_values_is_refused_with_run_proxy_set_again() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("c"), d.path().join("s"));
+        std::fs::create_dir_all(&paths.config_dir).unwrap();
+        std::fs::write(
+            paths.config_file(),
+            "[connection]\nproxy = \"http://127.0.0.1:3128\"\nheaders = { X-Key = \"s3cret-value\" }\n",
+        )
+        .unwrap();
+        for args in [&["proxy", "ls"][..], &["status"]] {
+            let e = run(&paths, args).unwrap_err();
+            assert!(e.contains("run `nerve-node proxy set` again"), "{e}");
+            assert!(!e.contains("s3cret"), "{e}");
+        }
+    }
+
+    #[test]
+    fn proxy_ls_and_rm_with_and_without_a_keyring_entry() {
+        let (_d, paths) = setup(&["home"]);
+        let set = [
+            "proxy",
+            "set",
+            "http://127.0.0.1:3128",
+            "--header",
+            "X-Key: s3cret-value",
+        ];
+        // With the entry: ls says the value is there, rm deletes it.
+        run(&paths, &set).unwrap();
+        let ls = run(&paths, &["proxy", "ls"]).unwrap();
+        assert_eq!(
+            ls,
+            "proxy http://127.0.0.1:3128\nheader X-Key (its value is in the system keyring)\n"
+        );
+        let rm = run(&paths, &["proxy", "rm"]).unwrap();
+        assert!(rm.contains("deleted the header values"), "{rm}");
+        assert_eq!(keyring_entry(&paths), None);
+        assert_eq!(run(&paths, &["proxy", "ls"]).unwrap(), "no proxy\n");
+
+        // Without it: ls names the entry the link misses, rm still works.
+        run(&paths, &set).unwrap();
+        let entry = crate::secrets::Entry::proxy(&paths);
+        crate::secrets::store::delete(entry.account()).unwrap();
+        let ls = run(&paths, &["proxy", "ls"]).unwrap();
+        assert!(ls.contains("header X-Key\n"), "{ls}");
+        assert!(ls.contains(&format!("no entry {entry}")), "{ls}");
+        let rm = run(&paths, &["proxy", "rm"]).unwrap();
+        assert_eq!(rm, "no proxy\n");
+        assert_eq!(load(&paths).connection, Default::default());
+
+        // A proxy without headers never needs the keyring, reachable or not.
+        crate::secrets::store::set_unreachable(true);
+        let plain = run(&paths, &["proxy", "set", "http://127.0.0.1:3128"]);
+        let ls = run(&paths, &["proxy", "ls"]);
+        let rm = run(&paths, &["proxy", "rm"]);
+        crate::secrets::store::set_unreachable(false);
+        assert_eq!(plain.unwrap(), "proxy http://127.0.0.1:3128\n");
+        assert_eq!(ls.unwrap(), "proxy http://127.0.0.1:3128\n");
+        assert_eq!(rm.unwrap(), "no proxy\n");
+    }
+
+    #[test]
+    fn without_a_keyring_proxy_set_refuses_and_writes_no_value() {
+        let (_d, paths) = setup(&["home"]);
+        let before = std::fs::read_to_string(paths.config_file()).unwrap();
+        crate::secrets::store::set_unreachable(true);
+        let r = run(
+            &paths,
+            &[
+                "proxy",
+                "set",
+                "http://alice:pa55w0rd@127.0.0.1:3128",
+                "--header",
+                "X-Key: s3cret-value",
+            ],
+        );
+        crate::secrets::store::set_unreachable(false);
+        let e = r.unwrap_err();
+        assert!(
+            e.contains("cannot store the proxy's header values in the system keyring"),
+            "{e}"
+        );
+        assert!(e.contains(crate::secrets::store::NO_SERVICE), "{e}");
+        assert!(!e.contains("s3cret") && !e.contains("pa55w0rd"), "{e}");
+        // Nothing changed, and no value went to any file of the node.
+        assert_eq!(
+            std::fs::read_to_string(paths.config_file()).unwrap(),
+            before
+        );
+        assert_eq!(keyring_entry(&paths), None);
+        for dir in [&paths.config_dir, &paths.state_dir] {
+            for f in files_below(dir) {
+                let bytes = std::fs::read(&f).unwrap();
+                let text = String::from_utf8_lossy(&bytes);
+                assert!(
+                    !text.contains("s3cret") && !text.contains("pa55w0rd"),
+                    "{f:?}"
+                );
+            }
+        }
+    }
+
+    fn files_below(dir: &Path) -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                out.extend(files_below(&p));
+            } else {
+                out.push(p);
+            }
+        }
+        out
+    }
+
+    /// A buffer the test's log subscriber writes into.
+    #[derive(Clone, Default)]
+    struct LogBuf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogBuf {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Everything the test process logs, from every thread. A subscriber
+    /// for one thread or one test misses lines: tracing caches per call site
+    /// whether anyone listens, and other tests' threads reach the same sites.
+    fn process_logs() -> LogBuf {
+        static LOGS: std::sync::OnceLock<LogBuf> = std::sync::OnceLock::new();
+        LOGS.get_or_init(|| {
+            let logs = LogBuf::default();
+            let sink = logs.clone();
+            tracing::subscriber::set_global_default(
+                tracing_subscriber::fmt()
+                    .with_writer(move || sink.clone())
+                    .with_max_level(tracing::Level::TRACE)
+                    .with_ansi(false)
+                    .finish(),
+            )
+            .expect("no other test sets a global subscriber");
+            logs
+        })
+        .clone()
+    }
+
+    /// `proxy set` through a running daemon: the audit log records the
+    /// change, and neither it nor the log holds a value.
+    #[cfg(unix)]
+    #[test]
+    fn no_secret_reaches_the_audit_log_or_the_log() {
+        let logs = process_logs();
+        let (d, paths) = setup(&["home"]);
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut opts = NodeOptions::new(paths.clone());
+        opts.home = d.path().to_path_buf();
+        let daemon = rt.block_on(Daemon::start(opts)).unwrap();
+        let set = [
+            "proxy",
+            "set",
+            "http://alice:pa55w0rd@127.0.0.1:3128",
+            "--header",
+            "X-Key: s3cret-value",
+        ];
+        let out = run(&paths, &set).unwrap();
+        assert_eq!(
+            daemon.config().connection.headers,
+            ["X-Key", PROXY_AUTHORIZATION]
+        );
+        rt.block_on(daemon.stop());
+        drop(rt);
+        let audit = std::fs::read_to_string(paths.audit_log()).unwrap();
+        assert!(audit.contains("connection.headers"), "{audit}");
+        let logs = String::from_utf8_lossy(&logs.0.lock().unwrap()).to_string();
+        assert!(logs.contains("node daemon running"), "{logs}");
+        use base64::Engine;
+        let basic = base64::engine::general_purpose::STANDARD.encode("alice:pa55w0rd");
+        for (what, text) in [("audit", &audit), ("log", &logs), ("output", &out)] {
+            for secret in ["s3cret", "pa55w0rd", &basic] {
+                assert!(!text.contains(secret), "{what} holds {secret}: {text}");
+            }
+        }
     }
 
     /// The names of the commands, noun then verb; the first column is what

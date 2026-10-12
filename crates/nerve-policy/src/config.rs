@@ -129,13 +129,19 @@ impl Default for Limits {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Connection {
-    /// `http://host:port`; `HTTPS_PROXY`/`NO_PROXY` apply when unset.
+    /// `http://host:port`, never with a user name and password;
+    /// `HTTPS_PROXY`/`NO_PROXY` apply when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
-    /// Extra header lines for the proxy's `CONNECT` request.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub headers: BTreeMap<String, String>,
+    /// The names of the extra header lines for the proxy's `CONNECT`
+    /// request. Their values are secrets and live in the system keyring
+    /// (`nerve-node proxy set`), never in this file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub headers: Vec<String>,
 }
+
+/// Why a `node.toml` that keeps proxy secrets in the file is refused.
+pub const PROXY_SECRETS_IN_FILE: &str = "connection holds proxy secrets (header values, or a user name and password in the proxy URL), which belong in the system keyring, not in node.toml: run `nerve-node proxy set` again (for a file of an earlier build, delete them from it and take it with `nerve-node config accept` first)";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -434,6 +440,7 @@ pub struct CenterDocument {
 impl NodeConfig {
     /// Parses and checks `node.toml`; unknown keys are errors.
     pub fn parse(text: &str) -> Result<NodeConfig, String> {
+        refuse_proxy_secrets(text)?;
         let c: NodeConfig = toml::from_str(text).map_err(|e| e.to_string())?;
         c.validate()?;
         Ok(c)
@@ -486,14 +493,24 @@ impl NodeConfig {
             return Err("limits.max_running must be at least 1".into());
         }
         if let Some(p) = &self.connection.proxy {
-            let headers = self
-                .connection
-                .headers
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect();
-            nerve_transport::Proxy::parse(p, headers)
+            if has_user_info(p) {
+                return Err(PROXY_SECRETS_IN_FILE.into());
+            }
+            nerve_transport::Proxy::parse(p, Vec::new())
                 .map_err(|e| format!("connection.proxy: {e}"))?;
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for (i, h) in self.connection.headers.iter().enumerate() {
+            // Not echoed: a value typed where the name belongs is a secret.
+            if !nerve_transport::net::valid_header_name(h) {
+                return Err(format!(
+                    "connection.headers: entry {} is not a header name (letters, digits and -)",
+                    i + 1
+                ));
+            }
+            if !seen.insert(h.to_ascii_lowercase()) {
+                return Err(format!("connection.headers names {h} twice"));
+            }
         }
         let mut names = std::collections::BTreeSet::new();
         for c in &self.centers {
@@ -514,6 +531,38 @@ impl NodeConfig {
         }
         Ok(())
     }
+}
+
+/// Refuses a file that keeps a proxy secret: a `connection.headers` table
+/// (name to value, as earlier builds wrote it) or a proxy URL with a user name
+/// and password. This runs on the raw TOML, before the typed parse, whose
+/// errors quote the offending line and so would quote the secret. Anything
+/// but a list of strings in `connection.headers` is refused the same way
+/// without quoting it.
+fn refuse_proxy_secrets(text: &str) -> Result<(), String> {
+    let Ok(doc) = toml::from_str::<toml::Table>(text) else {
+        // Not TOML at all: the typed parse says why.
+        return Ok(());
+    };
+    let Some(conn) = doc.get("connection").and_then(toml::Value::as_table) else {
+        return Ok(());
+    };
+    if let Some(p) = conn.get("proxy").and_then(toml::Value::as_str)
+        && has_user_info(p)
+    {
+        return Err(PROXY_SECRETS_IN_FILE.into());
+    }
+    match conn.get("headers") {
+        None => Ok(()),
+        Some(toml::Value::Table(_)) => Err(PROXY_SECRETS_IN_FILE.into()),
+        Some(toml::Value::Array(a)) if a.iter().all(toml::Value::is_str) => Ok(()),
+        Some(_) => Err("connection.headers is a list of header names".into()),
+    }
+}
+
+/// Whether a URL carries a user name or password (`http://user:pass@host`).
+fn has_user_info(url: &str) -> bool {
+    url.contains('@')
 }
 
 /// A center's name as the CLI and the key file name use it.
@@ -709,6 +758,47 @@ sudo_allow = ["sudo apt update"]
             assert_eq!(p.mode_at(999), mode);
             assert_eq!(p.mode_at(1000), Mode::Allowlist);
         }
+    }
+
+    #[test]
+    fn proxy_secrets_in_the_file_are_refused_without_quoting_them() {
+        // What earlier builds wrote: header values, or credentials in the URL.
+        for old in [
+            "[connection]\nproxy = \"http://p:3128\"\nheaders = { X-Key = \"s3cret\" }\n",
+            "[connection]\nproxy = \"http://user:s3cret@p:3128\"\n",
+            "[connection]\nheaders = { Proxy-Authorization = \"Basic s3cret\" }\n",
+        ] {
+            let e = NodeConfig::parse(old).unwrap_err();
+            assert!(e.contains("run `nerve-node proxy set` again"), "{old}: {e}");
+            assert!(!e.contains("s3cret"), "{e}");
+            let d = tempfile::tempdir().unwrap();
+            let path = d.path().join("node.toml");
+            std::fs::write(&path, old).unwrap();
+            let e = NodeConfig::load(&path).unwrap_err();
+            assert!(e.contains("proxy set") && !e.contains("s3cret"), "{e}");
+        }
+        // Not a list of names: refused, not quoted.
+        let e = NodeConfig::parse("[connection]\nheaders = \"X-Key: s3cret\"\n").unwrap_err();
+        assert!(!e.contains("s3cret"), "{e}");
+        let e = NodeConfig::parse("[connection]\nheaders = [\"X-Key: s3cret\"]\n").unwrap_err();
+        assert!(!e.contains("s3cret"), "{e}");
+    }
+
+    #[test]
+    fn the_file_keeps_the_proxy_url_and_the_header_names() {
+        let e = NodeConfig::parse("[connection]\nheaders = [\"X-Key\", \"x-key\"]\n").unwrap_err();
+        assert!(e.contains("twice"), "{e}");
+        let c = NodeConfig::parse(
+            "[connection]\nproxy = \"http://p:3128\"\nheaders = [\"Proxy-Authorization\", \"X-Key\"]\n",
+        )
+        .unwrap();
+        assert_eq!(c.connection.headers, ["Proxy-Authorization", "X-Key"]);
+        assert_eq!(NodeConfig::parse(&c.to_toml()).unwrap(), c);
+        // A credential set any other way (`config set`) is refused too.
+        let mut c = NodeConfig::default();
+        c.connection.proxy = Some("http://u:s3cret@p:3128".into());
+        let e = c.validate().unwrap_err();
+        assert!(e.contains("proxy set") && !e.contains("s3cret"), "{e}");
     }
 
     #[test]

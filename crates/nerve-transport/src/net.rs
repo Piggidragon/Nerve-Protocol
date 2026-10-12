@@ -231,7 +231,13 @@ pub struct Proxy {
 
 impl Proxy {
     /// `http://host:port` (an `https://` proxy is not supported in 0.0.1).
+    /// A URL with a user name and password is refused without echoing it,
+    /// since the error ends up in status lines and logs; `nerve-node proxy
+    /// set` takes them out and keeps them in the system keyring.
     pub fn parse(s: &str, headers: Vec<(String, String)>) -> Result<Proxy, String> {
+        if s.contains('@') {
+            return Err("a proxy URL here holds no user name or password".into());
+        }
         let u = CenterUrl::parse(s).map_err(|e| e.replace("center URL", "proxy URL"))?;
         if u.tls {
             return Err("an https:// proxy is not supported yet; use http://host:port".into());
@@ -240,7 +246,7 @@ impl Proxy {
             return Err("a proxy URL has no path".into());
         }
         for (k, v) in &headers {
-            if k.is_empty() || !k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+            if !valid_header_name(k) {
                 return Err(format!("bad proxy header name {k:?}"));
             }
             if v.contains(['\r', '\n']) {
@@ -269,8 +275,17 @@ impl Proxy {
         if no_proxy(get("NO_PROXY").as_deref().unwrap_or(""), host) {
             return Ok(None);
         }
+        if p.contains('@') {
+            return Err("HTTPS_PROXY holds a user name and password, which the node does not take from the environment; set the proxy with `nerve-node proxy set`".into());
+        }
         Proxy::parse(p.trim(), Vec::new()).map(Some)
     }
+}
+
+/// Whether `k` can be a header name on the `CONNECT` request: letters,
+/// digits and `-`.
+pub fn valid_header_name(k: &str) -> bool {
+    !k.is_empty() && k.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 /// Whether a `NO_PROXY` list names `host`: `*`, the host itself, or a domain
@@ -752,6 +767,9 @@ mod tests {
         assert!(Proxy::parse("http://p.example/x", vec![]).is_err());
         assert!(Proxy::parse("http://p", vec![("A".into(), "b\r\nX: y".into())]).is_err());
         assert!(Proxy::parse("http://p", vec![("A B".into(), "b".into())]).is_err());
+        // A user name and password are refused without being echoed.
+        let e = Proxy::parse("http://u:hunter2@p.example:3128", vec![]).unwrap_err();
+        assert!(!e.contains("hunter2"), "{e}");
     }
 
     /// A proxy that grants the tunnel carries bytes; one that refuses fails

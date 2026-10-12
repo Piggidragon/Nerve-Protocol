@@ -65,8 +65,9 @@ max_running = 4             # commands at once, per node
 output_cap_bytes = 16777216
 
 [connection]
-proxy = "http://proxy:3128" # optional; HTTP CONNECT
-headers = {}                # extra headers on the link request
+proxy = "http://proxy:3128" # optional; HTTP CONNECT, never with user:password@
+headers = ["X-Proxy-Token"] # names of extra headers on the CONNECT request;
+                            # their values are in the system keyring
 
 [[center]]
 name = "home"               # the owner's name; the CLI's --center
@@ -93,6 +94,33 @@ sudo_allow = ["sudo apt update"]                       # sudo commands, every mo
 Unknown keys are refused, and so is a rule that does not parse. Two centers
 with one name are refused. Folder paths are absolute in the platform's own
 form; on the wire they travel as `/c/Users/...` on Windows (protocol §7.2).
+
+### Proxy
+
+`nerve-node proxy set <url> [--header "Name: value"]...` sets the proxy. The
+header values are secrets: the node keeps them in the system keyring
+(Keychain on macOS, Credential Manager on Windows, the Secret Service on
+Linux), in one entry per node under the service `nerve`, named
+`proxy:<config folder>`. A user name and password in the URL
+(`http://user:password@host:port`) become a `Proxy-Authorization: Basic`
+header in the same entry. `node.toml` keeps only the URL without them and the
+header names. No value is written to a file, the audit log, a log line, an
+error text or the output of a command; `proxy set` and `proxy ls` print the
+header names only, and `proxy rm` deletes the entry with the config entries.
+
+There is no fallback to a file. Where the keyring cannot be reached (a Linux
+without a desktop session has no Secret Service), `proxy set` with a header or
+a password refuses and changes nothing; a proxy without either works there.
+When the daemon dials through the proxy it reads the entry; a missing or
+unreadable entry, or one without a value for a named header, stops the link
+with a status that names the entry, and the node does not dial directly
+instead (fail closed).
+
+A `node.toml` that holds header values (`headers = { Name = "value" }`) or a
+user name and password in `connection.proxy`, as earlier builds wrote it, is
+refused on load, without the values in the message: take them out of the
+file, accept it (`nerve-node config accept`) and run `nerve-node proxy set`
+again.
 
 ### Modes
 

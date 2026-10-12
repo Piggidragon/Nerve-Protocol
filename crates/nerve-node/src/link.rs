@@ -82,7 +82,7 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
                 return;
             }
         };
-        let proxy = match proxy_for(&cfg, &url) {
+        let proxy = match proxy_for(&shared, &cfg, &url).await {
             Ok(p) => p,
             Err(e) => {
                 cs.set_status(format!("bad proxy: {e}"));
@@ -143,17 +143,24 @@ fn load_key(shared: &Shared, name: &str) -> Result<NodeKey, String> {
     NodeKey::from_text(text.trim()).map_err(|e| format!("bad node key {}: {e}", path.display()))
 }
 
-fn proxy_for(cfg: &NodeConfig, url: &CenterUrl) -> Result<Option<Proxy>, String> {
-    let headers: Vec<(String, String)> = cfg
-        .connection
-        .headers
-        .iter()
-        .map(|(k, v)| (k.clone(), v.clone()))
-        .collect();
-    match &cfg.connection.proxy {
-        Some(p) => Proxy::parse(p, headers).map(Some),
-        None => Proxy::from_env(&url.host),
-    }
+/// The proxy to dial `url` through, its header values read from the system
+/// keyring. An error stops the dial: a configured proxy is never bypassed.
+async fn proxy_for(
+    shared: &Shared,
+    cfg: &NodeConfig,
+    url: &CenterUrl,
+) -> Result<Option<Proxy>, String> {
+    let Some(p) = &cfg.connection.proxy else {
+        return Proxy::from_env(&url.host);
+    };
+    // The keyring may block (the Secret Service asks to unlock), so off the
+    // runtime's threads.
+    let (paths, names) = (shared.paths.clone(), cfg.connection.headers.clone());
+    let headers =
+        tokio::task::spawn_blocking(move || crate::secrets::proxy_headers(&paths, &names))
+            .await
+            .map_err(|e| format!("the keyring read stopped: {e}"))??;
+    Proxy::parse(p, headers).map(Some)
 }
 
 /// What one read from the link gave.
@@ -1102,5 +1109,117 @@ impl Drop for Running<'_> {
         lock(&self.link.commands).remove(&self.id);
         self.link.shared.running.fetch_sub(1, Ordering::SeqCst);
         self.link.check_status();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    use crate::daemon::{Daemon, NodeOptions};
+    use crate::paths::NodePaths;
+
+    /// A node with one center behind a proxy that wants the header `X-Key`,
+    /// and listeners standing in for the center and the proxy.
+    async fn behind_a_proxy() -> (tempfile::TempDir, NodePaths, TcpListener, TcpListener) {
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("config"), d.path().join("state"));
+        let center = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut cfg = nerve_policy::NodeConfig::default();
+        cfg.centers.push(nerve_policy::CenterEntry {
+            name: "home".into(),
+            // Only TLS goes through the proxy; the tunnel carries it.
+            url: format!("https://127.0.0.1:{}", center.local_addr().unwrap().port()),
+            pin: None,
+            center_id: "c".into(),
+            node_id: "n".into(),
+            settings: Default::default(),
+            paused: false,
+            revoked: false,
+            unknown: false,
+            policy: Default::default(),
+        });
+        cfg.connection.proxy = Some(format!(
+            "http://127.0.0.1:{}",
+            proxy.local_addr().unwrap().port()
+        ));
+        cfg.connection.headers = vec!["X-Key".into()];
+        cfg.save(&paths.config_file()).unwrap();
+        let key = nerve_transport::keys::NodeKey::generate().unwrap();
+        let key_file = paths.key_file("home");
+        nerve_transport::files::create_private_dir(key_file.parent().unwrap()).unwrap();
+        nerve_transport::files::write_private(&key_file, key.to_text().as_bytes()).unwrap();
+        (d, paths, center, proxy)
+    }
+
+    async fn start(d: &tempfile::TempDir, paths: &NodePaths) -> Daemon {
+        let mut opts = NodeOptions::new(paths.clone());
+        opts.home = d.path().to_path_buf();
+        opts.ctl = false;
+        Daemon::start(opts).await.unwrap()
+    }
+
+    /// The status of the center once it is no longer `connecting`.
+    async fn settled_status(daemon: &Daemon) -> String {
+        for _ in 0..200 {
+            let s = daemon.status()["centers"][0]["status"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if !["", "not connected", "connecting"].contains(&s.as_str()) {
+                return s;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("the link never settled");
+    }
+
+    #[tokio::test]
+    async fn a_missing_keyring_entry_stops_the_link_and_names_it() {
+        let (d, paths, center, proxy) = behind_a_proxy().await;
+        let daemon = start(&d, &paths).await;
+        let status = settled_status(&daemon).await;
+        let entry = crate::secrets::Entry::proxy(&paths).to_string();
+        assert!(status.contains(&entry), "{status}");
+        assert!(status.contains("proxy set"), "{status}");
+        // Fail closed: neither the proxy nor the center was dialled.
+        let quiet = Duration::from_millis(300);
+        assert!(tokio::time::timeout(quiet, proxy.accept()).await.is_err());
+        assert!(tokio::time::timeout(quiet, center.accept()).await.is_err());
+        daemon.stop().await;
+    }
+
+    #[tokio::test]
+    async fn the_link_sends_the_values_from_the_keyring_to_the_proxy() {
+        let (d, paths, center, proxy) = behind_a_proxy().await;
+        let headers = [("X-Key".to_string(), "s3cret-value".to_string())];
+        crate::secrets::store_proxy_headers(&paths, &headers).unwrap();
+        let daemon = start(&d, &paths).await;
+        let (mut s, _) = tokio::time::timeout(Duration::from_secs(10), proxy.accept())
+            .await
+            .expect("the node dials the proxy")
+            .unwrap();
+        let mut buf = vec![0u8; 4096];
+        let n = s.read(&mut buf).await.unwrap();
+        let req = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(req.starts_with("CONNECT 127.0.0.1:"), "{req}");
+        assert!(req.contains("\r\nX-Key: s3cret-value\r\n"), "{req}");
+        s.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n")
+            .await
+            .unwrap();
+        drop(s);
+        let status = settled_status(&daemon).await;
+        assert!(
+            status.contains("403") && !status.contains("s3cret"),
+            "{status}"
+        );
+        // The refused tunnel is no reason to go direct.
+        let quiet = Duration::from_millis(300);
+        assert!(tokio::time::timeout(quiet, center.accept()).await.is_err());
+        daemon.stop().await;
     }
 }

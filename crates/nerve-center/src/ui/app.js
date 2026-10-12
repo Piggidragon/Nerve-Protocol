@@ -755,6 +755,22 @@ function draw(force) {
   $("page").replaceChildren(...parts);
 }
 
+// The pairing card shows a one-time code. Once the center no longer has it
+// open, a machine used it (or it ran out of tries), and the card has done its
+// job: close it, so nobody thinks the pairing failed and tries again. The
+// center says which machine the code paired, so the page never guesses it from
+// the machine list, which may be older than the pairing. A pairing that is
+// still under way counts as open there.
+async function closePairingWhenUsed() {
+  const p = state.pairing;
+  if (!p) return;
+  const { open, node } = await api("POST", "/api/pair/status", { code: p.code });
+  if (open || state.pairing !== p) return;
+  state.pairing = null;
+  if (node) notify(`Paired ${node.name}.`);
+  else notify("The pairing code is no longer valid.", "error");
+}
+
 async function tick() {
   if (busy || !csrf) return;
   busy = true;
@@ -770,6 +786,7 @@ async function tick() {
     if (page === "stats") state.stats = extra;
     if (page === "audit") state.audit = extra;
     if (page === "help" && extra) state.help = extra;
+    await closePairingWhenUsed();
     if (down) notify("Connected to the center again.");
     down = false;
     draw(false);

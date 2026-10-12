@@ -18,7 +18,7 @@ use nerve_transport::tls::ServerIdentity;
 
 use crate::audit::AuditFeed;
 use crate::link::{Link, SHORT_CALL};
-use crate::pairing::Codes;
+use crate::pairing::{Codes, Outcome};
 use crate::store::{NodeRecord, Store};
 use crate::tools::{self, Route, Tool};
 use crate::util::{self, now_ms};
@@ -294,10 +294,19 @@ impl Center {
         })
     }
 
-    /// Whether a code from [`Center::new_pairing`] can still pair a machine.
-    /// The web UI asks it to close the pairing card once the code is used.
-    pub fn pairing_open(&self, code: &str) -> bool {
-        self.codes.lock().unwrap().is_open(code, Instant::now())
+    /// What became of a code from [`Center::new_pairing`], for the web UI:
+    /// `open` while it can still pair a machine (a pairing in progress counts,
+    /// it may fail), and once a machine used it, that machine as `node`.
+    pub fn pairing_status(&self, code: &str) -> Value {
+        let outcome = self.codes.lock().unwrap().outcome(code, Instant::now());
+        match outcome {
+            Outcome::Open => json!({"open": true, "node": null}),
+            Outcome::Gone => json!({"open": false, "node": null}),
+            Outcome::Paired(id) => {
+                let name = self.read(|s| s.nodes.get(&id).map(|n| n.name.clone()));
+                json!({"open": false, "node": name.map(|name| json!({"id": id, "name": name}))})
+            }
+        }
     }
 
     /// Answers `POST /nerve/v0/pair`: the status and the body.
@@ -368,6 +377,7 @@ impl Center {
         });
         match out {
             Ok(resp) => {
+                self.codes.lock().unwrap().done(taken, &node_id);
                 tracing::info!(node = %node_id, name = %req.name, "a node paired");
                 self.changed(Change::Nodes);
                 (200, serde_json::to_value(resp).unwrap_or_default())

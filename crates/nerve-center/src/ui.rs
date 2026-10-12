@@ -304,7 +304,7 @@ impl Ui {
             // The node's own command list, read from its CLI definition.
             ("GET", "/api/help") => Ok(json!({"node": nerve_node::cli::help()})),
             ("POST", "/api/pair") => Ok(c.new_pairing()),
-            ("POST", "/api/pair/status") => Ok(json!({"open": c.pairing_open(&s("code"))})),
+            ("POST", "/api/pair/status") => Ok(c.pairing_status(&s("code"))),
             ("POST", "/api/nodes/rename") => c
                 .rename(&s("id"), &s("name"))
                 .map(|_| json!({}))
@@ -617,42 +617,95 @@ mod tests {
         assert_eq!(r.status, 401);
     }
 
+    async fn pair_status(ui: &Ui, code: &str) -> Value {
+        ui.api(
+            &req("POST", "/api/pair/status", &[], ""),
+            &json!({"code": code}),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn new_code(ui: &Ui) -> String {
+        let made = ui
+            .api(&req("POST", "/api/pair", &[], ""), &json!({}))
+            .await
+            .unwrap();
+        made["code"].as_str().unwrap().to_string()
+    }
+
+    fn pair_body(code: &str, name: &str, key: u8) -> Vec<u8> {
+        json!({
+            "code": code, "name": name, "platform": "linux", "arch": "x86_64",
+            "public_key": nerve_proto::msg::hex(&[key; 32]),
+        })
+        .to_string()
+        .into_bytes()
+    }
+
     #[tokio::test]
     async fn the_pairing_status_says_when_a_code_is_used_up() {
         let d = tempfile::tempdir().unwrap();
         let c = center(d.path());
         let ui = Ui::new(&c, None, false, false);
-        let status = |code: String| {
-            let ui = &ui;
-            async move {
-                let r = ui
-                    .api(
-                        &req("POST", "/api/pair/status", &[], ""),
-                        &json!({"code": code}),
-                    )
-                    .await
-                    .unwrap();
-                r["open"].as_bool().unwrap()
-            }
-        };
-        let made = ui
-            .api(&req("POST", "/api/pair", &[], ""), &json!({}))
-            .await
-            .unwrap();
-        let code = made["code"].as_str().unwrap().to_string();
-        assert!(status(code.clone()).await);
+        let code = new_code(&ui).await;
+        assert_eq!(pair_status(&ui, &code).await["open"], true);
         // Asking, even with wrong codes, uses up nothing.
         for _ in 0..crate::pairing::TRIES {
-            assert!(!status("wrong".into()).await);
+            assert_eq!(pair_status(&ui, "wrong").await["open"], false);
         }
-        assert!(status(code.clone()).await);
-        // A machine pairs with the code: the page sees it is gone.
-        let body = json!({
-            "code": code, "name": "box-1", "platform": "linux", "arch": "x86_64",
-            "public_key": nerve_proto::msg::hex(&[7; 32]),
-        });
-        assert_eq!(c.pair(body.to_string().as_bytes()).0, 200);
-        assert!(!status(code).await);
+        assert_eq!(pair_status(&ui, &code).await["open"], true);
+        // A machine pairs with the code: the page sees it is gone, and which
+        // machine it paired.
+        assert_eq!(c.pair(&pair_body(&code, "box-1", 7)).0, 200);
+        let st = pair_status(&ui, &code).await;
+        assert_eq!(st["open"], false);
+        assert_eq!(st["node"]["name"], "box-1");
+    }
+
+    #[tokio::test]
+    async fn a_code_names_only_the_machine_it_paired() {
+        let d = tempfile::tempdir().unwrap();
+        let c = center(d.path());
+        let ui = Ui::new(&c, None, false, false);
+        // Two cards open (two tabs): another code pairs a machine.
+        let mine = new_code(&ui).await;
+        let other = new_code(&ui).await;
+        assert_eq!(c.pair(&pair_body(&other, "box-2", 8)).0, 200);
+        let st = pair_status(&ui, &mine).await;
+        assert_eq!(
+            (st["open"].as_bool(), st["node"].is_null()),
+            (Some(true), true)
+        );
+        // Mine runs out of tries: closed, and no machine named, as box-2 is
+        // not the one this code paired.
+        for _ in 0..crate::pairing::TRIES {
+            assert_eq!(c.pair(&pair_body("wrongwrong12", "box-3", 9)).0, 403);
+        }
+        let st = pair_status(&ui, &mine).await;
+        assert_eq!(
+            (st["open"].as_bool(), st["node"].is_null()),
+            (Some(false), true)
+        );
+        assert_eq!(pair_status(&ui, &other).await["node"]["name"], "box-2");
+    }
+
+    #[tokio::test]
+    async fn a_pairing_that_is_refused_leaves_its_code_open() {
+        let d = tempfile::tempdir().unwrap();
+        let c = center(d.path());
+        let ui = Ui::new(&c, None, false, false);
+        let first = new_code(&ui).await;
+        assert_eq!(c.pair(&pair_body(&first, "box-1", 7)).0, 200);
+        // The same key again with a new code: refused with 409. The page
+        // must not take that code for used.
+        let second = new_code(&ui).await;
+        assert_eq!(c.pair(&pair_body(&second, "box-2", 7)).0, 409);
+        let st = pair_status(&ui, &second).await;
+        assert_eq!(
+            (st["open"].as_bool(), st["node"].is_null()),
+            (Some(true), true)
+        );
     }
 
     #[tokio::test]
@@ -672,6 +725,8 @@ mod tests {
         let poll = js.find("async function tick()").unwrap();
         let tick_end = js[poll..].find("\n}\n").unwrap() + poll;
         assert!(js[poll..tick_end].contains("closePairingWhenUsed("));
+        // It names the machine the center says, not one found in the list.
+        assert!(js[ask..poll].contains("node.name") && !js.contains(".known"));
         assert!(js[..ask].contains("function closePairingWhenUsed"));
         assert!(js[ask..poll].contains("state.pairing = null"));
     }

@@ -26,13 +26,30 @@ struct Open {
 }
 
 /// A code [`Codes::take`] took out: used up unless given back with
-/// [`Codes::fail`].
+/// [`Codes::fail`], or finished with [`Codes::done`].
 #[derive(Debug)]
 pub struct Taken(Open);
+
+/// What the owner's page is told about the code on its screen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Outcome {
+    /// Still usable, or taken by a pairing that has not finished: it may yet
+    /// be given back.
+    Open,
+    /// Used by the node with this id.
+    Paired(String),
+    /// Expired, out of tries or never made.
+    Gone,
+}
 
 #[derive(Debug, Default)]
 pub struct Codes {
     open: Vec<Open>,
+    /// Codes [`Codes::take`] took out and nobody has finished yet.
+    taking: Vec<String>,
+    /// Codes that paired a node, kept until they would have expired so the
+    /// page can name the node its code paired.
+    paired: Vec<(Open, String)>,
 }
 
 impl Codes {
@@ -50,6 +67,7 @@ impl Codes {
 
     fn prune(&mut self, now: Instant) {
         self.open.retain(|o| now < o.expires && o.tries < TRIES);
+        self.paired.retain(|(o, _)| now < o.expires);
     }
 
     /// Checks `code` without using it up. A wrong code costs every open code
@@ -85,7 +103,11 @@ impl Codes {
             .iter()
             .position(|o| crate::util::ct_eq(o.code.as_bytes(), code.as_bytes()))
         {
-            Some(i) => Ok(Taken(self.open.swap_remove(i))),
+            Some(i) => {
+                let o = self.open.swap_remove(i);
+                self.taking.push(o.code.clone());
+                Ok(Taken(o))
+            }
             None => Err(self.miss(now)),
         }
     }
@@ -94,18 +116,32 @@ impl Codes {
     /// again, with one try less.
     pub fn fail(&mut self, taken: Taken) {
         let mut o = taken.0;
+        self.taking.retain(|c| *c != o.code);
         o.tries += 1;
         self.open.push(o);
     }
 
-    /// Whether `code` can still be used. Unlike [`Codes::check`], a code that
-    /// is not open costs no try: the web UI asks this to see if the code on
-    /// its screen is used up.
-    pub fn is_open(&mut self, code: &str, now: Instant) -> bool {
+    /// A right code whose pairing worked: it stays known as the code that
+    /// paired `node_id`.
+    pub fn done(&mut self, taken: Taken, node_id: &str) {
+        let o = taken.0;
+        self.taking.retain(|c| *c != o.code);
+        self.paired.push((o, node_id.to_string()));
+    }
+
+    /// What became of `code`, for the web UI. Unlike [`Codes::check`], a code
+    /// that is not open costs no try. A code in the middle of a pairing counts
+    /// as open: it comes back if that pairing fails.
+    pub fn outcome(&mut self, code: &str, now: Instant) -> Outcome {
         self.prune(now);
-        self.open
-            .iter()
-            .any(|o| crate::util::ct_eq(o.code.as_bytes(), code.as_bytes()))
+        let is = |c: &str| crate::util::ct_eq(c.as_bytes(), code.as_bytes());
+        if self.open.iter().any(|o| is(&o.code)) || self.taking.iter().any(|c| is(c)) {
+            return Outcome::Open;
+        }
+        match self.paired.iter().find(|(o, _)| is(&o.code)) {
+            Some((_, node)) => Outcome::Paired(node.clone()),
+            None => Outcome::Gone,
+        }
     }
 
     pub fn open_count(&mut self, now: Instant) -> usize {
@@ -134,18 +170,44 @@ mod tests {
     }
 
     #[test]
-    fn asking_if_a_code_is_open_costs_no_try() {
+    fn asking_what_became_of_a_code_costs_no_try() {
         let mut c = Codes::default();
         let now = Instant::now();
         let code = c.create(now, TEN_MINUTES);
         for _ in 0..TRIES {
-            assert!(!c.is_open("wrong", now));
+            assert_eq!(c.outcome("wrong", now), Outcome::Gone);
         }
-        assert!(c.is_open(&code, now));
-        c.take(&code, now).unwrap();
-        assert!(!c.is_open(&code, now));
+        assert_eq!(c.outcome(&code, now), Outcome::Open);
+        let late = c.create(now, TEN_MINUTES);
+        assert_eq!(c.outcome(&late, now + TEN_MINUTES), Outcome::Gone);
+    }
+
+    #[test]
+    fn a_code_in_the_middle_of_a_pairing_is_still_open_and_then_names_its_node() {
+        let mut c = Codes::default();
+        let now = Instant::now();
         let code = c.create(now, TEN_MINUTES);
-        assert!(!c.is_open(&code, now + TEN_MINUTES));
+        let taken = c.take(&code, now).unwrap();
+        // Neither open nor paired yet: the page must not call it used.
+        assert_eq!(c.outcome(&code, now), Outcome::Open);
+        c.done(taken, "node-1");
+        assert_eq!(c.outcome(&code, now), Outcome::Paired("node-1".into()));
+        // Another code does not name that node, and the name goes with the
+        // code's lifetime.
+        let other = c.create(now, TEN_MINUTES);
+        assert_eq!(c.outcome(&other, now), Outcome::Open);
+        assert_eq!(c.outcome(&code, now + TEN_MINUTES), Outcome::Gone);
+    }
+
+    #[test]
+    fn a_failed_pairing_puts_the_code_back_to_open() {
+        let mut c = Codes::default();
+        let now = Instant::now();
+        let code = c.create(now, TEN_MINUTES);
+        let taken = c.take(&code, now).unwrap();
+        c.fail(taken);
+        assert_eq!(c.outcome(&code, now), Outcome::Open);
+        assert!(c.take(&code, now).is_ok());
     }
 
     #[test]

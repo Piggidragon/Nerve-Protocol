@@ -528,6 +528,32 @@ mod tests {
         )
     }
 
+    /// A home that is absolute on the platform the tests run on, so a
+    /// folder below it passes validation there and reaches the check under
+    /// test (Windows refuses `/home/u` as not absolute).
+    fn host_home() -> PathBuf {
+        PathBuf::from(if cfg!(windows) {
+            "C:\\Users\\u"
+        } else {
+            "/home/u"
+        })
+    }
+
+    /// `rel` (with `/`) below [`host_home`], in the platform's own form.
+    fn at_home(rel: &str) -> PathBuf {
+        rel.split('/').fold(host_home(), |p, seg| p.join(seg))
+    }
+
+    /// The protected list of a node at [`host_home`] on this platform.
+    fn host(opts: &ProtectedOptions) -> Protected {
+        let platform = if cfg!(windows) {
+            crate::protected::Platform::Windows(Default::default())
+        } else {
+            crate::protected::Platform::Unix
+        };
+        Protected::new(&platform, &host_home(), &[], opts)
+    }
+
     fn doc(s: &SettingsStore) -> Value {
         serde_json::to_value(s.center_document("home").unwrap()).unwrap()
     }
@@ -684,7 +710,8 @@ mod tests {
 
     /// A folder at or inside a protected entry releases it, so adding one is
     /// a release as well: a center may not, the owner may (code review 2 of
-    /// PR #19, finding 2).
+    /// PR #19, finding 2). The paths are this platform's own, so the check
+    /// runs on Windows as well (Windows review round 3, finding 1).
     #[test]
     fn a_center_cannot_release_a_protected_path_by_adding_a_folder() {
         let d = tempfile::tempdir().unwrap();
@@ -697,32 +724,54 @@ mod tests {
         })
         .unwrap();
         let v = s.version();
+        let shown = |rel: &str| to_wire(&at_home(rel)).to_lowercase();
         for (path, entry) in [
-            ("/home/u/secret", "/home/u/secret"),
-            ("/home/u/secret/inner", "/home/u/secret"),
-            ("/home/u/.ssh", "/home/u/.ssh"),
-            ("/home/u/.local/bin", "/home/u/.local/bin"),
+            ("secret", "secret"),
+            ("secret/inner", "secret"),
+            (".ssh", ".ssh"),
+            (".local/bin", ".local/bin"),
         ] {
             let mut new = doc(&s);
-            new["policy"]["folders"] = json!([{"path": path, "access": "r"}]);
-            let e = s.set_center_document("home", new, v, |_| false, unix);
+            new["policy"]["folders"] = json!([{"path": at_home(path), "access": "r"}]);
+            let e = s.set_center_document("home", new, v, |_| false, host);
             assert!(
                 matches!(&e, Err(SetError::Forbidden(m))
-                    if m.contains("policy.folders") && m.contains(entry)),
+                    if m.contains("policy.folders") && m.to_lowercase().contains(&shown(entry))),
                 "{path}: {e:?}"
             );
         }
         assert!(s.config().center("home").unwrap().policy.folders.is_empty());
+        // Spellings that would slip past the check and then match nothing
+        // are no folder path at all (Windows review round 3, finding 5).
+        let odd: &[&str] = if cfg!(windows) {
+            &[
+                "C:\\Users\\U~1\\.ssh",
+                "C:\\Users\\u\\.ssh.",
+                "C:\\Users\\u\\.ssh ",
+                "C:\\Users\\u\\x\\..\\.ssh",
+            ]
+        } else {
+            &["/home/u/x/../.ssh"]
+        };
+        for path in odd {
+            let mut new = doc(&s);
+            new["policy"]["folders"] = json!([{"path": path, "access": "r"}]);
+            let e = s.set_center_document("home", new, v, |_| false, host);
+            assert!(
+                matches!(&e, Err(SetError::Invalid(m)) if m.contains("use the full name")),
+                "{path}: {e:?}"
+            );
+        }
         // A folder that holds a protected entry releases nothing.
         let mut new = doc(&s);
-        new["policy"]["folders"] = json!([{"path": "/home/u", "access": "rw"}]);
-        s.set_center_document("home", new, v, |_| false, unix)
+        new["policy"]["folders"] = json!([{"path": host_home(), "access": "rw"}]);
+        s.set_center_document("home", new, v, |_| false, host)
             .unwrap();
         // The owner may release it.
         s.update(|c| {
             let p = &mut c.center_mut("home").unwrap().policy;
             p.folders.push(crate::config::Folder {
-                path: "/home/u/secret".into(),
+                path: at_home("secret").to_string_lossy().into_owned(),
                 access: crate::config::Access::parse("r").unwrap(),
             });
             Ok(())
@@ -735,15 +784,16 @@ mod tests {
         new["policy"]["folders"]
             .as_array_mut()
             .unwrap()
-            .push(json!({"path": "/home/u/secret/inner", "access": "r"}));
+            .push(json!({"path": at_home("secret/inner"), "access": "r"}));
         let v = s
-            .set_center_document("home", new, v, |_| false, unix)
+            .set_center_document("home", new, v, |_| false, host)
             .unwrap();
         let mut new = doc(&s);
         new["policy"]["folders"][1]["access"] = json!("rw");
-        let e = s.set_center_document("home", new, v, |_| false, unix);
+        let e = s.set_center_document("home", new, v, |_| false, host);
+        let named = format!("policy.folders {}", at_home("secret").display());
         assert!(
-            matches!(&e, Err(SetError::Forbidden(m)) if m.contains("policy.folders /home/u/secret")),
+            matches!(&e, Err(SetError::Forbidden(m)) if m.contains(&named)),
             "{e:?}"
         );
     }

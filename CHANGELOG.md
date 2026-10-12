@@ -92,3 +92,8 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
 - `exec.signal` is offered only where the policy can allow it: by an allow rule in allowlist mode, and in folder and user mode only with `caps.exec.signal = on`.
 - On Windows the protected list also holds the all-users Startup folder (`%ProgramData%\Microsoft\Windows\Start Menu\Programs\StartUp`) and Windows PowerShell's home with the all-users profiles (`%SystemRoot%\System32\WindowsPowerShell\v1.0` and its SysWOW64 twin).
 - On Windows the protected list also holds PowerShell 7's home with its profiles and modules (`%ProgramFiles%\PowerShell`, and `%ProgramFiles(x86)%\PowerShell` where that is set), where the MSI and winget install it.
+- The policy test of folders that release a protected path uses the platform's own paths, so `cargo test` passes on Windows and runs the check there.
+- On Windows the own-folder check on command lines also sees a dot at the end of a name (`node-state.\config.key`), volume and device paths (`\\?\Volume{...}\...`) and drive-relative paths from the working directory (`C:node-state\config.key`).
+- On Windows the user's PowerShell profiles and modules are protected in the Documents folder where Windows really has it (OneDrive's backup, a redirect), read with the known-folder API, as well as below `%USERPROFILE%\Documents`.
+- A drive-letter path in an `fs` call is refused with the wire form to use (`/c/Users/...` for `C:\Users\...`), and a Windows node's `fs` tools say it.
+- A folder spelled so that it matches nothing (a `..` segment, and on Windows an 8.3 short name or a name ending in a dot or space) is refused, from a center and in `node.toml`, with a message to use the full name.

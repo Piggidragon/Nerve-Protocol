@@ -63,7 +63,7 @@ impl NodeKey {
             .as_ref())
     }
 
-    /// The `sig` of a `settings.sudo_offer` result: hex Ed25519 over
+    /// The `sig` of a `settings.sudo-offer` result: hex Ed25519 over
     /// [`crate::sudo::Offer::message`].
     pub fn sign_sudo_offer(&self, center_id: &str, offer: &crate::sudo::Offer) -> String {
         hex(self.pair.sign(&offer.message(center_id)).as_ref())

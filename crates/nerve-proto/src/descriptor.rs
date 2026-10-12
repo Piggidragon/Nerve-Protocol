@@ -201,6 +201,37 @@ impl Descriptor {
     }
 }
 
+/// A capability or action name as it may appear in a tool name: ASCII
+/// letters, digits and `-`, at least one. A harness joins the parts of a tool name with `_`
+/// (spec/harness.md), so a name can never hold one.
+pub fn valid_member_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+}
+
+impl Descriptor {
+    /// Refuses a capability or action name a tool name could not carry, so a
+    /// tool name can never be split wrongly.
+    pub fn check_names(&self) -> Result<(), String> {
+        for c in &self.capabilities {
+            if !valid_member_name(&c.id) {
+                return Err(format!(
+                    "capability name {:?}: letters, digits and - only, no _",
+                    c.id
+                ));
+            }
+            for a in c.actions.keys() {
+                if !valid_member_name(a) {
+                    return Err(format!(
+                        "action name {:?} of capability {}: letters, digits and - only, no _",
+                        a, c.id
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// Word count of a summary; the spec asks for fewer than 60.
 pub fn summary_words(s: &str) -> usize {
     s.split_whitespace().count()
@@ -226,6 +257,30 @@ mod tests {
             }]
         }))
         .unwrap()
+    }
+
+    #[test]
+    fn member_names() {
+        assert!(valid_member_name("list-files"));
+        assert!(valid_member_name("fs2"));
+        assert!(!valid_member_name(""));
+        assert!(!valid_member_name("list_files"));
+        assert!(!valid_member_name("a.b"));
+        assert!(!valid_member_name("ü"));
+    }
+
+    #[test]
+    fn underscore_in_a_name_is_refused() {
+        let mut d = sample();
+        assert_eq!(d.check_names(), Ok(()));
+        d.capabilities[0].id = "my_fs".into();
+        let e = d.check_names().unwrap_err();
+        assert!(e.contains("capability name") && e.contains("my_fs"), "{e}");
+        let mut d = sample();
+        let a = d.capabilities[0].actions.remove("read").unwrap();
+        d.capabilities[0].actions.insert("read_all".into(), a);
+        let e = d.check_names().unwrap_err();
+        assert!(e.contains("action name") && e.contains("read_all"), "{e}");
     }
 
     #[test]

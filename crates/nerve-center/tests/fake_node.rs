@@ -238,14 +238,14 @@ async fn pair_connect_describe_and_call() {
         .iter()
         .map(|t| t["name"].as_str().unwrap())
         .collect();
-    assert_eq!(names, ["nodes", "exec__run", "fs__read"]);
+    assert_eq!(names, ["nodes", "exec_run", "fs_read"]);
 
     // A read goes straight through and is marked as device content.
     let call = rpc(
         &e,
         3,
         "tools/call",
-        json!({"name": "fs__read", "arguments": {"node": "box-1", "path": "/etc/hostname"}}),
+        json!({"name": "fs_read", "arguments": {"node": "box-1", "path": "/etc/hostname"}}),
     )
     .await;
     let out = call["result"]["content"][0]["text"].as_str().unwrap();
@@ -268,7 +268,7 @@ async fn pair_connect_describe_and_call() {
         &e,
         4,
         "tools/call",
-        json!({"name": "fs__read", "arguments": {"node": "nope", "path": "/"}}),
+        json!({"name": "fs_read", "arguments": {"node": "nope", "path": "/"}}),
     )
     .await;
     assert_eq!(bad["result"]["isError"], true);
@@ -285,7 +285,7 @@ async fn pair_connect_describe_and_call() {
         &e,
         5,
         "tools/call",
-        json!({"name": "exec__run", "arguments": {"node": "box-1", "command": "uname"}}),
+        json!({"name": "exec_run", "arguments": {"node": "box-1", "command": "uname"}}),
     )
     .await;
     assert_ne!(done["result"]["isError"], true, "{done}");
@@ -346,6 +346,25 @@ async fn a_second_link_while_the_first_answers_is_a_duplicate() {
     assert_eq!(m, method::BYE);
     assert_eq!(params["reason"], "duplicate");
     assert!(!r.center.alerts().is_empty(), "a duplicate raises an alert");
+    r.stop().await;
+}
+
+#[tokio::test]
+async fn a_descriptor_with_an_underscore_in_a_name_is_ignored() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    let key = NodeKey::generate().unwrap();
+    assert_eq!(pair(&r, &key, "box-1").await.0, 200);
+    let (ws, _) = handshake(&r, &key).await;
+    let mut d = descriptor(&key, "box-1");
+    d["capabilities"][0]["id"] = json!("my_fs");
+    let _seen = serve(ws, d);
+    let c = r.center.clone();
+    let id = key.node_id();
+    wait_for(|| c.link(&id).map(|_| ())).await;
+    // The describe call has long been answered when this passes.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(r.center.tools().is_empty(), "{:?}", r.center.tools().len());
     r.stop().await;
 }
 

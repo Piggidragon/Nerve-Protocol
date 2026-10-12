@@ -24,7 +24,7 @@ pub const OFFER_TTL_MS: u64 = 60_000;
 /// data.
 pub const HKDF_SALT: &[u8] = b"nerve-sudo-v1";
 
-/// What `settings.sudo_offer` returns (without the signature).
+/// What `settings.sudo-offer` returns (without the signature).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Offer {

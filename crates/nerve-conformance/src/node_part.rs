@@ -222,7 +222,7 @@ const PROFILE_CHECKS: &[(&str, &str)] = &[
     ),
     (
         "7.4.1",
-        "sudo_offer is signed with the node's key for this center",
+        "sudo-offer is signed with the node's key for this center",
     ),
     (
         "7.4.1",
@@ -338,7 +338,7 @@ async fn profiles(
 }
 
 async fn sudo_offer(conn: &mut Conn, center: &FakeCenter, key: &str) -> Result<Offer, String> {
-    let v = ok(invoke(conn, "settings", "sudo_offer", json!({})).await)?;
+    let v = ok(invoke(conn, "settings", "sudo-offer", json!({})).await)?;
     let offer = Offer {
         offer: v["offer"].as_str().unwrap_or_default().into(),
         key: v["key"].as_str().unwrap_or_default().into(),
@@ -651,6 +651,7 @@ fn check_descriptor(v: &Value, node_id: &str, rev: u64) -> Result<(), String> {
         "the summary has 60 words or more",
     )?;
     ensure(d.capability("node").is_some(), "no node capability")?;
+    d.check_names()?;
     let mut ids = std::collections::BTreeSet::new();
     for c in &d.capabilities {
         ensure(ids.insert(&c.id), format!("capability {} twice", c.id))?;

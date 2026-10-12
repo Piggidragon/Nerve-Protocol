@@ -49,7 +49,7 @@ fn center_part_passes_against_nerve_center_over_pinned_tls() {
 /// The name of the tool for `cap.action` and the arguments that pick `node`
 /// when the tool covers several nodes.
 fn tool(tools: &[Value], cap: &str, action: &str, node: &str) -> (String, Value) {
-    let suffix = format!("{cap}__{action}");
+    let suffix = format!("{cap}_{action}");
     let t = tools
         .iter()
         .find(|t| t["name"].as_str().is_some_and(|n| n.ends_with(&suffix)))
@@ -127,9 +127,9 @@ fn nerve_center_and_nerve_node_work_together() {
     // Tools: the device's capabilities, not its settings.
     let tools = mcp.tools();
     let names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
-    assert!(names.iter().any(|n| n.ends_with("fs__read")), "{names:?}");
-    assert!(names.iter().any(|n| n.ends_with("exec__run")), "{names:?}");
-    assert!(!names.iter().any(|n| n.contains("settings__")), "{names:?}");
+    assert!(names.iter().any(|n| n.ends_with("fs_read")), "{names:?}");
+    assert!(names.iter().any(|n| n.ends_with("exec_run")), "{names:?}");
+    assert!(!names.iter().any(|n| n.contains("settings_")), "{names:?}");
 
     // The settings grant, given on the node, reaches the center.
     node.ok(&["center", "grant", "settings", "write"]);
@@ -363,7 +363,7 @@ fn nerve_center_and_nerve_node_work_together() {
         .iter()
         .filter_map(|t| t["name"].as_str().map(str::to_string))
         .collect();
-    assert!(!names.iter().any(|n| n.ends_with("fs__read")), "{names:?}");
+    assert!(!names.iter().any(|n| n.ends_with("fs_read")), "{names:?}");
     let status = node.ok(&["status"]);
     assert!(
         status.contains("revoked") || status.contains("unknown") || status.contains("stopped"),

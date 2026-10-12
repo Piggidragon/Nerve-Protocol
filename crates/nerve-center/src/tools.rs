@@ -1,11 +1,13 @@
 //! MCP tools from node descriptors (spec/harness.md §2).
 //!
-//! - One tool per action, named `<cap>__<action>`.
+//! - One tool per action, named `<cap>_<action>`. `_` only separates: node,
+//!   capability and action names hold letters, digits and `-`, never `_`
+//!   (`Descriptor::check_names`).
 //! - A capability with a profile that several nodes offer with the same
 //!   parameter schema becomes one tool with a required `node` argument, an
 //!   enum of those nodes.
 //! - A capability without a profile, or one whose schema differs between
-//!   nodes, gets the node name as prefix: `<node>__<cap>__<action>`.
+//!   nodes, gets the node name as prefix: `<node>_<cap>_<action>`.
 //! - Names stay within `^[a-zA-Z0-9_-]{1,64}$`.
 //!
 //! The built-in capabilities `node`, `settings` and `audit` are never tools:
@@ -198,7 +200,7 @@ fn shared_tool(cap: &str, action: &str, entries: &[Entry]) -> Tool {
         .collect::<Vec<_>>()
         .join(", ");
     Tool {
-        name: sanitize(&format!("{cap}__{action}")),
+        name: sanitize(&format!("{cap}_{action}")),
         description: describe(&entries[0], &format!("the nodes {list}")),
         input_schema: schema,
         effect: entries[0].def.effect,
@@ -210,7 +212,7 @@ fn shared_tool(cap: &str, action: &str, entries: &[Entry]) -> Tool {
 fn node_tool(e: &Entry) -> Tool {
     let r = route(e);
     Tool {
-        name: sanitize(&format!("{}__{}__{}", e.node.name, e.cap.id, e.action)),
+        name: sanitize(&format!("{}_{}_{}", e.node.name, e.cap.id, e.action)),
         description: describe(e, &format!("the node {}", e.node.name)),
         input_schema: object_schema(&e.def.params),
         effect: e.def.effect,
@@ -233,7 +235,8 @@ fn object_schema(params: &Value) -> Value {
     }
 }
 
-/// Replaces what the name pattern does not allow and keeps it within 64
+/// Replaces what the name pattern does not allow with `-` (`_` separates the
+/// parts of a name, so it is not free) and keeps it within 64
 /// characters; a long name keeps a hash of its full form so two long names
 /// with the same start stay apart.
 pub fn sanitize(name: &str) -> String {
@@ -243,7 +246,7 @@ pub fn sanitize(name: &str) -> String {
             if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
                 c
             } else {
-                '_'
+                '-'
             }
         })
         .collect();
@@ -344,11 +347,44 @@ mod tests {
             name: "laptop",
             descriptor: &d,
         }]);
-        assert_eq!(names(&t), ["fs__read"]);
+        assert_eq!(names(&t), ["fs_read"]);
         let s = &t[0].input_schema;
         assert_eq!(s["properties"]["node"]["enum"], json!(["laptop"]));
         assert_eq!(s["required"], json!(["node", "path"]));
         assert_eq!(t[0].to_mcp()["annotations"]["readOnlyHint"], json!(true));
+    }
+
+    #[test]
+    fn a_tool_is_named_cap_underscore_action() {
+        let d = desc(
+            "box",
+            vec![cap(
+                "exec",
+                "exec",
+                &[("run", Effect::Execute, json!({"type": "object"}))],
+            )],
+        );
+        let t = build(&[NodeView {
+            id: "1",
+            name: "box",
+            descriptor: &d,
+        }]);
+        assert_eq!(names(&t), ["exec_run"]);
+        // With a hyphen in the action, still one `_` between the parts.
+        let d = desc(
+            "box",
+            vec![cap(
+                "fs",
+                "",
+                &[("list-files", Effect::Read, json!({"type": "object"}))],
+            )],
+        );
+        let t = build(&[NodeView {
+            id: "1",
+            name: "box",
+            descriptor: &d,
+        }]);
+        assert_eq!(names(&t), ["box_fs_list-files"]);
     }
 
     #[test]
@@ -373,7 +409,7 @@ mod tests {
                 descriptor: &b,
             },
         ]);
-        assert_eq!(names(&t), ["fs__read"]);
+        assert_eq!(names(&t), ["fs_read"]);
         assert_eq!(
             t[0].input_schema["properties"]["node"]["enum"],
             json!(["a", "b"])
@@ -410,7 +446,7 @@ mod tests {
                 descriptor: &b,
             },
         ]);
-        assert_eq!(names(&t), ["a__fs__read", "a__lamp__on", "b__fs__read"]);
+        assert_eq!(names(&t), ["a_fs_read", "a_lamp_on", "b_fs_read"]);
         assert!(!t[0].selector);
         assert_eq!(
             t[1].input_schema,
@@ -435,7 +471,9 @@ mod tests {
 
     #[test]
     fn names_are_cleaned_cut_and_kept_unique() {
-        assert_eq!(sanitize("a.b c"), "a_b_c");
+        assert_eq!(sanitize("a.b c"), "a-b-c");
+        // `_` separates the parts of a name and is kept; nothing else becomes one.
+        assert_eq!(sanitize("a_b:c"), "a_b-c");
         let long = "x".repeat(80);
         let s = sanitize(&long);
         assert_eq!(s.len(), NAME_MAX);
@@ -451,7 +489,7 @@ mod tests {
             "a",
             vec![
                 cap("x.y", "", &[("go", Effect::Read, Value::Null)]),
-                cap("x_y", "", &[("go", Effect::Read, Value::Null)]),
+                cap("x:y", "", &[("go", Effect::Read, Value::Null)]),
             ],
         );
         let t = build(&[NodeView {
@@ -459,7 +497,7 @@ mod tests {
             name: "a",
             descriptor: &d,
         }]);
-        assert_eq!(names(&t), ["a__x_y__go", "a__x_y__go_2"]);
+        assert_eq!(names(&t), ["a_x-y_go", "a_x-y_go_2"]);
     }
 
     #[test]
@@ -471,6 +509,6 @@ mod tests {
             name: "a",
             descriptor: &d,
         }]);
-        assert_eq!(names(&t), ["a__fs__read"]);
+        assert_eq!(names(&t), ["a_fs_read"]);
     }
 }

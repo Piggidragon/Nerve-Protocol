@@ -50,3 +50,7 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
 - Conformance suite with a center part and a node part (pairing, link,
   descriptor, fs, exec, allow and deny rules, audit and the sudo switch); the
   harness part is a skeleton (`spec/conformance.md`).
+- MCP tool names are `<cap>_<action>`, or `<node>_<cap>_<action>` when the node
+  is part of the name, with one `_` as the only separator; node, capability
+  and action names use letters, digits and `-`, and the center ignores a
+  descriptor whose names have a `_` (`spec/harness.md`).

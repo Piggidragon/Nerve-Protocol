@@ -69,13 +69,17 @@ that does not match `Host` are refused (403).
 
 - `nodes` lists the paired nodes, whether they are online and what
   they offer.
-- A capability with a profile becomes one tool per action, `<cap>__<action>`,
+- A capability with a profile becomes one tool per action, `<cap>_<action>`,
   shared by every node that offers the same capability with the same
   arguments and effect. Its first, required argument `node` names the node.
 - A capability without a profile, or one whose arguments differ between
-  nodes, becomes `<node>__<cap>__<action>`.
-- Names keep `[A-Za-z0-9_-]`; anything else becomes `_`. Names longer than 64
-  are cut and get a short hash; clashes get `_2`, `_3`.
+  nodes, becomes `<node>_<cap>_<action>`.
+- `_` is the only separator in a tool name, so node, capability and action
+  names use letters, digits and `-` and never `_` (`list-files`, not
+  `list_files`). A node's descriptor with a `_` in a capability or action name
+  is refused by the center. Tool names keep `[A-Za-z0-9_-]`; anything else in
+  a name becomes `-`. Names longer than 64 are cut and get a short hash;
+  clashes get `_2`, `_3`.
 - `node`, `settings` and `audit` are never tools, so a model cannot change
   the policy that limits it.
   Capabilities with exposure `off` are left out.

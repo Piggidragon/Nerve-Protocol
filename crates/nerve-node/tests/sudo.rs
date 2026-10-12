@@ -145,9 +145,9 @@ impl Seen {
     /// A fresh offer, its signature checked against the paired node key.
     async fn offer(&mut self, conn: &mut Conn<TcpStream>, center: &FakeCenter) -> Offer {
         let v = self
-            .invoke(conn, "settings", "sudo_offer", json!({}))
+            .invoke(conn, "settings", "sudo-offer", json!({}))
             .await
-            .expect("sudo_offer");
+            .expect("sudo-offer");
         let offer = Offer {
             offer: v["offer"].as_str().unwrap().into(),
             key: v["key"].as_str().unwrap().into(),

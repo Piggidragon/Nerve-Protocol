@@ -789,7 +789,7 @@ impl Link {
         match (inv.cap.as_str(), inv.action.as_str()) {
             ("settings", "set") => self.settings_set(&inv.args),
             ("settings", "pause") => self.settings_pause(),
-            ("settings", "sudo_offer") => self.sudo_offer(&entry),
+            ("settings", "sudo-offer") => self.sudo_offer(&entry),
             ("settings", "sudo") => self.settings_sudo(&inv.args).await,
             ("exec", "signal") => self.signal(&inv.args),
             ("exec", "run") => self.exec_run(id, &cfg, &entry, effect, &inv).await,
@@ -926,7 +926,7 @@ impl Link {
         settings_result(r).map(|_| json!({}))
     }
 
-    /// `settings.sudo_offer`: a fresh one-shot key for the sealed password,
+    /// `settings.sudo-offer`: a fresh one-shot key for the sealed password,
     /// signed with this node's key for the center. A new offer replaces the
     /// open one.
     fn sudo_offer(&self, entry: &CenterEntry) -> Result<Value, RpcError> {
@@ -966,7 +966,7 @@ impl Link {
         let pending = lock(&self.shared.sudo_offers)
             .remove(&self.name)
             .ok_or_else(|| {
-                RpcError::invalid_args("no open sudo offer; ask settings.sudo_offer for one")
+                RpcError::invalid_args("no open sudo offer; ask settings.sudo-offer for one")
             })?;
         let password = pending
             .open(&sealed, crate::now_ms())

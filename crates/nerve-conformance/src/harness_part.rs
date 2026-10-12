@@ -16,7 +16,7 @@ pub const PLANNED: &[(&str, &str)] = &[
     ),
     (
         "harness 2",
-        "tool names follow <cap>__<action> and the node enum rule",
+        "tool names follow <cap>_<action> and the node enum rule",
     ),
     (
         "harness 3",

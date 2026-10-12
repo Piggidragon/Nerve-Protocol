@@ -399,8 +399,8 @@ The reverse direction (a harness offering sessions, prompts and replies for a ch
 
 ### 6.2 Tools from descriptors
 
-- One tool per action: name `<cap>__<action>` (double underscore, since action names may contain one), description from the capability and action summaries, input schema from `params`.
-- Capabilities with the same profile on several nodes become one tool with a required `node` argument (an enum of granted nodes that have it). Capabilities without a profile, or with differing schemas, get the node name as prefix: `<node>__<cap>__<action>`. Names stay within `^[a-zA-Z0-9_-]{1,64}$`.
+- One tool per action: name `<cap>_<action>`, description from the capability and action summaries, input schema from `params`.
+- Capabilities with the same profile on several nodes become one tool with a required `node` argument (an enum of granted nodes that have it). Capabilities without a profile, or with differing schemas, get the node name as prefix: `<node>_<cap>_<action>`. `_` is the only separator, so node, capability and action names use letters, digits and `-` and never `_` (a descriptor with a `_` in a capability or action name is refused). Tool names stay within `^[a-zA-Z0-9_-]{1,64}$`.
 - Results: JSON as text, blobs as content where the harness supports it, otherwise saved by the center and referenced by a short-lived handle the harness can read.
 - Every tool result is marked as content from a device, not instructions.
 - Tool lists change with descriptors; the center notifies (`nodes.changed`).

@@ -481,6 +481,10 @@ impl Center {
             .await
         {
             Ok(v) => match serde_json::from_value::<Descriptor>(v) {
+                Ok(d) if d.check_names().is_err() => {
+                    let e = d.check_names().unwrap_err();
+                    tracing::warn!(node = %link.node_id, "the node sent a descriptor with a bad name, so the center ignores it: {e}")
+                }
                 Ok(d) => {
                     self.update(|s| {
                         if let Some(n) = s.nodes.get_mut(&link.node_id) {
@@ -739,7 +743,7 @@ impl Center {
         let v = link
             .call(
                 msg::method::INVOKE,
-                json!({"cap": "settings", "action": "sudo_offer", "args": {}, "ctx": {}}),
+                json!({"cap": "settings", "action": "sudo-offer", "args": {}, "ctx": {}}),
                 Some(SHORT_CALL),
             )
             .await?;

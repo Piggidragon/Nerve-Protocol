@@ -314,7 +314,7 @@ fn settings_cap() -> Capability {
         ),
     );
     c.actions.insert(
-        "sudo_offer".into(),
+        "sudo-offer".into(),
         action(
             Effect::Write,
             "A one-shot key to seal the sudo password for this node (spec §7.4.1).",
@@ -467,6 +467,15 @@ mod tests {
             unknown: false,
             policy: CenterPolicy::default(),
         }
+    }
+
+    #[test]
+    fn built_in_names_have_no_underscore() {
+        let mut e = entry();
+        e.settings = SettingsGrant::Write;
+        let d = for_center(&NodeConfig::default(), &e, 0);
+        assert_eq!(d.check_names(), Ok(()));
+        assert!(d.capabilities.len() >= 5);
     }
 
     #[test]

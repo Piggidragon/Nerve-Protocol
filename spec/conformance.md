@@ -84,7 +84,7 @@ With a `Setup::folder`, before `bye revoked`:
 | 7.5 | a refusal emits `audit` `decision` `forbidden` |
 | 7.4.1 | sudo is off at first |
 | 7.4.1 | with sudo off, a sudo command on the sudo allow list is `forbidden` |
-| 7.4.1 | `sudo_offer` is signed with the node's key for this center |
+| 7.4.1 | `sudo-offer` is signed with the node's key for this center |
 | 7.4.1 | a wrong sudo password is `invalid_args` and sudo stays off |
 
 With a `Setup::sudo_password` as well:

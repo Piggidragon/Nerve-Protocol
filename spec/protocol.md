@@ -258,6 +258,10 @@ call over the call limit fails with `busy`.
     "events": {}, "state": null, "streams": {}}]}
 ```
 
+- Capability ids and action names use ASCII letters, digits and `-`, never
+  `_`: a harness joins node, capability and action with `_` into one tool
+  name (`spec/harness.md`), and a `_` inside a part would make that name
+  ambiguous. A center ignores a descriptor with a name outside that set.
 - Effects: `read`, `sense`, `write`, `actuate`, `execute`.
 - Exposure: `on`, `off`. A capability that is `hidden` for a center is
   absent from that center's descriptor; `off` is listed with exposure `off`.
@@ -325,7 +329,7 @@ A center with the settings grant `write` may switch the node's sudo switch
 change. The password travels sealed end to end from the client (the owner's
 browser or tool) to the node; the center only relays it.
 
-- `sudo_offer {}` → `{offer, key, ts, sig}` (effect `write`): `offer` is 16
+- `sudo-offer {}` → `{offer, key, ts, sig}` (effect `write`): `offer` is 16
   random bytes and `key` a fresh X25519 public key, both base64; `ts` is the
   node's clock in ms; `sig` is the hex Ed25519 signature, with the node's key
   for this center (§2.2), of the UTF-8 bytes

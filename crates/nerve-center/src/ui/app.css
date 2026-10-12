@@ -305,6 +305,101 @@ textarea.json {
   overflow: auto;
 }
 
+/* A searchable list in place of a native select: a button opens a panel with a
+   search field above a list that scrolls after a few rows. */
+
+.picker-row {
+  margin-bottom: 20px;
+}
+
+.picker {
+  position: relative;
+  max-width: 22rem;
+}
+
+.picker-btn {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+  text-align: left;
+}
+
+.picker-btn > span:first-child,
+.opt > span {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.picker-btn:hover {
+  border-color: rgb(var(--fg-faint) / 0.5);
+}
+
+.picker-btn .chev {
+  color: rgb(var(--fg-faint));
+  transition: transform 0.2s var(--ease-out);
+}
+
+.picker-btn[aria-expanded="true"] .chev {
+  transform: rotate(180deg);
+}
+
+.picker-panel {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 30;
+  width: 100%;
+  padding: 6px;
+  border: 1px solid rgb(var(--line));
+  border-radius: 12px;
+  background: rgb(var(--surface));
+  box-shadow: var(--shadow-pop);
+}
+
+.picker-list {
+  position: relative;
+  max-height: 14.5rem;
+  margin-top: 6px;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.opt {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+
+.opt.active {
+  background: rgb(var(--fg) / 0.07);
+}
+
+.opt[aria-selected="true"] {
+  color: rgb(var(--accent));
+}
+
+.picker-list:empty {
+  display: none;
+}
+
+.picker-none {
+  margin-top: 6px;
+  padding: 6px 10px;
+  color: rgb(var(--fg-subtle));
+  font-size: 12px;
+}
+
+.picker-none:empty {
+  display: none;
+}
+
 /* ---- Shell ---- */
 
 .shell {

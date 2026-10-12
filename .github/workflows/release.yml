@@ -4,12 +4,13 @@
 #
 # `check` stops a bad run before anything is built: a release from any branch
 # but main, a version that is not the one in Cargo.toml, a release whose tag
-# exists or that has no CHANGELOG.md section. It picks the commit (the head of
-# the branch when the run starts) and the tag, then runs fmt, clippy and the
-# tests. Every build job checks out that commit, so a push to the branch during
-# the run changes nothing. `publish` is the only job that may write: it tags the
-# commit and publishes the release only after every check and build passed, so
-# a failed run leaves no tag. Tags are never moved or reused.
+# exists or that has no CHANGELOG.md section, a pre-release of a version that
+# is released already. It picks the commit (the head of the branch when the run
+# starts) and the tag, then runs fmt, clippy and the tests. Every build job
+# checks out that commit, so a push to the branch during the run changes
+# nothing. `publish` is the only job that may write: it tags the commit and
+# publishes the release only after every check and build passed, so a failed
+# run leaves no tag. Tags are never moved or reused.
 #
 # No secrets: nothing is signed, Nerve has no update channel yet. The actions are
 # pinned by commit.
@@ -100,8 +101,9 @@ jobs:
           echo "sha=$sha" >> "$GITHUB_OUTPUT"
           echo "$BRANCH is at $sha"
       # A release is v<version> and only once. A pre-release is pre<N>-v<version>,
-      # N one more than the highest one so far (pre1 first). `publish` creates the
-      # tag; creating it fails there if it has come to exist since.
+      # N one more than the highest one so far (pre1 first), and only for a
+      # version that is not released yet. `publish` creates the tag; creating it
+      # fails there if it has come to exist since.
       - name: The tag
         id: tag
         env:
@@ -115,6 +117,13 @@ jobs:
               exit 1
             fi
           else
+            # The pre-release would be numbered as older than the release but
+            # published after it, with newer code, and a list of pre-releases
+            # sorted by date would show it as the newest.
+            if grep -qxF "v$VERSION" <<< "$tags"; then
+              echo "v$VERSION is released already, and a pre-release of it would come after it: raise the version on the branch first" >&2
+              exit 1
+            fi
             n=$({ grep -E "^pre[0-9]+-v${VERSION//./\\.}\$" <<< "$tags" || true; } \
               | sed -E 's/^pre([0-9]+)-v.*$/\1/' | sort -n | tail -n 1)
             tag="pre$((10#${n:-0} + 1))-v$VERSION"
@@ -262,7 +271,7 @@ jobs:
   # The release is made as a draft with its files first, then the tag, then the
   # draft is published, so that the step most likely to fail (the upload) runs
   # before there is a tag. If anything here fails, the last step removes the
-  # draft and the tag this run created.
+  # draft and the tag this run created, and nothing else (see there).
   publish:
     needs: [check, linux, windows]
     runs-on: ubuntu-24.04
@@ -298,28 +307,39 @@ jobs:
           case "$KIND" in
             release)
               title="Nerve $VERSION"
-              flags=()
+              prerelease=false
               ;;
             *)
               title="Nerve $VERSION (pre-release $TAG)"
-              flags=(--prerelease)
+              prerelease=true
               ;;
           esac
           footer="Static Linux binaries (x86_64, aarch64) and Windows x86_64 programs of \`nerve-center\` and \`nerve-node\`, built from $SHA. SHA256SUMS lists their checksums. They are not signed: Nerve has no update channel yet (docs/releasing.md)."
           notes=notes/changelog.md
           { if [ -s "$notes" ]; then cat "$notes"; echo; fi; echo "$footer"; } > release-notes.md
-          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --target "$SHA" \
-            "${flags[@]}" --title "$title" --notes-file release-notes.md dist/*
-          # The newest draft of this tag is the one just made (the list is newest first).
-          ids=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-            --jq '.[] | select(.draft and .tag_name == env.TAG) | .id')
-          id=${ids%%$'\n'*}
+          # The draft is made without files, and its id is kept before the upload
+          # (the step most likely to fail): the clean-up then removes this draft
+          # by its id and no other draft of the tag.
+          id=$(gh api --method POST "repos/$GITHUB_REPOSITORY/releases" \
+            -f tag_name="$TAG" -f target_commitish="$SHA" -f name="$title" \
+            -F body=@release-notes.md -F draft=true -F prerelease="$prerelease" --jq .id)
           if [ -z "$id" ]; then
-            echo "the draft release for $TAG is not there" >&2
+            echo "the draft release for $TAG has no id" >&2
             exit 1
           fi
           echo "RELEASE_ID=$id" >> "$GITHUB_ENV"
-      # Creating the ref fails if the tag exists, so no tag is ever moved.
+          for f in dist/*; do
+            curl --fail-with-body --silent --show-error --request POST \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              --header "Content-Type: application/octet-stream" \
+              --data-binary "@$f" \
+              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$id/assets?name=${f##*/}" \
+              > /dev/null
+          done
+      # Creating the ref fails if the tag exists, so no tag is ever moved. The
+      # tag object is recorded before the ref is made, so that the clean-up can
+      # tell this run's tag from one that was there already.
       - name: The tag
         run: |
           if [ "$KIND" = release ]; then
@@ -329,8 +349,8 @@ jobs:
           fi
           object=$(gh api "repos/$GITHUB_REPOSITORY/git/tags" -f tag="$TAG" -f message="$message" \
             -f object="$SHA" -f type=commit --jq .sha)
+          echo "TAG_OBJECT=$object" >> "$GITHUB_ENV"
           gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$object" --silent
-          echo "TAG_CREATED=1" >> "$GITHUB_ENV"
       # A release is marked latest; a pre-release never is.
       - name: Publish
         run: |
@@ -340,16 +360,38 @@ jobs:
           fi
           gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
             -F draft=false -f make_latest="$latest" --jq .html_url
-      # Every draft of this tag goes: a failed upload can leave one before its id
-      # is known, and a draft is never a published release.
+      # What a failed or cancelled run removes: the draft it made (by its id) and
+      # the tag it made (the one that points at its tag object), and only when
+      # GitHub says no release of the tag is published. A Publish whose answer
+      # was lost may have published all the same, and then the tag is that
+      # release's. When GitHub cannot be asked, nothing is removed: a tag left
+      # over can be deleted by hand, a published release without its tag cannot
+      # be put back. A draft the owner made for the same tag has another id and
+      # stays.
       - name: Clean up after a failure
         if: ${{ failure() || cancelled() }}
         run: |
-          ids=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
-            --jq '.[] | select(.draft and .tag_name == env.TAG) | .id' || true)
-          for id in $ids; do
-            gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/$id" || true
-          done
-          if [ -n "${TAG_CREATED:-}" ]; then
-            gh api --method DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" || true
+          api="repos/$GITHUB_REPOSITORY"
+          if ! published=$(gh api --paginate "$api/releases?per_page=100" \
+            --jq '.[] | select(.tag_name == env.TAG and (.draft | not)) | .id'); then
+            echo "::warning::cannot tell whether $TAG is published, so its draft and tag are left as they are"
+            exit 0
+          fi
+          # true, false, or empty when there is no such release or it cannot be read.
+          draft=
+          if [ -n "${RELEASE_ID:-}" ]; then
+            draft=$(gh api "$api/releases/$RELEASE_ID" --jq .draft || true)
+          fi
+          if [ -n "$published" ] || [ "$draft" = false ]; then
+            echo "$TAG is published: its release and tag stay"
+            exit 0
+          fi
+          if [ "$draft" = true ]; then
+            gh api --method DELETE "$api/releases/$RELEASE_ID" || echo "::warning::the draft release $RELEASE_ID of $TAG is still there"
+          fi
+          if [ -n "${TAG_OBJECT:-}" ]; then
+            at=$(gh api "$api/git/ref/tags/$TAG" --jq .object.sha || true)
+            if [ "$at" = "$TAG_OBJECT" ]; then
+              gh api --method DELETE "$api/git/refs/tags/$TAG" || echo "::warning::the tag $TAG is still there"
+            fi
           fi

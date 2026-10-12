@@ -668,14 +668,14 @@ function logRow(e) {
 function pageLog() {
   const l = state.log;
   if (!l) return [empty("Loading…")];
-  const known = l.nodes.slice().sort((a, b) => a.name.localeCompare(b.name));
+  const machines = l.nodes.slice().sort((a, b) => a.name.localeCompare(b.name));
   // A machine the log no longer remembers cannot be filtered by.
-  if (logFilter.node !== null && logFilter.node !== "-" && !known.some((n) => n.id === logFilter.node)) logFilter.node = null;
+  if (logFilter.node !== null && logFilter.node !== "-" && !machines.some((n) => n.id === logFilter.node)) logFilter.node = null;
   logLevelPicker.set(LOG_LEVELS, logFilter.level);
   logNodes = [
     { value: null, text: "All machines" },
     { value: "-", text: "The center itself" },
-    ...known.map((n) => ({ value: n.id, text: n.paired ? n.name : `${n.name} (removed)` })),
+    ...machines.map((n) => ({ value: n.id, text: n.paired ? n.name : `${n.name} (removed)` })),
   ];
   logNodePicker.set(logNodes, logFilter.node);
   logDownload.hidden = !l.file;
@@ -897,6 +897,22 @@ function draw(force) {
   $("page").replaceChildren(...parts);
 }
 
+// The pairing card shows a one-time code. Once the center no longer has it
+// open, a machine used it (or it ran out of tries), and the card has done its
+// job: close it, so nobody thinks the pairing failed and tries again. The
+// center says which machine the code paired, so the page never guesses it from
+// the machine list, which may be older than the pairing. A pairing that is
+// still under way counts as open there.
+async function closePairingWhenUsed() {
+  const p = state.pairing;
+  if (!p) return;
+  const { open, node } = await api("POST", "/api/pair/status", { code: p.code });
+  if (open || state.pairing !== p) return;
+  state.pairing = null;
+  if (node) notify(`Paired ${node.name}.`);
+  else notify("The pairing code is no longer valid.", "error");
+}
+
 async function tick() {
   if (busy || !csrf) return;
   busy = true;
@@ -912,6 +928,7 @@ async function tick() {
     if (page === "stats") state.stats = extra;
     if (page === "audit") state.audit = extra;
     if (page === "help" && extra) state.help = extra;
+    await closePairingWhenUsed();
     if (down) notify("Connected to the center again.");
     down = false;
     draw(false);

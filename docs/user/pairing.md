@@ -31,7 +31,8 @@ Pairing links a machine to a center. Do it once per machine and center.
    nerve-node status
    ```
 
-   The machine shows as online in the web UI.
+   The machine shows as online in the web UI, and the pairing card there
+   closes: the code is used up.
 
 The new pairing starts closed: mode `allowlist`, no rule, and the center may
 not change settings. Every call is refused until you allow something

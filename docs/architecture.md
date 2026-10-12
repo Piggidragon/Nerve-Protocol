@@ -90,7 +90,7 @@ One daemon, `nerve-node`, Rust, Linux and Windows first, macOS later. It holds:
 - one pairing per center (center URL, pin, center id, the node key for that center);
 - the policy per center entry and the machine settings (§5);
 - the built-in capabilities: `node`, `fs`, `exec`, `settings`, `audit`;
-- the sandbox (Landlock, cgroup scope and exec shim on Linux, Job Object on Windows (not in 0.0.1: folder mode runs no command there), the dedicated-user install);
+- the sandbox (Landlock, cgroup scope and exec shim on Linux; on Windows a Job Object per command, which ends its whole process tree but confines no files, so folder mode runs no command there; the dedicated-user install);
 - the sudo password, while the sudo switch is on (§5.1);
 - the local interface: a control socket used by the CLI (§7.2; 0.0.1: Unix only).
 
@@ -297,7 +297,7 @@ Big-endian integers. `seq` counts per id and direction from 0. Backpressure: eac
 |---|---|---|
 | `node` | `nerve:node/1` | state `status` (`online`, `busy`, `paused`); events `descriptor_changed`, `going_away`, `capability_changed` (implicit) |
 | `fs` | `nerve:fs/1` | actions `stat`, `list`, `read`, `grep`, `find` (`read`), `write` (`write`, with `if_match`); one path form on every platform (`/c/Users/…` on Windows) |
-| `exec` | `nerve:exec/1` | action `run` (`execute`), `signal` (`actuate`); stream `output` (reliable); event `exit`; state `shell`, `confinement`. The `run` text names the shell (Windows PowerShell 5.1 on Windows). A timeout, `cancel` or `session.end` kills the command's process group; Windows has none and no Job Object in 0.0.1, so there the node ends the processes it saw below the shell (polled), best effort |
+| `exec` | `nerve:exec/1` | action `run` (`execute`), `signal` (`actuate`); stream `output` (reliable); event `exit`; state `shell`, `confinement`. The `run` text names the shell (Windows PowerShell 5.1 on Windows). A timeout, `cancel` or `session.end` kills the command's process group; on Windows these and every `signal` end the command's Job Object, which the shell joins before it runs and which holds every process it starts (not one WMI, a service or the task scheduler starts for it); only when Windows makes no job does the node end the processes it saw below the shell (polled), best effort |
 | `settings` | `nerve:settings/1` | state `document`; action `set` (`write`, with `if_version`); present only for a center with `settings = write` (§5.2) |
 | `audit` | `nerve:audit/1` | event `decision` (needs `sub`) |
 

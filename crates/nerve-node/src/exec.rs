@@ -1,8 +1,9 @@
 //! The `exec` capability (spec §7.3): shell commands, each in its own
 //! process group so the whole tree can be signalled and is killed when the
-//! call ends or the link drops. Windows has no process groups; there the node
-//! records the processes below the shell while it runs (crate::tree), which
-//! is best effort until a Job Object holds the tree.
+//! call ends or the link drops. Windows has no process groups; there each
+//! command runs in a job object of its own (crate::job), and only when
+//! Windows makes none does the node record the processes below the shell
+//! while it runs (crate::tree), best effort.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -326,13 +327,16 @@ pub async fn sudo_check(sudo_path: &str, password: &str) -> Result<(), String> {
 
 /// Kills the command's whole process group when dropped: a cancelled call, a
 /// dropped link and a finished command all leave nothing behind. On Windows
-/// that is the processes recorded below the shell (crate::tree).
+/// that is the command's job (crate::job), or, when it has none, the
+/// processes recorded below the shell (crate::tree).
 struct Group(Option<u32>);
 
 impl Group {
     fn start(pid: Option<u32>) -> Group {
         #[cfg(windows)]
-        if let Some(pid) = pid {
+        if let Some(pid) = pid
+            && !crate::job::holds(pid)
+        {
             crate::tree::watch(pid);
         }
         Group(pid)
@@ -344,7 +348,10 @@ impl Drop for Group {
         if let Some(pid) = self.0 {
             kill_group(pid, Sig::Kill);
             #[cfg(windows)]
-            crate::tree::forget(pid);
+            {
+                crate::job::release(pid);
+                crate::tree::forget(pid);
+            }
         }
     }
 }
@@ -381,12 +388,14 @@ pub fn kill_group(pid: u32, sig: Sig) {
     }
 }
 
-/// Ends the shell `pid` and every process recorded or found below it; every
-/// signal ends them. Best effort: a Job Object would hold the whole tree,
-/// and this misses what crate::tree cannot see.
+/// Ends every process in the job of the shell `pid`; every signal ends
+/// them. A command without a job (Windows made none) is ended by the walk of
+/// crate::tree, which misses what it cannot see.
 #[cfg(windows)]
 pub fn kill_group(pid: u32, _sig: Sig) {
-    crate::tree::kill(pid);
+    if !crate::job::end(pid) {
+        crate::tree::kill(pid);
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -551,9 +560,22 @@ pub async fn run(
         .kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
+    // The shell starts suspended and runs only once it is in its job, so
+    // nothing it starts escapes the job. No console is needed for this, so
+    // a node that runs as a service does the same.
+    #[cfg(windows)]
+    let job = crate::job::make();
+    #[cfg(windows)]
+    if job.is_some() {
+        cmd.creation_flags(crate::job::SUSPENDED);
+    }
     let mut child = cmd
         .spawn()
         .map_err(|e| RpcError::new(ErrorCode::Unavailable, format!("cannot start: {e}")))?;
+    #[cfg(windows)]
+    if let Some(job) = job {
+        crate::job::adopt(job, &mut child).map_err(|e| RpcError::new(ErrorCode::Unavailable, e))?;
+    }
     let group = Group::start(child.id());
     let mut sudo_stdin = None;
     if let Some(spec) = shim {
@@ -1044,5 +1066,179 @@ mod windows_tests {
             gone(grandchild).await,
             "the orphaned grandchild outlived the timeout"
         );
+    }
+
+    /// Ends `pid` when a failed test left it running.
+    fn sweep(pid: u32) {
+        if let Some(start) = crate::win::start_of(pid) {
+            crate::win::terminate(pid, start);
+        }
+    }
+
+    /// Runs `command` in `dir` until `pid_file` names a process, then
+    /// cancels the call the way the link does (the task is aborted, so the
+    /// run future is dropped); whether that process is gone afterwards.
+    async fn ended_by_cancel(command: &str, dir: &Path, pid_file: &str) -> bool {
+        let c = call(command, dir, Duration::from_secs(120));
+        let task = tokio::spawn(async move { run(&c, &opts(), |_| {}).await });
+        let pid = pid_in(&dir.join(pid_file)).await;
+        // Long enough for every parent in between to have exited.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let ended = gone(pid).await;
+        sweep(pid);
+        ended
+    }
+
+    /// A cancel ends a grandchild whose parents exited at once: three cmd
+    /// levels that each start the next and exit.
+    #[tokio::test]
+    async fn a_cancel_ends_a_grandchild_whose_parents_exited_at_once() {
+        let d = tempfile::tempdir().unwrap();
+        let w = |name: &str, text: &str| std::fs::write(d.path().join(name), text).unwrap();
+        w("a.cmd", "@start \"\" /b cmd /c b.cmd\r\n");
+        w("b.cmd", "@start \"\" /b cmd /c c.cmd\r\n");
+        w(
+            "c.cmd",
+            "@start \"\" /b powershell -NoProfile -ExecutionPolicy Bypass -File gc.ps1\r\n",
+        );
+        w(
+            "gc.ps1",
+            "Set-Content -Path gc.pid -Value $PID\r\nStart-Sleep 120\r\n",
+        );
+        assert!(
+            ended_by_cancel("cmd /c a.cmd; Start-Sleep 120", d.path(), "gc.pid").await,
+            "the grandchild outlived the cancel"
+        );
+    }
+
+    /// A process that keeps starting its successor and exiting, each one a
+    /// grandchild whose parent is gone: a walk of the process table loses
+    /// the chain when one hop lives shorter than a poll, the job holds every
+    /// one. Each hop adds a line to `hops.txt`; after the cancel the file
+    /// must stop growing.
+    #[tokio::test]
+    async fn a_cancel_ends_a_chain_of_processes_that_hand_over_and_exit() {
+        let d = tempfile::tempdir().unwrap();
+        // `stop` ends a chain a failed test left running.
+        std::fs::write(
+            d.path().join("hop.cmd"),
+            "@if exist stop exit /b\r\n@echo x>>hops.txt\r\n@start \"\" /b cmd /c hop.cmd\r\n",
+        )
+        .unwrap();
+        // Ten chains side by side, so the walk has a lot to keep up with.
+        std::fs::write(
+            d.path().join("go.cmd"),
+            "@start \"\" /b cmd /c hop.cmd\r\n".repeat(10),
+        )
+        .unwrap();
+        let c = call(
+            "cmd /c go.cmd; Start-Sleep 120",
+            d.path(),
+            Duration::from_secs(120),
+        );
+        let task = tokio::spawn(async move { run(&c, &opts(), |_| {}).await });
+        let hops = d.path().join("hops.txt");
+        let count = || {
+            std::fs::read_to_string(&hops)
+                .map(|t| t.lines().count())
+                .unwrap_or(0)
+        };
+        // Long enough for many hops.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert!(count() > 10, "the chain did not run: {} hops", count());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let after = count();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let later = count();
+        std::fs::write(d.path().join("stop"), "").unwrap();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(after, later, "the chain went on after the cancel");
+    }
+
+    /// A process the command starts through WMI. Its parent is the WMI
+    /// provider host (WmiPrvSE.exe), and a new process is born into its
+    /// parent's job, so it is in the provider host's job, not the
+    /// command's: no job object holds it, and neither does the walk. Kept
+    /// as the open gap it is (run it with `--ignored`); closing it takes
+    /// keeping the command from WMI, which a job cannot.
+    #[tokio::test]
+    #[ignore = "open gap: WMI starts the process outside the command's job"]
+    async fn a_cancel_ends_a_process_started_through_wmi() {
+        let d = tempfile::tempdir().unwrap();
+        let command = "$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create \
+             -Arguments @{CommandLine = 'powershell -NoProfile -Command Start-Sleep 120'}; \
+             Set-Content -Path wmi.pid -Value $r.ProcessId; \
+             Start-Sleep 120";
+        assert!(
+            ended_by_cancel(command, d.path(), "wmi.pid").await,
+            "the process started through WMI outlived the cancel"
+        );
+    }
+
+    /// The shell runs in a job of its own, nested in the job the test runs
+    /// in when there is one (a CI runner, an SSH session).
+    #[tokio::test]
+    async fn the_shell_runs_in_a_job_of_its_own() {
+        let d = tempfile::tempdir().unwrap();
+        let c = call("exit 0", d.path(), Duration::from_secs(60));
+        let mut held = false;
+        let r = run(&c, &opts(), |pid| held = crate::job::holds(pid))
+            .await
+            .unwrap();
+        assert_eq!(r["exit_code"], 0, "{r}");
+        assert!(held, "the shell ran without a job");
+    }
+
+    /// Run by [`a_node_that_dies_leaves_no_command_running`] in a process
+    /// of its own, which that test then kills: a command whose shell starts
+    /// a ping and waits.
+    #[tokio::test]
+    #[ignore = "a helper of a_node_that_dies_leaves_no_command_running"]
+    async fn helper_runs_a_command_until_killed() {
+        let dir = PathBuf::from(std::env::var_os("NERVE_TEST_DIR").expect("set by the test"));
+        let command = "Set-Content -Path shell.pid -Value $PID; \
+             $p = Start-Process ping -ArgumentList '-n','120','127.0.0.1' -WindowStyle Hidden -PassThru; \
+             Set-Content -Path ping.pid -Value $p.Id; \
+             Start-Sleep 120";
+        let _ = run(
+            &call(command, &dir, Duration::from_secs(120)),
+            &opts(),
+            |_| {},
+        )
+        .await;
+    }
+
+    /// A node that dies without ending its commands (killed, crashed)
+    /// leaves none running: its handle to the job closes with it, and the
+    /// job's KILL_ON_JOB_CLOSE ends every process in it. The walk dies with
+    /// the node and ends nothing.
+    #[tokio::test]
+    async fn a_node_that_dies_leaves_no_command_running() {
+        let d = tempfile::tempdir().unwrap();
+        let mut node = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--ignored",
+                "--exact",
+                "exec::windows_tests::helper_runs_a_command_until_killed",
+            ])
+            .env("NERVE_TEST_DIR", d.path())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let shell = pid_in(&d.path().join("shell.pid")).await;
+        let ping = pid_in(&d.path().join("ping.pid")).await;
+        // TerminateProcess: no destructor of the node runs, as in a crash.
+        node.kill().unwrap();
+        node.wait().unwrap();
+        let shell_gone = gone(shell).await;
+        let ping_gone = gone(ping).await;
+        sweep(shell);
+        sweep(ping);
+        assert!(shell_gone, "the shell outlived the node");
+        assert!(ping_gone, "the shell's child outlived the node");
     }
 }

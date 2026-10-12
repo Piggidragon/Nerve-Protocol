@@ -1,11 +1,11 @@
-//! A command's process tree on Windows, best effort without a Job Object:
-//! the node polls the process table while the command runs and remembers
-//! every process it saw below the shell, so a grandchild whose parent
-//! already exited still counts when the command is cancelled, times out or
-//! ends. It misses what never shows as a descendant: a process started
-//! through WMI, a service or the task scheduler (its parent is that
-//! service), and a child of a process that started and exited between two
-//! polls. Only a Job Object holds the whole tree.
+//! A command's process tree on Windows when Windows made no job object for
+//! it (crate::job), best effort: the node polls the process table while the
+//! command runs and remembers every process it saw below the shell, so a
+//! grandchild whose parent already exited still counts when the command is
+//! cancelled, times out or ends. It misses what never shows as a
+//! descendant: a process started through WMI, a service or the task
+//! scheduler (its parent is that service), and a child of a process that
+//! started and exited between two polls. The job holds the last one too.
 //!
 //! The walk itself ([`Tree`]) is plain logic over a process list, so it is
 //! tested on every platform; the process table and the kill are Windows only.

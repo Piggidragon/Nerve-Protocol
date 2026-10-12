@@ -210,8 +210,8 @@ mod imp {
         if spec.landlock.is_some() {
             return SHIM_FAILED;
         }
-        // Not done in 0.0.1: the Job Object that would hold every descendant
-        // (see `stubs::job_object`).
+        // No confinement here: the node runs the shim in a job object of the
+        // command's own, which holds this process and what it starts.
         match Command::new(&spec.program)
             .args(&spec.args)
             .stdin(Stdio::null())
@@ -312,11 +312,6 @@ pub mod stubs {
         Err(format!("cgroup confinement: {NOT_DONE}"))
     }
 
-    /// A Windows Job Object per command.
-    pub fn job_object() -> Result<(), String> {
-        Err(format!("Windows Job Object: {NOT_DONE}"))
-    }
-
     /// Running commands as a dedicated, unprivileged user.
     pub fn dedicated_user() -> Result<(), String> {
         Err(format!("dedicated user: {NOT_DONE}"))
@@ -329,11 +324,7 @@ mod tests {
 
     #[test]
     fn stubs_say_not_done() {
-        for r in [
-            stubs::cgroup(),
-            stubs::job_object(),
-            stubs::dedicated_user(),
-        ] {
+        for r in [stubs::cgroup(), stubs::dedicated_user()] {
             assert!(r.unwrap_err().ends_with(stubs::NOT_DONE));
         }
     }

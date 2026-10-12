@@ -48,6 +48,9 @@ tempfile = "3"
 # The one crate 0.0.1 adds: the system keyring (Keychain, Credential Manager,
 # Secret Service) for the proxy's header values and credentials.
 keyring = "4.2"
+# The Job Object a Windows command runs in (CreateJobObjectW and its limits),
+# the one binding the node does not declare itself.
+windows-sys = "0.61"
 
 [profile.release]
 lto = "thin"

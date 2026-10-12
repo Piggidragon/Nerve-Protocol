@@ -1,4 +1,4 @@
-//! JSON-RPC 2.0 envelopes (spec/core.md §Messages). Batches are not used, and
+//! JSON-RPC 2.0 envelopes (docs/dev/spec/protocol.md §5). Batches are not used, and
 //! `params` is always an object.
 
 use serde::{Deserialize, Serialize};

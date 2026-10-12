@@ -1,0 +1,64 @@
+# Sudo
+
+Sudo is a switch on the machine, not a mode. It works on Linux only. It is
+off by default.
+
+| Switch | What happens to a `sudo` command |
+|---|---|
+| Off | Refused, even if the sudo list names it. The node holds no password |
+| On | Runs only if the sudo list names it, in every mode. Deny rules and protected paths still apply |
+
+A sudo command is one whose first word is `sudo` (or a path ending in
+`/sudo`). It has its own list, `sudo`. The normal allow list does not count
+for it.
+
+## Turn it on
+
+1. Put the commands on the sudo list. `sudo` in front is optional:
+
+   ```sh
+   nerve-node rule add sudo 'apt update'
+   nerve-node rule add sudo 'apt update' --wildcard   # sudo apt, and anything after it
+   ```
+
+2. Switch sudo on. The node must be running. It asks for your sudo password:
+
+   ```sh
+   nerve-node sudo on
+   ```
+
+3. Look or turn it off:
+
+   ```sh
+   nerve-node sudo status
+   nerve-node sudo off
+   ```
+
+`rule add allow 'sudo …'` is refused. A sudo command goes on the sudo list.
+
+## What the node does
+
+- It checks the password with `sudo -S -k -v`. A wrong password is refused and
+  the switch stays as it was.
+- It keeps the password in memory only. Turning sudo off drops it. A node that
+  restarts has sudo off.
+- It never sends the password to a center. It replaces any copy in a frame or
+  in the audit log with `[redacted]`.
+- A sudo command must be one simple command. One with `; & | $ ` ( ) < >` or a
+  line break is refused.
+- It runs the command as `sudo -S -k -p <prompt> …` without the Landlock
+  sandbox, which would stop sudo from gaining privileges. It writes the
+  password only after sudo prints the prompt.
+- Every other command runs with `no_new_privs`. A `sudo` later in a command
+  line, or any setuid program, cannot gain privileges.
+
+## From the web UI
+
+A center with the [settings grant](settings-grant.md) can turn sudo on and off.
+In Settings, open the machine and press **Turn sudo on**. The browser seals the
+password for the node, and the center only passes it on. The center cannot read
+it.
+
+The center serves the form that takes the password. A tampered center could
+capture the password before the browser seals it. Turn sudo on from the
+machine if you do not trust the center.

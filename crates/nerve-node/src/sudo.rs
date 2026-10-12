@@ -1,4 +1,4 @@
-//! The node's sudo switch (spec/node-local.md §4, spec/protocol.md §7.4.1).
+//! The node's sudo switch (docs/dev/spec/node-local.md §4, docs/dev/spec/protocol.md §7.4.1).
 //!
 //! The switch is on only while the node holds a sudo password that `sudo -v`
 //! accepted. The password lives in memory only: a restarted node starts with

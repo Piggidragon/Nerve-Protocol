@@ -40,7 +40,7 @@ impl Entry {
         if let Some(o) = v.as_object_mut() {
             o.remove("center");
             // The center has the reason in the error already, and the
-            // event's fields are fixed (spec/protocol.md §7.5).
+            // event's fields are fixed (docs/dev/spec/protocol.md §7.5).
             o.remove("reason");
         }
         v["target"] = cut_target(&self.target).into();

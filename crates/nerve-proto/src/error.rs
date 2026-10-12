@@ -1,5 +1,5 @@
 //! Errors on the wire: a JSON-RPC numeric code plus a string code in `data.code`
-//! (spec/core.md §Errors).
+//! (docs/dev/spec/protocol.md §5.3).
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};

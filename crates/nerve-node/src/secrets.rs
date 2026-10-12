@@ -1,4 +1,4 @@
-//! The node's secrets in the system keyring (architecture §3.6): the values
+//! The node's secrets in the system keyring (docs/dev/node-link.md): the values
 //! of the proxy's header lines, a `Proxy-Authorization` made from a user name
 //! and password in the proxy URL among them. `node.toml` names the headers;
 //! their values are here and never in a file, a log, an error text or the

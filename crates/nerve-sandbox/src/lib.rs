@@ -1,4 +1,4 @@
-//! Confinement for the commands a node runs (architecture §5.1, §7).
+//! Confinement for the commands a node runs (docs/dev/policy-engine.md).
 //!
 //! 0.0.1 confines with Landlock on Linux, in `folders` mode: a command reads
 //! the system directories and the folders flagged `r`, writes only the `w`

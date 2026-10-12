@@ -1,4 +1,4 @@
-//! MCP tools from node descriptors (spec/harness.md §2).
+//! MCP tools from node descriptors (docs/dev/spec/harness.md §2).
 //!
 //! - One tool per action, named `<cap>_<action>`. `_` only separates: node,
 //!   capability and action names hold letters, digits and `-`, never `_`

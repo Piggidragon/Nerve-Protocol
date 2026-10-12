@@ -296,7 +296,7 @@ answer. For each call the node takes the center's policy and, in this order:
    Protected paths apply to the
    file actions and to the working directory of a command, not to what a
    command reads; in `user` mode a command runs as the user without a
-   sandbox (issue #22). A center's folder at or inside a protected entry is
+   sandbox. A center's folder at or inside a protected entry is
    judged by the access the owner's folders give that place, and may set no
    flag the deepest of them lacks; the spellings of one place
    (`/home/u/.ssh/`, `/home/u/.ssh`) are compared by path, not as text.

@@ -1,4 +1,4 @@
-//! The sudo password on its way to the node (spec/protocol.md §7.4.1).
+//! The sudo password on its way to the node (docs/dev/spec/protocol.md §7.4.1).
 //!
 //! The node offers a fresh X25519 key, signed with its pairing key for that
 //! center. The client agrees a key with it from its own fresh X25519 key

@@ -219,7 +219,7 @@ fn owner_verdict(owner: Option<u32>, me: u32, peer: SocketAddr) -> Result<(), St
 }
 
 /// An HTTP proxy the node reaches centers through with `CONNECT`
-/// (spec/node-link.md §Proxies). The tunnel only carries bytes: TLS to the center
+/// (docs/dev/spec/protocol.md §4.7). The tunnel only carries bytes: TLS to the center
 /// runs inside it, pinned as without a proxy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Proxy {

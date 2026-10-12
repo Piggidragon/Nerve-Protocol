@@ -1,4 +1,4 @@
-//! Binary frames (spec/node-link.md §Binary frames):
+//! Binary frames (docs/dev/spec/protocol.md §5.4):
 //! `u8 kind | u8 flags | u32 id | u32 seq | payload`, big-endian, payload at
 //! most 64 KiB.
 

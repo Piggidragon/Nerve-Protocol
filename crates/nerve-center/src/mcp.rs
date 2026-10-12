@@ -1,4 +1,4 @@
-//! The MCP server (protocol revision 2025-06-18, spec/harness.md): one
+//! The MCP server (protocol revision 2025-06-18, docs/dev/spec/harness.md): one
 //! engine for a session, served over stdio (newline-delimited JSON-RPC), over
 //! an attached process's socket, and over Streamable HTTP.
 

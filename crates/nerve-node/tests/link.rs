@@ -189,7 +189,7 @@ async fn offered(conn: &mut Conn<TcpStream>) -> (u64, Vec<String>) {
 /// an added or removed rule moves the rev and the node tells the center.
 /// Unix only: the rule reaches the running daemon through its control
 /// socket, and Windows has none in 0.0.1 (the CLI writes the file and the
-/// node takes it at its next start, spec/node-local.md §1).
+/// node takes it at its next start, docs/dev/spec/node-local.md §1).
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_rule_edit_changes_what_the_center_is_offered() {

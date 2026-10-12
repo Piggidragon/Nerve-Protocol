@@ -1,4 +1,4 @@
-//! Allow and deny rules (architecture §5.1, spec node-local §3).
+//! Allow and deny rules (docs/dev/policy-engine.md, spec node-local §3).
 //!
 //! A rule is `<scope>` or `<scope>:<pattern>`. The scope is a capability or
 //! `cap.action`, as in `caps`. The pattern is a glob over the call's target:

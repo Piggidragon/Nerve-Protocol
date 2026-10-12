@@ -1,6 +1,6 @@
 //! The settings store: `node.toml` with a version, written by the owner (CLI,
 //! control socket) and, with the settings grant `write`, by a center for its
-//! own [`CenterDocument`] (architecture §5.2, §5.3; spec §7.4).
+//! own [`CenterDocument`] (docs/dev/settings-and-config.md; spec §7.4).
 //!
 //! Every change is whole-document with `if_version`, so two writers never
 //! overwrite each other unseen, is validated before it is saved, and lands in
@@ -411,8 +411,9 @@ fn to_json(c: &NodeConfig) -> Value {
     v
 }
 
-/// The fields of its own document a center may not change (architecture
-/// §5.3). The whole document is refused, naming the first such field.
+/// The fields of its own document a center may not change
+/// (docs/dev/settings-and-config.md). The whole document is refused, naming
+/// the first such field.
 fn client_only(
     old: &CenterDocument,
     new: &CenterDocument,

@@ -1,5 +1,5 @@
 //! Local control sockets: how `nerve-node`'s CLI talks to the running node
-//! (spec/node-local.md).
+//! (docs/dev/spec/node-local.md).
 //!
 //! One JSON object per line. The client sends `{"method", "params"}`; the
 //! server answers with one line `{"ok": value}` or `{"error": "text"}`, or, for

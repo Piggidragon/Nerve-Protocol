@@ -1,4 +1,4 @@
-//! Typed `params` of the node link's methods (spec/node-link.md, spec/core.md).
+//! Typed `params` of the node link's methods (docs/dev/spec/protocol.md §4, §5).
 //!
 //! What a center sends to a node is parsed with `deny_unknown_fields`: a node
 //! acts on these, so a field it does not understand is an error rather than

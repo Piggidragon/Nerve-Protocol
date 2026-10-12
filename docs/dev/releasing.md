@@ -1,0 +1,73 @@
+# Releasing
+
+Releases are made by the `Release` workflow (`.github/workflows/release.yml`).
+The owner starts it by hand: **Actions, Release, Run workflow**. Leave "Use
+workflow from" on `main` and fill in:
+
+| Input | Meaning |
+|---|---|
+| `branch` | The branch to build from. Default `main` |
+| `kind` | `pre-release` or `release` |
+| `version` | `x.y.z`, the version of `nerve-center` and `nerve-node` in the workspace `Cargo.toml` |
+
+## Rules
+
+- A **release** comes from `main` only. Any other branch stops the run in its
+  first job. Its tag is `v<version>`. If that tag exists, the run fails. Tags
+  are never moved or reused, so a new release needs a new version.
+- A **pre-release** may come from any branch. Its tag is `pre<N>-v<version>`,
+  where `N` is one more than the highest `pre<N>-v<version>` so far (`pre1`
+  first, then `pre2`). It is only for a version that is not released yet. If
+  `v<version>` exists, the run fails, because the pre-release would come after
+  the release, with newer code, under a name that says it is older. Raise the
+  version on the branch first.
+- The version must equal the one in `Cargo.toml`.
+- A release needs a `## <version>` section with entries in `CHANGELOG.md`. The
+  section becomes its release notes. A pre-release never reads that file. Its
+  text is one line about the binaries and their checksums.
+- The run builds the commit the branch is at when it starts. It tags that
+  commit in its last job, after the checks and every build passed.
+- One run at a time. A second run waits for the first. While one run waits, a
+  third start replaces it, because GitHub keeps one waiting run per group.
+
+## What a run does
+
+1. Checks the inputs, the version and the tag (for a release, also the notes).
+   Then it runs `cargo fmt --check`,
+   `cargo clippy --locked --workspace --all-targets -- -D warnings` and
+   `cargo test --locked --workspace` with the pinned toolchain.
+2. Builds `nerve-center` and `nerve-node` for `x86_64-unknown-linux-musl` and
+   `aarch64-unknown-linux-musl` (static) and `x86_64-pc-windows-msvc` (static C
+   runtime). Each Linux binary must be static. Each binary must print its
+   version from `--version`, and it must equal the one given.
+3. Publishes a GitHub Release with the six binaries and `SHA256SUMS`. A release
+   is marked latest. A pre-release is marked as a pre-release.
+
+The binaries are not signed. The workflow uses no secrets. Only its last job
+may write to the repository.
+
+## A failed run
+
+A failed run leaves no tag and no release. It deletes the draft release and the
+tag it made itself, found by the id and the tag object it recorded. A draft you
+wrote by hand for the same tag stays. It deletes them only when GitHub says
+the tag has no published release.
+
+If the last call published the release and only its answer was lost, the run is
+red, the release and its tag stay as they are, and nothing needs doing.
+
+If GitHub cannot be asked, nothing is deleted and the log has a warning. Look at
+**Releases** and **Tags**, and delete a leftover draft or tag by hand before you
+run again.
+
+## Make a release
+
+1. Set the version in the workspace `Cargo.toml`, in the `version` of the path
+   dependencies in `[workspace.dependencies]`, and in `Cargo.lock` (run
+   `cargo build`). Write the `## <version>` section of `CHANGELOG.md`.
+2. Merge that to `main`.
+3. Run the workflow with kind `release` and that version.
+
+After a release, raise the version in `Cargo.toml` and `Cargo.lock` with the
+first change toward the next one. Until then the workflow refuses a pre-release
+of the released version.

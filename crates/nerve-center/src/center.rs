@@ -762,7 +762,7 @@ impl Center {
         .await
     }
 
-    /// A one-shot offer to seal the node's sudo password for (spec/protocol.md
+    /// A one-shot offer to seal the node's sudo password for (docs/dev/spec/protocol.md
     /// §7.4.1). The center checks that the paired node signed it for this
     /// center, so a client seals only for that node.
     pub async fn node_sudo_offer(&self, node_id: &str) -> Result<Value, RpcError> {

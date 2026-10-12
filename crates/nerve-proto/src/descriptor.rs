@@ -1,5 +1,5 @@
 //! The descriptor a node publishes: what it is and what it offers one center
-//! (spec/core.md §Descriptor).
+//! (docs/dev/spec/protocol.md §6).
 
 use std::collections::BTreeMap;
 
@@ -203,7 +203,7 @@ impl Descriptor {
 
 /// A capability or action name as it may appear in a tool name: ASCII
 /// letters, digits and `-`, at least one. A harness joins the parts of a tool name with `_`
-/// (spec/harness.md), so a name can never hold one.
+/// (docs/dev/spec/harness.md), so a name can never hold one.
 pub fn valid_member_name(name: &str) -> bool {
     !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }

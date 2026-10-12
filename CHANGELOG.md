@@ -8,14 +8,14 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
   certificate, a signed node link over WebSocket, JSON-RPC 2.0 messages,
   binary frames for blobs, the capability descriptor and the built-in
   profiles `node`, `fs`, `exec`, `settings` and `audit`
-  (`spec/protocol.md`).
+  (`docs/dev/spec/protocol.md`).
 - `nerve-node`: the node daemon and its headless CLI. Policy per center:
   default deny, the modes allowlist (the default), folder and user, capability
   switches, protected paths, and allow and deny rules with wildcards for every
   action. Folder and user give full access in their area, deny rules narrow it,
   allow rules count in allowlist mode only. A call that no rule allows is
   refused at once. The settings grant, panic and unlock, and a local audit log
-  (`spec/node-local.md`).
+  (`docs/dev/spec/node-local.md`).
 - In default deny the center gets tools only for the `fs` and `exec` actions
   an allow rule covers (and `exec.run` when the sudo list has an entry); the
   node sends a new descriptor when a rule is added or removed.
@@ -30,12 +30,12 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
 - On Linux, the node's config and state folders are its own: no call of a
   center reaches them and no Landlock rule of a command covers them, whatever
   the policy says; on Windows 0.0.1 has neither the socket nor a sandbox, see
-  `spec/node-local.md` §5. The node keeps its config in memory, signs
+  `docs/dev/spec/node-local.md` §5. The node keeps its config in memory, signs
   `node.toml` with an HMAC on every write, rereads it only when the owner
   asks, and refuses and audits a file changed outside the owner's path
   (`nerve-node config accept` takes it after a look). The check holds while
   `config.key` does: a process that can delete it can have another file taken
-  at the next start (`spec/node-local.md` §1).
+  at the next start (`docs/dev/spec/node-local.md` §1).
 - The sudo switch per node, off by default: off, no command runs with sudo
   even when the sudo allow list names it; on, a sudo command runs only when
   that list names it, in every mode. `nerve-node sudo on|off|status`, or a
@@ -55,15 +55,15 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
   has a login page (the harness token logs in; `--ui-no-login` on loopback
   turns it off) and shows nodes, the audit log (four rule buttons per entry),
   statistics, a help page with the node's commands and the settings of nodes
-  that granted write access (`spec/harness.md`).
+  that granted write access (`docs/dev/spec/harness.md`).
 - Conformance suite with a center part and a node part (pairing, link,
   descriptor, fs, exec, allow and deny rules, audit and the sudo switch); the
-  harness part is a skeleton (`spec/conformance.md`).
+  harness part is a skeleton (`docs/dev/spec/conformance.md`).
 - MCP tool names are `<cap>_<action>` (one tool for all nodes, with a `node`
   argument) or `<node>_<cap>_<action>`, plus the `nodes` tool; `_` separates
   the parts, so node, capability and action names use letters, digits and `-`
   only, and the center ignores a descriptor whose names have a `_`
-  (`spec/harness.md`).
+  (`docs/dev/spec/harness.md`).
 - The owner sets how long a pairing code is valid, 1 to 1440 minutes (24 hours), in Settings, Center; 10 minutes unless changed, and a code keeps the lifetime it was made with.
 - `fs.grep`, `fs.find` and `fs.list` in folder mode leave out what a direct read would refuse, such as a folder without `r` inside one with `r`; `grep` and `find` still reach a folder with `r` inside a sealed one.
 - `exec.signal` is decided by the policy and audited like every other action, so a deny rule refuses it.
@@ -103,4 +103,4 @@ First release of the rewrite. Nothing is compatible with Pithagoras-Sync.
 - A folder spelled so that it matches nothing (a `..` segment, and on Windows an 8.3 short name or a name ending in a dot or space) is refused, from a center and in `node.toml`, with a message to use the full name.
 - An `exec.run` command line over 64 KiB is refused before the policy checks it, and the audit log records the refusal with its reason (as it now does for every refusal); before, a center could send a line of drive letters (`a:a:a:...`) that kept a Windows node's own-folder check busy for hours. The check now takes time linear in the line on every platform.
 - `nerve-node audit` and `--follow` no longer miss a whole file of entries when the log is moved aside between the reads of its two files.
-- Releases are made by a workflow the owner starts by hand, with the branch and the kind: a pre-release (`pre<N>-v<version>`, any branch) or a release (`v<version>`, main only, marked latest). It checks and tests the workspace, builds static `nerve-center` and `nerve-node` binaries for Linux x86_64 and aarch64 and Windows x86_64, and publishes them with `SHA256SUMS`; the tag is made only after every build passed, and a pre-release of a version that is released already is refused (`docs/releasing.md`).
+- Releases are made by a workflow the owner starts by hand, with the branch and the kind: a pre-release (`pre<N>-v<version>`, any branch) or a release (`v<version>`, main only, marked latest). It checks and tests the workspace, builds static `nerve-center` and `nerve-node` binaries for Linux x86_64 and aarch64 and Windows x86_64, and publishes them with `SHA256SUMS`; the tag is made only after every build passed, and a pre-release of a version that is released already is refused (`docs/dev/releasing.md`).

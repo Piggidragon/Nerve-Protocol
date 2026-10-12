@@ -7,6 +7,6 @@
 | [harness.md](harness.md) | how `nerve-center` serves harnesses over MCP |
 | [conformance.md](conformance.md) | the conformance suite and what it checks |
 
-JSON Schemas of the descriptor and the pair request are in `../schemas/`.
+JSON Schemas of the descriptor and the pair request are in `../../../schemas/`.
 
 Protocol version: `"0"` (exact match; no promise between pre-releases).

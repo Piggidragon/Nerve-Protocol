@@ -4,8 +4,8 @@
 #
 # `check` stops a bad run before anything is built: a release from any branch
 # but main, a version that is not the one in Cargo.toml, a release whose tag
-# exists or that has no CHANGELOG.md section, a pre-release of a version that
-# is released already. It picks the commit (the head of the branch when the run
+# exists or that has no CHANGELOG.md section (a pre-release never reads
+# CHANGELOG.md), a pre-release of a version that is released already. It picks the commit (the head of the branch when the run
 # starts) and the tag, then runs fmt, clippy and the tests. Every build job
 # checks out that commit, so a push to the branch during the run changes
 # nothing. `publish` is the only job that may write: it tags the commit and
@@ -148,22 +148,24 @@ jobs:
               exit 1
             fi
           done
-      # The release notes are the version's section of CHANGELOG.md. A release
-      # needs one; a pre-release uses it when there is one. `publish` has no
-      # checkout, so the section travels as an artifact (empty when there is none).
+      # The release notes are the version's section of CHANGELOG.md, and only a
+      # release has them (it needs the section); a pre-release does not read the
+      # changelog. `publish` has no checkout, so the section travels as an artifact.
       - name: The changelog section
+        if: ${{ env.KIND == 'release' }}
         run: |
           mkdir notes
           awk -v v="$VERSION" '
             /^## / { on = ($2 == v); next }
             on { print }
           ' CHANGELOG.md | sed '/./,$!d' > notes/changelog.md
-          if [ ! -s notes/changelog.md ] && [ "$KIND" = release ]; then
+          if [ ! -s notes/changelog.md ]; then
             echo "CHANGELOG.md has no section '## $VERSION' with entries: write it, merge to main, then run this again" >&2
             exit 1
           fi
           cat notes/changelog.md
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      - if: ${{ env.KIND == 'release' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: release-notes
           path: notes/changelog.md
@@ -287,8 +289,9 @@ jobs:
           pattern: nerve-*
           path: dist
           merge-multiple: true
-      # Empty when a pre-release has no changelog section.
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+      # Only a release has notes.
+      - if: ${{ env.KIND == 'release' }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: release-notes
           path: notes
@@ -315,8 +318,12 @@ jobs:
               ;;
           esac
           footer="Static Linux binaries (x86_64, aarch64) and Windows x86_64 programs of \`nerve-center\` and \`nerve-node\`, built from $SHA. SHA256SUMS lists their checksums. They are not signed: Nerve has no update channel yet (docs/releasing.md)."
-          notes=notes/changelog.md
-          { if [ -s "$notes" ]; then cat "$notes"; echo; fi; echo "$footer"; } > release-notes.md
+          # A pre-release's body is the footer alone.
+          if [ "$KIND" = release ]; then
+            { cat notes/changelog.md; echo; echo "$footer"; } > release-notes.md
+          else
+            echo "$footer" > release-notes.md
+          fi
           # The draft is made without files, and its id is kept before the upload
           # (the step most likely to fail): the clean-up then removes this draft
           # by its id and no other draft of the tag.

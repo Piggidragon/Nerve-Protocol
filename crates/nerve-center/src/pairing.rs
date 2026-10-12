@@ -10,6 +10,10 @@ use std::time::{Duration, Instant};
 pub const TRIES: u32 = 10;
 /// 12 characters of `a-z0-9`: about 62 bits, against 10 tries.
 pub const CODE_LEN: usize = 12;
+/// How long past its expiry the center still says which node a code paired:
+/// the owner's page polls only while its tab is visible, and may come back
+/// after the code's lifetime.
+pub const PAIRED_KEPT: Duration = Duration::from_secs(600);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodeError {
@@ -47,8 +51,9 @@ pub struct Codes {
     open: Vec<Open>,
     /// Codes [`Codes::take`] took out and nobody has finished yet.
     taking: Vec<String>,
-    /// Codes that paired a node, kept until they would have expired so the
-    /// page can name the node its code paired.
+    /// Codes that paired a node, kept until [`PAIRED_KEPT`] past their expiry
+    /// so the page can name the node its code paired. Bounded by the codes
+    /// the owner makes.
     paired: Vec<(Open, String)>,
 }
 
@@ -67,7 +72,7 @@ impl Codes {
 
     fn prune(&mut self, now: Instant) {
         self.open.retain(|o| now < o.expires && o.tries < TRIES);
-        self.paired.retain(|(o, _)| now < o.expires);
+        self.paired.retain(|(o, _)| now < o.expires + PAIRED_KEPT);
     }
 
     /// Checks `code` without using it up. A wrong code costs every open code
@@ -192,11 +197,26 @@ mod tests {
         assert_eq!(c.outcome(&code, now), Outcome::Open);
         c.done(taken, "node-1");
         assert_eq!(c.outcome(&code, now), Outcome::Paired("node-1".into()));
-        // Another code does not name that node, and the name goes with the
-        // code's lifetime.
+        // Another code does not name that node.
         let other = c.create(now, TEN_MINUTES);
         assert_eq!(c.outcome(&other, now), Outcome::Open);
-        assert_eq!(c.outcome(&code, now + TEN_MINUTES), Outcome::Gone);
+    }
+
+    #[test]
+    fn a_paired_code_names_its_node_for_a_while_past_its_expiry() {
+        let mut c = Codes::default();
+        let now = Instant::now();
+        let code = c.create(now, TEN_MINUTES);
+        // Paired in the last second of its life; the page looks later.
+        let late = now + TEN_MINUTES - Duration::from_secs(1);
+        let taken = c.take(&code, late).unwrap();
+        c.done(taken, "node-1");
+        let last = now + TEN_MINUTES + PAIRED_KEPT;
+        assert_eq!(
+            c.outcome(&code, last - Duration::from_secs(1)),
+            Outcome::Paired("node-1".into())
+        );
+        assert_eq!(c.outcome(&code, last), Outcome::Gone);
     }
 
     #[test]
@@ -207,7 +227,10 @@ mod tests {
         let taken = c.take(&code, now).unwrap();
         c.fail(taken);
         assert_eq!(c.outcome(&code, now), Outcome::Open);
-        assert!(c.take(&code, now).is_ok());
+        // It can be used again, and it is not left as "in progress".
+        let taken = c.take(&code, now).unwrap();
+        c.fail(taken);
+        assert_eq!(c.outcome(&code, now + TEN_MINUTES), Outcome::Gone);
     }
 
     #[test]

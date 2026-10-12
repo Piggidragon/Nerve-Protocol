@@ -706,6 +706,15 @@ mod tests {
             (st["open"].as_bool(), st["node"].is_null()),
             (Some(true), true)
         );
+        // Refused is not "in progress": with its tries gone it reads closed.
+        for _ in 0..crate::pairing::TRIES {
+            assert_eq!(c.pair(&pair_body("wrongwrong12", "box-3", 9)).0, 403);
+        }
+        let st = pair_status(&ui, &second).await;
+        assert_eq!(
+            (st["open"].as_bool(), st["node"].is_null()),
+            (Some(false), true)
+        );
     }
 
     #[tokio::test]

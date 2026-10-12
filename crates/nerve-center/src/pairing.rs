@@ -10,10 +10,10 @@ use std::time::{Duration, Instant};
 pub const TRIES: u32 = 10;
 /// 12 characters of `a-z0-9`: about 62 bits, against 10 tries.
 pub const CODE_LEN: usize = 12;
-/// How long past its expiry the center still says which node a code paired:
-/// the owner's page polls only while its tab is visible, and may come back
-/// after the code's lifetime.
-pub const PAIRED_KEPT: Duration = Duration::from_secs(600);
+/// How long after the pairing the center still says which node a code paired,
+/// whatever the code's lifetime was: the owner's page polls only while its tab
+/// is visible, and may come back much later.
+pub const PAIRED_KEPT: Duration = Duration::from_secs(3600);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CodeError {
@@ -51,10 +51,10 @@ pub struct Codes {
     open: Vec<Open>,
     /// Codes [`Codes::take`] took out and nobody has finished yet.
     taking: Vec<String>,
-    /// Codes that paired a node, kept until [`PAIRED_KEPT`] past their expiry
-    /// so the page can name the node its code paired. Bounded by the codes
-    /// the owner makes.
-    paired: Vec<(Open, String)>,
+    /// Codes that paired a node: the code, the node and when the record ends
+    /// ([`PAIRED_KEPT`] after the pairing), so the page can name the node its
+    /// code paired. Bounded by the pairings made in that time.
+    paired: Vec<(String, String, Instant)>,
 }
 
 impl Codes {
@@ -72,7 +72,7 @@ impl Codes {
 
     fn prune(&mut self, now: Instant) {
         self.open.retain(|o| now < o.expires && o.tries < TRIES);
-        self.paired.retain(|(o, _)| now < o.expires + PAIRED_KEPT);
+        self.paired.retain(|(_, _, until)| now < *until);
     }
 
     /// Checks `code` without using it up. A wrong code costs every open code
@@ -126,12 +126,13 @@ impl Codes {
         self.open.push(o);
     }
 
-    /// A right code whose pairing worked: it stays known as the code that
-    /// paired `node_id`.
-    pub fn done(&mut self, taken: Taken, node_id: &str) {
+    /// A right code whose pairing worked at `now`: it stays known as the code
+    /// that paired `node_id` for [`PAIRED_KEPT`].
+    pub fn done(&mut self, taken: Taken, node_id: &str, now: Instant) {
         let o = taken.0;
         self.taking.retain(|c| *c != o.code);
-        self.paired.push((o, node_id.to_string()));
+        self.paired
+            .push((o.code, node_id.to_string(), now + PAIRED_KEPT));
     }
 
     /// What became of `code`, for the web UI. Unlike [`Codes::check`], a code
@@ -143,8 +144,8 @@ impl Codes {
         if self.open.iter().any(|o| is(&o.code)) || self.taking.iter().any(|c| is(c)) {
             return Outcome::Open;
         }
-        match self.paired.iter().find(|(o, _)| is(&o.code)) {
-            Some((_, node)) => Outcome::Paired(node.clone()),
+        match self.paired.iter().find(|(c, _, _)| is(c)) {
+            Some((_, node, _)) => Outcome::Paired(node.clone()),
             None => Outcome::Gone,
         }
     }
@@ -195,7 +196,7 @@ mod tests {
         let taken = c.take(&code, now).unwrap();
         // Neither open nor paired yet: the page must not call it used.
         assert_eq!(c.outcome(&code, now), Outcome::Open);
-        c.done(taken, "node-1");
+        c.done(taken, "node-1", now);
         assert_eq!(c.outcome(&code, now), Outcome::Paired("node-1".into()));
         // Another code does not name that node.
         let other = c.create(now, TEN_MINUTES);
@@ -203,20 +204,26 @@ mod tests {
     }
 
     #[test]
-    fn a_paired_code_names_its_node_for_a_while_past_its_expiry() {
+    fn a_paired_code_names_its_node_for_a_fixed_time_after_the_pairing() {
         let mut c = Codes::default();
         let now = Instant::now();
-        let code = c.create(now, TEN_MINUTES);
-        // Paired in the last second of its life; the page looks later.
-        let late = now + TEN_MINUTES - Duration::from_secs(1);
-        let taken = c.take(&code, late).unwrap();
-        c.done(taken, "node-1");
-        let last = now + TEN_MINUTES + PAIRED_KEPT;
-        assert_eq!(
-            c.outcome(&code, last - Duration::from_secs(1)),
-            Outcome::Paired("node-1".into())
-        );
-        assert_eq!(c.outcome(&code, last), Outcome::Gone);
+        let minute = Duration::from_secs(60);
+        // A short code and a long one, both paired in their first minute:
+        // the record is as long as the time since the pairing, not tied to
+        // the code's own lifetime.
+        let short = c.create(now, minute);
+        let long = c.create(now, 24 * HOUR);
+        let at = now + minute / 2;
+        let taken = c.take(&short, at).unwrap();
+        c.done(taken, "node-1", at);
+        let taken = c.take(&long, at).unwrap();
+        c.done(taken, "node-2", at);
+        let last = at + PAIRED_KEPT;
+        let before = last - Duration::from_secs(1);
+        assert_eq!(c.outcome(&short, before), Outcome::Paired("node-1".into()));
+        assert_eq!(c.outcome(&long, before), Outcome::Paired("node-2".into()));
+        assert_eq!(c.outcome(&short, last), Outcome::Gone);
+        assert_eq!(c.outcome(&long, last), Outcome::Gone);
     }
 
     #[test]

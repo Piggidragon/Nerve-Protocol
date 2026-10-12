@@ -377,7 +377,10 @@ impl Center {
         });
         match out {
             Ok(resp) => {
-                self.codes.lock().unwrap().done(taken, &node_id);
+                self.codes
+                    .lock()
+                    .unwrap()
+                    .done(taken, &node_id, Instant::now());
                 tracing::info!(node = %node_id, name = %req.name, "a node paired");
                 self.changed(Change::Nodes);
                 (200, serde_json::to_value(resp).unwrap_or_default())

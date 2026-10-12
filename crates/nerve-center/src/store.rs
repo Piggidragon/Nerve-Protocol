@@ -12,6 +12,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use nerve_proto::Descriptor;
+use nerve_transport::log::Level;
 
 pub const FILE: &str = "state.json";
 /// The default statistics retention.
@@ -37,6 +38,10 @@ pub struct Store {
     pub pair_code_minutes: u32,
     #[serde(default)]
     pub stats: BTreeMap<String, NodeStats>,
+    /// What the center logs (docs/user/logs.md); the `--log` flag overrides
+    /// it for one run.
+    #[serde(default)]
+    pub log_level: Level,
 }
 
 fn d_retention() -> u32 {
@@ -57,6 +62,7 @@ impl Store {
             retention_days: RETENTION_DAYS,
             pair_code_minutes: PAIR_CODE_MINUTES,
             stats: BTreeMap::new(),
+            log_level: Level::default(),
         }
     }
 

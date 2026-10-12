@@ -12,6 +12,7 @@ use nerve_node::{Daemon, NodeOptions, NodePaths};
 use nerve_policy::config::{SettingsGrant, Sudo};
 use nerve_policy::rules;
 use nerve_proto::{ErrorCode, Message, RpcError};
+use nerve_transport::log::{Level, Log};
 use nerve_transport::sudo::{Offer, Sealed, seal};
 use serde_json::{Value, json};
 use tokio::net::TcpStream;
@@ -62,6 +63,8 @@ async fn node(root: &Path, center: &FakeCenter) -> Daemon {
             .map(Into::into)
             .unwrap_or_else(|| env!("CARGO_BIN_EXE_nerve-node").into()),
     );
+    // Its own log, to see that the password stays out of it.
+    o.log = Some(Log::new(Level::Debug));
     nerve_node::pair::pair(&o.paths, &center.link(), Some("lab"))
         .await
         .expect("pair");
@@ -223,6 +226,20 @@ async fn the_sudo_switch() {
     assert_eq!(r["sudo"], "on");
     assert_eq!(seen.sudo_state(&mut conn).await, "on");
     assert_eq!(node.config().machine.sudo, Sudo::On);
+    // While the switch is on, a line that quotes the password is stripped of
+    // it, in the window and in the file.
+    let log = node.log().expect("a log").clone();
+    log.record(Level::Warn, None, &format!("oops {RIGHT} on stderr"));
+    let said = |log: &Log| {
+        log.entries(&nerve_transport::log::Query {
+            limit: 1,
+            ..Default::default()
+        })[0]
+            .1
+            .msg
+            .clone()
+    };
+    assert_eq!(said(&log), "oops [redacted] on stderr");
     // The same box again finds its offer used up.
     let r = seen.on(&mut conn, &sealed).await;
     assert_eq!(code(&r), ErrorCode::InvalidArgs);
@@ -264,6 +281,10 @@ async fn the_sudo_switch() {
         code(&seen.on(&mut conn, &sealed).await),
         ErrorCode::InvalidArgs
     );
+    // Off, the node holds no password to keep out of anything.
+    log.record(Level::Warn, None, &format!("again {RIGHT}"));
+    assert_eq!(said(&log), format!("again {RIGHT}"));
+    log.record(Level::Warn, None, "nothing");
     // Not even while a new offer is open.
     let _fresh = seen.offer(&mut conn, &center).await;
     let r = seen.on(&mut conn, &sealed).await;
@@ -284,6 +305,11 @@ async fn the_sudo_switch() {
     assert!(!log.contains(RIGHT), "{log}");
     let file = std::fs::read_to_string(node.paths().config_file()).unwrap();
     assert!(!file.contains(RIGHT));
+    // The log file saw the password only in the line that was stripped of it,
+    // and the one after the switch went off.
+    let written = std::fs::read_to_string(node.paths().log_file()).unwrap();
+    assert!(written.contains("oops [redacted] on stderr"), "{written}");
+    assert_eq!(written.matches(RIGHT).count(), 1, "{written}");
 
     node.stop().await;
 }

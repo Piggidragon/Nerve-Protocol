@@ -28,6 +28,7 @@ use nerve_proto::rpc::{Id, Message, params};
 use nerve_proto::{ErrorCode, PROTOCOL_VERSION, RpcError, limits};
 use nerve_transport::backoff::Backoff;
 use nerve_transport::keys::NodeKey;
+use nerve_transport::log::{Level, call_line, span};
 use nerve_transport::net::Proxy;
 use nerve_transport::ws::{self, ConnectError, WsMessage};
 
@@ -57,6 +58,9 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
     let mut backoff = Backoff::default();
     let mut stop = shared.stop.subscribe();
     let mut changed = shared.changed.subscribe();
+    // Dials that failed since the link was last up: the first is a warning,
+    // the rest are detail, or a center that is down fills the log.
+    let mut failed_dials = 0u32;
     loop {
         if *stop.borrow() {
             return;
@@ -71,6 +75,7 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
         let key = match load_key(&shared, &name) {
             Ok(k) => k,
             Err(e) => {
+                tracing::error!("center {name}: {e}; dialling stopped");
                 cs.set_status(e);
                 return;
             }
@@ -78,6 +83,7 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
         let url = match CenterUrl::parse(&entry.url) {
             Ok(u) => u,
             Err(e) => {
+                tracing::error!("center {name}: bad center url: {e}; dialling stopped");
                 cs.set_status(format!("bad center url: {e}"));
                 return;
             }
@@ -85,11 +91,13 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
         let proxy = match proxy_for(&shared, &cfg, &url).await {
             Ok(p) => p,
             Err(e) => {
+                tracing::error!("center {name}: bad proxy: {e}; dialling stopped");
                 cs.set_status(format!("bad proxy: {e}"));
                 return;
             }
         };
         cs.set_status("connecting");
+        tracing::debug!("center {name}: dialling {url}");
         let started = Instant::now();
         let dialled = ws::connect(
             &url,
@@ -108,15 +116,35 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
             }
             Err(ConnectError::Other(e)) => {
                 cs.set_status(format!("cannot connect: {e}"));
+                if failed_dials == 0 {
+                    tracing::warn!("center {name}: cannot connect: {e}");
+                } else {
+                    tracing::debug!("center {name}: cannot connect: {e}");
+                }
+                failed_dials += 1;
                 Outcome::Retry
             }
-            Ok(ws) => session(&shared, &cs, &entry, &key, ws).await,
+            Ok(ws) => {
+                let (outcome, was_up) = session(&shared, &cs, &entry, &key, ws).await;
+                if was_up {
+                    failed_dials = 0;
+                }
+                outcome
+            }
         };
         if let Outcome::Stop = outcome {
             return;
         }
         backoff.link_ended(started.elapsed());
-        let until = tokio::time::Instant::now() + backoff.next_wait();
+        let wait = backoff.next_wait();
+        // After a link that was up this is news, in a run of failed dials it
+        // is the same line every time.
+        if failed_dials == 0 {
+            tracing::info!("center {name}: dialling again in {}", span(wait));
+        } else {
+            tracing::debug!("center {name}: dialling again in {}", span(wait));
+        }
+        let until = tokio::time::Instant::now() + wait;
         // Wait out the backoff, but leave at once when the center goes away.
         loop {
             tokio::select! {
@@ -249,14 +277,15 @@ where
 
 type WsStream = tokio_tungstenite::WebSocketStream<nerve_transport::net::BoxIo>;
 
-/// One connected link: handshake, then serve until it ends.
+/// One connected link: handshake, then serve until it ends. Also says whether
+/// the handshake came through, so the link was up.
 async fn session(
     shared: &Arc<Shared>,
     cs: &Arc<CenterState>,
     entry: &CenterEntry,
     key: &NodeKey,
     ws: WsStream,
-) -> Outcome {
+) -> (Outcome, bool) {
     let (mut sink, mut stream) = ws.split();
     let cfg = shared.config();
 
@@ -305,12 +334,13 @@ async fn session(
     }
     .await;
     if let Err((reason, why)) = hello {
+        tracing::warn!("center {}: the handshake failed: {why}", entry.name);
         cs.set_status(format!("handshake failed: {why}"));
         if let Some(r) = reason {
             let _ = sink.send(bye(r)).await;
         }
         let _ = sink.close().await;
-        return Outcome::Retry;
+        return (Outcome::Retry, false);
     }
     tracing::info!("linked to center {}", entry.name);
     cs.set_status("connected");
@@ -368,7 +398,7 @@ async fn session(
     if matches!(outcome, Outcome::Retry) {
         cs.set_status("link lost; dialling again");
     }
-    outcome
+    (outcome, true)
 }
 
 /// A call in flight: its task, and the harness session it came from.
@@ -443,19 +473,28 @@ impl Link {
                             // No blobs or streams flow center → node in 0.0.1;
                             // only reserved media frames break the link.
                             if let Err(FrameError::MediaReserved) = Frame::decode(&b) {
+                                tracing::warn!("center {}: it sent a media frame, which 0.0.1 does not take", self.name);
                                 return self.end(ByeReason::ProtocolError, Outcome::Retry).await;
                             }
                         }
                         Got::Alive => {}
                         Got::TooLarge => {
+                            tracing::warn!("center {}: it sent a message that is too large", self.name);
                             return self.end(ByeReason::ProtocolError, Outcome::Retry).await;
                         }
-                        Got::Closed => return Outcome::Retry,
+                        Got::Closed => {
+                            tracing::warn!("center {}: the link closed without a bye", self.name);
+                            return Outcome::Retry;
+                        }
                     }
                 }
                 _ = tick.tick() => {
                     if heard.elapsed() >= DEAD {
-                        tracing::info!("center {} went quiet; dropping the link", self.name);
+                        tracing::warn!(
+                            "center {} went quiet: no frame for {}; dropping the link",
+                            self.name,
+                            span(DEAD)
+                        );
                         return Outcome::Retry;
                     }
                     if heard.elapsed() >= PING && pinged.elapsed() >= PING {
@@ -524,6 +563,17 @@ impl Link {
     }
 
     async fn end(&self, reason: ByeReason, o: Outcome) -> Outcome {
+        let level = if reason == ByeReason::ProtocolError {
+            Level::Warn
+        } else {
+            Level::Info
+        };
+        let why = format!(
+            "center {}: closing the link with bye {}",
+            self.name,
+            reason.as_str()
+        );
+        nerve_transport::log::emit(level, None, &why);
         let _ = self.tx.send(bye(reason)).await;
         o
     }
@@ -588,7 +638,23 @@ impl Link {
                         self.shared.mark_center(&self.name, |e| e.revoked = true);
                         Some(Outcome::Stop)
                     }
-                    _ => Some(Outcome::Retry),
+                    Some(r) => {
+                        let level = match r {
+                            ByeReason::Duplicate | ByeReason::ProtocolError => Level::Warn,
+                            _ => Level::Info,
+                        };
+                        let why = format!(
+                            "center {} said bye ({}); dialling again",
+                            self.name,
+                            r.as_str()
+                        );
+                        nerve_transport::log::emit(level, None, &why);
+                        Some(Outcome::Retry)
+                    }
+                    None => {
+                        tracing::warn!("center {} sent a bye the node cannot read", self.name);
+                        Some(Outcome::Retry)
+                    }
                 }
             }
             // Unknown notifications are ignored (spec §3).
@@ -773,6 +839,8 @@ impl Link {
         let mut calls = lock(&self.calls);
         let task = tokio::spawn(async move {
             let settings = inv.cap == "settings";
+            let what = format!("{}.{}", inv.cap, inv.action);
+            let started = Instant::now();
             let work = link.invoke(&call_id, inv);
             let r = match deadline {
                 Some(d) => tokio::time::timeout(d, work).await.unwrap_or_else(|_| {
@@ -780,6 +848,12 @@ impl Link {
                 }),
                 None => work.await,
             };
+            // A call that worked is in the audit log, not here.
+            if let Err(e) = &r {
+                let (level, line) = call_line(&what, e, started.elapsed(), false);
+                let line = format!("center {}: {line}", link.name);
+                nerve_transport::log::emit(level, None, &line);
+            }
             let mine = lock(&link.calls).remove(&call_id).is_some();
             if mine {
                 link.reply(call_id, r).await;

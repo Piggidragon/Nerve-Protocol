@@ -26,7 +26,7 @@ entry:
 | `--mcp` | `NERVE_MCP` | `stdio` | `stdio`, `http`, or `none` (center only) |
 | `--mcp-listen` | `NERVE_MCP_LISTEN` | `127.0.0.1:7481` | HTTP MCP address |
 | `--harness-token` | `NERVE_HARNESS_TOKEN` | none | the harness token: bearer token for HTTP MCP and the secret that logs in to the UI (more can be made in the UI) |
-| `--log` | `NERVE_LOG` | `info` | log level; logs go to stderr only |
+| `--log` | `NERVE_LOG` | the stored level, `info` at first | log level; wins over the stored one for this run. The log goes to stderr and `log.jsonl`, never to stdout |
 
 Example entry:
 

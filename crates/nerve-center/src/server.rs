@@ -5,6 +5,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
+use nerve_transport::log::Level;
 use tokio::task::JoinHandle;
 
 use crate::attach::Lock;
@@ -34,6 +35,9 @@ impl Running {
         for t in &self.tasks {
             t.abort();
         }
+        self.center
+            .log()
+            .record(Level::Info, None, "the center stopped");
     }
 }
 
@@ -82,7 +86,11 @@ pub async fn start(args: &Args, lock: Lock) -> Result<Running, String> {
         state_dir: state,
         name: args.name.clone(),
         public_url: args.public_url(nodes.port()),
+        log: nerve_transport::log::global(),
+        log_level: args.log,
     })?;
+    // Whatever else a message carries, this token is never in the log.
+    center.log().set_secret("harness-token", token.as_deref());
 
     let mut tasks = Vec::new();
 
@@ -108,8 +116,10 @@ pub async fn start(args: &Args, lock: Lock) -> Result<Running, String> {
         let server = Server::bind(&args.mcp_listen, &center, !tls).await?;
         mcp = Some(server.local_addr());
         if !has_token {
-            tracing::warn!(
-                "no harness token yet: the HTTP MCP endpoint refuses every client until one is made in the web UI or set with NERVE_HARNESS_TOKEN"
+            center.log().record(
+                Level::Warn,
+                None,
+                "no harness token yet: the HTTP MCP endpoint refuses every client until one is made in the web UI or set with NERVE_HARNESS_TOKEN",
             );
         }
         tasks.push(tokio::spawn(HttpMcp::new(&center, token).serve(server)));
@@ -121,30 +131,39 @@ pub async fn start(args: &Args, lock: Lock) -> Result<Running, String> {
         tasks.push(tokio::spawn(crate::attach::serve(center.clone(), listener)));
     }
 
-    // State changes are batched; this writes them out now and then.
+    // State changes are batched; this writes them out now and then, and
+    // notes the pairing codes that ran out.
     let c = center.clone();
     tasks.push(tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
         loop {
             tick.tick().await;
             c.flush();
+            c.sweep_codes();
         }
     }));
 
-    tracing::info!(
-        "center {} ({}) for nodes at {}{}",
-        center.name(),
-        center.id(),
-        center.public_url(),
-        ui.map(|u| format!(
-            ", web UI at {}://{u}",
-            if is_loopback(&u.to_string()) {
-                "http"
-            } else {
-                "https"
-            }
-        ))
-        .unwrap_or_default()
+    // The address of the web UI stays last: the end-to-end tests read it from
+    // this line.
+    center.log().record(
+        Level::Info,
+        None,
+        &format!(
+            "nerve-center {}: center {} ({}) for nodes at {}{}",
+            env!("CARGO_PKG_VERSION"),
+            center.name(),
+            center.id(),
+            center.public_url(),
+            ui.map(|u| format!(
+                ", web UI at {}://{u}",
+                if is_loopback(&u.to_string()) {
+                    "http"
+                } else {
+                    "https"
+                }
+            ))
+            .unwrap_or_default()
+        ),
     );
     Ok(Running {
         center,

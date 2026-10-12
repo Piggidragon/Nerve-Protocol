@@ -22,6 +22,7 @@ use serde_json::{Value, json};
 
 use nerve_proto::RpcError;
 use nerve_transport::http::{self, Request, Response};
+use nerve_transport::log::{Level, Query};
 use nerve_transport::net::BoxIo;
 
 use crate::center::{Center, Change, audit_rule};
@@ -46,6 +47,10 @@ const SESSION_TTL: Duration = Duration::from_secs(12 * 3600);
 const API_BODY: usize = 1024 * 1024;
 /// Wrong tokens allowed per minute before logins pause.
 const LOGIN_TRIES: u32 = 5;
+/// How many log entries a view gets unless it asks for another number, and
+/// the most it may ask for.
+const LOG_PAGE: usize = 500;
+const LOG_PAGE_MAX: usize = 1000;
 
 struct UiSession {
     csrf: String,
@@ -159,6 +164,9 @@ impl Ui {
                 );
             }
         }
+        if req.method == "GET" && req.path == "/api/log/download" {
+            return self.log_download();
+        }
         let body: Value = if req.body.is_empty() {
             json!({})
         } else {
@@ -266,17 +274,53 @@ impl Ui {
                 return login_form(429, Some(TOO_MANY)).with_header("Retry-After", "60");
             }
         }
+        let log = self.center.log();
         // A pasted token often carries a trailing newline or space.
         let given = req.form_param("token").unwrap_or_default();
         let given = given.trim();
         if given.is_empty() || !crate::mcp::token_ok(&self.center, self.env_token.as_deref(), given)
         {
-            self.failures.lock().unwrap().0 += 1;
+            let tries = {
+                let mut f = self.failures.lock().unwrap();
+                f.0 += 1;
+                f.0
+            };
+            // The token that was tried is not logged: a typo of a good one is
+            // as good as the token.
+            log.record(
+                Level::Warn,
+                None,
+                "a web UI sign-in was refused: wrong token",
+            );
+            if tries >= LOGIN_TRIES {
+                log.record(
+                    Level::Warn,
+                    None,
+                    "the web UI sign-in is locked for a minute after too many wrong tokens",
+                );
+            }
             tokio::time::sleep(Duration::from_millis(300)).await;
             return login_form(401, Some(WRONG_TOKEN));
         }
         let (token, _) = self.new_session(Some(util::sha256_hex(given.as_bytes())));
+        log.record(Level::Info, None, "signed in to the web UI");
         see_other("/").with_header("Set-Cookie", &self.set_cookie(&token))
+    }
+
+    /// The log file for the owner to keep: both files, the older first, one
+    /// JSON object per line.
+    fn log_download(&self) -> Response {
+        match self.center.log().file_bytes() {
+            None => Response::json(404, &json!({"error": "this center keeps no log file"})),
+            Some(Err(e)) => Response::json(
+                500,
+                &json!({"error": format!("cannot read the log file: {e}")}),
+            ),
+            Some(Ok(bytes)) => Response::new(200, "application/x-ndjson", bytes).with_header(
+                "Content-Disposition",
+                "attachment; filename=\"nerve-center-log.jsonl\"",
+            ),
+        }
     }
 
     /// Ends the browser's session and clears its cookie.
@@ -301,6 +345,7 @@ impl Ui {
             })),
             ("GET", "/api/stats") => Ok(c.stats_json()),
             ("GET", "/api/audit") => Ok(json!({"decisions": c.audit()})),
+            ("GET", "/api/log") => Ok(c.log_json(&log_query(req)?)),
             // The node's own command list, read from its CLI definition.
             ("GET", "/api/help") => Ok(json!({"node": nerve_node::cli::help()})),
             ("POST", "/api/pair") => Ok(c.new_pairing()),
@@ -380,14 +425,34 @@ impl Ui {
                     hash: util::sha256_hex(token.as_bytes()),
                     created_ms: now_ms(),
                 };
-                let id = rec.id.clone();
+                let (id, label) = (rec.id.clone(), rec.label.clone());
                 c.update(|st| st.harness_tokens.push(rec));
+                c.log().record(
+                    Level::Info,
+                    None,
+                    &format!("a harness token was made, labelled {label:?}"),
+                );
                 // The token is shown once; only its hash is kept.
                 Ok(json!({"id": id, "token": token}))
             }
             ("POST", "/api/tokens/delete") => {
                 let id = s("id");
-                c.update(|st| st.harness_tokens.retain(|t| t.id != id));
+                let gone = c.update(|st| {
+                    let label = st
+                        .harness_tokens
+                        .iter()
+                        .find(|t| t.id == id)
+                        .map(|t| t.label.clone());
+                    st.harness_tokens.retain(|t| t.id != id);
+                    label
+                });
+                if let Some(label) = gone {
+                    c.log().record(
+                        Level::Info,
+                        None,
+                        &format!("the harness token labelled {label:?} was deleted"),
+                    );
+                }
                 Ok(json!({}))
             }
             ("GET", "/api/center") => Ok(c.read(|st| {
@@ -395,6 +460,8 @@ impl Ui {
                     "name": st.center_name,
                     "retention_days": st.retention_days,
                     "pair_code_minutes": st.pair_code_minutes,
+                    "log_level": c.log().level(),
+                    "log_level_pinned": c.log_level_pinned(),
                 })
             })),
             ("POST", "/api/center") => {
@@ -421,6 +488,30 @@ impl Ui {
                         }
                     },
                 };
+                let level = match b.get("log_level") {
+                    None | Some(Value::Null) => None,
+                    Some(v) => match v.as_str().and_then(Level::parse) {
+                        Some(l) => Some(l),
+                        None => return Err(bad("the log level is error, warn, info or debug")),
+                    },
+                };
+                let (old_name, old_days, old_minutes) = c.read(|st| {
+                    (
+                        st.center_name.clone(),
+                        u64::from(st.retention_days),
+                        u64::from(st.pair_code_minutes),
+                    )
+                });
+                let mut changed = Vec::new();
+                if name.as_ref().is_some_and(|n| *n != old_name) {
+                    changed.push("name");
+                }
+                if days.is_some_and(|d| d != old_days) {
+                    changed.push("statistics retention");
+                }
+                if minutes.is_some_and(|m| m != old_minutes) {
+                    changed.push("pairing code lifetime");
+                }
                 c.update(|st| {
                     if let Some(n) = name {
                         st.center_name = n;
@@ -432,12 +523,52 @@ impl Ui {
                         st.pair_code_minutes = m as u32;
                     }
                 });
+                if let Some(l) = level {
+                    c.set_log_level(l);
+                }
+                // The UI sends all its fields every time, so only what differs
+                // is told.
+                if !changed.is_empty() {
+                    c.log().record(
+                        Level::Info,
+                        None,
+                        &format!("the center settings were saved ({})", changed.join(", ")),
+                    );
+                }
                 c.changed(Change::Nodes);
                 Ok(json!({}))
             }
             _ => Err((404, json!({"error": "unknown API call"}))),
         }
     }
+}
+
+/// The log view's question, from the query string: `level` (the least severe
+/// to show), `node` (an id, or `-` for the center alone), `q` (text),
+/// `after` (an entry number) and `limit`.
+fn log_query(req: &Request) -> Result<Query, (u16, Value)> {
+    let level = match req.query_param("level").filter(|l| !l.is_empty()) {
+        None => None,
+        Some(l) => {
+            Some(Level::parse(&l).ok_or_else(|| bad("the level is error, warn, info or debug"))?)
+        }
+    };
+    let number = |k: &str| -> Result<Option<u64>, (u16, Value)> {
+        match req.query_param(k).filter(|v| !v.is_empty()) {
+            None => Ok(None),
+            Some(v) => v
+                .parse()
+                .map(Some)
+                .map_err(|_| bad(format!("{k} is a whole number"))),
+        }
+    };
+    Ok(Query {
+        level,
+        node: req.query_param("node").filter(|n| !n.is_empty()),
+        text: req.query_param("q"),
+        after: number("after")?,
+        limit: number("limit")?.map_or(LOG_PAGE, |n| (n as usize).clamp(1, LOG_PAGE_MAX)),
+    })
 }
 
 fn bad(m: impl Into<String>) -> (u16, Value) {
@@ -530,6 +661,8 @@ mod tests {
             state_dir: dir.to_path_buf(),
             name: Some("test".into()),
             public_url: "http://127.0.0.1:1".into(),
+            log: None,
+            log_level: None,
         })
         .unwrap()
     }
@@ -822,6 +955,10 @@ mod tests {
 
     fn body(r: &Response) -> String {
         String::from_utf8_lossy(&r.body).into_owned()
+    }
+
+    fn json(r: &Response) -> Value {
+        serde_json::from_slice(&r.body).unwrap()
     }
 
     /// Posts the login form and returns the answer.
@@ -1229,6 +1366,404 @@ mod tests {
         let state = std::fs::read_to_string(d.path().join(crate::store::FILE)).unwrap();
         assert!(!state.contains(&token));
         assert!(state.contains(&util::sha256_hex(token.as_bytes())));
+    }
+
+    // ---- The log ----
+
+    /// A GET with a query string.
+    fn get(path: &str, query: &str, headers: &[(&str, &str)]) -> Request {
+        let mut r = req("GET", path, headers, "");
+        r.query = query.to_string();
+        r
+    }
+
+    /// A center with a UI that needs no login, a session for it, and a log
+    /// with a few nodes' entries in it.
+    async fn with_a_log(dir: &std::path::Path) -> (Center, Arc<Ui>, String) {
+        let c = center(dir);
+        let ui = Ui::new(&c, None, false, false);
+        let session = ui
+            .request(req(
+                "GET",
+                "/api/session",
+                &[("Host", "127.0.0.1:7480")],
+                "",
+            ))
+            .await;
+        let cookie = set_cookie(&session);
+        let log = c.log();
+        log.set_level(Level::Debug);
+        log.record(Level::Info, None, "nerve-center started");
+        log.record(
+            Level::Info,
+            Some(("alpha", "n1")),
+            "link up (node software 0.0.1)",
+        );
+        log.record(
+            Level::Warn,
+            Some(("alpha", "n1")),
+            "link dropped: the connection closed without a bye",
+        );
+        log.record(
+            Level::Info,
+            Some(("beta", "n2")),
+            "link up (node software 0.0.1)",
+        );
+        log.record(Level::Error, None, "cannot write the state file: disk full");
+        log.record(
+            Level::Debug,
+            Some(("beta", "n2")),
+            "the node's description changed",
+        );
+        (c, ui, cookie)
+    }
+
+    async fn log_view(ui: &Ui, cookie: &str, query: &str) -> Value {
+        let r = ui
+            .request(get(
+                "/api/log",
+                query,
+                &[("Host", "127.0.0.1:7480"), ("Cookie", cookie)],
+            ))
+            .await;
+        assert_eq!(r.status, 200, "{query}: {}", body(&r));
+        json(&r)
+    }
+
+    fn texts(v: &Value) -> Vec<&str> {
+        v["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["msg"].as_str().unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn the_log_page_has_its_lists_and_nothing_native() {
+        let d = tempfile::tempdir().unwrap();
+        let (_c, ui, ck) = with_a_log(d.path()).await;
+        let h = ("Host", "127.0.0.1:7480");
+        let index = ui.request(req("GET", "/", &[h, ("Cookie", &ck)], "")).await;
+        let index = body(&index);
+        assert!(index.contains("href=\"#log\""), "no Log tab in the menu");
+        let js = ui
+            .request(req("GET", "/app.js", &[h, ("Cookie", &ck)], ""))
+            .await;
+        let js = body(&js);
+        // The level and the machine are picked from lists of the page's own, a
+        // button and a search field, as the statistics page does; the file is
+        // a link to the download.
+        for part in [
+            "pageLog",
+            "logLevelPicker",
+            "logNodePicker",
+            "\"/api/log\"",
+            "/api/log/download",
+            "role: \"combobox\"",
+            "\"Errors only\"",
+            "\"The center itself\"",
+        ] {
+            assert!(js.contains(part), "the page has no {part}");
+        }
+        assert!(!js.contains("createElement(\"select\")") && !js.contains("el(\"select\""));
+        assert!(!index.contains("<select"));
+        // The level of the center is chosen from a list too, in the settings.
+        assert!(js.contains("levelPicker") && js.contains("log_level"));
+    }
+
+    #[tokio::test]
+    async fn the_log_view_is_newest_first_and_filters_by_level_node_and_text() {
+        let d = tempfile::tempdir().unwrap();
+        let (_c, ui, ck) = with_a_log(d.path()).await;
+        let all = log_view(&ui, &ck, "").await;
+        // The center's startup line is first made; the newest comes first.
+        let t = texts(&all);
+        assert_eq!(t.len(), 6, "{t:?}");
+        assert_eq!(t[0], "the node's description changed");
+        assert_eq!(t[5], "nerve-center started");
+        let first = &all["entries"][0];
+        assert_eq!(first["level"], "debug");
+        assert_eq!(first["node"], "beta");
+        assert_eq!(first["node_id"], "n2");
+        assert!(first["ts"].as_u64().unwrap() > 0 && first["seq"].as_u64().unwrap() > 0);
+        assert_eq!(all["level"], "debug");
+        assert_eq!(all["file"], true);
+        // The machines that can be picked: those the log knows about.
+        assert_eq!(
+            all["nodes"],
+            json!([
+                {"id": "n1", "name": "alpha", "paired": false},
+                {"id": "n2", "name": "beta", "paired": false},
+            ])
+        );
+        // The level is the least severe shown.
+        let warn = log_view(&ui, &ck, "level=warn").await;
+        assert_eq!(
+            texts(&warn),
+            [
+                "cannot write the state file: disk full",
+                "link dropped: the connection closed without a bye"
+            ]
+        );
+        assert_eq!(texts(&log_view(&ui, &ck, "level=error").await).len(), 1);
+        assert_eq!(texts(&log_view(&ui, &ck, "level=INFO").await).len(), 5);
+        // A machine by its id; `-` is what is about none.
+        let beta = log_view(&ui, &ck, "node=n2").await;
+        assert_eq!(texts(&beta).len(), 2);
+        let center_only = log_view(&ui, &ck, "node=-").await;
+        assert_eq!(
+            texts(&center_only),
+            [
+                "cannot write the state file: disk full",
+                "nerve-center started"
+            ]
+        );
+        // Text in the message or the machine's name, in any letter case.
+        assert_eq!(texts(&log_view(&ui, &ck, "q=DROPPED").await).len(), 1);
+        assert_eq!(texts(&log_view(&ui, &ck, "q=alpha").await).len(), 2);
+        // Percent-escapes are read: a space and a colon.
+        assert_eq!(
+            texts(&log_view(&ui, &ck, "q=state%20file%3A").await).len(),
+            1
+        );
+        // All of them at once.
+        let both = log_view(&ui, &ck, "level=warn&node=n1&q=link").await;
+        assert_eq!(
+            texts(&both),
+            ["link dropped: the connection closed without a bye"]
+        );
+        assert!(texts(&log_view(&ui, &ck, "node=nobody").await).is_empty());
+        assert_eq!(texts(&log_view(&ui, &ck, "limit=2").await).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_live_view_asks_for_what_came_after() {
+        let d = tempfile::tempdir().unwrap();
+        let (c, ui, ck) = with_a_log(d.path()).await;
+        let seen = log_view(&ui, &ck, "").await;
+        let last = seen["entries"][0]["seq"].as_u64().unwrap();
+        assert!(texts(&log_view(&ui, &ck, &format!("after={last}")).await).is_empty());
+        c.note(Level::Warn, Some("n1"), "link dropped again");
+        c.log().record(Level::Info, None, "something else");
+        let more = log_view(&ui, &ck, &format!("after={last}")).await;
+        assert_eq!(texts(&more), ["something else", "link dropped again"]);
+        // The entries are numbered one after the other.
+        let seqs: Vec<u64> = more["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| e["seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(seqs, [last + 2, last + 1]);
+    }
+
+    #[tokio::test]
+    async fn the_log_view_refuses_what_it_cannot_read() {
+        let d = tempfile::tempdir().unwrap();
+        let (_c, ui, ck) = with_a_log(d.path()).await;
+        for q in ["level=loud", "after=x", "limit=-1", "after=1.5"] {
+            let r = ui
+                .request(get(
+                    "/api/log",
+                    q,
+                    &[("Host", "127.0.0.1:7480"), ("Cookie", &ck)],
+                ))
+                .await;
+            assert_eq!(r.status, 400, "{q}");
+            assert!(json(&r)["error"].as_str().unwrap().len() > 5);
+        }
+        // Like every other API, the log is for a signed-in browser.
+        let locked = locked(d.path(), false);
+        for path in ["/api/log", "/api/log/download"] {
+            let r = locked.request(get(path, "", &[HOST])).await;
+            assert_eq!(r.status, 401, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_download_is_the_log_file() {
+        let d = tempfile::tempdir().unwrap();
+        let (_c, ui, ck) = with_a_log(d.path()).await;
+        let r = ui
+            .request(get(
+                "/api/log/download",
+                "",
+                &[("Host", "127.0.0.1:7480"), ("Cookie", &ck)],
+            ))
+            .await;
+        assert_eq!(r.status, 200);
+        assert_eq!(header(&r, "Content-Type"), Some("application/x-ndjson"));
+        assert_eq!(
+            header(&r, "Content-Disposition"),
+            Some("attachment; filename=\"nerve-center-log.jsonl\"")
+        );
+        // The same lines as the file, each an entry, the oldest first.
+        let file = std::fs::read(d.path().join("log.jsonl")).unwrap();
+        assert_eq!(r.body, file);
+        let lines: Vec<Value> = body(&r)
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 6);
+        assert_eq!(lines[0]["msg"], "nerve-center started");
+        assert_eq!(lines[2]["level"], "warn");
+        assert_eq!(lines[2]["node"], "alpha");
+    }
+
+    #[tokio::test]
+    async fn the_log_level_is_set_in_the_center_settings() {
+        let d = tempfile::tempdir().unwrap();
+        let c = center(d.path());
+        let ui = Ui::new(&c, None, false, false);
+        let got = center_settings(&ui, None).await.unwrap();
+        assert_eq!(got["log_level"], "info");
+        assert_eq!(got["log_level_pinned"], false);
+        center_settings(&ui, Some(json!({"log_level": "debug"})))
+            .await
+            .unwrap();
+        assert_eq!(
+            center_settings(&ui, None).await.unwrap()["log_level"],
+            "debug"
+        );
+        assert_eq!(c.log().level(), Level::Debug);
+        // A level that is none, or a refused save, changes nothing.
+        for bad_level in [json!("loud"), json!(3), json!(true)] {
+            let (status, body) = center_settings(
+                &ui,
+                Some(json!({"name": "other", "log_level": bad_level.clone()})),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(status, 400, "{bad_level}");
+            assert!(
+                body["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("error, warn, info or debug")
+            );
+        }
+        let got = center_settings(&ui, None).await.unwrap();
+        assert_eq!(
+            (got["log_level"].as_str(), got["name"].as_str()),
+            (Some("debug"), Some("test"))
+        );
+        // A save without it leaves it, and the log says what was saved.
+        center_settings(&ui, Some(json!({"retention_days": 5})))
+            .await
+            .unwrap();
+        assert_eq!(c.log().level(), Level::Debug);
+        let v = c.log_json(&Query {
+            limit: 100,
+            ..Query::default()
+        });
+        let t: Vec<&str> = texts(&v);
+        assert!(
+            t.contains(&"the log level changes from info to debug"),
+            "{t:?}"
+        );
+        assert!(
+            t.contains(&"the center settings were saved (statistics retention)"),
+            "{t:?}"
+        );
+        // The same values again are no change and no line; a new name is one.
+        center_settings(
+            &ui,
+            Some(json!({"retention_days": 5, "name": "test", "log_level": "debug"})),
+        )
+        .await
+        .unwrap();
+        center_settings(&ui, Some(json!({"name": "renamed"})))
+            .await
+            .unwrap();
+        let v = c.log_json(&Query {
+            limit: 100,
+            ..Query::default()
+        });
+        let saved: Vec<&str> = texts(&v)
+            .into_iter()
+            .filter(|t| t.starts_with("the center settings were saved"))
+            .collect();
+        assert_eq!(
+            saved,
+            [
+                "the center settings were saved (name)",
+                "the center settings were saved (statistics retention)"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_ui_logs_who_gets_in_and_leaves_every_secret_out() {
+        let d = tempfile::tempdir().unwrap();
+        let c = center(d.path());
+        let ui = Ui::new(&c, Some(TOKEN.into()), true, false);
+        // A wrong token is told, and what was typed is not.
+        let r = sign_in(&ui, "typo-of-nrv_test-token-lon").await;
+        assert_eq!(r.status, 401);
+        let r = sign_in(&ui, TOKEN).await;
+        assert_eq!(r.status, 303);
+        let ck = set_cookie(&r);
+        let csrf = serde_json::from_slice::<Value>(
+            &ui.request(req("GET", "/api/session", &[HOST, ("Cookie", &ck)], ""))
+                .await
+                .body,
+        )
+        .unwrap()["csrf"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        // A token made in the UI is shown to the browser once; it and its
+        // label's neighbours are not in the log, its label is.
+        let post = |path: &'static str, b: &'static str| {
+            ui.request(req(
+                "POST",
+                path,
+                &[HOST, ("Cookie", &ck), ("X-Nerve-CSRF", &csrf)],
+                b,
+            ))
+        };
+        let made = json(&post("/api/tokens/create", r#"{"label":"ci"}"#).await);
+        let (id, token) = (
+            made["id"].as_str().unwrap(),
+            made["token"].as_str().unwrap(),
+        );
+        assert!(token.starts_with("nrv_"));
+        let id_body: &'static str = Box::leak(format!(r#"{{"id":"{id}"}}"#).into_boxed_str());
+        post("/api/tokens/delete", id_body).await;
+
+        let v = c.log_json(&Query {
+            limit: 100,
+            ..Query::default()
+        });
+        let got = texts(&v);
+        assert_eq!(
+            got,
+            [
+                "the harness token labelled \"ci\" was deleted",
+                "a harness token was made, labelled \"ci\"",
+                "signed in to the web UI",
+                "a web UI sign-in was refused: wrong token",
+            ]
+        );
+        let file = std::fs::read_to_string(d.path().join("log.jsonl")).unwrap();
+        for secret in [token, TOKEN, "typo-of-nrv"] {
+            assert!(!file.contains(secret), "{secret} is in the file");
+            assert!(!v.to_string().contains(secret), "{secret} is in the view");
+        }
+        // Five wrong tokens lock the sign-in; the log says so once.
+        for _ in 0..LOGIN_TRIES {
+            sign_in(&ui, "wrong").await;
+        }
+        let v = c.log_json(&Query {
+            limit: 100,
+            ..Query::default()
+        });
+        let locked = texts(&v)
+            .into_iter()
+            .filter(|t| t.contains("locked for a minute"))
+            .count();
+        assert_eq!(locked, 1);
     }
 
     #[tokio::test]

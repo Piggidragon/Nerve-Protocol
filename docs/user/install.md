@@ -51,8 +51,8 @@ See [building](../dev/building.md).
 | What | Linux | Windows | Change with |
 |---|---|---|---|
 | Node: `node.toml`, one key per center | `~/.config/nerve` | `%USERPROFILE%\.config\nerve` | `--config-dir`, `NERVE_CONFIG_DIR` |
-| Node: audit log, control socket, config key | `~/.local/state/nerve` | `%USERPROFILE%\.local\state\nerve` | `--state-dir`, `NERVE_STATE_DIR` |
-| Center: identity, paired machines, statistics | `$XDG_STATE_HOME/nerve-center`, else `~/.local/state/nerve-center` | `%LOCALAPPDATA%\nerve-center` | `--state-dir`, `NERVE_STATE_DIR` |
+| Node: audit log, [log](logs.md), control socket, config key | `~/.local/state/nerve` | `%USERPROFILE%\.local\state\nerve` | `--state-dir`, `NERVE_STATE_DIR` |
+| Center: identity, paired machines, statistics, [log](logs.md) | `$XDG_STATE_HOME/nerve-center`, else `~/.local/state/nerve-center` | `%LOCALAPPDATA%\nerve-center` | `--state-dir`, `NERVE_STATE_DIR` |
 
 Both programs read `NERVE_STATE_DIR`. On a machine that runs both, set it per
 program or use the flags. Do not set it for the whole machine.

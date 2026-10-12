@@ -3,7 +3,7 @@
 
 #![cfg(unix)]
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -125,4 +125,83 @@ fn a_ui_beyond_loopback_without_a_harness_token_does_not_start() {
     assert!(!out.status.success());
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("NERVE_HARNESS_TOKEN"), "{err}");
+}
+
+/// Starts a center with the level in `NERVE_LOG`, lets one harness session
+/// come and go, and gives back what the center put on stderr.
+fn one_session(state: &std::path::Path, level: &str) -> String {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_nerve-center"))
+        .env_clear()
+        .env("NERVE_STATE_DIR", state)
+        .env("NERVE_LISTEN", "127.0.0.1:0")
+        .env("NERVE_PLAIN_LOOPBACK", "true")
+        .env("NERVE_UI", "off")
+        .env("NERVE_LOG", level)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out = BufReader::new(child.stdout.take().unwrap());
+    // `ask` reads stdout as JSON, so a log line there would fail it.
+    init(&mut child, &mut out);
+    drop(child.stdin.take());
+    assert!(wait(&mut child, Duration::from_secs(10)));
+    let mut err = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
+    err
+}
+
+#[test]
+fn the_log_goes_to_stderr_and_the_state_folder_and_follows_the_level() {
+    let lines = |dir: &std::path::Path| -> Vec<Value> {
+        std::fs::read_to_string(dir.join("log.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let err = one_session(dir.path(), "info");
+    let file = lines(dir.path());
+    let msgs: Vec<&str> = file.iter().map(|e| e["msg"].as_str().unwrap()).collect();
+    assert!(msgs[0].starts_with("nerve-center "), "{msgs:?}");
+    assert!(
+        msgs.iter()
+            .any(|m| m.starts_with("a harness session started over stdio"))
+    );
+    assert_eq!(*msgs.last().unwrap(), "the center stopped", "{msgs:?}");
+    assert!(
+        file.iter()
+            .all(|e| e["level"] == "info" && e["ts"].as_u64().unwrap() > 0)
+    );
+    // Stderr has the same lines, with their level.
+    for m in &msgs {
+        assert!(
+            err.contains(m) && err.contains("INFO"),
+            "{m} is not on stderr: {err}"
+        );
+    }
+
+    // A higher level than the lines have: none of them is kept or shown.
+    let quiet = tempfile::tempdir().unwrap();
+    let err = one_session(quiet.path(), "warn");
+    assert!(lines(quiet.path()).is_empty(), "{:?}", lines(quiet.path()));
+    assert!(!err.contains("INFO"), "{err}");
+
+    // The level is a word the center knows.
+    let out = Command::new(env!("CARGO_BIN_EXE_nerve-center"))
+        .env_clear()
+        .env("NERVE_STATE_DIR", dir.path())
+        .env("NERVE_LOG", "loud")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("error, warn, info or debug"));
 }

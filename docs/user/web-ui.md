@@ -87,6 +87,33 @@ rule on the machine, so it works only if the machine gave the center the
 [settings grant](settings-grant.md). Otherwise the buttons are off and the
 entry says why. A target that was cut to its start gets no buttons.
 
+### Log
+
+What the center did and saw, newest first: links that dropped and came back,
+pairing, changes, refused and failed calls, and errors. A line shows the time,
+its level, the machine it is about and what happened. The page is the center's
+own [log](logs.md); it is not the audit page above.
+
+- **Level.** Pick how much to show: everything, info and above, warnings and
+  errors, or errors only. This narrows the view. The level the center keeps
+  the log at is set in Settings.
+- **Machine.** Pick one machine, all machines, or **The center itself** for the
+  lines that are about no machine. A machine that was removed stays in the list
+  while the log still has lines about it.
+- **Search.** Shows the lines whose text or machine name contains what you
+  type, in any letter case.
+- **Live.** The page asks the center every two seconds and shows new lines at
+  the top. Press **Live** to stop that, so the lines do not move while you read
+  them; it then reads **Paused**. Press it again to go on. Leaving the page
+  resumes it.
+- **Download the file.** Saves the log file, `log.jsonl.1` and `log.jsonl` in
+  one file with a JSON object per line. The page shows the latest 500 lines
+  that match; the file has all the center kept.
+
+The two lists work like the one on the Statistics page: type in the search
+field to narrow a list, **Down** and **Up** move through it, **Enter** picks
+the marked entry and **Escape** closes it.
+
 ### Help
 
 Lists the commands of `nerve-node` with what each does. The center reads the
@@ -95,8 +122,10 @@ of the same build.
 
 ### Settings
 
-- **Center.** Its name, how many days to keep statistics, and how long a
-  pairing code is valid (1 to 1440 minutes, 10 by default).
+- **Center.** Its name, how many days to keep statistics, how long a
+  pairing code is valid (1 to 1440 minutes, 10 by default), and the **log
+  level**: error, warn, info (the default) or debug. The level applies at once
+  and stays for the next start, unless the center is started with `--log`.
 - **Harness tokens.** Make a token with a label. It is shown once. Delete one
   to stop it.
 - **Machines.** For each online machine that gave the center the settings

@@ -9,6 +9,7 @@ use futures_util::{SinkExt, StreamExt};
 use nerve_center::config::Args;
 use nerve_center::mcp::Engine;
 use nerve_center::server::{self, Running};
+use nerve_proto::RpcError;
 use nerve_proto::link::{CenterUrl, PairLink};
 use nerve_proto::msg::{self, method};
 use nerve_proto::rpc::Message;
@@ -49,6 +50,12 @@ fn url(r: &Running) -> CenterUrl {
 }
 
 async fn pair(r: &Running, key: &NodeKey, name: &str) -> (u16, Value) {
+    let (_, status, body) = pair_with_code(r, key, name).await;
+    (status, body)
+}
+
+/// [`pair`], also giving the code it used.
+async fn pair_with_code(r: &Running, key: &NodeKey, name: &str) -> (String, u16, Value) {
     let p = r.center.new_pairing();
     let link = PairLink::parse(p["link"].as_str().unwrap()).unwrap();
     assert!(link.pin.is_none(), "plain loopback has no pin");
@@ -67,6 +74,7 @@ async fn pair(r: &Running, key: &NodeKey, name: &str) -> (u16, Value) {
     .await
     .unwrap();
     (
+        link.code,
         resp.status,
         serde_json::from_slice(&resp.body).unwrap_or(Value::Null),
     )
@@ -145,11 +153,19 @@ enum Seen {
 }
 
 /// Answers the center like a node: describe, sub, invoke (echoing the
-/// arguments; the command `hang` is never answered), and reports what it
-/// saw.
-fn serve(mut ws: WebSocketStream<BoxIo>, desc: Value) -> mpsc::UnboundedReceiver<Seen> {
+/// arguments; the command `hang` is never answered, `refuse` is forbidden and
+/// `boom` fails), and reports what it saw.
+fn serve(ws: WebSocketStream<BoxIo>, desc: Value) -> mpsc::UnboundedReceiver<Seen> {
+    serve_task(ws, desc).0
+}
+
+/// [`serve`], also giving the task, which ends the link when it is aborted.
+fn serve_task(
+    mut ws: WebSocketStream<BoxIo>,
+    desc: Value,
+) -> (mpsc::UnboundedReceiver<Seen>, tokio::task::JoinHandle<()>) {
     let (tx, rx) = mpsc::unbounded_channel();
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         while let Some(m) = text(&mut ws).await {
             match m {
                 Message::Request {
@@ -159,6 +175,20 @@ fn serve(mut ws: WebSocketStream<BoxIo>, desc: Value) -> mpsc::UnboundedReceiver
                 } => {
                     if m == method::INVOKE && params["args"]["command"] == "hang" {
                         let _ = tx.send(Seen::Hang(serde_json::to_value(&id).unwrap()));
+                        continue;
+                    }
+                    let command = (m == method::INVOKE)
+                        .then(|| params["args"]["command"].as_str())
+                        .flatten();
+                    let failure = match command {
+                        Some("refuse") => Some(RpcError::forbidden("no allow rule matches refuse")),
+                        Some("boom") => {
+                            Some(RpcError::internal("the node could not start the command"))
+                        }
+                        _ => None,
+                    };
+                    if let Some(e) = failure {
+                        send(&mut ws, Message::error(Some(id), e)).await;
                         continue;
                     }
                     let result = match m.as_str() {
@@ -183,7 +213,7 @@ fn serve(mut ws: WebSocketStream<BoxIo>, desc: Value) -> mpsc::UnboundedReceiver
             }
         }
     });
-    rx
+    (rx, task)
 }
 
 async fn wait_for<T>(mut f: impl FnMut() -> Option<T>) -> T {
@@ -757,4 +787,202 @@ async fn audit_targets_are_cut_and_the_audit_feed_is_bounded() {
         "every large target is served cut"
     );
     r.stop().await;
+}
+
+/// A node that drops, goes quiet and comes back is in the log: the drop, the
+/// quiet period, and each reconnect with the time it took. Calls that were
+/// refused or failed are there with their reasons, and no secret is.
+#[tokio::test]
+async fn a_node_that_drops_and_comes_back_is_in_the_log() {
+    use nerve_transport::log::{Entry, Level, Query};
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    let key = NodeKey::generate().unwrap();
+    let (code, status, _) = pair_with_code(&r, &key, "box-1").await;
+    assert_eq!(status, 200);
+    let about = |r: &Running| -> Vec<Entry> {
+        let q = Query {
+            node: Some(key.node_id()),
+            limit: 100,
+            ..Query::default()
+        };
+        r.center
+            .log()
+            .entries(&q)
+            .into_iter()
+            .rev()
+            .map(|(_, e)| e)
+            .collect()
+    };
+    let has = |r: &Running, part: &str| about(r).iter().any(|e| e.msg.contains(part));
+
+    // Up, with a refused and a failed call.
+    let (ws, _) = handshake(&r, &key).await;
+    let (_seen, link) = serve_task(ws, descriptor(&key, "box-1"));
+    let c = r.center.clone();
+    wait_for(|| (!c.tools().is_empty()).then_some(())).await;
+    let e = Engine::new(&r.center, "test");
+    rpc(
+        &e,
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {},
+               "clientInfo": {"name": "test", "version": "1"}}),
+    )
+    .await;
+    for (n, command) in [(2, "refuse"), (3, "boom")] {
+        let call = rpc(
+            &e,
+            n,
+            "tools/call",
+            json!({"name": "exec_run", "arguments": {"node": "box-1", "command": command}}),
+        )
+        .await;
+        assert_eq!(call["result"]["isError"], true, "{call}");
+    }
+
+    // The link drops without a bye, and the node dials again.
+    link.abort();
+    wait_for(|| has(&r, "link dropped").then_some(())).await;
+    let (ws, _) = handshake(&r, &key).await;
+    let (_seen, link) = serve_task(ws, descriptor(&key, "box-1"));
+    wait_for(|| has(&r, "link up again after").then_some(())).await;
+    link.abort();
+    wait_for(|| {
+        (about(&r)
+            .iter()
+            .filter(|e| e.msg.starts_with("link dropped"))
+            .count()
+            == 2)
+            .then_some(())
+    })
+    .await;
+
+    // The next link says nothing. The center gives up on it after the quiet
+    // period (shortened here from 45 s), and the node comes back.
+    r.center.set_dead_after(Duration::from_millis(300));
+    let (_quiet, _) = handshake(&r, &key).await;
+    wait_for(|| has(&r, "no frame from the node for 300 ms").then_some(())).await;
+    let (ws, _) = handshake(&r, &key).await;
+    let _seen = serve(ws, descriptor(&key, "box-1"));
+    wait_for(|| {
+        (about(&r)
+            .iter()
+            .filter(|e| e.msg.starts_with("link up"))
+            .count()
+            == 4)
+            .then_some(())
+    })
+    .await;
+
+    let got: Vec<(Level, String)> = about(&r).into_iter().map(|e| (e.level, e.msg)).collect();
+    let line = |i: usize| (got[i].0, got[i].1.as_str());
+    assert_eq!(
+        line(0),
+        (
+            Level::Info,
+            "the node paired (linux/x86_64); its code is used up"
+        )
+    );
+    assert_eq!(line(1), (Level::Info, "link up (node software 0.0.1)"));
+    // Told by the code that came back, then what it was.
+    let calls: Vec<_> = got
+        .iter()
+        .filter(|(_, m)| m.starts_with("exec.run"))
+        .collect();
+    assert_eq!(
+        calls[0],
+        &(
+            Level::Info,
+            "exec.run was refused (forbidden): no allow rule matches refuse".to_string()
+        )
+    );
+    assert_eq!(calls[1].0, Level::Error);
+    assert!(
+        calls[1].1.starts_with("exec.run failed (internal) after ")
+            && calls[1]
+                .1
+                .ends_with(": the node could not start the command"),
+        "{calls:?}"
+    );
+    // The drops are warnings, the reconnects say how long they took.
+    let drops: Vec<_> = got
+        .iter()
+        .filter(|(_, m)| m.starts_with("link dropped"))
+        .collect();
+    assert_eq!(drops.len(), 3, "{got:?}");
+    assert!(drops.iter().all(|(l, _)| *l == Level::Warn));
+    assert!(
+        drops[0].1.starts_with("link dropped: the connection"),
+        "{drops:?}"
+    );
+    assert!(drops[0].1.contains("(it was up for "), "{drops:?}");
+    assert!(
+        drops[2]
+            .1
+            .starts_with("link dropped: no frame from the node for 300 ms"),
+        "{drops:?}"
+    );
+    let ups: Vec<_> = got
+        .iter()
+        .filter(|(_, m)| m.starts_with("link up"))
+        .collect();
+    assert_eq!(ups.len(), 4);
+    assert_eq!(ups[0].1, "link up (node software 0.0.1)");
+    for (_, m) in &ups[1..] {
+        assert!(
+            m.starts_with("link up again after ") && m.ends_with(" (node software 0.0.1)"),
+            "{m}"
+        );
+    }
+    // The wait after the quiet period counts from the last frame, so it holds
+    // the 300 ms the center waited for one.
+    let waited = |m: &str| -> Duration {
+        let t = m.strip_prefix("link up again after ").unwrap();
+        let mut words = t.split(' ');
+        let n: u64 = words.next().unwrap().parse().unwrap();
+        match words.next().unwrap() {
+            "ms" => Duration::from_millis(n),
+            "s" => Duration::from_secs(n),
+            unit => panic!("{unit} in {m}"),
+        }
+    };
+    assert!(waited(&ups[3].1) >= Duration::from_millis(300), "{ups:?}");
+    // In this order: up, a drop, up again, a drop, up again (a link that then
+    // says nothing), the quiet period, up again.
+    let order: Vec<&str> = got
+        .iter()
+        .filter_map(|(_, m)| match m {
+            m if m.starts_with("link up again") => Some("again"),
+            m if m.starts_with("link up") => Some("up"),
+            m if m.contains("no frame from the node") => Some("quiet"),
+            m if m.starts_with("link dropped") => Some("drop"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        order,
+        ["up", "drop", "again", "drop", "again", "quiet", "again"]
+    );
+
+    // The view's filter: the warnings and errors of this node.
+    let q = Query {
+        node: Some(key.node_id()),
+        level: Some(Level::Warn),
+        limit: 100,
+        ..Query::default()
+    };
+    assert_eq!(r.center.log().entries(&q).len(), 4);
+    // The pairing code is not in the log, in the window or the file.
+    let file = std::fs::read_to_string(dir.path().join("log.jsonl")).unwrap();
+    assert!(file.contains("link dropped") && !file.contains(&code));
+    r.stop().await;
+    // The stop is told: first that the links are closed, then that it is done.
+    // The links close on their own tasks, so lines may follow.
+    let file = std::fs::read_to_string(dir.path().join("log.jsonl")).unwrap();
+    let at = |part: &str| file.find(part).unwrap_or_else(|| panic!("{part}: {file}"));
+    assert!(
+        at("the center is stopping; closing 1 node link") < at("the center stopped"),
+        "{file}"
+    );
 }

@@ -141,6 +141,16 @@ async fn node_conn(center: Center, mut io: BoxIo) {
 async fn connect(center: Center, mut io: BoxIo, req: Request) {
     let node_id = req.header(NODE_HEADER).unwrap_or("").to_string();
     if !center.knows(&node_id) {
+        // Anyone can send this, so it is detail; a node removed here and
+        // still dialling stops after the answer.
+        center.log().record(
+            nerve_transport::log::Level::Debug,
+            None,
+            &format!(
+                "a node that is not paired tried to connect (id {})",
+                crate::util::clip(&node_id, 64)
+            ),
+        );
         // §4.1: an unknown node is told so before any handshake, and stops
         // dialling.
         let _ = Response::json(
@@ -153,6 +163,10 @@ async fn connect(center: Center, mut io: BoxIo, req: Request) {
     }
     match nerve_transport::ws::accept(io, &req, nerve_proto::limits::MESSAGE_BYTES as usize).await {
         Ok(ws) => crate::link::run(center, ws, node_id).await,
-        Err(e) => tracing::debug!("WebSocket upgrade failed: {e}"),
+        Err(e) => center.log().record(
+            nerve_transport::log::Level::Debug,
+            None,
+            &format!("a WebSocket upgrade failed: {e}"),
+        ),
     }
 }

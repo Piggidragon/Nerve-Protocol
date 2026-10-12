@@ -1071,6 +1071,82 @@ textarea.json {
   flex: 1 1 12rem;
 }
 
+/* ---- Log ---- */
+
+.log-bar {
+  margin-bottom: 12px;
+}
+
+.log-bar .picker {
+  max-width: none;
+}
+
+/* Narrow fields, so that the two lists, the search and the buttons share a
+   row where there is room. */
+.log-bar .form-row .field {
+  flex: 1 1 9rem;
+}
+
+.log-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+
+.log-rows {
+  padding: 0;
+  overflow: hidden;
+}
+
+.log-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 8px;
+  padding: 6px 12px;
+  border-bottom: 1px solid rgb(var(--line) / 0.6);
+  font-size: 12px;
+}
+
+.log-row:last-child {
+  border-bottom: 0;
+}
+
+.log-row.error {
+  box-shadow: inset 2px 0 0 rgb(var(--danger));
+}
+
+.log-row.warn {
+  box-shadow: inset 2px 0 0 rgb(var(--warn));
+}
+
+.log-row.debug .log-msg {
+  color: rgb(var(--fg-subtle));
+}
+
+.log-row .pill {
+  min-width: 3.4rem;
+  justify-content: center;
+}
+
+.log-when {
+  color: rgb(var(--fg-faint));
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.log-msg {
+  flex: 1 1 18rem;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.card .form-row + .form-row {
+  margin-top: 12px;
+}
+
 details.card > summary {
   display: flex;
   align-items: center;

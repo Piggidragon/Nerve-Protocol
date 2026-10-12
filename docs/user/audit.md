@@ -44,6 +44,13 @@ the log stays below about 20 MiB. A center that makes many refused calls cannot
 push out what the node allowed or changed: refusals take at most half of a full
 file, and the oldest refusals go first.
 
+## The audit log and the log
+
+The audit log is the node's record of its decisions. The [log](logs.md) is
+what the program did: links, pairing, changes, errors. They are separate files
+with their own sizes. A call that worked is only in the audit log; a call that
+was refused or failed is in both, in the log with its reason.
+
 ## In the web UI
 
 The Audit page lists the latest decisions of all machines, newest first. It

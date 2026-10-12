@@ -1,6 +1,7 @@
 //! Small helpers shared by the center's parts.
 
 pub use nerve_proto::msg::now_ms;
+pub use nerve_transport::log::span;
 
 /// Compares two byte strings in time that depends only on their lengths.
 pub fn ct_eq(a: &[u8], b: &[u8]) -> bool {

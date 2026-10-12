@@ -100,9 +100,15 @@ Windows has no control socket and no sandbox. The CLI signs `node.toml` itself,
 so a command the node runs for a center can change the policy. The change
 applies at the next start.
 
+## The log level
+
+`log.level` (`error`, `warn`, `info`, `debug`; `info` unless set) is a machine
+setting of the owner: it is not in the document a center reads or writes. The
+daemon applies it within a second of any change ([logging](logging.md)).
+
 ## The audit log
 
 `audit.jsonl` in the state folder holds one JSON line per event: settings
 changes, calls allowed or forbidden, and what happened to the config file. It
 holds targets, never file contents or output. See
-[the user guide](../user/audit.md) for sizes and rotation.
+[the user guide](../user/audit.md) for sizes and rotation. It is not the log: [logging](logging.md).

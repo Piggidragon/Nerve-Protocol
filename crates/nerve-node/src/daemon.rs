@@ -13,11 +13,12 @@ use tokio::task::JoinHandle;
 
 #[cfg(unix)]
 use nerve_policy::SetError;
-use nerve_policy::audit::{AuditLog, Entry};
+use nerve_policy::audit::{AuditLog, Change, Entry, diff};
 use nerve_policy::{NodeConfig, SettingsStore};
 use nerve_proto::Message;
 use nerve_proto::msg::{Topic, method};
 use nerve_sandbox::Confinement;
+use nerve_transport::log::{Level, Log};
 use nerve_transport::ws::WsMessage;
 
 use crate::descriptor::IMPLICIT;
@@ -34,6 +35,10 @@ pub struct NodeOptions {
     pub home: PathBuf,
     /// Serve the control socket (the CLI's way in).
     pub ctl: bool,
+    /// The log to write to: the process's, when `nerve_transport::log::install`
+    /// ran. The daemon adds the file in the state folder and sets the level
+    /// from `node.toml`.
+    pub log: Option<Arc<Log>>,
 }
 
 impl NodeOptions {
@@ -43,6 +48,7 @@ impl NodeOptions {
             exe: None,
             home: home_dir(),
             ctl: true,
+            log: nerve_transport::log::global(),
         }
     }
 }
@@ -163,6 +169,8 @@ pub(crate) struct Shared {
     /// Commands running now, over all centers (`limits.max_running`).
     pub running: AtomicUsize,
     pub stop: watch::Sender<bool>,
+    /// The log, to keep the sudo password out of it.
+    pub log: Option<Arc<Log>>,
     /// The checked sudo password while the switch is on (crate::sudo).
     pub sudo: Mutex<Option<crate::sudo::Secret>>,
     /// Open sudo offers by center; each is opened at most once.
@@ -188,8 +196,9 @@ impl Shared {
                 // A signed file may say sudo on without a password held.
                 self.settle_sudo();
                 self.bump();
+                tracing::info!("node.toml was read again and has changed");
             }
-            Ok(false) => {}
+            Ok(false) => tracing::debug!("node.toml was read again; nothing changed"),
             Err(e) => tracing::warn!("reload refused, the old config stays: {e}"),
         }
         r
@@ -227,7 +236,7 @@ impl Shared {
         e.decision = self.scrub(e.decision);
         let e = &e;
         if let Err(err) = lock(&self.store).audit().decision(e) {
-            tracing::warn!("audit log: {err}");
+            tracing::error!("the audit log cannot be written: {err}");
         }
         self.emit(&e.center, "audit", "decision", e.event_data());
     }
@@ -240,7 +249,7 @@ impl Shared {
             }
         });
         if let Err(e) = r {
-            tracing::warn!("cannot save the config: {e}");
+            tracing::error!("cannot save the config: {e}");
         }
         self.bump();
     }
@@ -319,12 +328,23 @@ impl Daemon {
             nerve_transport::files::create_private_dir(dir)
                 .map_err(|e| format!("{}: {e}", dir.display()))?;
         }
-        let store = SettingsStore::open(
+        let mut store = SettingsStore::open(
             paths.config_file(),
             paths.config_key(),
             AuditLog::new(paths.audit_log()),
         )?;
         let cfg = store.config().clone();
+        if let Some(log) = &opts.log {
+            log.set_level(cfg.log.level);
+            // The node runs without a log file it cannot open; stderr and the
+            // service manager still have the lines.
+            if let Err(e) = log.attach_file(paths.log_file()) {
+                eprintln!("cannot open the log {}: {e}", paths.log_file().display());
+            }
+        }
+        store.on_change(|by, version, changes| {
+            nerve_transport::log::emit(Level::Info, None, &describe_change(by, version, changes));
+        });
         #[cfg(unix)]
         if nerve_transport::net::euid() == 0 && !cfg.machine.allow_root {
             return Err(
@@ -353,6 +373,7 @@ impl Daemon {
             commands: Mutex::default(),
             running: AtomicUsize::new(0),
             stop,
+            log: opts.log,
             sudo: Mutex::new(None),
             sudo_offers: Mutex::default(),
         });
@@ -365,9 +386,11 @@ impl Daemon {
         };
         let supervisor = tokio::spawn(supervise(shared.clone()));
         tracing::info!(
-            "node daemon running ({} centers, confinement {})",
+            "node daemon running (nerve-node {}, {} centers, confinement {}, log level {})",
+            crate::descriptor::VERSION,
             cfg.centers.len(),
-            shared.confinement.describe()
+            shared.confinement.describe(),
+            cfg.log.level
         );
         Ok(Daemon {
             shared,
@@ -378,6 +401,11 @@ impl Daemon {
 
     pub fn paths(&self) -> &NodePaths {
         &self.shared.paths
+    }
+
+    /// The log the daemon writes to, if it was given one.
+    pub fn log(&self) -> Option<&Arc<Log>> {
+        self.shared.log.as_ref()
     }
 
     /// The config as the daemon holds it now.
@@ -398,12 +426,14 @@ impl Daemon {
 
     /// Ends every link with `bye shutdown` and stops.
     pub async fn stop(self) {
+        tracing::info!("node daemon stopping");
         self.shared.stop.send_replace(true);
         let _ = tokio::time::timeout(Duration::from_secs(5), self.supervisor).await;
         if let Some(c) = self.ctl {
             c.abort();
             let _ = std::fs::remove_file(self.shared.paths.ctl_socket());
         }
+        tracing::info!("node daemon stopped");
     }
 
     /// Runs until SIGINT or SIGTERM; SIGHUP reloads the config.
@@ -442,6 +472,10 @@ async fn supervise(shared: Arc<Shared>) {
     loop {
         shared.settle_sudo();
         let cfg = shared.config();
+        // The level follows the config, whoever changed it and however.
+        if let Some(log) = &shared.log {
+            log.set_level(cfg.log.level);
+        }
         tasks.retain(|_, t| !t.is_finished());
         if !cfg.locked {
             for c in cfg.centers.iter().filter(|c| c.dials()) {
@@ -491,7 +525,7 @@ async fn start_ctl(shared: Arc<Shared>) -> Result<JoinHandle<()>, String> {
         })
         .await;
         if let Err(e) = r {
-            tracing::warn!("the control socket stopped: {e}");
+            tracing::error!("the control socket stopped: {e}");
         }
     });
     // The socket is bound already, so a CLI started right after finds the
@@ -615,6 +649,107 @@ pub(crate) fn control(
     }
 }
 
+/// Settings whose values are not told in the log, only that they changed.
+fn is_quiet_key(key: &str) -> bool {
+    key.starts_with("connection") || key.ends_with(".pin") || key.ends_with("_id")
+}
+
+/// A value as the log tells it: a word or a number plainly, anything longer
+/// cut.
+fn show_value(v: &Value) -> String {
+    let text = match v {
+        Value::Null => "unset".to_string(),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    clip(&text, 80)
+}
+
+fn clip(text: &str, max: usize) -> String {
+    match text.char_indices().nth(max) {
+        Some((end, _)) => format!("{}…", &text[..end]),
+        None => text.to_string(),
+    }
+}
+
+/// The entries of a list setting. A list that is empty is not in the file, so
+/// an unset one is an empty list.
+fn list_of(v: &Value) -> Option<&[Value]> {
+    match v {
+        Value::Array(a) => Some(a),
+        Value::Null => Some(&[]),
+        _ => None,
+    }
+}
+
+/// What a changed leaf of the settings says: both values of a plain setting,
+/// what a list gained and lost, and for a secret-bearing one only its name.
+fn describe_leaf(key: &str, old: &Value, new: &Value) -> String {
+    if is_quiet_key(key) {
+        return format!("{key} changed");
+    }
+    let is_list = |v: &Value| matches!(v, Value::Array(_));
+    if is_list(old) || is_list(new) {
+        let (Some(o), Some(n)) = (list_of(old), list_of(new)) else {
+            return format!("{key} changed");
+        };
+        let mut out = key.to_string();
+        for v in n.iter().filter(|v| !o.contains(v)) {
+            out.push_str(&format!(" +{}", show_value(v)));
+        }
+        for v in o.iter().filter(|v| !n.contains(v)) {
+            out.push_str(&format!(" -{}", show_value(v)));
+        }
+        return out;
+    }
+    match (old, new) {
+        (Value::Object(_), _) | (_, Value::Object(_)) => format!("{key} changed"),
+        (o, n) => format!("{key}: {} -> {}", show_value(o), show_value(n)),
+    }
+}
+
+/// A change to the settings, for the log: who, the version it made, and each
+/// setting that differs. The paired centers are a list, so one is looked into
+/// by its name; a center that came or went is told by its name alone.
+fn describe_change(by: &str, version: u64, changes: &[Change]) -> String {
+    let named = |v: &Value| -> std::collections::BTreeMap<String, Value> {
+        v.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|c| Some((c.get("name")?.as_str()?.to_string(), c.clone())))
+            .collect()
+    };
+    let mut told = Vec::new();
+    for c in changes {
+        if c.key != "center" {
+            told.push(describe_leaf(&c.key, &c.old, &c.new));
+            continue;
+        }
+        let (old, new) = (named(&c.old), named(&c.new));
+        for (name, n) in &new {
+            match old.get(name) {
+                None => told.push(format!("center {name} was added")),
+                Some(o) => {
+                    for d in diff(o, n) {
+                        told.push(describe_leaf(
+                            &format!("center.{name}.{}", d.key),
+                            &d.old,
+                            &d.new,
+                        ));
+                    }
+                }
+            }
+        }
+        for name in old.keys().filter(|n| !new.contains_key(*n)) {
+            told.push(format!("center {name} was removed"));
+        }
+    }
+    format!(
+        "settings changed by {by} (version {version}): {}",
+        told.join("; ")
+    )
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -662,5 +797,102 @@ mod tests {
         assert!(Daemon::start(opts).await.is_err());
         daemon.stop().await;
         assert!(!paths.ctl_socket().exists());
+    }
+}
+
+#[cfg(test)]
+mod change_tests {
+    use super::*;
+
+    /// What the log says when `old` becomes `new`, as the settings store
+    /// would report it.
+    fn told(old: &str, new: &str) -> String {
+        let json = |t: &str| {
+            let mut v = serde_json::to_value(NodeConfig::parse(t).unwrap()).unwrap();
+            v.as_object_mut().unwrap().remove("version");
+            v
+        };
+        describe_change("local", 7, &diff(&json(old), &json(new)))
+    }
+
+    const CENTER: &str = r#"
+[[center]]
+name = "lab"
+url = "https://lab.example:7443"
+pin = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+center_id = "c1"
+node_id = "n1"
+"#;
+
+    #[test]
+    fn a_change_to_the_settings_is_told_by_what_changed() {
+        let with = |policy: &str| format!("{CENTER}[center.policy]\n{policy}\n");
+        // A plain value, both ways round.
+        assert_eq!(
+            told(&with("mode = \"allowlist\""), &with("mode = \"folder\"")),
+            "settings changed by local (version 7): center.lab.policy.mode: allowlist -> folder"
+        );
+        // A list says what it gained and lost; an empty list is not in the file.
+        assert_eq!(
+            told(&with(""), &with("allow = [\"fs.read:~/notes/*\"]")),
+            "settings changed by local (version 7): center.lab.policy.allow +fs.read:~/notes/*"
+        );
+        assert_eq!(
+            told(
+                &with("allow = [\"a\", \"b\"]"),
+                &with("allow = [\"b\", \"c\"]")
+            ),
+            "settings changed by local (version 7): center.lab.policy.allow +c -a"
+        );
+        assert_eq!(
+            told(&with("deny = [\"x\"]"), &with("")),
+            "settings changed by local (version 7): center.lab.policy.deny -x"
+        );
+        // Several at once, and a machine setting.
+        assert_eq!(
+            told(
+                &format!("{CENTER}[machine]\nsudo = \"off\"\n"),
+                &format!("[machine]\nsudo = \"on\"\n{CENTER}[center.policy]\nuntil = 5\n")
+            ),
+            "settings changed by local (version 7): center.lab.policy.until: unset -> 5; machine.sudo: off -> on"
+        );
+    }
+
+    #[test]
+    fn a_center_that_comes_or_goes_is_named_and_nothing_else_of_it() {
+        assert_eq!(
+            told("", CENTER),
+            "settings changed by local (version 7): center lab was added"
+        );
+        assert_eq!(
+            told(CENTER, ""),
+            "settings changed by local (version 7): center lab was removed"
+        );
+        let text = told(CENTER, &CENTER.replace("c1", "c2").replace("AAAA", "BBBB"));
+        // Its id and pin are told as changed, never shown.
+        assert_eq!(
+            text,
+            "settings changed by local (version 7): center.lab.center_id changed; center.lab.pin changed"
+        );
+    }
+
+    #[test]
+    fn the_proxy_is_never_shown() {
+        let a = "[connection]\nproxy = \"http://one.example:3128\"\nheaders = [\"X-Key\"]\n";
+        let b = "[connection]\nproxy = \"http://two.example:3128\"\nheaders = [\"X-Other\"]\n";
+        let text = told(a, b);
+        assert_eq!(
+            text,
+            "settings changed by local (version 7): connection.headers changed; connection.proxy changed"
+        );
+        assert!(!text.contains("example") && !text.contains("X-"), "{text}");
+    }
+
+    #[test]
+    fn a_long_value_is_cut() {
+        let long = "x".repeat(300);
+        let text = describe_leaf("a.b", &Value::Null, &Value::String(long));
+        assert_eq!(text.chars().count(), "a.b: unset -> ".len() + 81);
+        assert!(text.ends_with('…'));
     }
 }

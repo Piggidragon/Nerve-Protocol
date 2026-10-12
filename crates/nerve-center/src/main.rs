@@ -1,16 +1,13 @@
 //! `nerve-center`: started by a harness from its MCP configuration. Logs go to
-//! stderr only, since stdout carries MCP.
+//! stderr and to the log file in the state folder, never to stdout, which
+//! carries MCP.
 
 use clap::Parser;
 
 fn main() -> std::process::ExitCode {
     let args = nerve_center::config::Args::parse();
-    let level: tracing::Level = args.log.parse().unwrap_or(tracing::Level::INFO);
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .with_max_level(level)
-        .init();
+    // The level of the settings replaces this one once the state is opened.
+    nerve_transport::log::install(args.log.unwrap_or_default(), true);
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
@@ -22,7 +19,6 @@ fn main() -> std::process::ExitCode {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!("{e}");
-            eprintln!("nerve-center: {e}");
             std::process::ExitCode::FAILURE
         }
     }

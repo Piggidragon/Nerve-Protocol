@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use nerve_transport::keys::MacKey;
 use serde_json::Value;
 
-use crate::audit::{AuditLog, diff};
+use crate::audit::{AuditLog, Change, diff};
 use crate::config::{
     Access, CapSetting, CenterDocument, Folder, NodeConfig, ProtectedOptions, SettingsGrant, Sudo,
 };
@@ -112,11 +112,16 @@ fn read_file(path: &Path) -> Result<Option<String>, String> {
     }
 }
 
+/// Told of each change to the settings: who made it, the new version and the
+/// leaves that differ.
+type Observer = Box<dyn Fn(&str, u64, &[Change]) + Send>;
+
 pub struct SettingsStore {
     path: PathBuf,
     key: MacKey,
     audit: AuditLog,
     config: NodeConfig,
+    observer: Option<Observer>,
 }
 
 impl SettingsStore {
@@ -138,6 +143,7 @@ impl SettingsStore {
             key,
             audit,
             config: NodeConfig::default(),
+            observer: None,
         };
         let Some(text) = text else {
             return Ok(s);
@@ -169,6 +175,7 @@ impl SettingsStore {
             key: MacKey::load_or_create(key_path.as_ref())?,
             audit,
             config: NodeConfig::default(),
+            observer: None,
         };
         let v = s.accept().map_err(|e| e.to_string())?;
         Ok((s, v))
@@ -204,6 +211,23 @@ impl SettingsStore {
 
     pub fn audit(&self) -> &AuditLog {
         &self.audit
+    }
+
+    /// Calls `f` after every change the store writes (not after bookkeeping
+    /// the node sets itself). The daemon logs them; the CLI, which opens the
+    /// store for one command, has no observer.
+    pub fn on_change(&mut self, f: impl Fn(&str, u64, &[Change]) + Send + 'static) {
+        self.observer = Some(Box::new(f));
+    }
+
+    /// Audits a change that was saved and tells the observer.
+    fn changed(&self, by: &str, version: u64, changes: &[Change]) {
+        // The change is saved; an audit log that cannot be written is no
+        // reason to undo it.
+        let _ = self.audit.settings(by, version, changes);
+        if let Some(f) = &self.observer {
+            f(by, version, changes);
+        }
     }
 
     pub fn config(&self) -> &NodeConfig {
@@ -250,9 +274,7 @@ impl SettingsStore {
         let _ = self
             .audit
             .config("accepted", &self.path, "the owner took the file as it was");
-        let _ = self
-            .audit
-            .settings(&Writer::Local.label(), version, &changes);
+        self.changed(&Writer::Local.label(), version, &changes);
         Ok(version)
     }
 
@@ -396,9 +418,7 @@ impl SettingsStore {
         let changes = diff(&to_json(&self.config), &to_json(&new));
         let version = new.version;
         self.config = new;
-        // The change is saved; an audit log that cannot be written is logged
-        // by the caller's tracing, not a reason to undo it.
-        let _ = self.audit.settings(&by.label(), version, &changes);
+        self.changed(&by.label(), version, &changes);
         Ok(version)
     }
 }
@@ -552,6 +572,63 @@ mod tests {
         })
         .unwrap();
         s
+    }
+
+    /// The daemon hangs its log on this: each saved change is reported with
+    /// who made it, the version and what differs; a change that is not
+    /// saved, and one that changes nothing, is not.
+    #[test]
+    fn an_observer_hears_of_each_saved_change() {
+        use std::sync::{Arc, Mutex};
+        let d = tempfile::tempdir().unwrap();
+        let mut s = store(d.path(), SettingsGrant::Write);
+        type Heard = (String, u64, Vec<String>);
+        let heard: Arc<Mutex<Vec<Heard>>> = Arc::default();
+        let sink = heard.clone();
+        s.on_change(move |by, version, changes| {
+            let keys = changes.iter().map(|c| c.key.clone()).collect();
+            sink.lock().unwrap().push((by.to_string(), version, keys));
+        });
+        let before = s.version();
+        s.update(|c| {
+            c.log.level = nerve_transport::log::Level::Debug;
+            Ok(())
+        })
+        .unwrap();
+        // The same again changes nothing and is not reported.
+        s.update(|c| {
+            c.log.level = nerve_transport::log::Level::Debug;
+            Ok(())
+        })
+        .unwrap();
+        let mut doc = serde_json::to_value(s.center_document("home").unwrap()).unwrap();
+        doc["policy"]["allow"] = json!(["fs.read:/tmp/x"]);
+        s.set_center_document("home", doc, s.version(), |_| false, unix)
+            .unwrap();
+        // A refused write is not a change.
+        let stale = serde_json::to_value(s.center_document("home").unwrap()).unwrap();
+        assert!(
+            s.set_center_document("home", stale, 1, |_| false, unix)
+                .is_err()
+        );
+        s.set_sudo(Writer::Local, Sudo::Off).unwrap();
+        s.mark(|c| c.centers[0].revoked = true).unwrap();
+        let heard = heard.lock().unwrap();
+        assert_eq!(
+            *heard,
+            [
+                (
+                    "local".to_string(),
+                    before + 1,
+                    vec!["log.level".to_string()]
+                ),
+                (
+                    "center home".to_string(),
+                    before + 2,
+                    vec!["center".to_string()]
+                ),
+            ]
+        );
     }
 
     /// The protected list of a Unix node at `/home/u`.

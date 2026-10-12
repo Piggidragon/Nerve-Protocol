@@ -60,11 +60,11 @@ through its control socket.
 | Where | What |
 |---|---|
 | Config folder | `node.toml`, signed. `keys/<name>.key`, one Ed25519 key per center, mode 0600 |
-| State folder | `audit.jsonl`, `run/ctl.sock`, `config.key` (the key of the config's MAC) |
+| State folder | `audit.jsonl`, `log.jsonl`, `run/ctl.sock`, `config.key` (the key of the config's MAC) |
 
 No call of any center reaches these two folders. See
-[settings and config](settings-and-config.md). The center keeps `tls.pem` and
-`state.json` in its state folder.
+[settings and config](settings-and-config.md). The center keeps `tls.pem`,
+`state.json` and `log.jsonl` in its state folder ([logging](logging.md)).
 
 ## Repo layout
 

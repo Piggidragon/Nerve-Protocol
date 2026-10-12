@@ -10,11 +10,9 @@ fn main() {
     {
         std::process::exit(nerve_sandbox::shim_main());
     }
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_max_level(tracing::Level::INFO)
-        .with_target(false)
-        .init();
+    // Events go to stderr. The daemon adds the log file in the state folder and
+    // takes its level from `node.toml`.
+    nerve_transport::log::install(nerve_transport::log::Level::Info, true);
     let cli = nerve_node::cli::Cli::parse();
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()

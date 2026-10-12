@@ -2,7 +2,7 @@
 //! to nodes, the audit feed and the statistics. The MCP server, the node listener and the web UI are thin
 //! layers over this.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -14,6 +14,7 @@ use tokio::sync::broadcast;
 use nerve_proto::link::{CenterUrl, PairLink, PairRequest, PairResponse};
 use nerve_proto::msg::{self, ByeReason, Event, Hello};
 use nerve_proto::{Descriptor, ErrorCode, Exposure, RpcError};
+use nerve_transport::log::{Level, Log, Query, call_line};
 use nerve_transport::tls::ServerIdentity;
 
 use crate::audit::AuditFeed;
@@ -44,6 +45,11 @@ pub struct Options {
     pub name: Option<String>,
     /// The URL nodes reach the center at, put into pairing links.
     pub public_url: String,
+    /// The log to write to: the process's (`nerve_transport::log::install`),
+    /// else one of the center's own. The center attaches its file to it.
+    pub log: Option<Arc<Log>>,
+    /// The level from `--log`, which wins over the stored one for this run.
+    pub log_level: Option<Level>,
 }
 
 #[derive(Clone)]
@@ -62,6 +68,38 @@ pub struct Inner {
     audit: Mutex<AuditFeed>,
     alerts: Mutex<VecDeque<Value>>,
     sessions: Mutex<BTreeMap<String, Arc<Session>>>,
+    log: Arc<Log>,
+    /// `--log` was given, so the level in the settings does not hold at the
+    /// next start.
+    log_level_pinned: bool,
+    /// When each node's last link ended, for the wait before the next one.
+    down: Mutex<HashMap<String, Instant>>,
+    /// Failed pairings, logged now and then (they need no secret to make).
+    pair_log: Mutex<Quiet>,
+    /// How long a link may be silent, in milliseconds.
+    dead_after_ms: AtomicU64,
+}
+
+/// A line that may repeat: logged at most once in `QUIET_FOR`, with the count
+/// of those left out since.
+#[derive(Default)]
+struct Quiet {
+    last: Option<Instant>,
+    skipped: u32,
+}
+
+const QUIET_FOR: Duration = Duration::from_secs(10);
+
+impl Quiet {
+    /// Whether to log now, and how many were left out before.
+    fn take(&mut self, now: Instant) -> Option<u32> {
+        if self.last.is_some_and(|t| now.duration_since(t) < QUIET_FOR) {
+            self.skipped += 1;
+            return None;
+        }
+        self.last = Some(now);
+        Some(std::mem::take(&mut self.skipped))
+    }
 }
 
 /// One harness session: an MCP client (stdio, an attached process, or an
@@ -179,6 +217,16 @@ impl Center {
         store
             .save(&dir)
             .map_err(|e| format!("cannot write the state file: {e}"))?;
+        let log = opts.log.unwrap_or_else(|| Log::new(Level::default()));
+        log.set_level(opts.log_level.unwrap_or(store.log_level));
+        // A log that cannot be written is no reason not to run: the window
+        // and stderr still work.
+        if let Err(e) = log.attach_file(nerve_transport::log::file_in(&dir)) {
+            eprintln!(
+                "cannot open the log {}: {e}",
+                nerve_transport::log::file_in(&dir).display()
+            );
+        }
         let pin = public_url.tls.then(|| identity.pin());
         let (changes, _) = broadcast::channel(64);
         Ok(Center(Arc::new(Inner {
@@ -194,11 +242,105 @@ impl Center {
             audit: Mutex::new(AuditFeed::default()),
             alerts: Mutex::new(VecDeque::new()),
             sessions: Mutex::new(BTreeMap::new()),
+            log,
+            log_level_pinned: opts.log_level.is_some(),
+            down: Mutex::new(HashMap::new()),
+            pair_log: Mutex::new(Quiet::default()),
+            dead_after_ms: AtomicU64::new(crate::link::DEAD_AFTER.as_millis() as u64),
         })))
     }
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// The log (docs/user/logs.md): what the web UI shows and the file holds.
+    pub fn log(&self) -> &Arc<Log> {
+        &self.log
+    }
+
+    /// Logs `msg`, about the node `node_id` when one is given. Never called
+    /// with the state locked: it reads the node's name from it.
+    pub fn note(&self, level: Level, node_id: Option<&str>, msg: impl AsRef<str>) {
+        // A node that is gone from the state is named by its id.
+        let name = node_id.map(|id| match self.node_name(id) {
+            n if n.is_empty() => id.to_string(),
+            n => n,
+        });
+        let who = node_id.zip(name.as_deref()).map(|(id, n)| (n, id));
+        self.log.record(level, who, msg.as_ref());
+    }
+
+    /// How long a link may send nothing before it is closed (spec §4.4).
+    pub fn dead_after(&self) -> Duration {
+        Duration::from_millis(self.dead_after_ms.load(Ordering::Relaxed))
+    }
+
+    /// Shortens the silence a link may keep, so that a test need not wait
+    /// 45 s for the center to give up on a node that went quiet.
+    #[doc(hidden)]
+    pub fn set_dead_after(&self, d: Duration) {
+        self.dead_after_ms
+            .store(d.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Whether the `--log` flag was given, so that the level in the settings
+    /// does not hold at the next start.
+    pub fn log_level_pinned(&self) -> bool {
+        self.log_level_pinned
+    }
+
+    /// Sets the level from now on and keeps it for the next start.
+    pub fn set_log_level(&self, level: Level) {
+        if self.read(|s| s.log_level) != level {
+            self.update(|s| s.log_level = level);
+        }
+        let old = self.log.level();
+        if old == level {
+            return;
+        }
+        // Said at a level that both the old and the new setting keep.
+        let wide = old.max(level);
+        self.log.set_level(wide);
+        self.log.record(
+            wide.min(Level::Info),
+            None,
+            &format!("the log level changes from {old} to {level}"),
+        );
+        self.log.set_level(level);
+    }
+
+    /// What the log view shows: the entries `q` asks for, newest first, the
+    /// nodes that can be picked, and the level the log is kept at.
+    pub fn log_json(&self, q: &Query) -> Value {
+        let entries: Vec<Value> = self
+            .log
+            .entries(q)
+            .into_iter()
+            .map(|(seq, e)| {
+                let mut v = serde_json::to_value(&e).unwrap_or_default();
+                v["seq"] = json!(seq);
+                v
+            })
+            .collect();
+        // Every paired node, and those only the log remembers.
+        let mut nodes: Vec<Value> = self.read(|s| {
+            s.nodes
+                .values()
+                .map(|n| json!({"id": n.id, "name": n.name, "paired": true}))
+                .collect()
+        });
+        for (id, name) in self.log.nodes() {
+            if !nodes.iter().any(|n| n["id"] == id.as_str()) {
+                nodes.push(json!({"id": id, "name": name, "paired": false}));
+            }
+        }
+        json!({
+            "level": self.log.level(),
+            "entries": entries,
+            "nodes": nodes,
+            "file": self.log.file_path().is_some(),
+        })
     }
 
     pub fn id(&self) -> String {
@@ -230,7 +372,11 @@ impl Center {
         let mut s = self.store.lock().unwrap();
         let out = f(&mut s);
         if let Err(e) = s.save(&self.dir) {
-            tracing::error!("cannot write the state file: {e}");
+            self.log.record(
+                Level::Error,
+                None,
+                &format!("cannot write the state file: {e}"),
+            );
         }
         self.dirty.store(false, Ordering::SeqCst);
         out
@@ -252,7 +398,11 @@ impl Center {
             let mut s = self.store.lock().unwrap();
             s.prune_stats(now_ms());
             if let Err(e) = s.save(&self.dir) {
-                tracing::error!("cannot write the state file: {e}");
+                self.log.record(
+                    Level::Error,
+                    None,
+                    &format!("cannot write the state file: {e}"),
+                );
             }
         }
     }
@@ -280,6 +430,15 @@ impl Center {
     pub fn new_pairing(&self) -> Value {
         let ttl = Duration::from_secs(u64::from(self.read(|st| st.pair_code_minutes)) * 60);
         let code = self.codes.lock().unwrap().create(Instant::now(), ttl);
+        // The code is a secret until it is used, so it is not logged.
+        self.log.record(
+            Level::Info,
+            None,
+            &format!(
+                "a pairing code was made; it is valid for {}",
+                util::span(ttl)
+            ),
+        );
         let link = PairLink {
             center: self.public_url.clone(),
             code: code.clone(),
@@ -296,7 +455,16 @@ impl Center {
 
     /// Answers `POST /nerve/v0/pair`: the status and the body.
     pub fn pair(&self, body: &[u8]) -> (u16, Value) {
-        let err = |s: u16, m: &str| (s, json!({ "error": m }));
+        // A request without a code that works costs nothing to make, so a
+        // refusal before the code is checked is detail, not news.
+        let err = |s: u16, m: &str| {
+            self.log.record(
+                Level::Debug,
+                None,
+                &format!("a pairing request was refused ({s}): {m}"),
+            );
+            (s, json!({ "error": m }))
+        };
         let req: PairRequest = match serde_json::from_slice(body) {
             Ok(r) => r,
             Err(e) => return err(400, &format!("bad pairing request: {e}")),
@@ -324,9 +492,26 @@ impl Center {
         // Taken out in the same step as the check: the code is used up from
         // here on, and given back only if this pairing fails.
         let Ok(taken) = self.codes.lock().unwrap().take(&req.code, now) else {
-            return err(
+            // Anyone who reaches the port can send these; one line now and
+            // then says it happens.
+            let quiet = self.pair_log.lock().unwrap().take(now);
+            if let Some(more) = quiet {
+                let also = if more > 0 {
+                    format!(" ({more} more since the last line)")
+                } else {
+                    String::new()
+                };
+                self.log.record(
+                    Level::Warn,
+                    None,
+                    &format!(
+                        "pairing refused: the code is unknown, used, expired or out of tries{also}"
+                    ),
+                );
+            }
+            return (
                 403,
-                "the pairing code is unknown, used, expired or out of tries",
+                json!({ "error": "the pairing code is unknown, used, expired or out of tries" }),
             );
         };
         let node_id = nerve_transport::keys::node_id(&pk);
@@ -362,13 +547,25 @@ impl Center {
         });
         match out {
             Ok(resp) => {
-                tracing::info!(node = %node_id, name = %req.name, "a node paired");
+                self.log.record(
+                    Level::Info,
+                    Some((&req.name, &node_id)),
+                    &format!(
+                        "the node paired ({}/{}); its code is used up",
+                        req.platform, req.arch
+                    ),
+                );
                 self.changed(Change::Nodes);
                 (200, serde_json::to_value(resp).unwrap_or_default())
             }
             Err(why) => {
                 self.codes.lock().unwrap().fail(taken);
-                err(409, why)
+                self.log.record(
+                    Level::Warn,
+                    None,
+                    &format!("pairing refused for the name {}: {why}", req.name),
+                );
+                (409, json!({ "error": why }))
             }
         }
     }
@@ -379,14 +576,18 @@ impl Center {
         if !nerve_proto::valid_node_name(name) {
             return Err("a node name is 1 to 32 characters of a-z, 0-9 and -".into());
         }
-        self.update(|s| {
+        let old = self.update(|s| {
             if s.nodes.values().any(|n| n.name == name && n.id != node_id) {
                 return Err("another node already has this name".to_string());
             }
             let n = s.nodes.get_mut(node_id).ok_or("no such node")?;
-            n.name = name.to_string();
-            Ok(())
+            Ok(std::mem::replace(&mut n.name, name.to_string()))
         })?;
+        self.note(
+            Level::Info,
+            Some(node_id),
+            format!("the node was renamed from {old}"),
+        );
         self.changed(Change::Nodes);
         self.changed(Change::Tools);
         Ok(())
@@ -399,6 +600,15 @@ impl Center {
             s.nodes.get_mut(node_id).ok_or("no such node")?.disabled = disabled;
             Ok::<(), String>(())
         })?;
+        self.note(
+            Level::Info,
+            Some(node_id),
+            if disabled {
+                "the node was disabled: the agent gets none of its tools and calls to it are refused"
+            } else {
+                "the node was enabled"
+            },
+        );
         self.changed(Change::Nodes);
         self.changed(Change::Tools);
         Ok(())
@@ -413,25 +623,32 @@ impl Center {
         if let Some(l) = link {
             l.bye(ByeReason::Revoked).await;
         }
-        self.forget(node_id);
+        self.forget(node_id, "removed by the owner; its link got bye revoked");
         Ok(())
     }
 
-    /// Drops a node's record (a remove, or the node's `bye unpaired`).
-    pub fn forget(&self, node_id: &str) {
+    /// Drops a node's record (a remove, or the node's `bye unpaired`); `why`
+    /// goes to the log.
+    pub fn forget(&self, node_id: &str, why: &str) {
+        let name = self.node_name(node_id);
         let had = self.update(|s| {
             s.stats.remove(node_id);
             s.nodes.remove(node_id).is_some()
         });
         if had {
-            tracing::info!(node = %node_id, "the node is no longer paired");
+            self.down.lock().unwrap().remove(node_id);
+            self.log.record(
+                Level::Info,
+                Some((&name, node_id)),
+                &format!("the node is no longer paired: {why}"),
+            );
             self.changed(Change::Nodes);
             self.changed(Change::Tools);
         }
     }
 
     pub fn alert(&self, node_id: &str, text: &str) {
-        tracing::warn!(node = %node_id, "{text}");
+        self.note(Level::Warn, Some(node_id), text);
         let mut a = self.alerts.lock().unwrap();
         a.push_back(json!({"ts": now_ms(), "node": node_id, "text": text}));
         while a.len() > ALERTS_KEEP {
@@ -456,7 +673,15 @@ impl Center {
             }
             s.day(&id, now).links += 1;
         });
-        tracing::info!(node = %id, software = %hello.software.version, "a node link is up");
+        let again = match self.down.lock().unwrap().remove(&id) {
+            Some(t) => format!(" again after {}", util::span(t.elapsed())),
+            None => String::new(),
+        };
+        self.note(
+            Level::Info,
+            Some(&id),
+            format!("link up{again} (node software {})", hello.software.version),
+        );
         self.changed(Change::Nodes);
         let c = self.clone();
         tokio::spawn(async move {
@@ -478,7 +703,10 @@ impl Center {
         });
     }
 
-    pub(crate) fn link_down(&self, link: &Arc<Link>, clean: bool) {
+    /// A link ended. `clean` is whether the node said bye; `why` is what ended
+    /// it, for the log. `silent` is how long nothing had come from the node,
+    /// which the wait before its next link counts from.
+    pub(crate) fn link_down(&self, link: &Arc<Link>, clean: bool, why: &str, silent: Duration) {
         let id = &link.node_id;
         {
             let mut links = self.links.lock().unwrap();
@@ -500,7 +728,23 @@ impl Center {
                 }
             }
         });
-        tracing::info!(node = %id, clean, "a node link ended");
+        let gone = Instant::now()
+            .checked_sub(silent)
+            .unwrap_or_else(Instant::now);
+        self.down.lock().unwrap().insert(id.clone(), gone);
+        let (level, verb) = if clean {
+            (Level::Info, "closed")
+        } else {
+            (Level::Warn, "dropped")
+        };
+        self.note(
+            level,
+            Some(id),
+            format!(
+                "link {verb}: {why} (it was up for {})",
+                util::span(link.since.elapsed())
+            ),
+        );
         self.changed(Change::Nodes);
     }
 
@@ -517,7 +761,11 @@ impl Center {
             Ok(v) => match serde_json::from_value::<Descriptor>(v) {
                 Ok(d) if d.check_names().is_err() => {
                     let e = d.check_names().unwrap_err();
-                    tracing::warn!(node = %link.node_id, "the node sent a descriptor with a bad name, so the center ignores it: {e}")
+                    self.note(
+                        Level::Warn,
+                        Some(&link.node_id),
+                        format!("the node sent a description with a bad name, so the center ignores it: {e}"),
+                    );
                 }
                 Ok(d) => {
                     self.update(|s| {
@@ -528,11 +776,22 @@ impl Center {
                     self.changed(Change::Tools);
                     self.changed(Change::Nodes);
                 }
-                Err(e) => {
-                    tracing::warn!(node = %link.node_id, "the node sent a descriptor the center cannot read: {e}")
-                }
+                Err(e) => self.note(
+                    Level::Warn,
+                    Some(&link.node_id),
+                    format!("the node sent a description the center cannot read: {e}"),
+                ),
             },
-            Err(e) => tracing::warn!(node = %link.node_id, "describe failed: {}", e.message),
+            // A link that ended meanwhile says so on its own.
+            Err(e) => self.note(
+                if e.kind() == ErrorCode::ConnectionLost {
+                    Level::Debug
+                } else {
+                    Level::Warn
+                },
+                Some(&link.node_id),
+                format!("asking the node for its description failed: {}", e.message),
+            ),
         }
     }
 
@@ -540,6 +799,11 @@ impl Center {
         let node = link.node_id.clone();
         match (ev.cap.as_str(), ev.name.as_str()) {
             ("node", "descriptor_changed" | "capability_changed") => {
+                self.note(
+                    Level::Debug,
+                    Some(&node),
+                    "the node's description changed; fetching it again",
+                );
                 let c = self.clone();
                 let l = link.clone();
                 tokio::spawn(async move { c.refresh(&l).await });
@@ -556,9 +820,25 @@ impl Center {
                         n.going_away = Some(util::clip(&why, 200));
                     }
                 });
+                self.note(
+                    Level::Info,
+                    Some(&node),
+                    format!("the node is going away: {}", util::clip(&why, 200)),
+                );
                 self.changed(Change::Nodes);
             }
-            ("settings", "changed") => self.changed(Change::Nodes),
+            ("settings", "changed") => {
+                let version = ev.data.get("version").and_then(Value::as_u64);
+                self.note(
+                    Level::Info,
+                    Some(&node),
+                    match version {
+                        Some(v) => format!("the node's settings changed (version {v})"),
+                        None => "the node's settings changed".to_string(),
+                    },
+                );
+                self.changed(Change::Nodes);
+            }
             ("audit", "decision") => {
                 let name = self.node_name(&node);
                 let mut e = ev.data.clone();
@@ -675,6 +955,11 @@ impl Center {
             .lock()
             .unwrap()
             .insert(s.id.clone(), s.clone());
+        self.log.record(
+            Level::Info,
+            None,
+            &format!("a harness session started over {transport} ({})", s.id),
+        );
         self.changed(Change::Sessions);
         s
     }
@@ -689,6 +974,15 @@ impl Center {
             return false;
         };
         s.ended.store(true, Ordering::SeqCst);
+        self.log.record(
+            Level::Info,
+            None,
+            &format!(
+                "the harness session {} ended after {} calls",
+                s.id,
+                s.calls.load(Ordering::SeqCst)
+            ),
+        );
         let nodes: Vec<String> = s.nodes.lock().unwrap().iter().cloned().collect();
         for n in nodes {
             if let Some(l) = self.link(&n) {
@@ -751,6 +1045,17 @@ impl Center {
         document: Value,
         if_version: Value,
     ) -> Result<Value, RpcError> {
+        let r = self.send_settings(node_id, document, if_version).await;
+        self.log_change(node_id, "settings saved", "save the settings", &r);
+        r
+    }
+
+    async fn send_settings(
+        &self,
+        node_id: &str,
+        document: Value,
+        if_version: Value,
+    ) -> Result<Value, RpcError> {
         let link = self
             .link(node_id)
             .ok_or_else(|| RpcError::new(ErrorCode::Unavailable, "the node is offline"))?;
@@ -760,6 +1065,33 @@ impl Center {
             Some(SHORT_CALL),
         )
         .await
+    }
+
+    /// Logs what a change to a node's settings from the web UI came to: `done`
+    /// when the node took it, else that it refused to `wanted`.
+    fn log_change(&self, node_id: &str, done: &str, wanted: &str, r: &Result<Value, RpcError>) {
+        match r {
+            Ok(v) => {
+                let version = v
+                    .get("version")
+                    .map(|v| format!(" (version {v})"))
+                    .unwrap_or_default();
+                self.note(
+                    Level::Info,
+                    Some(node_id),
+                    format!("{done} from the web UI{version}"),
+                );
+            }
+            Err(e) => self.note(
+                Level::Warn,
+                Some(node_id),
+                format!(
+                    "the node did not {wanted} from the web UI ({}): {}",
+                    e.kind().as_str(),
+                    util::clip(&e.message, 300)
+                ),
+            ),
+        }
     }
 
     /// A one-shot offer to seal the node's sudo password for (docs/dev/spec/protocol.md
@@ -808,12 +1140,21 @@ impl Center {
         if let Some(sealed) = sealed {
             args["sealed"] = sealed;
         }
-        link.call(
-            msg::method::INVOKE,
-            json!({"cap": "settings", "action": "sudo", "args": args, "ctx": {}}),
-            Some(SHORT_CALL),
-        )
-        .await
+        let r = link
+            .call(
+                msg::method::INVOKE,
+                json!({"cap": "settings", "action": "sudo", "args": args, "ctx": {}}),
+                Some(SHORT_CALL),
+            )
+            .await;
+        // The password is sealed for the node; the center never sees it.
+        let (done, wanted) = if on {
+            ("sudo switched on", "switch sudo on")
+        } else {
+            ("sudo switched off", "switch sudo off")
+        };
+        self.log_change(node_id, done, wanted, &r);
+        r
     }
 
     /// Adds `rule` to one list of this center's policy on the node, from the
@@ -826,7 +1167,15 @@ impl Center {
         let mut doc = cur.get("document").cloned().unwrap_or_else(|| json!({}));
         let version = cur.get("version").cloned().unwrap_or(Value::Null);
         put_rule(&mut doc, key, rule)?;
-        self.set_node_settings(node_id, doc, version).await
+        let r = self.send_settings(node_id, doc, version).await;
+        let done = format!("rule added to the {list} list ({rule})");
+        self.log_change(
+            node_id,
+            &done,
+            &format!("add a rule to the {list} list"),
+            &r,
+        );
+        r
     }
 
     // ---- Calls ----
@@ -846,6 +1195,10 @@ impl Center {
             Ok(_) => None,
             Err(CallError::Rpc(e)) => Some(e.kind().as_str().to_string()),
         };
+        // A call that worked is in the node's audit log, not here.
+        if let Err(CallError::Rpc(e)) = &out {
+            self.log_failed_call(route, e, started.elapsed());
+        }
         self.update_soon(|s| {
             if !s.nodes.contains_key(&route.node_id) {
                 return;
@@ -912,13 +1265,57 @@ impl Center {
         .map_err(CallError::Rpc)
     }
 
+    /// Logs a call that was refused or that failed, with the reason.
+    fn log_failed_call(&self, route: &Route, e: &RpcError, took: Duration) {
+        // A node the owner switched off answers `unavailable`.
+        let disabled_here = e.kind() == ErrorCode::Unavailable
+            && self.read(|s| s.nodes.get(&route.node_id).is_some_and(|n| n.disabled));
+        let what = format!("{}.{}", route.cap, route.action);
+        let (level, line) = call_line(&what, e, took, disabled_here);
+        self.note(level, Some(&route.node_id), line);
+    }
+
     /// Closes every link with `bye shutdown`.
     pub async fn shutdown(&self) {
         let links: Vec<Arc<Link>> = self.links.lock().unwrap().values().cloned().collect();
+        self.log.record(
+            Level::Info,
+            None,
+            &format!(
+                "the center is stopping; closing {}",
+                plural(links.len() as u32, "node link")
+            ),
+        );
         for l in links {
             l.bye(ByeReason::Shutdown).await;
         }
         self.flush();
+    }
+
+    /// Notes the pairing codes that ran out unused. The center calls this now
+    /// and then, so a log line is at most a few seconds behind the expiry.
+    pub fn sweep_codes(&self) {
+        let lost = self.codes.lock().unwrap().sweep(Instant::now());
+        if lost.expired > 0 {
+            self.log.record(
+                Level::Info,
+                None,
+                &format!(
+                    "{} expired without being used",
+                    plural(lost.expired, "pairing code")
+                ),
+            );
+        }
+        if lost.out_of_tries > 0 {
+            self.log.record(
+                Level::Warn,
+                None,
+                &format!(
+                    "{} ran out of tries on wrong codes",
+                    plural(lost.out_of_tries, "pairing code")
+                ),
+            );
+        }
     }
 
     /// Statistics: per node (summed over the kept days) and in total.
@@ -941,6 +1338,14 @@ impl Center {
             }
             json!({"retention_days": s.retention_days, "total": total, "nodes": nodes})
         })
+    }
+}
+
+fn plural(n: u32, one: &str) -> String {
+    if n == 1 {
+        format!("{n} {one}")
+    } else {
+        format!("{n} {one}s")
     }
 }
 
@@ -1018,6 +1423,8 @@ mod tests {
             state_dir: dir.to_path_buf(),
             name: name.map(str::to_string),
             public_url: "http://127.0.0.1:7443".into(),
+            log: None,
+            log_level: None,
         })
         .unwrap()
     }
@@ -1065,6 +1472,283 @@ mod tests {
         assert!(
             statuses.iter().all(|s| matches!(s, 200 | 403)),
             "{statuses:?}"
+        );
+    }
+
+    // ---- The log ----
+
+    use nerve_transport::log::Entry;
+
+    /// Every entry of the log, oldest first.
+    fn lines(c: &Center) -> Vec<Entry> {
+        let all = Query {
+            limit: usize::MAX,
+            ..Query::default()
+        };
+        c.log()
+            .entries(&all)
+            .into_iter()
+            .rev()
+            .map(|(_, e)| e)
+            .collect()
+    }
+
+    fn said(c: &Center, level: Level, part: &str) -> Vec<Entry> {
+        lines(c)
+            .into_iter()
+            .filter(|e| e.level == level && e.msg.contains(part))
+            .collect()
+    }
+
+    fn pair_body(code: &str, name: &str, key: u8) -> Vec<u8> {
+        json!({
+            "code": code, "name": name, "platform": "linux", "arch": "x86_64",
+            "public_key": msg::hex(&[key; 32]),
+        })
+        .to_string()
+        .into_bytes()
+    }
+
+    #[test]
+    fn pairing_is_logged_and_no_code_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        let made = c.new_pairing();
+        let code = made["code"].as_str().unwrap().to_string();
+        let link = made["link"].as_str().unwrap().to_string();
+        // Wrong codes in a row make one line, not one each.
+        for _ in 0..3 {
+            assert_eq!(c.pair(&pair_body("wrongwrong12", "box-1", 1)).0, 403);
+        }
+        assert_eq!(c.pair(&pair_body(&code, "box-1", 7)).0, 200);
+        // A right code that cannot pair: told, with the name that was asked for.
+        let second = c.new_pairing()["code"].as_str().unwrap().to_string();
+        assert_eq!(c.pair(&pair_body(&second, "box-2", 7)).0, 409);
+        let id = nerve_transport::keys::node_id(&[7; 32]);
+
+        assert_eq!(
+            said(
+                &c,
+                Level::Info,
+                "a pairing code was made; it is valid for 10 min"
+            )
+            .len(),
+            2
+        );
+        assert_eq!(
+            said(&c, Level::Warn, "pairing refused: the code is unknown").len(),
+            1
+        );
+        let paired = said(&c, Level::Info, "the node paired (linux/x86_64)");
+        assert_eq!(paired.len(), 1);
+        assert_eq!(paired[0].node.as_deref(), Some("box-1"));
+        assert_eq!(paired[0].node_id.as_deref(), Some(id.as_str()));
+        assert_eq!(
+            said(
+                &c,
+                Level::Warn,
+                "pairing refused for the name box-2: this key is already paired"
+            )
+            .len(),
+            1
+        );
+        // Neither a code, the link that carries one, nor a wrong code is in
+        // the window or in the file.
+        let file = std::fs::read_to_string(dir.path().join("log.jsonl")).unwrap();
+        let window = serde_json::to_string(&lines(&c)).unwrap();
+        for secret in [&code, &second, &link, "wrongwrong12"] {
+            assert!(
+                !file.contains(secret) && !window.contains(secret),
+                "{secret}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_code_that_runs_out_unused_is_logged_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        let short = Duration::from_millis(1);
+        c.codes.lock().unwrap().create(Instant::now(), short);
+        c.codes.lock().unwrap().create(Instant::now(), short);
+        std::thread::sleep(Duration::from_millis(10));
+        c.sweep_codes();
+        c.sweep_codes();
+        let expired = said(&c, Level::Info, "expired without being used");
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].msg, "2 pairing codes expired without being used");
+        // A code taken by wrong tries is a warning.
+        c.codes
+            .lock()
+            .unwrap()
+            .create(Instant::now(), Duration::from_secs(60));
+        for _ in 0..crate::pairing::TRIES {
+            assert_eq!(c.pair(&pair_body("wrongwrong12", "box-1", 1)).0, 403);
+        }
+        c.sweep_codes();
+        assert_eq!(
+            said(
+                &c,
+                Level::Warn,
+                "1 pairing code ran out of tries on wrong codes"
+            )
+            .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn changes_to_a_node_are_logged_under_its_name_and_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        let code = c.new_pairing()["code"].as_str().unwrap().to_string();
+        assert_eq!(c.pair(&pair_body(&code, "box-1", 7)).0, 200);
+        let id = nerve_transport::keys::node_id(&[7; 32]);
+        c.rename(&id, "web-1").unwrap();
+        c.set_disabled(&id, true).unwrap();
+        c.set_disabled(&id, false).unwrap();
+        c.remove(&id).await.unwrap();
+
+        let about: Vec<(Level, Option<String>, String)> = lines(&c)
+            .into_iter()
+            .filter(|e| e.node_id.as_deref() == Some(id.as_str()))
+            .map(|e| (e.level, e.node, e.msg))
+            .collect();
+        let name = |n: &str| Some(n.to_string());
+        assert_eq!(
+            about[1],
+            (
+                Level::Info,
+                name("web-1"),
+                "the node was renamed from box-1".into()
+            )
+        );
+        assert_eq!(about[2].1, name("web-1"));
+        assert!(about[2].2.starts_with("the node was disabled"), "{about:?}");
+        assert_eq!(about[3].2, "the node was enabled");
+        // Removed, it is named as it was.
+        assert_eq!(about.len(), 5);
+        assert_eq!(about[4].1, name("web-1"));
+        assert!(about[4].2.contains("removed by the owner"), "{about:?}");
+        // The log still names a node the center forgot, for the view's list.
+        let v = c.log_json(&Query {
+            limit: 10,
+            ..Query::default()
+        });
+        assert_eq!(
+            v["nodes"],
+            json!([{"id": id, "name": "web-1", "paired": false}])
+        );
+    }
+
+    #[test]
+    fn the_log_level_is_a_setting_and_the_flag_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        // Info unless set; debug is not kept.
+        assert_eq!(c.log().level(), Level::Info);
+        c.log().record(Level::Debug, None, "detail one");
+        assert!(said(&c, Level::Debug, "detail").is_empty());
+        c.set_log_level(Level::Debug);
+        c.log().record(Level::Debug, None, "detail two");
+        assert_eq!(said(&c, Level::Debug, "detail two").len(), 1);
+        assert_eq!(
+            said(&c, Level::Info, "the log level changes from info to debug").len(),
+            1
+        );
+        // It lasts: the next start keeps it.
+        drop(c);
+        let c = open(dir.path(), None);
+        assert_eq!(c.log().level(), Level::Debug);
+        assert!(!c.log_level_pinned());
+        // Lowering is told too, while the old level still keeps it.
+        c.set_log_level(Level::Error);
+        assert_eq!(
+            said(&c, Level::Info, "the log level changes from debug to error").len(),
+            1
+        );
+        c.log().record(Level::Warn, None, "not kept");
+        assert!(said(&c, Level::Warn, "not kept").is_empty());
+        drop(c);
+        // `--log` wins for the run and leaves the stored level as it was.
+        let c = Center::open(Options {
+            state_dir: dir.path().to_path_buf(),
+            name: None,
+            public_url: "http://127.0.0.1:7443".into(),
+            log: None,
+            log_level: Some(Level::Warn),
+        })
+        .unwrap();
+        assert_eq!(c.log().level(), Level::Warn);
+        assert!(c.log_level_pinned());
+        assert_eq!(c.read(|s| s.log_level), Level::Error);
+        // The window is the file's: what an earlier run logged is still there.
+        assert!(!said(&c, Level::Debug, "detail two").is_empty());
+    }
+
+    #[test]
+    fn a_failed_call_says_what_it_was_and_why() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        let code = c.new_pairing()["code"].as_str().unwrap().to_string();
+        assert_eq!(c.pair(&pair_body(&code, "box-1", 7)).0, 200);
+        let id = nerve_transport::keys::node_id(&[7; 32]);
+        let route = Route {
+            node_id: id.clone(),
+            node_name: "box-1".into(),
+            cap: "fs".into(),
+            action: "read".into(),
+            profile: "fs".into(),
+            effect: nerve_proto::Effect::Read,
+        };
+        let took = Duration::from_millis(1500);
+        let refusal = RpcError::forbidden("no allow rule matches /etc/hostname");
+        c.log_failed_call(&route, &refusal, took);
+        c.log_failed_call(
+            &route,
+            &RpcError::new(ErrorCode::Timeout, "the node did not answer in time"),
+            Duration::from_secs(30),
+        );
+        c.log_failed_call(&route, &RpcError::internal("boom"), took);
+        // Not a refusal, though the code is `unavailable`: the owner disabled it.
+        c.set_disabled(&id, true).unwrap();
+        c.log_failed_call(
+            &route,
+            &RpcError::new(
+                ErrorCode::Unavailable,
+                "the node box-1 is disabled in the center",
+            ),
+            took,
+        );
+
+        let got: Vec<(Level, String)> = lines(&c)
+            .into_iter()
+            .filter(|e| e.msg.starts_with("fs.read"))
+            .map(|e| (e.level, e.msg))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (
+                    Level::Info,
+                    "fs.read was refused (forbidden): no allow rule matches /etc/hostname"
+                        .to_string()
+                ),
+                (
+                    Level::Warn,
+                    "fs.read failed (timeout) after 30 s: the node did not answer in time"
+                        .to_string()
+                ),
+                (
+                    Level::Error,
+                    "fs.read failed (internal) after 1 s: boom".to_string()
+                ),
+                (
+                    Level::Info,
+                    "fs.read was refused (unavailable): the node box-1 is disabled in the center"
+                        .to_string()
+                ),
+            ]
         );
     }
 

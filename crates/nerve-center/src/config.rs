@@ -5,6 +5,7 @@
 use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
+use nerve_transport::log::Level;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum McpMode {
@@ -56,9 +57,10 @@ pub struct Args {
     /// secret that logs in to the web UI, besides tokens made in the web UI.
     #[arg(long, env = "NERVE_HARNESS_TOKEN", hide_env_values = true)]
     pub harness_token: Option<String>,
-    /// The log level on stderr (error, warn, info, debug).
-    #[arg(long, env = "NERVE_LOG", default_value = "info")]
-    pub log: String,
+    /// The log level (error, warn, info, debug). Without it the level set in
+    /// the web UI holds, info at first; with it this level holds for this run.
+    #[arg(long, env = "NERVE_LOG")]
+    pub log: Option<Level>,
 }
 
 impl Args {
@@ -134,6 +136,11 @@ mod tests {
         assert!(Args::try_parse_from(["nerve-center", "--ui-password", "x"]).is_err());
         let a = Args::try_parse_from(["nerve-center", "--ui-no-login"]).unwrap();
         assert!(a.ui_no_login);
+        // The level comes from the flag, or else from the settings.
+        assert_eq!(a.log, None);
+        let a = Args::try_parse_from(["nerve-center", "--log", "Debug"]).unwrap();
+        assert_eq!(a.log, Some(Level::Debug));
+        assert!(Args::try_parse_from(["nerve-center", "--log", "loud"]).is_err());
         // No subcommands: anything positional is refused.
         assert!(Args::try_parse_from(["nerve-center", "pair"]).is_err());
         assert!(

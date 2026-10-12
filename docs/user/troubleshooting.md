@@ -4,6 +4,10 @@ Start with `nerve-node status`, `nerve-node center ls` and
 `nerve-node audit --denied` on the machine. The refusal in the audit log is
 the same text the agent saw.
 
+For a link that drops, a pairing that fails or an error, open the center's
+[log](logs.md), in the web UI under **Log** or in `log.jsonl`, and the node's
+`log.jsonl` on the machine. Raise the level to `debug` for more.
+
 ## A call is refused
 
 The agent sees `error forbidden: …` or `error disabled: …`. Every refusal

@@ -41,7 +41,7 @@ Open `http://127.0.0.1:7480` to [pair a machine](pairing.md).
 | `--mcp` | `NERVE_MCP` | `stdio` | `stdio`, `http` or `none` |
 | `--mcp-listen` | `NERVE_MCP_LISTEN` | `127.0.0.1:7481` | Address of the HTTP MCP endpoint |
 | `--harness-token` | `NERVE_HARNESS_TOKEN` | none | A [harness token](harness.md#tokens) |
-| `--log` | `NERVE_LOG` | `info` | `error`, `warn`, `info` or `debug`; logs go to stderr |
+| `--log` | `NERVE_LOG` | the level set in the web UI, `info` at first | `error`, `warn`, `info` or `debug`; wins over the stored level for this run. The [log](logs.md) goes to stderr and to `log.jsonl` |
 
 `nerve-center --help` prints the same list.
 
@@ -86,5 +86,6 @@ In the state folder:
 |---|---|
 | `tls.pem` | The center's key and certificate |
 | `state.json` | Center id and name, paired machines with their public keys and last descriptions, hashed harness tokens, daily statistics |
+| `log.jsonl` | The [log](logs.md): links, pairing, changes, refused and failed calls, errors. `log.jsonl.1` is the older half |
 
 It never stores file contents, command output, arguments or secrets.

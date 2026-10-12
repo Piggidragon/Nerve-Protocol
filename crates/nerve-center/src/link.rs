@@ -15,6 +15,7 @@ use tokio_tungstenite::WebSocketStream;
 use nerve_proto::frame::{Frame, FrameError};
 use nerve_proto::msg::{self, ByeReason, Hello, Limits, method};
 use nerve_proto::{ErrorCode, Id, Message, PROTOCOL_VERSION, RpcError};
+use nerve_transport::log::Level;
 use nerve_transport::net::BoxIo;
 use nerve_transport::ws::WsMessage;
 
@@ -222,16 +223,37 @@ pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String
     }
     let hello = match next_text(&mut ws, HANDSHAKE_STEP).await {
         Some(t) => t,
-        None => return refuse(ws, ByeReason::ProtocolError).await,
+        None => {
+            center.note(
+                Level::Debug,
+                Some(&node_id),
+                "the handshake failed: no hello within 15 s",
+            );
+            return refuse(ws, ByeReason::ProtocolError).await;
+        }
     };
     let hello: Hello = match Message::decode(&hello) {
         Ok(Message::Notification { method: m, params }) if m == method::HELLO => {
             match nerve_proto::rpc::params(&params) {
                 Ok(h) => h,
-                Err(_) => return refuse(ws, ByeReason::ProtocolError).await,
+                Err(_) => {
+                    center.note(
+                        Level::Debug,
+                        Some(&node_id),
+                        "the handshake failed: the hello cannot be read",
+                    );
+                    return refuse(ws, ByeReason::ProtocolError).await;
+                }
             }
         }
-        _ => return refuse(ws, ByeReason::ProtocolError).await,
+        _ => {
+            center.note(
+                Level::Debug,
+                Some(&node_id),
+                "the handshake failed: the first message was not a hello",
+            );
+            return refuse(ws, ByeReason::ProtocolError).await;
+        }
     };
     if hello.node_id != node_id
         || !nerve_transport::keys::verify_connect(
@@ -241,10 +263,22 @@ pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String
             &hello.auth.sig,
         )
     {
-        tracing::warn!(node = %node_id, "a link failed authentication");
+        center.note(
+            Level::Warn,
+            Some(&node_id),
+            "a link failed authentication: the hello is not signed with the key paired for this node",
+        );
         return refuse(ws, ByeReason::ProtocolError).await;
     }
     if !hello.versions.iter().any(|v| v == PROTOCOL_VERSION) {
+        center.note(
+            Level::Warn,
+            Some(&node_id),
+            format!(
+                "the node speaks protocol versions {:?}; this center speaks {PROTOCOL_VERSION}",
+                hello.versions
+            ),
+        );
         return refuse(ws, ByeReason::UnsupportedVersion).await;
     }
 
@@ -293,13 +327,29 @@ pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String
     center.link_up(link.clone(), &hello);
 
     let mut clean = false;
+    let quiet = center.dead_after();
+    // What ended the link, set on every way out of the loop, and for how long
+    // nothing had come when it did.
+    let why: String;
+    let mut silent = Duration::ZERO;
     loop {
-        let frame = match tokio::time::timeout(DEAD_AFTER, stream.next()).await {
+        let frame = match tokio::time::timeout(quiet, stream.next()).await {
             Err(_) => {
-                tracing::info!(node = %node_id, "the link went silent for 45 s");
+                why = format!(
+                    "no frame from the node for {}, not even a ping",
+                    crate::util::span(quiet)
+                );
+                silent = quiet;
                 break;
             }
-            Ok(None) | Ok(Some(Err(_))) => break,
+            Ok(None) => {
+                why = "the connection closed without a bye".into();
+                break;
+            }
+            Ok(Some(Err(e))) => {
+                why = format!("the connection failed: {e}");
+                break;
+            }
             Ok(Some(Ok(f))) => f,
         };
         match frame {
@@ -307,8 +357,9 @@ pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String
                 Ok(m) => {
                     if let Some(end) = handle(&center, &link, m).await {
                         clean = true;
+                        why = format!("the node said bye ({})", end.as_str());
                         if end == ByeReason::Unpaired {
-                            center.forget(&node_id);
+                            center.forget(&node_id, "the node unpaired itself (bye unpaired)");
                         }
                         break;
                     }
@@ -326,12 +377,14 @@ pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String
                 // 0.0.1 sends no blobs to the center; media frames are refused.
                 if let Err(FrameError::MediaReserved) = Frame::decode(&b) {
                     link.bye(ByeReason::ProtocolError).await;
+                    why = "the node sent a media frame, which 0.0.1 does not take".into();
                     break;
                 }
             }
             WsMessage::Pong(_) => link.pong.notify_waiters(),
             WsMessage::Close(_) => {
                 clean = true;
+                why = "the node closed the connection".into();
                 break;
             }
             _ => {}
@@ -339,7 +392,7 @@ pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String
     }
     link.fail_all();
     drop(writer);
-    center.link_down(&link, clean);
+    center.link_down(&link, clean, &why, silent);
 }
 
 /// Handles one message from the node. Returns the bye reason when the node
@@ -352,7 +405,11 @@ async fn handle(center: &Center, link: &Arc<Link>, m: Message) -> Option<ByeReas
             error,
         } => link.reply(&id, Err(error)),
         Message::Error { id: None, error } => {
-            tracing::warn!(node = %link.node_id, "the node reported: {}", error.message);
+            center.note(
+                Level::Warn,
+                Some(&link.node_id),
+                format!("the node reported an error: {}", error.message),
+            );
         }
         Message::Request { id, method: m, .. } => {
             let e = RpcError::new(

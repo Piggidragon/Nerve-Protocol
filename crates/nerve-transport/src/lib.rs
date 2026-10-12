@@ -1,13 +1,14 @@
 //! Transport of the Nerve Protocol: TLS with certificate pinning, the loopback
 //! rule for plain HTTP, `CONNECT` proxies, the WebSocket under the node link,
-//! the node's Ed25519 identity, the sealed sudo password, a small HTTP/1.1 server side, and local control
-//! sockets. Shared by `nerve-node` and `nerve-center`.
+//! the node's Ed25519 identity, the sealed sudo password, a small HTTP/1.1 server side, local control
+//! sockets and the log both programs write. Shared by `nerve-node` and `nerve-center`.
 
 pub mod backoff;
 pub mod ctl;
 pub mod files;
 pub mod http;
 pub mod keys;
+pub mod log;
 pub mod net;
 pub mod sudo;
 pub mod tls;

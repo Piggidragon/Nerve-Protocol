@@ -33,6 +33,8 @@ pub struct NodeConfig {
     pub limits: Limits,
     #[serde(default)]
     pub connection: Connection,
+    #[serde(default)]
+    pub log: LogSection,
     #[serde(default, rename = "center", skip_serializing_if = "Vec::is_empty")]
     pub centers: Vec<CenterEntry>,
 }
@@ -126,6 +128,16 @@ impl Default for Limits {
             output_cap_bytes: d_output_cap(),
         }
     }
+}
+
+/// The node's log (docs/user/logs.md). Only the owner sets it: it is a
+/// machine setting, not part of what a center reads or changes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LogSection {
+    /// What the node logs: `error`, `warn`, `info` (the default) or `debug`.
+    #[serde(default)]
+    pub level: nerve_transport::log::Level,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -753,6 +765,21 @@ sudo_allow = ["sudo apt update"]
     }
 
     #[test]
+    fn the_log_level_is_info_unless_the_owner_sets_it() {
+        use nerve_transport::log::Level;
+        assert_eq!(NodeConfig::default().log.level, Level::Info);
+        assert_eq!(NodeConfig::parse("[log]\n").unwrap().log.level, Level::Info);
+        for level in Level::ALL {
+            let c = NodeConfig::parse(&format!("[log]\nlevel = \"{level}\"\n")).unwrap();
+            assert_eq!(c.log.level, level);
+            assert_eq!(NodeConfig::parse(&c.to_toml()).unwrap().log.level, level);
+        }
+        // A center reads and changes its policy and `paused`, nothing of this.
+        let doc = serde_json::json!({"log": {"level": "debug"}});
+        assert!(serde_json::from_value::<CenterDocument>(doc).is_err());
+    }
+
+    #[test]
     fn refuses_unknown_keys_and_bad_values() {
         for (bad, why) in [
             ("[node]\nnmae = \"x\"\n", "unknown field"),
@@ -760,6 +787,8 @@ sudo_allow = ["sudo apt update"]
             ("[limits]\nmax_running = 0\n", "max_running"),
             ("[connection]\nproxy = \"https://p:1\"\n", "proxy"),
             ("[machine]\nsudo = \"doas\"\n", "unknown variant"),
+            ("[log]\nlevel = \"loud\"\n", "unknown variant"),
+            ("[log]\nlvl = \"info\"\n", "unknown field"),
         ] {
             let e = NodeConfig::parse(bad).unwrap_err();
             assert!(e.contains(why), "{bad}: {e}");

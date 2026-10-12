@@ -90,6 +90,14 @@ impl Shared {
         }
     }
 
+    /// Keeps `password` (or nothing) out of the log, whatever a message
+    /// carries.
+    fn log_secret(&self, password: Option<&str>) {
+        if let Some(log) = &self.log {
+            log.set_secret("sudo", password);
+        }
+    }
+
     /// Turns the switch on once `sudo -v` accepts `password`. A wrong
     /// password leaves the switch as it was.
     pub async fn sudo_switch_on(&self, by: Writer<'_>, password: String) -> Result<u64, SetError> {
@@ -117,6 +125,7 @@ impl Shared {
             .map_err(SetError::Invalid)?;
         // Password and config change together, so `settle_sudo` never sees
         // one without the other.
+        self.log_secret(Some(password.expose()));
         let r = {
             let mut store = lock(&self.store);
             *lock(&self.sudo) = Some(password);
@@ -126,6 +135,9 @@ impl Shared {
             }
             r
         };
+        if r.is_err() {
+            self.log_secret(None);
+        }
         self.bump();
         r
     }
@@ -145,6 +157,7 @@ impl Shared {
             *lock(&self.sudo) = None;
             store.set_sudo(by, Sudo::Off)
         };
+        self.log_secret(None);
         lock(&self.sudo_offers).clear();
         self.bump();
         r
@@ -166,6 +179,7 @@ impl Shared {
             self.bump();
         } else if !on && held.is_some() {
             *held = None;
+            self.log_secret(None);
         }
     }
 }

@@ -109,18 +109,20 @@ impl Tree {
 pub const POLL: std::time::Duration = std::time::Duration::from_millis(25);
 
 #[cfg(windows)]
-pub use watch::{forget, kill, watch};
+pub use watch::{Watch, watch};
 
 #[cfg(windows)]
 mod watch {
-    use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex, OnceLock};
+    use std::sync::{Arc, Mutex};
 
     use super::{POLL, Tree};
     use crate::win;
 
-    struct Watch {
+    /// The record of one command's processes, held by its call: it goes by
+    /// the creation times it saw, never by a pid alone, which Windows may
+    /// have given to another process since.
+    pub struct Watch {
         tree: Mutex<Tree>,
         stop: AtomicBool,
     }
@@ -130,70 +132,48 @@ mod watch {
             let procs = win::processes();
             self.tree.lock().unwrap().grow(&procs, win::start_of)
         }
-    }
 
-    /// The watched commands by their shell's pid.
-    fn watched() -> &'static Mutex<HashMap<u32, Arc<Watch>>> {
-        static W: OnceLock<Mutex<HashMap<u32, Arc<Watch>>>> = OnceLock::new();
-        W.get_or_init(Default::default)
+        /// Stops recording.
+        pub fn forget(&self) {
+            self.stop.store(true, Ordering::SeqCst);
+        }
+
+        /// Ends every process recorded and every one the process table shows
+        /// below them now, the shell included. Rounds repeat while they find
+        /// new processes, which catches a child started during the kill.
+        pub fn kill(&self) {
+            self.poll();
+            for _ in 0..5 {
+                let members = self.tree.lock().unwrap().members();
+                for (p, start) in members {
+                    win::terminate(p, start);
+                }
+                if !self.poll() {
+                    break;
+                }
+            }
+        }
     }
 
     /// Starts recording the processes below the shell `pid` on a thread of
-    /// its own, until [`forget`].
-    pub fn watch(pid: u32) {
-        let Some(start) = win::start_of(pid) else {
-            return;
-        };
+    /// its own, until [`Watch::forget`]; `None` when the shell's creation
+    /// time cannot be read, and then nothing can be ended safely.
+    pub fn watch(pid: u32) -> Option<Arc<Watch>> {
+        let start = win::start_of(pid)?;
         let w = Arc::new(Watch {
             tree: Mutex::new(Tree::new(pid, start)),
             stop: AtomicBool::new(false),
         });
-        watched().lock().unwrap().insert(pid, w.clone());
+        let polled = w.clone();
         let _ = std::thread::Builder::new()
             .name("nerve-exec-tree".into())
             .spawn(move || {
-                while !w.stop.load(Ordering::SeqCst) {
-                    w.poll();
+                while !polled.stop.load(Ordering::SeqCst) {
+                    polled.poll();
                     std::thread::sleep(POLL);
                 }
             });
-    }
-
-    /// Stops recording below `pid`.
-    pub fn forget(pid: u32) {
-        if let Some(w) = watched().lock().unwrap().remove(&pid) {
-            w.stop.store(true, Ordering::SeqCst);
-        }
-    }
-
-    /// Ends every process recorded below the shell `pid` and every one the
-    /// process table shows below them now, the shell included. Rounds repeat
-    /// while they find new processes, which catches a child started during
-    /// the kill.
-    pub fn kill(pid: u32) {
-        let w = watched().lock().unwrap().get(&pid).cloned();
-        let w = match w {
-            Some(w) => w,
-            None => {
-                let Some(start) = win::start_of(pid) else {
-                    return;
-                };
-                Arc::new(Watch {
-                    tree: Mutex::new(Tree::new(pid, start)),
-                    stop: AtomicBool::new(true),
-                })
-            }
-        };
-        w.poll();
-        for _ in 0..5 {
-            let members = w.tree.lock().unwrap().members();
-            for (p, start) in members {
-                win::terminate(p, start);
-            }
-            if !w.poll() {
-                break;
-            }
-        }
+        Some(w)
     }
 }
 

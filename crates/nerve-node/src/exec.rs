@@ -325,32 +325,78 @@ pub async fn sudo_check(sudo_path: &str, password: &str) -> Result<(), String> {
     }
 }
 
+/// What ends one running command, for its call and `exec.signal`: its
+/// process group on Unix; on Windows its job (crate::job), or, when Windows
+/// made none, the processes recorded below its shell (crate::tree). It is the
+/// call's, so a pid that Windows gave to another process after the shell
+/// exited leads nowhere.
+#[derive(Clone)]
+pub struct Ender {
+    pid: u32,
+    #[cfg(windows)]
+    ending: crate::job::Ending<crate::win::Job, Option<std::sync::Arc<crate::tree::Watch>>>,
+}
+
+impl Ender {
+    /// The shell's pid.
+    pub fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// Whether the command runs in a job of its own.
+    #[cfg(windows)]
+    pub fn has_job(&self) -> bool {
+        self.ending.has_job()
+    }
+
+    /// Signals the command's processes. On Windows every signal ends them.
+    pub fn signal(&self, sig: Sig) {
+        #[cfg(windows)]
+        {
+            let _ = sig;
+            self.ending.end(|w| {
+                if let Some(w) = w {
+                    w.kill();
+                }
+            });
+        }
+        #[cfg(not(windows))]
+        kill_group(self.pid, sig);
+    }
+}
+
 /// Kills the command's whole process group when dropped: a cancelled call, a
-/// dropped link and a finished command all leave nothing behind. On Windows
-/// that is the command's job (crate::job), or, when it has none, the
-/// processes recorded below the shell (crate::tree).
-struct Group(Option<u32>);
+/// dropped link and a finished command all leave nothing behind.
+struct Group(Option<Ender>);
 
 impl Group {
+    #[cfg(not(windows))]
     fn start(pid: Option<u32>) -> Group {
-        #[cfg(windows)]
-        if let Some(pid) = pid
-            && !crate::job::holds(pid)
-        {
-            crate::tree::watch(pid);
-        }
-        Group(pid)
+        Group(pid.map(|pid| Ender { pid }))
+    }
+
+    /// `job` is the shell's job; without one the processes below the shell
+    /// are recorded while it runs.
+    #[cfg(windows)]
+    fn start(pid: Option<u32>, job: Option<std::sync::Arc<crate::win::Job>>) -> Group {
+        use crate::job::Ending;
+        Group(pid.map(|pid| Ender {
+            pid,
+            ending: match job {
+                Some(j) => Ending::Job(j),
+                None => Ending::Walk(crate::tree::watch(pid)),
+            },
+        }))
     }
 }
 
 impl Drop for Group {
     fn drop(&mut self) {
-        if let Some(pid) = self.0 {
-            kill_group(pid, Sig::Kill);
+        if let Some(e) = &self.0 {
+            e.signal(Sig::Kill);
             #[cfg(windows)]
-            {
-                crate::job::release(pid);
-                crate::tree::forget(pid);
+            if let crate::job::Ending::Walk(Some(w)) = &e.ending {
+                w.forget();
             }
         }
     }
@@ -376,7 +422,7 @@ impl Sig {
 
 /// Signals the process group led by `pid`.
 #[cfg(unix)]
-pub fn kill_group(pid: u32, sig: Sig) {
+fn kill_group(pid: u32, sig: Sig) {
     let s = match sig {
         Sig::Term => libc::SIGTERM,
         Sig::Kill => libc::SIGKILL,
@@ -388,18 +434,8 @@ pub fn kill_group(pid: u32, sig: Sig) {
     }
 }
 
-/// Ends every process in the job of the shell `pid`; every signal ends
-/// them. A command without a job (Windows made none) is ended by the walk of
-/// crate::tree, which misses what it cannot see.
-#[cfg(windows)]
-pub fn kill_group(pid: u32, _sig: Sig) {
-    if !crate::job::end(pid) {
-        crate::tree::kill(pid);
-    }
-}
-
 #[cfg(not(any(unix, windows)))]
-pub fn kill_group(_pid: u32, _sig: Sig) {}
+fn kill_group(_pid: u32, _sig: Sig) {}
 
 /// Reads up to `cap` bytes and drains the rest, so the command never blocks
 /// on a full pipe. Returns the bytes and whether some were dropped.
@@ -512,12 +548,12 @@ fn has_child(_pid: u32) -> bool {
     false
 }
 
-/// Runs `call`. `started(pid)` hears the pid once the command runs (for
-/// `exec.signal` and the control socket's ancestry check).
+/// Runs `call`. `started` hears what ends the command once it runs (for
+/// `exec.signal`, and its pid for the control socket's ancestry check).
 pub async fn run(
     call: &RunCall,
     opts: &RunOptions,
-    started: impl FnOnce(u32),
+    started: impl FnOnce(&Ender),
 ) -> Result<Value, RpcError> {
     let (program, args) = shell_command(opts.shell.as_deref(), &call.command);
     let shim = opts.landlock.as_ref().map(|l| ShimSpec {
@@ -573,9 +609,16 @@ pub async fn run(
         .spawn()
         .map_err(|e| RpcError::new(ErrorCode::Unavailable, format!("cannot start: {e}")))?;
     #[cfg(windows)]
-    if let Some(job) = job {
-        crate::job::adopt(job, &mut child).map_err(|e| RpcError::new(ErrorCode::Unavailable, e))?;
-    }
+    let job = match job {
+        Some(job) => Some(
+            crate::job::adopt(job, &mut child)
+                .map_err(|e| RpcError::new(ErrorCode::Unavailable, e))?,
+        ),
+        None => None,
+    };
+    #[cfg(windows)]
+    let group = Group::start(child.id(), job);
+    #[cfg(not(windows))]
     let group = Group::start(child.id());
     let mut sudo_stdin = None;
     if let Some(spec) = shim {
@@ -590,8 +633,8 @@ pub async fn run(
         sudo_stdin = Some((child.stdin.take().expect("piped"), sudo));
     }
     let pid = child.id();
-    if let Some(pid) = pid {
-        started(pid);
+    if let Some(e) = &group.0 {
+        started(e);
     }
     let stdout = child.stdout.take().expect("piped");
     let stderr = child.stderr.take().expect("piped");
@@ -796,7 +839,7 @@ mod tests {
         let mut c = call("sleep 30 & sleep 30; wait");
         c.timeout = Some(Duration::from_millis(200));
         let mut pid = 0;
-        let e = run(&c, &opts(1024), |p| pid = p).await.unwrap_err();
+        let e = run(&c, &opts(1024), |p| pid = p.pid()).await.unwrap_err();
         assert_eq!(e.kind(), ErrorCode::Timeout);
         tokio::time::sleep(Duration::from_millis(100)).await;
         // SAFETY: signal 0 only checks whether the group exists.
@@ -1186,11 +1229,54 @@ mod windows_tests {
         let d = tempfile::tempdir().unwrap();
         let c = call("exit 0", d.path(), Duration::from_secs(60));
         let mut held = false;
-        let r = run(&c, &opts(), |pid| held = crate::job::holds(pid))
-            .await
-            .unwrap();
+        let r = run(&c, &opts(), |e| held = e.has_job()).await.unwrap();
         assert_eq!(r["exit_code"], 0, "{r}");
         assert!(held, "the shell ran without a job");
+    }
+
+    /// Command A's shell exits at once while a ping it started in the
+    /// background keeps A's output open; then commands B run one after
+    /// another until a B shell gets A's old shell pid. Neither may end the
+    /// other's processes: A's ping runs on, and every B exits with its own
+    /// code (code review 2 of PR #19, finding 1). Windows takes minutes to
+    /// give a pid out again, so run it with `--ignored`.
+    #[tokio::test]
+    #[ignore = "slow: waits until Windows gives a shell's pid to another shell"]
+    async fn a_shell_pid_given_to_another_command_reaches_no_other_job() {
+        let d = tempfile::tempdir().unwrap();
+        let mut o = opts();
+        o.shell = Some("cmd.exe".into());
+        let a = call(
+            "start /b ping -n 900 127.0.0.1",
+            d.path(),
+            Duration::from_secs(1200),
+        );
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let oa = o.clone();
+        let task = tokio::spawn(async move {
+            run(&a, &oa, |e| {
+                let _ = tx.send(e.pid());
+            })
+            .await
+        });
+        let a_pid = rx.await.unwrap();
+        assert!(gone(a_pid).await, "A's shell did not exit");
+        let mut reused = false;
+        for _ in 0..20_000 {
+            let mut b_pid = 0;
+            let b = call("exit 0", d.path(), Duration::from_secs(60));
+            let r = run(&b, &o, |e| b_pid = e.pid()).await.unwrap();
+            assert_eq!(r["exit_code"], 0, "A's end ended a B: {r}");
+            if b_pid == a_pid {
+                reused = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let a_runs = !task.is_finished();
+        task.abort();
+        assert!(reused, "no B shell got A's pid");
+        assert!(a_runs, "A's command ended when a B shell got its pid");
     }
 
     /// Run by [`a_node_that_dies_leaves_no_command_running`] in a process

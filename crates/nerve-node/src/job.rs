@@ -18,9 +18,8 @@
 //! The choices and their texts are plain logic, tested on every platform;
 //! the job itself is crate::win::Job.
 
-use std::collections::HashMap;
 use std::fmt::Display;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// What the node logs when Windows made no job for a command: it then runs
 /// with the walk.
@@ -58,54 +57,59 @@ pub trait End {
     fn end(&self) -> bool;
 }
 
-/// The jobs of the running commands, by their shell's pid.
-pub struct Jobs<J> {
-    held: Mutex<HashMap<u32, Arc<J>>>,
+/// How one command's processes are ended: through its job, or, when Windows
+/// made none, by the walk below its shell (`W`, the walk's record). The job
+/// goes with the call, never with the shell's pid: tokio lets go of the
+/// shell's handle once the shell has exited, while the call still waits for
+/// output a background process of the command may hold, and from then on
+/// Windows can give that pid to another process.
+pub enum Ending<J, W> {
+    Job(Arc<J>),
+    Walk(W),
 }
 
-impl<J> Default for Jobs<J> {
-    fn default() -> Self {
-        Jobs {
-            held: Mutex::default(),
+impl<J, W: Clone> Clone for Ending<J, W> {
+    fn clone(&self) -> Self {
+        match self {
+            Ending::Job(j) => Ending::Job(j.clone()),
+            Ending::Walk(w) => Ending::Walk(w.clone()),
         }
     }
 }
 
-impl<J: End> Jobs<J> {
-    /// Holds `job` as the job of the shell `pid`, until [`Jobs::release`].
-    pub fn hold(&self, pid: u32, job: J) {
-        self.held.lock().unwrap().insert(pid, Arc::new(job));
+impl<J: End, W> Ending<J, W> {
+    /// Whether the command has a job.
+    pub fn has_job(&self) -> bool {
+        matches!(self, Ending::Job(_))
     }
 
-    /// Whether the shell `pid` has a job.
-    pub fn holds(&self, pid: u32) -> bool {
-        self.held.lock().unwrap().contains_key(&pid)
-    }
-
-    /// Ends the processes of the shell `pid` through its job; false when it
-    /// has none or Windows did not end it, and the walk has to.
-    pub fn end(&self, pid: u32) -> bool {
-        let job = self.held.lock().unwrap().get(&pid).cloned();
-        job.is_some_and(|j| j.end())
-    }
-
-    /// Ends the job of `pid` and lets it go.
-    pub fn release(&self, pid: u32) {
-        let job = self.held.lock().unwrap().remove(&pid);
-        if let Some(j) = job {
-            j.end();
+    /// Ends the command's processes. A command with a job is ended through
+    /// that job alone, also when Windows did not end it: the walk goes by the
+    /// shell's pid, which may name another process by now.
+    pub fn end(&self, walk: impl FnOnce(&W)) {
+        match self {
+            Ending::Job(j) => {
+                if !j.end() {
+                    tracing::warn!("{}", END_FAILED);
+                }
+            }
+            Ending::Walk(w) => walk(w),
         }
     }
 }
+
+/// What the node logs when Windows did not end a command's job.
+const END_FAILED: &str = "Windows did not end a command's job object; its processes end when the \
+     call has ended and the node closes the job";
 
 #[cfg(windows)]
-pub use sys::{SUSPENDED, adopt, end, holds, make, release};
+pub use sys::{SUSPENDED, adopt, make};
 
 #[cfg(windows)]
 mod sys {
-    use std::sync::OnceLock;
+    use std::sync::Arc;
 
-    use super::{End, Jobs, assign_error, no_job_warning};
+    use super::{End, assign_error, no_job_warning};
     use crate::win::{self, Job};
 
     /// The creation flag that starts the shell suspended, so it runs nothing
@@ -116,11 +120,6 @@ mod sys {
         fn end(&self) -> bool {
             self.terminate()
         }
-    }
-
-    fn jobs() -> &'static Jobs<Job> {
-        static J: OnceLock<Jobs<Job>> = OnceLock::new();
-        J.get_or_init(Jobs::default)
     }
 
     /// A job for the next command; `None`, logged, when Windows makes none
@@ -135,10 +134,10 @@ mod sys {
         }
     }
 
-    /// Puts the suspended shell `child` in `job` and lets it run; the job
-    /// then holds it until [`release`]. On an error the shell has run
-    /// nothing and is ended.
-    pub fn adopt(job: Job, child: &mut tokio::process::Child) -> Result<(), String> {
+    /// Puts the suspended shell `child` in `job` and lets it run; the job is
+    /// then the call's, which ends it and closes it at its end. On an error
+    /// the shell has run nothing and is ended.
+    pub fn adopt(job: Job, child: &mut tokio::process::Child) -> Result<Arc<Job>, String> {
         let (Some(pid), Some(handle)) = (child.id(), child.raw_handle()) else {
             return Err("the command was not run: its shell ended before it started".into());
         };
@@ -148,32 +147,15 @@ mod sys {
             let _ = child.start_kill();
             return Err(why);
         }
-        // The pid stays the shell's while the node holds the child's handle,
-        // which it does until the call's end has released the job.
-        jobs().hold(pid, job);
+        // The shell is suspended and the node holds its handle, so the pid
+        // is still the shell's here.
         if let Err(e) = win::resume(pid) {
-            release(pid);
+            job.end();
             return Err(format!(
                 "the command was not run: its shell could not be resumed ({e})"
             ));
         }
-        Ok(())
-    }
-
-    /// Whether the shell `pid` runs in a job.
-    pub fn holds(pid: u32) -> bool {
-        jobs().holds(pid)
-    }
-
-    /// Ends every process in the job of the shell `pid`; false when it has
-    /// none (the walk's turn).
-    pub fn end(pid: u32) -> bool {
-        jobs().end(pid)
-    }
-
-    /// Ends the job of the shell `pid` and closes it.
-    pub fn release(pid: u32) {
-        jobs().release(pid);
+        Ok(Arc::new(job))
     }
 }
 
@@ -206,36 +188,45 @@ mod tests {
         )
     }
 
-    /// A command with a job is ended through it; one without (Windows made
-    /// none) is left to the walk, and so is one whose job Windows did not end.
+    /// A command with a job is ended through it, one without (Windows made
+    /// none) by the walk.
     #[test]
-    fn the_walk_ends_only_what_no_job_ended() {
-        let jobs = Jobs::default();
+    fn the_walk_ends_only_a_command_without_a_job() {
         let (job, ends) = fake(true);
-        jobs.hold(10, job);
-        assert!(jobs.holds(10));
-        assert!(jobs.end(10), "a job ends its command");
+        let with: Ending<Fake, u32> = Ending::Job(Arc::new(job));
+        assert!(with.has_job());
+        with.end(|_| panic!("a command with a job was walked"));
         assert_eq!(ends.load(Ordering::SeqCst), 1);
-        assert!(!jobs.holds(20));
-        assert!(!jobs.end(20), "no job: the walk's turn");
-        let (broken, _) = fake(false);
-        jobs.hold(30, broken);
-        assert!(!jobs.end(30), "a job Windows did not end: the walk's turn");
+        let without: Ending<Fake, u32> = Ending::Walk(20);
+        assert!(!without.has_job());
+        let mut walked = None;
+        without.end(|pid| walked = Some(*pid));
+        assert_eq!(walked, Some(20));
     }
 
-    /// The call's end ends the job once more and lets it go; after that the
-    /// pid is not the command's any more, also when Windows gives it to
-    /// another process.
+    /// Two commands whose shells had the same pid, the first one's long
+    /// exited while a background process still held its output: each call
+    /// ends its own job and nothing else, and a job Windows did not end is
+    /// not walked either, since the pid may be another process's by now
+    /// (code review 2 of PR #19, finding 1).
     #[test]
-    fn release_ends_the_job_and_forgets_the_pid() {
-        let jobs = Jobs::default();
-        let (job, ends) = fake(true);
-        jobs.hold(10, job);
-        jobs.release(10);
-        assert_eq!(ends.load(Ordering::SeqCst), 1);
-        assert!(!jobs.holds(10));
-        assert!(!jobs.end(10));
-        jobs.release(10);
+    fn a_call_ends_its_own_job_whatever_pid_its_shell_had() {
+        let (a, a_ends) = fake(true);
+        let (b, b_ends) = fake(true);
+        let a: Ending<Fake, u32> = Ending::Job(Arc::new(a));
+        let b: Ending<Fake, u32> = Ending::Job(Arc::new(b));
+        // `exec.signal` holds a copy; it ends the same job.
+        let signal = a.clone();
+        a.end(|_| panic!("walked"));
+        signal.end(|_| panic!("walked"));
+        assert_eq!(a_ends.load(Ordering::SeqCst), 2);
+        assert_eq!(b_ends.load(Ordering::SeqCst), 0, "A's end ended B's job");
+        drop((a, signal));
+        b.end(|_| panic!("walked"));
+        assert_eq!(b_ends.load(Ordering::SeqCst), 1);
+        let (broken, ends) = fake(false);
+        let broken: Ending<Fake, u32> = Ending::Job(Arc::new(broken));
+        broken.end(|_| panic!("a job Windows did not end was walked"));
         assert_eq!(ends.load(Ordering::SeqCst), 1);
     }
 

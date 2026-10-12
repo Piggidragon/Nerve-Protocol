@@ -386,8 +386,8 @@ struct Link {
     tx: mpsc::Sender<WsMessage>,
     /// Calls in flight; whoever removes an entry sends its reply.
     calls: Mutex<HashMap<Id, InFlight>>,
-    /// Running `exec.run` calls → their process group.
-    commands: Mutex<HashMap<Id, u32>>,
+    /// Running `exec.run` calls → what ends them.
+    commands: Mutex<HashMap<Id, exec::Ender>>,
     /// The `node` status the center last heard (online, busy or paused).
     last_status: Mutex<&'static str>,
 }
@@ -1039,11 +1039,11 @@ impl Link {
             .ok_or_else(|| RpcError::invalid_args("signal must be term, kill or int"))?;
         let id: Id = serde_json::from_value(s.call)
             .map_err(|_| RpcError::invalid_args("call must be a request id"))?;
-        let pid = lock(&self.commands)
+        let ender = lock(&self.commands)
             .get(&id)
-            .copied()
+            .cloned()
             .ok_or_else(|| RpcError::invalid_args(format!("no running command {id}")))?;
-        exec::kill_group(pid, sig);
+        ender.signal(sig);
         Ok(json!({}))
     }
 
@@ -1093,7 +1093,7 @@ impl Link {
             output_cap: (cfg.limits.output_cap_bytes as usize).min(exec::OUTPUT_HARD_CAP),
             sudo,
         };
-        let r = exec::run(&rc, &opts, |pid| guard.started(pid)).await;
+        let r = exec::run(&rc, &opts, |e| guard.started(e)).await;
         drop(guard);
         if let Ok(v) = &r {
             self.handle.event(
@@ -1153,10 +1153,11 @@ impl<'a> Running<'a> {
         })
     }
 
-    fn started(&self, pid: u32) {
+    fn started(&self, ender: &exec::Ender) {
+        let pid = ender.pid();
         *lock(&self.pid) = Some(pid);
         lock(&self.link.shared.commands).insert(pid, self.link.name.clone());
-        lock(&self.link.commands).insert(self.id.clone(), pid);
+        lock(&self.link.commands).insert(self.id.clone(), ender.clone());
     }
 }
 

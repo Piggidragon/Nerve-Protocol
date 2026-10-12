@@ -304,6 +304,7 @@ impl Ui {
             // The node's own command list, read from its CLI definition.
             ("GET", "/api/help") => Ok(json!({"node": nerve_node::cli::help()})),
             ("POST", "/api/pair") => Ok(c.new_pairing()),
+            ("POST", "/api/pair/status") => Ok(json!({"open": c.pairing_open(&s("code"))})),
             ("POST", "/api/nodes/rename") => c
                 .rename(&s("id"), &s("name"))
                 .map(|_| json!({}))
@@ -614,6 +615,65 @@ mod tests {
         let ui = Ui::new(&center(d.path()), Some("nrv_x".into()), true, false);
         let r = ui.request(req("GET", "/api/help", &[h], "")).await;
         assert_eq!(r.status, 401);
+    }
+
+    #[tokio::test]
+    async fn the_pairing_status_says_when_a_code_is_used_up() {
+        let d = tempfile::tempdir().unwrap();
+        let c = center(d.path());
+        let ui = Ui::new(&c, None, false, false);
+        let status = |code: String| {
+            let ui = &ui;
+            async move {
+                let r = ui
+                    .api(
+                        &req("POST", "/api/pair/status", &[], ""),
+                        &json!({"code": code}),
+                    )
+                    .await
+                    .unwrap();
+                r["open"].as_bool().unwrap()
+            }
+        };
+        let made = ui
+            .api(&req("POST", "/api/pair", &[], ""), &json!({}))
+            .await
+            .unwrap();
+        let code = made["code"].as_str().unwrap().to_string();
+        assert!(status(code.clone()).await);
+        // Asking, even with wrong codes, uses up nothing.
+        for _ in 0..crate::pairing::TRIES {
+            assert!(!status("wrong".into()).await);
+        }
+        assert!(status(code.clone()).await);
+        // A machine pairs with the code: the page sees it is gone.
+        let body = json!({
+            "code": code, "name": "box-1", "platform": "linux", "arch": "x86_64",
+            "public_key": nerve_proto::msg::hex(&[7; 32]),
+        });
+        assert_eq!(c.pair(body.to_string().as_bytes()).0, 200);
+        assert!(!status(code).await);
+    }
+
+    #[tokio::test]
+    async fn the_page_closes_the_pairing_card_when_the_code_is_used() {
+        let d = tempfile::tempdir().unwrap();
+        let ui = Ui::new(&center(d.path()), None, false, false);
+        let h = ("Host", "127.0.0.1:7480");
+        let session = ui.request(req("GET", "/api/session", &[h], "")).await;
+        let ck = set_cookie(&session);
+        let js = ui
+            .request(req("GET", "/app.js", &[h, ("Cookie", &ck)], ""))
+            .await;
+        let js = String::from_utf8(js.body).unwrap();
+        // The poll asks the center about the code on screen and drops the
+        // card when it is gone.
+        let ask = js.find("\"/api/pair/status\"").expect("the page asks");
+        let poll = js.find("async function tick()").unwrap();
+        let tick_end = js[poll..].find("\n}\n").unwrap() + poll;
+        assert!(js[poll..tick_end].contains("closePairingWhenUsed("));
+        assert!(js[..ask].contains("function closePairingWhenUsed"));
+        assert!(js[ask..poll].contains("state.pairing = null"));
     }
 
     async fn center_settings(ui: &Ui, body: Option<Value>) -> Result<Value, (u16, Value)> {

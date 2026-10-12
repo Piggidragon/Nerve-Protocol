@@ -294,6 +294,12 @@ impl Center {
         })
     }
 
+    /// Whether a code from [`Center::new_pairing`] can still pair a machine.
+    /// The web UI asks it to close the pairing card once the code is used.
+    pub fn pairing_open(&self, code: &str) -> bool {
+        self.codes.lock().unwrap().is_open(code, Instant::now())
+    }
+
     /// Answers `POST /nerve/v0/pair`: the status and the body.
     pub fn pair(&self, body: &[u8]) -> (u16, Value) {
         let err = |s: u16, m: &str| (s, json!({ "error": m }));

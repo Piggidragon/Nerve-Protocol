@@ -274,7 +274,11 @@ function pageOverview() {
       [o.sessions.length, o.sessions.length === 1 ? "session" : "sessions"],
     ]),
     o.alerts.slice(-5).map((a) => banner("warn", "alert", `${when(a.ts)}: ${a.text}`)),
-    section("Machines", null, btn("Pair a machine", "primary", act(async () => { state.pairing = await api("POST", "/api/pair"); }), "plus"),
+    section("Machines", null, btn("Pair a machine", "primary", act(async () => {
+      state.pairing = await api("POST", "/api/pair");
+      // The machines there are now: one that is not among them is the one this code pairs.
+      state.pairing.known = (state.overview ? state.overview.nodes : []).map((n) => n.id);
+    }), "plus"),
       state.pairing ? pairingCard(state.pairing) : null,
       o.nodes.length ? el("div", { class: "list" }, o.nodes.map(nodeCard)) : empty("No machines yet. Pair one to get started.")),
     section("Sessions", "Harnesses that are connected to this center.", null,
@@ -614,6 +618,20 @@ function draw(force) {
   $("page").replaceChildren(...PAGES[page].view().flat());
 }
 
+// The pairing card shows a one-time code. Once the center no longer has it
+// open, a machine used it (or it ran out of tries), and the card has done its
+// job: close it, so nobody thinks the pairing failed and tries again.
+async function closePairingWhenUsed(o) {
+  const p = state.pairing;
+  if (!p) return;
+  const { open } = await api("POST", "/api/pair/status", { code: p.code });
+  if (open || state.pairing !== p) return;
+  state.pairing = null;
+  const added = o.nodes.find((n) => !p.known.includes(n.id));
+  if (added) notify(`Paired ${added.name}.`);
+  else notify("The pairing code is no longer valid.", "error");
+}
+
 async function tick() {
   if (busy || !csrf) return;
   busy = true;
@@ -629,6 +647,7 @@ async function tick() {
     if (page === "stats") state.stats = extra;
     if (page === "audit") state.audit = extra;
     if (page === "help" && extra) state.help = extra;
+    await closePairingWhenUsed(o);
     if (down) notify("Connected to the center again.");
     down = false;
     draw(false);

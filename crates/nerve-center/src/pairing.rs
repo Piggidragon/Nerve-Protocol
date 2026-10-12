@@ -98,6 +98,16 @@ impl Codes {
         self.open.push(o);
     }
 
+    /// Whether `code` can still be used. Unlike [`Codes::check`], a code that
+    /// is not open costs no try: the web UI asks this to see if the code on
+    /// its screen is used up.
+    pub fn is_open(&mut self, code: &str, now: Instant) -> bool {
+        self.prune(now);
+        self.open
+            .iter()
+            .any(|o| crate::util::ct_eq(o.code.as_bytes(), code.as_bytes()))
+    }
+
     pub fn open_count(&mut self, now: Instant) -> usize {
         self.prune(now);
         self.open.len()
@@ -121,6 +131,21 @@ mod tests {
         assert!(c.take(&code, now).is_ok());
         assert!(c.take(&code, now).is_err());
         assert_eq!(c.check(&code, now), Err(CodeError::Refused));
+    }
+
+    #[test]
+    fn asking_if_a_code_is_open_costs_no_try() {
+        let mut c = Codes::default();
+        let now = Instant::now();
+        let code = c.create(now, TEN_MINUTES);
+        for _ in 0..TRIES {
+            assert!(!c.is_open("wrong", now));
+        }
+        assert!(c.is_open(&code, now));
+        c.take(&code, now).unwrap();
+        assert!(!c.is_open(&code, now));
+        let code = c.create(now, TEN_MINUTES);
+        assert!(!c.is_open(&code, now + TEN_MINUTES));
     }
 
     #[test]

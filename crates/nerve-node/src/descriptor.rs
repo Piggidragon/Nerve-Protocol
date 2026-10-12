@@ -5,8 +5,8 @@ use std::collections::BTreeMap;
 
 use serde_json::{Value, json};
 
-use nerve_policy::config::{CapSetting, SettingsGrant};
-use nerve_policy::{CenterEntry, NodeConfig};
+use nerve_policy::config::{CapSetting, CenterPolicy, Mode, SettingsGrant};
+use nerve_policy::{CenterEntry, NodeConfig, rules};
 use nerve_proto::descriptor::{
     Action, Capability, Descriptor, Direction, Effect, EventDecl, Exposure, NodeInfo, Software,
     StreamDecl, StreamKind,
@@ -393,9 +393,41 @@ fn exposure(entry: &CenterEntry, id: &str) -> Option<Exposure> {
     }
 }
 
+/// Whether the center is shown `cap.action`: not hidden, and in `allowlist`
+/// mode only when an allow rule covers it (any pattern, each call is still
+/// checked), and for `exec.run` also when the sudo allow list has an entry,
+/// since a sudo command runs by that list alone. In `folder` and `user` mode
+/// the allow rules do not count, so the action is offered. An action set to
+/// off stays, and fails `disabled`.
+fn offered(policy: &CenterPolicy, mode: Mode, by_rules: bool, cap: &str, action: &str) -> bool {
+    match policy.cap_setting(cap, Some(action)) {
+        Some(CapSetting::Hidden) => return false,
+        Some(CapSetting::Off) => return true,
+        _ => {}
+    }
+    // Only the policy-governed capabilities are decided by rules.
+    if !by_rules || mode != Mode::Allowlist || !matches!(cap, "fs" | "exec") {
+        return true;
+    }
+    rules::offers(&policy.allow, cap, action)
+        || (cap == "exec" && action == "run" && !policy.sudo_allow.is_empty())
+}
+
 /// The descriptor `entry` sees now; `rev` is derived from its content, so it
-/// changes exactly when the view changes.
+/// changes exactly when the view changes. The center builds its tools from
+/// it, so an action the policy cannot allow is not in it.
 pub fn for_center(cfg: &NodeConfig, entry: &CenterEntry, now_ms: u64) -> Descriptor {
+    build(cfg, entry, now_ms, true)
+}
+
+/// Every action a call may name: [`for_center`] without the cut by allow
+/// rules. A call for an action no rule covers still reaches the policy, which
+/// refuses it and writes the audit entry; only hidden ones are unknown.
+pub fn for_call(cfg: &NodeConfig, entry: &CenterEntry, now_ms: u64) -> Descriptor {
+    build(cfg, entry, now_ms, false)
+}
+
+fn build(cfg: &NodeConfig, entry: &CenterEntry, now_ms: u64, by_rules: bool) -> Descriptor {
     let mut caps = vec![node_cap()];
     if let Some(e) = exposure(entry, "fs") {
         caps.push(fs_cap(e));
@@ -407,13 +439,16 @@ pub fn for_center(cfg: &NodeConfig, entry: &CenterEntry, now_ms: u64) -> Descrip
         caps.push(settings_cap());
     }
     caps.push(audit_cap());
-    // Actions set to hidden are left out; off ones stay and fail `disabled`.
+    // Actions the policy cannot allow are left out, so the center builds no
+    // tool the node would refuse; off ones stay and fail `disabled`. A
+    // capability with no action left goes too.
+    let mode = entry.policy.mode_at(now_ms);
     for c in &mut caps {
         let id = c.id.clone();
-        c.actions.retain(|a, _| {
-            entry.policy.caps.get(&format!("{id}.{a}")) != Some(&CapSetting::Hidden)
-        });
+        c.actions
+            .retain(|a, _| offered(&entry.policy, mode, by_rules, &id, a));
     }
+    caps.retain(|c| !(matches!(c.id.as_str(), "fs" | "exec") && c.actions.is_empty()));
     let name = node_name(cfg);
     let platform = std::env::consts::OS.to_string();
     let mut d = Descriptor {
@@ -473,6 +508,8 @@ mod tests {
     fn built_in_names_have_no_underscore() {
         let mut e = entry();
         e.settings = SettingsGrant::Write;
+        // Default deny shows no fs or exec tool; the names are checked on all.
+        e.policy.mode = Mode::User;
         let d = for_center(&NodeConfig::default(), &e, 0);
         assert_eq!(d.check_names(), Ok(()));
         assert!(d.capabilities.len() >= 5);
@@ -482,6 +519,7 @@ mod tests {
     fn filtered_per_center() {
         let cfg = NodeConfig::default();
         let mut e = entry();
+        e.policy.mode = Mode::User;
         let d = for_center(&cfg, &e, 0);
         let ids: Vec<&str> = d.capabilities.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, ["node", "fs", "exec", "audit"]);
@@ -503,5 +541,107 @@ mod tests {
         assert!(!d2.capability("fs").unwrap().actions.contains_key("write"));
         assert_ne!(d.rev, d2.rev);
         assert_eq!(d2.rev, for_center(&cfg, &e, 0).rev);
+    }
+
+    fn actions(d: &Descriptor, cap: &str) -> Vec<String> {
+        d.capability(cap)
+            .map(|c| c.actions.keys().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn rules(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn allowlist_without_rules_offers_no_tools() {
+        let mut e = entry();
+        e.settings = SettingsGrant::Write;
+        let d = for_center(&NodeConfig::default(), &e, 0);
+        assert!(d.capability("fs").is_none());
+        assert!(d.capability("exec").is_none());
+        assert!(d.capability("node").is_some());
+        assert!(d.capability("audit").is_some());
+        assert!(d.capability("settings").is_some());
+    }
+
+    #[test]
+    fn allowlist_offers_what_a_rule_covers() {
+        let cfg = NodeConfig::default();
+        let mut e = entry();
+        e.policy.allow = rules(&["exec.run:git *"]);
+        let d = for_center(&cfg, &e, 0);
+        assert_eq!(actions(&d, "exec"), ["run"]);
+        assert!(d.capability("fs").is_none());
+
+        // The scope decides, the pattern does not.
+        e.policy.allow = rules(&["fs:~/notes/*"]);
+        let d = for_center(&cfg, &e, 0);
+        let mut fs = actions(&d, "fs");
+        fs.sort();
+        assert_eq!(fs, ["find", "grep", "list", "read", "stat", "write"]);
+        assert!(d.capability("exec").is_none());
+
+        e.policy.allow = rules(&["fs.read:/a/*"]);
+        assert_eq!(actions(&for_center(&cfg, &e, 0), "fs"), ["read"]);
+
+        e.policy.allow = rules(&["exec"]);
+        assert_eq!(actions(&for_center(&cfg, &e, 0), "exec"), ["run", "signal"]);
+    }
+
+    #[test]
+    fn a_sudo_entry_offers_exec_run_only() {
+        let cfg = NodeConfig::default();
+        let mut e = entry();
+        e.policy.sudo_allow = rules(&["sudo apt *"]);
+        let d = for_center(&cfg, &e, 0);
+        assert_eq!(actions(&d, "exec"), ["run"]);
+        assert!(d.capability("fs").is_none());
+    }
+
+    #[test]
+    fn folder_and_user_mode_ignore_the_rules() {
+        let cfg = NodeConfig::default();
+        let mut e = entry();
+        for mode in [Mode::Folder, Mode::User] {
+            e.policy.mode = mode;
+            let d = for_center(&cfg, &e, 0);
+            assert_eq!(actions(&d, "exec"), ["run", "signal"]);
+            assert_eq!(actions(&d, "fs").len(), 6);
+        }
+        // A folder or user mode that ran out is allowlist again.
+        e.policy.until = Some(10);
+        assert!(for_center(&cfg, &e, 9).capability("fs").is_some());
+        assert!(for_center(&cfg, &e, 10).capability("fs").is_none());
+    }
+
+    #[test]
+    fn off_and_hidden_keep_their_meaning_in_allowlist() {
+        let cfg = NodeConfig::default();
+        let mut e = entry();
+        e.policy.caps.insert("fs".into(), CapSetting::Off);
+        e.policy.allow = rules(&["exec.run"]);
+        e.policy
+            .caps
+            .insert("exec.signal".into(), CapSetting::Hidden);
+        let d = for_center(&cfg, &e, 0);
+        assert_eq!(d.capability("fs").unwrap().exposure, Exposure::Off);
+        assert_eq!(actions(&d, "fs").len(), 6);
+        assert_eq!(actions(&d, "exec"), ["run"]);
+    }
+
+    #[test]
+    fn a_rule_edit_changes_the_rev() {
+        let cfg = NodeConfig::default();
+        let mut e = entry();
+        let none = for_center(&cfg, &e, 0).rev;
+        e.policy.allow = rules(&["exec.run:git *"]);
+        let one = for_center(&cfg, &e, 0).rev;
+        // Another pattern of the same scope shows the same tools.
+        e.policy.allow = rules(&["exec.run:ls *"]);
+        assert_eq!(for_center(&cfg, &e, 0).rev, one);
+        e.policy.allow.clear();
+        assert_eq!(for_center(&cfg, &e, 0).rev, none);
+        assert_ne!(none, one);
     }
 }

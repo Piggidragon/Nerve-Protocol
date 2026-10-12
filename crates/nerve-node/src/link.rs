@@ -763,7 +763,7 @@ impl Link {
         let (cfg, entry) = self
             .entry()
             .ok_or_else(|| RpcError::new(ErrorCode::Unavailable, "this center was removed"))?;
-        let view = descriptor::for_center(&cfg, &entry, crate::now_ms());
+        let view = descriptor::for_call(&cfg, &entry, crate::now_ms());
         let cap = view.capability(&inv.cap).ok_or_else(|| {
             RpcError::new(
                 ErrorCode::UnknownCapability,

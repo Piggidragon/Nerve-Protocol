@@ -83,6 +83,11 @@ that does not match `Host` are refused (403).
 - `node`, `settings` and `audit` are never tools, so a model cannot change
   the policy that limits it.
   Capabilities with exposure `off` are left out.
+- The node cuts the descriptor to what the policy can allow (node-local §3),
+  so the center builds a tool only for an action a call may get through: in
+  default deny, `fs` and `exec` actions without a covering allow rule are
+  absent from the descriptor and have no tool. When rules change, the node
+  sends `descriptor_changed` and the tools follow.
 - Tools of paired nodes that are offline stay listed; calling one returns
   `unavailable`.
 - `readOnlyHint` is set for `read` and `sense` actions.

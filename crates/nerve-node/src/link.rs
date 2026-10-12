@@ -21,8 +21,8 @@ use nerve_proto::descriptor::{Detail, Effect, Exposure};
 use nerve_proto::frame::{Frame, FrameError};
 use nerve_proto::link::CenterUrl;
 use nerve_proto::msg::{
-    self, Bye, ByeReason, Cancel, Challenge, Describe, Get, Hello, Invoke, Topic, Topics, Welcome,
-    method,
+    self, Bye, ByeReason, Cancel, Challenge, Describe, Get, Hello, Invoke, SessionEnd, Topic,
+    Topics, Welcome, method,
 };
 use nerve_proto::rpc::{Id, Message, params};
 use nerve_proto::{ErrorCode, PROTOCOL_VERSION, RpcError, limits};
@@ -359,9 +359,9 @@ async fn session(
     // The link is gone (spec §4.5): calls end, commands die with their
     // process groups.
     *lock(&cs.link) = None;
-    let calls: Vec<AbortHandle> = lock(&link.calls).drain().map(|(_, h)| h).collect();
+    let calls: Vec<InFlight> = lock(&link.calls).drain().map(|(_, c)| c).collect();
     for c in calls {
-        c.abort();
+        c.abort.abort();
     }
     let _ = done_tx.send(());
     let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
@@ -369,6 +369,12 @@ async fn session(
         cs.set_status("link lost; dialling again");
     }
     outcome
+}
+
+/// A call in flight: its task, and the harness session it came from.
+struct InFlight {
+    abort: AbortHandle,
+    session: Option<String>,
 }
 
 /// A live link's state shared with its calls.
@@ -379,7 +385,7 @@ struct Link {
     handle: Arc<LinkHandle>,
     tx: mpsc::Sender<WsMessage>,
     /// Calls in flight; whoever removes an entry sends its reply.
-    calls: Mutex<HashMap<Id, AbortHandle>>,
+    calls: Mutex<HashMap<Id, InFlight>>,
     /// Running `exec.run` calls → their process group.
     commands: Mutex<HashMap<Id, u32>>,
     /// The `node` status the center last heard (online, busy or paused).
@@ -549,17 +555,25 @@ impl Link {
                 let Ok(id) = serde_json::from_value::<Id>(c.id) else {
                     return None;
                 };
-                let h = lock(&self.calls).remove(&id);
-                if let Some(h) = h {
-                    h.abort();
-                    let e =
-                        Message::error(Some(id), RpcError::new(ErrorCode::Cancelled, "cancelled"));
-                    let _ = self.tx.try_send(text(&e));
+                self.cancel(id, "cancelled");
+                None
+            }
+            // The calls of an ended session end like cancelled ones: a
+            // command's process group is killed as on a timeout.
+            method::SESSION_END => {
+                let Ok(end) = params::<SessionEnd>(&p) else {
+                    return None;
+                };
+                let ids: Vec<Id> = lock(&self.calls)
+                    .iter()
+                    .filter(|(_, c)| c.session.as_deref() == Some(end.session.as_str()))
+                    .map(|(id, _)| id.clone())
+                    .collect();
+                for id in ids {
+                    self.cancel(id, "cancelled: the harness session ended");
                 }
                 None
             }
-            // The node keeps nothing per session, so there is nothing to end.
-            method::SESSION_END => None,
             method::BYE => {
                 let reason = params::<Bye>(&p).ok().map(|b| b.reason);
                 match reason {
@@ -577,6 +591,17 @@ impl Link {
             }
             // Unknown notifications are ignored (spec §3).
             _ => None,
+        }
+    }
+
+    /// Stops call `id` and answers it `cancelled`. Aborting its task drops
+    /// a running command, which kills its process group (exec::Group).
+    fn cancel(&self, id: Id, why: &str) {
+        let c = lock(&self.calls).remove(&id);
+        if let Some(c) = c {
+            c.abort.abort();
+            let e = Message::error(Some(id), RpcError::new(ErrorCode::Cancelled, why));
+            let _ = self.tx.try_send(text(&e));
         }
     }
 
@@ -733,6 +758,7 @@ impl Link {
         }
         let link = self.clone();
         let call_id = id.clone();
+        let session = inv.ctx.session.clone();
         // The deadline counts from receipt (spec §5.1).
         let deadline = inv.deadline_ms.map(Duration::from_millis);
         // Held until the handle is in the map, so a call that finishes at
@@ -756,7 +782,13 @@ impl Link {
                 link.shared.bump();
             }
         });
-        calls.insert(id, task.abort_handle());
+        calls.insert(
+            id,
+            InFlight {
+                abort: task.abort_handle(),
+                session,
+            },
+        );
     }
 
     async fn invoke(self: &Arc<Self>, id: &Id, inv: Invoke) -> Result<Value, RpcError> {

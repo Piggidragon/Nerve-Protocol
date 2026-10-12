@@ -162,6 +162,14 @@ impl Mcp {
         stdin.flush().unwrap();
     }
 
+    /// Sends a request with `id` without waiting for its reply.
+    pub fn send(&mut self, id: &str, method: &str, params: Value) {
+        let msg = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
+        let stdin = self.stdin.as_mut().unwrap();
+        writeln!(stdin, "{msg}").unwrap();
+        stdin.flush().unwrap();
+    }
+
     /// Sends a request and waits for its reply, keeping notifications.
     pub fn request(&mut self, method: &str, params: Value) -> Value {
         self.request_wait(method, params, Duration::from_secs(60))

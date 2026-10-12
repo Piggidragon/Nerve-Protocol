@@ -137,11 +137,16 @@ async fn handshake(r: &Running, key: &NodeKey) -> (WebSocketStream<BoxIo>, Messa
 
 enum Seen {
     Invoke(Value),
+    /// An invoke of the command `hang`, which gets no answer: its id.
+    Hang(Value),
+    /// A `cancel`: the id it names.
+    Cancel(Value),
     SessionEnd(String),
 }
 
 /// Answers the center like a node: describe, sub, invoke (echoing the
-/// arguments), and reports what it saw.
+/// arguments; the command `hang` is never answered), and reports what it
+/// saw.
 fn serve(mut ws: WebSocketStream<BoxIo>, desc: Value) -> mpsc::UnboundedReceiver<Seen> {
     let (tx, rx) = mpsc::unbounded_channel();
     tokio::spawn(async move {
@@ -152,6 +157,10 @@ fn serve(mut ws: WebSocketStream<BoxIo>, desc: Value) -> mpsc::UnboundedReceiver
                     method: m,
                     params,
                 } => {
+                    if m == method::INVOKE && params["args"]["command"] == "hang" {
+                        let _ = tx.send(Seen::Hang(serde_json::to_value(&id).unwrap()));
+                        continue;
+                    }
                     let result = match m.as_str() {
                         method::DESCRIBE => desc.clone(),
                         method::INVOKE => {
@@ -161,6 +170,9 @@ fn serve(mut ws: WebSocketStream<BoxIo>, desc: Value) -> mpsc::UnboundedReceiver
                         _ => json!({}),
                     };
                     send(&mut ws, Message::result(id, result)).await;
+                }
+                Message::Notification { method: m, params } if m == method::CANCEL => {
+                    let _ = tx.send(Seen::Cancel(params["id"].clone()));
                 }
                 Message::Notification { method: m, params } if m == method::SESSION_END => {
                     let _ = tx.send(Seen::SessionEnd(
@@ -301,6 +313,69 @@ async fn pair_connect_describe_and_call() {
         panic!("no session.end")
     };
     assert_eq!(s, session);
+    r.stop().await;
+}
+
+/// An MCP `notifications/cancelled` cancels the call on its node: the node
+/// gets `cancel` with the invoke's id, and the cancelled request gets no
+/// response (MCP 2025-06-18, cancellation).
+#[tokio::test]
+async fn a_cancelled_mcp_call_is_cancelled_on_the_node() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    let key = NodeKey::generate().unwrap();
+    assert_eq!(pair(&r, &key, "box-1").await.0, 200);
+    let (ws, _) = handshake(&r, &key).await;
+    let mut seen = serve(ws, descriptor(&key, "box-1"));
+    let c = r.center.clone();
+    wait_for(|| (!c.tools().is_empty()).then_some(())).await;
+    let e = std::sync::Arc::new(Engine::new(&r.center, "test"));
+    rpc(
+        &e,
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18"}),
+    )
+    .await;
+
+    let call = tokio::spawn({
+        let e = e.clone();
+        async move {
+            e.handle(
+                json!({"jsonrpc": "2.0", "id": "run-1", "method": "tools/call",
+                "params": {"name": "exec_run", "arguments": {"node": "box-1", "command": "hang"}}}),
+            )
+            .await
+        }
+    });
+    async fn next(seen: &mut mpsc::UnboundedReceiver<Seen>) -> Option<Seen> {
+        tokio::time::timeout(Duration::from_secs(5), seen.recv())
+            .await
+            .ok()
+            .flatten()
+    }
+    let Some(Seen::Hang(invoke_id)) = next(&mut seen).await else {
+        panic!("no invoke")
+    };
+    let note = e
+        .handle(
+            json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+            "params": {"requestId": "run-1", "reason": "the user stopped it"}}),
+        )
+        .await;
+    assert!(note.is_none(), "a notification gets no reply: {note:?}");
+    let Some(Seen::Cancel(id)) = next(&mut seen).await else {
+        panic!("the node got no cancel")
+    };
+    assert_eq!(id, invoke_id);
+    let reply = tokio::time::timeout(Duration::from_secs(5), call)
+        .await
+        .expect("the cancelled call returns")
+        .unwrap();
+    assert!(
+        reply.is_none(),
+        "a cancelled request gets no response: {reply:?}"
+    );
     r.stop().await;
 }
 

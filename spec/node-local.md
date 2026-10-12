@@ -95,6 +95,20 @@ Unknown keys are refused, and so is a rule that does not parse. Two centers
 with one name are refused. Folder paths are absolute in the platform's own
 form; on the wire they travel as `/c/Users/...` on Windows (protocol §7.2).
 
+### Commands
+
+`exec.run` runs its command line with `machine.shell`: `/bin/sh -c`, on
+Windows `powershell.exe -NoProfile -Command` (Windows PowerShell 5.1: `;`
+chains commands, `&` does not); the action's text in the descriptor names the
+shell. Output that is not UTF-8 is read in the console code page (Windows).
+A command is killed with its process group when its call ends: on
+`timeout_ms`, `cancel`, `session.end` of the session that started it, a
+dropped link, and when the call returns. Windows has no process groups: the
+node records the processes below the shell every 25 ms and ends those and
+what is below them then, best effort that misses a process started through
+WMI, a service or the task scheduler, and the child of a parent that lived
+less than one poll.
+
 ### Proxy
 
 `nerve-node proxy set <url> [--header "Name: value"]...` sets the proxy. The
@@ -134,7 +148,9 @@ again.
   it. The flags do not imply each other: a write needs `w` and no `r`, a read
   `r` and no `w`, a command `x` and no `r`. Where folders nest, the deepest
   one that holds a path decides for it. Commands are confined where the
-  platform can confine them. `allow` rules do not count. On Linux a command
+  platform can confine them; Windows cannot yet (no Job Object in 0.0.1), so
+  there folder mode refuses every command, and only `allowlist` and `user`
+  run commands, unconfined. `allow` rules do not count. On Linux a command
   reads the system folders and its `r` folders, writes its `w` folders and
   runs programs from the system folders and its `x` folders (Landlock), each
   flag with its own rule. A folder with `w` and not `r` can be written but

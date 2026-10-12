@@ -92,6 +92,11 @@ CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static" \
 
    Allow rules count in `allowlist` mode only; deny rules count in every mode.
 
+   On Linux, folder mode runs commands under Landlock. On Windows commands
+   cannot be confined yet (the Job Object is not done): folder mode runs no
+   command there, `allowlist` and `user` run them unconfined in Windows
+   PowerShell 5.1, and ending a command's processes is best effort.
+
    Sudo is a switch per machine, off by default. While it is off, no command
    runs with sudo, whatever the rules say. Switched on (the node checks the
    password with `sudo -v` and keeps it in memory only), a sudo command runs

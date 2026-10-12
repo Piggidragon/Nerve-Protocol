@@ -1,0 +1,182 @@
+//! The few Win32 calls the node makes itself: the process table and ending a
+//! process (crate::tree), and the console code page that command output is
+//! written in (crate::exec). Declared here against kernel32, which every
+//! Windows program links, rather than through a bindings crate.
+
+use std::ffi::c_void;
+
+use crate::tree::Proc;
+
+type Handle = *mut c_void;
+
+const TH32CS_SNAPPROCESS: u32 = 0x0000_0002;
+const PROCESS_TERMINATE: u32 = 0x0001;
+const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+#[cfg(test)]
+const STILL_ACTIVE: u32 = 259;
+const INVALID_HANDLE_VALUE: Handle = -1isize as Handle;
+
+#[repr(C)]
+struct ProcessEntry32W {
+    size: u32,
+    usage: u32,
+    pid: u32,
+    default_heap_id: usize,
+    module_id: u32,
+    threads: u32,
+    ppid: u32,
+    pri_class_base: i32,
+    flags: u32,
+    exe_file: [u16; 260],
+}
+
+#[repr(C)]
+#[derive(Default, Clone, Copy)]
+struct FileTime {
+    low: u32,
+    high: u32,
+}
+
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn CreateToolhelp32Snapshot(flags: u32, pid: u32) -> Handle;
+    fn Process32FirstW(snapshot: Handle, entry: *mut ProcessEntry32W) -> i32;
+    fn Process32NextW(snapshot: Handle, entry: *mut ProcessEntry32W) -> i32;
+    fn OpenProcess(access: u32, inherit: i32, pid: u32) -> Handle;
+    fn GetProcessTimes(
+        process: Handle,
+        creation: *mut FileTime,
+        exit: *mut FileTime,
+        kernel: *mut FileTime,
+        user: *mut FileTime,
+    ) -> i32;
+    #[cfg(test)]
+    fn GetExitCodeProcess(process: Handle, code: *mut u32) -> i32;
+    fn TerminateProcess(process: Handle, code: u32) -> i32;
+    fn CloseHandle(handle: Handle) -> i32;
+    fn GetConsoleOutputCP() -> u32;
+    fn GetOEMCP() -> u32;
+    fn MultiByteToWideChar(
+        code_page: u32,
+        flags: u32,
+        bytes: *const u8,
+        len: i32,
+        wide: *mut u16,
+        wide_len: i32,
+    ) -> i32;
+}
+
+/// An open process handle, closed when dropped.
+struct Process(Handle);
+
+impl Process {
+    fn open(pid: u32, access: u32) -> Option<Process> {
+        // SAFETY: OpenProcess takes plain values and returns null on failure.
+        let h = unsafe { OpenProcess(access, 0, pid) };
+        (!h.is_null()).then_some(Process(h))
+    }
+
+    fn created(&self) -> Option<u64> {
+        let mut t = [FileTime::default(); 4];
+        let [c, e, k, u] = &mut t;
+        // SAFETY: the handle is open and the four pointers are valid.
+        let ok = unsafe { GetProcessTimes(self.0, c, e, k, u) } != 0;
+        ok.then(|| (u64::from(t[0].high) << 32) | u64::from(t[0].low))
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        // SAFETY: the handle came from OpenProcess and is closed once.
+        unsafe { CloseHandle(self.0) };
+    }
+}
+
+/// Every process the process table lists now; empty when it cannot be read.
+pub fn processes() -> Vec<Proc> {
+    let mut out = Vec::new();
+    // SAFETY: a process snapshot takes plain values; the result is checked.
+    let snap = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snap == INVALID_HANDLE_VALUE || snap.is_null() {
+        return out;
+    }
+    // SAFETY: the entry is zeroed plain data with its size set, as
+    // Process32FirstW requires.
+    let mut e: ProcessEntry32W = unsafe { std::mem::zeroed() };
+    e.size = std::mem::size_of::<ProcessEntry32W>() as u32;
+    // SAFETY: the snapshot is open and the entry valid for writes.
+    let mut more = unsafe { Process32FirstW(snap, &mut e) } != 0;
+    while more {
+        out.push(Proc {
+            pid: e.pid,
+            ppid: e.ppid,
+        });
+        // SAFETY: as above.
+        more = unsafe { Process32NextW(snap, &mut e) } != 0;
+    }
+    // SAFETY: the snapshot handle is closed once.
+    unsafe { CloseHandle(snap) };
+    out
+}
+
+/// When process `pid` was created (FILETIME), if it can be opened.
+pub fn start_of(pid: u32) -> Option<u64> {
+    Process::open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?.created()
+}
+
+/// Ends process `pid` when it is still the one created at `start`, so a pid
+/// Windows gave to another process meanwhile is left alone.
+pub fn terminate(pid: u32, start: u64) -> bool {
+    let Some(p) = Process::open(pid, PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION) else {
+        return false;
+    };
+    if p.created() != Some(start) {
+        return false;
+    }
+    // SAFETY: the handle is open with PROCESS_TERMINATE.
+    unsafe { TerminateProcess(p.0, 1) != 0 }
+}
+
+/// Whether process `pid` runs.
+#[cfg(test)]
+pub fn running(pid: u32) -> bool {
+    let Some(p) = Process::open(pid, PROCESS_QUERY_LIMITED_INFORMATION) else {
+        return false;
+    };
+    let mut code = 0u32;
+    // SAFETY: the handle is open and the pointer valid.
+    unsafe { GetExitCodeProcess(p.0, &mut code) != 0 && code == STILL_ACTIVE }
+}
+
+/// The code page a console program started by the node writes in: the
+/// node's console's, or, when the node has none (a service), the OEM code
+/// page a new console gets.
+pub fn console_code_page() -> u32 {
+    // SAFETY: both take no arguments.
+    match unsafe { GetConsoleOutputCP() } {
+        0 => unsafe { GetOEMCP() },
+        cp => cp,
+    }
+}
+
+/// `bytes` decoded from code page `cp`; `None` when Windows cannot.
+pub fn code_page_text(cp: u32, bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        return Some(String::new());
+    }
+    let len = i32::try_from(bytes.len()).ok()?;
+    // SAFETY: the input is valid for `len` bytes; a null output asks for the
+    // length only.
+    let n = unsafe { MultiByteToWideChar(cp, 0, bytes.as_ptr(), len, std::ptr::null_mut(), 0) };
+    if n <= 0 {
+        return None;
+    }
+    let mut wide = vec![0u16; n as usize];
+    // SAFETY: the output is valid for `n` units.
+    let n = unsafe { MultiByteToWideChar(cp, 0, bytes.as_ptr(), len, wide.as_mut_ptr(), n) };
+    if n <= 0 {
+        return None;
+    }
+    wide.truncate(n as usize);
+    Some(String::from_utf16_lossy(&wide))
+}

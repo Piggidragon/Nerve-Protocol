@@ -16,6 +16,11 @@ pub mod pair;
 pub mod paths;
 mod secrets;
 mod sudo;
+// The walk is Windows-only in use, tested everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod tree;
+#[cfg(windows)]
+mod win;
 
 pub use daemon::{Daemon, NodeOptions};
 pub use paths::NodePaths;

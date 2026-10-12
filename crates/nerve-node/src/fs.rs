@@ -770,11 +770,11 @@ mod tests {
         assert_eq!(read.targets()[0].path, work.join("d/note"));
         swap(&work.join("d"));
         assert!(
-            write.run(&|_| false).is_err(),
+            write.run(&|_, _| false).is_err(),
             "the write followed the link"
         );
         assert!(!outside.join("authorized_keys").exists());
-        let r = read.run(&|_| false);
+        let r = read.run(&|_, _| false);
         assert!(r.is_err(), "the read followed the link: {r:?}");
 
         // A last component swapped for a symlink fails the same way.
@@ -786,10 +786,10 @@ mod tests {
             FsCall::parse("write", &args(json!({"path": wire(&note), "content": "x"}))).unwrap();
         std::fs::remove_file(&note).unwrap();
         std::os::unix::fs::symlink(outside.join("note"), &note).unwrap();
-        let r = read.run(&|_| false);
+        let r = read.run(&|_, _| false);
         assert!(r.is_err(), "the read followed the link: {r:?}");
         assert!(
-            write.run(&|_| false).is_err(),
+            write.run(&|_, _| false).is_err(),
             "the write followed the link"
         );
         assert_eq!(

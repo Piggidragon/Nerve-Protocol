@@ -620,6 +620,8 @@ async fn walks_reach_a_readable_folder_inside_a_sealed_one() {
         .await
         .expect("list");
     assert_eq!(l["entries"], json!([]), "{l}");
+    node.stop().await;
+}
 
 /// Whether process `pid` still runs (a zombie does not count).
 #[cfg(target_os = "linux")]

@@ -1,0 +1,397 @@
+# A release of Nerve, started by hand: Actions, Release, Run workflow, with the
+# branch to build from, the kind (pre-release or release) and the version
+# (docs/releasing.md).
+#
+# `check` stops a bad run before anything is built: a release from any branch
+# but main, a version that is not the one in Cargo.toml, a release whose tag
+# exists or that has no CHANGELOG.md section, a pre-release of a version that
+# is released already. It picks the commit (the head of the branch when the run
+# starts) and the tag, then runs fmt, clippy and the tests. Every build job
+# checks out that commit, so a push to the branch during the run changes
+# nothing. `publish` is the only job that may write: it tags the commit and
+# publishes the release only after every check and build passed, so a failed
+# run leaves no tag. Tags are never moved or reused.
+#
+# No secrets: nothing is signed, Nerve has no update channel yet. The actions are
+# pinned by commit.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: "Branch to build from (a release only from main)"
+        type: string
+        required: true
+        default: main
+      kind:
+        description: "pre-release (any branch, tag pre<N>-v<version>) or release (main only, tag v<version>)"
+        type: choice
+        required: true
+        default: pre-release
+        options:
+          - pre-release
+          - release
+      version:
+        description: "Version x.y.z, the one in the workspace Cargo.toml"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+# One release run at a time, so two runs cannot pick the same pre-release number,
+# and a second release of a version finds the first one's tag.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+env:
+  # Pinned, so a release builds the same way again.
+  RUST_TOOLCHAIN: "1.99.0"
+  CARGO_TERM_COLOR: never
+  # The inputs reach the scripts through the environment only, never as text in
+  # a script.
+  BRANCH: ${{ inputs.branch }}
+  KIND: ${{ inputs.kind }}
+  VERSION: ${{ inputs.version }}
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.commit.outputs.sha }}
+      tag: ${{ steps.tag.outputs.tag }}
+    steps:
+      - name: The inputs
+        run: |
+          if ! [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "version '$VERSION' is not x.y.z" >&2
+            exit 1
+          fi
+          case "$KIND" in
+            pre-release | release) ;;
+            *)
+              echo "kind '$KIND' is neither pre-release nor release" >&2
+              exit 1
+              ;;
+          esac
+          if [ "$KIND" = release ] && [ "$BRANCH" != main ]; then
+            echo "a release only comes from main, not from '$BRANCH': merge to main first, or make a pre-release" >&2
+            exit 1
+          fi
+          if ! [[ "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]] || [[ "$BRANCH" == -* ]] \
+            || ! git check-ref-format "refs/heads/$BRANCH"; then
+            echo "'$BRANCH' is not a branch name" >&2
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/heads/${{ inputs.branch }}
+          persist-credentials: false
+      # The commit every job builds and `publish` tags.
+      - name: The commit
+        id: commit
+        run: |
+          sha=$(git rev-parse HEAD)
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "$BRANCH is at $sha"
+      # A release is v<version> and only once. A pre-release is pre<N>-v<version>,
+      # N one more than the highest one so far (pre1 first), and only for a
+      # version that is not released yet. `publish` creates the tag; creating it
+      # fails there if it has come to exist since.
+      - name: The tag
+        id: tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tags=$(gh api --paginate "repos/$GITHUB_REPOSITORY/tags?per_page=100" --jq '.[].name')
+          if [ "$KIND" = release ]; then
+            tag="v$VERSION"
+            if grep -qxF "$tag" <<< "$tags"; then
+              echo "tag $tag exists, and tags are never moved or reused: raise the version" >&2
+              exit 1
+            fi
+          else
+            # The pre-release would be numbered as older than the release but
+            # published after it, with newer code, and a list of pre-releases
+            # sorted by date would show it as the newest.
+            if grep -qxF "v$VERSION" <<< "$tags"; then
+              echo "v$VERSION is released already, and a pre-release of it would come after it: raise the version on the branch first" >&2
+              exit 1
+            fi
+            n=$({ grep -E "^pre[0-9]+-v${VERSION//./\\.}\$" <<< "$tags" || true; } \
+              | sed -E 's/^pre([0-9]+)-v.*$/\1/' | sort -n | tail -n 1)
+            tag="pre$((10#${n:-0} + 1))-v$VERSION"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "the tag will be $tag"
+          {
+            echo "- $KIND $tag"
+            echo "- branch $BRANCH at $(git rev-parse HEAD)"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt,clippy
+          rustup default "$RUST_TOOLCHAIN"
+      - name: The version is the one in Cargo.toml
+        run: |
+          meta=$(cargo metadata --locked --no-deps --format-version 1)
+          for p in nerve-center nerve-node; do
+            v=$(jq -r --arg p "$p" '.packages[] | select(.name == $p) | .version' <<< "$meta")
+            if [ "$v" != "$VERSION" ]; then
+              echo "the version is $VERSION, Cargo.toml says $p ${v:-(missing)}" >&2
+              exit 1
+            fi
+          done
+      # The release notes are the version's section of CHANGELOG.md. A release
+      # needs one; a pre-release uses it when there is one. `publish` has no
+      # checkout, so the section travels as an artifact (empty when there is none).
+      - name: The changelog section
+        run: |
+          mkdir notes
+          awk -v v="$VERSION" '
+            /^## / { on = ($2 == v); next }
+            on { print }
+          ' CHANGELOG.md | sed '/./,$!d' > notes/changelog.md
+          if [ ! -s notes/changelog.md ] && [ "$KIND" = release ]; then
+            echo "CHANGELOG.md has no section '## $VERSION' with entries: write it, merge to main, then run this again" >&2
+            exit 1
+          fi
+          cat notes/changelog.md
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-notes
+          path: notes/changelog.md
+          if-no-files-found: error
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --workspace --all-targets -- -D warnings
+      - run: cargo test --locked --workspace
+
+  linux:
+    needs: check
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          # A native arm64 runner: no cross C compiler for ring needed.
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      TARGET: ${{ matrix.arch }}-unknown-linux-musl
+      SUFFIX: ${{ matrix.arch }}-linux
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.check.outputs.sha }}
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "$TARGET"
+          rustup default "$RUST_TOOLCHAIN"
+      - name: A C compiler for musl (ring's C parts)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      - name: Build
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: |
+          cargo build --release --locked --target "$TARGET" -p nerve-center -p nerve-node
+          mkdir dist
+          for b in nerve-center nerve-node; do
+            cp "target/$TARGET/release/$b" "dist/$b-$SUFFIX"
+          done
+      - name: Static, and the version the tag names
+        run: |
+          for b in nerve-center nerve-node; do
+            file -b "dist/$b-$SUFFIX" | tee /dev/stderr | grep -Eq 'static(-pie)? linked|statically linked'
+            said=$("dist/$b-$SUFFIX" --version)
+            if [ "$said" != "$b $VERSION" ]; then
+              echo "$b-$SUFFIX says '$said', not '$b $VERSION'" >&2
+              exit 1
+            fi
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nerve-${{ env.SUFFIX }}
+          path: dist/*
+          if-no-files-found: error
+
+  windows:
+    needs: check
+    runs-on: windows-2025
+    env:
+      TARGET: x86_64-pc-windows-msvc
+      SUFFIX: x86_64-windows
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.check.outputs.sha }}
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target "$TARGET"
+          rustup default "$RUST_TOOLCHAIN"
+      # The static C runtime: a fresh Windows has no vcruntime140.dll.
+      - name: Build
+        env:
+          CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
+        run: |
+          cargo build --release --locked --target "$TARGET" -p nerve-center -p nerve-node
+          mkdir dist
+          for b in nerve-center nerve-node; do
+            cp "target/$TARGET/release/$b.exe" "dist/$b-$SUFFIX.exe"
+          done
+      - name: No Visual C++ runtime, and the version the tag names
+        run: |
+          for b in nerve-center nerve-node; do
+            if grep -aqi 'vcruntime140' "dist/$b-$SUFFIX.exe"; then
+              echo "$b-$SUFFIX.exe imports the Visual C++ runtime" >&2
+              exit 1
+            fi
+            said=$("dist/$b-$SUFFIX.exe" --version | tr -d '\r')
+            if [ "$said" != "$b $VERSION" ]; then
+              echo "$b-$SUFFIX.exe says '$said', not '$b $VERSION'" >&2
+              exit 1
+            fi
+          done
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nerve-${{ env.SUFFIX }}
+          path: dist/*
+          if-no-files-found: error
+
+  # No checkout and no build: only the artifacts of the jobs above and the API.
+  # The release is made as a draft with its files first, then the tag, then the
+  # draft is published, so that the step most likely to fail (the upload) runs
+  # before there is a tag. If anything here fails, the last step removes the
+  # draft and the tag this run created, and nothing else (see there).
+  publish:
+    needs: [check, linux, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHA: ${{ needs.check.outputs.sha }}
+      TAG: ${{ needs.check.outputs.tag }}
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: nerve-*
+          path: dist
+          merge-multiple: true
+      # Empty when a pre-release has no changelog section.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-notes
+          path: notes
+      - name: The checksums
+        run: |
+          cd dist
+          files=(nerve-center-* nerve-node-*)
+          if [ "${#files[@]}" != 6 ]; then
+            echo "expected 6 binaries, got: ${files[*]}" >&2
+            exit 1
+          fi
+          sha256sum "${files[@]}" > SHA256SUMS
+          cat SHA256SUMS
+      - name: The draft release
+        run: |
+          case "$KIND" in
+            release)
+              title="Nerve $VERSION"
+              prerelease=false
+              ;;
+            *)
+              title="Nerve $VERSION (pre-release $TAG)"
+              prerelease=true
+              ;;
+          esac
+          footer="Static Linux binaries (x86_64, aarch64) and Windows x86_64 programs of \`nerve-center\` and \`nerve-node\`, built from $SHA. SHA256SUMS lists their checksums. They are not signed: Nerve has no update channel yet (docs/releasing.md)."
+          notes=notes/changelog.md
+          { if [ -s "$notes" ]; then cat "$notes"; echo; fi; echo "$footer"; } > release-notes.md
+          # The draft is made without files, and its id is kept before the upload
+          # (the step most likely to fail): the clean-up then removes this draft
+          # by its id and no other draft of the tag.
+          id=$(gh api --method POST "repos/$GITHUB_REPOSITORY/releases" \
+            -f tag_name="$TAG" -f target_commitish="$SHA" -f name="$title" \
+            -F body=@release-notes.md -F draft=true -F prerelease="$prerelease" --jq .id)
+          if [ -z "$id" ]; then
+            echo "the draft release for $TAG has no id" >&2
+            exit 1
+          fi
+          echo "RELEASE_ID=$id" >> "$GITHUB_ENV"
+          for f in dist/*; do
+            curl --fail-with-body --silent --show-error --request POST \
+              --header "Authorization: Bearer $GH_TOKEN" \
+              --header "Accept: application/vnd.github+json" \
+              --header "Content-Type: application/octet-stream" \
+              --data-binary "@$f" \
+              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$id/assets?name=${f##*/}" \
+              > /dev/null
+          done
+      # Creating the ref fails if the tag exists, so no tag is ever moved. The
+      # tag object is recorded before the ref is made, so that the clean-up can
+      # tell this run's tag from one that was there already.
+      - name: The tag
+        run: |
+          if [ "$KIND" = release ]; then
+            message="Nerve $VERSION"
+          else
+            message="Nerve $VERSION, pre-release $TAG"
+          fi
+          object=$(gh api "repos/$GITHUB_REPOSITORY/git/tags" -f tag="$TAG" -f message="$message" \
+            -f object="$SHA" -f type=commit --jq .sha)
+          echo "TAG_OBJECT=$object" >> "$GITHUB_ENV"
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$object" --silent
+      # A release is marked latest; a pre-release never is.
+      - name: Publish
+        run: |
+          latest=false
+          if [ "$KIND" = release ]; then
+            latest=true
+          fi
+          gh api --method PATCH "repos/$GITHUB_REPOSITORY/releases/$RELEASE_ID" \
+            -F draft=false -f make_latest="$latest" --jq .html_url
+      # What a failed or cancelled run removes: the draft it made (by its id) and
+      # the tag it made (the one that points at its tag object), and only when
+      # GitHub says no release of the tag is published. A Publish whose answer
+      # was lost may have published all the same, and then the tag is that
+      # release's. When GitHub cannot be asked, nothing is removed: a tag left
+      # over can be deleted by hand, a published release without its tag cannot
+      # be put back. A draft the owner made for the same tag has another id and
+      # stays.
+      - name: Clean up after a failure
+        if: ${{ failure() || cancelled() }}
+        run: |
+          api="repos/$GITHUB_REPOSITORY"
+          if ! published=$(gh api --paginate "$api/releases?per_page=100" \
+            --jq '.[] | select(.tag_name == env.TAG and (.draft | not)) | .id'); then
+            echo "::warning::cannot tell whether $TAG is published, so its draft and tag are left as they are"
+            exit 0
+          fi
+          # true, false, or empty when there is no such release or it cannot be read.
+          draft=
+          if [ -n "${RELEASE_ID:-}" ]; then
+            draft=$(gh api "$api/releases/$RELEASE_ID" --jq .draft || true)
+          fi
+          if [ -n "$published" ] || [ "$draft" = false ]; then
+            echo "$TAG is published: its release and tag stay"
+            exit 0
+          fi
+          if [ "$draft" = true ]; then
+            gh api --method DELETE "$api/releases/$RELEASE_ID" || echo "::warning::the draft release $RELEASE_ID of $TAG is still there"
+          fi
+          if [ -n "${TAG_OBJECT:-}" ]; then
+            at=$(gh api "$api/git/ref/tags/$TAG" --jq .object.sha || true)
+            if [ "$at" = "$TAG_OBJECT" ]; then
+              gh api --method DELETE "$api/git/refs/tags/$TAG" || echo "::warning::the tag $TAG is still there"
+            fi
+          fi

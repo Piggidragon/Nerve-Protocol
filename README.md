@@ -48,6 +48,12 @@ CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS="-C target-feature=+crt-static" \
   cargo xwin build --release --target x86_64-pc-windows-msvc
 ```
 
+## Release
+
+Releases (static Linux x86_64 and aarch64 binaries, Windows x86_64 programs,
+`SHA256SUMS`) are made by the `Release` workflow, started by hand with the
+branch and pre-release or release: see [`docs/releasing.md`](docs/releasing.md).
+
 ## Run
 
 1. Add the center to the harness's MCP configuration:

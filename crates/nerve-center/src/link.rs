@@ -48,6 +48,8 @@ pub struct Link {
     pending: Mutex<HashMap<u64, oneshot::Sender<Reply>>>,
     next_id: AtomicU64,
     closed: AtomicBool,
+    /// When the last frame came, in milliseconds after `since`.
+    heard: AtomicU64,
     pong: Notify,
     /// `node` state `status` (online, busy, paused).
     pub status: Mutex<String>,
@@ -66,10 +68,24 @@ impl Link {
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             closed: AtomicBool::new(false),
+            heard: AtomicU64::new(0),
             pong: Notify::new(),
             status: Mutex::new("online".into()),
             sessions: Mutex::new(Default::default()),
         }
+    }
+
+    /// Notes that a frame came.
+    fn touch(&self) {
+        self.heard
+            .store(self.since.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// How long nothing has come from the node.
+    pub fn silent_for(&self) -> Duration {
+        self.since
+            .elapsed()
+            .saturating_sub(Duration::from_millis(self.heard.load(Ordering::Relaxed)))
     }
 
     pub fn is_closed(&self) -> bool {
@@ -294,6 +310,7 @@ pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String
         }
         held.bye(ByeReason::Replaced).await;
         held.fail_all();
+        center.link_replaced(&held);
     }
 
     let welcome = Message::notification(
@@ -352,6 +369,7 @@ pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String
             }
             Ok(Some(Ok(f))) => f,
         };
+        link.touch();
         match frame {
             WsMessage::Text(t) => match Message::decode(&t) {
                 Ok(m) => {

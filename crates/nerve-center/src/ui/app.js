@@ -725,7 +725,7 @@ function pageSettings() {
         el("label", { class: "field" }, el("span", { class: "label" }, "Pairing code valid for (minutes, at most 1440)"), pairMinutes)),
       el("div", { class: "form-row" }, levelPicker.root),
       el("p", { class: "meta" }, "Debug adds detail for tracking down a problem and makes the log file grow faster. What the log holds is on the Log page."),
-      s.center.log_level_pinned ? el("p", { class: "meta" }, "The --log option (NERVE_LOG) sets the level at every start and wins over this setting.") : null,
+      s.center.log_level_pinned ? el("p", { class: "meta" }, `The --log option (NERVE_LOG) sets the level at every start and wins over this setting. This run keeps the level ${s.center.log_level_now}.`) : null,
       el("div", { class: "actions" }, el("button", { type: "button", class: "btn primary", onclick: act(async () => {
         await api("POST", "/api/center", { name: name.value, retention_days: Number(days.value), pair_code_minutes: Number(pairMinutes.value), log_level: logLevel });
         notify("Saved.");

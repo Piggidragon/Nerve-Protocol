@@ -125,7 +125,8 @@ of the same build.
 - **Center.** Its name, how many days to keep statistics, how long a
   pairing code is valid (1 to 1440 minutes, 10 by default), and the **log
   level**: error, warn, info (the default) or debug. The level applies at once
-  and stays for the next start, unless the center is started with `--log`.
+  and stays for the next start. If the center was started with `--log`, that
+  level holds for this run and the one you pick is kept for the next start.
 - **Harness tokens.** Make a token with a label. It is shown once. Delete one
   to stop it.
 - **Machines.** For each online machine that gave the center the settings

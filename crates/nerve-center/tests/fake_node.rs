@@ -789,6 +789,18 @@ async fn audit_targets_are_cut_and_the_audit_feed_is_bounded() {
     r.stop().await;
 }
 
+/// The wait a "link up again after …" line names.
+fn waited(m: &str) -> Duration {
+    let t = m.strip_prefix("link up again after ").unwrap();
+    let mut words = t.split(' ');
+    let n: u64 = words.next().unwrap().parse().unwrap();
+    match words.next().unwrap() {
+        "ms" => Duration::from_millis(n),
+        "s" => Duration::from_secs(n),
+        unit => panic!("{unit} in {m}"),
+    }
+}
+
 /// A node that drops, goes quiet and comes back is in the log: the drop, the
 /// quiet period, and each reconnect with the time it took. Calls that were
 /// refused or failed are there with their reasons, and no secret is.
@@ -937,16 +949,6 @@ async fn a_node_that_drops_and_comes_back_is_in_the_log() {
     }
     // The wait after the quiet period counts from the last frame, so it holds
     // the 300 ms the center waited for one.
-    let waited = |m: &str| -> Duration {
-        let t = m.strip_prefix("link up again after ").unwrap();
-        let mut words = t.split(' ');
-        let n: u64 = words.next().unwrap().parse().unwrap();
-        match words.next().unwrap() {
-            "ms" => Duration::from_millis(n),
-            "s" => Duration::from_secs(n),
-            unit => panic!("{unit} in {m}"),
-        }
-    };
     assert!(waited(&ups[3].1) >= Duration::from_millis(300), "{ups:?}");
     // In this order: up, a drop, up again, a drop, up again (a link that then
     // says nothing), the quiet period, up again.
@@ -985,4 +987,87 @@ async fn a_node_that_drops_and_comes_back_is_in_the_log() {
         at("the center is stopping; closing 1 node link") < at("the center stopped"),
         "{file}"
     );
+}
+
+/// A node that comes back while the center still holds its old link (a
+/// half-open connection that does not answer a ping): the old link is told as
+/// dropped before the new one comes up, with the wait, and the old link's own
+/// end afterwards says nothing of a node that is online.
+#[tokio::test]
+async fn a_node_that_comes_back_over_a_held_link_is_logged_in_order() {
+    use nerve_transport::log::{Entry, Level, Query};
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    // The end of the old link is detail, so the log keeps detail.
+    r.center.log().set_level(Level::Debug);
+    let key = NodeKey::generate().unwrap();
+    assert_eq!(pair(&r, &key, "box-1").await.0, 200);
+    let about = |r: &Running| -> Vec<Entry> {
+        let q = Query {
+            node: Some(key.node_id()),
+            limit: 100,
+            ..Query::default()
+        };
+        r.center
+            .log()
+            .entries(&q)
+            .into_iter()
+            .rev()
+            .map(|(_, e)| e)
+            .collect()
+    };
+    let has = |r: &Running, part: &str| about(r).iter().any(|e| e.msg.contains(part));
+
+    // The old link is held and never read, so it does not answer the center's
+    // ping when the node comes back.
+    let (old, _) = handshake(&r, &key).await;
+    let c = r.center.clone();
+    let id = key.node_id();
+    wait_for(|| c.link(&id).map(|_| ())).await;
+    let (ws, _) = handshake(&r, &key).await;
+    let _seen = serve(ws, descriptor(&key, "box-1"));
+    wait_for(|| has(&r, "link up again after").then_some(())).await;
+    // Only now does the old link end.
+    drop(old);
+    wait_for(|| has(&r, "a link that was replaced ended").then_some(())).await;
+
+    let got: Vec<(Level, String)> = about(&r).into_iter().map(|e| (e.level, e.msg)).collect();
+    let order: Vec<&str> = got
+        .iter()
+        .filter_map(|(_, m)| match m {
+            m if m.starts_with("link up again") => Some("again"),
+            m if m.starts_with("link up") => Some("up"),
+            m if m.starts_with("link dropped") => Some("drop"),
+            m if m.starts_with("a link that was replaced ended") => Some("old ended"),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(order, ["up", "drop", "again", "old ended"], "{got:?}");
+    let drop_line = got
+        .iter()
+        .find(|(_, m)| m.starts_with("link dropped"))
+        .unwrap();
+    assert_eq!(drop_line.0, Level::Warn);
+    assert!(
+        drop_line
+            .1
+            .contains("did not answer a ping, so it was replaced"),
+        "{}",
+        drop_line.1
+    );
+    // The wait counts from the old link's last frame: the 3 s the center gave
+    // it to answer.
+    let again = got
+        .iter()
+        .find(|(_, m)| m.starts_with("link up again"))
+        .unwrap();
+    assert!(waited(&again.1) >= Duration::from_secs(3), "{}", again.1);
+    // The node is online, and the old link's end is detail, not a warning.
+    assert!(r.center.link(&id).is_some());
+    let old_ended = got
+        .iter()
+        .find(|(_, m)| m.starts_with("a link that was replaced"))
+        .unwrap();
+    assert_eq!(old_ended.0, Level::Debug);
+    r.stop().await;
 }

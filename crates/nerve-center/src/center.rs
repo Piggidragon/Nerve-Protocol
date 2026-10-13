@@ -91,6 +91,15 @@ struct Quiet {
 const QUIET_FOR: Duration = Duration::from_secs(10);
 
 impl Quiet {
+    /// How many were left out, once `QUIET_FOR` has passed since the last line
+    /// without another to carry the count; zero before.
+    fn flush(&mut self, now: Instant) -> u32 {
+        match self.last {
+            Some(t) if now.duration_since(t) >= QUIET_FOR => std::mem::take(&mut self.skipped),
+            _ => 0,
+        }
+    }
+
     /// Whether to log now, and how many were left out before.
     fn take(&mut self, now: Instant) -> Option<u32> {
         if self.last.is_some_and(|t| now.duration_since(t) < QUIET_FOR) {
@@ -290,12 +299,29 @@ impl Center {
         self.log_level_pinned
     }
 
-    /// Sets the level from now on and keeps it for the next start.
+    /// The level kept for the next start, which `--log` does not change.
+    pub fn stored_log_level(&self) -> Level {
+        self.read(|s| s.log_level)
+    }
+
+    /// Sets the level from now on and keeps it for the next start. With
+    /// `--log` the flag holds for this run: only the stored level changes.
     pub fn set_log_level(&self, level: Level) {
-        if self.read(|s| s.log_level) != level {
+        let stored = self.stored_log_level();
+        if stored != level {
             self.update(|s| s.log_level = level);
         }
         let old = self.log.level();
+        if self.log_level_pinned {
+            if stored != level {
+                self.log.record(
+                    Level::Info,
+                    None,
+                    &format!("the log level is kept as {level} for the next start; --log holds this run at {old}"),
+                );
+            }
+            return;
+        }
         if old == level {
             return;
         }
@@ -722,21 +748,45 @@ impl Center {
         });
     }
 
+    /// The node's old link is given up because the node connected again and
+    /// the old one did not answer a ping: told as the drop it is, with how long
+    /// it had been silent, which the wait before the new link counts from.
+    pub(crate) fn link_replaced(&self, old: &Arc<Link>) {
+        let silent = old.silent_for();
+        let gone = Instant::now()
+            .checked_sub(silent)
+            .unwrap_or_else(Instant::now);
+        self.down.lock().unwrap().insert(old.node_id.clone(), gone);
+        self.note(
+            Level::Warn,
+            Some(&old.node_id),
+            format!(
+                "link dropped: the node connected again and this link did not answer a ping, so it was replaced (it was up for {}, silent for {})",
+                util::span(old.since.elapsed()),
+                util::span(silent)
+            ),
+        );
+    }
+
     /// A link ended. `clean` is whether the node said bye; `why` is what ended
     /// it, for the log. `silent` is how long nothing had come from the node,
     /// which the wait before its next link counts from.
     pub(crate) fn link_down(&self, link: &Arc<Link>, clean: bool, why: &str, silent: Duration) {
         let id = &link.node_id;
-        {
+        // A link the node's newer one replaced is no longer the node's: its end
+        // says nothing about the node, which is up.
+        let current = {
             let mut links = self.links.lock().unwrap();
-            if links.get(id).is_some_and(|l| Arc::ptr_eq(l, link)) {
+            let current = links.get(id).is_some_and(|l| Arc::ptr_eq(l, link));
+            if current {
                 links.remove(id);
             }
-        }
+            current
+        };
         let now = now_ms();
         let online = link.since.elapsed().as_millis() as u64;
         self.update_soon(|s| {
-            if let Some(n) = s.nodes.get_mut(id) {
+            if current && let Some(n) = s.nodes.get_mut(id) {
                 n.last_seen_ms = now;
             }
             if s.nodes.contains_key(id) {
@@ -747,6 +797,18 @@ impl Center {
                 }
             }
         });
+        if !current {
+            self.note(
+                Level::Debug,
+                Some(id),
+                format!(
+                    "a link that was replaced ended: {why} (it was up for {})",
+                    util::span(link.since.elapsed())
+                ),
+            );
+            self.changed(Change::Nodes);
+            return;
+        }
         let gone = Instant::now()
             .checked_sub(silent)
             .unwrap_or_else(Instant::now);
@@ -1314,6 +1376,18 @@ impl Center {
     /// Notes the pairing codes that ran out unused. The center calls this now
     /// and then, so a log line is at most a few seconds behind the expiry.
     pub fn sweep_codes(&self) {
+        // The wrong codes left out of a burst are counted when it is over.
+        let left_out = self.pair_log.lock().unwrap().flush(Instant::now());
+        if left_out > 0 {
+            self.log.record(
+                Level::Warn,
+                None,
+                &format!(
+                    "{} left out since the last line: the code was unknown, used, expired or out of tries",
+                    plural(left_out, "pairing refusal")
+                ),
+            );
+        }
         let lost = self.codes.lock().unwrap().sweep(Instant::now());
         if lost.expired > 0 {
             self.log.record(
@@ -1614,6 +1688,73 @@ mod tests {
             .len(),
             1
         );
+    }
+
+    /// The wrong codes a burst leaves out of the log are counted once it is
+    /// over, not only if another one comes later.
+    #[test]
+    fn a_burst_of_wrong_codes_is_counted_when_it_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        for _ in 0..5 {
+            assert_eq!(c.pair(&pair_body("wrongwrong12", "box-1", 1)).0, 403);
+        }
+        assert_eq!(said(&c, Level::Warn, "pairing refused").len(), 1);
+        // Inside the window the count waits.
+        c.sweep_codes();
+        assert!(said(&c, Level::Warn, "left out").is_empty());
+        // Past it, the next sweep says how many there were, once.
+        c.pair_log.lock().unwrap().last = Instant::now().checked_sub(QUIET_FOR * 2);
+        c.sweep_codes();
+        c.sweep_codes();
+        let left = said(&c, Level::Warn, "left out");
+        assert_eq!(left.len(), 1);
+        assert!(
+            left[0]
+                .msg
+                .starts_with("4 pairing refusals left out since the last line"),
+            "{}",
+            left[0].msg
+        );
+        // A single refusal after the quiet is a line of its own, with no count.
+        assert_eq!(c.pair(&pair_body("wrongwrong12", "box-1", 1)).0, 403);
+        let lines = said(&c, Level::Warn, "pairing refused");
+        assert_eq!(lines.len(), 2);
+        assert!(!lines[1].msg.contains("more since"), "{}", lines[1].msg);
+    }
+
+    /// With `--log` the flag holds for the run; a level saved meanwhile is kept
+    /// for the next start and does not change this one.
+    #[test]
+    fn a_level_saved_under_the_flag_is_kept_for_the_next_start_only() {
+        let dir = tempfile::tempdir().unwrap();
+        open(dir.path(), None).set_log_level(Level::Debug);
+        let c = Center::open(Options {
+            state_dir: dir.path().to_path_buf(),
+            name: None,
+            public_url: "http://127.0.0.1:7443".into(),
+            log: None,
+            log_level: Some(Level::Warn),
+        })
+        .unwrap();
+        assert_eq!(
+            (c.log().level(), c.stored_log_level()),
+            (Level::Warn, Level::Debug)
+        );
+        // Saving the stored level again changes nothing.
+        c.set_log_level(Level::Debug);
+        assert_eq!(
+            (c.log().level(), c.stored_log_level()),
+            (Level::Warn, Level::Debug)
+        );
+        // Another one is stored; this run stays where the flag put it.
+        c.set_log_level(Level::Error);
+        assert_eq!(
+            (c.log().level(), c.stored_log_level()),
+            (Level::Warn, Level::Error)
+        );
+        drop(c);
+        assert_eq!(open(dir.path(), None).log().level(), Level::Error);
     }
 
     #[tokio::test]

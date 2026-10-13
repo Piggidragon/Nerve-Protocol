@@ -461,7 +461,10 @@ impl Ui {
                     "name": st.center_name,
                     "retention_days": st.retention_days,
                     "pair_code_minutes": st.pair_code_minutes,
-                    "log_level": c.log().level(),
+                    // The stored level is the setting; `--log` can hold another
+                    // for this run (`log_level_now`).
+                    "log_level": st.log_level,
+                    "log_level_now": c.log().level(),
                     "log_level_pinned": c.log_level_pinned(),
                 })
             })),
@@ -1815,6 +1818,39 @@ mod tests {
                 "the center settings were saved (statistics retention)"
             ]
         );
+    }
+
+    /// Saving another setting while `--log` holds the level must not store the
+    /// flag's level as the owner's: the page shows and sends the stored one.
+    #[tokio::test]
+    async fn saving_a_setting_under_the_flag_leaves_the_stored_level_alone() {
+        let d = tempfile::tempdir().unwrap();
+        center(d.path()).set_log_level(Level::Debug);
+        let c = Center::open(crate::center::Options {
+            state_dir: d.path().to_path_buf(),
+            name: Some("test".into()),
+            public_url: "http://127.0.0.1:1".into(),
+            log: None,
+            log_level: Some(Level::Warn),
+        })
+        .unwrap();
+        let ui = Ui::new(&c, None, false, false);
+        let got = center_settings(&ui, None).await.unwrap();
+        assert_eq!(got["log_level"], "debug");
+        assert_eq!(got["log_level_now"], "warn");
+        assert_eq!(got["log_level_pinned"], true);
+        // What the page does: sends every field, the level it was given.
+        center_settings(
+            &ui,
+            Some(json!({"name": "renamed", "retention_days": 30, "log_level": got["log_level"]})),
+        )
+        .await
+        .unwrap();
+        assert_eq!(c.stored_log_level(), Level::Debug);
+        assert_eq!(c.log().level(), Level::Warn);
+        drop(c);
+        // The next start without the flag runs at the level the owner set.
+        assert_eq!(center(d.path()).log().level(), Level::Debug);
     }
 
     #[tokio::test]

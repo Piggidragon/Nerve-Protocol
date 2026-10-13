@@ -53,7 +53,9 @@ A level includes the ones above it in this table.
 | `info` | Normal use: links, pairing, changes, refused calls. The default |
 | `debug` | Detail for tracking down a problem |
 
-A change of the level applies to the next line.
+A change of the level applies to the next line. The log's size is kept even if
+the file cannot be moved aside (another program holds it): then it is started
+again in place.
 
 | Where | How |
 |---|---|
@@ -69,7 +71,7 @@ a new `log.level` within a second.
 | Level | Lines |
 |---|---|
 | `error` | The state file cannot be written. A call failed inside the center or the node (`internal`) |
-| `warn` | A link dropped without a bye, or went quiet (no frame for 45 s). A link failed authentication, or the node speaks another protocol version. A second link while the first is alive (the key may be copied). A description of a node that cannot be used. A pairing was refused: the code is unknown, used, expired or out of tries (one line in ten seconds, with the number left out), or the name or key is taken. Pairing codes ran out of tries. A call failed: the node is offline, busy, too slow, or the link ended. A node refused a change from the web UI. A wrong token at the web UI sign-in, and the lock after too many |
+| `warn` | A link dropped without a bye, went quiet (no frame for 45 s), or was replaced because the node connected again and the old link did not answer a ping. A link failed authentication, or the node speaks another protocol version. A second link while the first is alive (the key may be copied). A description of a node that cannot be used. A pairing was refused: the code is unknown, used, expired or out of tries (one line in ten seconds; the number left out is told on the next line, or when the refusals stop), or the name or key is taken. Pairing codes ran out of tries. A call failed: the node is offline, busy, too slow, or the link ended. A node refused a change from the web UI. A wrong token at the web UI sign-in, and the lock after too many |
 | `info` | The center started and stopped. A link came up, with how long the node was away if it was; a link closed with a bye, with how long it was up. A node is going away, or changed its settings. A pairing code was made, or expired unused. A node paired, was renamed, disabled, enabled, removed or unpaired itself. A harness session started or ended. A call was refused, by the node's rules or because the node is disabled here. A call failed because of its own arguments or the node's answer (a missing file, a bad path). A harness token was made or deleted. Someone signed in to the web UI. Settings, a rule or the sudo switch were changed from the web UI. The center's settings or the log level were changed |
 | `debug` | A handshake that did not finish. A node that is not paired tried to connect. A pairing request in a wrong form. A node's description changed. A call was cancelled |
 
@@ -113,9 +115,21 @@ log; the audit log has it.
   pairing code, the node's key, a proxy's header values.
 
 The programs do not put a secret into a line. As a second guard, every line is
-checked before it is kept: a value after a name like `password`, `token`,
-`secret`, `api_key`, `authorization` or `cookie`, a bearer or basic credential,
-the user and password in a URL, the `code` of a pairing link and a harness
-token (`nrv_…`) are replaced by `[redacted]`. The center also holds back the
-harness token it was started with, and the node the sudo password while sudo is
-on, wherever they would appear.
+checked before it is kept. These are replaced by `[redacted]`:
+
+- the value after a name like `password`, `token`, `secret`, `api_key`,
+  `authorization` or `cookie`, written `name=value`, `name: value`, as JSON, or
+  as a flag with a space (`--password x`, `--with-token x`);
+- the credential after `Authorization:` and its scheme (`Bearer`, `Basic`,
+  `token`, and any other);
+- the user and password in a URL, the `code` of a pairing link and a harness
+  token (`nrv_…`).
+
+The center also holds back the harness token it was started with, and the node
+the sudo password while sudo is on. A secret of fewer than 8 characters is
+replaced only where it stands as a word of its own, so it does not cut other
+words.
+
+A secret that has no name it can be known by is not caught: `curl -u admin:pw`
+and `docker login -p pw` in the reason of a refused command show it. The audit
+log has the whole command line in any case.

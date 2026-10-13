@@ -42,8 +42,12 @@ handle to the daemon.
 `Log::attach_file` opens `log.jsonl` in the state folder (mode 0600), reads the
 latest entries of both files back into the window, then writes what was logged
 before the file was attached. A line is one write. At 5 MiB the file is moved
-to `log.jsonl.1` and replaces the older one. A file that cannot be opened or
-written is told once on stderr; the program goes on with the window.
+to `log.jsonl.1` and replaces the older one. When it cannot be moved (the
+older file cannot be replaced, or on Windows a reader holds it open), it is
+copied there if that works and started again in place, so it never grows past
+its limit. If it cannot be truncated either, lines are not written to the file
+until it can, and stderr says so once. A file that cannot be opened or written
+is told once on stderr; the program goes on with the window.
 
 The center attaches the file in `Center::open`, after it holds the state
 folder's lock, so a second `nerve-center` that only attaches to the first does
@@ -54,7 +58,10 @@ not the daemon writes no log file.
 
 - **Center.** The level is in `state.json` (`log_level`), changed in the web
   UI's settings (`POST /api/center`, `Center::set_log_level`). `--log` wins for
-  one run (`Options.log_level`) and leaves the stored level alone. A change is
+  one run (`Options.log_level`) and leaves the stored level alone: the settings
+  page is given the stored level (`log_level`; `log_level_now` is the one in
+  force), so saving another setting sends the stored level back, and a level
+  saved while `--log` holds is stored without changing this run. A change is
   told in the log while the more verbose of the old and the new level is in
   force, so it is always kept.
 - **Node.** The level is `log.level` in `node.toml`. The supervisor sets it
@@ -68,16 +75,25 @@ not the daemon writes no log file.
 - the value after `password`, `passwd`, `passphrase`, `pwd`, `secret`, `token`,
   `api_key`, `apikey`, `api-key`, `authorization`, `cookie`, `sealed`,
   `private_key` or `credential`, written `name=value`, `name: value` or as
-  JSON, in any letter case;
-- the credential after `Bearer` or `Basic`;
+  JSON, in any letter case, with spaces or tabs around the separator; or, for a
+  flag (`--password x`, `--with-token x`), after a space, unless the next word
+  is a placeholder (`(`, `<`, `[`, `{`, `-`, `$`);
+- the credential after `Bearer` or `Basic`, and after `Authorization:` and its
+  scheme, whatever the scheme;
 - `user:password@` in a URL;
 - the `code` parameter of a pairing link;
 - a harness token, `nrv_` and eight or more characters.
 
-Then the secrets the program holds are replaced by `[redacted]`: the center
-registers the harness token from its flag, the node the sudo password while the
-switch is on. Then control characters become spaces and the message is cut to
-1000 characters.
+The secrets the program holds are replaced by `[redacted]` first, as written:
+the center registers the harness token from its flag, the node the sudo
+password while the switch is on. One shorter than 8 characters is replaced only
+as a whole word (`hide`), so a password like `in` or `1234` does not cut words
+in other places. Then control characters become spaces, so a tab or a line
+break between a name and its value is a gap like any other, `redact` runs, and
+the message is cut to 1000 characters.
+
+A secret with no name to know it by (`curl -u user:pw`, `docker login -p pw`)
+is not caught.
 
 The scanner is by hand, since the workspace has no regex crate. It works on
 bytes and cuts only at ASCII, so it cannot split a character.
@@ -106,6 +122,12 @@ words. The center keeps when each node's link last ended in memory (`down`),
 so the next link says how long the node was away. A link is closed after 45 s
 without a frame (`Center::dead_after`); a test shortens it with
 `set_dead_after`.
+
+A node that connects while the center still holds its old link (a half-open
+connection that does not answer the 3 s ping) replaces it: `link_replaced`
+logs the old link as dropped, with how long it had been silent, and starts the
+wait from its last frame. The old link's own end, later, is a debug line and
+sets no wait, since it is no longer the node's link.
 
 A pairing code that runs out unused is noticed by `Center::sweep_codes`, which
 the center calls every five seconds, so its line is at most that late. The

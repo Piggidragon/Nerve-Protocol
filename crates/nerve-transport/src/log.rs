@@ -346,18 +346,19 @@ impl Log {
 }
 
 impl Inner {
-    /// `msg` as an entry keeps it.
+    /// `msg` as an entry keeps it. The secrets the program holds go first,
+    /// as they were written; then control characters become spaces, so the
+    /// redaction sees one line of words.
     fn clean(&self, msg: &str) -> String {
         let mut text = msg.to_string();
         for (_, secret) in &self.secrets {
-            text = text.replace(secret.as_str(), REDACTED);
+            text = hide(&text, secret);
         }
-        let text = redact(&text);
         let flat: String = text
             .chars()
             .map(|c| if c.is_control() { ' ' } else { c })
             .collect();
-        clip(&flat, MSG_MAX)
+        clip(&redact(&flat), MSG_MAX)
     }
 
     fn push(&mut self, e: Entry) {
@@ -433,10 +434,7 @@ impl Sink {
     fn append(&mut self, line: &[u8]) -> std::io::Result<()> {
         self.open()?;
         if self.len > 0 && self.len + line.len() as u64 > self.max {
-            // The old file goes; a failed move is no reason to lose the entry.
-            self.file = None;
-            let _ = std::fs::rename(&self.path, self.old_path());
-            self.open()?;
+            self.make_room()?;
         }
         let f = self.file.as_mut().expect("opened above");
         // One write per line, so a reader never sees half of one for long.
@@ -446,6 +444,23 @@ impl Sink {
         }
         self.len += line.len() as u64;
         Ok(())
+    }
+
+    /// Makes room in a full file: it is moved to `log.jsonl.1`. When it cannot
+    /// be (the older file is held, a reader keeps this one open on Windows), it
+    /// is copied there if that works, and started again in place, so it never
+    /// grows past its limit. When even that fails, nothing is written until it
+    /// works; the error is the caller's to tell.
+    fn make_room(&mut self) -> std::io::Result<()> {
+        self.file = None;
+        if std::fs::rename(&self.path, self.old_path()).is_err() {
+            let _ = std::fs::copy(&self.path, self.old_path());
+            std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&self.path)?;
+        }
+        self.open()
     }
 
     /// The whole lines of both files, the older first.
@@ -476,6 +491,40 @@ impl Sink {
         entries.drain(..extra);
         Ok(entries)
     }
+}
+
+/// A held secret shorter than this is replaced only where it stands as a word
+/// of its own.
+const WHOLE_WORD_BELOW: usize = 8;
+
+/// `text` with the secret `secret` replaced by [`REDACTED`]. A long secret goes
+/// wherever it is. A short one (a four-digit password, a two-letter word) goes
+/// only as a whole word: replaced inside other words it would garble the
+/// line, and the places it was cut would spell it out.
+fn hide(text: &str, secret: &str) -> String {
+    if secret.chars().count() >= WHOLE_WORD_BELOW {
+        return text.replace(secret, REDACTED);
+    }
+    let word = |c: char| c.is_alphanumeric() || c == '_';
+    // An end of the secret that is not a word character needs no boundary.
+    let (first, last) = (
+        secret.chars().next().is_some_and(word),
+        secret.chars().next_back().is_some_and(word),
+    );
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    for (i, m) in text.match_indices(secret) {
+        let end = i + m.len();
+        let before = !first || !text[..i].chars().next_back().is_some_and(word);
+        let after = !last || !text[end..].chars().next().is_some_and(word);
+        if before && after {
+            out.push_str(&text[at..i]);
+            out.push_str(REDACTED);
+            at = end;
+        }
+    }
+    out.push_str(&text[at..]);
+    out
 }
 
 /// A length of time for a person: `850 ms`, `12 s`, `3 min 4 s`, `10 min`,
@@ -700,41 +749,92 @@ fn merge_spans(spans: &mut Vec<(usize, usize)>) {
     *spans = out;
 }
 
-/// The value after a secret name, and the `code` of a pairing link.
+/// Whether `c` can be part of a word of a command line.
+fn is_word_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, b'-' | b'_')
+}
+
+/// Whether the name that spans `start..end` is a command-line flag
+/// (`--password`, `--with-token`) and ends there.
+fn is_flag(b: &[u8], start: usize, end: usize) -> bool {
+    if end < b.len() && is_word_byte(b[end]) {
+        return false;
+    }
+    let mut word = start;
+    while word > 0 && is_word_byte(b[word - 1]) {
+        word -= 1;
+    }
+    b[word..].starts_with(b"--")
+}
+
+/// The value after a secret name, and the `code` of a pairing link: after
+/// `=` or `:`, or, for a flag, after a space (`--password hunter2`). The
+/// credential of `Authorization: <scheme> <credential>` is the word after the
+/// scheme, whatever the scheme is.
 fn redact_keyed(text: &str) -> String {
     let lower = text.to_ascii_lowercase();
     let (b, lb) = (text.as_bytes(), lower.as_bytes());
+    let blank = |c: u8| matches!(c, b' ' | b'\t');
     let mut spans = Vec::new();
     let mut j = 0;
     while j < b.len() {
         let key = SECRET_KEYS
             .iter()
             .find(|k| lb[j..].starts_with(k.as_bytes()))
-            .map(|k| j + k.len())
+            .map(|k| (*k, j + k.len()))
             // `code=` is a pairing link's secret, only as a URL parameter.
             .or_else(|| {
                 (j > 0 && matches!(b[j - 1], b'?' | b'&') && lb[j..].starts_with(b"code="))
-                    .then_some(j + 4)
+                    .then_some(("code", j + 4))
             });
-        let Some(mut p) = key else {
+        let Some((name, key_end)) = key else {
             j += 1;
             continue;
         };
         // The end of a quoted name in JSON, then the separator.
-        while p < b.len() && matches!(b[p], b'"' | b'\'' | b'\\' | b' ') {
+        let mut p = key_end;
+        while p < b.len() && (blank(b[p]) || matches!(b[p], b'"' | b'\'' | b'\\')) {
             p += 1;
         }
+        let mut value = None;
         if p < b.len() && matches!(b[p], b'=' | b':') && !text[p + 1..].starts_with("//") {
             p += 1;
-            while p < b.len() && b[p] == b' ' {
+            while p < b.len() && blank(b[p]) {
                 p += 1;
             }
-            let (s, e) = value_span(b, p);
-            if e > s && !text[s..e].starts_with(REDACTED) {
-                spans.push((s, e));
-                j = e;
-                continue;
+            let (s, mut e) = value_span(b, p);
+            if name == "authorization" && e > s {
+                let mut q = e;
+                while q < b.len() && blank(b[q]) {
+                    q += 1;
+                }
+                let (s2, e2) = value_span(b, q);
+                if q > e && e2 > s2 {
+                    e = e2;
+                }
             }
+            value = Some((s, e));
+        } else if is_flag(b, j, key_end) {
+            let mut q = key_end;
+            while q < b.len() && blank(b[q]) {
+                q += 1;
+            }
+            // Prose that names a flag (`set --harness-token (NERVE_…)`) is not
+            // a flag with a value.
+            if q > key_end
+                && q < b.len()
+                && !matches!(b[q], b'(' | b'<' | b'[' | b'{' | b'-' | b'$')
+            {
+                value = Some(value_span(b, q));
+            }
+        }
+        if let Some((s, e)) = value
+            && e > s
+            && !text[s..e].starts_with(REDACTED)
+        {
+            spans.push((s, e));
+            j = e;
+            continue;
         }
         j += 1;
     }
@@ -1057,6 +1157,28 @@ mod tests {
                 "nrv_abcdef",
             ),
             ("sealed=BASE64DATA== iv=1", "BASE64DATA"),
+            // The forms of a command line: a flag and its value after a
+            // space, a value after a tab, the credential of any scheme.
+            (
+                "no allow rule matches mysql -u root --password hunter2 db",
+                "hunter2",
+            ),
+            (
+                "gh auth login --with-token ghp_abcdef123456",
+                "ghp_abcdef123456",
+            ),
+            ("login --api-key sk-1 --token sk-2", "sk-1"),
+            ("login --api-key sk-1 --token sk-2", "sk-2"),
+            ("tool --secret 'two words' x", "two words"),
+            ("tool --PASSWORD hunter2", "hunter2"),
+            ("password=\thunter2 next", "hunter2"),
+            ("password:\t \thunter2 next", "hunter2"),
+            (
+                "curl -H 'Authorization: token ghp_abcdef123456' https://api.example/",
+                "ghp_abcdef123456",
+            ),
+            ("Authorization: Negotiate YIIabc123 more", "YIIabc123"),
+            ("Proxy-Authorization: Digest abcdef123456", "abcdef123456"),
         ] {
             let out = redact(text);
             assert!(!out.contains(gone), "{text:?} -> {out:?}");
@@ -1076,6 +1198,11 @@ mod tests {
             "ssh://git@host/repo and http://host:3128/",
             "nrv_short and nrv_ alone",
             "tokens: 3, passwords are never logged",
+            // A flag named like a secret in prose, or with a file or a
+            // placeholder for its value, holds no secret.
+            "set --harness-token (NERVE_HARNESS_TOKEN) or use --ui 127.0.0.1:<port>",
+            "mysql --password-file /etc/mysql/pw db",
+            "usage: tool --token <value> --password $PASS",
             "über ünïcode — täxt with 日本語",
         ] {
             assert_eq!(redact(text), text);
@@ -1130,6 +1257,92 @@ mod tests {
         log.set_secret("sudo", Some("two-two"));
         log.record(Level::Info, None, "one-one two-two");
         assert_eq!(msgs(&log, &all())[0], "one-one [redacted]");
+    }
+
+    /// A tab or a line break between a name and its value is a gap like a
+    /// space: the entry is flat before it is checked.
+    #[test]
+    fn a_secret_after_a_control_character_is_taken_out() {
+        let log = Log::new(Level::Info);
+        for text in [
+            "password=\thunter2 next",
+            "password:\n hunter2 next",
+            "--password\thunter2 next",
+            "Authorization:\ttoken ghp_abcdef123456",
+        ] {
+            log.record(Level::Info, None, text);
+            let got = msgs(&log, &all())[0].clone();
+            assert!(
+                !got.contains("hunter2") && !got.contains("ghp_abc"),
+                "{text:?} -> {got:?}"
+            );
+            assert!(got.contains(REDACTED), "{text:?} -> {got:?}");
+        }
+    }
+
+    /// A short password held back is hidden where it stands alone, and a word
+    /// that only contains it is left whole, so nothing spells it out.
+    #[test]
+    fn a_short_held_secret_is_replaced_as_a_whole_word_or_not_at_all() {
+        let log = Log::new(Level::Info);
+        log.set_secret("sudo", Some("in"));
+        log.record(
+            Level::Info,
+            None,
+            "linked to center lab; the node is running in lab",
+        );
+        assert_eq!(
+            msgs(&log, &all())[0],
+            "linked to center lab; the node is running [redacted] lab"
+        );
+        log.set_secret("sudo", Some("1234"));
+        log.record(
+            Level::Info,
+            None,
+            "pw 1234, id 12345 and x1234 and (1234) and 1234",
+        );
+        assert_eq!(
+            msgs(&log, &all())[0],
+            "pw [redacted], id 12345 and x1234 and ([redacted]) and [redacted]"
+        );
+        // A secret that starts or ends with a mark needs no boundary there.
+        log.set_secret("sudo", Some("a!"));
+        log.record(Level::Info, None, "say a! then ba! and a!b");
+        assert_eq!(
+            msgs(&log, &all())[0],
+            "say [redacted] then ba! and [redacted]b"
+        );
+        // A longer one is replaced wherever it is.
+        log.set_secret("sudo", Some("longsecret-9"));
+        log.record(Level::Info, None, "xlongsecret-9y");
+        assert_eq!(msgs(&log, &all())[0], "x[redacted]y");
+    }
+
+    /// When the file cannot be moved aside, it is started again in place, so
+    /// it does not grow past its limit while the move keeps failing.
+    #[test]
+    fn a_file_that_cannot_be_moved_aside_stays_within_its_limit() {
+        let d = tempfile::tempdir().unwrap();
+        let path = file_in(d.path());
+        let log = Log::new(Level::Info);
+        log.attach_file_with_limit(&path, 400).unwrap();
+        // A folder with a file in it cannot be replaced by a rename.
+        let old = d.path().join("log.jsonl.1");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("keep"), "x").unwrap();
+        for i in 0..100 {
+            log.record(Level::Info, None, &format!("entry number {i:02}"));
+            assert!(std::fs::metadata(&path).unwrap().len() <= 400, "after {i}");
+        }
+        // The newest entries are in it, whole, and the window has them all.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.trim_end().ends_with("entry number 99\"}"), "{text}");
+        assert!(
+            text.lines()
+                .all(|l| serde_json::from_str::<Entry>(l).is_ok())
+        );
+        assert_eq!(log.entries(&all()).len(), 100);
+        assert!(old.join("keep").exists());
     }
 
     #[test]

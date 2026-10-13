@@ -350,19 +350,14 @@ impl Log {
 }
 
 impl Inner {
-    /// `msg` as an entry keeps it. The secrets the program holds go first,
-    /// as they were written; then control characters become spaces, so the
-    /// redaction sees one line of words.
+    /// `msg` as an entry keeps it: the secrets the program holds go first,
+    /// as they were written, then [`scrub`].
     fn clean(&self, msg: &str) -> String {
         let mut text = msg.to_string();
         for (_, secret) in &self.secrets {
             text = hide(&text, secret);
         }
-        let flat: String = text
-            .chars()
-            .map(|c| if c.is_control() { ' ' } else { c })
-            .collect();
-        clip(&redact(&flat), MSG_MAX)
+        scrub(&text)
     }
 
     fn push(&mut self, e: Entry) {
@@ -553,6 +548,19 @@ fn hide(text: &str, secret: &str) -> String {
     }
     out.push_str(&text[at..]);
     out
+}
+
+/// `text` as one line of the log: control characters become spaces, so the
+/// redaction sees one line of words, then [`redact`], cut to [`MSG_MAX`]
+/// characters. Whatever else shows a line of the log (the Windows Event
+/// Log of the node) goes through this too. It takes no lock, so a panic hook
+/// may call it.
+pub fn scrub(text: &str) -> String {
+    let flat: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    clip(&redact(&flat), MSG_MAX)
 }
 
 /// A length of time for a person: `850 ms`, `12 s`, `3 min 4 s`, `10 min`,
@@ -1385,6 +1393,26 @@ mod tests {
             );
             assert!(got.contains(REDACTED), "{text:?} -> {got:?}");
         }
+    }
+
+    /// A line made elsewhere than in a `Log` is flat, redacted and cut as an
+    /// entry is (PR #71 review round 1, finding 1).
+    #[test]
+    fn scrub_flattens_before_it_redacts() {
+        for text in [
+            "password:\nhunter2",
+            "token =\n  hunter2",
+            "--password\nhunter2",
+            "Authorization: Bearer\nhunter2",
+        ] {
+            let got = scrub(text);
+            assert!(!got.contains("hunter2"), "{text:?} -> {got:?}");
+            assert!(!got.contains('\n'), "{text:?} -> {got:?}");
+            assert!(got.contains(REDACTED), "{text:?} -> {got:?}");
+        }
+        let long = scrub(&"x".repeat(MSG_MAX + 5));
+        assert_eq!(long.chars().count(), MSG_MAX + 1);
+        assert!(long.ends_with('…'));
     }
 
     /// A short password held back is hidden where it stands alone, and a word

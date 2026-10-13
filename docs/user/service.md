@@ -265,7 +265,10 @@ command gets them.
 It stops the service, moves the old program aside, puts the new one in its
 place and starts the service; if the new one does not start, the old one
 goes back. The old program goes once nothing runs it, or at the next restart
-of Windows when `update` ran from it.
+of Windows when `update` ran from it. `update` also registers the Event Log
+source `nerve-node` again. A node installed by a program that did not
+register it yet gets it from the installed program:
+`& "C:\Program Files\Nerve\nerve-node.exe" install`, or the next `update`.
 
 `uninstall` stops and removes the service, the source `nerve-node` of the
 Event Log (its entries stay), the user `nerve` and its profile, and the

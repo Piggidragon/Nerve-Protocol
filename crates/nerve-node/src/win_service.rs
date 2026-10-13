@@ -49,6 +49,12 @@ static STARTED: AtomicBool = AtomicBool::new(false);
 /// Why the manager asked the service to stop, for the Event Log.
 static ASKED: Mutex<Option<&'static str>> = Mutex::new(None);
 
+thread_local! {
+    /// Set on the thread that runs the node's body: a panic there ends the
+    /// program, one elsewhere (a task, which tokio catches) does not.
+    static BODY_THREAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn stop_bell() -> &'static tokio::sync::Notify {
     STOP.get_or_init(tokio::sync::Notify::new)
 }
@@ -115,13 +121,9 @@ fn log_path() -> String {
 
 /// Writes an entry to the Windows Event Log (Application) as the source
 /// [`SOURCE`]. Every user of the machine may read that log, so the text is
-/// redacted and cut as a line of the node's log is.
+/// made one line, redacted and cut as a line of the node's log is.
 pub fn event(e: Event, text: &str) -> Result<(), String> {
-    let text = nerve_transport::log::redact(text);
-    let text: String = match text.char_indices().nth(nerve_transport::log::MSG_MAX) {
-        Some((end, _)) => format!("{}…", &text[..end]),
-        None => text,
-    };
+    let text = nerve_transport::log::scrub(text);
     let source = wide(SOURCE);
     // SAFETY: this machine and a NUL-terminated name; a source that is not
     // registered still writes, to the Application log.
@@ -159,10 +161,10 @@ pub fn event(e: Event, text: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Writes each panic to the Event Log as a crash, then does what the hook
-/// before did. A panic in the service's own thread ends the program, and the
-/// manager starts it again. The log file is left alone here: the panic may
-/// have come while its lock was held.
+/// Writes each panic to the Event Log, then does what the hook before did. A
+/// panic in the body's thread ends the program ([`run_body`]), and the
+/// manager starts it again; one elsewhere leaves the node running. The log
+/// file is left alone here: the panic may have come while its lock was held.
 fn watch_crashes() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -185,10 +187,17 @@ fn crash_text(info: &std::panic::PanicHookInfo<'_>) -> String {
         .location()
         .map(|l| format!(" at {}:{}", l.file(), l.line()))
         .unwrap_or_default();
-    format!(
-        "The Nerve node crashed (a panic{at}): {what}. Its log is {}.",
-        log_path()
-    )
+    if BODY_THREAD.with(|b| b.get()) {
+        format!(
+            "The Nerve node crashed (a panic{at}): {what}. The service ends, and Windows starts it again. Its log is {}.",
+            log_path()
+        )
+    } else {
+        format!(
+            "A part of the Nerve node panicked{at}: {what}. The node runs on. Its log is {}.",
+            log_path()
+        )
+    }
 }
 
 /// Waits until the manager asks the service to stop.
@@ -235,8 +244,27 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core
     report(SERVICE_START_PENDING, 0);
     watch_crashes();
     let body = crate::daemon::lock(&BODY).take();
-    let code = match body.map(|b| b()) {
-        Some(Err(e)) => {
+    let code = run_body(body);
+    report(SERVICE_STOPPED, code);
+}
+
+/// Runs the node's body and writes how it ended to the Event Log; the
+/// service's exit code. A panic is caught here, after the hook wrote it
+/// ([`watch_crashes`]): left to unwind into [`service_main`], which cannot
+/// unwind, it would panic a second time and write a second crash. The
+/// program then ends at once, as a crash does, so the service's failure
+/// actions start it again.
+fn run_body(body: Option<Body>) -> u32 {
+    BODY_THREAD.with(|b| b.set(true));
+    let ended = match body {
+        Some(b) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(b)),
+        None => Ok(Ok(())),
+    };
+    let Ok(ended) = ended else {
+        std::process::abort();
+    };
+    match ended {
+        Err(e) => {
             // Nobody reads stderr here: the node's log file has it.
             if let (Some(log), Some(path)) = (nerve_transport::log::global(), LOG.get()) {
                 let _ = log.attach_file(path);
@@ -253,13 +281,12 @@ unsafe extern "system" fn service_main(_argc: u32, _argv: *mut windows_sys::core
             );
             1
         }
-        _ => {
+        Ok(()) => {
             let why = crate::daemon::lock(&ASKED).unwrap_or("its work ended");
             let _ = event(Event::Stopped, &format!("The Nerve node stopped: {why}."));
             0
         }
-    };
-    report(SERVICE_STOPPED, code);
+    }
 }
 
 unsafe extern "system" fn control(
@@ -289,20 +316,38 @@ unsafe extern "system" fn control(
 mod tests {
     use super::*;
 
-    /// The newest entries of the source in the Application log, one line
-    /// each: the kind, the event id and the text.
-    fn entries() -> Vec<String> {
-        let script = format!(
-            "Get-EventLog -LogName Application -Source {SOURCE} -Newest 50 | ForEach-Object {{ \"$($_.EntryType) $($_.InstanceId) $($_.ReplacementStrings -join ' ')\" }}"
-        );
+    /// What a Windows PowerShell line prints, line by line.
+    fn powershell(script: &str) -> Vec<String> {
         let o = std::process::Command::new("powershell.exe")
-            .args(["-NoProfile", "-Command", &script])
+            .args(["-NoProfile", "-Command", script])
             .output()
             .unwrap();
         String::from_utf8_lossy(&o.stdout)
             .lines()
             .map(str::to_string)
             .collect()
+    }
+
+    /// The newest entries of the source in the Application log, one line
+    /// each: the kind, the event id and the text, its line breaks made
+    /// spaces.
+    fn entries() -> Vec<String> {
+        entries_after(0)
+    }
+
+    /// Those numbered above `index` only.
+    fn entries_after(index: u64) -> Vec<String> {
+        powershell(&format!(
+            "Get-EventLog -LogName Application -Source {SOURCE} -Newest 50 | Where-Object {{ $_.Index -gt {index} }} | ForEach-Object {{ \"$($_.EntryType) $($_.InstanceId) $(($_.ReplacementStrings -join ' ') -replace '[\\r\\n]+', ' ')\" }}"
+        ))
+    }
+
+    /// The number of the newest entry in the Application log.
+    fn last_index() -> u64 {
+        powershell("(Get-EventLog -LogName Application -Newest 1).Index")
+            .first()
+            .and_then(|l| l.trim().parse().ok())
+            .unwrap_or(0)
     }
 
     fn entry_with(marker: &str) -> String {
@@ -362,6 +407,15 @@ mod tests {
         let got = entry_with(&marker);
         assert!(got.starts_with("Information 1 test entry"), "{got}");
         assert!(!got.contains("hunter22"), "{got}");
+        // A value on the next line goes too, as in the log (PR #71 review
+        // round 1, finding 1).
+        event(
+            Event::NotStarted,
+            &format!("test lines {marker}z token:\nhunter23"),
+        )
+        .unwrap();
+        let got = entry_with(&format!("{marker}z"));
+        assert!(!got.contains("hunter23"), "{got}");
         event(Event::NotStarted, &format!("test refusal {marker}x")).unwrap();
         assert!(entry_with(&format!("{marker}x")).starts_with("Error 3 "));
         watch_crashes();
@@ -372,10 +426,63 @@ mod tests {
                 .join()
                 .is_err()
         );
+        // Another thread than the body's: the node runs on.
         let got = entry_with(&crash);
         assert!(
-            got.starts_with("Error 4 The Nerve node crashed (a panic at "),
+            got.starts_with("Error 4 A part of the Nerve node panicked at "),
             "{got}"
         );
+        assert!(got.contains("The node runs on."), "{got}");
+    }
+
+    /// Stands in for [`service_main`]: the body runs in a function that
+    /// cannot unwind.
+    extern "system" fn serve_panicking() {
+        let marker = std::env::var("NERVE_TEST_CRASH").unwrap();
+        run_body(Some(Box::new(move || panic!("test body crash {marker}"))));
+    }
+
+    /// Run by the test below in a program of its own, which it ends.
+    #[test]
+    #[ignore = "a child of a_crash_of_the_body_is_one_entry"]
+    fn crash_the_body() {
+        if std::env::var_os("NERVE_TEST_CRASH").is_none() {
+            return;
+        }
+        watch_crashes();
+        serve_panicking();
+    }
+
+    /// A panic in the body ends the program and writes one crash, not a
+    /// second one for the frame that cannot unwind (PR #71 review round 1,
+    /// finding 2).
+    #[test]
+    fn a_crash_of_the_body_is_one_entry() {
+        let marker = nerve_transport::keys::random_token(12);
+        let before = last_index();
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "win_service::tests::crash_the_body",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("NERVE_TEST_CRASH", &marker)
+            .output()
+            .unwrap();
+        assert!(!child.status.success());
+        let all = entries_after(before);
+        let crashes: Vec<&String> = all.iter().filter(|l| l.contains(&marker)).collect();
+        assert_eq!(crashes.len(), 1, "{all:#?}");
+        assert!(
+            crashes[0].starts_with("Error 4 The Nerve node crashed (a panic at "),
+            "{}",
+            crashes[0]
+        );
+        let not_unwinding = all
+            .iter()
+            .filter(|l| l.contains("panic in a function that cannot unwind"))
+            .count();
+        assert_eq!(not_unwinding, 0, "{all:#?}");
     }
 }

@@ -492,6 +492,10 @@ async fn update_steps(
         .ok_or_else(|| {
             format!("the user {USER} is missing; `nerve-node install` makes it again")
         })?;
+    // A node installed before it wrote to the Event Log has no source there,
+    // and one whose source points elsewhere gets it back; it is the same
+    // program path after the update.
+    sys.put_event_source(layout)?;
     let new = match from {
         Some(f) => {
             let b = std::fs::read(f).map_err(|e| format!("{}: {e}", f.display()))?;
@@ -1165,7 +1169,7 @@ mod tests {
             "{out}"
         );
         assert_eq!(std::fs::read(&l.bin).unwrap(), b"nerve-node 1.2.0\n");
-        assert_eq!(sys.calls()[calls..], ["stop", "start"]);
+        assert_eq!(sys.calls()[calls..], ["event source", "stop", "start"]);
         assert_eq!(sys.started.borrow().last().unwrap(), "nerve-node 1.2.0");
         for (p, b) in before {
             let now = std::fs::read(&p).unwrap();
@@ -1177,7 +1181,10 @@ mod tests {
         }
         assert_eq!(audit_events(&l).last().unwrap()["event"], "update");
         assert!(!staged(&l.bin).exists() && !previous(&l.bin).exists());
-        // The same program again changes nothing.
+        // The same program again changes nothing, but registers the Event
+        // Log source of a node installed before there was one (PR #71 review
+        // round 1, finding 3).
+        *sys.event_source.borrow_mut() = None;
         let calls = sys.calls().len();
         let mut out = Vec::new();
         update(&l, &sys, Some(&new), &mut out).await.unwrap();
@@ -1186,7 +1193,8 @@ mod tests {
                 .unwrap()
                 .contains("nothing to update")
         );
-        assert_eq!(sys.calls().len(), calls);
+        assert_eq!(sys.calls()[calls..], ["event source"]);
+        assert_eq!(*sys.event_source.borrow(), Some(l.bin.clone()));
     }
 
     #[tokio::test]
@@ -1217,7 +1225,10 @@ mod tests {
         assert!(e.contains("did not start"), "{e}");
         assert!(e.contains("the old one does not either"), "{e}");
         // The old program is started again, even though here it fails too.
-        assert_eq!(sys.calls()[calls..], ["stop", "start", "stop", "start"]);
+        assert_eq!(
+            sys.calls()[calls..],
+            ["event source", "stop", "start", "stop", "start"]
+        );
         assert_eq!(
             sys.started.borrow()[starts..],
             ["nerve-node 2.0.0", "nerve-node 1.2.0"]
@@ -1255,7 +1266,10 @@ mod tests {
         assert!(!staged(&l.bin).exists() && !previous(&l.bin).exists());
         // The new program was started and stopped, then the old one started
         // after it was put back: the node is up again.
-        assert_eq!(sys.calls()[calls..], ["stop", "start", "stop", "start"]);
+        assert_eq!(
+            sys.calls()[calls..],
+            ["event source", "stop", "start", "stop", "start"]
+        );
         assert_eq!(
             sys.started.borrow()[starts..],
             ["nerve-node 2.0.0", "nerve-node 1.2.0"]

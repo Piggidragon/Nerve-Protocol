@@ -453,7 +453,14 @@ pub fn sudo_prompt() -> String {
 /// (`run`), and a command sudo starts without asking never gets it. The
 /// shell `exec`s sudo, so the process the node started is sudo itself and
 /// its first child is the command.
+///
+/// Windows has no sudo program: the line is what followed `sudo`, which
+/// the shell runs with the account's administrator token (`run`,
+/// crate::winsudo).
 pub fn sudo_line(sudo_path: &str, args: &str, prompt: &str) -> String {
+    if cfg!(windows) {
+        return args.to_string();
+    }
     format!(
         "exec {} -S -k -p {} {args}",
         sh_quote(sudo_path),
@@ -753,7 +760,7 @@ fn has_child(pid: u32) -> bool {
 
 #[cfg(not(target_os = "linux"))]
 fn has_child(_pid: u32) -> bool {
-    // The sudo switch is Linux only; elsewhere the wait or the end decides.
+    // Only Linux runs a sudo program; elsewhere the wait or the end decides.
     false
 }
 
@@ -774,6 +781,15 @@ pub async fn run(
     #[cfg(windows)]
     if let Some(a) = &opts.account {
         return run_as(call, opts, a, &program, &args, started).await;
+    }
+    // Only the installed node can start a command with the administrator
+    // token of the account commands run as (crate::winsudo).
+    #[cfg(windows)]
+    if opts.sudo.is_some() {
+        return Err(RpcError::new(
+            ErrorCode::Unavailable,
+            crate::winsudo::INSTALLED_ONLY,
+        ));
     }
     let mut cmd = match &shim {
         Some(_) => {
@@ -960,7 +976,9 @@ pub async fn run(
 /// starts suspended with the account's token in the call's folder, is put
 /// in a job of its own and runs only then. It does not start when its
 /// account can open the node's own folders, nor without a job: the node
-/// may not end another account's processes one by one, only the job.
+/// may not end another account's processes one by one, only the job. A
+/// sudo command starts with the account's administrator token instead
+/// (crate::winsudo), which can open every folder.
 #[cfg(windows)]
 async fn run_as(
     call: &RunCall,
@@ -973,7 +991,22 @@ async fn run_as(
     let unavailable = |m: String| RpcError::new(ErrorCode::Unavailable, m);
     let token = crate::win_user::token_for(account)
         .map_err(|e| unavailable(format!("cannot start as {}: {e}", account.name)))?;
-    match crate::win_user::reach(&token, &opts.own) {
+    let elevated = match &opts.sudo {
+        Some(s) => Some(
+            crate::win_user::sudo_token(&account.name, &s.password).map_err(|e| {
+                unavailable(format!(
+                    "cannot start as {} with its administrator rights: {e}",
+                    account.name
+                ))
+            })?,
+        ),
+        None => None,
+    };
+    let reach = match elevated {
+        Some(_) => Ok(None),
+        None => crate::win_user::reach(&token, &opts.own),
+    };
+    match reach {
         Ok(None) => {}
         Ok(Some(_)) => {
             return Err(unavailable(format!(
@@ -994,14 +1027,20 @@ async fn run_as(
         ))
     })?;
     let line = windows_command_line(program, args);
-    let child = crate::win_user::spawn(&token, &line, Some(&call.cwd), Some(&account.home))
-        .map_err(|e| {
-            unavailable(format!(
-                "cannot start as {} in {}: {e}",
-                account.name,
-                to_wire(&call.cwd)
-            ))
-        })?;
+    let child = crate::win_user::spawn_as(
+        elevated.as_ref().unwrap_or(token.as_ref()),
+        &token,
+        &line,
+        Some(&call.cwd),
+        Some(&account.home),
+    )
+    .map_err(|e| {
+        unavailable(format!(
+            "cannot start as {} in {}: {e}",
+            account.name,
+            to_wire(&call.cwd)
+        ))
+    })?;
     if let Err(e) = job.assign(child.process()) {
         child.kill();
         return Err(unavailable(crate::job::assign_error(
@@ -1308,6 +1347,7 @@ mod tests {
         assert_eq!(r["stderr"], "", "the prompt is left out: {r}");
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn sudo_line_quotes_the_program() {
         assert_eq!(
@@ -1319,6 +1359,14 @@ mod tests {
         assert!(p.starts_with("nerve-sudo-") && p.ends_with(':'), "{p}");
         assert!(!p.contains('%'), "sudo would expand it: {p}");
         assert_ne!(p, sudo_prompt());
+    }
+
+    /// Windows has no sudo program: the shell runs what followed `sudo`,
+    /// started with the administrator token.
+    #[cfg(windows)]
+    #[test]
+    fn sudo_line_is_the_command_on_windows() {
+        assert_eq!(sudo_line("sudo", "net session", "p:"), "net session");
     }
 
     #[tokio::test]

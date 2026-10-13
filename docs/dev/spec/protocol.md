@@ -346,8 +346,8 @@ browser or tool) to the node; the center only relays it.
   right or wrong, and only within 60 s of making it; the inner `offer` must
   match and the inner `ts` be within 60 s of the node's clock. A replayed,
   late, tampered or foreign box is `invalid_args`, and so is a password that
-  `sudo -v` refuses (the message says the password is wrong); the switch then
-  stays as it was.
+  `sudo -v` refuses, or on Windows the account's logon (the message says the
+  password is wrong; node-local §4); the switch then stays as it was.
 - `sudo {on: false}` → `{sudo: "off"}` drops the password.
 - The password never appears in a frame the node sends.
 

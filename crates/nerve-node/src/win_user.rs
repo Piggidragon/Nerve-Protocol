@@ -22,9 +22,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_LOGON_FAILURE, ERROR_NOT_ALL_ASSIGNED, ERROR_SHARING_VIOLATION,
-    GENERIC_READ, GetLastError, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LUID, LocalFree,
-    SetHandleInformation, WAIT_OBJECT_0,
+    CloseHandle, ERROR_LOGON_FAILURE, ERROR_LOGON_TYPE_NOT_GRANTED, ERROR_NOT_ALL_ASSIGNED,
+    ERROR_SHARING_VIOLATION, GENERIC_READ, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
+    INVALID_HANDLE_VALUE, LUID, LocalFree, SetHandleInformation, WAIT_OBJECT_0,
 };
 use windows_sys::Win32::NetworkManagement::NetManagement::{
     LG_INCLUDE_INDIRECT, LOCALGROUP_USERS_INFO_0, NERR_UserNotFound, NetApiBufferFree,
@@ -39,14 +39,15 @@ use windows_sys::Win32::Security::Cryptography::{
 };
 use windows_sys::Win32::Security::{
     AdjustTokenPrivileges, CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE,
-    GetSecurityDescriptorDacl, GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation,
-    ImpersonateLoggedOnUser, IsWellKnownSid, LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT,
-    LUID_AND_ATTRIBUTES, LogonUserW, LookupAccountSidW, LookupPrivilegeValueW,
-    PSECURITY_DESCRIPTOR, PSID, RevertToSelf, SE_PRIVILEGE_ENABLED, SECURITY_ATTRIBUTES,
-    SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES, SID_NAME_USE, SetTokenInformation,
-    TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_PRIVILEGES, TOKEN_ASSIGN_PRIMARY, TOKEN_DEFAULT_DACL,
-    TOKEN_DUPLICATE, TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_PRIVILEGES, TOKEN_QUERY,
-    TOKEN_USER, TokenDefaultDacl, TokenOwner, TokenPrivileges, TokenUser, WELL_KNOWN_SID_TYPE,
+    EqualSid, GetSecurityDescriptorDacl, GetSidSubAuthority, GetSidSubAuthorityCount,
+    GetTokenInformation, ImpersonateLoggedOnUser, IsWellKnownSid, LOGON32_LOGON,
+    LOGON32_LOGON_BATCH, LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT, LUID_AND_ATTRIBUTES,
+    LogonUserW, LookupAccountSidW, LookupPrivilegeValueW, PSECURITY_DESCRIPTOR, PSID, RevertToSelf,
+    SE_PRIVILEGE_ENABLED, SECURITY_ATTRIBUTES, SECURITY_MAX_SID_SIZE, SID_AND_ATTRIBUTES,
+    SID_NAME_USE, SetTokenInformation, TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_PRIVILEGES,
+    TOKEN_ASSIGN_PRIMARY, TOKEN_DEFAULT_DACL, TOKEN_DUPLICATE, TOKEN_GROUPS,
+    TOKEN_INFORMATION_CLASS, TOKEN_OWNER, TOKEN_PRIVILEGES, TOKEN_QUERY, TOKEN_USER,
+    TokenDefaultDacl, TokenGroups, TokenOwner, TokenPrivileges, TokenUser, WELL_KNOWN_SID_TYPE,
     WinBuiltinAdministratorsSid, WinBuiltinBackupOperatorsSid, WinLocalSystemSid,
 };
 use windows_sys::Win32::Storage::FileSystem::{
@@ -471,6 +472,18 @@ pub(crate) fn enable(names: &[&str]) -> io::Result<()> {
 /// machine would be: an administrator gets the filtered token UAC gives
 /// such a logon, without the Administrators group.
 pub fn logon(name: &str, password: &str) -> Result<Token, String> {
+    logon_as(name, password, LOGON32_LOGON_INTERACTIVE)
+}
+
+/// Logs `name` on with `password` as a batch job, as the task scheduler
+/// does for a task that runs with highest privileges: UAC filters no such
+/// logon, so an administrator gets its full token, with the Administrators
+/// group. What a sudo command starts with (crate::winsudo).
+pub fn batch_logon(name: &str, password: &str) -> Result<Token, String> {
+    logon_as(name, password, LOGON32_LOGON_BATCH)
+}
+
+fn logon_as(name: &str, password: &str, kind: LOGON32_LOGON) -> Result<Token, String> {
     let mut h: HANDLE = std::ptr::null_mut();
     // SAFETY: NUL-terminated strings ("." is this machine) and a place for
     // the token.
@@ -479,21 +492,64 @@ pub fn logon(name: &str, password: &str) -> Result<Token, String> {
             wide(name).as_ptr(),
             wide(".").as_ptr(),
             wide(password).as_ptr(),
-            LOGON32_LOGON_INTERACTIVE,
+            kind,
             LOGON32_PROVIDER_DEFAULT,
             &mut h,
         )
     };
     if ok == 0 {
         let e = last();
-        return Err(if e.raw_os_error() == Some(ERROR_LOGON_FAILURE as i32) {
-            format!("the password of {name} is wrong, or {name} cannot log on with a password")
-        } else {
-            format!("cannot log {name} on: {e}")
+        return Err(match e.raw_os_error().map(|c| c as u32) {
+            Some(ERROR_LOGON_FAILURE) => {
+                format!("the password of {name} is wrong, or {name} cannot log on with a password")
+            }
+            // Administrators may log on as a batch job unless a policy
+            // took it from them.
+            Some(ERROR_LOGON_TYPE_NOT_GRANTED) if kind == LOGON32_LOGON_BATCH => format!(
+                "{name} may not log on as a batch job (the right \"Log on as a batch job\", which administrators have unless a policy takes it)"
+            ),
+            _ => format!("cannot log {name} on: {e}"),
         });
     }
     // SAFETY: LogonUserW returned a token this code now owns.
     Ok(Token(unsafe { OwnedHandle::from_raw_handle(h as _) }))
+}
+
+/// Group attributes from winnt.h, which windows-sys keeps in a module the
+/// node does not otherwise use.
+const SE_GROUP_ENABLED: u32 = 0x4;
+const SE_GROUP_USE_FOR_DENY_ONLY: u32 = 0x10;
+
+/// Whether `t` holds the Administrators group in effect: a full token of an
+/// administrator, not one that UAC filtered, where the group only denies.
+pub fn has_admins(t: &Token) -> io::Result<bool> {
+    let admins = well_known_sid(WinBuiltinAdministratorsSid)?;
+    let buf = token_info(t.raw(), TokenGroups)?;
+    // SAFETY: the buffer holds a TOKEN_GROUPS with its count of entries,
+    // whose SIDs point into it.
+    unsafe {
+        let g = &*buf.as_ptr().cast::<TOKEN_GROUPS>();
+        Ok(
+            std::slice::from_raw_parts(g.Groups.as_ptr(), g.GroupCount as usize)
+                .iter()
+                .any(|a| {
+                    a.Attributes & SE_GROUP_ENABLED != 0
+                        && a.Attributes & SE_GROUP_USE_FOR_DENY_ONLY == 0
+                        && EqualSid(a.Sid, admins.as_ptr() as PSID) != 0
+                }),
+        )
+    }
+}
+
+/// The token a sudo command of `name` starts with: its batch logon with
+/// `password`, which must hold the Administrators group.
+pub fn sudo_token(name: &str, password: &str) -> Result<Token, String> {
+    let t = batch_logon(name, password)?;
+    match has_admins(&t) {
+        Ok(true) => Ok(t),
+        Ok(false) => Err(crate::winsudo::not_admin(name)),
+        Err(e) => Err(format!("cannot read the groups of {name}'s logon: {e}")),
+    }
 }
 
 /// The thread acts as another account while this lives. It is not `Send`,
@@ -807,6 +863,20 @@ pub fn spawn(
     cwd: Option<&Path>,
     home: Option<&Path>,
 ) -> io::Result<Spawned> {
+    spawn_as(t, t, line, cwd, home)
+}
+
+/// [`spawn`] with the environment of `env`, a logon of the same account:
+/// the service may not act as an administrator's full token (a higher
+/// integrity level than its own) to read that account's registry, but it
+/// may act as the account's filtered one, whose environment is the same.
+pub fn spawn_as(
+    t: &Token,
+    env: &Token,
+    line: &str,
+    cwd: Option<&Path>,
+    home: Option<&Path>,
+) -> io::Result<Spawned> {
     // Held by the service; another caller starts only restricted copies of
     // its own token, which need neither.
     let _ = enable(&SWITCH);
@@ -826,7 +896,7 @@ pub fn spawn(
             return Err(last());
         }
     }
-    let r = start(t, line, cwd, home, &given);
+    let r = start(t, env, line, cwd, home, &given);
     for h in given {
         // SAFETY: as above.
         unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0) };
@@ -852,6 +922,7 @@ pub fn spawn(
 /// CreateProcessAsUserW with `given` as the only handles the process gets.
 fn start(
     t: &Token,
+    env_of: &Token,
     line: &str,
     cwd: Option<&Path>,
     home: Option<&Path>,
@@ -894,9 +965,9 @@ fn start(
     // The block is read as the account: the service, which keeps no
     // SeImpersonatePrivilege, is refused the account's registry otherwise.
     let made = {
-        let _as = Impersonation::new(t)?;
+        let _as = Impersonation::new(env_of)?;
         // SAFETY: the account's token; the block is destroyed below.
-        unsafe { CreateEnvironmentBlock(&mut env, t.raw(), 0) }
+        unsafe { CreateEnvironmentBlock(&mut env, env_of.raw(), 0) }
     };
     if made == 0 {
         return Err(failed("CreateEnvironmentBlock"));

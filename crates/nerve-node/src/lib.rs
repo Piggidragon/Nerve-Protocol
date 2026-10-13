@@ -33,7 +33,10 @@ mod win_host;
 pub mod win_service;
 #[cfg(windows)]
 mod win_user;
-// The Windows install steps are Windows-only in use; tested everywhere.
+// The Windows sudo switch and install steps are Windows-only in use;
+// tested everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod winsudo;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod winsvc;
 

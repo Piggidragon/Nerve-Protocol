@@ -69,6 +69,10 @@ pub trait WinSystem {
         password: &str,
         own: &[PathBuf],
     ) -> Result<Option<PathBuf>, String>;
+    /// Logs `name` on with `password` as a batch job, as a sudo command
+    /// starts (an error when that fails); whether that logon holds the
+    /// Administrators group (crate::winsudo).
+    fn sudo_logon(&self, name: &str, password: &str) -> Result<bool, String>;
     fn protect(&self, data: &[u8]) -> Result<Vec<u8>, String>;
     fn unprotect(&self, data: &[u8]) -> Result<Vec<u8>, String>;
     /// The groups of `account` whose members can read every file, the
@@ -344,7 +348,8 @@ pub fn admin_warning(name: &str, groups: &[String]) -> String {
 
 /// `uninstall`: stops and removes the service, then the folders (deleted
 /// with `purge`, the stored password with them, else kept and open to the
-/// administrators only), the user and the program.
+/// administrators only, without the sudo password), the user and the
+/// program.
 pub fn uninstall(
     layout: &Layout,
     sys: &dyn WinSystem,
@@ -384,6 +389,13 @@ fn uninstall_steps(
         &layout.home,
         &layout.paths.state_dir,
     ];
+    // The kept folders keep no sudo password: an install over them starts
+    // with sudo off.
+    let sudo = layout.paths.config_dir.join(crate::winsudo::SUDO_FILE);
+    if !purge && sudo.exists() {
+        crate::winsudo::forget(&layout.paths)?;
+        steps.did("removed the stored sudo password: sudo is off");
+    }
     if purge {
         for dir in folders {
             if dir.exists() {
@@ -567,23 +579,24 @@ async fn update_steps(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::paths::NodePaths;
     use std::cell::{Cell, RefCell};
 
     /// A Windows machine in a temporary folder: accounts, the service, the
-    /// logons and DPAPI are recorded or played.
-    struct Fake {
-        admin: bool,
-        accounts: RefCell<Vec<Account>>,
+    /// logons and DPAPI are recorded or played (crate::winsudo's tests use
+    /// it too).
+    pub(crate) struct Fake {
+        pub(crate) admin: bool,
+        pub(crate) accounts: RefCell<Vec<Account>>,
         /// The passwords the accounts log on with.
-        passwords: RefCell<Vec<(String, String)>>,
+        pub(crate) passwords: RefCell<Vec<(String, String)>>,
         /// What the owner types, one password per question.
         typed: RefCell<Vec<String>>,
         /// The accounts that can open the node's folders.
         reaching: RefCell<Vec<String>>,
-        calls: RefCell<Vec<String>>,
+        pub(crate) calls: RefCell<Vec<String>>,
         /// `None`: not registered; else whether it runs.
         service: Cell<Option<bool>>,
         /// Whether a node started by the service runs.
@@ -599,7 +612,7 @@ mod tests {
     }
 
     impl Fake {
-        fn new() -> Fake {
+        pub(crate) fn new() -> Fake {
             Fake {
                 admin: true,
                 accounts: RefCell::new(vec![account("alice", 1001, ""), account("bob", 1002, "")]),
@@ -620,16 +633,16 @@ mod tests {
             self.calls.borrow_mut().push(c.into());
         }
 
-        fn calls(&self) -> Vec<String> {
+        pub(crate) fn calls(&self) -> Vec<String> {
             self.calls.borrow().clone()
         }
 
-        fn types(&self, password: &str) {
+        pub(crate) fn types(&self, password: &str) {
             self.typed.borrow_mut().push(password.into());
         }
     }
 
-    fn account(name: &str, uid: u32, comment: &str) -> Account {
+    pub(crate) fn account(name: &str, uid: u32, comment: &str) -> Account {
         Account {
             name: name.into(),
             uid,
@@ -749,6 +762,19 @@ mod tests {
                 .contains(&name.to_string())
                 .then(|| own[0].clone()))
         }
+        /// Bob is the administrator ([`Fake::admin_groups`]).
+        fn sudo_logon(&self, name: &str, password: &str) -> Result<bool, String> {
+            self.call(format!("batch logon {name}"));
+            if !self
+                .passwords
+                .borrow()
+                .iter()
+                .any(|(n, p)| n == name && p == password)
+            {
+                return Err(format!("the password of {name} is wrong"));
+            }
+            Ok(name == "bob")
+        }
         /// Not encryption: what matters is that the file is not the text.
         fn protect(&self, data: &[u8]) -> Result<Vec<u8>, String> {
             Ok(data.iter().map(|b| b ^ 0x5a).collect())
@@ -774,7 +800,7 @@ mod tests {
         }
     }
 
-    fn layout(root: &Path) -> Layout {
+    pub(crate) fn layout(root: &Path) -> Layout {
         let data = root.join("ProgramData/Nerve");
         Layout {
             unit: PathBuf::new(),
@@ -786,7 +812,7 @@ mod tests {
     }
 
     /// Installs a "program" saying `version`, as alice with her password.
-    fn installed(root: &Path, sys: &Fake, version: &str) -> Layout {
+    pub(crate) fn installed(root: &Path, sys: &Fake, version: &str) -> Layout {
         let l = layout(root);
         let exe = root.join("Downloads/nerve-node-x86_64-windows.exe");
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
@@ -1008,9 +1034,14 @@ mod tests {
         let sys = Fake::new();
         let l = installed(d.path(), &sys, "1.0.0");
         std::fs::write(l.paths.config_file(), "version = 3\n").unwrap();
+        let sudo = l.paths.config_dir.join(crate::winsudo::SUDO_FILE);
+        std::fs::write(&sudo, "sealed").unwrap();
         sys.secured.borrow_mut().clear();
         let mut out = Vec::new();
         uninstall(&l, &sys, false, &mut out).unwrap();
+        // No sudo password stays behind: an install over the folders
+        // starts with sudo off.
+        assert!(!sudo.exists());
         assert!(!l.bin.exists());
         assert_eq!(sys.service.get(), None);
         assert!(sys.account(USER).unwrap().is_none());
@@ -1039,6 +1070,7 @@ mod tests {
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("uninstall --purge"), "{out}");
         assert!(out.contains("removed the program"), "{out}");
+        assert!(out.contains("removed the stored sudo password"), "{out}");
     }
 
     #[test]

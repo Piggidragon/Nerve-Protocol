@@ -746,6 +746,12 @@ impl WinSystem for WinHost {
         win_user::reach(&t, own).map_err(|e| format!("cannot check what {name} can open: {e}"))
     }
 
+    fn sudo_logon(&self, name: &str, password: &str) -> Result<bool, String> {
+        let t = win_user::batch_logon(name, password)?;
+        win_user::has_admins(&t)
+            .map_err(|e| format!("cannot read the groups of {name}'s logon: {e}"))
+    }
+
     fn protect(&self, data: &[u8]) -> Result<Vec<u8>, String> {
         win_user::protect(data).map_err(|e| format!("DPAPI: {e}"))
     }
@@ -903,6 +909,24 @@ mod tests {
         let (code, out) = win_user::run_capture(&t, &line, Duration::from_secs(30)).unwrap();
         assert_eq!(code, 0);
         assert!(!out.is_empty());
+    }
+
+    /// A batch logon of an administrator holds the Administrators group;
+    /// the interactive logon of the same account is filtered. A wrong
+    /// password is refused. Needs an administrator account of a test
+    /// machine and its password in `NERVE_WIN_SUDO_ACCOUNT` and
+    /// `NERVE_WIN_SUDO_PASSWORD`; tests/win_sudo.rs starts commands with it.
+    #[test]
+    #[ignore = "needs an administrator account of a Windows test machine"]
+    fn an_administrators_batch_logon_has_the_full_token() {
+        let name = std::env::var("NERVE_WIN_SUDO_ACCOUNT").unwrap();
+        let password = std::env::var("NERVE_WIN_SUDO_PASSWORD").unwrap();
+        let e = WinHost.sudo_logon(&name, "not-the-password").unwrap_err();
+        assert!(e.contains("is wrong"), "{e}");
+        assert!(WinHost.sudo_logon(&name, &password).unwrap());
+        assert!(win_user::sudo_token(&name, &password).is_ok());
+        let filtered = win_user::logon(&name, &password).unwrap();
+        assert!(!win_user::has_admins(&filtered).unwrap());
     }
 
     /// The account this test runs as is found, with its profile folder.

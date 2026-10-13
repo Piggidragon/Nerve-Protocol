@@ -134,6 +134,10 @@ password.
 - On, a `sudo` command runs only if the sudo list names it, in every mode.
 - The password is checked with `sudo -S -k -v` and kept in memory only. A
   restart turns the switch off.
+- On Windows the password is the one of the account commands run as. The
+  node checks it with a batch logon that must hold the Administrators group,
+  keeps it with DPAPI in the config folder (so a restart keeps the switch
+  on), and starts each sudo command with that logon's full token.
 - A center with the settings grant can switch it. The password then travels
   sealed from the owner's browser to the node. The node makes a one-shot offer
   with a fresh X25519 key and signs it with its pairing key. The browser derives

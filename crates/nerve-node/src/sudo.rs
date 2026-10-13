@@ -4,6 +4,11 @@
 //! accepted. The password lives in memory only: a restarted node starts with
 //! the switch off. It is never part of a document, a result or the audit log,
 //! and every outgoing frame is scrubbed of it.
+//!
+//! On Windows the password is the one of the account the commands run as,
+//! checked by a logon that must hold the Administrators group, and the node
+//! also keeps it with DPAPI in its config folder, which a restart reads
+//! again (crate::winsudo).
 
 use nerve_policy::config::Sudo;
 use nerve_policy::{SetError, Writer};
@@ -108,9 +113,9 @@ impl Shared {
     /// password leaves the switch as it was.
     pub async fn sudo_switch_on(&self, by: Writer<'_>, password: String) -> Result<u64, SetError> {
         let password = Secret::new(password);
-        if !cfg!(target_os = "linux") {
+        if !cfg!(any(target_os = "linux", windows)) {
             return Err(SetError::Invalid(
-                "the sudo switch works on Linux only".into(),
+                "the sudo switch works on Linux and Windows only".into(),
             ));
         }
         if let Writer::Center(c) = by {
@@ -132,6 +137,9 @@ impl Shared {
         let account = self
             .command_account(&self.config())
             .map_err(SetError::Invalid)?;
+        #[cfg(windows)]
+        self.windows_check(account.as_ref(), &password).await?;
+        #[cfg(not(windows))]
         crate::exec::sudo_check(&self.sudo_path(), password.expose(), account.as_ref())
             .await
             .map_err(SetError::Invalid)?;
@@ -145,6 +153,8 @@ impl Shared {
             let r = store.set_sudo(by, Sudo::On);
             if r.is_err() {
                 *lock(&self.sudo) = None;
+                #[cfg(windows)]
+                let _ = crate::winsudo::forget(&self.paths);
             }
             r
         };
@@ -153,6 +163,31 @@ impl Shared {
         }
         self.bump();
         r
+    }
+
+    /// [`Shared::sudo_switch_on`]'s check on Windows (crate::winsudo): the
+    /// installed node, and a logon of `account` with `password` that holds
+    /// the Administrators group. The password is then kept with DPAPI.
+    #[cfg(windows)]
+    async fn windows_check(
+        &self,
+        account: Option<&crate::service::Account>,
+        password: &Secret,
+    ) -> Result<(), SetError> {
+        let (account, paths) = (account.cloned(), self.paths.clone());
+        let pw = Secret::new(password.expose().to_string());
+        // A logon takes a moment; it does not hold up the other links.
+        tokio::task::spawn_blocking(move || {
+            let host = crate::win_host::WinHost;
+            crate::winsudo::check(&host, account.as_ref(), pw.expose())?;
+            let name = &account.as_ref().expect("checked").name;
+            crate::winsudo::keep(&paths, &host, name, pw.expose())?;
+            tracing::warn!("{}", crate::winsudo::warning(name));
+            Ok::<(), String>(())
+        })
+        .await
+        .map_err(|e| SetError::Invalid(e.to_string()))?
+        .map_err(SetError::Invalid)
     }
 
     /// Turns the switch off and drops the password and any open offer.
@@ -164,6 +199,12 @@ impl Shared {
                     "this node does not let this center change its settings".into(),
                 ));
             }
+        }
+        // The kept password goes first: a node that stops now starts with
+        // none (crate::winsudo).
+        #[cfg(windows)]
+        if let Err(e) = crate::winsudo::forget(&self.paths) {
+            tracing::warn!("cannot remove the kept sudo password: {e}");
         }
         let r = {
             let mut store = lock(&self.store);
@@ -178,11 +219,33 @@ impl Shared {
 
     /// Brings the config and the held password in line: a config that says
     /// on without a password (a restart, an edited file) is switched off; a
-    /// config that says off drops the password.
+    /// config that says off drops the password. On Windows the password kept
+    /// with DPAPI is held first, and one held that is no longer kept is
+    /// dropped (crate::winsudo).
     pub fn settle_sudo(&self) {
         let mut store = lock(&self.store);
         let on = store.config().machine.sudo == Sudo::On;
         let mut held = lock(&self.sudo);
+        #[cfg(windows)]
+        {
+            use crate::winsudo::{Settle, kept, settle, stored};
+            let user = store.config().machine.user.clone();
+            match settle(on, held.is_some(), on && kept(&self.paths)) {
+                Settle::Load => {
+                    let host = crate::win_host::WinHost;
+                    if let Some(pw) = stored(&self.paths, &host, user.as_deref()) {
+                        self.log_secret(Some(&pw));
+                        *held = Some(Secret::new(pw));
+                        *lock(&self.sudo_for) = user;
+                    }
+                }
+                Settle::Drop => {
+                    *held = None;
+                    self.log_secret(None);
+                }
+                Settle::Nothing => {}
+            }
+        }
         if on && held.is_none() {
             drop(held);
             if let Err(e) = store.set_sudo(Writer::Local, Sudo::Off) {

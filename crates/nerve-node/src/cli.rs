@@ -223,7 +223,7 @@ pub enum CapCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum SudoCmd {
-    /// Turn sudo on; asks for your sudo password and keeps it in memory only.
+    /// Turn sudo on; asks for your sudo password and keeps it in memory only (on Windows the password of the account commands run as, kept with DPAPI).
     On,
     /// Turn sudo off and forget the password.
     Off,
@@ -1621,6 +1621,8 @@ async fn add_folder(
 
 /// `nerve-node sudo on|off|status`. The password lives in the running
 /// daemon only, so `on` needs one; `off` without a daemon edits the file.
+/// Windows has no control socket: there the password is kept with DPAPI
+/// for the service (crate::winsudo).
 async fn sudo_cmd(paths: &NodePaths, c: SudoCmd, out: &mut dyn Write) -> Result<(), String> {
     let w = |out: &mut dyn Write, s: &str| {
         let _ = writeln!(out, "{s}");
@@ -1675,12 +1677,28 @@ async fn sudo_cmd(paths: &NodePaths, c: SudoCmd, out: &mut dyn Write) -> Result<
         }
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use crate::win_host::WinHost;
+        match c {
+            SudoCmd::On => {
+                let installed = crate::service::is_service_node(paths);
+                crate::winsudo::on(paths, &WinHost, installed, out).await
+            }
+            SudoCmd::Off => crate::winsudo::off(paths, &WinHost, out).await,
+            SudoCmd::Status => {
+                let on = crate::winsudo::status(paths)?;
+                w(out, if on { "sudo: on" } else { "sudo: off" });
+                Ok(())
+            }
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (paths, out, w);
         match c {
             SudoCmd::Status => Ok(()),
-            _ => Err("the sudo switch works on Linux only".into()),
+            _ => Err("the sudo switch works on Linux and Windows only".into()),
         }
     }
 }

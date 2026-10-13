@@ -1,7 +1,8 @@
 # Sudo
 
-Sudo is a switch on the machine, not a mode. It works on Linux only. It is
-off by default.
+Sudo is a switch on the machine, not a mode. It works on Linux, and on
+Windows on the node [installed as a service](service.md#windows) ([sudo on
+Windows](#sudo-on-windows)). It is off by default.
 
 | Switch | What happens to a `sudo` command |
 |---|---|
@@ -41,15 +42,17 @@ for it.
 
 ## What the node does
 
+On Linux (Windows differs, see [sudo on Windows](#sudo-on-windows)):
+
 - It checks the password with `sudo -S -k -v`, run as the account the
   commands run as, so sudo checks that account's password and its sudoers
   entries. A wrong password is refused and the switch stays as it was.
 - It keeps the password in memory only. Turning sudo off drops it. A node that
   restarts has sudo off.
 - It never sends the password to a center. It replaces any copy in a frame or
-  in the audit log with `[redacted]`.
+  in the audit log with `[redacted]`. This holds on Windows too.
 - A sudo command must be one simple command. One with `; & | $ ` ( ) < >` or a
-  line break is refused.
+  line break is refused. This holds on Windows too.
 - It starts the command as that account, as `sudo -S -k -p <prompt> …`, so
   sudo raises it from that account. It runs without the Landlock
   sandbox, which would stop sudo from gaining privileges. It writes the
@@ -67,3 +70,45 @@ it.
 The center serves the form that takes the password. A tampered center could
 capture the password before the browser seals it. Turn sudo on from the
 machine if you do not trust the center.
+
+## Sudo on Windows
+
+Windows has no `sudo` program. A sudo command runs as the
+[account commands run as](service.md#the-account-commands-run-as-on-windows),
+with that account's administrator rights: the elevated token that "Run as
+administrator" gives, not the token UAC gives its other commands. So:
+
+- It works only on the node installed as a service. A node you start
+  yourself refuses to switch sudo on.
+- The account commands run as must be an administrator. Otherwise the switch
+  refuses to turn on.
+- `sudo on` asks for that account's password, the one `install` stored. A
+  wrong password is refused and the switch stays as it was.
+- The node keeps the password with DPAPI in the config folder, as `install`
+  keeps it (`sudo.dpapi`). Unlike on Linux, sudo stays on when the service
+  restarts. `sudo off` removes the file, and `uninstall` removes it too.
+
+Run the commands in a terminal opened with "Run as administrator". Windows
+has no control socket yet, so `sudo on` takes effect when the service starts
+again. `sudo off` takes effect at once: the running service drops the
+password within a second.
+
+```powershell
+& "C:\Program Files\Nerve\nerve-node.exe" rule add sudo 'net session'
+& "C:\Program Files\Nerve\nerve-node.exe" sudo on
+Restart-Service nerve-node
+& "C:\Program Files\Nerve\nerve-node.exe" sudo off
+```
+
+A center with the settings grant switches the running service at once, as on
+Linux.
+
+The node starts the command line after `sudo` with the shell
+(`machine.shell`, Windows PowerShell 5.1 by default), logged on as a batch
+job: the logon Windows uses for a scheduled task that runs with highest
+privileges. The account needs the right "Log on as a batch job", which
+administrators have unless a policy takes it. The command runs in a Job
+Object like every other command, so a timeout or `exec.signal` ends it.
+
+A sudo command can change anything on the machine and read the node's keys.
+Put only the commands you mean on the sudo list.

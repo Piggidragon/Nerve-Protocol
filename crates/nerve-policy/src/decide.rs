@@ -144,8 +144,9 @@ fn not_plain(line: &str) -> Option<String> {
         .chars()
         .find(|c| SHELL_CONTROL.contains(c) || EXPRESSION.contains(c) || odd(*c))
     {
-        return Some(if c.is_control() {
-            "a line break or control character".into()
+        // One the owner cannot see is named by its number.
+        return Some(if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+            format!("the invisible character U+{:04X}", u32::from(c))
         } else {
             format!("`{c}`")
         });
@@ -338,7 +339,7 @@ fn by_sudo_list(policy: &CenterPolicy, call: &Call, reasons: &mut Vec<String>) -
             // PowerShell's `start` is Start-Process), so a wildcard cannot
             // say what they are handed.
             Some(what) => format!(
-                "a wildcard sudo entry does not cover a line with {what} (an expression character or a word that starts another command); add an entry for the whole line: nerve-node rule add sudo '<the line>'"
+                "a wildcard sudo entry does not cover a line with {what}: it covers no expression character, invisible character or word that starts another command; add an entry for the whole line with `nerve-node rule add sudo`, without --wildcard"
             ),
             None => "a sudo command runs only when the sudo allow list names it".into(),
         });
@@ -1173,12 +1174,21 @@ mod tests {
                 ("sudo choco install 'a b'", "`'`"),
                 ("sudo choco install a,b", "`,`"),
                 ("sudo choco start x", "`start`"),
+                // Invisible ones by their number.
+                (
+                    "sudo choco install x\u{2028}y",
+                    "the invisible character U+2028",
+                ),
+                ("sudo choco install x\ty", "the invisible character U+0009"),
             ] {
                 let d = decide(&p, &on, &sudo(line));
+                // The hint quotes nothing: a line with `'` in `'…'` would
+                // be another line.
                 assert!(
                     matches!(&d, Decision::Forbidden(m)
-                        if m.contains(&format!("does not cover a line with {what}"))
-                            && m.contains("rule add sudo")),
+                        if m.contains(&format!("does not cover a line with {what}:"))
+                            && m.contains("with `nerve-node rule add sudo`, without --wildcard")
+                            && !m.contains("'<")),
                     "{mode:?} {line}: {d:?}"
                 );
             }

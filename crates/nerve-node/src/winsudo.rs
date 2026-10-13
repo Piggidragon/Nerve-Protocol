@@ -50,10 +50,12 @@ pub fn warning(name: &str) -> String {
     )
 }
 
-/// What `sudo off` adds while the account is still an administrator.
-pub fn still_admin(name: &str) -> String {
+/// What `sudo off` adds while the account is still in `groups`, the ones
+/// whose members can read every file (crate::winsvc::admin_warning).
+pub fn still_admin(name: &str, groups: &[String]) -> String {
+    let groups = groups.join(", ");
     format!(
-        "{name} is still an administrator: its commands can still get the administrator rights back (UAC is no security boundary). Take it out of the Administrators group to close that way too."
+        "{name} is still in the group {groups}: its commands can still get those rights back (UAC is no security boundary) and read the node's keys. Take it out of {groups} to close that way too."
     )
 }
 
@@ -209,14 +211,16 @@ pub async fn off(
         out,
         "sudo: off (a running service drops the password within a second)"
     );
-    // What `sudo on` asked for stays: the account is still an administrator.
-    let admin = read(paths)
+    // What `sudo on` asked for stays: the account is still in the group.
+    let account = read(paths)
         .ok()
         .and_then(|c| c.machine.user)
-        .and_then(|n| sys.account(&n).ok().flatten())
-        .filter(|a| !sys.admin_groups(a).is_empty());
-    if let Some(a) = admin {
-        let _ = writeln!(out, "{}", still_admin(&a.name));
+        .and_then(|n| sys.account(&n).ok().flatten());
+    if let Some(a) = account {
+        let groups = sys.admin_groups(&a);
+        if !groups.is_empty() {
+            let _ = writeln!(out, "{}", still_admin(&a.name, &groups));
+        }
     }
     Ok(())
 }
@@ -335,10 +339,10 @@ mod tests {
         off(p, &sys, &mut out).await.unwrap();
         let out = String::from_utf8(out).unwrap();
         assert!(out.starts_with("sudo: off"), "{out}");
-        // Bob stays an administrator; off says so.
+        // Bob stays an administrator; off says so, naming his group.
         assert!(
-            out.contains("bob is still an administrator")
-                && out.contains("Take it out of the Administrators group"),
+            out.contains("bob is still in the group Administrators")
+                && out.contains("Take it out of Administrators"),
             "{out}"
         );
         assert!(!file.exists());
@@ -347,6 +351,29 @@ mod tests {
         assert_eq!(stored(p, &sys, Some("bob")), None);
         // Off again is fine.
         off(p, &sys, &mut Vec::new()).await.unwrap();
+        // Another group that can read every file is named as it is; an
+        // account in none gets no reminder.
+        for (who, said) in [
+            ("dave", Some("dave is still in the group Backup Operators")),
+            ("alice", None),
+        ] {
+            crate::cli::edit(p, |c| {
+                c.machine.user = Some(who.into());
+                Ok(())
+            })
+            .await
+            .unwrap();
+            let mut out = Vec::new();
+            off(p, &sys, &mut out).await.unwrap();
+            let out = String::from_utf8(out).unwrap();
+            match said {
+                Some(s) => assert!(
+                    out.contains(s) && out.contains("Take it out of Backup Operators"),
+                    "{out}"
+                ),
+                None => assert!(!out.contains("still in the group"), "{out}"),
+            }
+        }
     }
 
     /// A node whose config key is in the system keyring (no `config.key`)

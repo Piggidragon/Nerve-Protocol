@@ -661,7 +661,11 @@ pub(crate) mod tests {
         pub(crate) fn new() -> Fake {
             Fake {
                 admin: true,
-                accounts: RefCell::new(vec![account("alice", 1001, ""), account("bob", 1002, "")]),
+                accounts: RefCell::new(vec![
+                    account("alice", 1001, ""),
+                    account("bob", 1002, ""),
+                    account("dave", 1004, ""),
+                ]),
                 passwords: RefCell::new(vec![("alice".into(), "alice's".into())]),
                 typed: RefCell::new(Vec::new()),
                 reaching: RefCell::new(Vec::new()),
@@ -840,10 +844,10 @@ pub(crate) mod tests {
             self.protect(data)
         }
         fn admin_groups(&self, account: &Account) -> Vec<String> {
-            if account.name == "bob" {
-                vec!["Administrators".into()]
-            } else {
-                Vec::new()
+            match account.name.as_str() {
+                "bob" => vec!["Administrators".into()],
+                "dave" => vec!["Backup Operators".into()],
+                _ => Vec::new(),
             }
         }
         /// A program here is a text file whose first line is what it says.

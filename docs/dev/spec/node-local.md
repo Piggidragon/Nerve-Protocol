@@ -184,8 +184,9 @@ its key is in does not check, and is refused like any changed file.
 
 With `keyring` and no keyring that answers, the node does not start, and a
 command that reads the config refuses. The message names the entry and the
-keyring's error. Nothing falls back to a file. The sudo password is never at
-rest, whatever the setting (§4).
+keyring's error. Nothing falls back to a file. On Linux the sudo password is
+never at rest, whatever the setting; on Windows the node keeps it with DPAPI
+in `sudo.dpapi` in the config folder, whatever the setting (§4).
 
 A change of the setting moves the keys once, through the settings store, in
 whatever writes the config (the running node, else the CLI):

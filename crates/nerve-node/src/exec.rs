@@ -1027,9 +1027,8 @@ async fn run_as(
         ))
     })?;
     let line = windows_command_line(program, args);
-    let child = crate::win_user::spawn_as(
+    let child = crate::win_user::spawn(
         elevated.as_ref().unwrap_or(token.as_ref()),
-        &token,
         &line,
         Some(&call.cwd),
         Some(&account.home),

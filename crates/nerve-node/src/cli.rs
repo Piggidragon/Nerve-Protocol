@@ -893,9 +893,11 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
         crate::service::check_access(&paths)?;
     }
     // The daemon writes the file itself while it runs; the service commands
-    // leave it alone (or delete it with the rest).
-    let before =
-        (!matches!(cli.cmd, Cmd::Run) && !service).then(|| std::fs::read(paths.config_file()).ok());
+    // leave it alone (or delete it with the rest). Sudo on Windows says
+    // itself when its change counts (crate::winsudo).
+    let own_say = cfg!(windows) && matches!(cli.cmd, Cmd::Sudo(_));
+    let before = (!matches!(cli.cmd, Cmd::Run) && !service && !own_say)
+        .then(|| std::fs::read(paths.config_file()).ok());
     let r = command(paths.clone(), cli.cmd, out).await;
     if r.is_ok()
         && let Some(before) = before

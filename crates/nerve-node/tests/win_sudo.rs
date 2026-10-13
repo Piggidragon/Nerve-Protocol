@@ -33,6 +33,8 @@ const CENTER: &str = "winsudo";
 /// token is high, a filtered one medium.
 const HIGH: &str = "S-1-16-12288";
 const MEDIUM: &str = "S-1-16-8192";
+/// A sudo command that runs for half a minute.
+const PING: &str = "sudo ping -n 30 127.0.0.1";
 
 fn env(name: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"))
@@ -129,6 +131,14 @@ async fn sudo_runs_a_listed_command_elevated_on_the_installed_service() {
     let paths = layout.paths.clone();
     let kept = paths.config_dir.join("sudo.dpapi");
     let mut center = FakeCenter::start(false).await.unwrap();
+    // What an earlier run paired goes first.
+    nerve_node::cli::edit(&paths, |cfg| {
+        cfg.centers.retain(|c| c.name != CENTER);
+        Ok(())
+    })
+    .await
+    .expect("the owner's edit");
+    let _ = std::fs::remove_file(paths.key_file(CENTER));
     nerve_node::pair::pair(&paths, &center.link(), Some(CENTER))
         .await
         .expect("pair");
@@ -146,6 +156,7 @@ async fn sudo_runs_a_listed_command_elevated_on_the_installed_service() {
         e.policy.sudo_allow = vec![
             rules::sudo_rule_for("sudo whoami /groups", false)?,
             rules::sudo_rule_for("sudo net session", false)?,
+            rules::sudo_rule_for(PING, false)?,
         ];
         Ok(())
     })
@@ -200,6 +211,24 @@ async fn sudo_runs_a_listed_command_elevated_on_the_installed_service() {
     // What the sudo list does not name is refused.
     let e = refused(run(&mut conn, "sudo net user").await, ErrorCode::Forbidden);
     assert!(e.contains("sudo allow list"), "{e}");
+
+    // The job ends an elevated command too, at its timeout.
+    let started = std::time::Instant::now();
+    let r = invoke(
+        &mut conn,
+        "exec",
+        "run",
+        json!({"command": PING, "timeout_ms": 1000}),
+    )
+    .await;
+    refused(r, ErrorCode::Timeout);
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let o = Command::new("tasklist")
+        .args(["/fi", "imagename eq PING.EXE", "/fo", "csv", "/nh"])
+        .output()
+        .unwrap();
+    let left = String::from_utf8_lossy(&o.stdout);
+    assert!(!left.to_lowercase().contains("ping.exe"), "{left}");
 
     // A restarted service holds the kept password again.
     restart_service();

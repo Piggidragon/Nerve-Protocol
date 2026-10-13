@@ -506,7 +506,7 @@ fn logon_as(name: &str, password: &str, kind: LOGON32_LOGON) -> Result<Token, St
             // Administrators may log on as a batch job unless a policy
             // took it from them.
             Some(ERROR_LOGON_TYPE_NOT_GRANTED) if kind == LOGON32_LOGON_BATCH => format!(
-                "{name} may not log on as a batch job (the right \"Log on as a batch job\", which administrators have unless a policy takes it)"
+                "{name} may not log on as a batch job, which a sudo command needs; administrators have the right \"Log on as a batch job\" unless a policy takes it"
             ),
             _ => format!("cannot log {name} on: {e}"),
         });
@@ -863,20 +863,6 @@ pub fn spawn(
     cwd: Option<&Path>,
     home: Option<&Path>,
 ) -> io::Result<Spawned> {
-    spawn_as(t, t, line, cwd, home)
-}
-
-/// [`spawn`] with the environment of `env`, a logon of the same account:
-/// the service may not act as an administrator's full token (a higher
-/// integrity level than its own) to read that account's registry, but it
-/// may act as the account's filtered one, whose environment is the same.
-pub fn spawn_as(
-    t: &Token,
-    env: &Token,
-    line: &str,
-    cwd: Option<&Path>,
-    home: Option<&Path>,
-) -> io::Result<Spawned> {
     // Held by the service; another caller starts only restricted copies of
     // its own token, which need neither.
     let _ = enable(&SWITCH);
@@ -896,7 +882,7 @@ pub fn spawn_as(
             return Err(last());
         }
     }
-    let r = start(t, env, line, cwd, home, &given);
+    let r = start(t, line, cwd, home, &given);
     for h in given {
         // SAFETY: as above.
         unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, 0) };
@@ -922,7 +908,6 @@ pub fn spawn_as(
 /// CreateProcessAsUserW with `given` as the only handles the process gets.
 fn start(
     t: &Token,
-    env_of: &Token,
     line: &str,
     cwd: Option<&Path>,
     home: Option<&Path>,
@@ -965,9 +950,9 @@ fn start(
     // The block is read as the account: the service, which keeps no
     // SeImpersonatePrivilege, is refused the account's registry otherwise.
     let made = {
-        let _as = Impersonation::new(env_of)?;
+        let _as = Impersonation::new(t)?;
         // SAFETY: the account's token; the block is destroyed below.
-        unsafe { CreateEnvironmentBlock(&mut env, env_of.raw(), 0) }
+        unsafe { CreateEnvironmentBlock(&mut env, t.raw(), 0) }
     };
     if made == 0 {
         return Err(failed("CreateEnvironmentBlock"));

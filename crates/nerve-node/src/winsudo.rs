@@ -187,7 +187,10 @@ pub async fn off(
         Ok(())
     })
     .await?;
-    let _ = writeln!(out, "sudo: off");
+    let _ = writeln!(
+        out,
+        "sudo: off (a running service drops the password within a second)"
+    );
     Ok(())
 }
 
@@ -295,7 +298,8 @@ mod tests {
         // Off removes it.
         let mut out = Vec::new();
         off(p, &sys, &mut out).await.unwrap();
-        assert_eq!(String::from_utf8(out).unwrap(), "sudo: off\n");
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.starts_with("sudo: off"), "{out}");
         assert!(!file.exists());
         assert_eq!(sudo_of(p), Sudo::Off);
         assert!(!status(p).unwrap());

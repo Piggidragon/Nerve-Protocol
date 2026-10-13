@@ -1472,10 +1472,13 @@ async fn setup_steps(
         );
     }
     // Keys in a keyring that does not answer: nothing can be read, so that
-    // comes first. A node whose keys may not be in the keyring asks none:
-    // its keys go into files below.
+    // comes first, also where the keys may not stay there, so that they
+    // can go into files below (review round 8, note 1). The installed node
+    // on Windows asks none: the keyring setup reaches is not the service's.
     let no_keyring = crate::secrets::no_keyring(paths);
-    if crate::secrets::stated_storage(paths) == SecretStorage::Keyring && no_keyring.is_none() {
+    if crate::secrets::stated_storage(paths) == SecretStorage::Keyring
+        && no_keyring != Some(crate::secrets::NoKeyring::WindowsService)
+    {
         let me = crate::keyring_setup::me()?;
         crate::keyring_setup::ensure(keyring, &me, Some(input), out)?;
         after_keyring_answers(paths, machine, out).await?;
@@ -3191,6 +3194,30 @@ mod tests {
         pretend_landlock(&paths, Landlock::Abi(9));
         set("keyring").unwrap();
         assert_eq!(load(&paths).machine.secret_storage, SecretStorage::Keyring);
+    }
+
+    /// Below Landlock ABI 9 with the keys in a keyring that does not
+    /// answer, setup still offers to install one, so that it can take the
+    /// keys into files (review round 8, note 1).
+    #[test]
+    fn below_landlock_9_setup_reaches_the_keyring_to_empty_it() {
+        use crate::secrets::{Landlock, for_tests::pretend_landlock};
+        let (_d, paths) = setup(&[]);
+        run(
+            &paths,
+            &["config", "set", "machine.secret_storage", "keyring"],
+        )
+        .unwrap();
+        pretend_landlock(&paths, Landlock::Abi(5));
+        crate::secrets::store::set_unreachable(true);
+        let k = crate::keyring_setup::tests::FakeKeyring::new(false);
+        let (r, out) = setup_keyring(&paths, None, None, &k, "y\n\n\n");
+        crate::secrets::store::set_unreachable(false);
+        r.unwrap();
+        assert!(out.contains("Install it now? [y/N]"), "{out}");
+        assert!(out.contains("the node's keys are in files now"), "{out}");
+        assert_eq!(load(&paths).machine.secret_storage, SecretStorage::File);
+        assert_eq!(config_key_at(&paths), (true, false));
     }
 
     /// Where no keyring answers, setup offers to install one: no keeps the

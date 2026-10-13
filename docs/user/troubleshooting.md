@@ -20,7 +20,6 @@ names its reason.
 | `outside the folders that allow reading` or `… writing` | `folder` mode, and no folder grants `r` or `w` there | `nerve-node folder add <path> +r +w` |
 | `the working directory is not in a folder that allows running` | `folder` mode, and no folder with `x` holds the working directory | `nerve-node folder set <path> +x` |
 | `commands cannot be confined on this machine` | `folder` mode on a machine without Landlock, or on Windows | Use `allowlist` or `user` mode. See [platforms](platforms.md) |
-| `commands cannot be confined on this machine while the node's keys are in the system keyring: …` | `folder` mode, the keys in the keyring, and a kernel before Linux 7.1 | `nerve-node config set machine.secret_storage file`, or `allowlist` or `user` mode. See [keys](config.md#where-the-node-keeps-its-keys) |
 | `… is protected (…)` | The path is [protected](protected-paths.md) | Grant a folder at it, with the right it needs |
 | `… is denied (…)` | A deny rule matches | `nerve-node rule rm deny …` |
 | `… belongs to the node itself; no rule or mode reaches it` | The call touched the node's config or state folder | Nothing opens these |

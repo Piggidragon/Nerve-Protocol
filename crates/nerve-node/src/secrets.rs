@@ -745,19 +745,20 @@ impl Secrets for NodeSecrets {
 
     fn copy(&mut self, cfg: &NodeConfig) -> Result<(), String> {
         let to = cfg.machine.secret_storage;
-        if let Some((open, ended)) = self.open_commands(to) {
-            return Err(format!(
-                "{open}; the node's keys stay in their files, and nothing was changed. Wait until {ended} ended, or end every command with `nerve-node panic`, change it again, then `nerve-node unlock`"
-            ));
-        }
-        // After the count of running commands, which tells more where both
-        // refuse (an old Landlock with such a command running).
+        // Before the count of running commands: this refusal holds whatever
+        // runs, so the count's advice (end them, change it again) would
+        // not help (review round 8, finding 2).
         if to == SecretStorage::Keyring
             && let Some(n) = no_keyring(&self.paths)
         {
             return Err(format!(
                 "machine.secret_storage cannot be \"keyring\" here: {}; nothing was changed",
                 n.why()
+            ));
+        }
+        if let Some((open, ended)) = self.open_commands(to) {
+            return Err(format!(
+                "{open}; the node's keys stay in their files, and nothing was changed. Wait until {ended} ended, or end every command with `nerve-node panic`, change it again, then `nerve-node unlock`"
             ));
         }
         if to == SecretStorage::Keyring && self.defer && !self.defers_keyring {
@@ -1655,6 +1656,27 @@ mod tests {
         assert_eq!(s.config().machine.secret_storage, SecretStorage::File);
         assert!(paths.key_file("home").exists());
         assert_eq!(in_keyring(&paths, Key::Center("home")), None);
+    }
+
+    /// Below Landlock ABI 9 a move into the keyring is refused for that
+    /// reason even while a folder mode command runs: the count's advice
+    /// (end them, change it again) would not help (review round 8,
+    /// finding 2).
+    #[test]
+    fn below_landlock_9_the_refusal_does_not_wait_for_commands() {
+        let (_d, paths) = node();
+        drop(paired(&paths, SecretStorage::File, &["home"]));
+        for_tests::pretend_landlock(&paths, Landlock::Abi(6));
+        let mut running = SettingsStore::open_with(
+            paths.config_file(),
+            Box::new(NodeSecrets::for_node(&paths, Arc::new(AtomicUsize::new(1)))),
+            AuditLog::new(paths.audit_log()),
+        )
+        .unwrap();
+        let e = set_storage(&mut running, SecretStorage::Keyring).unwrap_err();
+        assert!(e.contains("Landlock ABI 6, below 9"), "{e}");
+        assert!(!e.contains("nerve-node panic"), "{e}");
+        assert_eq!(running.config().machine.secret_storage, SecretStorage::File);
     }
 
     /// The installed node's folders on Windows in another spelling are

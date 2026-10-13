@@ -147,23 +147,30 @@ Two kinds of node keep their keys in files whatever is asked:
   keys in that administrator's Credential Manager, out of the service's
   reach. The node counts as installed on the folders `install` uses, in any
   spelling of their case, or when it runs as `nerve`.
-- A Linux node whose kernel has a Landlock ABI below 9. There a `folder`
-  mode command cannot run programs from its folders while the keys are in
-  the keyring: the sandbox cannot grant the keyring's access and execute
-  together (§Modes). Only an ABI that is read counts: where Landlock is
-  missing or off, so that its ABI cannot be read, the keyring is allowed as
-  before, and `setup` warns that it cannot tell.
+- A Linux node whose kernel has a Landlock ABI below 9. Landlock there
+  cannot keep a command off the session bus the keyring answers on (§1,
+  the paragraphs on the session bus below), so with the keys in the keyring
+  a `folder` mode command could not run programs from its folders: the
+  sandbox cannot grant the keyring's access and execute together. This
+  holds whatever account runs the commands. Only an ABI that is read
+  counts: where Landlock is missing or off, so that its ABI cannot be read,
+  the keyring is allowed as before (folder mode then runs no command
+  anyway), and `setup` warns that it cannot tell.
 
 On such a node:
 
 - A change to `keyring` is refused before anything moves, by whatever
   writes the config (`config set`, setup, a center's `settings.set`, `config
-  accept`); `node.toml` and the keys stay as they were. A running node does not reload a file
-  another writer saved with `keyring`.
+  accept`); `node.toml` and the keys stay as they were. This refusal comes
+  before the count of running commands below, as it holds whatever runs. A
+  running node does not reload a file another writer saved with `keyring`.
 - `config accept` refuses a file that says `keyring`, even when the keys are
   in the keyring already, so nothing would move.
-- `setup` does not ask where the keys go and asks no keyring. It prints a
-  warning with the reason, and moves keys left in the keyring into files.
+- `setup` does not ask where the keys go. It prints a warning with the
+  reason, and moves keys left in the keyring into files. On Linux it first
+  checks that the keyring answers, and offers to install one as it does
+  elsewhere, so that it can read the keys it moves; on the installed node on
+  Windows it asks no keyring.
 - `install`, and the node at its start, refuse a `node.toml` that says
   `keyring`. The message names the file and the command that moves the keys
   into files, with `--config-dir` and `--state-dir` of the folders it
@@ -230,15 +237,15 @@ keys: the node's `XDG_RUNTIME_DIR`, `/run/user/<uid>`, a socket that a
 gets a Landlock rule for connecting to socket files
 (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`, ABI 9, Linux 7.1): everywhere but the
 own folders. Where the kernel has a Landlock ABI below 9 the keys do not go
-into the keyring at all ([where the keys are](#where-the-keys-are)). The
-gate below stays as a second line: with the keys in the keyring and no
-ABI 9, `folder` mode offers no `exec`, as on a machine without Landlock,
-unless commands run as an account other than root and the node's own; the
-bus folder is the user's alone (0700). The node logs that at start and when a change of the settings
-turns it on, its status says it (`folder_commands_off`, also printed by
-`nerve-node status`), and `config set` and `setup` say it when they move
-the keys into the keyring. A refused command names the keyring as the
-reason. The gate and the command's Landlock rules go by one answer per
+into the keyring at all ([where the keys are](#where-the-keys-are)).
+
+The code keeps a gate as a second line, which an owner cannot reach while
+that refusal holds: with the keys in the keyring and no ABI 9, `folder`
+mode would offer no `exec`, as on a machine without Landlock, unless
+commands run as an account other than root and the node's own (the bus
+folder is the user's alone, 0700); the node would log it, its status would
+say it (`folder_commands_off`), and a refused command would name the
+keyring. The gate and the command's Landlock rules go by one answer per
 call, from the same config and account.
 
 A Landlock domain does not change while its command runs, so a `folder`

@@ -534,8 +534,13 @@ async fn folder_mode_confines_commands_to_their_folders() {
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_keys_do_not_move_into_the_keyring_past_a_running_folder_command() {
-    if !nerve_sandbox::Confinement::detect().available() {
+    let Some(abi) = nerve_sandbox::Confinement::detect().landlock_abi else {
         eprintln!("skipped: Landlock is not available here");
+        return;
+    };
+    // Below ABI 9 the keys never go into the keyring, whatever runs.
+    if abi < 9 {
+        eprintln!("skipped: Landlock ABI {abi} here, below 9, keeps the keys in files");
         return;
     }
     let dir = tempdir();

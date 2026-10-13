@@ -11,6 +11,16 @@ fn paths(root: &std::path::Path) -> NodePaths {
     NodePaths::new(root.join("config"), root.join("state"))
 }
 
+/// The answer to setup's question where the keys go, Enter, or nothing
+/// where setup does not ask it: on a kernel whose Landlock ABI is below 9
+/// the keys stay in files (docs/user/config.md).
+fn storage_answer() -> &'static str {
+    match nerve_sandbox::Confinement::detect().landlock_abi {
+        Some(v) if v < 9 => "",
+        _ => "\n",
+    }
+}
+
 async fn setup(paths: &NodePaths, answers: &str) -> Result<String, String> {
     let mut out = Vec::new();
     let mut input = std::io::Cursor::new(answers.as_bytes().to_vec());
@@ -25,7 +35,8 @@ async fn setup_pairs_the_first_center_and_sets_its_mode() {
     let paths = paths(d.path());
     let center = FakeCenter::start(false).await.unwrap();
     let link = center.link().render();
-    let out = setup(&paths, &format!("my-node\n\n{link}\ny\nuser\n"))
+    let keys = storage_answer();
+    let out = setup(&paths, &format!("my-node\n{keys}{link}\ny\nuser\n"))
         .await
         .unwrap();
     assert!(out.contains("paired with"), "{out}");
@@ -48,7 +59,8 @@ async fn setup_goes_through_the_running_node() {
     let daemon = Daemon::start(o).await.unwrap();
     let center = FakeCenter::start(false).await.unwrap();
     let link = center.link().render();
-    let out = setup(&paths, &format!("other-name\n\n{link}\nn\n"))
+    let keys = storage_answer();
+    let out = setup(&paths, &format!("other-name\n{keys}{link}\nn\n"))
         .await
         .unwrap();
     assert!(out.contains("not paired"), "{out}");

@@ -92,8 +92,7 @@ nerve-node status
 The first line reads `daemon: running (confinement landlock v…)`. With
 `confinement none` the node cannot confine commands, so `folder` mode refuses
 every command. A line `folder mode runs no command: …` says the same, and
-why, also where Landlock is there but the keys in the keyring keep it from
-being enough.
+why.
 
 ## `user` mode
 

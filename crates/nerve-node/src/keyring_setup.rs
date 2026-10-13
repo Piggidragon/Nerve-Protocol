@@ -580,9 +580,8 @@ pub(crate) mod tests {
         );
     }
 
-    /// On a desktop nothing is offered: the keyring would be the default
-    /// of every program there (review round 1, finding 4). The question
-    /// says that it becomes the default.
+    /// On a desktop nothing is offered: the keyring would be the default of
+    /// every program there. The question says that it becomes the default.
     #[test]
     fn a_user_with_a_desktop_is_offered_no_keyring() {
         let mut k = FakeKeyring::new(false);

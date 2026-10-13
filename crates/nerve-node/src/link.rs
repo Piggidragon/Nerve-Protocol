@@ -1231,12 +1231,12 @@ impl Link {
             RunCall::parse(&inv.args, &home)?
         };
         let target = rc.command.clone();
-        // The gate and the sandbox below go by one answer, from `cfg` and
-        // its account, taken before the gate: a config written meanwhile
-        // or a limit that passes cannot let a command the gate judged by
-        // the folders run without Landlock (review round 2, finding 1). A
-        // limit only ever turns folder mode into allowlist, which the gate
-        // then judges, so the sandbox is never less than what it judged.
+        // The gate and the sandbox below go by one answer, from `cfg` and its
+        // account, taken before the gate: a config written meanwhile or a limit
+        // that passes cannot let a command the gate judged by the folders run
+        // without Landlock. A limit only ever turns folder mode into allowlist,
+        // which the gate then judges, so the sandbox is never less than what it
+        // judged.
         let by_folders = entry.policy.mode_at(crate::now_ms()) == Mode::Folder;
         let unconfined = self.shared.unconfined_as(cfg, || known.clone());
         self.gate(
@@ -1282,8 +1282,7 @@ impl Link {
             spec
         });
         // Counted while it runs, so the keys do not move into the keyring
-        // meanwhile, and not started when they moved after `cfg` was taken
-        // (review round 3, finding 1).
+        // meanwhile, and not started when they moved after `cfg` was taken.
         let open = crate::daemon::reaches_bus(landlock.as_ref(), || known.clone())
             .then(|| self.shared.open_to_bus())
             .transpose()

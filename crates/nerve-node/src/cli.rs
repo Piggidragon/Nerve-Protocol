@@ -1392,11 +1392,11 @@ pub async fn setup(
     r
 }
 
-/// Once the keyring answers setup, whether setup installed it or it came
-/// some other way (review round 2, finding 5): a node that runs and found
-/// none before does not look again (`keyring_failed` in its status,
-/// [`crate::secrets::store::failed`]), so it would refuse the move. The
-/// installed node is restarted; a node run by hand is left to its owner.
+/// Once the keyring answers setup, whether setup installed it or it came some
+/// other way: a node that runs and found none before does not look again
+/// (`keyring_failed` in its status, [`crate::secrets::store::failed`]), so it
+/// would refuse the move. The installed node is restarted; a node run by hand
+/// is left to its owner.
 async fn after_keyring_answers(
     paths: &NodePaths,
     machine: Option<&dyn crate::service::System>,
@@ -1472,9 +1472,9 @@ async fn setup_steps(
         );
     }
     // Keys in a keyring that does not answer: nothing can be read, so that
-    // comes first, also where the keys may not stay there, so that they
-    // can go into files below (review round 8, note 1). The installed node
-    // on Windows asks none: the keyring setup reaches is not the service's.
+    // comes first, also where the keys may not stay there, so that they can go
+    // into files below. The installed node on Windows asks none: the keyring
+    // setup reaches is not the service's.
     let no_keyring = crate::secrets::no_keyring(paths);
     if crate::secrets::stated_storage(paths) == SecretStorage::Keyring
         && no_keyring != Some(crate::secrets::NoKeyring::WindowsService)
@@ -2147,9 +2147,8 @@ async fn config_cmd(paths: &NodePaths, c: ConfigCmd, out: &mut dyn Write) -> Res
 
 /// Says, once the keys went into the keyring, that folder mode now runs no
 /// command where Landlock cannot keep a command off the session bus
-/// (crate::daemon::KEYRING_NOT_CONFINED; review round 2, finding 3). The
-/// running node knows; without one, the kernel here and the account `cfg`
-/// runs commands as tell (review round 3, finding 2).
+/// (crate::daemon::KEYRING_NOT_CONFINED). The running node knows; without one,
+/// the kernel here and the account `cfg` runs commands as tell.
 async fn tell_folder_commands(paths: &NodePaths, cfg: &NodeConfig, out: &mut dyn Write) {
     #[cfg(unix)]
     if let Ok(v) = nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await {
@@ -3006,7 +3005,7 @@ mod tests {
 
     /// Folder mode's commands are told off where Landlock cannot keep a
     /// command off the session bus, and `status` prints why the node says
-    /// they are (review round 2, finding 3).
+    /// they are.
     #[test]
     fn the_keyring_turns_folder_commands_off_below_abi_9() {
         use nerve_sandbox::Confinement;
@@ -3022,8 +3021,7 @@ mod tests {
         let (root, alice) = (account(0), account(4242));
         assert!(keyring_turns_commands_off(abi(Some(6)), || None));
         assert!(keyring_turns_commands_off(abi(Some(6)), || Some(root)));
-        // Another account than root cannot reach the bus: its commands run
-        // (review round 3, finding 2).
+        // Another account than root cannot reach the bus: its commands run.
         assert!(!keyring_turns_commands_off(abi(Some(6)), || Some(alice)));
         let asked = std::cell::Cell::new(false);
         let ask = || {
@@ -3149,7 +3147,7 @@ mod tests {
     /// Below Landlock ABI 9 the keys stay in files: setup warns and does
     /// not ask, taking keys left in the keyring into files; `config set`
     /// refuses the keyring; `config accept` refuses a file that keeps them
-    /// there. Where the ABI cannot be read, setup warns and asks as before.
+    /// there. Where the ABI cannot be read, setup warns and still asks.
     #[test]
     fn below_landlock_9_the_keys_stay_in_files() {
         use crate::secrets::{Landlock, for_tests::pretend_landlock};
@@ -3198,7 +3196,7 @@ mod tests {
 
     /// Below Landlock ABI 9 with the keys in a keyring that does not
     /// answer, setup still offers to install one, so that it can take the
-    /// keys into files (review round 8, note 1).
+    /// keys into files.
     #[test]
     fn below_landlock_9_setup_reaches_the_keyring_to_empty_it() {
         use crate::secrets::{Landlock, for_tests::pretend_landlock};
@@ -3243,8 +3241,8 @@ mod tests {
 
     /// A running node that found no keyring keeps that failure: after
     /// setup installed one, the installed node is restarted before the keys
-    /// move, and the owner of a node run by hand is told to restart it
-    /// (review round 1, finding 3). A node that never failed is left alone.
+    /// move, and the owner of a node run by hand is told to restart it. A
+    /// node that never failed is left alone.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_node_that_found_no_keyring_is_restarted_after_one_is_installed() {
@@ -3273,8 +3271,7 @@ mod tests {
     }
 
     /// Setup restarts a node that found no keyring also when the keyring
-    /// answers without setup installing it, e.g. installed by hand (review
-    /// round 2, finding 5).
+    /// answers without setup installing it, e.g. installed by hand.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_node_that_found_no_keyring_is_restarted_when_one_answers_setup() {

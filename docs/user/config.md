@@ -191,8 +191,8 @@ So:
 
 `nerve-node status` shows the kernel's Landlock ABI (`confinement landlock
 v…`). Where Landlock is missing or off, its ABI cannot be read: `setup` then
-says so in a warning and asks as before. Keep the keys in files unless you
-know the kernel has ABI 9 or later.
+says so in a warning and still asks where the keys go. Keep the keys in
+files unless you know the kernel has ABI 9 or later.
 
 ### A keyring on a Linux without a desktop
 

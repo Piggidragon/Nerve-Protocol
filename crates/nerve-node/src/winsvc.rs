@@ -859,9 +859,8 @@ mod tests {
         let e = install(&l, &sys, &exe, "alice", &mut Vec::new()).unwrap_err();
         assert!(e.contains("install changed nothing"), "{e}");
         assert!(e.contains("Credential Manager"), "{e}");
-        // The command names the folders: without a registered service the
-        // CLI would work on the administrator's own (review round 7,
-        // finding 1).
+        // The command names the folders: without a registered service the CLI
+        // would work on the administrator's own.
         let command = format!(
             "`nerve-node --config-dir \"{}\" --state-dir \"{}\" config set machine.secret_storage file`",
             l.paths.config_dir.display(),

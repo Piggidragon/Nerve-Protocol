@@ -98,16 +98,15 @@ mod unix {
     /// matters: a socket dropped and bound again can look in use while a
     /// child forked meanwhile still holds the old one.
     ///
-    /// A connection that cannot be taken does not end the serving, whatever
-    /// the reason: for want of descriptors or memory (EMFILE once a process
-    /// of the user holds the node's open files), of epoll watches (ENOSPC,
-    /// which a process of the user can use up for every process of the
-    /// user), or because it went before it was taken. The socket stays, and
-    /// the next connection is taken once the cause is gone. Ending would
-    /// leave the node without its socket until it restarts, and the CLI
-    /// would take a running node for none (keyring review round 4, finding
-    /// 1, and round 5, finding 1). Only an error that says the listener
-    /// itself is broken ends it.
+    /// A connection that cannot be taken does not end the serving, whatever the
+    /// reason: for want of descriptors or memory (EMFILE once a process of the
+    /// user holds the node's open files), of epoll watches (ENOSPC, which a
+    /// process of the user can use up for every process of the user), or
+    /// because it went before it was taken. The socket stays, and the next
+    /// connection is taken once the cause is gone. Ending would leave the node
+    /// without its socket until it restarts, and the CLI would take a running
+    /// node for none. Only an error that says the listener itself is broken
+    /// ends it.
     pub async fn serve_on<F, Fut>(listener: UnixListener, handler: F) -> std::io::Result<()>
     where
         F: Fn(CtlRequest, Peer) -> Fut + Send + Sync + 'static,
@@ -347,10 +346,9 @@ mod unix {
         #[cfg(target_os = "linux")]
         const OUT_OF_DESCRIPTORS: &str = "NERVE_TEST_CTL_OUT_OF_DESCRIPTORS";
 
-        /// With no descriptor left to take a connection, the server goes
-        /// on and answers once they are back (keyring review round 4,
-        /// finding 1). The limit on open files holds for a whole process,
-        /// so the test runs again in a process of its own.
+        /// With no descriptor left to take a connection, the server goes on and
+        /// answers once they are back. The limit on open files holds for a
+        /// whole process, so the test runs again in a process of its own.
         #[cfg(target_os = "linux")]
         #[test]
         fn serving_outlasts_running_out_of_descriptors() {
@@ -425,11 +423,10 @@ mod unix {
         }
 
         /// Running out of epoll watches (ENOSPC when the new connection is
-        /// registered with the reactor) does not end the socket, nor does
-        /// any other error of one connection; only a broken listener or
-        /// tokio itself does (keyring review round 5, finding 1). Filling
-        /// the real limit would disturb every process of the user, so this
-        /// asks `passing` directly.
+        /// registered with the reactor) does not end the socket, nor does any
+        /// other error of one connection; only a broken listener or tokio
+        /// itself does. Filling the real limit would disturb every process of
+        /// the user, so this asks `passing` directly.
         #[test]
         fn only_a_broken_listener_ends_the_serving() {
             let os = std::io::Error::from_raw_os_error;

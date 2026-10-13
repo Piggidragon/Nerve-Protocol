@@ -1344,9 +1344,9 @@ mod tests {
         assert!(!alive, "the process group outlived the call");
     }
 
-    /// With the keys in the keyring a command connects to socket files
-    /// anywhere but the node's own folders, the session bus's among them
-    /// (review round 1, finding 1): no rule holds those.
+    /// With the keys in the keyring a command connects to socket files anywhere
+    /// but the node's own folders, the session bus's among them: no rule holds
+    /// those.
     #[test]
     fn the_connect_rule_leaves_the_own_folders_out() {
         let d = tempfile::tempdir().unwrap();

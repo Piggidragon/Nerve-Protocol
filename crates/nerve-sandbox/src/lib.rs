@@ -486,11 +486,10 @@ mod tests {
         cmd.status().is_ok_and(|s| s.success())
     }
 
-    /// With `connect` set, a command connects to the socket files below it
-    /// and to none elsewhere, even in a folder it may read: the node's keys
-    /// in the keyring are behind the session bus, a socket file (review
-    /// round 1, finding 1). Without it, as before. Skipped where the kernel
-    /// has no ABI 9.
+    /// With `connect` set, a command connects to the socket files below it and
+    /// to none elsewhere, even in a folder it may read: the node's keys in the
+    /// keyring are behind the session bus, a socket file. Without it, socket
+    /// files are not limited. Skipped where the kernel has no ABI 9.
     #[cfg(target_os = "linux")]
     #[test]
     fn landlock_keeps_a_command_off_socket_files_outside_connect() {

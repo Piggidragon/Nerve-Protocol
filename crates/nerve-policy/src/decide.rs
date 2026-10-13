@@ -640,8 +640,7 @@ mod tests {
             &call(Effect::Execute, &exec_in, Some("make")),
         );
         assert_eq!(short(&d), "refused");
-        // The refusal names the node's reason (review round 2 of the node
-        // keyring, finding 3).
+        // The refusal names the node's reason.
         let why = "kept off by the keyring";
         let d = decide(
             &policy(Mode::Folder),

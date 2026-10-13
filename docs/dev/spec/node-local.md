@@ -154,8 +154,8 @@ Two kinds of node keep their keys in files whatever is asked:
   sandbox cannot grant the keyring's access and execute together. This
   holds whatever account runs the commands. Only an ABI that is read
   counts: where Landlock is missing or off, so that its ABI cannot be read,
-  the keyring is allowed as before (folder mode then runs no command
-  anyway), and `setup` warns that it cannot tell.
+  the keyring is allowed (folder mode then runs no command anyway), and
+  `setup` warns that it cannot tell.
 
 On such a node:
 

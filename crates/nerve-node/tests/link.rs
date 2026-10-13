@@ -521,15 +521,14 @@ async fn folder_mode_confines_commands_to_their_folders() {
     node.stop().await;
 }
 
-/// A folder mode command that started with the keys in files is counted for
-/// as long as its `exec.run` runs: a move of the keys into the keyring is
-/// refused meanwhile and nothing moves, and the count is 0 again once the
-/// call answered (keyring review round 4, finding 2). The count is checked
-/// before the move is asked for, so a node that does not count the command
-/// fails here without writing to the machine's keyring. The test, not a
-/// timer, ends the command, once the refusal was checked: a command that
-/// ended on its own before the move was asked for (a slow machine) would let
-/// the move go into the real keyring (round 5, finding 2).
+/// A folder mode command that started with the keys in files is counted for as
+/// long as its `exec.run` runs: a move of the keys into the keyring is refused
+/// meanwhile and nothing moves, and the count is 0 again once the call
+/// answered. The count is checked before the move is asked for, so a node that
+/// does not count the command fails here without writing to the machine's
+/// keyring. The test, not a timer, ends the command, once the refusal was
+/// checked: a command that ended on its own before the move was asked for (a
+/// slow machine) would let the move go into the real keyring.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_keys_do_not_move_into_the_keyring_past_a_running_folder_command() {

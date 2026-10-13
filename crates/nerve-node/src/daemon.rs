@@ -325,14 +325,13 @@ impl Shared {
     }
 
     /// Counts a `folder` mode command whose Landlock domain has no connect
-    /// rule, made from a config that keeps the keys in their files, while
-    /// it runs: a domain does not change while its command runs, so with
-    /// the keys moved into the keyring it would reach them over the session
-    /// bus. A move into the keyring is refused while one is counted. A move
-    /// made after the command's config was taken refuses the command: it is
-    /// counted first and looks at the keys' place then, under the store
-    /// lock that a move holds, so one of the two always sees the other
-    /// (review round 3, finding 1).
+    /// rule, made from a config that keeps the keys in their files, while it
+    /// runs: a domain does not change while its command runs, so with the keys
+    /// moved into the keyring it would reach them over the session bus. A move
+    /// into the keyring is refused while one is counted. A move made after the
+    /// command's config was taken refuses the command: it is counted first and
+    /// looks at the keys' place then, under the store lock that a move holds,
+    /// so one of the two always sees the other.
     pub fn open_to_bus(&self) -> Result<OpenToBus<'_>, &'static str> {
         self.open_to_bus.fetch_add(1, Ordering::SeqCst);
         let counted = OpenToBus(self);
@@ -343,8 +342,8 @@ impl Shared {
     }
 
     /// Logs once when the keyring turns folder mode's commands off, at the
-    /// start and after a change of the settings (review round 2, finding
-    /// 3): otherwise only a refused call would show it.
+    /// start and after a change of the settings: otherwise only a refused call
+    /// would show it.
     fn tell_confinement(&self, cfg: &NodeConfig) {
         let keyring = self.unconfined(cfg) == Some(KEYRING_NOT_CONFINED);
         if keyring && !self.told_keyring.swap(true, Ordering::Relaxed) {
@@ -1057,10 +1056,9 @@ fn describe_change(by: &str, version: u64, changes: &[Change]) -> String {
 mod tests {
     use super::*;
 
-    /// With the keys in the keyring, folder mode runs commands only where
-    /// they cannot reach the session bus it answers on: Landlock ABI 9, or
-    /// an account other than root and the node's own (review round 1,
-    /// finding 1).
+    /// With the keys in the keyring, folder mode runs commands only where they
+    /// cannot reach the session bus it answers on: Landlock ABI 9, or an
+    /// account other than root and the node's own.
     #[test]
     fn folder_commands_with_the_keyring_need_the_bus_out_of_reach() {
         let account = |uid| crate::service::Account {
@@ -1086,8 +1084,7 @@ mod tests {
     }
 
     /// A command reaches the session bus for good when its domain has no
-    /// connect rule, unless it runs as another account than root (review
-    /// round 3, finding 1).
+    /// connect rule, unless it runs as another account than root.
     #[test]
     fn a_domain_without_a_connect_rule_reaches_the_bus() {
         let account = |uid| crate::service::Account {
@@ -1118,10 +1115,9 @@ mod tests {
         assert!(!asked.get());
     }
 
-    /// The keys do not move into the keyring while a folder mode command
-    /// that started with them in files runs, and a command whose config was
-    /// taken before a move does not start after it (review round 3,
-    /// finding 1).
+    /// The keys do not move into the keyring while a folder mode command that
+    /// started with them in files runs, and a command whose config was taken
+    /// before a move does not start after it.
     #[cfg(unix)]
     #[tokio::test]
     async fn the_keys_do_not_move_past_a_command_that_reaches_the_bus() {
@@ -1170,9 +1166,9 @@ mod tests {
         daemon.stop().await;
     }
 
-    /// The account is looked up only where the answer depends on it: with
-    /// the keys in files, or Landlock off the bus, a link's 5 s tick starts
-    /// no program (review round 2, finding 2).
+    /// The account is looked up only where the answer depends on it: with the
+    /// keys in files, or Landlock off the bus, a link's 5 s tick starts no
+    /// program.
     #[test]
     fn the_account_is_asked_only_where_it_decides() {
         use SecretStorage::{File, Keyring};
@@ -1188,8 +1184,7 @@ mod tests {
         assert_eq!(asked.get(), 1);
     }
 
-    /// The keyring's places are the node's own only while its keys are
-    /// there (review round 1, finding 2).
+    /// The keyring's places are the node's own only while its keys are there.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn the_keyring_folder_is_the_nodes_own_with_the_keyring() {
@@ -1379,9 +1374,8 @@ mod tests {
     }
 
     /// With the keys moved into the keyring where Landlock cannot keep a
-    /// command off the session bus, the running node says that folder mode
-    /// runs no command: in its log once, and in its status (review round 2,
-    /// finding 3).
+    /// command off the session bus, the running node says that folder mode runs
+    /// no command: in its log once, and in its status.
     #[tokio::test]
     async fn the_keyring_turning_folder_commands_off_is_told() {
         use nerve_transport::ctl::Reply;

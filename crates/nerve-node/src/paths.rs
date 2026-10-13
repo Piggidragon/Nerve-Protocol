@@ -377,8 +377,8 @@ mod tests {
         assert_eq!(f.documents, [PathBuf::from("c:\\users\\u\\documents")]);
     }
 
-    /// With the keys in the keyring, the session bus and GNOME Keyring's
-    /// folder are the node's own too (review round 1, findings 1 and 2).
+    /// With the keys in the keyring, the session bus and GNOME Keyring's folder
+    /// are the node's own too.
     #[test]
     fn the_keyring_places_are_the_session_bus_and_the_keyring_folder() {
         let env = |k: &str| {

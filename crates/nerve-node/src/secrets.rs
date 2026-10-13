@@ -374,8 +374,8 @@ impl NoKeyring {
 }
 
 /// Why the keys of the node at `paths` may not go into the keyring, or
-/// `None` when they may. Where the Landlock ABI cannot be read, they may,
-/// as before; setup warns.
+/// `None` when they may. Where the Landlock ABI cannot be read, they may;
+/// setup warns.
 pub fn no_keyring(paths: &NodePaths) -> Option<NoKeyring> {
     if windows_service(paths) {
         return Some(NoKeyring::WindowsService);
@@ -480,7 +480,7 @@ pub fn center_key(
 ) -> Result<NodeKey, String> {
     let key = Key::Center(center);
     let text = match storage {
-        // As before the keyring: the file and its own messages.
+        // The file, with its own messages.
         SecretStorage::File => {
             let path = key.file(paths);
             let text = std::fs::read_to_string(&path)
@@ -562,14 +562,13 @@ pub struct NodeSecrets {
     held: Option<KeysLock>,
     /// The move in progress leaves the old copies to the next start.
     defer: bool,
-    /// Whether a move into the keyring may be left to the next start of a
-    /// node that holds [`KeysLock`]. Not on Linux: that node did not answer
-    /// on its control socket (it starts, or its socket stopped), so it goes
-    /// on with the keys in files in memory, and every `folder` mode command
-    /// it starts gets a sandbox that leaves the session bus open while the
-    /// keys are in the keyring; its count of such commands is not in this
-    /// process either (review round 4, finding 1). On Windows `folder` mode
-    /// runs no command.
+    /// Whether a move into the keyring may be left to the next start of a node
+    /// that holds [`KeysLock`]. Not on Linux: that node did not answer on its
+    /// control socket (it starts, or its socket stopped), so it goes on with
+    /// the keys in files in memory, and every `folder` mode command it starts
+    /// gets a sandbox that leaves the session bus open while the keys are in
+    /// the keyring; its count of such commands is not in this process either.
+    /// On Windows `folder` mode runs no command.
     defers_keyring: bool,
     /// The running node's count of commands its Landlock does not keep off
     /// the session bus (crate::daemon::Shared::open_to_bus): while one runs,
@@ -673,7 +672,7 @@ impl NodeSecrets {
     /// files, and a Landlock domain does not change while it runs: with the
     /// keys in the keyring it would reach them for the rest of its life.
     /// The store lock a move or a reload holds keeps a new one from
-    /// starting until it is over (review round 3, finding 1).
+    /// starting until it is over.
     fn open_commands(&self, to: SecretStorage) -> Option<(String, &'static str)> {
         let open = self
             .open_to_bus
@@ -747,7 +746,7 @@ impl Secrets for NodeSecrets {
         let to = cfg.machine.secret_storage;
         // Before the count of running commands: this refusal holds whatever
         // runs, so the count's advice (end them, change it again) would
-        // not help (review round 8, finding 2).
+        // not help.
         if to == SecretStorage::Keyring
             && let Some(n) = no_keyring(&self.paths)
         {
@@ -821,8 +820,7 @@ impl Secrets for NodeSecrets {
 
     /// Another writer moved the keys into the keyring: the running node
     /// does not follow where they may not be there ([`no_keyring`]), nor
-    /// while it counts a command that would reach them there (review round
-    /// 4, finding 1).
+    /// while it counts a command that would reach them there.
     fn may_reload(&self, cfg: &NodeConfig) -> Result<(), String> {
         if cfg.machine.secret_storage == SecretStorage::Keyring
             && let Some(n) = no_keyring(&self.paths)
@@ -1323,7 +1321,7 @@ mod tests {
 
     /// A copy whose write went through but whose read-back did not answer
     /// goes with the copies before it: neither place keeps anything of the
-    /// move (review round 1, finding 5).
+    /// move.
     #[test]
     fn a_copy_that_fails_after_its_write_leaves_nothing_in_the_new_place() {
         let (_d, paths) = node();
@@ -1345,7 +1343,7 @@ mod tests {
 
     /// Two CLIs with no node: one moves the keys, the other saves a change
     /// it made on the file before the move. That one is refused, so the
-    /// file keeps naming where the keys are (review round 1, finding 6).
+    /// file keeps naming where the keys are.
     #[test]
     fn a_cli_write_on_a_file_another_cli_changed_meanwhile_is_refused() {
         let (_d, paths) = node();
@@ -1375,8 +1373,7 @@ mod tests {
     }
 
     /// A center removed while a move waits for the next start loses its key
-    /// in the old place too: that start no longer looks for it (review
-    /// round 1, finding 7).
+    /// in the old place too: that start no longer looks for it.
     #[test]
     fn a_center_removed_while_a_move_waits_leaves_no_key_behind() {
         let (_d, paths) = node();
@@ -1428,7 +1425,7 @@ mod tests {
     /// On Linux a CLI that finds a node holding the lock does not move the
     /// keys into the keyring: that node did not answer on its control
     /// socket, so it would go on giving its folder mode commands a sandbox
-    /// for keys in files (review round 4, finding 1).
+    /// for keys in files.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_cli_does_not_move_the_keys_into_the_keyring_past_a_silent_node() {
@@ -1464,7 +1461,7 @@ mod tests {
 
     /// A running node does not take in a file that another writer saved
     /// with the keys in the keyring while it counts a folder mode command
-    /// that started with them in files (review round 4, finding 1).
+    /// that started with them in files.
     #[test]
     fn a_reload_into_the_keyring_waits_for_the_commands_that_reach_the_bus() {
         let (_d, paths) = node();
@@ -1660,8 +1657,7 @@ mod tests {
 
     /// Below Landlock ABI 9 a move into the keyring is refused for that
     /// reason even while a folder mode command runs: the count's advice
-    /// (end them, change it again) would not help (review round 8,
-    /// finding 2).
+    /// (end them, change it again) would not help.
     #[test]
     fn below_landlock_9_the_refusal_does_not_wait_for_commands() {
         let (_d, paths) = node();
@@ -1680,7 +1676,7 @@ mod tests {
     }
 
     /// The installed node's folders on Windows in another spelling are
-    /// still its folders (review round 7, finding 1).
+    /// still its folders.
     #[test]
     fn folders_differing_in_case_are_the_same_folders() {
         let a = NodePaths::new(

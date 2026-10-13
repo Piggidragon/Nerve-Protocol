@@ -208,8 +208,7 @@ mod tests {
     /// Two commands whose shells had the same pid, the first one's long
     /// exited while a background process still held its output: each call
     /// ends its own job and nothing else, and a job Windows did not end is
-    /// not walked either, since the pid may be another process's by now
-    /// (code review 2 of PR #19, finding 1).
+    /// not walked either, since the pid may be another process's by now.
     #[test]
     fn a_call_ends_its_own_job_whatever_pid_its_shell_had() {
         let (a, a_ends) = fake(true);

@@ -102,20 +102,20 @@ Every file the node writes is signed: its first line is
 It sits in the state folder rather than beside `node.toml`, so the key does
 not hang on a setting of the file it checks, and whatever could read the
 config folder would still not hold it. `machine.secret_storage = "keyring"`
-is not done, for this key as for the center keys.
+changes nothing, for this key as for the center keys: they stay files.
 
 A file whose MAC is missing or does not match was changed outside the
 owner's path. It is refused and the refusal is audited (§6): at start-up the
 node does not start; on a reload the old config stays in force. A reload also
 refuses a signed file older than the one in force. After looking at a refused
 file, the owner takes it as it is with `nerve-node config accept`; the node
-then signs it. A `node.toml` from before the node kept a MAC (no key yet, no
-MAC line) is taken once as it is and signed.
+then signs it. A `node.toml` without a MAC line (no key yet) is taken once
+as it is and signed.
 
 The check stands on `config.key`. A process that can delete or read it, and a
 `user` mode command is one (it runs unconfined as the user), can make the node
 take another file at its next start: with the key gone, an unsigned file
-counts as one from before the MAC and is signed. The start-up audits that as
+counts as a first file and is signed. The start-up audits that as
 `signed`. In `folder` mode Landlock keeps commands out of the state folder.
 
 On Windows there is no control socket: the CLI writes the signed
@@ -222,8 +222,7 @@ with a status that names the entry, and the node does not dial directly
 instead (fail closed).
 
 A `node.toml` that holds header values (`headers = { Name = "value" }`) or a
-user name and password in `connection.proxy`, as earlier builds wrote it, is
-refused on load, without the values in the message: take them out of the
+user name and password in `connection.proxy` is refused on load, without the values in the message: take them out of the
 file, accept it (`nerve-node config accept`) and run `nerve-node proxy set`
 again.
 
@@ -246,7 +245,7 @@ again.
   AppContainer and the paths of the same sets as on Linux, each by a grant
   for the container on the folder with the rights of its flags; the
   installed Windows service, whose commands run as another account, has no
-  such confinement yet and refuses them. `allow` rules do not count. On Linux a command
+  such confinement and refuses them. `allow` rules do not count. On Linux a command
   reads the system folders and its `r` folders, writes its `w` folders and
   runs programs from the system folders and its `x` folders (Landlock), each
   flag with its own rule. A folder with `w` and not `r` can be written but
@@ -436,7 +435,7 @@ discarded), run as the account the commands run as (§1, `machine.user` on
 the installed node, else the node's own user), so the password is that
 account's and refuses a wrong one with `invalid_args`; the switch then stays
 as it was. Turning it off drops the password. The password is kept in memory
-only (`secret_storage` at rest is not done), so a restarted node, or
+only, never at rest, so a restarted node, or
 a `node.toml` that says `on` without a password held, has the switch off. It
 never reaches a center: the node replaces every copy in an outgoing frame and
 in the audit log with `[redacted]`. `machine.sudo` changes only through the

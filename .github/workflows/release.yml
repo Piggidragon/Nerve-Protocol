@@ -12,8 +12,8 @@
 # publishes the release only after every check and build passed, so a failed
 # run leaves no tag. Tags are never moved or reused.
 #
-# No secrets: nothing is signed, Nerve has no update channel yet. The actions are
-# pinned by commit.
+# No secrets: nothing is signed (the node's `update` checks a download against
+# SHA256SUMS). The actions are pinned by commit.
 name: Release
 
 on:

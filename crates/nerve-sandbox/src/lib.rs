@@ -15,7 +15,7 @@
 //! on the center's folders for their flags ([`acl`]) and takes them off when a
 //! folder goes. The shim starts the command in the container and waits for it.
 //!
-//! Everything else in this area is a stub (see [`stubs`]).
+//! Neither limits a command's memory or process count by cgroup.
 
 use std::path::PathBuf;
 
@@ -1482,33 +1482,9 @@ pub mod appcontainer {
     }
 }
 
-/// What the sandbox does not do. Each returns an error ending in
-/// [`stubs::NOT_DONE`], so callers and the CLI say so plainly instead of
-/// pretending.
-pub mod stubs {
-    pub const NOT_DONE: &str = "not done";
-
-    /// A cgroup per command (memory, process count, kill of the whole tree).
-    pub fn cgroup() -> Result<(), String> {
-        Err(format!("cgroup confinement: {NOT_DONE}"))
-    }
-
-    /// Running commands as a dedicated, unprivileged user.
-    pub fn dedicated_user() -> Result<(), String> {
-        Err(format!("dedicated user: {NOT_DONE}"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn stubs_say_not_done() {
-        for r in [stubs::cgroup(), stubs::dedicated_user()] {
-            assert!(r.unwrap_err().ends_with(stubs::NOT_DONE));
-        }
-    }
 
     #[test]
     fn spec_round_trips_strictly() {

@@ -319,7 +319,7 @@ impl Shared {
         self.bump();
     }
 
-    // Only the Unix control socket asks this; Windows has none yet.
+    // Only the Unix control socket asks this; Windows has none.
     /// Whether `pid` runs below a command the node started for a center: such
     /// a process must not change the node's settings.
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -648,8 +648,8 @@ async fn start_ctl(shared: Arc<Shared>) -> Result<JoinHandle<()>, String> {
 
 #[cfg(not(unix))]
 async fn start_ctl(_shared: Arc<Shared>) -> Result<JoinHandle<()>, String> {
-    // Not done: a named pipe. The CLI writes the signed file itself,
-    // and the running node takes it at its next start.
+    // Windows has no control channel (no named pipe). The CLI writes the
+    // signed file itself, and the running node takes it at its next start.
     Ok(tokio::spawn(async {}))
 }
 

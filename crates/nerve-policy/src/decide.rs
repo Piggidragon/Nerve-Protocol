@@ -445,7 +445,7 @@ mod tests {
     }
 
     /// The deepest folder is the one with the most components, not the
-    /// longest spelling (security review 3 of PR #19, finding 1).
+    /// longest spelling.
     #[test]
     fn the_deepest_folder_goes_by_components_not_by_length() {
         let folders = [
@@ -1203,10 +1203,10 @@ mod tests {
         assert_eq!(run(&p, &env, &c("rm -rf /")), "refused");
     }
 
-    /// The Windows review of PR #19, round 2, finding 1: a wildcard allow
-    /// covers one plain command only. Each character class that can open a
-    /// second command or a sub-expression in sh, PowerShell or cmd, and each
-    /// word that runs a string as code, needs a rule that names the line.
+    /// A wildcard allow covers one plain command only. Each character class
+    /// that can open a second command or a sub-expression in sh, PowerShell or
+    /// cmd, and each word that runs a string as code, needs a rule that names
+    /// the line.
     #[test]
     fn a_wildcard_allow_covers_no_expression_or_inner_command() {
         let x = T::new();
@@ -1270,7 +1270,7 @@ mod tests {
 
     /// A Windows node in `user` mode: the OpenSSH server's key list and the
     /// registry hives are refused to `fs` calls and as a command's working
-    /// directory (Windows review of PR #19, finding 1).
+    /// directory.
     #[test]
     fn windows_system_files_are_refused_in_user_mode() {
         let folders = WinFolders {

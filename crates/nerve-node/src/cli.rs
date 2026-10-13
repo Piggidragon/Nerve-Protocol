@@ -982,8 +982,8 @@ async fn owner_check(paths: &[&NodePaths]) -> Result<(), String> {
             Ok(_) => {}
             // No node runs, so no command of one does.
             Err(e) if e == nerve_transport::ctl::NOT_RUNNING => {}
-            // A node from before this check cannot answer it. It is let
-            // through, as every caller was before the check existed.
+            // A node that does not know the method cannot answer it. It is let
+            // through.
             Err(e) if e.starts_with("unknown method") => {}
             Err(e) => return Err(e),
         }
@@ -2617,7 +2617,7 @@ mod tests {
     }
 
     /// install, update and uninstall work on the installed node only, so
-    /// they take no folders; none says it is not done any more.
+    /// they take no folders; none says it is not done.
     #[test]
     fn the_service_commands_take_no_folders() {
         let (_d, paths) = setup(&[]);
@@ -3191,10 +3191,10 @@ mod tests {
         }
     }
 
-    /// The names of the commands, noun then verb; the first column is what
-    /// parses, the second what each one was called before.
+    /// The names of the commands, noun then verb: the first list parses, the
+    /// second (single words and other orders) does not.
     #[test]
-    fn the_commands_are_noun_then_verb_and_the_old_names_are_gone() {
+    fn the_commands_are_noun_then_verb() {
         let parses = |args: &[&str]| {
             let mut argv = vec!["nerve-node"];
             argv.extend(args);
@@ -3232,7 +3232,7 @@ mod tests {
         ] {
             assert!(parses(ok), "{ok:?}");
         }
-        for old in [
+        for bad in [
             &["pair", "nerve://x"][..],
             &["unpair"],
             &["centers"],
@@ -3257,7 +3257,7 @@ mod tests {
             &["rule", "add", "bogus", "x"],
             &["rule", "ls", "allow", "extra"],
         ] {
-            assert!(!parses(old), "{old:?}");
+            assert!(!parses(bad), "{bad:?}");
         }
     }
 
@@ -3396,7 +3396,7 @@ mod tests {
         assert_eq!(abouts.len(), n, "two commands say the same");
     }
 
-    /// The help page no longer calls any command not done.
+    /// The help page calls no command not done.
     #[test]
     fn no_command_is_called_not_done() {
         let text = Cli::command().render_help().to_string();
@@ -3451,8 +3451,7 @@ mod tests {
     }
 
     /// After a rotation the older entries are in `audit.jsonl.1`; `audit`
-    /// shows them before the current file's (code review 2 of PR #19,
-    /// finding 3).
+    /// shows them before the current file's.
     #[test]
     fn audit_shows_the_rotated_file_too() {
         let d = tempfile::tempdir().unwrap();

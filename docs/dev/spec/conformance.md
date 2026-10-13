@@ -98,8 +98,8 @@ With a `Setup::sudo_password` as well:
 | 7.4.1 | a replayed sealed password is `invalid_args` and sudo stays off |
 | 7.4.1 | no frame the node sent carries the sudo password |
 
-## Not covered yet
+## Not covered
 
 Binary frames and blobs (§5.4), limits (§5.5), the duplicate-link rule (§4.3),
 liveness timing (§4.4), back-off (§4.6) and proxies (§4.7) have unit tests in
-the implementations but no conformance checks yet.
+the implementations but no conformance checks.

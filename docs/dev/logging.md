@@ -14,6 +14,7 @@ built.
 | `Log` | The level (changeable at any time), a window of the latest 2000 entries, and the file. It also holds the secrets the program knows (`set_secret`) |
 | `Entry` | One line: `ts`, `level`, `node`, `node_id`, `msg` |
 | `redact` | Takes secrets out of text ([below](#redaction)) |
+| `scrub` | A line as the log keeps it: control characters to spaces, `redact`, cut to 1000 characters. The node's Windows Event Log entries go through it too |
 | `LogLayer` | A `tracing` layer that hands every event to a `Log` |
 | `install`, `global` | Make the process's `Log` once and set the layer as the global subscriber |
 | `emit` | `tracing` at a level only known at run time |
@@ -69,6 +70,39 @@ not the daemon writes no log file.
 - **Node.** The level is `log.level` in `node.toml`. The supervisor sets it
   from the config it holds on every pass, so any writer (the CLI, a reload)
   is followed within a second.
+
+## The Windows Event Log
+
+The installed node on Windows also writes its start, its stop, a start that
+fails and a crash to the Application log, as the source `nerve-node`
+(`crate::win_service::event`, ids in `crate::eventlog`). It does so only when
+the service control manager started it. `running()` writes the start once the
+daemon runs; `run_body`, which `service_main` calls, writes the stop, or,
+when the body returned an error, "did not start" before `running()` and
+"stopped with an error" after it. A panic hook writes a crash and calls the hook it replaced; it does
+not touch the log file, whose lock the panicking thread may hold. A panic in
+the body's thread (`run_body`) is caught there and ends the program with
+`abort`, so the service's failure actions start it again (three times a day
+at most, as `install` sets them; the entry says so) and the frame of
+`service_main`, which cannot unwind, adds no second panic. A panic on another
+thread, such as a task tokio catches, is written as a part of the node that
+panicked; the node runs on. The text goes through `log::scrub`, as a line of
+the log does: one line, redacted, cut. Every user may read the Application
+log.
+
+The Event Viewer takes an entry's text from the source's message file.
+`build.rs` writes a `.res` file with one message table (`%1` for each id,
+`eventlog::resource`) and links it into every program of the crate on
+windows-msvc; `install` and `update` register `nerve-node.exe` as the message file under
+`HKLM\SYSTEM\CurrentControlSet\Services\EventLog\Application\nerve-node`,
+and `uninstall` removes the key. A windows-gnu build has no table, and the
+Event Viewer then shows the text with a note that the description is missing.
+
+Once someone read the entries, the Event Log service holds the program open
+as their message file. It cannot be written over or deleted then, but it can
+be renamed: `install` moves an installed program aside (`remove_program`, to
+`nerve-node.*.del`, deleted at the next restart) before it writes the new
+one, as `update` and `uninstall` already did.
 
 ## Redaction
 

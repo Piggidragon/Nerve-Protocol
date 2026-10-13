@@ -740,7 +740,7 @@ mod tests {
         let env = Env {
             home,
             protected: &prot,
-            confined: true,
+            unconfined: None,
             sudo: false,
         };
         let call = Call {

@@ -57,9 +57,10 @@ pub struct Call<'a> {
 pub struct Env<'a> {
     pub home: &'a Path,
     pub protected: &'a Protected,
-    /// Whether commands run in `folder` mode can be confined (Landlock). When
-    /// they cannot, a command in a folder that allows running is refused.
-    pub confined: bool,
+    /// Why commands run in `folder` mode cannot be confined (Landlock) here,
+    /// or `None` when they can. When they cannot, a command in a folder that
+    /// allows running is refused with this reason.
+    pub unconfined: Option<&'a str>,
     /// The node's sudo switch: on only while the node holds a sudo password
     /// it has checked.
     pub sudo: bool,
@@ -432,14 +433,14 @@ fn by_mode(
                     .cwd
                     .and_then(|c| inside_folder(&policy.folders, c))
                     .is_some_and(|f| f.access.execute);
-                if in_exec && !env.confined {
-                    reasons.push("commands cannot be confined on this machine".into());
+                if let (true, Some(why)) = (in_exec, env.unconfined) {
+                    reasons.push(why.into());
                 } else if !in_exec {
                     reasons.push(
                         "the working directory is not in a folder that allows running".into(),
                     );
                 }
-                in_exec && env.confined
+                in_exec && env.unconfined.is_none()
             }
         },
     }
@@ -521,7 +522,7 @@ mod tests {
             Env {
                 home: Path::new("/h"),
                 protected: &self.prot,
-                confined,
+                unconfined: (!confined).then_some("commands cannot be confined on this machine"),
                 sudo: false,
             }
         }
@@ -676,6 +677,20 @@ mod tests {
             &call(Effect::Execute, &exec_in, Some("make")),
         );
         assert_eq!(short(&d), "refused");
+        // The refusal names the node's reason.
+        let why = "kept off by the keyring";
+        let d = decide(
+            &policy(Mode::Folder),
+            &Env {
+                unconfined: Some(why),
+                ..x.env(false)
+            },
+            &call(Effect::Execute, &exec_in, Some("make")),
+        );
+        assert!(
+            matches!(&d, Decision::Forbidden(m) if m.contains(why)),
+            "{d:?}"
+        );
         // A limit that is still running changes nothing; one that has run out
         // leaves default deny, so a read in a folder needs a rule again.
         for mode in [Mode::Folder, Mode::User] {
@@ -1380,7 +1395,7 @@ mod tests {
         let env = Env {
             home: Path::new("C:\\Users\\u"),
             protected: &prot,
-            confined: false,
+            unconfined: Some("commands cannot be confined on this machine"),
             sudo: false,
         };
         let p = policy(Mode::User);

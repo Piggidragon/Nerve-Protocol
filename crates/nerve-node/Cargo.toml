@@ -38,7 +38,8 @@ libc.workspace = true
 # command as another account (Pipes, Environment, Storage_FileSystem).
 # Registry reads an account's profile folder and hides `nerve` from the
 # sign-in screen; Console reads a password without echo; WindowsProgramming
-# names the account that runs a command.
+# names the account that runs a command. EventLog writes the installed
+# node's start, stop and failures to the Windows Event Log.
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_NetManagement",
@@ -50,6 +51,7 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Com",
     "Win32_System_Console",
     "Win32_System_Environment",
+    "Win32_System_EventLog",
     "Win32_System_JobObjects",
     "Win32_System_Pipes",
     "Win32_System_Registry",
@@ -65,3 +67,10 @@ tempfile.workspace = true
 tracing-subscriber.workspace = true
 # The conformance suite's fake center drives the link tests.
 nerve-conformance = { path = "../nerve-conformance" }
+
+[target.'cfg(windows)'.dev-dependencies]
+# A test reads the Event Log messages back out of the program.
+windows-sys = { workspace = true, features = [
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_LibraryLoader",
+] }

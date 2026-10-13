@@ -10,11 +10,16 @@ pub mod account;
 pub mod cli;
 pub mod daemon;
 pub mod descriptor;
+// The Event Log is Windows-only in use, and its message table is build.rs's;
+// both are tested everywhere.
+#[cfg_attr(not(test), allow(dead_code))]
+mod eventlog;
 pub mod exec;
 pub mod fs;
 // The job is Windows-only in use; its choices are tested everywhere.
 #[cfg_attr(not(windows), allow(dead_code))]
 mod job;
+pub mod keyring_setup;
 mod link;
 pub mod pair;
 pub mod paths;

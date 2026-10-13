@@ -16,6 +16,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use nerve_policy::audit::AuditLog;
+use nerve_policy::config::SecretStorage;
 use nerve_policy::settings::SettingsStore;
 
 use crate::service::{
@@ -57,6 +58,13 @@ pub trait WinSystem {
     /// Stops the service and waits until it has; a stopped one is fine.
     fn stop(&self) -> Result<(), String>;
     fn delete_service(&self) -> Result<(), String>;
+    /// Registers the source of the node's entries in the Windows Event Log,
+    /// with `layout.bin` as the file that holds their text
+    /// ([`crate::eventlog`]), or changes it.
+    fn put_event_source(&self, layout: &Layout) -> Result<(), String>;
+    /// Removes that source; `false` when it was not registered. The entries
+    /// stay in the log.
+    fn delete_event_source(&self) -> Result<bool, String>;
     /// Waits until the node the service started runs.
     fn wait_running(&self, layout: &Layout) -> Result<(), String>;
     /// Asks for a password, without echo on a console.
@@ -82,8 +90,10 @@ pub trait WinSystem {
     /// rights.
     fn version_of(&self, program: &Path) -> Result<String, String>;
     /// Removes the program file and its folder when that is empty; `false`
-    /// when the program runs (this command started from it): it then moves
-    /// aside to a `nerve-node.*.del` beside it and goes at the next restart.
+    /// when Windows holds the program (this command started from it, or the
+    /// Event Log reads the text of the node's entries from it): it then
+    /// moves aside to a `nerve-node.*.del` beside it and goes at the next
+    /// restart.
     fn remove_program(&self, path: &Path) -> Result<bool, String>;
 }
 
@@ -164,6 +174,16 @@ fn install_steps(
     invoker: &str,
     steps: &mut Steps,
 ) -> Result<(), String> {
+    // The service would look for keys in the keyring in the Credential
+    // Manager of nerve, and they are in that of whoever moved them there.
+    if crate::secrets::stated_storage(&layout.paths) == SecretStorage::Keyring {
+        return Err(crate::secrets::keyring_refused(
+            &layout.paths,
+            crate::secrets::NoKeyring::WindowsService,
+            "install changed nothing",
+            "run `nerve-node install` again",
+        ));
+    }
     // A running service holds the program and the folders' files.
     if sys.service()? == Some(true) {
         sys.stop()?;
@@ -214,6 +234,12 @@ fn install_steps(
         ));
     } else {
         let program = std::fs::read(exe).map_err(|e| format!("{}: {e}", exe.display()))?;
+        // Once someone read the node's entries, the Event Log holds the
+        // installed program as their message file: it cannot be written
+        // over then, but it can be moved aside.
+        if layout.bin.exists() {
+            sys.remove_program(&layout.bin)?;
+        }
         write_file(&layout.bin, &program, 0o755)?;
         steps.did(format!("put the program at {}", layout.bin.display()));
     }
@@ -235,6 +261,12 @@ fn install_steps(
     sys.put_service(layout, &password)?;
     steps.did(format!(
         "registered the service {SERVICE_NAME}, which runs as {USER} and starts with the machine"
+    ));
+    sys.put_event_source(layout)?;
+    steps.did(format!(
+        "registered the source {} in the Windows Event Log (Application): the service's start, stop and failures go there as well as to {}",
+        crate::eventlog::SOURCE,
+        layout.paths.log_file().display()
     ));
     sys.start()?;
     sys.wait_running(layout)?;
@@ -384,6 +416,12 @@ fn uninstall_steps(
         sys.delete_service()?;
         steps.did(format!("stopped and removed the service {SERVICE_NAME}"));
     }
+    if sys.delete_event_source()? {
+        steps.did(format!(
+            "removed the source {} from the Windows Event Log; its entries stay",
+            crate::eventlog::SOURCE
+        ));
+    }
     let folders = [
         &layout.paths.config_dir,
         &layout.home,
@@ -439,7 +477,7 @@ fn uninstall_steps(
             steps.did(format!("removed the program {}", layout.bin.display()));
         } else {
             steps.did(format!(
-                "removed the program {}; this command runs from it, so Windows deletes the file at its next start",
+                "removed the program {}; Windows holds it (this command runs from it, or the Event Log reads it), so Windows deletes the file at its next start",
                 layout.bin.display()
             ));
         }
@@ -485,6 +523,10 @@ async fn update_steps(
         .ok_or_else(|| {
             format!("the user {USER} is missing; `nerve-node install` makes it again")
         })?;
+    // A node installed before it wrote to the Event Log has no source there,
+    // and one whose source points elsewhere gets it back; it is the same
+    // program path after the update.
+    sys.put_event_source(layout)?;
     let new = match from {
         Some(f) => {
             let b = std::fs::read(f).map_err(|e| format!("{}: {e}", f.display()))?;
@@ -609,6 +651,10 @@ pub(crate) mod tests {
         started: RefCell<Vec<String>>,
         /// The folders and whom they were opened to.
         secured: RefCell<Vec<(PathBuf, Option<String>)>>,
+        /// The message file of the Event Log source, while it is registered.
+        event_source: RefCell<Option<PathBuf>>,
+        /// The programs removed, in order.
+        removed: RefCell<Vec<PathBuf>>,
     }
 
     impl Fake {
@@ -626,6 +672,8 @@ pub(crate) mod tests {
                 program: RefCell::new(None),
                 started: RefCell::new(Vec::new()),
                 secured: RefCell::new(Vec::new()),
+                event_source: RefCell::new(None),
+                removed: RefCell::new(Vec::new()),
             }
         }
 
@@ -722,6 +770,15 @@ pub(crate) mod tests {
             self.service.set(None);
             Ok(())
         }
+        fn put_event_source(&self, layout: &Layout) -> Result<(), String> {
+            self.call("event source");
+            *self.event_source.borrow_mut() = Some(layout.bin.clone());
+            Ok(())
+        }
+        fn delete_event_source(&self) -> Result<bool, String> {
+            self.call("no event source");
+            Ok(self.event_source.borrow_mut().take().is_some())
+        }
         /// Judges the program the last start started, not what is in its
         /// place now.
         fn wait_running(&self, _: &Layout) -> Result<(), String> {
@@ -795,6 +852,7 @@ pub(crate) mod tests {
             Ok(text.lines().next().unwrap_or_default().to_string())
         }
         fn remove_program(&self, path: &Path) -> Result<bool, String> {
+            self.removed.borrow_mut().push(path.to_path_buf());
             std::fs::remove_file(path).map_err(|e| e.to_string())?;
             Ok(true)
         }
@@ -852,6 +910,48 @@ pub(crate) mod tests {
         assert_ne!(p, new_password());
     }
 
+    /// A node.toml that keeps the keys in the keyring is refused before
+    /// install changes anything: the service, as nerve, would not find
+    /// keys that are in another account's Credential Manager.
+    #[test]
+    fn install_refuses_keys_in_the_keyring() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = layout(d.path());
+        // Left by a node run on these folders before.
+        std::fs::create_dir_all(&l.paths.config_dir).unwrap();
+        std::fs::create_dir_all(&l.paths.state_dir).unwrap();
+        std::fs::write(
+            l.paths.config_file(),
+            "[machine]\nsecret_storage = \"keyring\"\n",
+        )
+        .unwrap();
+        let exe = d.path().join("Downloads/nerve-node-x86_64-windows.exe");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "nerve-node 1.0.0\n").unwrap();
+        let e = install(&l, &sys, &exe, "alice", &mut Vec::new()).unwrap_err();
+        assert!(e.contains("install changed nothing"), "{e}");
+        assert!(e.contains("Credential Manager"), "{e}");
+        // The command names the folders: without a registered service the CLI
+        // would work on the administrator's own.
+        let command = format!(
+            "`nerve-node --config-dir \"{}\" --state-dir \"{}\" config set machine.secret_storage file`",
+            l.paths.config_dir.display(),
+            l.paths.state_dir.display()
+        );
+        assert!(e.contains(&command), "{e}");
+        assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+        assert!(sys.secured.borrow().is_empty());
+        assert!(!l.bin.exists());
+        let a = audit_events(&l);
+        assert_eq!(a.len(), 1);
+        assert!(
+            a[0]["error"].as_str().unwrap().contains("keyring"),
+            "{}",
+            a[0]
+        );
+    }
+
     #[test]
     fn install_registers_the_service_under_its_own_account() {
         let d = tempfile::tempdir().unwrap();
@@ -881,8 +981,16 @@ pub(crate) mod tests {
                 "add nerve".to_string(),
                 "logon alice".into(),
                 format!("put {}", l.bin.display()),
+                "event source".into(),
                 "start".into(),
             ]
+        );
+        // The Event Log takes the text of the node's entries from the
+        // installed program.
+        assert_eq!(*sys.event_source.borrow(), Some(l.bin.clone()));
+        assert!(
+            out.contains("registered the source nerve-node in the Windows Event Log"),
+            "{out}"
         );
         // The folders are nerve's; the program is in place.
         let secured = sys.secured.borrow().clone();
@@ -904,7 +1012,7 @@ pub(crate) mod tests {
         assert_eq!(a.len(), 1);
         assert_eq!(a[0]["event"], "install");
         assert!(a[0].get("error").is_none());
-        assert_eq!(a[0]["steps"].as_array().unwrap().len(), 6, "{}", a[0]);
+        assert_eq!(a[0]["steps"].as_array().unwrap().len(), 7, "{}", a[0]);
         // Again, as another administrator: the account is reset, the
         // service stopped and started, the account of the commands and its
         // stored password kept without a question.
@@ -915,6 +1023,13 @@ pub(crate) mod tests {
         let mut out = Vec::new();
         install(&l, &sys, &exe, "bob", &mut out).unwrap();
         assert!(!aside.exists());
+        // The old program is removed, or moved aside where the Event Log
+        // holds it, before the new one takes its place: written over, a
+        // held file refuses.
+        assert_eq!(
+            sys.removed.borrow().as_slice(),
+            std::slice::from_ref(&l.bin)
+        );
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("stopped the service nerve-node"), "{out}");
         assert!(out.contains("the user nerve is there already"), "{out}");
@@ -1046,11 +1161,16 @@ pub(crate) mod tests {
         assert_eq!(sys.service.get(), None);
         assert!(sys.account(USER).unwrap().is_none());
         assert!(
-            sys.calls()
-                .ends_with(&["stop".into(), "delete".into(), "remove nerve".into()]),
+            sys.calls().ends_with(&[
+                "stop".into(),
+                "delete".into(),
+                "no event source".into(),
+                "remove nerve".into()
+            ]),
             "{:?}",
             sys.calls()
         );
+        assert_eq!(*sys.event_source.borrow(), None);
         // The config, the stored password and the state stay, open to the
         // administrators only, and the audit log has both commands.
         assert_eq!(
@@ -1068,6 +1188,10 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(events, ["install", "uninstall"]);
         let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("removed the source nerve-node from the Windows Event Log"),
+            "{out}"
+        );
         assert!(out.contains("uninstall --purge"), "{out}");
         assert!(out.contains("removed the program"), "{out}");
         assert!(out.contains("removed the stored sudo password"), "{out}");
@@ -1089,7 +1213,9 @@ pub(crate) mod tests {
             assert!(!p.exists(), "{p:?}");
         }
         assert_eq!(sys.service.get(), None);
+        assert_eq!(*sys.event_source.borrow(), None);
         assert!(sys.account(USER).unwrap().is_none());
+        // Nothing left, the source included: nothing is said to be removed.
         let mut out = Vec::new();
         uninstall(&l, &sys, true, &mut out).unwrap();
         assert!(
@@ -1147,7 +1273,7 @@ pub(crate) mod tests {
             "{out}"
         );
         assert_eq!(std::fs::read(&l.bin).unwrap(), b"nerve-node 1.2.0\n");
-        assert_eq!(sys.calls()[calls..], ["stop", "start"]);
+        assert_eq!(sys.calls()[calls..], ["event source", "stop", "start"]);
         assert_eq!(sys.started.borrow().last().unwrap(), "nerve-node 1.2.0");
         for (p, b) in before {
             let now = std::fs::read(&p).unwrap();
@@ -1159,7 +1285,9 @@ pub(crate) mod tests {
         }
         assert_eq!(audit_events(&l).last().unwrap()["event"], "update");
         assert!(!staged(&l.bin).exists() && !previous(&l.bin).exists());
-        // The same program again changes nothing.
+        // The same program again changes nothing, but registers the Event
+        // Log source of a node installed before there was one.
+        *sys.event_source.borrow_mut() = None;
         let calls = sys.calls().len();
         let mut out = Vec::new();
         update(&l, &sys, Some(&new), &mut out).await.unwrap();
@@ -1168,7 +1296,8 @@ pub(crate) mod tests {
                 .unwrap()
                 .contains("nothing to update")
         );
-        assert_eq!(sys.calls().len(), calls);
+        assert_eq!(sys.calls()[calls..], ["event source"]);
+        assert_eq!(*sys.event_source.borrow(), Some(l.bin.clone()));
     }
 
     #[tokio::test]
@@ -1199,7 +1328,10 @@ pub(crate) mod tests {
         assert!(e.contains("did not start"), "{e}");
         assert!(e.contains("the old one does not either"), "{e}");
         // The old program is started again, even though here it fails too.
-        assert_eq!(sys.calls()[calls..], ["stop", "start", "stop", "start"]);
+        assert_eq!(
+            sys.calls()[calls..],
+            ["event source", "stop", "start", "stop", "start"]
+        );
         assert_eq!(
             sys.started.borrow()[starts..],
             ["nerve-node 2.0.0", "nerve-node 1.2.0"]
@@ -1237,7 +1369,10 @@ pub(crate) mod tests {
         assert!(!staged(&l.bin).exists() && !previous(&l.bin).exists());
         // The new program was started and stopped, then the old one started
         // after it was put back: the node is up again.
-        assert_eq!(sys.calls()[calls..], ["stop", "start", "stop", "start"]);
+        assert_eq!(
+            sys.calls()[calls..],
+            ["event source", "stop", "start", "stop", "start"]
+        );
         assert_eq!(
             sys.started.borrow()[starts..],
             ["nerve-node 2.0.0", "nerve-node 1.2.0"]

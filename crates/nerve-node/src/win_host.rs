@@ -34,8 +34,9 @@ use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_DELAY_UNTIL_REBOOT, MoveF
 use windows_sys::Win32::System::Console::{
     ENABLE_ECHO_INPUT, GetConsoleMode, GetStdHandle, STD_INPUT_HANDLE, SetConsoleMode,
 };
+use windows_sys::Win32::System::EventLog::{EVENTLOG_ERROR_TYPE, EVENTLOG_INFORMATION_TYPE};
 use windows_sys::Win32::System::Registry::{
-    HKEY_LOCAL_MACHINE, REG_DWORD, RegDeleteKeyValueW, RegSetKeyValueW,
+    HKEY_LOCAL_MACHINE, REG_DWORD, REG_SZ, RegDeleteKeyValueW, RegDeleteKeyW, RegSetKeyValueW,
 };
 use windows_sys::Win32::System::Services::{
     ChangeServiceConfig2W, ChangeServiceConfigW, CloseServiceHandle, ControlService,
@@ -48,6 +49,7 @@ use windows_sys::Win32::System::Services::{
     SERVICE_STOPPED, SERVICE_WIN32_OWN_PROCESS, StartServiceW,
 };
 
+use crate::eventlog::{SOURCE, SOURCE_KEY};
 use crate::service::{Account, Layout, USER, USER_MARK};
 use crate::win_user::{self, wide};
 use crate::winsvc::{SERVICE_NAME, WinSystem};
@@ -679,6 +681,54 @@ impl WinSystem for WinHost {
         Ok(())
     }
 
+    fn put_event_source(&self, layout: &Layout) -> Result<(), String> {
+        let file = wide(&layout.bin);
+        // The node writes errors and information, nothing else.
+        let types = u32::from(EVENTLOG_ERROR_TYPE | EVENTLOG_INFORMATION_TYPE);
+        for (name, kind, data, len) in [
+            (
+                "EventMessageFile",
+                REG_SZ,
+                file.as_ptr().cast(),
+                (file.len() * 2) as u32,
+            ),
+            ("TypesSupported", REG_DWORD, (&raw const types).cast(), 4),
+        ] {
+            // SAFETY: NUL-terminated key and value names; data of the length
+            // given (the path with its NUL, or a DWORD). The key is made when
+            // it is missing.
+            let r = unsafe {
+                RegSetKeyValueW(
+                    HKEY_LOCAL_MACHINE,
+                    wide(SOURCE_KEY).as_ptr(),
+                    wide(name).as_ptr(),
+                    kind,
+                    data,
+                    len,
+                )
+            };
+            if r != 0 {
+                return Err(format!(
+                    "cannot register the source {SOURCE} in the Windows Event Log: {}",
+                    os(r)
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn delete_event_source(&self) -> Result<bool, String> {
+        // SAFETY: a NUL-terminated key name; the key has values only.
+        match unsafe { RegDeleteKeyW(HKEY_LOCAL_MACHINE, wide(SOURCE_KEY).as_ptr()) } {
+            0 => Ok(true),
+            ERROR_FILE_NOT_FOUND => Ok(false),
+            r => Err(format!(
+                "cannot remove the source {SOURCE} from the Windows Event Log: {}",
+                os(r)
+            )),
+        }
+    }
+
     fn wait_running(&self, layout: &Layout) -> Result<(), String> {
         let s = the_service()?;
         let until = Instant::now() + Duration::from_secs(60);
@@ -927,6 +977,44 @@ mod tests {
         assert!(win_user::sudo_token(&name, &password).is_ok());
         let filtered = win_user::logon(&name, &password).unwrap();
         assert!(!win_user::has_admins(&filtered).unwrap());
+    }
+
+    fn reg_query(key: &str) -> String {
+        let o = std::process::Command::new("reg")
+            .args(["query", &format!("HKLM\\{key}")])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    }
+
+    /// The Event Log source is registered with the program as its message
+    /// file, and removed again. Needs an administrator, and leaves the
+    /// source of an installed node alone.
+    #[test]
+    fn the_event_source_is_registered_and_removed() {
+        if !reg_query(SOURCE_KEY).is_empty() {
+            eprintln!("skipped: the source {SOURCE} is registered on this machine");
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let l = Layout {
+            bin: d.path().join("Nerve Test").join("nerve-node.exe"),
+            ..Layout::system()
+        };
+        WinHost.put_event_source(&l).unwrap();
+        let got = reg_query(SOURCE_KEY);
+        let removed = WinHost.delete_event_source();
+        assert!(
+            got.contains(&format!(
+                "EventMessageFile    REG_SZ    {}",
+                l.bin.display()
+            )),
+            "{got}"
+        );
+        assert!(got.contains("TypesSupported    REG_DWORD    0x5"), "{got}");
+        assert_eq!(removed, Ok(true));
+        assert!(reg_query(SOURCE_KEY).is_empty());
+        assert_eq!(WinHost.delete_event_source(), Ok(false));
     }
 
     /// The account this test runs as is found, with its profile folder.

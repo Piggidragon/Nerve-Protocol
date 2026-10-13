@@ -1,17 +1,32 @@
-//! The node's secrets in the system keyring (docs/dev/node-link.md): the values
-//! of the proxy's header lines, a `Proxy-Authorization` made from a user name
-//! and password in the proxy URL among them. `node.toml` names the headers;
-//! their values are here and never in a file, a log, an error text or the
-//! audit log.
+//! The node's secrets (docs/dev/spec/node-local.md §1 and §2).
+//!
+//! The values of the proxy's header lines, a `Proxy-Authorization` made from a
+//! user name and password in the proxy URL among them, are always in the
+//! system keyring: `node.toml` names the headers, and their values are never
+//! in a file, a log, an error text or the audit log.
+//!
+//! The node's own keys, the key of the config's MAC and the node key per
+//! center, are where `machine.secret_storage` says: 0600 files (`file`, the
+//! default) or the system keyring (`keyring`). A change moves them once,
+//! through the settings store ([`NodeSecrets`]): copied, read back, then the
+//! old copies go.
 //!
 //! There is no fallback. Where the keyring cannot be reached (a headless
-//! Linux has no Secret Service), storing fails and `proxy set` refuses, and a
-//! link whose proxy needs a value it cannot read fails closed. Tests put an
-//! in-memory store in place of the system's; it is compiled into test builds
-//! only, so a release never holds a secret anywhere but the keyring.
+//! Linux has no Secret Service), storing fails and `proxy set` refuses, a
+//! link whose proxy needs a value it cannot read fails closed, and a node
+//! whose keys are in the keyring does not start. Tests put an in-memory store
+//! in place of the system's; it is compiled into test builds only, so a
+//! release never holds a secret anywhere but the keyring.
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use nerve_policy::NodeConfig;
+use nerve_policy::config::SecretStorage;
+use nerve_policy::settings::Secrets;
+use nerve_transport::keys::{MacKey, NodeKey};
 
 use crate::paths::NodePaths;
 
@@ -32,6 +47,25 @@ impl Entry {
         let dir = absolute(&paths.config_dir);
         Entry {
             account: format!("proxy:{}", dir.display()),
+        }
+    }
+
+    /// The entry with the key of the config's MAC, named after the state
+    /// folder that would hold its file.
+    pub fn config_key(paths: &NodePaths) -> Entry {
+        Entry {
+            account: format!("config-key:{}", absolute(&paths.state_dir).display()),
+        }
+    }
+
+    /// The entry with the node key for `center`, named after the config
+    /// folder that would hold its file.
+    pub fn center_key(paths: &NodePaths, center: &str) -> Entry {
+        Entry {
+            account: format!(
+                "center-key:{center}:{}",
+                absolute(&paths.config_dir).display()
+            ),
         }
     }
 
@@ -110,13 +144,842 @@ pub fn remove_proxy_headers(paths: &NodePaths) -> Result<bool, String> {
         .map_err(|e| format!("cannot delete the keyring entry {entry}: {e}"))
 }
 
+/// One of the node's own keys, in its file or its keyring entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Key<'a> {
+    /// The key of the config's MAC.
+    Config,
+    /// The node key for a center.
+    Center(&'a str),
+}
+
+impl Key<'_> {
+    fn file(self, paths: &NodePaths) -> std::path::PathBuf {
+        match self {
+            Key::Config => paths.config_key(),
+            Key::Center(c) => paths.key_file(c),
+        }
+    }
+
+    fn entry(self, paths: &NodePaths) -> Entry {
+        match self {
+            Key::Config => Entry::config_key(paths),
+            Key::Center(c) => Entry::center_key(paths, c),
+        }
+    }
+
+    /// How a message names it.
+    fn what(self) -> String {
+        match self {
+            Key::Config => "the key of the config's MAC".into(),
+            Key::Center(c) => format!("the node key for center {c}"),
+        }
+    }
+}
+
+/// Every key of the node `cfg` describes: the config's and one per center.
+fn keys(cfg: &NodeConfig) -> Vec<Key<'_>> {
+    std::iter::once(Key::Config)
+        .chain(cfg.centers.iter().map(|c| Key::Center(&c.name)))
+        .collect()
+}
+
+/// The other place.
+fn other(storage: SecretStorage) -> SecretStorage {
+    match storage {
+        SecretStorage::File => SecretStorage::Keyring,
+        SecretStorage::Keyring => SecretStorage::File,
+    }
+}
+
+/// How a message names a place.
+fn place(storage: SecretStorage) -> &'static str {
+    match storage {
+        SecretStorage::File => "its file",
+        SecretStorage::Keyring => "the system keyring",
+    }
+}
+
+/// The text of `key` in `storage`, trimmed; `None` when it is not there.
+/// Errors name the file or the entry, never the text.
+fn get(paths: &NodePaths, storage: SecretStorage, key: Key) -> Result<Option<String>, String> {
+    match storage {
+        SecretStorage::File => {
+            let file = key.file(paths);
+            match std::fs::read_to_string(&file) {
+                Ok(t) => Ok(Some(t.trim().to_string())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(format!(
+                    "cannot read {} {}: {e}",
+                    key.what(),
+                    file.display()
+                )),
+            }
+        }
+        SecretStorage::Keyring => {
+            let entry = key.entry(paths);
+            store::get(entry.account())
+                .map(|t| t.map(|t| t.trim().to_string()))
+                .map_err(|e| {
+                    format!(
+                        "cannot read {} from the system keyring (entry {entry}): {e}",
+                        key.what()
+                    )
+                })
+        }
+    }
+}
+
+/// Keeps `text` as `key` in `storage`, replacing what was there, and reads
+/// it back: a copy that does not read back as written is an error.
+fn put(paths: &NodePaths, storage: SecretStorage, key: Key, text: &str) -> Result<(), String> {
+    match storage {
+        SecretStorage::File => {
+            let file = key.file(paths);
+            if let Some(dir) = file.parent() {
+                nerve_transport::files::create_private_dir(dir)
+                    .map_err(|e| format!("{}: {e}", dir.display()))?;
+            }
+            nerve_transport::files::write_private(&file, format!("{text}\n").as_bytes())
+                .map_err(|e| format!("cannot write {} {}: {e}", key.what(), file.display()))?;
+        }
+        SecretStorage::Keyring => {
+            let entry = key.entry(paths);
+            store::set(entry.account(), text).map_err(|e| {
+                format!(
+                    "cannot keep {} in the system keyring (entry {entry}): {e}",
+                    key.what()
+                )
+            })?;
+        }
+    }
+    if get(paths, storage, key)?.as_deref() != Some(text) {
+        return Err(format!(
+            "{} in {} does not read back as it was written",
+            key.what(),
+            place(storage)
+        ));
+    }
+    Ok(())
+}
+
+/// Deletes `key` from `storage`; `Ok(false)` when it was not there.
+fn delete(paths: &NodePaths, storage: SecretStorage, key: Key) -> Result<bool, String> {
+    match storage {
+        SecretStorage::File => {
+            let file = key.file(paths);
+            match std::fs::remove_file(&file) {
+                Ok(()) => Ok(true),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(format!("cannot delete {}: {e}", file.display())),
+            }
+        }
+        SecretStorage::Keyring => {
+            let entry = key.entry(paths);
+            store::delete(entry.account())
+                .map_err(|e| format!("cannot delete the keyring entry {entry}: {e}"))
+        }
+    }
+}
+
+/// Where the node's `node.toml` says its keys are, read without checking
+/// its MAC: the key that checks it is looked for there. No file, or one
+/// that does not parse: `file`.
+pub fn stated_storage(paths: &NodePaths) -> SecretStorage {
+    std::fs::read_to_string(paths.config_file())
+        .map(|t| nerve_policy::settings::stated_storage(&t))
+        .unwrap_or_default()
+}
+
+/// Why the installed node on Windows keeps its keys in files. The service
+/// runs as its own account, `nerve`, and the Credential Manager is one per
+/// account: `setup` and `config set` run as an administrator, so whatever
+/// they put in the keyring would be in that administrator's, where the
+/// service never finds it.
+pub const KEYRING_WINDOWS_SERVICE: &str = "the installed node on Windows is the service nerve-node, which runs as the account nerve, and the Credential Manager is one per account: keys that `setup` or `config set` put in the system keyring go to the Credential Manager of the account that runs them, not to that of nerve, and the service does not find them. The installed node on Windows keeps its keys in files (machine.secret_storage = \"file\"), which only nerve and the administrators can open";
+
+/// Why a Linux node keeps its keys in files on a kernel whose Landlock is
+/// older than ABI 9, the first that can keep a command off a socket file:
+/// there the sandbox of a `folder` mode command cannot grant what the
+/// keyring needs and execute together.
+pub fn keyring_old_landlock(abi: i32) -> String {
+    format!(
+        "on this kernel (Landlock ABI {abi}, below 9) a folder mode command cannot run programs from its folders while the node's keys are in the system keyring: the sandbox cannot grant the keyring's access and execute together. So the node keeps its keys in files here (machine.secret_storage = \"file\")"
+    )
+}
+
+/// What Landlock says on this machine, for where the keys may go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Landlock {
+    /// The kernel's ABI version.
+    Abi(i32),
+    /// Linux, but the version cannot be read: Landlock is missing or off.
+    Unknown,
+    /// Not Linux: there is no Landlock to ask.
+    NotHere,
+}
+
+/// What Landlock says for the node at `paths`: the kernel's, but in tests
+/// what the test pretends, else [`Landlock::NotHere`], so a test does not
+/// hang on the kernel it runs on.
+pub fn landlock(paths: &NodePaths) -> Landlock {
+    #[cfg(test)]
+    {
+        for_tests::landlock(paths).unwrap_or(Landlock::NotHere)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = paths;
+        if !cfg!(target_os = "linux") {
+            return Landlock::NotHere;
+        }
+        match nerve_sandbox::Confinement::detect().landlock_abi {
+            Some(v) => Landlock::Abi(v),
+            None => Landlock::Unknown,
+        }
+    }
+}
+
+/// Why the node at `paths` keeps its keys in files, whatever asks for the
+/// keyring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoKeyring {
+    /// The installed node on Windows ([`KEYRING_WINDOWS_SERVICE`]).
+    WindowsService,
+    /// A Linux kernel whose Landlock ABI, this one, is below 9
+    /// ([`keyring_old_landlock`]).
+    OldLandlock(i32),
+}
+
+impl NoKeyring {
+    pub fn why(self) -> String {
+        match self {
+            NoKeyring::WindowsService => KEYRING_WINDOWS_SERVICE.into(),
+            NoKeyring::OldLandlock(abi) => keyring_old_landlock(abi),
+        }
+    }
+
+    /// Who runs the command that takes the keys out of the keyring: the
+    /// keyring that holds them is that account's.
+    fn who(self) -> &'static str {
+        match self {
+            NoKeyring::WindowsService => {
+                "as the account that put them in the keyring, in a terminal opened with \"Run as administrator\""
+            }
+            NoKeyring::OldLandlock(_) => {
+                "as the node's user, or with sudo for a node installed as a service (it then runs as the node's user)"
+            }
+        }
+    }
+}
+
+/// Why the keys of the node at `paths` may not go into the keyring, or
+/// `None` when they may. Where the Landlock ABI cannot be read, they may;
+/// setup warns.
+pub fn no_keyring(paths: &NodePaths) -> Option<NoKeyring> {
+    if windows_service(paths) {
+        return Some(NoKeyring::WindowsService);
+    }
+    match landlock(paths) {
+        Landlock::Abi(v) if v < 9 => Some(NoKeyring::OldLandlock(v)),
+        _ => None,
+    }
+}
+
+/// Whether the node at `paths` is the installed node on Windows, whose keys
+/// may not go into the keyring ([`KEYRING_WINDOWS_SERVICE`]). Its folders
+/// are found in any spelling: Windows does not tell `C:\ProgramData` from
+/// `c:\programdata`.
+pub fn windows_service(paths: &NodePaths) -> bool {
+    #[cfg(test)]
+    if for_tests::windows_service(paths) {
+        return true;
+    }
+    cfg!(windows)
+        && (crate::service::is_service_node(paths)
+            || same_folders_ignoring_case(paths, &crate::service::Layout::system().paths))
+}
+
+/// Whether `a` and `b` name the same folders when case and a trailing
+/// separator do not count.
+fn same_folders_ignoring_case(a: &NodePaths, b: &NodePaths) -> bool {
+    let norm = |p: &Path| {
+        p.to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .replace('/', "\\")
+            .to_lowercase()
+    };
+    norm(&a.config_dir) == norm(&b.config_dir) && norm(&a.state_dir) == norm(&b.state_dir)
+}
+
+/// What a test has the other code take for the installed node on Windows,
+/// and for the kernel's Landlock, per node and on every platform.
+#[cfg(test)]
+pub(crate) mod for_tests {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+    use std::sync::{LazyLock, Mutex};
+
+    use super::Landlock;
+    use crate::paths::NodePaths;
+
+    #[derive(Default)]
+    struct Pretended {
+        windows_service: bool,
+        landlock: Option<Landlock>,
+    }
+
+    static NODES: LazyLock<Mutex<HashMap<PathBuf, Pretended>>> = LazyLock::new(Mutex::default);
+
+    fn with<T>(paths: &NodePaths, f: impl FnOnce(&mut Pretended) -> T) -> T {
+        let mut nodes = NODES.lock().unwrap_or_else(|e| e.into_inner());
+        f(nodes.entry(paths.config_dir.clone()).or_default())
+    }
+
+    /// The node at `paths` counts as the installed node on Windows.
+    pub fn pretend_windows_service(paths: &NodePaths) {
+        with(paths, |p| p.windows_service = true);
+    }
+
+    /// The node at `paths` runs where Landlock says `l`.
+    pub fn pretend_landlock(paths: &NodePaths, l: Landlock) {
+        with(paths, |p| p.landlock = Some(l));
+    }
+
+    pub fn windows_service(paths: &NodePaths) -> bool {
+        with(paths, |p| p.windows_service)
+    }
+
+    pub fn landlock(paths: &NodePaths) -> Option<Landlock> {
+        with(paths, |p| p.landlock)
+    }
+}
+
+/// The refusal of a node whose `node.toml` keeps the keys in the keyring
+/// where [`no_keyring`] says `n`: at its start, at install, at `config
+/// accept`. The command it names moves them into files on these folders,
+/// whether or not they are the installed node's yet.
+///
+/// `what` says what does not happen, `then` what to do after the move.
+pub fn keyring_refused(paths: &NodePaths, n: NoKeyring, what: &str, then: &str) -> String {
+    format!(
+        "{} keeps the node's keys in the system keyring (machine.secret_storage = \"keyring\"), but {}. So {what}. Move the keys into files {}: `nerve-node --config-dir \"{}\" --state-dir \"{}\" config set machine.secret_storage file`; then {then}",
+        paths.config_file().display(),
+        n.why(),
+        n.who(),
+        paths.config_dir.display(),
+        paths.state_dir.display(),
+    )
+}
+
+/// The node key for `center` from where `storage` keeps it.
+pub fn center_key(
+    paths: &NodePaths,
+    storage: SecretStorage,
+    center: &str,
+) -> Result<NodeKey, String> {
+    let key = Key::Center(center);
+    let text = match storage {
+        // The file, with its own messages.
+        SecretStorage::File => {
+            let path = key.file(paths);
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| format!("cannot read the node key {}: {e}", path.display()))?;
+            return NodeKey::from_text(text.trim())
+                .map_err(|e| format!("bad node key {}: {e}", path.display()));
+        }
+        SecretStorage::Keyring => match get(paths, storage, key)? {
+            Some(t) => t,
+            // The keyring answered and holds none: a key whose move has not
+            // finished is still in its file. An unreachable keyring is an
+            // error above, never a reason to read the file.
+            None => get(paths, SecretStorage::File, key)?.ok_or_else(|| {
+                format!(
+                    "the system keyring has no entry {} with the node key for center {center}; pair the center again",
+                    key.entry(paths)
+                )
+            })?,
+        },
+    };
+    NodeKey::from_text(&text).map_err(|e| {
+        format!(
+            "bad node key for center {center} in the keyring entry {}: {e}",
+            key.entry(paths)
+        )
+    })
+}
+
+/// Keeps a new node key for `center` where `storage` says.
+pub fn store_center_key(
+    paths: &NodePaths,
+    storage: SecretStorage,
+    center: &str,
+    key: &NodeKey,
+) -> Result<(), String> {
+    put(paths, storage, Key::Center(center), key.to_text().trim())
+}
+
+/// Deletes the node key for `center`: from where `storage` keeps it, a file
+/// left from before a move, and while a move waits (`keys.moving`) the copy
+/// in the other place, which the start that finishes the move no longer
+/// looks for once the center is gone.
+pub fn remove_center_key(
+    paths: &NodePaths,
+    storage: SecretStorage,
+    center: &str,
+) -> Result<(), String> {
+    let key = Key::Center(center);
+    delete(paths, storage, key)?;
+    if storage == SecretStorage::Keyring || paths.keys_moving().exists() {
+        delete(paths, other(storage), key)?;
+    }
+    Ok(())
+}
+
+/// The node's own keys where `machine.secret_storage` says, for the
+/// settings store: the MAC key, and a move of every key when a saved config
+/// names the other place.
+///
+/// A move writes `keys.moving` in the state folder first, then copies every
+/// key and reads each copy back; the config is saved; then the old copies go
+/// and so does the mark. Whatever stops it in between, the next start of the
+/// node ([`settle`]) finds the mark and finishes or undoes the move by the
+/// config in force.
+///
+/// A running node holds [`KeysLock`]. A CLI that writes `node.toml` itself
+/// moves the keys only while it holds that lock too; when a node holds it
+/// (on Windows, which has no control socket to ask that node, or one that is
+/// starting), the old copies stay for that node to read until its next
+/// start, which finishes the move. On Linux a move into the keyring is
+/// refused then (`defers_keyring`).
+pub struct NodeSecrets {
+    paths: NodePaths,
+    storage: SecretStorage,
+    /// Whether a write takes [`KeysLock`] first: the CLI's. The daemon holds
+    /// it already.
+    locks: bool,
+    /// The lock while a write holds it.
+    held: Option<KeysLock>,
+    /// The move in progress leaves the old copies to the next start.
+    defer: bool,
+    /// Whether a move into the keyring may be left to the next start of a node
+    /// that holds [`KeysLock`]. Not on Linux: that node did not answer on its
+    /// control socket (it starts, or its socket stopped), so it goes on with
+    /// the keys in files in memory, and every `folder` mode command it starts
+    /// gets a sandbox that leaves the session bus open while the keys are in
+    /// the keyring; its count of such commands is not in this process either.
+    /// On Windows `folder` mode runs no command.
+    defers_keyring: bool,
+    /// The running node's count of commands its Landlock does not keep off
+    /// the session bus (crate::daemon::Shared::open_to_bus): while one runs,
+    /// the keys do not go into the keyring.
+    open_to_bus: Option<Arc<AtomicUsize>>,
+}
+
+impl NodeSecrets {
+    /// The keys of the node at `paths`, where its `node.toml` says they are
+    /// ([`stated_storage`]). The store checks the file with the key found
+    /// there, so a file that names another place than its own key's does
+    /// not pass.
+    pub fn new(paths: &NodePaths) -> NodeSecrets {
+        NodeSecrets {
+            paths: paths.clone(),
+            storage: stated_storage(paths),
+            locks: false,
+            held: None,
+            defer: false,
+            defers_keyring: false,
+            open_to_bus: None,
+        }
+    }
+
+    /// For the running node: a move into the keyring is refused while
+    /// `open` counts a command that could reach it there.
+    pub fn for_node(paths: &NodePaths, open: Arc<AtomicUsize>) -> NodeSecrets {
+        NodeSecrets {
+            open_to_bus: Some(open),
+            ..NodeSecrets::new(paths)
+        }
+    }
+
+    /// For a CLI that writes `node.toml` itself: each write takes
+    /// [`KeysLock`] and is refused when the file changed since it was read,
+    /// and a move leaves the old copies to a node that holds the lock; on
+    /// Linux a move into the keyring is refused then.
+    pub fn for_cli(paths: &NodePaths) -> NodeSecrets {
+        NodeSecrets {
+            locks: true,
+            defers_keyring: !cfg!(target_os = "linux"),
+            ..NodeSecrets::new(paths)
+        }
+    }
+
+    /// For `config accept` without a running node: the file was edited, so
+    /// its `machine.secret_storage` may not say where the key is. When the
+    /// place it names holds no key and the other one does, the keys are
+    /// taken to be there, and accepting the file moves them. With `file`
+    /// named and its key file there, the keyring is not asked.
+    pub fn for_accept(paths: &NodePaths) -> NodeSecrets {
+        let mut s = NodeSecrets::for_cli(paths);
+        let found = |storage| match storage {
+            SecretStorage::File => paths.config_key().exists(),
+            SecretStorage::Keyring => {
+                matches!(get(paths, SecretStorage::Keyring, Key::Config), Ok(Some(_)))
+            }
+        };
+        if !found(s.storage) && found(other(s.storage)) {
+            s.storage = other(s.storage);
+        }
+        s
+    }
+
+    /// Moves every key of `cfg` into `into` from the other place: a key
+    /// only there is copied over and read back, and a copy there that
+    /// equals the one in `into` is deleted. Says what it could not do.
+    fn gather(&self, cfg: &NodeConfig, into: SecretStorage) -> Vec<String> {
+        let from = other(into);
+        let mut left = Vec::new();
+        for key in keys(cfg) {
+            let r = (|| {
+                let Some(old) = get(&self.paths, from, key)? else {
+                    return Ok(());
+                };
+                match get(&self.paths, into, key)? {
+                    None => put(&self.paths, into, key, &old)?,
+                    Some(new) if new != old => {
+                        return Err(format!(
+                            "{} in {} differs from the one in {}, so it was left there",
+                            key.what(),
+                            place(from),
+                            place(into)
+                        ));
+                    }
+                    Some(_) => {}
+                }
+                delete(&self.paths, from, key).map(drop)
+            })();
+            if let Err(e) = r {
+                left.push(e);
+            }
+        }
+        left
+    }
+
+    /// With the keys going `to` the keyring while the running node counts
+    /// `folder` mode commands that started with them in files: how many
+    /// run and why that keeps the keys out, then how a message says they
+    /// ended. Such a command got its sandbox while the keys were in their
+    /// files, and a Landlock domain does not change while it runs: with the
+    /// keys in the keyring it would reach them for the rest of its life.
+    /// The store lock a move or a reload holds keeps a new one from
+    /// starting until it is over.
+    fn open_commands(&self, to: SecretStorage) -> Option<(String, &'static str)> {
+        let open = self
+            .open_to_bus
+            .as_ref()
+            .map_or(0, |n| n.load(Ordering::SeqCst));
+        if to != SecretStorage::Keyring || open == 0 {
+            return None;
+        }
+        let one = open == 1;
+        Some((
+            format!(
+                "{open} folder mode {} that started while the node's keys were in their files, and {} sandbox does not keep {} off the session bus the keyring answers on",
+                if one { "command runs" } else { "commands run" },
+                if one { "its" } else { "their" },
+                if one { "it" } else { "them" },
+            ),
+            if one { "it has" } else { "they have" },
+        ))
+    }
+
+    /// Ends a move: without anything left behind, the mark goes.
+    fn finish(&self, left: Vec<String>) {
+        for e in &left {
+            tracing::warn!("moving the node's keys: {e}");
+        }
+        if left.is_empty() {
+            let _ = std::fs::remove_file(self.paths.keys_moving());
+        }
+    }
+}
+
+impl Secrets for NodeSecrets {
+    fn storage(&self) -> SecretStorage {
+        self.storage
+    }
+
+    fn mac_key(&self) -> Result<Option<MacKey>, String> {
+        let file = self.paths.config_key();
+        match self.storage {
+            SecretStorage::File => MacKey::load(&file),
+            SecretStorage::Keyring => {
+                let entry = Entry::config_key(&self.paths);
+                let text =
+                    store::get(entry.account()).map_err(|e| unreachable_keyring(&entry, &e))?;
+                match text {
+                    Some(t) => MacKey::from_text(&t)
+                        .map(Some)
+                        .map_err(|e| format!("the keyring entry {entry}: {e}")),
+                    // A key whose move has not finished is still in its file.
+                    None => MacKey::load(&file),
+                }
+            }
+        }
+    }
+
+    fn mac_key_or_new(&self) -> Result<MacKey, String> {
+        match self.storage {
+            SecretStorage::File => MacKey::load_or_create(&self.paths.config_key()),
+            SecretStorage::Keyring => {
+                if let Some(k) = self.mac_key()? {
+                    return Ok(k);
+                }
+                let (key, text) = MacKey::generate();
+                put(&self.paths, SecretStorage::Keyring, Key::Config, &text)?;
+                Ok(key)
+            }
+        }
+    }
+
+    fn copy(&mut self, cfg: &NodeConfig) -> Result<(), String> {
+        let to = cfg.machine.secret_storage;
+        // Before the count of running commands: this refusal holds whatever
+        // runs, so the count's advice (end them, change it again) would
+        // not help.
+        if to == SecretStorage::Keyring
+            && let Some(n) = no_keyring(&self.paths)
+        {
+            return Err(format!(
+                "machine.secret_storage cannot be \"keyring\" here: {}; nothing was changed",
+                n.why()
+            ));
+        }
+        if let Some((open, ended)) = self.open_commands(to) {
+            return Err(format!(
+                "{open}; the node's keys stay in their files, and nothing was changed. Wait until {ended} ended, or end every command with `nerve-node panic`, change it again, then `nerve-node unlock`"
+            ));
+        }
+        if to == SecretStorage::Keyring && self.defer && !self.defers_keyring {
+            return Err(format!(
+                "another nerve-node holds {}: a node runs for this state folder but does not answer on its control socket, or a command moves its keys. That node would go on with its keys in files and give its folder mode commands a sandbox for that, so the node's keys stay in their files, and nothing was changed. Stop the node, or wait until it has started, then change it again",
+                self.paths.keys_lock().display()
+            ));
+        }
+        nerve_transport::files::write_private(
+            &self.paths.keys_moving(),
+            format!("moving the node's keys to {}\n", place(to)).as_bytes(),
+        )
+        .map_err(|e| format!("{}: {e}", self.paths.keys_moving().display()))?;
+        // The keys this move wrote in the new place, the one being written
+        // included: a write that fails half way (its read-back does not
+        // answer) may have left a copy there all the same.
+        let mut written = Vec::new();
+        for key in keys(cfg) {
+            let r = get(&self.paths, self.storage, key).and_then(|text| {
+                let Some(t) = text else {
+                    return Ok(());
+                };
+                // A copy there that equals it is left as it is: a node may
+                // still read it, from a move left to its next start.
+                if get(&self.paths, to, key).ok().flatten().as_deref() == Some(t.as_str()) {
+                    return Ok(());
+                }
+                written.push(key);
+                put(&self.paths, to, key, &t)
+            });
+            if let Err(e) = r {
+                // Nothing is saved: what was copied goes again.
+                for key in written {
+                    let _ = delete(&self.paths, to, key);
+                }
+                let _ = std::fs::remove_file(self.paths.keys_moving());
+                let hint = match to {
+                    // The keyring crate keeps a failure to reach the
+                    // keyring for the life of the process: a running node
+                    // that met one asks no keyring installed after it.
+                    SecretStorage::Keyring if !self.locks && store::failed() => {
+                        " (this running node found no keyring and does not look again until it is restarted; on a Linux without a desktop, `nerve-node setup` installs one and restarts the installed node)"
+                    }
+                    SecretStorage::Keyring => {
+                        " (on a Linux without a desktop, `nerve-node setup` can install a keyring)"
+                    }
+                    SecretStorage::File => "",
+                };
+                return Err(format!(
+                    "{e}; the node's keys stay in {}, and nothing was changed{hint}",
+                    match self.storage {
+                        SecretStorage::File => "their files",
+                        SecretStorage::Keyring => "the system keyring",
+                    }
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Another writer moved the keys into the keyring: the running node
+    /// does not follow where they may not be there ([`no_keyring`]), nor
+    /// while it counts a command that would reach them there.
+    fn may_reload(&self, cfg: &NodeConfig) -> Result<(), String> {
+        if cfg.machine.secret_storage == SecretStorage::Keyring
+            && let Some(n) = no_keyring(&self.paths)
+        {
+            return Err(format!(
+                "node.toml keeps the node's keys in the system keyring, but {}; the node goes on with the config in force, which keeps them in their files",
+                n.why()
+            ));
+        }
+        match self.open_commands(cfg.machine.secret_storage) {
+            Some((open, ended)) => Err(format!(
+                "node.toml keeps the node's keys in the system keyring, but {open}; the node goes on with the config in force, which keeps them in their files. Wait until {ended} ended, then reload again"
+            )),
+            None => Ok(()),
+        }
+    }
+
+    fn moved(&mut self, cfg: &NodeConfig) {
+        self.storage = cfg.machine.secret_storage;
+        if !self.defer {
+            self.finish(self.gather(cfg, self.storage));
+        }
+    }
+
+    fn not_moved(&mut self, cfg: &NodeConfig) {
+        self.finish(self.gather(cfg, self.storage));
+    }
+
+    /// The CLI's: every write it makes holds [`KeysLock`] where no node
+    /// holds it, so a move and a write of another CLI do not cross; a move
+    /// made while a node holds it leaves the old copies to that node, or is
+    /// refused (`defers_keyring`).
+    fn begin(&mut self) -> Result<bool, String> {
+        if !self.locks {
+            return Ok(false);
+        }
+        self.held = KeysLock::try_take(&self.paths)?;
+        self.defer = self.held.is_none();
+        Ok(true)
+    }
+
+    fn end(&mut self) {
+        self.held = None;
+        self.defer = false;
+    }
+}
+
+/// The refusal of a node whose keys are in a keyring it cannot reach.
+fn unreachable_keyring(entry: &Entry, e: &str) -> String {
+    format!(
+        "machine.secret_storage is \"keyring\", but the system keyring cannot be reached (entry {entry}): {e}. The node keeps its keys nowhere else, so it cannot read its config; start the keyring (on a Linux without a desktop, `nerve-node setup` can install one)"
+    )
+}
+
+/// At the start of the node, with its config checked and [`KeysLock`]
+/// held: finishes a move of its keys that stopped half way, or one a CLI
+/// left to this start ([`NodeSecrets::for_cli`]), by the config in force;
+/// and with `keyring`, takes into the keyring every key still in a file.
+/// With `file` and no move pending, the keyring is not asked. A file that
+/// names another place than `cfg` was changed since the node read it; its
+/// move is left to the next start.
+pub fn settle(paths: &NodePaths, cfg: &NodeConfig) {
+    let storage = cfg.machine.secret_storage;
+    if storage == SecretStorage::File && !paths.keys_moving().exists() {
+        return;
+    }
+    if stated_storage(paths) != storage {
+        return;
+    }
+    let s = NodeSecrets {
+        storage,
+        ..NodeSecrets::new(paths)
+    };
+    s.finish(s.gather(cfg, storage));
+}
+
+/// `keys.lock` in the state folder, held by a running node for its life and
+/// by a CLI while it moves the keys: a move never runs while a node reads
+/// them. It is released when its holder ends, however it ends.
+pub struct KeysLock {
+    _file: std::fs::File,
+}
+
+impl KeysLock {
+    /// The lock, when nobody holds it; `None` when someone does.
+    pub fn try_take(paths: &NodePaths) -> Result<Option<KeysLock>, String> {
+        let path = paths.keys_lock();
+        nerve_transport::files::create_private_dir(&paths.state_dir)
+            .map_err(|e| format!("{}: {e}", paths.state_dir.display()))?;
+        let mut o = std::fs::OpenOptions::new();
+        o.create(true).truncate(false).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::io::AsRawFd;
+            o.mode(0o600);
+            let file = o
+                .open(&path)
+                .map_err(|e| format!("{}: {e}", path.display()))?;
+            // SAFETY: flock on a descriptor this function owns.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(Some(KeysLock { _file: file }));
+            }
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            Err(format!("{}: {e}", path.display()))
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            // Opened without sharing: nobody else opens it while it is held.
+            const SHARING_VIOLATION: i32 = 32;
+            match o.share_mode(0).open(&path) {
+                Ok(file) => Ok(Some(KeysLock { _file: file })),
+                Err(e) if e.raw_os_error() == Some(SHARING_VIOLATION) => Ok(None),
+                Err(e) => Err(format!("{}: {e}", path.display())),
+            }
+        }
+    }
+
+    /// The lock, waiting up to `wait` for a CLI that moves the keys.
+    pub async fn take(
+        paths: &NodePaths,
+        wait: std::time::Duration,
+    ) -> Result<Option<KeysLock>, String> {
+        let until = tokio::time::Instant::now() + wait;
+        loop {
+            if let Some(l) = KeysLock::try_take(paths)? {
+                return Ok(Some(l));
+            }
+            if tokio::time::Instant::now() >= until {
+                return Ok(None);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+}
+
 /// The system keyring: Keychain on macOS, Credential Manager on Windows, the
 /// Secret Service elsewhere.
 #[cfg(not(test))]
-mod store {
+pub(crate) mod store {
     use super::SERVICE;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Whether this process asked the keyring at all.
+    static ASKED: AtomicBool = AtomicBool::new(false);
+
+    /// Whether this process asked the keyring and none answered: the
+    /// keyring crate connects once per process and keeps that failure for
+    /// its life, so only a new process sees a keyring installed after it.
+    pub fn failed() -> bool {
+        ASKED.load(Ordering::Relaxed) && keyring::Entry::store_status().is_err()
+    }
 
     fn entry(account: &str) -> Result<keyring::Entry, String> {
+        ASKED.store(true, Ordering::Relaxed);
         keyring::Entry::new(SERVICE, account).map_err(|e| {
             match (&e, keyring::Entry::store_status()) {
                 // The store failed to start; its own error says why.
@@ -163,6 +1026,14 @@ pub(crate) mod store {
 
     thread_local! {
         static UNREACHABLE: Cell<bool> = const { Cell::new(false) };
+        static FAILED: Cell<bool> = const { Cell::new(false) };
+        static CALLS: Cell<usize> = const { Cell::new(0) };
+        static UNREADABLE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    }
+
+    /// How often this thread asked the keyring.
+    pub fn calls() -> usize {
+        CALLS.with(Cell::get)
     }
 
     /// What the Secret Service crate says on a Linux without a desktop session.
@@ -172,17 +1043,38 @@ pub(crate) mod store {
     /// Makes the keyring unreachable on this thread (`true`) or reachable.
     pub fn set_unreachable(on: bool) {
         UNREACHABLE.with(|u| u.set(on));
+        if !on {
+            FAILED.with(|f| f.set(false));
+        }
+    }
+
+    /// Whether a call on this thread found the keyring unreachable since it
+    /// was last made reachable, as the real store keeps such a failure.
+    pub fn failed() -> bool {
+        FAILED.with(Cell::get)
+    }
+
+    /// Makes reading `account` fail on this thread, as a read that does not
+    /// answer in time; writing it still works.
+    pub fn set_unreadable(account: Option<&str>) {
+        UNREADABLE.with(|u| *u.borrow_mut() = account.map(String::from));
     }
 
     fn reach() -> Result<std::sync::MutexGuard<'static, HashMap<String, String>>, String> {
+        CALLS.with(|c| c.set(c.get() + 1));
         if UNREACHABLE.with(Cell::get) {
+            FAILED.with(|f| f.set(true));
             return Err(NO_SERVICE.into());
         }
         Ok(ENTRIES.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     pub fn get(account: &str) -> Result<Option<String>, String> {
-        Ok(reach()?.get(account).cloned())
+        let entries = reach()?;
+        if UNREADABLE.with(|u| u.borrow().as_deref() == Some(account)) {
+            return Err("the keyring did not answer in time".into());
+        }
+        Ok(entries.get(account).cloned())
     }
 
     pub fn set(account: &str, value: &str) -> Result<(), String> {
@@ -192,5 +1084,614 @@ pub(crate) mod store {
 
     pub fn delete(account: &str) -> Result<bool, String> {
         Ok(reach()?.remove(account).is_some())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nerve_policy::SettingsStore;
+    use nerve_policy::audit::AuditLog;
+
+    fn node() -> (tempfile::TempDir, NodePaths) {
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("config"), d.path().join("state"));
+        (d, paths)
+    }
+
+    fn in_keyring(paths: &NodePaths, key: Key) -> Option<String> {
+        store::get(key.entry(paths).account()).unwrap()
+    }
+
+    fn open(paths: &NodePaths) -> Result<SettingsStore, String> {
+        SettingsStore::open_with(
+            paths.config_file(),
+            Box::new(NodeSecrets::new(paths)),
+            AuditLog::new(paths.audit_log()),
+        )
+    }
+
+    fn peek(paths: &NodePaths) -> Result<NodeConfig, String> {
+        SettingsStore::peek_with(&paths.config_file(), &NodeSecrets::new(paths))
+    }
+
+    /// A node with `centers` paired (their keys stored) under `storage`.
+    fn paired(paths: &NodePaths, storage: SecretStorage, centers: &[&str]) -> SettingsStore {
+        let mut s = open(paths).unwrap();
+        if storage == SecretStorage::Keyring {
+            s.update(|c| {
+                c.machine.secret_storage = storage;
+                Ok(())
+            })
+            .unwrap();
+        }
+        for name in centers {
+            let key = NodeKey::generate().unwrap();
+            store_center_key(paths, storage, name, &key).unwrap();
+            s.update(|c| {
+                c.centers.push(nerve_policy::CenterEntry {
+                    name: name.to_string(),
+                    url: "https://center.example".into(),
+                    pin: None,
+                    center_id: format!("id-{name}"),
+                    node_id: key.node_id(),
+                    settings: Default::default(),
+                    paused: false,
+                    revoked: false,
+                    unknown: false,
+                    policy: Default::default(),
+                });
+                Ok(())
+            })
+            .unwrap();
+        }
+        s
+    }
+
+    fn set_storage(s: &mut SettingsStore, storage: SecretStorage) -> Result<u64, String> {
+        s.update(|c| {
+            c.machine.secret_storage = storage;
+            Ok(())
+        })
+        .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn each_key_is_stored_read_rotated_and_removed_in_either_place() {
+        for storage in [SecretStorage::File, SecretStorage::Keyring] {
+            let (_d, paths) = node();
+            // The center's key.
+            let first = NodeKey::generate().unwrap();
+            store_center_key(&paths, storage, "home", &first).unwrap();
+            let read = center_key(&paths, storage, "home").unwrap();
+            assert_eq!(read.public_key(), first.public_key());
+            let second = NodeKey::generate().unwrap();
+            store_center_key(&paths, storage, "home", &second).unwrap();
+            let read = center_key(&paths, storage, "home").unwrap();
+            assert_eq!(read.public_key(), second.public_key());
+            remove_center_key(&paths, storage, "home").unwrap();
+            assert!(center_key(&paths, storage, "home").is_err());
+            // The config's key.
+            let secrets = NodeSecrets {
+                storage,
+                ..NodeSecrets::new(&paths)
+            };
+            assert!(secrets.mac_key().unwrap().is_none());
+            let mac = secrets.mac_key_or_new().unwrap().sign(b"node.toml");
+            let again = secrets.mac_key().unwrap().unwrap();
+            assert!(again.verify(b"node.toml", &mac));
+            // Never replaced by asking again.
+            assert!(secrets.mac_key_or_new().unwrap().verify(b"node.toml", &mac));
+            let (_, text) = MacKey::generate();
+            put(&paths, storage, Key::Config, &text).unwrap();
+            let rotated = secrets.mac_key().unwrap().unwrap();
+            assert!(!rotated.verify(b"node.toml", &mac));
+            assert!(delete(&paths, storage, Key::Config).unwrap());
+            assert!(secrets.mac_key().unwrap().is_none());
+            // Each place holds only its own: the keyring's keys never touch
+            // a file, the files' never the keyring.
+            store_center_key(&paths, storage, "lab", &first).unwrap();
+            secrets.mac_key_or_new().unwrap();
+            let files = paths.config_key().exists() || paths.key_file("lab").exists();
+            let keyring = in_keyring(&paths, Key::Config).is_some()
+                || in_keyring(&paths, Key::Center("lab")).is_some();
+            assert_eq!(files, storage == SecretStorage::File, "{storage:?}");
+            assert_eq!(keyring, storage == SecretStorage::Keyring, "{storage:?}");
+        }
+    }
+
+    #[test]
+    fn without_a_keyring_a_node_with_keys_there_refuses_and_reads_no_file() {
+        let (_d, paths) = node();
+        paired(&paths, SecretStorage::Keyring, &["home"]);
+        // Files with the same names, as if left behind: never read instead.
+        std::fs::write(paths.config_key(), "00".repeat(32)).unwrap();
+        let key = NodeKey::generate().unwrap();
+        store_center_key(&paths, SecretStorage::File, "home", &key).unwrap();
+        store::set_unreachable(true);
+        let e = open(&paths).err().unwrap();
+        assert!(e.contains("machine.secret_storage is \"keyring\""), "{e}");
+        assert!(e.contains("cannot be reached"), "{e}");
+        assert!(e.contains(store::NO_SERVICE), "{e}");
+        assert!(peek(&paths).is_err());
+        let e = center_key(&paths, SecretStorage::Keyring, "home")
+            .err()
+            .unwrap();
+        assert!(e.contains("from the system keyring"), "{e}");
+        // Nor is a new key written to a file instead.
+        let e = store_center_key(&paths, SecretStorage::Keyring, "lab", &key)
+            .err()
+            .unwrap();
+        assert!(e.contains("system keyring"), "{e}");
+        assert!(!paths.key_file("lab").exists());
+        store::set_unreachable(false);
+        assert!(open(&paths).is_ok());
+    }
+
+    #[test]
+    fn keys_move_to_the_keyring_and_back_once() {
+        let (_d, paths) = node();
+        let mut s = paired(&paths, SecretStorage::File, &["home", "lab"]);
+        let mac_text = get(&paths, SecretStorage::File, Key::Config)
+            .unwrap()
+            .unwrap();
+        let home = center_key(&paths, SecretStorage::File, "home").unwrap();
+        set_storage(&mut s, SecretStorage::Keyring).unwrap();
+        // In the keyring, read back, and the files are gone.
+        assert_eq!(in_keyring(&paths, Key::Config), Some(mac_text.clone()));
+        assert!(in_keyring(&paths, Key::Center("lab")).is_some());
+        assert!(!paths.config_key().exists());
+        assert!(!paths.key_file("home").exists() && !paths.key_file("lab").exists());
+        assert!(!paths.keys_moving().exists());
+        // The node starts on them: the file's MAC checks with the keyring's
+        // key, and the center keys are the same.
+        drop(s);
+        let mut s = open(&paths).unwrap();
+        assert_eq!(s.config().machine.secret_storage, SecretStorage::Keyring);
+        let back = center_key(&paths, SecretStorage::Keyring, "home").unwrap();
+        assert_eq!(back.public_key(), home.public_key());
+        // And back to files.
+        set_storage(&mut s, SecretStorage::File).unwrap();
+        assert_eq!(
+            get(&paths, SecretStorage::File, Key::Config).unwrap(),
+            Some(mac_text)
+        );
+        assert!(paths.key_file("lab").exists());
+        assert_eq!(in_keyring(&paths, Key::Config), None);
+        assert_eq!(in_keyring(&paths, Key::Center("home")), None);
+        assert!(!paths.keys_moving().exists());
+        drop(s);
+        let s = open(&paths).unwrap();
+        assert_eq!(s.config().machine.secret_storage, SecretStorage::File);
+        let back = center_key(&paths, SecretStorage::File, "home").unwrap();
+        assert_eq!(back.public_key(), home.public_key());
+        // The change is audited as a setting.
+        let audit = std::fs::read_to_string(paths.audit_log()).unwrap();
+        assert!(audit.contains("machine.secret_storage"), "{audit}");
+    }
+
+    #[test]
+    fn a_move_to_a_keyring_that_does_not_answer_changes_nothing() {
+        let (_d, paths) = node();
+        let mut s = paired(&paths, SecretStorage::File, &["home"]);
+        let before = std::fs::read(paths.config_file()).unwrap();
+        store::set_unreachable(true);
+        let e = set_storage(&mut s, SecretStorage::Keyring).unwrap_err();
+        store::set_unreachable(false);
+        assert!(e.contains("cannot keep"), "{e}");
+        assert!(
+            e.contains("stay in their files, and nothing was changed"),
+            "{e}"
+        );
+        assert!(e.contains("nerve-node setup"), "{e}");
+        assert_eq!(s.config().machine.secret_storage, SecretStorage::File);
+        assert_eq!(std::fs::read(paths.config_file()).unwrap(), before);
+        assert!(paths.config_key().exists() && paths.key_file("home").exists());
+        assert!(!paths.keys_moving().exists());
+        assert_eq!(in_keyring(&paths, Key::Config), None);
+        assert!(open(&paths).is_ok());
+    }
+
+    #[test]
+    fn a_move_left_to_the_next_start_is_finished_there() {
+        let (_d, paths) = node();
+        paired(&paths, SecretStorage::File, &["home"]);
+        // A running node holds the lock: a CLI that writes the file itself
+        // (on Windows) leaves it the old copies.
+        let running = KeysLock::try_take(&paths).unwrap().unwrap();
+        assert!(KeysLock::try_take(&paths).unwrap().is_none());
+        let mut s = windows_cli_store(&paths);
+        set_storage(&mut s, SecretStorage::Keyring).unwrap();
+        assert!(paths.config_key().exists() && paths.key_file("home").exists());
+        assert!(in_keyring(&paths, Key::Center("home")).is_some());
+        assert!(paths.keys_moving().exists());
+        let cfg = s.config().clone();
+        drop(s);
+        // The node reads its key where it was, then its next start takes
+        // the config and finishes the move.
+        assert!(center_key(&paths, SecretStorage::File, "home").is_ok());
+        drop(running);
+        let s = open(&paths).unwrap();
+        settle(&paths, s.config());
+        assert_eq!(cfg.machine.secret_storage, SecretStorage::Keyring);
+        assert!(!paths.config_key().exists() && !paths.key_file("home").exists());
+        assert!(in_keyring(&paths, Key::Config).is_some());
+        assert!(!paths.keys_moving().exists());
+    }
+
+    /// A copy whose write went through but whose read-back did not answer
+    /// goes with the copies before it: neither place keeps anything of the
+    /// move.
+    #[test]
+    fn a_copy_that_fails_after_its_write_leaves_nothing_in_the_new_place() {
+        let (_d, paths) = node();
+        let mut s = paired(&paths, SecretStorage::File, &["home", "lab"]);
+        let before = std::fs::read(paths.config_file()).unwrap();
+        // The second key is written, then its read-back fails.
+        store::set_unreadable(Some(Entry::center_key(&paths, "home").account()));
+        let e = set_storage(&mut s, SecretStorage::Keyring).unwrap_err();
+        store::set_unreadable(None);
+        assert!(e.contains("nothing was changed"), "{e}");
+        for key in [Key::Config, Key::Center("home"), Key::Center("lab")] {
+            assert_eq!(in_keyring(&paths, key), None, "{key:?}");
+            assert!(key.file(&paths).exists(), "{key:?}");
+        }
+        assert!(!paths.keys_moving().exists());
+        assert_eq!(std::fs::read(paths.config_file()).unwrap(), before);
+        assert_eq!(s.config().machine.secret_storage, SecretStorage::File);
+    }
+
+    /// Two CLIs with no node: one moves the keys, the other saves a change
+    /// it made on the file before the move. That one is refused, so the
+    /// file keeps naming where the keys are.
+    #[test]
+    fn a_cli_write_on_a_file_another_cli_changed_meanwhile_is_refused() {
+        let (_d, paths) = node();
+        drop(paired(&paths, SecretStorage::File, &["home"]));
+        let mut a = cli_store(&paths);
+        let mut b = cli_store(&paths);
+        set_storage(&mut a, SecretStorage::Keyring).unwrap();
+        assert!(!paths.key_file("home").exists());
+        let e = b
+            .update(|c| {
+                c.node.name = Some("lab-pc".into());
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(matches!(e, nerve_policy::SetError::Conflict { .. }), "{e}");
+        drop((a, b));
+        let s = open(&paths).unwrap();
+        assert_eq!(s.config().machine.secret_storage, SecretStorage::Keyring);
+        assert!(center_key(&paths, SecretStorage::Keyring, "home").is_ok());
+        // Opened again, the write goes through.
+        let mut b = cli_store(&paths);
+        b.update(|c| {
+            c.node.name = Some("lab-pc".into());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// A center removed while a move waits for the next start loses its key
+    /// in the old place too: that start no longer looks for it.
+    #[test]
+    fn a_center_removed_while_a_move_waits_leaves_no_key_behind() {
+        let (_d, paths) = node();
+        drop(paired(&paths, SecretStorage::Keyring, &["lab"]));
+        let running = KeysLock::try_take(&paths).unwrap().unwrap();
+        let mut s = cli_store(&paths);
+        set_storage(&mut s, SecretStorage::File).unwrap();
+        assert!(paths.keys_moving().exists());
+        assert!(paths.key_file("lab").exists());
+        assert!(in_keyring(&paths, Key::Center("lab")).is_some());
+        s.update(|c| {
+            c.centers.clear();
+            Ok(())
+        })
+        .unwrap();
+        remove_center_key(&paths, SecretStorage::File, "lab").unwrap();
+        assert!(!paths.key_file("lab").exists());
+        assert_eq!(in_keyring(&paths, Key::Center("lab")), None);
+        drop((s, running));
+        let s = open(&paths).unwrap();
+        settle(&paths, s.config());
+        assert!(!paths.keys_moving().exists());
+        assert_eq!(in_keyring(&paths, Key::Config), None);
+    }
+
+    fn cli_store(paths: &NodePaths) -> SettingsStore {
+        SettingsStore::open_with(
+            paths.config_file(),
+            Box::new(NodeSecrets::for_cli(paths)),
+            AuditLog::new(paths.audit_log()),
+        )
+        .unwrap()
+    }
+
+    /// The CLI's store as on Windows, where a move into the keyring is left
+    /// to the next start of a node that holds the lock.
+    fn windows_cli_store(paths: &NodePaths) -> SettingsStore {
+        SettingsStore::open_with(
+            paths.config_file(),
+            Box::new(NodeSecrets {
+                defers_keyring: true,
+                ..NodeSecrets::for_cli(paths)
+            }),
+            AuditLog::new(paths.audit_log()),
+        )
+        .unwrap()
+    }
+
+    /// On Linux a CLI that finds a node holding the lock does not move the
+    /// keys into the keyring: that node did not answer on its control
+    /// socket, so it would go on giving its folder mode commands a sandbox
+    /// for keys in files.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cli_does_not_move_the_keys_into_the_keyring_past_a_silent_node() {
+        let (_d, paths) = node();
+        drop(paired(&paths, SecretStorage::File, &["home"]));
+        let files = || {
+            [
+                paths.config_file(),
+                paths.config_key(),
+                paths.key_file("home"),
+            ]
+            .map(|f| std::fs::read(f).unwrap())
+        };
+        let before = files();
+        let running = KeysLock::try_take(&paths).unwrap().unwrap();
+        let mut s = cli_store(&paths);
+        let asked = store::calls();
+        let e = set_storage(&mut s, SecretStorage::Keyring).unwrap_err();
+        assert_eq!(store::calls(), asked, "the keyring was asked");
+        assert!(e.contains("does not answer on its control socket"), "{e}");
+        assert!(e.contains("nothing was changed"), "{e}");
+        assert_eq!(files(), before);
+        assert!(!paths.keys_moving().exists());
+        assert_eq!(in_keyring(&paths, Key::Config), None);
+        assert_eq!(in_keyring(&paths, Key::Center("home")), None);
+        assert_eq!(s.config().machine.secret_storage, SecretStorage::File);
+        // Once no node holds the lock, the move goes through.
+        drop(running);
+        set_storage(&mut s, SecretStorage::Keyring).unwrap();
+        assert!(in_keyring(&paths, Key::Center("home")).is_some());
+        assert!(!paths.key_file("home").exists());
+    }
+
+    /// A running node does not take in a file that another writer saved
+    /// with the keys in the keyring while it counts a folder mode command
+    /// that started with them in files.
+    #[test]
+    fn a_reload_into_the_keyring_waits_for_the_commands_that_reach_the_bus() {
+        let (_d, paths) = node();
+        drop(paired(&paths, SecretStorage::File, &["home"]));
+        let count = Arc::new(AtomicUsize::new(1));
+        let mut running = SettingsStore::open_with(
+            paths.config_file(),
+            Box::new(NodeSecrets::for_node(&paths, count.clone())),
+            AuditLog::new(paths.audit_log()),
+        )
+        .unwrap();
+        let mut other = open(&paths).unwrap();
+        set_storage(&mut other, SecretStorage::Keyring).unwrap();
+        let e = running.reload().unwrap_err();
+        assert!(e.contains("1 folder mode command runs"), "{e}");
+        assert!(e.contains("reload again"), "{e}");
+        assert_eq!(running.config().machine.secret_storage, SecretStorage::File);
+        count.store(0, Ordering::SeqCst);
+        assert!(running.reload().unwrap());
+        assert_eq!(
+            running.config().machine.secret_storage,
+            SecretStorage::Keyring
+        );
+    }
+
+    /// A CLI with no node running moves the keys at once, holding the lock
+    /// meanwhile; a node that read the config before that, and starts
+    /// after it, leaves the keys alone.
+    #[test]
+    fn a_start_on_a_config_changed_since_it_was_read_moves_nothing() {
+        let (_d, paths) = node();
+        let s = paired(&paths, SecretStorage::Keyring, &["home"]);
+        let read_before = s.config().clone();
+        drop(s);
+        let mut s = cli_store(&paths);
+        set_storage(&mut s, SecretStorage::File).unwrap();
+        assert!(!paths.keys_moving().exists());
+        assert!(paths.config_key().exists() && paths.key_file("home").exists());
+        // The lock went with the move.
+        assert!(KeysLock::try_take(&paths).unwrap().is_some());
+        settle(&paths, &read_before);
+        assert!(paths.config_key().exists() && paths.key_file("home").exists());
+        assert_eq!(in_keyring(&paths, Key::Config), None);
+        assert_eq!(in_keyring(&paths, Key::Center("home")), None);
+        drop(s);
+        assert!(open(&paths).is_ok());
+    }
+
+    #[test]
+    fn copies_of_a_move_that_never_saved_its_config_go_at_the_next_start() {
+        let (_d, paths) = node();
+        let s = paired(&paths, SecretStorage::File, &["home"]);
+        // Copied to the keyring, then stopped before node.toml was saved.
+        let mut secrets = NodeSecrets::new(&paths);
+        let mut target = s.config().clone();
+        target.machine.secret_storage = SecretStorage::Keyring;
+        secrets.copy(&target).unwrap();
+        assert!(in_keyring(&paths, Key::Config).is_some());
+        drop(s);
+        let s = open(&paths).unwrap();
+        assert_eq!(s.config().machine.secret_storage, SecretStorage::File);
+        settle(&paths, s.config());
+        assert_eq!(in_keyring(&paths, Key::Config), None);
+        assert_eq!(in_keyring(&paths, Key::Center("home")), None);
+        assert!(paths.config_key().exists() && paths.key_file("home").exists());
+        assert!(!paths.keys_moving().exists());
+    }
+
+    #[test]
+    fn a_node_on_the_keyring_takes_keys_still_in_files_at_start() {
+        let (_d, paths) = node();
+        paired(&paths, SecretStorage::File, &["home"]);
+        // Saved with `keyring`, the old copies left, and no mark of it.
+        let running = KeysLock::try_take(&paths).unwrap().unwrap();
+        let mut s = windows_cli_store(&paths);
+        set_storage(&mut s, SecretStorage::Keyring).unwrap();
+        drop((s, running));
+        std::fs::remove_file(paths.keys_moving()).unwrap();
+        store::delete(Entry::center_key(&paths, "home").account()).unwrap();
+        // Until the start, the key still in its file is read there.
+        assert!(center_key(&paths, SecretStorage::Keyring, "home").is_ok());
+        let s = open(&paths).unwrap();
+        settle(&paths, s.config());
+        assert!(in_keyring(&paths, Key::Center("home")).is_some());
+        assert!(!paths.config_key().exists() && !paths.key_file("home").exists());
+    }
+
+    #[test]
+    fn an_edited_file_that_names_the_other_place_moves_the_keys_when_accepted() {
+        let (_d, paths) = node();
+        drop(paired(&paths, SecretStorage::File, &["home"]));
+        let edit = |from: &str, to: &str| {
+            let text = std::fs::read_to_string(paths.config_file()).unwrap();
+            let line = |s| format!("secret_storage = \"{s}\"");
+            assert!(text.contains(&line(from)), "{text}");
+            std::fs::write(paths.config_file(), text.replace(&line(from), &line(to))).unwrap();
+        };
+        let accept = || {
+            SettingsStore::open_accepting_with(
+                paths.config_file(),
+                Box::new(NodeSecrets::for_accept(&paths)),
+                AuditLog::new(paths.audit_log()),
+            )
+            .map(|(s, _)| s.config().machine.secret_storage)
+        };
+        edit("file", "keyring");
+        // Changed by hand, so its MAC no longer checks.
+        assert!(open(&paths).is_err());
+        assert_eq!(accept(), Ok(SecretStorage::Keyring));
+        assert!(in_keyring(&paths, Key::Config).is_some());
+        assert!(in_keyring(&paths, Key::Center("home")).is_some());
+        assert!(!paths.config_key().exists() && !paths.key_file("home").exists());
+        assert!(open(&paths).is_ok());
+        // And back: the key is found in the keyring.
+        edit("keyring", "file");
+        assert_eq!(accept(), Ok(SecretStorage::File));
+        assert!(paths.config_key().exists() && paths.key_file("home").exists());
+        assert_eq!(in_keyring(&paths, Key::Config), None);
+        assert!(open(&paths).is_ok());
+    }
+
+    #[test]
+    fn with_the_default_the_keyring_is_never_asked() {
+        // A keyring that would fail every call: a node with files works on
+        // as it did, from its first start to its last key, and never asks
+        // it.
+        store::set_unreachable(true);
+        let asked = store::calls();
+        let (_d, paths) = node();
+        assert_eq!(stated_storage(&paths), SecretStorage::File);
+        let mut s = paired(&paths, SecretStorage::File, &["home"]);
+        assert_eq!(s.config().machine.secret_storage, SecretStorage::File);
+        s.update(|c| {
+            c.node.name = Some("lab-pc".into());
+            Ok(())
+        })
+        .unwrap();
+        drop(s);
+        let s = open(&paths).unwrap();
+        settle(&paths, s.config());
+        assert!(center_key(&paths, SecretStorage::File, "home").is_ok());
+        remove_center_key(&paths, SecretStorage::File, "home").unwrap();
+        assert!(peek(&paths).is_ok());
+        // The key file is where it always was.
+        assert!(paths.config_key().is_file());
+        assert!(!paths.keys_moving().exists());
+        assert_eq!(store::calls(), asked);
+        // A file that does not parse names the default too.
+        std::fs::write(paths.config_file(), "not toml [").unwrap();
+        assert_eq!(stated_storage(&paths), SecretStorage::File);
+        store::set_unreachable(false);
+    }
+
+    /// Below Landlock ABI 9 the keys do not go into the keyring: a move is
+    /// refused and changes nothing, a running node does not take in a file
+    /// another writer saved with them there, and a move out still works.
+    /// ABI 9, and an ABI that cannot be read, change nothing.
+    #[test]
+    fn below_landlock_9_the_keys_stay_in_files() {
+        let (_d, paths) = node();
+        assert_eq!(no_keyring(&paths), None);
+        for l in [Landlock::Abi(9), Landlock::Unknown] {
+            for_tests::pretend_landlock(&paths, l);
+            assert_eq!(no_keyring(&paths), None, "{l:?}");
+        }
+        let mut s = paired(&paths, SecretStorage::File, &["home"]);
+        let mut running = SettingsStore::open_with(
+            paths.config_file(),
+            Box::new(NodeSecrets::for_node(&paths, Arc::default())),
+            AuditLog::new(paths.audit_log()),
+        )
+        .unwrap();
+        // Saved there while the kernel still allowed it.
+        set_storage(&mut s, SecretStorage::Keyring).unwrap();
+        for_tests::pretend_landlock(&paths, Landlock::Abi(8));
+        assert_eq!(no_keyring(&paths), Some(NoKeyring::OldLandlock(8)));
+        let e = running.reload().unwrap_err();
+        assert!(e.contains("Landlock ABI 8, below 9"), "{e}");
+        assert_eq!(running.config().machine.secret_storage, SecretStorage::File);
+        set_storage(&mut s, SecretStorage::File).unwrap();
+        assert!(paths.key_file("home").exists());
+        let e = set_storage(&mut s, SecretStorage::Keyring).unwrap_err();
+        assert!(e.contains("cannot be \"keyring\" here"), "{e}");
+        assert!(
+            e.contains("cannot run programs from its folders while the node's keys are in the system keyring"),
+            "{e}"
+        );
+        assert!(e.contains("nothing was changed"), "{e}");
+        assert_eq!(s.config().machine.secret_storage, SecretStorage::File);
+        assert!(paths.key_file("home").exists());
+        assert_eq!(in_keyring(&paths, Key::Center("home")), None);
+    }
+
+    /// Below Landlock ABI 9 a move into the keyring is refused for that
+    /// reason even while a folder mode command runs: the count's advice
+    /// (end them, change it again) would not help.
+    #[test]
+    fn below_landlock_9_the_refusal_does_not_wait_for_commands() {
+        let (_d, paths) = node();
+        drop(paired(&paths, SecretStorage::File, &["home"]));
+        for_tests::pretend_landlock(&paths, Landlock::Abi(6));
+        let mut running = SettingsStore::open_with(
+            paths.config_file(),
+            Box::new(NodeSecrets::for_node(&paths, Arc::new(AtomicUsize::new(1)))),
+            AuditLog::new(paths.audit_log()),
+        )
+        .unwrap();
+        let e = set_storage(&mut running, SecretStorage::Keyring).unwrap_err();
+        assert!(e.contains("Landlock ABI 6, below 9"), "{e}");
+        assert!(!e.contains("nerve-node panic"), "{e}");
+        assert_eq!(running.config().machine.secret_storage, SecretStorage::File);
+    }
+
+    /// The installed node's folders on Windows in another spelling are
+    /// still its folders.
+    #[test]
+    fn folders_differing_in_case_are_the_same_folders() {
+        let a = NodePaths::new(
+            "C:\\ProgramData\\Nerve\\config",
+            "C:\\ProgramData\\Nerve\\state",
+        );
+        let b = NodePaths::new(
+            "c:/programdata/nerve/config/",
+            "c:\\PROGRAMDATA\\nerve\\state",
+        );
+        assert!(same_folders_ignoring_case(&a, &b));
+        let c = NodePaths::new(
+            "C:\\ProgramData\\Nerve\\config2",
+            "C:\\ProgramData\\Nerve\\state",
+        );
+        assert!(!same_folders_ignoring_case(&a, &c));
     }
 }

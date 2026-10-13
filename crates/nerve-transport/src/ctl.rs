@@ -97,6 +97,16 @@ mod unix {
     /// Like [`serve`], on a socket [`bind`] made already. Binding once
     /// matters: a socket dropped and bound again can look in use while a
     /// child forked meanwhile still holds the old one.
+    ///
+    /// A connection that cannot be taken does not end the serving, whatever the
+    /// reason: for want of descriptors or memory (EMFILE once a process of the
+    /// user holds the node's open files), of epoll watches (ENOSPC, which a
+    /// process of the user can use up for every process of the user), or
+    /// because it went before it was taken. The socket stays, and the next
+    /// connection is taken once the cause is gone. Ending would leave the node
+    /// without its socket until it restarts, and the CLI would take a running
+    /// node for none. Only an error that says the listener itself is broken
+    /// ends it.
     pub async fn serve_on<F, Fut>(listener: UnixListener, handler: F) -> std::io::Result<()>
     where
         F: Fn(CtlRequest, Peer) -> Fut + Send + Sync + 'static,
@@ -104,8 +114,22 @@ mod unix {
     {
         let handler = Arc::new(handler);
         let me = crate::net::euid();
+        let mut failing = false;
         loop {
-            let (stream, _) = listener.accept().await?;
+            let stream = match listener.accept().await {
+                Ok((stream, _)) => stream,
+                Err(e) if passing(&e) => {
+                    // Once per run of failures: they come as fast as the
+                    // pause allows.
+                    if !std::mem::replace(&mut failing, true) {
+                        tracing::warn!("the control socket cannot take a connection now: {e}");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            failing = false;
             let handler = handler.clone();
             tokio::spawn(async move {
                 let peer = match stream.peer_cred() {
@@ -120,6 +144,23 @@ mod unix {
                 }
                 let _ = connection(stream, peer, handler).await;
             });
+        }
+    }
+
+    /// Whether `accept` failed for this connection only and the listener
+    /// can take the next one. The list is of the errors that mean the
+    /// listener itself is broken, not of the passing ones: a limit of the
+    /// user's that runs out (descriptors, memory, epoll watches) shows up as
+    /// one of many errors, and missing one would end the socket for good.
+    /// An error without an OS code comes from tokio itself (the runtime
+    /// shutting down) and ends it too.
+    fn passing(e: &std::io::Error) -> bool {
+        match e.raw_os_error() {
+            Some(libc::EBADF | libc::EINVAL | libc::ENOTSOCK | libc::EOPNOTSUPP | libc::EFAULT) => {
+                false
+            }
+            Some(_) => true,
+            None => false,
         }
     }
 
@@ -298,6 +339,117 @@ mod unix {
                     .unwrap_err(),
                 NOT_RUNNING
             );
+        }
+
+        /// Set in the process `serving_outlasts_running_out_of_descriptors`
+        /// starts for itself.
+        #[cfg(target_os = "linux")]
+        const OUT_OF_DESCRIPTORS: &str = "NERVE_TEST_CTL_OUT_OF_DESCRIPTORS";
+
+        /// With no descriptor left to take a connection, the server goes on and
+        /// answers once they are back. The limit on open files holds for a
+        /// whole process, so the test runs again in a process of its own.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn serving_outlasts_running_out_of_descriptors() {
+            if std::env::var_os(OUT_OF_DESCRIPTORS).is_none() {
+                let name = format!(
+                    "{}::serving_outlasts_running_out_of_descriptors",
+                    module_path!().split_once("::").unwrap().1
+                );
+                let out = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", &name, "--test-threads=1"])
+                    .env(OUT_OF_DESCRIPTORS, "1")
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                assert!(
+                    String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+                    "the test did not run in its own process"
+                );
+                return;
+            }
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                use std::os::unix::io::AsRawFd;
+                let d = tempfile::tempdir().unwrap();
+                let p = d.path().join("ctl.sock");
+                let listener = bind(&p).await.unwrap();
+                // Connections that wait to be taken; each needs a descriptor.
+                let waiting: Vec<_> = (0..8)
+                    .map(|_| std::os::unix::net::UnixStream::connect(&p).unwrap())
+                    .collect();
+                let mut old = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                // SAFETY: the limits of this process, into a local.
+                assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut old) }, 0);
+                // The lowest free descriptor becomes the limit: none is left.
+                let next = std::fs::File::open("/dev/null").unwrap().as_raw_fd();
+                let none = libc::rlimit {
+                    rlim_cur: next as libc::rlim_t,
+                    rlim_max: old.rlim_max,
+                };
+                // SAFETY: as above.
+                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &none) }, 0);
+                let server =
+                    tokio::spawn(serve_on(listener, |_, _| async { Reply::Ok(json!("up")) }));
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                assert!(
+                    std::fs::File::open("/dev/null").is_err(),
+                    "a descriptor was left"
+                );
+                assert!(!server.is_finished(), "the server stopped");
+                drop(waiting);
+                // SAFETY: as above.
+                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &old) }, 0);
+                let v = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    call(&p, "status", json!({})),
+                )
+                .await
+                .expect("an answer in time");
+                assert_eq!(v, Ok(json!("up")));
+            });
+        }
+
+        /// Running out of epoll watches (ENOSPC when the new connection is
+        /// registered with the reactor) does not end the socket, nor does any
+        /// other error of one connection; only a broken listener or tokio
+        /// itself does. Filling the real limit would disturb every process of
+        /// the user, so this asks `passing` directly.
+        #[test]
+        fn only_a_broken_listener_ends_the_serving() {
+            let os = std::io::Error::from_raw_os_error;
+            for code in [
+                libc::ENOSPC,
+                libc::EMFILE,
+                libc::ENFILE,
+                libc::ENOMEM,
+                libc::ECONNABORTED,
+                libc::EPERM,
+            ] {
+                assert!(passing(&os(code)), "{} ends the serving", os(code));
+            }
+            for code in [
+                libc::EBADF,
+                libc::EINVAL,
+                libc::ENOTSOCK,
+                libc::EOPNOTSUPP,
+                libc::EFAULT,
+            ] {
+                assert!(!passing(&os(code)), "{} does not end it", os(code));
+            }
+            assert!(!passing(&std::io::Error::other("the runtime shuts down")));
         }
 
         #[cfg(target_os = "linux")]

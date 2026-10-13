@@ -18,6 +18,7 @@ use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use nerve_policy::audit::AuditLog;
+use nerve_policy::config::SecretStorage;
 use nerve_policy::settings::SettingsStore;
 
 use crate::paths::NodePaths;
@@ -195,6 +196,12 @@ pub trait System {
     fn wait_running(&self, paths: &NodePaths) -> Result<(), String>;
     /// What `<program> --version` prints, run as `account`.
     fn version_of(&self, program: &Path, account: &Account) -> Result<String, String>;
+    /// Ends the session a system keyring gave `name` (`loginctl
+    /// enable-linger`, [`crate::keyring_setup`]), so that the user can go;
+    /// `Ok(false)` when it had none.
+    fn end_session(&self, _name: &str) -> Result<bool, String> {
+        Ok(false)
+    }
 }
 
 /// This machine.
@@ -231,22 +238,7 @@ impl System for Host {
             ]);
         // setup runs as the node's user and keeps root only as its saved
         // id ([`become_owner`]); useradd gets it back.
-        #[cfg(target_os = "linux")]
-        if !self.is_root() {
-            use std::os::unix::process::CommandExt;
-            // SAFETY: plain system calls between fork and exec.
-            unsafe {
-                c.pre_exec(|| {
-                    if libc::setresuid(0, 0, 0) != 0
-                        || libc::setresgid(0, 0, 0) != 0
-                        || libc::setgroups(0, std::ptr::null()) != 0
-                    {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-        }
+        regain_root(&mut c);
         let o = c.output().map_err(|e| format!("useradd: {e}"))?;
         if o.status.success() {
             Ok(())
@@ -289,7 +281,16 @@ impl System for Host {
     }
 
     fn systemctl(&self, args: &[&str]) -> Result<(), String> {
-        run("systemctl", args)
+        let mut c = std::process::Command::new("systemctl");
+        c.args(args);
+        // setup restarts the node after it installed a keyring.
+        regain_root(&mut c);
+        let o = c.output().map_err(|e| format!("systemctl: {e}"))?;
+        if o.status.success() {
+            Ok(())
+        } else {
+            Err(format!("systemctl {}: {}", args.join(" "), failure(&o)))
+        }
     }
 
     fn give(&self, path: &Path, uid: u32, gid: u32) -> Result<(), String> {
@@ -345,6 +346,20 @@ impl System for Host {
         }
         Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
     }
+
+    fn end_session(&self, name: &str) -> Result<bool, String> {
+        if !Path::new("/var/lib/systemd/linger").join(name).exists() {
+            return Ok(false);
+        }
+        run("loginctl", &["disable-linger", name])?;
+        // userdel refuses a user whose processes (the keyring) still run;
+        // systemctl waits until the session's manager has stopped them.
+        if let Ok(Some(a)) = self.account(name) {
+            let _ = run("systemctl", &["stop", &format!("user@{}.service", a.uid)]);
+        }
+        let _ = run("loginctl", &["terminate-user", name]);
+        Ok(true)
+    }
 }
 
 /// The shell of an account that does not log in.
@@ -358,6 +373,36 @@ fn no_login() -> &'static str {
 const LINUX_ONLY: &str = "works on Linux with systemd only; elsewhere run `nerve-node run` under your own service manager";
 
 /// Runs a system tool; its error output is the error.
+/// Lets `c` run as root where this process keeps root only as its saved id
+/// (setup on the installed node, [`become_owner`]); elsewhere it runs as
+/// this process does.
+fn regain_root(c: &mut std::process::Command) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        let (mut r, mut e, mut s) = (0, 0, 0);
+        // SAFETY: getresuid writes the three ids it is given.
+        unsafe { libc::getresuid(&mut r, &mut e, &mut s) };
+        if e == 0 || s != 0 {
+            return;
+        }
+        // SAFETY: plain system calls between fork and exec.
+        unsafe {
+            c.pre_exec(|| {
+                if libc::setresuid(0, 0, 0) != 0
+                    || libc::setresgid(0, 0, 0) != 0
+                    || libc::setgroups(0, std::ptr::null()) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = c;
+}
+
 fn run(program: &str, args: &[&str]) -> Result<(), String> {
     let o = std::process::Command::new(program)
         .args(args)
@@ -477,12 +522,31 @@ pub fn install(
     invoker: &str,
     out: &mut dyn Write,
 ) -> Result<(), String> {
+    let keyring = crate::keyring_setup::HostKeyring {
+        exe: layout.bin.clone(),
+    };
+    install_asking(layout, sys, &keyring, None, exe, invoker, out)
+}
+
+/// [`install`] in a terminal: `input` answers the question whether to
+/// install a system keyring, asked when the node's keys are to be in one
+/// and none answers for its user ([`crate::keyring_setup`]). `keyring` asks
+/// through the installed program, which that user can run.
+pub fn install_asking(
+    layout: &Layout,
+    sys: &dyn System,
+    keyring: &dyn crate::keyring_setup::Keyring,
+    input: Option<&mut dyn BufRead>,
+    exe: &Path,
+    invoker: &str,
+    out: &mut dyn Write,
+) -> Result<(), String> {
     supported(sys, "install")?;
     let mut steps = Steps {
         done: Vec::new(),
         out,
     };
-    let r = install_steps(layout, sys, exe, invoker, &mut steps);
+    let r = install_steps(layout, sys, keyring, input, exe, invoker, &mut steps);
     audit(&layout.paths, "install", &steps.done, &r, steps.out);
     r?;
     let _ = writeln!(
@@ -495,10 +559,24 @@ pub fn install(
 fn install_steps(
     layout: &Layout,
     sys: &dyn System,
+    keyring: &dyn crate::keyring_setup::Keyring,
+    input: Option<&mut dyn BufRead>,
     exe: &Path,
     invoker: &str,
     steps: &mut Steps,
 ) -> Result<(), String> {
+    // Keys in the keyring where they may not be there (an old Landlock):
+    // the installed node would not start, so install changes nothing.
+    if crate::secrets::stated_storage(&layout.paths) == SecretStorage::Keyring
+        && let Some(n) = crate::secrets::no_keyring(&layout.paths)
+    {
+        return Err(crate::secrets::keyring_refused(
+            &layout.paths,
+            n,
+            "install changed nothing",
+            "run `sudo nerve-node install` again",
+        ));
+    }
     let account = match sys.account(USER)? {
         Some(a) if a.comment == USER_MARK => {
             steps.did(format!("the user {USER} is there already"));
@@ -541,7 +619,15 @@ fn install_steps(
         layout.paths.config_dir.display(),
         layout.paths.state_dir.display()
     ));
-    default_account(layout, sys, invoker, steps);
+    let in_keyring = crate::secrets::stated_storage(&layout.paths) == SecretStorage::Keyring;
+    if in_keyring {
+        // Root does not open the keyring of the node's user, so the account
+        // is left to setup, which runs as that user.
+        steps
+            .did("the account of the commands stays as it is; `sudo nerve-node setup` chooses one");
+    } else {
+        default_account(layout, sys, invoker, steps);
+    }
     let real = |p: &Path| std::fs::canonicalize(p).ok();
     if real(exe).is_some() && real(exe) == real(&layout.bin) {
         steps.did(format!(
@@ -552,6 +638,14 @@ fn install_steps(
         let program = std::fs::read(exe).map_err(|e| format!("{}: {e}", exe.display()))?;
         write_file(&layout.bin, &program, 0o755)?;
         steps.did(format!("put the program at {}", layout.bin.display()));
+    }
+    // A node whose keys are in the system keyring does not start without
+    // one that answers for its user; the installed program asks it.
+    if in_keyring {
+        crate::keyring_setup::ensure(keyring, &account, input, steps.out)?;
+        steps.did(format!(
+            "the node's keys are in the system keyring of {USER}, and it answers"
+        ));
     }
     write_file(&layout.unit, layout.unit_text().as_bytes(), 0o644)?;
     steps.did(format!("wrote the service unit {}", layout.unit.display()));
@@ -819,6 +913,11 @@ fn uninstall_steps(
     }
     match sys.account(USER)? {
         Some(a) if a.comment == USER_MARK => {
+            if sys.end_session(USER)? {
+                steps.did(format!(
+                    "ended the session of {USER} that its keyring needed"
+                ));
+            }
             sys.remove_account(USER)?;
             steps.did(format!("removed the user {USER}"));
         }
@@ -1316,6 +1415,13 @@ pub fn become_owner(paths: &NodePaths, keep_root: bool) -> Result<(), String> {
                 std::io::Error::last_os_error()
             ));
         }
+        // The session bus these name is the caller's, not the owner's: the
+        // system keyring is found in the owner's session (/run/user/<uid>).
+        // SAFETY: `main` calls this while the process has one thread.
+        unsafe {
+            std::env::remove_var("DBUS_SESSION_BUS_ADDRESS");
+            std::env::remove_var("XDG_RUNTIME_DIR");
+        }
         Ok(())
     }
     #[cfg(not(unix))]
@@ -1372,6 +1478,8 @@ pub(crate) mod tests {
         starts: std::cell::Cell<bool>,
         /// The accounts in a group that gets root, and that group.
         root_groups: RefCell<Vec<(String, String)>>,
+        /// Whether the node's user keeps a session (a keyring's linger).
+        lingers: std::cell::Cell<bool>,
     }
 
     impl Fake {
@@ -1383,6 +1491,7 @@ pub(crate) mod tests {
                 given: RefCell::new(Vec::new()),
                 starts: std::cell::Cell::new(true),
                 root_groups: RefCell::new(Vec::new()),
+                lingers: std::cell::Cell::new(false),
             }
         }
 
@@ -1494,6 +1603,15 @@ pub(crate) mod tests {
             assert_eq!(account.comment, USER_MARK);
             let text = std::fs::read_to_string(program).map_err(|e| e.to_string())?;
             Ok(text.lines().next().unwrap_or_default().to_string())
+        }
+        fn end_session(&self, name: &str) -> Result<bool, String> {
+            if !self.lingers.replace(false) {
+                return Ok(false);
+            }
+            self.calls
+                .borrow_mut()
+                .push(format!("loginctl disable-linger {name}"));
+            Ok(true)
         }
     }
 
@@ -1619,6 +1737,130 @@ pub(crate) mod tests {
                 .contains("the user nerve is there already")
         );
         assert_eq!(audit_events(&l).len(), 2);
+    }
+
+    /// An earlier install's config keeps the keys in the system keyring:
+    /// install checks that it answers for the node's user before it starts
+    /// the service, and offers to install one only in a terminal.
+    #[test]
+    fn install_checks_the_keyring_the_keys_are_in() {
+        use crate::keyring_setup::tests::FakeKeyring;
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = layout(d.path());
+        let mut store = SettingsStore::open_with(
+            l.paths.config_file(),
+            Box::new(crate::secrets::NodeSecrets::new(&l.paths)),
+            AuditLog::new(l.paths.audit_log()),
+        )
+        .unwrap();
+        store
+            .update(|c| {
+                c.machine.secret_storage = SecretStorage::Keyring;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        let exe = d.path().join("nerve-node");
+        std::fs::write(&exe, "nerve-node 1.0.0\n").unwrap();
+        let started = |sys: &Fake| sys.calls().iter().any(|c| c.contains("restart"));
+        let k = FakeKeyring::new(false);
+        let install = |sys: &Fake, typed: Option<&str>| {
+            let mut out = Vec::new();
+            let mut input = typed.map(|t| std::io::Cursor::new(t.as_bytes().to_vec()));
+            let r = install_asking(
+                &l,
+                sys,
+                &k,
+                input.as_mut().map(|i| i as &mut dyn BufRead),
+                &exe,
+                "alice",
+                &mut out,
+            );
+            (r, String::from_utf8(out).unwrap())
+        };
+        let (r, out) = install(&sys, None);
+        let e = r.unwrap_err();
+        assert!(e.contains("no system keyring answers for nerve"), "{e}");
+        assert!(e.contains("run in a terminal"), "{e}");
+        assert!(!out.contains("[y/N]"), "{out}");
+        assert!(!started(&sys));
+        let (r, out) = install(&sys, Some("\n"));
+        assert!(r.is_err());
+        assert!(out.contains("Install it now? [y/N]"), "{out}");
+        assert!(k.installed.borrow().is_empty() && !started(&sys));
+        let (r, out) = install(&sys, Some("y\n"));
+        r.unwrap();
+        assert_eq!(k.installed.borrow().len(), 1);
+        assert!(started(&sys));
+        assert!(out.contains("keyring of nerve, and it answers"), "{out}");
+        // Root does not open the keyring, so the account is setup's.
+        assert!(out.contains("`sudo nerve-node setup` chooses one"), "{out}");
+        // Once it answers, nothing is asked.
+        let (r, out) = install(&sys, None);
+        r.unwrap();
+        assert!(!out.contains("[y/N]"), "{out}");
+    }
+
+    /// On a kernel below Landlock ABI 9, an earlier install's config that
+    /// keeps the keys in the keyring is refused before install changes
+    /// anything, with the command that moves them into files on these
+    /// folders.
+    #[test]
+    fn install_refuses_keys_in_the_keyring_below_landlock_9() {
+        use crate::keyring_setup::tests::FakeKeyring;
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = layout(d.path());
+        let mut store = SettingsStore::open_with(
+            l.paths.config_file(),
+            Box::new(crate::secrets::NodeSecrets::new(&l.paths)),
+            AuditLog::new(l.paths.audit_log()),
+        )
+        .unwrap();
+        store
+            .update(|c| {
+                c.machine.secret_storage = SecretStorage::Keyring;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        crate::secrets::for_tests::pretend_landlock(&l.paths, crate::secrets::Landlock::Abi(6));
+        let exe = d.path().join("nerve-node");
+        std::fs::write(&exe, "nerve-node 1.0.0\n").unwrap();
+        let k = FakeKeyring::new(true);
+        let e = install_asking(&l, &sys, &k, None, &exe, "alice", &mut Vec::new()).unwrap_err();
+        assert!(e.contains("install changed nothing"), "{e}");
+        assert!(e.contains("Landlock ABI 6, below 9"), "{e}");
+        assert!(e.contains("cannot run programs from its folders"), "{e}");
+        let command = format!(
+            "`nerve-node --config-dir \"{}\" --state-dir \"{}\" config set machine.secret_storage file`",
+            l.paths.config_dir.display(),
+            l.paths.state_dir.display()
+        );
+        assert!(e.contains(&command), "{e}");
+        assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+        assert!(!l.bin.exists() && !l.unit.exists());
+    }
+
+    #[test]
+    fn uninstall_ends_the_session_a_keyring_gave_the_user() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = installed(d.path(), &sys, "1.0.0");
+        sys.lingers.set(true);
+        let mut out = Vec::new();
+        uninstall(&l, &sys, true, &mut out).unwrap();
+        assert!(
+            sys.calls().ends_with(&[
+                "loginctl disable-linger nerve".into(),
+                "userdel nerve".into()
+            ]),
+            "{:?}",
+            sys.calls()
+        );
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("ended the session of nerve"), "{out}");
     }
 
     #[test]

@@ -37,8 +37,9 @@ pub fn preview(link: &PairLink, name: Option<&str>) -> String {
 }
 
 /// Pairs with the center in `link` and stores the result: the node key
-/// (0600) under `keys/<name>.key` and a `[[center]]` entry with the default
-/// policy. Returns the new entry.
+/// (a 0600 file `keys/<name>.key`, or the system keyring with
+/// `machine.secret_storage = "keyring"`) and a `[[center]]` entry with the
+/// default policy. Returns the new entry.
 pub async fn pair(
     paths: &NodePaths,
     link: &PairLink,
@@ -105,18 +106,14 @@ pub async fn pair(
         policy: CenterPolicy::default(),
     };
 
-    let key_file = paths.key_file(&entry_name);
-    if let Some(dir) = key_file.parent() {
-        nerve_transport::files::create_private_dir(dir)
-            .map_err(|e| format!("{}: {e}", dir.display()))?;
-    }
-    // The key goes first: an entry without its key cannot dial, a key
-    // without an entry is just a stray file that the next pairing replaces.
+    // The key goes first, where `machine.secret_storage` says: an entry
+    // without its key cannot dial, a key without an entry is just a stray
+    // that the next pairing replaces.
     if cfg.center(&entry_name).is_some() {
         return Err(format!("a center named {entry_name} is paired already"));
     }
-    nerve_transport::files::write_private(&key_file, key.to_text().as_bytes())
-        .map_err(|e| format!("{}: {e}", key_file.display()))?;
+    let storage = cfg.machine.secret_storage;
+    crate::secrets::store_center_key(paths, storage, &entry_name, &key)?;
     let added = entry.clone();
     let r = crate::cli::edit(paths, move |c| {
         if c.center(&added.name).is_some() {
@@ -130,7 +127,7 @@ pub async fn pair(
     })
     .await;
     if let Err(e) = r {
-        let _ = std::fs::remove_file(&key_file);
+        let _ = crate::secrets::remove_center_key(paths, storage, &entry_name);
         return Err(e);
     }
     Ok(entry)

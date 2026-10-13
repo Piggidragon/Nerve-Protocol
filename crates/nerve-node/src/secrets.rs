@@ -901,7 +901,14 @@ pub fn settle(paths: &NodePaths, cfg: &NodeConfig) {
 /// by a CLI while it moves the keys: a move never runs while a node reads
 /// them. It is released when its holder ends, however it ends.
 pub struct KeysLock {
-    _file: std::fs::File,
+    file: Option<std::fs::File>,
+}
+
+impl Drop for KeysLock {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        crate::spawn_gate::settled();
+    }
 }
 
 impl KeysLock {
@@ -922,7 +929,7 @@ impl KeysLock {
                 .map_err(|e| format!("{}: {e}", path.display()))?;
             // SAFETY: flock on a descriptor this function owns.
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-                return Ok(Some(KeysLock { _file: file }));
+                return Ok(Some(KeysLock { file: Some(file) }));
             }
             let e = std::io::Error::last_os_error();
             if e.kind() == std::io::ErrorKind::WouldBlock {
@@ -936,7 +943,7 @@ impl KeysLock {
             // Opened without sharing: nobody else opens it while it is held.
             const SHARING_VIOLATION: i32 = 32;
             match o.share_mode(0).open(&path) {
-                Ok(file) => Ok(Some(KeysLock { _file: file })),
+                Ok(file) => Ok(Some(KeysLock { file: Some(file) })),
                 Err(e) if e.raw_os_error() == Some(SHARING_VIOLATION) => Ok(None),
                 Err(e) => Err(format!("{}: {e}", path.display())),
             }

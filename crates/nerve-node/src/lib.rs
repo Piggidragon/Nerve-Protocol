@@ -26,6 +26,7 @@ pub mod paths;
 pub mod rights;
 mod secrets;
 pub mod service;
+mod spawn_gate;
 mod sudo;
 // The walk is Windows-only in use, tested everywhere.
 #[cfg_attr(not(windows), allow(dead_code))]

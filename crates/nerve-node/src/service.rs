@@ -382,7 +382,10 @@ fn supported(sys: &dyn System, what: &str) -> Result<(), String> {
 
 /// Writes the command's audit entry, when the state folder is there to hold
 /// it. It is written as the folder's owner ([`as_owner_of`]): root does not
-/// write through a link that the node's user put there.
+/// write through a link that the node's user put there. A folder given to
+/// root (by `uninstall`, or one an earlier uninstall left) is written as
+/// root, so the log must be a plain file of one name there: a link that was
+/// given away with the folder would otherwise be followed with root's rights.
 fn audit(
     paths: &NodePaths,
     event: &str,
@@ -395,12 +398,42 @@ fn audit(
     }
     let log = AuditLog::new(paths.audit_log());
     let written = as_owner_of(&paths.state_dir).and_then(|_owner| {
+        plain_log(log.path())?;
         log.node(event, steps, r.as_ref().err().map(String::as_str))
             .map_err(|e| e.to_string())
     });
     if let Err(e) = written {
         let _ = writeln!(out, "the audit log cannot be written: {e}");
     }
+}
+
+/// Refuses an audit log that is not a plain file with one name (one that
+/// is not there yet is fine). The check holds in a folder of root's, which
+/// nobody else can change between it and the write; in one of `nerve`'s,
+/// the write runs as `nerve` anyway.
+fn plain_log(log: &Path) -> Result<(), String> {
+    let m = match std::fs::symlink_metadata(log) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("{}: {e}", log.display())),
+    };
+    if !m.file_type().is_file() {
+        return Err(format!(
+            "{} is not a plain file (a link?); root does not write through it",
+            log.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if m.nlink() > 1 {
+            return Err(format!(
+                "{} has more than one name, and another may be outside the node's folders",
+                log.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// `install`: the user, the folders, the account of the commands, the
@@ -1963,6 +1996,33 @@ pub(crate) mod tests {
                 (l.paths.state_dir.clone(), 0)
             ]
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn uninstall_writes_no_audit_entry_through_a_link_or_a_second_name() {
+        // Without --purge the folders are root's before the entry is
+        // written, so it is written as root: a link or a hard link left in
+        // place of the log must not lead that write outside the folders.
+        for hard in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            let sys = Fake::new();
+            let l = installed(d.path(), &sys, "1.0.0");
+            let outside = d.path().join("outside");
+            std::fs::write(&outside, "kept\n").unwrap();
+            std::fs::remove_file(l.paths.audit_log()).unwrap();
+            if hard {
+                std::fs::hard_link(&outside, l.paths.audit_log()).unwrap();
+            } else {
+                std::os::unix::fs::symlink(&outside, l.paths.audit_log()).unwrap();
+            }
+            let mut out = Vec::new();
+            uninstall(&l, &sys, false, &mut out).unwrap();
+            assert_eq!(std::fs::read_to_string(&outside).unwrap(), "kept\n");
+            let out = String::from_utf8(out).unwrap();
+            assert!(out.contains("the audit log cannot be written"), "{out}");
+            assert!(!l.bin.exists() && sys.user.borrow().is_none());
+        }
     }
 
     #[test]

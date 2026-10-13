@@ -70,7 +70,11 @@ thread's file-system ids), refuse a link in place of one of the node's
 folders, and give the folders away by walking them through descriptors
 opened without following links. A file with more than one name (a hard
 link) is not given away: the walk stops there with an error, since its
-other name may be outside the node's folders.
+other name may be outside the node's folders. A folder that belongs to
+root already (`uninstall` without `--purge` gives the folders to root
+before it writes its entry) is written as root, so the audit log there must
+be a plain file with one name; a link or a hard link in its place is not
+written to, and the command says so.
 
 `node.toml` is written private to the owner (mode 0600 on Unix). The daemon
 refuses to run as root unless `machine.allow_root = true`.

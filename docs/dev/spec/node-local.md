@@ -111,13 +111,13 @@ owner's path. It is refused and the refusal is audited (§6): at start-up the
 node does not start; on a reload the old config stays in force. A reload also
 refuses a signed file older than the one in force. After looking at a refused
 file, the owner takes it as it is with `nerve-node config accept`; the node
-then signs it. A `node.toml` from before the node kept a MAC (no key yet, no
-MAC line) is taken once as it is and signed.
+then signs it. A `node.toml` without a MAC line (no key yet) is taken once
+as it is and signed.
 
 The check stands on `config.key`. A process that can delete or read it, and a
 `user` mode command is one (it runs unconfined as the user), can make the node
 take another file at its next start: with the key gone, an unsigned file
-counts as one from before the MAC and is signed. The start-up audits that as
+counts as a first file and is signed. The start-up audits that as
 `signed`. In `folder` mode Landlock keeps commands out of the state folder.
 
 On Windows there is no control socket: the CLI writes the signed
@@ -412,8 +412,7 @@ with a status that names the entry, and the node does not dial directly
 instead (fail closed).
 
 A `node.toml` that holds header values (`headers = { Name = "value" }`) or a
-user name and password in `connection.proxy`, as earlier builds wrote it, is
-refused on load, without the values in the message: take them out of the
+user name and password in `connection.proxy` is refused on load, without the values in the message: take them out of the
 file, accept it (`nerve-node config accept`) and run `nerve-node proxy set`
 again.
 
@@ -429,8 +428,8 @@ again.
   it. The flags do not imply each other: a write needs `w` and no `r`, a read
   `r` and no `w`, a command `x` and no `r`. Where folders nest, the deepest
   one that holds a path decides for it. Commands are confined where the
-  platform can confine them. Windows has no file confinement for commands
-  yet, so there folder mode refuses every command and offers no `exec`
+  platform can confine them. Windows has no file confinement for commands,
+  so there folder mode refuses every command and offers no `exec`
   action (unless the sudo allow list has an entry), and only `allowlist` and
   `user` run them, each owned by its Job Object but not confined. `allow` rules do not count. On Linux a command
   reads the system folders and its `r` folders, writes its `w` folders and

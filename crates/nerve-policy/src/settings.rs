@@ -220,8 +220,8 @@ pub struct SettingsStore {
 impl SettingsStore {
     /// Loads `path` (a missing file is the default config) and checks its MAC
     /// with the key at `key_path`. A file whose MAC does not match is refused
-    /// and audited. The key is made when there is none; a file from before
-    /// the node kept a MAC is then taken once, as it is, and signed.
+    /// and audited. The key is made when there is none; a file without
+    /// a MAC line is then taken once, as it is, and signed.
     pub fn open(
         path: impl Into<PathBuf>,
         key_path: impl AsRef<Path>,
@@ -256,11 +256,9 @@ impl SettingsStore {
             let c = NodeConfig::parse(&text).map_err(|e| format!("{}: {e}", s.path.display()))?;
             s.write(&c, None).map_err(|e| e.to_string())?;
             s.config = c;
-            let _ = s.audit.config(
-                "signed",
-                &s.path,
-                "written before the node kept a MAC; signed as it was",
-            );
+            let _ = s
+                .audit
+                .config("signed", &s.path, "has no MAC; signed as it was");
             return Ok(s);
         }
         s.config = verified(&text, &s.key).map_err(|why| s.refuse(&why))?;
@@ -1001,9 +999,8 @@ mod tests {
     }
 
     /// A folder at or inside a protected entry releases it, so adding one is
-    /// a release as well: a center may not, the owner may (code review 2 of
-    /// PR #19, finding 2). The paths are this platform's own, so the check
-    /// runs on Windows as well (Windows review round 3, finding 1).
+    /// a release as well: a center may not, the owner may. The paths are this
+    /// platform's own, so the check runs on Windows as well.
     #[test]
     fn a_center_cannot_release_a_protected_path_by_adding_a_folder() {
         let d = tempfile::tempdir().unwrap();
@@ -1034,7 +1031,7 @@ mod tests {
         }
         assert!(s.config().center("home").unwrap().policy.folders.is_empty());
         // Spellings that would slip past the check and then match nothing
-        // are no folder path at all (Windows review round 3, finding 5).
+        // are no folder path at all.
         let odd: &[&str] = if cfg!(windows) {
             &[
                 "C:\\Users\\U~1\\.ssh",
@@ -1149,14 +1146,13 @@ mod tests {
 
     /// `rel` (with `/`) below [`host_home`], as the string a folder is
     /// given by. These tests use this platform's own paths, so the check
-    /// under test runs on Windows as well (Windows final round, finding 1).
+    /// under test runs on Windows as well.
     fn home_str(rel: &str) -> String {
         at_home(rel).to_string_lossy().into_owned()
     }
 
     /// The owner released `~/.ssh` read-only; another spelling of that
-    /// folder gives a center no more (security review 3 of PR #19,
-    /// finding 1).
+    /// folder gives a center no more.
     #[test]
     fn a_center_cannot_widen_a_protected_folder_by_another_spelling() {
         let d = tempfile::tempdir().unwrap();
@@ -1228,7 +1224,7 @@ mod tests {
     }
 
     /// A folder inside the owner's read-only `~/.ssh` gets no flag the
-    /// owner's folder lacks (security review 3 of PR #19, finding 1).
+    /// owner's folder lacks.
     #[test]
     fn a_center_cannot_widen_a_protected_folder_by_an_inner_one() {
         let d = tempfile::tempdir().unwrap();
@@ -1449,7 +1445,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_from_before_the_mac_is_signed_once() {
+    fn a_file_without_a_mac_is_signed_once() {
         let d = tempfile::tempdir().unwrap();
         let mut old = NodeConfig::default();
         old.limits.max_running = 3;

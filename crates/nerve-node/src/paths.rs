@@ -362,8 +362,7 @@ mod tests {
     }
 
     /// The Documents folder where the known-folder API puts it (OneDrive's
-    /// backup, a redirect), and its usual place below the profile as well
-    /// (Windows review round 3, finding 3).
+    /// backup, a redirect), and its usual place below the profile as well.
     #[test]
     fn the_documents_folder_comes_from_the_known_folder_and_the_profile() {
         let env = |k: &str| (k == "USERPROFILE").then(|| OsString::from("C:\\Users\\u"));

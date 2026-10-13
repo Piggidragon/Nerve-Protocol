@@ -174,7 +174,7 @@ pub struct Connection {
 }
 
 /// Why a `node.toml` that keeps proxy secrets in the file is refused.
-pub const PROXY_SECRETS_IN_FILE: &str = "connection holds proxy secrets (header values, or a user name and password in the proxy URL), which belong in the system keyring, not in node.toml: run `nerve-node proxy set` again (for a file of an earlier build, delete them from it and take it with `nerve-node config accept` first)";
+pub const PROXY_SECRETS_IN_FILE: &str = "connection holds proxy secrets (header values, or a user name and password in the proxy URL), which belong in the system keyring, not in node.toml: run `nerve-node proxy set` again (if the file holds them already, delete them from it and take it with `nerve-node config accept` first)";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -621,7 +621,7 @@ impl NodeConfig {
 }
 
 /// Refuses a file that keeps a proxy secret: a `connection.headers` table
-/// (name to value, as earlier builds wrote it) or a proxy URL with a user name
+/// (a table of name to value) or a proxy URL with a user name
 /// and password. This runs on the raw TOML, before the typed parse, whose
 /// errors quote the offending line and so would quote the secret. Anything
 /// but a list of strings in `connection.headers` is refused the same way
@@ -856,7 +856,7 @@ sudo_allow = ["sudo apt update"]
 
     /// A folder spelled so that it matches nothing at call time (an 8.3
     /// name, a trailing dot or space, `x\..`) is refused, with Windows'
-    /// rules tested on every platform (Windows review round 3, finding 5).
+    /// rules tested on every platform.
     #[test]
     fn a_folder_spelling_that_names_no_folder_is_refused() {
         for (path, why) in [
@@ -943,7 +943,7 @@ sudo_allow = ["sudo apt update"]
 
     #[test]
     fn proxy_secrets_in_the_file_are_refused_without_quoting_them() {
-        // What earlier builds wrote: header values, or credentials in the URL.
+        // Secrets in the file: header values, or credentials in the URL.
         for old in [
             "[connection]\nproxy = \"http://p:3128\"\nheaders = { X-Key = \"s3cret\" }\n",
             "[connection]\nproxy = \"http://user:s3cret@p:3128\"\n",
@@ -1005,7 +1005,7 @@ sudo_allow = ["sudo apt update"]
     }
 
     #[test]
-    fn keys_and_values_of_earlier_builds_are_errors() {
+    fn unknown_keys_and_values_are_errors() {
         for bad in [
             "mode = \"ask\"",
             "mode = \"full\"",
@@ -1057,8 +1057,7 @@ sudo_allow = ["sudo apt update"]
         assert!(p.folders[0].access.is_none());
     }
 
-    /// Folders are kept in one form, so one place is never two folders
-    /// (security review 3 of PR #19, finding 1).
+    /// Folders are kept in one form, so one place is never two folders.
     #[cfg(not(windows))]
     #[test]
     fn a_folder_list_names_each_place_once_in_one_form() {
@@ -1134,13 +1133,13 @@ sudo_allow = ["sudo apt update"]
             let text = format!("folders = [{{ path = \"{FOLDER}\", access = \"{bad}\" }}]");
             assert!(toml::from_str::<CenterPolicy>(&text).is_err(), "{bad:?}");
         }
-        // The two keys of earlier builds are gone.
+        // Separate flags next to the access string are not accepted.
         let old = format!("folders = [{{ path = \"{FOLDER}\", access = \"rw\", execute = true }}]");
         assert!(toml::from_str::<CenterPolicy>(&old).is_err());
     }
 
     #[test]
-    fn ask_is_not_a_value_of_new_input() {
+    fn ask_is_not_a_value() {
         let ask = serde_json::json!({"mode": "ask"});
         assert!(serde_json::from_value::<CenterPolicy>(ask).is_err());
         let cap = serde_json::json!({"caps": {"fs": "ask"}});

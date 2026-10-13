@@ -240,7 +240,7 @@ impl Proxy {
         }
         let u = CenterUrl::parse(s).map_err(|e| e.replace("center URL", "proxy URL"))?;
         if u.tls {
-            return Err("an https:// proxy is not supported yet; use http://host:port".into());
+            return Err("an https:// proxy is not supported; use http://host:port".into());
         }
         if !u.base.is_empty() {
             return Err("a proxy URL has no path".into());
@@ -501,8 +501,8 @@ mod tests {
         assert!(usable_addrs(false, true, vec![a("[::1]:80")]).is_err());
     }
 
-    /// The reviewer's probe: the center on 127.0.0.1, another user's program on
-    /// [::1] at the same port. `localhost` reaches the center.
+    /// With the center on 127.0.0.1 and another user's program on [::1] at
+    /// the same port, `localhost` reaches the center.
     #[tokio::test]
     async fn localhost_reaches_the_ipv4_center_not_a_listener_on_ipv6() {
         let v4 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

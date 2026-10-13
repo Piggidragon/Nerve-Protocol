@@ -1849,8 +1849,8 @@ mod windows_tests {
     /// background keeps A's output open; then commands B run one after
     /// another until a B shell gets A's old shell pid. Neither may end the
     /// other's processes: A's ping runs on, and every B exits with its own
-    /// code (code review 2 of PR #19, finding 1). Windows takes minutes to
-    /// give a pid out again, so run it with `--ignored`.
+    /// code. Windows takes minutes to give a pid out again, so run it with
+    /// `--ignored`.
     #[tokio::test]
     #[ignore = "slow: waits until Windows gives a shell's pid to another shell"]
     async fn a_shell_pid_given_to_another_command_reaches_no_other_job() {

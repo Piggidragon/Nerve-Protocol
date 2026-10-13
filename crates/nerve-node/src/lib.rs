@@ -6,6 +6,7 @@
 //! the control socket the CLI ([`cli`]) talks to. Tests start a daemon in
 //! process with [`daemon::Daemon::start`] and pair with [`pair::pair`].
 
+pub mod account;
 pub mod cli;
 pub mod daemon;
 pub mod descriptor;
@@ -18,6 +19,7 @@ mod link;
 pub mod pair;
 pub mod paths;
 mod secrets;
+pub mod service;
 mod sudo;
 // The walk is Windows-only in use, tested everywhere.
 #[cfg_attr(not(windows), allow(dead_code))]

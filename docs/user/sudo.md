@@ -21,7 +21,10 @@ for it.
    nerve-node rule add sudo 'apt update' --wildcard   # sudo apt, and anything after it
    ```
 
-2. Switch sudo on. The node must be running. It asks for your sudo password:
+2. Switch sudo on. The node must be running. It asks for the sudo password
+   of the account the commands run as: your own on a node you run yourself,
+   the account `install` took or `setup` chose on a node installed as a
+   [service](service.md#the-account-commands-run-as):
 
    ```sh
    nerve-node sudo on
@@ -38,15 +41,17 @@ for it.
 
 ## What the node does
 
-- It checks the password with `sudo -S -k -v`. A wrong password is refused and
-  the switch stays as it was.
+- It checks the password with `sudo -S -k -v`, run as the account the
+  commands run as, so sudo checks that account's password and its sudoers
+  entries. A wrong password is refused and the switch stays as it was.
 - It keeps the password in memory only. Turning sudo off drops it. A node that
   restarts has sudo off.
 - It never sends the password to a center. It replaces any copy in a frame or
   in the audit log with `[redacted]`.
 - A sudo command must be one simple command. One with `; & | $ ` ( ) < >` or a
   line break is refused.
-- It runs the command as `sudo -S -k -p <prompt> …` without the Landlock
+- It starts the command as that account, as `sudo -S -k -p <prompt> …`, so
+  sudo raises it from that account. It runs without the Landlock
   sandbox, which would stop sudo from gaining privileges. It writes the
   password only after sudo prints the prompt.
 - Every other command runs with `no_new_privs`. A `sudo` later in a command

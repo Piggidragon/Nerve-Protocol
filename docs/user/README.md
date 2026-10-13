@@ -18,7 +18,8 @@ open port.
 
 1. [Install](install.md) the programs.
 2. [Run the center](center.md) and [connect a harness](harness.md).
-3. [Pair a machine](pairing.md).
+3. [Pair a machine](pairing.md), or on Linux [install the node as a
+   service](service.md) and run `sudo nerve-node setup`.
 4. Allow something with a [mode](modes.md) or a [rule](rules.md). Until you do,
    every call is refused.
 
@@ -30,6 +31,7 @@ open port.
 | [center.md](center.md) | Start the center, its flags and ports |
 | [harness.md](harness.md) | Connect an MCP harness, the tools it gets |
 | [pairing.md](pairing.md) | Pair a machine, start the node, unpair |
+| [service.md](service.md) | Install the node as a service, set it up, update and uninstall it |
 | [modes.md](modes.md) | `allowlist`, `folder` and `user` mode, folders and their rights |
 | [rules.md](rules.md) | Allow and deny rules, wildcards, switching capabilities off |
 | [protected-paths.md](protected-paths.md) | The files that stay closed in every mode |

@@ -62,13 +62,19 @@ impl Shared {
         // The store is always locked before the password, never after.
         let store = lock(&self.store);
         let held = lock(&self.sudo).is_some();
-        held && store.config().machine.sudo == Sudo::On
+        held && store.config().machine.sudo == Sudo::On && self.same_account(&store)
+    }
+
+    /// Whether the account the commands run as is still the one the held
+    /// password was checked for: a password is one account's.
+    fn same_account(&self, store: &nerve_policy::SettingsStore) -> bool {
+        *lock(&self.sudo_for) == store.config().machine.user
     }
 
     /// The password for one allowed sudo command, while the switch is on.
     pub fn sudo_password(&self) -> Option<String> {
         let store = lock(&self.store);
-        if store.config().machine.sudo != Sudo::On {
+        if store.config().machine.sudo != Sudo::On || !self.same_account(&store) {
             return None;
         }
         lock(&self.sudo).as_ref().map(|s| s.expose().to_string())
@@ -120,7 +126,13 @@ impl Shared {
                 "the sudo password is empty or has a line break".into(),
             ));
         }
-        crate::exec::sudo_check(&self.sudo_path(), password.expose())
+        // The password is the one of the account the commands run as: sudo
+        // asks for that account's, since its commands start as it.
+        let checked_for = self.config().machine.user;
+        let account = self
+            .command_account(&self.config())
+            .map_err(SetError::Invalid)?;
+        crate::exec::sudo_check(&self.sudo_path(), password.expose(), account.as_ref())
             .await
             .map_err(SetError::Invalid)?;
         // Password and config change together, so `settle_sudo` never sees
@@ -129,6 +141,7 @@ impl Shared {
         let r = {
             let mut store = lock(&self.store);
             *lock(&self.sudo) = Some(password);
+            *lock(&self.sudo_for) = checked_for;
             let r = store.set_sudo(by, Sudo::On);
             if r.is_err() {
                 *lock(&self.sudo) = None;

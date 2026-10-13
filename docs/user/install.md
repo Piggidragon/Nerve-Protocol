@@ -31,6 +31,19 @@ nerve-node --version
 Use the `aarch64` files on an ARM machine. `~/.local/bin` must be on your
 `PATH`.
 
+To run the node as a service that starts with the machine, download it and
+let it install itself instead ([service](service.md)):
+
+```sh
+curl -LO https://github.com/Piggidragon/Nerve-Protocol/releases/latest/download/nerve-node-x86_64-linux
+chmod +x nerve-node-x86_64-linux
+sudo ./nerve-node-x86_64-linux install
+sudo nerve-node setup
+```
+
+`install` puts the program at `/usr/local/bin/nerve-node`, whatever the
+downloaded file is called.
+
 ## Install on Windows
 
 In PowerShell, compare each hash with its line in `SHA256SUMS`:
@@ -53,6 +66,10 @@ See [building](../dev/building.md).
 | Node: `node.toml`, one key per center | `~/.config/nerve` | `%USERPROFILE%\.config\nerve` | `--config-dir`, `NERVE_CONFIG_DIR` |
 | Node: audit log, [log](logs.md), control socket, config key | `~/.local/state/nerve` | `%USERPROFILE%\.local\state\nerve` | `--state-dir`, `NERVE_STATE_DIR` |
 | Center: identity, paired machines, statistics, [log](logs.md) | `$XDG_STATE_HOME/nerve-center`, else `~/.local/state/nerve-center` | `%LOCALAPPDATA%\nerve-center` | `--state-dir`, `NERVE_STATE_DIR` |
+
+A node [installed as a service](service.md) keeps its files in `/etc/nerve`
+and `/var/lib/nerve/state`. Without `--config-dir` and `--state-dir` the
+commands use those folders.
 
 Both programs read `NERVE_STATE_DIR`. On a machine that runs both, set it per
 program or use the flags. Do not set it for the whole machine.

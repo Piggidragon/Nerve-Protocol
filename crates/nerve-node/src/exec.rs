@@ -47,7 +47,9 @@ pub struct RunCall {
 }
 
 impl RunCall {
-    /// `cwd` defaults to the owner's home.
+    /// `cwd` defaults to `home`, the home of the account the command runs
+    /// as. On the installed node the folder is looked at as that account
+    /// (crate::account::FsAs).
     pub fn parse(args: &Map<String, Value>, home: &Path) -> Result<RunCall, RpcError> {
         let a: RunArgs = params(args)?;
         if a.command.trim().is_empty() {
@@ -316,6 +318,11 @@ pub struct RunOptions {
     /// prompt. Every other command runs with no_new_privs (Linux), so a
     /// `sudo` the rules did not see (`ls; sudo x`) cannot gain privileges.
     pub sudo: Option<SudoInput>,
+    /// The account the command runs as (the installed node, every mode,
+    /// crate::account); `None` runs it as the node's own user.
+    pub account: Option<crate::service::Account>,
+    /// The node's own folders, which the account must not reach.
+    pub own: Vec<PathBuf>,
 }
 
 /// What a sudo command needs: the password and the prompt sudo was told to
@@ -363,16 +370,44 @@ pub fn sudo_line(sudo_path: &str, args: &str, prompt: &str) -> String {
 }
 
 /// Checks `password` with `sudo -S -k -v`, which runs nothing and caches
-/// nothing; its output is discarded.
-pub async fn sudo_check(sudo_path: &str, password: &str) -> Result<(), String> {
-    let mut child = Command::new(sudo_path)
-        .args(["-S", "-k", "-v", "-p", ""])
+/// nothing; its output is discarded. It runs as `account`, the account the
+/// commands run as (crate::account), so sudo checks that account's
+/// password; `None` runs it as the node's own user.
+pub async fn sudo_check(
+    sudo_path: &str,
+    password: &str,
+    account: Option<&crate::service::Account>,
+) -> Result<(), String> {
+    let mut cmd = Command::new(sudo_path);
+    cmd.args(["-S", "-k", "-v", "-p", ""])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    #[cfg(target_os = "linux")]
+    {
+        let switch = account
+            .map(|a| crate::account::Switch::new(a, None, &[]))
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        // SAFETY: plain system calls on memory moved into the closure.
+        unsafe {
+            cmd.pre_exec(move || match &switch {
+                Some(s) => s.apply(),
+                None if nerve_transport::net::euid() != 0 => crate::account::drop_caps(),
+                None => Ok(()),
+            });
+        }
+    }
+    if let Some(a) = account {
+        cmd.env("HOME", &a.home)
+            .env("USER", &a.name)
+            .env("LOGNAME", &a.name);
+    }
+    let as_whom = account.map_or(String::new(), |a| format!(" as {}", a.name));
+    let mut child = cmd
         .spawn()
-        .map_err(|e| format!("cannot run {sudo_path}: {e}"))?;
+        .map_err(|e| format!("cannot run {sudo_path}{as_whom}: {e}"))?;
     let mut stdin = child.stdin.take().expect("piped");
     // sudo may exit before reading (no such user in sudoers); the exit
     // status says what matters.
@@ -380,7 +415,9 @@ pub async fn sudo_check(sudo_path: &str, password: &str) -> Result<(), String> {
     drop(stdin);
     match tokio::time::timeout(Duration::from_secs(30), child.wait()).await {
         Ok(Ok(s)) if s.success() => Ok(()),
-        Ok(Ok(_)) => Err("the sudo password is wrong (sudo -v refused it)".into()),
+        Ok(Ok(_)) => Err(format!(
+            "the sudo password is wrong (sudo -v{as_whom} refused it)"
+        )),
         Ok(Err(e)) => Err(format!("waiting for sudo: {e}")),
         Err(_) => Err("sudo -v did not answer within 30 s".into()),
     }
@@ -394,6 +431,10 @@ pub async fn sudo_check(sudo_path: &str, password: &str) -> Result<(), String> {
 #[derive(Clone)]
 pub struct Ender {
     pid: u32,
+    /// The account the command runs as, when it is not the node's: the
+    /// node signals it as that account.
+    #[cfg(unix)]
+    uid: Option<u32>,
     #[cfg(windows)]
     ending: crate::job::Ending<crate::win::Job, Option<std::sync::Arc<crate::tree::Watch>>>,
 }
@@ -421,7 +462,9 @@ impl Ender {
                 }
             });
         }
-        #[cfg(not(windows))]
+        #[cfg(unix)]
+        kill_group(self.pid, sig, self.uid);
+        #[cfg(not(any(unix, windows)))]
         kill_group(self.pid, sig);
     }
 }
@@ -431,7 +474,12 @@ impl Ender {
 struct Group(Option<Ender>);
 
 impl Group {
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    fn start(pid: Option<u32>, uid: Option<u32>) -> Group {
+        Group(pid.map(|pid| Ender { pid, uid }))
+    }
+
+    #[cfg(not(any(unix, windows)))]
     fn start(pid: Option<u32>) -> Group {
         Group(pid.map(|pid| Ender { pid }))
     }
@@ -481,14 +529,22 @@ impl Sig {
     }
 }
 
-/// Signals the process group led by `pid`.
+/// Signals the process group led by `pid`, as `uid` when the command runs
+/// as another account.
 #[cfg(unix)]
-fn kill_group(pid: u32, sig: Sig) {
+fn kill_group(pid: u32, sig: Sig, uid: Option<u32>) {
     let s = match sig {
         Sig::Term => libc::SIGTERM,
         Sig::Kill => libc::SIGKILL,
         Sig::Int => libc::SIGINT,
     };
+    #[cfg(target_os = "linux")]
+    if let Some(uid) = uid {
+        crate::account::kill_as(uid, pid, s);
+        return;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = uid;
     // SAFETY: kill with a negative pid signals that process group only.
     unsafe {
         libc::kill(-(pid as libc::pid_t), s);
@@ -639,20 +695,54 @@ pub async fn run(
             c
         }
     };
+    // A command of another account takes its ids, drops the service's
+    // capabilities and enters its folder in the child (crate::account);
+    // any other drops the capabilities.
     #[cfg(target_os = "linux")]
-    if opts.sudo.is_none() {
-        // SAFETY: prctl is async-signal-safe and touches only this process.
+    {
+        let switch = match &opts.account {
+            Some(a) => Some(
+                crate::account::Switch::new(a, Some(&call.cwd), &opts.own)
+                    .map_err(|e| RpcError::invalid_args(e.to_string()))?,
+            ),
+            None => None,
+        };
+        // Root as the account (the owner chose it, warned) gets root's
+        // rights back at exec, which no_new_privs would keep from it.
+        let nnp = opts.sudo.is_none() && opts.account.as_ref().is_none_or(|a| a.uid != 0);
+        // SAFETY: plain system calls on memory moved into the closure.
         unsafe {
-            cmd.pre_exec(|| {
-                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            cmd.pre_exec(move || {
+                match &switch {
+                    Some(s) => s.apply()?,
+                    None if nerve_transport::net::euid() != 0 => crate::account::drop_caps()?,
+                    None => {}
+                }
+                if nnp && libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
             });
         }
     }
-    cmd.current_dir(&call.cwd)
-        .stdout(Stdio::piped())
+    #[cfg(not(target_os = "linux"))]
+    if let Some(a) = &opts.account {
+        return Err(RpcError::new(
+            ErrorCode::Unavailable,
+            format!("cannot run commands as {}: Linux only", a.name),
+        ));
+    }
+    match &opts.account {
+        Some(a) => {
+            cmd.env("HOME", &a.home)
+                .env("USER", &a.name)
+                .env("LOGNAME", &a.name);
+        }
+        None => {
+            cmd.current_dir(&call.cwd);
+        }
+    }
+    cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     #[cfg(unix)]
@@ -666,9 +756,24 @@ pub async fn run(
     if job.is_some() {
         cmd.creation_flags(crate::job::SUSPENDED);
     }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| RpcError::new(ErrorCode::Unavailable, format!("cannot start: {e}")))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        RpcError::new(
+            ErrorCode::Unavailable,
+            match &opts.account {
+                #[cfg(target_os = "linux")]
+                Some(a) if e.raw_os_error() == Some(crate::account::IN_REACH) => format!(
+                    "cannot start as {}: that account can open the node's own folders, where its keys are",
+                    a.name
+                ),
+                Some(a) => format!(
+                    "cannot start as {} in {}: {e}",
+                    a.name,
+                    to_wire(&call.cwd)
+                ),
+                None => format!("cannot start: {e}"),
+            },
+        )
+    })?;
     #[cfg(windows)]
     let job = match job {
         Some(job) => Some(
@@ -679,7 +784,9 @@ pub async fn run(
     };
     #[cfg(windows)]
     let group = Group::start(child.id(), job);
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    let group = Group::start(child.id(), opts.account.as_ref().map(|a| a.uid));
+    #[cfg(not(any(unix, windows)))]
     let group = Group::start(child.id());
     let mut sudo_stdin = None;
     if let Some(spec) = shim {
@@ -765,6 +872,8 @@ mod tests {
             exe: PathBuf::from("/nonexistent"),
             output_cap: cap,
             sudo: None,
+            account: None,
+            own: Vec::new(),
         }
     }
 
@@ -818,28 +927,82 @@ mod tests {
         assert_eq!(r["stderr"], "", "the prompt is left out: {r}");
     }
 
+    /// Writes an executable script at `path` from another process. Written
+    /// here, its descriptor would leak into a command that another test
+    /// thread forks meanwhile, and running the script would fail with "Text
+    /// file busy" until that command execs.
+    #[cfg(target_os = "linux")]
+    fn write_script(path: &Path, text: &str) {
+        use std::io::Write;
+        let mut c = std::process::Command::new("sh")
+            .args(["-c", "cat > \"$0\" && chmod 755 \"$0\""])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        c.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
+        assert!(c.wait().unwrap().success(), "cannot write {path:?}");
+    }
+
     /// A fake sudo at `dir/sudo`: with `asks` it prints its `-p` prompt to
     /// stderr and reads the password like `sudo -S`, else it asks for none
     /// (NOPASSWD, root). Either way it runs the command as its child.
     #[cfg(target_os = "linux")]
     fn fake_sudo(dir: &Path, asks: bool) -> String {
-        use std::os::unix::fs::PermissionsExt;
         let ask = if asks {
             "printf %s \"$p\" >&2\nIFS= read -r pw\n[ \"$pw\" = right-pw ] || exit 1\n"
         } else {
             ""
         };
         let sudo = dir.join("sudo");
-        std::fs::write(
+        write_script(
             &sudo,
-            format!(
+            &format!(
                 "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in -S|-k) shift ;; \
                  -p) p=\"$2\"; shift 2 ;; *) break ;; esac; done\n{ask}\"$@\"\n"
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         sudo.display().to_string()
+    }
+
+    /// `sudo on` checks the password of the account the commands run as:
+    /// sudo -v runs as that account, so sudo asks for its password.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_sudo_check_runs_as_the_chosen_account() {
+        let d = tempfile::tempdir().unwrap();
+        let seen = d.path().join("seen");
+        let sudo = d.path().join("sudo");
+        // Like sudo -v: takes the password of the user it runs as.
+        write_script(
+            &sudo,
+            &format!(
+                "#!/bin/sh\nIFS= read -r pw\necho \"$USER $(id -u)\" > '{}'\n[ \"$pw\" = \"pw-of-$USER\" ]\n",
+                seen.display()
+            ),
+        );
+        let sudo = sudo.display().to_string();
+        // SAFETY: plain getters.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let chosen = crate::service::Account {
+            name: "chosen".into(),
+            uid,
+            gid,
+            comment: String::new(),
+            home: d.path().to_path_buf(),
+            groups: vec![gid],
+        };
+        sudo_check(&sudo, "pw-of-chosen", Some(&chosen))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&seen).unwrap(),
+            format!("chosen {uid}\n")
+        );
+        let e = sudo_check(&sudo, "pw-of-nerve", Some(&chosen))
+            .await
+            .unwrap_err();
+        assert!(e.contains("sudo -v as chosen refused it"), "{e}");
     }
 
     /// A sudo that asks for no password: the command it starts finds no
@@ -1175,6 +1338,8 @@ mod windows_tests {
             exe: PathBuf::from("nerve-node.exe"),
             output_cap: 64 * 1024,
             sudo: None,
+            account: None,
+            own: Vec::new(),
         }
     }
 

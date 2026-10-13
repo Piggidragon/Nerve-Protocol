@@ -1,5 +1,6 @@
-//! The local audit log: one JSON line per decision, per settings change and
-//! per refused config file, in the node's state directory. It is the owner's record and client-only: no
+//! The local audit log: one JSON line per decision, per settings change, per
+//! refused config file and per install, setup, update or uninstall, in the
+//! node's state directory. It is the owner's record and client-only: no
 //! center can read or change the file (centers see their own decisions as
 //! `audit/decision` events at most).
 
@@ -244,6 +245,22 @@ impl AuditLog {
         }))
     }
 
+    /// What the owner did to the node itself: `install`, `setup`, `update`
+    /// or `uninstall`, with the steps that were done, in order, and the
+    /// error that stopped the rest, if one did.
+    pub fn node(&self, event: &str, steps: &[String], error: Option<&str>) -> std::io::Result<()> {
+        let mut v = json!({
+            "ts": nerve_proto::msg::now_ms(),
+            "kind": "node",
+            "event": event,
+            "steps": steps,
+        });
+        if let Some(e) = error {
+            v["error"] = e.into();
+        }
+        self.append(&v)
+    }
+
     /// Every line, oldest first, the older file's included; lines that do
     /// not parse are skipped.
     pub fn read(&self) -> std::io::Result<Vec<Value>> {
@@ -370,8 +387,14 @@ mod tests {
             &diff(&json!({"mode": "folder"}), &json!({"mode": "user"})),
         )
         .unwrap();
+        log.node("update", &["replaced nerve-node".into()], Some("no start"))
+            .unwrap();
         let lines = log.read().unwrap();
-        assert_eq!(lines.len(), 2);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[2]["kind"], "node");
+        assert_eq!(lines[2]["event"], "update");
+        assert_eq!(lines[2]["steps"][0], "replaced nerve-node");
+        assert_eq!(lines[2]["error"], "no start");
         assert_eq!(lines[0]["center"], "home");
         assert_eq!(lines[1]["by"], "center home");
         assert_eq!(lines[1]["changes"][0]["key"], "mode");

@@ -73,6 +73,10 @@ The node confines commands with Landlock:
 - Landlock cannot run a file it may not read. So an `x` folder also lets a
   command read files there by name. It still cannot list the folder.
 - The node's own folders are in none of these sets.
+- On a node installed as a service the command runs as the account
+  commands run as ([service](service.md#the-account-commands-run-as)), and
+  what that account may not open stays closed as well. Landlock only takes
+  away; it gives the account nothing it lacks.
 
 Check that your kernel supports it, with the node running:
 
@@ -90,6 +94,15 @@ every command.
 [protected paths](protected-paths.md). Commands run as your user, without
 confinement. A command can do what you can do, including changing the node's
 own state. Use it only for a center you would trust with a shell.
+
+On a node [installed as a service](service.md#the-account-commands-run-as)
+the node runs as its own user, `nerve`, and commands in every mode run as
+the account you chose at `install` or `setup` instead. In `user` mode they
+can do what that account can do, and cannot read the node's keys or change
+its state, unless that account can become root (root itself, or a member
+of a group such as `docker`; see
+[the account commands run as](service.md#the-account-commands-run-as)). In `folder` mode they are the same account, held to their
+folders.
 
 ## Which mode
 

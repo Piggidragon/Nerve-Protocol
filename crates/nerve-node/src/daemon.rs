@@ -152,8 +152,13 @@ impl CenterState {
 }
 
 /// Everything the daemon's tasks share.
+/// How long a looked-up account is used before it is looked up again.
+const ACCOUNT_FRESH: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub(crate) struct Shared {
     pub paths: NodePaths,
+    /// Whether this is the installed service (crate::service::is_service_node).
+    pub service: bool,
     pub exe: Option<PathBuf>,
     pub home: PathBuf,
     /// Which protected list applies, and where its system folders are.
@@ -175,11 +180,53 @@ pub(crate) struct Shared {
     pub sudo: Mutex<Option<crate::sudo::Secret>>,
     /// Open sudo offers by center; each is opened at most once.
     pub sudo_offers: Mutex<HashMap<String, nerve_transport::sudo::Pending>>,
+    /// The account sudo's password was checked for (crate::sudo): the
+    /// switch holds only for that account.
+    pub sudo_for: Mutex<Option<String>>,
+    /// The last account looked up for `machine.user`, and when: every call
+    /// of a center needs it, and a lookup starts two programs.
+    pub account_cache: Mutex<Option<(String, std::time::Instant, Option<crate::service::Account>)>>,
 }
 
 impl Shared {
     pub fn config(&self) -> NodeConfig {
         lock(&self.store).config().clone()
+    }
+
+    /// The account a command and the sudo switch run as (crate::account);
+    /// `None` runs them as the node's own user.
+    pub fn command_account(
+        &self,
+        cfg: &NodeConfig,
+    ) -> Result<Option<crate::service::Account>, String> {
+        let cached = |name: &str| {
+            if let Some((n, at, a)) = lock(&self.account_cache).as_ref()
+                && n == name
+                && at.elapsed() < ACCOUNT_FRESH
+            {
+                return Ok(a.clone());
+            }
+            let a = crate::account::lookup(name)?;
+            *lock(&self.account_cache) =
+                Some((name.to_string(), std::time::Instant::now(), a.clone()));
+            Ok(a)
+        };
+        crate::account::for_commands(
+            cfg.machine.user.as_deref(),
+            nerve_transport::net::euid(),
+            self.service,
+            crate::account::can_switch(),
+            cached,
+        )
+    }
+
+    /// The `~` of the rules and the protected list: the home of the account
+    /// the commands run as, else the node's own.
+    pub fn rules_home(&self, cfg: &NodeConfig) -> PathBuf {
+        match self.command_account(cfg) {
+            Ok(Some(a)) => a.home,
+            _ => self.home.clone(),
+        }
     }
 
     pub fn bump(&self) {
@@ -361,8 +408,16 @@ impl Daemon {
         }
         let (changed, _) = watch::channel(0);
         let (stop, _) = watch::channel(false);
+        let service = crate::service::is_service_node(&paths);
+        #[cfg(unix)]
+        if service && nerve_transport::net::euid() != 0 && !crate::account::can_switch() {
+            tracing::warn!(
+                "this is the installed node, started without CAP_SETUID and CAP_SETGID: it runs no command; start it as the service: `sudo systemctl start nerve-node`"
+            );
+        }
         let shared = Arc::new(Shared {
             paths: paths.clone(),
+            service,
             exe: opts.exe,
             home: opts.home,
             platform: crate::paths::platform(),
@@ -376,6 +431,8 @@ impl Daemon {
             log: opts.log,
             sudo: Mutex::new(None),
             sudo_offers: Mutex::default(),
+            sudo_for: Mutex::default(),
+            account_cache: Mutex::default(),
         });
         // The password lives in memory only: a file that says on starts off.
         shared.settle_sudo();
@@ -541,6 +598,8 @@ async fn start_ctl(_shared: Arc<Shared>) -> Result<JoinHandle<()>, String> {
 }
 
 /// Methods that change something: refused from below a center's command.
+/// `owner.check` changes nothing itself: the CLI asks it before `install`,
+/// `setup`, `update` and `uninstall`, which change the node.
 #[cfg(unix)]
 const MUTATING: &[&str] = &[
     "config.write",
@@ -548,6 +607,7 @@ const MUTATING: &[&str] = &[
     "reload",
     "sudo.on",
     "sudo.off",
+    "owner.check",
 ];
 
 /// `sudo.on {password}`: the CLI on this machine turns the switch on. The
@@ -593,6 +653,7 @@ pub(crate) fn control(
     let str_of = |k: &str| params.get(k).and_then(Value::as_str).map(str::to_string);
     match method {
         "status" => Reply::Ok(shared.status()),
+        "owner.check" => Reply::Ok(json!({})),
         "sudo.status" => Reply::Ok(json!({"sudo": if shared.sudo_on() { "on" } else { "off" }})),
         "sudo.off" => match shared.sudo_switch_off(nerve_policy::Writer::Local) {
             Ok(v) => Reply::Ok(json!({"sudo": "off", "version": v})),
@@ -778,8 +839,13 @@ mod tests {
         assert!(matches!(r, nerve_transport::ctl::Reply::Err(e) if e.starts_with("refused")));
         let r = control(&s, "status", json!({}), Some(me));
         assert!(matches!(r, nerve_transport::ctl::Reply::Ok(_)));
+        // What install, setup, update and uninstall ask first.
+        let r = control(&s, "owner.check", json!({}), Some(me));
+        assert!(matches!(r, nerve_transport::ctl::Reply::Err(e) if e.starts_with("refused")));
         lock(&s.commands).clear();
         let r = control(&s, "config.write", write, Some(me));
+        assert!(matches!(r, nerve_transport::ctl::Reply::Ok(_)));
+        let r = control(&s, "owner.check", json!({}), Some(me));
         assert!(matches!(r, nerve_transport::ctl::Reply::Ok(_)));
         daemon.stop().await;
     }

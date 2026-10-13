@@ -21,6 +21,13 @@
 //! grant whose folder was moved or renamed comes off where the folder is
 //! now. A folder made again in place of a granted one has no grant, so each
 //! sync looks at every grant and puts a missing one on again.
+//!
+//! Commands move only what they read and write, and a granted folder only
+//! out of another one they read and write (`nerve_sandbox::acl`), so taking
+//! a grant off where a moved folder is now makes nothing readable that was
+//! not. Where they write, though, they can put something in place of a
+//! granted folder inside it, such as a junction to another folder; a grant
+//! goes on there only on a folder of its own ([`Folders::set`]).
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -127,6 +134,9 @@ pub struct Synced {
     /// grants are on is then not known, so no command may run in any
     /// container until it can.
     pub unknown: Option<String>,
+    /// Grants on a volume that is not on the machine now: nothing reaches
+    /// them while it is away, and the record keeps them until it is back.
+    pub away: Vec<Grant>,
     /// Containers that had grants and have none now.
     pub emptied: Vec<String>,
     /// How many grants were taken off.
@@ -167,13 +177,18 @@ pub trait Folders {
     /// Where the object `id` is now; `near` is a path it had.
     fn locate(&mut self, id: &str, near: &Path) -> io::Result<Found>;
     /// Puts `container`'s grant with `access` on `path` in place of any it
-    /// had, or takes it off (`None`); NotFound when nothing is there. The
-    /// id of the object it changed, when the volume names one.
+    /// had, or takes it off (`None`); NotFound when nothing is there. With
+    /// `own`, a grant goes on only an object of its own at `path` (not a
+    /// link or junction to elsewhere, not a file with other names, and with
+    /// a list that inherits); otherwise it is refused (InvalidInput) and
+    /// nothing changes. The id of the object it changed, when the volume
+    /// names one.
     fn set(
         &mut self,
         path: &Path,
         container: &str,
         access: Option<Access>,
+        own: bool,
     ) -> io::Result<Option<String>>;
 }
 
@@ -203,6 +218,16 @@ fn write_record(file: &Path, grants: &[Grant]) -> Result<(), String> {
             file.display()
         )
     })
+}
+
+/// Whether commands may put something at `path`: it lies inside a folder
+/// that a container may write, by a wanted or a recorded grant. What is
+/// there may then be a junction to another folder, or a file linked to one
+/// elsewhere, and a grant on it would reach that.
+fn open_to_commands(path: &Path, want: &[Grant], record: &[Grant]) -> bool {
+    want.iter()
+        .chain(record)
+        .any(|g| g.access.write && within(path, &g.path) && !within(&g.path, path))
 }
 
 /// One process changes grants at a time: commands of several centers, and
@@ -284,12 +309,23 @@ impl RecordLock {
 /// flags is replaced. Each wanted grant without a record is put on, and is
 /// recorded before it is, so no failure can leave a grant on that the record
 /// does not hold. A path that is gone gets no grant: it gets one at a later
-/// sync. A grant that could not be taken off, or whose object could not be
-/// found, stays recorded and is stale. A record that cannot be read stops
-/// the sync, since the grants in it could not be found again.
+/// sync. A path inside a folder commands may write gets one only on an
+/// object of its own ([`open_to_commands`]). A grant that could not be taken
+/// off, or whose object could not be found, stays recorded and is stale. A
+/// record that cannot be read stops the sync, since the grants in it could
+/// not be found again.
 pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
     let _one = SYNC.lock().unwrap_or_else(|p| p.into_inner());
     let out = Synced::default();
+    // Without a state folder nothing is recorded, and with nothing wanted
+    // there is nothing to do: no folder and no lock file are made for it
+    // (uninstall on a machine where the node never ran).
+    let dir = file.parent().unwrap_or(Path::new(""));
+    if want.is_empty()
+        && matches!(std::fs::metadata(dir), Err(e) if e.kind() == io::ErrorKind::NotFound)
+    {
+        return out;
+    }
     let _held = match RecordLock::take(file) {
         Ok(l) => l,
         Err(e) => return out.not_known(format!("{}: {e}", lock_file(file).display())),
@@ -331,7 +367,7 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
                     kept.push(Grant { id, ..old.clone() });
                 }
                 Some(_) => replaced.push(old.clone()),
-                None => match folders.set(&old.path, &old.container, None) {
+                None => match folders.set(&old.path, &old.container, None, false) {
                     Ok(_) => {
                         changed = true;
                         out.removed += 1;
@@ -358,8 +394,11 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
             Ok(Found::Gone) => changed = true,
             // Nothing reaches it while its volume is away; a later sync
             // looks again.
-            Ok(Found::Away) => kept.push(old.clone()),
-            Ok(Found::At(now)) => match folders.set(&now, &old.container, None) {
+            Ok(Found::Away) => {
+                out.away.push(old.clone());
+                kept.push(old.clone());
+            }
+            Ok(Found::At(now)) => match folders.set(&now, &old.container, None, false) {
                 Ok(_) => {
                     changed = true;
                     out.removed += 1;
@@ -420,9 +459,16 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
             Ok(()) => {
                 changed = true;
                 for w in todo {
-                    match folders.set(&w.path, &w.container, Some(w.access)) {
+                    let own = open_to_commands(&w.path, want, &record);
+                    match folders.set(&w.path, &w.container, Some(w.access), own) {
                         Ok(id) => kept.push(Grant { id, ..w.clone() }),
                         Err(e) if gone(&e) => {}
+                        // Refused before anything changed: what was there
+                        // stays.
+                        Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+                            out.errors.push(format!("{}: {e}", w.path.display()));
+                            keep_replaced(w, &mut out, &mut kept);
+                        }
                         Err(e) => {
                             out.errors.push(format!(
                                 "cannot grant {} to the commands: {e}",
@@ -521,10 +567,11 @@ impl Folders for Acls {
         path: &Path,
         container: &str,
         access: Option<Access>,
+        own: bool,
     ) -> io::Result<Option<String>> {
         use nerve_sandbox::{acl, appcontainer};
         let masks = access.map(|a| acl::masks(a.read, a.write, a.execute));
-        appcontainer::set(path, container, masks)?;
+        appcontainer::set(path, container, masks, own)?;
         Ok(appcontainer::file_id(path).ok().map(|i| i.to_string()))
     }
 }
@@ -574,6 +621,11 @@ mod tests {
         on: Vec<(String, String, Access)>,
         /// Paths whose access list cannot be changed.
         locked: Vec<PathBuf>,
+        /// Paths whose object is not one of its own there: a junction to
+        /// elsewhere, a file with other names.
+        foreign: Vec<PathBuf>,
+        /// The `own` of each grant put on, by path.
+        asked: Vec<(PathBuf, bool)>,
         /// The volume is not on the machine.
         away: bool,
         /// How many changes were made or tried.
@@ -669,8 +721,18 @@ mod tests {
             path: &Path,
             container: &str,
             access: Option<Access>,
+            own: bool,
         ) -> io::Result<Option<String>> {
             self.sets += 1;
+            if access.is_some() {
+                self.asked.push((path.into(), own));
+                if own && self.foreign.iter().any(|m| m == path) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "not an object of its own",
+                    ));
+                }
+            }
             if let (Some(file), Some(_)) = (&self.record, access) {
                 assert!(
                     recorded(file).iter().any(|g| g.path == path),
@@ -820,10 +882,14 @@ mod tests {
         assert_eq!(recorded(&file), std::slice::from_ref(&b));
 
         // A volume that is away: nothing reaches the grant, so it neither
-        // stops the commands nor leaves the record.
+        // stops the commands nor leaves the record, and it is named.
         f.away = true;
         let s = sync(&file, &[], &mut f);
         assert!(s.stale.is_empty() && s.errors.is_empty(), "{s:?}");
+        assert_eq!(
+            s.away.iter().map(plain).collect::<Vec<_>>(),
+            std::slice::from_ref(&b)
+        );
         assert_eq!(recorded(&file), std::slice::from_ref(&b));
         f.away = false;
         f.locked.clear();
@@ -860,6 +926,90 @@ mod tests {
         f.on.clear();
         sync(&file, &want, &mut f);
         assert_eq!(f.all(), on);
+    }
+
+    /// Inside a folder that commands may write, a command can put a
+    /// junction or a linked file in place of a granted folder: a grant goes
+    /// on there only on an object of its own, and one refused leaves what
+    /// was on as it was. Elsewhere, what the owner granted is taken as it is.
+    #[test]
+    fn inside_a_writable_folder_a_grant_goes_on_an_object_of_its_own() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("grants.json");
+        let mut f = Fake::default();
+        for p in ["/w", "/w/p", "/w/z", "/x", "/r", "/r/q"] {
+            f.make(p);
+        }
+        f.foreign = ["/w/p", "/x", "/r/q"].map(PathBuf::from).to_vec();
+        let p = grant("c1", "/w/p", "r");
+        let want = [
+            grant("c1", "/w", "rw"),
+            p.clone(),
+            // Inside another container's writable folder too.
+            grant("c2", "/w/z", "r"),
+            // The owner's own junction, where no command writes.
+            grant("c1", "/x", "r"),
+            grant("c2", "/r", "r"),
+            grant("c2", "/r/q", "rw"),
+        ];
+        let s = sync(&file, &want, &mut f);
+        assert_eq!(s.errors.len(), 1, "{s:?}");
+        assert!(s.errors[0].contains("/w/p"), "{s:?}");
+        assert!(s.stale.is_empty() && s.refusal("c1").is_none(), "{s:?}");
+        let mut asked = f.asked.clone();
+        asked.sort();
+        assert_eq!(
+            asked,
+            [
+                ("/r".into(), false),
+                ("/r/q".into(), false),
+                ("/w".into(), false),
+                ("/w/p".into(), true),
+                ("/w/z".into(), true),
+                ("/x".into(), false),
+            ]
+        );
+        assert!(f.on("/w/p").is_empty(), "{:?}", f.all());
+        assert!(!recorded(&file).contains(&p));
+        // Once a folder of its own is there, it gets its grant.
+        f.foreign.clear();
+        let s = sync(&file, &want, &mut f);
+        assert!(s.errors.is_empty(), "{s:?}");
+        assert_eq!(f.on("/w/p"), [("c1".to_string(), p.access)]);
+        // A refused change keeps the grant that is on, as stale.
+        f.foreign.push("/w/p".into());
+        let mut changed = want.to_vec();
+        changed[1] = grant("c1", "/w/p", "rw");
+        let s = sync(&file, &changed, &mut f);
+        assert_eq!(s.errors.len(), 1, "{s:?}");
+        assert_eq!(
+            s.stale.iter().map(plain).collect::<Vec<_>>(),
+            std::slice::from_ref(&p)
+        );
+        assert!(s.refusal("c1").is_some());
+        assert!(recorded(&file).contains(&p));
+        assert_eq!(f.on("/w/p"), [("c1".to_string(), p.access)]);
+    }
+
+    /// Without a state folder and with nothing wanted, a sync makes neither
+    /// the folder nor its lock file: uninstall on a machine where no node
+    /// ran leaves nothing behind. Something wanted makes them.
+    #[test]
+    fn a_sync_with_nothing_to_do_makes_no_state_folder() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("config"), d.path().join("state"));
+        let file = record_file(&paths);
+        let mut f = Fake::default();
+        let s = sync(&file, &[], &mut f);
+        assert!(s.errors.is_empty() && s.unknown.is_none(), "{s:?}");
+        assert!(!paths.state_dir.exists());
+        let s = remove_all(&paths, &[]);
+        assert!(s.errors.is_empty() && s.unknown.is_none(), "{s:?}");
+        assert!(!paths.state_dir.exists());
+        f.make("/w/a");
+        let a = grant("c1", "/w/a", "r");
+        sync(&file, std::slice::from_ref(&a), &mut f);
+        assert_eq!(recorded(&file), [a]);
     }
 
     /// Each grant is in the record before it goes on, and stays in it when
@@ -1039,7 +1189,7 @@ mod tests {
         let paths = NodePaths::new(d.path().join("config"), d.path().join("state"));
         let work = d.path().join("work");
         std::fs::create_dir_all(work.join("sub")).unwrap();
-        let before = icacls(&work.join("sub"));
+        let (before, root) = (icacls(&work.join("sub")), icacls(&work));
         let want = [Grant {
             container: container(&paths, "lab"),
             path: work.clone(),
@@ -1058,8 +1208,73 @@ mod tests {
         assert!(s.errors.is_empty(), "{s:?}");
         assert_eq!(s.removed, 1);
         assert!(!icacls(&work).contains("S-1-15-2-"), "{}", icacls(&work));
+        assert_eq!(icacls(&work), root, "the inherited entries stay");
         assert_eq!(icacls(&work.join("sub")), before);
         assert!(read_record(&record_file(&paths)).unwrap().is_empty());
+    }
+
+    /// On Windows: a granted folder inside a granted folder with `w` that a
+    /// command replaced by a junction to another folder gets no grant, and
+    /// the folder it leads to gets none either; a plain folder there again
+    /// gets it.
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_in_place_of_a_granted_folder_gets_no_grant() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("config"), d.path().join("state"));
+        let (work, outside) = (d.path().join("work"), d.path().join("outside"));
+        let inner = work.join("bin");
+        for p in [&inner, &outside] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        let lab = container(&paths, "lab");
+        let want = [
+            Grant {
+                container: lab.clone(),
+                path: work.clone(),
+                access: Access::parse("rw").unwrap(),
+                id: None,
+            },
+            Grant {
+                container: lab.clone(),
+                path: inner.clone(),
+                access: Access::ALL,
+                id: None,
+            },
+        ];
+        let s = windows_sync(&paths, &want);
+        assert!(s.errors.is_empty(), "{s:?}");
+        std::fs::remove_dir(&inner).unwrap();
+        let o = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&inner)
+            .arg(&outside)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{o:?}");
+        let s = windows_sync(&paths, &want);
+        assert_eq!(s.errors.len(), 1, "{s:?}");
+        assert!(s.errors[0].contains("junction"), "{s:?}");
+        assert!(
+            !icacls(&outside).contains("S-1-15-2-"),
+            "{}",
+            icacls(&outside)
+        );
+        std::fs::remove_dir(&inner).unwrap();
+        std::fs::create_dir(&inner).unwrap();
+        let s = windows_sync(&paths, &want);
+        assert!(s.errors.is_empty(), "{s:?}");
+        assert!(
+            nerve_sandbox::appcontainer::look(
+                &inner,
+                &lab,
+                nerve_sandbox::acl::masks(true, true, true)
+            )
+            .unwrap()
+            .1
+        );
+        let s = remove_all(&paths, &["lab".into()]);
+        assert!(s.errors.is_empty(), "{s:?}");
     }
 
     /// On Windows: a granted folder that was renamed takes its grant along,
@@ -1101,7 +1316,7 @@ mod tests {
         assert!(s.errors.is_empty() && s.stale.is_empty(), "{s:?}");
         assert!(icacls(&work).contains("S-1-15-2-"), "{}", icacls(&work));
         // The same folder, with its grant taken off by hand: it comes back.
-        nerve_sandbox::appcontainer::set(&work, &want[0].container, None).unwrap();
+        nerve_sandbox::appcontainer::set(&work, &want[0].container, None, false).unwrap();
         assert!(!icacls(&work).contains("S-1-15-2-"), "{}", icacls(&work));
         windows_sync(&paths, &want);
         assert!(icacls(&work).contains("S-1-15-2-"), "{}", icacls(&work));

@@ -119,13 +119,29 @@ folders.
 - A granted folder you move or rename on the same drive takes its entry
   along, as Windows keeps its permissions. At its next sync (at start, on a
   change, before a command, and when the CLI changes the config) the node
-  finds it by its file ID and takes the entry off where it is now. A granted
-  folder you delete and make again gets its entry back at the next sync.
+  finds it by its file ID and takes the entry off where it is now, also on a
+  drive mounted in a folder. A granted folder you delete and make again gets
+  its entry back at the next sync. One on a drive that is not connected keeps
+  its entry until the drive is back; `uninstall` names those it leaves on.
 - A file or folder you move out of a granted folder on the same drive keeps
   the entry it inherited. `icacls <path> /reset` gives it the permissions of
   its new place.
 - The flags stay independent: `w` without `r` writes but neither reads nor
   lists, `x` runs programs and reads files by name but does not list.
+- Deleting and renaming need `r` and `w`, since Windows allows a move with
+  the same right as a delete: a command must not move what it cannot read
+  to a folder where it can. So in a folder with `w` but not `r`, a command
+  adds and changes files, but does not delete, rename or move any. A
+  granted folder or file itself is deleted, renamed or moved only through
+  the folder above it, with `r` and `w` there; on Linux too that needs a
+  right on the folder above.
+- A folder you grant inside another granted folder with `w` gets its entry
+  only while it is a folder of its own there: not a junction or link to
+  another place, not a file with a second name (a hard link), and with
+  permissions that inherit. A command may write there, so it could put a
+  junction in its place, and the entry would land on the folder it leads
+  to. The node names such a folder in its log and grants it once it is a
+  plain folder again.
 - The node's own folders and the [protected paths](protected-paths.md) get no
   entry, also inside a folder you grant. That folder is granted as its other
   entries instead, as on Linux.

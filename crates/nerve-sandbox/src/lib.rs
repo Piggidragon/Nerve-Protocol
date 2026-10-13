@@ -364,6 +364,15 @@ pub mod acl {
     //! program cannot run from a file it may not read, and a script is read
     //! by its interpreter). No flag gives a right on the access list or the
     //! owner, so a command cannot widen its own grants.
+    //!
+    //! Deleting and renaming need `r` as well as `w`. Windows grants a move
+    //! by the same right as a delete, and a moved object keeps its own
+    //! access list until a change on its new folder passes that folder's
+    //! entries down to it: so a command that could move what it may not
+    //! read could make it readable, where on Linux Landlock refuses a rename
+    //! that gains rights. And a granted folder or file itself has no
+    //! `DELETE` ([`entries`]): a command deletes, renames or moves it only
+    //! where the folder above it gives that, as on Linux.
 
     pub const READ_DATA: u32 = 0x1; // FILE_LIST_DIRECTORY on a folder
     pub const WRITE_DATA: u32 = 0x2; // FILE_ADD_FILE
@@ -400,14 +409,12 @@ pub mod acl {
             m.file |= BASE | READ_DATA | READ_EA;
         }
         if write {
-            m.dir |= BASE
-                | WRITE_DATA
-                | APPEND_DATA
-                | WRITE_EA
-                | WRITE_ATTRIBUTES
-                | DELETE_CHILD
-                | DELETE;
-            m.file |= BASE | WRITE_DATA | APPEND_DATA | WRITE_EA | WRITE_ATTRIBUTES | DELETE;
+            m.dir |= BASE | WRITE_DATA | APPEND_DATA | WRITE_EA | WRITE_ATTRIBUTES;
+            m.file |= BASE | WRITE_DATA | APPEND_DATA | WRITE_EA | WRITE_ATTRIBUTES;
+            if read {
+                m.dir |= DELETE_CHILD | DELETE;
+                m.file |= DELETE;
+            }
         }
         if execute {
             m.dir |= BASE | EXECUTE;
@@ -415,6 +422,56 @@ pub mod acl {
             m.file |= BASE | EXECUTE | READ_DATA | READ_EA;
         }
         m
+    }
+
+    pub const OBJECT_INHERIT: u32 = 0x1;
+    pub const CONTAINER_INHERIT: u32 = 0x2;
+    pub const INHERIT_ONLY: u32 = 0x8;
+
+    /// The entries a grant of `m` is on a folder (`is_dir`) or a file, as
+    /// (ACE flags, mask): for the folder itself, for the folders below it,
+    /// and for the files below it. The granted folder or file itself has no
+    /// `DELETE`, so a command deletes, renames or moves it only through the
+    /// folder above it; what is below it has `DELETE` by the flags.
+    pub fn entries(is_dir: bool, m: Masks) -> Vec<(u32, u32)> {
+        let all = if !is_dir {
+            vec![(0, m.file & !DELETE)]
+        } else if m.dir & DELETE == 0 {
+            vec![
+                (CONTAINER_INHERIT, m.dir),
+                (OBJECT_INHERIT | INHERIT_ONLY, m.file),
+            ]
+        } else {
+            vec![
+                (0, m.dir & !DELETE),
+                (CONTAINER_INHERIT | INHERIT_ONLY, m.dir),
+                (OBJECT_INHERIT | INHERIT_ONLY, m.file),
+            ]
+        };
+        all.into_iter().filter(|(_, mask)| *mask != 0).collect()
+    }
+
+    /// Whether two Windows paths name the same place by the same names, as
+    /// NTFS compares them: in either case, by either separator, with or
+    /// without the `\\?\` prefix.
+    pub fn same_path(a: &str, b: &str) -> bool {
+        // Whether it is a share's (`\\host\…`), and its names.
+        fn parts(s: &str) -> (bool, Vec<String>) {
+            let (unc, rest) = match s.strip_prefix(r"\\?\") {
+                Some(r) => match r.strip_prefix(r"UNC\") {
+                    Some(u) => (true, u),
+                    None => (false, r),
+                },
+                None => (s.starts_with(r"\\"), s),
+            };
+            let names = rest
+                .split(['\\', '/'])
+                .filter(|c| !c.is_empty())
+                .map(str::to_lowercase)
+                .collect();
+            (unc, names)
+        }
+        parts(a) == parts(b)
     }
 
     /// Which file or folder carries a grant, whatever its name: the serial
@@ -526,8 +583,7 @@ pub mod appcontainer {
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        GetNamedSecurityInfoW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
-        SetNamedSecurityInfoW,
+        GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SetSecurityInfo,
     };
     use windows_sys::Win32::Security::Isolation::{
         CreateAppContainerProfile, DeleteAppContainerProfile,
@@ -545,10 +601,12 @@ pub mod appcontainer {
         WinCapabilityInternetClientSid, WinCapabilityPrivateNetworkClientServerSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        ExtendedFileIdType, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_128, FILE_ID_DESCRIPTOR,
-        FILE_ID_DESCRIPTOR_0, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
-        FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, GetFileInformationByHandleEx,
-        GetFinalPathNameByHandleW, GetLogicalDrives, OpenFileById, READ_CONTROL,
+        BY_HANDLE_FILE_INFORMATION, ExtendedFileIdType, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_128,
+        FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, FindFirstVolumeW,
+        FindNextVolumeW, FindVolumeClose, GetFileInformationByHandle, GetFileInformationByHandleEx,
+        GetFinalPathNameByHandleW, GetLogicalDrives, GetLongPathNameW, OpenFileById, READ_CONTROL,
+        WRITE_DAC,
     };
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
@@ -558,7 +616,14 @@ pub mod appcontainer {
         STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
     };
 
-    use super::acl::{FileId, Found, Masks, command_line};
+    use super::acl::{self, FileId, Found, Masks, command_line, entries};
+
+    // The flags of `acl::entries` are Windows' own.
+    const _: () = assert!(
+        acl::OBJECT_INHERIT == OBJECT_INHERIT_ACE
+            && acl::CONTAINER_INHERIT == CONTAINER_INHERIT_ACE
+            && acl::INHERIT_ONLY == INHERIT_ONLY_ACE
+    );
 
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
     const ACCESS_DENIED_ACE_TYPE: u8 = 1;
@@ -610,21 +675,6 @@ pub mod appcontainer {
             // SAFETY: the pointer came from LocalAlloc (or is null).
             unsafe { LocalFree(self.0) };
         }
-    }
-
-    /// The entries [`set`] puts on for `masks`, as (ACE flags, mask): on a
-    /// folder one for itself and the folders below, one for the files below;
-    /// on a file one.
-    fn entries(is_dir: bool, m: Masks) -> Vec<(u32, u32)> {
-        let all = if is_dir {
-            vec![
-                (CONTAINER_INHERIT_ACE, m.dir),
-                (OBJECT_INHERIT_ACE | INHERIT_ONLY_ACE, m.file),
-            ]
-        } else {
-            vec![(0, m.file)]
-        };
-        all.into_iter().filter(|(_, mask)| *mask != 0).collect()
     }
 
     /// The ACEs of `dacl`, each from its header.
@@ -752,13 +802,25 @@ pub mod appcontainer {
         Ok((id, have == want))
     }
 
-    /// The path of the object open as `f`.
+    /// The path of the object open as `f`: by its drive or the folder its
+    /// volume is mounted in, or else by the volume's own name
+    /// (`\\?\Volume{…}\…`), which reaches it too.
     fn final_path(f: &std::fs::File) -> io::Result<PathBuf> {
+        const VOLUME_NAME_GUID: u32 = 1;
+        named_path(f, 0).or_else(|_| named_path(f, VOLUME_NAME_GUID))
+    }
+
+    fn named_path(f: &std::fs::File, how: u32) -> io::Result<PathBuf> {
         let mut buf = vec![0u16; 512];
         loop {
             // SAFETY: an open handle and a buffer of the length given.
             let n = unsafe {
-                GetFinalPathNameByHandleW(f.as_raw_handle(), buf.as_mut_ptr(), buf.len() as u32, 0)
+                GetFinalPathNameByHandleW(
+                    f.as_raw_handle(),
+                    buf.as_mut_ptr(),
+                    buf.len() as u32,
+                    how,
+                )
             } as usize;
             if n == 0 {
                 return Err(io::Error::last_os_error());
@@ -772,18 +834,37 @@ pub mod appcontainer {
         }
     }
 
-    /// Where the object `id` is now ([`Found`]). Its volume is looked for at
-    /// the drive of `near`, a path it had, and then at every drive letter.
-    pub fn locate(id: &FileId, near: &Path) -> io::Result<Found> {
-        use std::path::Component;
-        let mut roots: Vec<PathBuf> = Vec::new();
-        let root: PathBuf = near
-            .components()
-            .take_while(|c| matches!(c, Component::Prefix(_) | Component::RootDir))
-            .collect();
-        if !root.as_os_str().is_empty() {
-            roots.push(root);
+    /// The root of every volume on the machine, by its own name
+    /// (`\\?\Volume{…}\`): also those without a drive letter.
+    fn volumes() -> Vec<PathBuf> {
+        let mut out = Vec::new();
+        let mut buf = [0u16; 260];
+        // SAFETY: a buffer of the length given.
+        let h = unsafe { FindFirstVolumeW(buf.as_mut_ptr(), buf.len() as u32) };
+        if h == INVALID_HANDLE_VALUE {
+            return out;
         }
+        loop {
+            let n = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            out.push(PathBuf::from(std::ffi::OsString::from_wide(&buf[..n])));
+            // SAFETY: the search handle from above and a buffer of the length
+            // given.
+            if unsafe { FindNextVolumeW(h, buf.as_mut_ptr(), buf.len() as u32) } == 0 {
+                break;
+            }
+        }
+        // SAFETY: the search handle from above, closed once.
+        unsafe { FindVolumeClose(h) };
+        out
+    }
+
+    /// Where the object `id` is now ([`Found`]). Its volume is looked for at
+    /// each folder of `near`, a path it had (one may be where a volume is
+    /// mounted), then among all the volumes on the machine, and at every
+    /// drive letter. Away only when none of them is its volume.
+    pub fn locate(id: &FileId, near: &Path) -> io::Result<Found> {
+        let mut roots: Vec<PathBuf> = near.ancestors().map(Path::to_path_buf).collect();
+        roots.extend(volumes());
         // SAFETY: no arguments.
         let drives = unsafe { GetLogicalDrives() };
         roots.extend(
@@ -834,21 +915,85 @@ pub mod appcontainer {
         Ok(Found::Away)
     }
 
+    /// `path` with each short (8.3) name in it written out, as the final
+    /// path of what it names has them; links and junctions stay as they
+    /// are. `path` itself when that fails.
+    fn long_path(path: &Path) -> PathBuf {
+        let p = wide(path.as_os_str());
+        let mut buf = vec![0u16; 512];
+        loop {
+            // SAFETY: a NUL-terminated path and a buffer of the length given.
+            let n = unsafe { GetLongPathNameW(p.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) }
+                as usize;
+            if n == 0 {
+                return path.to_path_buf();
+            }
+            if n < buf.len() {
+                buf.truncate(n);
+                return PathBuf::from(std::ffi::OsString::from_wide(&buf));
+            }
+            // Too short: `n` is the length it needs.
+            buf.resize(n, 0);
+        }
+    }
+
+    /// Why what `f` opened at `path` is not an object of its own there, if
+    /// it is not: a link or junction on the way leads elsewhere, or it is a
+    /// file with other names (hard links), which share its access list.
+    fn not_own(f: &std::fs::File, path: &Path) -> io::Result<Option<String>> {
+        let now = final_path(f)?;
+        if !acl::same_path(&now.to_string_lossy(), &long_path(path).to_string_lossy()) {
+            return Ok(Some(format!(
+                "it leads to {} (a link or a junction)",
+                now.display()
+            )));
+        }
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: an open handle and a buffer for the answer.
+        check(unsafe { GetFileInformationByHandle(f.as_raw_handle(), &mut info) })?;
+        if !f.metadata()?.is_dir() && info.nNumberOfLinks > 1 {
+            return Ok(Some(format!(
+                "the file has {} names (hard links), and a grant on it would reach them all",
+                info.nNumberOfLinks
+            )));
+        }
+        Ok(None)
+    }
+
     /// Puts the grants of `masks` for the container `name` on `path`, in
     /// place of any it had (`None` takes them off). They are inherited by
     /// everything below `path`, and Windows passes the change on to what is
     /// there now. Other entries of the access list stay as they are.
-    pub fn set(path: &Path, name: &str, masks: Option<Masks>) -> io::Result<()> {
+    ///
+    /// With `own`, grants go on only an object of its own at `path`: none
+    /// on a link or junction to elsewhere, on a file with other names, or on
+    /// one whose list does not inherit. A command may have put what is
+    /// there, where it may write; the grant would then reach what it
+    /// leads to. A refusal is InvalidInput, and changes nothing.
+    pub fn set(path: &Path, name: &str, masks: Option<Masks>, own: bool) -> io::Result<()> {
         let sid = Sid::derive(name)?;
-        let is_dir = std::fs::metadata(path)?.is_dir();
-        let wpath = wide(path.as_os_str());
+        // The change goes through this handle, on the object it opened.
+        let f = open(path, READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES)?;
+        let refuse = |why: String| {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("the node puts no grant on it, since {why}"),
+            ))
+        };
+        if own
+            && masks.is_some()
+            && let Some(why) = not_own(&f, path)?
+        {
+            return refuse(why);
+        }
+        let is_dir = f.metadata()?.is_dir();
         let mut dacl: *mut ACL = null_mut();
         let mut sd: PSECURITY_DESCRIPTOR = null_mut();
-        // SAFETY: a NUL-terminated path and out pointers to locals; the
-        // descriptor is freed with LocalFree, and `dacl` points into it.
+        // SAFETY: an open handle and out pointers to locals; the descriptor
+        // is freed with LocalFree, and `dacl` points into it.
         let e = unsafe {
-            GetNamedSecurityInfoW(
-                wpath.as_ptr(),
+            GetSecurityInfo(
+                f.as_raw_handle(),
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION,
                 null_mut(),
@@ -870,6 +1015,10 @@ pub mod appcontainer {
         let (mut control, mut revision) = (0u16, 0u32);
         // SAFETY: the descriptor is valid while `_sd` lives.
         check(unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut revision) })?;
+        let protected = control & SE_DACL_PROTECTED != 0;
+        if own && masks.is_some() && protected {
+            return refuse("its permissions do not inherit from its folder".into());
+        }
         let mut info = ACL_SIZE_INFORMATION::default();
         // SAFETY: a valid ACL and a buffer of the size given.
         check(unsafe {
@@ -880,10 +1029,11 @@ pub mod appcontainer {
                 AclSizeInformation,
             )
         })?;
+        let add = masks.map(|m| entries(is_dir, m)).unwrap_or_default();
         // SAFETY: a valid SID.
         let sid_len = unsafe { GetLengthSid(sid.0) };
         let ace_len = size_of::<ACCESS_ALLOWED_ACE>() as u32 - 4 + sid_len;
-        let size = info.AclBytesInUse + 2 * ace_len;
+        let size = info.AclBytesInUse + add.len() as u32 * ace_len;
         // u32s, since an ACL is aligned to them.
         let mut buf = vec![0u32; (size as usize).div_ceil(4)];
         let new = buf.as_mut_ptr() as *mut ACL;
@@ -914,20 +1064,20 @@ pub mod appcontainer {
             // new one has room for all of them.
             check(unsafe { AddAce(new, ACL_REVISION_DS, u32::MAX, ace, u32::from(h.AceSize)) })?;
         }
-        for (flags, mask) in masks.map(|m| entries(is_dir, m)).unwrap_or_default() {
-            // SAFETY: the list has room for two more of these ACEs.
+        for (flags, mask) in add {
+            // SAFETY: the list has room for each of these ACEs.
             check(unsafe { AddAccessAllowedAceEx(new, ACL_REVISION_DS, flags, mask, sid.0) })?;
         }
         // A list that did not inherit keeps not inheriting.
-        let keep = if control & SE_DACL_PROTECTED != 0 {
+        let keep = if protected {
             PROTECTED_DACL_SECURITY_INFORMATION
         } else {
             UNPROTECTED_DACL_SECURITY_INFORMATION
         };
-        // SAFETY: a NUL-terminated path and a valid ACL.
+        // SAFETY: an open handle and a valid ACL.
         let e = unsafe {
-            SetNamedSecurityInfoW(
-                wpath.as_ptr(),
+            SetSecurityInfo(
+                f.as_raw_handle(),
                 SE_FILE_OBJECT,
                 DACL_SECURITY_INFORMATION | keep,
                 null_mut(),
@@ -1395,8 +1545,71 @@ mod tests {
         assert_eq!((x.dir | x.file) & (WRITE_DATA | DELETE), 0);
         let all = masks(true, true, true);
         assert_eq!((all.dir | all.file) & (WRITE_DAC | WRITE_OWNER), 0);
-        assert_eq!(all.dir, r.dir | w.dir | x.dir);
-        assert_eq!(all.file, r.file | w.file | x.file);
+        assert_eq!(
+            all.dir,
+            r.dir | w.dir | x.dir | masks(true, true, false).dir
+        );
+        assert_eq!(
+            all.file,
+            r.file | w.file | x.file | masks(true, true, false).file
+        );
+        // A move is a delete to Windows: only what is read is moved, so no
+        // move makes what a command may not read readable at its new place.
+        for (r, w, x) in [(false, true, false), (false, true, true)] {
+            let m = masks(r, w, x);
+            assert_eq!((m.dir | m.file) & (DELETE | DELETE_CHILD), 0, "{r} {w} {x}");
+        }
+        let rw = masks(true, true, false);
+        assert_eq!(rw.dir & (DELETE | DELETE_CHILD), DELETE | DELETE_CHILD);
+        assert_eq!(rw.file & DELETE, DELETE);
+    }
+
+    /// A granted folder or file itself is never deleted, renamed or moved
+    /// by a command: its own entry has no `DELETE`, while what is below it
+    /// keeps the rights of the flags.
+    #[test]
+    fn a_granted_folder_itself_has_no_delete() {
+        use acl::*;
+        let rw = masks(true, true, false);
+        let dir = entries(true, rw);
+        let on_itself: u32 = dir
+            .iter()
+            .filter(|(f, _)| f & INHERIT_ONLY == 0)
+            .map(|(_, m)| m)
+            .fold(0, |a, m| a | m);
+        assert_eq!(on_itself, rw.dir & !DELETE, "{dir:?}");
+        assert!(
+            dir.contains(&(CONTAINER_INHERIT | INHERIT_ONLY, rw.dir)),
+            "{dir:?}"
+        );
+        assert!(
+            dir.contains(&(OBJECT_INHERIT | INHERIT_ONLY, rw.file)),
+            "{dir:?}"
+        );
+        assert_eq!(entries(false, rw), [(0, rw.file & !DELETE)]);
+        // Without DELETE one entry serves the folder and those below.
+        let r = masks(true, false, false);
+        assert_eq!(
+            entries(true, r),
+            [
+                (CONTAINER_INHERIT, r.dir),
+                (OBJECT_INHERIT | INHERIT_ONLY, r.file)
+            ]
+        );
+        assert!(entries(true, Masks::default()).is_empty());
+    }
+
+    /// Paths compare as NTFS names them: in either case, by either
+    /// separator, with or without `\\?\`; a share is not a drive path.
+    #[test]
+    fn windows_paths_compare_by_their_names() {
+        use acl::same_path;
+        assert!(same_path(r"\\?\C:\Work\Proj", r"c:\work\proj\"));
+        assert!(same_path(r"C:/work/proj", r"C:\work\proj"));
+        assert!(same_path(r"\\?\UNC\host\share\a", r"\\host\share\a"));
+        assert!(!same_path(r"C:\work\proj", r"C:\work\proj2"));
+        assert!(!same_path(r"C:\work\proj", r"D:\work\proj"));
+        assert!(!same_path(r"\\host\share", r"host\share"));
     }
 
     /// A file ID reads back as it was written, and nothing else reads as
@@ -1528,7 +1741,7 @@ mod tests {
         std::fs::write(granted.join("sub").join("in.txt"), "inside").unwrap();
         std::fs::write(other.join("secret.txt"), "secret").unwrap();
         let name = format!("nerve.test.{}", std::process::id());
-        appcontainer::set(&granted, &name, Some(acl::masks(true, true, true))).unwrap();
+        appcontainer::set(&granted, &name, Some(acl::masks(true, true, true)), false).unwrap();
         let d = |p: &std::path::Path| p.display().to_string();
         let run = |command: String| in_container(&name, &granted, &command);
 
@@ -1548,7 +1761,7 @@ mod tests {
         assert_ne!(run(format!(r#"echo x> "{}\new.txt""#, d(&other))), 0);
         assert!(!other.join("new.txt").exists());
 
-        appcontainer::set(&granted, &name, None).unwrap();
+        appcontainer::set(&granted, &name, None, false).unwrap();
         assert_ne!(run(r"type sub\in.txt > copy2.txt".into()), 0);
         assert!(!granted.join("copy2.txt").exists());
         appcontainer::remove_profile(&name).unwrap();
@@ -1572,7 +1785,7 @@ mod tests {
         let other = acl::masks(true, false, false);
         for p in [&a, &file] {
             assert!(!appcontainer::look(p, &name, m).unwrap().1);
-            appcontainer::set(p, &name, Some(m)).unwrap();
+            appcontainer::set(p, &name, Some(m), false).unwrap();
             assert!(appcontainer::look(p, &name, m).unwrap().1, "{p:?}");
             assert!(!appcontainer::look(p, &name, other).unwrap().1, "{p:?}");
         }
@@ -1588,7 +1801,7 @@ mod tests {
             panic!("not found")
         };
         assert_eq!(appcontainer::file_id(&now).unwrap(), id);
-        appcontainer::set(&now, &name, None).unwrap();
+        appcontainer::set(&now, &name, None, false).unwrap();
         assert!(!appcontainer::look(&b, &name, m).unwrap().1);
         std::fs::remove_dir(&b).unwrap();
         assert_eq!(appcontainer::locate(&id, &a).unwrap(), acl::Found::Gone);
@@ -1597,7 +1810,7 @@ mod tests {
             ..id
         };
         assert_eq!(appcontainer::locate(&away, &a).unwrap(), acl::Found::Away);
-        appcontainer::set(&file, &name, None).unwrap();
+        appcontainer::set(&file, &name, None, false).unwrap();
     }
 
     /// The flags are independent in the container too: a folder with `w`
@@ -1627,7 +1840,7 @@ mod tests {
         .unwrap();
         let name = format!("nerve.test.flags.{}", std::process::id());
         let grant = |p: &std::path::Path, r, w, x| {
-            appcontainer::set(p, &name, Some(acl::masks(r, w, x))).unwrap()
+            appcontainer::set(p, &name, Some(acl::masks(r, w, x)), false).unwrap()
         };
         grant(&work, true, true, true);
         grant(&wo, false, true, false);
@@ -1679,9 +1892,215 @@ mod tests {
         assert!(!xo.join("no.txt").exists());
 
         for d in [&work, &wo, &xo] {
-            appcontainer::set(d, &name, None).unwrap();
+            appcontainer::set(d, &name, None, false).unwrap();
         }
         appcontainer::remove_profile(&name).unwrap();
+    }
+
+    /// A command deletes, renames and moves inside a folder it reads and
+    /// writes, but neither moves a granted folder itself nor anything out of
+    /// a folder it only writes: a folder with `w` moved into one with `rw`
+    /// would be read there.
+    #[cfg(windows)]
+    #[test]
+    fn an_appcontainer_moves_only_what_it_reads_and_writes() {
+        let base = tempfile::tempdir().unwrap();
+        let (work, outbox, empty) = (
+            base.path().join("work"),
+            base.path().join("outbox"),
+            base.path().join("empty"),
+        );
+        for d in [&work, &outbox.join("sub"), &empty] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(outbox.join("secret.txt"), "secret").unwrap();
+        let name = format!("nerve.test.move.{}", std::process::id());
+        let grant = |p: &std::path::Path, r, w, x| {
+            appcontainer::set(p, &name, Some(acl::masks(r, w, x)), false).unwrap()
+        };
+        grant(&work, true, true, true);
+        grant(&empty, true, true, false);
+        grant(&outbox, false, true, false);
+        std::fs::write(work.join("a.txt"), "a").unwrap();
+        let (w, o, e) = (work.display(), outbox.display(), empty.display());
+        // .NET moves and deletes by name, where cmd would list the folder
+        // first.
+        let ps = |op: String| {
+            let (code, log) = run_in_container(
+                &name,
+                &work,
+                "powershell.exe",
+                &[
+                    "-NoProfile",
+                    "-Command",
+                    &format!("{POWERSHELL_START}try {{ {op}; exit 0 }} catch {{ $_; exit 3 }}"),
+                ],
+            );
+            assert!(code == 0 || code == 3, "{op}: {log}");
+            code == 0
+        };
+        for op in [
+            format!(r"mkdir '{w}\d1' | Out-Null; [IO.Directory]::Move('{w}\d1', '{w}\d2')"),
+            format!(r"[IO.File]::Move('{w}\a.txt', '{w}\d2\a.txt')"),
+            format!(r"[IO.Directory]::Move('{w}\d2', '{e}\d2')"),
+            format!(r"[IO.File]::Delete('{e}\d2\a.txt'); [IO.Directory]::Delete('{e}\d2')"),
+        ] {
+            assert!(ps(op.clone()), "{op}");
+        }
+        assert!(!empty.join("d2").exists());
+        for op in [
+            format!(r"[IO.Directory]::Move('{o}', '{w}\o')"),
+            format!(r"[IO.Directory]::Move('{o}\sub', '{w}\sub')"),
+            format!(r"[IO.File]::Move('{o}\secret.txt', '{w}\s.txt')"),
+            format!(r"[IO.File]::Move('{o}\secret.txt', '{o}\s.txt')"),
+            format!(r"[IO.File]::Delete('{o}\secret.txt')"),
+            // A granted folder itself is not removed either.
+            format!(r"[IO.Directory]::Delete('{e}')"),
+        ] {
+            assert!(!ps(op.clone()), "{op}");
+        }
+        assert!(outbox.join("secret.txt").exists() && outbox.join("sub").exists());
+        assert!(empty.exists() && !work.join("o").exists() && !work.join("s.txt").exists());
+        assert!(!ps(format!(
+            r"[IO.File]::ReadAllText('{o}\secret.txt') | Set-Content got.txt"
+        )));
+
+        for d in [&work, &empty, &outbox] {
+            appcontainer::set(d, &name, None, false).unwrap();
+        }
+        appcontainer::remove_profile(&name).unwrap();
+    }
+
+    /// Asked for an object of its own, `set` puts no grant on a junction to
+    /// another folder, a file with a second name, or a folder whose list
+    /// does not inherit; it does on a plain folder. Not asked, it follows a
+    /// junction as before.
+    #[cfg(windows)]
+    #[test]
+    fn a_grant_goes_on_an_object_of_its_own_when_asked() {
+        let base = tempfile::tempdir().unwrap();
+        let (real, link, closed, plain) = (
+            base.path().join("real"),
+            base.path().join("link"),
+            base.path().join("closed"),
+            base.path().join("plain"),
+        );
+        for d in [&real, &closed, &plain] {
+            std::fs::create_dir(d).unwrap();
+        }
+        let mklink = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&real)
+            .output()
+            .unwrap();
+        assert!(mklink.status.success(), "{mklink:?}");
+        let icacls = std::process::Command::new("icacls")
+            .arg(&closed)
+            .arg("/inheritance:d")
+            .output()
+            .unwrap();
+        assert!(icacls.status.success(), "{icacls:?}");
+        let (one, two) = (base.path().join("one.txt"), base.path().join("two.txt"));
+        std::fs::write(&one, "x").unwrap();
+        std::fs::hard_link(&one, &two).unwrap();
+        let name = format!("nerve.test.own.{}", std::process::id());
+        let m = acl::masks(true, true, false);
+        let granted = |p: &std::path::Path| appcontainer::look(p, &name, m).unwrap().1;
+
+        for p in [&link, &one, &closed] {
+            let e = appcontainer::set(p, &name, Some(m), true).unwrap_err();
+            assert!(e.to_string().contains("puts no grant"), "{p:?}: {e}");
+        }
+        assert!(!granted(&real) && !granted(&one) && !granted(&closed));
+        appcontainer::set(&plain, &name, Some(m), true).unwrap();
+        assert!(granted(&plain));
+        // Taking a grant off is never refused.
+        appcontainer::set(&link, &name, None, true).unwrap();
+        appcontainer::set(&link, &name, Some(m), false).unwrap();
+        assert!(granted(&real), "it went through the junction");
+        for p in [&real, &plain] {
+            appcontainer::set(p, &name, None, false).unwrap();
+        }
+        std::fs::remove_dir(&link).unwrap();
+    }
+
+    /// A folder on a volume mounted in a folder (no drive letter) is found
+    /// again by its file ID after a rename, and so it is once the volume
+    /// has no path at all but its own name. Makes a virtual disk, so it
+    /// needs an administrator.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs an administrator: mounts a virtual disk in a folder"]
+    fn a_folder_on_a_volume_mounted_in_a_folder_is_found_again() {
+        let base = tempfile::tempdir().unwrap();
+        let (vhd, mnt) = (base.path().join("v.vhdx"), base.path().join("mnt"));
+        std::fs::create_dir(&mnt).unwrap();
+        let diskpart = |script: String| {
+            let file = base.path().join("diskpart.txt");
+            std::fs::write(&file, script).unwrap();
+            let o = std::process::Command::new("diskpart")
+                .arg("/s")
+                .arg(&file)
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stdout));
+        };
+        let v = vhd.display();
+        diskpart(format!(
+            "create vdisk file=\"{v}\" maximum=16 type=expandable\nselect vdisk file=\"{v}\"\n\
+             attach vdisk\ncreate partition primary\nformat fs=ntfs quick\n\
+             assign mount=\"{}\"\n",
+            mnt.display()
+        ));
+        // Detaches the disk however the test ends, before its folder goes.
+        struct Detach(std::path::PathBuf);
+        impl Drop for Detach {
+            fn drop(&mut self) {
+                let file = self.0.with_extension("detach.txt");
+                let script = format!("select vdisk file=\"{}\"\ndetach vdisk\n", self.0.display());
+                if std::fs::write(&file, script).is_ok() {
+                    let _ = std::process::Command::new("diskpart")
+                        .arg("/s")
+                        .arg(&file)
+                        .output();
+                }
+            }
+        }
+        let _detach = Detach(vhd.clone());
+        let (proj, old) = (mnt.join("proj"), mnt.join("proj-old"));
+        std::fs::create_dir(&proj).unwrap();
+        let id = appcontainer::file_id(&proj).unwrap();
+        assert_ne!(
+            id.volume,
+            appcontainer::file_id(base.path()).unwrap().volume
+        );
+        std::fs::rename(&proj, &old).unwrap();
+        let found = appcontainer::locate(&id, &proj).unwrap();
+        let acl::Found::At(now) = &found else {
+            panic!("{found:?}")
+        };
+        assert!(
+            acl::same_path(&now.to_string_lossy(), &old.to_string_lossy()),
+            "{now:?}"
+        );
+        // Without its mount point the volume is reached by its own name.
+        let o = std::process::Command::new("mountvol")
+            .arg(format!("{}\\", mnt.display()))
+            .arg("/D")
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{o:?}");
+        let found = appcontainer::locate(&id, &proj).unwrap();
+        let acl::Found::At(now) = &found else {
+            panic!("{found:?}")
+        };
+        assert!(
+            now.to_string_lossy().starts_with(r"\\?\Volume{")
+                && now.to_string_lossy().ends_with("proj-old"),
+            "{now:?}"
+        );
+        assert_eq!(appcontainer::file_id(now).unwrap(), id);
     }
 
     /// Windows PowerShell, the default shell, works in the container: it
@@ -1695,7 +2114,7 @@ mod tests {
         std::fs::write(granted.join("in.txt"), "inside").unwrap();
         std::fs::write(base.path().join("secret.txt"), "secret").unwrap();
         let name = format!("nerve.test.ps.{}", std::process::id());
-        appcontainer::set(&granted, &name, Some(acl::masks(true, true, true))).unwrap();
+        appcontainer::set(&granted, &name, Some(acl::masks(true, true, true)), false).unwrap();
         let script = format!(
             "{POWERSHELL_START}Get-Content in.txt | Set-Content out.txt; \
              mkdir sub | Out-Null; cd sub; Set-Content here.txt (cmd /c cd); cd ..; \
@@ -1728,7 +2147,7 @@ mod tests {
         assert!(!granted.join("leak.txt").exists(), "{log}");
         let refused = std::fs::read_to_string(granted.join("refused.txt")).unwrap();
         assert!(refused.contains("UnauthorizedAccess"), "{refused} {log}");
-        appcontainer::set(&granted, &name, None).unwrap();
+        appcontainer::set(&granted, &name, None, false).unwrap();
         appcontainer::remove_profile(&name).unwrap();
     }
 

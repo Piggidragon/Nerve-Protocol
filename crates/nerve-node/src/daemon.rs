@@ -366,6 +366,9 @@ pub struct Daemon {
     shared: Arc<Shared>,
     supervisor: JoinHandle<()>,
     ctl: Option<JoinHandle<()>>,
+    /// Held while the node runs: a CLI moves the keys only while no node
+    /// reads them.
+    _keys: crate::secrets::KeysLock,
 }
 
 impl Daemon {
@@ -387,12 +390,37 @@ impl Daemon {
             nerve_transport::files::create_private_dir(dir)
                 .map_err(|e| format!("{}: {e}", dir.display()))?;
         }
-        let mut store = SettingsStore::open(
+        let keys = match crate::secrets::KeysLock::try_take(&paths)? {
+            Some(l) => l,
+            None => {
+                #[cfg(unix)]
+                if opts.ctl
+                    && nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({}))
+                        .await
+                        .is_ok()
+                {
+                    return Err("a node daemon already runs for this state directory".into());
+                }
+                // A command that moves the keys holds it for a moment.
+                crate::secrets::KeysLock::take(&paths, Duration::from_secs(10))
+                    .await?
+                    .ok_or_else(|| {
+                        format!(
+                            "another nerve-node holds {}: a node runs for this state directory, or a command moves its keys",
+                            paths.keys_lock().display()
+                        )
+                    })?
+            }
+        };
+        let mut store = SettingsStore::open_with(
             paths.config_file(),
-            paths.config_key(),
+            Box::new(crate::secrets::NodeSecrets::new(&paths)),
             AuditLog::new(paths.audit_log()),
         )?;
         let cfg = store.config().clone();
+        // With the config checked, a move of the keys that stopped half way
+        // is finished by it.
+        crate::secrets::settle(&paths, &cfg);
         if let Some(log) = &opts.log {
             log.set_level(cfg.log.level);
             // The node runs without a log file it cannot open; stderr and the
@@ -462,6 +490,7 @@ impl Daemon {
             shared,
             supervisor,
             ctl,
+            _keys: keys,
         })
     }
 

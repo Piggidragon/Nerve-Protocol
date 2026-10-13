@@ -10,6 +10,10 @@
 //! MAC whose key no command of a center can read. The file is read at start-up
 //! and when the owner asks for it; a file the node did not sign (one a command
 //! rewrote, say) is refused, audited, and changes nothing.
+//!
+//! Where the MAC key is kept is not the store's business: it asks a
+//! [`Secrets`], which also moves the node's other secrets when
+//! `machine.secret_storage` changes.
 
 use std::path::{Path, PathBuf};
 
@@ -18,7 +22,8 @@ use serde_json::Value;
 
 use crate::audit::{AuditLog, Change, diff};
 use crate::config::{
-    Access, CapSetting, CenterDocument, Folder, NodeConfig, ProtectedOptions, SettingsGrant, Sudo,
+    Access, CapSetting, CenterDocument, Folder, NodeConfig, ProtectedOptions, SecretStorage,
+    SettingsGrant, Sudo,
 };
 use crate::paths::to_wire;
 use crate::protected::Protected;
@@ -103,6 +108,76 @@ fn verified(text: &str, key: &MacKey) -> Result<NodeConfig, String> {
     }
 }
 
+/// Where the node keeps the key of its config's MAC and its other secrets
+/// (`machine.secret_storage`, docs/dev/spec/node-local.md §1), as the store
+/// sees it: the key, and a move of everything when a saved config names
+/// another place.
+pub trait Secrets: Send {
+    /// Where the secrets are now.
+    fn storage(&self) -> SecretStorage;
+    /// The key; `None` when there is none yet.
+    fn mac_key(&self) -> Result<Option<MacKey>, String>;
+    /// The key, made and kept first when there is none. An existing key is
+    /// never replaced: it would turn every file it signed into one the node
+    /// refuses.
+    fn mac_key_or_new(&self) -> Result<MacKey, String>;
+    /// Before `cfg`, whose `machine.secret_storage` differs from
+    /// [`Secrets::storage`], is saved: copies every secret there and reads
+    /// each copy back. An error refuses the change; nothing is saved then.
+    fn copy(&mut self, cfg: &NodeConfig) -> Result<(), String>;
+    /// `cfg` is saved: the secrets are in its place from now on, and the
+    /// old copies go.
+    fn moved(&mut self, cfg: &NodeConfig);
+    /// `cfg` could not be saved: the copies [`Secrets::copy`] made go, and
+    /// the secrets stay where they were.
+    fn not_moved(&mut self, cfg: &NodeConfig);
+}
+
+/// The MAC key in a file of its own, and no other secret: a store opened on
+/// a key path. It cannot move the key anywhere.
+pub struct KeyFile(pub PathBuf);
+
+impl Secrets for KeyFile {
+    fn storage(&self) -> SecretStorage {
+        SecretStorage::File
+    }
+
+    fn mac_key(&self) -> Result<Option<MacKey>, String> {
+        MacKey::load(&self.0)
+    }
+
+    fn mac_key_or_new(&self) -> Result<MacKey, String> {
+        MacKey::load_or_create(&self.0)
+    }
+
+    fn copy(&mut self, _cfg: &NodeConfig) -> Result<(), String> {
+        Err(format!(
+            "this store keeps the config's key in {} and cannot move it to the system keyring",
+            self.0.display()
+        ))
+    }
+
+    fn moved(&mut self, _cfg: &NodeConfig) {}
+
+    fn not_moved(&mut self, _cfg: &NodeConfig) {}
+}
+
+/// Where a config file says the node's secrets are, read without checking
+/// its MAC: the key that checks it is looked for there. A file that cannot
+/// be read says `file`, the default.
+pub fn stated_storage(text: &str) -> SecretStorage {
+    let table: Option<toml::Table> = toml::from_str(unseal(text).1).ok();
+    match table
+        .as_ref()
+        .and_then(|t| t.get("machine"))
+        .and_then(|m| m.get("secret_storage"))
+        .and_then(toml::Value::as_str)
+    {
+        Some("keyring") => SecretStorage::Keyring,
+        _ => SecretStorage::File,
+    }
+}
+
 /// The file's text; `None` when there is no file.
 fn read_file(path: &Path) -> Result<Option<String>, String> {
     match std::fs::read_to_string(path) {
@@ -119,6 +194,7 @@ type Observer = Box<dyn Fn(&str, u64, &[Change]) + Send>;
 pub struct SettingsStore {
     path: PathBuf,
     key: MacKey,
+    secrets: Box<dyn Secrets>,
     audit: AuditLog,
     config: NodeConfig,
     observer: Option<Observer>,
@@ -134,13 +210,24 @@ impl SettingsStore {
         key_path: impl AsRef<Path>,
         audit: AuditLog,
     ) -> Result<SettingsStore, String> {
+        let secrets = KeyFile(key_path.as_ref().to_path_buf());
+        SettingsStore::open_with(path, Box::new(secrets), audit)
+    }
+
+    /// [`SettingsStore::open`] with the key where `secrets` keeps it.
+    pub fn open_with(
+        path: impl Into<PathBuf>,
+        secrets: Box<dyn Secrets>,
+        audit: AuditLog,
+    ) -> Result<SettingsStore, String> {
         let path = path.into();
         let text = read_file(&path)?;
-        let first = MacKey::load(key_path.as_ref())?.is_none();
-        let key = MacKey::load_or_create(key_path.as_ref())?;
+        let first = secrets.mac_key()?.is_none();
+        let key = secrets.mac_key_or_new()?;
         let mut s = SettingsStore {
             path,
             key,
+            secrets,
             audit,
             config: NodeConfig::default(),
             observer: None,
@@ -170,9 +257,21 @@ impl SettingsStore {
         key_path: impl AsRef<Path>,
         audit: AuditLog,
     ) -> Result<(SettingsStore, u64), String> {
+        let secrets = KeyFile(key_path.as_ref().to_path_buf());
+        SettingsStore::open_accepting_with(path, Box::new(secrets), audit)
+    }
+
+    /// [`SettingsStore::open_accepting`] with the key where `secrets` keeps
+    /// it. When the file names another place, the secrets move there.
+    pub fn open_accepting_with(
+        path: impl Into<PathBuf>,
+        secrets: Box<dyn Secrets>,
+        audit: AuditLog,
+    ) -> Result<(SettingsStore, u64), String> {
         let mut s = SettingsStore {
             path: path.into(),
-            key: MacKey::load_or_create(key_path.as_ref())?,
+            key: secrets.mac_key_or_new()?,
+            secrets,
             audit,
             config: NodeConfig::default(),
             observer: None,
@@ -184,6 +283,11 @@ impl SettingsStore {
     /// The config at `path` as [`SettingsStore::open`] would take it, without
     /// writing anything (what the CLI shows while no daemon runs).
     pub fn peek(path: &Path, key_path: &Path) -> Result<NodeConfig, String> {
+        SettingsStore::peek_with(path, &KeyFile(key_path.to_path_buf()))
+    }
+
+    /// [`SettingsStore::peek`] with the key where `secrets` keeps it.
+    pub fn peek_with(path: &Path, secrets: &dyn Secrets) -> Result<NodeConfig, String> {
         let Some(text) = read_file(path)? else {
             return Ok(NodeConfig::default());
         };
@@ -193,7 +297,7 @@ impl SettingsStore {
                 path.display()
             )
         };
-        match MacKey::load(key_path)? {
+        match secrets.mac_key()? {
             Some(key) => verified(&text, &key).map_err(refused),
             // The node signs such a file the first time it opens it.
             None if unseal(&text).0.is_none() => {
@@ -251,6 +355,11 @@ impl SettingsStore {
                 fresh.version, self.config.version
             )));
         }
+        // Another writer saved a file that keeps the secrets elsewhere, and
+        // copied them there first.
+        if fresh.machine.secret_storage != self.secrets.storage() {
+            self.secrets.moved(&fresh);
+        }
         let changed = fresh != self.config;
         self.config = fresh;
         Ok(changed)
@@ -288,8 +397,24 @@ impl SettingsStore {
         )
     }
 
+    /// Writes `c`, moving the node's secrets first when it keeps them in
+    /// another place: copied there and read back, then the file, then the
+    /// old copies go. A move that fails saves nothing.
+    fn write(&mut self, c: &NodeConfig) -> Result<(), String> {
+        if c.machine.secret_storage == self.secrets.storage() {
+            return self.write_file(c);
+        }
+        self.secrets.copy(c)?;
+        if let Err(e) = self.write_file(c) {
+            self.secrets.not_moved(c);
+            return Err(e);
+        }
+        self.secrets.moved(c);
+        Ok(())
+    }
+
     /// Writes `c` atomically, signed.
-    fn write(&self, c: &NodeConfig) -> Result<(), String> {
+    fn write_file(&self, c: &NodeConfig) -> Result<(), String> {
         if let Some(dir) = self.path.parent() {
             nerve_transport::files::create_private_dir(dir)
                 .map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -1162,6 +1287,111 @@ mod tests {
     fn refusals(s: &SettingsStore) -> usize {
         let log = s.audit().read().unwrap();
         log.iter().filter(|v| v["event"] == "refused").count()
+    }
+
+    /// Secrets that record each step of a move and what the file said at
+    /// that step, and fail their copy when told to.
+    struct Moves {
+        key: PathBuf,
+        file: PathBuf,
+        storage: SecretStorage,
+        fail: bool,
+        log: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    }
+
+    impl Moves {
+        fn note(&self, step: &str) {
+            let text = std::fs::read_to_string(&self.file).unwrap_or_default();
+            self.log
+                .lock()
+                .unwrap()
+                .push(format!("{step} {:?}", stated_storage(&text)));
+        }
+    }
+
+    impl Secrets for Moves {
+        fn storage(&self) -> SecretStorage {
+            self.storage
+        }
+        fn mac_key(&self) -> Result<Option<MacKey>, String> {
+            MacKey::load(&self.key)
+        }
+        fn mac_key_or_new(&self) -> Result<MacKey, String> {
+            MacKey::load_or_create(&self.key)
+        }
+        fn copy(&mut self, _cfg: &NodeConfig) -> Result<(), String> {
+            self.note("copy");
+            if self.fail {
+                return Err("no keyring".into());
+            }
+            Ok(())
+        }
+        fn moved(&mut self, cfg: &NodeConfig) {
+            self.note("moved");
+            self.storage = cfg.machine.secret_storage;
+        }
+        fn not_moved(&mut self, _cfg: &NodeConfig) {
+            self.note("not_moved");
+        }
+    }
+
+    /// A config that keeps the secrets elsewhere is saved between their
+    /// copy and the removal of the old ones; a failed copy saves nothing.
+    #[test]
+    fn the_secrets_move_around_the_save_of_a_config_that_names_another_place() {
+        let d = tempfile::tempdir().unwrap();
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let file = d.path().join("node.toml");
+        let open = |fail, storage| {
+            SettingsStore::open_with(
+                &file,
+                Box::new(Moves {
+                    key: d.path().join("config.key"),
+                    file: file.clone(),
+                    storage,
+                    fail,
+                    log: log.clone(),
+                }),
+                AuditLog::new(d.path().join("audit.jsonl")),
+            )
+            .unwrap()
+        };
+        let to_keyring = |c: &mut NodeConfig| {
+            c.machine.secret_storage = SecretStorage::Keyring;
+            Ok(())
+        };
+        let mut s = open(true, SecretStorage::File);
+        s.update(|c| {
+            c.node.name = Some("a".into());
+            Ok(())
+        })
+        .unwrap();
+        // Nothing moves for a change that keeps the place.
+        assert!(log.lock().unwrap().is_empty());
+        let v = s.version();
+        let e = s.update(to_keyring).unwrap_err();
+        assert_eq!(e, SetError::Io("no keyring".into()));
+        assert_eq!(s.version(), v);
+        assert_eq!(*log.lock().unwrap(), ["copy File"]);
+        log.lock().unwrap().clear();
+        let mut s = open(false, SecretStorage::File);
+        s.update(to_keyring).unwrap();
+        assert_eq!(*log.lock().unwrap(), ["copy File", "moved Keyring"]);
+        assert_eq!(
+            stated_storage(&std::fs::read_to_string(&file).unwrap()),
+            SecretStorage::Keyring
+        );
+        // A file that cannot be written leaves the secrets where they were.
+        log.lock().unwrap().clear();
+        let mut s = open(false, SecretStorage::Keyring);
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        s.update(|c| {
+            c.machine.secret_storage = SecretStorage::File;
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(*log.lock().unwrap(), ["copy File", "not_moved File"]);
     }
 
     #[test]

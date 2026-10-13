@@ -80,6 +80,19 @@ impl NodePaths {
         self.state_dir.join("config.key")
     }
 
+    /// Says that a move of the node's keys between their files and the
+    /// system keyring is not finished: the other place may still hold
+    /// copies ([`crate::secrets::settle`]). It holds no secret.
+    pub fn keys_moving(&self) -> PathBuf {
+        self.state_dir.join("keys.moving")
+    }
+
+    /// Held by a running node, and by a CLI while it moves the keys
+    /// ([`crate::secrets::KeysLock`]).
+    pub fn keys_lock(&self) -> PathBuf {
+        self.state_dir.join("keys.lock")
+    }
+
     /// The node's own files: no center reaches them, whatever its policy.
     pub fn own(&self) -> Vec<PathBuf> {
         vec![self.config_dir.clone(), self.state_dir.clone()]

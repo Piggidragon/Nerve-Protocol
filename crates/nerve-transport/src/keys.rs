@@ -2,9 +2,9 @@
 //! (docs/dev/spec/protocol.md §2 and §4.2); and the secret key of the MAC the node keeps
 //! over its own config file ([`MacKey`]).
 //!
-//! 0.0.1 keeps the key as a 0600 file next to the node's config. Keeping it in
-//! the system keyring (`machine.secret_storage = "keyring"`) is not done yet;
-//! see the README's list of what is missing.
+//! Where the node keeps these keys (a 0600 file, or the system keyring with
+//! `machine.secret_storage = "keyring"`) is the node's business; this module
+//! reads and writes their text and, for the MAC key, its file.
 
 use ring::rand::SystemRandom;
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
@@ -114,13 +114,27 @@ impl MacKey {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(format!("{}: {e}", path.display())),
         };
+        MacKey::from_text(&text)
+            .map(Some)
+            .map_err(|e| format!("{}: {e}", path.display()))
+    }
+
+    /// The key from its stored text: 32 bytes, hex. The error does not
+    /// quote the text.
+    pub fn from_text(text: &str) -> Result<MacKey, String> {
         let raw = unhex(text.trim())
             .filter(|r| r.len() == 32)
-            .ok_or_else(|| format!("{}: not a 32-byte hex key", path.display()))?;
-        Ok(Some(MacKey(ring::hmac::Key::new(
-            ring::hmac::HMAC_SHA256,
-            &raw,
-        ))))
+            .ok_or("not a 32-byte hex key")?;
+        Ok(MacKey(ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &raw)))
+    }
+
+    /// A new random key and its text, for a place other than a file.
+    pub fn generate() -> (MacKey, String) {
+        let raw = random_bytes(32);
+        (
+            MacKey(ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &raw)),
+            hex(&raw),
+        )
     }
 
     /// The key at `path`, made and written there first when there is none.
@@ -245,6 +259,18 @@ mod tests {
         );
         std::fs::write(&path, "abcd\n").unwrap();
         assert!(MacKey::load(&path).is_err());
+    }
+
+    #[test]
+    fn mac_keys_round_trip_through_their_text() {
+        let (k, text) = MacKey::generate();
+        let mac = k.sign(b"node.toml");
+        let back = MacKey::from_text(&format!("{text}\n")).unwrap();
+        assert!(back.verify(b"node.toml", &mac));
+        assert_ne!(MacKey::generate().1, text);
+        // The error names no part of what it was given.
+        let err = MacKey::from_text("secret-ish").err().unwrap();
+        assert!(!err.contains("secret"), "{err}");
     }
 
     #[test]

@@ -8,8 +8,11 @@ same way and so the owner knows what each setting does.
 
 | What | Default | Override |
 |---|---|---|
-| `node.toml` and one key per center | `~/.config/nerve` | `--config-dir`, `NERVE_CONFIG_DIR` |
-| control socket `run/ctl.sock`, audit log `audit.jsonl`, log `log.jsonl`, the config's MAC key `config.key` | `~/.local/state/nerve` | `--state-dir`, `NERVE_STATE_DIR` |
+| `node.toml` and one key per center (`keys/<name>.key`) | `~/.config/nerve` | `--config-dir`, `NERVE_CONFIG_DIR` |
+| control socket `run/ctl.sock`, audit log `audit.jsonl`, log `log.jsonl`, the config's MAC key `config.key`, `keys.lock`, `keys.moving` | `~/.local/state/nerve` | `--state-dir`, `NERVE_STATE_DIR` |
+
+With `machine.secret_storage = "keyring"` the keys are in the system keyring
+instead of `keys/` and `config.key` ([where the keys are](#where-the-keys-are)).
 
 A node that `nerve-node install` put on a Linux machine
 ([service](../../user/service.md)) runs as the system user `nerve` with
@@ -98,11 +101,10 @@ memory. It reads the file at start-up and when the owner asks for it
 
 Every file the node writes is signed: its first line is
 `# mac hmac-sha256 <hex> (…)`, an HMAC over the rest of the file. The key is
-`<state>/config.key` (0600), made the first time the node opens its config.
-It sits in the state folder rather than beside `node.toml`, so the key does
-not hang on a setting of the file it checks, and whatever could read the
-config folder would still not hold it. `machine.secret_storage = "keyring"`
-is not done in 0.0.1, for this key as for the center keys.
+`<state>/config.key` (0600), made the first time the node opens its config,
+or its keyring entry ([where the keys are](#where-the-keys-are)). It sits in
+the state folder rather than beside `node.toml`, so whatever could read the
+config folder would still not hold it.
 
 A file whose MAC is missing or does not match was changed outside the
 owner's path. It is refused and the refusal is audited (§6): at start-up the
@@ -123,6 +125,92 @@ file itself, and a running node takes the change at its next start. After
 a change no daemon answered for, the CLI says so in one line ("takes effect
 at the next start of the node").
 
+### Where the keys are
+
+`machine.secret_storage` says where the node keeps its own keys: the key of
+the config's MAC and its key per center.
+
+- `file`, the default: `<state>/config.key` and `<config>/keys/<name>.key`,
+  each 0600.
+- `keyring`: the system keyring (Credential Manager on Windows, the Secret
+  Service on Linux), under the service `nerve`, one entry per key, named
+  `config-key:<state folder>` and `center-key:<name>:<config folder>`. Each
+  holds the key's hex text. No copy stays in a file.
+
+The proxy's header values are in the keyring either way (§2).
+
+The node looks for the key that checks `node.toml` where that file says,
+read before its MAC is checked. A file that names another place than the one
+its key is in does not check, and is refused like any changed file.
+
+With `keyring` and no keyring that answers, the node does not start, and a
+command that reads the config refuses. The message names the entry and the
+keyring's error. Nothing falls back to a file. The sudo password is never at
+rest, whatever the setting (§4).
+
+A change of the setting moves the keys once, through the settings store, in
+whatever writes the config (the running node, else the CLI):
+
+1. `<state>/keys.moving` is written. It holds no secret.
+2. Every key is copied to the new place and read back. When a copy fails or
+   reads back otherwise, the copies made are deleted and the change is
+   refused: `node.toml` stays as it was, and so do the keys.
+3. `node.toml` is saved with the new setting.
+4. Each old copy is deleted once the new place holds the same key, then
+   `keys.moving` goes.
+
+A running node holds `<state>/keys.lock` for its life. A CLI that writes
+`node.toml` itself (no daemon answers: on Windows always, on Linux while a
+node starts) moves the keys only while it holds that lock too. When a node
+holds it, step 4 is left to that node's next start, and the running node goes
+on reading its keys where they were. At start-up, with `node.toml` checked
+and the lock held, the node finishes a move by the config in force: a key
+still in the other place moves into the configured one. That covers a move
+`keys.moving` marks and one a crash stopped; with `keyring`, keys still in
+files move in too. With `file` and no mark, the keyring is not asked. When
+`node.toml` changed since the node read it, the move waits for the next
+start. `config accept` of a file that names the other place moves the keys
+there; when the place it names holds no key and the other one does, the key
+is taken from there.
+
+With `keyring` the MAC key is in no file that a process can read. The check
+still stands on that key: a process that can write both folders can still
+set `file` with a key of its own, and a process of the node's user can ask
+the keyring for its entries.
+
+#### A keyring on a Linux without a desktop
+
+A Linux without a desktop usually has no Secret Service. When the keys are to
+be in the keyring (the config says so, or the owner chooses it in `setup`)
+and none answers for the node's user, `setup` asks whether to install one.
+`install` asks the same when it runs in a terminal and the config of an
+earlier install says `keyring`; without a terminal it refuses before it
+starts the service. No is the default and keeps the refusal. Yes runs, as
+root:
+
+- the package manager: `apt-get update` and `apt-get install -y
+  gnome-keyring dbus-user-session` (Debian, Ubuntu), `dnf install -y
+  gnome-keyring` (Fedora, RHEL) or `pacman -S --needed --noconfirm
+  gnome-keyring` (Arch);
+- `loginctl enable-linger <user>`: the user keeps a session with its own
+  D-Bus from boot on, and D-Bus starts GNOME Keyring there when the node
+  asks;
+- a login keyring for the user in GNOME Keyring's plain format,
+  `~/.local/share/keyrings/login.keyring`, that opens without a password. A
+  login keyring that is there is left as it is.
+
+Then it checks that the keyring answers. Whether a keyring answers is asked
+by `nerve-node` itself in a process of its own, as the node's user and in
+that user's session.
+
+The kernel keyring (keyutils) needs no daemon, but its keys are gone after a
+reboot, and the node's with them, so it is not used. A keyring that opens
+without anyone typing a password keeps its entries unencrypted on disk,
+readable by the node's user like the key files; the question says so. At
+boot the node can start before its user's session; it then exits with the
+refusal, and systemd starts it again 5 seconds later. `uninstall` ends that
+session (`loginctl disable-linger`).
+
 ## 2. `node.toml`
 
 ```toml
@@ -138,6 +226,7 @@ allow_root = false
 sudo = "off"                # off | on: the sudo switch (§4); off when missing
 sudo_path = "/usr/bin/sudo" # optional; `sudo` from PATH by default
 user = "alice"              # optional: the account commands and the sudo switch run as (§1)
+secret_storage = "file"     # file | keyring: where the node keeps its keys (§1)
 
 [limits]
 max_running = 4             # commands at once, per node
@@ -432,7 +521,7 @@ discarded), run as the account the commands run as (§1, `machine.user` on
 the installed node, else the node's own user), so the password is that
 account's and refuses a wrong one with `invalid_args`; the switch then stays
 as it was. Turning it off drops the password. The password is kept in memory
-only (`secret_storage` at rest is not done in 0.0.1), so a restarted node, or
+only, whatever `secret_storage` says, so a restarted node, or
 a `node.toml` that says `on` without a password held, has the switch off. It
 never reaches a center: the node replaces every copy in an outgoing frame and
 in the audit log with `[redacted]`. `machine.sudo` changes only through the

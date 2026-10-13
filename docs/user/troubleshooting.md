@@ -69,6 +69,7 @@ commands run as and runs no command at all.
 |---|---|
 | `refusing to run as root; set machine.allow_root = true to allow it` | Run as a normal user (on Windows: not elevated), or set `machine.allow_root` |
 | `node.toml is refused: its MAC does not match …` | Look at the file, then `nerve-node config accept`. See [config](config.md) |
+| `machine.secret_storage is "keyring", but the system keyring cannot be reached …` | The keys are in a keyring that does not answer. Start it, or run `nerve-node setup`, which offers to install one on a Linux without a desktop. See [keys](config.md#where-the-node-keeps-its-keys) |
 
 ## The center will not start
 

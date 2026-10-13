@@ -11,7 +11,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use nerve_policy::audit::AuditLog;
-use nerve_policy::config::{Access, CapSetting, Folder, SettingsGrant};
+use nerve_policy::config::{Access, CapSetting, Folder, SecretStorage, SettingsGrant};
 use nerve_policy::{Mode, NodeConfig, SetError, SettingsStore, rules, sudo_command};
 use nerve_proto::link::PairLink;
 
@@ -89,7 +89,7 @@ pub enum Cmd {
     Unlock,
     /// Install the node as a service that starts with the machine and runs under a user of its own (Linux, as root).
     Install,
-    /// Name the node, choose the account commands run as (installed node), pair the first center and choose its mode, one question at a time.
+    /// Name the node, choose the account commands run as (installed node), choose where the node keeps its keys, pair the first center and choose its mode, one question at a time.
     Setup {
         /// Run commands as this account instead of asking, and make it if it is not there: a group and a home (/home/NAME) of its own, no login (installed node).
         #[arg(long, value_name = "NAME")]
@@ -624,7 +624,10 @@ pub async fn read_config(paths: &NodePaths) -> Result<(NodeConfig, Option<u64>),
         Err(_) => {}
     }
     Ok((
-        SettingsStore::peek(&paths.config_file(), &paths.config_key())?,
+        SettingsStore::peek_with(
+            &paths.config_file(),
+            &crate::secrets::NodeSecrets::for_cli(paths),
+        )?,
         None,
     ))
 }
@@ -652,9 +655,9 @@ pub async fn edit(
             Err(e) => return Err(e),
         }
     }
-    let mut store = SettingsStore::open(
+    let mut store = SettingsStore::open_with(
         paths.config_file(),
-        paths.config_key(),
+        Box::new(crate::secrets::NodeSecrets::for_cli(paths)),
         AuditLog::new(paths.audit_log()),
     )?;
     match store.update(f) {
@@ -1014,12 +1017,18 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
         Cmd::Center(CenterCmd::Rm(center)) => {
             let (cfg, _) = read_config(&paths).await?;
             let name = pick_center(&cfg, &center)?;
-            edit(&paths, |c| {
+            let cfg = edit(&paths, |c| {
                 c.centers.retain(|e| e.name != name);
                 Ok(())
             })
             .await?;
-            let _ = std::fs::remove_file(paths.key_file(&name));
+            // The center is gone either way; a key that stays behind is
+            // said, not hidden.
+            if let Err(e) =
+                crate::secrets::remove_center_key(&paths, cfg.machine.secret_storage, &name)
+            {
+                w(out, format!("the node key for {name} was not deleted: {e}"));
+            }
             w(out, format!("unpaired {name}"));
             Ok(())
         }
@@ -1112,7 +1121,10 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                 Err(e) if e != nerve_transport::ctl::NOT_RUNNING => return Err(e),
                 Err(_) => {}
             }
-            let cfg = SettingsStore::peek(&paths.config_file(), &paths.config_key())?;
+            let cfg = SettingsStore::peek_with(
+                &paths.config_file(),
+                &crate::secrets::NodeSecrets::for_cli(&paths),
+            )?;
             w(out, no_daemon_status(cfg!(unix)));
             if cfg.locked {
                 w(
@@ -1253,7 +1265,24 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             let layout = Layout::system();
             owner_check(&[&paths, &layout.paths]).await?;
             let exe = std::env::current_exe().map_err(|e| format!("this program: {e}"))?;
-            crate::service::install(&layout, &Host, &exe, &invoker(), out)
+            // Asked only in a terminal: a script that installs gets the
+            // refusal instead of a question.
+            use std::io::IsTerminal;
+            let stdin = std::io::stdin();
+            let mut input = std::io::BufReader::new(stdin.lock());
+            let terminal = stdin.is_terminal();
+            let keyring = crate::keyring_setup::HostKeyring {
+                exe: layout.bin.clone(),
+            };
+            crate::service::install_asking(
+                &layout,
+                &Host,
+                &keyring,
+                terminal.then_some(&mut input as &mut dyn BufRead),
+                &exe,
+                &invoker(),
+                out,
+            )
         }
         Cmd::Setup { create_user } => {
             owner_check(&[&paths]).await?;
@@ -1261,7 +1290,23 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             let layout = Layout::system();
             let machine = (layout.installed() && paths == layout.paths)
                 .then_some(&Host as &dyn crate::service::System);
-            setup(&paths, machine, create_user.as_deref(), &mut input, out).await
+            // The installed program, which the node's user can run, asks
+            // its keyring.
+            let keyring = match machine {
+                Some(_) => crate::keyring_setup::HostKeyring {
+                    exe: layout.bin.clone(),
+                },
+                None => crate::keyring_setup::HostKeyring::this_program(),
+            };
+            setup(
+                &paths,
+                machine,
+                create_user.as_deref(),
+                &keyring,
+                &mut input,
+                out,
+            )
+            .await
         }
         Cmd::Update { from } => {
             let layout = Layout::system();
@@ -1276,22 +1321,26 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
     }
 }
 
-/// `setup`: the first-run steps in the terminal: the node's name, its first
-/// center and that center's mode. Each answer is saved when it is given,
+/// `setup`: the first-run steps in the terminal: the node's name, where it
+/// keeps its keys, its first center and that center's mode. Each answer is
+/// saved when it is given,
 /// through the same owner path as the other commands (the running node, or
 /// the signed `node.toml`), so setup can stop anywhere and run again; Enter
 /// keeps what is there. The steps done are audited. `machine` is there on
 /// the installed node, where setup also chooses the account of the
-/// commands: `create_user` names it (and makes it) instead of asking.
+/// commands: `create_user` names it (and makes it) instead of asking. Keys
+/// in the system keyring need one that answers; `keyring` checks it, and
+/// installs one when the owner says so ([`crate::keyring_setup`]).
 pub async fn setup(
     paths: &NodePaths,
     machine: Option<&dyn crate::service::System>,
     create_user: Option<&str>,
+    keyring: &dyn crate::keyring_setup::Keyring,
     input: &mut dyn BufRead,
     out: &mut dyn Write,
 ) -> Result<(), String> {
     let mut steps = Vec::new();
-    let r = setup_steps(paths, machine, create_user, input, out, &mut steps).await;
+    let r = setup_steps(paths, machine, create_user, keyring, input, out, &mut steps).await;
     let log = AuditLog::new(paths.audit_log());
     if let Err(e) = log.node("setup", &steps, r.as_ref().err().map(String::as_str)) {
         let _ = writeln!(out, "the audit log cannot be written: {e}");
@@ -1326,6 +1375,7 @@ async fn setup_steps(
     paths: &NodePaths,
     machine: Option<&dyn crate::service::System>,
     create_user: Option<&str>,
+    keyring: &dyn crate::keyring_setup::Keyring,
     input: &mut dyn BufRead,
     out: &mut dyn Write,
     steps: &mut Vec<String>,
@@ -1334,6 +1384,12 @@ async fn setup_steps(
         return Err(
             "--create-user chooses the account commands run as on a node installed as a service (`sudo nerve-node install`); this node runs them as its own user".into(),
         );
+    }
+    // Keys in a keyring that does not answer: nothing can be read, so that
+    // comes first.
+    if crate::secrets::stated_storage(paths) == SecretStorage::Keyring {
+        let me = crate::keyring_setup::me()?;
+        crate::keyring_setup::ensure(keyring, &me, Some(input), out)?;
     }
     let (cfg, _) = read_config(paths).await?;
     if let (Some(sys), Some(name)) = (machine, create_user) {
@@ -1377,6 +1433,35 @@ async fn setup_steps(
             out,
         )?;
         account_chosen(paths, chosen, out, steps).await?;
+    }
+
+    // Where the keys go, before pairing makes one.
+    let now = read_config(paths).await?.0.machine.secret_storage;
+    let answer = ask(
+        input,
+        out,
+        &format!(
+            "Where the node keeps its keys: file (files only the node's user can read) or keyring (the system keyring) [{}]: ",
+            enum_str(&now)
+        ),
+    )?;
+    let storage = match answer.as_str() {
+        "" => now,
+        a => parse_enum::<SecretStorage>(a, "file or keyring")?,
+    };
+    if storage != now {
+        if storage == SecretStorage::Keyring {
+            let me = crate::keyring_setup::me()?;
+            crate::keyring_setup::ensure(keyring, &me, Some(input), out)?;
+        }
+        edit(paths, |c| {
+            c.machine.secret_storage = storage;
+            Ok(())
+        })
+        .await?;
+        let step = format!("the node's keys are in {} now", storage_place(storage));
+        let _ = writeln!(out, "{step}");
+        steps.push(step);
     }
 
     let link = ask(
@@ -1464,6 +1549,14 @@ async fn setup_steps(
         "Done. `nerve-node rule add allow '<command>'` allows one command; `nerve-node --help` lists the rest."
     );
     Ok(())
+}
+
+/// How setup names where the keys are.
+fn storage_place(s: SecretStorage) -> &'static str {
+    match s {
+        SecretStorage::File => "files",
+        SecretStorage::Keyring => "the system keyring",
+    }
 }
 
 /// Asks one question; the answer without the line break and the spaces
@@ -2098,9 +2191,9 @@ async fn accept(paths: &NodePaths) -> Result<u64, String> {
         Err(e) if e != nerve_transport::ctl::NOT_RUNNING => return Err(e),
         Err(_) => {}
     }
-    let (_, v) = SettingsStore::open_accepting(
+    let (_, v) = SettingsStore::open_accepting_with(
         paths.config_file(),
-        paths.config_key(),
+        Box::new(crate::secrets::NodeSecrets::for_accept(paths)),
         AuditLog::new(paths.audit_log()),
     )?;
     Ok(v)
@@ -2578,6 +2671,17 @@ mod tests {
         create_user: Option<&str>,
         answers: &str,
     ) -> (Result<(), String>, String) {
+        let keyring = crate::keyring_setup::tests::FakeKeyring::new(true);
+        setup_keyring(paths, machine, create_user, &keyring, answers)
+    }
+
+    fn setup_keyring(
+        paths: &NodePaths,
+        machine: Option<&dyn crate::service::System>,
+        create_user: Option<&str>,
+        keyring: &dyn crate::keyring_setup::Keyring,
+        answers: &str,
+    ) -> (Result<(), String>, String) {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -2588,6 +2692,7 @@ mod tests {
             paths,
             machine,
             create_user,
+            keyring,
             &mut input,
             &mut out,
         ));
@@ -2605,8 +2710,9 @@ mod tests {
         assert!(Cli::try_parse_from(["nerve-node", "setup", "--create-user"]).is_err());
         let (_d, paths) = setup(&["home"]);
         let sys = crate::service::tests::Fake::new();
-        // Name, no link, user mode for the one center: no account question.
-        let (r, out) = setup_on(&paths, Some(&sys), Some("bob"), "lab-pc\n\nuser\n");
+        // Name, the keys stay in files, no link, user mode for the one
+        // center: no account question.
+        let (r, out) = setup_on(&paths, Some(&sys), Some("bob"), "lab-pc\n\n\nuser\n");
         r.unwrap();
         assert!(!out.contains("Account that commands"), "{out}");
         assert!(out.contains("commands run as bob"), "{out}");
@@ -2659,9 +2765,9 @@ mod tests {
         let (d, paths) = setup(&["home"]);
         let dir = d.path().join("work");
         std::fs::create_dir(&dir).unwrap();
-        // A name, no new center (the one paired is the first), folder mode
-        // with one folder.
-        let answers = format!("lab-pc\n\nfolder\n{}\n+r +x\n", dir.display());
+        // A name, the keys where they are, no new center (the one paired is
+        // the first), folder mode with one folder.
+        let answers = format!("lab-pc\n\n\nfolder\n{}\n+r +x\n", dir.display());
         let (r, out) = setup_with(&paths, &answers);
         r.unwrap();
         assert!(out.contains("Name of this node"), "{out}");
@@ -2678,7 +2784,7 @@ mod tests {
         assert_eq!(a[0]["steps"].as_array().unwrap().len(), 3, "{}", a[0]);
         // Again with Enter everywhere: nothing changes.
         let before = std::fs::read(paths.config_file()).unwrap();
-        let (r, _) = setup_with(&paths, "\n\n\n\n");
+        let (r, _) = setup_with(&paths, "\n\n\n\n\n");
         r.unwrap();
         assert_eq!(std::fs::read(paths.config_file()).unwrap(), before);
         // A bad name or a short input stops it, and the audit log says so.
@@ -2700,18 +2806,130 @@ mod tests {
         );
     }
 
+    /// The node's keys as setup and `config set` leave them: whether the
+    /// config's key is in its file, and in the test keyring.
+    fn config_key_at(paths: &NodePaths) -> (bool, bool) {
+        let entry = crate::secrets::Entry::config_key(paths);
+        (
+            paths.config_key().exists(),
+            crate::secrets::store::get(entry.account())
+                .unwrap()
+                .is_some(),
+        )
+    }
+
+    #[test]
+    fn config_set_moves_the_keys_and_center_rm_deletes_them_from_the_keyring() {
+        let (_d, paths) = setup(&["home"]);
+        let key = nerve_transport::keys::NodeKey::generate().unwrap();
+        crate::secrets::store_center_key(&paths, SecretStorage::File, "home", &key).unwrap();
+        let set = |to: &str| run(&paths, &["config", "set", "machine.secret_storage", to]);
+        // Without a keyring nothing moves, and the setting stays.
+        crate::secrets::store::set_unreachable(true);
+        let e = set("keyring").unwrap_err();
+        crate::secrets::store::set_unreachable(false);
+        assert!(e.contains("nothing was changed"), "{e}");
+        assert_eq!(load(&paths).machine.secret_storage, SecretStorage::File);
+        assert_eq!(config_key_at(&paths), (true, false));
+        assert!(paths.key_file("home").exists());
+        set("keyring").unwrap();
+        assert_eq!(load(&paths).machine.secret_storage, SecretStorage::Keyring);
+        assert_eq!(config_key_at(&paths), (false, true));
+        assert!(!paths.key_file("home").exists());
+        let read = crate::secrets::center_key(&paths, SecretStorage::Keyring, "home").unwrap();
+        assert_eq!(read.public_key(), key.public_key());
+        run(&paths, &["center", "rm", "--center", "home"]).unwrap();
+        assert!(crate::secrets::center_key(&paths, SecretStorage::Keyring, "home").is_err());
+        set("file").unwrap();
+        assert_eq!(config_key_at(&paths), (true, false));
+        assert_eq!(
+            run(&paths, &["config", "get", "machine.secret_storage"])
+                .unwrap()
+                .trim(),
+            "file"
+        );
+    }
+
+    /// Setup asks where the keys go; `keyring` moves them there.
+    #[test]
+    fn setup_keeps_the_keys_in_the_keyring_when_asked() {
+        let (_d, paths) = setup(&[]);
+        // Name kept, keys to the keyring, no link.
+        let (r, out) = setup_with(&paths, "\nkeyring\n\n");
+        r.unwrap();
+        assert!(out.contains("Where the node keeps its keys"), "{out}");
+        assert!(out.contains("[file]"), "{out}");
+        assert!(
+            out.contains("the node's keys are in the system keyring now"),
+            "{out}"
+        );
+        assert_eq!(load(&paths).machine.secret_storage, SecretStorage::Keyring);
+        assert_eq!(config_key_at(&paths), (false, true));
+        let steps = node_audit(&paths)[0]["steps"].to_string();
+        assert!(steps.contains("system keyring"), "{steps}");
+        // Asked again, the keyring is what Enter keeps.
+        let (r, out) = setup_with(&paths, "\n\n\n");
+        r.unwrap();
+        assert!(out.contains("[keyring]"), "{out}");
+        let (r, _) = setup_with(&paths, "\nwallet\n");
+        assert!(r.unwrap_err().contains("file or keyring"));
+    }
+
+    /// Where no keyring answers, setup offers to install one: no keeps the
+    /// files, yes installs it and moves the keys.
+    #[test]
+    fn setup_offers_a_keyring_where_none_answers() {
+        let (_d, paths) = setup(&[]);
+        crate::secrets::store::set_unreachable(true);
+        let k = crate::keyring_setup::tests::FakeKeyring::new(false);
+        let (r, out) = setup_keyring(&paths, None, None, &k, "\nkeyring\nn\n");
+        let e = r.unwrap_err();
+        assert!(e.contains("no system keyring answers"), "{e}");
+        assert!(out.contains("Install it now? [y/N]"), "{out}");
+        assert!(k.installed.borrow().is_empty());
+        assert_eq!(load(&paths).machine.secret_storage, SecretStorage::File);
+        let (r, out) = setup_keyring(&paths, None, None, &k, "\nkeyring\ny\n\n");
+        r.unwrap();
+        assert_eq!(k.installed.borrow().len(), 1);
+        assert!(out.contains("the system keyring answers"), "{out}");
+        assert_eq!(load(&paths).machine.secret_storage, SecretStorage::Keyring);
+        assert_eq!(config_key_at(&paths), (false, true));
+    }
+
+    /// A node whose keys are in a keyring that no longer answers: setup
+    /// asks about that before anything else, and a no stops it.
+    #[test]
+    fn setup_on_keys_in_a_keyring_that_does_not_answer_asks_first() {
+        let (_d, paths) = setup(&[]);
+        run(
+            &paths,
+            &["config", "set", "machine.secret_storage", "keyring"],
+        )
+        .unwrap();
+        crate::secrets::store::set_unreachable(true);
+        let k = crate::keyring_setup::tests::FakeKeyring::new(false);
+        let (r, out) = setup_keyring(&paths, None, None, &k, "\n");
+        assert!(r.unwrap_err().contains("no system keyring answers"));
+        assert!(!out.contains("Name of this node"), "{out}");
+        assert!(run(&paths, &["status"]).is_err());
+        let (r, out) = setup_keyring(&paths, None, None, &k, "y\n\n\n\n");
+        r.unwrap();
+        assert!(out.contains("Name of this node"), "{out}");
+        assert!(run(&paths, &["status"]).is_ok());
+    }
+
     #[test]
     fn setup_without_a_center_stops_after_the_name() {
         let (_d, paths) = setup(&[]);
-        let (r, out) = setup_with(&paths, "\n\n");
+        let (r, out) = setup_with(&paths, "\n\n\n");
         r.unwrap();
         assert!(out.contains("No center is paired"), "{out}");
         let (_d, paths) = setup(&["a", "b"]);
-        let (r, out) = setup_with(&paths, "\n\n");
+        let (r, out) = setup_with(&paths, "\n\n\n");
         r.unwrap();
         assert!(out.contains("Several centers are paired"), "{out}");
         // A link that does not parse pairs nothing.
-        let (r, _) = setup_with(&paths, "\nnot a link\n");
+        let (r, _) = setup_with(&paths, "\n\nnot a link\n");
         assert!(r.unwrap_err().contains("nerve://pair"));
     }
 

@@ -14,7 +14,8 @@ fn paths(root: &std::path::Path) -> NodePaths {
 async fn setup(paths: &NodePaths, answers: &str) -> Result<String, String> {
     let mut out = Vec::new();
     let mut input = std::io::Cursor::new(answers.as_bytes().to_vec());
-    nerve_node::cli::setup(paths, None, None, &mut input, &mut out).await?;
+    let keyring = nerve_node::keyring_setup::HostKeyring::this_program();
+    nerve_node::cli::setup(paths, None, None, &keyring, &mut input, &mut out).await?;
     Ok(String::from_utf8(out).unwrap())
 }
 
@@ -24,7 +25,7 @@ async fn setup_pairs_the_first_center_and_sets_its_mode() {
     let paths = paths(d.path());
     let center = FakeCenter::start(false).await.unwrap();
     let link = center.link().render();
-    let out = setup(&paths, &format!("my-node\n{link}\ny\nuser\n"))
+    let out = setup(&paths, &format!("my-node\n\n{link}\ny\nuser\n"))
         .await
         .unwrap();
     assert!(out.contains("paired with"), "{out}");
@@ -47,7 +48,7 @@ async fn setup_goes_through_the_running_node() {
     let daemon = Daemon::start(o).await.unwrap();
     let center = FakeCenter::start(false).await.unwrap();
     let link = center.link().render();
-    let out = setup(&paths, &format!("other-name\n{link}\nn\n"))
+    let out = setup(&paths, &format!("other-name\n\n{link}\nn\n"))
         .await
         .unwrap();
     assert!(out.contains("not paired"), "{out}");

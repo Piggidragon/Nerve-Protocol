@@ -72,7 +72,13 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
         if !entry.dials() || cfg.locked {
             return;
         }
-        let key = match load_key(&shared, &name) {
+        // The keyring may block (the Secret Service asks to unlock), so off
+        // the runtime's threads.
+        let read = {
+            let (shared, name) = (shared.clone(), name.clone());
+            tokio::task::spawn_blocking(move || load_key(&shared, &name)).await
+        };
+        let key = match read.unwrap_or_else(|e| Err(format!("the key read stopped: {e}"))) {
             Ok(k) => k,
             Err(e) => {
                 tracing::error!("center {name}: {e}; dialling stopped");
@@ -164,11 +170,10 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
     }
 }
 
+/// The node key for center `name`, where `machine.secret_storage` keeps it.
 fn load_key(shared: &Shared, name: &str) -> Result<NodeKey, String> {
-    let path = shared.paths.key_file(name);
-    let text = std::fs::read_to_string(&path)
-        .map_err(|e| format!("cannot read the node key {}: {e}", path.display()))?;
-    NodeKey::from_text(text.trim()).map_err(|e| format!("bad node key {}: {e}", path.display()))
+    let storage = shared.config().machine.secret_storage;
+    crate::secrets::center_key(&shared.paths, storage, name)
 }
 
 /// The proxy to dial `url` through, its header values read from the system

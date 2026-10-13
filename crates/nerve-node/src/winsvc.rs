@@ -95,7 +95,15 @@ pub trait WinSystem {
 }
 
 /// Takes the folder grants of the node at `paths` off, for uninstall.
-fn remove_grants(paths: &NodePaths, sys: &dyn WinSystem, steps: &mut Steps, whose: &str) {
+/// `kept`: whether its record stays (no purge of its state folder), so that
+/// another uninstall finds the grants left on a drive that is not here.
+fn remove_grants(
+    paths: &NodePaths,
+    sys: &dyn WinSystem,
+    steps: &mut Steps,
+    whose: &str,
+    kept: bool,
+) {
     let cfg = SettingsStore::peek(&paths.config_file(), &paths.config_key()).ok();
     let centers: Vec<String> = cfg
         .iter()
@@ -110,6 +118,23 @@ fn remove_grants(paths: &NodePaths, sys: &dyn WinSystem, steps: &mut Steps, whos
         steps.did(format!(
             "took {} folder grants of {whose} off",
             synced.removed
+        ));
+    }
+    if !synced.away.is_empty() {
+        let at: Vec<String> = synced
+            .away
+            .iter()
+            .map(|g| g.path.display().to_string())
+            .collect();
+        let then = if kept {
+            "connect their drives and run `nerve-node uninstall` again to take them off"
+        } else {
+            "their record goes with --purge, so once their drives are connected, take them off with `icacls <folder> /reset`"
+        };
+        steps.did(format!(
+            "left {} folder grants of {whose} on, on drives that are not connected now ({}): {then}",
+            at.len(),
+            at.join(", ")
         ));
     }
 }
@@ -420,10 +445,10 @@ fn uninstall_steps(
     // record is in the state folder, so this comes before a purge. The
     // node run by hand keeps its folders; if it runs again, it puts its
     // grants on again.
-    remove_grants(&layout.paths, sys, steps, "the commands");
+    remove_grants(&layout.paths, sys, steps, "the commands", !purge);
     if *by_hand != layout.paths && crate::grants::record_file(by_hand).exists() {
         let whose = format!("the node run by hand ({})", by_hand.state_dir.display());
-        remove_grants(by_hand, sys, steps, &whose);
+        remove_grants(by_hand, sys, steps, &whose, true);
     }
     let folders = [
         &layout.paths.config_dir,
@@ -642,6 +667,8 @@ mod tests {
         started: RefCell<Vec<String>>,
         /// The folders and whom they were opened to.
         secured: RefCell<Vec<(PathBuf, Option<String>)>>,
+        /// Granted folders on drives that are not connected.
+        away: RefCell<Vec<PathBuf>>,
     }
 
     impl Fake {
@@ -659,6 +686,7 @@ mod tests {
                 program: RefCell::new(None),
                 started: RefCell::new(Vec::new()),
                 secured: RefCell::new(Vec::new()),
+                away: RefCell::new(Vec::new()),
             }
         }
 
@@ -832,8 +860,21 @@ mod tests {
                 paths.state_dir.display(),
                 user.unwrap_or("-")
             ));
+            let away = self
+                .away
+                .borrow()
+                .iter()
+                .filter(|_| recorded)
+                .map(|p| crate::grants::Grant {
+                    container: "nerve.away".into(),
+                    path: p.clone(),
+                    access: nerve_policy::config::Access::ALL,
+                    id: None,
+                })
+                .collect();
             crate::grants::Synced {
                 removed: usize::from(recorded),
+                away,
                 ..Default::default()
             }
         }
@@ -1217,6 +1258,27 @@ mod tests {
         );
         assert!(out.contains(&did), "{out}");
         assert!(hand.config_file().exists() && hand.state_dir.exists());
+    }
+
+    /// Grants on a drive that is not connected stay on: uninstall says so,
+    /// and how they come off, by another uninstall while their record stays.
+    #[test]
+    fn uninstall_names_the_grants_left_on_drives_that_are_not_here() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = installed(d.path(), &sys, "1.0.0");
+        let hand = by_hand(d.path());
+        std::fs::create_dir_all(&hand.state_dir).unwrap();
+        std::fs::write(crate::grants::record_file(&hand), "[]").unwrap();
+        sys.away.borrow_mut().push(PathBuf::from(r"E:\proj"));
+        let mut out = Vec::new();
+        uninstall(&l, &hand, &sys, true, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        let left = format!(
+            "left 1 folder grants of the node run by hand ({}) on, on drives that are not connected now (E:\\proj): connect their drives and run `nerve-node uninstall` again",
+            hand.state_dir.display()
+        );
+        assert!(out.contains(&left), "{out}");
     }
 
     #[test]

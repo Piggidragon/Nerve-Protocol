@@ -259,7 +259,7 @@ fn decode(bytes: &[u8], cut: bool) -> String {
 /// the folders say ([`leave_out`]).
 pub fn landlock_spec(policy: &CenterPolicy, home: &Path, own: &[PathBuf]) -> LandlockSpec {
     // Landlock is Linux's, so the list is the Unix one.
-    let f = folder_sets(policy, home, own, &Platform::Unix);
+    let f = folder_sets(policy, home, own, &Platform::Unix, &[]);
     LandlockSpec {
         read: leave_out(&[nerve_sandbox::system_dirs(), f.read].concat(), own),
         write: leave_out(&[nerve_sandbox::system_writable(), f.write].concat(), own),
@@ -296,23 +296,36 @@ pub struct FolderSets {
 /// as the own folders are ([`leave_protected_out`]). The write set leaves
 /// out the entries protected for writes as well. The node's own folders are
 /// the caller's to leave out ([`leave_out`]).
+///
+/// A folder that lies strictly inside one of `writable` (configured paths,
+/// `~` expanded) is left out when it no longer leads to its own place below
+/// that folder ([`led_away`]): commands may write there, so a link or
+/// junction on its way may be theirs.
 pub fn folder_sets(
     policy: &CenterPolicy,
     home: &Path,
     own: &[PathBuf],
     platform: &Platform,
+    writable: &[PathBuf],
 ) -> FolderSets {
     let protected = Protected::new(platform, home, own, &policy.protected);
     let real: Vec<(Access, PathBuf)> = policy
         .folders
         .iter()
         .filter_map(|x| {
+            let path = expand(home, &x.path)?;
             let folder = Folder {
-                path: expand(home, &x.path)?.display().to_string(),
+                path: path.display().to_string(),
                 access: x.access,
             };
-            match protected.real_folder(&folder, &policy.folders) {
-                Ok(path) => Some((x.access, path)),
+            let real = protected
+                .real_folder(&folder, &policy.folders)
+                .and_then(|real| match led_away(&path, &real, writable) {
+                    Some(why) => Err(why),
+                    None => Ok(real),
+                });
+            match real {
+                Ok(real) => Some((x.access, real)),
                 Err(why) => {
                     tracing::warn!("folder {} left out of the command's sandbox: {why}", x.path);
                     None
@@ -340,13 +353,20 @@ pub fn folder_sets(
 /// flags of the sets it is in. A grant covers what is below its path, as a
 /// Landlock rule does. Windows opens its system folders to every
 /// AppContainer, so they need none.
+///
+/// `writable` are the folders that any container may write (`w`, of every
+/// center): a folder strictly inside one gets no grant where a link or
+/// junction on its way now leads, since a command may have put it there.
+/// The grant goes on by the path below that folder, so a link put there
+/// later is refused when it goes on (`crate::grants::sync`).
 pub fn container_grants(
     policy: &CenterPolicy,
     home: &Path,
     own: &[PathBuf],
     platform: &Platform,
+    writable: &[PathBuf],
 ) -> Vec<(PathBuf, Access)> {
-    let f = folder_sets(policy, home, own, platform);
+    let f = folder_sets(policy, home, own, platform, writable);
     let mut out: Vec<(PathBuf, Access)> = Vec::new();
     for (set, flag) in [(f.read, 'r'), (f.write, 'w'), (f.exec, 'x')] {
         for p in leave_out(&set, own) {
@@ -366,6 +386,30 @@ pub fn container_grants(
         }
     }
     out
+}
+
+/// Why `real`, the resolved `path` of a folder, is not the place `path`
+/// names below a folder of `writable` that holds it strictly: a link or
+/// junction on the way leads elsewhere. Only the folders above `writable`
+/// are resolved, since links there are the owner's.
+fn led_away(path: &Path, real: &Path, writable: &[PathBuf]) -> Option<String> {
+    writable
+        .iter()
+        .filter(|w| within(path, w) && !within(w, path))
+        .find_map(|w| {
+            let rest: PathBuf = path.components().skip(w.components().count()).collect();
+            let here = match nerve_policy::paths::resolve(w) {
+                Ok(r) => r.join(rest),
+                Err(e) => return Some(format!("{} cannot be resolved: {e}", w.display())),
+            };
+            (!(within(&here, real) && within(real, &here))).then(|| {
+                format!(
+                    "it leads to {}, through a link or junction inside {}, where commands may write",
+                    real.display(),
+                    w.display()
+                )
+            })
+        })
 }
 
 /// `p` resolved, as the policy compares paths (on Windows without the

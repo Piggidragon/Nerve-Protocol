@@ -159,6 +159,16 @@ command in an AppContainer, one per center (`nerve_sandbox::appcontainer`):
   and puts it on again on a folder made anew. A lock file
   (`grants.json.lock`) keeps the CLI and a running node from writing over each
   other's record, and a grant is recorded before it goes on.
+- `w` gives `DELETE` and `FILE_DELETE_CHILD` only with `r`, and a granted
+  folder's or file's own entry has no `DELETE` (`nerve_sandbox::acl`).
+  Windows grants a move by `DELETE`, and a moved object keeps its own list
+  until a change on its new folder passes that folder's entries down. So a
+  command moves only what it reads and writes, and a granted folder only
+  out of another one it reads and writes: no move makes readable what it
+  could not read. Inside a folder with `w` a command can put a junction or
+  a hard link where a granted folder was, so a grant goes on there only on
+  an object of its own (its final path is its path, one name, an inheriting
+  list), through the handle the check opened.
 - A grant that should be off and cannot be taken off stops the commands of its
   container. A record that cannot be read stops the commands of every
   container, since no grant in it could be found again.

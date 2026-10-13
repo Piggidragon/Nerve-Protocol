@@ -127,7 +127,10 @@ folders.
   the entry it inherited. `icacls <path> /reset` gives it the permissions of
   its new place.
 - The flags stay independent: `w` without `r` writes but neither reads nor
-  lists, `x` runs programs and reads files by name but does not list.
+  lists, `x` runs programs and reads files by name but does not list. One
+  case gets past this, listed under "What the AppContainer does not stop": a
+  file a command hard-links out of a `w`-only folder into a folder where it
+  also reads can become readable there.
 - Deleting and renaming need `r` and `w`, since Windows allows a move with
   the same right as a delete: a command must not move what it cannot read
   to a folder where it can. So in a folder with `w` but not `r`, a command
@@ -142,7 +145,14 @@ folders.
   junction in its place, and the entry would land on the folder it leads
   to. This holds for a folder inside a `w` folder of any pairing. The node
   names such a folder in its log (`left out of the command's sandbox: it
-  leads to …`) and grants it once it is a plain folder again.
+  leads to …`) and grants it once it is a plain folder again. One gap is
+  left here: if a command makes such a junction while the outer folder has
+  `w`, and you then take the `w` off that folder (narrow it to `r`, or
+  remove the pairing it belongs to), the node no longer knows commands could
+  write there and follows the junction again. Before you take `w` off a
+  folder or remove a pairing, check it for junctions and links
+  (`dir /AL /S <folder>`). A fix that remembers the place you judged when
+  you added the folder is tracked in its own issue.
 - The node's own folders and the [protected paths](protected-paths.md) get no
   entry, also inside a folder you grant. That folder is granted as its other
   entries instead, as on Linux.
@@ -156,6 +166,17 @@ folders.
   AppContainer (reading the system folders, the network), and work a command
   gets another program outside the container to do for it, such as a service
   or the task scheduler.
+- Hard links across your flags: a file has one set of permissions for all
+  its names. A command of a pairing that has a `w`-only folder and, on the
+  same drive, a folder it reads and writes can hard-link a file from the
+  `w`-only folder into the read-write one. When the node next writes that
+  read-write folder's permissions — because you added a folder, changed its
+  flags, or a command renamed or remade a folder inside it — Windows passes
+  the read right down to the linked file, and the command can then read it
+  under its first name too. So a `w`-only drop folder whose files the
+  commands must not read belongs on a drive where that pairing has no folder
+  it both reads and writes (hard links do not cross drives). Closing this in
+  the node is tracked in its own issue.
 
 `nerve-node status` cannot ask the running node on Windows
 ([platforms](platforms.md#no-control-socket)). The node names its

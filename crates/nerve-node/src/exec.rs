@@ -297,10 +297,9 @@ pub struct FolderSets {
 /// out the entries protected for writes as well. The node's own folders are
 /// the caller's to leave out ([`leave_out`]).
 ///
-/// A folder that lies strictly inside one of `writable` (configured paths,
-/// `~` expanded) is left out when it no longer leads to its own place below
-/// that folder ([`led_away`]): commands may write there, so a link or
-/// junction on its way may be theirs.
+/// A folder whose resolution crosses a link or junction at or inside a
+/// place where commands may write (`writable`, configured paths, `~`
+/// expanded) is left out ([`led_away`]): commands may have put that link.
 pub fn folder_sets(
     policy: &CenterPolicy,
     home: &Path,
@@ -309,6 +308,9 @@ pub fn folder_sets(
     writable: &[PathBuf],
 ) -> FolderSets {
     let protected = Protected::new(platform, home, own, &policy.protected);
+    // The boundary is judged by resolved places, so a writable folder
+    // reached by one spelling catches a folder configured by another.
+    let bounds: Vec<PathBuf> = writable.iter().map(|w| real(w)).collect();
     let real: Vec<(Access, PathBuf)> = policy
         .folders
         .iter()
@@ -320,7 +322,7 @@ pub fn folder_sets(
             };
             let real = protected
                 .real_folder(&folder, &policy.folders)
-                .and_then(|real| match led_away(&path, &real, writable) {
+                .and_then(|real| match led_away(&path, &bounds) {
                     Some(why) => Err(why),
                     None => Ok(real),
                 });
@@ -388,28 +390,39 @@ pub fn container_grants(
     out
 }
 
-/// Why `real`, the resolved `path` of a folder, is not the place `path`
-/// names below a folder of `writable` that holds it strictly: a link or
-/// junction on the way leads elsewhere. Only the folders above `writable`
-/// are resolved, since links there are the owner's.
-fn led_away(path: &Path, real: &Path, writable: &[PathBuf]) -> Option<String> {
-    writable
-        .iter()
-        .filter(|w| within(path, w) && !within(w, path))
-        .find_map(|w| {
-            let rest: PathBuf = path.components().skip(w.components().count()).collect();
-            let here = match nerve_policy::paths::resolve(w) {
-                Ok(r) => r.join(rest),
-                Err(e) => return Some(format!("{} cannot be resolved: {e}", w.display())),
-            };
-            (!(within(&here, real) && within(real, &here))).then(|| {
-                format!(
-                    "it leads to {}, through a link or junction inside {}, where commands may write",
-                    real.display(),
-                    w.display()
-                )
-            })
-        })
+/// Why resolving `path` leads out of its own place: a link or junction on
+/// the way lies at or inside a place where commands may write (`writable`,
+/// resolved). `path` is walked component by component; once the resolved
+/// prefix is at or inside a `writable` place, a component that resolves
+/// elsewhere than its plain name is a link or junction a command may have
+/// put there, and the folder is left out. Above that boundary the links are
+/// the owner's and are followed, the boundary's own component (the write
+/// folder itself may be a junction of the owner's) among them. Places are
+/// judged resolved, so a writable folder reached by one spelling catches a
+/// folder configured by another (a link, a mount point, an 8.3 name).
+fn led_away(path: &Path, writable: &[PathBuf]) -> Option<String> {
+    let comps: Vec<_> = path.components().collect();
+    let mut inside = false;
+    for i in 1..=comps.len() {
+        let here = real(&comps[..i].iter().collect::<PathBuf>());
+        // The place this component names without following a link of its
+        // own: the resolved parent plus the component's name.
+        let plain = if i == 1 {
+            here.clone()
+        } else {
+            real(&comps[..i - 1].iter().collect::<PathBuf>()).join(comps[i - 1].as_os_str())
+        };
+        if inside && here != plain {
+            return Some(format!(
+                "it leads to {} through a link or junction inside a folder where commands may write",
+                here.display()
+            ));
+        }
+        if !inside && writable.iter().any(|w| within(&here, w)) {
+            inside = true;
+        }
+    }
+    None
 }
 
 /// `p` resolved, as the policy compares paths (on Windows without the

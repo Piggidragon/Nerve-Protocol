@@ -84,9 +84,10 @@ pub fn container(paths: &NodePaths, center: &str) -> String {
 
 /// The grants the config asks for: every center's folders, each with the
 /// flags of its sets (`exec::container_grants`). `home` is the `~` of the
-/// rules, the home of the account commands run as. A folder inside one that
-/// any center's commands may write gets its grant only where it is itself,
-/// not where a link or junction there leads.
+/// rules, the home of the account commands run as. A folder whose
+/// resolution crosses a link or junction at or inside a place where any
+/// center's commands may write gets no grant, wherever that link leads
+/// (`exec::led_away`): a command may have put it there.
 pub fn wanted(cfg: &NodeConfig, paths: &NodePaths, home: &Path, platform: &Platform) -> Vec<Grant> {
     let own = paths.own();
     let writable: Vec<PathBuf> = cfg
@@ -1272,6 +1273,58 @@ mod tests {
         assert_eq!(
             f.on(&outbox.display().to_string()),
             [(lab.clone(), Access::parse("w").unwrap())]
+        );
+    }
+
+    /// The writable folder and the nested folder are spelled differently:
+    /// the owner gives the write folder through a link of their own and the
+    /// nested folder by its real path. A command's link at the nested
+    /// folder is still caught, because the boundary is judged by resolved
+    /// places, not by the spelling (`exec::led_away`).
+    #[cfg(unix)]
+    #[test]
+    fn a_junction_with_two_spellings_gets_no_grant() {
+        let d = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let (real_work, outbox) = (root.join("real-work"), root.join("outbox"));
+        // The owner gives the write folder through their own link `work`,
+        // and the folder inside it by its real path `real-work/bin`.
+        let work = root.join("work");
+        let bin = real_work.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&outbox).unwrap();
+        std::os::unix::fs::symlink(&real_work, &work).unwrap();
+        let paths = NodePaths::new(root.join("cfg"), root.join("state"));
+        let mut cfg = NodeConfig::default();
+        cfg.centers.push(center(
+            "lab",
+            &[(&work, "rw"), (&bin, "rwx"), (&outbox, "w")],
+        ));
+        let lab = container(&paths, "lab");
+        let g = |p: &Path, a: &str| Grant {
+            container: lab.clone(),
+            path: p.into(),
+            access: Access::parse(a).unwrap(),
+            id: None,
+        };
+        let sorted = |mut v: Vec<Grant>| {
+            v.sort_by(|a, b| a.path.cmp(&b.path));
+            v
+        };
+        let want = wanted(&cfg, &paths, &root, &Platform::Unix);
+        assert_eq!(
+            sorted(want.clone()),
+            sorted(vec![g(&real_work, "rw"), g(&bin, "rwx"), g(&outbox, "w"),])
+        );
+
+        // A command swaps the real nested folder for a link to the outbox.
+        std::fs::remove_dir(&bin).unwrap();
+        std::os::unix::fs::symlink(&outbox, &bin).unwrap();
+        let swapped = wanted(&cfg, &paths, &root, &Platform::Unix);
+        assert_eq!(
+            sorted(swapped),
+            sorted(vec![g(&real_work, "rw"), g(&outbox, "w")]),
+            "the outbox must not gain the nested folder's flags"
         );
     }
 

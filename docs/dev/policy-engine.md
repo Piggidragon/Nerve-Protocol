@@ -151,11 +151,18 @@ command in an AppContainer, one per center (`nerve_sandbox::appcontainer`):
   Windows grants a move by `DELETE`, and a moved object keeps its own list
   until a change on its new folder passes that folder's entries down. So a
   command moves only what it reads and writes, and a granted folder only
-  out of another one it reads and writes: no move makes readable what it
-  could not read. Inside a folder with `w` a command can put a junction or
-  a hard link where a granted folder was, so a grant goes on there only on
-  an object of its own (its final path is its path, one name, an inheriting
-  list), through the handle the check opened.
+  out of another one it reads and writes. A move alone makes nothing
+  readable that was not. A hard link is the gap: a file has one list for all
+  its names, so a command that hard-links a file out of a `w`-only folder
+  into a folder it reads and writes makes it readable once the node passes
+  that folder's list down (the take-off of a renamed folder, the re-grant of
+  a remade one, an added folder, a flag change). That is an open limit, named
+  in the user docs and tracked in its own issue. Inside a folder with `w` a
+  command can put a junction or a hard link where a granted folder was, so a
+  grant goes on there only on an object of its own (its final path is its
+  path, one name, an inheriting list), through the handle the check opened;
+  a folder whose resolution crosses a link at or inside a writable place
+  gets no grant at all (`exec::led_away`).
 - A grant that should be off and cannot be taken off stops the commands of its
   container. A record that cannot be read stops the commands of every
   container, since no grant in it could be found again.

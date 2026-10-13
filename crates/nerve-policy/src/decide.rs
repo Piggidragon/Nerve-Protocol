@@ -303,9 +303,24 @@ fn by_sudo_list(policy: &CenterPolicy, call: &Call, reasons: &mut Vec<String>) -
         );
         return false;
     }
-    let ok = command_matches(&policy.sudo_allow, cmd);
+    // As for the allow rules: a wildcard entry covers no expression the
+    // shell runs and no word that starts another one (PowerShell runs the
+    // value of `@{a=...}`), only an entry that names the line exactly does.
+    // The command runs with full rights, so this holds on every platform.
+    let cmd = cmd.trim();
+    let wild = command_matches(&policy.sudo_allow, cmd);
+    let ok = if plain_command(cmd) {
+        wild
+    } else {
+        let want = crate::rules::escape(cmd);
+        policy.sudo_allow.iter().any(|e| e.trim() == want)
+    };
     if !ok {
-        reasons.push("a sudo command runs only when the sudo allow list names it".into());
+        reasons.push(if wild {
+            "a sudo command with an expression (@ { } % ' \" # , \\) or a word such as powershell, cmd, iex or -Command runs only when a sudo allow entry names it exactly".into()
+        } else {
+            "a sudo command runs only when the sudo allow list names it".into()
+        });
     }
     ok
 }
@@ -1108,6 +1123,46 @@ mod tests {
                 p.caps.insert("camera".into(), CapSetting::On);
                 assert_eq!(run(&p, &env, &c), "allow");
             }
+        }
+    }
+
+    /// A sudo command runs with full rights (the administrator token on
+    /// Windows, through PowerShell): a wildcard sudo entry covers no more
+    /// than a wildcard allow rule does, only an entry that names the line.
+    #[test]
+    fn a_wildcard_sudo_entry_covers_no_expression_or_inner_command() {
+        let x = T::new();
+        let on = x.sudo_on();
+        let e = t("/w/rw", false);
+        let sudo = |cmd| call(Effect::Execute, &e, Some(cmd));
+        let payload = "sudo choco install @{a=powershell -EncodedCommand AAAA}";
+        for mode in MODES {
+            let mut p = policy(mode);
+            p.sudo_allow = vec![crate::rules::sudo_rule_for("sudo choco install", true).unwrap()];
+            assert_eq!(p.sudo_allow, ["sudo choco *"]);
+            assert_eq!(run(&p, &on, &sudo("sudo choco install git -y")), "allow");
+            for line in [
+                payload,
+                "sudo choco install powershell",
+                "sudo choco install x -EncodedCommand AAAA",
+                "sudo choco install 'a b'",
+                "sudo choco install a,b",
+            ] {
+                let d = decide(&p, &on, &sudo(line));
+                assert!(
+                    matches!(&d, Decision::Forbidden(m) if m.contains("names it exactly")),
+                    "{mode:?} {line}: {d:?}"
+                );
+            }
+            // An entry that names the line exactly covers it.
+            p.sudo_allow
+                .push(crate::rules::sudo_rule_for(payload, false).unwrap());
+            assert_eq!(run(&p, &on, &sudo(payload)), "allow", "{mode:?}");
+            assert_eq!(
+                run(&p, &on, &sudo("sudo choco install @{a=1}")),
+                "refused",
+                "{mode:?}"
+            );
         }
     }
 

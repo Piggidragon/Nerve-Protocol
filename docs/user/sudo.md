@@ -53,6 +53,10 @@ On Linux (Windows differs, see [sudo on Windows](#sudo-on-windows)):
   in the audit log with `[redacted]`. This holds on Windows too.
 - A sudo command must be one simple command. One with `; & | $ ` ( ) < >` or a
   line break is refused. This holds on Windows too.
+- A `--wildcard` entry covers plain commands only, as a [wildcard allow
+  rule](rules.md#what-a-wildcard-covers) does. A line with `@ { } % ' " # , \`
+  or a word such as `powershell`, `cmd`, `iex` or `-Command` runs only when an
+  entry names the whole line. This holds on Windows too.
 - It starts the command as that account, as `sudo -S -k -p <prompt> …`, so
   sudo raises it from that account. It runs without the Landlock
   sandbox, which would stop sudo from gaining privileges. It writes the

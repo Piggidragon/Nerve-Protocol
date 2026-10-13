@@ -65,6 +65,8 @@ call's target: the whole command line, the resolved path, or `<cap>.<action>`.
   expression characters or a word that starts another shell or runs text as
   code is covered only by an allow rule that names the whole line.
 - A `sudo` command must be one simple command. Control characters are refused.
+  A wildcard sudo entry covers plain lines only, as a wildcard allow rule
+  does; any other line needs an entry that names it whole.
 
 ## Modes
 

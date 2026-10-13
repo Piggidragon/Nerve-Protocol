@@ -414,7 +414,9 @@ The normal `allow` list does not count for them.
 - **On**: such a command runs only when `sudo_allow` names it, in every
   mode; `deny` rules and protected paths still refuse it. A sudo command must
   be one simple command: one with `; & | $ \` ( ) < >` or a line break is
-  refused. The node runs it as `sudo -S -k -p <prompt> …` without Landlock
+  refused. A `sudo_allow` glob covers only the plain lines a wildcard allow
+  rule covers (§2, Rules); any other line runs only when an entry is that
+  whole line, escaped as `rule add sudo` writes it. The node runs it as `sudo -S -k -p <prompt> …` without Landlock
   (which would stop sudo from gaining privileges), with a random prompt per
   command, started as the account the commands run as (§1), so sudo raises
   it from that account. It writes the password to stdin only after sudo

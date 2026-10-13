@@ -7,7 +7,9 @@
 //! an explicit yes: GNOME Keyring through the distribution's package
 //! manager, a session of the node's user that outlives logins and reboots
 //! (`loginctl enable-linger`), in which D-Bus starts the keyring when the
-//! node asks, and a login keyring that opens without a password.
+//! node asks, and a login keyring that opens without a password. Where the
+//! node's user has a desktop session, nothing is offered: such a keyring
+//! would become the default of every program in that session.
 //!
 //! The kernel keyring (keyutils) needs no daemon, but its keys are gone
 //! after a reboot, and with them the node's: so it is not offered. A keyring
@@ -113,21 +115,26 @@ pub trait Keyring {
     /// How a keyring would be installed here; `None` where nerve-node cannot
     /// install one (not Linux, or no package manager it knows).
     fn offer(&self) -> Option<Offer>;
+    /// Whether `who` has a graphical session: its desktop brings or chooses
+    /// the keyring, and a password-less one of nerve-node's would become
+    /// the default of every program there.
+    fn desktop(&self, who: &Account) -> bool;
     /// Installs and starts a keyring for `who` as `offer` says.
     fn install(&self, offer: &Offer, who: &Account, out: &mut dyn Write) -> Result<(), String>;
 }
 
 /// Makes sure the system keyring of `who` answers: when it does not, says
-/// why and, where nerve-node can install one and `input` is a terminal's,
-/// offers to. Anything but a yes leaves the refusal.
+/// why and, where nerve-node can install one, `who` has no desktop and
+/// `input` is a terminal's, offers to. Anything but a yes leaves the
+/// refusal. `Ok(true)` when a keyring was installed now.
 pub fn ensure(
     keyring: &dyn Keyring,
     who: &Account,
     input: Option<&mut dyn BufRead>,
     out: &mut dyn Write,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let Err(why) = keyring.check(who) else {
-        return Ok(());
+        return Ok(false);
     };
     let name = &who.name;
     let refusal = format!(
@@ -136,6 +143,11 @@ pub fn ensure(
     let Some(offer) = keyring.offer() else {
         return Err(refusal);
     };
+    if keyring.desktop(who) {
+        return Err(format!(
+            "{refusal}; {name} has a desktop session, so start the keyring of that desktop (GNOME Keyring, or KWallet with its Secret Service on)"
+        ));
+    }
     let Some(input) = input else {
         return Err(format!(
             "{refusal}; `nerve-node setup`, run in a terminal, offers to install one"
@@ -150,7 +162,7 @@ pub fn ensure(
     );
     let _ = writeln!(
         out,
-        "Without a desktop nobody types a password when the machine starts, so this keyring keeps the keys unencrypted in {}, readable by {name} as the key files are; it guards them no better than the files.",
+        "Without a desktop nobody types a password when the machine starts, so this keyring keeps the keys unencrypted in {}, readable by {name} as the key files are; the node keeps centers out of it as it does out of the key files. It becomes the default keyring of {name}: any other program of {name} that keeps a secret in the system keyring keeps it there, unencrypted too.",
         store.display()
     );
     let yes = crate::cli::ask(input, out, "Install it now? [y/N] ")?;
@@ -162,7 +174,7 @@ pub fn ensure(
         .check(who)
         .map_err(|e| format!("the keyring is installed, but it does not answer for {name}: {e}"))?;
     let _ = writeln!(out, "the system keyring answers for {name}");
-    Ok(())
+    Ok(true)
 }
 
 /// The account this process runs as, from the system's account database.
@@ -249,6 +261,38 @@ impl Keyring for HostKeyring {
         })
     }
 
+    fn desktop(&self, who: &Account) -> bool {
+        // Setup run in that user's own session: its environment says so.
+        // Under sudo it is someone else's.
+        #[cfg(unix)]
+        if who.uid == nerve_transport::net::euid()
+            && std::env::var_os("SUDO_UID").is_none()
+            && graphical_env(|k| std::env::var_os(k))
+        {
+            return true;
+        }
+        // A graphical session of that user elsewhere: logind's display
+        // session, when it is one.
+        let loginctl = |args: &[&str]| {
+            std::process::Command::new("loginctl")
+                .args(args)
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default()
+        };
+        let uid = who.uid.to_string();
+        let display = loginctl(&["show-user", &uid, "--property=Display", "--value"]);
+        !display.is_empty()
+            && graphical_type(&loginctl(&[
+                "show-session",
+                &display,
+                "--property=Type",
+                "--value",
+            ]))
+    }
+
     fn install(&self, offer: &Offer, who: &Account, out: &mut dyn Write) -> Result<(), String> {
         for cmd in &offer.commands {
             let _ = writeln!(out, "running {}", cmd.join(" "));
@@ -272,6 +316,20 @@ impl Keyring for HostKeyring {
         }
         Ok(())
     }
+}
+
+/// Whether an environment is a graphical session's.
+pub fn graphical_env(var: impl Fn(&str) -> Option<std::ffi::OsString>) -> bool {
+    let set = |k: &str| var(k).is_some_and(|v| !v.is_empty());
+    set("DISPLAY")
+        || set("WAYLAND_DISPLAY")
+        || set("XDG_CURRENT_DESKTOP")
+        || var("XDG_SESSION_TYPE").is_some_and(|t| graphical_type(&t.to_string_lossy()))
+}
+
+/// Whether a logind session type is a graphical one.
+fn graphical_type(t: &str) -> bool {
+    matches!(t, "x11" | "wayland" | "mir")
 }
 
 /// Runs a system command as root: directly when this process is root; on
@@ -383,6 +441,7 @@ pub(crate) mod tests {
     pub struct FakeKeyring {
         pub answers: Cell<bool>,
         pub offer: Option<Offer>,
+        pub desktop: bool,
         pub installed: RefCell<Vec<String>>,
     }
 
@@ -391,6 +450,7 @@ pub(crate) mod tests {
             FakeKeyring {
                 answers: Cell::new(answers),
                 offer: Offer::for_system(|p| p == "apt-get"),
+                desktop: false,
                 installed: RefCell::new(Vec::new()),
             }
         }
@@ -407,6 +467,10 @@ pub(crate) mod tests {
 
         fn offer(&self) -> Option<Offer> {
             self.offer.clone()
+        }
+
+        fn desktop(&self, _who: &Account) -> bool {
+            self.desktop
         }
 
         fn install(
@@ -438,7 +502,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn run(k: &FakeKeyring, typed: Option<&str>) -> (Result<(), String>, String) {
+    fn run(k: &FakeKeyring, typed: Option<&str>) -> (Result<bool, String>, String) {
         let mut out = Vec::new();
         let mut input = typed.map(|t| std::io::Cursor::new(t.as_bytes().to_vec()));
         let r = ensure(
@@ -454,7 +518,7 @@ pub(crate) mod tests {
     fn a_keyring_that_answers_is_not_asked_about() {
         let k = FakeKeyring::new(true);
         let (r, out) = run(&k, Some(""));
-        assert_eq!(r, Ok(()));
+        assert_eq!(r, Ok(false));
         assert!(out.is_empty(), "{out}");
     }
 
@@ -503,7 +567,7 @@ pub(crate) mod tests {
     fn yes_installs_the_keyring_and_checks_it_answers() {
         let k = FakeKeyring::new(false);
         let (r, out) = run(&k, Some("y\n"));
-        assert_eq!(r, Ok(()), "{out}");
+        assert_eq!(r, Ok(true), "{out}");
         assert_eq!(
             *k.installed.borrow(),
             [
@@ -514,6 +578,42 @@ pub(crate) mod tests {
             out.contains("the system keyring answers for nerve"),
             "{out}"
         );
+    }
+
+    /// On a desktop nothing is offered: the keyring would be the default
+    /// of every program there (review round 1, finding 4). The question
+    /// says that it becomes the default.
+    #[test]
+    fn a_user_with_a_desktop_is_offered_no_keyring() {
+        let mut k = FakeKeyring::new(false);
+        k.desktop = true;
+        let (r, out) = run(&k, Some("y\n"));
+        let e = r.unwrap_err();
+        assert!(e.contains("no system keyring answers for nerve"), "{e}");
+        assert!(e.contains("has a desktop session"), "{e}");
+        assert!(out.is_empty(), "{out}");
+        assert!(k.installed.borrow().is_empty());
+        let k = FakeKeyring::new(false);
+        let (_, out) = run(&k, Some("n\n"));
+        assert!(out.contains("default keyring of nerve"), "{out}");
+    }
+
+    #[test]
+    fn a_graphical_session_is_told_by_its_environment() {
+        use std::ffi::OsString;
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                vars.iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| OsString::from(v))
+            }
+        };
+        assert!(graphical_env(env(&[("WAYLAND_DISPLAY", "wayland-1")])));
+        assert!(graphical_env(env(&[("DISPLAY", ":0")])));
+        assert!(graphical_env(env(&[("XDG_CURRENT_DESKTOP", "sway")])));
+        assert!(graphical_env(env(&[("XDG_SESSION_TYPE", "x11")])));
+        assert!(!graphical_env(env(&[("XDG_SESSION_TYPE", "tty")])));
+        assert!(!graphical_env(env(&[("DISPLAY", ""), ("HOME", "/root")])));
     }
 
     #[test]

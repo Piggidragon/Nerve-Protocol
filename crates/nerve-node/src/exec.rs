@@ -222,7 +222,17 @@ pub fn landlock_spec(policy: &CenterPolicy, home: &Path, own: &[PathBuf]) -> Lan
             &[nerve_sandbox::system_dirs(), folders(&|a| a.execute, false)].concat(),
             own,
         ),
+        connect: None,
     }
+}
+
+/// Where a command of `folders` mode may connect to socket files while the
+/// node's keys are in the keyring: anywhere but the folders in `own`, which
+/// then hold the session bus the keyring answers on
+/// (crate::paths::keyring_places). With the files the rule is not set, and
+/// commands connect where they did.
+pub fn connect_rule(own: &[PathBuf]) -> Vec<PathBuf> {
+    leave_out(&[PathBuf::from("/")], own)
 }
 
 /// `paths` without the folders in `own`. A Landlock rule grants a folder and
@@ -1069,6 +1079,24 @@ mod tests {
         // SAFETY: signal 0 only checks whether the group exists.
         let alive = unsafe { libc::kill(-(pid as libc::pid_t), 0) } == 0;
         assert!(!alive, "the process group outlived the call");
+    }
+
+    /// With the keys in the keyring a command connects to socket files
+    /// anywhere but the node's own folders, the session bus's among them
+    /// (review round 1, finding 1): no rule holds those.
+    #[test]
+    fn the_connect_rule_leaves_the_own_folders_out() {
+        let d = tempfile::tempdir().unwrap();
+        let w = std::fs::canonicalize(d.path()).unwrap();
+        for dir in ["run/user/1000", "run/user/1001", "run/lock"] {
+            std::fs::create_dir_all(w.join(dir)).unwrap();
+        }
+        let bus = w.join("run/user/1000");
+        let got = connect_rule(std::slice::from_ref(&bus));
+        assert!(got.contains(&w.join("run/user/1001")), "{got:?}");
+        assert!(got.contains(&w.join("run/lock")), "{got:?}");
+        assert!(!got.iter().any(|p| bus.starts_with(p)), "{got:?}");
+        assert!(!got.iter().any(|p| p.starts_with(&bus)), "{got:?}");
     }
 
     #[test]

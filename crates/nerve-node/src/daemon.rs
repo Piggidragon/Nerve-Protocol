@@ -14,6 +14,7 @@ use tokio::task::JoinHandle;
 #[cfg(unix)]
 use nerve_policy::SetError;
 use nerve_policy::audit::{AuditLog, Change, Entry, diff};
+use nerve_policy::config::SecretStorage;
 use nerve_policy::{NodeConfig, SettingsStore};
 use nerve_proto::Message;
 use nerve_proto::msg::{Topic, method};
@@ -256,9 +257,39 @@ impl Shared {
         r
     }
 
-    /// Whether commands may run confined (Landlock and the shim's host).
-    pub fn confined(&self) -> bool {
-        self.confinement.available() && self.exe.is_some()
+    /// The folders no center reaches, whatever its policy: the node's own,
+    /// and with its keys in the keyring on Linux, the places that reach
+    /// them there (crate::paths::keyring_places). Not called while the
+    /// store is locked when `cfg` comes from [`Shared::config`].
+    pub fn own(&self, cfg: &NodeConfig) -> Vec<PathBuf> {
+        let own = self.paths.own();
+        #[cfg(target_os = "linux")]
+        if cfg.machine.secret_storage == SecretStorage::Keyring {
+            let places =
+                crate::paths::keyring_places(&self.home, nerve_transport::net::euid(), |k| {
+                    std::env::var_os(k)
+                });
+            return [own, places].concat();
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = cfg;
+        own
+    }
+
+    /// Whether commands of `folder` mode may run: confined (Landlock and the
+    /// shim's host), and kept from the node's keys. With the keys in the
+    /// keyring a command reaches them over the session bus, a socket file:
+    /// Landlock keeps a command from connecting to one only from ABI 9 on
+    /// (Linux 7.1), and before that only an account other than root and the
+    /// node's own cannot reach that bus.
+    pub fn confined(&self, cfg: &NodeConfig) -> bool {
+        self.confinement.available()
+            && self.exe.is_some()
+            && keys_kept_from_commands(
+                cfg.machine.secret_storage,
+                self.confinement.keeps_sockets(),
+                self.command_account(cfg).ok().flatten().as_ref(),
+            )
     }
 
     pub fn center(&self, name: &str) -> Arc<CenterState> {
@@ -356,9 +387,27 @@ impl Shared {
             "confinement": self.confinement.describe(),
             "running": self.running.load(Ordering::Relaxed),
             "sudo": if self.sudo_on() { "on" } else { "off" },
+            // This process found no keyring and does not look again
+            // (crate::secrets::store::failed): setup restarts it after it
+            // installed one.
+            "keyring_failed": crate::secrets::store::failed(),
             "centers": centers,
         })
     }
+}
+
+/// Whether a confined command of `account` (`None`: the node's own user)
+/// cannot reach the node's keys where `storage` keeps them. Files are out of
+/// its sandbox. The keyring answers on the session bus of the node's user:
+/// Landlock keeps a command off it where it `keeps_sockets`; elsewhere only
+/// another account than root is kept out, by the bus folder's owner-only
+/// mode.
+pub fn keys_kept_from_commands(
+    storage: SecretStorage,
+    keeps_sockets: bool,
+    account: Option<&crate::service::Account>,
+) -> bool {
+    storage == SecretStorage::File || keeps_sockets || account.is_some_and(|a| a.uid != 0)
 }
 
 /// A running node daemon.
@@ -471,6 +520,15 @@ impl Daemon {
             sudo_for: Mutex::default(),
             account_cache: Mutex::default(),
         });
+        if cfg.machine.secret_storage == SecretStorage::Keyring
+            && shared.confinement.available()
+            && shared.exe.is_some()
+            && !shared.confined(&cfg)
+        {
+            tracing::warn!(
+                "the node's keys are in the system keyring, which answers any process of the node's user, and Landlock here cannot keep a command off it (that needs ABI 9, Linux 7.1): folder mode runs no command unless commands run as another account than root"
+            );
+        }
         // The password lives in memory only: a file that says on starts off.
         shared.settle_sudo();
         let ctl = if opts.ctl {
@@ -852,6 +910,76 @@ fn describe_change(by: &str, version: u64, changes: &[Change]) -> String {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// With the keys in the keyring, folder mode runs commands only where
+    /// they cannot reach the session bus it answers on: Landlock ABI 9, or
+    /// an account other than root and the node's own (review round 1,
+    /// finding 1).
+    #[test]
+    fn folder_commands_with_the_keyring_need_the_bus_out_of_reach() {
+        let account = |uid| crate::service::Account {
+            name: "a".into(),
+            uid,
+            gid: uid,
+            comment: String::new(),
+            home: "/home/a".into(),
+            groups: vec![uid],
+        };
+        let (other, root) = (account(4242), account(0));
+        use SecretStorage::{File, Keyring};
+        assert!(keys_kept_from_commands(File, false, None));
+        assert!(keys_kept_from_commands(File, false, Some(&root)));
+        assert!(!keys_kept_from_commands(Keyring, false, None));
+        assert!(!keys_kept_from_commands(Keyring, false, Some(&root)));
+        assert!(keys_kept_from_commands(Keyring, false, Some(&other)));
+        assert!(keys_kept_from_commands(Keyring, true, None));
+        assert!(keys_kept_from_commands(Keyring, true, Some(&root)));
+    }
+
+    /// The keyring's places are the node's own only while its keys are
+    /// there (review round 1, finding 2).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_keyring_folder_is_the_nodes_own_with_the_keyring() {
+        let (d, daemon) = daemon().await;
+        let mut cfg = daemon.config();
+        let keyrings = d.path().join(".local/share/keyrings");
+        assert_eq!(daemon.shared.own(&cfg), daemon.paths().own());
+        cfg.machine.secret_storage = SecretStorage::Keyring;
+        let own = daemon.shared.own(&cfg);
+        assert!(own.contains(&keyrings), "{own:?}");
+        let bus = PathBuf::from(format!("/run/user/{}", nerve_transport::net::euid()));
+        assert!(own.contains(&bus), "{own:?}");
+        // A center reaches neither the plain-text keyring through the fs
+        // capability nor the folder from a command, even with the whole
+        // home in its folders.
+        std::fs::create_dir_all(&keyrings).unwrap();
+        std::fs::write(keyrings.join("login.keyring"), "[keyring]\n").unwrap();
+        let home = std::fs::canonicalize(d.path()).unwrap();
+        let p = nerve_policy::protected::Protected::new(
+            &nerve_policy::protected::Platform::Unix,
+            &home,
+            &own,
+            &Default::default(),
+        );
+        assert!(
+            p.own(&home.join(".local/share/keyrings/login.keyring"))
+                .is_some()
+        );
+        let policy = nerve_policy::CenterPolicy {
+            folders: vec![nerve_policy::config::Folder {
+                path: home.display().to_string(),
+                access: nerve_policy::config::Access::ALL,
+            }],
+            ..Default::default()
+        };
+        let spec = crate::exec::landlock_spec(&policy, &home, &own);
+        let keyrings = std::fs::canonicalize(&keyrings).unwrap();
+        for set in [&spec.read, &spec.write, &spec.exec] {
+            assert!(!set.iter().any(|r| keyrings.starts_with(r)), "{set:?}");
+        }
+        daemon.stop().await;
+    }
 
     async fn daemon() -> (tempfile::TempDir, Daemon) {
         let d = tempfile::tempdir().unwrap();

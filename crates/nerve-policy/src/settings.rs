@@ -131,6 +131,16 @@ pub trait Secrets: Send {
     /// `cfg` could not be saved: the copies [`Secrets::copy`] made go, and
     /// the secrets stay where they were.
     fn not_moved(&mut self, cfg: &NodeConfig);
+    /// Before the store writes the file: keeps other writers off until
+    /// [`Secrets::end`] where it can, and says whether another process may
+    /// have written the file since this store read it (the CLI's store,
+    /// opened for one command while another may run). The store then
+    /// refuses a change made on a version that is no longer the file's.
+    fn begin(&mut self) -> Result<bool, String> {
+        Ok(false)
+    }
+    /// After that write, saved or not.
+    fn end(&mut self) {}
 }
 
 /// The MAC key in a file of its own, and no other secret: a store opened on
@@ -237,7 +247,7 @@ impl SettingsStore {
         };
         if first && unseal(&text).0.is_none() {
             let c = NodeConfig::parse(&text).map_err(|e| format!("{}: {e}", s.path.display()))?;
-            s.write(&c)?;
+            s.write(&c, None).map_err(|e| e.to_string())?;
             s.config = c;
             let _ = s.audit.config(
                 "signed",
@@ -376,7 +386,8 @@ impl SettingsStore {
         let mut new = NodeConfig::parse(unseal(&text).1)
             .map_err(|e| SetError::Invalid(format!("{}: {e}", self.path.display())))?;
         new.version = self.config.version.max(new.version) + 1;
-        self.write(&new).map_err(SetError::Io)?;
+        // Taken as it is: whoever wrote it last.
+        self.write(&new, None)?;
         let changes = diff(&to_json(&self.config), &to_json(&new));
         let version = new.version;
         self.config = new;
@@ -400,17 +411,49 @@ impl SettingsStore {
     /// Writes `c`, moving the node's secrets first when it keeps them in
     /// another place: copied there and read back, then the file, then the
     /// old copies go. A move that fails saves nothing.
-    fn write(&mut self, c: &NodeConfig) -> Result<(), String> {
-        if c.machine.secret_storage == self.secrets.storage() {
-            return self.write_file(c);
-        }
-        self.secrets.copy(c)?;
-        if let Err(e) = self.write_file(c) {
-            self.secrets.not_moved(c);
-            return Err(e);
-        }
-        self.secrets.moved(c);
-        Ok(())
+    ///
+    /// `opened` is the version `c` was made from. Where another process may
+    /// have written the file meanwhile ([`Secrets::begin`]), a file that is
+    /// no longer that version is a conflict and nothing is written: a
+    /// change made on the old file would undo the other one, and with it a
+    /// move of the keys that one made.
+    fn write(&mut self, c: &NodeConfig, opened: Option<u64>) -> Result<(), SetError> {
+        let shared = self.secrets.begin().map_err(SetError::Io)?;
+        let r = (|| {
+            if let Some(opened) = opened.filter(|_| shared) {
+                let now = self.version_on_disk().map_err(SetError::Io)?;
+                if now != opened {
+                    return Err(SetError::Conflict { current: now });
+                }
+            }
+            if c.machine.secret_storage == self.secrets.storage() {
+                return self.write_file(c).map_err(SetError::Io);
+            }
+            self.secrets.copy(c).map_err(SetError::Io)?;
+            if let Err(e) = self.write_file(c) {
+                self.secrets.not_moved(c);
+                return Err(SetError::Io(e));
+            }
+            self.secrets.moved(c);
+            Ok(())
+        })();
+        self.secrets.end();
+        r
+    }
+
+    /// The version of the file as it is now, read without checking its MAC
+    /// (the version a write must not go behind): 0 for no file, and for one
+    /// that names none.
+    fn version_on_disk(&self) -> Result<u64, String> {
+        let Some(text) = read_file(&self.path)? else {
+            return Ok(0);
+        };
+        let table: Option<toml::Table> = toml::from_str(unseal(&text).1).ok();
+        Ok(table
+            .as_ref()
+            .and_then(|t| t.get("version"))
+            .and_then(toml::Value::as_integer)
+            .map_or(0, |v| v as u64))
     }
 
     /// Writes `c` atomically, signed.
@@ -455,7 +498,8 @@ impl SettingsStore {
             return Ok(());
         }
         new.version = self.config.version + 1;
-        self.write(&new)?;
+        self.write(&new, Some(self.config.version))
+            .map_err(|e| e.to_string())?;
         self.config = new;
         Ok(())
     }
@@ -539,7 +583,7 @@ impl SettingsStore {
             return Ok(self.config.version);
         }
         new.version = self.config.version + 1;
-        self.write(&new).map_err(SetError::Io)?;
+        self.write(&new, Some(self.config.version))?;
         let changes = diff(&to_json(&self.config), &to_json(&new));
         let version = new.version;
         self.config = new;

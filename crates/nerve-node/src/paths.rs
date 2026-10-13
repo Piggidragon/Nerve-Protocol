@@ -99,6 +99,76 @@ impl NodePaths {
     }
 }
 
+/// Where a Linux node whose keys are in the system keyring has them, or a
+/// way to them, beside its own folders: no center reaches these either. The
+/// D-Bus session the Secret Service answers on, which hands every entry to
+/// any process of the user that asks (its runtime folder, `/run/user/<uid>`
+/// where a D-Bus library looks when nothing names one, and the socket a
+/// `unix:path=` bus address names), and the folder GNOME Keyring keeps its
+/// keyrings in, which holds the keys in plain text when the keyring opens
+/// without a password (`crate::keyring_setup`). `home` is the node's user's
+/// home, `uid` its id and `var` reads the node's environment.
+pub fn keyring_places(
+    home: &Path,
+    uid: u32,
+    var: impl Fn(&str) -> Option<OsString>,
+) -> Vec<PathBuf> {
+    let dir = |k: &str| var(k).map(PathBuf::from).filter(|p| p.is_absolute());
+    let mut out = Vec::new();
+    out.extend(dir("XDG_RUNTIME_DIR"));
+    out.push(PathBuf::from(format!("/run/user/{uid}")));
+    if let Some(address) = var("DBUS_SESSION_BUS_ADDRESS") {
+        out.extend(bus_sockets(&address.to_string_lossy()));
+    }
+    out.extend(dir("XDG_DATA_HOME").map(|d| d.join("keyrings")));
+    out.push(home.join(".local/share/keyrings"));
+    let mut seen = Vec::new();
+    out.retain(|p| {
+        let new = !seen.contains(p);
+        seen.push(p.clone());
+        new
+    });
+    out
+}
+
+/// The sockets a D-Bus address names (`unix:path=…`, `;` between the
+/// addresses tried in turn). An abstract socket has no path; Landlock keeps
+/// a command off those anyway.
+fn bus_sockets(address: &str) -> Vec<PathBuf> {
+    address
+        .split(';')
+        .filter_map(|a| a.strip_prefix("unix:"))
+        .filter_map(|keys| {
+            keys.split(',')
+                .find_map(|kv| kv.strip_prefix("path="))
+                .map(unescape)
+        })
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .collect()
+}
+
+/// A D-Bus address value with its `%xx` escapes undone.
+fn unescape(v: &str) -> String {
+    let b = v.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = |c: u8| (c as char).to_digit(16);
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2]))
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// The owner's home directory.
 pub fn home_dir() -> PathBuf {
     let var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
@@ -306,6 +376,43 @@ mod tests {
         // Not moved: once.
         let f = windows_folders(env, Some("c:\\users\\u\\documents".into()));
         assert_eq!(f.documents, [PathBuf::from("c:\\users\\u\\documents")]);
+    }
+
+    /// With the keys in the keyring, the session bus and GNOME Keyring's
+    /// folder are the node's own too (review round 1, findings 1 and 2).
+    #[test]
+    fn the_keyring_places_are_the_session_bus_and_the_keyring_folder() {
+        let env = |k: &str| {
+            match k {
+                "XDG_RUNTIME_DIR" => Some("/run/user/1000"),
+                "DBUS_SESSION_BUS_ADDRESS" => {
+                    Some("unix:abstract=/tmp/x;unix:guid=1,path=/tmp/dbus%2dabc")
+                }
+                "XDG_DATA_HOME" => Some("/data/bob"),
+                _ => None,
+            }
+            .map(OsString::from)
+        };
+        assert_eq!(
+            keyring_places(Path::new("/home/bob"), 1000, env),
+            [
+                PathBuf::from("/run/user/1000"),
+                "/tmp/dbus-abc".into(),
+                "/data/bob/keyrings".into(),
+                "/home/bob/.local/share/keyrings".into()
+            ]
+        );
+        // Nothing named: the usual places of the installed node's user.
+        assert_eq!(
+            keyring_places(Path::new("/var/lib/nerve"), 990, |_| None),
+            [
+                PathBuf::from("/run/user/990"),
+                "/var/lib/nerve/.local/share/keyrings".into()
+            ]
+        );
+        // A relative folder in the environment names nothing.
+        let odd = |k: &str| (k == "XDG_RUNTIME_DIR").then(|| OsString::from("run"));
+        assert_eq!(keyring_places(Path::new("/h"), 7, odd).len(), 2);
     }
 
     /// The real known-folder read; only a Windows run reaches it.

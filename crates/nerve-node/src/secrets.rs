@@ -336,8 +336,10 @@ pub fn store_center_key(
     put(paths, storage, Key::Center(center), key.to_text().trim())
 }
 
-/// Deletes the node key for `center`: from where `storage` keeps it, and a
-/// file left from before a move.
+/// Deletes the node key for `center`: from where `storage` keeps it, a file
+/// left from before a move, and while a move waits (`keys.moving`) the copy
+/// in the other place, which the start that finishes the move no longer
+/// looks for once the center is gone.
 pub fn remove_center_key(
     paths: &NodePaths,
     storage: SecretStorage,
@@ -345,8 +347,8 @@ pub fn remove_center_key(
 ) -> Result<(), String> {
     let key = Key::Center(center);
     delete(paths, storage, key)?;
-    if storage == SecretStorage::Keyring {
-        delete(paths, SecretStorage::File, key)?;
+    if storage == SecretStorage::Keyring || paths.keys_moving().exists() {
+        delete(paths, other(storage), key)?;
     }
     Ok(())
 }
@@ -369,10 +371,10 @@ pub fn remove_center_key(
 pub struct NodeSecrets {
     paths: NodePaths,
     storage: SecretStorage,
-    /// Whether a move takes [`KeysLock`] first: the CLI's. The daemon holds
+    /// Whether a write takes [`KeysLock`] first: the CLI's. The daemon holds
     /// it already.
     locks: bool,
-    /// The lock while a move holds it.
+    /// The lock while a write holds it.
     held: Option<KeysLock>,
     /// The move in progress leaves the old copies to the next start.
     defer: bool,
@@ -393,8 +395,9 @@ impl NodeSecrets {
         }
     }
 
-    /// For a CLI that writes `node.toml` itself: a move takes [`KeysLock`],
-    /// and leaves the old copies to a node that holds it.
+    /// For a CLI that writes `node.toml` itself: each write takes
+    /// [`KeysLock`] and is refused when the file changed since it was read,
+    /// and a move leaves the old copies to a node that holds the lock.
     pub fn for_cli(paths: &NodePaths) -> NodeSecrets {
         NodeSecrets {
             locks: true,
@@ -504,29 +507,41 @@ impl Secrets for NodeSecrets {
 
     fn copy(&mut self, cfg: &NodeConfig) -> Result<(), String> {
         let to = cfg.machine.secret_storage;
-        if self.locks {
-            self.held = KeysLock::try_take(&self.paths)?;
-            self.defer = self.held.is_none();
-        }
         nerve_transport::files::write_private(
             &self.paths.keys_moving(),
             format!("moving the node's keys to {}\n", place(to)).as_bytes(),
         )
         .map_err(|e| format!("{}: {e}", self.paths.keys_moving().display()))?;
-        let mut copied = Vec::new();
+        // The keys this move wrote in the new place, the one being written
+        // included: a write that fails half way (its read-back does not
+        // answer) may have left a copy there all the same.
+        let mut written = Vec::new();
         for key in keys(cfg) {
-            let r = get(&self.paths, self.storage, key).and_then(|text| match text {
-                Some(t) => put(&self.paths, to, key, &t).map(|_| copied.push(key)),
-                None => Ok(()),
+            let r = get(&self.paths, self.storage, key).and_then(|text| {
+                let Some(t) = text else {
+                    return Ok(());
+                };
+                // A copy there that equals it is left as it is: a node may
+                // still read it, from a move left to its next start.
+                if get(&self.paths, to, key).ok().flatten().as_deref() == Some(t.as_str()) {
+                    return Ok(());
+                }
+                written.push(key);
+                put(&self.paths, to, key, &t)
             });
             if let Err(e) = r {
                 // Nothing is saved: what was copied goes again.
-                for key in copied {
+                for key in written {
                     let _ = delete(&self.paths, to, key);
                 }
                 let _ = std::fs::remove_file(self.paths.keys_moving());
-                self.held = None;
                 let hint = match to {
+                    // The keyring crate keeps a failure to reach the
+                    // keyring for the life of the process: a running node
+                    // that met one asks no keyring installed after it.
+                    SecretStorage::Keyring if !self.locks && store::failed() => {
+                        " (this running node found no keyring and does not look again until it is restarted; on a Linux without a desktop, `nerve-node setup` installs one and restarts the installed node)"
+                    }
                     SecretStorage::Keyring => {
                         " (on a Linux without a desktop, `nerve-node setup` can install a keyring)"
                     }
@@ -549,12 +564,27 @@ impl Secrets for NodeSecrets {
         if !self.defer {
             self.finish(self.gather(cfg, self.storage));
         }
-        self.held = None;
     }
 
     fn not_moved(&mut self, cfg: &NodeConfig) {
         self.finish(self.gather(cfg, self.storage));
+    }
+
+    /// The CLI's: every write it makes holds [`KeysLock`] where no node
+    /// holds it, so a move and a write of another CLI do not cross; a move
+    /// made while a node holds it leaves the old copies to that node.
+    fn begin(&mut self) -> Result<bool, String> {
+        if !self.locks {
+            return Ok(false);
+        }
+        self.held = KeysLock::try_take(&self.paths)?;
+        self.defer = self.held.is_none();
+        Ok(true)
+    }
+
+    fn end(&mut self) {
         self.held = None;
+        self.defer = false;
     }
 }
 
@@ -656,8 +686,20 @@ impl KeysLock {
 #[cfg(not(test))]
 pub(crate) mod store {
     use super::SERVICE;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Whether this process asked the keyring at all.
+    static ASKED: AtomicBool = AtomicBool::new(false);
+
+    /// Whether this process asked the keyring and none answered: the
+    /// keyring crate connects once per process and keeps that failure for
+    /// its life, so only a new process sees a keyring installed after it.
+    pub fn failed() -> bool {
+        ASKED.load(Ordering::Relaxed) && keyring::Entry::store_status().is_err()
+    }
 
     fn entry(account: &str) -> Result<keyring::Entry, String> {
+        ASKED.store(true, Ordering::Relaxed);
         keyring::Entry::new(SERVICE, account).map_err(|e| {
             match (&e, keyring::Entry::store_status()) {
                 // The store failed to start; its own error says why.
@@ -704,7 +746,9 @@ pub(crate) mod store {
 
     thread_local! {
         static UNREACHABLE: Cell<bool> = const { Cell::new(false) };
+        static FAILED: Cell<bool> = const { Cell::new(false) };
         static CALLS: Cell<usize> = const { Cell::new(0) };
+        static UNREADABLE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
     }
 
     /// How often this thread asked the keyring.
@@ -719,18 +763,38 @@ pub(crate) mod store {
     /// Makes the keyring unreachable on this thread (`true`) or reachable.
     pub fn set_unreachable(on: bool) {
         UNREACHABLE.with(|u| u.set(on));
+        if !on {
+            FAILED.with(|f| f.set(false));
+        }
+    }
+
+    /// Whether a call on this thread found the keyring unreachable since it
+    /// was last made reachable, as the real store keeps such a failure.
+    pub fn failed() -> bool {
+        FAILED.with(Cell::get)
+    }
+
+    /// Makes reading `account` fail on this thread, as a read that does not
+    /// answer in time; writing it still works.
+    pub fn set_unreadable(account: Option<&str>) {
+        UNREADABLE.with(|u| *u.borrow_mut() = account.map(String::from));
     }
 
     fn reach() -> Result<std::sync::MutexGuard<'static, HashMap<String, String>>, String> {
         CALLS.with(|c| c.set(c.get() + 1));
         if UNREACHABLE.with(Cell::get) {
+            FAILED.with(|f| f.set(true));
             return Err(NO_SERVICE.into());
         }
         Ok(ENTRIES.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     pub fn get(account: &str) -> Result<Option<String>, String> {
-        Ok(reach()?.get(account).cloned())
+        let entries = reach()?;
+        if UNREADABLE.with(|u| u.borrow().as_deref() == Some(account)) {
+            return Err("the keyring did not answer in time".into());
+        }
+        Ok(entries.get(account).cloned())
     }
 
     pub fn set(account: &str, value: &str) -> Result<(), String> {
@@ -973,6 +1037,87 @@ mod tests {
         assert!(!paths.config_key().exists() && !paths.key_file("home").exists());
         assert!(in_keyring(&paths, Key::Config).is_some());
         assert!(!paths.keys_moving().exists());
+    }
+
+    /// A copy whose write went through but whose read-back did not answer
+    /// goes with the copies before it: neither place keeps anything of the
+    /// move (review round 1, finding 5).
+    #[test]
+    fn a_copy_that_fails_after_its_write_leaves_nothing_in_the_new_place() {
+        let (_d, paths) = node();
+        let mut s = paired(&paths, SecretStorage::File, &["home", "lab"]);
+        let before = std::fs::read(paths.config_file()).unwrap();
+        // The second key is written, then its read-back fails.
+        store::set_unreadable(Some(Entry::center_key(&paths, "home").account()));
+        let e = set_storage(&mut s, SecretStorage::Keyring).unwrap_err();
+        store::set_unreadable(None);
+        assert!(e.contains("nothing was changed"), "{e}");
+        for key in [Key::Config, Key::Center("home"), Key::Center("lab")] {
+            assert_eq!(in_keyring(&paths, key), None, "{key:?}");
+            assert!(key.file(&paths).exists(), "{key:?}");
+        }
+        assert!(!paths.keys_moving().exists());
+        assert_eq!(std::fs::read(paths.config_file()).unwrap(), before);
+        assert_eq!(s.config().machine.secret_storage, SecretStorage::File);
+    }
+
+    /// Two CLIs with no node: one moves the keys, the other saves a change
+    /// it made on the file before the move. That one is refused, so the
+    /// file keeps naming where the keys are (review round 1, finding 6).
+    #[test]
+    fn a_cli_write_on_a_file_another_cli_changed_meanwhile_is_refused() {
+        let (_d, paths) = node();
+        drop(paired(&paths, SecretStorage::File, &["home"]));
+        let mut a = cli_store(&paths);
+        let mut b = cli_store(&paths);
+        set_storage(&mut a, SecretStorage::Keyring).unwrap();
+        assert!(!paths.key_file("home").exists());
+        let e = b
+            .update(|c| {
+                c.node.name = Some("lab-pc".into());
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(matches!(e, nerve_policy::SetError::Conflict { .. }), "{e}");
+        drop((a, b));
+        let s = open(&paths).unwrap();
+        assert_eq!(s.config().machine.secret_storage, SecretStorage::Keyring);
+        assert!(center_key(&paths, SecretStorage::Keyring, "home").is_ok());
+        // Opened again, the write goes through.
+        let mut b = cli_store(&paths);
+        b.update(|c| {
+            c.node.name = Some("lab-pc".into());
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// A center removed while a move waits for the next start loses its key
+    /// in the old place too: that start no longer looks for it (review
+    /// round 1, finding 7).
+    #[test]
+    fn a_center_removed_while_a_move_waits_leaves_no_key_behind() {
+        let (_d, paths) = node();
+        drop(paired(&paths, SecretStorage::Keyring, &["lab"]));
+        let running = KeysLock::try_take(&paths).unwrap().unwrap();
+        let mut s = cli_store(&paths);
+        set_storage(&mut s, SecretStorage::File).unwrap();
+        assert!(paths.keys_moving().exists());
+        assert!(paths.key_file("lab").exists());
+        assert!(in_keyring(&paths, Key::Center("lab")).is_some());
+        s.update(|c| {
+            c.centers.clear();
+            Ok(())
+        })
+        .unwrap();
+        remove_center_key(&paths, SecretStorage::File, "lab").unwrap();
+        assert!(!paths.key_file("lab").exists());
+        assert_eq!(in_keyring(&paths, Key::Center("lab")), None);
+        drop((s, running));
+        let s = open(&paths).unwrap();
+        settle(&paths, s.config());
+        assert!(!paths.keys_moving().exists());
+        assert_eq!(in_keyring(&paths, Key::Config), None);
     }
 
     fn cli_store(paths: &NodePaths) -> SettingsStore {

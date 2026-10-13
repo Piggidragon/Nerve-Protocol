@@ -112,10 +112,13 @@ impl Sudo {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SecretStorage {
-    /// A 0600 key file per center below the config directory.
+    /// 0600 files: a key file per center below the config directory, and
+    /// the key of the config's MAC in the state directory.
     #[default]
     File,
-    /// The system keyring. Not done in 0.0.1.
+    /// The system keyring (the Credential Manager on Windows, the Secret
+    /// Service on Linux), one entry per key and no copy in a file. A node
+    /// whose keyring does not answer refuses to start.
     Keyring,
 }
 

@@ -307,7 +307,7 @@ async fn session(
                 "the center's id is not the paired one".to_string(),
             ));
         }
-        let rev = descriptor::for_center(&cfg, entry, crate::now_ms(), shared.confined()).rev;
+        let rev = descriptor::for_center(&cfg, entry, crate::now_ms(), shared.confined(&cfg)).rev;
         let hello = Hello {
             node_id: key.node_id(),
             auth: msg::Auth {
@@ -461,7 +461,7 @@ impl Link {
             None => return self.end(ByeReason::Unpaired, Outcome::Stop).await,
         };
         let mut rev =
-            descriptor::for_center(&cfg, &entry, crate::now_ms(), self.shared.confined()).rev;
+            descriptor::for_center(&cfg, &entry, crate::now_ms(), self.shared.confined(&cfg)).rev;
         let mut version = cfg.version;
         loop {
             tokio::select! {
@@ -544,7 +544,8 @@ impl Link {
     fn check_rev(&self, rev: &mut u64) {
         if let Some((cfg, entry)) = self.entry() {
             let now =
-                descriptor::for_center(&cfg, &entry, crate::now_ms(), self.shared.confined()).rev;
+                descriptor::for_center(&cfg, &entry, crate::now_ms(), self.shared.confined(&cfg))
+                    .rev;
             if now != *rev {
                 *rev = now;
                 self.handle
@@ -708,7 +709,7 @@ impl Link {
             &cfg,
             &entry,
             crate::now_ms(),
-            self.shared.confined(),
+            self.shared.confined(&cfg),
         ))
     }
 
@@ -801,10 +802,11 @@ impl Link {
     }
 
     fn confinement(&self) -> String {
-        let folders = self
-            .entry()
-            .is_some_and(|(_, e)| e.policy.mode_at(crate::now_ms()) == Mode::Folder);
-        if folders && self.shared.confined() {
+        let Some((cfg, entry)) = self.entry() else {
+            return "none".into();
+        };
+        let folders = entry.policy.mode_at(crate::now_ms()) == Mode::Folder;
+        if folders && self.shared.confined(&cfg) {
             self.shared.confinement.describe()
         } else {
             "none".into()
@@ -990,7 +992,17 @@ impl Link {
     }
 
     fn protected(&self, entry: &CenterEntry) -> Protected {
-        self.protected_with(&entry.policy.protected, self.account().as_ref())
+        self.protected_with(
+            &entry.policy.protected,
+            self.account().as_ref(),
+            &self.own(),
+        )
+    }
+
+    /// The folders no center reaches (Shared::own). Not called while the
+    /// store is locked: it reads the config.
+    fn own(&self) -> Vec<std::path::PathBuf> {
+        self.shared.own(&self.shared.config())
     }
 
     /// This node's protected list with a center's options. On the
@@ -1001,12 +1013,13 @@ impl Link {
         &self,
         opts: &nerve_policy::config::ProtectedOptions,
         account: Option<&crate::service::Account>,
+        own: &[std::path::PathBuf],
     ) -> Protected {
         let home = account.map_or(&self.shared.home, |a| &a.home);
         // Without the switch the entries are still there as written; only
         // the places they lead to through links are not found.
         let _as = act_as(account).ok().flatten();
-        Protected::new(&self.shared.platform, home, &self.shared.paths.own(), opts)
+        Protected::new(&self.shared.platform, home, own, opts)
     }
 
     /// Runs the policy for one call: it either runs or is refused at once.
@@ -1041,7 +1054,7 @@ impl Link {
             let env = Env {
                 home,
                 protected: &protected,
-                confined: self.shared.confined(),
+                confined: self.shared.confined(&self.shared.config()),
                 sudo: self.shared.sudo_on(),
             };
             nerve_policy::decide(&entry.policy, &env, &call)
@@ -1084,13 +1097,14 @@ impl Link {
         }
         let s: Set = params(args)?;
         let account = self.account();
+        let own = self.own();
         let r = lock(&self.shared.store).set_center_document(
             &self.name,
             s.document,
             s.if_version,
             // This node offers no sense capabilities in 0.0.1.
             |_| false,
-            |opts| self.protected_with(opts, account.as_ref()),
+            |opts| self.protected_with(opts, account.as_ref(), &own),
         );
         settings_result(r)
     }
@@ -1098,6 +1112,7 @@ impl Link {
     /// `settings.pause`: a center may pause itself, never unpause.
     fn settings_pause(&self) -> Result<Value, RpcError> {
         let account = self.account();
+        let own = self.own();
         let mut store = lock(&self.shared.store);
         let doc = store
             .center_document(&self.name)
@@ -1110,7 +1125,7 @@ impl Link {
             v,
             version,
             |_| false,
-            |opts| self.protected_with(opts, account.as_ref()),
+            |opts| self.protected_with(opts, account.as_ref(), &own),
         );
         settings_result(r).map(|_| json!({}))
     }
@@ -1231,13 +1246,20 @@ impl Link {
         let guard = Running::start(self, id.clone(), cfg.limits.max_running as usize)?;
         // The account's home is the `~` of its rules: its own shell
         // profiles and keys stay out of them.
+        let own = self.shared.own(cfg);
         let landlock = (sudo.is_none()
             && entry.policy.mode_at(crate::now_ms()) == Mode::Folder
-            && self.shared.confined())
+            && self.shared.confined(cfg))
         .then(|| {
             // The folders' entries are listed as the account.
             let _as = act_as(known.as_ref()).ok().flatten();
-            exec::landlock_spec(&entry.policy, &home, &self.shared.paths.own())
+            let mut spec = exec::landlock_spec(&entry.policy, &home, &own);
+            // The keys in the keyring are behind the session bus, a socket
+            // file in the own folders then.
+            if cfg.machine.secret_storage == nerve_policy::config::SecretStorage::Keyring {
+                spec.connect = Some(exec::connect_rule(&own));
+            }
+            spec
         });
         let opts = RunOptions {
             shell: cfg.machine.shell.clone(),
@@ -1246,7 +1268,7 @@ impl Link {
             output_cap: (cfg.limits.output_cap_bytes as usize).min(exec::OUTPUT_HARD_CAP),
             sudo,
             account,
-            own: self.shared.paths.own(),
+            own,
         };
         let r = exec::run(&rc, &opts, |e| guard.started(e)).await;
         drop(guard);

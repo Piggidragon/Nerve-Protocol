@@ -152,9 +152,11 @@ A change of the setting moves the keys once, through the settings store, in
 whatever writes the config (the running node, else the CLI):
 
 1. `<state>/keys.moving` is written. It holds no secret.
-2. Every key is copied to the new place and read back. When a copy fails or
-   reads back otherwise, the copies made are deleted and the change is
-   refused: `node.toml` stays as it was, and so do the keys.
+2. Every key is copied to the new place and read back; a copy there that
+   holds the same key already is left as it is. When a copy fails or reads
+   back otherwise, the copies this move wrote are deleted, the failing one
+   included, and the change is refused: `node.toml` stays as it was, and so
+   do the keys.
 3. `node.toml` is saved with the new setting.
 4. Each old copy is deleted once the new place holds the same key, then
    `keys.moving` goes.
@@ -173,10 +175,30 @@ start. `config accept` of a file that names the other place moves the keys
 there; when the place it names holds no key and the other one does, the key
 is taken from there.
 
+A CLI that writes `node.toml` itself holds `keys.lock` for each write it
+can (no node holds it), and refuses a change whose file is no longer the
+version it read: a change made before another CLI moved the keys would undo
+that move in the file. `center rm` deletes the center's key in both places
+while `keys.moving` is there, since the start that finishes the move no
+longer looks for a removed center.
+
 With `keyring` the MAC key is in no file that a process can read. The check
 still stands on that key: a process that can write both folders can still
 set `file` with a key of its own, and a process of the node's user can ask
-the keyring for its entries.
+the keyring for its entries over the user's D-Bus session.
+
+So with `keyring` on Linux the node's own folders, which no policy opens
+and Landlock's rules leave out, also take in the places that reach the
+keys: the node's `XDG_RUNTIME_DIR`, `/run/user/<uid>`, a socket that a
+`unix:path=` `DBUS_SESSION_BUS_ADDRESS` names, and `keyrings` in
+`XDG_DATA_HOME` and in `~/.local/share`. A `folder` mode command then also
+gets a Landlock rule for connecting to socket files
+(`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`, ABI 9, Linux 7.1): everywhere but the
+own folders. Where the
+kernel has no ABI 9, `folder` mode offers no `exec` while the keys are in the
+keyring, as on a machine without Landlock, unless commands run as an account
+other than root and the node's own; the bus folder is the user's alone
+(0700). The node logs that at start.
 
 #### A keyring on a Linux without a desktop
 
@@ -203,13 +225,26 @@ Then it checks that the keyring answers. Whether a keyring answers is asked
 by `nerve-node` itself in a process of its own, as the node's user and in
 that user's session.
 
+Nothing is offered where the user has a graphical session: the
+environment of a setup run in it (`DISPLAY`, `WAYLAND_DISPLAY`,
+`XDG_CURRENT_DESKTOP`, `XDG_SESSION_TYPE`), or logind's display session of
+the user when its type is x11, wayland or mir. A password-less login keyring
+would become the default for every program of that desktop.
+
+The keyring crate connects once per process and keeps a failure for the
+process's life. A running node reports one in its status
+(`keyring_failed`); after setup installed a keyring it restarts the
+installed node (`systemctl restart`, then waits for it), and stops with a
+message on a node run by hand.
+
 The kernel keyring (keyutils) needs no daemon, but its keys are gone after a
 reboot, and the node's with them, so it is not used. A keyring that opens
 without anyone typing a password keeps its entries unencrypted on disk,
-readable by the node's user like the key files; the question says so. At
-boot the node can start before its user's session; it then exits with the
-refusal, and systemd starts it again 5 seconds later. `uninstall` ends that
-session (`loginctl disable-linger`).
+readable by the node's user like the key files, and kept from centers like
+them (above); the question says so, and that it becomes the user's default
+keyring. At boot the node can start before its user's session; it then
+exits with the refusal, and systemd starts it again 5 seconds later.
+`uninstall` ends that session (`loginctl disable-linger`).
 
 ## 2. `node.toml`
 

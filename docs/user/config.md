@@ -122,6 +122,17 @@ The change moves the keys at once: each is copied, read back, and only then
 deleted where it was. If the keyring cannot take them, nothing changes. On
 Windows, while the node runs, the old copies stay until its next start.
 
+A keyring hands its entries to any program of the node's user that asks,
+through the user's D-Bus session. So with `keyring` on Linux the node keeps
+centers out of that session's folder (`/run/user/<uid>`) and out of GNOME
+Keyring's folder (`~/.local/share/keyrings`), as it does with its own
+folders. A `folder` mode command cannot connect to the session either: from
+Linux 7.1 on (Landlock ABI 9) Landlock refuses that. An older kernel cannot,
+so there `folder` mode runs no command while the keys are in the keyring,
+unless commands run as another account than root
+([service](service.md#the-account-commands-run-as)), which cannot reach the
+session of the node's user. The node then logs a warning at start.
+
 With `keyring`, the node needs a keyring that answers. Without one it does
 not start, and `status` and the other commands that read the settings say:
 
@@ -141,7 +152,7 @@ the settings say `keyring` and no keyring answers, setup asks:
 ```
 No system keyring answers for nerve: ….
 nerve-node can install GNOME Keyring: `apt-get update`, `apt-get install -y gnome-keyring dbus-user-session`, `loginctl enable-linger nerve`, so that nerve keeps a session after a reboot, and a login keyring for nerve that opens without a password.
-Without a desktop nobody types a password when the machine starts, so this keyring keeps the keys unencrypted in /var/lib/nerve/.local/share/keyrings, readable by nerve as the key files are; it guards them no better than the files.
+Without a desktop nobody types a password when the machine starts, so this keyring keeps the keys unencrypted in /var/lib/nerve/.local/share/keyrings, readable by nerve as the key files are; the node keeps centers out of it as it does out of the key files. It becomes the default keyring of nerve: any other program of nerve that keeps a secret in the system keyring keeps it there, unencrypted too.
 Install it now? [y/N]
 ```
 
@@ -151,6 +162,15 @@ with the system's package manager (apt, dnf or pacman), keeps a session for
 the node's user from boot on, makes a login keyring for it without a
 password, and checks that it answers. `install` asks the same when an
 earlier install's settings say `keyring` and it runs in a terminal.
+
+Setup offers this only where the user has no desktop session. On a desktop,
+start the desktop's keyring instead (GNOME Keyring, or KWallet with its
+Secret Service on).
+
+A node that runs and found no keyring before does not look for one again
+until it restarts. After installing one, setup restarts the installed node.
+For a node you run yourself, setup stops and asks you to restart it, then to
+run setup again.
 
 Such a keyring survives a reboot, but as the question says, it keeps the
 keys unencrypted on disk, as safe as the files. Whether a server should

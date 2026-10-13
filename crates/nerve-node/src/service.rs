@@ -209,22 +209,7 @@ impl System for Host {
             ]);
         // setup runs as the node's user and keeps root only as its saved
         // id ([`become_owner`]); useradd gets it back.
-        #[cfg(target_os = "linux")]
-        if !self.is_root() {
-            use std::os::unix::process::CommandExt;
-            // SAFETY: plain system calls between fork and exec.
-            unsafe {
-                c.pre_exec(|| {
-                    if libc::setresuid(0, 0, 0) != 0
-                        || libc::setresgid(0, 0, 0) != 0
-                        || libc::setgroups(0, std::ptr::null()) != 0
-                    {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                });
-            }
-        }
+        regain_root(&mut c);
         let o = c.output().map_err(|e| format!("useradd: {e}"))?;
         if o.status.success() {
             Ok(())
@@ -267,7 +252,16 @@ impl System for Host {
     }
 
     fn systemctl(&self, args: &[&str]) -> Result<(), String> {
-        run("systemctl", args)
+        let mut c = std::process::Command::new("systemctl");
+        c.args(args);
+        // setup restarts the node after it installed a keyring.
+        regain_root(&mut c);
+        let o = c.output().map_err(|e| format!("systemctl: {e}"))?;
+        if o.status.success() {
+            Ok(())
+        } else {
+            Err(format!("systemctl {}: {}", args.join(" "), failure(&o)))
+        }
     }
 
     fn give(&self, path: &Path, uid: u32, gid: u32) -> Result<(), String> {
@@ -350,6 +344,36 @@ fn no_login() -> &'static str {
 const LINUX_ONLY: &str = "works on Linux with systemd only; elsewhere run `nerve-node run` under your own service manager";
 
 /// Runs a system tool; its error output is the error.
+/// Lets `c` run as root where this process keeps root only as its saved id
+/// (setup on the installed node, [`become_owner`]); elsewhere it runs as
+/// this process does.
+fn regain_root(c: &mut std::process::Command) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::process::CommandExt;
+        let (mut r, mut e, mut s) = (0, 0, 0);
+        // SAFETY: getresuid writes the three ids it is given.
+        unsafe { libc::getresuid(&mut r, &mut e, &mut s) };
+        if e == 0 || s != 0 {
+            return;
+        }
+        // SAFETY: plain system calls between fork and exec.
+        unsafe {
+            c.pre_exec(|| {
+                if libc::setresuid(0, 0, 0) != 0
+                    || libc::setresgid(0, 0, 0) != 0
+                    || libc::setgroups(0, std::ptr::null()) != 0
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = c;
+}
+
 fn run(program: &str, args: &[&str]) -> Result<(), String> {
     let o = std::process::Command::new(program)
         .args(args)

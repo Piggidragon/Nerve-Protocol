@@ -1348,6 +1348,47 @@ pub async fn setup(
     r
 }
 
+/// After setup installed a keyring: a node that runs and found none before
+/// does not look again (`keyring_failed` in its status,
+/// [`crate::secrets::store::failed`]), so it would refuse the move. The
+/// installed node is restarted; a node run by hand is left to its owner.
+async fn after_keyring_installed(
+    paths: &NodePaths,
+    machine: Option<&dyn crate::service::System>,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    #[cfg(unix)]
+    if let Ok(status) = nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await {
+        return restart_for_keyring(&status, paths, machine, out);
+    }
+    #[cfg(not(unix))]
+    let _ = (paths, machine, out);
+    Ok(())
+}
+
+/// What [`after_keyring_installed`] does with the running node's `status`.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn restart_for_keyring(
+    status: &Value,
+    paths: &NodePaths,
+    machine: Option<&dyn crate::service::System>,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    if status["keyring_failed"] != true {
+        return Ok(());
+    }
+    let Some(sys) = machine else {
+        return Err("the system keyring answers now, but the node that runs for this folder found none before and does not look again until it is restarted; restart it, then run `nerve-node setup` again".into());
+    };
+    sys.systemctl(&["restart", crate::service::UNIT_NAME])?;
+    sys.wait_running(paths)?;
+    let _ = writeln!(
+        out,
+        "restarted the node, which had found no keyring before this one was installed"
+    );
+    Ok(())
+}
+
 /// Saves the account setup chose for the commands, if it chose one.
 async fn account_chosen(
     paths: &NodePaths,
@@ -1389,7 +1430,9 @@ async fn setup_steps(
     // comes first.
     if crate::secrets::stated_storage(paths) == SecretStorage::Keyring {
         let me = crate::keyring_setup::me()?;
-        crate::keyring_setup::ensure(keyring, &me, Some(input), out)?;
+        if crate::keyring_setup::ensure(keyring, &me, Some(input), out)? {
+            after_keyring_installed(paths, machine, out).await?;
+        }
     }
     let (cfg, _) = read_config(paths).await?;
     if let (Some(sys), Some(name)) = (machine, create_user) {
@@ -1452,7 +1495,9 @@ async fn setup_steps(
     if storage != now {
         if storage == SecretStorage::Keyring {
             let me = crate::keyring_setup::me()?;
-            crate::keyring_setup::ensure(keyring, &me, Some(input), out)?;
+            if crate::keyring_setup::ensure(keyring, &me, Some(input), out)? {
+                after_keyring_installed(paths, machine, out).await?;
+            }
         }
         edit(paths, |c| {
             c.machine.secret_storage = storage;
@@ -2894,6 +2939,58 @@ mod tests {
         assert!(out.contains("the system keyring answers"), "{out}");
         assert_eq!(load(&paths).machine.secret_storage, SecretStorage::Keyring);
         assert_eq!(config_key_at(&paths), (false, true));
+    }
+
+    /// A running node that found no keyring keeps that failure: after
+    /// setup installed one, the installed node is restarted before the keys
+    /// move, and the owner of a node run by hand is told to restart it
+    /// (review round 1, finding 3). A node that never failed is left alone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_node_that_found_no_keyring_is_restarted_after_one_is_installed() {
+        let (_d, paths) = setup(&[]);
+        let failed = json!({"version": 1, "keyring_failed": true});
+        let sys = crate::service::tests::Fake::new();
+        let mut out = Vec::new();
+        restart_for_keyring(&failed, &paths, Some(&sys), &mut out).unwrap();
+        assert!(
+            sys.calls()
+                .contains(&format!("systemctl restart {}", crate::service::UNIT_NAME)),
+            "{:?}",
+            sys.calls()
+        );
+        assert!(String::from_utf8_lossy(&out).contains("restarted the node"));
+        let e = restart_for_keyring(&failed, &paths, None, &mut out).unwrap_err();
+        assert!(
+            e.contains("restart it, then run `nerve-node setup` again"),
+            "{e}"
+        );
+        let sys = crate::service::tests::Fake::new();
+        let fine = json!({"version": 1, "keyring_failed": false});
+        restart_for_keyring(&fine, &paths, Some(&sys), &mut out).unwrap();
+        restart_for_keyring(&fine, &paths, None, &mut out).unwrap();
+        assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+    }
+
+    /// The running node says in its status whether it found no keyring.
+    #[cfg(unix)]
+    #[test]
+    fn the_status_says_whether_the_node_found_no_keyring() {
+        let (d, paths) = setup(&["home"]);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut opts = NodeOptions::new(paths.clone());
+        opts.home = d.path().to_path_buf();
+        opts.ctl = false;
+        let daemon = rt.block_on(Daemon::start(opts)).unwrap();
+        assert_eq!(daemon.status()["keyring_failed"], false);
+        crate::secrets::store::set_unreachable(true);
+        assert!(crate::secrets::store::get("any").is_err());
+        assert_eq!(daemon.status()["keyring_failed"], true);
+        crate::secrets::store::set_unreachable(false);
+        rt.block_on(daemon.stop());
     }
 
     /// A node whose keys are in a keyring that no longer answers: setup

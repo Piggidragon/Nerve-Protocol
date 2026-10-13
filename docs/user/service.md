@@ -134,7 +134,8 @@ in brackets.
    and the comment `Nerve user mode`. Choosing root shows the warning above.
 3. Where the node keeps its keys: `file` or `keyring`
    ([keys](config.md#where-the-node-keeps-its-keys)). With `keyring` and no
-   keyring that answers, it offers to install one.
+   keyring that answers, it offers to install one where `nerve` has no
+   desktop, and then restarts the node if it had found none before.
 4. A pairing link from the center's web UI. Enter skips it. The node shows
    the center and asks before it pairs, as `center add` does.
 5. The mode of that center: `allowlist`, `folder` or `user`

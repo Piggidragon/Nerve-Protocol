@@ -60,9 +60,9 @@ Without a flag, the node is dialling. The wait grows from 1 to 60 seconds. If
 
 If `status` says `daemon: not running`, start `nerve-node run`. On a node
 [installed as a service](service.md), start the service instead:
-`sudo systemctl start nerve-node`. A node started there by hand lacks the
-two capabilities the service has, so it cannot switch to the account
-commands run as and runs no command at all.
+`sudo systemctl start nerve-node`, on Windows `Start-Service nerve-node`. A
+node started there by hand lacks the privileges the service has, so it
+cannot switch to the account commands run as and runs no command at all.
 
 ## The node will not start
 

@@ -230,7 +230,7 @@ impl Shared {
         };
         crate::account::for_commands(
             cfg.machine.user.as_deref(),
-            nerve_transport::net::euid(),
+            crate::account::own_uid(),
             self.service,
             crate::account::can_switch(),
             cached,
@@ -604,6 +604,17 @@ impl Daemon {
                 "this is the installed node, started without CAP_SETUID and CAP_SETGID: it runs no command; start it as the service: `sudo systemctl start nerve-node`"
             );
         }
+        // The stored password of the account the commands run as is in the
+        // config folder (crate::win_user).
+        #[cfg(windows)]
+        {
+            crate::win_user::init(&paths.config_dir);
+            if service && crate::account::own_uid() != 0 && !crate::account::can_switch() {
+                tracing::warn!(
+                    "this is the installed node, started without SeAssignPrimaryTokenPrivilege: it runs no command; start it as the service: `Start-Service nerve-node`"
+                );
+            }
+        }
         let shared = Arc::new(Shared {
             paths: paths.clone(),
             service,
@@ -710,7 +721,17 @@ impl Daemon {
                 }
             }
         }
-        #[cfg(not(unix))]
+        // Under the service control manager, its stop request ends the node.
+        #[cfg(windows)]
+        {
+            crate::win_service::running();
+            if crate::win_service::is_service() {
+                crate::win_service::stop_requested().await;
+            } else {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         let _ = tokio::signal::ctrl_c().await;
         d.stop().await;
         Ok(())
@@ -791,7 +812,7 @@ async fn start_ctl(shared: Arc<Shared>) -> Result<JoinHandle<()>, String> {
 
 #[cfg(not(unix))]
 async fn start_ctl(_shared: Arc<Shared>) -> Result<JoinHandle<()>, String> {
-    // Not done in 0.0.1: a named pipe. The CLI writes the signed file itself,
+    // Not done: a named pipe. The CLI writes the signed file itself,
     // and the running node takes it at its next start.
     Ok(tokio::spawn(async {}))
 }

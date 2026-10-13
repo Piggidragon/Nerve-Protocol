@@ -230,7 +230,7 @@ pub struct Proxy {
 }
 
 impl Proxy {
-    /// `http://host:port` (an `https://` proxy is not supported in 0.0.1).
+    /// `http://host:port` (an `https://` proxy is not supported).
     /// A URL with a user name and password is refused without echoing it,
     /// since the error ends up in status lines and logs; `nerve-node proxy
     /// set` takes them out and keeps them in the system keyring.

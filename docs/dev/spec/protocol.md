@@ -309,8 +309,8 @@ concurrently.
   running `run`.
 - state: `{shell, confinement}`; event `exit {call, exit_code}` (needs `sub`).
 - Output is capped at `limits.output_cap_bytes` of the node's config;
-  `truncated` says it was cut. In 0.0.1 output comes in the result; the
-  `output` reliable stream is declared for later versions.
+  `truncated` says it was cut. Output comes in the result; the
+  `output` reliable stream is declared for later.
 
 ### 7.4 `settings` (only with the settings grant `write`)
 
@@ -358,4 +358,4 @@ browser or tool) to the node; the center only relays it.
 
 ## 8. Center side
 
-The center serves harnesses. In 0.0.1 `nerve-center` is an MCP server ([harness.md](harness.md)). It maps capabilities to tools, holds sessions, and never stores file contents, command output or secrets.
+The center serves harnesses. `nerve-center` is an MCP server ([harness.md](harness.md)). It maps capabilities to tools, holds sessions, and never stores file contents, command output or secrets.

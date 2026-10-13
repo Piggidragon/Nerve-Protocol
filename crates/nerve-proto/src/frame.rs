@@ -16,7 +16,7 @@ pub enum Kind {
     Blob = 1,
     /// Data of a reliable stream (`id` = stream id).
     Stream = 2,
-    /// Reserved for media streams; refused in 0.0.1.
+    /// Reserved for media streams; refused.
     Media = 3,
 }
 
@@ -33,7 +33,7 @@ pub struct Frame {
 pub enum FrameError {
     Short,
     UnknownKind(u8),
-    /// Kind 3 is reserved and not accepted by 0.0.1.
+    /// Kind 3 is reserved and not accepted.
     MediaReserved,
     TooLarge(usize),
 }

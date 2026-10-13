@@ -634,7 +634,7 @@ impl Dir {
     }
 }
 
-/// Not done on Windows in 0.0.1: the steps go by path, as resolved.
+/// Not done on Windows: the steps go by path, as resolved.
 #[cfg(not(unix))]
 impl Dir {
     fn open(path: &Path) -> std::io::Result<Dir> {

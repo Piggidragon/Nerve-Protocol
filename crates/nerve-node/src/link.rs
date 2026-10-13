@@ -475,10 +475,10 @@ impl Link {
                         }
                         Got::Bad(reply) => self.send(reply).await,
                         Got::Binary(b) => {
-                            // No blobs or streams flow center → node in 0.0.1;
+                            // No blobs or streams flow center → node;
                             // only reserved media frames break the link.
                             if let Err(FrameError::MediaReserved) = Frame::decode(&b) {
-                                tracing::warn!("center {}: it sent a media frame, which 0.0.1 does not take", self.name);
+                                tracing::warn!("center {}: it sent a media frame, which this node does not take", self.name);
                                 return self.end(ByeReason::ProtocolError, Outcome::Retry).await;
                             }
                         }
@@ -1116,7 +1116,7 @@ impl Link {
             &self.name,
             s.document,
             s.if_version,
-            // This node offers no sense capabilities in 0.0.1.
+            // This node offers no sense capabilities.
             |_| false,
             |opts| self.protected_with(opts, account.as_ref(), &own),
         );
@@ -1329,7 +1329,25 @@ fn act_as(
         .transpose()
 }
 
-#[cfg(not(target_os = "linux"))]
+/// [`act_as`] on Windows: the thread impersonates the account, logged on
+/// with its stored password ([`crate::win_user::FsAs`]).
+#[cfg(windows)]
+fn act_as(
+    account: Option<&crate::service::Account>,
+) -> Result<Option<crate::win_user::FsAs>, RpcError> {
+    account
+        .map(|a| {
+            crate::win_user::FsAs::new(a).map_err(|e| {
+                RpcError::new(
+                    ErrorCode::Unavailable,
+                    format!("cannot act as {}: {e}", a.name),
+                )
+            })
+        })
+        .transpose()
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn act_as(account: Option<&crate::service::Account>) -> Result<Option<()>, RpcError> {
     match account {
         Some(a) => Err(RpcError::new(

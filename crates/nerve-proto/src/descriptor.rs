@@ -94,7 +94,7 @@ pub struct EventDecl {
 #[serde(rename_all = "lowercase")]
 pub enum StreamKind {
     Reliable,
-    /// Reserved for later; a 0.0.1 node never declares it.
+    /// Reserved for later; no node declares it.
     Media,
 }
 
@@ -246,7 +246,7 @@ mod tests {
         serde_json::from_value(json!({
             "nerve": "0",
             "node": {"id": "n1", "name": "box", "platform": "linux", "arch": "x86_64",
-                     "software": {"name": "nerve-node", "version": "0.0.1"}},
+                     "software": {"name": "nerve-node", "version": "x.y.z"}},
             "rev": 3,
             "summary": "A test box.",
             "capabilities": [{

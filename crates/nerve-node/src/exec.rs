@@ -110,6 +110,98 @@ pub fn shell_command(shell: Option<&str>, command: &str) -> (String, Vec<String>
     (sh, args)
 }
 
+/// A Windows command line for `program` and `args`, quoted as the Rust
+/// standard library quotes one for `CreateProcessW` (the rules of the
+/// Microsoft C runtime): a command started with another account's token
+/// (crate::win_user) gets the same arguments as one the node starts as
+/// itself.
+pub fn windows_command_line(program: &str, args: &[String]) -> String {
+    let mut line = format!("\"{program}\"");
+    for a in args {
+        line.push(' ');
+        let quote = a.is_empty() || a.contains([' ', '\t']);
+        if quote {
+            line.push('"');
+        }
+        // Backslashes count only before a quote: doubled there, and one
+        // more escapes the quote itself.
+        let mut backslashes = 0;
+        for c in a.chars() {
+            if c == '\\' {
+                backslashes += 1;
+            } else {
+                if c == '"' {
+                    line.extend(std::iter::repeat_n('\\', backslashes + 1));
+                }
+                backslashes = 0;
+            }
+            line.push(c);
+        }
+        if quote {
+            line.extend(std::iter::repeat_n('\\', backslashes));
+            line.push('"');
+        }
+    }
+    line
+}
+
+/// An account's environment (`NAME=value` entries) pointed at its profile
+/// folder `home`. While the account is not signed in its registry is not
+/// loaded, and Windows builds the environment from the default profile,
+/// without the folders of the account's own: those are set as a sign-in
+/// sets them, and any other value below the default profile is moved to
+/// `home`. The entries come sorted by name, as Windows wants them.
+pub fn rehome_env(vars: Vec<String>, home: &str) -> Vec<String> {
+    let name = |v: &str| {
+        v.split_once('=')
+            .map_or(String::new(), |(n, _)| n.to_uppercase())
+    };
+    let Some(profile) = vars.iter().find_map(|v| {
+        let (n, val) = v.split_once('=')?;
+        n.eq_ignore_ascii_case("USERPROFILE")
+            .then(|| val.to_string())
+    }) else {
+        return vars;
+    };
+    if profile.eq_ignore_ascii_case(home) || profile.is_empty() {
+        return vars;
+    }
+    let (drive, path) = match home.get(..2) {
+        Some(d) if d.ends_with(':') => (d, &home[2..]),
+        _ => ("", home),
+    };
+    let own = [
+        ("USERPROFILE", home.to_string()),
+        ("HOMEDRIVE", drive.to_string()),
+        ("HOMEPATH", path.to_string()),
+        ("APPDATA", format!("{home}\\AppData\\Roaming")),
+        ("LOCALAPPDATA", format!("{home}\\AppData\\Local")),
+        ("TEMP", format!("{home}\\AppData\\Local\\Temp")),
+        ("TMP", format!("{home}\\AppData\\Local\\Temp")),
+    ];
+    let mut out: Vec<String> = vars
+        .into_iter()
+        .filter(|v| !own.iter().any(|(n, _)| *n == name(v)))
+        .map(|v| {
+            let Some((n, val)) = v.split_once('=') else {
+                return v;
+            };
+            let below = val
+                .get(..profile.len())
+                .is_some_and(|p| p.eq_ignore_ascii_case(&profile))
+                && matches!(val[profile.len()..].chars().next(), None | Some('\\'));
+            if below {
+                format!("{n}={home}{}", &val[profile.len()..])
+            } else {
+                v
+            }
+        })
+        .collect();
+    out.extend(own.iter().map(|(n, v)| format!("{n}={v}")));
+    out.sort_by_key(|v| name(v));
+    out
+}
+
 /// What the `exec.run` action says about the shell, so a model writes the
 /// syntax of the shell that runs it: Windows PowerShell 5.1 is the default
 /// on Windows, and cmd's `a & b` is a parser error there.
@@ -689,6 +781,10 @@ pub async fn run(
         parent: std::process::id(),
         landlock: Some(l.clone()),
     });
+    #[cfg(windows)]
+    if let Some(a) = &opts.account {
+        return run_as(call, opts, a, &program, &args, started).await;
+    }
     let mut cmd = match &shim {
         Some(_) => {
             let mut c = Command::new(&opts.exe);
@@ -735,11 +831,11 @@ pub async fn run(
             });
         }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", windows)))]
     if let Some(a) = &opts.account {
         return Err(RpcError::new(
             ErrorCode::Unavailable,
-            format!("cannot run commands as {}: Linux only", a.name),
+            format!("cannot run commands as {}: Linux and Windows only", a.name),
         ));
     }
     match &opts.account {
@@ -868,6 +964,173 @@ pub async fn run(
         }
     }
     Ok(result)
+}
+
+/// [`run`] as another account on Windows (crate::win_user): the shell
+/// starts suspended with the account's token in the call's folder, is put
+/// in a job of its own and runs only then. It does not start when its
+/// account can open the node's own folders, nor without a job: the node
+/// may not end another account's processes one by one, only the job.
+#[cfg(windows)]
+async fn run_as(
+    call: &RunCall,
+    opts: &RunOptions,
+    account: &crate::service::Account,
+    program: &str,
+    args: &[String],
+    started: impl FnOnce(&Ender),
+) -> Result<Value, RpcError> {
+    let unavailable = |m: String| RpcError::new(ErrorCode::Unavailable, m);
+    let token = crate::win_user::token_for(account)
+        .map_err(|e| unavailable(format!("cannot start as {}: {e}", account.name)))?;
+    match crate::win_user::reach(&token, &opts.own) {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            return Err(unavailable(format!(
+                "cannot start as {}: that account can open the node's own folders, where its keys are",
+                account.name
+            )));
+        }
+        Err(e) => {
+            return Err(unavailable(format!(
+                "cannot start as {}: cannot check what it can open ({e})",
+                account.name
+            )));
+        }
+    }
+    let job = crate::win::Job::new().map_err(|e| {
+        unavailable(format!(
+            "the command was not run: Windows made no job object for it ({e})"
+        ))
+    })?;
+    let line = windows_command_line(program, args);
+    let child = crate::win_user::spawn(&token, &line, Some(&call.cwd), Some(&account.home))
+        .map_err(|e| {
+            unavailable(format!(
+                "cannot start as {} in {}: {e}",
+                account.name,
+                to_wire(&call.cwd)
+            ))
+        })?;
+    if let Err(e) = job.assign(child.process()) {
+        child.kill();
+        return Err(unavailable(crate::job::assign_error(
+            crate::win::in_job(child.process()),
+            &e,
+        )));
+    }
+    let job = std::sync::Arc::new(job);
+    if let Err(e) = child.resume() {
+        job.terminate();
+        return Err(unavailable(format!(
+            "the command was not run: its shell could not be resumed ({e})"
+        )));
+    }
+    let group = Group::start(Some(child.pid), Some(job));
+    if let Some(e) = &group.0 {
+        started(e);
+    }
+    let wait = child
+        .waiter()
+        .map_err(|e| RpcError::internal(format!("waiting for the command: {e}")))?;
+    let crate::win_user::Spawned { stdout, stderr, .. } = child;
+    let cap = opts.output_cap.min(OUTPUT_HARD_CAP);
+    let work = async {
+        tokio::join!(
+            capped(tokio::fs::File::from_std(stdout), cap),
+            capped(tokio::fs::File::from_std(stderr), cap),
+            async {
+                tokio::task::spawn_blocking(wait)
+                    .await
+                    .map_err(std::io::Error::other)
+                    .and_then(|r| r)
+            }
+        )
+    };
+    let (out, err, code) = match call.timeout {
+        Some(t) => match tokio::time::timeout(t, work).await {
+            Ok(r) => r,
+            Err(_) => {
+                drop(group);
+                return Err(RpcError::new(
+                    ErrorCode::Timeout,
+                    "the command ran past timeout_ms and was killed",
+                ));
+            }
+        },
+        None => work.await,
+    };
+    drop(group);
+    let code = code.map_err(|e| RpcError::internal(format!("waiting for the command: {e}")))?;
+    Ok(json!({
+        "exit_code": code as i32,
+        "stdout": decode(&out.0, out.1),
+        "stderr": decode(&err.0, err.1),
+        "truncated": out.1 || err.1,
+    }))
+}
+
+/// The command lines a command of another account gets on Windows.
+#[cfg(test)]
+mod command_line_tests {
+    use super::windows_command_line;
+
+    fn args(a: &[&str]) -> Vec<String> {
+        a.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn arguments_are_quoted_as_the_standard_library_quotes_them() {
+        assert_eq!(
+            windows_command_line(
+                "powershell.exe",
+                &args(&["-NoProfile", "-Command", r#"echo "a b" \x\"#])
+            ),
+            r#""powershell.exe" -NoProfile -Command "echo \"a b\" \x\\""#
+        );
+        // Without a space no quotes, and a quote is escaped all the same,
+        // with the backslashes before it doubled.
+        assert_eq!(
+            windows_command_line("cmd.exe", &args(&["/C", r#"a\"b"#, ""])),
+            r#""cmd.exe" /C a\\\"b """#
+        );
+        assert_eq!(
+            windows_command_line(r"C:\Program Files\x.exe", &args(&["a\tb", r"c\"])),
+            "\"C:\\Program Files\\x.exe\" \"a\tb\" c\\"
+        );
+    }
+
+    /// The environment Windows builds from the default profile names the
+    /// account's own; one that names it already stays as it is.
+    #[test]
+    fn the_environment_names_the_accounts_profile() {
+        let default = args(&[
+            "=C:=C:\\",
+            r"Path=C:\Windows\system32",
+            r"USERPROFILE=C:\Users\Default",
+            r"TEMP=C:\WINDOWS\TEMP",
+            r"OneDrive=c:\users\default\OneDrive",
+            r"OTHER=C:\Users\DefaultAppPool",
+        ]);
+        assert_eq!(
+            super::rehome_env(default, r"D:\Users\bob"),
+            args(&[
+                "=C:=C:\\",
+                r"APPDATA=D:\Users\bob\AppData\Roaming",
+                r"HOMEDRIVE=D:",
+                r"HOMEPATH=\Users\bob",
+                r"LOCALAPPDATA=D:\Users\bob\AppData\Local",
+                r"OneDrive=D:\Users\bob\OneDrive",
+                r"OTHER=C:\Users\DefaultAppPool",
+                r"Path=C:\Windows\system32",
+                r"TEMP=D:\Users\bob\AppData\Local\Temp",
+                r"TMP=D:\Users\bob\AppData\Local\Temp",
+                r"USERPROFILE=D:\Users\bob",
+            ])
+        );
+        let own = args(&[r"HOMEPATH=\x", r"USERPROFILE=C:\Users\bob"]);
+        assert_eq!(super::rehome_env(own.clone(), r"C:\Users\bob"), own);
+    }
 }
 
 #[cfg(all(test, unix))]

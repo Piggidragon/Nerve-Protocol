@@ -148,7 +148,7 @@ impl Mcp {
         let r = m.request(
             "initialize",
             json!({"protocolVersion": "2025-06-18", "capabilities": {},
-                   "clientInfo": {"name": "e2e", "version": "0.0.1"}}),
+                   "clientInfo": {"name": "e2e", "version": "x.y.z"}}),
         );
         assert_eq!(r["result"]["serverInfo"]["name"], "nerve-center", "{r}");
         m.notify("notifications/initialized", json!({}));

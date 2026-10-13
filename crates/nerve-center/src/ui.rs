@@ -1524,7 +1524,7 @@ mod tests {
         log.record(
             Level::Info,
             Some(("alpha", "n1")),
-            "link up (node software 0.0.1)",
+            "link up (node software x.y.z)",
         );
         log.record(
             Level::Warn,
@@ -1534,7 +1534,7 @@ mod tests {
         log.record(
             Level::Info,
             Some(("beta", "n2")),
-            "link up (node software 0.0.1)",
+            "link up (node software x.y.z)",
         );
         log.record(Level::Error, None, "cannot write the state file: disk full");
         log.record(

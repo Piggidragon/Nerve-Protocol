@@ -876,7 +876,7 @@ const NEXT_START: &str = "takes effect at the next start of the node";
 
 /// Runs one command line, writing what it shows to `out`. A change made
 /// while no daemon answers on the control socket (none runs, or Windows,
-/// which has no socket in 0.0.1) is only in the file, so the output says
+/// which has no socket) is only in the file, so the output says
 /// when it counts.
 pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
     let service = cli.cmd.is_service();

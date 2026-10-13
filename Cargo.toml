@@ -11,18 +11,18 @@ members = [
 ]
 
 [workspace.package]
-version = "0.0.1"
+version = "0.0.2"
 edition = "2024"
 repository = "https://github.com/Piggidragon/Nerve-Protocol"
 rust-version = "1.88"
 
 [workspace.dependencies]
-nerve-proto = { path = "crates/nerve-proto", version = "0.0.1" }
-nerve-transport = { path = "crates/nerve-transport", version = "0.0.1" }
-nerve-policy = { path = "crates/nerve-policy", version = "0.0.1" }
-nerve-sandbox = { path = "crates/nerve-sandbox", version = "0.0.1" }
-nerve-node = { path = "crates/nerve-node", version = "0.0.1" }
-nerve-center = { path = "crates/nerve-center", version = "0.0.1" }
+nerve-proto = { path = "crates/nerve-proto", version = "0.0.2" }
+nerve-transport = { path = "crates/nerve-transport", version = "0.0.2" }
+nerve-policy = { path = "crates/nerve-policy", version = "0.0.2" }
+nerve-sandbox = { path = "crates/nerve-sandbox", version = "0.0.2" }
+nerve-node = { path = "crates/nerve-node", version = "0.0.2" }
+nerve-center = { path = "crates/nerve-center", version = "0.0.2" }
 
 # Every crate below except keyring is a widely used, well-tested choice for its job.
 tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "net", "io-util", "process", "time", "sync", "signal", "fs"] }
@@ -45,7 +45,7 @@ globset = "0.4"
 landlock = "0.4"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
 tempfile = "3"
-# The one crate 0.0.1 adds: the system keyring (Keychain, Credential Manager,
+# The system keyring (Keychain, Credential Manager,
 # Secret Service) for the proxy's header values and credentials.
 keyring = "4.2"
 # The Job Object a Windows command runs in (CreateJobObjectW and its limits),

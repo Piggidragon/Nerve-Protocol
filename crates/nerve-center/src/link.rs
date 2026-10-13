@@ -392,10 +392,10 @@ pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String
                 }
             },
             WsMessage::Binary(b) => {
-                // 0.0.1 sends no blobs to the center; media frames are refused.
+                // Nodes send no blobs to the center; media frames are refused.
                 if let Err(FrameError::MediaReserved) = Frame::decode(&b) {
                     link.bye(ByeReason::ProtocolError).await;
-                    why = "the node sent a media frame, which 0.0.1 does not take".into();
+                    why = "the node sent a media frame, which the center does not take".into();
                     break;
                 }
             }
@@ -460,7 +460,7 @@ async fn handle(center: &Center, link: &Arc<Link>, m: Message) -> Option<ByeReas
                     .unwrap_or(ByeReason::Shutdown);
                 return Some(reason);
             }
-            // Progress is not passed on to MCP clients in 0.0.1.
+            // Progress is not passed on to MCP clients.
             _ => {}
         },
     }

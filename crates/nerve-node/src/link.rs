@@ -470,10 +470,10 @@ impl Link {
                         }
                         Got::Bad(reply) => self.send(reply).await,
                         Got::Binary(b) => {
-                            // No blobs or streams flow center → node in 0.0.1;
+                            // No blobs or streams flow center → node;
                             // only reserved media frames break the link.
                             if let Err(FrameError::MediaReserved) = Frame::decode(&b) {
-                                tracing::warn!("center {}: it sent a media frame, which 0.0.1 does not take", self.name);
+                                tracing::warn!("center {}: it sent a media frame, which this node does not take", self.name);
                                 return self.end(ByeReason::ProtocolError, Outcome::Retry).await;
                             }
                         }
@@ -1083,7 +1083,7 @@ impl Link {
             &self.name,
             s.document,
             s.if_version,
-            // This node offers no sense capabilities in 0.0.1.
+            // This node offers no sense capabilities.
             |_| false,
             |opts| self.protected_with(opts, account.as_ref()),
         );

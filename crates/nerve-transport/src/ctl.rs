@@ -98,13 +98,16 @@ mod unix {
     /// matters: a socket dropped and bound again can look in use while a
     /// child forked meanwhile still holds the old one.
     ///
-    /// A connection that cannot be taken for want of descriptors or memory
-    /// (EMFILE once a process of the user holds the node's open files) or
-    /// that went before it was taken does not end the serving: the socket
-    /// stays, and the next connection is taken once they are back. Ending
-    /// would leave the node without its socket until it restarts, and the
-    /// CLI would take a running node for none (keyring review round 4,
-    /// finding 1). Only another error ends it.
+    /// A connection that cannot be taken does not end the serving, whatever
+    /// the reason: for want of descriptors or memory (EMFILE once a process
+    /// of the user holds the node's open files), of epoll watches (ENOSPC,
+    /// which a process of the user can use up for every process of the
+    /// user), or because it went before it was taken. The socket stays, and
+    /// the next connection is taken once the cause is gone. Ending would
+    /// leave the node without its socket until it restarts, and the CLI
+    /// would take a running node for none (keyring review round 4, finding
+    /// 1, and round 5, finding 1). Only an error that says the listener
+    /// itself is broken ends it.
     pub async fn serve_on<F, Fut>(listener: UnixListener, handler: F) -> std::io::Result<()>
     where
         F: Fn(CtlRequest, Peer) -> Fut + Send + Sync + 'static,
@@ -145,21 +148,21 @@ mod unix {
         }
     }
 
-    /// Whether `accept` failed for a while only: out of descriptors, buffers
-    /// or memory, or a connection that went before it was taken.
+    /// Whether `accept` failed for this connection only and the listener
+    /// can take the next one. The list is of the errors that mean the
+    /// listener itself is broken, not of the passing ones: a limit of the
+    /// user's that runs out (descriptors, memory, epoll watches) shows up as
+    /// one of many errors, and missing one would end the socket for good.
+    /// An error without an OS code comes from tokio itself (the runtime
+    /// shutting down) and ends it too.
     fn passing(e: &std::io::Error) -> bool {
-        matches!(
-            e.raw_os_error(),
-            Some(
-                libc::EMFILE
-                    | libc::ENFILE
-                    | libc::ENOBUFS
-                    | libc::ENOMEM
-                    | libc::ECONNABORTED
-                    | libc::EINTR
-                    | libc::EPROTO
-            )
-        )
+        match e.raw_os_error() {
+            Some(libc::EBADF | libc::EINVAL | libc::ENOTSOCK | libc::EOPNOTSUPP | libc::EFAULT) => {
+                false
+            }
+            Some(_) => true,
+            None => false,
+        }
     }
 
     pub async fn bind(path: &Path) -> std::io::Result<UnixListener> {
@@ -419,6 +422,37 @@ mod unix {
                 .expect("an answer in time");
                 assert_eq!(v, Ok(json!("up")));
             });
+        }
+
+        /// Running out of epoll watches (ENOSPC when the new connection is
+        /// registered with the reactor) does not end the socket, nor does
+        /// any other error of one connection; only a broken listener or
+        /// tokio itself does (keyring review round 5, finding 1). Filling
+        /// the real limit would disturb every process of the user, so this
+        /// asks `passing` directly.
+        #[test]
+        fn only_a_broken_listener_ends_the_serving() {
+            let os = std::io::Error::from_raw_os_error;
+            for code in [
+                libc::ENOSPC,
+                libc::EMFILE,
+                libc::ENFILE,
+                libc::ENOMEM,
+                libc::ECONNABORTED,
+                libc::EPERM,
+            ] {
+                assert!(passing(&os(code)), "{} ends the serving", os(code));
+            }
+            for code in [
+                libc::EBADF,
+                libc::EINVAL,
+                libc::ENOTSOCK,
+                libc::EOPNOTSUPP,
+                libc::EFAULT,
+            ] {
+                assert!(!passing(&os(code)), "{} does not end it", os(code));
+            }
+            assert!(!passing(&std::io::Error::other("the runtime shuts down")));
         }
 
         #[cfg(target_os = "linux")]

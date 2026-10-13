@@ -527,7 +527,10 @@ async fn folder_mode_confines_commands_to_their_folders() {
 /// refused meanwhile and nothing moves, and the count is 0 again once the
 /// call answered (keyring review round 4, finding 2). The count is checked
 /// before the move is asked for, so a node that does not count the command
-/// fails here without writing to the machine's keyring.
+/// fails here without writing to the machine's keyring. The test, not a
+/// timer, ends the command, once the refusal was checked: a command that
+/// ended on its own before the move was asked for (a slow machine) would let
+/// the move go into the real keyring (round 5, finding 2).
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn the_keys_do_not_move_into_the_keyring_past_a_running_folder_command() {
@@ -550,12 +553,16 @@ async fn the_keys_do_not_move_into_the_keyring_past_a_running_folder_command() {
     .await;
     let mut conn = linked(&mut center).await;
     let paths = node.paths().clone();
+    // Waits for `release`, bounded to about 30 s so a broken test does not
+    // hang for good; it fails if it was not released.
+    let command = "sh -c 'echo > started; i=0; \
+                   while [ ! -e release ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done; \
+                   [ -e release ]'";
     let run = conn
         .request(
             "invoke",
             json!({"cap": "exec", "action": "run",
-                   "args": {"command": "sh -c 'echo > started; sleep 3'",
-                            "cwd": work.display().to_string()}}),
+                   "args": {"command": command, "cwd": work.display().to_string()}}),
         )
         .await
         .unwrap();
@@ -593,6 +600,13 @@ async fn the_keys_do_not_move_into_the_keyring_past_a_running_folder_command() {
         nerve_policy::config::SecretStorage::File
     );
 
+    assert_eq!(
+        node.open_to_bus(),
+        1,
+        "the command ended before its release"
+    );
+
+    std::fs::write(work.join("release"), b"").unwrap();
     let mut others = Vec::new();
     let ran = conn
         .answer(run, WAIT, &mut others)

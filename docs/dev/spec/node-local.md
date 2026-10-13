@@ -596,9 +596,11 @@ signed `node.toml` itself, §1). One JSON object per line: the client sends
 `{"method", "params"}`, the server answers `{"ok": value}` or
 `{"error": "text"}`, or, for streaming methods, several `{"item": value}`
 lines until it closes. The socket is 0600 in a 0700 folder; only its own user
-or root may talk to it. A connection the node cannot take for want of
-descriptors or memory does not end the socket: the node takes the next one
-once they are back. Methods:
+or root may talk to it. A connection the node cannot take (for want of
+descriptors, memory or epoll watches, or for any other reason of that one
+connection) does not end the socket: the node takes the next one once the
+cause is gone. Only an error that says the listener itself is broken ends it.
+Methods:
 
 | Method | Params | |
 |---|---|---|

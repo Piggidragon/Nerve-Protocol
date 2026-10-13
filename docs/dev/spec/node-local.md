@@ -79,7 +79,9 @@ written to, and the command says so.
 `node.toml` is written private to the owner (mode 0600 on Unix). The daemon
 refuses to run as root, or in an elevated token on Windows, unless
 `machine.allow_root = true`; when it runs that way, it logs a warning at
-start that commands then run with full rights and the owner is responsible.
+start (stderr and the node's log file, not the center) that commands then run
+with full rights, unless `machine.user` names another account, and the owner is
+responsible.
 
 These two folders are the node's own. No call of a center reaches them, in
 any mode and whatever the rules, folders or `protected.allow` say (§3), and

@@ -27,7 +27,7 @@ pub fn full_rights() -> bool {
 /// The warning for a node that runs as `who` with full rights.
 pub fn warning_for(who: &str) -> String {
     format!(
-        "this node runs as {who}: commands from a center then run with full rights on this machine, the node's keys included. You are responsible for what they do."
+        "this node runs as {who}: unless machine.user names another account, commands from a center then run with full rights on this machine, the node's keys included. You are responsible for what they do."
     )
 }
 
@@ -66,6 +66,22 @@ mod tests {
             assert!(w.contains("full rights"), "{w}");
             assert!(w.contains("You are responsible"), "{w}");
         }
+    }
+
+    /// The token check must agree with the system's own report: a process
+    /// at high or system integrity (an elevated token) is the one that has
+    /// full rights, and `whoami /groups` lists that level.
+    #[cfg(windows)]
+    #[test]
+    fn full_rights_follow_the_integrity_level() {
+        let out = std::process::Command::new("whoami")
+            .arg("/groups")
+            .output()
+            .expect("whoami runs");
+        assert!(out.status.success(), "whoami failed");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let high = text.contains("S-1-16-12288") || text.contains("S-1-16-16384");
+        assert_eq!(full_rights(), high, "{text}");
     }
 
     /// The test suite does not run as root, so a plain run is not full.

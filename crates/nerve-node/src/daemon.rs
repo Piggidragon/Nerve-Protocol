@@ -881,7 +881,7 @@ mod tests {
         let w = warnings(&log);
         assert_eq!(w.len(), 1, "{w:?}");
         assert!(w[0].contains("full rights") && w[0].contains("You are responsible"));
-        // The warning also reaches the log file, which the Logs page reads.
+        // The warning also reaches the node's log file.
         let file = std::fs::read_to_string(paths.log_file()).unwrap();
         assert!(file.contains("You are responsible"), "{file}");
         daemon.stop().await;

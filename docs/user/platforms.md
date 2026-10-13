@@ -41,9 +41,10 @@ behaves the same except where this page says so.
 
 ### Root and administrator
 
-A node with full rights hands those rights to every command a center runs:
-root on Linux, an elevated administrator token on Windows. So on both
-platforms it is refused at start unless you allow it:
+A node with full rights hands those rights to every command a center runs,
+unless `machine.user` names another account for them: root on Linux, an
+elevated administrator token on Windows. So on both platforms it is refused
+at start unless you allow it:
 
 ```
 nerve-node config set machine.allow_root true
@@ -54,14 +55,17 @@ machine.allow_root = true to allow it`.
 
 On Windows the node counts as elevated when its token is elevated: a
 PowerShell started with "Run as administrator", a scheduled task that runs
-with highest privileges, or an account such as SYSTEM. An administrator whose
-PowerShell was not started elevated is a normal user to the node, and needs
-no setting.
+with highest privileges, an account such as SYSTEM, or an administrator's
+session over SSH, which Windows OpenSSH gives the full, elevated token. An
+administrator at the desktop whose PowerShell was not started elevated (a
+UAC-filtered session) is a normal user to the node, and needs no setting.
 
 When the node runs with full rights because you allowed it, it says so with a
-warning at start: in the stderr output, in the node's log file and on the
-Logs page. Commands from a center then run with full rights on the machine,
-and you are responsible for what they do.
+warning at start: in the stderr output and in the node's log file. The
+center's Log page shows the center's own log and does not carry it. Commands
+from a center then run with full rights on the machine, unless
+`machine.user` names another account for them, and you are responsible for
+what they do.
 
 ### No control socket
 

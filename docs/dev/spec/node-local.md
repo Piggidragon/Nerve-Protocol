@@ -205,6 +205,17 @@ the keys into the keyring. A refused command names the keyring as the
 reason. The gate and the command's Landlock rules go by one answer per
 call, from the same config and account.
 
+A Landlock domain does not change while its command runs, so a `folder`
+mode command that started while the keys were in files keeps a way to the
+session bus for its whole life, unless it runs as an account other than
+root. The running node counts these commands, and a move of the keys into
+the keyring is refused while one runs: nothing moves, and the refusal says
+how many run. The command is counted first and looks at the keys' place
+then, under the store lock that a move holds, so a command whose config was
+taken before a move that finished first does not start either. A process
+that a command takes out of its process group (`setsid`) outlives its call
+and is not counted.
+
 `allowlist` and `user` mode commands get no Landlock rules, so an allowed
 command that talks to the Secret Service (`secret-tool`, `busctl --user`,
 `gdbus`, `dbus-send`) reads the node's keys with `keyring`; it names no

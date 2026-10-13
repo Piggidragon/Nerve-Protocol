@@ -1281,6 +1281,13 @@ impl Link {
             }
             spec
         });
+        // Counted while it runs, so the keys do not move into the keyring
+        // meanwhile, and not started when they moved after `cfg` was taken
+        // (review round 3, finding 1).
+        let open = crate::daemon::reaches_bus(landlock.as_ref(), || known.clone())
+            .then(|| self.shared.open_to_bus())
+            .transpose()
+            .map_err(|e| RpcError::new(ErrorCode::Unavailable, e))?;
         let opts = RunOptions {
             shell: cfg.machine.shell.clone(),
             landlock,
@@ -1291,6 +1298,7 @@ impl Link {
             own,
         };
         let r = exec::run(&rc, &opts, |e| guard.started(e)).await;
+        drop(open);
         drop(guard);
         if let Ok(v) = &r {
             self.handle.event(

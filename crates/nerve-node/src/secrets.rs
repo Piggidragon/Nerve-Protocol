@@ -20,6 +20,8 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use nerve_policy::NodeConfig;
 use nerve_policy::config::SecretStorage;
@@ -378,6 +380,10 @@ pub struct NodeSecrets {
     held: Option<KeysLock>,
     /// The move in progress leaves the old copies to the next start.
     defer: bool,
+    /// The running node's count of commands its Landlock does not keep off
+    /// the session bus (crate::daemon::Shared::open_to_bus): while one runs,
+    /// the keys do not go into the keyring.
+    open_to_bus: Option<Arc<AtomicUsize>>,
 }
 
 impl NodeSecrets {
@@ -392,6 +398,16 @@ impl NodeSecrets {
             locks: false,
             held: None,
             defer: false,
+            open_to_bus: None,
+        }
+    }
+
+    /// For the running node: a move into the keyring is refused while
+    /// `open` counts a command that could reach it there.
+    pub fn for_node(paths: &NodePaths, open: Arc<AtomicUsize>) -> NodeSecrets {
+        NodeSecrets {
+            open_to_bus: Some(open),
+            ..NodeSecrets::new(paths)
         }
     }
 
@@ -507,6 +523,28 @@ impl Secrets for NodeSecrets {
 
     fn copy(&mut self, cfg: &NodeConfig) -> Result<(), String> {
         let to = cfg.machine.secret_storage;
+        // Such a command got its sandbox while the keys were in their
+        // files, and a Landlock domain does not change while it runs: with
+        // the keys in the keyring it would reach them for the rest of its
+        // life. The store lock this runs under keeps a new one from
+        // starting until the move is over (review round 3, finding 1).
+        let open = self
+            .open_to_bus
+            .as_ref()
+            .map_or(0, |n| n.load(Ordering::SeqCst));
+        if to == SecretStorage::Keyring && open > 0 {
+            return Err(format!(
+                "{open} folder mode {} that started while the node's keys were in their files, and {} sandbox does not keep {} off the session bus the keyring answers on; the node's keys stay in their files, and nothing was changed. Wait until {} ended, or end every command with `nerve-node panic`, change it again, then `nerve-node unlock`",
+                if open == 1 {
+                    "command runs"
+                } else {
+                    "commands run"
+                },
+                if open == 1 { "its" } else { "their" },
+                if open == 1 { "it" } else { "them" },
+                if open == 1 { "it has" } else { "they have" },
+            ));
+        }
         nerve_transport::files::write_private(
             &self.paths.keys_moving(),
             format!("moving the node's keys to {}\n", place(to)).as_bytes(),

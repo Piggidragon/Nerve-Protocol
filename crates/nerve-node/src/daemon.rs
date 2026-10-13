@@ -183,6 +183,10 @@ pub(crate) struct Shared {
     pub commands: Mutex<HashMap<u32, String>>,
     /// Commands running now, over all centers (`limits.max_running`).
     pub running: AtomicUsize,
+    /// The `folder` mode commands running now that Landlock does not keep
+    /// off the session bus ([`Shared::open_to_bus`]); the store's secrets
+    /// refuse to move the keys into the keyring while there are any.
+    pub open_to_bus: Arc<AtomicUsize>,
     pub stop: watch::Sender<bool>,
     /// The log, to keep the sudo password out of it.
     pub log: Option<Arc<Log>>,
@@ -320,6 +324,24 @@ impl Shared {
         (!kept).then_some(KEYRING_NOT_CONFINED)
     }
 
+    /// Counts a `folder` mode command whose Landlock domain has no connect
+    /// rule, made from a config that keeps the keys in their files, while
+    /// it runs: a domain does not change while its command runs, so with
+    /// the keys moved into the keyring it would reach them over the session
+    /// bus. A move into the keyring is refused while one is counted. A move
+    /// made after the command's config was taken refuses the command: it is
+    /// counted first and looks at the keys' place then, under the store
+    /// lock that a move holds, so one of the two always sees the other
+    /// (review round 3, finding 1).
+    pub fn open_to_bus(&self) -> Result<OpenToBus<'_>, &'static str> {
+        self.open_to_bus.fetch_add(1, Ordering::SeqCst);
+        let counted = OpenToBus(self);
+        if lock(&self.store).config().machine.secret_storage != SecretStorage::File {
+            return Err(KEYS_MOVED);
+        }
+        Ok(counted)
+    }
+
     /// Logs once when the keyring turns folder mode's commands off, at the
     /// start and after a change of the settings (review round 2, finding
     /// 3): otherwise only a refused call would show it.
@@ -439,6 +461,19 @@ impl Shared {
     }
 }
 
+/// A command counted by [`Shared::open_to_bus`] while it runs.
+pub(crate) struct OpenToBus<'a>(&'a Shared);
+
+impl Drop for OpenToBus<'_> {
+    fn drop(&mut self) {
+        self.0.open_to_bus.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Why a command decided while the node's keys were in their files does
+/// not start once they are in the keyring ([`Shared::open_to_bus`]).
+pub const KEYS_MOVED: &str = "the node's keys moved into the system keyring while this call was decided, and its sandbox was made for keys in files; call again";
+
 /// Why `folder` mode runs no command where Landlock or the shim's host is
 /// missing.
 pub const NOT_CONFINED: &str = "commands cannot be confined on this machine";
@@ -459,6 +494,19 @@ pub fn keys_kept_from_commands(
     account: impl FnOnce() -> Option<crate::service::Account>,
 ) -> bool {
     storage == SecretStorage::File || keeps_sockets || account().is_some_and(|a| a.uid != 0)
+}
+
+/// Whether a command confined by `landlock` and run as `account` could
+/// reach the keys over the session bus once they are in the keyring
+/// ([`Shared::open_to_bus`]): a domain without a connect rule leaves the bus
+/// open for the command's whole life, and only another account than root is
+/// kept off it then. `account` is asked only for such a domain.
+pub fn reaches_bus(
+    landlock: Option<&nerve_sandbox::LandlockSpec>,
+    account: impl FnOnce() -> Option<crate::service::Account>,
+) -> bool {
+    landlock.is_some_and(|s| s.connect.is_none())
+        && !keys_kept_from_commands(SecretStorage::Keyring, false, account)
 }
 
 /// A running node daemon.
@@ -512,9 +560,13 @@ impl Daemon {
                     })?
             }
         };
+        let open_to_bus = Arc::new(AtomicUsize::new(0));
         let mut store = SettingsStore::open_with(
             paths.config_file(),
-            Box::new(crate::secrets::NodeSecrets::new(&paths)),
+            Box::new(crate::secrets::NodeSecrets::for_node(
+                &paths,
+                open_to_bus.clone(),
+            )),
             AuditLog::new(paths.audit_log()),
         )?;
         let cfg = store.config().clone();
@@ -564,6 +616,7 @@ impl Daemon {
             centers: Mutex::default(),
             commands: Mutex::default(),
             running: AtomicUsize::new(0),
+            open_to_bus,
             stop,
             log: opts.log,
             sudo: Mutex::new(None),
@@ -981,6 +1034,91 @@ mod tests {
         assert!(kept(Keyring, false, Some(&other)));
         assert!(kept(Keyring, true, None));
         assert!(kept(Keyring, true, Some(&root)));
+    }
+
+    /// A command reaches the session bus for good when its domain has no
+    /// connect rule, unless it runs as another account than root (review
+    /// round 3, finding 1).
+    #[test]
+    fn a_domain_without_a_connect_rule_reaches_the_bus() {
+        let account = |uid| crate::service::Account {
+            name: "a".into(),
+            uid,
+            gid: uid,
+            comment: String::new(),
+            home: "/home/a".into(),
+            groups: vec![uid],
+        };
+        let open = nerve_sandbox::LandlockSpec::default();
+        let barred = nerve_sandbox::LandlockSpec {
+            connect: Some(vec!["/run/user/1000".into()]),
+            ..Default::default()
+        };
+        assert!(reaches_bus(Some(&open), || None));
+        assert!(reaches_bus(Some(&open), || Some(account(0))));
+        assert!(!reaches_bus(Some(&open), || Some(account(4242))));
+        let asked = std::cell::Cell::new(false);
+        let ask = || {
+            asked.set(true);
+            None
+        };
+        assert!(!reaches_bus(Some(&barred), ask));
+        // Without Landlock (allowlist, user and sudo commands) the move
+        // changes nothing a command reaches.
+        assert!(!reaches_bus(None, ask));
+        assert!(!asked.get());
+    }
+
+    /// The keys do not move into the keyring while a folder mode command
+    /// that started with them in files runs, and a command whose config was
+    /// taken before a move does not start after it (review round 3,
+    /// finding 1).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_keys_do_not_move_past_a_command_that_reaches_the_bus() {
+        use nerve_transport::ctl::Reply;
+        let log = Log::new(Level::Info);
+        let d = tempfile::tempdir().unwrap();
+        let daemon = Daemon::start(options(&d, &log)).await.unwrap();
+        let s = daemon.shared.clone();
+        let paths = daemon.paths().clone();
+        let write = |to| {
+            let Reply::Ok(v) = control(&s, "config.read", json!({}), None) else {
+                panic!("config.read failed")
+            };
+            let mut cfg = NodeConfig::parse(v["config"].as_str().unwrap()).unwrap();
+            cfg.machine.secret_storage = to;
+            let params = json!({"config": cfg.to_toml(), "if_version": v["version"]});
+            control(&s, "config.write", params, None)
+        };
+        let storage = || s.config().machine.secret_storage;
+        let one = s.open_to_bus().unwrap();
+        let two = s.open_to_bus().unwrap();
+        let Reply::Err(e) = write(SecretStorage::Keyring) else {
+            panic!("the keys moved past two commands")
+        };
+        assert!(e.contains("2 folder mode commands run"), "{e}");
+        assert!(e.contains("nothing was changed"), "{e}");
+        drop(two);
+        let Reply::Err(e) = write(SecretStorage::Keyring) else {
+            panic!("the keys moved past a command")
+        };
+        assert!(e.contains("1 folder mode command runs"), "{e}");
+        assert_eq!(storage(), SecretStorage::File);
+        assert!(paths.config_key().exists());
+        assert!(!paths.keys_moving().exists());
+        drop(one);
+        assert!(matches!(write(SecretStorage::Keyring), Reply::Ok(_)));
+        assert_eq!(storage(), SecretStorage::Keyring);
+        // A call decided on the config from before the move.
+        assert_eq!(s.open_to_bus().err(), Some(KEYS_MOVED));
+        assert_eq!(s.open_to_bus.load(Ordering::SeqCst), 0);
+        // Out of the keyring nothing waits for a command.
+        s.open_to_bus.fetch_add(1, Ordering::SeqCst);
+        assert!(matches!(write(SecretStorage::File), Reply::Ok(_)));
+        assert_eq!(storage(), SecretStorage::File);
+        s.open_to_bus.fetch_sub(1, Ordering::SeqCst);
+        daemon.stop().await;
     }
 
     /// The account is looked up only where the answer depends on it: with

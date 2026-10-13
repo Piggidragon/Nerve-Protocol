@@ -135,6 +135,17 @@ session of the node's user. The node then logs a warning, `nerve-node
 status` prints `folder mode runs no command: …`, and `config set` and
 `setup` say so when they move the keys. `file` brings the commands back.
 
+A command keeps the sandbox it started with. So while a `folder` mode
+command that started with the keys in files still runs, the keys do not go
+into the keyring: `config set` and `setup` say how many such commands run,
+and nothing changes. Wait until they end, or end every command with `nerve-node panic`,
+set `keyring`, then `nerve-node unlock`. Commands that run as another
+account than root do not count, as they cannot reach the session.
+A process that a command takes out of its process group (`setsid`) outlives
+the command and is not counted. If a center you do not trust had `folder`
+mode while the keys were in files, restart the machine before you set
+`keyring`.
+
 The keyring is kept from `folder` mode commands only. An `allowlist` or
 `user` mode command runs without Landlock, and a command that talks to the
 Secret Service needs no path to read the keys. With `keyring`, an allow

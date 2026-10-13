@@ -1501,7 +1501,7 @@ async fn setup_steps(
             crate::keyring_setup::ensure(keyring, &me, Some(input), out)?;
             after_keyring_answers(paths, machine, out).await?;
         }
-        edit(paths, |c| {
+        let cfg = edit(paths, |c| {
             c.machine.secret_storage = storage;
             Ok(())
         })
@@ -1510,7 +1510,7 @@ async fn setup_steps(
         let _ = writeln!(out, "{step}");
         steps.push(step);
         if storage == SecretStorage::Keyring {
-            tell_folder_commands(paths, out).await;
+            tell_folder_commands(paths, &cfg, out).await;
         }
     }
 
@@ -2079,7 +2079,7 @@ async fn config_cmd(paths: &NodePaths, c: ConfigCmd, out: &mut dyn Write) -> Res
     if before.get() != SecretStorage::Keyring
         && cfg.machine.secret_storage == SecretStorage::Keyring
     {
-        tell_folder_commands(paths, out).await;
+        tell_folder_commands(paths, &cfg, out).await;
     }
     Ok(())
 }
@@ -2087,8 +2087,9 @@ async fn config_cmd(paths: &NodePaths, c: ConfigCmd, out: &mut dyn Write) -> Res
 /// Says, once the keys went into the keyring, that folder mode now runs no
 /// command where Landlock cannot keep a command off the session bus
 /// (crate::daemon::KEYRING_NOT_CONFINED; review round 2, finding 3). The
-/// running node knows; without one, the kernel here tells.
-async fn tell_folder_commands(paths: &NodePaths, out: &mut dyn Write) {
+/// running node knows; without one, the kernel here and the account `cfg`
+/// runs commands as tell (review round 3, finding 2).
+async fn tell_folder_commands(paths: &NodePaths, cfg: &NodeConfig, out: &mut dyn Write) {
     #[cfg(unix)]
     if let Ok(v) = nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await {
         if v["folder_commands_off"] == crate::daemon::KEYRING_NOT_CONFINED {
@@ -2096,11 +2097,37 @@ async fn tell_folder_commands(paths: &NodePaths, out: &mut dyn Write) {
         }
         return;
     }
-    #[cfg(not(unix))]
-    let _ = paths;
-    if keyring_turns_commands_off(nerve_sandbox::Confinement::detect()) {
+    if keyring_turns_commands_off(nerve_sandbox::Confinement::detect(), || {
+        node_command_account(paths, cfg)
+    }) {
         let _ = writeln!(out, "{}", folder_commands_off());
     }
+}
+
+/// The account the node at `paths` runs commands as with `cfg`, looked up as
+/// that node does (crate::account::for_commands), for a CLI that finds no
+/// node to ask: the installed node runs as its own user and can switch, a
+/// node run by hand as this CLI's user. `None` for the node's own user, and
+/// where no command runs.
+fn node_command_account(paths: &NodePaths, cfg: &NodeConfig) -> Option<crate::service::Account> {
+    let me = nerve_transport::net::euid();
+    let service = crate::service::is_service_node(paths);
+    let own = match service {
+        true => crate::account::lookup(crate::service::USER)
+            .ok()
+            .flatten()
+            .map_or(me, |a| a.uid),
+        false => me,
+    };
+    crate::account::for_commands(
+        cfg.machine.user.as_deref(),
+        own,
+        service,
+        service || crate::account::can_switch(),
+        crate::account::lookup,
+    )
+    .ok()
+    .flatten()
 }
 
 fn folder_commands_off() -> String {
@@ -2111,9 +2138,19 @@ fn folder_commands_off() -> String {
 }
 
 /// Whether, with the keys in the keyring, `c` leaves folder mode's commands
-/// a way to the session bus: Landlock without ABI 9.
-fn keyring_turns_commands_off(c: nerve_sandbox::Confinement) -> bool {
-    c.available() && !c.keeps_sockets()
+/// a way to the session bus: Landlock without ABI 9, for commands that run
+/// as the node's own user or root (crate::daemon::keys_kept_from_commands).
+/// `account` is asked only on such a kernel.
+fn keyring_turns_commands_off(
+    c: nerve_sandbox::Confinement,
+    account: impl FnOnce() -> Option<crate::service::Account>,
+) -> bool {
+    c.available()
+        && !crate::daemon::keys_kept_from_commands(
+            SecretStorage::Keyring,
+            c.keeps_sockets(),
+            account,
+        )
 }
 
 /// `proxy set|rm|ls`. The header values, and a user name and password given
@@ -2902,9 +2939,28 @@ mod tests {
     fn the_keyring_turns_folder_commands_off_below_abi_9() {
         use nerve_sandbox::Confinement;
         let abi = |v| Confinement { landlock_abi: v };
-        assert!(keyring_turns_commands_off(abi(Some(6))));
-        assert!(!keyring_turns_commands_off(abi(Some(9))));
-        assert!(!keyring_turns_commands_off(abi(None)));
+        let account = |uid| crate::service::Account {
+            name: "alice".into(),
+            uid,
+            gid: uid,
+            comment: String::new(),
+            home: "/home/alice".into(),
+            groups: vec![uid],
+        };
+        let (root, alice) = (account(0), account(4242));
+        assert!(keyring_turns_commands_off(abi(Some(6)), || None));
+        assert!(keyring_turns_commands_off(abi(Some(6)), || Some(root)));
+        // Another account than root cannot reach the bus: its commands run
+        // (review round 3, finding 2).
+        assert!(!keyring_turns_commands_off(abi(Some(6)), || Some(alice)));
+        let asked = std::cell::Cell::new(false);
+        let ask = || {
+            asked.set(true);
+            None
+        };
+        assert!(!keyring_turns_commands_off(abi(Some(9)), ask));
+        assert!(!keyring_turns_commands_off(abi(None), ask));
+        assert!(!asked.get());
         assert!(folder_commands_off().contains("machine.secret_storage file"));
     }
 

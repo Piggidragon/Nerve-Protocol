@@ -3414,6 +3414,50 @@ mod tests {
         assert!(r.unwrap_err().contains("nerve://pair"));
     }
 
+    /// A node that runs but takes no connection now (its queue is full) is
+    /// not "not running": `panic` and `sudo off` must not write the file and
+    /// report the change as done while the node never got it.
+    #[cfg(unix)]
+    #[test]
+    fn a_busy_node_is_not_taken_for_none() {
+        use std::os::unix::io::AsRawFd;
+        let (_d, paths) = setup(&["home"]);
+        let sock = paths.ctl_socket();
+        std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        // SAFETY: listen on a socket this test owns; a backlog of one is
+        // full after a few connections, and nothing accepts them.
+        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut queued = vec![];
+        rt.block_on(async {
+            while let Ok(s) = tokio::net::UnixStream::connect(&sock).await {
+                queued.push(s);
+                assert!(queued.len() < 100, "the queue never filled");
+            }
+        });
+        let before = std::fs::read(paths.config_file()).unwrap();
+        let busy = nerve_transport::ctl::BUSY;
+        for args in [
+            &["panic"][..],
+            &["sudo", "off"],
+            &["rule", "add", "allow", "ls"],
+        ] {
+            let e = run(&paths, args).unwrap_err();
+            assert_eq!(e, busy, "{args:?}");
+        }
+        assert_eq!(std::fs::read(paths.config_file()).unwrap(), before);
+        assert!(!load(&paths).locked);
+        // Gone, the node is none, and the same commands go to the file.
+        drop((queued, listener));
+        std::fs::remove_file(&sock).unwrap();
+        run(&paths, &["panic"]).unwrap();
+        assert!(load(&paths).locked);
+    }
+
     #[test]
     fn the_three_lists_add_remove_and_show() {
         let (_d, paths) = setup(&["home"]);

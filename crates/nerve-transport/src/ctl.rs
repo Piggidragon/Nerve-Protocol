@@ -229,11 +229,29 @@ mod unix {
     /// Error when nothing listens on `path`.
     pub const NOT_RUNNING: &str = "not running";
 
+    /// Error when a node listens but takes no connection now: its queue is
+    /// full (EAGAIN).
+    pub const BUSY: &str = "the node does not take connections now; try again";
+
+    /// What a failed connect means. Only a missing socket (ENOENT) and one
+    /// nobody listens on (ECONNREFUSED) say that no node runs: any other
+    /// error leaves the node that may run unknown, and a caller that took it
+    /// for none would write the change into the file and call it done.
+    fn connect_error(e: &std::io::Error) -> String {
+        match e.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+                NOT_RUNNING.to_string()
+            }
+            std::io::ErrorKind::WouldBlock => BUSY.to_string(),
+            _ => format!("cannot connect to the node's control socket: {e}"),
+        }
+    }
+
     /// One call: sends the request and returns the answer.
     pub async fn call(path: &Path, method: &str, params: Value) -> Result<Value, String> {
         let stream = UnixStream::connect(path)
             .await
-            .map_err(|_| NOT_RUNNING.to_string())?;
+            .map_err(|e| connect_error(&e))?;
         let (r, mut w) = stream.into_split();
         write_line(&mut w, &json!({"method": method, "params": params}))
             .await
@@ -264,7 +282,7 @@ mod unix {
     ) -> Result<(), String> {
         let stream = UnixStream::connect(path)
             .await
-            .map_err(|_| NOT_RUNNING.to_string())?;
+            .map_err(|e| connect_error(&e))?;
         let (r, mut w) = stream.into_split();
         write_line(&mut w, &json!({"method": method, "params": params}))
             .await
@@ -339,6 +357,56 @@ mod unix {
                     .unwrap_err(),
                 NOT_RUNNING
             );
+        }
+
+        /// A listener whose queue is full answers `connect` with EAGAIN: the
+        /// node runs, it only takes no connection now. That is not "not
+        /// running", which sends a caller on to change the file itself.
+        #[tokio::test]
+        async fn a_node_with_a_full_queue_is_not_taken_for_none() {
+            let d = tempfile::tempdir().unwrap();
+            let p = d.path().join("ctl.sock");
+            let listener = bind(&p).await.unwrap();
+            // A backlog of one: a few connections fill it, and nothing
+            // accepts them.
+            {
+                use std::os::unix::io::AsRawFd;
+                // SAFETY: listen on a socket this test owns.
+                assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+            }
+            let mut queued = vec![];
+            loop {
+                match UnixStream::connect(&p).await {
+                    Ok(s) => queued.push(s),
+                    Err(e) => {
+                        assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{e}");
+                        break;
+                    }
+                }
+                assert!(queued.len() < 100, "the queue never filled");
+            }
+            let busy = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                call(&p, "status", json!({})),
+            )
+            .await
+            .expect("an answer in time");
+            assert_eq!(busy, Err(BUSY.to_string()));
+            let followed = follow(&p, "status", json!({}), |_| {}).await;
+            assert_eq!(followed, Err(BUSY.to_string()));
+            // A socket file nobody listens on is no node.
+            drop(listener);
+            drop(queued);
+            assert_eq!(
+                call(&p, "status", json!({})).await,
+                Err(NOT_RUNNING.to_string())
+            );
+            // Any other error says what it is.
+            let under_a_file = d.path().join("run/ctl.sock");
+            std::fs::write(d.path().join("run"), b"").unwrap();
+            let e = call(&under_a_file, "status", json!({})).await.unwrap_err();
+            assert!(e.starts_with("cannot connect"), "{e}");
+            assert_ne!(e, NOT_RUNNING);
         }
 
         /// Set in the process `serving_outlasts_running_out_of_descriptors`
@@ -465,4 +533,4 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub use unix::{NOT_RUNNING, Reply, bind, call, follow, serve, serve_on};
+pub use unix::{BUSY, NOT_RUNNING, Reply, bind, call, follow, serve, serve_on};

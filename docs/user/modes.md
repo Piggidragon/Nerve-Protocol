@@ -179,8 +179,12 @@ folders.
 - Build tools make hard links of their own. cargo builds each program
   under two names in `target`, so a file in a folder named exactly `target`
   inside the folder passes the check when every one of its names lies in
-  such a folder of the same granted folder, under the same grants, and the
-  node finds no granted folder moved or renamed in that sync. So a built
+  such a folder of the same granted folder, under the same grants, no
+  pairing has `w` without `r` on that folder, one above it or one inside
+  it, and the node finds no granted folder moved or renamed in that sync.
+  (A command may give a folder it makes permissions of its own, and the
+  change would pass them to a file it linked there: that gains it nothing
+  only where it may read already.) So a built
   Rust project you rename or move needs `cargo clean` before its entry can
   come off at its new place; until then the record of the entry stays stale
   and that pairing's commands stop. Any other

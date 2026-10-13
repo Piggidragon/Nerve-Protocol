@@ -165,7 +165,15 @@ command in an AppContainer, one per center (`nerve_sandbox::appcontainer`):
   each is held by exactly the same wanted and recorded grants as the walked
   name. That compares grant paths, while a grant's entry goes with its
   folder, so a sync in which a recorded grant is not at its path (moved, or
-  it cannot be told) gives no pass at all. A link to anywhere else is refused, other build tools' too (pnpm's
+  it cannot be told) gives no pass at all. Nor does a walk of a folder
+  where a wanted or recorded grant of any container, on it, above it or
+  inside it, may write but not read (`grants::pass`): a command that may
+  make a folder there sets its security descriptor at creation, without
+  `WRITE_DAC`, and the change passes an entry of its own there (read for
+  its container) down to a file it linked into that folder. Where every container that may
+  write there may read too, that entry gives nothing new. What stays: a
+  command with `rw` can give itself `WRITE_DAC` on an owner's file there
+  and keep its access after the grant comes off. A link to anywhere else is refused, other build tools' too (pnpm's
   store, uv's cache, a local `git clone`); the user docs give the ways
   around. A link a command of
   any pairing that may write there makes between the walk and the change

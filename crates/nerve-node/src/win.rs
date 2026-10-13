@@ -1,19 +1,25 @@
 //! The few Win32 calls the node makes itself: the process table and ending a
 //! process (crate::tree), the job object a command runs in (crate::job), and
-//! the console code page that command output is written in (crate::exec).
+//! the console code page that command output is written in (crate::exec),
+//! and whether the node's own token is elevated (crate::rights).
 //! Declared here against kernel32, which every Windows program links; only
-//! the job object comes from windows-sys, whose limit structures are too
-//! easy to get wrong by hand.
+//! the job object and the token come from windows-sys, whose structures are
+//! too easy to get wrong by hand.
 
 use std::ffi::c_void;
 use std::io;
 
+use windows_sys::Win32::Security::{
+    GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
+};
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject, TerminateJobObject,
 };
-use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+use windows_sys::Win32::System::Threading::{
+    GetCurrentProcess, OpenProcessToken, OpenThread, ResumeThread, THREAD_SUSPEND_RESUME,
+};
 
 use crate::tree::Proc;
 
@@ -292,6 +298,35 @@ pub fn resume(pid: u32) -> io::Result<()> {
         (0, None) => Err(io::Error::other("the process has no thread")),
         _ => Ok(()),
     }
+}
+
+/// Whether this process runs in an elevated token: an administrator who
+/// passed UAC, or an account like SYSTEM that always does. A token that
+/// cannot be read counts as elevated, so the node errs on the side of the
+/// refusal and the warning.
+pub fn is_elevated() -> bool {
+    let mut token = std::ptr::null_mut();
+    // SAFETY: the current process pseudo-handle needs no closing, and the
+    // token is written only on success.
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        return true;
+    }
+    let mut info = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut len = 0u32;
+    // SAFETY: the buffer is a TOKEN_ELEVATION of the size given; the token
+    // is open and closed once.
+    let ok = unsafe {
+        let ok = GetTokenInformation(
+            token,
+            TokenElevation,
+            std::ptr::from_mut(&mut info).cast(),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        );
+        CloseHandle(token);
+        ok
+    };
+    ok == 0 || info.TokenIsElevated != 0
 }
 
 /// The code page a console program started by the node writes in: the

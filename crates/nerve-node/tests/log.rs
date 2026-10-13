@@ -75,6 +75,8 @@ async fn the_daemon_logs_its_links_changes_and_failed_calls() {
         dir.path().join("state"),
     ));
     o.home = std::fs::canonicalize(dir.path()).unwrap().join("home");
+    // Not the rights of whoever runs the tests: an elevated run must pass.
+    o.full_rights = Some(false);
     std::fs::create_dir_all(&o.home).unwrap();
     let home = nerve_policy::paths::to_wire(&o.home);
     let paths = o.paths.clone();

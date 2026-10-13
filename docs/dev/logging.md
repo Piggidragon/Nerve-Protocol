@@ -81,9 +81,10 @@ not the daemon writes no log file.
   flag (`--password x`, `--with-token x`), after a space, unless the next word
   is a placeholder (`(`, `<`, `[`, `{`, `-`, `$`);
 - the credential after `Bearer` or `Basic`, and after `Authorization:` and its
-  scheme, whatever the scheme. A value in quotes goes to the closing quote; a
-  quote that is never closed ends no value, so only the word after it goes and
-  the rest of the message stays;
+  scheme, whatever the scheme. A value in quotes goes to the closing quote (one
+  that opens with an escaped quote, `\"`, to the next escaped quote); a quote
+  that is never closed ends no value, so only the word after it goes and the
+  rest of the message stays;
 - `user:password@` in a URL;
 - the `code` parameter of a pairing link;
 - a harness token, `nrv_` and eight or more characters.

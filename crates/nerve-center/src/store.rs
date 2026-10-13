@@ -197,7 +197,7 @@ mod tests {
     #[test]
     fn the_pairing_code_lifetime_defaults_to_ten_minutes() {
         assert_eq!(Store::new("c".into(), "home".into()).pair_code_minutes, 10);
-        // A state file from before the setting existed reads as ten minutes.
+        // A state file without the setting reads as ten minutes.
         let old = r#"{"center_id": "c", "center_name": "home"}"#;
         let s: Store = serde_json::from_str(old).unwrap();
         assert_eq!(s.pair_code_minutes, 10);
@@ -245,7 +245,7 @@ mod tests {
     }
 
     #[test]
-    fn an_old_state_file_reads_a_node_as_enabled() {
+    fn a_state_file_without_the_flag_reads_a_node_as_enabled() {
         let old = r#"{"center_id":"c","center_name":"home","nodes":{"a":{"id":"a","name":"a",
             "public_key":"00","platform":"linux","arch":"x86_64","paired_ms":1}}}"#;
         let s: Store = serde_json::from_str(old).unwrap();

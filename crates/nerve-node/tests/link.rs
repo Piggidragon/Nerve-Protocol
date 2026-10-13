@@ -248,8 +248,7 @@ async fn a_call_no_rule_allows_is_refused_immediately() {
 }
 
 /// A command line longer than the node checks is refused, also with no
-/// grant at all, and the audit log says why (code review 3 of PR #19,
-/// finding 1).
+/// grant at all, and the audit log says why.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_overlong_command_line_is_refused_and_audited_with_the_reason() {
     let dir = tempdir();

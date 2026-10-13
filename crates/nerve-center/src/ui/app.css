@@ -1,4 +1,4 @@
-/* The Nerve center UI. The look follows the Pithagoras portal: colour tokens
+/* The Nerve center UI. The look is built from colour tokens
    as RGB triplets (used as rgb(var(--x) / alpha)), dark by default with a
    light set, system fonts, a sidebar shell that turns into a drawer on a
    phone, and rounded cards on a quiet canvas. The login page shares this

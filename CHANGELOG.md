@@ -11,3 +11,5 @@
 - Commands run with sudo only if the owner turns sudo on for the node. The password is kept in memory and never logged.
 - The node keeps a local audit log of every decision, and can be locked with panic and unlock.
 - A web UI for the center shows nodes, the audit log (with one-click rules), statistics and help, and lets you disable a node.
+- The web UI has a Log page for the center's own log (written to `log.jsonl`), with levels, filters and download.
+- Statistics can be shown per machine, picked from a searchable list; the default is overall.

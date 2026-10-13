@@ -1,0 +1,262 @@
+//! The sudo switch on Windows, end to end on the installed service: the
+//! conformance fake center pairs with it, turns sudo on with the password of
+//! the account the commands run as, and runs commands with and without
+//! sudo. It needs a Windows test machine: the node installed as a service
+//! (`nerve-node install`) whose account for commands (`machine.user`) is an
+//! administrator, an elevated terminal, and that account and its password
+//! in `NERVE_WIN_SUDO_ACCOUNT` and `NERVE_WIN_SUDO_PASSWORD`:
+//!
+//! ```text
+//! cargo test -p nerve-node --test win_sudo -- --ignored
+//! ```
+//!
+//! It pairs the service with a center named `winsudo`, changes its rules
+//! and restarts it.
+#![cfg(windows)]
+
+use std::process::Command;
+use std::time::Duration;
+
+use nerve_conformance::fake_center::{self, FakeCenter};
+use nerve_conformance::wire::Conn;
+use nerve_node::service::Layout;
+use nerve_policy::config::{SettingsGrant, Sudo};
+use nerve_policy::rules;
+use nerve_proto::{ErrorCode, RpcError};
+use nerve_transport::sudo::{Offer, seal};
+use serde_json::{Value, json};
+use tokio::net::TcpStream;
+
+const WAIT: Duration = Duration::from_secs(30);
+const CENTER: &str = "winsudo";
+/// The SIDs of the integrity levels `whoami /groups` lists: an elevated
+/// token is high, a filtered one medium.
+const HIGH: &str = "S-1-16-12288";
+const MEDIUM: &str = "S-1-16-8192";
+/// A sudo command that runs for half a minute.
+const PING: &str = "sudo ping -n 30 127.0.0.1";
+
+fn env(name: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| panic!("{name} is not set"))
+}
+
+fn restart_service() {
+    let ok = Command::new("powershell.exe")
+        .args(["-NoProfile", "-Command", "Restart-Service nerve-node"])
+        .status()
+        .unwrap()
+        .success();
+    assert!(ok, "Restart-Service nerve-node");
+}
+
+async fn linked(center: &mut FakeCenter) -> Conn<TcpStream> {
+    let paired = center.paired().expect("paired");
+    let mut inc = center.next_link(WAIT).await.expect("the node dials");
+    fake_center::handshake(&mut inc.conn, &center.center_id, &paired)
+        .await
+        .expect("handshake");
+    inc.conn
+}
+
+async fn call(conn: &mut Conn<TcpStream>, method: &str, params: Value) -> Result<Value, RpcError> {
+    let id = conn.request(method, params).await.unwrap();
+    conn.answer(id, WAIT, &mut Vec::new()).await.unwrap()
+}
+
+async fn invoke(
+    conn: &mut Conn<TcpStream>,
+    cap: &str,
+    action: &str,
+    args: Value,
+) -> Result<Value, RpcError> {
+    call(
+        conn,
+        "invoke",
+        json!({"cap": cap, "action": action, "args": args}),
+    )
+    .await
+}
+
+async fn run(conn: &mut Conn<TcpStream>, command: &str) -> Result<Value, RpcError> {
+    invoke(conn, "exec", "run", json!({"command": command})).await
+}
+
+async fn state(conn: &mut Conn<TcpStream>) -> String {
+    let v = call(conn, "get", json!({"cap": "settings", "keys": ["sudo"]}))
+        .await
+        .expect("settings state");
+    v["sudo"].as_str().unwrap_or_default().to_string()
+}
+
+async fn on(conn: &mut Conn<TcpStream>, password: &str) -> Result<Value, RpcError> {
+    let v = invoke(conn, "settings", "sudo-offer", json!({}))
+        .await
+        .expect("sudo-offer");
+    let offer = Offer {
+        offer: v["offer"].as_str().unwrap().into(),
+        key: v["key"].as_str().unwrap().into(),
+        ts: v["ts"].as_u64().unwrap(),
+    };
+    let now = nerve_proto::msg::now_ms();
+    let sealed = seal(&offer, password, now).unwrap();
+    invoke(
+        conn,
+        "settings",
+        "sudo",
+        json!({"on": true, "sealed": sealed}),
+    )
+    .await
+}
+
+fn refused(r: Result<Value, RpcError>, kind: ErrorCode) -> String {
+    match r {
+        Ok(v) => panic!("succeeded with {v}"),
+        Err(e) => {
+            assert_eq!(e.kind(), kind, "{}", e.message);
+            e.message
+        }
+    }
+}
+
+fn stdout(r: &Value) -> &str {
+    r["stdout"].as_str().unwrap_or_default()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs the node installed as a service on a Windows test machine"]
+async fn sudo_runs_a_listed_command_elevated_on_the_installed_service() {
+    let account = env("NERVE_WIN_SUDO_ACCOUNT");
+    let password = env("NERVE_WIN_SUDO_PASSWORD");
+    let layout = Layout::system();
+    let paths = layout.paths.clone();
+    let kept = paths.config_dir.join("sudo.dpapi");
+    let mut center = FakeCenter::start(false).await.unwrap();
+    // What an earlier run paired goes first.
+    nerve_node::cli::edit(&paths, |cfg| {
+        cfg.centers.retain(|c| c.name != CENTER);
+        Ok(())
+    })
+    .await
+    .expect("the owner's edit");
+    let _ = std::fs::remove_file(paths.key_file(CENTER));
+    nerve_node::pair::pair(&paths, &center.link(), Some(CENTER))
+        .await
+        .expect("pair");
+    nerve_node::cli::edit(&paths, |cfg| {
+        assert!(
+            cfg.machine
+                .user
+                .as_deref()
+                .is_some_and(|u| u.eq_ignore_ascii_case(&account)),
+            "machine.user is not {account}"
+        );
+        let e = cfg.center_mut(CENTER).expect("paired");
+        e.settings = SettingsGrant::Write;
+        e.policy.allow = vec![rules::rule_for("exec", "run", "whoami /groups", false)?];
+        e.policy.sudo_allow = vec![
+            rules::sudo_rule_for("sudo whoami /groups", false)?,
+            rules::sudo_rule_for("sudo net session", false)?,
+            rules::sudo_rule_for(PING, false)?,
+        ];
+        Ok(())
+    })
+    .await
+    .expect("the owner's edit");
+    restart_service();
+    let mut conn = linked(&mut center).await;
+
+    // Off: the sudo list names the command, yet it is refused.
+    assert_eq!(state(&mut conn).await, "off");
+    let e = refused(
+        run(&mut conn, "sudo whoami /groups").await,
+        ErrorCode::Forbidden,
+    );
+    assert!(e.contains("sudo is off"), "{e}");
+
+    // A wrong password is refused and the switch stays off.
+    let e = refused(
+        on(&mut conn, "not-the-password").await,
+        ErrorCode::InvalidArgs,
+    );
+    assert!(e.contains("is wrong"), "{e}");
+    assert_eq!(state(&mut conn).await, "off");
+    assert!(!kept.exists());
+
+    // The right one turns it on and is kept with DPAPI.
+    on(&mut conn, &password).await.expect("on");
+    assert_eq!(state(&mut conn).await, "on");
+    let blob = std::fs::read(&kept).unwrap();
+    assert!(
+        !blob
+            .windows(password.len())
+            .any(|w| w == password.as_bytes())
+    );
+
+    // A command without sudo runs with the filtered token, one with sudo
+    // with the full one.
+    let r = run(&mut conn, "whoami /groups").await.expect("whoami");
+    assert!(
+        stdout(&r).contains(MEDIUM) && !stdout(&r).contains(HIGH),
+        "{r}"
+    );
+    let r = run(&mut conn, "sudo whoami /groups")
+        .await
+        .expect("sudo whoami");
+    assert!(stdout(&r).contains(HIGH), "{r}");
+    // `net session` needs the administrators' rights.
+    let r = run(&mut conn, "sudo net session")
+        .await
+        .expect("net session");
+    assert_eq!(r["exit_code"], 0, "{r}");
+    // What the sudo list does not name is refused.
+    let e = refused(run(&mut conn, "sudo net user").await, ErrorCode::Forbidden);
+    assert!(e.contains("sudo allow list"), "{e}");
+
+    // The job ends an elevated command too, at its timeout.
+    let started = std::time::Instant::now();
+    let r = invoke(
+        &mut conn,
+        "exec",
+        "run",
+        json!({"command": PING, "timeout_ms": 1000}),
+    )
+    .await;
+    refused(r, ErrorCode::Timeout);
+    assert!(started.elapsed() < Duration::from_secs(10));
+    let o = Command::new("tasklist")
+        .args(["/fi", "imagename eq PING.EXE", "/fo", "csv", "/nh"])
+        .output()
+        .unwrap();
+    let left = String::from_utf8_lossy(&o.stdout);
+    assert!(!left.to_lowercase().contains("ping.exe"), "{left}");
+
+    // A restarted service holds the kept password again.
+    restart_service();
+    let mut conn = linked(&mut center).await;
+    assert_eq!(state(&mut conn).await, "on");
+    let r = run(&mut conn, "sudo whoami /groups")
+        .await
+        .expect("sudo whoami");
+    assert!(stdout(&r).contains(HIGH), "{r}");
+
+    // `nerve-node sudo off` removes it, and the running service drops the
+    // password.
+    let o = Command::new(&layout.bin)
+        .args(["sudo", "off"])
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{o:?}");
+    assert!(!kept.exists());
+    let until = std::time::Instant::now() + Duration::from_secs(5);
+    while state(&mut conn).await != "off" {
+        assert!(std::time::Instant::now() < until, "sudo stays on");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let e = refused(
+        run(&mut conn, "sudo whoami /groups").await,
+        ErrorCode::Forbidden,
+    );
+    assert!(e.contains("sudo is off"), "{e}");
+    let cfg = nerve_policy::SettingsStore::peek(&paths.config_file(), &paths.config_key()).unwrap();
+    assert_eq!(cfg.machine.sudo, Sudo::Off);
+}

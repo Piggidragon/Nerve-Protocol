@@ -282,6 +282,8 @@ refuses it if it can. `install` checks the same.
 UAC is no security boundary: a command of an administrator can get the
 group's rights back and read the keys. `install` warns about an account in
 Administrators or Backup Operators. Choose an ordinary account as above.
+[Sudo on Windows](sudo.md#sudo-on-windows) needs an administrator: its
+commands run with the account's administrator rights on purpose.
 
 If the account's password changes, commands fail until `install` runs again
 and asks for the new one. A Microsoft account works with its Microsoft
@@ -308,7 +310,9 @@ register it yet gets it from the installed program:
 `uninstall` stops and removes the service, the source `nerve-node` of the
 Event Log (its entries stay), the user `nerve` and its profile, and the
 program. Without `--purge` the folders and the stored password stay,
-open to the administrators only. A later `install` takes them up again.
+open to the administrators only; the [sudo](sudo.md#sudo-on-windows)
+password goes, so sudo is off after a later `install`. A later `install`
+takes them up again.
 `--purge` deletes them. Run from the installed program, `uninstall` cannot
 delete that file at once: it moves it aside, and Windows deletes it at its
 next start. Where Windows

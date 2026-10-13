@@ -658,7 +658,8 @@ impl Daemon {
             told_keyring: Default::default(),
         });
         shared.tell_confinement(&cfg);
-        // The password lives in memory only: a file that says on starts off.
+        // A file that says on starts off: on Linux the password lives in
+        // memory only; Windows holds the one kept with DPAPI (crate::winsudo).
         shared.settle_sudo();
         let ctl = if opts.ctl {
             Some(start_ctl(shared.clone()).await?)

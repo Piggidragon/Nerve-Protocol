@@ -184,8 +184,9 @@ its key is in does not check, and is refused like any changed file.
 
 With `keyring` and no keyring that answers, the node does not start, and a
 command that reads the config refuses. The message names the entry and the
-keyring's error. Nothing falls back to a file. The sudo password is never at
-rest, whatever the setting (§4).
+keyring's error. Nothing falls back to a file. On Linux the sudo password is
+never at rest, whatever the setting; on Windows the node keeps it with DPAPI
+in `sudo.dpapi` in the config folder, whatever the setting (§4).
 
 A change of the setting moves the keys once, through the settings store, in
 whatever writes the config (the running node, else the CLI):
@@ -604,7 +605,9 @@ The normal `allow` list does not count for them.
 - **On**: such a command runs only when `sudo_allow` names it, in every
   mode; `deny` rules and protected paths still refuse it. A sudo command must
   be one simple command: one with `; & | $ \` ( ) < >` or a line break is
-  refused. The node runs it as `sudo -S -k -p <prompt> …` without Landlock
+  refused. A `sudo_allow` glob covers only the plain lines a wildcard allow
+  rule covers (§2, Rules); any other line runs only when an entry is that
+  whole line, escaped as `rule add sudo` writes it. The node runs it as `sudo -S -k -p <prompt> …` without Landlock
   (which would stop sudo from gaining privileges), with a random prompt per
   command, started as the account the commands run as (§1), so sudo raises
   it from that account. It writes the password to stdin only after sudo
@@ -620,13 +623,33 @@ the center cannot read it). The node checks it with `sudo -S -k -v` (output
 discarded), run as the account the commands run as (§1, `machine.user` on
 the installed node, else the node's own user), so the password is that
 account's and refuses a wrong one with `invalid_args`; the switch then stays
-as it was. Turning it off drops the password. The password is kept in memory
-only, whatever `secret_storage` says, so a restarted node, or
+as it was. Turning it off drops the password. On Linux the password is kept
+in memory only, whatever `secret_storage` says, so a restarted node, or
 a `node.toml` that says `on` without a password held, has the switch off. It
 never reaches a center: the node replaces every copy in an outgoing frame and
 in the audit log with `[redacted]`. `machine.sudo` changes only through the
 switch; a value written into the file is turned off at start-up, since no
-password is held. The switch works on Linux only.
+password is held. The switch works on Linux and Windows.
+
+On Windows there is no `sudo` program. The switch works on the installed
+node only (§1: the service, which may start a process with another
+account's token), and its password is the one of the account the commands
+run as, which must be an administrator. `sudo on` checks it with a logon of
+that account as a batch job (`LogonUserW`, `LOGON32_LOGON_BATCH`), which UAC
+does not filter: the logon must succeed and its token must hold the
+Administrators group enabled; else the switch stays as it was. The node then
+keeps the password with DPAPI in the config folder (`sudo.dpapi`, like the
+command account's password), and holds it in memory as on Linux. A restart
+holds the kept password again when `machine.sudo` says on and the file is
+the current account's. A sudo command runs what followed `sudo` in the
+shell, started with a fresh batch logon's full token (`CreateProcessAsUserW`)
+with the account's own environment, in a job like every command; the check
+that the account cannot open the node's folders does not apply to it. Without
+a control channel, `nerve-node sudo on` (elevated) checks the password,
+writes the file and sets `machine.sudo` in the signed file, which the service
+takes at its next start; `nerve-node sudo off` removes the file, and the
+running node drops a held password whose file is gone within a second and
+switches off. `uninstall` removes the file.
 
 ## 5. Control socket
 

@@ -15,7 +15,7 @@ async fn start(dir: &std::path::Path, extra: &[&str]) -> Result<Running, String>
         "--state-dir",
         dir.to_str().unwrap(),
         "--listen",
-        "127.0.0.2:0",
+        "127.0.0.1:0",
         "--plain-loopback",
         "--mcp",
         "none",
@@ -34,7 +34,7 @@ async fn get_root(r: &Running) -> (u16, Option<String>) {
     let mut io = tokio::net::TcpStream::connect(r.ui.expect("a UI"))
         .await
         .unwrap();
-    io.write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.2\r\nConnection: close\r\n\r\n")
+    io.write_all(b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
         .await
         .unwrap();
     let mut buf = Vec::new();
@@ -66,7 +66,7 @@ fn store_with_a_token(dir: &std::path::Path) {
 #[tokio::test]
 async fn a_fresh_center_is_open_on_loopback_so_the_first_token_can_be_made() {
     let d = tempfile::tempdir().unwrap();
-    let r = start(d.path(), &["--ui", "127.0.0.2:0"]).await.unwrap();
+    let r = start(d.path(), &["--ui", "127.0.0.1:0"]).await.unwrap();
     assert_eq!(get_root(&r).await, (200, None));
 }
 
@@ -75,7 +75,7 @@ async fn a_token_from_a_flag_turns_the_login_on() {
     let d = tempfile::tempdir().unwrap();
     let r = start(
         d.path(),
-        &["--ui", "127.0.0.2:0", "--harness-token", "nrv_secret"],
+        &["--ui", "127.0.0.1:0", "--harness-token", "nrv_secret"],
     )
     .await
     .unwrap();
@@ -86,7 +86,7 @@ async fn a_token_from_a_flag_turns_the_login_on() {
 async fn a_token_made_in_an_earlier_run_turns_the_login_on() {
     let d = tempfile::tempdir().unwrap();
     store_with_a_token(d.path());
-    let r = start(d.path(), &["--ui", "127.0.0.2:0"]).await.unwrap();
+    let r = start(d.path(), &["--ui", "127.0.0.1:0"]).await.unwrap();
     assert_eq!(get_root(&r).await, (303, Some("/login".into())));
 }
 
@@ -97,7 +97,7 @@ async fn the_login_can_be_switched_off_on_loopback() {
         d.path(),
         &[
             "--ui",
-            "127.0.0.2:0",
+            "127.0.0.1:0",
             "--harness-token",
             "nrv_secret",
             "--ui-no-login",
@@ -175,7 +175,7 @@ async fn without_a_web_ui_nothing_is_asked() {
 async fn the_harness_token_from_a_flag_stays_out_of_the_log() {
     let token = "plain-words-for-a-token";
     let d = tempfile::tempdir().unwrap();
-    let r = start(d.path(), &["--ui", "127.0.0.2:0", "--harness-token", token])
+    let r = start(d.path(), &["--ui", "127.0.0.1:0", "--harness-token", token])
         .await
         .unwrap();
     r.center.log().record(

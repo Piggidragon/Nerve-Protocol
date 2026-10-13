@@ -296,13 +296,13 @@ fn exec_cap(exposure: Exposure, shell: Option<&str>, windows: bool) -> Capabilit
             ),
         ),
     );
-    // Declared for later versions; 0.0.2 sends output in the result.
+    // Declared for later; the output comes in the result.
     c.streams.insert(
         "output".into(),
         StreamDecl {
             kind: StreamKind::Reliable,
             direction: Direction::Up,
-            summary: "Command output (not served in 0.0.2).".into(),
+            summary: "Command output (not served).".into(),
         },
     );
     c

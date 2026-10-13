@@ -25,7 +25,7 @@ The center then listens on:
 | 7443 | nodes | `--listen` |
 | 7480 | the [web UI](web-ui.md), on this machine only | `--ui` |
 
-Open `http://127.0.0.2:7480` to [pair a machine](pairing.md).
+Open `http://127.0.0.1:7480` to [pair a machine](pairing.md).
 
 ## Settings
 
@@ -36,10 +36,10 @@ Open `http://127.0.0.2:7480` to [pair a machine](pairing.md).
 | `--listen` | `NERVE_LISTEN` | `0.0.0.0:7443` | Where nodes connect |
 | `--public-url` | `NERVE_PUBLIC_URL` | `https://<host name>:<port>` | The address written into pairing links |
 | `--plain-loopback` | `NERVE_PLAIN_LOOPBACK` | off | Plain HTTP for nodes; only with a loopback `--listen` |
-| `--ui` | `NERVE_UI` | `127.0.0.2:7480` | Web UI address, or `off` |
+| `--ui` | `NERVE_UI` | `127.0.0.1:7480` | Web UI address, or `off` |
 | `--ui-no-login` | `NERVE_UI_NO_LOGIN` | off | No login for the web UI; refused beyond loopback |
 | `--mcp` | `NERVE_MCP` | `stdio` | `stdio`, `http` or `none` |
-| `--mcp-listen` | `NERVE_MCP_LISTEN` | `127.0.0.2:7481` | Address of the HTTP MCP endpoint |
+| `--mcp-listen` | `NERVE_MCP_LISTEN` | `127.0.0.1:7481` | Address of the HTTP MCP endpoint |
 | `--harness-token` | `NERVE_HARNESS_TOKEN` | none | A [harness token](harness.md#tokens) |
 | `--log` | `NERVE_LOG` | the level set in the web UI, `info` at first | `error`, `warn`, `info` or `debug`; wins over the stored level for this run. The [log](logs.md) goes to stderr and to `log.jsonl` |
 

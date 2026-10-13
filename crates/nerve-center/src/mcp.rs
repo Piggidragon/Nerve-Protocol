@@ -622,15 +622,15 @@ mod tests {
     #[test]
     fn origins() {
         assert!(origin_matches(
-            "http://127.0.0.2:7481",
-            Some("127.0.0.2:7481")
+            "http://127.0.0.1:7481",
+            Some("127.0.0.1:7481")
         ));
         assert!(!origin_matches(
             "http://evil.example",
-            Some("127.0.0.2:7481")
+            Some("127.0.0.1:7481")
         ));
-        assert!(!origin_matches("null", Some("127.0.0.2:7481")));
-        assert!(!origin_matches("http://127.0.0.2:7481", None));
+        assert!(!origin_matches("null", Some("127.0.0.1:7481")));
+        assert!(!origin_matches("http://127.0.0.1:7481", None));
     }
 
     #[tokio::test]

@@ -83,7 +83,7 @@ pub fn peer_owner(local: SocketAddr, peer: SocketAddr, me: u32) -> Option<u32> {
 /// A socket has the family of its listener, not of the client's: a listener on
 /// `[::]` (dual-stack) or `[::ffff:0.0.0.0]` takes an IPv4 connection on an
 /// IPv6 socket, listed in `tcp6` under v4-mapped addresses, and a client that
-/// names `[::ffff:127.0.0.2]` reaches an IPv4 listener, listed in `tcp`. So an
+/// names `[::ffff:127.0.0.1]` reaches an IPv4 listener, listed in `tcp`. So an
 /// IPv4 connection, in either form, is looked up in both tables. The table its
 /// entry is in says the family of the listener that took it, so only the
 /// listeners in that table count (another user's IPv6-only `[::]` cannot have
@@ -230,7 +230,7 @@ pub struct Proxy {
 }
 
 impl Proxy {
-    /// `http://host:port` (an `https://` proxy is not supported in 0.0.2).
+    /// `http://host:port` (an `https://` proxy is not supported).
     /// A URL with a user name and password is refused without echoing it,
     /// since the error ends up in status lines and logs; `nerve-node proxy
     /// set` takes them out and keeps them in the system keyring.
@@ -481,11 +481,11 @@ mod tests {
 
     #[test]
     fn plain_http_only_reaches_loopback() {
-        assert!(usable_addrs(false, false, vec![a("127.0.0.2:80")]).is_ok());
+        assert!(usable_addrs(false, false, vec![a("127.0.0.1:80")]).is_ok());
         assert!(usable_addrs(false, false, vec![a("[::1]:80")]).is_ok());
-        assert!(usable_addrs(false, false, vec![a("[::ffff:127.0.0.2]:80")]).is_ok());
+        assert!(usable_addrs(false, false, vec![a("[::ffff:127.0.0.1]:80")]).is_ok());
         // A name that resolves to loopback and to another machine is refused whole.
-        assert!(usable_addrs(false, true, vec![a("127.0.0.2:80"), a("192.0.2.7:80")]).is_err());
+        assert!(usable_addrs(false, true, vec![a("127.0.0.1:80"), a("192.0.2.7:80")]).is_err());
         assert!(usable_addrs(false, true, vec![a("192.0.2.7:80")]).is_err());
         assert!(usable_addrs(false, true, vec![]).is_err());
         assert!(usable_addrs(true, true, vec![a("192.0.2.7:443")]).is_ok());
@@ -495,17 +495,17 @@ mod tests {
     fn a_name_takes_only_its_ipv4_loopback_address() {
         // `localhost` as getaddrinfo gives it: ::1 first.
         assert_eq!(
-            usable_addrs(false, true, vec![a("[::1]:80"), a("127.0.0.2:80")]).unwrap(),
-            vec![a("127.0.0.2:80")]
+            usable_addrs(false, true, vec![a("[::1]:80"), a("127.0.0.1:80")]).unwrap(),
+            vec![a("127.0.0.1:80")]
         );
         assert!(usable_addrs(false, true, vec![a("[::1]:80")]).is_err());
     }
 
-    /// The reviewer's probe: the center on 127.0.0.2, another user's program on
+    /// The reviewer's probe: the center on 127.0.0.1, another user's program on
     /// [::1] at the same port. `localhost` reaches the center.
     #[tokio::test]
     async fn localhost_reaches_the_ipv4_center_not_a_listener_on_ipv6() {
-        let v4 = tokio::net::TcpListener::bind("127.0.0.2:0").await.unwrap();
+        let v4 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = v4.local_addr().unwrap().port();
         let Ok(v6) = tokio::net::TcpListener::bind(("::1", port)).await else {
             eprintln!("  (no IPv6 loopback here; nothing to show)");
@@ -532,7 +532,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn the_far_end_of_a_loopback_connection_has_an_owner() {
-        let l = tokio::net::TcpListener::bind("127.0.0.2:0").await.unwrap();
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let c = TcpStream::connect(l.local_addr().unwrap()).await.unwrap();
         let (local, peer) = (c.local_addr().unwrap(), c.peer_addr().unwrap());
         let me = euid();
@@ -579,13 +579,13 @@ mod tests {
     fn a_connection_not_yet_accepted_is_judged_by_its_listeners() {
         const ME: u32 = 1000;
         const OTHER: u32 = 1001;
-        let (client, server) = ("127.0.0.2:50000", "127.0.0.2:8080");
+        let (client, server) = ("127.0.0.1:50000", "127.0.0.1:8080");
         let conn = |uid| row(server, client, "01", uid);
         // The same connection taken by an IPv6 listener, listed in tcp6.
         let conn_m = |uid| {
             row(
-                "[::ffff:127.0.0.2]:8080",
-                "[::ffff:127.0.0.2]:50000",
+                "[::ffff:127.0.0.1]:8080",
+                "[::ffff:127.0.0.1]:50000",
                 "01",
                 uid,
             )
@@ -615,7 +615,7 @@ mod tests {
             Some(OTHER)
         );
         assert_eq!(
-            owner(&[], &[conn_m(0), listen6("[::ffff:127.0.0.2]:8080", OTHER)]),
+            owner(&[], &[conn_m(0), listen6("[::ffff:127.0.0.1]:8080", OTHER)]),
             Some(OTHER)
         );
         assert_eq!(
@@ -657,7 +657,7 @@ mod tests {
         assert_eq!(owner(&[mine.clone(), listen(server, ME)], &[]), None);
         // This user's or root's listener; others' elsewhere do not matter.
         let others = [
-            listen("127.0.0.2:8081", OTHER),
+            listen("127.0.0.1:8081", OTHER),
             listen("127.0.0.2:8080", OTHER),
         ];
         let mut rows = vec![mine, conn(0), listen(server, ME)];
@@ -703,24 +703,24 @@ mod tests {
         if let Ok(dual) = tokio::net::TcpListener::bind("[::]:0").await {
             let port = dual.local_addr().unwrap().port();
             // Dual-stack unless the system set `net.ipv6.bindv6only`.
-            if std::net::TcpStream::connect(("127.0.0.2", port)).is_ok() {
-                assert_eq!(open_ok(format!("http://127.0.0.2:{port}")).await, Ok(()));
+            if std::net::TcpStream::connect(("127.0.0.1", port)).is_ok() {
+                assert_eq!(open_ok(format!("http://127.0.0.1:{port}")).await, Ok(()));
                 assert_eq!(open_ok(format!("http://localhost:{port}")).await, Ok(()));
                 assert_eq!(
-                    open_ok(format!("http://[::ffff:127.0.0.2]:{port}")).await,
+                    open_ok(format!("http://[::ffff:127.0.0.1]:{port}")).await,
                     Ok(())
                 );
             } else {
                 eprintln!("  (IPv6 sockets are IPv6 only here; no dual-stack listener)");
             }
         }
-        let v4 = tokio::net::TcpListener::bind("127.0.0.2:0").await.unwrap();
+        let v4 = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = v4.local_addr().unwrap().port();
         assert_eq!(
-            open_ok(format!("http://[::ffff:127.0.0.2]:{port}")).await,
+            open_ok(format!("http://[::ffff:127.0.0.1]:{port}")).await,
             Ok(())
         );
-        assert_eq!(open_ok(format!("http://127.0.0.2:{port}")).await, Ok(()));
+        assert_eq!(open_ok(format!("http://127.0.0.1:{port}")).await, Ok(()));
     }
 
     /// `open` hands out no plain-http connection that another user's program
@@ -728,9 +728,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn plain_http_is_refused_when_another_user_answers() {
-        let l = tokio::net::TcpListener::bind("127.0.0.2:0").await.unwrap();
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = CenterUrl::parse(&format!(
-            "http://127.0.0.2:{}",
+            "http://127.0.0.1:{}",
             l.local_addr().unwrap().port()
         ))
         .unwrap();
@@ -777,7 +777,7 @@ mod tests {
     #[tokio::test]
     async fn connect_tunnels() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let l = tokio::net::TcpListener::bind("127.0.0.2:0").await.unwrap();
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = l.local_addr().unwrap().port();
         let server = tokio::spawn(async move {
             for answer in [
@@ -795,7 +795,7 @@ mod tests {
             }
         });
         let p = Proxy::parse(
-            &format!("http://127.0.0.2:{port}"),
+            &format!("http://127.0.0.1:{port}"),
             vec![("Proxy-Authorization".into(), "Basic x".into())],
         )
         .unwrap();

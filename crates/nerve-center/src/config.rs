@@ -41,7 +41,7 @@ pub struct Args {
     #[arg(long, env = "NERVE_PLAIN_LOOPBACK")]
     pub plain_loopback: bool,
     /// The web UI address, or `off`.
-    #[arg(long, env = "NERVE_UI", default_value = "127.0.0.2:7480")]
+    #[arg(long, env = "NERVE_UI", default_value = "127.0.0.1:7480")]
     pub ui: String,
     /// Let the web UI in without a login. It logs in with a harness token
     /// otherwise; only for a UI on loopback, a UI beyond it always needs one.
@@ -51,7 +51,7 @@ pub struct Args {
     #[arg(long, env = "NERVE_MCP", value_enum, default_value = "stdio")]
     pub mcp: McpMode,
     /// The HTTP MCP address (with `--mcp http`).
-    #[arg(long, env = "NERVE_MCP_LISTEN", default_value = "127.0.0.2:7481")]
+    #[arg(long, env = "NERVE_MCP_LISTEN", default_value = "127.0.0.1:7481")]
     pub mcp_listen: String,
     /// A harness token: the bearer token of the HTTP MCP endpoint and the
     /// secret that logs in to the web UI, besides tokens made in the web UI.
@@ -78,7 +78,7 @@ impl Args {
             return u.clone();
         }
         if self.plain_loopback {
-            return format!("http://127.0.0.2:{port}");
+            return format!("http://127.0.0.1:{port}");
         }
         format!("https://{}:{port}", crate::center::host_name())
     }
@@ -101,7 +101,7 @@ pub fn default_state_dir() -> PathBuf {
     home.join(".local/state/nerve-center")
 }
 
-/// Whether an address like `127.0.0.2:7480` or `[::1]:7480` is loopback.
+/// Whether an address like `127.0.0.1:7480` or `[::1]:7480` is loopback.
 pub fn is_loopback(addr: &str) -> bool {
     match addr.parse::<std::net::SocketAddr>() {
         Ok(a) => a.ip().is_loopback(),
@@ -128,7 +128,7 @@ mod tests {
             "none",
         ])
         .unwrap();
-        assert_eq!(a.public_url(9), "http://127.0.0.2:9");
+        assert_eq!(a.public_url(9), "http://127.0.0.1:9");
         assert!(a.ui_off());
         // The web UI logs in with the harness token; there is no password of
         // its own, and the login is switched off by a flag alone.
@@ -144,7 +144,7 @@ mod tests {
         // No subcommands: anything positional is refused.
         assert!(Args::try_parse_from(["nerve-center", "pair"]).is_err());
         assert!(
-            is_loopback("127.0.0.2:7480") && is_loopback("[::1]:1") && !is_loopback("0.0.0.0:7480")
+            is_loopback("127.0.0.1:7480") && is_loopback("[::1]:1") && !is_loopback("0.0.0.0:7480")
         );
     }
 }

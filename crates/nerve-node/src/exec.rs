@@ -1672,12 +1672,12 @@ mod windows_tests {
         let d = tempfile::tempdir().unwrap();
         std::fs::write(
             d.path().join("inner.ps1"),
-            "$p = Start-Process ping -ArgumentList '-n','120','127.0.0.2' -WindowStyle Hidden -PassThru\r\n\
+            "$p = Start-Process ping -ArgumentList '-n','120','127.0.0.1' -WindowStyle Hidden -PassThru\r\n\
              Set-Content -Path grandchild.pid -Value $p.Id\r\n\
              Start-Sleep -Milliseconds 1500\r\n",
         )
         .unwrap();
-        let command = "$c = Start-Process ping -ArgumentList '-n','120','127.0.0.2' -WindowStyle Hidden -PassThru; \
+        let command = "$c = Start-Process ping -ArgumentList '-n','120','127.0.0.1' -WindowStyle Hidden -PassThru; \
              Set-Content -Path child.pid -Value $c.Id; \
              Start-Process powershell -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','inner.ps1' -WindowStyle Hidden; \
              Start-Sleep 120";
@@ -1830,7 +1830,7 @@ mod windows_tests {
         let mut o = opts();
         o.shell = Some("cmd.exe".into());
         let a = call(
-            "start /b ping -n 900 127.0.0.2",
+            "start /b ping -n 900 127.0.0.1",
             d.path(),
             Duration::from_secs(1200),
         );
@@ -1870,7 +1870,7 @@ mod windows_tests {
     async fn helper_runs_a_command_until_killed() {
         let dir = PathBuf::from(std::env::var_os("NERVE_TEST_DIR").expect("set by the test"));
         let command = "Set-Content -Path shell.pid -Value $PID; \
-             $p = Start-Process ping -ArgumentList '-n','120','127.0.0.2' -WindowStyle Hidden -PassThru; \
+             $p = Start-Process ping -ArgumentList '-n','120','127.0.0.1' -WindowStyle Hidden -PassThru; \
              Set-Content -Path ping.pid -Value $p.Id; \
              Start-Sleep 120";
         let _ = run(

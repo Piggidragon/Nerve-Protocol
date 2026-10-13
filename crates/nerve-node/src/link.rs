@@ -470,10 +470,10 @@ impl Link {
                         }
                         Got::Bad(reply) => self.send(reply).await,
                         Got::Binary(b) => {
-                            // No blobs or streams flow center → node in 0.0.2;
+                            // No blobs or streams flow center → node;
                             // only reserved media frames break the link.
                             if let Err(FrameError::MediaReserved) = Frame::decode(&b) {
-                                tracing::warn!("center {}: it sent a media frame, which 0.0.2 does not take", self.name);
+                                tracing::warn!("center {}: it sent a media frame, which this node does not take", self.name);
                                 return self.end(ByeReason::ProtocolError, Outcome::Retry).await;
                             }
                         }
@@ -1083,7 +1083,7 @@ impl Link {
             &self.name,
             s.document,
             s.if_version,
-            // This node offers no sense capabilities in 0.0.2.
+            // This node offers no sense capabilities.
             |_| false,
             |opts| self.protected_with(opts, account.as_ref()),
         );
@@ -1384,13 +1384,13 @@ mod tests {
     async fn behind_a_proxy() -> (tempfile::TempDir, NodePaths, TcpListener, TcpListener) {
         let d = tempfile::tempdir().unwrap();
         let paths = NodePaths::new(d.path().join("config"), d.path().join("state"));
-        let center = TcpListener::bind("127.0.0.2:0").await.unwrap();
-        let proxy = TcpListener::bind("127.0.0.2:0").await.unwrap();
+        let center = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let mut cfg = nerve_policy::NodeConfig::default();
         cfg.centers.push(nerve_policy::CenterEntry {
             name: "home".into(),
             // Only TLS goes through the proxy; the tunnel carries it.
-            url: format!("https://127.0.0.2:{}", center.local_addr().unwrap().port()),
+            url: format!("https://127.0.0.1:{}", center.local_addr().unwrap().port()),
             pin: None,
             center_id: "c".into(),
             node_id: "n".into(),
@@ -1401,7 +1401,7 @@ mod tests {
             policy: Default::default(),
         });
         cfg.connection.proxy = Some(format!(
-            "http://127.0.0.2:{}",
+            "http://127.0.0.1:{}",
             proxy.local_addr().unwrap().port()
         ));
         cfg.connection.headers = vec!["X-Key".into()];
@@ -1464,7 +1464,7 @@ mod tests {
         let mut buf = vec![0u8; 4096];
         let n = s.read(&mut buf).await.unwrap();
         let req = String::from_utf8_lossy(&buf[..n]).to_string();
-        assert!(req.starts_with("CONNECT 127.0.0.2:"), "{req}");
+        assert!(req.starts_with("CONNECT 127.0.0.1:"), "{req}");
         assert!(req.contains("\r\nX-Key: s3cret-value\r\n"), "{req}");
         s.write_all(b"HTTP/1.1 403 Forbidden\r\n\r\n")
             .await

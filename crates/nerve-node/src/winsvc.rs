@@ -781,7 +781,7 @@ mod tests {
             bin: root.join("Program Files/Nerve/nerve-node.exe"),
             paths: NodePaths::new(data.join("config"), data.join("state")),
             home: data,
-            release: "http://127.0.0.2:1/none".into(),
+            release: "http://127.0.0.1:1/none".into(),
         }
     }
 

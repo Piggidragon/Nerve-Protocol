@@ -1503,7 +1503,7 @@ pub(crate) mod tests {
             bin: root.join("usr/local/bin/nerve-node"),
             home: root.join("var/lib/nerve"),
             paths: NodePaths::new(root.join("etc/nerve"), root.join("var/lib/nerve/state")),
-            release: "http://127.0.0.2:1/none".into(),
+            release: "http://127.0.0.1:1/none".into(),
         }
     }
 
@@ -2219,7 +2219,7 @@ pub(crate) mod tests {
     /// program behind a redirect as GitHub has it.
     async fn release(program: &'static [u8], sums: String) -> String {
         use nerve_transport::http::{Response, read_request};
-        let listener = tokio::net::TcpListener::bind("127.0.0.2:0").await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         let asset = asset_name().unwrap();
         tokio::spawn(async move {
@@ -2237,7 +2237,7 @@ pub(crate) mod tests {
                 let _ = r.write(&mut io).await;
             }
         });
-        format!("http://127.0.0.2:{port}/rel")
+        format!("http://127.0.0.1:{port}/rel")
     }
 
     fn sha(b: &[u8]) -> String {
@@ -2288,7 +2288,7 @@ pub(crate) mod tests {
         for bad in [
             "nerve-center 1.0.0",
             "nerve-node 1.0",
-            "nerve-node 1.0.0.2",
+            "nerve-node 1.0.0.1",
             "nerve-node x",
         ] {
             assert_eq!(Version::parse(bad), None, "{bad}");
@@ -2299,7 +2299,7 @@ pub(crate) mod tests {
             ("example.com", 443, true)
         );
         assert_eq!(target, "/a/b?x=1");
-        let (at, target) = split_url("http://127.0.0.2:8080?q").unwrap();
+        let (at, target) = split_url("http://127.0.0.1:8080?q").unwrap();
         assert_eq!((at.port, target.as_str()), (8080, "/?q"));
         assert!(split_url("ftp://x/y").is_err());
     }

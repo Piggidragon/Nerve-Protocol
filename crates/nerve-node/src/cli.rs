@@ -876,7 +876,7 @@ const NEXT_START: &str = "takes effect at the next start of the node";
 
 /// Runs one command line, writing what it shows to `out`. A change made
 /// while no daemon answers on the control socket (none runs, or Windows,
-/// which has no socket in 0.0.2) is only in the file, so the output says
+/// which has no socket) is only in the file, so the output says
 /// when it counts.
 pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
     let service = cli.cmd.is_service();
@@ -2274,7 +2274,7 @@ mod tests {
     fn entry(name: &str) -> nerve_policy::CenterEntry {
         nerve_policy::CenterEntry {
             name: name.into(),
-            url: "http://127.0.0.2:1".into(),
+            url: "http://127.0.0.1:1".into(),
             pin: None,
             center_id: format!("id-{name}"),
             node_id: "n".into(),
@@ -2842,7 +2842,7 @@ mod tests {
             &[
                 "proxy",
                 "set",
-                "http://127.0.0.2:3128",
+                "http://127.0.0.1:3128",
                 "--header",
                 "X-Key: s3cret-value",
             ],
@@ -2850,7 +2850,7 @@ mod tests {
         .unwrap();
         let ls = run(&paths, &["proxy", "ls"]).unwrap();
         assert!(
-            ls.contains("http://127.0.0.2:3128") && ls.contains("X-Key"),
+            ls.contains("http://127.0.0.1:3128") && ls.contains("X-Key"),
             "{ls}"
         );
         assert!(!ls.contains("s3cret"), "{ls}");
@@ -2872,7 +2872,7 @@ mod tests {
             &[
                 "proxy",
                 "set",
-                "http://127.0.0.2:3128",
+                "http://127.0.0.1:3128",
                 "--header",
                 "X-Key: s3cret-value",
                 "--header",
@@ -2893,7 +2893,7 @@ mod tests {
         let cfg = load(&paths);
         assert_eq!(
             cfg.connection.proxy.as_deref(),
-            Some("http://127.0.0.2:3128")
+            Some("http://127.0.0.1:3128")
         );
         assert_eq!(cfg.connection.headers, ["X-Key", "X-Other"]);
         let held: std::collections::BTreeMap<String, String> =
@@ -2901,7 +2901,7 @@ mod tests {
         assert_eq!(held["X-Key"], "s3cret-value");
         assert_eq!(held["X-Other"], "two words");
         // A proxy without headers needs no entry; the old one goes.
-        run(&paths, &["proxy", "set", "http://127.0.0.2:3129"]).unwrap();
+        run(&paths, &["proxy", "set", "http://127.0.0.1:3129"]).unwrap();
         assert_eq!(keyring_entry(&paths), None);
         assert!(load(&paths).connection.headers.is_empty());
     }
@@ -2911,7 +2911,7 @@ mod tests {
         let (_d, paths) = setup(&["home"]);
         let out = run(
             &paths,
-            &["proxy", "set", "http://alice:pa%40ss-w0rd@127.0.0.2:3128"],
+            &["proxy", "set", "http://alice:pa%40ss-w0rd@127.0.0.1:3128"],
         )
         .unwrap();
         assert!(!out.contains("pa%40ss") && !out.contains("alice"), "{out}");
@@ -2923,7 +2923,7 @@ mod tests {
         let cfg = load(&paths);
         assert_eq!(
             cfg.connection.proxy.as_deref(),
-            Some("http://127.0.0.2:3128")
+            Some("http://127.0.0.1:3128")
         );
         assert_eq!(cfg.connection.headers, [PROXY_AUTHORIZATION]);
         use base64::Engine;
@@ -2936,16 +2936,16 @@ mod tests {
         let both = [
             "proxy",
             "set",
-            "http://alice:s3cret@127.0.0.2:3128",
+            "http://alice:s3cret@127.0.0.1:3128",
             "--header",
             "proxy-authorization: Basic x",
         ];
         assert!(run(&paths, &both).unwrap_err().contains("not both"));
         for bad in [
-            "alice:s3cret@127.0.0.2:3128",
-            "http://alice:s3cret@127.0.0.2:3128/path",
-            "https://alice:s3cret@127.0.0.2:3128",
-            "http://alice:s3cr%zzet@127.0.0.2:3128",
+            "alice:s3cret@127.0.0.1:3128",
+            "http://alice:s3cret@127.0.0.1:3128/path",
+            "https://alice:s3cret@127.0.0.1:3128",
+            "http://alice:s3cr%zzet@127.0.0.1:3128",
         ] {
             let e = run(&paths, &["proxy", "set", bad]).unwrap_err();
             assert!(!e.contains("s3cr"), "{bad}: {e}");
@@ -2953,7 +2953,7 @@ mod tests {
         // A --header without its colon is not quoted either.
         let e = run(
             &paths,
-            &["proxy", "set", "http://127.0.0.2:1", "--header", "s3cret"],
+            &["proxy", "set", "http://127.0.0.1:1", "--header", "s3cret"],
         )
         .unwrap_err();
         assert!(!e.contains("s3cret"), "{e}");
@@ -2966,7 +2966,7 @@ mod tests {
         std::fs::create_dir_all(&paths.config_dir).unwrap();
         std::fs::write(
             paths.config_file(),
-            "[connection]\nproxy = \"http://127.0.0.2:3128\"\nheaders = { X-Key = \"s3cret-value\" }\n",
+            "[connection]\nproxy = \"http://127.0.0.1:3128\"\nheaders = { X-Key = \"s3cret-value\" }\n",
         )
         .unwrap();
         for args in [&["proxy", "ls"][..], &["status"]] {
@@ -2982,7 +2982,7 @@ mod tests {
         let set = [
             "proxy",
             "set",
-            "http://127.0.0.2:3128",
+            "http://127.0.0.1:3128",
             "--header",
             "X-Key: s3cret-value",
         ];
@@ -2991,7 +2991,7 @@ mod tests {
         let ls = run(&paths, &["proxy", "ls"]).unwrap();
         assert_eq!(
             ls,
-            "proxy http://127.0.0.2:3128\nheader X-Key (its value is in the system keyring)\n"
+            "proxy http://127.0.0.1:3128\nheader X-Key (its value is in the system keyring)\n"
         );
         let rm = run(&paths, &["proxy", "rm"]).unwrap();
         assert!(rm.contains("deleted the header values"), "{rm}");
@@ -3014,16 +3014,16 @@ mod tests {
 
         // A proxy without headers never needs the keyring, reachable or not.
         crate::secrets::store::set_unreachable(true);
-        let plain = run(&paths, &["proxy", "set", "http://127.0.0.2:3128"]);
+        let plain = run(&paths, &["proxy", "set", "http://127.0.0.1:3128"]);
         let ls = run(&paths, &["proxy", "ls"]);
         let rm = run(&paths, &["proxy", "rm"]);
         crate::secrets::store::set_unreachable(false);
         let next = format!("the change is in node.toml; it {NEXT_START}\n");
         assert_eq!(
             plain.unwrap(),
-            format!("proxy http://127.0.0.2:3128\n{next}")
+            format!("proxy http://127.0.0.1:3128\n{next}")
         );
-        assert_eq!(ls.unwrap(), "proxy http://127.0.0.2:3128\n");
+        assert_eq!(ls.unwrap(), "proxy http://127.0.0.1:3128\n");
         assert_eq!(rm.unwrap(), format!("no proxy\n{next}"));
     }
 
@@ -3037,7 +3037,7 @@ mod tests {
             &[
                 "proxy",
                 "set",
-                "http://alice:pa55w0rd@127.0.0.2:3128",
+                "http://alice:pa55w0rd@127.0.0.1:3128",
                 "--header",
                 "X-Key: s3cret-value",
             ],
@@ -3138,7 +3138,7 @@ mod tests {
         let set = [
             "proxy",
             "set",
-            "http://alice:pa55w0rd@127.0.0.2:3128",
+            "http://alice:pa55w0rd@127.0.0.1:3128",
             "--header",
             "X-Key: s3cret-value",
         ];

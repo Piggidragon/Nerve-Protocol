@@ -7,7 +7,7 @@
 //! versions and `x-` members.
 //!
 //! The crate only depends on `serde` and `serde_json`. It is not built as
-//! `no_std` in 0.0.2; nothing in it needs more than `alloc`, so that can follow
+//! `no_std`; nothing in it needs more than `alloc`, so that can follow
 //! when a constrained node exists.
 
 pub mod base32;

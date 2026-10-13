@@ -1253,7 +1253,7 @@ mod tests {
             "tokens: 3, passwords are never logged",
             // A flag named like a secret in prose, or with a file or a
             // placeholder for its value, holds no secret.
-            "set --harness-token (NERVE_HARNESS_TOKEN) or use --ui 127.0.0.2:<port>",
+            "set --harness-token (NERVE_HARNESS_TOKEN) or use --ui 127.0.0.1:<port>",
             "mysql --password-file /etc/mysql/pw db",
             "usage: tool --token <value> --password $PASS",
             "über ünïcode — täxt with 日本語",

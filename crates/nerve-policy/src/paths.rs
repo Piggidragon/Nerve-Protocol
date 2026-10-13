@@ -8,7 +8,7 @@
 //! Unix the node's `fs.read` and `fs.write` then open that resolved path one
 //! component at a time without following a symlink, so a symlink that appears
 //! between check and use fails the call. The other `fs` actions, and every action
-//! on Windows, go by the resolved path as it is then (not done in 0.0.2).
+//! on Windows, go by the resolved path as it is then (not done).
 
 use std::fs;
 use std::io;

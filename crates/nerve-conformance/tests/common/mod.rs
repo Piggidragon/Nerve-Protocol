@@ -49,7 +49,7 @@ pub fn bin(name: &str) -> PathBuf {
 
 /// A port that was free a moment ago.
 pub fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.2:0")
+    std::net::TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
         .unwrap()
@@ -79,15 +79,15 @@ impl Mcp {
             .env("HOME", state)
             .env("NERVE_STATE_DIR", state)
             .env("NERVE_NAME", "e2e-center")
-            .env("NERVE_LISTEN", format!("127.0.0.2:{node_port}"))
-            .env("NERVE_UI", "127.0.0.2:0")
+            .env("NERVE_LISTEN", format!("127.0.0.1:{node_port}"))
+            .env("NERVE_UI", "127.0.0.1:0")
             .env("NERVE_LOG", "info")
             .env("NERVE_CALL_WAIT", "20");
         if tls {
-            cmd.env("NERVE_PUBLIC_URL", format!("https://127.0.0.2:{node_port}"));
+            cmd.env("NERVE_PUBLIC_URL", format!("https://127.0.0.1:{node_port}"));
         } else {
             cmd.env("NERVE_PLAIN_LOOPBACK", "true")
-                .env("NERVE_PUBLIC_URL", format!("http://127.0.0.2:{node_port}"));
+                .env("NERVE_PUBLIC_URL", format!("http://127.0.0.1:{node_port}"));
         }
         for (k, v) in extra {
             cmd.env(k, v);
@@ -148,7 +148,7 @@ impl Mcp {
         let r = m.request(
             "initialize",
             json!({"protocolVersion": "2025-06-18", "capabilities": {},
-                   "clientInfo": {"name": "e2e", "version": "0.0.2"}}),
+                   "clientInfo": {"name": "e2e", "version": "x.y.z"}}),
         );
         assert_eq!(r["result"]["serverInfo"]["name"], "nerve-center", "{r}");
         m.notify("notifications/initialized", json!({}));

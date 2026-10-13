@@ -6,7 +6,7 @@
 //! `NERVE_*` variables in the harness's MCP entry, or in the web UI.
 //
 // Harnesses get Nerve through MCP only: this MCP server is the whole
-// integration surface in 0.0.2. Native plugins are a backlog item.
+// integration surface. Native plugins are a backlog item.
 
 pub mod attach;
 pub mod audit;

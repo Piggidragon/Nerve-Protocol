@@ -5,7 +5,7 @@ server; nodes connect to it as [protocol.md](protocol.md) describes. This page
 is what a harness, and whoever writes its MCP entry, can rely on.
 
 > **Integration.** Harnesses get Nerve through MCP only: the MCP server is the
-> whole integration surface in 0.0.2. Native plugins for harnesses are a
+> whole integration surface. Native plugins for harnesses are a
 > backlog item. Nothing waits for a person: a call the node's policy does not
 > allow is refused at once.
 
@@ -21,10 +21,10 @@ entry:
 | `--listen` | `NERVE_LISTEN` | `0.0.0.0:7443` | where nodes connect |
 | `--public-url` | `NERVE_PUBLIC_URL` | `https://<host name>:<port>` | the URL put in pairing links |
 | `--plain-loopback` | `NERVE_PLAIN_LOOPBACK` | off | plain HTTP for nodes, only on a loopback `--listen` |
-| `--ui` | `NERVE_UI` | `127.0.0.2:7480` | web UI address, or `off` |
+| `--ui` | `NERVE_UI` | `127.0.0.1:7480` | web UI address, or `off` |
 | `--ui-no-login` | `NERVE_UI_NO_LOGIN` | off | let the UI in without a login; refused when the UI listens beyond loopback |
 | `--mcp` | `NERVE_MCP` | `stdio` | `stdio`, `http`, or `none` (center only) |
-| `--mcp-listen` | `NERVE_MCP_LISTEN` | `127.0.0.2:7481` | HTTP MCP address |
+| `--mcp-listen` | `NERVE_MCP_LISTEN` | `127.0.0.1:7481` | HTTP MCP address |
 | `--harness-token` | `NERVE_HARNESS_TOKEN` | none | the harness token: bearer token for HTTP MCP and the secret that logs in to the UI (more can be made in the UI) |
 | `--log` | `NERVE_LOG` | the stored level, `info` at first | log level; wins over the stored one for this run. The log goes to stderr and `log.jsonl`, never to stdout |
 
@@ -47,7 +47,7 @@ it relays its stdio over `<state>/run/harness.sock` (mode 0600 in a 0700
 folder; the owner also checks the peer's uid) and each harness gets its own
 session. When the owner's own harness goes, the owner keeps running until the
 attached harnesses have ended too. A second instance with `--mcp http` or
-`none` refuses to start. Windows has no attach in 0.0.2: the second instance
+`none` refuses to start. Windows has no attach: the second instance
 fails when it cannot bind the node port.
 
 ## 3. MCP
@@ -172,7 +172,7 @@ with its token: deleting the token in the UI stops the cookie that logged in
 with it. A token that is lost is replaced by starting once with
 `--ui-no-login` on loopback and making a new one. Every change needs the CSRF
 header from `/api/session`. Pairing shows the link and the code; a QR code is
-not offered in 0.0.2.
+not offered.
 
 ## 8. What the center keeps
 

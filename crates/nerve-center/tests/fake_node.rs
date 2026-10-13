@@ -31,10 +31,10 @@ async fn center(dir: &std::path::Path) -> Running {
         "--name",
         "test-center",
         "--listen",
-        "127.0.0.2:0",
+        "127.0.0.1:0",
         "--plain-loopback",
         "--ui",
-        "127.0.0.2:0",
+        "127.0.0.1:0",
         "--mcp",
         "none",
     ])
@@ -46,7 +46,7 @@ async fn center(dir: &std::path::Path) -> Running {
 }
 
 fn url(r: &Running) -> CenterUrl {
-    CenterUrl::parse(&format!("http://127.0.0.2:{}", r.nodes.port())).unwrap()
+    CenterUrl::parse(&format!("http://127.0.0.1:{}", r.nodes.port())).unwrap()
 }
 
 async fn pair(r: &Running, key: &NodeKey, name: &str) -> (u16, Value) {
@@ -66,7 +66,7 @@ async fn pair_with_code(r: &Running, key: &NodeKey, name: &str) -> (String, u16,
     });
     let resp = nerve_transport::http::post_json(
         &mut io,
-        "127.0.0.2",
+        "127.0.0.1",
         nerve_proto::PAIR_PATH,
         &body,
         64 * 1024,
@@ -84,7 +84,7 @@ fn descriptor(key: &NodeKey, name: &str) -> Value {
     json!({
         "nerve": "0",
         "node": {"id": key.node_id(), "name": name, "platform": "linux", "arch": "x86_64",
-                 "software": {"name": "fake-node", "version": "0.0.2"}},
+                 "software": {"name": "fake-node", "version": "x.y.z"}},
         "rev": 1,
         "summary": "A fake node.",
         "capabilities": [
@@ -135,7 +135,7 @@ async fn handshake(r: &Running, key: &NodeKey) -> (WebSocketStream<BoxIo>, Messa
         "node_id": key.node_id(),
         "auth": {"sig": key.sign_connect(&center_id, &nonce)},
         "versions": ["0"],
-        "software": {"name": "fake-node", "version": "0.0.2"},
+        "software": {"name": "fake-node", "version": "x.y.z"},
         "rev": 1,
     });
     send(&mut ws, Message::notification(method::HELLO, hello)).await;
@@ -444,7 +444,7 @@ async fn unknown_node_and_wrong_codes() {
     let body = json!({"code": "aaaaaaaaaaaa", "name": "x", "platform": "linux", "arch": "x86_64",
                       "public_key": key.public_hex()});
     let resp =
-        nerve_transport::http::post_json(&mut io, "127.0.0.2", nerve_proto::PAIR_PATH, &body, 4096)
+        nerve_transport::http::post_json(&mut io, "127.0.0.1", nerve_proto::PAIR_PATH, &body, 4096)
             .await
             .unwrap();
     assert_eq!(resp.status, 403);
@@ -533,7 +533,7 @@ async fn http_mcp_needs_a_token_and_a_session() {
     assert_eq!(
         h.request(http(
             "POST",
-            &[auth, evil, ("host", "127.0.0.2:7481")],
+            &[auth, evil, ("host", "127.0.0.1:7481")],
             init.clone()
         ))
         .await
@@ -754,7 +754,7 @@ async fn audit_targets_are_cut_and_the_audit_feed_is_bounded() {
     );
     // The UI without a login hands out a session to the page.
     let ui = nerve_center::ui::Ui::new(&r.center, None, false, false);
-    let mut req = http("GET", &[("host", "127.0.0.2:1")], Value::Null);
+    let mut req = http("GET", &[("host", "127.0.0.1:1")], Value::Null);
     req.path = "/api/session".into();
     let resp = ui.request(req).await;
     let (_, cookie) = resp
@@ -765,7 +765,7 @@ async fn audit_targets_are_cut_and_the_audit_feed_is_bounded() {
     let cookie = cookie.split(';').next().unwrap();
     let mut req = http(
         "GET",
-        &[("host", "127.0.0.2:1"), ("cookie", cookie)],
+        &[("host", "127.0.0.1:1"), ("cookie", cookie)],
         Value::Null,
     );
     req.path = "/api/audit".into();
@@ -896,7 +896,7 @@ async fn a_node_that_drops_and_comes_back_is_in_the_log() {
             "the node paired (linux/x86_64); its code is used up"
         )
     );
-    assert_eq!(line(1), (Level::Info, "link up (node software 0.0.2)"));
+    assert_eq!(line(1), (Level::Info, "link up (node software x.y.z)"));
     // Told by the code that came back, then what it was.
     let calls: Vec<_> = got
         .iter()
@@ -940,10 +940,10 @@ async fn a_node_that_drops_and_comes_back_is_in_the_log() {
         .filter(|(_, m)| m.starts_with("link up"))
         .collect();
     assert_eq!(ups.len(), 4);
-    assert_eq!(ups[0].1, "link up (node software 0.0.2)");
+    assert_eq!(ups[0].1, "link up (node software x.y.z)");
     for (_, m) in &ups[1..] {
         assert!(
-            m.starts_with("link up again after ") && m.ends_with(" (node software 0.0.2)"),
+            m.starts_with("link up again after ") && m.ends_with(" (node software x.y.z)"),
             "{m}"
         );
     }

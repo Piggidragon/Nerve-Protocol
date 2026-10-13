@@ -45,7 +45,7 @@ globset = "0.4"
 landlock = "0.4"
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
 tempfile = "3"
-# The one crate 0.0.2 adds: the system keyring (Keychain, Credential Manager,
+# The system keyring (Keychain, Credential Manager,
 # Secret Service) for the proxy's header values and credentials.
 keyring = "4.2"
 # The Job Object a Windows command runs in (CreateJobObjectW and its limits),

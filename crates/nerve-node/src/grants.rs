@@ -243,14 +243,14 @@ fn open_to_commands(path: &Path, want: &[Grant], record: &[Grant]) -> bool {
         .any(|g| g.access.write && within(path, &g.path) && !within(&g.path, path))
 }
 
-/// Whether commands may write in `path` or below it: it is a folder a
-/// container may write, or lies inside one, by a wanted or a recorded grant.
-/// A change of its list that Windows passes down then reaches what commands
-/// put there.
+/// Whether commands may write in `path` or below it: a folder a container
+/// may write, by a wanted or a recorded grant, is `path`, holds it, or lies
+/// inside it. A change of its list that Windows passes down then reaches
+/// what commands put there, also through a writable folder below it.
 fn written_in(path: &Path, want: &[Grant], record: &[Grant]) -> bool {
     want.iter()
         .chain(record)
-        .any(|g| g.access.write && within(path, &g.path))
+        .any(|g| g.access.write && (within(path, &g.path) || within(&g.path, path)))
 }
 
 /// Why the list of `path` must not be changed now, if it must not: Windows
@@ -276,7 +276,10 @@ fn held(folders: &mut impl Folders, path: &Path) -> Option<String> {
 
 /// The first file below the folder `dir` with more than one name, by
 /// `names`, and how many it has; `None` for a file or when there is none.
-/// Links and junctions below `dir` are not followed.
+/// Only plain folders are walked into: a link or junction below `dir` is
+/// not followed, and is checked as itself like every other entry that is
+/// not a folder (`names` opens it as itself), so a file that is a reparse
+/// point of another kind is checked too.
 #[cfg(any(windows, test))]
 fn linked_below(
     dir: &Path,
@@ -301,17 +304,7 @@ fn linked_below(
                 Err(e) if gone(&e) => continue,
                 Err(e) => return Err(e),
             };
-            #[cfg(windows)]
-            let link = {
-                use std::os::windows::fs::MetadataExt;
-                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-                m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
-            };
-            #[cfg(not(windows))]
-            let link = m.file_type().is_symlink();
-            if link {
-                continue;
-            }
+            // A link or junction to a folder is not a folder here.
             if m.is_dir() {
                 todo.push(path);
                 continue;
@@ -505,11 +498,15 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
                 kept.push(old.clone());
             }
             Ok(Found::At(now)) => {
-                // Commands wrote in it where it was, or write where it is
-                // now, and taking the grant off passes the change down.
-                let hold = (old.access.write || written_in(&now, want, &record))
-                    .then(|| held(folders, &now))
-                    .flatten();
+                // Commands wrote in it, or below it, where it was (the record
+                // still holds what was below it under its old path), or write
+                // where it is now, and taking the grant off passes the change
+                // down.
+                let hold = (old.access.write
+                    || written_in(&old.path, want, &record)
+                    || written_in(&now, want, &record))
+                .then(|| held(folders, &now))
+                .flatten();
                 match hold.map_or_else(
                     || folders.set(&now, &old.container, None, false),
                     |why| Err(io::Error::other(why)),
@@ -1206,6 +1203,70 @@ mod tests {
         assert_eq!(f.on("/r"), [("c2".to_string(), r.access)]);
     }
 
+    /// A folder that holds a writable one passes a change down through it,
+    /// so it is checked too: put on, changed, taken off, by another
+    /// container, and taken off where it is after a move (also when the
+    /// writable folder below it is recorded under the old path).
+    #[test]
+    fn a_folder_that_holds_a_writable_one_is_checked() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("grants.json");
+        let mut f = Fake::default();
+        for p in ["/d", "/d/in", "/out"] {
+            f.make(p);
+        }
+        let (inbox, out) = (grant("c1", "/d/in", "rw"), grant("c1", "/out", "w"));
+        let base = [inbox.clone(), out.clone()];
+        let s = sync(&file, &base, &mut f);
+        assert!(s.errors.is_empty(), "{s:?}");
+        f.linked.push("/d/in/x".into());
+        let refused = |s: &Synced| {
+            s.errors.len() == 1 && s.errors[0].contains("/d/in/x") && s.errors[0].contains("/d")
+        };
+
+        // Put on, for this container and another one.
+        for dr in [grant("c1", "/d", "r"), grant("c2", "/d", "r")] {
+            let s = sync(&file, &[base.to_vec(), vec![dr.clone()]].concat(), &mut f);
+            assert!(refused(&s), "{s:?}");
+            assert!(f.on("/d").is_empty(), "{:?}", f.all());
+        }
+
+        // Changed and taken off: what is on stays.
+        f.linked.clear();
+        let dr = grant("c1", "/d", "r");
+        let s = sync(&file, &[base.to_vec(), vec![dr.clone()]].concat(), &mut f);
+        assert!(s.errors.is_empty(), "{s:?}");
+        f.linked.push("/d/in/x".into());
+        let s = sync(
+            &file,
+            &[base.to_vec(), vec![grant("c1", "/d", "rx")]].concat(),
+            &mut f,
+        );
+        assert!(refused(&s), "{s:?}");
+        assert_eq!(f.on("/d"), [("c1".to_string(), dr.access)]);
+        let s = sync(&file, &base, &mut f);
+        assert!(refused(&s), "{s:?}");
+        assert!(s.stale.iter().any(|g| g.path == Path::new("/d")), "{s:?}");
+        assert_eq!(f.on("/d"), [("c1".to_string(), dr.access)]);
+
+        // Moved with the writable folder in it: neither comes off there.
+        f.mv("/d", "/d2");
+        f.mv("/d/in", "/d2/in");
+        f.linked = vec!["/d2/in/x".into()];
+        let s = sync(&file, std::slice::from_ref(&out), &mut f);
+        assert!(s.errors.iter().all(|e| e.contains("/d2/in/x")), "{s:?}");
+        assert_eq!(s.errors.len(), 2, "{s:?}");
+        assert_eq!(f.on("/d2"), [("c1".to_string(), dr.access)]);
+        assert_eq!(f.on("/d2/in"), [("c1".to_string(), inbox.access)]);
+        assert!(s.refusal("c1").is_some());
+
+        // Without the link, all comes off.
+        f.linked.clear();
+        let s = sync(&file, std::slice::from_ref(&out), &mut f);
+        assert!(s.errors.is_empty() && s.stale.is_empty(), "{s:?}");
+        assert!(f.on("/d2").is_empty() && f.on("/d2/in").is_empty());
+    }
+
     /// The walk finds a file with a second name below a folder, also deep
     /// down, and does not follow a link out of the folder.
     #[cfg(unix)]
@@ -1633,6 +1694,28 @@ mod tests {
         nerve_sandbox::appcontainer::look(path, container, m)
             .unwrap()
             .1
+    }
+
+    /// On Windows: a folder inside a writable one, configured in another
+    /// case than its name on disk, is the same place (NTFS ignores case),
+    /// so it gets its grant and is not taken for a link.
+    #[cfg(windows)]
+    #[test]
+    fn a_folder_spelled_in_another_case_gets_its_grant() {
+        let d = tempfile::tempdir().unwrap();
+        let root = canonical(d.path());
+        let paths = NodePaths::new(root.join("config"), root.join("state"));
+        let work = root.join("work");
+        std::fs::create_dir_all(work.join("bin")).unwrap();
+        let mut cfg = NodeConfig::default();
+        cfg.centers
+            .push(center("lab", &[(&work, "rw"), (&work.join("BIN"), "rwx")]));
+        let want = wanted(&cfg, &paths, &root, &crate::paths::platform());
+        assert!(
+            want.iter()
+                .any(|g| within(&g.path, &work.join("bin")) && g.access == Access::ALL),
+            "{want:?}"
+        );
     }
 
     /// On Windows: a folder granted inside a folder with `w` that a command

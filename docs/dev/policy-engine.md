@@ -156,10 +156,14 @@ command in an AppContainer, one per center (`nerve_sandbox::appcontainer`):
   its names, so a change the node passes down a folder (a grant put on or
   changed, one taken off, also where a moved folder is now) reaches a file
   a command linked there from a `w`-only folder. So before such a change on
-  a folder commands may write in, `grants::sync` walks it and refuses while
-  a file below has more than one name (a removal stays stale). A link made
-  between the walk and the change still gets through: a documented limit,
-  with its own issue for a race-free design. Inside a folder with `w` a
+  a folder commands may write in, or one that holds such a folder,
+  `grants::sync` walks it and refuses while a file below has more than one
+  name (a removal stays stale). It does not tell a command's link from a
+  build tool's (cargo's `target`, pnpm, uv, a local `git clone`), so those
+  are refused too; the user docs give the ways around. A link a command of
+  any pairing that may write there makes between the walk and the change
+  still gets through: a documented limit, with its own issue for a
+  race-free design. Inside a folder with `w` a
   command can put a junction or a hard link where a granted folder was, so a
   grant goes on there only on an object of its own (its final path is its
   path, one name, an inheriting list), through the handle the check opened;

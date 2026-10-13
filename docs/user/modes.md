@@ -110,7 +110,8 @@ folders.
   takes it off. A running node takes changes from the CLI at its next start
   ([platforms](platforms.md#no-control-socket)), and gives its folders their
   entries again until then.
-- `uninstall` takes off the entries of the node in your own folders
+- `uninstall` takes off the entries of the node in your own folders (not
+  those of a folder that holds hard links, see below)
   (`%USERPROFILE%\.config\nerve` and `.local\state\nerve`, or those you name
   with `--config-dir` and `--state-dir`). Once a service is installed, the CLI
   reaches the service, so name the folders to change the node you run
@@ -166,14 +167,26 @@ folders.
   or the task scheduler.
 - A hard link is one file under two names, and both share one access list.
   When the node grants, changes or moves a folder that commands may write
-  in, Windows passes the change to everything below it, and that includes
-  hard links. Before such a change the node checks the folder and refuses
-  if a file below it has more than one name. A command of the same pairing
-  that runs during the sync can still make a link between the check and the
-  change, and the file it links then gets the folder's rights. Hard links
-  only work within one drive. So put a write-only folder whose files
-  commands must not read on a drive where the pairing has no folder with
-  both read and write.
+  in, or a folder that holds one, Windows passes the change to everything
+  below it, and that includes hard links. Before such a change the node
+  checks the folder and refuses if a file below it has more than one name.
+  A command of any pairing that may write in that folder can still make a
+  link between the check and the change, and the file it links then gets
+  the folder's rights. Hard links only work within one drive. So put a
+  write-only folder whose files commands must not read on a drive where the
+  pairing can write nowhere that it can also read or run programs, also
+  through a folder above.
+- Build tools make hard links of their own, and the check refuses those too:
+  cargo builds each program under two names in `target`, pnpm links
+  `node_modules` to its store, uv links a `.venv` to its cache, and a local
+  `git clone` links its objects. A folder that holds such links does not get
+  its entry, and its entry is not changed or taken off. A refused removal
+  stops that pairing's commands, and `uninstall` leaves the entry on, until
+  the links are gone. Keep them out of granted folders: `CARGO_TARGET_DIR`
+  outside the folder, `UV_LINK_MODE=copy`, pnpm's
+  `package-import-method=copy`, `git clone --no-hardlinks`. Or remove them
+  (`cargo clean`, delete `node_modules` or `.venv`) before you add, change
+  or remove the folder.
 
 `nerve-node status` cannot ask the running node on Windows
 ([platforms](platforms.md#no-control-socket)). The node names its

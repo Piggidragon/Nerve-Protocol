@@ -401,18 +401,27 @@ pub fn container_grants(
 /// judged resolved, so a writable folder reached by one spelling catches a
 /// folder configured by another (a link, a mount point, an 8.3 name).
 fn led_away(path: &Path, writable: &[PathBuf]) -> Option<String> {
+    use std::path::Component;
     let comps: Vec<_> = path.components().collect();
+    // The drive and the root are one first step: `C:` alone names the
+    // current folder on drive C, not its root.
+    let roots = comps
+        .iter()
+        .take_while(|c| matches!(c, Component::Prefix(_) | Component::RootDir))
+        .count()
+        .max(1);
     let mut inside = false;
-    for i in 1..=comps.len() {
+    for i in roots..=comps.len() {
         let here = real(&comps[..i].iter().collect::<PathBuf>());
         // The place this component names without following a link of its
         // own: the resolved parent plus the component's name.
-        let plain = if i == 1 {
+        let plain = if i == roots {
             here.clone()
         } else {
             real(&comps[..i - 1].iter().collect::<PathBuf>()).join(comps[i - 1].as_os_str())
         };
-        if inside && here != plain {
+        // By the platform's path rules: NTFS names ignore case.
+        if inside && !(within(&here, &plain) && within(&plain, &here)) {
             return Some(format!(
                 "it leads to {} through a link or junction inside a folder where commands may write",
                 here.display()

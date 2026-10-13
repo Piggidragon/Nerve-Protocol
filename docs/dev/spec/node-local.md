@@ -80,7 +80,8 @@ written to, and the command says so.
 refuses to run as root, or in an elevated token on Windows, unless
 `machine.allow_root = true`; when it runs that way, it logs a warning at
 start (stderr and the node's log file, not the center) that commands then run
-with full rights, unless `machine.user` names another account, and the owner is
+with full rights (on Unix unless `machine.user` names another account; Windows
+has no such setting, commands keep the node's token), and the owner is
 responsible.
 
 These two folders are the node's own. No call of a center reaches them, in

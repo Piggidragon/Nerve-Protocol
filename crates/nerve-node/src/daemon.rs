@@ -39,6 +39,10 @@ pub struct NodeOptions {
     /// ran. The daemon adds the file in the state folder and sets the level
     /// from `node.toml`.
     pub log: Option<Arc<Log>>,
+    /// Whether the process counts as having full rights (root, an elevated
+    /// token), instead of asking the system. A test sets it: the same test
+    /// must pass for a developer who runs it elevated.
+    pub full_rights: Option<bool>,
 }
 
 impl NodeOptions {
@@ -49,6 +53,7 @@ impl NodeOptions {
             home: home_dir(),
             ctl: true,
             log: nerve_transport::log::global(),
+            full_rights: None,
         }
     }
 }
@@ -367,7 +372,8 @@ impl Daemon {
     /// Starts the daemon: loads the config, serves the control socket, dials
     /// every center that is not paused, revoked or unknown.
     pub async fn start(opts: NodeOptions) -> Result<Daemon, String> {
-        Daemon::start_with(opts, crate::rights::full_rights()).await
+        let full = opts.full_rights.unwrap_or_else(crate::rights::full_rights);
+        Daemon::start_with(opts, full).await
     }
 
     /// [`Daemon::start`] for a process whose rights are `full_rights`: root,
@@ -892,6 +898,21 @@ mod tests {
         let daemon = Daemon::start_with(options(&d, &log), false).await.unwrap();
         assert!(warnings(&log).is_empty());
         daemon.stop().await;
+    }
+
+    /// `Daemon::start` takes the rights from the options when a test sets
+    /// them, whoever runs the test.
+    #[tokio::test]
+    async fn start_takes_the_rights_from_the_options() {
+        let log = Log::new(Level::Info);
+        let d = tempfile::tempdir().unwrap();
+        let mut o = options(&d, &log);
+        o.full_rights = Some(true);
+        let err = Daemon::start(o).await.err();
+        assert_eq!(err.as_deref(), Some(crate::rights::REFUSED));
+        let mut o = options(&d, &log);
+        o.full_rights = Some(false);
+        Daemon::start(o).await.unwrap().stop().await;
     }
 
     #[tokio::test]

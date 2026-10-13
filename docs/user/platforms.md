@@ -41,10 +41,12 @@ behaves the same except where this page says so.
 
 ### Root and administrator
 
-A node with full rights hands those rights to every command a center runs,
-unless `machine.user` names another account for them: root on Linux, an
-elevated administrator token on Windows. So on both platforms it is refused
-at start unless you allow it:
+A node with full rights hands those rights to every command a center runs:
+root on Linux, an elevated administrator token on Windows. On Linux a root
+node can run the commands as the account `machine.user` names instead; on
+Windows `machine.user` is not supported and commands always run with the
+node's own token. So on both platforms it is refused at start unless you
+allow it:
 
 ```
 nerve-node config set machine.allow_root true
@@ -63,8 +65,8 @@ UAC-filtered session) is a normal user to the node, and needs no setting.
 When the node runs with full rights because you allowed it, it says so with a
 warning at start: in the stderr output and in the node's log file. The
 center's Log page shows the center's own log and does not carry it. Commands
-from a center then run with full rights on the machine, unless
-`machine.user` names another account for them, and you are responsible for
+from a center then run with full rights on the machine (on Linux unless
+`machine.user` names another account for them), and you are responsible for
 what they do.
 
 ### No control socket

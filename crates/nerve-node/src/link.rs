@@ -1399,6 +1399,7 @@ mod tests {
         let mut opts = NodeOptions::new(paths.clone());
         opts.home = d.path().to_path_buf();
         opts.ctl = false;
+        opts.full_rights = Some(false);
         Daemon::start(opts).await.unwrap()
     }
 

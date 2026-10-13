@@ -179,7 +179,8 @@ folders.
 - Build tools make hard links of their own. cargo builds each program
   under two names in `target`, so a file in a folder named exactly `target`
   inside the folder passes the check when every one of its names lies in
-  such a folder of the same granted folder, under the same grants. Any other
+  such a folder of the same granted folder, under the same grants, and the
+  node finds no granted folder moved or renamed in that sync. Any other
   second name is still refused, also a `target` file whose other name lies
   outside the folder or under another grant, and one whose names Windows
   cannot list. Other tools' links are refused too: pnpm links

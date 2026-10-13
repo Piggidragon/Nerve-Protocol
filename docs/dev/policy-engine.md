@@ -163,7 +163,9 @@ command in an AppContainer, one per center (`nerve_sandbox::appcontainer`):
   all its names (as many as the file has; a failed listing refuses), every
   one, compared resolved, lies in such a folder of the walked folder, and
   each is held by exactly the same wanted and recorded grants as the walked
-  name. A link to anywhere else is refused, other build tools' too (pnpm's
+  name. That compares grant paths, while a grant's entry goes with its
+  folder, so a sync in which a recorded grant is not at its path (moved, or
+  it cannot be told) gives no pass at all. A link to anywhere else is refused, other build tools' too (pnpm's
   store, uv's cache, a local `git clone`); the user docs give the ways
   around. A link a command of
   any pairing that may write there makes between the walk and the change

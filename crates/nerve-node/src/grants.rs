@@ -203,8 +203,12 @@ pub trait Folders {
     /// The first file below the folder `dir` with more than one name (hard
     /// links), and how many it has; `None` for a file or when there is none.
     /// `grants` are the paths of every wanted and recorded grant, for the
-    /// build-folder exception (`linked_below`).
-    fn linked(&mut self, dir: &Path, grants: &[PathBuf]) -> io::Result<Option<(PathBuf, u64)>>;
+    /// pass for cargo's `target` (`linked_below`); `None` gives no pass.
+    fn linked(
+        &mut self,
+        dir: &Path,
+        grants: Option<&[PathBuf]>,
+    ) -> io::Result<Option<(PathBuf, u64)>>;
 }
 
 /// What [`Folders::look`] saw at a path.
@@ -260,7 +264,7 @@ fn written_in(path: &Path, want: &[Grant], record: &[Grant]) -> bool {
 /// more than one name (a hard link) shares its list with its other names,
 /// which may be in a folder the commands may only write. Commands may have
 /// linked it there, so the change is refused until the link is gone.
-fn held(folders: &mut impl Folders, path: &Path, grants: &[PathBuf]) -> Option<String> {
+fn held(folders: &mut impl Folders, path: &Path, grants: Option<&[PathBuf]>) -> Option<String> {
     match folders.linked(path, grants) {
         Ok(None) => None,
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
@@ -305,11 +309,12 @@ fn in_build_folder(rest: &Path) -> bool {
 /// wanted and recorded grant, of any container) as the walked name. Such a
 /// link gains nothing from the change: every name gets the same rights. A
 /// file with a name anywhere else is still found, and so is one whose
-/// names cannot all be listed.
+/// names cannot all be listed. Without `grants` (a granted folder is not
+/// where its record says, `sync`) nothing passes.
 #[cfg(any(windows, test))]
 fn linked_below(
     dir: &Path,
-    grants: &[PathBuf],
+    grants: Option<&[PathBuf]>,
     count: &dyn Fn(&Path) -> io::Result<u64>,
     names: &dyn Fn(&Path) -> io::Result<Vec<PathBuf>>,
 ) -> io::Result<Option<(PathBuf, u64)>> {
@@ -321,7 +326,7 @@ fn linked_below(
     // holds no name, so nothing passes.
     let real_dir = nerve_policy::paths::resolve(dir).ok();
     // The grants that hold a place, by their place in `grants`.
-    let held_by = |p: &Path| -> Vec<usize> {
+    let held_by = |grants: &[PathBuf], p: &Path| -> Vec<usize> {
         grants
             .iter()
             .enumerate()
@@ -330,7 +335,7 @@ fn linked_below(
             .collect()
     };
     let own = |path: &Path, n: u64| -> io::Result<bool> {
-        let Some(real_dir) = &real_dir else {
+        let (Some(real_dir), Some(grants)) = (&real_dir, grants) else {
             return Ok(false);
         };
         let rest = path.strip_prefix(dir).unwrap_or(path);
@@ -338,7 +343,7 @@ fn linked_below(
             return Ok(false);
         }
         let depth = real_dir.components().count();
-        let mine = held_by(&real_dir.join(rest));
+        let mine = held_by(grants, &real_dir.join(rest));
         let all = names(path)?;
         Ok(all.len() as u64 >= n
             && all.iter().all(|name| {
@@ -346,7 +351,7 @@ fn linked_below(
                 within(name, real_dir)
                     && !within(real_dir, name)
                     && in_build_folder(&rest)
-                    && held_by(name) == mine
+                    && held_by(grants, name) == mine
             }))
     };
     let gone = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
@@ -502,8 +507,35 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
         Err(e) => return out.not_known(e),
     };
     let mut out = out;
-    // Where every wanted and recorded grant is, for the hard-link check.
-    let places: Vec<PathBuf> = want.iter().chain(&record).map(|g| g.path.clone()).collect();
+    // Whether the object with a recorded grant is still at its path. A
+    // record without the object's id takes the one there; one that cannot
+    // be told counts as there (a change there fails in turn and keeps it).
+    let at_path = |old: &Grant, here: &io::Result<Option<Look>>| match here {
+        Ok(Some(l)) => old.id.is_none() || l.id.is_none() || old.id == l.id,
+        Ok(None) => false,
+        Err(_) => true,
+    };
+    // Each recorded grant's object, looked up before anything changes: and
+    // where one is not at its path, where it is now.
+    let mut seen = Vec::with_capacity(record.len());
+    for old in &record {
+        let here = folders.look(&old.path, &old.container, old.access);
+        let found = (!at_path(old, &here)).then(|| match &old.id {
+            Some(id) => folders.locate(id, &old.path),
+            None => Ok(Found::Gone),
+        });
+        seen.push((here, found));
+    }
+    // Where every wanted and recorded grant is, for the hard-link check's
+    // pass for cargo's `target` (`linked_below`). It compares the grants by
+    // their paths, while a grant's entry goes with its folder: so when a
+    // granted folder is somewhere else now, or cannot be told, the paths do
+    // not show what holds a name, and this sync gives no pass.
+    let settled = seen.iter().all(|(here, found)| {
+        here.is_ok() && !matches!(found, Some(Ok(Found::At(_))) | Some(Err(_)))
+    });
+    let places: Option<Vec<PathBuf>> =
+        settled.then(|| want.iter().chain(&record).map(|g| g.path.clone()).collect());
     let gone = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
     let mut kept: Vec<Grant> = Vec::new();
     let mut changed = false;
@@ -511,18 +543,9 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
     let mut done = vec![false; want.len()];
     // Recorded grants at their path that a wanted one replaces below.
     let mut replaced: Vec<Grant> = Vec::new();
-    for old in &record {
+    for (old, (here, found)) in record.iter().zip(seen) {
         let wanted = want.iter().position(|w| w.same_place(old));
-        let here = folders.look(&old.path, &old.container, old.access);
-        // Whether the object with the grant is still at its path. A record
-        // without the object's id takes the one there.
-        let at_path = match &here {
-            Ok(Some(l)) => old.id.is_none() || l.id.is_none() || old.id == l.id,
-            Ok(None) => false,
-            // Cannot tell: a change there fails in turn and keeps it.
-            Err(_) => true,
-        };
-        if at_path {
+        if at_path(old, &here) {
             let look = here.ok().flatten();
             match wanted {
                 // Another record of the same object holds the place.
@@ -539,7 +562,7 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
                 None => {
                     // Taking it off passes the change down too.
                     let hold = written_in(&old.path, want, &record)
-                        .then(|| held(folders, &old.path, &places))
+                        .then(|| held(folders, &old.path, places.as_deref()))
                         .flatten();
                     match hold.map_or_else(
                         || folders.set(&old.path, &old.container, None, false),
@@ -564,11 +587,7 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
             continue;
         }
         // Moved, made again, or deleted: the grant is where the object is.
-        let found = match &old.id {
-            Some(id) => folders.locate(id, &old.path),
-            None => Ok(Found::Gone),
-        };
-        match found {
+        match found.unwrap_or(Ok(Found::Gone)) {
             Ok(Found::Gone) => changed = true,
             // Nothing reaches it while its volume is away; a later sync
             // looks again.
@@ -584,7 +603,7 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
                 let hold = (old.access.write
                     || written_in(&old.path, want, &record)
                     || written_in(&now, want, &record))
-                .then(|| held(folders, &now, &places))
+                .then(|| held(folders, &now, places.as_deref()))
                 .flatten();
                 match hold.map_or_else(
                     || folders.set(&now, &old.container, None, false),
@@ -653,7 +672,7 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
                 for w in todo {
                     // Refused before anything changed: what was there stays.
                     if let Some(why) = written_in(&w.path, want, &record)
-                        .then(|| held(folders, &w.path, &places))
+                        .then(|| held(folders, &w.path, places.as_deref()))
                         .flatten()
                     {
                         out.errors.push(why);
@@ -778,7 +797,11 @@ impl Folders for Acls {
         Ok(id.map(|i| i.to_string()))
     }
 
-    fn linked(&mut self, dir: &Path, grants: &[PathBuf]) -> io::Result<Option<(PathBuf, u64)>> {
+    fn linked(
+        &mut self,
+        dir: &Path,
+        grants: Option<&[PathBuf]>,
+    ) -> io::Result<Option<(PathBuf, u64)>> {
         linked_below(
             dir,
             grants,
@@ -838,6 +861,9 @@ mod tests {
         foreign: Vec<PathBuf>,
         /// Files with a second name (hard links).
         linked: Vec<PathBuf>,
+        /// Walk the real files below this folder instead (`linked_below`).
+        #[cfg(unix)]
+        walk: Option<PathBuf>,
         /// The `own` of each grant put on, by path.
         asked: Vec<(PathBuf, bool)>,
         /// The volume is not on the machine.
@@ -967,8 +993,16 @@ mod tests {
         fn linked(
             &mut self,
             dir: &Path,
-            _grants: &[PathBuf],
+            grants: Option<&[PathBuf]>,
         ) -> io::Result<Option<(PathBuf, u64)>> {
+            #[cfg(unix)]
+            if let Some(root) = &self.walk {
+                use std::os::unix::fs::MetadataExt;
+                let count = |p: &Path| std::fs::symlink_metadata(p).map(|m| m.nlink());
+                let names = |p: &Path| names_below(root, p);
+                return linked_below(dir, grants, &count, &names);
+            }
+            let _ = grants;
             Ok(self
                 .linked
                 .iter()
@@ -1392,7 +1426,8 @@ mod tests {
         std::os::unix::fs::symlink(&outside, dir.join("a/link")).unwrap();
         let count = |p: &Path| std::fs::symlink_metadata(p).map(|m| m.nlink());
         let names = |p: &Path| names_below(&root, p);
-        let walk = |d: &Path| linked_below(d, std::slice::from_ref(&dir), &count, &names).unwrap();
+        let walk =
+            |d: &Path| linked_below(d, Some(std::slice::from_ref(&dir)), &count, &names).unwrap();
         assert_eq!(walk(&dir), None);
         assert_eq!(walk(&dir.join("a/b/one.txt")), None);
         std::fs::hard_link(outside.join("secret.txt"), dir.join("a/b/s")).unwrap();
@@ -1436,7 +1471,7 @@ mod tests {
             let grants: Vec<PathBuf> = grants.iter().map(|g| self.root.join(g)).collect();
             let count = |p: &Path| std::fs::symlink_metadata(p).map(|m| m.nlink());
             let names = |p: &Path| names_below(&self.root, p);
-            linked_below(&self.proj, &grants, &count, &names).unwrap()
+            linked_below(&self.proj, Some(&grants), &count, &names).unwrap()
         }
     }
 
@@ -1464,8 +1499,9 @@ mod tests {
             ("drop/target/secret", "proj/target/debug/s"),
         ] {
             let to = p.link(from, to);
-            // Also where no grant holds the folder, as for a folder that
-            // was moved: then only the place of each name counts.
+            // Also where no grant path holds the folder: then only the
+            // place of each name counts. (A sync where a granted folder has
+            // moved gives no pass at all, `a_moved_project_gives_no_pass`.)
             for grants in [&["proj", "drop"][..], &[]] {
                 let found = p.walk(grants);
                 assert!(found.is_some(), "{from} -> {}: {found:?}", to.display());
@@ -1494,6 +1530,98 @@ mod tests {
         assert_eq!(p.walk(&["proj", "proj/target/work"]), None);
     }
 
+    /// The pass for `target` compares grants by their paths, but a grant's
+    /// entry goes with its folder. So in a sync where a granted folder is
+    /// not where its record says, nothing passes: a project the owner
+    /// renamed, with a nested grant in its `target`, keeps its grant where
+    /// it is now while a link between the two grants is there.
+    #[cfg(unix)]
+    #[test]
+    fn a_moved_project_gives_no_pass() {
+        let p = Project::new();
+        let work = p.proj.join("target/work");
+        std::fs::create_dir_all(&work).unwrap();
+        let file = p.root.join("grants.json");
+        let mut f = Fake {
+            walk: Some(p.root.clone()),
+            ..Default::default()
+        };
+        let s = |q: &Path| q.display().to_string();
+        f.make(&s(&p.proj));
+        f.make(&s(&work));
+        let want = [
+            grant("lab", &s(&p.proj), "w"),
+            grant("lab", &s(&work), "rw"),
+        ];
+        let r = sync(&file, &want, &mut f);
+        assert!(r.errors.is_empty(), "{r:?}");
+        p.link("proj/target/secret.bin", "proj/target/work/x");
+
+        let proj2 = p.root.join("proj2");
+        std::fs::rename(&p.proj, &proj2).unwrap();
+        f.mv(&s(&p.proj), &s(&proj2));
+        f.mv(&s(&work), &s(&proj2.join("target/work")));
+        let r = sync(&file, &want, &mut f);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.contains("secret.bin") || e.contains("work/x")),
+            "{r:?}"
+        );
+        assert_eq!(
+            f.on(&s(&proj2)),
+            [("lab".to_string(), Access::parse("w").unwrap())],
+            "{r:?}"
+        );
+    }
+
+    /// The same for a granted folder a command moved into `target`: its
+    /// grant is not under its recorded path, so a change on the folder
+    /// around it gets no pass for a link into it.
+    #[cfg(unix)]
+    #[test]
+    fn a_grant_moved_into_target_gives_no_pass() {
+        let p = Project::new();
+        let (x, g) = (p.root.join("x"), p.root.join("x/g"));
+        std::fs::create_dir_all(p.proj.join("target")).unwrap();
+        std::fs::create_dir_all(&g).unwrap();
+        let file = p.root.join("grants.json");
+        let mut f = Fake {
+            walk: Some(p.root.clone()),
+            ..Default::default()
+        };
+        let s = |q: &Path| q.display().to_string();
+        for q in [&p.proj, &x, &g] {
+            f.make(&s(q));
+        }
+        let want = |proj: &str| {
+            [
+                grant("lab", &s(&p.proj), proj),
+                grant("lab", &s(&x), "rw"),
+                grant("m", &s(&g), "r"),
+            ]
+        };
+        let r = sync(&file, &want("w"), &mut f);
+        assert!(r.errors.is_empty(), "{r:?}");
+
+        let moved = p.proj.join("target/g");
+        std::fs::rename(&g, &moved).unwrap();
+        f.mv(&s(&g), &s(&moved));
+        p.link("proj/target/secret.bin", "proj/target/g/s");
+        let r = sync(&file, &want("wx"), &mut f);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.contains("permissions of") && e.contains("hard links")),
+            "{r:?}"
+        );
+        assert_eq!(
+            f.on(&s(&p.proj)),
+            [("lab".to_string(), Access::parse("w").unwrap())],
+            "{r:?}"
+        );
+    }
+
     /// A file whose names cannot all be listed passes nothing: a listing
     /// that fails while the file is there (as for a path too long for it)
     /// stops the walk, and a listing with fewer names than the file has
@@ -1507,11 +1635,11 @@ mod tests {
         let count = |_: &Path| Ok(2);
         let failing =
             |_: &Path| -> io::Result<Vec<PathBuf>> { Err(io::ErrorKind::NotFound.into()) };
-        let e = linked_below(&p.proj, &grants, &count, &failing).unwrap_err();
+        let e = linked_below(&p.proj, Some(&grants), &count, &failing).unwrap_err();
         assert_ne!(e.kind(), io::ErrorKind::NotFound, "{e}");
         let short = |q: &Path| -> io::Result<Vec<PathBuf>> { Ok(vec![q.to_path_buf()]) };
         assert!(
-            linked_below(&p.proj, &grants, &count, &short)
+            linked_below(&p.proj, Some(&grants), &count, &short)
                 .unwrap()
                 .is_some()
         );
@@ -1522,7 +1650,7 @@ mod tests {
             Err(io::ErrorKind::NotFound.into())
         };
         assert_eq!(
-            linked_below(&p.proj, &grants, &count, &vanish).unwrap(),
+            linked_below(&p.proj, Some(&grants), &count, &vanish).unwrap(),
             None
         );
         assert!(!x.exists() || !p.proj.join("target/a").exists());

@@ -789,7 +789,18 @@ impl List {
             List::Allow if sudo_command(command).is_some() => {
                 Err("a sudo command goes on the sudo list: `nerve-node rule add sudo`".into())
             }
-            List::Allow | List::Deny => rules::rule_for("exec", "run", command, wildcard),
+            List::Allow | List::Deny => {
+                if let Some((scope, _)) = command.trim().split_once(':')
+                    && scope.contains('.')
+                    && rules::valid_scope(scope)
+                {
+                    return Err(format!(
+                        "`{scope}:` is the pattern form for files and other actions, not a command: add it with `nerve-node config add center.<name>.policy.{}`",
+                        self.word()
+                    ));
+                }
+                rules::rule_for("exec", "run", command, wildcard)
+            }
             List::Sudo if sudo_command(command).is_some() => {
                 rules::sudo_rule_for(command, wildcard)
             }
@@ -3425,6 +3436,21 @@ mod tests {
         // A sudo command is not an allow rule.
         let e = run(&paths, &["rule", "add", "allow", "sudo apt update"]).unwrap_err();
         assert!(e.contains("rule add sudo"), "{e}");
+        // The `cap.action:pattern` form is for `config add`; as a command it
+        // would become a rule that never matches.
+        for list in ["allow", "deny"] {
+            let e = run(&paths, &["rule", "add", list, "exec.run:echo *"]).unwrap_err();
+            assert!(e.contains("config add"), "{e}");
+        }
+        let e = run(&paths, &["rule", "add", "allow", "fs.read:~/notes/*"]).unwrap_err();
+        assert!(e.contains("policy.allow"), "{e}");
+        assert_eq!(
+            load(&paths).centers[0].policy.allow,
+            ["exec.run:git status"]
+        );
+        // A colon in a command that is not a scope stays a command.
+        run(&paths, &["rule", "add", "allow", "C:\\tools\\x.exe"]).unwrap();
+        run(&paths, &["rule", "rm", "allow", "C:\\tools\\x.exe"]).unwrap();
         // A command with a glob character in it is allowed as itself.
         run(&paths, &["rule", "add", "allow", "rm *"]).unwrap();
         assert!(load(&paths).centers[0].policy.allow[1].contains("[*]"));

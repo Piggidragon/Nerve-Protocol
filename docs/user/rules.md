@@ -48,7 +48,8 @@ nerve-node rule rm allow 'git status' --wildcard
 
 ## Rules for files and other actions
 
-`rule add` writes command rules. For files and other actions, add the rule to
+`rule add` writes command rules, and refuses a `fs.read:...` style
+entry, which would never match as a command. For files and other actions, add the rule to
 the policy by name. `lab` is the center's name on this machine (see
 `nerve-node center ls`).
 

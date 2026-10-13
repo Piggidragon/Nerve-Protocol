@@ -1182,7 +1182,7 @@ impl Link {
         inv: &Invoke,
     ) -> Result<Value, RpcError> {
         // The installed node runs every command as the account the owner
-        // chose (crate::account), from its home; folder mode adds Landlock.
+        // chose (crate::account), from its home; folder mode confines it.
         // A missing account stops the command after the call is decided and
         // audited.
         let account = self.shared.command_account(cfg);
@@ -1223,13 +1223,20 @@ impl Link {
             rc.command = exec::sudo_line(&self.shared.sudo_path(), args, &prompt);
             sudo = Some(exec::SudoInput { password, prompt });
         }
+        // Folder mode confines: Landlock on Linux, the center's AppContainer
+        // on Windows.
+        let folder = sudo.is_none()
+            && entry.policy.mode_at(crate::now_ms()) == Mode::Folder
+            && self.shared.confined();
+        let container = if folder && self.shared.confinement.appcontainer {
+            Some(self.container(cfg, &home).await?)
+        } else {
+            None
+        };
         let guard = Running::start(self, id.clone(), cfg.limits.max_running as usize)?;
         // The account's home is the `~` of its rules: its own shell
         // profiles and keys stay out of them.
-        let landlock = (sudo.is_none()
-            && entry.policy.mode_at(crate::now_ms()) == Mode::Folder
-            && self.shared.confined())
-        .then(|| {
+        let landlock = (folder && self.shared.confinement.landlock_abi.is_some()).then(|| {
             // The folders' entries are listed as the account.
             let _as = act_as(known.as_ref()).ok().flatten();
             exec::landlock_spec(&entry.policy, &home, &self.shared.paths.own())
@@ -1237,6 +1244,7 @@ impl Link {
         let opts = RunOptions {
             shell: cfg.machine.shell.clone(),
             landlock,
+            container,
             exe: self.shared.exe.clone().unwrap_or_default(),
             output_cap: (cfg.limits.output_cap_bytes as usize).min(exec::OUTPUT_HARD_CAP),
             sudo,
@@ -1253,6 +1261,37 @@ impl Link {
             );
         }
         r
+    }
+}
+
+impl Link {
+    /// The AppContainer of this center's commands, once the folder grants
+    /// follow `cfg` (crate::grants); `home` is the `~` of the rules. A grant
+    /// of this center's container that its folders no longer give and that
+    /// could not be taken off stops the command.
+    async fn container(
+        &self,
+        cfg: &NodeConfig,
+        home: &std::path::Path,
+    ) -> Result<nerve_sandbox::ContainerSpec, RpcError> {
+        let (paths, cfg, home) = (self.shared.paths.clone(), cfg.clone(), home.to_path_buf());
+        let synced = tokio::task::spawn_blocking(move || crate::grants::apply(&paths, &cfg, &home))
+            .await
+            .map_err(|e| RpcError::internal(e.to_string()))?;
+        for e in &synced.errors {
+            tracing::warn!("folder grants: {e}");
+        }
+        let name = crate::grants::container(&self.shared.paths, &self.name);
+        if let Some(g) = synced.stale.iter().find(|g| g.container == name) {
+            return Err(RpcError::new(
+                ErrorCode::Unavailable,
+                format!(
+                    "the command was not run: {} keeps a grant for this center's commands that its folders no longer give, and it could not be taken off",
+                    nerve_policy::paths::to_wire(&g.path)
+                ),
+            ));
+        }
+        Ok(nerve_sandbox::ContainerSpec { name })
     }
 }
 

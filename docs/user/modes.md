@@ -5,7 +5,7 @@ Every pairing has a mode. It sets how much that center may do on the machine.
 | Mode | What is allowed | Commands |
 |---|---|---|
 | `allowlist` (default) | Only what an [allow rule](rules.md) names | Run as the rule says |
-| `folder` | Full access inside the folders you grant, by their rights | Confined to those folders (Linux) |
+| `folder` | Full access inside the folders you grant, by their rights | Confined to those folders |
 | `user` | Everything you could do yourself | Not confined |
 
 [Deny rules](rules.md#deny-a-command) and [protected paths](protected-paths.md)
@@ -87,6 +87,43 @@ nerve-node status
 The first line reads `daemon: running (confinement landlock v…)`. With
 `confinement none` the node cannot confine commands, so `folder` mode refuses
 every command.
+
+## What a command can reach in `folder` mode (Windows)
+
+Each pairing's commands run in an AppContainer of their own. Windows lets a
+process there open only what is granted to that container, and what it opens
+to every AppContainer:
+
+| A command can | Where |
+|---|---|
+| Read and run programs | the Windows folder and Program Files |
+| Read, write, run programs | each folder by its rights |
+
+- The node gives each folder a permission entry for the pairing's container,
+  with the folder's rights. Everything below the folder inherits it. Adding a
+  large folder takes as long as changing its permissions with `icacls`.
+- `folder rm` and `folder set` change the entry, and removing the pairing or
+  `uninstall` takes it off. A running node takes changes from the CLI at its
+  next start ([platforms](platforms.md#no-control-socket)), and gives its
+  folders their entries again until then.
+- The flags stay independent: `w` without `r` writes but neither reads nor
+  lists, `x` runs programs and reads files by name but does not list.
+- The node's own folders and the [protected paths](protected-paths.md) get no
+  entry, also inside a folder you grant. That folder is granted as its other
+  entries instead, as on Linux.
+- PowerShell starts on a drive `Work:` that is the working folder, because the
+  container may not look at the folders above it. Relative paths and native
+  programs work as usual. `cd` to a whole path above the folder does not.
+- The command has the network, but not `localhost`, and no folder for
+  temporary files. It has its own desktop, so it cannot reach your windows or
+  clipboard.
+- What the AppContainer does not stop: what Windows opens to every
+  AppContainer (reading the system folders, the network), and work a command
+  gets another program outside the container to do for it, such as a service
+  or the task scheduler.
+
+With the node running, `nerve-node status` reads
+`daemon: running (confinement appcontainer)`.
 
 ## `user` mode
 

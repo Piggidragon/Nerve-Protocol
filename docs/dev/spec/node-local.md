@@ -234,10 +234,12 @@ again.
   it. The flags do not imply each other: a write needs `w` and no `r`, a read
   `r` and no `w`, a command `x` and no `r`. Where folders nest, the deepest
   one that holds a path decides for it. Commands are confined where the
-  platform can confine them. Windows has no file confinement for commands
-  yet, so there folder mode refuses every command and offers no `exec`
-  action (unless the sudo allow list has an entry), and only `allowlist` and
-  `user` run them, each owned by its Job Object but not confined. `allow` rules do not count. On Linux a command
+  platform can confine them; where it cannot (Linux without Landlock),
+  folder mode refuses every command and offers no `exec` action (unless the
+  sudo allow list has an entry). On Windows a command runs in an AppContainer
+  of its center, which reaches the system folders Windows opens to every
+  AppContainer and the paths of the same sets as on Linux, each by a grant
+  for the container on the folder with the rights of its flags. `allow` rules do not count. On Linux a command
   reads the system folders and its `r` folders, writes its `w` folders and
   runs programs from the system folders and its `x` folders (Landlock), each
   flag with its own rule. A folder with `w` and not `r` can be written but

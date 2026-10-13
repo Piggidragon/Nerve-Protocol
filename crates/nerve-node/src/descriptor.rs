@@ -477,8 +477,8 @@ struct View {
 /// The descriptor `entry` sees now; `rev` is derived from its content, so it
 /// changes exactly when the view changes. The center builds its tools from
 /// it, so an action the policy cannot allow is not in it. `confined` says
-/// whether this machine can confine a command in `folder` mode (Landlock);
-/// where it cannot, folder mode offers no command.
+/// whether this machine can confine a command in `folder` mode (Landlock,
+/// a Windows AppContainer); where it cannot, folder mode offers no command.
 pub fn for_center(
     cfg: &NodeConfig,
     entry: &CenterEntry,
@@ -701,7 +701,7 @@ mod tests {
         assert!(for_center(&cfg, &e, 10, true).capability("fs").is_none());
     }
 
-    /// Where commands cannot be confined (Windows, Linux without Landlock),
+    /// Where commands cannot be confined (Linux without Landlock),
     /// folder mode refuses every command, so it offers no exec tool; a sudo
     /// entry still runs by its list (Windows review of PR #19, round 2,
     /// finding 3).
@@ -713,7 +713,7 @@ mod tests {
         let d = for_center(&cfg, &e, 0, false);
         assert!(d.capability("exec").is_none());
         assert_eq!(actions(&d, "fs").len(), 6);
-        // Confined, as on Linux with Landlock: offered.
+        // Confined, as with Landlock or an AppContainer: offered.
         let d = for_center(&cfg, &e, 0, true);
         assert_eq!(actions(&d, "exec"), ["run"]);
         // User mode runs commands unconfined anyway.

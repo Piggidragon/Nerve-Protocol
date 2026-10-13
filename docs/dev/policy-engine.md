@@ -123,7 +123,34 @@ rules and runs the command.
 - Without Landlock (`confinement none`), `folder` mode refuses every command.
 
 On Windows, each command runs in a Job Object that ends all its processes with
-it. A Job Object limits no file access, so `folder` mode runs no command there.
+it. A Job Object limits no file access. So in `folder` mode the shim starts the
+command in an AppContainer, one per center (`nerve_sandbox::appcontainer`):
+
+| Access | Allowed |
+|---|---|
+| Read, write, run programs | What carries a grant for the container's SID: the center's folders, by their flags |
+| Read, run programs | What Windows opens to every AppContainer: the Windows folder, Program Files |
+
+- The node puts the grants on the folders for the container's SID
+  (`crates/nerve-node/src/grants.rs`), inherited by everything below. The sets
+  are Landlock's (`exec::folder_sets`), the own folders and protected entries
+  cut out the same way. The grants follow the folders, whatever the mode: the
+  node syncs them at start, on a change of its config and before each
+  `folder` command, the CLI when it writes the config, and `uninstall` takes
+  them off. A record in the state folder (`grants.json`) finds them again.
+- A grant that should be off and cannot be taken off stops the commands of its
+  container.
+- The container's SID is derived from its name. Windows starts no process in a
+  container without a profile, so the shim makes one for the user it runs as;
+  the node removes it with the container's last grant.
+- The command gets a window station and desktop of its own: Windows keeps an
+  AppContainer out of the one it was started from, and PowerShell does not
+  start without one.
+- PowerShell checks every folder above its working folder, which the
+  container may not see, so a PowerShell command starts with a drive `Work:`
+  rooted at its working folder.
+- The container has the network, as Landlock leaves it, but not the loopback
+  address.
 
 ## The sudo switch
 

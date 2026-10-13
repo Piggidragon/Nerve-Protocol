@@ -12,6 +12,7 @@ pub mod daemon;
 pub mod descriptor;
 pub mod exec;
 pub mod fs;
+pub mod grants;
 // The job is Windows-only in use; its choices are tested everywhere.
 #[cfg_attr(not(windows), allow(dead_code))]
 mod job;

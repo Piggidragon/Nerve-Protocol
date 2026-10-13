@@ -17,9 +17,17 @@ pub const MADE_MARK: &str = "Nerve user mode";
 /// What a command of the installed node gets while no account is chosen.
 pub const NONE_CHOSEN: &str = "this node runs commands as an account of their own, and none is chosen: `sudo nerve-node setup` chooses one (machine.user)";
 
-/// The warning for root as the account of the commands.
+/// The warning for root (on Windows an administrator) as the account of
+/// the commands.
 pub fn root_warning() -> String {
-    "Warning: commands from a center then run as root, with every right on this machine, the node's keys included; in folder mode only Landlock still holds them. You are responsible for what they do.".into()
+    let (who, holds) = if cfg!(windows) {
+        ("an administrator", "their AppContainer")
+    } else {
+        ("root", "Landlock")
+    };
+    format!(
+        "Warning: commands from a center then run as {who}, with every right on this machine, the node's keys included; in folder mode only {holds} still holds them. You are responsible for what they do."
+    )
 }
 
 /// Groups whose members get root without a password and without a setuid

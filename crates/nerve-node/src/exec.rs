@@ -20,7 +20,7 @@ use nerve_policy::protected::{Platform, Protected};
 use nerve_policy::{Target, protected::expand};
 use nerve_proto::rpc::params;
 use nerve_proto::{ErrorCode, RpcError};
-use nerve_sandbox::{LandlockSpec, SHIM_ARG, ShimSpec};
+use nerve_sandbox::{ContainerSpec, LandlockSpec, SHIM_ARG, ShimSpec};
 
 use crate::fs::WirePath;
 
@@ -98,7 +98,7 @@ pub fn shell_command(shell: Option<&str>, command: &str) -> (String, Vec<String>
     };
     let sh = shell.unwrap_or(default).to_string();
     let lower = sh.to_lowercase();
-    let flag = if lower.contains("powershell") || lower.contains("pwsh") {
+    let flag = if powershell(&sh) {
         vec!["-NoProfile".to_string(), "-Command".to_string()]
     } else if lower.ends_with("cmd.exe") || lower == "cmd" {
         vec!["/C".to_string()]
@@ -108,6 +108,12 @@ pub fn shell_command(shell: Option<&str>, command: &str) -> (String, Vec<String>
     let mut args = flag;
     args.push(command.into());
     (sh, args)
+}
+
+/// Whether `shell` is Windows PowerShell or PowerShell 7.
+fn powershell(shell: &str) -> bool {
+    let lower = shell.to_lowercase();
+    lower.contains("powershell") || lower.contains("pwsh")
 }
 
 /// What the `exec.run` action says about the shell, so a model writes the
@@ -156,30 +162,55 @@ fn decode(bytes: &[u8], cut: bool) -> String {
 
 /// The Landlock rules for a command of a center in `folders` mode: it reads
 /// the system and its `r` folders, writes its `w` folders, runs programs from
-/// the system and its `x` folders. The three flags are independent, so each
-/// set takes the folders with its own flag and nothing else: a folder with
-/// only `w` is in `write` alone, and the write rule carries no read right
-/// (the command can put files there but not list or read them), and a folder
-/// with only `x` can run its programs but not be listed: Landlock refuses to
-/// run a file it may not read, so the `exec` rule carries ReadFile and the
-/// files there can be read by name. The node's own folders
+/// the system and its `x` folders ([`folder_sets`]). The node's own folders
 /// (`own`: its config, keys and state) are in none of these sets, whatever
 /// the folders say ([`leave_out`]).
+pub fn landlock_spec(policy: &CenterPolicy, home: &Path, own: &[PathBuf]) -> LandlockSpec {
+    // Landlock is Linux's, so the list is the Unix one.
+    let f = folder_sets(policy, home, own, &Platform::Unix);
+    LandlockSpec {
+        read: leave_out(&[nerve_sandbox::system_dirs(), f.read].concat(), own),
+        write: leave_out(&[nerve_sandbox::system_writable(), f.write].concat(), own),
+        exec: leave_out(&[nerve_sandbox::system_dirs(), f.exec].concat(), own),
+    }
+}
+
+/// A center's folders by what its commands may do there, the system's
+/// aside.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FolderSets {
+    pub read: Vec<PathBuf>,
+    pub write: Vec<PathBuf>,
+    pub exec: Vec<PathBuf>,
+}
+
+/// The folders of a center in `folders` mode by flag. The three flags are
+/// independent, so each set takes the folders with its own flag and nothing
+/// else: a folder with only `w` is in `write` alone, and the write rule
+/// carries no read right (the command can put files there but not list or
+/// read them), and a folder with only `x` can run its programs but not be
+/// listed: Landlock refuses to run a file it may not read, so the `exec`
+/// rule carries ReadFile and the files there can be read by name.
 ///
 /// Each folder is resolved again here, since it may have become a link
-/// after it was added and Landlock follows a link in a rule's path: one
-/// that now leads into a protected entry the folders do not release with
-/// its flags is left out and the reason logged (`Protected::real_folder`).
-/// The others go in by their real path, the place that was judged.
+/// after it was added and Landlock (like a Windows grant) follows a link in
+/// a rule's path: one that now leads into a protected entry the folders do
+/// not release with its flags is left out and the reason logged
+/// (`Protected::real_folder`). The others go in by their real path, the
+/// place that was judged.
 ///
 /// A folder that holds a protected entry gives none of it either: it is
 /// replaced by its other entries, level by level down to the protected one,
 /// as the own folders are ([`leave_protected_out`]). The write set leaves
-/// out the entries protected for writes as well. The system folders are not
-/// cut: what a command reads there is the system's to guard.
-pub fn landlock_spec(policy: &CenterPolicy, home: &Path, own: &[PathBuf]) -> LandlockSpec {
-    // Landlock is Linux's, so the list is the Unix one.
-    let protected = Protected::new(&Platform::Unix, home, own, &policy.protected);
+/// out the entries protected for writes as well. The node's own folders are
+/// the caller's to leave out ([`leave_out`]).
+pub fn folder_sets(
+    policy: &CenterPolicy,
+    home: &Path,
+    own: &[PathBuf],
+    platform: &Platform,
+) -> FolderSets {
+    let protected = Protected::new(platform, home, own, &policy.protected);
     let real: Vec<(Access, PathBuf)> = policy
         .folders
         .iter()
@@ -205,23 +236,57 @@ pub fn landlock_spec(policy: &CenterPolicy, home: &Path, own: &[PathBuf]) -> Lan
             .collect();
         leave_protected_out(&granted, &protected, write)
     };
-    LandlockSpec {
-        read: leave_out(
-            &[nerve_sandbox::system_dirs(), folders(&|a| a.read, false)].concat(),
-            own,
-        ),
-        write: leave_out(
-            &[
-                nerve_sandbox::system_writable(),
-                folders(&|a| a.write, true),
-            ]
-            .concat(),
-            own,
-        ),
-        exec: leave_out(
-            &[nerve_sandbox::system_dirs(), folders(&|a| a.execute, false)].concat(),
-            own,
-        ),
+    FolderSets {
+        read: folders(&|a| a.read, false),
+        write: folders(&|a| a.write, true),
+        exec: folders(&|a| a.execute, false),
+    }
+}
+
+/// The grants a center's AppContainer gets on Windows: every path of
+/// [`folder_sets`] (the node's own folders left out, [`leave_out`]) with the
+/// flags of the sets it is in. A grant covers what is below its path, as a
+/// Landlock rule does. Windows opens its system folders to every
+/// AppContainer, so they need none.
+pub fn container_grants(
+    policy: &CenterPolicy,
+    home: &Path,
+    own: &[PathBuf],
+    platform: &Platform,
+) -> Vec<(PathBuf, Access)> {
+    let f = folder_sets(policy, home, own, platform);
+    let mut out: Vec<(PathBuf, Access)> = Vec::new();
+    for (set, flag) in [(f.read, 'r'), (f.write, 'w'), (f.exec, 'x')] {
+        for p in leave_out(&set, own) {
+            let i = match out.iter().position(|(q, _)| within(q, &p) && within(&p, q)) {
+                Some(i) => i,
+                None => {
+                    out.push((p, Access::NONE));
+                    out.len() - 1
+                }
+            };
+            let a = &mut out[i].1;
+            match flag {
+                'r' => a.read = true,
+                'w' => a.write = true,
+                _ => a.execute = true,
+            }
+        }
+    }
+    out
+}
+
+/// `p` resolved, as the policy compares paths (on Windows without the
+/// `\\?\` prefix); `p` itself when it cannot be resolved.
+fn real(p: &Path) -> PathBuf {
+    match std::fs::canonicalize(p) {
+        #[cfg(windows)]
+        Ok(c) => PathBuf::from(nerve_policy::paths::win::strip_verbatim(
+            &c.to_string_lossy(),
+        )),
+        #[cfg(not(windows))]
+        Ok(c) => c,
+        Err(_) => p.to_path_buf(),
     }
 }
 
@@ -235,7 +300,6 @@ pub fn landlock_spec(policy: &CenterPolicy, home: &Path, own: &[PathBuf]) -> Lan
 /// rule's path; an entry that is a symlink to or around an own folder is
 /// dropped as well.
 pub fn leave_out(paths: &[PathBuf], own: &[PathBuf]) -> Vec<PathBuf> {
-    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     let own: Vec<PathBuf> = own.iter().map(|o| real(o)).collect();
     let mut out = Vec::new();
     for p in paths {
@@ -265,7 +329,7 @@ pub fn leave_protected_out(paths: &[PathBuf], protected: &Protected, write: bool
     let holds = |p: &Path| protected.holds_entry(p, write);
     let mut out = Vec::new();
     for p in paths {
-        let r = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+        let r = real(p);
         if !inside(&r) && holds(&r) {
             split(&r, &inside, &holds, &mut out);
         } else {
@@ -291,13 +355,13 @@ fn split(
     for e in entries.flatten() {
         let path = e.path();
         let link = e.file_type().is_ok_and(|t| t.is_symlink());
-        let real = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        let held = holds(&real);
-        if inside(&real) || (held && link) {
+        let r = real(&path);
+        let held = holds(&r);
+        if inside(&r) || (held && link) {
             continue;
         }
         if held {
-            split(&real, inside, holds, out);
+            split(&r, inside, holds, out);
         } else {
             out.push(path);
         }
@@ -310,6 +374,9 @@ pub struct RunOptions {
     pub shell: Option<String>,
     /// Confine with these rules through the shim (`exe __exec-shim`).
     pub landlock: Option<LandlockSpec>,
+    /// Windows: run in this AppContainer through the shim, whose folders
+    /// carry their grants already (crate::grants).
+    pub container: Option<ContainerSpec>,
     /// The `nerve-node` binary that hosts the shim.
     pub exe: PathBuf,
     pub output_cap: usize,
@@ -672,12 +739,20 @@ pub async fn run(
     opts: &RunOptions,
     started: impl FnOnce(&Ender),
 ) -> Result<Value, RpcError> {
-    let (program, args) = shell_command(opts.shell.as_deref(), &call.command);
-    let shim = opts.landlock.as_ref().map(|l| ShimSpec {
+    let (program, mut args) = shell_command(opts.shell.as_deref(), &call.command);
+    // PowerShell in a container would stand somewhere else than its folder.
+    if opts.container.is_some()
+        && powershell(&program)
+        && let Some(line) = args.last_mut()
+    {
+        line.insert_str(0, nerve_sandbox::POWERSHELL_START);
+    }
+    let shim = (opts.landlock.is_some() || opts.container.is_some()).then(|| ShimSpec {
         program: program.clone().into(),
         args: args.clone(),
         parent: std::process::id(),
-        landlock: Some(l.clone()),
+        landlock: opts.landlock.clone(),
+        container: opts.container.clone(),
     });
     let mut cmd = match &shim {
         Some(_) => {
@@ -869,6 +944,7 @@ mod tests {
         RunOptions {
             shell: None,
             landlock: None,
+            container: None,
             exe: PathBuf::from("/nonexistent"),
             output_cap: cap,
             sudo: None,
@@ -1335,6 +1411,7 @@ mod windows_tests {
         RunOptions {
             shell: None,
             landlock: None,
+            container: None,
             exe: PathBuf::from("nerve-node.exe"),
             output_cap: 64 * 1024,
             sudo: None,

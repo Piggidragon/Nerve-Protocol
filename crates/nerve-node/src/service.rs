@@ -764,6 +764,22 @@ fn uninstall_steps(
             layout.unit.display()
         ));
     }
+    // Windows folder mode put grants for the commands' AppContainers on
+    // the owner's folders (crate::grants); none stays behind the node.
+    let centers: Vec<String> =
+        SettingsStore::peek(&layout.paths.config_file(), &layout.paths.config_key())
+            .map(|c| c.centers.iter().map(|c| c.name.clone()).collect())
+            .unwrap_or_default();
+    let synced = crate::grants::remove_all(&layout.paths, &centers);
+    for e in &synced.errors {
+        let _ = writeln!(steps.out, "warning: {e}");
+    }
+    if synced.removed > 0 {
+        steps.did(format!(
+            "took {} folder grants of the commands off",
+            synced.removed
+        ));
+    }
     let folders = [
         &layout.paths.config_dir,
         &layout.home,

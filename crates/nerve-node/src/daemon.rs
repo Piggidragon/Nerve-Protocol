@@ -251,7 +251,8 @@ impl Shared {
         r
     }
 
-    /// Whether commands may run confined (Landlock and the shim's host).
+    /// Whether commands may run confined (Landlock or an AppContainer, and
+    /// the shim's host).
     pub fn confined(&self) -> bool {
         self.confinement.available() && self.exe.is_some()
     }
@@ -415,6 +416,12 @@ impl Daemon {
                 "this is the installed node, started without CAP_SETUID and CAP_SETGID: it runs no command; start it as the service: `sudo systemctl start nerve-node`"
             );
         }
+        // A node that runs elevated runs its commands so too, as root does
+        // on Linux with machine.allow_root.
+        #[cfg(windows)]
+        if nerve_sandbox::appcontainer::elevated() {
+            tracing::warn!("{}", crate::account::root_warning());
+        }
         let shared = Arc::new(Shared {
             paths: paths.clone(),
             service,
@@ -526,9 +533,22 @@ async fn supervise(shared: Arc<Shared>) {
     let mut changed = shared.changed.subscribe();
     let mut stop = shared.stop.subscribe();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut granted: Option<u64> = None;
     loop {
         shared.settle_sudo();
         let cfg = shared.config();
+        // The folder grants follow the config as it changes (crate::grants);
+        // a command syncs them as well before it runs.
+        if shared.confinement.appcontainer && granted != Some(cfg.version) {
+            granted = Some(cfg.version);
+            let (s, c) = (shared.clone(), cfg.clone());
+            tokio::task::spawn_blocking(move || {
+                let synced = crate::grants::apply(&s.paths, &c, &s.rules_home(&c));
+                for e in synced.errors {
+                    tracing::warn!("folder grants: {e}");
+                }
+            });
+        }
         // The level follows the config, whoever changed it and however.
         if let Some(log) = &shared.log {
             log.set_level(cfg.log.level);

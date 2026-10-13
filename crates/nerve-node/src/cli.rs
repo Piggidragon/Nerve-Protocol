@@ -658,7 +658,20 @@ pub async fn edit(
         AuditLog::new(paths.audit_log()),
     )?;
     match store.update(f) {
-        Ok(_) => Ok(store.config().clone()),
+        Ok(_) => {
+            let cfg = store.config().clone();
+            // No daemon took the change, so the folder grants of Windows
+            // folder mode follow it here (crate::grants); a running node
+            // brings them in line with its own config again before a
+            // command.
+            let synced = crate::grants::apply(paths, &cfg, &crate::paths::home_dir());
+            if let Some(e) = synced.errors.first() {
+                return Err(format!(
+                    "the config is saved, but the folder grants do not follow it: {e}"
+                ));
+            }
+            Ok(cfg)
+        }
         Err(SetError::Conflict { .. }) => Err("the config changed meanwhile; try again".into()),
         Err(e) => Err(e.to_string()),
     }

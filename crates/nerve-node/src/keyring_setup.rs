@@ -162,7 +162,7 @@ pub fn ensure(
     );
     let _ = writeln!(
         out,
-        "Without a desktop nobody types a password when the machine starts, so this keyring keeps the keys unencrypted in {}, readable by {name} as the key files are; the node keeps centers out of it as it does out of the key files. It becomes the default keyring of {name}: any other program of {name} that keeps a secret in the system keyring keeps it there, unencrypted too.",
+        "Without a desktop nobody types a password when the machine starts, so this keyring keeps the keys unencrypted in {}, readable by {name} as the key files are; the node keeps centers out of it as it does out of the key files, except a command you let a center run outside folder mode that asks the keyring itself (secret-tool and the like). It becomes the default keyring of {name}: any other program of {name} that keeps a secret in the system keyring keeps it there, unencrypted too.",
         store.display()
     );
     let yes = crate::cli::ask(input, out, "Install it now? [y/N] ")?;

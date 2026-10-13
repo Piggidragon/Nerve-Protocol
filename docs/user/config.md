@@ -131,7 +131,16 @@ Linux 7.1 on (Landlock ABI 9) Landlock refuses that. An older kernel cannot,
 so there `folder` mode runs no command while the keys are in the keyring,
 unless commands run as another account than root
 ([service](service.md#the-account-commands-run-as)), which cannot reach the
-session of the node's user. The node then logs a warning at start.
+session of the node's user. The node then logs a warning, `nerve-node
+status` prints `folder mode runs no command: …`, and `config set` and
+`setup` say so when they move the keys. `file` brings the commands back.
+
+The keyring is kept from `folder` mode commands only. An `allowlist` or
+`user` mode command runs without Landlock, and a command that talks to the
+Secret Service needs no path to read the keys. With `keyring`, an allow
+rule for `secret-tool`, `busctl --user`, `gdbus`, `dbus-send` or the like
+hands a center every key of the node, which with `file` it could not read.
+Do not allow such a tool to a center, or keep the keys in files.
 
 With `keyring`, the node needs a keyring that answers. Without one it does
 not start, and `status` and the other commands that read the settings say:
@@ -152,7 +161,7 @@ the settings say `keyring` and no keyring answers, setup asks:
 ```
 No system keyring answers for nerve: ….
 nerve-node can install GNOME Keyring: `apt-get update`, `apt-get install -y gnome-keyring dbus-user-session`, `loginctl enable-linger nerve`, so that nerve keeps a session after a reboot, and a login keyring for nerve that opens without a password.
-Without a desktop nobody types a password when the machine starts, so this keyring keeps the keys unencrypted in /var/lib/nerve/.local/share/keyrings, readable by nerve as the key files are; the node keeps centers out of it as it does out of the key files. It becomes the default keyring of nerve: any other program of nerve that keeps a secret in the system keyring keeps it there, unencrypted too.
+Without a desktop nobody types a password when the machine starts, so this keyring keeps the keys unencrypted in /var/lib/nerve/.local/share/keyrings, readable by nerve as the key files are; the node keeps centers out of it as it does out of the key files, except a command you let a center run outside folder mode that asks the keyring itself (secret-tool and the like). It becomes the default keyring of nerve: any other program of nerve that keeps a secret in the system keyring keeps it there, unencrypted too.
 Install it now? [y/N]
 ```
 

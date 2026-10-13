@@ -1099,6 +1099,9 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                             v["confinement"].as_str().unwrap_or("?")
                         ),
                     );
+                    if let Some(why) = v["folder_commands_off"].as_str() {
+                        w(out, format!("folder mode runs no command: {why}"));
+                    }
                     if v["locked"] == true {
                         w(
                             out,
@@ -1348,11 +1351,12 @@ pub async fn setup(
     r
 }
 
-/// After setup installed a keyring: a node that runs and found none before
-/// does not look again (`keyring_failed` in its status,
+/// Once the keyring answers setup, whether setup installed it or it came
+/// some other way (review round 2, finding 5): a node that runs and found
+/// none before does not look again (`keyring_failed` in its status,
 /// [`crate::secrets::store::failed`]), so it would refuse the move. The
 /// installed node is restarted; a node run by hand is left to its owner.
-async fn after_keyring_installed(
+async fn after_keyring_answers(
     paths: &NodePaths,
     machine: Option<&dyn crate::service::System>,
     out: &mut dyn Write,
@@ -1366,7 +1370,7 @@ async fn after_keyring_installed(
     Ok(())
 }
 
-/// What [`after_keyring_installed`] does with the running node's `status`.
+/// What [`after_keyring_answers`] does with the running node's `status`.
 #[cfg_attr(not(unix), allow(dead_code))]
 fn restart_for_keyring(
     status: &Value,
@@ -1384,7 +1388,7 @@ fn restart_for_keyring(
     sys.wait_running(paths)?;
     let _ = writeln!(
         out,
-        "restarted the node, which had found no keyring before this one was installed"
+        "restarted the node, which had found no keyring before this one answered"
     );
     Ok(())
 }
@@ -1430,9 +1434,8 @@ async fn setup_steps(
     // comes first.
     if crate::secrets::stated_storage(paths) == SecretStorage::Keyring {
         let me = crate::keyring_setup::me()?;
-        if crate::keyring_setup::ensure(keyring, &me, Some(input), out)? {
-            after_keyring_installed(paths, machine, out).await?;
-        }
+        crate::keyring_setup::ensure(keyring, &me, Some(input), out)?;
+        after_keyring_answers(paths, machine, out).await?;
     }
     let (cfg, _) = read_config(paths).await?;
     if let (Some(sys), Some(name)) = (machine, create_user) {
@@ -1495,9 +1498,8 @@ async fn setup_steps(
     if storage != now {
         if storage == SecretStorage::Keyring {
             let me = crate::keyring_setup::me()?;
-            if crate::keyring_setup::ensure(keyring, &me, Some(input), out)? {
-                after_keyring_installed(paths, machine, out).await?;
-            }
+            crate::keyring_setup::ensure(keyring, &me, Some(input), out)?;
+            after_keyring_answers(paths, machine, out).await?;
         }
         edit(paths, |c| {
             c.machine.secret_storage = storage;
@@ -1507,6 +1509,9 @@ async fn setup_steps(
         let step = format!("the node's keys are in {} now", storage_place(storage));
         let _ = writeln!(out, "{step}");
         steps.push(step);
+        if storage == SecretStorage::Keyring {
+            tell_folder_commands(paths, out).await;
+        }
     }
 
     let link = ask(
@@ -2022,7 +2027,9 @@ async fn config_cmd(paths: &NodePaths, c: ConfigCmd, out: &mut dyn Write) -> Res
         let _ = writeln!(out, "{}", show(&v));
         return Ok(());
     }
-    edit(paths, |cfg| {
+    let before = std::cell::Cell::new(SecretStorage::File);
+    let cfg = edit(paths, |cfg| {
+        before.set(cfg.machine.secret_storage);
         let mut doc = toml::Value::Table(as_table(cfg)?);
         match &c {
             ConfigCmd::Get { .. } | ConfigCmd::Accept => {}
@@ -2069,7 +2076,44 @@ async fn config_cmd(paths: &NodePaths, c: ConfigCmd, out: &mut dyn Write) -> Res
     })
     .await?;
     let _ = writeln!(out, "saved");
+    if before.get() != SecretStorage::Keyring
+        && cfg.machine.secret_storage == SecretStorage::Keyring
+    {
+        tell_folder_commands(paths, out).await;
+    }
     Ok(())
+}
+
+/// Says, once the keys went into the keyring, that folder mode now runs no
+/// command where Landlock cannot keep a command off the session bus
+/// (crate::daemon::KEYRING_NOT_CONFINED; review round 2, finding 3). The
+/// running node knows; without one, the kernel here tells.
+async fn tell_folder_commands(paths: &NodePaths, out: &mut dyn Write) {
+    #[cfg(unix)]
+    if let Ok(v) = nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await {
+        if v["folder_commands_off"] == crate::daemon::KEYRING_NOT_CONFINED {
+            let _ = writeln!(out, "{}", folder_commands_off());
+        }
+        return;
+    }
+    #[cfg(not(unix))]
+    let _ = paths;
+    if keyring_turns_commands_off(nerve_sandbox::Confinement::detect()) {
+        let _ = writeln!(out, "{}", folder_commands_off());
+    }
+}
+
+fn folder_commands_off() -> String {
+    format!(
+        "folder mode runs no command: {}",
+        crate::daemon::KEYRING_NOT_CONFINED
+    )
+}
+
+/// Whether, with the keys in the keyring, `c` leaves folder mode's commands
+/// a way to the session bus: Landlock without ABI 9.
+fn keyring_turns_commands_off(c: nerve_sandbox::Confinement) -> bool {
+    c.available() && !c.keeps_sockets()
 }
 
 /// `proxy set|rm|ls`. The header values, and a user name and password given
@@ -2851,6 +2895,19 @@ mod tests {
         );
     }
 
+    /// Folder mode's commands are told off where Landlock cannot keep a
+    /// command off the session bus, and `status` prints why the node says
+    /// they are (review round 2, finding 3).
+    #[test]
+    fn the_keyring_turns_folder_commands_off_below_abi_9() {
+        use nerve_sandbox::Confinement;
+        let abi = |v| Confinement { landlock_abi: v };
+        assert!(keyring_turns_commands_off(abi(Some(6))));
+        assert!(!keyring_turns_commands_off(abi(Some(9))));
+        assert!(!keyring_turns_commands_off(abi(None)));
+        assert!(folder_commands_off().contains("machine.secret_storage file"));
+    }
+
     /// The node's keys as setup and `config set` leave them: whether the
     /// config's key is in its file, and in the test keyring.
     fn config_key_at(paths: &NodePaths) -> (bool, bool) {
@@ -2970,6 +3027,62 @@ mod tests {
         restart_for_keyring(&fine, &paths, Some(&sys), &mut out).unwrap();
         restart_for_keyring(&fine, &paths, None, &mut out).unwrap();
         assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+    }
+
+    /// Setup restarts a node that found no keyring also when the keyring
+    /// answers without setup installing it, e.g. installed by hand (review
+    /// round 2, finding 5).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_node_that_found_no_keyring_is_restarted_when_one_answers_setup() {
+        let (d, paths) = setup(&[]);
+        let (ready_tx, ready) = std::sync::mpsc::channel();
+        let (stop, stop_rx) = std::sync::mpsc::channel::<()>();
+        let node = {
+            let (home, paths) = (d.path().to_path_buf(), paths.clone());
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                // This node asked a keyring that was not there yet, and
+                // keeps that answer.
+                crate::secrets::store::set_unreachable(true);
+                assert!(crate::secrets::store::get("any").is_err());
+                let mut opts = NodeOptions::new(paths);
+                opts.home = home;
+                opts.full_rights = Some(false);
+                let daemon = rt.block_on(Daemon::start(opts)).unwrap();
+                ready_tx.send(()).unwrap();
+                rt.block_on(async {
+                    while stop_rx.try_recv().is_err() {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    daemon.stop().await;
+                });
+            })
+        };
+        ready.recv().unwrap();
+        // The keyring answers setup: nothing to install.
+        let k = crate::keyring_setup::tests::FakeKeyring::new(true);
+        let (r, _) = setup_keyring(&paths, None, None, &k, "\nkeyring\n");
+        let e = r.unwrap_err();
+        assert!(
+            e.contains("restart it, then run `nerve-node setup` again"),
+            "{e}"
+        );
+        assert!(k.installed.borrow().is_empty());
+        let sys = crate::service::tests::Fake::new();
+        // Name, the account question of the installed node, the keys.
+        let (r, out) = setup_keyring(&paths, Some(&sys), None, &k, "\n\nkeyring\n");
+        assert!(
+            sys.calls()
+                .contains(&format!("systemctl restart {}", crate::service::UNIT_NAME)),
+            "{:?} {r:?} {out}",
+            sys.calls()
+        );
+        stop.send(()).unwrap();
+        node.join().unwrap();
     }
 
     /// The running node says in its status whether it found no keyring.

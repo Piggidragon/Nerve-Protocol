@@ -198,7 +198,17 @@ own folders. Where the
 kernel has no ABI 9, `folder` mode offers no `exec` while the keys are in the
 keyring, as on a machine without Landlock, unless commands run as an account
 other than root and the node's own; the bus folder is the user's alone
-(0700). The node logs that at start.
+(0700). The node logs that at start and when a change of the settings
+turns it on, its status says it (`folder_commands_off`, also printed by
+`nerve-node status`), and `config set` and `setup` say it when they move
+the keys into the keyring. A refused command names the keyring as the
+reason. The gate and the command's Landlock rules go by one answer per
+call, from the same config and account.
+
+`allowlist` and `user` mode commands get no Landlock rules, so an allowed
+command that talks to the Secret Service (`secret-tool`, `busctl --user`,
+`gdbus`, `dbus-send`) reads the node's keys with `keyring`; it names no
+path the protected list could refuse.
 
 #### A keyring on a Linux without a desktop
 
@@ -233,9 +243,9 @@ would become the default for every program of that desktop.
 
 The keyring crate connects once per process and keeps a failure for the
 process's life. A running node reports one in its status
-(`keyring_failed`); after setup installed a keyring it restarts the
-installed node (`systemctl restart`, then waits for it), and stops with a
-message on a node run by hand.
+(`keyring_failed`); once a keyring answers setup, installed by setup or
+not, it restarts the installed node (`systemctl restart`, then waits for
+it), and stops with a message on a node run by hand.
 
 The kernel keyring (keyutils) needs no daemon, but its keys are gone after a
 reboot, and the node's with them, so it is not used. A keyring that opens

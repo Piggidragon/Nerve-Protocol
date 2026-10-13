@@ -1112,7 +1112,7 @@ mod tests {
         let env = crate::decide::Env {
             home: &home,
             protected: &prot,
-            confined: true,
+            unconfined: None,
             sudo: false,
         };
         let targets = [crate::decide::Target {

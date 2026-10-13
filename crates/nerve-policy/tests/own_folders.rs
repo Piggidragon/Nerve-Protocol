@@ -92,7 +92,7 @@ fn nothing_reaches_the_nodes_own_folders() {
         let env = Env {
             home: Path::new("/h"),
             protected: &prot,
-            confined: true,
+            unconfined: None,
             sudo: true,
         };
         let check = |c: &Call| {
@@ -129,7 +129,7 @@ fn nothing_reaches_the_nodes_own_folders() {
     let env = Env {
         home: Path::new("/h"),
         protected: &prot,
-        confined: true,
+        unconfined: None,
         sudo: false,
     };
     let notes = at("/h/notes/a", true);
@@ -150,7 +150,7 @@ fn the_nodes_own_folders_are_seen_in_every_plain_spelling() {
         let env = Env {
             home: Path::new("/h"),
             protected: &prot,
-            confined: true,
+            unconfined: None,
             sudo: true,
         };
         let home = at("/h", false);
@@ -202,7 +202,7 @@ fn a_windows_command_line_reaches_no_own_folder() {
     let env = Env {
         home: Path::new("C:\\Users\\u"),
         protected: &prot,
-        confined: true,
+        unconfined: None,
         sudo: false,
     };
     let proj = at("C:\\Users\\u\\nerve-test\\proj", false);
@@ -246,7 +246,7 @@ fn a_long_windows_command_line_is_checked_at_once() {
     let env = Env {
         home: Path::new("C:\\Users\\u"),
         protected: &prot,
-        confined: true,
+        unconfined: None,
         sudo: false,
     };
     let proj = at("C:\\Users\\u\\nerve-test\\proj", false);

@@ -915,7 +915,18 @@ impl Link {
                 // Decided and audited like any other action; its rule target
                 // is the action itself.
                 let target = format!("{}.{}", inv.cap, inv.action);
-                self.gate(&entry, &inv, effect, &[], None, None, target, None)?;
+                let unconfined = self.shared.unconfined(&cfg);
+                self.gate(
+                    &entry,
+                    &inv,
+                    effect,
+                    &[],
+                    None,
+                    None,
+                    target,
+                    None,
+                    unconfined,
+                )?;
                 self.signal(&inv.args)
             }
             ("exec", "run") => self.exec_run(id, &cfg, &entry, effect, &inv).await,
@@ -934,6 +945,7 @@ impl Link {
                 // folders, the walk below does too, even if `until` passes
                 // in between.
                 let by_folders = entry.policy.mode_at(crate::now_ms()) == Mode::Folder;
+                let unconfined = self.shared.unconfined_as(&cfg, || known.clone());
                 self.gate(
                     &entry,
                     &inv,
@@ -943,6 +955,7 @@ impl Link {
                     None,
                     call.target_text(),
                     known.as_ref(),
+                    unconfined,
                 )?;
                 account.map_err(|e| RpcError::new(ErrorCode::Unavailable, e))?;
                 let protected = self.protected(&entry);
@@ -1035,6 +1048,7 @@ impl Link {
         cwd: Option<&std::path::Path>,
         target: String,
         account: Option<&crate::service::Account>,
+        unconfined: Option<&str>,
     ) -> Result<(), RpcError> {
         let call = Call {
             cap: &inv.cap,
@@ -1054,7 +1068,7 @@ impl Link {
             let env = Env {
                 home,
                 protected: &protected,
-                confined: self.shared.confined(&self.shared.config()),
+                unconfined,
                 sudo: self.shared.sudo_on(),
             };
             nerve_policy::decide(&entry.policy, &env, &call)
@@ -1217,6 +1231,14 @@ impl Link {
             RunCall::parse(&inv.args, &home)?
         };
         let target = rc.command.clone();
+        // The gate and the sandbox below go by one answer, from `cfg` and
+        // its account, taken before the gate: a config written meanwhile
+        // or a limit that passes cannot let a command the gate judged by
+        // the folders run without Landlock (review round 2, finding 1). A
+        // limit only ever turns folder mode into allowlist, which the gate
+        // then judges, so the sandbox is never less than what it judged.
+        let by_folders = entry.policy.mode_at(crate::now_ms()) == Mode::Folder;
+        let unconfined = self.shared.unconfined_as(cfg, || known.clone());
         self.gate(
             entry,
             inv,
@@ -1226,6 +1248,7 @@ impl Link {
             Some(&rc.cwd),
             target,
             known.as_ref(),
+            unconfined,
         )?;
         let account = account.map_err(|e| RpcError::new(ErrorCode::Unavailable, e))?;
         // The policy let a sudo command through only with the switch on and
@@ -1247,10 +1270,7 @@ impl Link {
         // The account's home is the `~` of its rules: its own shell
         // profiles and keys stay out of them.
         let own = self.shared.own(cfg);
-        let landlock = (sudo.is_none()
-            && entry.policy.mode_at(crate::now_ms()) == Mode::Folder
-            && self.shared.confined(cfg))
-        .then(|| {
+        let landlock = (sudo.is_none() && by_folders && unconfined.is_none()).then(|| {
             // The folders' entries are listed as the account.
             let _as = act_as(known.as_ref()).ok().flatten();
             let mut spec = exec::landlock_spec(&entry.policy, &home, &own);

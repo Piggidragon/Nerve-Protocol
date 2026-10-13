@@ -76,8 +76,8 @@ The node confines commands with Landlock:
 - With the keys in the system keyring, the node's D-Bus session and GNOME
   Keyring's folder count as its own, and a command cannot connect to a
   socket there ([keys](config.md#where-the-node-keeps-its-keys)). That needs
-  Linux 7.1. On an older kernel `folder` mode then runs commands only as
-  another account than root, and `nerve-node status` says so.
+  Linux 7.1. On an older kernel the keys stay in files
+  ([keys](config.md#an-older-linux-kernel)).
 - On a node installed as a service the command runs as the account
   commands run as ([service](service.md#the-account-commands-run-as)), and
   what that account may not open stays closed as well. Landlock only takes

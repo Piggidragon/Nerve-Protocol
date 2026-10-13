@@ -115,7 +115,8 @@ The node has a key per center and the key for the MAC above.
   Not on the node installed as a service on Windows: it runs as `nerve`,
   whose Credential Manager the commands you run as an administrator cannot
   reach, so it keeps its keys in files
-  ([service](service.md#windows)).
+  ([service](service.md#windows)). Nor on a Linux kernel with a Landlock
+  ABI below 9 ([below](#an-older-linux-kernel)).
 
 ```sh
 nerve-node config set machine.secret_storage keyring
@@ -135,13 +136,40 @@ through the user's D-Bus session. So with `keyring` on Linux the node keeps
 centers out of that session's folder (`/run/user/<uid>`) and out of GNOME
 Keyring's folder (`~/.local/share/keyrings`), as it does with its own
 folders. A `folder` mode command cannot connect to the session either: from
-Linux 7.1 on (Landlock ABI 9) Landlock refuses that. An older kernel cannot,
-so there `folder` mode runs no command while the keys are in the keyring,
-unless commands run as another account than root
-([service](service.md#the-account-commands-run-as)), which cannot reach the
-session of the node's user. The node then logs a warning, `nerve-node
-status` prints `folder mode runs no command: …`, and `config set` and
-`setup` say so when they move the keys. `file` brings the commands back.
+Linux 7.1 on (Landlock ABI 9) Landlock refuses that.
+
+### An older Linux kernel
+
+On a kernel whose Landlock ABI is below 9 the node keeps its keys in files.
+There a `folder` mode command could not run programs from its folders while
+the keys are in the keyring: the sandbox cannot grant the keyring's access
+and execute together. So:
+
+- `config set machine.secret_storage keyring` is refused and changes nothing,
+  and so is a center's change of the setting.
+- `setup` does not ask where the keys go. It warns with the reason, keeps
+  the keys in files, and moves keys it finds in the keyring into files.
+- `config accept` refuses a `node.toml` that says `keyring`. Change it to
+  `secret_storage = "file"` and accept it again.
+- `install` and the node's start refuse a `node.toml` that says `keyring`.
+  The message names the command that moves the keys into files on those
+  folders; run it with sudo for the installed node:
+
+  ```sh
+  sudo nerve-node --config-dir /etc/nerve --state-dir /var/lib/nerve/state config set machine.secret_storage file
+  ```
+
+`nerve-node status` shows the kernel's Landlock ABI (`confinement landlock
+v…`). Where Landlock is missing or off, its ABI cannot be read: `setup` then
+says so in a warning and asks as before. Keep the keys in files unless you
+know the kernel has ABI 9 or later.
+
+Should the keys be in the keyring on such a kernel all the same, `folder`
+mode runs no command while they are there, unless commands run as another
+account than root ([service](service.md#the-account-commands-run-as)),
+which cannot reach the session of the node's user. The node then logs a
+warning and `nerve-node status` prints `folder mode runs no command: …`.
+`file` brings the commands back.
 
 A command keeps the sandbox it started with. So while a `folder` mode
 command that started with the keys in files still runs, the keys do not go

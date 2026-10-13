@@ -538,15 +538,26 @@ impl Daemon {
             nerve_transport::files::create_private_dir(dir)
                 .map_err(|e| format!("{}: {e}", dir.display()))?;
         }
-        // The installed node on Windows would look for its keys in the
-        // Credential Manager of its own account, which holds none of them.
-        if crate::secrets::windows_service(&paths)
-            && crate::secrets::stated_storage(&paths) == SecretStorage::Keyring
+        // Where the keys may not be in the keyring, a node.toml that keeps
+        // them there is refused: the installed node on Windows would look
+        // in the Credential Manager of its own account, which holds none of
+        // them, and an old Landlock leaves folder mode without programs.
+        if crate::secrets::stated_storage(&paths) == SecretStorage::Keyring
+            && let Some(n) = crate::secrets::no_keyring(&paths)
         {
-            return Err(crate::secrets::keyring_windows_service(
+            let then = match n {
+                crate::secrets::NoKeyring::WindowsService => {
+                    "`Restart-Service nerve-node` starts it"
+                }
+                crate::secrets::NoKeyring::OldLandlock(_) => {
+                    "start the node again (`sudo systemctl restart nerve-node` for the installed node)"
+                }
+            };
+            return Err(crate::secrets::keyring_refused(
                 &paths,
+                n,
                 "the node does not start",
-                "`Restart-Service nerve-node` starts it",
+                then,
             ));
         }
         let keys = match crate::secrets::KeysLock::try_take(&paths)? {
@@ -1230,18 +1241,11 @@ mod tests {
         (d, Daemon::start(opts).await.unwrap())
     }
 
-    /// The installed node on Windows does not start with its keys in the
-    /// keyring: they are in the Credential Manager of whoever moved them
-    /// there, and the message says how to get them back into files.
-    #[tokio::test]
-    async fn the_installed_node_on_windows_refuses_keys_in_the_keyring() {
-        let d = tempfile::tempdir().unwrap();
-        let log = Log::new(Level::Info);
-        let opts = options(&d, &log);
-        let paths = opts.paths.clone();
+    /// A node.toml that keeps the keys in the keyring, made before.
+    fn keys_in_the_keyring(paths: &NodePaths) {
         let mut store = SettingsStore::open_with(
             paths.config_file(),
-            Box::new(crate::secrets::NodeSecrets::new(&paths)),
+            Box::new(crate::secrets::NodeSecrets::new(paths)),
             AuditLog::new(paths.audit_log()),
         )
         .unwrap();
@@ -1251,18 +1255,44 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-        drop(store);
-        crate::secrets::windows_service_for_tests::pretend(&paths);
+    }
+
+    /// The installed node on Windows does not start with its keys in the
+    /// keyring: they are in the Credential Manager of whoever moved them
+    /// there, and the message says how to get them back into files.
+    #[tokio::test]
+    async fn the_installed_node_on_windows_refuses_keys_in_the_keyring() {
+        let d = tempfile::tempdir().unwrap();
+        let log = Log::new(Level::Info);
+        let opts = options(&d, &log);
+        let paths = opts.paths.clone();
+        keys_in_the_keyring(&paths);
+        crate::secrets::for_tests::pretend_windows_service(&paths);
         let Err(e) = Daemon::start(opts).await else {
             panic!("the node started");
         };
         assert!(e.contains("the node does not start"), "{e}");
         assert!(e.contains("Credential Manager"), "{e}");
-        assert!(
-            e.contains("`nerve-node config set machine.secret_storage file`"),
-            "{e}"
-        );
+        assert!(e.contains("config set machine.secret_storage file`"), "{e}");
         assert!(e.contains("Restart-Service nerve-node"), "{e}");
+    }
+
+    /// Nor does a node on a kernel below Landlock ABI 9.
+    #[tokio::test]
+    async fn a_node_below_landlock_9_refuses_keys_in_the_keyring() {
+        let d = tempfile::tempdir().unwrap();
+        let log = Log::new(Level::Info);
+        let opts = options(&d, &log);
+        let paths = opts.paths.clone();
+        keys_in_the_keyring(&paths);
+        crate::secrets::for_tests::pretend_landlock(&paths, crate::secrets::Landlock::Abi(7));
+        let Err(e) = Daemon::start(opts).await else {
+            panic!("the node started");
+        };
+        assert!(e.contains("the node does not start"), "{e}");
+        assert!(e.contains("Landlock ABI 7, below 9"), "{e}");
+        assert!(e.contains("config set machine.secret_storage file`"), "{e}");
+        assert!(e.contains("systemctl restart nerve-node"), "{e}");
     }
 
     fn options(d: &tempfile::TempDir, log: &Arc<Log>) -> NodeOptions {

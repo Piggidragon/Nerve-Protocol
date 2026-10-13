@@ -298,53 +298,177 @@ pub fn stated_storage(paths: &NodePaths) -> SecretStorage {
 /// service never finds it.
 pub const KEYRING_WINDOWS_SERVICE: &str = "the installed node on Windows is the service nerve-node, which runs as the account nerve, and the Credential Manager is one per account: keys that `setup` or `config set` put in the system keyring go to the Credential Manager of the account that runs them, not to that of nerve, and the service does not find them. The installed node on Windows keeps its keys in files (machine.secret_storage = \"file\"), which only nerve and the administrators can open";
 
-/// Whether the node at `paths` is the installed node on Windows, whose keys
-/// may not go into the keyring ([`KEYRING_WINDOWS_SERVICE`]).
-pub fn windows_service(paths: &NodePaths) -> bool {
-    #[cfg(test)]
-    if windows_service_for_tests::is(paths) {
-        return true;
-    }
-    cfg!(windows) && crate::service::is_service_node(paths)
+/// Why a Linux node keeps its keys in files on a kernel whose Landlock is
+/// older than ABI 9, the first that can keep a command off a socket file:
+/// there the sandbox of a `folder` mode command cannot grant what the
+/// keyring needs and execute together.
+pub fn keyring_old_landlock(abi: i32) -> String {
+    format!(
+        "on this kernel (Landlock ABI {abi}, below 9) a folder mode command cannot run programs from its folders while the node's keys are in the system keyring: the sandbox cannot grant the keyring's access and execute together. So the node keeps its keys in files here (machine.secret_storage = \"file\")"
+    )
 }
 
-/// The nodes a test has the other code take for the installed node on
-/// Windows, on every platform.
+/// What Landlock says on this machine, for where the keys may go.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Landlock {
+    /// The kernel's ABI version.
+    Abi(i32),
+    /// Linux, but the version cannot be read: Landlock is missing or off.
+    Unknown,
+    /// Not Linux: there is no Landlock to ask.
+    NotHere,
+}
+
+/// What Landlock says for the node at `paths`: the kernel's, but in tests
+/// what the test pretends, else [`Landlock::NotHere`], so a test does not
+/// hang on the kernel it runs on.
+pub fn landlock(paths: &NodePaths) -> Landlock {
+    #[cfg(test)]
+    {
+        for_tests::landlock(paths).unwrap_or(Landlock::NotHere)
+    }
+    #[cfg(not(test))]
+    {
+        let _ = paths;
+        if !cfg!(target_os = "linux") {
+            return Landlock::NotHere;
+        }
+        match nerve_sandbox::Confinement::detect().landlock_abi {
+            Some(v) => Landlock::Abi(v),
+            None => Landlock::Unknown,
+        }
+    }
+}
+
+/// Why the node at `paths` keeps its keys in files, whatever asks for the
+/// keyring.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NoKeyring {
+    /// The installed node on Windows ([`KEYRING_WINDOWS_SERVICE`]).
+    WindowsService,
+    /// A Linux kernel whose Landlock ABI, this one, is below 9
+    /// ([`keyring_old_landlock`]).
+    OldLandlock(i32),
+}
+
+impl NoKeyring {
+    pub fn why(self) -> String {
+        match self {
+            NoKeyring::WindowsService => KEYRING_WINDOWS_SERVICE.into(),
+            NoKeyring::OldLandlock(abi) => keyring_old_landlock(abi),
+        }
+    }
+
+    /// Who runs the command that takes the keys out of the keyring: the
+    /// keyring that holds them is that account's.
+    fn who(self) -> &'static str {
+        match self {
+            NoKeyring::WindowsService => {
+                "as the account that put them in the keyring, in a terminal opened with \"Run as administrator\""
+            }
+            NoKeyring::OldLandlock(_) => {
+                "as the node's user, or with sudo for a node installed as a service (it then runs as the node's user)"
+            }
+        }
+    }
+}
+
+/// Why the keys of the node at `paths` may not go into the keyring, or
+/// `None` when they may. Where the Landlock ABI cannot be read, they may,
+/// as before; setup warns.
+pub fn no_keyring(paths: &NodePaths) -> Option<NoKeyring> {
+    if windows_service(paths) {
+        return Some(NoKeyring::WindowsService);
+    }
+    match landlock(paths) {
+        Landlock::Abi(v) if v < 9 => Some(NoKeyring::OldLandlock(v)),
+        _ => None,
+    }
+}
+
+/// Whether the node at `paths` is the installed node on Windows, whose keys
+/// may not go into the keyring ([`KEYRING_WINDOWS_SERVICE`]). Its folders
+/// are found in any spelling: Windows does not tell `C:\ProgramData` from
+/// `c:\programdata`.
+pub fn windows_service(paths: &NodePaths) -> bool {
+    #[cfg(test)]
+    if for_tests::windows_service(paths) {
+        return true;
+    }
+    cfg!(windows)
+        && (crate::service::is_service_node(paths)
+            || same_folders_ignoring_case(paths, &crate::service::Layout::system().paths))
+}
+
+/// Whether `a` and `b` name the same folders when case and a trailing
+/// separator do not count.
+fn same_folders_ignoring_case(a: &NodePaths, b: &NodePaths) -> bool {
+    let norm = |p: &Path| {
+        p.to_string_lossy()
+            .trim_end_matches(['\\', '/'])
+            .replace('/', "\\")
+            .to_lowercase()
+    };
+    norm(&a.config_dir) == norm(&b.config_dir) && norm(&a.state_dir) == norm(&b.state_dir)
+}
+
+/// What a test has the other code take for the installed node on Windows,
+/// and for the kernel's Landlock, per node and on every platform.
 #[cfg(test)]
-pub(crate) mod windows_service_for_tests {
-    use std::collections::HashSet;
+pub(crate) mod for_tests {
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::{LazyLock, Mutex};
 
+    use super::Landlock;
     use crate::paths::NodePaths;
 
-    static NODES: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Mutex::default);
-
-    /// The node at `paths` counts as the installed node on Windows.
-    pub fn pretend(paths: &NodePaths) {
-        NODES
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(paths.config_dir.clone());
+    #[derive(Default)]
+    struct Pretended {
+        windows_service: bool,
+        landlock: Option<Landlock>,
     }
 
-    pub fn is(paths: &NodePaths) -> bool {
-        NODES
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .contains(&paths.config_dir)
+    static NODES: LazyLock<Mutex<HashMap<PathBuf, Pretended>>> = LazyLock::new(Mutex::default);
+
+    fn with<T>(paths: &NodePaths, f: impl FnOnce(&mut Pretended) -> T) -> T {
+        let mut nodes = NODES.lock().unwrap_or_else(|e| e.into_inner());
+        f(nodes.entry(paths.config_dir.clone()).or_default())
+    }
+
+    /// The node at `paths` counts as the installed node on Windows.
+    pub fn pretend_windows_service(paths: &NodePaths) {
+        with(paths, |p| p.windows_service = true);
+    }
+
+    /// The node at `paths` runs where Landlock says `l`.
+    pub fn pretend_landlock(paths: &NodePaths, l: Landlock) {
+        with(paths, |p| p.landlock = Some(l));
+    }
+
+    pub fn windows_service(paths: &NodePaths) -> bool {
+        with(paths, |p| p.windows_service)
+    }
+
+    pub fn landlock(paths: &NodePaths) -> Option<Landlock> {
+        with(paths, |p| p.landlock)
     }
 }
 
-/// The refusal of the installed node on Windows, or of its install, when
-/// `node.toml` keeps the keys in the keyring: they are in the Credential
-/// Manager of whoever moved them there, not in that of `nerve`.
+/// The refusal of a node whose `node.toml` keeps the keys in the keyring
+/// where [`no_keyring`] says `n`: at its start, at install, at `config
+/// accept`. The command it names moves them into files on these folders,
+/// whether or not they are the installed node's yet.
 ///
 /// `what` says what does not happen, `then` what to do after the move.
-pub fn keyring_windows_service(paths: &NodePaths, what: &str, then: &str) -> String {
+pub fn keyring_refused(paths: &NodePaths, n: NoKeyring, what: &str, then: &str) -> String {
     format!(
-        "{} keeps the node's keys in the system keyring (machine.secret_storage = \"keyring\"), but {KEYRING_WINDOWS_SERVICE}. So {what}. Move the keys into files as the account that put them in the keyring, in a terminal opened with \"Run as administrator\": `nerve-node config set machine.secret_storage file`; then {then}",
-        paths.config_file().display()
+        "{} keeps the node's keys in the system keyring (machine.secret_storage = \"keyring\"), but {}. So {what}. Move the keys into files {}: `nerve-node --config-dir \"{}\" --state-dir \"{}\" config set machine.secret_storage file`; then {then}",
+        paths.config_file().display(),
+        n.why(),
+        n.who(),
+        paths.config_dir.display(),
+        paths.state_dir.display(),
     )
 }
 
@@ -621,14 +745,19 @@ impl Secrets for NodeSecrets {
 
     fn copy(&mut self, cfg: &NodeConfig) -> Result<(), String> {
         let to = cfg.machine.secret_storage;
-        if to == SecretStorage::Keyring && windows_service(&self.paths) {
-            return Err(format!(
-                "machine.secret_storage cannot be \"keyring\" here: {KEYRING_WINDOWS_SERVICE}; nothing was changed"
-            ));
-        }
         if let Some((open, ended)) = self.open_commands(to) {
             return Err(format!(
                 "{open}; the node's keys stay in their files, and nothing was changed. Wait until {ended} ended, or end every command with `nerve-node panic`, change it again, then `nerve-node unlock`"
+            ));
+        }
+        // After the count of running commands, which tells more where both
+        // refuse (an old Landlock with such a command running).
+        if to == SecretStorage::Keyring
+            && let Some(n) = no_keyring(&self.paths)
+        {
+            return Err(format!(
+                "machine.secret_storage cannot be \"keyring\" here: {}; nothing was changed",
+                n.why()
             ));
         }
         if to == SecretStorage::Keyring && self.defer && !self.defers_keyring {
@@ -690,9 +819,18 @@ impl Secrets for NodeSecrets {
     }
 
     /// Another writer moved the keys into the keyring: the running node
-    /// does not follow while it counts a command that would reach them
-    /// there (review round 4, finding 1).
+    /// does not follow where they may not be there ([`no_keyring`]), nor
+    /// while it counts a command that would reach them there (review round
+    /// 4, finding 1).
     fn may_reload(&self, cfg: &NodeConfig) -> Result<(), String> {
+        if cfg.machine.secret_storage == SecretStorage::Keyring
+            && let Some(n) = no_keyring(&self.paths)
+        {
+            return Err(format!(
+                "node.toml keeps the node's keys in the system keyring, but {}; the node goes on with the config in force, which keeps them in their files",
+                n.why()
+            ));
+        }
         match self.open_commands(cfg.machine.secret_storage) {
             Some((open, ended)) => Err(format!(
                 "node.toml keeps the node's keys in the system keyring, but {open}; the node goes on with the config in force, which keeps them in their files. Wait until {ended} ended, then reload again"
@@ -1477,5 +1615,65 @@ mod tests {
         std::fs::write(paths.config_file(), "not toml [").unwrap();
         assert_eq!(stated_storage(&paths), SecretStorage::File);
         store::set_unreachable(false);
+    }
+
+    /// Below Landlock ABI 9 the keys do not go into the keyring: a move is
+    /// refused and changes nothing, a running node does not take in a file
+    /// another writer saved with them there, and a move out still works.
+    /// ABI 9, and an ABI that cannot be read, change nothing.
+    #[test]
+    fn below_landlock_9_the_keys_stay_in_files() {
+        let (_d, paths) = node();
+        assert_eq!(no_keyring(&paths), None);
+        for l in [Landlock::Abi(9), Landlock::Unknown] {
+            for_tests::pretend_landlock(&paths, l);
+            assert_eq!(no_keyring(&paths), None, "{l:?}");
+        }
+        let mut s = paired(&paths, SecretStorage::File, &["home"]);
+        let mut running = SettingsStore::open_with(
+            paths.config_file(),
+            Box::new(NodeSecrets::for_node(&paths, Arc::default())),
+            AuditLog::new(paths.audit_log()),
+        )
+        .unwrap();
+        // Saved there while the kernel still allowed it.
+        set_storage(&mut s, SecretStorage::Keyring).unwrap();
+        for_tests::pretend_landlock(&paths, Landlock::Abi(8));
+        assert_eq!(no_keyring(&paths), Some(NoKeyring::OldLandlock(8)));
+        let e = running.reload().unwrap_err();
+        assert!(e.contains("Landlock ABI 8, below 9"), "{e}");
+        assert_eq!(running.config().machine.secret_storage, SecretStorage::File);
+        set_storage(&mut s, SecretStorage::File).unwrap();
+        assert!(paths.key_file("home").exists());
+        let e = set_storage(&mut s, SecretStorage::Keyring).unwrap_err();
+        assert!(e.contains("cannot be \"keyring\" here"), "{e}");
+        assert!(
+            e.contains("cannot run programs from its folders while the node's keys are in the system keyring"),
+            "{e}"
+        );
+        assert!(e.contains("nothing was changed"), "{e}");
+        assert_eq!(s.config().machine.secret_storage, SecretStorage::File);
+        assert!(paths.key_file("home").exists());
+        assert_eq!(in_keyring(&paths, Key::Center("home")), None);
+    }
+
+    /// The installed node's folders on Windows in another spelling are
+    /// still its folders (review round 7, finding 1).
+    #[test]
+    fn folders_differing_in_case_are_the_same_folders() {
+        let a = NodePaths::new(
+            "C:\\ProgramData\\Nerve\\config",
+            "C:\\ProgramData\\Nerve\\state",
+        );
+        let b = NodePaths::new(
+            "c:/programdata/nerve/config/",
+            "c:\\PROGRAMDATA\\nerve\\state",
+        );
+        assert!(same_folders_ignoring_case(&a, &b));
+        let c = NodePaths::new(
+            "C:\\ProgramData\\Nerve\\config2",
+            "C:\\ProgramData\\Nerve\\state",
+        );
+        assert!(!same_folders_ignoring_case(&a, &c));
     }
 }

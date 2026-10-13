@@ -139,7 +139,8 @@ in brackets.
    keyring that answers, it offers to install one where `nerve` has no
    desktop, and then restarts the node if it had found none before. Not
    asked on the installed node on Windows, which keeps them in files
-   ([Windows](#windows)).
+   ([Windows](#windows)), nor on a kernel with a Landlock ABI below 9
+   ([keys](config.md#an-older-linux-kernel)); setup warns instead.
 4. A pairing link from the center's web UI. Enter skips it. The node shows
    the center and asks before it pairs, as `center add` does.
 5. The mode of that center: `allowlist`, `folder` or `user`
@@ -241,10 +242,13 @@ files; `config set machine.secret_storage keyring` is refused and changes
 nothing. A `node.toml` that keeps the keys in the keyring is refused by
 `install`, before it changes anything, and the service does not start with
 one. Move the keys into files first, as the account that put them in the
-keyring, in a terminal opened with "Run as administrator":
+keyring, in a terminal opened with "Run as administrator". Name the folders:
+without a registered service the commands work on your own folders, not on
+the node's. Run it with the program you have, the downloaded one before a
+first install:
 
 ```powershell
-& "C:\Program Files\Nerve\nerve-node.exe" config set machine.secret_storage file
+.\nerve-node-x86_64-windows.exe --config-dir "C:\ProgramData\Nerve\config" --state-dir "C:\ProgramData\Nerve\state" config set machine.secret_storage file
 ```
 
 To run the commands as another account, an ordinary one, name it and run

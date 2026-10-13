@@ -72,6 +72,8 @@ cannot switch to the account commands run as and runs no command at all.
 | `node.toml is refused: its MAC does not match …` | Look at the file, then `nerve-node config accept`. See [config](config.md) |
 | `machine.secret_storage is "keyring", but the system keyring cannot be reached …` | The keys are in a keyring that does not answer. Start it, or run `nerve-node setup`, which offers to install one on a Linux without a desktop. See [keys](config.md#where-the-node-keeps-its-keys) |
 | `… this running node found no keyring and does not look again until it is restarted …` | The node asked for a keyring before one answered. Restart the node, then change the setting again. `setup` restarts the installed node itself after it installed a keyring |
+| `… keeps the node's keys in the system keyring (machine.secret_storage = "keyring"), but … So the node does not start` (also from `install`) | The keys may not be in the keyring here: the installed node on Windows, or a Linux kernel with a Landlock ABI below 9. Run the `config set machine.secret_storage file` command the message names, as it says, then start the node. See [Windows](service.md#windows) and [keys](config.md#an-older-linux-kernel) |
+| `machine.secret_storage cannot be "keyring" here: …` (from `config set` or a center) | The same reasons. Keep the keys in files |
 
 ## The center will not start
 

@@ -565,6 +565,18 @@ fn install_steps(
     invoker: &str,
     steps: &mut Steps,
 ) -> Result<(), String> {
+    // Keys in the keyring where they may not be there (an old Landlock):
+    // the installed node would not start, so install changes nothing.
+    if crate::secrets::stated_storage(&layout.paths) == SecretStorage::Keyring
+        && let Some(n) = crate::secrets::no_keyring(&layout.paths)
+    {
+        return Err(crate::secrets::keyring_refused(
+            &layout.paths,
+            n,
+            "install changed nothing",
+            "run `sudo nerve-node install` again",
+        ));
+    }
     let account = match sys.account(USER)? {
         Some(a) if a.comment == USER_MARK => {
             steps.did(format!("the user {USER} is there already"));
@@ -1788,6 +1800,47 @@ pub(crate) mod tests {
         let (r, out) = install(&sys, None);
         r.unwrap();
         assert!(!out.contains("[y/N]"), "{out}");
+    }
+
+    /// On a kernel below Landlock ABI 9, an earlier install's config that
+    /// keeps the keys in the keyring is refused before install changes
+    /// anything, with the command that moves them into files on these
+    /// folders.
+    #[test]
+    fn install_refuses_keys_in_the_keyring_below_landlock_9() {
+        use crate::keyring_setup::tests::FakeKeyring;
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = layout(d.path());
+        let mut store = SettingsStore::open_with(
+            l.paths.config_file(),
+            Box::new(crate::secrets::NodeSecrets::new(&l.paths)),
+            AuditLog::new(l.paths.audit_log()),
+        )
+        .unwrap();
+        store
+            .update(|c| {
+                c.machine.secret_storage = SecretStorage::Keyring;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        crate::secrets::for_tests::pretend_landlock(&l.paths, crate::secrets::Landlock::Abi(6));
+        let exe = d.path().join("nerve-node");
+        std::fs::write(&exe, "nerve-node 1.0.0\n").unwrap();
+        let k = FakeKeyring::new(true);
+        let e = install_asking(&l, &sys, &k, None, &exe, "alice", &mut Vec::new()).unwrap_err();
+        assert!(e.contains("install changed nothing"), "{e}");
+        assert!(e.contains("Landlock ABI 6, below 9"), "{e}");
+        assert!(e.contains("cannot run programs from its folders"), "{e}");
+        let command = format!(
+            "`nerve-node --config-dir \"{}\" --state-dir \"{}\" config set machine.secret_storage file`",
+            l.paths.config_dir.display(),
+            l.paths.state_dir.display()
+        );
+        assert!(e.contains(&command), "{e}");
+        assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+        assert!(!l.bin.exists() && !l.unit.exists());
     }
 
     #[test]

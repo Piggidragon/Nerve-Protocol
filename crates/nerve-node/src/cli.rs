@@ -1472,10 +1472,10 @@ async fn setup_steps(
         );
     }
     // Keys in a keyring that does not answer: nothing can be read, so that
-    // comes first. The installed node on Windows asks no keyring: its keys
-    // go into files below.
-    let windows_service = crate::secrets::windows_service(paths);
-    if crate::secrets::stated_storage(paths) == SecretStorage::Keyring && !windows_service {
+    // comes first. A node whose keys may not be in the keyring asks none:
+    // its keys go into files below.
+    let no_keyring = crate::secrets::no_keyring(paths);
+    if crate::secrets::stated_storage(paths) == SecretStorage::Keyring && no_keyring.is_none() {
         let me = crate::keyring_setup::me()?;
         crate::keyring_setup::ensure(keyring, &me, Some(input), out)?;
         after_keyring_answers(paths, machine, out).await?;
@@ -1524,17 +1524,17 @@ async fn setup_steps(
         account_chosen(paths, chosen, out, steps).await?;
     }
 
-    // Where the keys go, before pairing makes one. The installed node on
-    // Windows is not asked: the keyring setup could reach is not the
-    // service's (crate::secrets::KEYRING_WINDOWS_SERVICE).
+    // Where the keys go, before pairing makes one. Where they may not be in
+    // the keyring (the installed node on Windows, an old Landlock), setup
+    // does not ask; it says why.
     let now = read_config(paths).await?.0.machine.secret_storage;
-    let storage = if windows_service {
-        let _ = writeln!(
-            out,
-            "The node keeps its keys in files: on Windows the installed node runs as nerve, whose Credential Manager setup cannot reach."
-        );
+    let storage = if let Some(n) = no_keyring {
+        let _ = writeln!(out, "Warning: {}.", n.why());
         SecretStorage::File
     } else {
+        if crate::secrets::landlock(paths) == crate::secrets::Landlock::Unknown {
+            let _ = writeln!(out, "{LANDLOCK_UNKNOWN}");
+        }
         let answer = ask(
             input,
             out,
@@ -1653,6 +1653,11 @@ async fn setup_steps(
     );
     Ok(())
 }
+
+/// Setup's warning where the kernel's Landlock ABI cannot be read: below
+/// ABI 9 the keys would not be allowed in the keyring
+/// (crate::secrets::keyring_old_landlock), and here nobody can tell.
+const LANDLOCK_UNKNOWN: &str = "Warning: the Landlock ABI of this kernel cannot be read (Landlock is missing or off), so setup cannot tell whether the node's keys may be in the system keyring. On a kernel below Landlock ABI 9 a folder mode command cannot run programs from its folders while the keys are in the keyring: the sandbox cannot grant the keyring's access and execute together. Unless you know this kernel has ABI 9 or later, keep the keys in files (file).";
 
 /// How setup names where the keys are.
 fn storage_place(s: SecretStorage) -> &'static str {
@@ -2364,6 +2369,17 @@ fn pct_decode(s: &str) -> Option<String> {
 /// `config accept`: the running daemon takes the file, or, when none runs,
 /// the file is signed here.
 async fn accept(paths: &NodePaths) -> Result<u64, String> {
+    // Keys already in the keyring move nowhere when the file is taken, so
+    // the settings store alone would not refuse it.
+    if crate::secrets::stated_storage(paths) == SecretStorage::Keyring
+        && let Some(n) = crate::secrets::no_keyring(paths)
+    {
+        return Err(format!(
+            "{} says machine.secret_storage = \"keyring\", but {}. So the file was not accepted: change it to `secret_storage = \"file\"` and accept it again, which takes keys found in the keyring into files",
+            paths.config_file().display(),
+            n.why()
+        ));
+    }
     #[cfg(unix)]
     match nerve_transport::ctl::call(&paths.ctl_socket(), "config.accept", json!({})).await {
         Ok(v) => return Ok(v["version"].as_u64().unwrap_or_default()),
@@ -3097,11 +3113,14 @@ mod tests {
         let set = |to: &str| run(&paths, &["config", "set", "machine.secret_storage", to]);
         // Moved there before it was the installed node.
         set("keyring").unwrap();
-        crate::secrets::windows_service_for_tests::pretend(&paths);
+        crate::secrets::for_tests::pretend_windows_service(&paths);
         let (r, out) = setup_with(&paths, "\n\n\n");
         r.unwrap();
         assert!(!out.contains("Where the node keeps its keys"), "{out}");
-        assert!(out.contains("The node keeps its keys in files"), "{out}");
+        assert!(
+            out.contains("Warning: the installed node on Windows"),
+            "{out}"
+        );
         assert!(out.contains("the node's keys are in files now"), "{out}");
         assert_eq!(load(&paths).machine.secret_storage, SecretStorage::File);
         assert_eq!(config_key_at(&paths), (true, false));
@@ -3122,6 +3141,56 @@ mod tests {
         r.unwrap();
         assert!(!out.contains("are in files now"), "{out}");
         assert_eq!(load(&paths).machine.secret_storage, SecretStorage::File);
+    }
+
+    /// Below Landlock ABI 9 the keys stay in files: setup warns and does
+    /// not ask, taking keys left in the keyring into files; `config set`
+    /// refuses the keyring; `config accept` refuses a file that keeps them
+    /// there. Where the ABI cannot be read, setup warns and asks as before.
+    #[test]
+    fn below_landlock_9_the_keys_stay_in_files() {
+        use crate::secrets::{Landlock, for_tests::pretend_landlock};
+        let (_d, paths) = setup(&["home"]);
+        let key = nerve_transport::keys::NodeKey::generate().unwrap();
+        crate::secrets::store_center_key(&paths, SecretStorage::File, "home", &key).unwrap();
+        let set = |to: &str| run(&paths, &["config", "set", "machine.secret_storage", to]);
+        // The ABI cannot be read: a warning, the question, and the keyring
+        // if asked for.
+        pretend_landlock(&paths, Landlock::Unknown);
+        let (r, out) = setup_with(&paths, "\nkeyring\n\n\n");
+        r.unwrap();
+        assert!(
+            out.contains("the Landlock ABI of this kernel cannot be read"),
+            "{out}"
+        );
+        assert!(out.contains("keep the keys in files (file)"), "{out}");
+        assert!(out.contains("Where the node keeps its keys"), "{out}");
+        assert_eq!(load(&paths).machine.secret_storage, SecretStorage::Keyring);
+        // A file changed by hand that keeps them there is not taken.
+        pretend_landlock(&paths, Landlock::Abi(5));
+        let text = std::fs::read_to_string(paths.config_file()).unwrap();
+        std::fs::write(paths.config_file(), format!("{text}# edited\n")).unwrap();
+        let e = run(&paths, &["config", "accept"]).unwrap_err();
+        assert!(e.contains("was not accepted"), "{e}");
+        assert!(e.contains("Landlock ABI 5, below 9"), "{e}");
+        std::fs::write(paths.config_file(), &text).unwrap();
+        // Setup warns, asks nothing about the keys, and moves them out.
+        let (r, out) = setup_with(&paths, "\n\n\n");
+        r.unwrap();
+        assert!(!out.contains("Where the node keeps its keys"), "{out}");
+        assert!(out.contains("Warning: on this kernel (Landlock ABI 5, below 9) a folder mode command cannot run programs from its folders while the node's keys are in the system keyring: the sandbox cannot grant the keyring's access and execute together"), "{out}");
+        assert!(out.contains("the node's keys are in files now"), "{out}");
+        assert_eq!(load(&paths).machine.secret_storage, SecretStorage::File);
+        assert_eq!(config_key_at(&paths), (true, false));
+        assert!(paths.key_file("home").exists());
+        let e = set("keyring").unwrap_err();
+        assert!(e.contains("Landlock ABI 5, below 9"), "{e}");
+        assert!(e.contains("nothing was changed"), "{e}");
+        assert_eq!(load(&paths).machine.secret_storage, SecretStorage::File);
+        // ABI 9 lets them go there again.
+        pretend_landlock(&paths, Landlock::Abi(9));
+        set("keyring").unwrap();
+        assert_eq!(load(&paths).machine.secret_storage, SecretStorage::Keyring);
     }
 
     /// Where no keyring answers, setup offers to install one: no keeps the

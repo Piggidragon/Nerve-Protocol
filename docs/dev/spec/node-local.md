@@ -139,21 +139,37 @@ the config's MAC and its key per center.
 
 The proxy's header values are in the keyring either way (§2).
 
-The installed node on Windows (the service, which runs as `nerve`) keeps its
-keys in files. The Credential Manager is one per account, and the CLI that
-writes the config there runs as an administrator, so a move into the keyring
-would put the keys in that administrator's Credential Manager, out of the
-service's reach. The node counts as installed on the folders `install` uses,
-or when it runs as `nerve`. On it:
+Two kinds of node keep their keys in files whatever is asked:
+
+- The installed node on Windows (the service, which runs as `nerve`). The
+  Credential Manager is one per account, and the CLI that writes the config
+  there runs as an administrator, so a move into the keyring would put the
+  keys in that administrator's Credential Manager, out of the service's
+  reach. The node counts as installed on the folders `install` uses, in any
+  spelling of their case, or when it runs as `nerve`.
+- A Linux node whose kernel has a Landlock ABI below 9. There a `folder`
+  mode command cannot run programs from its folders while the keys are in
+  the keyring: the sandbox cannot grant the keyring's access and execute
+  together (§Modes). Only an ABI that is read counts: where Landlock is
+  missing or off, so that its ABI cannot be read, the keyring is allowed as
+  before, and `setup` warns that it cannot tell.
+
+On such a node:
 
 - A change to `keyring` is refused before anything moves, by whatever
-  writes the config (`config set`, `config accept`, a center's
-  `settings.set`); `node.toml` and the keys stay as they were.
-- `setup` asks no place and asks no keyring; it moves keys left in the
-  keyring into files.
+  writes the config (`config set`, setup, a center's `settings.set`, `config
+  accept`); `node.toml` and the keys stay as they were. A running node does not reload a file
+  another writer saved with `keyring`.
+- `config accept` refuses a file that says `keyring`, even when the keys are
+  in the keyring already, so nothing would move.
+- `setup` does not ask where the keys go and asks no keyring. It prints a
+  warning with the reason, and moves keys left in the keyring into files.
 - `install`, and the node at its start, refuse a `node.toml` that says
   `keyring`. The message names the file and the command that moves the keys
-  into files, run as the account that put them in the keyring.
+  into files, with `--config-dir` and `--state-dir` of the folders it
+  refused, so it works whether or not a service is registered yet. It is run
+  as the account whose keyring holds them: on Windows the administrator
+  that put them there, on Linux the node's user (sudo becomes it).
 
 The node looks for the key that checks `node.toml` where that file says,
 read before its MAC is checked. A file that names another place than the one
@@ -213,11 +229,12 @@ keys: the node's `XDG_RUNTIME_DIR`, `/run/user/<uid>`, a socket that a
 `XDG_DATA_HOME` and in `~/.local/share`. A `folder` mode command then also
 gets a Landlock rule for connecting to socket files
 (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`, ABI 9, Linux 7.1): everywhere but the
-own folders. Where the
-kernel has no ABI 9, `folder` mode offers no `exec` while the keys are in the
-keyring, as on a machine without Landlock, unless commands run as an account
-other than root and the node's own; the bus folder is the user's alone
-(0700). The node logs that at start and when a change of the settings
+own folders. Where the kernel has a Landlock ABI below 9 the keys do not go
+into the keyring at all ([where the keys are](#where-the-keys-are)). The
+gate below stays as a second line: with the keys in the keyring and no
+ABI 9, `folder` mode offers no `exec`, as on a machine without Landlock,
+unless commands run as an account other than root and the node's own; the
+bus folder is the user's alone (0700). The node logs that at start and when a change of the settings
 turns it on, its status says it (`folder_commands_off`, also printed by
 `nerve-node status`), and `config set` and `setup` say it when they move
 the keys into the keyring. A refused command names the keyring as the

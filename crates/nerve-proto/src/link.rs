@@ -356,7 +356,7 @@ mod tests {
             "nerve://pair?center=https%3A%2F%2Fc%2F..&code=a",
             "nerve://pair?code=a",
             "nerve://pair?center=https%3A%2F%2Fc&code=a#frag",
-            "pithagoras-sync://pair?portal=x",
+            "other-app://pair?portal=x",
         ] {
             assert!(PairLink::parse(bad).is_err(), "{bad}");
         }

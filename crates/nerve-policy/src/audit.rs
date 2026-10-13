@@ -233,7 +233,7 @@ impl AuditLog {
 
     /// Something that happened to the config file itself: `refused` (it was
     /// changed outside the owner's path and is not applied), `signed` (the
-    /// node signed a file from before it kept a MAC) or `accepted` (the owner
+    /// node signed a file without a MAC line) or `accepted` (the owner
     /// took a refused file as it is).
     pub fn config(&self, event: &str, file: &Path, reason: &str) -> std::io::Result<()> {
         self.append(&json!({
@@ -470,8 +470,7 @@ mod tests {
     }
 
     /// A move of the log between the reads of its two files leaves no
-    /// entry out and shows none twice, wherever it lands (code review 3 of
-    /// PR #19, finding 2).
+    /// entry out and shows none twice, wherever it lands.
     #[test]
     fn a_move_between_the_reads_drops_no_entries() {
         let lines = |r: std::ops::Range<u64>| -> String {
@@ -566,8 +565,7 @@ mod tests {
     /// A center that makes refused calls as fast as it can does not push
     /// what the node allowed or changed out of the log: refusals have half of
     /// a file, and past that the oldest refusals go first. The log stays
-    /// within twice its size limit and keeps the newest refusals (code
-    /// review 2 of PR #19, finding 3).
+    /// within twice its size limit and keeps the newest refusals.
     #[test]
     fn refusals_do_not_push_out_what_was_allowed() {
         let d = tempfile::tempdir().unwrap();
@@ -621,8 +619,7 @@ mod tests {
 
     /// A rotation that fails (here `audit.jsonl.1` is a directory, so the
     /// rename cannot replace it) does not drop the entry: it is written past
-    /// the bound, and the failure is reported once (code review 2 of PR #19,
-    /// finding 5).
+    /// the bound, and the failure is reported once.
     #[test]
     fn a_failed_rotation_still_writes_the_entry() {
         let d = tempfile::tempdir().unwrap();

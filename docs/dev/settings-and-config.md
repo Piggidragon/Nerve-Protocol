@@ -38,7 +38,7 @@ node refuses it and audits that:
   is older than the one in force.
 
 The owner looks at the file, then runs `nerve-node config accept`. The node
-signs it. A file from before the node kept a MAC (no key, no MAC line) is taken
+signs it. A file without a MAC line (and no key) is taken
 once and signed.
 
 The check holds while `config.key` does. A process that can read or delete it

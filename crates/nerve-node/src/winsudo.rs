@@ -9,8 +9,8 @@
 //!
 //! The switch keeps that password with DPAPI in the config folder
 //! ([`SUDO_FILE`]), as `install` keeps the account's password
-//! (crate::winsvc::SECRET_FILE). The running service has no control pipe
-//! yet: `nerve-node sudo on` checks the password and writes the file, and
+//! (crate::winsvc::SECRET_FILE). The running service has no control pipe:
+//! `nerve-node sudo on` checks the password and writes the file, and
 //! the service takes it at its next start; `nerve-node sudo off` removes it,
 //! and the running service drops the password within a second ([`settle`]).
 //! A center with the settings grant switches the running service directly.

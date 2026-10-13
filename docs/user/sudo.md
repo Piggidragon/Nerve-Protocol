@@ -89,7 +89,7 @@ administrator" gives, not the token UAC gives its other commands. So:
   restarts. `sudo off` removes the file, and `uninstall` removes it too.
 
 Run the commands in a terminal opened with "Run as administrator". Windows
-has no control socket yet, so `sudo on` takes effect when the service starts
+has no control socket, so `sudo on` takes effect when the service starts
 again. `sudo off` takes effect at once: the running service drops the
 password within a second.
 

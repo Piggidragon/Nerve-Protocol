@@ -141,7 +141,7 @@ fn nothing_reaches_the_nodes_own_folders() {
 
 /// The same folders named in ways a plain substring of the absolute path
 /// misses: from the working directory, with `..`, doubled or `.` separators,
-/// and quoted (issue: Windows review of PR #19, finding 2).
+/// and quoted.
 #[test]
 fn the_nodes_own_folders_are_seen_in_every_plain_spelling() {
     for mode in [Mode::Allowlist, Mode::Folder, Mode::User] {
@@ -184,9 +184,9 @@ fn the_nodes_own_folders_are_seen_in_every_plain_spelling() {
     }
 }
 
-/// A Windows node whose folders sit beside a project, as on the review VM of
-/// PR #19: the spellings a PowerShell line names them by are refused in
-/// every mode, through the whole decision.
+/// A Windows node whose folders sit beside a project: the spellings a
+/// PowerShell line names them by are refused in every mode, through the whole
+/// decision.
 #[test]
 fn a_windows_command_line_reaches_no_own_folder() {
     let own = [
@@ -232,8 +232,7 @@ fn a_windows_command_line_reaches_no_own_folder() {
 
 /// A Windows node checks a long command line of drive letters (`a:a:…`)
 /// at once, and refuses one past the length it checks before it looks for
-/// its own folders, with no grant at all (code review 3 of PR #19,
-/// finding 1).
+/// its own folders, with no grant at all.
 #[test]
 fn a_long_windows_command_line_is_checked_at_once() {
     let own = [PathBuf::from("C:\\Users\\u\\nerve-test\\node-config")];

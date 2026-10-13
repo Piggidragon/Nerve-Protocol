@@ -665,8 +665,7 @@ fn named_end(text: &str, name: &str) -> Option<usize> {
 /// `..` only takes segments off the end of the directory, so what a joined
 /// path holds of it is one of its prefixes. What each prefix names is
 /// worked out here once, so each word costs only its own length, however
-/// long the directory and however many words the line has (code review 3
-/// of PR #19, finding 1).
+/// long the directory and however many words the line has.
 struct Base<'c> {
     text: &'c str,
     /// `None` for a directory that `fold_dotdot` would change, or with a
@@ -936,7 +935,7 @@ impl Protected {
     /// and the part of the segment each starts with is matched with what the
     /// segment holds looked up once. So a word of drive letters
     /// (`a:a:a:...`) takes work that grows with its length, not with its
-    /// square (code review 3 of PR #19, finding 1).
+    /// square.
     fn drives_own(&self, word: &str, base: Option<&Base>) -> (Option<&Path>, bool) {
         let b = word.as_bytes();
         let cwd_drive = base.and_then(|c| {
@@ -1363,8 +1362,7 @@ mod tests {
     }
 
     /// The OpenSSH server's files, the registry hives with the password
-    /// hashes and the user's own hive, besides the keys in the profile
-    /// (Windows review of PR #19, finding 1).
+    /// hashes and the user's own hive, besides the keys in the profile.
     #[test]
     fn protects_windows_system_and_credential_files() {
         let p = win_prot();
@@ -1420,8 +1418,7 @@ mod tests {
 
     /// The all-users Startup folder and the all-users PowerShell profiles run
     /// code at every user's logon or in every PowerShell session, like
-    /// `/etc/xdg/autostart` and `/etc/profile` (code review 2 of PR #19,
-    /// finding 6).
+    /// `/etc/xdg/autostart` and `/etc/profile`.
     #[test]
     fn protects_the_windows_all_users_start_up_and_profiles() {
         let p = win_prot();
@@ -1451,8 +1448,7 @@ mod tests {
 
     /// PowerShell 7's home, `%ProgramFiles%\PowerShell\7`: it runs the
     /// all-users profiles and loads the modules there at every start, so a
-    /// write there plants code in every PowerShell 7 session (code review 2,
-    /// WinFolders had no `%ProgramFiles%`).
+    /// write there plants code in every PowerShell 7 session.
     #[test]
     fn protects_the_powershell_7_install_folder() {
         let p = win_prot();
@@ -1543,9 +1539,9 @@ mod tests {
         assert_eq!(p.tool_config(Path::new("/w/src/git.rs")), None);
     }
 
-    /// The spellings of the Windows review of PR #19 (finding 2): forward
-    /// slashes, the home in each shell's form, `..` from the working
-    /// directory, quotes and other case.
+    /// Spellings that could slip past the check: forward slashes,
+    /// the home in each shell's form, `..` from the working directory, quotes
+    /// and other case.
     #[test]
     fn sees_the_own_folders_in_windows_spellings() {
         let p = win_prot();
@@ -1638,7 +1634,7 @@ mod tests {
         }
     }
 
-    /// The spellings of the Windows review of PR #19, round 2 (finding 2):
+    /// More spellings that could slip past the check:
     /// 8.3 short names, a path without a drive, an admin share and
     /// wildcards in a folder's name.
     #[test]
@@ -1703,7 +1699,7 @@ mod tests {
         }
     }
 
-    /// The spellings of the Windows review of PR #19, round 3 (finding 2):
+    /// Still more spellings that could slip past the check:
     /// a trailing dot or space on a name, which Windows drops, a volume or
     /// device path, and a drive-relative path (`C:name`) from the working
     /// directory.
@@ -1789,8 +1785,7 @@ mod tests {
 
     /// PowerShell takes `$PROFILE` and the user's modules from the Documents
     /// known folder, which OneDrive's backup or a redirect moves away from
-    /// the profile: both places are protected (Windows review round 3,
-    /// finding 3).
+    /// the profile: both places are protected.
     #[test]
     fn protects_the_powershell_profiles_in_a_moved_documents_folder() {
         let folders = WinFolders {
@@ -1854,9 +1849,9 @@ mod tests {
         assert!(!segment_matches("node~x", "node-state", true));
     }
 
-    /// The short name Windows gave a real folder reaches it as well (round
-    /// 2 of the Windows review of PR #19, finding 2). Volumes without 8.3
-    /// names give none, and the test then has nothing to check.
+    /// The short name Windows gave a real folder reaches it as well.
+    /// Volumes without 8.3 names give none, and the test then has nothing to
+    /// check.
     #[cfg(windows)]
     #[test]
     fn a_windows_short_name_names_the_own_folder() {
@@ -1927,8 +1922,7 @@ mod tests {
     /// A word of many drive letters (`a:a:a:…`) or many brackets, or many
     /// words from a deep working directory, are looked at in work that
     /// grows with their length, not with its square or with words times
-    /// directory: no copy and no new pass per drive letter or per word
-    /// (code review 3 of PR #19, finding 1).
+    /// directory: no copy and no new pass per drive letter or per word.
     #[test]
     fn long_lines_take_linear_work() {
         let n = 16 * 1024;

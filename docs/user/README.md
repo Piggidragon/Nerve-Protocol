@@ -18,8 +18,9 @@ open port.
 
 1. [Install](install.md) the programs.
 2. [Run the center](center.md) and [connect a harness](harness.md).
-3. [Pair a machine](pairing.md), or on Linux [install the node as a
-   service](service.md) and run `sudo nerve-node setup`.
+3. [Pair a machine](pairing.md), or [install the node as a
+   service](service.md) and run `nerve-node setup` (with `sudo` on Linux,
+   as administrator on Windows).
 4. Allow something with a [mode](modes.md) or a [rule](rules.md). Until you do,
    every call is refused.
 

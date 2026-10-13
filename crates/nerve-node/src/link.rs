@@ -1274,7 +1274,25 @@ fn act_as(
         .transpose()
 }
 
-#[cfg(not(target_os = "linux"))]
+/// [`act_as`] on Windows: the thread impersonates the account, logged on
+/// with its stored password ([`crate::win_user::FsAs`]).
+#[cfg(windows)]
+fn act_as(
+    account: Option<&crate::service::Account>,
+) -> Result<Option<crate::win_user::FsAs>, RpcError> {
+    account
+        .map(|a| {
+            crate::win_user::FsAs::new(a).map_err(|e| {
+                RpcError::new(
+                    ErrorCode::Unavailable,
+                    format!("cannot act as {}: {e}", a.name),
+                )
+            })
+        })
+        .transpose()
+}
+
+#[cfg(not(any(target_os = "linux", windows)))]
 fn act_as(account: Option<&crate::service::Account>) -> Result<Option<()>, RpcError> {
     match account {
         Some(a) => Err(RpcError::new(

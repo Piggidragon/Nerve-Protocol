@@ -1,0 +1,1168 @@
+//! The node as a Windows service (docs/user/service.md): `install`, `update`
+//! and `uninstall`, as the Linux ones in [`crate::service`] are. The service
+//! `nerve-node` runs `nerve-node run` as a local account of its own, `nerve`,
+//! which with SYSTEM and the administrators alone may open the node's config,
+//! keys and state (a DACL of their own, inherited by nothing above). The
+//! commands of a center run as the account that ran `install`
+//! ([`crate::win_user`]); its password is asked once and stored with DPAPI
+//! in the config folder ([`SECRET_FILE`]).
+//!
+//! What these commands do to the machine beyond the node's files (accounts,
+//! the service control manager, DPAPI, a logon) goes through [`WinSystem`],
+//! so the steps run on every platform in the tests; the real calls are
+//! `crate::win_host`.
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+
+use nerve_policy::audit::AuditLog;
+use nerve_policy::settings::SettingsStore;
+
+use crate::service::{
+    Account, Layout, Steps, USER, USER_MARK, Version, asset_name, audit, fetch_release, write_file,
+};
+
+/// The name the service is registered under.
+pub const SERVICE_NAME: &str = "nerve-node";
+/// The file in the config folder that holds the password of the account
+/// the commands run as, encrypted with DPAPI.
+pub const SECRET_FILE: &str = "command-account.dpapi";
+
+/// What `install`, `update` and `uninstall` do to a Windows machine besides
+/// writing the node's files.
+pub trait WinSystem {
+    /// Whether this process runs as an administrator, elevated.
+    fn is_admin(&self) -> bool;
+    fn account(&self, name: &str) -> Result<Option<Account>, String>;
+    /// Makes the node's local account with `password` and the comment
+    /// [`USER_MARK`]: it may log on as a service and start a process with
+    /// another account's token, and may not log on any other way.
+    fn add_account(&self, name: &str, password: &str) -> Result<(), String>;
+    /// Gives the node's account a new password, and its rights again.
+    fn reset_account(&self, name: &str, password: &str) -> Result<(), String>;
+    /// Removes the account, its rights and its profile; what Windows
+    /// keeps of the profile until it restarts, said.
+    fn remove_account(&self, name: &str) -> Result<Option<String>, String>;
+    /// Makes `dir` when it is missing and lets only `owner`, SYSTEM and the
+    /// administrators open it (only the latter two for `None`); what is
+    /// below inherits that. A link in place of the folder is refused.
+    fn secure(&self, dir: &Path, owner: Option<&str>) -> Result<(), String>;
+    /// The service: `None` when it is not registered, else whether it runs.
+    fn service(&self) -> Result<Option<bool>, String>;
+    /// Registers the service, or changes it: `layout.bin` with the folders,
+    /// as `.\nerve` with `password`, started with the machine and again
+    /// after a failure.
+    fn put_service(&self, layout: &Layout, password: &str) -> Result<(), String>;
+    fn start(&self) -> Result<(), String>;
+    /// Stops the service and waits until it has; a stopped one is fine.
+    fn stop(&self) -> Result<(), String>;
+    fn delete_service(&self) -> Result<(), String>;
+    /// Waits until the node the service started runs.
+    fn wait_running(&self, layout: &Layout) -> Result<(), String>;
+    /// Asks for a password, without echo on a console.
+    fn read_password(&self, prompt: &str, out: &mut dyn Write) -> Result<String, String>;
+    /// Logs `name` on with `password` (an error when that fails); then the
+    /// first of `own`, or of what is below, that the logon can open.
+    fn check_logon(
+        &self,
+        name: &str,
+        password: &str,
+        own: &[PathBuf],
+    ) -> Result<Option<PathBuf>, String>;
+    fn protect(&self, data: &[u8]) -> Result<Vec<u8>, String>;
+    fn unprotect(&self, data: &[u8]) -> Result<Vec<u8>, String>;
+    /// The groups of `account` whose members can read every file, the
+    /// node's keys included.
+    fn admin_groups(&self, account: &Account) -> Vec<String>;
+    /// What `<program> --version` prints, run without the administrators'
+    /// rights.
+    fn version_of(&self, program: &Path) -> Result<String, String>;
+    /// Removes the program file and its folder when that is empty; `false`
+    /// when the program runs (this command started from it): it then moves
+    /// aside to a `nerve-node.*.del` beside it and goes at the next restart.
+    fn remove_program(&self, path: &Path) -> Result<bool, String>;
+}
+
+/// The plain text [`SECRET_FILE`] holds: the account's name and password.
+pub fn secret(name: &str, password: &str) -> Vec<u8> {
+    let mut b = name.as_bytes().to_vec();
+    b.push(0);
+    b.extend_from_slice(password.as_bytes());
+    b
+}
+
+/// The name and password in what [`secret`] made.
+pub fn parse_secret(b: &[u8]) -> Option<(String, String)> {
+    let at = b.iter().position(|&c| c == 0)?;
+    let name = std::str::from_utf8(&b[..at]).ok()?;
+    let password = std::str::from_utf8(&b[at + 1..]).ok()?;
+    (!name.is_empty()).then(|| (name.to_string(), password.to_string()))
+}
+
+/// A new password for `nerve`, which nobody types: the service control
+/// manager keeps it. It has the four kinds of characters a complexity
+/// rule asks for.
+fn new_password() -> String {
+    format!("Nn1-{}", nerve_transport::keys::random_token(28))
+}
+
+/// Where `update` puts the new program before it replaces the old one, and
+/// where the old one waits until the new one runs.
+fn staged(bin: &Path) -> PathBuf {
+    bin.with_file_name("nerve-node.new.exe")
+}
+
+fn previous(bin: &Path) -> PathBuf {
+    bin.with_file_name("nerve-node.old.exe")
+}
+
+/// Whether `what` can run here: as an elevated administrator.
+fn supported(sys: &dyn WinSystem, what: &str) -> Result<(), String> {
+    if !sys.is_admin() {
+        return Err(format!(
+            "{what} needs an administrator: run `nerve-node {what}` in a terminal opened with \"Run as administrator\""
+        ));
+    }
+    Ok(())
+}
+
+/// `install`: the account, the folders, the account of the commands and its
+/// password, the program, the service, in that order. `invoker` is the
+/// account that ran install; it becomes the account of the commands unless
+/// one is chosen already. Running it again puts back what is missing and
+/// restarts the service.
+pub fn install(
+    layout: &Layout,
+    sys: &dyn WinSystem,
+    exe: &Path,
+    invoker: &str,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    supported(sys, "install")?;
+    let mut steps = Steps {
+        done: Vec::new(),
+        out,
+    };
+    let r = install_steps(layout, sys, exe, invoker, &mut steps);
+    audit(&layout.paths, "install", &steps.done, &r, steps.out);
+    r?;
+    let _ = writeln!(
+        steps.out,
+        "Next: `nerve-node setup` names the node and pairs it with its first center; `Restart-Service {SERVICE_NAME}` then lets the service take the change."
+    );
+    Ok(())
+}
+
+fn install_steps(
+    layout: &Layout,
+    sys: &dyn WinSystem,
+    exe: &Path,
+    invoker: &str,
+    steps: &mut Steps,
+) -> Result<(), String> {
+    // A running service holds the program and the folders' files.
+    if sys.service()? == Some(true) {
+        sys.stop()?;
+        steps.did(format!(
+            "stopped the service {SERVICE_NAME} to install over it"
+        ));
+    }
+    let password = new_password();
+    match sys.account(USER)? {
+        Some(a) if a.comment == USER_MARK => {
+            sys.reset_account(USER, &password)?;
+            steps.did(format!(
+                "the user {USER} is there already; it has a new password"
+            ));
+        }
+        Some(_) => {
+            return Err(format!(
+                "a user {USER} exists already, and nerve-node install did not make it; the node needs a user of its own"
+            ));
+        }
+        None => {
+            sys.add_account(USER, &password)?;
+            sys.account(USER)?
+                .ok_or_else(|| format!("Windows made no user {USER}"))?;
+            steps.did(format!(
+                "made the user {USER}, which may log on as a service only"
+            ));
+        }
+    }
+    for dir in [
+        &layout.home,
+        &layout.paths.config_dir,
+        &layout.paths.state_dir,
+    ] {
+        sys.secure(dir, Some(USER))?;
+    }
+    steps.did(format!(
+        "{} and {} are open to {USER} and the administrators only",
+        layout.paths.config_dir.display(),
+        layout.paths.state_dir.display()
+    ));
+    command_account(layout, sys, invoker, steps);
+    let real = |p: &Path| std::fs::canonicalize(p).ok();
+    if real(exe).is_some() && real(exe) == real(&layout.bin) {
+        steps.did(format!(
+            "the program is at {} already",
+            layout.bin.display()
+        ));
+    } else {
+        let program = std::fs::read(exe).map_err(|e| format!("{}: {e}", exe.display()))?;
+        write_file(&layout.bin, &program, 0o755)?;
+        steps.did(format!("put the program at {}", layout.bin.display()));
+    }
+    // What an update or an uninstall left behind when it ran from the
+    // program it replaced or removed.
+    let _ = std::fs::remove_file(previous(&layout.bin));
+    let _ = std::fs::remove_file(staged(&layout.bin));
+    if let Some(dir) = layout.bin.parent()
+        && let Ok(entries) = std::fs::read_dir(dir)
+    {
+        for e in entries.flatten() {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with("nerve-node.") && name.ends_with(".del") {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    sys.put_service(layout, &password)?;
+    steps.did(format!(
+        "registered the service {SERVICE_NAME}, which runs as {USER} and starts with the machine"
+    ));
+    sys.start()?;
+    sys.wait_running(layout)?;
+    steps.did(format!("the service {SERVICE_NAME} runs"));
+    Ok(())
+}
+
+/// The account of the commands at install: the one chosen before, else
+/// `invoker`, with its password. A stored password that still logs it on is
+/// kept; else it is asked for. What fails here is said, and the node then
+/// runs no command until install runs again.
+fn command_account(layout: &Layout, sys: &dyn WinSystem, invoker: &str, steps: &mut Steps) {
+    let p = &layout.paths;
+    let r = (|| {
+        let mut store = SettingsStore::open(
+            p.config_file(),
+            p.config_key(),
+            AuditLog::new(p.audit_log()),
+        )?;
+        let chosen = store.config().machine.user.clone();
+        let a = usable_account(sys, chosen.as_deref().unwrap_or(invoker))?;
+        let own = p.own();
+        let file = p.config_dir.join(SECRET_FILE);
+        let stored = std::fs::read(&file)
+            .ok()
+            .and_then(|b| sys.unprotect(&b).ok())
+            .and_then(|b| parse_secret(&b))
+            .filter(|(n, _)| n.eq_ignore_ascii_case(&a.name))
+            .map(|(_, pw)| pw);
+        let (reach, asked) = match stored.map(|pw| sys.check_logon(&a.name, &pw, &own)) {
+            Some(Ok(reach)) => (reach, None),
+            _ => {
+                let pw = sys.read_password(
+                    &format!(
+                        "Password of {}, the account commands from centers run as: ",
+                        a.name
+                    ),
+                    steps.out,
+                )?;
+                let reach = sys.check_logon(&a.name, &pw, &own)?;
+                (reach, Some(pw))
+            }
+        };
+        if let Some(at) = reach {
+            return Err(format!(
+                "{} could open {}, where the node keeps its keys; choose another account",
+                a.name,
+                at.display()
+            ));
+        }
+        if let Some(pw) = &asked {
+            write_file(&file, &sys.protect(&secret(&a.name, pw))?, 0o600)?;
+        }
+        if chosen.is_none() {
+            store
+                .update(|c| {
+                    c.machine.user = Some(a.name.clone());
+                    Ok(())
+                })
+                .map_err(|e| e.to_string())?;
+        }
+        let groups = sys.admin_groups(&a);
+        if !groups.is_empty() {
+            let _ = writeln!(steps.out, "{}", admin_warning(&a.name, &groups));
+        }
+        let who = if chosen.is_some() {
+            "as chosen before"
+        } else {
+            "who ran install"
+        };
+        let password = if asked.is_some() {
+            "its password is stored with DPAPI"
+        } else {
+            "its stored password still works"
+        };
+        Ok::<_, String>(format!("commands run as {}, {who}; {password}", a.name))
+    })();
+    match r {
+        Ok(step) => steps.did(step),
+        Err(e) => steps.did(format!(
+            "no account for commands: {e}; `nerve-node install` asks again"
+        )),
+    }
+}
+
+/// `name` as the account of the commands, or why not: it must be a local
+/// account of this machine and not the node's own.
+fn usable_account(sys: &dyn WinSystem, name: &str) -> Result<Account, String> {
+    if !nerve_policy::config::valid_account_name(name) {
+        return Err(format!("{name:?} is not an account name"));
+    }
+    let a = sys
+        .account(name)?
+        .ok_or_else(|| format!("there is no local account {name}"))?;
+    if a.name.eq_ignore_ascii_case(USER) || a.comment == USER_MARK {
+        return Err(format!(
+            "{name} is the node's own user, which owns its keys; choose another account"
+        ));
+    }
+    Ok(a)
+}
+
+/// The warning for an account of the commands in a group that can read
+/// every file.
+pub fn admin_warning(name: &str, groups: &[String]) -> String {
+    format!(
+        "Warning: {name} is in the group {}. Its commands run without the group's rights (UAC), but UAC is no security boundary: a command from a center can get them back and read the node's keys. Choose an account outside it, or you are responsible for what commands do.",
+        groups.join(", ")
+    )
+}
+
+/// `uninstall`: stops and removes the service, then the folders (deleted
+/// with `purge`, the stored password with them, else kept and open to the
+/// administrators only), the user and the program.
+pub fn uninstall(
+    layout: &Layout,
+    sys: &dyn WinSystem,
+    purge: bool,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    supported(sys, "uninstall")?;
+    let mut steps = Steps {
+        done: Vec::new(),
+        out,
+    };
+    let r = uninstall_steps(layout, sys, purge, &mut steps);
+    // With --purge the log went with the state folder.
+    audit(&layout.paths, "uninstall", &steps.done, &r, steps.out);
+    if r.is_ok() && steps.done.is_empty() {
+        let _ = writeln!(
+            steps.out,
+            "nothing to uninstall: no service, user {USER} or program of the node is here"
+        );
+    }
+    r
+}
+
+fn uninstall_steps(
+    layout: &Layout,
+    sys: &dyn WinSystem,
+    purge: bool,
+    steps: &mut Steps,
+) -> Result<(), String> {
+    if sys.service()?.is_some() {
+        sys.stop()?;
+        sys.delete_service()?;
+        steps.did(format!("stopped and removed the service {SERVICE_NAME}"));
+    }
+    let folders = [
+        &layout.paths.config_dir,
+        &layout.home,
+        &layout.paths.state_dir,
+    ];
+    if purge {
+        for dir in folders {
+            if dir.exists() {
+                std::fs::remove_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+                steps.did(format!("deleted {}", dir.display()));
+            }
+        }
+    } else if folders.iter().any(|d| d.exists()) {
+        for dir in folders.iter().filter(|d| d.exists()) {
+            sys.secure(dir, None)?;
+        }
+        steps.did(format!(
+            "kept {} with the stored password, and {} (only administrators can open them now; `uninstall --purge` deletes them)",
+            layout.paths.config_dir.display(),
+            layout.paths.state_dir.display()
+        ));
+    }
+    match sys.account(USER)? {
+        Some(a) if a.comment == USER_MARK => match sys.remove_account(USER)? {
+            None => steps.did(format!("removed the user {USER} and its profile")),
+            Some(left) => {
+                steps.did(format!("removed the user {USER}"));
+                steps.did(left);
+            }
+        },
+        Some(_) => {
+            let _ = writeln!(
+                steps.out,
+                "left the user {USER} as it is: nerve-node install did not make it"
+            );
+        }
+        None => {}
+    }
+    for left in [staged(&layout.bin), previous(&layout.bin)] {
+        if left.exists() {
+            sys.remove_program(&left)?;
+        }
+    }
+    if layout.bin.exists() {
+        if sys.remove_program(&layout.bin)? {
+            steps.did(format!("removed the program {}", layout.bin.display()));
+        } else {
+            steps.did(format!(
+                "removed the program {}; this command runs from it, so Windows deletes the file at its next start",
+                layout.bin.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// `update`: the new program (the latest release, checked against its
+/// `SHA256SUMS`, or a file the owner gives) replaces the installed one, and
+/// the service restarts. The config, the keys and the audit log are not
+/// touched. A program that does not run here, or is older than the
+/// installed one, is refused; one that does not start is replaced by the
+/// old one again.
+pub async fn update(
+    layout: &Layout,
+    sys: &dyn WinSystem,
+    from: Option<&Path>,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    supported(sys, "update")?;
+    if sys.service()?.is_none() || !layout.bin.is_file() {
+        return Err(
+            "the node is not installed as a service here; `nerve-node install` installs it".into(),
+        );
+    }
+    let mut steps = Steps {
+        done: Vec::new(),
+        out,
+    };
+    let r = update_steps(layout, sys, from, &mut steps).await;
+    audit(&layout.paths, "update", &steps.done, &r, steps.out);
+    r
+}
+
+async fn update_steps(
+    layout: &Layout,
+    sys: &dyn WinSystem,
+    from: Option<&Path>,
+    steps: &mut Steps<'_>,
+) -> Result<(), String> {
+    sys.account(USER)?
+        .filter(|a| a.comment == USER_MARK)
+        .ok_or_else(|| {
+            format!("the user {USER} is missing; `nerve-node install` makes it again")
+        })?;
+    let new = match from {
+        Some(f) => {
+            let b = std::fs::read(f).map_err(|e| format!("{}: {e}", f.display()))?;
+            steps.did(format!("read the new program from {}", f.display()));
+            b
+        }
+        None => {
+            let asset = asset_name()?;
+            let b = fetch_release(&layout.release, &asset).await?;
+            steps.did(format!(
+                "downloaded {asset} from {} and checked it against its SHA256SUMS",
+                layout.release
+            ));
+            b
+        }
+    };
+    let bin = &layout.bin;
+    let old = std::fs::read(bin).map_err(|e| format!("{}: {e}", bin.display()))?;
+    if new == old {
+        steps.did("the installed program is that one already; nothing to update");
+        return Ok(());
+    }
+    let new_path = staged(bin);
+    write_file(&new_path, &new, 0o755)?;
+    let checked = (|| {
+        let said = sys.version_of(&new_path)?;
+        let new_v = Version::parse(&said)
+            .ok_or_else(|| format!("the new program is not nerve-node: it says {said:?}"))?;
+        let old_v = sys.version_of(bin).ok().and_then(|s| Version::parse(&s));
+        if let Some(o) = old_v
+            && new_v < o
+        {
+            return Err(format!(
+                "the new program is nerve-node {new_v}, older than the installed {o}; nothing changed"
+            ));
+        }
+        Ok((old_v, new_v))
+    })();
+    let (old_v, new_v) = match checked {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = std::fs::remove_file(&new_path);
+            return Err(e);
+        }
+    };
+    // A running program cannot be overwritten, but it can be renamed: the
+    // old one moves aside, also when this command runs from it.
+    if let Err(e) = sys.stop() {
+        let _ = std::fs::remove_file(&new_path);
+        return Err(e);
+    }
+    let old_path = previous(bin);
+    let _ = std::fs::remove_file(&old_path);
+    let swap = |from: &Path, to: &Path| {
+        std::fs::rename(from, to)
+            .map_err(|e| format!("{} to {}: {e}", from.display(), to.display()))
+    };
+    // When the new one cannot be put in place, the old one runs on.
+    let moved = swap(bin, &old_path).and_then(|()| {
+        swap(&new_path, bin).inspect_err(|_| {
+            let _ = swap(&old_path, bin);
+        })
+    });
+    if let Err(e) = moved {
+        let _ = std::fs::remove_file(&new_path);
+        let _ = sys.start();
+        return Err(e);
+    }
+    let old_v = old_v.map_or_else(|| "?".to_string(), |v| v.to_string());
+    steps.did(format!("replaced nerve-node {old_v} with {new_v}"));
+    let started = sys.start().and_then(|()| sys.wait_running(layout));
+    if let Err(e) = started {
+        let _ = sys.stop();
+        let back = swap(bin, &new_path)
+            .and_then(|()| swap(&old_path, bin))
+            .and_then(|()| sys.start())
+            .and_then(|()| sys.wait_running(layout));
+        let _ = std::fs::remove_file(&new_path);
+        steps.did(format!("put nerve-node {old_v} back"));
+        return Err(match back {
+            Ok(()) => format!("the new program did not start ({e}); the old one runs again"),
+            Err(e2) => format!(
+                "the new program did not start ({e}), and the old one does not either ({e2})"
+            ),
+        });
+    }
+    steps.did(format!("restarted the service {SERVICE_NAME}"));
+    // This command may run from the old program; then it goes at the next
+    // restart, or with the next update or install.
+    let _ = sys.remove_program(&old_path);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::paths::NodePaths;
+    use std::cell::{Cell, RefCell};
+
+    /// A Windows machine in a temporary folder: accounts, the service, the
+    /// logons and DPAPI are recorded or played.
+    struct Fake {
+        admin: bool,
+        accounts: RefCell<Vec<Account>>,
+        /// The passwords the accounts log on with.
+        passwords: RefCell<Vec<(String, String)>>,
+        /// What the owner types, one password per question.
+        typed: RefCell<Vec<String>>,
+        /// The accounts that can open the node's folders.
+        reaching: RefCell<Vec<String>>,
+        calls: RefCell<Vec<String>>,
+        /// `None`: not registered; else whether it runs.
+        service: Cell<Option<bool>>,
+        /// Whether a node started by the service runs.
+        starts: Cell<bool>,
+        /// The folders and whom they were opened to.
+        secured: RefCell<Vec<(PathBuf, Option<String>)>>,
+    }
+
+    impl Fake {
+        fn new() -> Fake {
+            Fake {
+                admin: true,
+                accounts: RefCell::new(vec![account("alice", 1001, ""), account("bob", 1002, "")]),
+                passwords: RefCell::new(vec![("alice".into(), "alice's".into())]),
+                typed: RefCell::new(Vec::new()),
+                reaching: RefCell::new(Vec::new()),
+                calls: RefCell::new(Vec::new()),
+                service: Cell::new(None),
+                starts: Cell::new(true),
+                secured: RefCell::new(Vec::new()),
+            }
+        }
+
+        fn call(&self, c: impl Into<String>) {
+            self.calls.borrow_mut().push(c.into());
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.borrow().clone()
+        }
+
+        fn types(&self, password: &str) {
+            self.typed.borrow_mut().push(password.into());
+        }
+    }
+
+    fn account(name: &str, uid: u32, comment: &str) -> Account {
+        Account {
+            name: name.into(),
+            uid,
+            gid: uid,
+            comment: comment.into(),
+            home: format!("C:\\Users\\{name}").into(),
+            groups: Vec::new(),
+        }
+    }
+
+    impl WinSystem for Fake {
+        fn is_admin(&self) -> bool {
+            self.admin
+        }
+        fn account(&self, name: &str) -> Result<Option<Account>, String> {
+            Ok(self
+                .accounts
+                .borrow()
+                .iter()
+                .find(|a| a.name.eq_ignore_ascii_case(name))
+                .cloned())
+        }
+        fn add_account(&self, name: &str, password: &str) -> Result<(), String> {
+            assert!(password.len() >= 16);
+            self.call(format!("add {name}"));
+            self.accounts
+                .borrow_mut()
+                .push(account(name, 1010, USER_MARK));
+            Ok(())
+        }
+        fn reset_account(&self, name: &str, _: &str) -> Result<(), String> {
+            self.call(format!("reset {name}"));
+            Ok(())
+        }
+        fn remove_account(&self, name: &str) -> Result<Option<String>, String> {
+            self.call(format!("remove {name}"));
+            self.accounts.borrow_mut().retain(|a| a.name != name);
+            Ok(None)
+        }
+        fn secure(&self, dir: &Path, owner: Option<&str>) -> Result<(), String> {
+            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+            self.secured
+                .borrow_mut()
+                .push((dir.to_path_buf(), owner.map(str::to_string)));
+            Ok(())
+        }
+        fn service(&self) -> Result<Option<bool>, String> {
+            Ok(self.service.get())
+        }
+        fn put_service(&self, layout: &Layout, _: &str) -> Result<(), String> {
+            self.call(format!("put {}", layout.bin.display()));
+            if self.service.get().is_none() {
+                self.service.set(Some(false));
+            }
+            Ok(())
+        }
+        fn start(&self) -> Result<(), String> {
+            self.call("start");
+            self.service.set(Some(true));
+            Ok(())
+        }
+        fn stop(&self) -> Result<(), String> {
+            self.call("stop");
+            if self.service.get().is_some() {
+                self.service.set(Some(false));
+            }
+            Ok(())
+        }
+        fn delete_service(&self) -> Result<(), String> {
+            self.call("delete");
+            self.service.set(None);
+            Ok(())
+        }
+        fn wait_running(&self, _: &Layout) -> Result<(), String> {
+            if self.starts.get() {
+                Ok(())
+            } else {
+                Err("the service stopped at its start".into())
+            }
+        }
+        fn read_password(&self, prompt: &str, out: &mut dyn Write) -> Result<String, String> {
+            let _ = write!(out, "{prompt}");
+            let mut typed = self.typed.borrow_mut();
+            if typed.is_empty() {
+                return Err("no password given".into());
+            }
+            Ok(typed.remove(0))
+        }
+        fn check_logon(
+            &self,
+            name: &str,
+            password: &str,
+            own: &[PathBuf],
+        ) -> Result<Option<PathBuf>, String> {
+            self.call(format!("logon {name}"));
+            if !self
+                .passwords
+                .borrow()
+                .iter()
+                .any(|(n, p)| n == name && p == password)
+            {
+                return Err(format!("the password of {name} is wrong"));
+            }
+            Ok(self
+                .reaching
+                .borrow()
+                .contains(&name.to_string())
+                .then(|| own[0].clone()))
+        }
+        /// Not encryption: what matters is that the file is not the text.
+        fn protect(&self, data: &[u8]) -> Result<Vec<u8>, String> {
+            Ok(data.iter().map(|b| b ^ 0x5a).collect())
+        }
+        fn unprotect(&self, data: &[u8]) -> Result<Vec<u8>, String> {
+            self.protect(data)
+        }
+        fn admin_groups(&self, account: &Account) -> Vec<String> {
+            if account.name == "bob" {
+                vec!["Administrators".into()]
+            } else {
+                Vec::new()
+            }
+        }
+        /// A program here is a text file whose first line is what it says.
+        fn version_of(&self, program: &Path) -> Result<String, String> {
+            let text = std::fs::read_to_string(program).map_err(|e| e.to_string())?;
+            Ok(text.lines().next().unwrap_or_default().to_string())
+        }
+        fn remove_program(&self, path: &Path) -> Result<bool, String> {
+            std::fs::remove_file(path).map_err(|e| e.to_string())?;
+            Ok(true)
+        }
+    }
+
+    fn layout(root: &Path) -> Layout {
+        let data = root.join("ProgramData/Nerve");
+        Layout {
+            unit: PathBuf::new(),
+            bin: root.join("Program Files/Nerve/nerve-node.exe"),
+            paths: NodePaths::new(data.join("config"), data.join("state")),
+            home: data,
+            release: "http://127.0.0.1:1/none".into(),
+        }
+    }
+
+    /// Installs a "program" saying `version`, as alice with her password.
+    fn installed(root: &Path, sys: &Fake, version: &str) -> Layout {
+        let l = layout(root);
+        let exe = root.join("Downloads/nerve-node-x86_64-windows.exe");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, format!("nerve-node {version}\n")).unwrap();
+        sys.types("alice's");
+        install(&l, sys, &exe, "alice", &mut Vec::new()).unwrap();
+        l
+    }
+
+    fn audit_events(l: &Layout) -> Vec<serde_json::Value> {
+        AuditLog::new(l.paths.audit_log())
+            .read()
+            .unwrap()
+            .into_iter()
+            .filter(|v| v["kind"] == "node")
+            .collect()
+    }
+
+    fn user(l: &Layout) -> Option<String> {
+        SettingsStore::peek(&l.paths.config_file(), &l.paths.config_key())
+            .unwrap()
+            .machine
+            .user
+    }
+
+    #[test]
+    fn the_secret_holds_name_and_password() {
+        let s = secret("alice", "a\0b c");
+        assert_eq!(
+            parse_secret(&s),
+            Some(("alice".to_string(), "a\0b c".to_string()))
+        );
+        assert_eq!(parse_secret(b"no separator"), None);
+        assert_eq!(parse_secret(b"\0pw"), None);
+        let p = new_password();
+        assert!(p.len() >= 32 && p.starts_with("Nn1-"), "{p}");
+        assert_ne!(p, new_password());
+    }
+
+    #[test]
+    fn install_registers_the_service_under_its_own_account() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = layout(d.path());
+        let exe = d.path().join("Downloads/nerve-node-x86_64-windows.exe");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "nerve-node 1.0.0\n").unwrap();
+        sys.types("alice's");
+        let mut out = Vec::new();
+        install(&l, &sys, &exe, "alice", &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("made the user nerve"), "{out}");
+        assert!(out.contains("Password of alice"), "{out}");
+        assert!(
+            out.contains(
+                "commands run as alice, who ran install; its password is stored with DPAPI"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("Warning"), "{out}");
+        assert!(out.contains("nerve-node setup"), "{out}");
+        assert_eq!(user(&l).as_deref(), Some("alice"));
+        assert_eq!(
+            sys.calls(),
+            [
+                "add nerve".to_string(),
+                "logon alice".into(),
+                format!("put {}", l.bin.display()),
+                "start".into(),
+            ]
+        );
+        // The folders are nerve's; the program is in place.
+        let secured = sys.secured.borrow().clone();
+        assert_eq!(
+            secured,
+            [&l.home, &l.paths.config_dir, &l.paths.state_dir]
+                .map(|d| (d.clone(), Some(USER.to_string())))
+        );
+        assert_eq!(std::fs::read(&l.bin).unwrap(), b"nerve-node 1.0.0\n");
+        // The password is stored, not in clear.
+        let file = l.paths.config_dir.join(SECRET_FILE);
+        let blob = std::fs::read(&file).unwrap();
+        assert!(!blob.windows(7).any(|w| w == b"alice's"));
+        assert_eq!(
+            parse_secret(&sys.unprotect(&blob).unwrap()),
+            Some(("alice".into(), "alice's".into()))
+        );
+        let a = audit_events(&l);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0]["event"], "install");
+        assert!(a[0].get("error").is_none());
+        assert_eq!(a[0]["steps"].as_array().unwrap().len(), 6, "{}", a[0]);
+        // Again, as another administrator: the account is reset, the
+        // service stopped and started, the account of the commands and its
+        // stored password kept without a question.
+        std::fs::write(&exe, "nerve-node 1.0.1\n").unwrap();
+        // What an uninstall that ran from the program moved aside goes.
+        let aside = l.bin.with_file_name("nerve-node.x1y2.del");
+        std::fs::write(&aside, "old").unwrap();
+        let mut out = Vec::new();
+        install(&l, &sys, &exe, "bob", &mut out).unwrap();
+        assert!(!aside.exists());
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("stopped the service nerve-node"), "{out}");
+        assert!(out.contains("the user nerve is there already"), "{out}");
+        assert!(
+            out.contains(
+                "commands run as alice, as chosen before; its stored password still works"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("Password of"), "{out}");
+        assert_eq!(std::fs::read(&l.bin).unwrap(), b"nerve-node 1.0.1\n");
+        assert!(sys.calls().contains(&"reset nerve".to_string()));
+        assert_eq!(audit_events(&l).len(), 2);
+    }
+
+    #[test]
+    fn install_asks_again_and_refuses_what_could_read_the_keys() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = installed(d.path(), &sys, "1.0.0");
+        // The password changed: the stored one no longer works, and the new
+        // one is asked for and stored.
+        sys.passwords.borrow_mut()[0].1 = "new".into();
+        sys.types("new");
+        let exe = l.bin.clone();
+        let mut out = Vec::new();
+        install(&l, &sys, &exe, "alice", &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("Password of alice"), "{out}");
+        assert!(out.contains("the program is at"), "{out}");
+        let blob = std::fs::read(l.paths.config_dir.join(SECRET_FILE)).unwrap();
+        assert_eq!(
+            parse_secret(&sys.unprotect(&blob).unwrap()).unwrap().1,
+            "new"
+        );
+        // Each of these leaves the node without an account, and install
+        // still does the rest.
+        sys.passwords
+            .borrow_mut()
+            .push(("bob".into(), "bob's".into()));
+        sys.reaching.borrow_mut().push("carol".into());
+        sys.accounts.borrow_mut().push(account("carol", 1003, ""));
+        sys.passwords
+            .borrow_mut()
+            .push(("carol".into(), "carol's".into()));
+        for (who, typed, why) in [
+            ("bob", "wrong", "the password of bob is wrong"),
+            ("ghost", "", "there is no local account ghost"),
+            ("nerve", "", "node's own user"),
+            ("carol", "carol's", "carol could open"),
+            ("a:b", "", "not an account name"),
+        ] {
+            let l = layout(&d.path().join(who.replace(':', "_")));
+            if !typed.is_empty() {
+                sys.types(typed);
+            }
+            let mut out = Vec::new();
+            install(&l, &sys, &exe, who, &mut out).unwrap();
+            let out = String::from_utf8(out).unwrap();
+            assert!(out.contains("no account for commands"), "{who}: {out}");
+            assert!(out.contains(why), "{who}: {out}");
+            assert_eq!(user(&l), None, "{who}");
+            assert!(!l.paths.config_dir.join(SECRET_FILE).exists(), "{who}");
+        }
+        // An administrator is taken, with a warning.
+        let l = layout(&d.path().join("admin"));
+        sys.types("bob's");
+        let mut out = Vec::new();
+        install(&l, &sys, &exe, "bob", &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("Warning: bob is in the group Administrators")
+                && out.contains("UAC is no security boundary"),
+            "{out}"
+        );
+        assert_eq!(user(&l).as_deref(), Some("bob"));
+    }
+
+    #[test]
+    fn install_refuses_a_user_it_did_not_make_and_needs_an_administrator() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        sys.accounts
+            .borrow_mut()
+            .push(account("nerve", 1010, "someone"));
+        let l = layout(d.path());
+        let e = install(&l, &sys, Path::new("x"), "alice", &mut Vec::new()).unwrap_err();
+        assert!(e.contains("did not make it"), "{e}");
+        assert!(!l.bin.exists());
+        assert!(sys.calls().is_empty());
+        let not_admin = Fake {
+            admin: false,
+            ..Fake::new()
+        };
+        for (what, e) in [
+            (
+                "install",
+                install(&l, &not_admin, Path::new("x"), "alice", &mut Vec::new()),
+            ),
+            (
+                "uninstall",
+                uninstall(&l, &not_admin, false, &mut Vec::new()),
+            ),
+        ] {
+            let e = e.unwrap_err();
+            assert!(
+                e.starts_with(&format!("{what} needs an administrator")),
+                "{e}"
+            );
+        }
+        assert!(not_admin.calls().is_empty());
+    }
+
+    #[test]
+    fn uninstall_leaves_no_service_user_or_program_and_keeps_the_folders() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = installed(d.path(), &sys, "1.0.0");
+        std::fs::write(l.paths.config_file(), "version = 3\n").unwrap();
+        sys.secured.borrow_mut().clear();
+        let mut out = Vec::new();
+        uninstall(&l, &sys, false, &mut out).unwrap();
+        assert!(!l.bin.exists());
+        assert_eq!(sys.service.get(), None);
+        assert!(sys.account(USER).unwrap().is_none());
+        assert!(
+            sys.calls()
+                .ends_with(&["stop".into(), "delete".into(), "remove nerve".into()]),
+            "{:?}",
+            sys.calls()
+        );
+        // The config, the stored password and the state stay, open to the
+        // administrators only, and the audit log has both commands.
+        assert_eq!(
+            std::fs::read_to_string(l.paths.config_file()).unwrap(),
+            "version = 3\n"
+        );
+        assert!(l.paths.config_dir.join(SECRET_FILE).exists());
+        assert_eq!(
+            sys.secured.borrow().clone(),
+            [&l.paths.config_dir, &l.home, &l.paths.state_dir].map(|d| (d.clone(), None))
+        );
+        let events: Vec<_> = audit_events(&l)
+            .iter()
+            .map(|v| v["event"].clone())
+            .collect();
+        assert_eq!(events, ["install", "uninstall"]);
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("uninstall --purge"), "{out}");
+        assert!(out.contains("removed the program"), "{out}");
+    }
+
+    #[test]
+    fn uninstall_purge_deletes_the_folders_and_the_password_and_leaves_a_foreign_user() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = installed(d.path(), &sys, "1.0.0");
+        uninstall(&l, &sys, true, &mut Vec::new()).unwrap();
+        for p in [
+            &l.bin,
+            &l.home,
+            &l.paths.config_dir,
+            &l.paths.state_dir,
+            &l.paths.config_dir.join(SECRET_FILE),
+        ] {
+            assert!(!p.exists(), "{p:?}");
+        }
+        assert_eq!(sys.service.get(), None);
+        assert!(sys.account(USER).unwrap().is_none());
+        let mut out = Vec::new();
+        uninstall(&l, &sys, true, &mut out).unwrap();
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .starts_with("nothing to uninstall"),
+        );
+        sys.accounts
+            .borrow_mut()
+            .push(account("nerve", 1010, "someone"));
+        let mut out = Vec::new();
+        uninstall(&l, &sys, true, &mut out).unwrap();
+        assert!(sys.account(USER).unwrap().is_some());
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("left the user nerve")
+        );
+    }
+
+    /// What update must not touch: the config, a key, the stored password
+    /// and the audit log so far.
+    fn kept(l: &Layout) -> Vec<(PathBuf, Vec<u8>)> {
+        [
+            l.paths.config_file(),
+            l.paths.key_file("lab"),
+            l.paths.config_key(),
+            l.paths.config_dir.join(SECRET_FILE),
+            l.paths.audit_log(),
+        ]
+        .into_iter()
+        .map(|p| {
+            let b = std::fs::read(&p).unwrap();
+            (p, b)
+        })
+        .collect()
+    }
+
+    #[tokio::test]
+    async fn update_replaces_the_program_and_keeps_config_keys_and_audit() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = installed(d.path(), &sys, "1.0.0");
+        std::fs::create_dir_all(l.paths.key_file("lab").parent().unwrap()).unwrap();
+        std::fs::write(l.paths.key_file("lab"), "key").unwrap();
+        let before = kept(&l);
+        let new = d.path().join("new.exe");
+        std::fs::write(&new, "nerve-node 1.2.0\n").unwrap();
+        let calls = sys.calls().len();
+        let mut out = Vec::new();
+        update(&l, &sys, Some(&new), &mut out).await.unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("replaced nerve-node 1.0.0 with 1.2.0"),
+            "{out}"
+        );
+        assert_eq!(std::fs::read(&l.bin).unwrap(), b"nerve-node 1.2.0\n");
+        assert_eq!(sys.calls()[calls..], ["stop", "start"]);
+        for (p, b) in before {
+            let now = std::fs::read(&p).unwrap();
+            if p == l.paths.audit_log() {
+                assert!(now.starts_with(&b), "{p:?}");
+            } else {
+                assert_eq!(now, b, "{p:?}");
+            }
+        }
+        assert_eq!(audit_events(&l).last().unwrap()["event"], "update");
+        assert!(!staged(&l.bin).exists() && !previous(&l.bin).exists());
+        // The same program again changes nothing.
+        let calls = sys.calls().len();
+        let mut out = Vec::new();
+        update(&l, &sys, Some(&new), &mut out).await.unwrap();
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("nothing to update")
+        );
+        assert_eq!(sys.calls().len(), calls);
+    }
+
+    #[tokio::test]
+    async fn update_refuses_an_older_or_foreign_program_and_puts_back_one_that_does_not_start() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = installed(d.path(), &sys, "1.2.0");
+        let new = d.path().join("new.exe");
+        for (text, why) in [
+            ("nerve-node 1.1.9\n", "older than the installed 1.2.0"),
+            ("something else\n", "is not nerve-node"),
+        ] {
+            std::fs::write(&new, text).unwrap();
+            let e = update(&l, &sys, Some(&new), &mut Vec::new())
+                .await
+                .unwrap_err();
+            assert!(e.contains(why), "{e}");
+            assert_eq!(std::fs::read(&l.bin).unwrap(), b"nerve-node 1.2.0\n");
+            assert!(!staged(&l.bin).exists());
+        }
+        std::fs::write(&new, "nerve-node 2.0.0\n").unwrap();
+        sys.starts.set(false);
+        let e = update(&l, &sys, Some(&new), &mut Vec::new())
+            .await
+            .unwrap_err();
+        assert!(e.contains("did not start"), "{e}");
+        assert_eq!(std::fs::read(&l.bin).unwrap(), b"nerve-node 1.2.0\n");
+        assert!(!staged(&l.bin).exists() && !previous(&l.bin).exists());
+        let a = audit_events(&l);
+        let last = a.last().unwrap();
+        assert_eq!(last["event"], "update");
+        assert!(last["error"].as_str().unwrap().contains("did not start"));
+        assert!(
+            last["steps"]
+                .to_string()
+                .contains("put nerve-node 1.2.0 back")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_needs_an_installed_node() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let e = update(&layout(d.path()), &sys, None, &mut Vec::new())
+            .await
+            .unwrap_err();
+        assert!(e.contains("not installed"), "{e}");
+    }
+}

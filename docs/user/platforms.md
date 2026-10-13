@@ -10,6 +10,7 @@ behaves the same except where this page says so.
 | `allowlist` and `user` mode run commands | Yes | Yes, in a Job Object, not confined to folders |
 | Sudo switch | Yes | No |
 | Control socket | Yes | No |
+| Install as a service | Yes, with systemd | Yes |
 | Config folder | `~/.config/nerve` | `%USERPROFILE%\.config\nerve` |
 
 ## Linux
@@ -44,7 +45,9 @@ A running node cannot be told about changes. The CLI writes the signed
 that the node runs for a center can therefore change the node's own policy.
 
 Allow commands on Windows only for centers you would also give the
-[settings grant](settings-grant.md).
+[settings grant](settings-grant.md), or [install the node as a
+service](service.md#windows): its commands run as another account, which
+cannot open the node's folders.
 
 ### Windows protected paths
 

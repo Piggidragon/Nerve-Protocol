@@ -200,6 +200,9 @@ pub trait Folders {
         access: Option<Access>,
         own: bool,
     ) -> io::Result<Option<String>>;
+    /// The first file below the folder `dir` with more than one name (hard
+    /// links), and how many it has; `None` for a file or when there is none.
+    fn linked(&mut self, dir: &Path) -> io::Result<Option<(PathBuf, u64)>>;
 }
 
 /// What [`Folders::look`] saw at a path.
@@ -238,6 +241,90 @@ fn open_to_commands(path: &Path, want: &[Grant], record: &[Grant]) -> bool {
     want.iter()
         .chain(record)
         .any(|g| g.access.write && within(path, &g.path) && !within(&g.path, path))
+}
+
+/// Whether commands may write in `path` or below it: it is a folder a
+/// container may write, or lies inside one, by a wanted or a recorded grant.
+/// A change of its list that Windows passes down then reaches what commands
+/// put there.
+fn written_in(path: &Path, want: &[Grant], record: &[Grant]) -> bool {
+    want.iter()
+        .chain(record)
+        .any(|g| g.access.write && within(path, &g.path))
+}
+
+/// Why the list of `path` must not be changed now, if it must not: Windows
+/// passes the change down to everything below `path`, and a file there with
+/// more than one name (a hard link) shares its list with its other names,
+/// which may be in a folder the commands may only write. Commands may have
+/// linked it there, so the change is refused until the link is gone.
+fn held(folders: &mut impl Folders, path: &Path) -> Option<String> {
+    match folders.linked(path) {
+        Ok(None) => None,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Ok(Some((file, names))) => Some(format!(
+            "the node does not change the permissions of {}, since {} below it has {names} names (hard links), and the change would reach them all",
+            path.display(),
+            file.display()
+        )),
+        Err(e) => Some(format!(
+            "the node does not change the permissions of {}, since it cannot check it for hard links: {e}",
+            path.display()
+        )),
+    }
+}
+
+/// The first file below the folder `dir` with more than one name, by
+/// `names`, and how many it has; `None` for a file or when there is none.
+/// Links and junctions below `dir` are not followed.
+#[cfg(any(windows, test))]
+fn linked_below(
+    dir: &Path,
+    names: &dyn Fn(&Path) -> io::Result<u64>,
+) -> io::Result<Option<(PathBuf, u64)>> {
+    // `dir` itself as the change reaches it: through a link of the owner's.
+    if !std::fs::metadata(dir)?.is_dir() {
+        return Ok(None);
+    }
+    let gone = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
+    let mut todo = vec![dir.to_path_buf()];
+    while let Some(d) = todo.pop() {
+        let entries = match std::fs::read_dir(&d) {
+            Ok(e) => e,
+            Err(e) if gone(&e) => continue,
+            Err(e) => return Err(e),
+        };
+        for e in entries {
+            let path = e?.path();
+            let m = match std::fs::symlink_metadata(&path) {
+                Ok(m) => m,
+                Err(e) if gone(&e) => continue,
+                Err(e) => return Err(e),
+            };
+            #[cfg(windows)]
+            let link = {
+                use std::os::windows::fs::MetadataExt;
+                const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+                m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+            };
+            #[cfg(not(windows))]
+            let link = m.file_type().is_symlink();
+            if link {
+                continue;
+            }
+            if m.is_dir() {
+                todo.push(path);
+                continue;
+            }
+            match names(&path) {
+                Ok(n) if n > 1 => return Ok(Some((path, n))),
+                Ok(_) => {}
+                Err(e) if gone(&e) => {}
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// One process changes grants at a time: commands of several centers, and
@@ -377,21 +464,30 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
                     kept.push(Grant { id, ..old.clone() });
                 }
                 Some(_) => replaced.push(old.clone()),
-                None => match folders.set(&old.path, &old.container, None, false) {
-                    Ok(_) => {
-                        changed = true;
-                        out.removed += 1;
+                None => {
+                    // Taking it off passes the change down too.
+                    let hold = written_in(&old.path, want, &record)
+                        .then(|| held(folders, &old.path))
+                        .flatten();
+                    match hold.map_or_else(
+                        || folders.set(&old.path, &old.container, None, false),
+                        |why| Err(io::Error::other(why)),
+                    ) {
+                        Ok(_) => {
+                            changed = true;
+                            out.removed += 1;
+                        }
+                        Err(e) if gone(&e) => changed = true,
+                        Err(e) => {
+                            out.errors.push(format!(
+                                "cannot take the grant off {}: {e}",
+                                old.path.display()
+                            ));
+                            out.stale.push(old.clone());
+                            kept.push(old.clone());
+                        }
                     }
-                    Err(e) if gone(&e) => changed = true,
-                    Err(e) => {
-                        out.errors.push(format!(
-                            "cannot take the grant off {}: {e}",
-                            old.path.display()
-                        ));
-                        out.stale.push(old.clone());
-                        kept.push(old.clone());
-                    }
-                },
+                }
             }
             continue;
         }
@@ -408,22 +504,32 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
                 out.away.push(old.clone());
                 kept.push(old.clone());
             }
-            Ok(Found::At(now)) => match folders.set(&now, &old.container, None, false) {
-                Ok(_) => {
-                    changed = true;
-                    out.removed += 1;
+            Ok(Found::At(now)) => {
+                // Commands wrote in it where it was, or write where it is
+                // now, and taking the grant off passes the change down.
+                let hold = (old.access.write || written_in(&now, want, &record))
+                    .then(|| held(folders, &now))
+                    .flatten();
+                match hold.map_or_else(
+                    || folders.set(&now, &old.container, None, false),
+                    |why| Err(io::Error::other(why)),
+                ) {
+                    Ok(_) => {
+                        changed = true;
+                        out.removed += 1;
+                    }
+                    Err(e) if gone(&e) => changed = true,
+                    Err(e) => {
+                        out.errors.push(format!(
+                            "cannot take the grant off {}, which was {}: {e}",
+                            now.display(),
+                            old.path.display()
+                        ));
+                        out.stale.push(old.clone());
+                        kept.push(old.clone());
+                    }
                 }
-                Err(e) if gone(&e) => changed = true,
-                Err(e) => {
-                    out.errors.push(format!(
-                        "cannot take the grant off {}, which was {}: {e}",
-                        now.display(),
-                        old.path.display()
-                    ));
-                    out.stale.push(old.clone());
-                    kept.push(old.clone());
-                }
-            },
+            }
             Err(e) => {
                 out.errors.push(format!(
                     "cannot find what was {} again to take its grant off: {e}",
@@ -469,6 +575,15 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
             Ok(()) => {
                 changed = true;
                 for w in todo {
+                    // Refused before anything changed: what was there stays.
+                    if let Some(why) = written_in(&w.path, want, &record)
+                        .then(|| held(folders, &w.path))
+                        .flatten()
+                    {
+                        out.errors.push(why);
+                        keep_replaced(w, &mut out, &mut kept);
+                        continue;
+                    }
                     let own = open_to_commands(&w.path, want, &record);
                     match folders.set(&w.path, &w.container, Some(w.access), own) {
                         Ok(id) => kept.push(Grant { id, ..w.clone() }),
@@ -586,6 +701,12 @@ impl Folders for Acls {
         let id = appcontainer::set(path, container, masks, own)?;
         Ok(id.map(|i| i.to_string()))
     }
+
+    fn linked(&mut self, dir: &Path) -> io::Result<Option<(PathBuf, u64)>> {
+        linked_below(dir, &|p| {
+            nerve_sandbox::appcontainer::names(p).map(u64::from)
+        })
+    }
 }
 
 #[cfg(windows)]
@@ -636,6 +757,8 @@ mod tests {
         /// Paths whose object is not one of its own there: a junction to
         /// elsewhere, a file with other names.
         foreign: Vec<PathBuf>,
+        /// Files with a second name (hard links).
+        linked: Vec<PathBuf>,
         /// The `own` of each grant put on, by path.
         asked: Vec<(PathBuf, bool)>,
         /// The volume is not on the machine.
@@ -761,6 +884,13 @@ mod tests {
                 self.on.push((id.clone(), container.into(), a));
             }
             Ok(Some(id))
+        }
+        fn linked(&mut self, dir: &Path) -> io::Result<Option<(PathBuf, u64)>> {
+            Ok(self
+                .linked
+                .iter()
+                .find(|f| within(f, dir) && !within(dir, f))
+                .map(|f| (f.clone(), 2)))
         }
     }
 
@@ -1001,6 +1131,108 @@ mod tests {
         assert!(s.refusal("c1").is_some());
         assert!(recorded(&file).contains(&p));
         assert_eq!(f.on("/w/p"), [("c1".to_string(), p.access)]);
+    }
+
+    /// A change whose list Windows would pass down into a folder commands
+    /// may write in is refused while a file below it has a second name (a
+    /// hard link): a grant put on, one taken off, and one taken off where a
+    /// moved folder is now. The refusal names the folder and the file; a
+    /// refused removal stays recorded and stops the container's commands. A
+    /// folder no command writes in is changed as before.
+    #[test]
+    fn a_hard_link_below_a_writable_folder_stops_the_change() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("grants.json");
+        let mut f = Fake::default();
+        for p in ["/w", "/w/b", "/w/c", "/r", "/r/q"] {
+            f.make(p);
+        }
+        let (w, b) = (grant("c1", "/w", "rw"), grant("c1", "/w/b", "rwx"));
+        let s = sync(&file, &[w.clone(), b.clone()], &mut f);
+        assert!(s.errors.is_empty(), "{s:?}");
+
+        // A grant put on: refused, nothing on, not recorded.
+        f.linked.push("/w/c/s".into());
+        let c = grant("c1", "/w/c", "r");
+        let s = sync(&file, &[w.clone(), b.clone(), c.clone()], &mut f);
+        assert_eq!(s.errors.len(), 1, "{s:?}");
+        assert!(
+            s.errors[0].contains("/w/c/s") && s.errors[0].contains("hard links"),
+            "{s:?}"
+        );
+        assert!(s.errors[0].contains("permissions of /w/c"), "{s:?}");
+        assert!(f.on("/w/c").is_empty(), "{:?}", f.all());
+        assert!(!recorded(&file).contains(&c));
+        assert!(s.stale.is_empty(), "{s:?}");
+
+        // A folder moved inside the writable one, with a link in it: its
+        // grant is not taken off where it is now, and stops the commands.
+        f.linked = vec!["/w/b2/s".into()];
+        f.mv("/w/b", "/w/b2");
+        let s = sync(&file, std::slice::from_ref(&w), &mut f);
+        assert_eq!(s.errors.len(), 1, "{s:?}");
+        assert!(s.errors[0].contains("/w/b2/s"), "{s:?}");
+        assert_eq!(
+            s.stale.iter().map(plain).collect::<Vec<_>>(),
+            std::slice::from_ref(&b)
+        );
+        assert!(s.refusal("c1").is_some());
+        assert_eq!(f.on("/w/b2"), [("c1".to_string(), b.access)]);
+
+        // Taken off at its path: refused as well while the link is there.
+        f.linked = vec!["/w/s".into()];
+        f.mv("/w/b2", "/elsewhere/b2");
+        let s = sync(&file, &[], &mut f);
+        assert!(
+            s.errors
+                .iter()
+                .any(|e| e.contains("/w/s") && e.contains("take the grant off /w")),
+            "{s:?}"
+        );
+        assert!(s.stale.iter().any(|g| g.path == Path::new("/w")), "{s:?}");
+        assert_eq!(f.on("/w"), [("c1".to_string(), w.access)]);
+
+        // Without the link, all goes as before.
+        f.linked.clear();
+        let s = sync(&file, &[], &mut f);
+        assert!(s.errors.is_empty() && s.stale.is_empty(), "{s:?}");
+        assert!(f.all().is_empty(), "{:?}", f.all());
+
+        // Where no command writes, a link below changes nothing.
+        f.linked = vec!["/r/q/s".into()];
+        let r = grant("c2", "/r", "r");
+        let s = sync(&file, std::slice::from_ref(&r), &mut f);
+        assert!(s.errors.is_empty(), "{s:?}");
+        assert_eq!(f.on("/r"), [("c2".to_string(), r.access)]);
+    }
+
+    /// The walk finds a file with a second name below a folder, also deep
+    /// down, and does not follow a link out of the folder.
+    #[cfg(unix)]
+    #[test]
+    fn the_walk_finds_a_file_with_a_second_name() {
+        use std::os::unix::fs::MetadataExt;
+        let d = tempfile::tempdir().unwrap();
+        let (dir, outside) = (d.path().join("dir"), d.path().join("outside"));
+        std::fs::create_dir_all(dir.join("a/b")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(dir.join("a/b/one.txt"), "x").unwrap();
+        std::fs::write(outside.join("secret.txt"), "x").unwrap();
+        std::fs::hard_link(outside.join("secret.txt"), outside.join("again.txt")).unwrap();
+        std::os::unix::fs::symlink(&outside, dir.join("a/link")).unwrap();
+        let names = |p: &Path| std::fs::symlink_metadata(p).map(|m| m.nlink());
+        assert_eq!(linked_below(&dir, &names).unwrap(), None);
+        assert_eq!(
+            linked_below(&dir.join("a/b/one.txt"), &names).unwrap(),
+            None
+        );
+        std::fs::hard_link(outside.join("secret.txt"), dir.join("a/b/s")).unwrap();
+        assert_eq!(
+            linked_below(&dir, &names).unwrap(),
+            Some((dir.join("a/b/s"), 3))
+        );
+        std::fs::remove_file(dir.join("a/b/s")).unwrap();
+        assert_eq!(linked_below(&dir, &names).unwrap(), None);
     }
 
     /// Without a state folder and with nothing wanted, a sync makes neither

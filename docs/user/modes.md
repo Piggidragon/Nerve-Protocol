@@ -127,10 +127,8 @@ folders.
   the entry it inherited. `icacls <path> /reset` gives it the permissions of
   its new place.
 - The flags stay independent: `w` without `r` writes but neither reads nor
-  lists, `x` runs programs and reads files by name but does not list. One
-  case gets past this, listed under "What the AppContainer does not stop": a
-  file a command hard-links out of a `w`-only folder into a folder where it
-  also reads can become readable there.
+  lists, `x` runs programs and reads files by name but does not list. Hard
+  links are the exception, see "What the AppContainer does not stop" below.
 - Deleting and renaming need `r` and `w`, since Windows allows a move with
   the same right as a delete: a command must not move what it cannot read
   to a folder where it can. So in a folder with `w` but not `r`, a command
@@ -166,17 +164,16 @@ folders.
   AppContainer (reading the system folders, the network), and work a command
   gets another program outside the container to do for it, such as a service
   or the task scheduler.
-- Hard links across your flags: a file has one set of permissions for all
-  its names. A command of a pairing that has a `w`-only folder and, on the
-  same drive, a folder it reads and writes can hard-link a file from the
-  `w`-only folder into the read-write one. When the node next writes that
-  read-write folder's permissions — because you added a folder, changed its
-  flags, or a command renamed or remade a folder inside it — Windows passes
-  the read right down to the linked file, and the command can then read it
-  under its first name too. So a `w`-only drop folder whose files the
-  commands must not read belongs on a drive where that pairing has no folder
-  it both reads and writes (hard links do not cross drives). Closing this in
-  the node is tracked in its own issue.
+- A hard link is one file under two names, and both share one access list.
+  When the node grants, changes or moves a folder that commands may write
+  in, Windows passes the change to everything below it, and that includes
+  hard links. Before such a change the node checks the folder and refuses
+  if a file below it has more than one name. A command of the same pairing
+  that runs during the sync can still make a link between the check and the
+  change, and the file it links then gets the folder's rights. Hard links
+  only work within one drive. So put a write-only folder whose files
+  commands must not read on a drive where the pairing has no folder with
+  both read and write.
 
 `nerve-node status` cannot ask the running node on Windows
 ([platforms](platforms.md#no-control-socket)). The node names its

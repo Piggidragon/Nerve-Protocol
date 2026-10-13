@@ -153,11 +153,13 @@ command in an AppContainer, one per center (`nerve_sandbox::appcontainer`):
   command moves only what it reads and writes, and a granted folder only
   out of another one it reads and writes. A move alone makes nothing
   readable that was not. A hard link is the gap: a file has one list for all
-  its names, so a command that hard-links a file out of a `w`-only folder
-  into a folder it reads and writes makes it readable once the node passes
-  that folder's list down (the take-off of a renamed folder, the re-grant of
-  a remade one, an added folder, a flag change). That is an open limit, named
-  in the user docs and tracked in its own issue. Inside a folder with `w` a
+  its names, so a change the node passes down a folder (a grant put on or
+  changed, one taken off, also where a moved folder is now) reaches a file
+  a command linked there from a `w`-only folder. So before such a change on
+  a folder commands may write in, `grants::sync` walks it and refuses while
+  a file below has more than one name (a removal stays stale). A link made
+  between the walk and the change still gets through: a documented limit,
+  with its own issue for a race-free design. Inside a folder with `w` a
   command can put a junction or a hard link where a granted folder was, so a
   grant goes on there only on an object of its own (its final path is its
   path, one name, an inheriting list), through the handle the check opened;

@@ -601,12 +601,12 @@ pub mod appcontainer {
         WinCapabilityInternetClientSid, WinCapabilityPrivateNetworkClientServerSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, ExtendedFileIdType, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_128,
-        FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, FindFirstVolumeW,
-        FindNextVolumeW, FindVolumeClose, GetFileInformationByHandle, GetFileInformationByHandleEx,
-        GetFinalPathNameByHandleW, GetLogicalDrives, GetLongPathNameW, OpenFileById, READ_CONTROL,
-        WRITE_DAC,
+        BY_HANDLE_FILE_INFORMATION, ExtendedFileIdType, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_128, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0,
+        FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FileIdInfo, FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetFileInformationByHandle,
+        GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetLogicalDrives,
+        GetLongPathNameW, OpenFileById, READ_CONTROL, WRITE_DAC,
     };
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
@@ -748,6 +748,21 @@ pub mod appcontainer {
     /// Which object is at `path` now.
     pub fn file_id(path: &Path) -> io::Result<FileId> {
         id_of(&open(path, FILE_READ_ATTRIBUTES)?)
+    }
+
+    /// How many names (hard links) the object at `path` has. A link or
+    /// junction at `path` is opened as itself, not followed.
+    pub fn names(path: &Path) -> io::Result<u32> {
+        use std::os::windows::fs::OpenOptionsExt;
+        let f = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        let mut info = BY_HANDLE_FILE_INFORMATION::default();
+        // SAFETY: an open handle and a buffer for the answer.
+        check(unsafe { GetFileInformationByHandle(f.as_raw_handle(), &mut info) })?;
+        Ok(info.nNumberOfLinks)
     }
 
     /// What is at `path` (its [`FileId`], `None` where the volume gives

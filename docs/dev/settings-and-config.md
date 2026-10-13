@@ -91,10 +91,12 @@ client sends one JSON object per line, `{"method", "params"}`, and gets
 | `config.accept` | Take a refused `node.toml` as it is |
 | `reload` | Reread `node.toml` (only a file the node signed) |
 | `sudo.status`, `sudo.on`, `sudo.off` | The sudo switch |
+| `owner.check` | Nothing; the CLI asks it before `install`, `setup`, `update` and `uninstall` |
 
-`config.write`, `config.accept`, `reload`, `sudo.on` and `sudo.off` are refused
-from a process that runs below a command the node started for a center. On
-Linux an agent cannot change its own policy through the socket.
+`config.write`, `config.accept`, `reload`, `sudo.on`, `sudo.off` and
+`owner.check` are refused from a process that runs below a command the node
+started for a center. On Linux an agent cannot change its own policy through
+the socket, nor install, set up, update or remove the node.
 
 Windows has no control socket and no sandbox. The CLI signs `node.toml` itself,
 so a command the node runs for a center can change the policy. The change

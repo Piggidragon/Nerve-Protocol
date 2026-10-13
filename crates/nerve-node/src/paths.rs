@@ -24,21 +24,29 @@ impl NodePaths {
     }
 
     /// `--config-dir`/`NERVE_CONFIG_DIR`, else `~/.config/nerve`; likewise
-    /// `--state-dir`/`NERVE_STATE_DIR`, else `~/.local/state/nerve`.
+    /// `--state-dir`/`NERVE_STATE_DIR`, else `~/.local/state/nerve`. When
+    /// neither folder is named and `nerve-node install` put the node on this
+    /// machine as a service, both are the installed node's
+    /// ([`crate::service::Layout`]): the commands then reach the node that
+    /// runs.
     pub fn from_args(config_dir: Option<PathBuf>, state_dir: Option<PathBuf>) -> NodePaths {
-        let home = home_dir();
         let env = |k: &str| {
             std::env::var_os(k)
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from)
         };
+        let config_dir = config_dir.or_else(|| env("NERVE_CONFIG_DIR"));
+        let state_dir = state_dir.or_else(|| env("NERVE_STATE_DIR"));
+        if config_dir.is_none() && state_dir.is_none() {
+            let layout = crate::service::Layout::system();
+            if layout.installed() {
+                return layout.paths;
+            }
+        }
+        let home = home_dir();
         NodePaths {
-            config_dir: config_dir
-                .or_else(|| env("NERVE_CONFIG_DIR"))
-                .unwrap_or_else(|| home.join(".config/nerve")),
-            state_dir: state_dir
-                .or_else(|| env("NERVE_STATE_DIR"))
-                .unwrap_or_else(|| home.join(".local/state/nerve")),
+            config_dir: config_dir.unwrap_or_else(|| home.join(".config/nerve")),
+            state_dir: state_dir.unwrap_or_else(|| home.join(".local/state/nerve")),
         }
     }
 

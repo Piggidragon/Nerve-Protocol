@@ -18,6 +18,7 @@ mod link;
 pub mod pair;
 pub mod paths;
 mod secrets;
+pub mod service;
 mod sudo;
 // The walk is Windows-only in use, tested everywhere.
 #[cfg_attr(not(windows), allow(dead_code))]

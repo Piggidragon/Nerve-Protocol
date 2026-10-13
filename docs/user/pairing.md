@@ -93,6 +93,7 @@ answers, the center refuses it and shows an alert.
 
 ## Keep it running
 
-`nerve-node run` runs in the foreground. The node has no built-in service
-install: `install`, `setup`, `update` and `uninstall` only say that they are
-not done. Run `nerve-node run` under your own service manager.
+`nerve-node run` runs in the foreground. On Linux with systemd,
+`sudo nerve-node install` makes it a service that starts with the machine,
+under a user of its own ([service](service.md)). Elsewhere, run
+`nerve-node run` under your own service manager.

@@ -11,6 +11,13 @@ same way and so the owner knows what each setting does.
 | `node.toml` and one key per center | `~/.config/nerve` | `--config-dir`, `NERVE_CONFIG_DIR` |
 | control socket `run/ctl.sock`, audit log `audit.jsonl`, log `log.jsonl`, the config's MAC key `config.key` | `~/.local/state/nerve` | `--state-dir`, `NERVE_STATE_DIR` |
 
+A node that `nerve-node install` put on a Linux machine
+([service](../../user/service.md)) runs as the system user `nerve` with
+`/etc/nerve` and `/var/lib/nerve/state`; without `--config-dir`,
+`--state-dir` and their variables the CLI uses those two folders, and a
+command root runs on them runs as their owner, so that what it writes stays
+the node's.
+
 `node.toml` is written private to the owner (mode 0600 on Unix). The daemon
 refuses to run as root unless `machine.allow_root = true`.
 
@@ -384,10 +391,12 @@ or root may talk to it. Methods:
 | `sudo.status` | | `{sudo: "on"|"off"}` |
 | `sudo.on` | `password` | checks it with `sudo -v` and turns the switch on (§4) |
 | `sudo.off` | | turns the switch off and drops the password |
+| `owner.check` | | changes nothing; the CLI asks it before `install`, `setup`, `update` and `uninstall` |
 
-`config.write`, `config.accept`, `reload`, `sudo.on` and `sudo.off` are
-refused from a process that runs below a command the node started for a
-center, so on Linux an agent cannot change its own policy through the socket.
+`config.write`, `config.accept`, `reload`, `sudo.on`, `sudo.off` and
+`owner.check` are refused from a process that runs below a command the node
+started for a center, so on Linux an agent cannot change its own policy
+through the socket, nor install, set up, update or remove the node.
 **Windows in 0.0.1 has no socket and no sandbox:** the CLI signs node.toml
 itself, so a command the node runs for a center can change the policy, and
 the change applies at the next start. On Windows, allow commands only to
@@ -398,7 +407,9 @@ centers you would also give `settings = write`.
 `<state>/audit.jsonl`, one JSON line per event: settings changes (with old
 and new value), calls allowed or forbidden (a refusal with its reason), and what happened to the config
 file itself (`"kind": "config"`, `event` `refused`, `signed` or `accepted`,
-with the file and the reason). It holds targets (paths, command lines), never
+with the file and the reason), and what the owner did to the node
+(`"kind": "node"`, `event` `install`, `setup`, `update` or `uninstall`, with
+its `steps` and the `error` that stopped it). It holds targets (paths, command lines), never
 file content or output; a target longer than 512 characters is cut there
 and says so; the `audit/decision` event carries the same cut target, and the
 center cuts what it gets the same way and keeps at most 500 decisions and

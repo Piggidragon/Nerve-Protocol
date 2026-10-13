@@ -14,23 +14,22 @@ use nerve_policy::audit::AuditLog;
 use nerve_policy::config::{Access, CapSetting, Folder, SettingsGrant};
 use nerve_policy::{Mode, NodeConfig, SetError, SettingsStore, rules, sudo_command};
 use nerve_proto::link::PairLink;
-use nerve_sandbox::stubs::NOT_DONE;
 
 use crate::daemon::{Daemon, NodeOptions};
 use crate::paths::NodePaths;
+use crate::service::{Host, Layout};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "nerve-node",
     version,
-    about = "Links this machine to its Nerve centers.",
-    after_help = "install, setup, update and uninstall are not done in 0.0.1: they only say so. Start the node by hand with `nerve-node run`."
+    about = "Links this machine to its Nerve centers."
 )]
 pub struct Cli {
-    /// Where node.toml and the keys live [env: NERVE_CONFIG_DIR] [default: ~/.config/nerve]
+    /// Where node.toml and the keys live [env: NERVE_CONFIG_DIR] [default: ~/.config/nerve, or /etc/nerve when installed as a service]
     #[arg(long, global = true)]
     pub config_dir: Option<PathBuf>,
-    /// Where the control socket and the audit log live [env: NERVE_STATE_DIR] [default: ~/.local/state/nerve]
+    /// Where the control socket and the audit log live [env: NERVE_STATE_DIR] [default: ~/.local/state/nerve, or /var/lib/nerve/state when installed as a service]
     #[arg(long, global = true)]
     pub state_dir: Option<PathBuf>,
     #[command(subcommand)]
@@ -88,18 +87,22 @@ pub enum Cmd {
     Panic,
     /// Let the node work again after `panic`.
     Unlock,
-    /// Install the node as a service.
+    /// Install the node as a service that starts with the machine and runs under a user of its own (Linux, as root).
     Install,
-    /// Set up this machine for the node.
-    Setup {
-        /// Create a dedicated user for the node.
-        #[arg(long)]
-        create_user: bool,
+    /// Name the node, pair it with its first center and choose that center's mode, one question at a time.
+    Setup,
+    /// Replace the installed program with the latest release and restart the service; config, keys and audit log stay.
+    Update {
+        /// Take the new program from this file instead of downloading the latest release.
+        #[arg(long, value_name = "FILE")]
+        from: Option<PathBuf>,
     },
-    /// Update the node.
-    Update,
-    /// Remove the node from this machine.
-    Uninstall,
+    /// Stop and remove the service, its user and the program; the config and state folders stay.
+    Uninstall {
+        /// Delete the config and state folders too: the keys, the pairings and the audit log.
+        #[arg(long)]
+        purge: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -344,6 +347,11 @@ pub struct Help {
 /// in a section of its own, and a test fails until it is placed.
 const SECTIONS: &[(&str, &str, &[&[&str]])] = &[
     (
+        "Install and set up",
+        "Run the node as a service under a user of its own (Linux, with sudo), set it up and keep it current.",
+        &[&["install", "uninstall"], &["setup"], &["update"]],
+    ),
+    (
         "Pair and connect",
         "Link this machine to centers and choose how it reaches them.",
         &[&["center"], &["proxy"]],
@@ -364,11 +372,6 @@ const SECTIONS: &[(&str, &str, &[&[&str]])] = &[
         "Run and watch",
         "Start the node, see what it did, and stop it.",
         &[&["run"], &["status"], &["audit"], &["panic", "unlock"]],
-    ),
-    (
-        "Not done yet",
-        "These answer \"not done in 0.0.1\" and change nothing.",
-        &[&["install", "setup", "update", "uninstall"]],
     ),
 ];
 
@@ -872,9 +875,23 @@ const NEXT_START: &str = "takes effect at the next start of the node";
 /// which has no socket in 0.0.1) is only in the file, so the output says
 /// when it counts.
 pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
+    let service = cli.cmd.is_service();
+    if service && (cli.config_dir.is_some() || cli.state_dir.is_some()) {
+        let l = Layout::system();
+        return Err(format!(
+            "install, update and uninstall keep the node's files in {} and {}; --config-dir and --state-dir do not go with them",
+            l.paths.config_dir.display(),
+            l.paths.state_dir.display()
+        ));
+    }
     let paths = NodePaths::from_args(cli.config_dir, cli.state_dir);
-    // The daemon writes the file itself while it runs.
-    let before = (!matches!(cli.cmd, Cmd::Run)).then(|| std::fs::read(paths.config_file()).ok());
+    if !service {
+        crate::service::check_access(&paths)?;
+    }
+    // The daemon writes the file itself while it runs; the service commands
+    // leave it alone (or delete it with the rest).
+    let before =
+        (!matches!(cli.cmd, Cmd::Run) && !service).then(|| std::fs::read(paths.config_file()).ok());
     let r = command(paths.clone(), cli.cmd, out).await;
     if r.is_ok()
         && let Some(before) = before
@@ -884,6 +901,54 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
         let _ = writeln!(out, "the change is in node.toml; it {NEXT_START}");
     }
     r
+}
+
+impl Cmd {
+    /// install, update and uninstall: they work on the installed node, as
+    /// root.
+    fn is_service(&self) -> bool {
+        matches!(
+            self,
+            Cmd::Install | Cmd::Update { .. } | Cmd::Uninstall { .. }
+        )
+    }
+}
+
+/// Run first in `main`, while the process has one thread: a command that
+/// root runs on a node whose folders belong to another user, as the
+/// installed node's belong to `nerve`, runs as that user
+/// ([`crate::service::become_owner`]), so that what it writes stays the
+/// node's. install, update and uninstall keep root.
+pub fn settle_user(cli: &Cli) -> Result<(), String> {
+    if cli.cmd.is_service() {
+        return Ok(());
+    }
+    crate::service::become_owner(&NodePaths::from_args(
+        cli.config_dir.clone(),
+        cli.state_dir.clone(),
+    ))
+}
+
+/// The rule of the other owner commands (docs/dev/spec/node-local.md §5):
+/// nothing a command of a center starts may install, set up, update or
+/// remove the node. The node that runs knows its commands, so it is asked
+/// over its control socket, and refuses a caller below one of them.
+async fn owner_check(paths: &[&NodePaths]) -> Result<(), String> {
+    #[cfg(unix)]
+    for p in paths {
+        match nerve_transport::ctl::call(&p.ctl_socket(), "owner.check", json!({})).await {
+            Ok(_) => {}
+            // No node runs, so no command of one does.
+            Err(e) if e == nerve_transport::ctl::NOT_RUNNING => {}
+            // A node from before this check cannot answer it. It is let
+            // through, as every caller was before the check existed.
+            Err(e) if e.starts_with("unknown method") => {}
+            Err(e) => return Err(e),
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = paths;
+    Ok(())
 }
 
 /// Whether a daemon answers on the control socket; it then took every
@@ -926,7 +991,7 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
         Cmd::Center(CenterCmd::Add { link, name, yes }) => {
             let link = PairLink::parse(&link)?;
             w(out, crate::pair::preview(&link, name.as_deref()));
-            if !yes && !confirm(out)? {
+            if !yes && !confirm(&mut std::io::stdin().lock(), out)? {
                 return Err("not paired".into());
             }
             let e = crate::pair::pair(&paths, &link, name.as_deref()).await?;
@@ -1051,85 +1116,12 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             mode,
             for_hours,
             center,
-        }) => {
-            let m = match mode.as_str() {
-                "allowlist" => Mode::Allowlist,
-                "folder" => Mode::Folder,
-                "user" => Mode::User,
-                other => {
-                    return Err(format!("unknown mode {other} (allowlist, folder or user)"));
-                }
-            };
-            if for_hours.is_some() && m == Mode::Allowlist {
-                return Err("--for only goes with folder or user".into());
-            }
-            // No --for: no limit, and an old one is cleared. The end is a
-            // millisecond count that the config file (a TOML integer) holds.
-            let until = for_hours
-                .map(|h| {
-                    if h == 0 {
-                        return Err("--for must be at least 1 hour".to_string());
-                    }
-                    h.checked_mul(3_600_000)
-                        .and_then(|ms| crate::now_ms().checked_add(ms))
-                        .filter(|t| i64::try_from(*t).is_ok())
-                        .ok_or_else(|| "--for is too large".to_string())
-                })
-                .transpose()?;
-            let name = edit_center(&paths, &center, |e| {
-                e.policy.mode = m;
-                e.policy.until = until;
-                Ok(())
-            })
-            .await?;
-            w(out, format!("{name}: mode {}", m.as_str()));
-            Ok(())
-        }
+        }) => set_mode(&paths, &mode, for_hours, &center, out).await,
         Cmd::Folder(FolderCmd::Add {
             path,
             rights,
             center,
-        }) => {
-            // Nothing is the default, and a folder that grants nothing is
-            // never what was meant, so it is refused.
-            let access = rights.iter().try_fold(Access::NONE, |a, r| {
-                if r.starts_with('+') {
-                    a.change(r)
-                } else {
-                    Err(format!("{r:?}: a new folder takes +r, +w or +x"))
-                }
-            })?;
-            if access.is_none() {
-                return Err(
-                    "name what the center may do in the folder: +r (read), +w (write), +x (run commands)"
-                        .into(),
-                );
-            }
-            let real = resolve_folder(&path)?;
-            let mode = std::cell::Cell::new(Mode::Folder);
-            let name = edit_center(&paths, &center, |e| {
-                e.policy.folders.retain(|f| f.path != real);
-                e.policy.folders.push(Folder {
-                    path: real.clone(),
-                    access,
-                });
-                mode.set(e.policy.mode);
-                Ok(())
-            })
-            .await?;
-            w(out, format!("{name}: folder {real} {}", access.to_chmod()));
-            let mode = mode.get();
-            if mode != Mode::Folder {
-                w(
-                    out,
-                    format!(
-                        "note: folders count in folder mode; {name} is in {} mode (`nerve-node mode set folder`)",
-                        mode.as_str()
-                    ),
-                );
-            }
-            Ok(())
-        }
+        }) => add_folder(&paths, &path, &rights, &center, out).await,
         Cmd::Folder(FolderCmd::Set {
             path,
             changes,
@@ -1244,13 +1236,272 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
         Cmd::Audit { follow, denied } => audit(&paths, follow, denied, out).await,
         Cmd::Proxy(c) => proxy_cmd(&paths, c, out).await,
         Cmd::Sudo(c) => sudo_cmd(&paths, c, out).await,
-        // Not done in 0.0.1: service install, a dedicated user, self-update
-        // and removal.
-        Cmd::Install => Err(format!("install: {NOT_DONE}")),
-        Cmd::Setup { .. } => Err(format!("setup: {NOT_DONE}")),
-        Cmd::Update => Err(format!("update: {NOT_DONE}")),
-        Cmd::Uninstall => Err(format!("uninstall: {NOT_DONE}")),
+        Cmd::Install => {
+            let layout = Layout::system();
+            owner_check(&[&paths, &layout.paths]).await?;
+            let exe = std::env::current_exe().map_err(|e| format!("this program: {e}"))?;
+            crate::service::install(&layout, &Host, &exe, out)
+        }
+        Cmd::Setup => {
+            owner_check(&[&paths]).await?;
+            let mut input = std::io::BufReader::new(std::io::stdin());
+            setup(&paths, &mut input, out).await
+        }
+        Cmd::Update { from } => {
+            let layout = Layout::system();
+            owner_check(&[&layout.paths]).await?;
+            crate::service::update(&layout, &Host, from.as_deref(), out).await
+        }
+        Cmd::Uninstall { purge } => {
+            let layout = Layout::system();
+            owner_check(&[&layout.paths]).await?;
+            crate::service::uninstall(&layout, &Host, purge, out)
+        }
     }
+}
+
+/// `setup`: the first-run steps in the terminal: the node's name, its first
+/// center and that center's mode. Each answer is saved when it is given,
+/// through the same owner path as the other commands (the running node, or
+/// the signed `node.toml`), so setup can stop anywhere and run again; Enter
+/// keeps what is there. The steps done are audited.
+pub async fn setup(
+    paths: &NodePaths,
+    input: &mut dyn BufRead,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    let mut steps = Vec::new();
+    let r = setup_steps(paths, input, out, &mut steps).await;
+    let log = AuditLog::new(paths.audit_log());
+    if let Err(e) = log.node("setup", &steps, r.as_ref().err().map(String::as_str)) {
+        let _ = writeln!(out, "the audit log cannot be written: {e}");
+    }
+    r
+}
+
+async fn setup_steps(
+    paths: &NodePaths,
+    input: &mut dyn BufRead,
+    out: &mut dyn Write,
+    steps: &mut Vec<String>,
+) -> Result<(), String> {
+    let _ = writeln!(out, "Set up this node. Enter keeps what is in [brackets].");
+    let (cfg, _) = read_config(paths).await?;
+    let current = crate::descriptor::node_name(&cfg);
+    let name = ask(
+        input,
+        out,
+        &format!("Name of this node, as centers show it [{current}]: "),
+    )?;
+    if !name.is_empty() && name != current {
+        if !nerve_proto::valid_node_name(&name) {
+            return Err(format!(
+                "{name:?} is not a node name: 1 to 32 characters of a-z, 0-9 and -"
+            ));
+        }
+        edit(paths, |c| {
+            c.node.name = Some(name.clone());
+            Ok(())
+        })
+        .await?;
+        steps.push(format!("named the node {name}"));
+    }
+
+    let link = ask(
+        input,
+        out,
+        "Pairing link from the center's web UI (Enter to skip): ",
+    )?;
+    let mut center = None;
+    if !link.is_empty() {
+        let link = PairLink::parse(&link)?;
+        let _ = writeln!(out, "{}", crate::pair::preview(&link, None));
+        if confirm(input, out)? {
+            let e = crate::pair::pair(paths, &link, None).await?;
+            let _ = writeln!(out, "paired with {} as {}", e.url, e.name);
+            steps.push(format!("paired with {} as {}", e.url, e.name));
+            center = Some(e.name);
+        } else {
+            let _ = writeln!(out, "not paired");
+        }
+    }
+    let center = match center {
+        Some(c) => c,
+        None => match read_config(paths).await?.0.centers.as_slice() {
+            [one] => one.name.clone(),
+            [] => {
+                let _ = writeln!(
+                    out,
+                    "No center is paired; `nerve-node center add '<link>'` pairs one."
+                );
+                return Ok(());
+            }
+            _ => {
+                let _ = writeln!(
+                    out,
+                    "Several centers are paired; `nerve-node mode set <mode> --center <name>` sets the mode of each."
+                );
+                return Ok(());
+            }
+        },
+    };
+
+    let (cfg, _) = read_config(paths).await?;
+    let entry = cfg
+        .center(&center)
+        .ok_or_else(|| format!("no center named {center}"))?;
+    let now = entry.policy.mode_at(crate::now_ms()).as_str().to_string();
+    let mode = ask(
+        input,
+        out,
+        &format!(
+            "Mode for {center}: allowlist (only what allow rules name), folder (the folders you give it) or user (all you may do) [{now}]: "
+        ),
+    )?;
+    let mode = if mode.is_empty() { now.clone() } else { mode };
+    let which = CenterArg {
+        center: Some(center.clone()),
+    };
+    if mode != now {
+        set_mode(paths, &mode, None, &which, out).await?;
+        steps.push(format!("{center}: mode {mode}"));
+    }
+    if mode == "folder" {
+        let folder = ask(
+            input,
+            out,
+            &format!("A folder {center} may use (Enter to skip): "),
+        )?;
+        if !folder.is_empty() {
+            let rights = ask(
+                input,
+                out,
+                "What it may do there: +r reads, +w writes, +x runs commands, as in `+r +x` [+r]: ",
+            )?;
+            let rights: Vec<String> = if rights.is_empty() {
+                vec!["+r".into()]
+            } else {
+                rights.split_whitespace().map(str::to_string).collect()
+            };
+            add_folder(paths, Path::new(&folder), &rights, &which, out).await?;
+            steps.push(format!("{center}: folder {folder} {}", rights.join(" ")));
+        }
+    }
+    let _ = writeln!(
+        out,
+        "Done. `nerve-node rule add allow '<command>'` allows one command; `nerve-node --help` lists the rest."
+    );
+    Ok(())
+}
+
+/// Asks one question; the answer without the line break and the spaces
+/// around it. The end of the input is an error, so setup never loops on it.
+fn ask(input: &mut dyn BufRead, out: &mut dyn Write, question: &str) -> Result<String, String> {
+    let _ = write!(out, "{question}");
+    let _ = out.flush();
+    let mut line = String::new();
+    if input.read_line(&mut line).map_err(|e| e.to_string())? == 0 {
+        let _ = writeln!(out);
+        return Err("stopped: the input ended before every question was answered".into());
+    }
+    Ok(line.trim().to_string())
+}
+
+/// `mode set`, and the mode step of `setup`.
+async fn set_mode(
+    paths: &NodePaths,
+    mode: &str,
+    for_hours: Option<u64>,
+    center: &CenterArg,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    let w = |out: &mut dyn Write, s: String| {
+        let _ = writeln!(out, "{s}");
+    };
+    let m = match mode {
+        "allowlist" => Mode::Allowlist,
+        "folder" => Mode::Folder,
+        "user" => Mode::User,
+        other => {
+            return Err(format!("unknown mode {other} (allowlist, folder or user)"));
+        }
+    };
+    if for_hours.is_some() && m == Mode::Allowlist {
+        return Err("--for only goes with folder or user".into());
+    }
+    // No --for: no limit, and an old one is cleared. The end is a
+    // millisecond count that the config file (a TOML integer) holds.
+    let until = for_hours
+        .map(|h| {
+            if h == 0 {
+                return Err("--for must be at least 1 hour".to_string());
+            }
+            h.checked_mul(3_600_000)
+                .and_then(|ms| crate::now_ms().checked_add(ms))
+                .filter(|t| i64::try_from(*t).is_ok())
+                .ok_or_else(|| "--for is too large".to_string())
+        })
+        .transpose()?;
+    let name = edit_center(paths, center, |e| {
+        e.policy.mode = m;
+        e.policy.until = until;
+        Ok(())
+    })
+    .await?;
+    w(out, format!("{name}: mode {}", m.as_str()));
+    Ok(())
+}
+
+/// `folder add`, and the folder step of `setup`.
+async fn add_folder(
+    paths: &NodePaths,
+    path: &Path,
+    rights: &[String],
+    center: &CenterArg,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    let w = |out: &mut dyn Write, s: String| {
+        let _ = writeln!(out, "{s}");
+    };
+    // Nothing is the default, and a folder that grants nothing is
+    // never what was meant, so it is refused.
+    let access = rights.iter().try_fold(Access::NONE, |a, r| {
+        if r.starts_with('+') {
+            a.change(r)
+        } else {
+            Err(format!("{r:?}: a new folder takes +r, +w or +x"))
+        }
+    })?;
+    if access.is_none() {
+        return Err(
+            "name what the center may do in the folder: +r (read), +w (write), +x (run commands)"
+                .into(),
+        );
+    }
+    let real = resolve_folder(path)?;
+    let mode = std::cell::Cell::new(Mode::Folder);
+    let name = edit_center(paths, center, |e| {
+        e.policy.folders.retain(|f| f.path != real);
+        e.policy.folders.push(Folder {
+            path: real.clone(),
+            access,
+        });
+        mode.set(e.policy.mode);
+        Ok(())
+    })
+    .await?;
+    w(out, format!("{name}: folder {real} {}", access.to_chmod()));
+    let mode = mode.get();
+    if mode != Mode::Folder {
+        w(
+            out,
+            format!(
+                "note: folders count in folder mode; {name} is in {} mode (`nerve-node mode set folder`)",
+                mode.as_str()
+            ),
+        );
+    }
+    Ok(())
 }
 
 /// `nerve-node sudo on|off|status`. The password lives in the running
@@ -1353,14 +1604,11 @@ fn read_password(out: &mut dyn Write, prompt: &str) -> Result<String, String> {
     Ok(password)
 }
 
-fn confirm(out: &mut dyn Write) -> Result<bool, String> {
+fn confirm(input: &mut dyn BufRead, out: &mut dyn Write) -> Result<bool, String> {
     let _ = write!(out, "Pair with this center? [y/N] ");
     let _ = out.flush();
     let mut line = String::new();
-    std::io::stdin()
-        .lock()
-        .read_line(&mut line)
-        .map_err(|e| e.to_string())?;
+    input.read_line(&mut line).map_err(|e| e.to_string())?;
     Ok(matches!(line.trim(), "y" | "Y" | "yes"))
 }
 
@@ -1395,6 +1643,19 @@ fn audit_line(v: &Value) -> String {
     };
     if v.get("changes").is_some() {
         return format!("{}  settings v{} by {}", s("ts"), s("version"), s("by"));
+    }
+    if v["kind"] == "node" {
+        let steps: Vec<String> = v["steps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|s| s.as_str().map(str::to_string))
+            .collect();
+        let mut line = format!("{}  {}: {}", s("ts"), s("event"), steps.join("; "));
+        if let Some(e) = v["error"].as_str() {
+            line.push_str(&format!(" (failed: {e})"));
+        }
+        return line;
     }
     if v["kind"] == "config" {
         return format!(
@@ -2175,18 +2436,106 @@ mod tests {
         assert_eq!(load(&paths).limits.max_running, 16);
     }
 
+    /// install, update and uninstall work on the installed node only, so
+    /// they take no folders; none says it is not done any more.
     #[test]
-    fn stubs_say_not_done() {
+    fn the_service_commands_take_no_folders() {
         let (_d, paths) = setup(&[]);
         for cmd in [
             &["install"][..],
-            &["setup", "--create-user"],
             &["update"],
+            &["update", "--from", "/tmp/x"],
             &["uninstall"],
+            &["uninstall", "--purge"],
         ] {
             let e = run(&paths, cmd).unwrap_err();
-            assert!(e.contains("not done in 0.0.1"), "{e}");
+            assert!(e.contains("--config-dir and --state-dir do not go"), "{e}");
+            assert!(!e.contains("not done"), "{e}");
         }
+        assert!(Cli::try_parse_from(["nerve-node", "setup", "--create-user"]).is_err());
+    }
+
+    fn setup_with(paths: &NodePaths, answers: &str) -> (Result<(), String>, String) {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let mut out = Vec::new();
+        let mut input = std::io::Cursor::new(answers.as_bytes().to_vec());
+        let r = rt.block_on(super::setup(paths, &mut input, &mut out));
+        (r, String::from_utf8(out).unwrap())
+    }
+
+    fn node_audit(paths: &NodePaths) -> Vec<Value> {
+        AuditLog::new(paths.audit_log())
+            .read()
+            .unwrap()
+            .into_iter()
+            .filter(|v| v["kind"] == "node")
+            .collect()
+    }
+
+    /// Setup asks name, center and mode; Enter keeps each, and every answer
+    /// goes through the owner's path into the signed file and the audit log.
+    #[test]
+    fn setup_names_the_node_and_sets_the_first_centers_mode() {
+        let (d, paths) = setup(&["home"]);
+        let dir = d.path().join("work");
+        std::fs::create_dir(&dir).unwrap();
+        // A name, no new center (the one paired is the first), folder mode
+        // with one folder.
+        let answers = format!("lab-pc\n\nfolder\n{}\n+r +x\n", dir.display());
+        let (r, out) = setup_with(&paths, &answers);
+        r.unwrap();
+        assert!(out.contains("Name of this node"), "{out}");
+        assert!(out.contains("home: mode folder"), "{out}");
+        let cfg = SettingsStore::peek(&paths.config_file(), &paths.config_key()).unwrap();
+        assert_eq!(cfg.node.name.as_deref(), Some("lab-pc"));
+        let c = cfg.center("home").unwrap();
+        assert_eq!(c.policy.mode, Mode::Folder);
+        assert_eq!(c.policy.folders.len(), 1);
+        assert_eq!(c.policy.folders[0].access.to_string(), "rx");
+        let a = node_audit(&paths);
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0]["event"], "setup");
+        assert_eq!(a[0]["steps"].as_array().unwrap().len(), 3, "{}", a[0]);
+        // Again with Enter everywhere: nothing changes.
+        let before = std::fs::read(paths.config_file()).unwrap();
+        let (r, _) = setup_with(&paths, "\n\n\n\n");
+        r.unwrap();
+        assert_eq!(std::fs::read(paths.config_file()).unwrap(), before);
+        // A bad name or a short input stops it, and the audit log says so.
+        let (r, _) = setup_with(&paths, "Bad Name\n");
+        assert!(r.unwrap_err().contains("not a node name"));
+        let (r, _) = setup_with(&paths, "");
+        assert!(r.unwrap_err().contains("input ended"));
+        let a = node_audit(&paths);
+        assert!(
+            a.last().unwrap()["error"]
+                .as_str()
+                .unwrap()
+                .contains("input ended")
+        );
+        let shown = run(&paths, &["audit"]).unwrap();
+        assert!(
+            shown.contains("setup: named the node lab-pc; home: mode folder"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn setup_without_a_center_stops_after_the_name() {
+        let (_d, paths) = setup(&[]);
+        let (r, out) = setup_with(&paths, "\n\n");
+        r.unwrap();
+        assert!(out.contains("No center is paired"), "{out}");
+        let (_d, paths) = setup(&["a", "b"]);
+        let (r, out) = setup_with(&paths, "\n\n");
+        r.unwrap();
+        assert!(out.contains("Several centers are paired"), "{out}");
+        // A link that does not parse pairs nothing.
+        let (r, _) = setup_with(&paths, "\nnot a link\n");
+        assert!(r.unwrap_err().contains("nerve://pair"));
     }
 
     #[test]
@@ -2712,10 +3061,10 @@ mod tests {
         assert_eq!(
             names,
             [
+                "Install and set up",
                 "Pair and connect",
                 "What a center may do",
                 "Run and watch",
-                "Not done yet"
             ]
         );
         // A noun is one card with its verbs; `rule` has the three lists as
@@ -2742,7 +3091,9 @@ mod tests {
             rule.verbs[2].usage
         );
         assert_eq!(card("panic / unlock").verbs.len(), 2);
-        assert_eq!(card("install / setup / update / uninstall").verbs.len(), 4);
+        assert_eq!(card("install / uninstall").verbs.len(), 2);
+        assert_eq!(card("setup").verbs.len(), 1);
+        assert_eq!(card("update").verbs.len(), 1);
         // What several verbs take alike is said once, on the card, and what
         // several cards take alike once on the page.
         let folder = card("folder");
@@ -2802,13 +3153,14 @@ mod tests {
         assert_eq!(abouts.len(), n, "two commands say the same");
     }
 
+    /// The help page no longer calls any command not done.
     #[test]
-    fn the_root_help_says_which_commands_are_not_done() {
+    fn no_command_is_called_not_done() {
         let text = Cli::command().render_help().to_string();
-        assert!(
-            text.contains("install, setup, update and uninstall are not done in 0.0.1"),
-            "{text}"
-        );
+        assert!(!text.contains("not done"), "{text}");
+        assert!(text.contains("install"), "{text}");
+        let page = serde_json::to_string(&help()).unwrap();
+        assert!(!page.to_lowercase().contains("not done"), "{page}");
     }
 
     #[test]

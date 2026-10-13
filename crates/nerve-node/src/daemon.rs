@@ -541,6 +541,8 @@ async fn start_ctl(_shared: Arc<Shared>) -> Result<JoinHandle<()>, String> {
 }
 
 /// Methods that change something: refused from below a center's command.
+/// `owner.check` changes nothing itself: the CLI asks it before `install`,
+/// `setup`, `update` and `uninstall`, which change the node.
 #[cfg(unix)]
 const MUTATING: &[&str] = &[
     "config.write",
@@ -548,6 +550,7 @@ const MUTATING: &[&str] = &[
     "reload",
     "sudo.on",
     "sudo.off",
+    "owner.check",
 ];
 
 /// `sudo.on {password}`: the CLI on this machine turns the switch on. The
@@ -593,6 +596,7 @@ pub(crate) fn control(
     let str_of = |k: &str| params.get(k).and_then(Value::as_str).map(str::to_string);
     match method {
         "status" => Reply::Ok(shared.status()),
+        "owner.check" => Reply::Ok(json!({})),
         "sudo.status" => Reply::Ok(json!({"sudo": if shared.sudo_on() { "on" } else { "off" }})),
         "sudo.off" => match shared.sudo_switch_off(nerve_policy::Writer::Local) {
             Ok(v) => Reply::Ok(json!({"sudo": "off", "version": v})),
@@ -778,8 +782,13 @@ mod tests {
         assert!(matches!(r, nerve_transport::ctl::Reply::Err(e) if e.starts_with("refused")));
         let r = control(&s, "status", json!({}), Some(me));
         assert!(matches!(r, nerve_transport::ctl::Reply::Ok(_)));
+        // What install, setup, update and uninstall ask first.
+        let r = control(&s, "owner.check", json!({}), Some(me));
+        assert!(matches!(r, nerve_transport::ctl::Reply::Err(e) if e.starts_with("refused")));
         lock(&s.commands).clear();
         let r = control(&s, "config.write", write, Some(me));
+        assert!(matches!(r, nerve_transport::ctl::Reply::Ok(_)));
+        let r = control(&s, "owner.check", json!({}), Some(me));
         assert!(matches!(r, nerve_transport::ctl::Reply::Ok(_)));
         daemon.stop().await;
     }

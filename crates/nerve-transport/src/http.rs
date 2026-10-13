@@ -255,6 +255,8 @@ pub fn reason(status: u16) -> &'static str {
 #[derive(Debug, Clone)]
 pub struct ClientResponse {
     pub status: u16,
+    /// The `Location` header, which a redirect carries.
+    pub location: Option<String>,
     pub body: Vec<u8>,
 }
 
@@ -276,6 +278,35 @@ pub async fn post_json<S: AsyncRead + AsyncWrite + Unpin>(
     io.write_all(req.as_bytes())
         .await
         .map_err(|e| e.to_string())?;
+    read_response(io, max_body).await
+}
+
+/// Sends `GET target` (a path with its query) over `io` and reads the
+/// answer, its body capped at `max_body`. A redirect is returned as it is,
+/// with its `location`.
+pub async fn get<S: AsyncRead + AsyncWrite + Unpin>(
+    io: &mut S,
+    host: &str,
+    target: &str,
+    max_body: usize,
+) -> Result<ClientResponse, String> {
+    let req = format!(
+        "GET {target} HTTP/1.1\r\nHost: {host}\r\nAccept: */*\r\nConnection: close\r\nUser-Agent: nerve/{}\r\n\r\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    io.write_all(req.as_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    read_response(io, max_body).await
+}
+
+/// Reads an answer to a request sent with `Connection: close`: up to its
+/// `Content-Length`, or to the end of the connection; a chunked body is
+/// decoded.
+async fn read_response<S: AsyncRead + Unpin>(
+    io: &mut S,
+    max_body: usize,
+) -> Result<ClientResponse, String> {
     let (head, rest) = tokio::time::timeout(HEAD_TIMEOUT, read_head(io))
         .await
         .map_err(|_| "timed out waiting for the answer".to_string())??;
@@ -286,17 +317,19 @@ pub async fn post_json<S: AsyncRead + AsyncWrite + Unpin>(
         _ => return Err("malformed HTTP answer".into()),
     }
     let status = resp.code.unwrap_or(0);
-    let len = resp
-        .headers
-        .iter()
-        .find(|h| h.name.eq_ignore_ascii_case("content-length"))
-        .and_then(|h| {
-            std::str::from_utf8(h.value)
-                .ok()?
-                .trim()
-                .parse::<usize>()
-                .ok()
-        });
+    let header = |name: &str| {
+        resp.headers
+            .iter()
+            .find(|h| h.name.eq_ignore_ascii_case(name))
+            .and_then(|h| std::str::from_utf8(h.value).ok())
+            .map(|v| v.trim().to_string())
+    };
+    let len = header("content-length").and_then(|v| v.parse::<usize>().ok());
+    let chunked = header("transfer-encoding").is_some_and(|v| v.eq_ignore_ascii_case("chunked"));
+    let location = header("location");
+    if len.is_some_and(|l| l > max_body) {
+        return Err("answer over the size limit".into());
+    }
     let mut body = rest;
     let mut chunk = [0u8; 8192];
     loop {
@@ -316,9 +349,36 @@ pub async fn post_json<S: AsyncRead + AsyncWrite + Unpin>(
         body.extend_from_slice(&chunk[..n]);
     }
     if let Some(l) = len {
+        if body.len() < l {
+            return Err("the answer ended before its Content-Length".into());
+        }
         body.truncate(l);
+    } else if chunked {
+        body = dechunk(&body).ok_or("malformed chunked answer")?;
     }
-    Ok(ClientResponse { status, body })
+    Ok(ClientResponse {
+        status,
+        location,
+        body,
+    })
+}
+
+/// A chunked body (RFC 9112 §7.1) without its framing; `None` when it is cut
+/// short or malformed. Extensions and trailers are skipped.
+fn dechunk(mut b: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(b.len());
+    loop {
+        let eol = find(b, b"\r\n")?;
+        let size = std::str::from_utf8(&b[..eol]).ok()?;
+        let size = size.split(';').next()?.trim();
+        let n = usize::from_str_radix(size, 16).ok()?;
+        b = &b[eol + 2..];
+        if n == 0 {
+            return Some(out);
+        }
+        out.extend_from_slice(b.get(..n)?);
+        b = b.get(n..)?.strip_prefix(b"\r\n")?;
+    }
 }
 
 #[cfg(test)]
@@ -367,6 +427,53 @@ mod tests {
             .await
             .unwrap();
         assert!(read_request(&mut b, 10).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_reads_lengths_chunks_and_redirects() {
+        async fn answer(raw: &'static [u8], max: usize) -> Result<ClientResponse, String> {
+            let (mut a, mut b) = tokio::io::duplex(64 * 1024);
+            let server = tokio::spawn(async move {
+                let req = read_request(&mut b, 0).await.unwrap();
+                assert_eq!(req.method, "GET");
+                assert_eq!(req.path, "/a/b");
+                assert_eq!(req.query_param("x").as_deref(), Some("1"));
+                b.write_all(raw).await.unwrap();
+            });
+            let r = get(&mut a, "h.example", "/a/b?x=1", max).await;
+            server.await.unwrap();
+            r
+        }
+        let r = answer(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabcdef", 10)
+            .await
+            .unwrap();
+        assert_eq!((r.status, r.body.as_slice()), (200, &b"abc"[..]));
+        let r = answer(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3;x=y\r\nabc\r\n2\r\nde\r\n0\r\n\r\n",
+            64,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.body, b"abcde");
+        let r = answer(
+            b"HTTP/1.1 302 Found\r\nLocation: /next?s=1\r\nContent-Length: 0\r\n\r\n",
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!((r.status, r.location.as_deref()), (302, Some("/next?s=1")));
+        // Too big, cut short, or a broken chunk: an error, not a short body.
+        for raw in [
+            &b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\n\r\n"[..],
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nabc",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nabc",
+        ] {
+            assert!(
+                answer(raw, 10).await.is_err(),
+                "{:?}",
+                String::from_utf8_lossy(raw)
+            );
+        }
     }
 
     #[test]

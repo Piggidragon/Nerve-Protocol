@@ -317,7 +317,7 @@ jobs:
               prerelease=true
               ;;
           esac
-          footer="Static Linux binaries (x86_64, aarch64) and Windows x86_64 programs of \`nerve-center\` and \`nerve-node\`, built from $SHA. SHA256SUMS lists their checksums. They are not signed: Nerve has no update channel yet (docs/dev/releasing.md)."
+          footer="Static Linux binaries (x86_64, aarch64) and Windows x86_64 programs of \`nerve-center\` and \`nerve-node\`, built from $SHA. SHA256SUMS lists their checksums. They are not signed; \`nerve-node update\` checks the one it downloads against SHA256SUMS (docs/user/service.md)."
           # A pre-release's body is the footer alone.
           if [ "$KIND" = release ]; then
             { cat notes/changelog.md; echo; echo "$footer"; } > release-notes.md

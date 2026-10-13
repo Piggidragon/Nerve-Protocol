@@ -26,6 +26,11 @@ Settings changes are lines like `1791834068828  settings v1 by local`. They
 show the new version and who changed it: `local` for `nerve-node`, or the name
 of a center. The log holds the old and the new value of each setting.
 
+`install`, `setup`, `update` and `uninstall` are lines like
+`1791834068828  update: replaced nerve-node 0.0.1 with 0.0.2; restarted the service nerve-node.service`,
+with the steps that were done and the error that stopped the rest, if any
+([service](service.md)).
+
 ## What the log holds
 
 - Targets: paths and command lines, cut at 512 characters.

@@ -14,6 +14,12 @@ fn main() {
     // takes its level from `node.toml`.
     nerve_transport::log::install(nerve_transport::log::Level::Info, true);
     let cli = nerve_node::cli::Cli::parse();
+    // Before the runtime starts threads: root's command on the installed
+    // node runs as the node's user.
+    if let Err(e) = nerve_node::cli::settle_user(&cli) {
+        eprintln!("nerve-node: {e}");
+        std::process::exit(1);
+    }
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()

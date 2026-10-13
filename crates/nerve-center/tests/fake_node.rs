@@ -1071,3 +1071,70 @@ async fn a_node_that_comes_back_over_a_held_link_is_logged_in_order() {
     assert_eq!(old_ended.0, Level::Debug);
     r.stop().await;
 }
+
+/// A node that reboots and redials on the same IP: the old link fails while
+/// the center waits for its answer to the ping. That is one drop, told when it
+/// happened, not a second one that says the link did not answer.
+#[tokio::test]
+async fn an_old_link_that_fails_during_the_ping_is_one_drop() {
+    use nerve_transport::log::{Entry, Level, Query};
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    r.center.log().set_level(Level::Debug);
+    let key = NodeKey::generate().unwrap();
+    assert_eq!(pair(&r, &key, "box-1").await.0, 200);
+    let (old, _) = handshake(&r, &key).await;
+    let c = r.center.clone();
+    let id = key.node_id();
+    wait_for(|| c.link(&id).map(|_| ())).await;
+    // The node comes back; its old connection is reset while the center is
+    // waiting for the old link to answer.
+    let again = handshake(&r, &key);
+    let reset = async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        drop(old);
+    };
+    let ((ws, _), ()) = tokio::join!(again, reset);
+    let _seen = serve(ws, descriptor(&key, "box-1"));
+    wait_for(|| r.center.link(&id).map(|_| ())).await;
+
+    let q = Query {
+        node: Some(id.clone()),
+        limit: 100,
+        ..Query::default()
+    };
+    let got: Vec<Entry> = r
+        .center
+        .log()
+        .entries(&q)
+        .into_iter()
+        .rev()
+        .map(|(_, e)| e)
+        .collect();
+    let drops: Vec<&Entry> = got
+        .iter()
+        .filter(|e| e.msg.starts_with("link dropped"))
+        .collect();
+    assert_eq!(drops.len(), 1, "{got:?}");
+    assert_eq!(drops[0].level, Level::Warn);
+    assert!(
+        drops[0].msg.starts_with("link dropped: the connection"),
+        "{}",
+        drops[0].msg
+    );
+    assert!(
+        !got.iter().any(|e| e.msg.contains("did not answer a ping")),
+        "{got:?}"
+    );
+    // The wait counts from that drop, and the node ends up online.
+    let again = got
+        .iter()
+        .find(|e| e.msg.starts_with("link up again"))
+        .unwrap();
+    assert!(
+        waited(&again.msg) >= Duration::from_secs(2),
+        "{}",
+        again.msg
+    );
+    r.stop().await;
+}

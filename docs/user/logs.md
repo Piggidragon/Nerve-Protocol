@@ -54,8 +54,11 @@ A level includes the ones above it in this table.
 | `debug` | Detail for tracking down a problem |
 
 A change of the level applies to the next line. The log's size is kept even if
-the file cannot be moved aside (another program holds it): then it is started
-again in place.
+the file cannot be moved aside because another program holds it. Then it is
+copied to `log.jsonl.1` and started again in place. If it cannot be copied
+either, it is left as it is, no more lines are written to it, and the program
+says so once on stderr; the center's Log page still shows the lines. The move
+is tried again every 10 seconds.
 
 | Where | How |
 |---|---|

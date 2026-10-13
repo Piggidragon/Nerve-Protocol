@@ -44,9 +44,11 @@ latest entries of both files back into the window, then writes what was logged
 before the file was attached. A line is one write. At 5 MiB the file is moved
 to `log.jsonl.1` and replaces the older one. When it cannot be moved (the
 older file cannot be replaced, or on Windows a reader holds it open), it is
-copied there if that works and started again in place, so it never grows past
-its limit. If it cannot be truncated either, lines are not written to the file
-until it can, and stderr says so once. A file that cannot be opened or written
+copied there and started again in place, so it never grows past its limit. If
+it cannot be copied either, the file is left with its lines and nothing is
+written to it; stderr says so once, and the move is tried again every 10 s
+(`RETRY_AFTER`), not for each line. The same goes for a file that cannot be
+started again after the copy. A file that cannot be opened or written
 is told once on stderr; the program goes on with the window.
 
 The center attaches the file in `Center::open`, after it holds the state
@@ -79,7 +81,9 @@ not the daemon writes no log file.
   flag (`--password x`, `--with-token x`), after a space, unless the next word
   is a placeholder (`(`, `<`, `[`, `{`, `-`, `$`);
 - the credential after `Bearer` or `Basic`, and after `Authorization:` and its
-  scheme, whatever the scheme;
+  scheme, whatever the scheme. A value in quotes goes to the closing quote; a
+  quote that is never closed ends no value, so only the word after it goes and
+  the rest of the message stays;
 - `user:password@` in a URL;
 - the `code` parameter of a pairing link;
 - a harness token, `nrv_` and eight or more characters.
@@ -127,7 +131,9 @@ A node that connects while the center still holds its old link (a half-open
 connection that does not answer the 3 s ping) replaces it: `link_replaced`
 logs the old link as dropped, with how long it had been silent, and starts the
 wait from its last frame. The old link's own end, later, is a debug line and
-sets no wait, since it is no longer the node's link.
+sets no wait, since it is no longer the node's link. `link_replaced` takes
+the old link out of the node's links at once and says nothing if it is not
+there: a link that ended during the 3 s wait has told its drop already.
 
 A pairing code that runs out unused is noticed by `Center::sweep_codes`, which
 the center calls every five seconds, so its line is at most that late. The

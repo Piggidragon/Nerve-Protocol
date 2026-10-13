@@ -750,8 +750,19 @@ impl Center {
 
     /// The node's old link is given up because the node connected again and
     /// the old one did not answer a ping: told as the drop it is, with how long
-    /// it had been silent, which the wait before the new link counts from.
+    /// it had been silent, which the wait before the new link counts from. The
+    /// old link stops being the node's here, so its own end, whenever it
+    /// comes, is detail. A link that ended while the ping was waited for has
+    /// told its drop already, and says nothing more.
     pub(crate) fn link_replaced(&self, old: &Arc<Link>) {
+        {
+            let mut links = self.links.lock().unwrap();
+            let current = links.get(&old.node_id).is_some_and(|l| Arc::ptr_eq(l, old));
+            if !current {
+                return;
+            }
+            links.remove(&old.node_id);
+        }
         let silent = old.silent_for();
         let gone = Instant::now()
             .checked_sub(silent)

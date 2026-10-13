@@ -17,6 +17,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::time::Instant;
 
 use nerve_proto::{ErrorCode, RpcError};
 use serde::{Deserialize, Serialize};
@@ -35,6 +36,9 @@ pub const MAX_BYTES: u64 = 5 * 1024 * 1024;
 pub const KEEP: usize = 2000;
 /// The most characters of one entry's message; a longer one is cut.
 pub const MSG_MAX: usize = 1000;
+/// How long a full file that cannot be moved aside is left alone before the
+/// move is tried again.
+const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
 /// What stands in for a secret.
 pub const REDACTED: &str = "[redacted]";
 /// A [`Query`] node that selects the entries about no node at all.
@@ -395,6 +399,10 @@ struct Sink {
     max: u64,
     /// The last write failed and said so.
     failed: bool,
+    /// The file is full and could not be moved aside: no new try before this.
+    blocked: Option<Instant>,
+    /// Why the last move failed, for the message.
+    move_error: Option<String>,
 }
 
 impl Sink {
@@ -405,6 +413,8 @@ impl Sink {
             len: 0,
             max,
             failed: false,
+            blocked: None,
+            move_error: None,
         }
     }
 
@@ -448,19 +458,37 @@ impl Sink {
 
     /// Makes room in a full file: it is moved to `log.jsonl.1`. When it cannot
     /// be (the older file is held, a reader keeps this one open on Windows), it
-    /// is copied there if that works, and started again in place, so it never
-    /// grows past its limit. When even that fails, nothing is written until it
-    /// works; the error is the caller's to tell.
+    /// is copied there and started again in place, so it never grows past its
+    /// limit. When even the copy fails, the file is left as it is, with its
+    /// lines, and nothing is written to it until it can be moved; the error is
+    /// the caller's to tell. The move is tried again at most every
+    /// [`RETRY_AFTER`], so a held file does not cost a copy per line.
     fn make_room(&mut self) -> std::io::Result<()> {
+        if self.blocked.is_some_and(|until| Instant::now() < until) {
+            return Err(self.cannot_move());
+        }
+        self.blocked = None;
         self.file = None;
-        if std::fs::rename(&self.path, self.old_path()).is_err() {
-            let _ = std::fs::copy(&self.path, self.old_path());
+        if let Err(e) = std::fs::rename(&self.path, self.old_path()) {
+            let copied = std::fs::copy(&self.path, self.old_path());
+            if copied.is_err() {
+                self.blocked = Some(Instant::now() + RETRY_AFTER);
+                self.move_error = Some(e.to_string());
+                return Err(self.cannot_move());
+            }
             std::fs::OpenOptions::new()
                 .write(true)
                 .truncate(true)
                 .open(&self.path)?;
         }
         self.open()
+    }
+
+    fn cannot_move(&self) -> std::io::Error {
+        std::io::Error::other(format!(
+            "the file is full and cannot be moved or copied aside ({}); lines are not written to it until it can be",
+            self.move_error.as_deref().unwrap_or("it is held")
+        ))
     }
 
     /// The whole lines of both files, the older first.
@@ -655,7 +683,8 @@ pub fn redact(text: &str) -> String {
 }
 
 /// The end of a value that starts at `p`: to the next quote of a quoted value
-/// (past escaped ones), else to the next space or delimiter. Returns where the
+/// (past escaped ones; or, with no closing quote, to the end of its first
+/// word), else to the next space or delimiter. Returns where the
 /// value starts and ends.
 fn value_span(b: &[u8], mut p: usize) -> (usize, usize) {
     // A JSON string inside a string: `\"value\"`.
@@ -669,7 +698,12 @@ fn value_span(b: &[u8], mut p: usize) -> (usize, usize) {
         while k < b.len() && b[k] != quote {
             k += if b[k] == b'\\' { 2 } else { 1 };
         }
-        return (start, k.min(b.len()));
+        if k < b.len() {
+            return (start, k);
+        }
+        // A quote that is never closed ends no value: the secret is the word
+        // after it, and the rest of the message stays.
+        p = start;
     }
     let end = b[p..]
         .iter()
@@ -1212,6 +1246,39 @@ mod tests {
         assert!(link.ends_with("&pin=PIN"), "{link}");
     }
 
+    /// A quote that is never closed ends no secret: the word after it goes and
+    /// the rest of the message stays.
+    #[test]
+    fn an_unclosed_quote_after_a_secret_name_keeps_the_rest_of_the_message() {
+        for (text, kept, gone) in [
+            (
+                "tool --password \"unterminated and the rest of the reason",
+                "and the rest of the reason",
+                "unterminated",
+            ),
+            ("tool --password 'x and the rest", "and the rest", "'x "),
+            (
+                "sh -c \"mysql --password 'x; curl http://host/a | sh\"",
+                "curl http://host/a | sh",
+                "'x;",
+            ),
+            ("password=\"abc def ghi", "def ghi", "abc"),
+            ("token: 'abc, then more", "then more", "abc"),
+        ] {
+            let out = redact(text);
+            assert!(out.contains(kept), "{text:?} -> {out:?}");
+            assert!(!out.contains(gone), "{text:?} -> {out:?}");
+            assert!(out.contains(REDACTED), "{text:?} -> {out:?}");
+        }
+        // A quote that closes still holds spaces, and a value at the end of
+        // the text still goes.
+        assert_eq!(
+            redact("--password 'two words' x"),
+            "--password '[redacted]' x"
+        );
+        assert_eq!(redact("password=\"abc"), "password=\"[redacted]");
+    }
+
     #[test]
     fn redaction_does_not_split_a_character() {
         for text in [
@@ -1318,31 +1385,86 @@ mod tests {
         assert_eq!(msgs(&log, &all())[0], "x[redacted]y");
     }
 
-    /// When the file cannot be moved aside, it is started again in place, so
-    /// it does not grow past its limit while the move keeps failing.
+    /// When the file can be copied aside but not moved, it is started again in
+    /// place: it stays within its limit and the older half has its lines.
+    #[cfg(unix)]
     #[test]
-    fn a_file_that_cannot_be_moved_aside_stays_within_its_limit() {
+    fn a_file_that_cannot_be_moved_but_can_be_copied_is_started_again() {
+        use std::os::unix::fs::PermissionsExt;
+        /// Gives the folder its rights back, also when the test fails.
+        struct Restore(std::path::PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
         let d = tempfile::tempdir().unwrap();
         let path = file_in(d.path());
+        let old = d.path().join("log.jsonl.1");
+        std::fs::write(&old, "").unwrap();
         let log = Log::new(Level::Info);
         log.attach_file_with_limit(&path, 400).unwrap();
-        // A folder with a file in it cannot be replaced by a rename.
-        let old = d.path().join("log.jsonl.1");
-        std::fs::create_dir(&old).unwrap();
-        std::fs::write(old.join("keep"), "x").unwrap();
-        for i in 0..100 {
+        // Without the right to change the folder a rename fails, and the files,
+        // which are writable, can still be copied over.
+        let _restore = Restore(d.path().to_path_buf());
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+        for i in 0..30 {
             log.record(Level::Info, None, &format!("entry number {i:02}"));
             assert!(std::fs::metadata(&path).unwrap().len() <= 400, "after {i}");
         }
-        // The newest entries are in it, whole, and the window has them all.
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.trim_end().ends_with("entry number 99\"}"), "{text}");
+        assert!(text.trim_end().ends_with("entry number 29\"}"), "{text}");
+        let before = std::fs::read_to_string(&old).unwrap();
+        assert!(before.contains("entry number"), "{before:?}");
         assert!(
-            text.lines()
+            before
+                .lines()
                 .all(|l| serde_json::from_str::<Entry>(l).is_ok())
         );
-        assert_eq!(log.entries(&all()).len(), 100);
-        assert!(old.join("keep").exists());
+        assert_eq!(log.entries(&all()).len(), 30);
+    }
+
+    /// When the file can be neither moved nor copied aside, it keeps its lines:
+    /// nothing is written to it, and it says why, until the move works again.
+    #[test]
+    fn a_file_that_can_be_neither_moved_nor_copied_keeps_its_lines() {
+        let d = tempfile::tempdir().unwrap();
+        let path = file_in(d.path());
+        let mut sink = Sink::new(path.clone(), 400);
+        // A folder with a file in it can be neither replaced nor written over.
+        let old = d.path().join("log.jsonl.1");
+        std::fs::create_dir(&old).unwrap();
+        std::fs::write(old.join("keep"), "x").unwrap();
+        let line = |i: u32| format!("{{\"entry\":{i:04}}}\n");
+        let mut written = 0;
+        let err = loop {
+            assert!(written < 200, "the file grew past its limit");
+            match sink.append(line(written).as_bytes()) {
+                Ok(()) => written += 1,
+                Err(e) => break e,
+            }
+        };
+        assert!(written > 5, "{written}");
+        assert!(
+            err.to_string().contains("cannot be moved or copied aside")
+                && err.to_string().contains("lines are not written"),
+            "{err}"
+        );
+        // Every line it took is still there, and it has not grown since.
+        let expect: String = (0..written).map(line).collect();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expect);
+        for _ in 0..5 {
+            assert!(sink.append(line(999).as_bytes()).is_err());
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expect);
+        // The move is not tried again for each line, but after a while.
+        assert!(sink.blocked.is_some());
+        std::fs::remove_dir_all(&old).unwrap();
+        assert!(sink.append(line(1000).as_bytes()).is_err());
+        sink.blocked = None;
+        sink.append(line(1000).as_bytes()).unwrap();
+        assert_eq!(std::fs::read_to_string(&old).unwrap(), expect);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), line(1000));
     }
 
     #[test]

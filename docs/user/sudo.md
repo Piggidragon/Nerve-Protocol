@@ -55,8 +55,12 @@ On Linux (Windows differs, see [sudo on Windows](#sudo-on-windows)):
   line break is refused. This holds on Windows too.
 - A `--wildcard` entry covers plain commands only, as a [wildcard allow
   rule](rules.md#what-a-wildcard-covers) does. A line with `@ { } % ' " # , \`
-  or a word such as `powershell`, `cmd`, `iex` or `-Command` runs only when an
-  entry names the whole line. This holds on Windows too.
+  or a word that starts another command, such as `start`, `sh`, `powershell`,
+  `cmd`, `iex` or `-Command`, runs only when an entry names the whole line.
+  So `sudo systemctl *` does not cover `sudo systemctl start nginx`, and
+  `sudo net *` does not cover `sudo net start spooler`: add
+  `nerve-node rule add sudo 'systemctl start nginx'` without `--wildcard`.
+  The refusal names the character or word. This holds on Windows too.
 - It starts the command as that account, as `sudo -S -k -p <prompt> …`, so
   sudo raises it from that account. It runs without the Landlock
   sandbox, which would stop sudo from gaining privileges. It writes the

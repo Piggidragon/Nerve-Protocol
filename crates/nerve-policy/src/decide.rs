@@ -130,19 +130,34 @@ const INNER_COMMAND: &[&str] = &[
 /// [`SHELL_CONTROL`] or [`EXPRESSION`] and no word of [`INNER_COMMAND`].
 /// Otherwise only a rule that names the line exactly covers it.
 fn plain_command(line: &str) -> bool {
+    not_plain(line).is_none()
+}
+
+/// What keeps `line` from being a plain command ([`plain_command`]): the
+/// first such character or word, quoted, for a refusal to name.
+fn not_plain(line: &str) -> Option<String> {
     // Control characters, the Unicode line breaks and the typographic quotes
     // PowerShell reads as quotes.
     let odd =
         |c: char| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{2018}'..='\u{201F}');
-    if line.contains(SHELL_CONTROL) || line.contains(EXPRESSION) || line.contains(odd) {
-        return false;
+    if let Some(c) = line
+        .chars()
+        .find(|c| SHELL_CONTROL.contains(c) || EXPRESSION.contains(c) || odd(*c))
+    {
+        return Some(if c.is_control() {
+            "a line break or control character".into()
+        } else {
+            format!("`{c}`")
+        });
     }
-    !line.split_whitespace().any(|w| {
-        let w = w.to_lowercase();
-        let name = w.rsplit('/').next().unwrap_or(&w);
-        let name = name.strip_suffix(".exe").unwrap_or(name);
-        INNER_COMMAND.contains(&w.as_str()) || INNER_COMMAND.contains(&name)
-    })
+    line.split_whitespace()
+        .find(|w| {
+            let w = w.to_lowercase();
+            let name = w.rsplit('/').next().unwrap_or(&w);
+            let name = name.strip_suffix(".exe").unwrap_or(name);
+            INNER_COMMAND.contains(&w.as_str()) || INNER_COMMAND.contains(&name)
+        })
+        .map(|w| format!("`{w}`"))
 }
 
 fn inside_folder<'f>(folders: &'f [Folder], path: &Path) -> Option<&'f Folder> {
@@ -309,17 +324,23 @@ fn by_sudo_list(policy: &CenterPolicy, call: &Call, reasons: &mut Vec<String>) -
     // The command runs with full rights, so this holds on every platform.
     let cmd = cmd.trim();
     let wild = command_matches(&policy.sudo_allow, cmd);
-    let ok = if plain_command(cmd) {
-        wild
-    } else {
-        let want = crate::rules::escape(cmd);
-        policy.sudo_allow.iter().any(|e| e.trim() == want)
+    let odd = not_plain(cmd);
+    let ok = match &odd {
+        None => wild,
+        Some(_) => {
+            let want = crate::rules::escape(cmd);
+            policy.sudo_allow.iter().any(|e| e.trim() == want)
+        }
     };
     if !ok {
-        reasons.push(if wild {
-            "a sudo command with an expression (@ { } % ' \" # , \\) or a word such as powershell, cmd, iex or -Command runs only when a sudo allow entry names it exactly".into()
-        } else {
-            "a sudo command runs only when the sudo allow list names it".into()
+        reasons.push(match odd.filter(|_| wild) {
+            // Words such as `start` start another command (`cmd /c start`,
+            // PowerShell's `start` is Start-Process), so a wildcard cannot
+            // say what they are handed.
+            Some(what) => format!(
+                "a wildcard sudo entry does not cover a line with {what} (an expression character or a word that starts another command); add an entry for the whole line: nerve-node rule add sudo '<the line>'"
+            ),
+            None => "a sudo command runs only when the sudo allow list names it".into(),
         });
     }
     ok
@@ -1141,16 +1162,23 @@ mod tests {
             p.sudo_allow = vec![crate::rules::sudo_rule_for("sudo choco install", true).unwrap()];
             assert_eq!(p.sudo_allow, ["sudo choco *"]);
             assert_eq!(run(&p, &on, &sudo("sudo choco install git -y")), "allow");
-            for line in [
-                payload,
-                "sudo choco install powershell",
-                "sudo choco install x -EncodedCommand AAAA",
-                "sudo choco install 'a b'",
-                "sudo choco install a,b",
+            // The refusal names what kept the entry from covering the line.
+            for (line, what) in [
+                (payload, "`@`"),
+                ("sudo choco install powershell", "`powershell`"),
+                (
+                    "sudo choco install x -EncodedCommand AAAA",
+                    "`-EncodedCommand`",
+                ),
+                ("sudo choco install 'a b'", "`'`"),
+                ("sudo choco install a,b", "`,`"),
+                ("sudo choco start x", "`start`"),
             ] {
                 let d = decide(&p, &on, &sudo(line));
                 assert!(
-                    matches!(&d, Decision::Forbidden(m) if m.contains("names it exactly")),
+                    matches!(&d, Decision::Forbidden(m)
+                        if m.contains(&format!("does not cover a line with {what}"))
+                            && m.contains("rule add sudo")),
                     "{mode:?} {line}: {d:?}"
                 );
             }

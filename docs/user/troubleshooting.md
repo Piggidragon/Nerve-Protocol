@@ -25,6 +25,7 @@ names its reason.
 | `… belongs to the node itself; no rule or mode reaches it` | The call touched the node's config or state folder | Nothing opens these |
 | `sudo is off on this node` | A `sudo` command, and the switch is off | [Turn sudo on](sudo.md) |
 | `a sudo command runs only when the sudo allow list names it` | The sudo list lacks it | `nerve-node rule add sudo '<command>'` |
+| `a wildcard sudo entry does not cover a line with …` | A wildcard sudo entry covers no expression character (`@ { } % ' " # , \`) and no word that starts another command, such as `start`, `sh` or `powershell` | `nerve-node rule add sudo '<whole line>'`, without `--wildcard` |
 | `disabled: exec.run is off` | `cap set` switched it off or hid it | `nerve-node cap set exec.run on` |
 | `the command line is … bytes, longer than …` | A command over 64 KiB | Use a shorter command |
 | `unavailable` | The machine is offline | Check the link, below |

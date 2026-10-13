@@ -27,6 +27,15 @@ mod sudo;
 mod tree;
 #[cfg(windows)]
 mod win;
+#[cfg(windows)]
+mod win_host;
+#[cfg(windows)]
+pub mod win_service;
+#[cfg(windows)]
+mod win_user;
+// The Windows install steps are Windows-only in use; tested everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod winsvc;
 
 pub use daemon::{Daemon, NodeOptions};
 pub use paths::NodePaths;

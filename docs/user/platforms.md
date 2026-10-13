@@ -10,6 +10,7 @@ behaves the same except where this page says so.
 | `allowlist` and `user` mode run commands | Yes | Yes, in a Job Object, not confined to folders |
 | Sudo switch | Yes | No |
 | Control socket | Yes | No |
+| Install as a service | Yes, with systemd | Yes |
 | Config folder | `~/.config/nerve` | `%USERPROFILE%\.config\nerve` |
 
 ## Linux
@@ -44,9 +45,10 @@ behaves the same except where this page says so.
 A node with full rights hands those rights to every command a center runs:
 root on Linux, an elevated administrator token on Windows. On Linux a root
 node can run the commands as the account `machine.user` names instead; on
-Windows `machine.user` is not supported and commands always run with the
-node's own token. So on both platforms it is refused at start unless you
-allow it:
+Windows an elevated node cannot start a command as another account, so
+commands run with the node's own token (`machine.user` there is for the
+[installed service](service.md#windows)). So on both platforms it is refused
+at start unless you allow it:
 
 ```
 nerve-node config set machine.allow_root true
@@ -76,7 +78,9 @@ A running node cannot be told about changes. The CLI writes the signed
 that the node runs for a center can therefore change the node's own policy.
 
 Allow commands on Windows only for centers you would also give the
-[settings grant](settings-grant.md).
+[settings grant](settings-grant.md), or [install the node as a
+service](service.md#windows): its commands run as another account, which
+cannot open the node's folders.
 
 ### Windows protected paths
 

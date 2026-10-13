@@ -34,6 +34,11 @@ Names are matched without regard to case.
 - It does not cover what a command reads or writes by itself. In `folder` mode
   on Linux, a command's Landlock rules leave protected paths out. In `user`
   mode a command runs as you, without a sandbox, and can reach them.
+- It does not cover what a command asks another program for. With the keys
+  in the system keyring, a command that asks the keyring (`secret-tool`,
+  `busctl --user`, `gdbus`, `dbus-send`) names no protected path, so an
+  allow rule for it reaches the node's keys
+  ([keys](config.md#where-the-node-keeps-its-keys)).
 
 ## The node's own folders
 

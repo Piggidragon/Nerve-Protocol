@@ -14,6 +14,7 @@ use tokio::task::JoinHandle;
 #[cfg(unix)]
 use nerve_policy::SetError;
 use nerve_policy::audit::{AuditLog, Change, Entry, diff};
+use nerve_policy::config::SecretStorage;
 use nerve_policy::{NodeConfig, SettingsStore};
 use nerve_proto::Message;
 use nerve_proto::msg::{Topic, method};
@@ -43,6 +44,9 @@ pub struct NodeOptions {
     /// token), instead of asking the system. A test sets it: the same test
     /// must pass for a developer who runs it elevated.
     pub full_rights: Option<bool>,
+    /// How commands can be confined, instead of asking the kernel. A test
+    /// sets it, to stand for a kernel it does not run on.
+    pub confinement: Option<Confinement>,
 }
 
 impl NodeOptions {
@@ -54,6 +58,7 @@ impl NodeOptions {
             ctl: true,
             log: nerve_transport::log::global(),
             full_rights: None,
+            confinement: None,
         }
     }
 }
@@ -178,6 +183,10 @@ pub(crate) struct Shared {
     pub commands: Mutex<HashMap<u32, String>>,
     /// Commands running now, over all centers (`limits.max_running`).
     pub running: AtomicUsize,
+    /// The `folder` mode commands running now that Landlock does not keep
+    /// off the session bus ([`Shared::open_to_bus`]); the store's secrets
+    /// refuse to move the keys into the keyring while there are any.
+    pub open_to_bus: Arc<AtomicUsize>,
     pub stop: watch::Sender<bool>,
     /// The log, to keep the sudo password out of it.
     pub log: Option<Arc<Log>>,
@@ -191,6 +200,9 @@ pub(crate) struct Shared {
     /// The last account looked up for `machine.user`, and when: every call
     /// of a center needs it, and a lookup starts two programs.
     pub account_cache: Mutex<Option<(String, std::time::Instant, Option<crate::service::Account>)>>,
+    /// Whether the log said that the keyring turned folder mode's commands
+    /// off ([`Shared::tell_confinement`]).
+    pub told_keyring: std::sync::atomic::AtomicBool,
 }
 
 impl Shared {
@@ -236,6 +248,7 @@ impl Shared {
 
     pub fn bump(&self) {
         self.changed.send_modify(|v| *v += 1);
+        self.tell_confinement(&self.config());
     }
 
     /// Reads the config file again because the owner asked (SIGHUP, the
@@ -256,9 +269,88 @@ impl Shared {
         r
     }
 
-    /// Whether commands may run confined (Landlock and the shim's host).
-    pub fn confined(&self) -> bool {
-        self.confinement.available() && self.exe.is_some()
+    /// The folders no center reaches, whatever its policy: the node's own,
+    /// and with its keys in the keyring on Linux, the places that reach
+    /// them there (crate::paths::keyring_places). Not called while the
+    /// store is locked when `cfg` comes from [`Shared::config`].
+    pub fn own(&self, cfg: &NodeConfig) -> Vec<PathBuf> {
+        let own = self.paths.own();
+        #[cfg(target_os = "linux")]
+        if cfg.machine.secret_storage == SecretStorage::Keyring {
+            let places =
+                crate::paths::keyring_places(&self.home, nerve_transport::net::euid(), |k| {
+                    std::env::var_os(k)
+                });
+            return [own, places].concat();
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = cfg;
+        own
+    }
+
+    /// Whether commands of `folder` mode may run: confined (Landlock and the
+    /// shim's host), and kept from the node's keys. With the keys in the
+    /// keyring a command reaches them over the session bus, a socket file:
+    /// Landlock keeps a command from connecting to one only from ABI 9 on
+    /// (Linux 7.1), and before that only an account other than root and the
+    /// node's own cannot reach that bus.
+    pub fn confined(&self, cfg: &NodeConfig) -> bool {
+        self.unconfined(cfg).is_none()
+    }
+
+    /// Why commands of `folder` mode may not run, or `None` when they may
+    /// ([`Shared::confined`]).
+    pub fn unconfined(&self, cfg: &NodeConfig) -> Option<&'static str> {
+        self.unconfined_as(cfg, || self.command_account(cfg).ok().flatten())
+    }
+
+    /// [`Shared::unconfined`] for commands that run as `account`, the
+    /// account a call already looked up for `cfg`: a call decides and
+    /// confines its command by one answer. `account` is asked only when
+    /// the answer depends on it, as a lookup may start two programs.
+    pub fn unconfined_as(
+        &self,
+        cfg: &NodeConfig,
+        account: impl FnOnce() -> Option<crate::service::Account>,
+    ) -> Option<&'static str> {
+        if !self.confinement.available() || self.exe.is_none() {
+            return Some(NOT_CONFINED);
+        }
+        let kept = keys_kept_from_commands(
+            cfg.machine.secret_storage,
+            self.confinement.keeps_sockets(),
+            account,
+        );
+        (!kept).then_some(KEYRING_NOT_CONFINED)
+    }
+
+    /// Counts a `folder` mode command whose Landlock domain has no connect
+    /// rule, made from a config that keeps the keys in their files, while it
+    /// runs: a domain does not change while its command runs, so with the keys
+    /// moved into the keyring it would reach them over the session bus. A move
+    /// into the keyring is refused while one is counted. A move made after the
+    /// command's config was taken refuses the command: it is counted first and
+    /// looks at the keys' place then, under the store lock that a move holds,
+    /// so one of the two always sees the other.
+    pub fn open_to_bus(&self) -> Result<OpenToBus<'_>, &'static str> {
+        self.open_to_bus.fetch_add(1, Ordering::SeqCst);
+        let counted = OpenToBus(self);
+        if lock(&self.store).config().machine.secret_storage != SecretStorage::File {
+            return Err(KEYS_MOVED);
+        }
+        Ok(counted)
+    }
+
+    /// Logs once when the keyring turns folder mode's commands off, at the
+    /// start and after a change of the settings: otherwise only a refused call
+    /// would show it.
+    fn tell_confinement(&self, cfg: &NodeConfig) {
+        let keyring = self.unconfined(cfg) == Some(KEYRING_NOT_CONFINED);
+        if keyring && !self.told_keyring.swap(true, Ordering::Relaxed) {
+            tracing::warn!("folder mode runs no command: {KEYRING_NOT_CONFINED}");
+        } else if !keyring {
+            self.told_keyring.store(false, Ordering::Relaxed);
+        }
     }
 
     pub fn center(&self, name: &str) -> Arc<CenterState> {
@@ -356,9 +448,64 @@ impl Shared {
             "confinement": self.confinement.describe(),
             "running": self.running.load(Ordering::Relaxed),
             "sudo": if self.sudo_on() { "on" } else { "off" },
+            // This process found no keyring and does not look again
+            // (crate::secrets::store::failed): setup restarts it after it
+            // installed one.
+            "keyring_failed": crate::secrets::store::failed(),
+            // Why folder mode runs no command, which `confinement` alone
+            // does not say once the keyring is the reason.
+            "folder_commands_off": self.unconfined(&cfg),
             "centers": centers,
         })
     }
+}
+
+/// A command counted by [`Shared::open_to_bus`] while it runs.
+pub(crate) struct OpenToBus<'a>(&'a Shared);
+
+impl Drop for OpenToBus<'_> {
+    fn drop(&mut self) {
+        self.0.open_to_bus.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Why a command decided while the node's keys were in their files does
+/// not start once they are in the keyring ([`Shared::open_to_bus`]).
+pub const KEYS_MOVED: &str = "the node's keys moved into the system keyring while this call was decided, and its sandbox was made for keys in files; call again";
+
+/// Why `folder` mode runs no command where Landlock or the shim's host is
+/// missing.
+pub const NOT_CONFINED: &str = "commands cannot be confined on this machine";
+
+/// Why `folder` mode runs no command with the keys in the keyring where
+/// [`keys_kept_from_commands`] does not hold.
+pub const KEYRING_NOT_CONFINED: &str = "commands cannot be confined on this machine while the node's keys are in the system keyring: Landlock here (below ABI 9, Linux 7.1) cannot keep a command off the session bus the keyring answers on, so folder mode runs no command unless commands run as another account than root; `nerve-node config set machine.secret_storage file` brings them back";
+
+/// Whether a confined command of `account` (`None`: the node's own user)
+/// cannot reach the node's keys where `storage` keeps them. Files are out of
+/// its sandbox. The keyring answers on the session bus of the node's user:
+/// Landlock keeps a command off it where it `keeps_sockets`; elsewhere only
+/// another account than root is kept out, by the bus folder's owner-only
+/// mode. `account` is asked only in that last case.
+pub fn keys_kept_from_commands(
+    storage: SecretStorage,
+    keeps_sockets: bool,
+    account: impl FnOnce() -> Option<crate::service::Account>,
+) -> bool {
+    storage == SecretStorage::File || keeps_sockets || account().is_some_and(|a| a.uid != 0)
+}
+
+/// Whether a command confined by `landlock` and run as `account` could
+/// reach the keys over the session bus once they are in the keyring
+/// ([`Shared::open_to_bus`]): a domain without a connect rule leaves the bus
+/// open for the command's whole life, and only another account than root is
+/// kept off it then. `account` is asked only for such a domain.
+pub fn reaches_bus(
+    landlock: Option<&nerve_sandbox::LandlockSpec>,
+    account: impl FnOnce() -> Option<crate::service::Account>,
+) -> bool {
+    landlock.is_some_and(|s| s.connect.is_none())
+        && !keys_kept_from_commands(SecretStorage::Keyring, false, account)
 }
 
 /// A running node daemon.
@@ -366,6 +513,9 @@ pub struct Daemon {
     shared: Arc<Shared>,
     supervisor: JoinHandle<()>,
     ctl: Option<JoinHandle<()>>,
+    /// Held while the node runs: a CLI moves the keys only while no node
+    /// reads them.
+    _keys: crate::secrets::KeysLock,
 }
 
 impl Daemon {
@@ -387,12 +537,63 @@ impl Daemon {
             nerve_transport::files::create_private_dir(dir)
                 .map_err(|e| format!("{}: {e}", dir.display()))?;
         }
-        let mut store = SettingsStore::open(
+        // Where the keys may not be in the keyring, a node.toml that keeps
+        // them there is refused: the installed node on Windows would look
+        // in the Credential Manager of its own account, which holds none of
+        // them, and an old Landlock leaves folder mode without programs.
+        if crate::secrets::stated_storage(&paths) == SecretStorage::Keyring
+            && let Some(n) = crate::secrets::no_keyring(&paths)
+        {
+            let then = match n {
+                crate::secrets::NoKeyring::WindowsService => {
+                    "`Restart-Service nerve-node` starts it"
+                }
+                crate::secrets::NoKeyring::OldLandlock(_) => {
+                    "start the node again (`sudo systemctl restart nerve-node` for the installed node)"
+                }
+            };
+            return Err(crate::secrets::keyring_refused(
+                &paths,
+                n,
+                "the node does not start",
+                then,
+            ));
+        }
+        let keys = match crate::secrets::KeysLock::try_take(&paths)? {
+            Some(l) => l,
+            None => {
+                #[cfg(unix)]
+                if opts.ctl
+                    && nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({}))
+                        .await
+                        .is_ok()
+                {
+                    return Err("a node daemon already runs for this state directory".into());
+                }
+                // A command that moves the keys holds it for a moment.
+                crate::secrets::KeysLock::take(&paths, Duration::from_secs(10))
+                    .await?
+                    .ok_or_else(|| {
+                        format!(
+                            "another nerve-node holds {}: a node runs for this state directory, or a command moves its keys",
+                            paths.keys_lock().display()
+                        )
+                    })?
+            }
+        };
+        let open_to_bus = Arc::new(AtomicUsize::new(0));
+        let mut store = SettingsStore::open_with(
             paths.config_file(),
-            paths.config_key(),
+            Box::new(crate::secrets::NodeSecrets::for_node(
+                &paths,
+                open_to_bus.clone(),
+            )),
             AuditLog::new(paths.audit_log()),
         )?;
         let cfg = store.config().clone();
+        // With the config checked, a move of the keys that stopped half way
+        // is finished by it.
+        crate::secrets::settle(&paths, &cfg);
         if let Some(log) = &opts.log {
             log.set_level(cfg.log.level);
             // The node runs without a log file it cannot open; stderr and the
@@ -441,19 +642,22 @@ impl Daemon {
             exe: opts.exe,
             home: opts.home,
             platform: crate::paths::platform(),
-            confinement: Confinement::detect(),
+            confinement: opts.confinement.unwrap_or_else(Confinement::detect),
             store: Mutex::new(store),
             changed,
             centers: Mutex::default(),
             commands: Mutex::default(),
             running: AtomicUsize::new(0),
+            open_to_bus,
             stop,
             log: opts.log,
             sudo: Mutex::new(None),
             sudo_offers: Mutex::default(),
             sudo_for: Mutex::default(),
             account_cache: Mutex::default(),
+            told_keyring: Default::default(),
         });
+        shared.tell_confinement(&cfg);
         // The password lives in memory only: a file that says on starts off.
         shared.settle_sudo();
         let ctl = if opts.ctl {
@@ -473,6 +677,7 @@ impl Daemon {
             shared,
             supervisor,
             ctl,
+            _keys: keys,
         })
     }
 
@@ -493,6 +698,12 @@ impl Daemon {
     /// What `nerve-node status` shows.
     pub fn status(&self) -> Value {
         self.shared.status()
+    }
+
+    /// How many `folder` mode commands run now that the keys do not move
+    /// into the keyring past ([`Shared::open_to_bus`]).
+    pub fn open_to_bus(&self) -> usize {
+        self.shared.open_to_bus.load(Ordering::SeqCst)
     }
 
     /// Reads the config file again (what SIGHUP does). Only a file the node
@@ -845,12 +1056,238 @@ fn describe_change(by: &str, version: u64, changes: &[Change]) -> String {
 mod tests {
     use super::*;
 
+    /// With the keys in the keyring, folder mode runs commands only where they
+    /// cannot reach the session bus it answers on: Landlock ABI 9, or an
+    /// account other than root and the node's own.
+    #[test]
+    fn folder_commands_with_the_keyring_need_the_bus_out_of_reach() {
+        let account = |uid| crate::service::Account {
+            name: "a".into(),
+            uid,
+            gid: uid,
+            comment: String::new(),
+            home: "/home/a".into(),
+            groups: vec![uid],
+        };
+        let (other, root) = (account(4242), account(0));
+        use SecretStorage::{File, Keyring};
+        let kept = |storage, keeps_sockets, a: Option<&crate::service::Account>| {
+            keys_kept_from_commands(storage, keeps_sockets, || a.cloned())
+        };
+        assert!(kept(File, false, None));
+        assert!(kept(File, false, Some(&root)));
+        assert!(!kept(Keyring, false, None));
+        assert!(!kept(Keyring, false, Some(&root)));
+        assert!(kept(Keyring, false, Some(&other)));
+        assert!(kept(Keyring, true, None));
+        assert!(kept(Keyring, true, Some(&root)));
+    }
+
+    /// A command reaches the session bus for good when its domain has no
+    /// connect rule, unless it runs as another account than root.
+    #[test]
+    fn a_domain_without_a_connect_rule_reaches_the_bus() {
+        let account = |uid| crate::service::Account {
+            name: "a".into(),
+            uid,
+            gid: uid,
+            comment: String::new(),
+            home: "/home/a".into(),
+            groups: vec![uid],
+        };
+        let open = nerve_sandbox::LandlockSpec::default();
+        let barred = nerve_sandbox::LandlockSpec {
+            connect: Some(vec!["/run/user/1000".into()]),
+            ..Default::default()
+        };
+        assert!(reaches_bus(Some(&open), || None));
+        assert!(reaches_bus(Some(&open), || Some(account(0))));
+        assert!(!reaches_bus(Some(&open), || Some(account(4242))));
+        let asked = std::cell::Cell::new(false);
+        let ask = || {
+            asked.set(true);
+            None
+        };
+        assert!(!reaches_bus(Some(&barred), ask));
+        // Without Landlock (allowlist, user and sudo commands) the move
+        // changes nothing a command reaches.
+        assert!(!reaches_bus(None, ask));
+        assert!(!asked.get());
+    }
+
+    /// The keys do not move into the keyring while a folder mode command that
+    /// started with them in files runs, and a command whose config was taken
+    /// before a move does not start after it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_keys_do_not_move_past_a_command_that_reaches_the_bus() {
+        use nerve_transport::ctl::Reply;
+        let log = Log::new(Level::Info);
+        let d = tempfile::tempdir().unwrap();
+        let daemon = Daemon::start(options(&d, &log)).await.unwrap();
+        let s = daemon.shared.clone();
+        let paths = daemon.paths().clone();
+        let write = |to| {
+            let Reply::Ok(v) = control(&s, "config.read", json!({}), None) else {
+                panic!("config.read failed")
+            };
+            let mut cfg = NodeConfig::parse(v["config"].as_str().unwrap()).unwrap();
+            cfg.machine.secret_storage = to;
+            let params = json!({"config": cfg.to_toml(), "if_version": v["version"]});
+            control(&s, "config.write", params, None)
+        };
+        let storage = || s.config().machine.secret_storage;
+        let one = s.open_to_bus().unwrap();
+        let two = s.open_to_bus().unwrap();
+        let Reply::Err(e) = write(SecretStorage::Keyring) else {
+            panic!("the keys moved past two commands")
+        };
+        assert!(e.contains("2 folder mode commands run"), "{e}");
+        assert!(e.contains("nothing was changed"), "{e}");
+        drop(two);
+        let Reply::Err(e) = write(SecretStorage::Keyring) else {
+            panic!("the keys moved past a command")
+        };
+        assert!(e.contains("1 folder mode command runs"), "{e}");
+        assert_eq!(storage(), SecretStorage::File);
+        assert!(paths.config_key().exists());
+        assert!(!paths.keys_moving().exists());
+        drop(one);
+        assert!(matches!(write(SecretStorage::Keyring), Reply::Ok(_)));
+        assert_eq!(storage(), SecretStorage::Keyring);
+        // A call decided on the config from before the move.
+        assert_eq!(s.open_to_bus().err(), Some(KEYS_MOVED));
+        assert_eq!(s.open_to_bus.load(Ordering::SeqCst), 0);
+        // Out of the keyring nothing waits for a command.
+        s.open_to_bus.fetch_add(1, Ordering::SeqCst);
+        assert!(matches!(write(SecretStorage::File), Reply::Ok(_)));
+        assert_eq!(storage(), SecretStorage::File);
+        s.open_to_bus.fetch_sub(1, Ordering::SeqCst);
+        daemon.stop().await;
+    }
+
+    /// The account is looked up only where the answer depends on it: with the
+    /// keys in files, or Landlock off the bus, a link's 5 s tick starts no
+    /// program.
+    #[test]
+    fn the_account_is_asked_only_where_it_decides() {
+        use SecretStorage::{File, Keyring};
+        let asked = std::cell::Cell::new(0);
+        let ask = || {
+            asked.set(asked.get() + 1);
+            None
+        };
+        assert!(keys_kept_from_commands(File, false, ask));
+        assert!(keys_kept_from_commands(Keyring, true, ask));
+        assert_eq!(asked.get(), 0);
+        assert!(!keys_kept_from_commands(Keyring, false, ask));
+        assert_eq!(asked.get(), 1);
+    }
+
+    /// The keyring's places are the node's own only while its keys are there.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_keyring_folder_is_the_nodes_own_with_the_keyring() {
+        let (d, daemon) = daemon().await;
+        let mut cfg = daemon.config();
+        let keyrings = d.path().join(".local/share/keyrings");
+        assert_eq!(daemon.shared.own(&cfg), daemon.paths().own());
+        cfg.machine.secret_storage = SecretStorage::Keyring;
+        let own = daemon.shared.own(&cfg);
+        assert!(own.contains(&keyrings), "{own:?}");
+        let bus = PathBuf::from(format!("/run/user/{}", nerve_transport::net::euid()));
+        assert!(own.contains(&bus), "{own:?}");
+        // A center reaches neither the plain-text keyring through the fs
+        // capability nor the folder from a command, even with the whole
+        // home in its folders.
+        std::fs::create_dir_all(&keyrings).unwrap();
+        std::fs::write(keyrings.join("login.keyring"), "[keyring]\n").unwrap();
+        let home = std::fs::canonicalize(d.path()).unwrap();
+        let p = nerve_policy::protected::Protected::new(
+            &nerve_policy::protected::Platform::Unix,
+            &home,
+            &own,
+            &Default::default(),
+        );
+        assert!(
+            p.own(&home.join(".local/share/keyrings/login.keyring"))
+                .is_some()
+        );
+        let policy = nerve_policy::CenterPolicy {
+            folders: vec![nerve_policy::config::Folder {
+                path: home.display().to_string(),
+                access: nerve_policy::config::Access::ALL,
+            }],
+            ..Default::default()
+        };
+        let spec = crate::exec::landlock_spec(&policy, &home, &own);
+        let keyrings = std::fs::canonicalize(&keyrings).unwrap();
+        for set in [&spec.read, &spec.write, &spec.exec] {
+            assert!(!set.iter().any(|r| keyrings.starts_with(r)), "{set:?}");
+        }
+        daemon.stop().await;
+    }
+
     async fn daemon() -> (tempfile::TempDir, Daemon) {
         let d = tempfile::tempdir().unwrap();
         let paths = NodePaths::new(d.path().join("config"), d.path().join("state"));
         let mut opts = NodeOptions::new(paths);
         opts.home = d.path().to_path_buf();
         (d, Daemon::start(opts).await.unwrap())
+    }
+
+    /// A node.toml that keeps the keys in the keyring, made before.
+    fn keys_in_the_keyring(paths: &NodePaths) {
+        let mut store = SettingsStore::open_with(
+            paths.config_file(),
+            Box::new(crate::secrets::NodeSecrets::new(paths)),
+            AuditLog::new(paths.audit_log()),
+        )
+        .unwrap();
+        store
+            .update(|c| {
+                c.machine.secret_storage = SecretStorage::Keyring;
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// The installed node on Windows does not start with its keys in the
+    /// keyring: they are in the Credential Manager of whoever moved them
+    /// there, and the message says how to get them back into files.
+    #[tokio::test]
+    async fn the_installed_node_on_windows_refuses_keys_in_the_keyring() {
+        let d = tempfile::tempdir().unwrap();
+        let log = Log::new(Level::Info);
+        let opts = options(&d, &log);
+        let paths = opts.paths.clone();
+        keys_in_the_keyring(&paths);
+        crate::secrets::for_tests::pretend_windows_service(&paths);
+        let Err(e) = Daemon::start(opts).await else {
+            panic!("the node started");
+        };
+        assert!(e.contains("the node does not start"), "{e}");
+        assert!(e.contains("Credential Manager"), "{e}");
+        assert!(e.contains("config set machine.secret_storage file`"), "{e}");
+        assert!(e.contains("Restart-Service nerve-node"), "{e}");
+    }
+
+    /// Nor does a node on a kernel below Landlock ABI 9.
+    #[tokio::test]
+    async fn a_node_below_landlock_9_refuses_keys_in_the_keyring() {
+        let d = tempfile::tempdir().unwrap();
+        let log = Log::new(Level::Info);
+        let opts = options(&d, &log);
+        let paths = opts.paths.clone();
+        keys_in_the_keyring(&paths);
+        crate::secrets::for_tests::pretend_landlock(&paths, crate::secrets::Landlock::Abi(7));
+        let Err(e) = Daemon::start(opts).await else {
+            panic!("the node started");
+        };
+        assert!(e.contains("the node does not start"), "{e}");
+        assert!(e.contains("Landlock ABI 7, below 9"), "{e}");
+        assert!(e.contains("config set machine.secret_storage file`"), "{e}");
+        assert!(e.contains("systemctl restart nerve-node"), "{e}");
     }
 
     fn options(d: &tempfile::TempDir, log: &Arc<Log>) -> NodeOptions {
@@ -934,6 +1371,56 @@ mod tests {
         let mut o = options(&d, &log);
         o.full_rights = Some(false);
         Daemon::start(o).await.unwrap().stop().await;
+    }
+
+    /// With the keys moved into the keyring where Landlock cannot keep a
+    /// command off the session bus, the running node says that folder mode runs
+    /// no command: in its log once, and in its status.
+    #[tokio::test]
+    async fn the_keyring_turning_folder_commands_off_is_told() {
+        use nerve_transport::ctl::Reply;
+        use tracing_subscriber::layer::SubscriberExt;
+        let log = Log::new(Level::Info);
+        let sub = tracing_subscriber::Registry::default().with(log.layer());
+        let _guard = tracing::subscriber::set_default(sub);
+        let d = tempfile::tempdir().unwrap();
+        let mut o = options(&d, &log);
+        o.full_rights = Some(false);
+        o.exe = Some("/bin/true".into());
+        o.confinement = Some(Confinement {
+            landlock_abi: Some(6),
+        });
+        let daemon = Daemon::start(o).await.unwrap();
+        let s = daemon.shared.clone();
+        let write = |f: &dyn Fn(&mut NodeConfig)| {
+            let Reply::Ok(v) = control(&s, "config.read", json!({}), None) else {
+                panic!("config.read failed")
+            };
+            let mut cfg = NodeConfig::parse(v["config"].as_str().unwrap()).unwrap();
+            f(&mut cfg);
+            let params = json!({"config": cfg.to_toml(), "if_version": v["version"]});
+            let r = control(&s, "config.write", params, None);
+            assert!(matches!(r, Reply::Ok(_)));
+        };
+        let told = || {
+            warnings(&log)
+                .iter()
+                .filter(|w| w.contains(KEYRING_NOT_CONFINED))
+                .count()
+        };
+        let storage = |to| move |c: &mut NodeConfig| c.machine.secret_storage = to;
+        assert_eq!(daemon.status()["folder_commands_off"], Value::Null);
+        write(&storage(SecretStorage::Keyring));
+        assert_eq!(daemon.status()["folder_commands_off"], KEYRING_NOT_CONFINED);
+        assert_eq!(told(), 1);
+        // Told once, not at every change after.
+        write(&|c| c.node.name = Some("lab-pc".into()));
+        assert_eq!(told(), 1);
+        write(&storage(SecretStorage::File));
+        assert_eq!(daemon.status()["folder_commands_off"], Value::Null);
+        write(&storage(SecretStorage::Keyring));
+        assert_eq!(told(), 2);
+        daemon.stop().await;
     }
 
     #[tokio::test]

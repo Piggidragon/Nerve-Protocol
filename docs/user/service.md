@@ -40,12 +40,19 @@ Whatever the downloaded file is called, `install` puts it in place as
 5. Writes the unit `/etc/systemd/system/nerve-node.service`, enables it and
    starts it. It waits until the node answers.
 
+When the settings of an earlier install keep the keys in the system keyring
+([keys](config.md#where-the-node-keeps-its-keys)), `install` first checks
+that a keyring answers for `nerve`. In a terminal it offers to install one;
+otherwise, and on a no, it stops before it starts the service. It then leaves
+the account of the commands to `setup`.
+
 Running `install` again repairs what is missing and restarts the service.
 
 | What | Where |
 |---|---|
 | `node.toml`, one key per center | `/etc/nerve` |
 | Audit log, [log](logs.md), control socket, config key | `/var/lib/nerve/state` |
+| The keys, with `machine.secret_storage = "keyring"` | the keyring of `nerve`, `/var/lib/nerve/.local/share/keyrings` |
 | Home of `nerve` | `/var/lib/nerve` |
 | The program | `/usr/local/bin/nerve-node` |
 | The unit | `/etc/systemd/system/nerve-node.service` |
@@ -127,9 +134,16 @@ in brackets.
    installed node. It must exist, or setup offers to make it: an ordinary
    account with a group and a home (`/home/<name>`) of its own, no login,
    and the comment `Nerve user mode`. Choosing root shows the warning above.
-3. A pairing link from the center's web UI. Enter skips it. The node shows
+3. Where the node keeps its keys: `file` or `keyring`
+   ([keys](config.md#where-the-node-keeps-its-keys)). With `keyring` and no
+   keyring that answers, it offers to install one where `nerve` has no
+   desktop, and then restarts the node if it had found none before. Not
+   asked on the installed node on Windows, which keeps them in files
+   ([Windows](#windows)), nor on a kernel with a Landlock ABI below 9
+   ([keys](config.md#an-older-linux-kernel)); setup warns instead.
+4. A pairing link from the center's web UI. Enter skips it. The node shows
    the center and asks before it pairs, as `center add` does.
-4. The mode of that center: `allowlist`, `folder` or `user`
+5. The mode of that center: `allowlist`, `folder` or `user`
    ([modes](modes.md)). For `folder` it asks for one folder and its rights.
 
 Each answer is saved when you give it, through the running node, like every
@@ -172,7 +186,8 @@ sudo nerve-node uninstall --purge   # deletes them too
 ```
 
 `uninstall` stops and disables the service, removes the unit, the user
-`nerve` and `/usr/local/bin/nerve-node`. Without `--purge`, `/etc/nerve` and
+`nerve` and `/usr/local/bin/nerve-node`. A session that a keyring gave
+`nerve` is ended first. Without `--purge`, `/etc/nerve` and
 `/var/lib/nerve` stay and belong to root from then on, so no later user with
 the old uid gets the keys. The account of the commands stays, also one that
 `setup` made; `sudo userdel -r <name>` removes it. A later `install` takes them up again: the node
@@ -217,6 +232,24 @@ The other commands work on the installed node from an administrator's
 terminal. Windows has no control socket, so the service takes a change at
 its next start: `Restart-Service nerve-node`. `setup` asks no account
 there, and `--create-user` is refused.
+
+The installed node on Windows keeps its keys in files. The service runs as
+`nerve`, and the Credential Manager is one per account: keys that `setup` or
+`config set` put in the keyring would be in the Credential Manager of the
+administrator who ran them, where the service does not find them. So `setup`
+does not ask where the keys go, and takes keys it finds in the keyring into
+files; `config set machine.secret_storage keyring` is refused and changes
+nothing. A `node.toml` that keeps the keys in the keyring is refused by
+`install`, before it changes anything, and the service does not start with
+one. Move the keys into files first, as the account that put them in the
+keyring, in a terminal opened with "Run as administrator". Name the folders:
+without a registered service the commands work on your own folders, not on
+the node's. Run it with the program you have, the downloaded one before a
+first install:
+
+```powershell
+.\nerve-node-x86_64-windows.exe --config-dir "C:\ProgramData\Nerve\config" --state-dir "C:\ProgramData\Nerve\state" config set machine.secret_storage file
+```
 
 To run the commands as another account, an ordinary one, name it and run
 `install` again; it asks for that account's password:

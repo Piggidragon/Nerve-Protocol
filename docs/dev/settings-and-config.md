@@ -26,7 +26,9 @@ The node has one config file and one way to change it. Details:
 ## The signature
 
 Every file the node writes starts with `# mac hmac-sha256 <hex> …`, an HMAC
-over the rest. The key is `config.key` in the state folder (mode 0600). It is
+over the rest. The key is `config.key` in the state folder (mode 0600), or an
+entry in the system keyring with `machine.secret_storage = "keyring"`
+([spec §1](spec/node-local.md#where-the-keys-are)). It is
 not beside `node.toml`, so whatever can read the config folder does not hold
 the key.
 

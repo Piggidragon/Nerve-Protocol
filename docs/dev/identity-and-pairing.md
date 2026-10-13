@@ -7,7 +7,7 @@ Exact formats are in [spec/protocol.md](spec/protocol.md) §2 and §3.
 | Who | Identity |
 |---|---|
 | Center | A random id (UUID-shaped) and a name, both made on its first start. A TLS key and a self-signed certificate. Its **pin** is the base64url SHA-256 of the certificate's public key info (43 characters) |
-| Node | One Ed25519 key pair **per center**, made at pairing and kept in `keys/<name>.key` (mode 0600). The **node id** is the base32 of the first 16 bytes of the SHA-256 of the public key (26 characters). The node name is 1 to 32 characters of `a-z`, `0-9` and `-`, from the host name by default |
+| Node | One Ed25519 key pair **per center**, made at pairing and kept in `keys/<name>.key` (mode 0600), or in the system keyring with `machine.secret_storage = "keyring"`. The **node id** is the base32 of the first 16 bytes of the SHA-256 of the public key (26 characters). The node name is 1 to 32 characters of `a-z`, `0-9` and `-`, from the host name by default |
 | Harness | A token, from `--harness-token` or made in the web UI. It is local to the center host |
 
 Because the key is per center, two centers see two unrelated ids for the same

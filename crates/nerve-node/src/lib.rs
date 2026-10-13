@@ -15,6 +15,7 @@ pub mod fs;
 // The job is Windows-only in use; its choices are tested everywhere.
 #[cfg_attr(not(windows), allow(dead_code))]
 mod job;
+pub mod keyring_setup;
 mod link;
 pub mod pair;
 pub mod paths;

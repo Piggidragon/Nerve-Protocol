@@ -629,6 +629,24 @@ pub async fn read_config(paths: &NodePaths) -> Result<(NodeConfig, Option<u64>),
     ))
 }
 
+/// The `~` of the folders whose grants the CLI brings in line
+/// (crate::grants): on the installed node the home of the account the
+/// commands run as, as the daemon takes it, else this user's.
+fn grants_home(paths: &NodePaths, cfg: &NodeConfig) -> PathBuf {
+    #[cfg(windows)]
+    if crate::service::is_service_node(paths)
+        && let Some(a) = cfg
+            .machine
+            .user
+            .as_deref()
+            .and_then(|u| crate::account::lookup(u).ok().flatten())
+    {
+        return a.home;
+    }
+    let _ = (paths, cfg);
+    crate::paths::home_dir()
+}
+
 /// Changes the config: through the daemon (retrying when someone else wrote
 /// meanwhile), or directly in the file when no daemon runs.
 pub async fn edit(
@@ -664,7 +682,7 @@ pub async fn edit(
             // folder mode follow it here (crate::grants); a running node
             // brings them in line with its own config again before a
             // command.
-            let synced = crate::grants::apply(paths, &cfg, &crate::paths::home_dir());
+            let synced = crate::grants::apply(paths, &cfg, &grants_home(paths, &cfg));
             if let Some(e) = synced.errors.first() {
                 return Err(format!(
                     "the config is saved, but the folder grants do not follow it: {e}"

@@ -824,6 +824,33 @@ fn has_child(_pid: u32) -> bool {
     false
 }
 
+/// What the shim gets to run `program` with `args` in `cwd` confined, when
+/// the command is confined (Landlock, or the AppContainer of Windows). On
+/// Windows a container command of another account (the installed service)
+/// gets its desktop in that account's own window station, where the shim
+/// stands, and the shim enters `cwd` itself, as that account (crate::win_user
+/// starts it elsewhere).
+pub fn shim_spec(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    opts: &RunOptions,
+) -> Option<ShimSpec> {
+    let mut container = opts.container.clone();
+    let as_account = container.is_some() && opts.account.is_some();
+    if let Some(c) = &mut container {
+        c.own_station = as_account;
+    }
+    (opts.landlock.is_some() || container.is_some()).then(|| ShimSpec {
+        program: program.into(),
+        args: args.to_vec(),
+        parent: std::process::id(),
+        landlock: opts.landlock.clone(),
+        container,
+        cwd: as_account.then(|| cwd.to_path_buf()),
+    })
+}
+
 /// Runs `call`. `started` hears what ends the command once it runs (for
 /// `exec.signal`, and its pid for the control socket's ancestry check).
 pub async fn run(
@@ -839,31 +866,10 @@ pub async fn run(
     {
         line.insert_str(0, nerve_sandbox::POWERSHELL_START);
     }
-    let shim = (opts.landlock.is_some() || opts.container.is_some()).then(|| ShimSpec {
-        program: program.clone().into(),
-        args: args.clone(),
-        parent: std::process::id(),
-        landlock: opts.landlock.clone(),
-        container: opts.container.clone(),
-    });
-    // The shim makes the container's profile and window station for the
-    // user it runs as, which is not wired for another account yet; such a
-    // command would run without its container (crate::daemon, which gives
-    // the installed Windows node none).
-    if opts.container.is_some()
-        && let Some(a) = &opts.account
-    {
-        return Err(RpcError::new(
-            ErrorCode::Unavailable,
-            format!(
-                "the command was not run: folder mode cannot run a command in its AppContainer as {}",
-                a.name
-            ),
-        ));
-    }
+    let shim = shim_spec(&program, &args, &call.cwd, opts);
     #[cfg(windows)]
     if let Some(a) = &opts.account {
-        return run_as(call, opts, a, &program, &args, started).await;
+        return run_as(call, opts, a, &program, &args, shim, started).await;
     }
     let mut cmd = match &shim {
         Some(_) => {
@@ -1051,6 +1057,13 @@ pub async fn run(
 /// in a job of its own and runs only then. It does not start when its
 /// account can open the node's own folders, nor without a job: the node
 /// may not end another account's processes one by one, only the job.
+///
+/// A confined command (`shim`, folder mode) starts the exec shim that way
+/// instead, which gets its spec on stdin, enters the call's folder and
+/// starts the shell in the center's AppContainer, as the account. The shim makes the container's
+/// profile in the account's registry, which the account's profile holds:
+/// Windows loads that for the command (crate::win_user::Profile), and it
+/// stays loaded until the command ends.
 #[cfg(windows)]
 async fn run_as(
     call: &RunCall,
@@ -1058,6 +1071,7 @@ async fn run_as(
     account: &crate::service::Account,
     program: &str,
     args: &[String],
+    shim: Option<ShimSpec>,
     started: impl FnOnce(&Ender),
 ) -> Result<Value, RpcError> {
     let unavailable = |m: String| RpcError::new(ErrorCode::Unavailable, m);
@@ -1083,8 +1097,25 @@ async fn run_as(
             "the command was not run: Windows made no job object for it ({e})"
         ))
     })?;
-    let line = windows_command_line(program, args);
-    let child = crate::win_user::spawn(&token, &line, Some(&call.cwd), Some(&account.home))
+    let profile = match &shim {
+        Some(s) if s.container.is_some() => Some(
+            crate::win_user::stored_password(account)
+                .and_then(|pw| crate::win_user::load_profile(account, &pw))
+                .map_err(|e| unavailable(format!("the command was not run: {e}")))?,
+        ),
+        _ => None,
+    };
+    let line = match &shim {
+        Some(_) => windows_command_line(&opts.exe.display().to_string(), &[SHIM_ARG.to_string()]),
+        None => windows_command_line(program, args),
+    };
+    let spec = match &shim {
+        Some(s) => Some(serde_json::to_vec(s).map_err(|e| RpcError::internal(e.to_string()))?),
+        None => None,
+    };
+    // The shim enters the call's folder itself (`ShimSpec::cwd`).
+    let cwd = shim.is_none().then_some(call.cwd.as_path());
+    let child = crate::win_user::spawn(&token, &line, cwd, Some(&account.home), shim.is_some())
         .map_err(|e| {
             unavailable(format!(
                 "cannot start as {} in {}: {e}",
@@ -1098,6 +1129,11 @@ async fn run_as(
             crate::win::in_job(child.process()),
             &e,
         )));
+    }
+    // The process that holds the profile goes with the job too, should the
+    // node end before it drops it.
+    if let Some(p) = &profile {
+        let _ = job.assign(p.process());
     }
     let job = std::sync::Arc::new(job);
     if let Err(e) = child.resume() {
@@ -1113,10 +1149,25 @@ async fn run_as(
     let wait = child
         .waiter()
         .map_err(|e| RpcError::internal(format!("waiting for the command: {e}")))?;
-    let crate::win_user::Spawned { stdout, stderr, .. } = child;
+    let crate::win_user::Spawned {
+        stdin,
+        stdout,
+        stderr,
+        ..
+    } = child;
+    // The spec is written while the shim runs and reads it: it may not fit
+    // the pipe. A shim that ends early closes the pipe, and its exit code
+    // tells.
+    let feed = async move {
+        if let (Some(mut stdin), Some(spec)) = (stdin, spec) {
+            let _ =
+                tokio::task::spawn_blocking(move || std::io::Write::write_all(&mut stdin, &spec))
+                    .await;
+        }
+    };
     let cap = opts.output_cap.min(OUTPUT_HARD_CAP);
     let work = async {
-        tokio::join!(
+        let (o, e, c, ()) = tokio::join!(
             capped(tokio::fs::File::from_std(stdout), cap),
             capped(tokio::fs::File::from_std(stderr), cap),
             async {
@@ -1124,8 +1175,10 @@ async fn run_as(
                     .await
                     .map_err(std::io::Error::other)
                     .and_then(|r| r)
-            }
-        )
+            },
+            feed
+        );
+        (o, e, c)
     };
     let (out, err, code) = match call.timeout {
         Some(t) => match tokio::time::timeout(t, work).await {
@@ -1141,6 +1194,7 @@ async fn run_as(
         None => work.await,
     };
     drop(group);
+    drop(profile);
     let code = code.map_err(|e| RpcError::internal(format!("waiting for the command: {e}")))?;
     Ok(json!({
         "exit_code": code as i32,
@@ -1148,6 +1202,57 @@ async fn run_as(
         "stderr": decode(&err.0, err.1),
         "truncated": out.1 || err.1,
     }))
+}
+
+/// What the exec shim gets for a confined command.
+#[cfg(test)]
+mod shim_spec_tests {
+    use super::*;
+
+    fn opts(container: bool, account: bool) -> RunOptions {
+        RunOptions {
+            shell: None,
+            landlock: None,
+            container: container.then(|| ContainerSpec {
+                name: "nerve.test".into(),
+                own_station: false,
+            }),
+            exe: PathBuf::from("nerve-node.exe"),
+            output_cap: 1024,
+            sudo: None,
+            account: account.then(|| crate::service::Account {
+                name: "chosen".into(),
+                uid: 1001,
+                gid: 1001,
+                comment: String::new(),
+                home: PathBuf::from("C:\\Users\\chosen"),
+                groups: Vec::new(),
+            }),
+            own: Vec::new(),
+        }
+    }
+
+    /// A container command of another account (the installed Windows
+    /// service) goes to the shim with its desktop in that account's own
+    /// window station and the folder the shim enters; one of the node's own
+    /// user keeps a station of its own and starts in its folder. An
+    /// unconfined command needs no shim.
+    #[test]
+    fn another_accounts_container_takes_its_own_station() {
+        let args = vec!["-Command".to_string(), "dir".to_string()];
+        let cwd = Path::new("C:\\Users\\chosen\\proj");
+        let s = shim_spec("powershell.exe", &args, cwd, &opts(true, true)).unwrap();
+        assert_eq!(s.program, PathBuf::from("powershell.exe"));
+        assert_eq!(s.args, args);
+        assert_eq!(s.cwd.as_deref(), Some(cwd));
+        let c = s.container.unwrap();
+        assert_eq!(c.name, "nerve.test");
+        assert!(c.own_station);
+        let s = shim_spec("powershell.exe", &args, cwd, &opts(true, false)).unwrap();
+        assert!(!s.container.unwrap().own_station);
+        assert_eq!(s.cwd, None);
+        assert!(shim_spec("powershell.exe", &args, cwd, &opts(false, true)).is_none());
+    }
 }
 
 /// The command lines a command of another account gets on Windows.
@@ -1317,37 +1422,6 @@ mod tests {
             ),
         );
         sudo.display().to_string()
-    }
-
-    /// A folder-mode command of another account is not started at all
-    /// while the AppContainer is not wired for that account: it would run
-    /// without its container.
-    #[tokio::test]
-    async fn a_container_command_of_another_account_does_not_run() {
-        let d = tempfile::tempdir().unwrap();
-        let mark = d.path().join("ran");
-        let mut o = opts(1024);
-        o.container = Some(ContainerSpec {
-            name: "nerve.test".into(),
-        });
-        o.account = Some(crate::service::Account {
-            name: "chosen".into(),
-            uid: 4242,
-            gid: 4242,
-            comment: String::new(),
-            home: d.path().to_path_buf(),
-            groups: vec![4242],
-        });
-        let e = run(&call(&format!("touch '{}'", mark.display())), &o, |_| {})
-            .await
-            .unwrap_err();
-        assert_eq!(e.kind(), ErrorCode::Unavailable, "{e:?}");
-        assert!(
-            e.message
-                .contains("cannot run a command in its AppContainer as chosen"),
-            "{e:?}"
-        );
-        assert!(!mark.exists());
     }
 
     /// `sudo on` checks the password of the account the commands run as:

@@ -156,18 +156,6 @@ impl CenterState {
     }
 }
 
-/// How this node confines the commands of folder mode. The installed
-/// Windows service runs every command as another account (crate::win_user),
-/// and the AppContainer is not wired for that account yet (its profile and
-/// window station are made for the user the shim runs as), so there folder
-/// mode has no confinement and runs no command.
-fn confinement_for(detected: Confinement, service: bool) -> Confinement {
-    Confinement {
-        appcontainer: detected.appcontainer && !service,
-        ..detected
-    }
-}
-
 /// Everything the daemon's tasks share.
 /// How long a looked-up account is used before it is looked up again.
 const ACCOUNT_FRESH: std::time::Duration = std::time::Duration::from_secs(5);
@@ -454,7 +442,7 @@ impl Daemon {
             exe: opts.exe,
             home: opts.home,
             platform: crate::paths::platform(),
-            confinement: confinement_for(Confinement::detect(), service),
+            confinement: Confinement::detect(),
             store: Mutex::new(store),
             changed,
             centers: Mutex::default(),
@@ -1099,31 +1087,5 @@ node_id = "n1"
         let text = describe_leaf("a.b", &Value::Null, &Value::String(long));
         assert_eq!(text.chars().count(), "a.b: unset -> ".len() + 81);
         assert!(text.ends_with('…'));
-    }
-}
-
-#[cfg(test)]
-mod confinement_tests {
-    use super::*;
-
-    /// The installed Windows service runs commands as another account, for
-    /// which the AppContainer is not wired: folder mode is not confined there
-    /// and runs no command. Landlock and a node run by hand keep theirs.
-    #[test]
-    fn the_installed_service_runs_no_command_in_an_appcontainer() {
-        let windows = Confinement {
-            landlock_abi: None,
-            appcontainer: true,
-        };
-        assert!(confinement_for(windows, false).appcontainer);
-        let installed = confinement_for(windows, true);
-        assert!(!installed.available(), "{installed:?}");
-        assert_eq!(installed.describe(), "none");
-        let linux = Confinement {
-            landlock_abi: Some(4),
-            appcontainer: false,
-        };
-        assert_eq!(confinement_for(linux, true), linux);
-        assert_eq!(confinement_for(linux, false), linux);
     }
 }

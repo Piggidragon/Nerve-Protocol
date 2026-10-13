@@ -137,8 +137,21 @@ command in an AppContainer, one per center (`nerve_sandbox::appcontainer`):
   cut out the same way. The grants follow the folders, whatever the mode: the
   node syncs them at start, on a change of its config and before each
   `folder` command, and the CLI when it writes the config. `uninstall` takes
-  off those of the node in the invoking user's own folders; the installed
-  service puts none on.
+  off those of the service and of the node in the invoking user's own
+  folders.
+- On the installed service the shim runs as the account the commands run as
+  (`win_user::spawn`), gets its spec on a pipe and enters the call's folder
+  itself, since Windows checks a new process's folder as the service. The
+  container's profile lives in that account's registry, which the service
+  may not load: it has the Secondary Logon service start a suspended process
+  of the account with its profile (`win_user::Profile`) while the command
+  runs, and removes profiles through `nerve-node __remove-profiles` started
+  as the account; an administrator loads the profile and removes them while
+  it acts as the account. Only an administrator may make a window station in
+  the service's session, so the command's desktop goes into the station of
+  the account's logon, which gets an entry for ALL APPLICATION PACKAGES
+  without the clipboard. The service syncs the grants as the account
+  (`win_user::FsAs`), on the folders whose permissions it may change.
 - A record in the state folder (`grants.json`) finds them again. It holds the
   file ID of each grant's object, since the grant is in that object's own
   access list and goes with it: a grant on a moved or renamed folder comes off

@@ -60,12 +60,14 @@ use windows_sys::Win32::System::Registry::{
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessAsUserW,
-    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
-    GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, OpenProcessToken,
-    PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION, ResumeThread, STARTF_USESTDHANDLES,
-    STARTUPINFOEXW, TerminateProcess, UpdateProcThreadAttribute, WaitForSingleObject,
+    CreateProcessWithLogonW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+    GetCurrentProcess, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
+    LOGON_WITH_PROFILE, OpenProcessToken, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROCESS_INFORMATION,
+    ResumeThread, STARTF_USESTDHANDLES, STARTUPINFOEXW, STARTUPINFOW, TerminateProcess,
+    UpdateProcThreadAttribute, WaitForSingleObject,
 };
 use windows_sys::Win32::System::WindowsProgramming::GetUserNameW;
+use windows_sys::Win32::UI::Shell::{LoadUserProfileW, PROFILEINFOW, UnloadUserProfile};
 
 use crate::service::Account;
 
@@ -654,15 +656,31 @@ pub fn token_for(account: &Account) -> Result<Arc<Token>, String> {
     {
         return Ok(t.clone());
     }
-    let again = "`nerve-node install`, run again as administrator, asks for it";
+    let password = stored_password(account)?;
+    let t = Arc::new(logon(&account.name, &password).map_err(|e| format!("{e}; {AGAIN}"))?);
+    *cached = Some((account.name.clone(), Instant::now(), t.clone()));
+    Ok(t)
+}
+
+/// What a failure with the stored password says to do.
+const AGAIN: &str = "`nerve-node install`, run again as administrator, asks for it";
+
+/// The password of `account` that `install` stored ([`init`]), or why
+/// there is none.
+pub fn stored_password(account: &Account) -> Result<String, String> {
     let file = SECRET
         .get()
-        .ok_or_else(|| format!("no password of {} is stored; {again}", account.name))?;
+        .ok_or_else(|| format!("no password of {} is stored; {AGAIN}", account.name))?;
+    stored_password_in(file, account)
+}
+
+/// The password of `account` stored in `file`.
+pub(crate) fn stored_password_in(file: &Path, account: &Account) -> Result<String, String> {
     let blob = match std::fs::read(file) {
         Ok(b) => b,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
             return Err(format!(
-                "no password of {} is stored; {again}",
+                "no password of {} is stored; {AGAIN}",
                 account.name
             ));
         }
@@ -670,21 +688,159 @@ pub fn token_for(account: &Account) -> Result<Arc<Token>, String> {
     };
     let plain = unprotect(&blob).map_err(|e| {
         format!(
-            "the stored password of {} cannot be decrypted ({e}); {again}",
+            "the stored password of {} cannot be decrypted ({e}); {AGAIN}",
             account.name
         )
     })?;
     let (name, password) = crate::winsvc::parse_secret(&plain)
-        .ok_or_else(|| format!("the stored password cannot be read; {again}"))?;
+        .ok_or_else(|| format!("the stored password cannot be read; {AGAIN}"))?;
     if !name.eq_ignore_ascii_case(&account.name) {
         return Err(format!(
-            "the stored password is {name}'s, not {}'s; {again}",
+            "the stored password is {name}'s, not {}'s; {AGAIN}",
             account.name
         ));
     }
-    let t = Arc::new(logon(&name, &password).map_err(|e| format!("{e}; {again}"))?);
-    *cached = Some((account.name.clone(), Instant::now(), t.clone()));
-    Ok(t)
+    Ok(password)
+}
+
+/// The profile of an account, loaded while this lives: its registry
+/// (`HKCU` and the classes in it), where Windows keeps the profiles of
+/// AppContainers. While an account is not signed in, nothing loads it, and
+/// a process started with a token from [`logon`] has none. Windows loads a
+/// profile for an administrator (LoadUserProfileW), which the service is
+/// not, and for a logon through its Secondary Logon service: the service
+/// has that start a process of the account with its profile, suspended.
+/// The process never runs; while it is there the profile stays loaded, and
+/// it is ended when this is dropped.
+pub struct Profile {
+    process: OwnedHandle,
+}
+
+impl Profile {
+    /// The process that holds the profile, for the command's job: it ends
+    /// with the job, also when the node does.
+    pub fn process(&self) -> crate::win::Handle {
+        self.process.as_raw_handle()
+    }
+}
+
+impl Drop for Profile {
+    fn drop(&mut self) {
+        // SAFETY: the process started in `load_profile`, which this owns.
+        unsafe { TerminateProcess(self.process.as_raw_handle() as HANDLE, 0) };
+    }
+}
+
+/// LoadUserProfileW shows no message box.
+const PI_NOUI: u32 = 1;
+
+/// Loads the profile of `account` ([`Profile`]), logged on with
+/// `password`.
+pub fn load_profile(account: &Account, password: &str) -> Result<Profile, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("this program's path: {e}"))?;
+    // Never run; were it resumed, it would say its version and end.
+    let mut line = wide(crate::exec::windows_command_line(
+        &exe.display().to_string(),
+        &["--version".to_string()],
+    ));
+    // SAFETY: STARTUPINFOW is plain data; zero is its empty value.
+    let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
+    si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
+    // SAFETY: PROCESS_INFORMATION is plain data that the call fills.
+    let mut pi: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    // SAFETY: NUL-terminated strings ("." is this machine), a writable
+    // command line, and the startup info, all alive for the call.
+    let ok = unsafe {
+        CreateProcessWithLogonW(
+            wide(&account.name).as_ptr(),
+            wide(".").as_ptr(),
+            wide(password).as_ptr(),
+            LOGON_WITH_PROFILE,
+            std::ptr::null(),
+            line.as_mut_ptr(),
+            CREATE_SUSPENDED | CREATE_NO_WINDOW,
+            std::ptr::null(),
+            std::ptr::null(),
+            &si,
+            &mut pi,
+        )
+    };
+    if ok == 0 {
+        return Err(format!(
+            "Windows did not load the profile of {}: {}; the Secondary Logon service (seclogon) loads it and must not be disabled",
+            account.name,
+            failed("CreateProcessWithLogonW")
+        ));
+    }
+    // SAFETY: CreateProcessWithLogonW returned two handles this code now
+    // owns; the thread's is not needed.
+    let process = unsafe {
+        CloseHandle(pi.hThread);
+        OwnedHandle::from_raw_handle(pi.hProcess as _)
+    };
+    Ok(Profile { process })
+}
+
+/// Takes the AppContainer profiles `names` away from `account`, whose
+/// registry holds them; one that is not there is fine. The installed
+/// service loads the account's profile ([`load_profile`]) and starts
+/// `nerve-node __remove-profiles` as the account, since only that account
+/// can remove them. An administrator (`uninstall`, the CLI on the installed
+/// node) loads the profile itself and removes them while it acts as the
+/// account. `secret` is the file with the stored password.
+pub fn remove_profiles(account: &Account, names: &[String], secret: &Path) -> Result<(), String> {
+    if names.is_empty() {
+        return Ok(());
+    }
+    let what = |e: String| {
+        format!(
+            "cannot remove the AppContainer profiles {} of {}: {e}",
+            names.join(", "),
+            account.name
+        )
+    };
+    let password = stored_password_in(secret, account).map_err(what)?;
+    let t = logon(&account.name, &password).map_err(what)?;
+    if can_switch() {
+        let _profile = load_profile(account, &password).map_err(what)?;
+        let exe = std::env::current_exe().map_err(|e| what(e.to_string()))?;
+        let line = crate::exec::windows_command_line(
+            &exe.display().to_string(),
+            &[nerve_sandbox::PROFILES_ARG.to_string()],
+        );
+        let input = serde_json::to_vec(names).expect("names serialise");
+        let (code, _, err) = run_capture(&t, &line, Some(&input), Duration::from_secs(60))
+            .map_err(|e| what(e.to_string()))?;
+        if code != 0 {
+            return Err(what(String::from_utf8_lossy(&err).trim().to_string()));
+        }
+        return Ok(());
+    }
+    if !crate::win_host::is_admin() {
+        return Err(what(
+            "only the installed service or an administrator can".into(),
+        ));
+    }
+    let mut user = wide(&account.name);
+    // SAFETY: PROFILEINFOW is plain data; zero is its empty value.
+    let mut info: PROFILEINFOW = unsafe { std::mem::zeroed() };
+    info.dwSize = std::mem::size_of::<PROFILEINFOW>() as u32;
+    info.dwFlags = PI_NOUI;
+    info.lpUserName = user.as_mut_ptr();
+    // SAFETY: the account's token and the info with a live name.
+    if unsafe { LoadUserProfileW(t.raw(), &mut info) } == 0 {
+        return Err(what(failed("LoadUserProfileW").to_string()));
+    }
+    let r = (|| {
+        let _as = Impersonation::new(&t).map_err(|e| e.to_string())?;
+        names
+            .iter()
+            .try_for_each(|n| nerve_sandbox::appcontainer::remove_profile(n))
+            .map_err(|e| e.to_string())
+    })();
+    // SAFETY: the profile loaded above, with the same token.
+    unsafe { UnloadUserProfile(t.raw(), info.hProfile) };
+    r.map_err(what)
 }
 
 /// The node's own file access as `account`, on this thread only, while it
@@ -711,6 +867,8 @@ pub struct Spawned {
     pub pid: u32,
     process: OwnedHandle,
     thread: OwnedHandle,
+    /// The pipe to its stdin, when it was given one.
+    pub stdin: Option<std::fs::File>,
     pub stdout: std::fs::File,
     pub stderr: std::fs::File,
 }
@@ -798,21 +956,28 @@ fn nul() -> io::Result<OwnedHandle> {
 
 /// Starts `line` (a command line, [`crate::exec::windows_command_line`])
 /// suspended with token `t`, in `cwd`, with the account's own environment
-/// and no window. It gets the NUL device as stdin and a pipe each for
-/// stdout and stderr, and no other handle of the node. A token that is not
-/// a restricted copy of this process's own needs [`SWITCH`].
+/// and no window. It gets a pipe each for stdout and stderr, and as stdin
+/// a pipe with `input` (the exec shim reads its spec there) or else the
+/// NUL device; no other handle of the node. A token that is not a
+/// restricted copy of this process's own needs [`SWITCH`].
 pub fn spawn(
     t: &Token,
     line: &str,
     cwd: Option<&Path>,
     home: Option<&Path>,
+    input: bool,
 ) -> io::Result<Spawned> {
     // Held by the service; another caller starts only restricted copies of
     // its own token, which need neither.
     let _ = enable(&SWITCH);
     let (out_r, out_w) = pipe()?;
     let (err_r, err_w) = pipe()?;
-    let input = nul()?;
+    let (input, stdin) = if input {
+        let (r, w) = pipe()?;
+        (r, Some(std::fs::File::from(w)))
+    } else {
+        (nul()?, None)
+    };
     let given = [
         input.as_raw_handle() as HANDLE,
         out_w.as_raw_handle() as HANDLE,
@@ -844,6 +1009,7 @@ pub fn spawn(
         pid: pi.dwProcessId,
         process,
         thread,
+        stdin,
         stdout: out_r.into(),
         stderr: err_r.into(),
     })
@@ -1085,26 +1251,42 @@ pub fn restricted() -> io::Result<Token> {
     r.map(|()| t)
 }
 
-/// Runs `line` with token `t` and waits up to `limit` for it; its exit
-/// code and stdout. One that runs longer is ended.
-pub fn run_capture(t: &Token, line: &str, limit: Duration) -> io::Result<(u32, Vec<u8>)> {
-    use std::io::Read;
-    let child = spawn(t, line, None, None)?;
+/// Runs `line` with token `t`, with `input` on its stdin (else the NUL
+/// device), and waits up to `limit` for it; its exit code, stdout and
+/// stderr (64 KiB of each). One that runs longer is ended.
+pub fn run_capture(
+    t: &Token,
+    line: &str,
+    input: Option<&[u8]>,
+    limit: Duration,
+) -> io::Result<(u32, Vec<u8>, Vec<u8>)> {
+    use std::io::{Read, Write};
+    let child = spawn(t, line, None, None, input.is_some())?;
     child.resume()?;
     let wait = child.waiter()?;
     let Spawned {
         process,
-        stdout: mut out,
-        stderr: mut err,
+        stdin,
+        stdout: out,
+        stderr: err,
         ..
     } = child;
-    let reader = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        let _ = out.by_ref().take(64 * 1024).read_to_end(&mut b);
-        b
-    });
-    let drain = std::thread::spawn(move || {
-        let _ = std::io::copy(&mut err, &mut std::io::sink());
+    let read = |mut f: std::fs::File| {
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            let _ = Read::by_ref(&mut f).take(64 * 1024).read_to_end(&mut b);
+            // The rest is drained, so the program never blocks on a full pipe.
+            let _ = std::io::copy(&mut f, &mut std::io::sink());
+            b
+        })
+    };
+    let (out, err) = (read(out), read(err));
+    let fed = stdin.zip(input.map(<[u8]>::to_vec)).map(|(mut f, data)| {
+        // Written while the program runs and reads it; a program that ends
+        // early closes the pipe, and its exit code tells.
+        std::thread::spawn(move || {
+            let _ = f.write_all(&data);
+        })
     });
     let raw = process.as_raw_handle() as HANDLE;
     // SAFETY: an open process handle.
@@ -1114,14 +1296,17 @@ pub fn run_capture(t: &Token, line: &str, limit: Duration) -> io::Result<(u32, V
         // SAFETY: as above, with every right.
         unsafe { TerminateProcess(raw, 1) };
         let _ = wait();
-        let _ = (reader.join(), drain.join());
+        let _ = (out.join(), err.join(), fed.map(|f| f.join()));
         return Err(io::Error::new(
             io::ErrorKind::TimedOut,
             "it did not end in time",
         ));
     }
     let code = wait()?;
-    let out = reader.join().unwrap_or_default();
-    let _ = drain.join();
-    Ok((code, out))
+    let _ = fed.map(|f| f.join());
+    Ok((
+        code,
+        out.join().unwrap_or_default(),
+        err.join().unwrap_or_default(),
+    ))
 }

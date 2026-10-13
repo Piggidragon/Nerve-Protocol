@@ -1286,7 +1286,10 @@ impl Link {
         if let Some(why) = synced.refusal(&name) {
             return Err(RpcError::new(ErrorCode::Unavailable, why));
         }
-        Ok(nerve_sandbox::ContainerSpec { name })
+        Ok(nerve_sandbox::ContainerSpec {
+            name,
+            own_station: false,
+        })
     }
 }
 

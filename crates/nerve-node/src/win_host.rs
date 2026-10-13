@@ -765,7 +765,8 @@ impl WinSystem for WinHost {
             &program.display().to_string(),
             &["--version".to_string()],
         );
-        let (code, out) = win_user::run_capture(&t, &line, Duration::from_secs(30)).map_err(at)?;
+        let (code, out, _) =
+            win_user::run_capture(&t, &line, None, Duration::from_secs(30)).map_err(at)?;
         if code != 0 {
             return Err(format!("{} --version: exit code {code}", program.display()));
         }
@@ -803,8 +804,9 @@ impl WinSystem for WinHost {
         &self,
         paths: &crate::paths::NodePaths,
         centers: &[String],
+        user: Option<&str>,
     ) -> crate::grants::Synced {
-        crate::grants::remove_all(paths, centers)
+        crate::grants::remove_all(paths, centers, user)
     }
 }
 
@@ -908,7 +910,8 @@ mod tests {
             &exe.to_string_lossy(),
             &["/D".into(), "/C".into(), "whoami /groups".into()],
         );
-        let (code, out) = win_user::run_capture(&t, &line, Duration::from_secs(30)).unwrap();
+        let (code, out, _) =
+            win_user::run_capture(&t, &line, None, Duration::from_secs(30)).unwrap();
         assert_eq!(code, 0);
         assert!(!out.is_empty());
     }

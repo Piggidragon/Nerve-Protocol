@@ -5,10 +5,15 @@ use clap::Parser;
 fn main() {
     // The exec shim is this same binary, started by the daemon for each
     // confined command. It is not a command the owner types, so it is checked
-    // before clap (and stays out of `--help`).
-    if std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(nerve_sandbox::SHIM_ARG))
-    {
+    // before clap (and stays out of `--help`). So is the removal of
+    // AppContainer profiles, which the installed Windows service starts as
+    // the account its commands run as.
+    let first = std::env::args_os().nth(1);
+    if first.as_deref() == Some(std::ffi::OsStr::new(nerve_sandbox::SHIM_ARG)) {
         std::process::exit(nerve_sandbox::shim_main());
+    }
+    if first.as_deref() == Some(std::ffi::OsStr::new(nerve_sandbox::PROFILES_ARG)) {
+        std::process::exit(nerve_sandbox::profiles_main());
     }
     // Events go to stderr. The daemon adds the log file in the state folder and
     // takes its level from `node.toml`.

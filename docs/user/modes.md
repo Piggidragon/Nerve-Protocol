@@ -92,11 +92,10 @@ every command.
 
 Each pairing's commands run in an AppContainer of their own. Windows lets a
 process there open only what is granted to that container, and what it opens
-to every AppContainer. This holds for a node you run yourself. The
-[installed service](service.md#windows) runs every command as another account,
-and does not start the AppContainer as that account yet: there `folder` mode
-runs no command (`confinement none`), and the service puts no grants on
-folders.
+to every AppContainer. On the [installed service](service.md#windows) the
+command runs as the account commands run as, in the same AppContainer: it
+opens only what that account may open and the container is granted
+([folder mode on the service](#folder-mode-on-the-installed-windows-service)).
 
 | A command can | Where |
 |---|---|
@@ -110,12 +109,12 @@ folders.
   takes it off. A running node takes changes from the CLI at its next start
   ([platforms](platforms.md#no-control-socket)), and gives its folders their
   entries again until then.
-- `uninstall` takes off the entries of the node in your own folders
-  (`%USERPROFILE%\.config\nerve` and `.local\state\nerve`, or those you name
-  with `--config-dir` and `--state-dir`). Once a service is installed, the CLI
-  reaches the service, so name the folders to change the node you run
-  yourself. Before you delete its folders, remove its pairings: the record of
-  the entries is in its state folder.
+- `uninstall` takes off the entries of the service and of the node in your
+  own folders (`%USERPROFILE%\.config\nerve` and `.local\state\nerve`, or
+  those you name with `--config-dir` and `--state-dir`). Once a service is
+  installed, the CLI reaches the service, so name the folders to change the
+  node you run yourself. Before you delete its folders, remove its pairings:
+  the record of the entries is in its state folder.
 - A granted folder you move or rename on the same drive takes its entry
   along, as Windows keeps its permissions. At its next sync (at start, on a
   change, before a command, and when the CLI changes the config) the node
@@ -144,8 +143,29 @@ folders.
 ([platforms](platforms.md#no-control-socket)). The node names its
 confinement when it starts, in its output and its [log](logs.md):
 `node daemon running (…, confinement appcontainer, …)`. The center sees it in
-the node's `exec` state, `confinement appcontainer`, or `none` on the
-installed service.
+the node's `exec` state, `confinement appcontainer`.
+
+### Folder mode on the installed Windows service
+
+- The command runs as the account commands run as
+  ([service](service.md#the-account-commands-run-as-on-windows)), inside the
+  pairing's AppContainer. Before it starts, the node checks that this account
+  cannot open the node's folders, as in every mode.
+- `~` in a folder is that account's profile folder.
+- The service puts the entries on as that account, so it can do so only on
+  folders whose permissions that account may change: its own, such as the
+  folders in its profile. For any other folder, run `folder add` in an
+  administrator's terminal: the CLI puts the entry on itself. If the folder
+  is made anew later, the service cannot give it the entry again; run
+  `folder add` there again.
+- The container keeps its profile in the account's registry. While the
+  account is not signed in, Windows loads that registry for the command
+  through its Secondary Logon service (`seclogon`), which must not be
+  disabled. The profile is made at the first command, and removed with the
+  pairing or its last folder, and by `uninstall`. The first command of an
+  account that never signed in makes its profile folder.
+- The command gets a desktop of its own in the window station of the
+  account's logon. It cannot open the clipboard there.
 
 ## `user` mode
 

@@ -51,6 +51,13 @@ pub struct ShimSpec {
     /// Windows: run the command in this AppContainer.
     #[serde(default)]
     pub container: Option<ContainerSpec>,
+    /// The folder the shim enters before it starts the command; without it
+    /// the command works where the shim was started. The installed Windows
+    /// service starts the shim of another account in a folder of its own:
+    /// Windows looks at the folder a process starts in as the one starting
+    /// it, and the account's folders may be closed to the service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
 }
 
 /// What a PowerShell command in an AppContainer starts with. PowerShell
@@ -71,7 +78,18 @@ pub const POWERSHELL_START: &str = "$null = New-PSDrive -Name Work -PSProvider F
 #[serde(deny_unknown_fields)]
 pub struct ContainerSpec {
     pub name: String,
+    /// The command's desktop goes into the window station the shim stands
+    /// in, instead of one of its own: the installed service starts the shim
+    /// as another account in that account's own station, and there only an
+    /// administrator may make a new one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub own_station: bool,
 }
+
+/// The argument that makes the `nerve-node` binary take AppContainer
+/// profiles away from the account it runs as ([`profiles_main`]). Hidden
+/// from `--help`.
+pub const PROFILES_ARG: &str = "__remove-profiles";
 
 /// The largest spec the shim reads.
 const MAX_SPEC: u64 = 1 << 20;
@@ -99,11 +117,61 @@ pub fn shim_main() -> i32 {
         return SHIM_FAILED;
     }
     match serde_json::from_slice::<ShimSpec>(&json) {
-        Ok(spec) => imp::run(spec),
+        Ok(spec) => {
+            if let Some(dir) = &spec.cwd
+                && let Err(e) = std::env::set_current_dir(dir)
+            {
+                eprintln!("nerve-node: cannot enter {}: {e}", dir.display());
+                return SHIM_FAILED;
+            }
+            imp::run(spec)
+        }
         Err(e) => {
             eprintln!("nerve-node: bad exec shim spec: {e}");
             SHIM_FAILED
         }
+    }
+}
+
+/// Takes the AppContainer profiles named on stdin (a JSON list) away from
+/// the account this process runs as; one that is not there is fine. The
+/// installed Windows service starts this as the account its commands run
+/// as, whose profiles only that account can remove. Returns the exit code.
+pub fn profiles_main() -> i32 {
+    use std::io::Read;
+    let mut json = Vec::new();
+    if std::io::stdin()
+        .lock()
+        .take(MAX_SPEC)
+        .read_to_end(&mut json)
+        .is_err()
+    {
+        eprintln!("nerve-node: no profiles to remove were given");
+        return SHIM_FAILED;
+    }
+    let names: Vec<String> = match serde_json::from_slice(&json) {
+        Ok(n) => n,
+        Err(e) => {
+            eprintln!("nerve-node: bad list of profiles: {e}");
+            return SHIM_FAILED;
+        }
+    };
+    #[cfg(windows)]
+    {
+        let mut code = 0;
+        for n in names {
+            if let Err(e) = appcontainer::remove_profile(&n) {
+                eprintln!("nerve-node: {e}");
+                code = SHIM_FAILED;
+            }
+        }
+        code
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = names;
+        eprintln!("nerve-node: AppContainers are Windows'");
+        SHIM_FAILED
     }
 }
 
@@ -253,7 +321,7 @@ mod imp {
         // holds this process and what it starts, the container's processes
         // too.
         if let Some(c) = &spec.container {
-            return match super::appcontainer::run(&spec.program, &spec.args, &c.name) {
+            return match super::appcontainer::run(&spec.program, &spec.args, c) {
                 Ok(code) => code as i32,
                 Err(e) => {
                     eprintln!(
@@ -507,8 +575,11 @@ pub mod appcontainer {
     //! on folders for it without asking anything of Windows. To start a
     //! process in it, Windows wants its profile; the shim makes that for the
     //! user it runs as ([`ensure_profile`]), and the node removes it with the
-    //! container's last grant ([`remove_profile`]). The container has the
-    //! network (`internetClient`, `internetClientServer`,
+    //! container's last grant ([`remove_profile`]). A profile lives in the
+    //! user's registry, so it is made and removed only while that is loaded:
+    //! the installed service, whose shim runs as another account, has
+    //! Windows load it meanwhile (`nerve-node`'s `win_user`). The container
+    //! has the network (`internetClient`, `internetClientServer`,
     //! `privateNetworkClientServer`), which Landlock leaves open too, but not
     //! the machine's own loopback address, which Windows keeps from every
     //! AppContainer.
@@ -526,8 +597,10 @@ pub mod appcontainer {
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        GetNamedSecurityInfoW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
-        SetNamedSecurityInfoW,
+        EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, GetSecurityInfo,
+        NO_MULTIPLE_TRUSTEE, SDDL_REVISION_1, SE_FILE_OBJECT, SE_WINDOW_OBJECT, SetEntriesInAclW,
+        SetNamedSecurityInfoW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_WELL_KNOWN_GROUP,
+        TRUSTEE_W,
     };
     use windows_sys::Win32::Security::Isolation::{
         CreateAppContainerProfile, DeleteAppContainerProfile,
@@ -541,8 +614,9 @@ pub mod appcontainer {
         INHERIT_ONLY_ACE, INHERITED_ACE, InitializeAcl, OBJECT_INHERIT_ACE,
         PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
         SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
-        TokenUser, UNPROTECTED_DACL_SECURITY_INFORMATION, WinCapabilityInternetClientServerSid,
-        WinCapabilityInternetClientSid, WinCapabilityPrivateNetworkClientServerSid,
+        TokenUser, UNPROTECTED_DACL_SECURITY_INFORMATION, WinBuiltinAnyPackageSid,
+        WinCapabilityInternetClientServerSid, WinCapabilityInternetClientSid,
+        WinCapabilityPrivateNetworkClientServerSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         ExtendedFileIdType, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_128, FILE_ID_DESCRIPTOR,
@@ -985,7 +1059,8 @@ pub mod appcontainer {
         Ok(())
     }
 
-    /// A capability SID in a buffer of its own.
+    /// A well-known SID (a capability, ALL APPLICATION PACKAGES) in a
+    /// buffer of its own.
     fn capability(kind: i32) -> io::Result<Vec<u8>> {
         let mut buf = vec![0u8; 68]; // SECURITY_MAX_SID_SIZE
         let mut len = buf.len() as u32;
@@ -1038,7 +1113,17 @@ pub mod appcontainer {
         ) -> HANDLE;
         fn CloseDesktop(desktop: HANDLE) -> i32;
         fn CloseWindowStation(station: HANDLE) -> i32;
+        fn GetUserObjectInformationW(
+            object: HANDLE,
+            index: i32,
+            info: *mut c_void,
+            len: u32,
+            needed: *mut u32,
+        ) -> i32;
     }
+
+    /// GetUserObjectInformationW: the name of the object.
+    const UOI_NAME: i32 = 2;
 
     /// The SID as text (`S-1-...`).
     fn sid_text(sid: PSID) -> io::Result<String> {
@@ -1100,7 +1185,9 @@ pub mod appcontainer {
     /// does not reach the user's windows or clipboard either. They go when
     /// the shim does.
     struct Desktop {
-        station: HANDLE,
+        /// The station made for the command; `None` for the one this
+        /// process stands in, which is not this code's to close.
+        station: Option<HANDLE>,
         desktop: HANDLE,
         /// `station\desktop`, for the startup info.
         name: Vec<u16>,
@@ -1108,37 +1195,175 @@ pub mod appcontainer {
 
     impl Drop for Desktop {
         fn drop(&mut self) {
-            // SAFETY: made in `desktop`, closed once.
+            // SAFETY: made in `desktop` or `own_station_desktop`, closed
+            // once.
             unsafe {
                 CloseDesktop(self.desktop);
-                CloseWindowStation(self.station);
+                if let Some(s) = self.station {
+                    CloseWindowStation(s);
+                }
             }
         }
     }
 
-    fn desktop(container: &Sid) -> io::Result<Desktop> {
-        let sddl = format!(
-            "D:P(A;;GA;;;SY)(A;;GA;;;{})(A;;GA;;;{})",
-            user_sid()?,
-            sid_text(container.0)?
-        );
-        let mut sd: PSECURITY_DESCRIPTOR = null_mut();
-        // SAFETY: a NUL-terminated SDDL string; the descriptor is freed
-        // with LocalFree.
+    /// Security attributes that let only SYSTEM, this user and the
+    /// container open what is made with them.
+    struct Private {
+        sd: Local,
+    }
+
+    impl Private {
+        fn new(container: &Sid) -> io::Result<Private> {
+            let sddl = format!(
+                "D:P(A;;GA;;;SY)(A;;GA;;;{})(A;;GA;;;{})",
+                user_sid()?,
+                sid_text(container.0)?
+            );
+            let mut sd: PSECURITY_DESCRIPTOR = null_mut();
+            // SAFETY: a NUL-terminated SDDL string; the descriptor is
+            // freed with LocalFree.
+            check(unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    wide(OsStr::new(&sddl)).as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut sd,
+                    null_mut(),
+                )
+            })?;
+            Ok(Private { sd: Local(sd) })
+        }
+
+        fn attributes(&self) -> SECURITY_ATTRIBUTES {
+            SECURITY_ATTRIBUTES {
+                nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: self.sd.0,
+                bInheritHandle: 0,
+            }
+        }
+    }
+
+    /// What a program in a container needs of the window station it
+    /// starts in: to see it and its desktops, and its atoms. Not its
+    /// clipboard (WINSTA_ACCESSCLIPBOARD), nor making desktops there.
+    const STATION_RIGHTS: u32 = 0x1 // WINSTA_ENUMDESKTOPS
+        | 0x2 // WINSTA_READATTRIBUTES
+        | 0x20 // WINSTA_ACCESSGLOBALATOMS
+        | 0x100 // WINSTA_ENUMERATE
+        | READ_CONTROL;
+
+    /// A desktop of the command's own in the window station this process
+    /// stands in ([`super::ContainerSpec::own_station`]). The installed
+    /// service starts the shim as another account in the station of that
+    /// account's logon, which only processes of that logon may open; an
+    /// AppContainer needs an entry of its own there as well, which this
+    /// gives to every AppContainer (ALL APPLICATION PACKAGES), with
+    /// [`STATION_RIGHTS`]: the same entry whichever command adds it, so
+    /// two that start at once cannot drop each other's. The desktop is the
+    /// command's alone, as in [`desktop`].
+    fn own_station_desktop(container: &Sid) -> io::Result<Desktop> {
+        // SAFETY: a plain getter; the handle is not to be closed.
+        let station = unsafe { GetProcessWindowStation() };
+        if station.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        let mut buf = vec![0u16; 256];
+        let mut needed = 0u32;
+        // SAFETY: the station and a buffer of the size given.
         check(unsafe {
-            ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                wide(OsStr::new(&sddl)).as_ptr(),
-                SDDL_REVISION_1,
-                &mut sd,
-                null_mut(),
+            GetUserObjectInformationW(
+                station,
+                UOI_NAME,
+                buf.as_mut_ptr().cast(),
+                (buf.len() * 2) as u32,
+                &mut needed,
             )
         })?;
-        let _sd = Local(sd);
-        let sa = SECURITY_ATTRIBUTES {
-            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: sd,
-            bInheritHandle: 0,
+        let station_name =
+            String::from_utf16_lossy(&buf[..buf.iter().take_while(|c| **c != 0).count()]);
+        let packages = capability(WinBuiltinAnyPackageSid)?;
+        let mut dacl: *mut ACL = null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = null_mut();
+        // SAFETY: the station and out pointers to locals; the descriptor
+        // is freed with LocalFree, and `dacl` points into it.
+        let e = unsafe {
+            GetSecurityInfo(
+                station,
+                SE_WINDOW_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut sd,
+            )
         };
+        if e != 0 {
+            return Err(io::Error::from_raw_os_error(e as i32));
+        }
+        let _sd = Local(sd);
+        let entry = EXPLICIT_ACCESS_W {
+            grfAccessPermissions: STATION_RIGHTS,
+            grfAccessMode: GRANT_ACCESS,
+            grfInheritance: 0,
+            Trustee: TRUSTEE_W {
+                pMultipleTrustee: null_mut(),
+                MultipleTrusteeOperation: NO_MULTIPLE_TRUSTEE,
+                TrusteeForm: TRUSTEE_IS_SID,
+                TrusteeType: TRUSTEE_IS_WELL_KNOWN_GROUP,
+                ptstrName: packages.as_ptr() as *mut u16,
+            },
+        };
+        let mut new: *mut ACL = null_mut();
+        // SAFETY: one entry with a valid SID, the old list (or null), and
+        // an out pointer; the new list is freed with LocalFree.
+        let e = unsafe { SetEntriesInAclW(1, &entry, dacl, &mut new) };
+        if e != 0 {
+            return Err(io::Error::from_raw_os_error(e as i32));
+        }
+        let _new = Local(new.cast());
+        // SAFETY: the station and a valid list.
+        let e = unsafe {
+            SetSecurityInfo(
+                station,
+                SE_WINDOW_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                new,
+                null(),
+            )
+        };
+        if e != 0 {
+            return Err(io::Error::from_raw_os_error(e as i32));
+        }
+        let private = Private::new(container)?;
+        let sa = private.attributes();
+        let name = format!("nerve-{}", std::process::id());
+        // SAFETY: a NUL-terminated name and security attributes that live
+        // for the call; CreateDesktopW makes it in this process's station.
+        let desktop = unsafe {
+            CreateDesktopW(
+                wide(OsStr::new(&name)).as_ptr(),
+                null(),
+                null(),
+                0,
+                GENERIC_ALL,
+                &sa,
+            )
+        };
+        if desktop.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Desktop {
+            station: None,
+            desktop,
+            name: wide(OsStr::new(&format!("{station_name}\\{name}"))),
+        })
+    }
+
+    fn desktop(container: &Sid) -> io::Result<Desktop> {
+        let private = Private::new(container)?;
+        let sa = private.attributes();
         let name = format!("nerve-{}", std::process::id());
         // SAFETY: NUL-terminated names and security attributes that live
         // for the calls; the handles are closed by `Desktop`.
@@ -1171,7 +1396,7 @@ pub mod appcontainer {
                 return Err(made);
             }
             Ok(Desktop {
-                station,
+                station: Some(station),
                 desktop,
                 name: wide(OsStr::new(&format!("{name}\\Default"))),
             })
@@ -1184,11 +1409,12 @@ pub mod appcontainer {
         check(unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) })
     }
 
-    /// Runs `program` with `args` in the container `name`, with this
+    /// Runs `program` with `args` in the container `spec` names, with this
     /// process's environment, working folder, stdout and stderr, and the
     /// null device as its stdin; no other handle goes to it. Waits for it
     /// and returns its exit code.
-    pub fn run(program: &Path, args: &[String], name: &str) -> io::Result<u32> {
+    pub fn run(program: &Path, args: &[String], spec: &super::ContainerSpec) -> io::Result<u32> {
+        let name = spec.name.as_str();
         ensure_profile(name)?;
         let sid = Sid::derive(name)?;
         let mut caps_buf = [
@@ -1265,8 +1491,13 @@ pub mod appcontainer {
                 null(),
             ))?;
         }
-        let mut desk = desktop(&sid)
-            .map_err(|e| io::Error::new(e.kind(), format!("a desktop of its own: {e}")))?;
+        let desk = if spec.own_station {
+            own_station_desktop(&sid)
+        } else {
+            desktop(&sid)
+        };
+        let mut desk =
+            desk.map_err(|e| io::Error::new(e.kind(), format!("a desktop of its own: {e}")))?;
         let mut si = STARTUPINFOEXW::default();
         si.StartupInfo.lpDesktop = desk.name.as_mut_ptr();
         si.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
@@ -1338,6 +1569,30 @@ mod tests {
         }
     }
 
+    /// Whether the command's desktop goes into the shim's own window
+    /// station reaches the shim; a spec that does not say so keeps a
+    /// station of its own, as before.
+    #[test]
+    fn the_own_station_reaches_the_shim() {
+        let c = ContainerSpec {
+            name: "nerve.x".into(),
+            own_station: true,
+        };
+        let j = serde_json::to_string(&c).unwrap();
+        assert_eq!(j, r#"{"name":"nerve.x","own_station":true}"#);
+        assert_eq!(serde_json::from_str::<ContainerSpec>(&j).unwrap(), c);
+        let plain: ContainerSpec = serde_json::from_str(r#"{"name":"nerve.x"}"#).unwrap();
+        assert!(!plain.own_station);
+        let plain = ContainerSpec {
+            own_station: false,
+            ..c
+        };
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"name":"nerve.x"}"#
+        );
+    }
+
     #[test]
     fn spec_round_trips_strictly() {
         let s = ShimSpec {
@@ -1347,7 +1602,9 @@ mod tests {
             landlock: Some(LandlockSpec::default()),
             container: Some(ContainerSpec {
                 name: "nerve.x".into(),
+                own_station: false,
             }),
+            cwd: Some("/work".into()),
         };
         let j = serde_json::to_string(&s).unwrap();
         assert_eq!(serde_json::from_str::<ShimSpec>(&j).unwrap(), s);
@@ -1356,6 +1613,7 @@ mod tests {
         let plain = r#"{"program":"x","args":[],"parent":1}"#;
         let plain = serde_json::from_str::<ShimSpec>(plain).unwrap();
         assert_eq!((plain.landlock, plain.container), (None, None));
+        assert_eq!(plain.cwd, None);
         let mut c = Confinement {
             landlock_abi: None,
             appcontainer: false,
@@ -1460,6 +1718,19 @@ mod tests {
         program: &str,
         args: &[&str],
     ) -> (u32, String) {
+        run_in_container_at(name, cwd, program, args, false)
+    }
+
+    /// [`run_in_container`], with the command's desktop in the window
+    /// station the helper stands in when `own_station` says so.
+    #[cfg(windows)]
+    fn run_in_container_at(
+        name: &str,
+        cwd: &std::path::Path,
+        program: &str,
+        args: &[&str],
+        own_station: bool,
+    ) -> (u32, String) {
         // The shim's process runs in the command's folder; so does this one
         // for the call. Tests run in threads, so a child process takes the
         // place of the shim.
@@ -1474,6 +1745,7 @@ mod tests {
             .env("NERVE_TEST_CONTAINER", name)
             .env("NERVE_TEST_PROGRAM", program)
             .env("NERVE_TEST_ARGS", args.join("\n"))
+            .env("NERVE_TEST_OWN_STATION", if own_station { "1" } else { "" })
             .current_dir(cwd)
             .output()
             .unwrap();
@@ -1504,11 +1776,11 @@ mod tests {
             .collect();
         let program = var("NERVE_TEST_PROGRAM");
         // A container that may not enter its working folder does not start.
-        match appcontainer::run(
-            std::path::Path::new(&program),
-            &args,
-            &var("NERVE_TEST_CONTAINER"),
-        ) {
+        let spec = ContainerSpec {
+            name: var("NERVE_TEST_CONTAINER"),
+            own_station: var("NERVE_TEST_OWN_STATION") == "1",
+        };
+        match appcontainer::run(std::path::Path::new(&program), &args, &spec) {
             Ok(code) => println!("exit code: {code}"),
             Err(e) => println!("exit code: {}\n{e}", u32::MAX),
         }
@@ -1551,6 +1823,37 @@ mod tests {
         appcontainer::set(&granted, &name, None).unwrap();
         assert_ne!(run(r"type sub\in.txt > copy2.txt".into()), 0);
         assert!(!granted.join("copy2.txt").exists());
+        appcontainer::remove_profile(&name).unwrap();
+    }
+
+    /// A command whose desktop goes into the window station the shim stands
+    /// in (the shim of the installed service, as another account) starts
+    /// there and works in its granted folder; so does PowerShell, which
+    /// does not start without a desktop it may open.
+    #[cfg(windows)]
+    #[test]
+    fn an_appcontainer_starts_on_a_desktop_in_the_shims_station() {
+        let base = tempfile::tempdir().unwrap();
+        let granted = base.path().join("granted");
+        std::fs::create_dir_all(&granted).unwrap();
+        let name = format!("nerve.test.station.{}", std::process::id());
+        appcontainer::set(&granted, &name, Some(acl::masks(true, true, true))).unwrap();
+        let script = format!("{POWERSHELL_START}Set-Content -Path made.txt -Value here");
+        let (code, log) = run_in_container_at(
+            &name,
+            &granted,
+            "powershell.exe",
+            &["-NoProfile", "-Command", &script],
+            true,
+        );
+        assert_eq!(code, 0, "{log}");
+        assert_eq!(
+            std::fs::read_to_string(granted.join("made.txt"))
+                .unwrap()
+                .trim(),
+            "here"
+        );
+        appcontainer::set(&granted, &name, None).unwrap();
         appcontainer::remove_profile(&name).unwrap();
     }
 

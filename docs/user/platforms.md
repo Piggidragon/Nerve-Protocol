@@ -6,7 +6,7 @@ behaves the same except where this page says so.
 | | Linux | Windows |
 |---|---|---|
 | Shell for commands | `/bin/sh -c` | Windows PowerShell 5.1 (`powershell.exe -NoProfile -Command`) |
-| `folder` mode runs commands | Yes, confined by Landlock | Yes, confined by an AppContainer; not yet on the [installed service](service.md#windows) |
+| `folder` mode runs commands | Yes, confined by Landlock | Yes, confined by an AppContainer, also on the [installed service](service.md#windows) |
 | `allowlist` and `user` mode run commands | Yes | Yes, in a Job Object, not confined to folders |
 | Sudo switch | Yes | No |
 | Control socket | Yes | No |

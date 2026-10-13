@@ -5,7 +5,9 @@
 //! rights of their flags (`exec::container_grants`), so the grants follow
 //! the folders: a folder added gets one, a folder or center removed loses
 //! it, and `uninstall` takes them all off. They follow the folders whatever
-//! the mode; only folder mode runs commands in the container.
+//! the mode; only folder mode runs commands in the container. On the
+//! installed service the commands run as another account (crate::win_user),
+//! in the same containers, and `~` in the folders is that account's home.
 //!
 //! The node keeps a record of the grants it put on (`grants.json` in its
 //! state folder), so it finds them again to take them off, also after the
@@ -95,22 +97,6 @@ pub fn wanted(cfg: &NodeConfig, paths: &NodePaths, home: &Path, platform: &Platf
                 })
         })
         .collect()
-}
-
-/// The grants a node wants on this machine: [`wanted`], or none on the
-/// installed service (`installed`), whose commands run as another account
-/// and never in a container (crate::daemon), so their grants come off.
-pub fn wanted_on(
-    installed: bool,
-    cfg: &NodeConfig,
-    paths: &NodePaths,
-    home: &Path,
-    platform: &Platform,
-) -> Vec<Grant> {
-    if installed {
-        return Vec::new();
-    }
-    wanted(cfg, paths, home, platform)
 }
 
 /// What [`sync`] left.
@@ -454,13 +440,27 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
 
 /// Brings the grants on this machine in line with `cfg` ([`wanted`],
 /// [`sync`]), and removes the profile of a container left without grants.
-/// Nothing to do where commands are not confined by grants (Linux).
+/// `home` is the `~` of the rules: on the installed service the home of the
+/// account the commands run as. Nothing to do where commands are not
+/// confined by grants (Linux).
 pub fn apply(paths: &NodePaths, cfg: &NodeConfig, home: &Path) -> Synced {
     #[cfg(windows)]
     {
-        let installed = crate::service::is_service_node(paths);
-        let want = wanted_on(installed, cfg, paths, home, &crate::paths::platform());
-        windows_sync(paths, &want)
+        let user = cfg.machine.user.as_deref();
+        let (account, errors) = acting(paths, user);
+        // The folders are resolved as the account too: its own may be
+        // closed to the service's user.
+        let as_account = match account.as_ref().map(crate::win_user::FsAs::new).transpose() {
+            Ok(a) => a,
+            Err(e) => {
+                let mut s = Synced::default().not_known(format!("cannot act as the account: {e}"));
+                s.errors.splice(0..0, errors);
+                return s;
+            }
+        };
+        let want = wanted(cfg, paths, home, &crate::paths::platform());
+        drop(as_account);
+        windows_sync(paths, &want, user, account, errors)
     }
     #[cfg(not(windows))]
     {
@@ -470,36 +470,97 @@ pub fn apply(paths: &NodePaths, cfg: &NodeConfig, home: &Path) -> Synced {
 }
 
 /// Takes off every grant the node put on, and the profiles of its
-/// containers: those in the record and those of `centers`. For uninstall.
-pub fn remove_all(paths: &NodePaths, centers: &[String]) -> Synced {
+/// containers: those in the record and those of `centers`. `user` is the
+/// account the commands run as (`machine.user`), whose registry holds the
+/// profiles on the installed service. For uninstall.
+pub fn remove_all(paths: &NodePaths, centers: &[String], user: Option<&str>) -> Synced {
     #[cfg(windows)]
     {
-        let mut s = windows_sync(paths, &[]);
-        for c in centers {
-            let name = container(paths, c);
-            if !s.emptied.contains(&name)
-                && let Err(e) = nerve_sandbox::appcontainer::remove_profile(&name)
-            {
-                s.errors.push(e.to_string());
-            }
-        }
+        let (account, errors) = acting(paths, user);
+        let mut s = windows_sync(paths, &[], user, account, errors);
+        let rest: Vec<String> = centers
+            .iter()
+            .map(|c| container(paths, c))
+            .filter(|n| !s.emptied.contains(n))
+            .collect();
+        let errors = remove_profiles(paths, user, &rest);
+        s.errors.extend(errors);
         s
     }
     #[cfg(not(windows))]
     {
-        let _ = (paths, centers);
+        let _ = (paths, centers, user);
         Synced::default()
     }
 }
 
-/// The folders' access lists on Windows.
+/// Removes the profiles `names` of a node's containers; what failed. They
+/// are in the registry of the user the node runs as, or on the installed
+/// service in that of the account its commands run as (`user`), which only
+/// that account, or an administrator acting as it, can change
+/// (crate::win_user::remove_profiles).
 #[cfg(windows)]
-struct Acls;
+fn remove_profiles(paths: &NodePaths, user: Option<&str>, names: &[String]) -> Vec<String> {
+    if names.is_empty() {
+        return Vec::new();
+    }
+    if !crate::service::is_service_node(paths) {
+        return names
+            .iter()
+            .filter_map(|n| nerve_sandbox::appcontainer::remove_profile(n).err())
+            .map(|e| e.to_string())
+            .collect();
+    }
+    let left = || names.join(", ");
+    let Some(user) = user else {
+        return vec![format!(
+            "no account runs the commands, so the AppContainer profiles {} stay with the account that had them",
+            left()
+        )];
+    };
+    let secret = paths.config_dir.join(crate::winsvc::SECRET_FILE);
+    match crate::win_user::lookup(user) {
+        Ok(Some(a)) => crate::win_user::remove_profiles(&a, names, &secret)
+            .err()
+            .into_iter()
+            .collect(),
+        Ok(None) => vec![format!(
+            "there is no account {user}, so its AppContainer profiles {} cannot be removed",
+            left()
+        )],
+        Err(e) => vec![e],
+    }
+}
+
+/// The folders' access lists on Windows, changed as `account` when one is
+/// given: the installed service acts on the owner's folders as the account
+/// its commands run as (crate::win_user::FsAs), whose folders they are, as
+/// the service's own user may not change them. The record stays the
+/// service's.
+#[cfg(windows)]
+struct Acls {
+    account: Option<crate::service::Account>,
+}
+
+#[cfg(windows)]
+impl Acls {
+    /// This thread acts as the account while the result lives.
+    fn acting(&self) -> io::Result<Option<crate::win_user::FsAs>> {
+        self.account
+            .as_ref()
+            .map(|a| {
+                crate::win_user::FsAs::new(a)
+                    .map_err(|e| io::Error::new(e.kind(), format!("as {}: {e}", a.name)))
+            })
+            .transpose()
+    }
+}
 
 #[cfg(windows)]
 impl Folders for Acls {
     fn look(&mut self, path: &Path, container: &str, access: Access) -> io::Result<Option<Look>> {
         use nerve_sandbox::{acl, appcontainer};
+        let _as = self.acting()?;
         let masks = acl::masks(access.read, access.write, access.execute);
         match appcontainer::look(path, container, masks) {
             Ok((id, granted)) => Ok(Some(Look {
@@ -513,6 +574,7 @@ impl Folders for Acls {
 
     fn locate(&mut self, id: &str, near: &Path) -> io::Result<Found> {
         let id = id.parse().map_err(io::Error::other)?;
+        let _as = self.acting()?;
         nerve_sandbox::appcontainer::locate(&id, near)
     }
 
@@ -523,21 +585,54 @@ impl Folders for Acls {
         access: Option<Access>,
     ) -> io::Result<Option<String>> {
         use nerve_sandbox::{acl, appcontainer};
+        let _as = self.acting()?;
         let masks = access.map(|a| acl::masks(a.read, a.write, a.execute));
-        appcontainer::set(path, container, masks)?;
+        appcontainer::set(path, container, masks).map_err(|e| match &self.account {
+            Some(a) => io::Error::new(e.kind(), format!("as {}: {e}", a.name)),
+            None => e,
+        })?;
         Ok(appcontainer::file_id(path).ok().map(|i| i.to_string()))
     }
 }
 
+/// [`sync`] on this machine, then the profiles of the containers left
+/// without grants go ([`remove_profiles`]). The installed service changes
+/// the folders as the account its commands run as (`account`, [`acting`]);
+/// an administrator (the CLI, `uninstall`) and a node run by hand as
+/// themselves. `errors` come first in what it returns.
 #[cfg(windows)]
-fn windows_sync(paths: &NodePaths, want: &[Grant]) -> Synced {
-    let mut s = sync(&record_file(paths), want, &mut Acls);
-    for c in &s.emptied {
-        if let Err(e) = nerve_sandbox::appcontainer::remove_profile(c) {
-            s.errors.push(e.to_string());
-        }
-    }
+fn windows_sync(
+    paths: &NodePaths,
+    want: &[Grant],
+    user: Option<&str>,
+    account: Option<crate::service::Account>,
+    errors: Vec<String>,
+) -> Synced {
+    let mut s = sync(&record_file(paths), want, &mut Acls { account });
+    s.errors.splice(0..0, errors);
+    let errors = remove_profiles(paths, user, &s.emptied);
+    s.errors.extend(errors);
     s
+}
+
+/// The account the installed service acts as on the owner's folders: the
+/// one its commands run as (`user`), when this is the service ([`Acls`]);
+/// and why it cannot, if it cannot.
+#[cfg(windows)]
+fn acting(paths: &NodePaths, user: Option<&str>) -> (Option<crate::service::Account>, Vec<String>) {
+    let service = crate::service::is_service_node(paths) && crate::win_user::can_switch();
+    match user.filter(|_| service).map(crate::win_user::lookup) {
+        Some(Ok(Some(a))) => (Some(a), Vec::new()),
+        Some(Ok(None)) => (
+            None,
+            vec![format!(
+                "there is no account {} to change the folders' grants as",
+                user.unwrap_or_default()
+            )],
+        ),
+        Some(Err(e)) => (None, vec![e]),
+        None => (None, Vec::new()),
+    }
 }
 
 #[cfg(test)]
@@ -1013,10 +1108,6 @@ mod tests {
                 id: None,
             }]
         );
-        // The installed service runs no command in a container, so it
-        // wants none of these, and those it has come off.
-        assert_eq!(wanted_on(false, &cfg, &paths, &home, &Platform::Unix), want);
-        assert!(wanted_on(true, &cfg, &paths, &home, &Platform::Unix).is_empty());
     }
 
     /// The access list of `path` as icacls prints it.
@@ -1046,7 +1137,7 @@ mod tests {
             access: Access::ALL,
             id: None,
         }];
-        let s = windows_sync(&paths, &want);
+        let s = windows_sync(&paths, &want, None, None, Vec::new());
         assert!(s.errors.is_empty(), "{s:?}");
         // Inherited below the folder too.
         assert!(
@@ -1054,7 +1145,7 @@ mod tests {
             "{}",
             icacls(&work)
         );
-        let s = remove_all(&paths, &["lab".into()]);
+        let s = remove_all(&paths, &["lab".into()], None);
         assert!(s.errors.is_empty(), "{s:?}");
         assert_eq!(s.removed, 1);
         assert!(!icacls(&work).contains("S-1-15-2-"), "{}", icacls(&work));
@@ -1078,11 +1169,11 @@ mod tests {
             access: Access::ALL,
             id: None,
         }];
-        let s = windows_sync(&paths, &want);
+        let s = windows_sync(&paths, &want, None, None, Vec::new());
         assert!(s.errors.is_empty(), "{s:?}");
         std::fs::rename(&work, &moved).unwrap();
         assert!(icacls(&moved).contains("S-1-15-2-"), "{}", icacls(&moved));
-        let s = windows_sync(&paths, &[]);
+        let s = windows_sync(&paths, &[], None, None, Vec::new());
         assert!(s.errors.is_empty() && s.stale.is_empty(), "{s:?}");
         assert_eq!(s.removed, 1);
         assert!(!icacls(&moved).contains("S-1-15-2-"), "{}", icacls(&moved));
@@ -1093,19 +1184,19 @@ mod tests {
         );
 
         std::fs::create_dir_all(&work).unwrap();
-        windows_sync(&paths, &want);
+        windows_sync(&paths, &want, None, None, Vec::new());
         std::fs::remove_dir_all(&work).unwrap();
         std::fs::create_dir_all(&work).unwrap();
         assert!(!icacls(&work).contains("S-1-15-2-"), "{}", icacls(&work));
-        let s = windows_sync(&paths, &want);
+        let s = windows_sync(&paths, &want, None, None, Vec::new());
         assert!(s.errors.is_empty() && s.stale.is_empty(), "{s:?}");
         assert!(icacls(&work).contains("S-1-15-2-"), "{}", icacls(&work));
         // The same folder, with its grant taken off by hand: it comes back.
         nerve_sandbox::appcontainer::set(&work, &want[0].container, None).unwrap();
         assert!(!icacls(&work).contains("S-1-15-2-"), "{}", icacls(&work));
-        windows_sync(&paths, &want);
+        windows_sync(&paths, &want, None, None, Vec::new());
         assert!(icacls(&work).contains("S-1-15-2-"), "{}", icacls(&work));
-        let s = remove_all(&paths, &["lab".into()]);
+        let s = remove_all(&paths, &["lab".into()], None);
         assert!(s.errors.is_empty(), "{s:?}");
         assert!(!icacls(&work).contains("S-1-15-2-"), "{}", icacls(&work));
     }

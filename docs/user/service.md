@@ -241,9 +241,9 @@ Administrators group only denies. Before a command starts, the node checks
 that the account can open neither the node's folders nor a file in them, and
 refuses it if it can. `install` checks the same.
 
-`folder` mode runs no command on the service yet: its AppContainer is not
-started as another account ([modes](modes.md#what-a-command-can-reach-in-folder-mode-windows)).
-Use `allowlist` or `user` mode for its centers.
+In `folder` mode a command runs as that account as well, inside the
+pairing's AppContainer, which reaches only the folders you gave it
+([modes](modes.md#folder-mode-on-the-installed-windows-service)).
 
 UAC is no security boundary: a command of an administrator can get the
 group's rights back and read the keys. `install` warns about an account in

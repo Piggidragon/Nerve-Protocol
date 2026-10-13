@@ -244,9 +244,9 @@ again.
   sudo allow list has an entry). On Windows a command runs in an AppContainer
   of its center, which reaches the system folders Windows opens to every
   AppContainer and the paths of the same sets as on Linux, each by a grant
-  for the container on the folder with the rights of its flags; the
-  installed Windows service, whose commands run as another account, has no
-  such confinement yet and refuses them. `allow` rules do not count. On Linux a command
+  for the container on the folder with the rights of its flags; on the
+  installed Windows service the command runs in it as the account commands
+  run as. `allow` rules do not count. On Linux a command
   reads the system folders and its `r` folders, writes its `w` folders and
   runs programs from the system folders and its `x` folders (Landlock), each
   flag with its own rule. A folder with `w` and not `r` can be written but

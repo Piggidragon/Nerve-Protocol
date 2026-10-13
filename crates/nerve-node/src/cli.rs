@@ -89,7 +89,7 @@ pub enum Cmd {
     Unlock,
     /// Install the node as a service that starts with the machine and runs under a user of its own (Linux, as root).
     Install,
-    /// Name the node, pair it with its first center and choose that center's mode, one question at a time.
+    /// Name the node, choose the account user mode runs commands as (installed node), pair the first center and choose its mode, one question at a time.
     Setup,
     /// Replace the installed program with the latest release and restart the service; config, keys and audit log stay.
     Update {
@@ -918,15 +918,24 @@ impl Cmd {
 /// root runs on a node whose folders belong to another user, as the
 /// installed node's belong to `nerve`, runs as that user
 /// ([`crate::service::become_owner`]), so that what it writes stays the
-/// node's. install, update and uninstall keep root.
+/// node's. install, update and uninstall keep root; setup keeps it as its
+/// saved id, to make the account of user mode when the owner asks.
 pub fn settle_user(cli: &Cli) -> Result<(), String> {
     if cli.cmd.is_service() {
         return Ok(());
     }
-    crate::service::become_owner(&NodePaths::from_args(
-        cli.config_dir.clone(),
-        cli.state_dir.clone(),
-    ))
+    crate::service::become_owner(
+        &NodePaths::from_args(cli.config_dir.clone(), cli.state_dir.clone()),
+        matches!(cli.cmd, Cmd::Setup),
+    )
+}
+
+/// The account that ran this command through sudo, else root.
+fn invoker() -> String {
+    std::env::var("SUDO_USER")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .unwrap_or_else(|| "root".into())
 }
 
 /// The rule of the other owner commands (docs/dev/spec/node-local.md §5):
@@ -1240,7 +1249,7 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             let layout = Layout::system();
             owner_check(&[&paths, &layout.paths]).await?;
             let exe = std::env::current_exe().map_err(|e| format!("this program: {e}"))?;
-            crate::service::install(&layout, &Host, &exe, out)
+            crate::service::install(&layout, &Host, &exe, &invoker(), out)
         }
         Cmd::Setup => {
             owner_check(&[&paths]).await?;
@@ -1305,6 +1314,33 @@ async fn setup_steps(
         })
         .await?;
         steps.push(format!("named the node {name}"));
+    }
+
+    // The account of user mode, where the node can switch to one: the
+    // installed service.
+    let layout = Layout::system();
+    if layout.installed() && *paths == layout.paths {
+        let suggested = Some(invoker()).filter(|u| u != "root");
+        let chosen = crate::service::choose_account(
+            &Host,
+            paths,
+            cfg.machine.user.as_deref(),
+            suggested.as_deref(),
+            input,
+            out,
+        )?;
+        if let Some(c) = chosen {
+            if c.made {
+                steps.push(format!("made the account {}", c.name));
+            }
+            edit(paths, |cfg| {
+                cfg.machine.user = Some(c.name.clone());
+                Ok(())
+            })
+            .await?;
+            let _ = writeln!(out, "user mode runs commands as {}", c.name);
+            steps.push(format!("user mode runs commands as {}", c.name));
+        }
     }
 
     let link = ask(
@@ -1396,7 +1432,11 @@ async fn setup_steps(
 
 /// Asks one question; the answer without the line break and the spaces
 /// around it. The end of the input is an error, so setup never loops on it.
-fn ask(input: &mut dyn BufRead, out: &mut dyn Write, question: &str) -> Result<String, String> {
+pub(crate) fn ask(
+    input: &mut dyn BufRead,
+    out: &mut dyn Write,
+    question: &str,
+) -> Result<String, String> {
     let _ = write!(out, "{question}");
     let _ = out.flush();
     let mut line = String::new();

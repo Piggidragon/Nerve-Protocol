@@ -11,6 +11,23 @@ Two programs:
 | `nerve-center` | The center. A harness starts it as an MCP server. It pairs machines, keeps their links, gives the harness their tools and serves a web UI |
 | `nerve-node` | The node. A daemon on each machine, plus a CLI for pairing, rules and the audit log |
 
+## Quick install
+
+On a Linux machine the agent may use, install the node as a service (use
+`nerve-node-aarch64-linux` on ARM):
+
+```sh
+curl -LO https://github.com/Piggidragon/Nerve-Protocol/releases/latest/download/nerve-node-x86_64-linux
+chmod +x nerve-node-x86_64-linux
+sudo ./nerve-node-x86_64-linux install
+sudo nerve-node setup
+```
+
+`install` puts the program at `/usr/local/bin/nerve-node` and starts it as a
+service under a user of its own ([service](docs/user/service.md)). The center
+is `nerve-center-x86_64-linux` (or `-aarch64-linux`, `-x86_64-windows.exe`)
+from the same release.
+
 ## Quick start
 
 Get the programs from

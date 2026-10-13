@@ -56,7 +56,7 @@ center reads, or the node refuses the whole change and names the field.
 3. `panic` and `unlock`. A center with the grant may pause. Only the owner
    unpauses or unlocks.
 4. Machine settings: `machine.shell`, `machine.allow_root`,
-   `machine.sudo_path`, `machine.secret_storage`.
+   `machine.sudo_path`, `machine.secret_storage`, `machine.user`.
 5. The sudo password. The node never returns it. A center only passes it on,
    sealed, when it switches sudo on.
 6. The proxy and its credentials.

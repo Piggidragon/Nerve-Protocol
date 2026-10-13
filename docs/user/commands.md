@@ -51,6 +51,6 @@ center is paired.
 | Command | Does | Page |
 |---|---|---|
 | `install` | Install the node as a service under its own user (Linux, root) | [service](service.md#install) |
-| `setup` | Name the node, pair the first center, choose its mode | [service](service.md#setup) |
+| `setup` | Name the node, choose the account of user mode, pair the first center, choose its mode | [service](service.md#setup) |
 | `update [--from FILE]` | Put the latest release in place and restart the service | [service](service.md#update) |
 | `uninstall [--purge]` | Remove the service, its user and the program | [service](service.md#uninstall) |

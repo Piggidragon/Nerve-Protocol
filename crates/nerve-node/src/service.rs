@@ -5,14 +5,20 @@
 //! a command root runs on folders that belong to another user runs as that
 //! user ([`become_owner`]), so whatever it writes stays the node's.
 //!
+//! In `user` mode the node runs a center's commands as an ordinary account
+//! (`machine.user`, [`crate::account`]), not as `nerve`, so they cannot read
+//! the node's keys. `install` takes the account that ran it; `setup` can
+//! choose or make another.
+//!
 //! What these commands do to the machine beyond the node's files (the user,
 //! systemd, running a program) goes through [`System`], so the tests run
 //! every step on temporary folders.
 
-use std::io::Write;
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 use nerve_policy::audit::AuditLog;
+use nerve_policy::settings::SettingsStore;
 
 use crate::paths::NodePaths;
 
@@ -64,7 +70,11 @@ impl Layout {
 
     /// The service unit. The node runs as its own user with the folders
     /// given; stopping the service ends every command it runs, and a node
-    /// that fails is started again.
+    /// that fails is started again. CAP_SETUID and CAP_SETGID are the one
+    /// privilege it keeps: they let it start a `user` mode command as the
+    /// account `machine.user` names. Every command drops them before it
+    /// runs; the bounding set stays as it is, since an allowed sudo command
+    /// needs root's.
     pub fn unit_text(&self) -> String {
         format!(
             "# Written by `nerve-node install`; `nerve-node uninstall` removes it.
@@ -79,6 +89,7 @@ Type=simple
 User={USER}
 Group={USER}
 Environment=HOME={home}
+AmbientCapabilities=CAP_SETUID CAP_SETGID
 ExecStart={bin} --config-dir {config} --state-dir {state} run
 ExecReload=kill -HUP $MAINPID
 Restart=on-failure
@@ -100,10 +111,14 @@ WantedBy=multi-user.target
 /// A user account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
+    pub name: String,
     pub uid: u32,
     pub gid: u32,
     /// The comment field, where [`USER_MARK`] goes.
     pub comment: String,
+    pub home: PathBuf,
+    /// Every group the account is in, its own included.
+    pub groups: Vec<u32>,
 }
 
 /// What install, update and uninstall do to the machine besides writing the
@@ -116,6 +131,10 @@ pub trait System {
     /// Makes a system user with a group of the same name, the home given
     /// (not created) and no login, marked with [`USER_MARK`].
     fn add_account(&self, name: &str, home: &Path) -> Result<(), String>;
+    /// Makes an ordinary account for `user` mode, as `setup` offers: a
+    /// group and a home of its own, no login, marked with
+    /// [`crate::account::MADE_MARK`].
+    fn add_user(&self, name: &str) -> Result<(), String>;
     /// Removes the user and its group.
     fn remove_account(&self, name: &str) -> Result<(), String>;
     fn systemctl(&self, args: &[&str]) -> Result<(), String>;
@@ -141,35 +160,49 @@ impl System for Host {
     }
 
     fn account(&self, name: &str) -> Result<Option<Account>, String> {
-        let o = std::process::Command::new("getent")
-            .args(["passwd", name])
-            .output()
-            .map_err(|e| format!("getent: {e}"))?;
-        // 2: no such key.
-        if o.status.code() == Some(2) {
-            return Ok(None);
+        crate::account::lookup(name)
+    }
+
+    fn add_user(&self, name: &str) -> Result<(), String> {
+        let mut c = std::process::Command::new("useradd");
+        c.args([
+            "--user-group",
+            "--create-home",
+            "--shell",
+            no_login(),
+            "--comment",
+            crate::account::MADE_MARK,
+            "--",
+            name,
+        ]);
+        // setup runs as the node's user and keeps root only as its saved
+        // id ([`become_owner`]); useradd gets it back.
+        #[cfg(target_os = "linux")]
+        if !self.is_root() {
+            use std::os::unix::process::CommandExt;
+            // SAFETY: plain system calls between fork and exec.
+            unsafe {
+                c.pre_exec(|| {
+                    if libc::setresuid(0, 0, 0) != 0
+                        || libc::setresgid(0, 0, 0) != 0
+                        || libc::setgroups(0, std::ptr::null()) != 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
         }
-        if !o.status.success() {
-            return Err(format!("getent passwd {name}: {}", failure(&o)));
-        }
-        let line = String::from_utf8_lossy(&o.stdout);
-        let f: Vec<&str> = line.trim().split(':').collect();
-        let num = |i: usize| f.get(i).and_then(|v| v.parse::<u32>().ok());
-        match (num(2), num(3)) {
-            (Some(uid), Some(gid)) => Ok(Some(Account {
-                uid,
-                gid,
-                comment: f.get(4).unwrap_or(&"").to_string(),
-            })),
-            _ => Err(format!("getent passwd {name}: cannot read {line:?}")),
+        let o = c.output().map_err(|e| format!("useradd: {e}"))?;
+        if o.status.success() {
+            Ok(())
+        } else {
+            Err(format!("useradd {name}: {}", failure(&o)))
         }
     }
 
     fn add_account(&self, name: &str, home: &Path) -> Result<(), String> {
-        let shell = ["/usr/sbin/nologin", "/sbin/nologin"]
-            .into_iter()
-            .find(|s| Path::new(s).exists())
-            .unwrap_or("/bin/false");
+        let shell = no_login();
         run(
             "useradd",
             &[
@@ -258,6 +291,14 @@ impl System for Host {
         }
         Ok(String::from_utf8_lossy(&o.stdout).trim().to_string())
     }
+}
+
+/// The shell of an account that does not log in.
+fn no_login() -> &'static str {
+    ["/usr/sbin/nologin", "/sbin/nologin"]
+        .into_iter()
+        .find(|s| Path::new(s).exists())
+        .unwrap_or("/bin/false")
 }
 
 const LINUX_ONLY: &str = "works on Linux with systemd only; elsewhere run `nerve-node run` under your own service manager";
@@ -352,13 +393,16 @@ fn audit(
     }
 }
 
-/// `install`: the user, the folders, the program, the unit, the running
-/// service, in that order. Running it again puts back what is missing and
-/// restarts the service.
+/// `install`: the user, the folders, the account of `user` mode, the
+/// program, the unit, the running service, in that order. `invoker` is the
+/// account that ran install (`SUDO_USER`, else root); it becomes the account
+/// of `user` mode unless one is chosen already. Running it again puts back
+/// what is missing and restarts the service.
 pub fn install(
     layout: &Layout,
     sys: &dyn System,
     exe: &Path,
+    invoker: &str,
     out: &mut dyn Write,
 ) -> Result<(), String> {
     supported(sys, "install")?;
@@ -366,7 +410,7 @@ pub fn install(
         done: Vec::new(),
         out,
     };
-    let r = install_steps(layout, sys, exe, &mut steps);
+    let r = install_steps(layout, sys, exe, invoker, &mut steps);
     audit(sys, &layout.paths, "install", &steps.done, &r, steps.out);
     r?;
     let _ = writeln!(
@@ -380,6 +424,7 @@ fn install_steps(
     layout: &Layout,
     sys: &dyn System,
     exe: &Path,
+    invoker: &str,
     steps: &mut Steps,
 ) -> Result<(), String> {
     let account = match sys.account(USER)? {
@@ -401,16 +446,20 @@ fn install_steps(
             a
         }
     };
-    // The folders may be left from an earlier install, whose user had
-    // another uid: everything in them is given to this one.
-    for dir in [
+    let dirs = [
         &layout.home,
         &layout.paths.config_dir,
         &layout.paths.state_dir,
-    ] {
+    ];
+    for dir in dirs {
         nerve_transport::files::create_private_dir(dir)
             .map_err(|e| format!("{}: {e}", dir.display()))?;
         set_mode(dir, 0o700)?;
+    }
+    default_account(layout, sys, invoker, steps);
+    // The folders may be left from an earlier install, whose user had
+    // another uid: everything in them is given to this one.
+    for dir in dirs {
         sys.give(dir, account.uid, account.gid)?;
     }
     steps.did(format!(
@@ -439,6 +488,148 @@ fn install_steps(
         "the service {UNIT_NAME} runs as {USER} and starts with the machine"
     ));
     Ok(())
+}
+
+/// The account of `user` mode at install: the one chosen before, else
+/// `invoker`. What fails here is said and left to `setup`; the node then
+/// runs no user-mode command until an account is chosen.
+fn default_account(layout: &Layout, sys: &dyn System, invoker: &str, steps: &mut Steps) {
+    let p = &layout.paths;
+    let r = (|| {
+        let mut store = SettingsStore::open(
+            p.config_file(),
+            p.config_key(),
+            AuditLog::new(p.audit_log()),
+        )?;
+        if let Some(u) = &store.config().machine.user {
+            return Ok(format!("user mode runs commands as {u}, as chosen before"));
+        }
+        let a = usable_account(sys, p, invoker)?;
+        store
+            .update(|c| {
+                c.machine.user = Some(invoker.to_string());
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+        if a.uid == 0 {
+            let _ = writeln!(steps.out, "{}", crate::account::root_warning());
+        }
+        Ok::<_, String>(format!(
+            "user mode runs commands as {invoker}, who ran install"
+        ))
+    })();
+    match r {
+        Ok(step) => steps.did(step),
+        Err(e) => steps.did(format!(
+            "no account for user mode: {e}; `sudo nerve-node setup` chooses one"
+        )),
+    }
+}
+
+/// `name` as the account of `user` mode, or why not: it must exist, and
+/// must not be the node's own user nor reach the node's folders, where the
+/// keys are. Root is allowed: the caller warns.
+pub fn usable_account(sys: &dyn System, paths: &NodePaths, name: &str) -> Result<Account, String> {
+    let a = sys
+        .account(name)?
+        .ok_or_else(|| format!("there is no account {name}"))?;
+    if a.uid == 0 {
+        return Ok(a);
+    }
+    #[cfg(unix)]
+    let owner = {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(&paths.config_dir).ok().map(|m| m.uid())
+    };
+    #[cfg(not(unix))]
+    let owner: Option<u32> = None;
+    if name == USER || a.comment == USER_MARK || owner == Some(a.uid) {
+        return Err(format!(
+            "{name} is the node's own user, which owns its keys; choose another account"
+        ));
+    }
+    for dir in [&paths.config_dir, &paths.state_dir] {
+        if crate::account::reaches(dir, &a) {
+            return Err(format!(
+                "{name} could open {}, where the node keeps its keys; choose another account",
+                dir.display()
+            ));
+        }
+    }
+    Ok(a)
+}
+
+/// The account `setup` chose for `user` mode, and whether it made it.
+#[derive(Debug, PartialEq, Eq)]
+pub struct Chosen {
+    pub name: String,
+    pub made: bool,
+}
+
+/// The account step of `setup` on the installed node: which account
+/// `user` mode runs commands as. Enter keeps `current`, else takes
+/// `suggested` (the account that runs setup). An account that does not
+/// exist is made when the owner says yes. `None`: nothing changes.
+pub fn choose_account(
+    sys: &dyn System,
+    paths: &NodePaths,
+    current: Option<&str>,
+    suggested: Option<&str>,
+    input: &mut dyn BufRead,
+    out: &mut dyn Write,
+) -> Result<Option<Chosen>, String> {
+    let default = current.or(suggested);
+    let answer = crate::cli::ask(
+        input,
+        out,
+        &format!(
+            "Account that commands in user mode run as [{}]: ",
+            default.unwrap_or("none")
+        ),
+    )?;
+    let name = match (answer.as_str(), default) {
+        ("", Some(d)) => d.to_string(),
+        ("", None) => {
+            let _ = writeln!(
+                out,
+                "No account: user mode runs no command until one is chosen."
+            );
+            return Ok(None);
+        }
+        (a, _) => a.to_string(),
+    };
+    if current == Some(name.as_str()) {
+        return Ok(None);
+    }
+    if !nerve_policy::config::valid_account_name(&name) {
+        return Err(format!("{name:?} is not an account name"));
+    }
+    let mut made = false;
+    if sys.account(&name)?.is_none() {
+        if !crate::account::makeable_name(&name) {
+            return Err(format!(
+                "there is no account {name}, and setup makes accounts only with a name of a-z, 0-9, _ and -"
+            ));
+        }
+        let yes = crate::cli::ask(
+            input,
+            out,
+            &format!(
+                "There is no account {name}. Make it, with a group and a home of its own and no login? [y/N] "
+            ),
+        )?;
+        if !matches!(yes.as_str(), "y" | "Y" | "yes") {
+            return Err(format!("there is no account {name}; nothing changed"));
+        }
+        sys.add_user(&name)?;
+        let _ = writeln!(out, "made the account {name}");
+        made = true;
+    }
+    let a = usable_account(sys, paths, &name)?;
+    if a.uid == 0 {
+        let _ = writeln!(out, "{}", crate::account::root_warning());
+    }
+    Ok(Some(Chosen { name, made }))
 }
 
 /// `uninstall`: stops and removes the service, then the folders (deleted
@@ -832,8 +1023,11 @@ fn chown_tree(path: &Path, uid: u32, gid: u32) -> Result<(), String> {
 /// installed node's `nerve`) runs as that user, so that what it writes stays
 /// readable to the node. Called before anything else runs in the process:
 /// it changes the user of the calling thread only where the C library does
-/// not change every thread's.
-pub fn become_owner(paths: &NodePaths) -> Result<(), String> {
+/// not change every thread's. With `keep_root` (setup) root stays the saved
+/// id, so the process can get it back for one thing, making an account
+/// ([`System::add_user`]); a process of the node's user cannot trace or
+/// read it, since its ids are not all that user's.
+pub fn become_owner(paths: &NodePaths, keep_root: bool) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -849,13 +1043,29 @@ pub fn become_owner(paths: &NodePaths) -> Result<(), String> {
         if m.uid() == 0 {
             return Ok(());
         }
-        // SAFETY: plain calls with no pointers but the empty group list;
-        // groups first, the user last, while root may still change both.
-        let failed = unsafe {
-            libc::setgroups(0, std::ptr::null()) != 0
-                || libc::setgid(m.gid()) != 0
-                || libc::setuid(m.uid()) != 0
+        #[cfg(target_os = "linux")]
+        let (setgid, setuid) = {
+            let saved = |id: u32| if keep_root { 0 } else { id };
+            (
+                // SAFETY: plain calls without pointers.
+                move |g: u32| unsafe { libc::setresgid(g, g, saved(g)) },
+                move |u: u32| unsafe { libc::setresuid(u, u, saved(u)) },
+            )
         };
+        #[cfg(not(target_os = "linux"))]
+        let (setgid, setuid) = {
+            let _ = keep_root;
+            // SAFETY: plain calls without pointers.
+            (
+                |g: u32| unsafe { libc::setgid(g) },
+                |u: u32| unsafe { libc::setuid(u) },
+            )
+        };
+        // SAFETY: the empty group list; groups first, the user last, while
+        // root may still change both.
+        let failed = unsafe { libc::setgroups(0, std::ptr::null()) != 0 }
+            || setgid(m.gid()) != 0
+            || setuid(m.uid()) != 0;
         if failed {
             return Err(format!(
                 "cannot run as the owner (uid {}) of {}: {}",
@@ -868,7 +1078,7 @@ pub fn become_owner(paths: &NodePaths) -> Result<(), String> {
     }
     #[cfg(not(unix))]
     {
-        let _ = paths;
+        let _ = (paths, keep_root);
         Ok(())
     }
 }
@@ -904,6 +1114,8 @@ mod tests {
     /// systemctl and the node's start are recorded.
     struct Fake {
         user: RefCell<Option<Account>>,
+        /// The other accounts of the machine.
+        others: RefCell<Vec<Account>>,
         calls: RefCell<Vec<String>>,
         /// The folders given to another user, and to whom.
         given: RefCell<Vec<(PathBuf, u32)>>,
@@ -915,6 +1127,7 @@ mod tests {
         fn new() -> Fake {
             Fake {
                 user: RefCell::new(None),
+                others: RefCell::new(vec![other("alice", 4242), other("root", 0)]),
                 calls: RefCell::new(Vec::new()),
                 given: RefCell::new(Vec::new()),
                 starts: std::cell::Cell::new(true),
@@ -930,9 +1143,24 @@ mod tests {
         // SAFETY: plain getters.
         let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
         Account {
+            name: USER.into(),
             uid,
             gid,
             comment: USER_MARK.into(),
+            home: "/var/lib/nerve".into(),
+            groups: vec![gid],
+        }
+    }
+
+    /// An account that is not the test's own.
+    fn other(name: &str, uid: u32) -> Account {
+        Account {
+            name: name.into(),
+            uid,
+            gid: uid,
+            comment: String::new(),
+            home: format!("/home/{name}").into(),
+            groups: vec![uid],
         }
     }
 
@@ -944,8 +1172,24 @@ mod tests {
             true
         }
         fn account(&self, name: &str) -> Result<Option<Account>, String> {
-            assert_eq!(name, USER);
-            Ok(self.user.borrow().clone())
+            if name == USER {
+                return Ok(self.user.borrow().clone());
+            }
+            Ok(self
+                .others
+                .borrow()
+                .iter()
+                .find(|a| a.name == name)
+                .cloned())
+        }
+        fn add_user(&self, name: &str) -> Result<(), String> {
+            self.calls.borrow_mut().push(format!("useradd {name}"));
+            let uid = 5000 + self.others.borrow().len() as u32;
+            self.others.borrow_mut().push(Account {
+                comment: crate::account::MADE_MARK.into(),
+                ..other(name, uid)
+            });
+            Ok(())
         }
         fn add_account(&self, name: &str, home: &Path) -> Result<(), String> {
             self.calls
@@ -1003,11 +1247,11 @@ mod tests {
     /// Installs a "program" saying `version` from a file in `root`.
     fn installed(root: &Path, sys: &Fake, version: &str) -> Layout {
         let l = layout(root);
-        let exe = root.join("download/nerve-node");
+        let exe = root.join("download/nerve-node-x86_64-linux");
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
         std::fs::write(&exe, format!("nerve-node {version}\n")).unwrap();
         let mut out = Vec::new();
-        install(&l, sys, &exe, &mut out).unwrap();
+        install(&l, sys, &exe, "alice", &mut out).unwrap();
         l
     }
 
@@ -1030,13 +1274,21 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let sys = Fake::new();
         let l = layout(d.path());
-        let exe = d.path().join("download/nerve-node");
+        // The program as the release names it lands as nerve-node.
+        let exe = d.path().join("download/nerve-node-x86_64-linux");
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
         std::fs::write(&exe, "nerve-node 1.0.0\n").unwrap();
         let mut out = Vec::new();
-        install(&l, &sys, &exe, &mut out).unwrap();
+        install(&l, &sys, &exe, "alice", &mut out).unwrap();
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("made the user nerve"), "{out}");
+        assert!(
+            out.contains("user mode runs commands as alice, who ran install"),
+            "{out}"
+        );
+        assert!(!out.contains("Warning"), "{out}");
+        let cfg = SettingsStore::peek(&l.paths.config_file(), &l.paths.config_key()).unwrap();
+        assert_eq!(cfg.machine.user.as_deref(), Some("alice"));
         assert!(out.contains("sudo nerve-node setup"), "{out}");
         // The user, made once with the home the unit names.
         assert_eq!(
@@ -1054,6 +1306,14 @@ mod tests {
         let unit = std::fs::read_to_string(&l.unit).unwrap();
         assert_eq!(unit, l.unit_text());
         assert!(unit.contains("\nUser=nerve\n"), "{unit}");
+        // The one privilege: switching to the account of user mode. Nothing
+        // narrows the bounding set or sets no_new_privs, which an allowed
+        // sudo command needs.
+        let caps: Vec<&str> = unit
+            .lines()
+            .filter(|l| l.contains("Capabilit") || l.contains("NoNewPrivileges"))
+            .collect();
+        assert_eq!(caps, ["AmbientCapabilities=CAP_SETUID CAP_SETGID"]);
         assert!(
             unit.contains(&format!(
                 "\nExecStart={} --config-dir {} --state-dir {} run\n",
@@ -1071,11 +1331,17 @@ mod tests {
         assert_eq!(a.len(), 1);
         assert_eq!(a[0]["event"], "install");
         assert!(a[0].get("error").is_none());
-        assert_eq!(a[0]["steps"].as_array().unwrap().len(), 5, "{}", a[0]);
-        // Again: the user is reused, the program replaced, the service restarted.
+        assert_eq!(a[0]["steps"].as_array().unwrap().len(), 6, "{}", a[0]);
+        // Again: the user is reused, the program replaced, the service
+        // restarted, the account kept.
         std::fs::write(&exe, "nerve-node 1.0.1\n").unwrap();
         let mut out = Vec::new();
-        install(&l, &sys, &exe, &mut out).unwrap();
+        install(&l, &sys, &exe, "root", &mut out).unwrap();
+        assert!(
+            String::from_utf8(out.clone())
+                .unwrap()
+                .contains("user mode runs commands as alice, as chosen before")
+        );
         assert_eq!(std::fs::read(&l.bin).unwrap(), b"nerve-node 1.0.1\n");
         assert_eq!(
             sys.calls()
@@ -1093,6 +1359,151 @@ mod tests {
     }
 
     #[test]
+    fn install_takes_root_with_a_warning_and_leaves_an_unusable_account_to_setup() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = layout(d.path());
+        let mut out = Vec::new();
+        install(&l, &sys, Path::new("/bin/true"), "root", &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("user mode runs commands as root"), "{out}");
+        assert!(
+            out.contains("Warning: commands from a center in user mode then run as root")
+                && out.contains("You are responsible"),
+            "{out}"
+        );
+        let user = |l: &Layout| {
+            SettingsStore::peek(&l.paths.config_file(), &l.paths.config_key())
+                .unwrap()
+                .machine
+                .user
+        };
+        assert_eq!(user(&l).as_deref(), Some("root"));
+        // An account that is not there, or the node's own: no account, and
+        // install still does the rest.
+        for who in ["ghost", USER] {
+            let l = layout(&d.path().join(who));
+            let mut out = Vec::new();
+            install(&l, &sys, Path::new("/bin/true"), who, &mut out).unwrap();
+            let out = String::from_utf8(out).unwrap();
+            assert!(out.contains("no account for user mode"), "{out}");
+            assert!(out.contains("sudo nerve-node setup"), "{out}");
+            assert_eq!(user(&l), None);
+            assert!(l.unit.is_file());
+        }
+    }
+
+    /// Setup's account step, with what the owner types.
+    fn choose(
+        sys: &Fake,
+        l: &Layout,
+        current: Option<&str>,
+        typed: &str,
+    ) -> (Result<Option<Chosen>, String>, String) {
+        let mut out = Vec::new();
+        let mut input = std::io::Cursor::new(typed.as_bytes().to_vec());
+        let r = choose_account(sys, &l.paths, current, Some("alice"), &mut input, &mut out);
+        (r, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn setup_chooses_or_makes_the_account_of_user_mode() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = installed(d.path(), &sys, "1.0.0");
+        let chosen = |name: &str, made| {
+            Some(Chosen {
+                name: name.into(),
+                made,
+            })
+        };
+        // Default: Enter takes the account that runs setup, or keeps the
+        // one chosen.
+        let (r, out) = choose(&sys, &l, None, "\n");
+        assert_eq!(r.unwrap(), chosen("alice", false));
+        assert!(out.contains("[alice]"), "{out}");
+        assert_eq!(choose(&sys, &l, Some("alice"), "\n").0.unwrap(), None);
+        // Chosen: another account that exists.
+        sys.others.borrow_mut().push(other("carol", 4343));
+        assert_eq!(
+            choose(&sys, &l, Some("alice"), "carol\n").0.unwrap(),
+            chosen("carol", false)
+        );
+        // Made: setup asks, then makes it.
+        let (r, out) = choose(&sys, &l, Some("alice"), "bob\ny\n");
+        assert_eq!(r.unwrap(), chosen("bob", true));
+        assert!(out.contains("There is no account bob. Make it"), "{out}");
+        assert!(sys.calls().contains(&"useradd bob".to_string()));
+        // Root: allowed, with the warning.
+        let (r, out) = choose(&sys, &l, Some("alice"), "root\n");
+        assert_eq!(r.unwrap(), chosen("root", false));
+        assert!(
+            out.contains("run as root") && out.contains("You are responsible"),
+            "{out}"
+        );
+        // Refused: one that is not there and is not to be made, a name
+        // useradd would not take, the node's own user.
+        let made = sys.calls().len();
+        let e = choose(&sys, &l, None, "dave\nn\n").0.unwrap_err();
+        assert!(e.contains("there is no account dave"), "{e}");
+        let e = choose(&sys, &l, None, "Dave.X\n").0.unwrap_err();
+        assert!(e.contains("there is no account Dave.X"), "{e}");
+        let e = choose(&sys, &l, None, "a:b\n").0.unwrap_err();
+        assert!(e.contains("not an account name"), "{e}");
+        assert_eq!(sys.calls().len(), made, "nothing was made");
+        let e = choose(&sys, &l, None, "nerve\n").0.unwrap_err();
+        assert!(e.contains("node's own user"), "{e}");
+    }
+
+    /// The account of user mode cannot read the keys: they are 0600 in
+    /// folders private to `nerve`. An account that could open those folders
+    /// is refused.
+    #[test]
+    fn the_account_of_user_mode_cannot_read_the_keys() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        // Open down to the node's folders, as / and /etc are.
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sys = Fake::new();
+        let l = installed(d.path(), &sys, "1.0.0");
+        for open in ["etc", "var", "var/lib"] {
+            std::fs::set_permissions(d.path().join(open), std::fs::Permissions::from_mode(0o755))
+                .unwrap();
+        }
+        let key = l.paths.key_file("lab");
+        nerve_transport::files::write_private(&key, b"key").unwrap();
+        let cfg = SettingsStore::peek(&l.paths.config_file(), &l.paths.config_key()).unwrap();
+        let name = cfg.machine.user.unwrap();
+        let account = sys.account(&name).unwrap().unwrap();
+        assert_ne!(account.uid, me().uid);
+        for p in [
+            key.clone(),
+            l.paths.config_key(),
+            l.paths.config_file(),
+            l.paths.audit_log(),
+        ] {
+            assert!(p.exists(), "{p:?}");
+            assert!(!crate::account::reaches(&p, &account), "{p:?}");
+            assert!(crate::account::reaches(&p, &me()), "{p:?}");
+        }
+        assert_eq!(mode(&key), 0o600);
+        usable_account(&sys, &l.paths, &name).unwrap();
+        // Opened to others, the folder and the key are in its reach, and
+        // the account is refused.
+        std::fs::set_permissions(&l.paths.config_dir, std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::fs::set_permissions(
+            key.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+        std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(crate::account::reaches(&key, &account));
+        let e = usable_account(&sys, &l.paths, &name).unwrap_err();
+        assert!(e.contains("could open"), "{e}");
+    }
+
+    #[test]
     fn install_refuses_a_user_it_did_not_make_and_needs_root() {
         let d = tempfile::tempdir().unwrap();
         let sys = Fake::new();
@@ -1101,7 +1512,7 @@ mod tests {
             ..me()
         });
         let l = layout(d.path());
-        let e = install(&l, &sys, Path::new("/bin/true"), &mut Vec::new()).unwrap_err();
+        let e = install(&l, &sys, Path::new("/bin/true"), "alice", &mut Vec::new()).unwrap_err();
         assert!(e.contains("did not make it"), "{e}");
         assert!(!l.bin.exists() && !l.unit.exists());
         assert!(sys.calls().is_empty());
@@ -1115,6 +1526,9 @@ mod tests {
                 true
             }
             fn account(&self, _: &str) -> Result<Option<Account>, String> {
+                unreachable!()
+            }
+            fn add_user(&self, _: &str) -> Result<(), String> {
                 unreachable!()
             }
             fn add_account(&self, _: &str, _: &Path) -> Result<(), String> {
@@ -1139,7 +1553,13 @@ mod tests {
         for (what, e) in [
             (
                 "install",
-                install(&l, &NotRoot, Path::new("/bin/true"), &mut Vec::new()),
+                install(
+                    &l,
+                    &NotRoot,
+                    Path::new("/bin/true"),
+                    "alice",
+                    &mut Vec::new(),
+                ),
             ),
             ("uninstall", uninstall(&l, &NotRoot, false, &mut Vec::new())),
         ] {

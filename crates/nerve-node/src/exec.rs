@@ -47,8 +47,10 @@ pub struct RunCall {
 }
 
 impl RunCall {
-    /// `cwd` defaults to the owner's home.
-    pub fn parse(args: &Map<String, Value>, home: &Path) -> Result<RunCall, RpcError> {
+    /// `cwd` defaults to `home`, the home of the account the command runs
+    /// as. `seen`: the node can look into the folder; a command that runs
+    /// as another account enters it itself, and fails there when it cannot.
+    pub fn parse(args: &Map<String, Value>, home: &Path, seen: bool) -> Result<RunCall, RpcError> {
         let a: RunArgs = params(args)?;
         if a.command.trim().is_empty() {
             return Err(RpcError::invalid_args("command is empty"));
@@ -57,7 +59,7 @@ impl RunCall {
             Some(c) => WirePath::parse(&c)?.real,
             None => home.to_path_buf(),
         };
-        if !cwd.is_dir() {
+        if seen && !cwd.is_dir() {
             return Err(crate::fs::bad_path(format!(
                 "{} is not a directory",
                 to_wire(&cwd)
@@ -316,6 +318,11 @@ pub struct RunOptions {
     /// prompt. Every other command runs with no_new_privs (Linux), so a
     /// `sudo` the rules did not see (`ls; sudo x`) cannot gain privileges.
     pub sudo: Option<SudoInput>,
+    /// The account the command runs as (`user` mode on the installed node,
+    /// crate::account); `None` runs it as the node's own user.
+    pub account: Option<crate::service::Account>,
+    /// The node's own folders, which the account must not reach.
+    pub own: Vec<PathBuf>,
 }
 
 /// What a sudo command needs: the password and the prompt sudo was told to
@@ -394,6 +401,10 @@ pub async fn sudo_check(sudo_path: &str, password: &str) -> Result<(), String> {
 #[derive(Clone)]
 pub struct Ender {
     pid: u32,
+    /// The account the command runs as, when it is not the node's: the
+    /// node signals it as that account.
+    #[cfg(unix)]
+    uid: Option<u32>,
     #[cfg(windows)]
     ending: crate::job::Ending<crate::win::Job, Option<std::sync::Arc<crate::tree::Watch>>>,
 }
@@ -421,7 +432,9 @@ impl Ender {
                 }
             });
         }
-        #[cfg(not(windows))]
+        #[cfg(unix)]
+        kill_group(self.pid, sig, self.uid);
+        #[cfg(not(any(unix, windows)))]
         kill_group(self.pid, sig);
     }
 }
@@ -431,7 +444,12 @@ impl Ender {
 struct Group(Option<Ender>);
 
 impl Group {
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    fn start(pid: Option<u32>, uid: Option<u32>) -> Group {
+        Group(pid.map(|pid| Ender { pid, uid }))
+    }
+
+    #[cfg(not(any(unix, windows)))]
     fn start(pid: Option<u32>) -> Group {
         Group(pid.map(|pid| Ender { pid }))
     }
@@ -481,14 +499,22 @@ impl Sig {
     }
 }
 
-/// Signals the process group led by `pid`.
+/// Signals the process group led by `pid`, as `uid` when the command runs
+/// as another account.
 #[cfg(unix)]
-fn kill_group(pid: u32, sig: Sig) {
+fn kill_group(pid: u32, sig: Sig, uid: Option<u32>) {
     let s = match sig {
         Sig::Term => libc::SIGTERM,
         Sig::Kill => libc::SIGKILL,
         Sig::Int => libc::SIGINT,
     };
+    #[cfg(target_os = "linux")]
+    if let Some(uid) = uid {
+        crate::account::kill_as(uid, pid, s);
+        return;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = uid;
     // SAFETY: kill with a negative pid signals that process group only.
     unsafe {
         libc::kill(-(pid as libc::pid_t), s);
@@ -639,20 +665,54 @@ pub async fn run(
             c
         }
     };
+    // A command of another account takes its ids, drops the service's
+    // capabilities and enters its folder in the child (crate::account);
+    // any other drops the capabilities.
     #[cfg(target_os = "linux")]
-    if opts.sudo.is_none() {
-        // SAFETY: prctl is async-signal-safe and touches only this process.
+    {
+        let switch = match &opts.account {
+            Some(a) => Some(
+                crate::account::Switch::new(a, &call.cwd, &opts.own)
+                    .map_err(|e| RpcError::invalid_args(e.to_string()))?,
+            ),
+            None => None,
+        };
+        // Root as the account (the owner chose it, warned) gets root's
+        // rights back at exec, which no_new_privs would keep from it.
+        let nnp = opts.sudo.is_none() && opts.account.as_ref().is_none_or(|a| a.uid != 0);
+        // SAFETY: plain system calls on memory moved into the closure.
         unsafe {
-            cmd.pre_exec(|| {
-                if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+            cmd.pre_exec(move || {
+                match &switch {
+                    Some(s) => s.apply()?,
+                    None if nerve_transport::net::euid() != 0 => crate::account::drop_caps()?,
+                    None => {}
+                }
+                if nnp && libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
             });
         }
     }
-    cmd.current_dir(&call.cwd)
-        .stdout(Stdio::piped())
+    #[cfg(not(target_os = "linux"))]
+    if let Some(a) = &opts.account {
+        return Err(RpcError::new(
+            ErrorCode::Unavailable,
+            format!("cannot run commands as {}: Linux only", a.name),
+        ));
+    }
+    match &opts.account {
+        Some(a) => {
+            cmd.env("HOME", &a.home)
+                .env("USER", &a.name)
+                .env("LOGNAME", &a.name);
+        }
+        None => {
+            cmd.current_dir(&call.cwd);
+        }
+    }
+    cmd.stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     #[cfg(unix)]
@@ -666,9 +726,24 @@ pub async fn run(
     if job.is_some() {
         cmd.creation_flags(crate::job::SUSPENDED);
     }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| RpcError::new(ErrorCode::Unavailable, format!("cannot start: {e}")))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        RpcError::new(
+            ErrorCode::Unavailable,
+            match &opts.account {
+                #[cfg(target_os = "linux")]
+                Some(a) if e.raw_os_error() == Some(crate::account::IN_REACH) => format!(
+                    "cannot start as {}: that account can open the node's own folders, where its keys are",
+                    a.name
+                ),
+                Some(a) => format!(
+                    "cannot start as {} in {}: {e}",
+                    a.name,
+                    to_wire(&call.cwd)
+                ),
+                None => format!("cannot start: {e}"),
+            },
+        )
+    })?;
     #[cfg(windows)]
     let job = match job {
         Some(job) => Some(
@@ -679,7 +754,9 @@ pub async fn run(
     };
     #[cfg(windows)]
     let group = Group::start(child.id(), job);
-    #[cfg(not(windows))]
+    #[cfg(unix)]
+    let group = Group::start(child.id(), opts.account.as_ref().map(|a| a.uid));
+    #[cfg(not(any(unix, windows)))]
     let group = Group::start(child.id());
     let mut sudo_stdin = None;
     if let Some(spec) = shim {
@@ -765,6 +842,8 @@ mod tests {
             exe: PathBuf::from("/nonexistent"),
             output_cap: cap,
             sudo: None,
+            account: None,
+            own: Vec::new(),
         }
     }
 
@@ -1084,13 +1163,21 @@ mod tests {
     fn parses_args() {
         let home = std::env::temp_dir();
         let a = json!({"command": "ls"}).as_object().unwrap().clone();
-        let c = RunCall::parse(&a, &home).unwrap();
+        let c = RunCall::parse(&a, &home, true).unwrap();
         assert_eq!(c.cwd, home);
         let bad = json!({"command": "ls", "shell": "x"})
             .as_object()
             .unwrap()
             .clone();
-        assert!(RunCall::parse(&bad, &home).is_err());
+        assert!(RunCall::parse(&bad, &home, true).is_err());
+        // A folder the node cannot see is left to the command's account.
+        let hidden = home.join("nerve-test-not-here");
+        let a = json!({"command": "ls", "cwd": hidden.to_str().unwrap()})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(RunCall::parse(&a, &home, true).is_err());
+        assert_eq!(RunCall::parse(&a, &home, false).unwrap().cwd, hidden);
         assert_eq!(shell_command(None, "ls").1, ["-c", "ls"]);
     }
 }
@@ -1175,6 +1262,8 @@ mod windows_tests {
             exe: PathBuf::from("nerve-node.exe"),
             output_cap: 64 * 1024,
             sudo: None,
+            account: None,
+            own: Vec::new(),
         }
     }
 

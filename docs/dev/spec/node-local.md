@@ -18,6 +18,32 @@ A node that `nerve-node install` put on a Linux machine
 command root runs on them runs as their owner, so that what it writes stays
 the node's.
 
+On that node a `user` mode command runs as the account `machine.user` names
+(§2), not as `nerve`: with that account's ids and groups, `HOME`, `USER` and
+`LOGNAME` set to it, and its home as the working directory when the call
+names none. `install` sets it to the account that ran `sudo` (root when
+there was none), unless one is set; `setup` chooses another and can make one
+(`useradd`, a group and a home of its own, no login shell). The account must
+exist and must not be `nerve`; with none set, or one that cannot be used,
+the command is not run (`unavailable`) after its call was decided and
+audited. Before the command starts, in the child, the node checks with
+`access()` that the account can neither list nor enter the config and state
+folders, and refuses to run it if it can. Root is allowed: `install` and
+`setup` warn that commands of a center in user mode then run as root, keys
+included, and that the owner is responsible; root's command runs without
+`no_new_privs`, so it has root's rights.
+
+For this the service keeps one privilege: `CAP_SETUID` and `CAP_SETGID`
+(`AmbientCapabilities=` in the unit), and nothing else. The owner chose it,
+so that a `user` mode command runs as a real account that cannot read the
+node's keys. Every command the node starts drops every capability, ambient
+and inheritable ones included, before exec, in every mode; the bounding set
+is not narrowed, since an allowed sudo command needs root's. The node signals
+a command of another account from a child that takes that account's uid,
+since it has no `CAP_KILL`. `folder` and `allowlist` mode commands still run
+as `nerve`. A node not installed as a service runs `user` mode commands as
+its own user and refuses a `machine.user` it cannot switch to.
+
 `node.toml` is written private to the owner (mode 0600 on Unix). The daemon
 refuses to run as root unless `machine.allow_root = true`.
 
@@ -74,6 +100,7 @@ shell = "/bin/bash"         # for exec.run; the platform shell by default
 allow_root = false
 sudo = "off"                # off | on: the sudo switch (§4); off when missing
 sudo_path = "/usr/bin/sudo" # optional; `sudo` from PATH by default
+user = "alice"              # optional: the account `user` mode runs commands as (§1)
 
 [limits]
 max_running = 4             # commands at once, per node

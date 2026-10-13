@@ -31,8 +31,18 @@ nerve-node --version
 Use the `aarch64` files on an ARM machine. `~/.local/bin` must be on your
 `PATH`.
 
-To run the node as a service that starts with the machine, install it with
-`sudo ./nerve-node-x86_64-linux install` instead ([service](service.md)).
+To run the node as a service that starts with the machine, download it and
+let it install itself instead ([service](service.md)):
+
+```sh
+curl -LO https://github.com/Piggidragon/Nerve-Protocol/releases/latest/download/nerve-node-x86_64-linux
+chmod +x nerve-node-x86_64-linux
+sudo ./nerve-node-x86_64-linux install
+sudo nerve-node setup
+```
+
+`install` puts the program at `/usr/local/bin/nerve-node`, whatever the
+downloaded file is called.
 
 ## Install on Windows
 

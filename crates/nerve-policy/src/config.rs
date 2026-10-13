@@ -71,6 +71,22 @@ pub struct Machine {
     pub sudo_path: Option<String>,
     #[serde(default)]
     pub secret_storage: SecretStorage,
+    /// The account `user` mode runs commands as, on a node that can switch
+    /// accounts (the installed service). Unset, they run as the node's own
+    /// user; the installed service then runs none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+}
+
+/// Whether `name` can be an account name: 1 to 32 characters of a-z, A-Z,
+/// 0-9, `.`, `_` and `-`, not starting with `-`.
+pub fn valid_account_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 32
+        && !name.starts_with('-')
+        && name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'_' | b'-'))
 }
 
 /// The sudo switch. Off, no command runs through `sudo`, whatever the rules
@@ -550,6 +566,13 @@ impl NodeConfig {
                 "node.name {n:?}: 1 to 32 characters of a-z, 0-9 and -"
             ));
         }
+        if let Some(u) = &self.machine.user
+            && !valid_account_name(u)
+        {
+            return Err(format!(
+                "machine.user {u:?}: an account name, 1 to 32 characters of a-z, A-Z, 0-9, ., _ and -"
+            ));
+        }
         if self.limits.max_running == 0 {
             return Err("limits.max_running must be at least 1".into());
         }
@@ -954,6 +977,18 @@ sudo_allow = ["sudo apt update"]
         c.connection.proxy = Some("http://u:s3cret@p:3128".into());
         let e = c.validate().unwrap_err();
         assert!(e.contains("proxy set") && !e.contains("s3cret"), "{e}");
+    }
+
+    #[test]
+    fn the_account_of_user_mode_is_an_account_name() {
+        let c = NodeConfig::parse("[machine]\nuser = \"alice.b\"\n").unwrap();
+        assert_eq!(c.machine.user.as_deref(), Some("alice.b"));
+        assert_eq!(NodeConfig::parse(&c.to_toml()).unwrap(), c);
+        assert_eq!(NodeConfig::default().machine.user, None);
+        for bad in ["", "-x", "a b", "a:b", "a/b"] {
+            let e = NodeConfig::parse(&format!("[machine]\nuser = {bad:?}\n")).unwrap_err();
+            assert!(e.contains("machine.user"), "{bad}: {e}");
+        }
     }
 
     #[test]

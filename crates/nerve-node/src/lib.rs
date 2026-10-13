@@ -6,6 +6,7 @@
 //! the control socket the CLI ([`cli`]) talks to. Tests start a daemon in
 //! process with [`daemon::Daemon::start`] and pair with [`pair::pair`].
 
+pub mod account;
 pub mod cli;
 pub mod daemon;
 pub mod descriptor;

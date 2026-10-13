@@ -182,6 +182,20 @@ impl Shared {
         lock(&self.store).config().clone()
     }
 
+    /// The account a `user` mode command runs as (crate::account); `None`
+    /// runs it as the node's own user.
+    pub fn user_account(
+        &self,
+        cfg: &NodeConfig,
+    ) -> Result<Option<crate::service::Account>, String> {
+        crate::account::for_user_mode(
+            cfg.machine.user.as_deref(),
+            nerve_transport::net::euid(),
+            crate::account::can_switch(),
+            crate::account::lookup,
+        )
+    }
+
     pub fn bump(&self) {
         self.changed.send_modify(|v| *v += 1);
     }

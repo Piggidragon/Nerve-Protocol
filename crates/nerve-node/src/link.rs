@@ -1142,7 +1142,17 @@ impl Link {
         effect: Effect,
         inv: &Invoke,
     ) -> Result<Value, RpcError> {
-        let rc = RunCall::parse(&inv.args, &self.shared.home)?;
+        // In user mode the installed node runs the command as the account
+        // the owner chose (crate::account), from its home. A missing
+        // account stops the command after the call is decided and audited.
+        let account = if entry.policy.mode_at(crate::now_ms()) == Mode::User {
+            self.shared.user_account(cfg)
+        } else {
+            Ok(None)
+        };
+        let known = account.as_ref().ok().and_then(Option::as_ref);
+        let home = known.map_or(&self.shared.home, |a| &a.home);
+        let rc = RunCall::parse(&inv.args, home, known.is_none())?;
         let target = rc.command.clone();
         self.gate(
             entry,
@@ -1153,6 +1163,7 @@ impl Link {
             Some(&rc.cwd),
             target,
         )?;
+        let account = account.map_err(|e| RpcError::new(ErrorCode::Unavailable, e))?;
         // The policy let a sudo command through only with the switch on and
         // the sudo allow list naming it. It runs the node's sudo, with the
         // password on stdin once sudo prompts for it, and without Landlock,
@@ -1179,6 +1190,8 @@ impl Link {
             exe: self.shared.exe.clone().unwrap_or_default(),
             output_cap: (cfg.limits.output_cap_bytes as usize).min(exec::OUTPUT_HARD_CAP),
             sudo,
+            account,
+            own: self.shared.paths.own(),
         };
         let r = exec::run(&rc, &opts, |e| guard.started(e)).await;
         drop(guard);

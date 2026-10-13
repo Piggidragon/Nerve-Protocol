@@ -39,6 +39,7 @@ name = "laptop"             # shown to centers; the host name by default
 shell = "/bin/bash"         # runs commands; the platform shell by default
 allow_root = false          # let the node run as root
 sudo_path = "/usr/bin/sudo" # optional
+user = "alice"              # installed node: the account user mode runs commands as
 
 [limits]
 max_running = 16            # commands at once, over all centers
@@ -96,7 +97,9 @@ The node signs it and uses it.
 
 The key for the MAC is `config.key` in the node's state folder. A command that
 runs as you (in `user` mode) can reach it. The check protects against
-`folder` mode commands and against centers, not against `user` mode.
+`folder` mode commands and against centers, not against `user` mode. On a
+node installed as a service, `user` mode commands run as another account
+([service](service.md#user-mode)) and cannot reach it.
 
 ## When a change applies
 

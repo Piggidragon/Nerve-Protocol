@@ -91,6 +91,11 @@ every command.
 confinement. A command can do what you can do, including changing the node's
 own state. Use it only for a center you would trust with a shell.
 
+On a node [installed as a service](service.md#user-mode) the node runs as
+its own user, `nerve`, and commands in `user` mode run as the account you
+chose at `install` or `setup` instead. They can do what that account can
+do, and cannot read the node's keys or change its state.
+
 ## Which mode
 
 | You want | Use |

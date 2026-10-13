@@ -50,6 +50,13 @@ pub fn warning(name: &str) -> String {
     )
 }
 
+/// What `sudo off` adds while the account is still an administrator.
+pub fn still_admin(name: &str) -> String {
+    format!(
+        "{name} is still an administrator: its commands can still get the administrator rights back (UAC is no security boundary). Take it out of the Administrators group to close that way too."
+    )
+}
+
 /// Whether the switch may turn on for `account` (`None`: the node runs the
 /// commands as its own user) with `password`: the installed node, and an
 /// account whose batch logon with that password holds the Administrators
@@ -120,6 +127,15 @@ pub fn settle(on: bool, held: bool, kept: bool) -> Settle {
     }
 }
 
+/// The signed config, read as the CLI reads it: its key may be in the
+/// system keyring (`machine.secret_storage`).
+fn read(paths: &NodePaths) -> Result<nerve_policy::NodeConfig, String> {
+    SettingsStore::peek_with(
+        &paths.config_file(),
+        &crate::secrets::NodeSecrets::for_cli(paths),
+    )
+}
+
 /// `nerve-node sudo on`: asks for the password of the account the commands
 /// run as, checks it ([`check`]) and keeps it ([`keep`]), and sets the
 /// switch in the signed config. `installed` says whether `paths` are the
@@ -138,7 +154,7 @@ pub async fn on(
     if !installed {
         return Err(INSTALLED_ONLY.into());
     }
-    let cfg = SettingsStore::peek(&paths.config_file(), &paths.config_key())?;
+    let cfg = read(paths)?;
     let name = cfg.machine.user.ok_or(
         "no account is chosen for commands; `nerve-node install`, run again as administrator, takes the one that runs it",
     )?;
@@ -193,13 +209,22 @@ pub async fn off(
         out,
         "sudo: off (a running service drops the password within a second)"
     );
+    // What `sudo on` asked for stays: the account is still an administrator.
+    let admin = read(paths)
+        .ok()
+        .and_then(|c| c.machine.user)
+        .and_then(|n| sys.account(&n).ok().flatten())
+        .filter(|a| !sys.admin_groups(a).is_empty());
+    if let Some(a) = admin {
+        let _ = writeln!(out, "{}", still_admin(&a.name));
+    }
     Ok(())
 }
 
 /// `nerve-node sudo status`: on when the signed config says so and the
 /// password is kept.
 pub fn status(paths: &NodePaths) -> Result<bool, String> {
-    let cfg = SettingsStore::peek(&paths.config_file(), &paths.config_key())?;
+    let cfg = read(paths)?;
     Ok(cfg.machine.sudo == Sudo::On && kept(paths))
 }
 
@@ -209,10 +234,7 @@ mod tests {
     use crate::winsvc::tests::{Fake, account, installed};
 
     fn sudo_of(paths: &NodePaths) -> Sudo {
-        SettingsStore::peek(&paths.config_file(), &paths.config_key())
-            .unwrap()
-            .machine
-            .sudo
+        read(paths).unwrap().machine.sudo
     }
 
     #[test]
@@ -313,12 +335,39 @@ mod tests {
         off(p, &sys, &mut out).await.unwrap();
         let out = String::from_utf8(out).unwrap();
         assert!(out.starts_with("sudo: off"), "{out}");
+        // Bob stays an administrator; off says so.
+        assert!(
+            out.contains("bob is still an administrator")
+                && out.contains("Take it out of the Administrators group"),
+            "{out}"
+        );
         assert!(!file.exists());
         assert_eq!(sudo_of(p), Sudo::Off);
         assert!(!status(p).unwrap());
         assert_eq!(stored(p, &sys, Some("bob")), None);
         // Off again is fine.
         off(p, &sys, &mut Vec::new()).await.unwrap();
+    }
+
+    /// A node whose config key is in the system keyring (no `config.key`)
+    /// reads its config there for `sudo status`.
+    #[test]
+    fn status_reads_a_config_whose_key_is_in_the_keyring() {
+        let d = tempfile::tempdir().unwrap();
+        let p = NodePaths::new(d.path().join("config"), d.path().join("state"));
+        let mut s = SettingsStore::open_with(
+            p.config_file(),
+            Box::new(crate::secrets::NodeSecrets::new(&p)),
+            nerve_policy::audit::AuditLog::new(p.audit_log()),
+        )
+        .unwrap();
+        s.update(|c| {
+            c.machine.secret_storage = nerve_policy::config::SecretStorage::Keyring;
+            Ok(())
+        })
+        .unwrap();
+        assert!(!p.config_key().exists());
+        assert_eq!(status(&p), Ok(false));
     }
 
     /// The running node holds a kept password when the switch is on, and

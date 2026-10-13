@@ -38,7 +38,9 @@ behaves the same except where this page says so.
 - Output that is not UTF-8 is read in the console code page.
 - A [sudo](sudo.md#sudo-on-windows) command runs with the elevated token of
   the account commands run as, which must be an administrator. Every other
-  command of that account runs with the token UAC filtered.
+  command of that account runs with the token UAC filtered. UAC is no
+  security boundary, so those commands can get the administrator rights back
+  as well.
 - Paths in rules and over the wire look like `/c/Users/x`.
 - A node that runs elevated (as an administrator) is refused unless
   `machine.allow_root` is set ([root and administrator](#root-and-administrator)).

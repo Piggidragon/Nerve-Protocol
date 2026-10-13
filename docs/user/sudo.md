@@ -89,7 +89,11 @@ administrator" gives, not the token UAC gives its other commands. So:
 - It works only on the node installed as a service. A node you start
   yourself refuses to switch sudo on.
 - The account commands run as must be an administrator. Otherwise the switch
-  refuses to turn on.
+  refuses to turn on. An administrator's other commands run with the token
+  UAC filtered, but UAC is no security boundary: any command of that account,
+  not only a sudo command, can get the administrator rights back and read the
+  node's keys. With sudo on, allow commands only to centers you trust with the
+  whole machine.
 - `sudo on` asks for that account's password, the one `install` stored. A
   wrong password is refused and the switch stays as it was.
 - The node keeps the password with DPAPI in the config folder, as `install`
@@ -119,4 +123,5 @@ administrators have unless a policy takes it. The command runs in a Job
 Object like every other command, so a timeout or `exec.signal` ends it.
 
 A sudo command can change anything on the machine and read the node's keys.
-Put only the commands you mean on the sudo list.
+Put only the commands you mean on the sudo list. On Windows the sudo list is
+not the only way to those rights: see the administrator above.

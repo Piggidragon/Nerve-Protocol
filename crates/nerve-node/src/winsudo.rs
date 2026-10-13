@@ -37,14 +37,16 @@ pub const INSTALLED_ONLY: &str = "on Windows the sudo switch works on the node i
 /// Why `name`, not an administrator, cannot have the switch.
 pub fn not_admin(name: &str) -> String {
     format!(
-        "{name} is not an administrator: on Windows a sudo command runs with the administrator rights of the account commands run as, so that account must be in the Administrators group"
+        "{name} is not an administrator: on Windows a sudo command runs with the administrator rights of the account commands run as, so that account must be in the Administrators group. Then every command of {name}, not only sudo commands, can get those rights back (UAC is no security boundary) and read the node's keys"
     )
 }
 
-/// What the owner is told when the switch turns on.
+/// What the owner is told when the switch turns on: the account is an
+/// administrator, so its other commands can rise as well
+/// (crate::winsvc::admin_warning says the same at install).
 pub fn warning(name: &str) -> String {
     format!(
-        "Warning: sudo commands run as {name} with its administrator rights. They can change anything on this machine and read the node's keys. Only the commands on the sudo list run so."
+        "Warning: sudo commands run as {name} with its administrator rights. They can change anything on this machine and read the node's keys. {name} is an administrator, and UAC is no security boundary: every other command of {name} can get these rights back too, not only the commands on the sudo list. Allow commands only to centers you trust with this machine."
     )
 }
 
@@ -224,6 +226,11 @@ mod tests {
         // Alice logs on, but her logon has no Administrators group.
         let e = check(&sys, Some(&alice), "alice's").unwrap_err();
         assert!(e.contains("alice is not an administrator"), "{e}");
+        // What making her one means is said.
+        assert!(
+            e.contains("not only sudo commands") && e.contains("UAC is no security boundary"),
+            "{e}"
+        );
         let e = check(&sys, Some(&bob), "wrong").unwrap_err();
         assert!(e.contains("password of bob is wrong"), "{e}");
         check(&sys, Some(&bob), "bob's").unwrap();
@@ -283,6 +290,12 @@ mod tests {
         assert!(out.contains("sudo: on"), "{out}");
         assert!(
             out.contains("run as bob with its administrator rights"),
+            "{out}"
+        );
+        // Not only sudo commands: the account's others can rise too.
+        assert!(
+            out.contains("UAC is no security boundary")
+                && out.contains("not only the commands on the sudo list"),
             "{out}"
         );
         assert!(out.contains("Restart-Service nerve-node"), "{out}");

@@ -73,6 +73,11 @@ The node confines commands with Landlock:
 - Landlock cannot run a file it may not read. So an `x` folder also lets a
   command read files there by name. It still cannot list the folder.
 - The node's own folders are in none of these sets.
+- A command with `w` on a folder can put a link in place of a folder inside
+  it. So a folder inside a `w` folder (of any pairing) whose path now leads
+  somewhere else, also by a link you made yourself, is left out of the sets,
+  and the node logs a warning. A link would give that folder's rights in a
+  place you never named. A link of your own above the `w` folder is followed.
 - With the keys in the system keyring, the node's D-Bus session and GNOME
   Keyring's folder count as its own, and a command cannot connect to a
   socket there ([keys](config.md#where-the-node-keeps-its-keys)). That needs

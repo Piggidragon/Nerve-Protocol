@@ -96,6 +96,12 @@ and, per platform, system files that open the machine.
   place gives nothing. A folder that is, or passes through, a link into a
   protected entry is refused unless the owner's folders release the place it
   leads to.
+- A command with `w` on a folder can replace a folder inside it by a link,
+  and Landlock follows a link in a rule's path. So a folder strictly inside a
+  `w` folder of any center, whose path now resolves elsewhere than the `w`
+  folder's real path plus its own rest, is left out of the Landlock rules
+  (`exec::led_away`). Links above the `w` folder, and the `w` folder itself,
+  are the owner's and are followed.
 - A folder that holds a protected entry gives a command none of it. Landlock
   cannot deny inside a rule, so the sandbox takes the folder's other entries,
   level by level, down to the protected one.

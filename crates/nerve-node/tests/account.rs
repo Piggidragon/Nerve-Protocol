@@ -34,7 +34,7 @@ fn me(home: &Path) -> Account {
 fn opts(policy: &CenterPolicy, account: &Account, own: &[PathBuf]) -> RunOptions {
     RunOptions {
         shell: None,
-        landlock: Some(exec::landlock_spec(policy, &account.home, own)),
+        landlock: Some(exec::landlock_spec(policy, &account.home, own, &[])),
         exe: env!("CARGO_BIN_EXE_nerve-node").into(),
         output_cap: 64 * 1024,
         sudo: None,

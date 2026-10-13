@@ -1221,7 +1221,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let spec = crate::exec::landlock_spec(&policy, &home, &own);
+        let spec = crate::exec::landlock_spec(&policy, &home, &own, &[]);
         let keyrings = std::fs::canonicalize(&keyrings).unwrap();
         for set in [&spec.read, &spec.write, &spec.exec] {
             assert!(!set.iter().any(|r| keyrings.starts_with(r)), "{set:?}");

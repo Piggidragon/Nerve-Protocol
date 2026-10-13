@@ -20,6 +20,14 @@ cargo test
 The release workflow runs the same three with `--locked --workspace` before it
 builds anything ([releasing](releasing.md)).
 
+The `CI` workflow (`.github/workflows/ci.yml`) runs on every pull request and on
+every push to `main`, in two jobs. The Linux job runs the same three. The
+Windows job runs clippy for the workspace and the tests of `nerve-node` and
+`nerve-policy`, the crates with Windows-only code (grants, the integrity level,
+the service steps, Windows paths). Both use the toolchain of the release and a
+cargo cache keyed by `Cargo.lock`, so a change to the lock file builds once from
+scratch.
+
 `cargo test` runs the unit tests, the integration tests and the
 [conformance suite](spec/conformance.md). The end-to-end tests, which
 start the real `nerve-center` and `nerve-node`, run on Unix. To run only the

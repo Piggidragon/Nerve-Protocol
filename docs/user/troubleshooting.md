@@ -75,7 +75,7 @@ cannot switch to the account commands run as and runs no command at all.
 | Message | Cause | Fix |
 |---|---|---|
 | `another nerve-center already runs the center in …` | Another center uses this state folder, and this one is not `--mcp stdio` | Use another `--state-dir`, or stop the other center |
-| `the web UI at … is beyond loopback and logs in with a harness token, but there is none` | `--ui` is not on loopback | Set `--harness-token`, or use `--ui 127.0.0.1:7480` |
+| `the web UI at … is beyond loopback and logs in with a harness token, but there is none` | `--ui` is not on loopback | Set `--harness-token`, or use `--ui 127.0.0.2:7480` |
 | `… always needs a login; drop --ui-no-login …` | `--ui-no-login` with a UI beyond loopback | Drop `--ui-no-login` |
 | The MCP endpoint refuses every client | No harness token yet | Set `--harness-token`, or make one in the web UI |
 

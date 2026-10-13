@@ -39,7 +39,7 @@ Get the programs from
    {"mcpServers": {"nerve": {"command": "nerve-center"}}}
    ```
 
-2. Open `http://127.0.0.1:7480`, press **Pair a machine**, and run the command
+2. Open `http://127.0.0.2:7480`, press **Pair a machine**, and run the command
    it shows on the machine:
 
    ```sh

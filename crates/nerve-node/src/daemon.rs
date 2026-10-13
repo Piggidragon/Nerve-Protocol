@@ -622,7 +622,7 @@ async fn start_ctl(shared: Arc<Shared>) -> Result<JoinHandle<()>, String> {
 
 #[cfg(not(unix))]
 async fn start_ctl(_shared: Arc<Shared>) -> Result<JoinHandle<()>, String> {
-    // Not done in 0.0.1: a named pipe. The CLI writes the signed file itself,
+    // Not done in 0.0.2: a named pipe. The CLI writes the signed file itself,
     // and the running node takes it at its next start.
     Ok(tokio::spawn(async {}))
 }

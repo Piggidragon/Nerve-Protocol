@@ -1,5 +1,5 @@
 //! The harness part: checks the MCP server surface a harness sees. A skeleton
-//! in 0.0.1.
+//! in 0.0.2.
 //!
 //! Harnesses integrate through MCP only (docs/dev/spec/harness.md); native plugins are
 //! a backlog item. This part only lists the checks it will run, and reports
@@ -32,7 +32,7 @@ pub const PLANNED: &[(&str, &str)] = &[
 pub fn run() -> Report {
     let mut r = Report::new("harness");
     for (section, name) in PLANNED {
-        r.skip(section, name, "the harness part is a skeleton in 0.0.1");
+        r.skip(section, name, "the harness part is a skeleton in 0.0.2");
     }
     r
 }

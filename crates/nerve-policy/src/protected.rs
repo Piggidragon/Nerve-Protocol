@@ -1660,7 +1660,7 @@ mod tests {
                 proj,
             ),
             (
-                "type \\\\127.0.0.1\\c$\\Users\\u\\nerve-test\\node-config\\node.toml",
+                "type \\\\127.0.0.2\\c$\\Users\\u\\nerve-test\\node-config\\node.toml",
                 proj,
             ),
             (

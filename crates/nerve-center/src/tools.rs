@@ -315,7 +315,7 @@ mod tests {
                 arch: "x86_64".into(),
                 software: Software {
                     name: "nerve-node".into(),
-                    version: "0.0.1".into(),
+                    version: "0.0.2".into(),
                 },
             },
             rev: 1,

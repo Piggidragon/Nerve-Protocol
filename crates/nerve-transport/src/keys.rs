@@ -2,7 +2,7 @@
 //! (docs/dev/spec/protocol.md §2 and §4.2); and the secret key of the MAC the node keeps
 //! over its own config file ([`MacKey`]).
 //!
-//! 0.0.1 keeps the key as a 0600 file next to the node's config. Keeping it in
+//! 0.0.2 keeps the key as a 0600 file next to the node's config. Keeping it in
 //! the system keyring (`machine.secret_storage = "keyring"`) is not done yet;
 //! see the README's list of what is missing.
 

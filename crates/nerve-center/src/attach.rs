@@ -4,7 +4,7 @@
 //! stdio, so both harnesses share the nodes and links.
 //!
 //! The socket is mode 0600 in a 0700 folder, and the owner also checks the
-//! peer's uid. Windows has neither the lock nor the socket in 0.0.1: a second
+//! peer's uid. Windows has neither the lock nor the socket in 0.0.2: a second
 //! instance there fails when it cannot bind the node port.
 
 use std::fs::File;

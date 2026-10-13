@@ -69,12 +69,12 @@ pub async fn start(args: &Args, lock: Lock) -> Result<Running, String> {
     if let Some(a) = ui_addr.as_deref().filter(|a| !is_loopback(a)) {
         if args.ui_no_login {
             return Err(format!(
-                "the web UI at {a} is beyond loopback, where it always needs a login; drop --ui-no-login or use --ui 127.0.0.1:<port>"
+                "the web UI at {a} is beyond loopback, where it always needs a login; drop --ui-no-login or use --ui 127.0.0.2:<port>"
             ));
         }
         if !has_token {
             return Err(format!(
-                "the web UI at {a} is beyond loopback and logs in with a harness token, but there is none; set --harness-token (NERVE_HARNESS_TOKEN) or use --ui 127.0.0.1:<port>"
+                "the web UI at {a} is beyond loopback and logs in with a harness token, but there is none; set --harness-token (NERVE_HARNESS_TOKEN) or use --ui 127.0.0.2:<port>"
             ));
         }
     }

@@ -1526,7 +1526,7 @@ mod tests {
         Center::open(Options {
             state_dir: dir.to_path_buf(),
             name: name.map(str::to_string),
-            public_url: "http://127.0.0.1:7443".into(),
+            public_url: "http://127.0.0.2:7443".into(),
             log: None,
             log_level: None,
         })
@@ -1743,7 +1743,7 @@ mod tests {
         let c = Center::open(Options {
             state_dir: dir.path().to_path_buf(),
             name: None,
-            public_url: "http://127.0.0.1:7443".into(),
+            public_url: "http://127.0.0.2:7443".into(),
             log: None,
             log_level: Some(Level::Warn),
         })
@@ -1845,7 +1845,7 @@ mod tests {
         let c = Center::open(Options {
             state_dir: dir.path().to_path_buf(),
             name: None,
-            public_url: "http://127.0.0.1:7443".into(),
+            public_url: "http://127.0.0.2:7443".into(),
             log: None,
             log_level: Some(Level::Warn),
         })

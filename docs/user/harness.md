@@ -21,7 +21,7 @@ Point the harness at the endpoint, and send the token as a bearer token:
 
 | Setting | Value |
 |---|---|
-| URL | `http://127.0.0.1:7481/mcp` (`--mcp-listen`) |
+| URL | `http://127.0.0.2:7481/mcp` (`--mcp-listen`) |
 | Header | `Authorization: Bearer <token>` |
 
 A harness on another machine needs `--mcp-listen 0.0.0.0:7481`. The endpoint

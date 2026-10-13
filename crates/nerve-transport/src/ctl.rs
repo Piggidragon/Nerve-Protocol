@@ -7,7 +7,7 @@
 //!
 //! On Unix the socket is created 0600 in a 0700 folder, and every peer's
 //! credentials are read: only the socket's own user or root may talk to it.
-//! Windows named pipes with an owner-only ACL are not done in 0.0.1; there the
+//! Windows named pipes with an owner-only ACL are not done in 0.0.2; there the
 //! CLI works on the config files directly (see `nerve-node`).
 
 use serde::{Deserialize, Serialize};

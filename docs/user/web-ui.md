@@ -1,6 +1,6 @@
 # The web UI
 
-`nerve-center` serves a web UI at `http://127.0.0.1:7480` (`--ui`). Its pages,
+`nerve-center` serves a web UI at `http://127.0.0.2:7480` (`--ui`). Its pages,
 scripts and styles are built into the program. It loads nothing from another
 host.
 
@@ -25,7 +25,7 @@ HTTP endpoint takes.
 To reach a UI that listens on loopback from another machine, use an SSH tunnel:
 
 ```sh
-ssh -L 7480:127.0.0.1:7480 user@center-host
+ssh -L 7480:127.0.0.2:7480 user@center-host
 ```
 
 ## Pages

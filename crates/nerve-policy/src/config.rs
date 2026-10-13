@@ -115,7 +115,7 @@ pub enum SecretStorage {
     /// A 0600 key file per center below the config directory.
     #[default]
     File,
-    /// The system keyring. Not done in 0.0.1.
+    /// The system keyring. Not done in 0.0.2.
     Keyring,
 }
 
@@ -729,7 +729,7 @@ sudo = "off"
 max_running = 4
 
 [connection]
-proxy = "http://127.0.0.1:3128"
+proxy = "http://127.0.0.2:3128"
 
 [[center]]
 name = "home"

@@ -50,10 +50,10 @@ const CENTER_NAME: &str = "conformance-center";
 
 impl FakeCenter {
     pub async fn start(auto: bool) -> std::io::Result<FakeCenter> {
-        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let listener = TcpListener::bind("127.0.0.2:0").await?;
         let port = listener.local_addr()?.port();
         let url =
-            CenterUrl::parse(&format!("http://127.0.0.1:{port}")).map_err(std::io::Error::other)?;
+            CenterUrl::parse(&format!("http://127.0.0.2:{port}")).map_err(std::io::Error::other)?;
         let code = nerve_transport::keys::random_token(12);
         let center_id = format!("conformance-{}", nerve_transport::keys::random_token(16));
         let state = Arc::new(Mutex::new(State {

@@ -4,7 +4,7 @@ Pairing links a machine to a center. Do it once per machine and center.
 
 ## Steps
 
-1. Open the center's web UI (`http://127.0.0.1:7480`). On Overview, press
+1. Open the center's web UI (`http://127.0.0.2:7480`). On Overview, press
    **Pair a machine**. It shows a command, the center's address, a code and a
    certificate pin.
 2. On the machine, as a normal user, run the command it shows:

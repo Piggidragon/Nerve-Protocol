@@ -1,6 +1,6 @@
 //! Confinement for the commands a node runs (docs/dev/policy-engine.md).
 //!
-//! 0.0.1 confines with Landlock on Linux, in `folders` mode: a command reads
+//! 0.0.2 confines with Landlock on Linux, in `folders` mode: a command reads
 //! the system directories and the folders flagged `r`, writes only the `w`
 //! folders, and runs programs only from the system directories and the `x`
 //! folders. The rules are applied in a small shim, `nerve-node __exec-shim`,
@@ -8,7 +8,7 @@
 //! and doing that between `fork` and `exec` of a multi-threaded async node is
 //! not safe, while the shim is single-threaded.
 //!
-//! Everything else in this area is a stub in 0.0.1 (see [`stubs`]).
+//! Everything else in this area is a stub in 0.0.2 (see [`stubs`]).
 
 use std::path::PathBuf;
 
@@ -301,11 +301,11 @@ pub mod landlock_rules {
     }
 }
 
-/// What 0.0.1 does not do. Each returns an error ending in
+/// What 0.0.2 does not do. Each returns an error ending in
 /// [`stubs::NOT_DONE`], so callers and the CLI say so plainly instead of
 /// pretending.
 pub mod stubs {
-    pub const NOT_DONE: &str = "not done in 0.0.1";
+    pub const NOT_DONE: &str = "not done in 0.0.2";
 
     /// A cgroup per command (memory, process count, kill of the whole tree).
     pub fn cgroup() -> Result<(), String> {

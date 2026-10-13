@@ -93,7 +93,7 @@ pub struct Auth {
 pub struct Hello {
     pub node_id: String,
     pub auth: Auth,
-    /// Protocol versions the node speaks; 0.0.1 knows only "0".
+    /// Protocol versions the node speaks; 0.0.2 knows only "0".
     pub versions: Vec<String>,
     pub software: Software,
     #[serde(default)]

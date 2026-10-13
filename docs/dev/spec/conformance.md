@@ -4,18 +4,18 @@ The conformance suite lives in `crates/nerve-conformance`. It has three
 parts; every check names the section of [protocol.md](protocol.md) it tests,
 so a failure points at the rule that was broken.
 
-| Part | Checks | Acts as | State in 0.0.1 |
+| Part | Checks | Acts as | State in 0.0.2 |
 |---|---|---|---|
 | center | a center | the echo node | runs |
 | node | a node | a fake center | runs |
 | harness | the MCP server surface a harness sees | a center | skeleton: lists its checks, runs none |
 
-Harnesses integrate through MCP only in 0.0.1, so the harness part checks the
+Harnesses integrate through MCP only in 0.0.2, so the harness part checks the
 MCP server surface. Native plugins are a backlog item.
 
 ## Running it
 
-There is no runner binary in 0.0.1. The parts are library calls that return a
+There is no runner binary in 0.0.2. The parts are library calls that return a
 report, and `cargo test -p nerve-conformance` runs them:
 
 - `tests/self_test.rs`: the center part against the fake center and the node

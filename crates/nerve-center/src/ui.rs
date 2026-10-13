@@ -623,7 +623,7 @@ pub fn host_is_loopback(host: Option<&str>) -> bool {
     };
     matches!(
         name.to_ascii_lowercase().as_str(),
-        "127.0.0.1" | "localhost" | "::1"
+        "127.0.0.2" | "localhost" | "::1"
     )
 }
 
@@ -664,7 +664,7 @@ mod tests {
         Center::open(crate::center::Options {
             state_dir: dir.to_path_buf(),
             name: Some("test".into()),
-            public_url: "http://127.0.0.1:1".into(),
+            public_url: "http://127.0.0.2:1".into(),
             log: None,
             log_level: None,
         })
@@ -695,7 +695,7 @@ mod tests {
         use clap::CommandFactory;
         let d = tempfile::tempdir().unwrap();
         let ui = Ui::new(&center(d.path()), None, false, false);
-        let h = ("Host", "127.0.0.1:7480");
+        let h = ("Host", "127.0.0.2:7480");
         let session = ui.request(req("GET", "/api/session", &[h], "")).await;
         let ck = set_cookie(&session);
         // The page: a tab in the menu, drawn from /api/help.
@@ -857,7 +857,7 @@ mod tests {
     async fn the_page_closes_the_pairing_card_when_the_code_is_used() {
         let d = tempfile::tempdir().unwrap();
         let ui = Ui::new(&center(d.path()), None, false, false);
-        let h = ("Host", "127.0.0.1:7480");
+        let h = ("Host", "127.0.0.2:7480");
         let session = ui.request(req("GET", "/api/session", &[h], "")).await;
         let ck = set_cookie(&session);
         let js = ui
@@ -910,7 +910,7 @@ mod tests {
         }
         store.save(d.path()).unwrap();
         let ui = Ui::new(&center(d.path()), None, false, false);
-        let h = ("Host", "127.0.0.1:7480");
+        let h = ("Host", "127.0.0.2:7480");
         let session = ui.request(req("GET", "/api/session", &[h], "")).await;
         let ck = set_cookie(&session);
         // The page draws overall numbers, and one machine's from a searchable
@@ -995,7 +995,7 @@ mod tests {
 
     #[test]
     fn loopback_hosts() {
-        assert!(host_is_loopback(Some("127.0.0.1:7480")));
+        assert!(host_is_loopback(Some("127.0.0.2:7480")));
         assert!(host_is_loopback(Some("localhost")));
         assert!(host_is_loopback(Some("[::1]:7480")));
         assert!(!host_is_loopback(Some("evil.example:7480")));
@@ -1006,7 +1006,7 @@ mod tests {
     async fn open_ui_needs_loopback_host_cookie_and_csrf() {
         let d = tempfile::tempdir().unwrap();
         let ui = Ui::new(&center(d.path()), None, false, false);
-        let h = ("Host", "127.0.0.1:7480");
+        let h = ("Host", "127.0.0.2:7480");
         // A rebound name is refused.
         let r = ui
             .request(req("GET", "/api/session", &[("Host", "evil.example")], ""))
@@ -1333,7 +1333,7 @@ mod tests {
     async fn an_open_ui_has_no_login() {
         let d = tempfile::tempdir().unwrap();
         let ui = Ui::new(&center(d.path()), None, false, false);
-        let h = ("Host", "127.0.0.1:7480");
+        let h = ("Host", "127.0.0.2:7480");
         let r = ui.request(req("GET", "/", &[h], "")).await;
         assert_eq!(r.status, 200);
         let r = ui.request(req("GET", "/login", &[h], "")).await;
@@ -1351,7 +1351,7 @@ mod tests {
         let c = center(d.path());
         // The token is made in the open UI, as on a fresh center.
         let open = Ui::new(&c, None, false, false);
-        let h = ("Host", "127.0.0.1:7480");
+        let h = ("Host", "127.0.0.2:7480");
         let r = open.request(req("GET", "/api/session", &[h], "")).await;
         let (ck, csrf) = (
             set_cookie(&r),
@@ -1439,7 +1439,7 @@ mod tests {
     async fn with_the_login_off_a_token_changes_nothing() {
         let d = tempfile::tempdir().unwrap();
         let ui = Ui::new(&center(d.path()), Some(TOKEN.into()), false, false);
-        let h = ("Host", "127.0.0.1:7480");
+        let h = ("Host", "127.0.0.2:7480");
         let r = ui.request(req("GET", "/login", &[h], "")).await;
         assert_eq!((r.status, header(&r, "Location")), (303, Some("/")));
         let r = ui
@@ -1513,7 +1513,7 @@ mod tests {
             .request(req(
                 "GET",
                 "/api/session",
-                &[("Host", "127.0.0.1:7480")],
+                &[("Host", "127.0.0.2:7480")],
                 "",
             ))
             .await;
@@ -1524,7 +1524,7 @@ mod tests {
         log.record(
             Level::Info,
             Some(("alpha", "n1")),
-            "link up (node software 0.0.1)",
+            "link up (node software 0.0.2)",
         );
         log.record(
             Level::Warn,
@@ -1534,7 +1534,7 @@ mod tests {
         log.record(
             Level::Info,
             Some(("beta", "n2")),
-            "link up (node software 0.0.1)",
+            "link up (node software 0.0.2)",
         );
         log.record(Level::Error, None, "cannot write the state file: disk full");
         log.record(
@@ -1550,7 +1550,7 @@ mod tests {
             .request(get(
                 "/api/log",
                 query,
-                &[("Host", "127.0.0.1:7480"), ("Cookie", cookie)],
+                &[("Host", "127.0.0.2:7480"), ("Cookie", cookie)],
             ))
             .await;
         assert_eq!(r.status, 200, "{query}: {}", body(&r));
@@ -1570,7 +1570,7 @@ mod tests {
     async fn the_log_page_has_its_lists_and_nothing_native() {
         let d = tempfile::tempdir().unwrap();
         let (_c, ui, ck) = with_a_log(d.path()).await;
-        let h = ("Host", "127.0.0.1:7480");
+        let h = ("Host", "127.0.0.2:7480");
         let index = ui.request(req("GET", "/", &[h, ("Cookie", &ck)], "")).await;
         let index = body(&index);
         assert!(index.contains("href=\"#log\""), "no Log tab in the menu");
@@ -1694,7 +1694,7 @@ mod tests {
                 .request(get(
                     "/api/log",
                     q,
-                    &[("Host", "127.0.0.1:7480"), ("Cookie", &ck)],
+                    &[("Host", "127.0.0.2:7480"), ("Cookie", &ck)],
                 ))
                 .await;
             assert_eq!(r.status, 400, "{q}");
@@ -1716,7 +1716,7 @@ mod tests {
             .request(get(
                 "/api/log/download",
                 "",
-                &[("Host", "127.0.0.1:7480"), ("Cookie", &ck)],
+                &[("Host", "127.0.0.2:7480"), ("Cookie", &ck)],
             ))
             .await;
         assert_eq!(r.status, 200);
@@ -1829,7 +1829,7 @@ mod tests {
         let c = Center::open(crate::center::Options {
             state_dir: d.path().to_path_buf(),
             name: Some("test".into()),
-            public_url: "http://127.0.0.1:1".into(),
+            public_url: "http://127.0.0.2:1".into(),
             log: None,
             log_level: Some(Level::Warn),
         })
@@ -1948,7 +1948,7 @@ mod tests {
             );
         });
         let ui = Ui::new(&c, None, false, false);
-        let h = ("Host", "127.0.0.1:7480");
+        let h = ("Host", "127.0.0.2:7480");
         let r = ui.request(req("GET", "/api/session", &[h], "")).await;
         let ck = set_cookie(&r);
         let csrf = serde_json::from_slice::<Value>(&r.body).unwrap()["csrf"]

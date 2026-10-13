@@ -140,8 +140,9 @@ folders.
   another place, not a file with a second name (a hard link), and with
   permissions that inherit. A command may write there, so it could put a
   junction in its place, and the entry would land on the folder it leads
-  to. The node names such a folder in its log and grants it once it is a
-  plain folder again.
+  to. This holds for a folder inside a `w` folder of any pairing. The node
+  names such a folder in its log (`left out of the command's sandbox: it
+  leads to …`) and grants it once it is a plain folder again.
 - The node's own folders and the [protected paths](protected-paths.md) get no
   entry, also inside a folder you grant. That folder is granted as its other
   entries instead, as on Linux.

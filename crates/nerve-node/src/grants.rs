@@ -84,14 +84,23 @@ pub fn container(paths: &NodePaths, center: &str) -> String {
 
 /// The grants the config asks for: every center's folders, each with the
 /// flags of its sets (`exec::container_grants`). `home` is the `~` of the
-/// rules, the home of the account commands run as.
+/// rules, the home of the account commands run as. A folder inside one that
+/// any center's commands may write gets its grant only where it is itself,
+/// not where a link or junction there leads.
 pub fn wanted(cfg: &NodeConfig, paths: &NodePaths, home: &Path, platform: &Platform) -> Vec<Grant> {
     let own = paths.own();
+    let writable: Vec<PathBuf> = cfg
+        .centers
+        .iter()
+        .flat_map(|c| &c.policy.folders)
+        .filter(|f| f.access.write)
+        .filter_map(|f| nerve_policy::protected::expand(home, &f.path))
+        .collect();
     cfg.centers
         .iter()
         .flat_map(|c| {
             let name = container(paths, &c.name);
-            crate::exec::container_grants(&c.policy, home, &own, platform)
+            crate::exec::container_grants(&c.policy, home, &own, platform, &writable)
                 .into_iter()
                 .filter(|(_, a)| *a != Access::NONE)
                 .map(move |(path, access)| Grant {
@@ -571,8 +580,10 @@ impl Folders for Acls {
     ) -> io::Result<Option<String>> {
         use nerve_sandbox::{acl, appcontainer};
         let masks = access.map(|a| acl::masks(a.read, a.write, a.execute));
-        appcontainer::set(path, container, masks, own)?;
-        Ok(appcontainer::file_id(path).ok().map(|i| i.to_string()))
+        // The object changed, as its handle names it: the path may lead
+        // elsewhere by now.
+        let id = appcontainer::set(path, container, masks, own)?;
+        Ok(id.map(|i| i.to_string()))
     }
 }
 
@@ -1169,6 +1180,101 @@ mod tests {
         assert!(wanted_on(true, &cfg, &paths, &home, &Platform::Unix).is_empty());
     }
 
+    /// A center named `name` with these folders.
+    fn center(name: &str, folders: &[(&Path, &str)]) -> nerve_policy::CenterEntry {
+        nerve_policy::CenterEntry {
+            name: name.into(),
+            url: String::new(),
+            pin: None,
+            center_id: String::new(),
+            node_id: String::new(),
+            settings: Default::default(),
+            paused: false,
+            revoked: false,
+            unknown: false,
+            policy: nerve_policy::CenterPolicy {
+                folders: folders
+                    .iter()
+                    .map(|(p, a)| nerve_policy::config::Folder {
+                        path: p.display().to_string(),
+                        access: Access::parse(a).unwrap(),
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// A folder granted inside a folder that commands may write (of its own
+    /// center or another one) that a command replaced by a link to another
+    /// folder gets no grant there: the folder it leads to keeps its own
+    /// flags and gets none of the nested folder's. The link put there
+    /// between `wanted` and the change is the Windows `set`'s to refuse
+    /// (`a_junction_in_place_of_a_granted_folder_gets_no_grant`). A link the
+    /// owner put above the writable folder is followed.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_put_in_place_of_a_nested_folder_gets_no_grant() {
+        let d = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let (real_work, outbox) = (root.join("real-work"), root.join("outbox"));
+        let work = root.join("work");
+        let bin = work.join("bin");
+        std::fs::create_dir_all(real_work.join("bin")).unwrap();
+        std::fs::create_dir_all(&outbox).unwrap();
+        // The owner's own link to the work folder.
+        std::os::unix::fs::symlink(&real_work, &work).unwrap();
+        let paths = NodePaths::new(root.join("cfg"), root.join("state"));
+        let mut cfg = NodeConfig::default();
+        cfg.centers.push(center(
+            "lab",
+            &[(&work, "rw"), (&bin, "rwx"), (&outbox, "w")],
+        ));
+        cfg.centers.push(center("home", &[(&bin, "r")]));
+        let (lab, home) = (container(&paths, "lab"), container(&paths, "home"));
+        let g = |c: &str, p: &Path, a: &str| Grant {
+            container: c.into(),
+            path: p.into(),
+            access: Access::parse(a).unwrap(),
+            id: None,
+        };
+        let sorted = |mut v: Vec<Grant>| {
+            v.sort_by(|a, b| (&a.container, &a.path).cmp(&(&b.container, &b.path)));
+            v
+        };
+        let want = wanted(&cfg, &paths, &root, &Platform::Unix);
+        assert_eq!(
+            sorted(want.clone()),
+            sorted(vec![
+                g(&lab, &real_work, "rw"),
+                g(&lab, &real_work.join("bin"), "rwx"),
+                g(&lab, &outbox, "w"),
+                g(&home, &real_work.join("bin"), "r"),
+            ])
+        );
+
+        std::fs::remove_dir(real_work.join("bin")).unwrap();
+        std::os::unix::fs::symlink(&outbox, real_work.join("bin")).unwrap();
+        let swapped = wanted(&cfg, &paths, &root, &Platform::Unix);
+        assert_eq!(
+            sorted(swapped.clone()),
+            sorted(vec![g(&lab, &real_work, "rw"), g(&lab, &outbox, "w")])
+        );
+        // The sync puts nothing more on the outbox.
+        let file = root.join("grants.json");
+        let mut f = Fake::default();
+        for p in [&real_work, &real_work.join("bin"), &outbox] {
+            f.make(&p.display().to_string());
+        }
+        sync(&file, &want, &mut f);
+        let s = sync(&file, &swapped, &mut f);
+        assert!(s.errors.is_empty() && s.stale.is_empty(), "{s:?}");
+        assert_eq!(
+            f.on(&outbox.display().to_string()),
+            [(lab.clone(), Access::parse("w").unwrap())]
+        );
+    }
+
     /// The access list of `path` as icacls prints it.
     #[cfg(windows)]
     fn icacls(path: &Path) -> String {
@@ -1213,66 +1319,88 @@ mod tests {
         assert!(read_record(&record_file(&paths)).unwrap().is_empty());
     }
 
-    /// On Windows: a granted folder inside a granted folder with `w` that a
-    /// command replaced by a junction to another folder gets no grant, and
-    /// the folder it leads to gets none either; a plain folder there again
+    /// The canonical form of a temporary folder, as the policy compares
+    /// paths: long names, no `\\?\`.
+    #[cfg(windows)]
+    fn canonical(p: &Path) -> PathBuf {
+        PathBuf::from(nerve_policy::paths::win::strip_verbatim(
+            &std::fs::canonicalize(p).unwrap().display().to_string(),
+        ))
+    }
+
+    /// Makes `link` a junction to `to`.
+    #[cfg(windows)]
+    fn junction(link: &Path, to: &Path) {
+        let o = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(to)
+            .output()
+            .unwrap();
+        assert!(o.status.success(), "{o:?}");
+    }
+
+    /// Whether `path` carries exactly `container`'s grant of `access`.
+    #[cfg(windows)]
+    fn carries(path: &Path, container: &str, access: &str) -> bool {
+        let a = Access::parse(access).unwrap();
+        let m = nerve_sandbox::acl::masks(a.read, a.write, a.execute);
+        nerve_sandbox::appcontainer::look(path, container, m)
+            .unwrap()
+            .1
+    }
+
+    /// On Windows: a folder granted inside a folder with `w` that a command
+    /// replaced by a junction to another folder gets no grant, and the
+    /// folder it leads to keeps its own flags: `wanted` leaves it out when
+    /// the junction is there already, and `set` refuses it when the junction
+    /// comes between `wanted` and the change. A plain folder there again
     /// gets it.
     #[cfg(windows)]
     #[test]
     fn a_junction_in_place_of_a_granted_folder_gets_no_grant() {
         let d = tempfile::tempdir().unwrap();
-        let paths = NodePaths::new(d.path().join("config"), d.path().join("state"));
-        let (work, outside) = (d.path().join("work"), d.path().join("outside"));
-        let inner = work.join("bin");
-        for p in [&inner, &outside] {
+        let root = canonical(d.path());
+        let paths = NodePaths::new(root.join("config"), root.join("state"));
+        let (work, outbox) = (root.join("work"), root.join("outbox"));
+        let bin = work.join("bin");
+        for p in [&bin, &outbox] {
             std::fs::create_dir_all(p).unwrap();
         }
+        let mut cfg = NodeConfig::default();
+        cfg.centers.push(center(
+            "lab",
+            &[(&work, "rw"), (&bin, "rwx"), (&outbox, "w")],
+        ));
         let lab = container(&paths, "lab");
-        let want = [
-            Grant {
-                container: lab.clone(),
-                path: work.clone(),
-                access: Access::parse("rw").unwrap(),
-                id: None,
-            },
-            Grant {
-                container: lab.clone(),
-                path: inner.clone(),
-                access: Access::ALL,
-                id: None,
-            },
-        ];
+        let platform = crate::paths::platform();
+        let want = wanted(&cfg, &paths, &root, &platform);
+        assert_eq!(want.len(), 3, "{want:?}");
         let s = windows_sync(&paths, &want);
         assert!(s.errors.is_empty(), "{s:?}");
-        std::fs::remove_dir(&inner).unwrap();
-        let o = std::process::Command::new("cmd")
-            .args(["/C", "mklink", "/J"])
-            .arg(&inner)
-            .arg(&outside)
-            .output()
-            .unwrap();
-        assert!(o.status.success(), "{o:?}");
+        std::fs::remove_dir(&bin).unwrap();
+        junction(&bin, &outbox);
+
+        let now = wanted(&cfg, &paths, &root, &platform);
+        assert!(
+            now.iter()
+                .all(|g| !within(&g.path, &bin) && g.access != Access::ALL),
+            "{now:?}"
+        );
+        let s = windows_sync(&paths, &now);
+        assert!(s.errors.is_empty() && s.stale.is_empty(), "{s:?}");
+        assert!(carries(&outbox, &lab, "w"), "{}", icacls(&outbox));
+
         let s = windows_sync(&paths, &want);
         assert_eq!(s.errors.len(), 1, "{s:?}");
         assert!(s.errors[0].contains("junction"), "{s:?}");
-        assert!(
-            !icacls(&outside).contains("S-1-15-2-"),
-            "{}",
-            icacls(&outside)
-        );
-        std::fs::remove_dir(&inner).unwrap();
-        std::fs::create_dir(&inner).unwrap();
-        let s = windows_sync(&paths, &want);
+        assert!(carries(&outbox, &lab, "w"), "{}", icacls(&outbox));
+
+        std::fs::remove_dir(&bin).unwrap();
+        std::fs::create_dir(&bin).unwrap();
+        let s = windows_sync(&paths, &wanted(&cfg, &paths, &root, &platform));
         assert!(s.errors.is_empty(), "{s:?}");
-        assert!(
-            nerve_sandbox::appcontainer::look(
-                &inner,
-                &lab,
-                nerve_sandbox::acl::masks(true, true, true)
-            )
-            .unwrap()
-            .1
-        );
+        assert!(carries(&bin, &lab, "rwx"), "{}", icacls(&bin));
         let s = remove_all(&paths, &["lab".into()]);
         assert!(s.errors.is_empty(), "{s:?}");
     }

@@ -969,8 +969,15 @@ pub mod appcontainer {
     /// on a link or junction to elsewhere, on a file with other names, or on
     /// one whose list does not inherit. A command may have put what is
     /// there, where it may write; the grant would then reach what it
-    /// leads to. A refusal is InvalidInput, and changes nothing.
-    pub fn set(path: &Path, name: &str, masks: Option<Masks>, own: bool) -> io::Result<()> {
+    /// leads to. A refusal is InvalidInput, and changes nothing. The
+    /// [`FileId`] of the object it changed, as its handle names it, when
+    /// the volume names one.
+    pub fn set(
+        path: &Path,
+        name: &str,
+        masks: Option<Masks>,
+        own: bool,
+    ) -> io::Result<Option<FileId>> {
         let sid = Sid::derive(name)?;
         // The change goes through this handle, on the object it opened.
         let f = open(path, READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES)?;
@@ -1089,7 +1096,7 @@ pub mod appcontainer {
         if e != 0 {
             return Err(io::Error::from_raw_os_error(e as i32));
         }
-        Ok(())
+        Ok(id_of(&f).ok())
     }
 
     /// HRESULTs of the profile calls.
@@ -2013,8 +2020,9 @@ mod tests {
             assert!(e.to_string().contains("puts no grant"), "{p:?}: {e}");
         }
         assert!(!granted(&real) && !granted(&one) && !granted(&closed));
-        appcontainer::set(&plain, &name, Some(m), true).unwrap();
+        let id = appcontainer::set(&plain, &name, Some(m), true).unwrap();
         assert!(granted(&plain));
+        assert_eq!(id, Some(appcontainer::file_id(&plain).unwrap()));
         // Taking a grant off is never refused.
         appcontainer::set(&link, &name, None, true).unwrap();
         appcontainer::set(&link, &name, Some(m), false).unwrap();

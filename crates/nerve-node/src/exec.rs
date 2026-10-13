@@ -48,9 +48,9 @@ pub struct RunCall {
 
 impl RunCall {
     /// `cwd` defaults to `home`, the home of the account the command runs
-    /// as. `seen`: the node can look into the folder; a command that runs
-    /// as another account enters it itself, and fails there when it cannot.
-    pub fn parse(args: &Map<String, Value>, home: &Path, seen: bool) -> Result<RunCall, RpcError> {
+    /// as. On the installed node the folder is looked at as that account
+    /// (crate::account::FsAs).
+    pub fn parse(args: &Map<String, Value>, home: &Path) -> Result<RunCall, RpcError> {
         let a: RunArgs = params(args)?;
         if a.command.trim().is_empty() {
             return Err(RpcError::invalid_args("command is empty"));
@@ -59,7 +59,7 @@ impl RunCall {
             Some(c) => WirePath::parse(&c)?.real,
             None => home.to_path_buf(),
         };
-        if seen && !cwd.is_dir() {
+        if !cwd.is_dir() {
             return Err(crate::fs::bad_path(format!(
                 "{} is not a directory",
                 to_wire(&cwd)
@@ -318,7 +318,7 @@ pub struct RunOptions {
     /// prompt. Every other command runs with no_new_privs (Linux), so a
     /// `sudo` the rules did not see (`ls; sudo x`) cannot gain privileges.
     pub sudo: Option<SudoInput>,
-    /// The account the command runs as (`user` mode on the installed node,
+    /// The account the command runs as (the installed node, every mode,
     /// crate::account); `None` runs it as the node's own user.
     pub account: Option<crate::service::Account>,
     /// The node's own folders, which the account must not reach.
@@ -370,16 +370,44 @@ pub fn sudo_line(sudo_path: &str, args: &str, prompt: &str) -> String {
 }
 
 /// Checks `password` with `sudo -S -k -v`, which runs nothing and caches
-/// nothing; its output is discarded.
-pub async fn sudo_check(sudo_path: &str, password: &str) -> Result<(), String> {
-    let mut child = Command::new(sudo_path)
-        .args(["-S", "-k", "-v", "-p", ""])
+/// nothing; its output is discarded. It runs as `account`, the account the
+/// commands run as (crate::account), so sudo checks that account's
+/// password; `None` runs it as the node's own user.
+pub async fn sudo_check(
+    sudo_path: &str,
+    password: &str,
+    account: Option<&crate::service::Account>,
+) -> Result<(), String> {
+    let mut cmd = Command::new(sudo_path);
+    cmd.args(["-S", "-k", "-v", "-p", ""])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    #[cfg(target_os = "linux")]
+    {
+        let switch = account
+            .map(|a| crate::account::Switch::new(a, None, &[]))
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        // SAFETY: plain system calls on memory moved into the closure.
+        unsafe {
+            cmd.pre_exec(move || match &switch {
+                Some(s) => s.apply(),
+                None if nerve_transport::net::euid() != 0 => crate::account::drop_caps(),
+                None => Ok(()),
+            });
+        }
+    }
+    if let Some(a) = account {
+        cmd.env("HOME", &a.home)
+            .env("USER", &a.name)
+            .env("LOGNAME", &a.name);
+    }
+    let as_whom = account.map_or(String::new(), |a| format!(" as {}", a.name));
+    let mut child = cmd
         .spawn()
-        .map_err(|e| format!("cannot run {sudo_path}: {e}"))?;
+        .map_err(|e| format!("cannot run {sudo_path}{as_whom}: {e}"))?;
     let mut stdin = child.stdin.take().expect("piped");
     // sudo may exit before reading (no such user in sudoers); the exit
     // status says what matters.
@@ -387,7 +415,9 @@ pub async fn sudo_check(sudo_path: &str, password: &str) -> Result<(), String> {
     drop(stdin);
     match tokio::time::timeout(Duration::from_secs(30), child.wait()).await {
         Ok(Ok(s)) if s.success() => Ok(()),
-        Ok(Ok(_)) => Err("the sudo password is wrong (sudo -v refused it)".into()),
+        Ok(Ok(_)) => Err(format!(
+            "the sudo password is wrong (sudo -v{as_whom} refused it)"
+        )),
         Ok(Err(e)) => Err(format!("waiting for sudo: {e}")),
         Err(_) => Err("sudo -v did not answer within 30 s".into()),
     }
@@ -672,7 +702,7 @@ pub async fn run(
     {
         let switch = match &opts.account {
             Some(a) => Some(
-                crate::account::Switch::new(a, &call.cwd, &opts.own)
+                crate::account::Switch::new(a, Some(&call.cwd), &opts.own)
                     .map_err(|e| RpcError::invalid_args(e.to_string()))?,
             ),
             None => None,
@@ -921,6 +951,49 @@ mod tests {
         sudo.display().to_string()
     }
 
+    /// `sudo on` checks the password of the account the commands run as:
+    /// sudo -v runs as that account, so sudo asks for its password.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_sudo_check_runs_as_the_chosen_account() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let seen = d.path().join("seen");
+        let sudo = d.path().join("sudo");
+        // Like sudo -v: takes the password of the user it runs as.
+        std::fs::write(
+            &sudo,
+            format!(
+                "#!/bin/sh\nIFS= read -r pw\necho \"$USER $(id -u)\" > '{}'\n[ \"$pw\" = \"pw-of-$USER\" ]\n",
+                seen.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let sudo = sudo.display().to_string();
+        // SAFETY: plain getters.
+        let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+        let chosen = crate::service::Account {
+            name: "chosen".into(),
+            uid,
+            gid,
+            comment: String::new(),
+            home: d.path().to_path_buf(),
+            groups: vec![gid],
+        };
+        sudo_check(&sudo, "pw-of-chosen", Some(&chosen))
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&seen).unwrap(),
+            format!("chosen {uid}\n")
+        );
+        let e = sudo_check(&sudo, "pw-of-nerve", Some(&chosen))
+            .await
+            .unwrap_err();
+        assert!(e.contains("sudo -v as chosen refused it"), "{e}");
+    }
+
     /// A sudo that asks for no password: the command it starts finds no
     /// password on its stdin, only its end.
     #[cfg(target_os = "linux")]
@@ -1163,21 +1236,13 @@ mod tests {
     fn parses_args() {
         let home = std::env::temp_dir();
         let a = json!({"command": "ls"}).as_object().unwrap().clone();
-        let c = RunCall::parse(&a, &home, true).unwrap();
+        let c = RunCall::parse(&a, &home).unwrap();
         assert_eq!(c.cwd, home);
         let bad = json!({"command": "ls", "shell": "x"})
             .as_object()
             .unwrap()
             .clone();
-        assert!(RunCall::parse(&bad, &home, true).is_err());
-        // A folder the node cannot see is left to the command's account.
-        let hidden = home.join("nerve-test-not-here");
-        let a = json!({"command": "ls", "cwd": hidden.to_str().unwrap()})
-            .as_object()
-            .unwrap()
-            .clone();
-        assert!(RunCall::parse(&a, &home, true).is_err());
-        assert_eq!(RunCall::parse(&a, &home, false).unwrap().cwd, hidden);
+        assert!(RunCall::parse(&bad, &home).is_err());
         assert_eq!(shell_command(None, "ls").1, ["-c", "ls"]);
     }
 }

@@ -908,12 +908,21 @@ impl Link {
                 // Decided and audited like any other action; its rule target
                 // is the action itself.
                 let target = format!("{}.{}", inv.cap, inv.action);
-                self.gate(&entry, &inv, effect, &[], None, None, target)?;
+                self.gate(&entry, &inv, effect, &[], None, None, target, None)?;
                 self.signal(&inv.args)
             }
             ("exec", "run") => self.exec_run(id, &cfg, &entry, effect, &inv).await,
             ("fs", a) => {
-                let call = FsCall::parse(a, &inv.args)?;
+                // On the installed node the node reads and writes as the
+                // account the commands run as (crate::account::FsAs), from
+                // the paths of the call to the files it makes. A missing
+                // account stops the call once it is decided and audited.
+                let account = self.shared.command_account(&cfg);
+                let known = account.as_ref().ok().cloned().flatten();
+                let call = {
+                    let _as = act_as(known.as_ref())?;
+                    FsCall::parse(a, &inv.args)?
+                };
                 // Taken before the gate: whenever the gate judged by the
                 // folders, the walk below does too, even if `until` passes
                 // in between.
@@ -926,12 +935,15 @@ impl Link {
                     None,
                     None,
                     call.target_text(),
+                    known.as_ref(),
                 )?;
+                account.map_err(|e| RpcError::new(ErrorCode::Unavailable, e))?;
                 let protected = self.protected(&entry);
-                let deny = RuleSet::new(&entry.policy.deny, &self.shared.home);
+                let deny = RuleSet::new(&entry.policy.deny, &self.home());
                 let folders = entry.policy.folders.clone();
                 let action = inv.action.clone();
                 tokio::task::spawn_blocking(move || {
+                    let _as = act_as(known.as_ref())?;
                     // An entry the direct read would refuse stays out of the
                     // walk, so a folder without `r` inside one with `r` is
                     // sealed to grep, find and list too. A walk still passes
@@ -958,18 +970,38 @@ impl Link {
         }
     }
 
-    fn protected(&self, entry: &CenterEntry) -> Protected {
-        self.protected_with(&entry.policy.protected)
+    /// The `~` of the rules and the protected list (Shared::rules_home).
+    fn home(&self) -> std::path::PathBuf {
+        self.shared.rules_home(&self.shared.config())
     }
 
-    /// This node's protected list with a center's options.
-    fn protected_with(&self, opts: &nerve_policy::config::ProtectedOptions) -> Protected {
-        Protected::new(
-            &self.shared.platform,
-            &self.shared.home,
-            &self.shared.paths.own(),
-            opts,
-        )
+    /// The account the commands run as, when there is one to use. Not
+    /// called while the store is locked: it reads the config.
+    fn account(&self) -> Option<crate::service::Account> {
+        self.shared
+            .command_account(&self.shared.config())
+            .ok()
+            .flatten()
+    }
+
+    fn protected(&self, entry: &CenterEntry) -> Protected {
+        self.protected_with(&entry.policy.protected, self.account().as_ref())
+    }
+
+    /// This node's protected list with a center's options. On the
+    /// installed node its `~` is the account's home, and its entries are
+    /// looked at as that account (crate::account::FsAs), which may see
+    /// where the node's user may not.
+    fn protected_with(
+        &self,
+        opts: &nerve_policy::config::ProtectedOptions,
+        account: Option<&crate::service::Account>,
+    ) -> Protected {
+        let home = account.map_or(&self.shared.home, |a| &a.home);
+        // Without the switch the entries are still there as written; only
+        // the places they lead to through links are not found.
+        let _as = act_as(account).ok().flatten();
+        Protected::new(&self.shared.platform, home, &self.shared.paths.own(), opts)
     }
 
     /// Runs the policy for one call: it either runs or is refused at once.
@@ -984,6 +1016,7 @@ impl Link {
         command: Option<&str>,
         cwd: Option<&std::path::Path>,
         target: String,
+        account: Option<&crate::service::Account>,
     ) -> Result<(), RpcError> {
         let call = Call {
             cap: &inv.cap,
@@ -994,10 +1027,14 @@ impl Link {
             cwd,
             now_ms: crate::now_ms(),
         };
+        // The policy looks at the paths as the account (crate::account::FsAs);
+        // the audit entry below is the node's own again.
         let decision = {
             let protected = self.protected(entry);
+            let home = account.map_or(&self.shared.home, |a| &a.home);
+            let _as = act_as(account)?;
             let env = Env {
-                home: &self.shared.home,
+                home,
                 protected: &protected,
                 confined: self.shared.confined(),
                 sudo: self.shared.sudo_on(),
@@ -1041,19 +1078,21 @@ impl Link {
             if_version: u64,
         }
         let s: Set = params(args)?;
+        let account = self.account();
         let r = lock(&self.shared.store).set_center_document(
             &self.name,
             s.document,
             s.if_version,
             // This node offers no sense capabilities in 0.0.1.
             |_| false,
-            |opts| self.protected_with(opts),
+            |opts| self.protected_with(opts, account.as_ref()),
         );
         settings_result(r)
     }
 
     /// `settings.pause`: a center may pause itself, never unpause.
     fn settings_pause(&self) -> Result<Value, RpcError> {
+        let account = self.account();
         let mut store = lock(&self.shared.store);
         let doc = store
             .center_document(&self.name)
@@ -1066,7 +1105,7 @@ impl Link {
             v,
             version,
             |_| false,
-            |opts| self.protected_with(opts),
+            |opts| self.protected_with(opts, account.as_ref()),
         );
         settings_result(r).map(|_| json!({}))
     }
@@ -1142,17 +1181,21 @@ impl Link {
         effect: Effect,
         inv: &Invoke,
     ) -> Result<Value, RpcError> {
-        // In user mode the installed node runs the command as the account
-        // the owner chose (crate::account), from its home. A missing
-        // account stops the command after the call is decided and audited.
-        let account = if entry.policy.mode_at(crate::now_ms()) == Mode::User {
-            self.shared.user_account(cfg)
-        } else {
-            Ok(None)
+        // The installed node runs every command as the account the owner
+        // chose (crate::account), from its home; folder mode adds Landlock.
+        // A missing account stops the command after the call is decided and
+        // audited.
+        let account = self.shared.command_account(cfg);
+        let known = account.as_ref().ok().cloned().flatten();
+        let home = known
+            .as_ref()
+            .map_or(&self.shared.home, |a| &a.home)
+            .clone();
+        // The paths are looked at as the account (crate::account::FsAs).
+        let rc = {
+            let _as = act_as(known.as_ref())?;
+            RunCall::parse(&inv.args, &home)?
         };
-        let known = account.as_ref().ok().and_then(Option::as_ref);
-        let home = known.map_or(&self.shared.home, |a| &a.home);
-        let rc = RunCall::parse(&inv.args, home, known.is_none())?;
         let target = rc.command.clone();
         self.gate(
             entry,
@@ -1162,6 +1205,7 @@ impl Link {
             Some(&rc.command),
             Some(&rc.cwd),
             target,
+            known.as_ref(),
         )?;
         let account = account.map_err(|e| RpcError::new(ErrorCode::Unavailable, e))?;
         // The policy let a sudo command through only with the switch on and
@@ -1180,10 +1224,16 @@ impl Link {
             sudo = Some(exec::SudoInput { password, prompt });
         }
         let guard = Running::start(self, id.clone(), cfg.limits.max_running as usize)?;
+        // The account's home is the `~` of its rules: its own shell
+        // profiles and keys stay out of them.
         let landlock = (sudo.is_none()
             && entry.policy.mode_at(crate::now_ms()) == Mode::Folder
             && self.shared.confined())
-        .then(|| exec::landlock_spec(&entry.policy, &self.shared.home, &self.shared.paths.own()));
+        .then(|| {
+            // The folders' entries are listed as the account.
+            let _as = act_as(known.as_ref()).ok().flatten();
+            exec::landlock_spec(&entry.policy, &home, &self.shared.paths.own())
+        });
         let opts = RunOptions {
             shell: cfg.machine.shell.clone(),
             landlock,
@@ -1203,6 +1253,35 @@ impl Link {
             );
         }
         r
+    }
+}
+
+/// The node's file access as `account` on this thread while the result
+/// lives ([`crate::account::FsAs`]); nothing for the node's own user.
+#[cfg(target_os = "linux")]
+fn act_as(
+    account: Option<&crate::service::Account>,
+) -> Result<Option<crate::account::FsAs>, RpcError> {
+    account
+        .map(|a| {
+            crate::account::FsAs::new(a).map_err(|e| {
+                RpcError::new(
+                    ErrorCode::Unavailable,
+                    format!("cannot act as {}: {e}", a.name),
+                )
+            })
+        })
+        .transpose()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn act_as(account: Option<&crate::service::Account>) -> Result<Option<()>, RpcError> {
+    match account {
+        Some(a) => Err(RpcError::new(
+            ErrorCode::Unavailable,
+            format!("cannot act as {}: Linux only", a.name),
+        )),
+        None => Ok(None),
     }
 }
 

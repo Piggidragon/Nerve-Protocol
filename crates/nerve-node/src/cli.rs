@@ -89,7 +89,7 @@ pub enum Cmd {
     Unlock,
     /// Install the node as a service that starts with the machine and runs under a user of its own (Linux, as root).
     Install,
-    /// Name the node, choose the account user mode runs commands as (installed node), pair the first center and choose its mode, one question at a time.
+    /// Name the node, choose the account commands run as (installed node), pair the first center and choose its mode, one question at a time.
     Setup,
     /// Replace the installed program with the latest release and restart the service; config, keys and audit log stay.
     Update {
@@ -919,7 +919,7 @@ impl Cmd {
 /// installed node's belong to `nerve`, runs as that user
 /// ([`crate::service::become_owner`]), so that what it writes stays the
 /// node's. install, update and uninstall keep root; setup keeps it as its
-/// saved id, to make the account of user mode when the owner asks.
+/// saved id, to make the account of the commands when the owner asks.
 pub fn settle_user(cli: &Cli) -> Result<(), String> {
     if cli.cmd.is_service() {
         return Ok(());
@@ -1316,7 +1316,7 @@ async fn setup_steps(
         steps.push(format!("named the node {name}"));
     }
 
-    // The account of user mode, where the node can switch to one: the
+    // The account of the commands, where the node can switch to one: the
     // installed service.
     let layout = Layout::system();
     if layout.installed() && *paths == layout.paths {
@@ -1338,8 +1338,8 @@ async fn setup_steps(
                 Ok(())
             })
             .await?;
-            let _ = writeln!(out, "user mode runs commands as {}", c.name);
-            steps.push(format!("user mode runs commands as {}", c.name));
+            let _ = writeln!(out, "commands run as {}", c.name);
+            steps.push(format!("commands run as {}", c.name));
         }
     }
 
@@ -1671,8 +1671,18 @@ fn resolve_folder(p: &Path) -> Result<String, String> {
     } else {
         std::env::current_dir().map_err(|e| e.to_string())?.join(p)
     };
-    let real = nerve_policy::paths::resolve(&abs).map_err(|e| e.to_string())?;
-    Ok(real.display().to_string())
+    match nerve_policy::paths::resolve(&abs) {
+        Ok(real) => Ok(real.display().to_string()),
+        // On the installed node this command runs as `nerve`, which may not
+        // look into the account's home; the folder is kept as given, and the
+        // node looks at it as the account when a call comes.
+        Err(nerve_policy::paths::PathError::Io(e))
+            if e.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            nerve_policy::paths::normal_folder(&abs.display().to_string())
+        }
+        Err(e) => Err(e.to_string()),
+    }
 }
 
 fn audit_line(v: &Value) -> String {
@@ -2138,6 +2148,34 @@ fn table_at<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A folder in a home the node's user may not look into (the installed
+    /// node's CLI runs as `nerve`) is kept as given, in its normal form;
+    /// what may be seen is resolved.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_the_cli_cannot_look_into_is_kept_as_given() {
+        use std::os::unix::fs::PermissionsExt;
+        if nerve_transport::net::euid() == 0 {
+            return; // root looks into every folder
+        }
+        let d = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join("proj")).unwrap();
+        std::os::unix::fs::symlink(home.join("proj"), root.join("link")).unwrap();
+        assert_eq!(
+            resolve_folder(&root.join("link")).unwrap(),
+            home.join("proj").display().to_string()
+        );
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let given = format!("{}//proj/./x/", home.display());
+        let r = resolve_folder(Path::new(&given));
+        let up = resolve_folder(&home.join("proj/../../etc"));
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(r.unwrap(), home.join("proj/x").display().to_string());
+        assert!(up.is_err(), "{up:?}");
+    }
 
     fn run(paths: &NodePaths, args: &[&str]) -> Result<String, String> {
         let mut argv = vec![

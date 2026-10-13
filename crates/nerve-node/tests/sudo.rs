@@ -336,3 +336,29 @@ async fn a_restart_turns_sudo_off() {
     assert_eq!(node.status()["sudo"], "off");
     node.stop().await;
 }
+
+/// The password belongs to the account the commands run as; when the owner
+/// names another one, the switch no longer holds and no sudo command runs
+/// with the old password.
+#[tokio::test(flavor = "multi_thread")]
+async fn another_account_turns_the_held_password_off() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let node = node(dir.path(), &center).await;
+    let mut conn = linked(&mut center).await;
+    let mut seen = Seen { frames: Vec::new() };
+    let offer = seen.offer(&mut conn, &center).await;
+    let sealed = seal(&offer, RIGHT, now()).unwrap();
+    seen.on(&mut conn, &sealed).await.expect("on");
+    assert_eq!(seen.sudo_state(&mut conn).await, "on");
+    nerve_node::cli::edit(node.paths(), |cfg| {
+        cfg.machine.user = Some("someone-else".into());
+        Ok(())
+    })
+    .await
+    .expect("the owner's edit");
+    assert_eq!(seen.sudo_state(&mut conn).await, "off");
+    let r = seen.run(&mut conn, "sudo echo hi").await;
+    assert_eq!(code(&r), ErrorCode::Forbidden, "{r:?}");
+    node.stop().await;
+}

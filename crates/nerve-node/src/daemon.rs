@@ -152,6 +152,9 @@ impl CenterState {
 }
 
 /// Everything the daemon's tasks share.
+/// How long a looked-up account is used before it is looked up again.
+const ACCOUNT_FRESH: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub(crate) struct Shared {
     pub paths: NodePaths,
     pub exe: Option<PathBuf>,
@@ -175,6 +178,12 @@ pub(crate) struct Shared {
     pub sudo: Mutex<Option<crate::sudo::Secret>>,
     /// Open sudo offers by center; each is opened at most once.
     pub sudo_offers: Mutex<HashMap<String, nerve_transport::sudo::Pending>>,
+    /// The account sudo's password was checked for (crate::sudo): the
+    /// switch holds only for that account.
+    pub sudo_for: Mutex<Option<String>>,
+    /// The last account looked up for `machine.user`, and when: every call
+    /// of a center needs it, and a lookup starts two programs.
+    pub account_cache: Mutex<Option<(String, std::time::Instant, Option<crate::service::Account>)>>,
 }
 
 impl Shared {
@@ -182,18 +191,39 @@ impl Shared {
         lock(&self.store).config().clone()
     }
 
-    /// The account a `user` mode command runs as (crate::account); `None`
-    /// runs it as the node's own user.
-    pub fn user_account(
+    /// The account a command and the sudo switch run as (crate::account);
+    /// `None` runs them as the node's own user.
+    pub fn command_account(
         &self,
         cfg: &NodeConfig,
     ) -> Result<Option<crate::service::Account>, String> {
-        crate::account::for_user_mode(
+        let cached = |name: &str| {
+            if let Some((n, at, a)) = lock(&self.account_cache).as_ref()
+                && n == name
+                && at.elapsed() < ACCOUNT_FRESH
+            {
+                return Ok(a.clone());
+            }
+            let a = crate::account::lookup(name)?;
+            *lock(&self.account_cache) =
+                Some((name.to_string(), std::time::Instant::now(), a.clone()));
+            Ok(a)
+        };
+        crate::account::for_commands(
             cfg.machine.user.as_deref(),
             nerve_transport::net::euid(),
             crate::account::can_switch(),
-            crate::account::lookup,
+            cached,
         )
+    }
+
+    /// The `~` of the rules and the protected list: the home of the account
+    /// the commands run as, else the node's own.
+    pub fn rules_home(&self, cfg: &NodeConfig) -> PathBuf {
+        match self.command_account(cfg) {
+            Ok(Some(a)) => a.home,
+            _ => self.home.clone(),
+        }
     }
 
     pub fn bump(&self) {
@@ -390,6 +420,8 @@ impl Daemon {
             log: opts.log,
             sudo: Mutex::new(None),
             sudo_offers: Mutex::default(),
+            sudo_for: Mutex::default(),
+            account_cache: Mutex::default(),
         });
         // The password lives in memory only: a file that says on starts off.
         shared.settle_sudo();

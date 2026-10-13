@@ -1,9 +1,11 @@
-//! The account `user` mode runs a center's commands as, on a node installed
-//! as a service (docs/user/service.md). The service runs as `nerve`, which
-//! owns the node's keys; a `user` mode command runs as the account
-//! `machine.user` names instead, so that it cannot read them. To switch to
-//! that account the service keeps CAP_SETUID and CAP_SETGID, the one
-//! privilege it has, and every command it starts drops both before it runs.
+//! The account a center's commands run as on a node installed as a service
+//! (docs/user/service.md). The service runs as `nerve`, which owns the
+//! node's config, keys and state; every command, in every mode, and the
+//! sudo switch run as the account `machine.user` names instead, so that
+//! they cannot read them. Folder mode differs from user mode only by its
+//! confinement. To switch to that account the service keeps CAP_SETUID and
+//! CAP_SETGID, the one privilege it has, and every command it starts drops
+//! both before it runs.
 
 use std::path::Path;
 #[cfg(target_os = "linux")]
@@ -11,16 +13,15 @@ use std::path::PathBuf;
 
 use crate::service::Account;
 
-/// The comment `setup` gives an account it makes for `user` mode.
-pub const MADE_MARK: &str = "Nerve user mode";
+/// The comment `setup` gives an account it makes for the commands.
+pub const MADE_MARK: &str = "Nerve commands";
 
-/// What a user-mode command of the installed node gets while no account is
-/// chosen.
-pub const NONE_CHOSEN: &str = "user mode runs commands as an account of its own on this node, and none is chosen: `sudo nerve-node setup` chooses one (machine.user)";
+/// What a command of the installed node gets while no account is chosen.
+pub const NONE_CHOSEN: &str = "this node runs commands as an account of their own, and none is chosen: `sudo nerve-node setup` chooses one (machine.user)";
 
-/// The warning for root as the account of `user` mode.
+/// The warning for root as the account of the commands.
 pub fn root_warning() -> String {
-    "Warning: commands from a center in user mode then run as root, with every right on this machine, the node's keys included. You are responsible for what they do.".into()
+    "Warning: commands from a center then run as root, with every right on this machine, the node's keys included; in folder mode only Landlock still holds them. You are responsible for what they do.".into()
 }
 
 /// Whether `setup` may make an account of this name: what `useradd` takes
@@ -111,13 +112,13 @@ fn plain(program: &str) -> std::process::Command {
     c
 }
 
-/// The account a `user` mode command runs as, from `machine.user` (`user`):
-/// `None` runs it as the node's own user, as a node that a person runs
-/// does. A node that can switch accounts and is not root (the installed
-/// service) runs no user-mode command until an account is chosen, and none
-/// as itself, since it owns the keys. Root is allowed: the owner chose it
-/// and was warned.
-pub fn for_user_mode(
+/// The account a command (and the sudo switch) runs as, from
+/// `machine.user` (`user`): `None` runs it as the node's own user, as a
+/// node that a person runs does. A node that can switch accounts and is not
+/// root (the installed service) runs no command until an account is
+/// chosen, and none as itself, since it owns the keys. Root is allowed: the
+/// owner chose it and was warned.
+pub fn for_commands(
     user: Option<&str>,
     own_uid: u32,
     can_switch: bool,
@@ -131,7 +132,7 @@ pub fn for_user_mode(
     };
     let a = lookup(name)?.ok_or_else(|| {
         format!(
-            "the account {name} that user mode runs commands as (machine.user) does not exist on this machine"
+            "the account {name} that commands run as (machine.user) does not exist on this machine"
         )
     })?;
     if a.uid == own_uid {
@@ -139,7 +140,7 @@ pub fn for_user_mode(
             return Ok(None);
         }
         return Err(format!(
-            "machine.user {name} is the node's own user, which can read the node's keys; user mode runs no command as it"
+            "machine.user {name} is the node's own user, which can read the node's keys; no command runs as it"
         ));
     }
     if !can_switch {
@@ -234,7 +235,7 @@ pub struct Switch {
     uid: u32,
     gid: u32,
     groups: Vec<libc::gid_t>,
-    cwd: std::ffi::CString,
+    cwd: Option<std::ffi::CString>,
     own: Vec<std::ffi::CString>,
 }
 
@@ -242,7 +243,7 @@ pub struct Switch {
 impl Switch {
     /// `cwd` is entered as the account, after the switch, since the node's
     /// user may not see into it. `own` are the node's folders.
-    pub fn new(account: &Account, cwd: &Path, own: &[PathBuf]) -> std::io::Result<Switch> {
+    pub fn new(account: &Account, cwd: Option<&Path>, own: &[PathBuf]) -> std::io::Result<Switch> {
         use std::os::unix::ffi::OsStrExt;
         let c = |p: &Path| {
             std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(|_| {
@@ -257,7 +258,7 @@ impl Switch {
             uid: account.uid,
             gid: account.gid,
             groups,
-            cwd: c(cwd)?,
+            cwd: cwd.map(c).transpose()?,
             own: own.iter().map(|p| c(p)).collect::<Result<_, _>>()?,
         })
     }
@@ -265,14 +266,20 @@ impl Switch {
     /// In the forked child, before exec: the account's groups and ids, no
     /// capability left, a check that the node's own folders are out of its
     /// reach (root aside, which the owner chose knowing), then its working
-    /// folder. Plain system calls only.
+    /// folder. Plain system calls only. A process that has the account's
+    /// ids already keeps its groups.
     pub fn apply(&self) -> std::io::Result<()> {
         let last = std::io::Error::last_os_error;
         // SAFETY: plain system calls on memory this struct owns.
         unsafe {
-            if libc::setgroups(self.groups.len(), self.groups.as_ptr()) != 0
-                || libc::setresgid(self.gid, self.gid, self.gid) != 0
-                || libc::setresuid(self.uid, self.uid, self.uid) != 0
+            let same = libc::getuid() == self.uid
+                && libc::geteuid() == self.uid
+                && libc::getgid() == self.gid
+                && libc::getegid() == self.gid;
+            if !same
+                && (libc::setgroups(self.groups.len(), self.groups.as_ptr()) != 0
+                    || libc::setresgid(self.gid, self.gid, self.gid) != 0
+                    || libc::setresuid(self.uid, self.uid, self.uid) != 0)
             {
                 return Err(last());
             }
@@ -282,7 +289,9 @@ impl Switch {
             out_of_reach(&self.own)?;
         }
         // SAFETY: a NUL-terminated path this struct owns.
-        if unsafe { libc::chdir(self.cwd.as_ptr()) } != 0 {
+        if let Some(cwd) = &self.cwd
+            && unsafe { libc::chdir(cwd.as_ptr()) } != 0
+        {
             return Err(last());
         }
         Ok(())
@@ -361,10 +370,83 @@ pub fn drop_caps() -> std::io::Result<()> {
     Ok(())
 }
 
+/// The node's own file access as `account`, on this thread only: the `fs`
+/// actions of a center and the path checks of its calls see what the
+/// account sees, and files they make belong to it. The file system ids and
+/// the groups are the thread's own in Linux (the C library's calls change
+/// every thread's, so plain system calls are used); the service's
+/// CAP_SETUID and CAP_SETGID allow the change. Dropped, the thread is the
+/// node's again. It is not `Send`, so it cannot be held across an `.await`
+/// and leak to another task.
+#[cfg(target_os = "linux")]
+pub struct FsAs {
+    uid: u32,
+    gid: u32,
+    groups: Vec<libc::gid_t>,
+    _thread: std::marker::PhantomData<*const ()>,
+}
+
+#[cfg(target_os = "linux")]
+impl FsAs {
+    pub fn new(account: &Account) -> std::io::Result<FsAs> {
+        let last = std::io::Error::last_os_error;
+        // SAFETY: getgroups into a buffer of the size it asked for, and plain
+        // system calls with integers or that buffer.
+        unsafe {
+            let n = libc::getgroups(0, std::ptr::null_mut());
+            if n < 0 {
+                return Err(last());
+            }
+            let mut groups = vec![0; n as usize];
+            if libc::getgroups(n, groups.as_mut_ptr()) < 0 {
+                return Err(last());
+            }
+            let me = FsAs {
+                uid: libc::geteuid(),
+                gid: libc::getegid(),
+                groups,
+                _thread: std::marker::PhantomData,
+            };
+            let mut want = account.groups.clone();
+            if want.is_empty() {
+                want.push(account.gid);
+            }
+            if libc::syscall(libc::SYS_setgroups, want.len(), want.as_ptr()) != 0 {
+                return Err(last());
+            }
+            // setfsuid answers with the old id whether it worked or not; a
+            // second call with an impossible id reads the one in force.
+            libc::setfsgid(account.gid);
+            libc::setfsuid(account.uid);
+            if libc::setfsuid(u32::MAX) as u32 != account.uid
+                || libc::setfsgid(u32::MAX) as u32 != account.gid
+            {
+                drop(me);
+                return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+            }
+            Ok(me)
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for FsAs {
+    fn drop(&mut self) {
+        // SAFETY: as in `new`, back to the ids and groups read there.
+        unsafe {
+            libc::setfsuid(self.uid);
+            libc::setfsgid(self.gid);
+            libc::syscall(libc::SYS_setgroups, self.groups.len(), self.groups.as_ptr());
+        }
+    }
+}
+
 /// Signals the process group `pgid` as `uid`: the service's own user may
 /// not signal another account's processes, and it has no CAP_KILL. A child
-/// process takes the account and sends the signal, so the node itself
-/// keeps its ids.
+/// process takes the account as its effective id only and sends the
+/// signal, so the node itself keeps its ids, and the account's processes
+/// cannot signal the child (its real and saved ids stay the node's). The
+/// node waits for it a short while at most.
 #[cfg(target_os = "linux")]
 pub fn kill_as(uid: u32, pgid: u32, sig: libc::c_int) {
     // SAFETY: the child of a process with many threads makes plain system
@@ -372,16 +454,19 @@ pub fn kill_as(uid: u32, pgid: u32, sig: libc::c_int) {
     unsafe {
         let pid = libc::fork();
         if pid == 0 {
-            if libc::syscall(libc::SYS_setresuid, uid, uid, uid) == 0 {
+            if libc::syscall(libc::SYS_setresuid, u32::MAX, uid, u32::MAX) == 0 {
                 libc::kill(-(pgid as libc::pid_t), sig);
             }
             libc::_exit(0);
         }
         if pid > 0 {
+            let until = std::time::Instant::now() + std::time::Duration::from_secs(2);
             let mut status = 0;
-            while libc::waitpid(pid, &mut status, 0) < 0
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR)
-            {}
+            while libc::waitpid(pid, &mut status, libc::WNOHANG) == 0
+                && std::time::Instant::now() < until
+            {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
         }
     }
 }
@@ -411,34 +496,32 @@ mod tests {
     }
 
     #[test]
-    fn the_account_of_user_mode() {
+    fn the_account_of_the_commands() {
         // Chosen: the service (uid 990, may switch) runs the command as it.
-        let a = for_user_mode(Some("alice"), 990, true, db)
-            .unwrap()
-            .unwrap();
+        let a = for_commands(Some("alice"), 990, true, db).unwrap().unwrap();
         assert_eq!((a.name.as_str(), a.uid), ("alice", 1000));
         // Root is allowed; the owner was warned when choosing it.
         assert_eq!(
-            for_user_mode(Some("root"), 990, true, db)
+            for_commands(Some("root"), 990, true, db)
                 .unwrap()
                 .unwrap()
                 .uid,
             0
         );
         // None chosen: the service runs none, a person's node runs it as itself.
-        assert_eq!(for_user_mode(None, 990, true, db).unwrap_err(), NONE_CHOSEN);
-        assert_eq!(for_user_mode(None, 1000, false, db).unwrap(), None);
-        assert_eq!(for_user_mode(None, 0, true, db).unwrap(), None);
+        assert_eq!(for_commands(None, 990, true, db).unwrap_err(), NONE_CHOSEN);
+        assert_eq!(for_commands(None, 1000, false, db).unwrap(), None);
+        assert_eq!(for_commands(None, 0, true, db).unwrap(), None);
         // Refused: an account that does not exist, the node's own user, and
         // any switch the node cannot make.
-        let e = for_user_mode(Some("bob"), 990, true, db).unwrap_err();
+        let e = for_commands(Some("bob"), 990, true, db).unwrap_err();
         assert!(e.contains("bob") && e.contains("does not exist"), "{e}");
-        let e = for_user_mode(Some("nerve"), 990, true, db).unwrap_err();
+        let e = for_commands(Some("nerve"), 990, true, db).unwrap_err();
         assert!(e.contains("node's own user"), "{e}");
-        let e = for_user_mode(Some("alice"), 1001, false, db).unwrap_err();
+        let e = for_commands(Some("alice"), 1001, false, db).unwrap_err();
         assert!(e.contains("cannot switch"), "{e}");
         // A root node asked to run as root just does.
-        assert_eq!(for_user_mode(Some("root"), 0, true, db).unwrap(), None);
+        assert_eq!(for_commands(Some("root"), 0, true, db).unwrap(), None);
     }
 
     #[test]

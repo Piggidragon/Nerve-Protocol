@@ -18,31 +18,52 @@ A node that `nerve-node install` put on a Linux machine
 command root runs on them runs as their owner, so that what it writes stays
 the node's.
 
-On that node a `user` mode command runs as the account `machine.user` names
-(§2), not as `nerve`: with that account's ids and groups, `HOME`, `USER` and
-`LOGNAME` set to it, and its home as the working directory when the call
-names none. `install` sets it to the account that ran `sudo` (root when
-there was none), unless one is set; `setup` chooses another and can make one
-(`useradd`, a group and a home of its own, no login shell). The account must
-exist and must not be `nerve`; with none set, or one that cannot be used,
-the command is not run (`unavailable`) after its call was decided and
-audited. Before the command starts, in the child, the node checks with
-`access()` that the account can neither list nor enter the config and state
-folders, and refuses to run it if it can. Root is allowed: `install` and
-`setup` warn that commands of a center in user mode then run as root, keys
-included, and that the owner is responsible; root's command runs without
-`no_new_privs`, so it has root's rights.
+On that node `nerve` only holds the config, keys and state: every command
+of a center, in every mode, runs as the account `machine.user` names (§2),
+with that account's ids and groups, `HOME`, `USER` and `LOGNAME` set to it,
+and its home as the working directory when the call names none. `folder`
+mode differs from `user` mode only by its confinement: the same account,
+held by Landlock to its folders (§Modes), with the account's home as the
+`~` of those rules. The sudo switch uses the account too (§4). `install`
+sets it to the account that ran `sudo` (root when there was none), unless
+one is set; `setup` chooses another and can make one (`useradd`, a group
+and a home of its own, no login shell). The account must exist and must not
+be `nerve`; with none set, or one that cannot be used, no command runs
+(`unavailable`), after its call was decided and audited. Before a command
+starts, in the child, the node checks with `access()` that the account can
+neither list nor enter the config and state folders, and refuses to run it
+if it can. Root is allowed: `install` and `setup` warn that commands of a
+center then run as root, keys included, and that the owner is responsible;
+root's command runs without `no_new_privs`, so it has root's rights (in
+`folder` mode the shim still sets it with Landlock).
 
 For this the service keeps one privilege: `CAP_SETUID` and `CAP_SETGID`
 (`AmbientCapabilities=` in the unit), and nothing else. The owner chose it,
-so that a `user` mode command runs as a real account that cannot read the
-node's keys. Every command the node starts drops every capability, ambient
-and inheritable ones included, before exec, in every mode; the bounding set
-is not narrowed, since an allowed sudo command needs root's. The node signals
-a command of another account from a child that takes that account's uid,
-since it has no `CAP_KILL`. `folder` and `allowlist` mode commands still run
-as `nerve`. A node not installed as a service runs `user` mode commands as
-its own user and refuses a `machine.user` it cannot switch to.
+so that commands run as a real account that cannot read the node's keys.
+Every command the node starts drops every capability, ambient and
+inheritable ones included, before exec; the bounding set is not narrowed,
+since an allowed sudo command needs root's. The node signals a command of
+another account from a child that takes that account's uid, since it has no
+`CAP_KILL`; the child changes only its effective uid, so the account's
+processes cannot signal it, and the node waits for it two seconds at most.
+The `fs` actions of a center, and the path checks of every call (resolving
+paths, the protected list, the folders), are done by the node itself, on
+the calling thread under the account's file-system uid and gid and its
+groups (`setfsuid`, `setfsgid`, and `setgroups` as a plain system call, all
+per thread on Linux); the audit entry is written as `nerve` again. So a
+file the node makes for a center belongs to the account, and `~` in rules
+and in the protected list is the account's home. With root as the account
+the file-system ids are root's without root's capabilities. The CLI, which
+runs as `nerve` on the installed node, keeps a folder it may not look into
+in its normal form (`folder add`), unresolved. A node not installed as a
+service runs commands as its own user and refuses a `machine.user` it
+cannot switch to.
+
+`install`, `update` and `uninstall` run as root and write into folders
+that belong to `nerve`: they write there as the folder's owner (the
+thread's file-system ids), refuse a link in place of one of the node's
+folders, and give the folders away by walking them through descriptors
+opened without following links.
 
 `node.toml` is written private to the owner (mode 0600 on Unix). The daemon
 refuses to run as root unless `machine.allow_root = true`.
@@ -100,7 +121,7 @@ shell = "/bin/bash"         # for exec.run; the platform shell by default
 allow_root = false
 sudo = "off"                # off | on: the sudo switch (§4); off when missing
 sudo_path = "/usr/bin/sudo" # optional; `sudo` from PATH by default
-user = "alice"              # optional: the account `user` mode runs commands as (§1)
+user = "alice"              # optional: the account commands and the sudo switch run as (§1)
 
 [limits]
 max_running = 4             # commands at once, per node
@@ -380,8 +401,9 @@ The normal `allow` list does not count for them.
   be one simple command: one with `; & | $ \` ( ) < >` or a line break is
   refused. The node runs it as `sudo -S -k -p <prompt> …` without Landlock
   (which would stop sudo from gaining privileges), with a random prompt per
-  command. It writes the password to stdin only after sudo printed that
-  prompt; when sudo asks for none (a `NOPASSWD` entry, root), the command
+  command, started as the account the commands run as (§1), so sudo raises
+  it from that account. It writes the password to stdin only after sudo
+  printed that prompt; when sudo asks for none (a `NOPASSWD` entry, root), the command
   finds no password on its stdin.
 - Every other command runs with `no_new_privs` (Linux), so a `sudo` later in
   a command line, or any setuid program, cannot gain privileges.
@@ -390,7 +412,9 @@ The switch is never on without a working password. Turning it on takes the
 password from a client: `nerve-node sudo on` (it asks on the terminal) or a
 center with the settings grant `write` (protocol §7.4.1, sealed end to end so
 the center cannot read it). The node checks it with `sudo -S -k -v` (output
-discarded) and refuses a wrong one with `invalid_args`; the switch then stays
+discarded), run as the account the commands run as (§1, `machine.user` on
+the installed node, else the node's own user), so the password is that
+account's and refuses a wrong one with `invalid_args`; the switch then stays
 as it was. Turning it off drops the password. The password is kept in memory
 only (`secret_storage` at rest is not done in 0.0.1), so a restarted node, or
 a `node.toml` that says `on` without a password held, has the switch off. It

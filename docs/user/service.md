@@ -27,10 +27,10 @@ Whatever the downloaded file is called, `install` puts it in place as
    `/var/lib/nerve`. A `nerve` user that `install` did not make is refused.
 2. Makes the folders, private to `nerve` (mode 0700). Folders an earlier
    install left behind are given to the new user.
-3. Sets the account that [user mode](#user-mode) runs commands as: the
-   account that ran `sudo`. An account chosen before stays. When you are
-   logged in as root without `sudo`, it is root, and `install` warns that
-   commands from a center in user mode then run as root.
+3. Sets the account that [commands run as](#the-account-commands-run-as):
+   the account that ran `sudo`. An account chosen before stays. When you
+   are logged in as root without `sudo`, it is root, and `install` warns
+   that commands from a center then run as root.
 4. Copies the program to `/usr/local/bin/nerve-node`.
 5. Writes the unit `/etc/systemd/system/nerve-node.service`, enables it and
    starts it. It waits until the node answers.
@@ -41,7 +41,7 @@ Running `install` again repairs what is missing and restarts the service.
 |---|---|
 | `node.toml`, one key per center | `/etc/nerve` |
 | Audit log, [log](logs.md), control socket, config key | `/var/lib/nerve/state` |
-| Home of `nerve`: a command's working folder when the call names none | `/var/lib/nerve` |
+| Home of `nerve` | `/var/lib/nerve` |
 | The program | `/usr/local/bin/nerve-node` |
 | The unit | `/etc/systemd/system/nerve-node.service` |
 
@@ -60,31 +60,43 @@ sudo nerve-node rule add allow 'git status'
 A command that root runs on these folders runs as `nerve`, so every file it
 writes stays the node's. Another user gets a message that says to use `sudo`.
 
-## User mode
+## The account commands run as
 
-In `allowlist` and `folder` mode the commands a center runs on the node run
-as `nerve`. In `user` mode they run as an ordinary account: the one `install`
-took or `setup` chose (`machine.user` in the [config](config.md)). They get
-that account's groups, its home as `HOME` and, when the call names no
-folder, as their working folder. So a command in user mode may do what that
-account may do, and cannot read the node's keys: they are private to
-`nerve`. Before a command starts, the node checks that its account cannot
-open the node's folders, and refuses to run it if it can.
+`nerve` only holds the node's config, keys and state. The commands a center
+runs on the node, in every mode, run as an ordinary account: the one
+`install` took or `setup` chose (`machine.user` in the [config](config.md)).
+They get that account's groups, its home as `HOME` and, when the call names
+no folder, as their working folder. A [sudo](sudo.md) command starts as that
+account too, and `sudo on` takes that account's password. The node reads and
+writes files for a center (`fs`) as that account as well: it sees what the
+account sees, and the files it makes belong to the account. `~` in
+[rules](rules.md) and the [protected paths](protected-paths.md) is that
+account's home.
 
-- No account chosen: the node runs no command in user mode, and says that
+- In `user` mode a command may do what that account may do.
+- In `folder` mode it is that account as well, held by Landlock to the
+  folders you gave the center ([modes](modes.md)). That is the only
+  difference to `user` mode.
+- In `allowlist` mode it runs what an allow rule names, as that account.
+
+No command can read the node's keys: they are private to `nerve`. Before a
+command starts, the node checks that its account cannot open the node's
+folders, and refuses to run it if it can.
+
+- No account chosen: the node runs no command, and says that
   `sudo nerve-node setup` chooses one.
 - `nerve` itself is refused, and so is an account that could open the
   node's folders.
-- Root is allowed, with a warning: commands from a center in user mode then
-  run as root, with every right on the machine, the node's keys included.
-  You are responsible for what they do.
+- Root is allowed, with a warning: commands from a center then run as root,
+  with every right on the machine, the node's keys included; in `folder`
+  mode only Landlock still holds them. You are responsible for what they do.
 
 ### The one privilege the service keeps
 
 To start a command as that account, the service keeps two capabilities,
 `CAP_SETUID` and `CAP_SETGID` (`AmbientCapabilities=` in the unit). This is
 the one privilege it has beyond what `nerve` may do, chosen so that commands
-in user mode run as a real account and not as the user that owns the keys.
+run as a real account and not as the user that owns the keys.
 The node uses it only to switch to the account. Every command it starts
 drops both capabilities before it runs, in every mode, so no command keeps
 them.
@@ -95,7 +107,7 @@ them.
 in brackets.
 
 1. The node's name, as centers show it. The host name by default.
-2. The account that [user mode](#user-mode) runs commands as, on an
+2. The account that [commands run as](#the-account-commands-run-as), on an
    installed node. It must exist, or setup offers to make it: an ordinary
    account with a group and a home (`/home/<name>`) of its own and no
    login. Choosing root shows the warning above.
@@ -134,7 +146,7 @@ sudo nerve-node uninstall --purge   # deletes them too
 `uninstall` stops and disables the service, removes the unit, the user
 `nerve` and `/usr/local/bin/nerve-node`. Without `--purge`, `/etc/nerve` and
 `/var/lib/nerve` stay and belong to root from then on, so no later user with
-the old uid gets the keys. The account of user mode stays, also one that
+the old uid gets the keys. The account of the commands stays, also one that
 `setup` made; `sudo userdel -r <name>` removes it. A later `install` takes them up again: the node
 comes back with its pairings, rules and audit log. `--purge` deletes them,
 keys and audit log included.

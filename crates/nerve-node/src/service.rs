@@ -5,7 +5,7 @@
 //! a command root runs on folders that belong to another user runs as that
 //! user ([`become_owner`]), so whatever it writes stays the node's.
 //!
-//! In `user` mode the node runs a center's commands as an ordinary account
+//! The node runs a center's commands, in every mode, as an ordinary account
 //! (`machine.user`, [`crate::account`]), not as `nerve`, so they cannot read
 //! the node's keys. `install` takes the account that ran it; `setup` can
 //! choose or make another.
@@ -71,7 +71,7 @@ impl Layout {
     /// The service unit. The node runs as its own user with the folders
     /// given; stopping the service ends every command it runs, and a node
     /// that fails is started again. CAP_SETUID and CAP_SETGID are the one
-    /// privilege it keeps: they let it start a `user` mode command as the
+    /// privilege it keeps: they let it start a command as the
     /// account `machine.user` names. Every command drops them before it
     /// runs; the bounding set stays as it is, since an allowed sudo command
     /// needs root's.
@@ -131,7 +131,7 @@ pub trait System {
     /// Makes a system user with a group of the same name, the home given
     /// (not created) and no login, marked with [`USER_MARK`].
     fn add_account(&self, name: &str, home: &Path) -> Result<(), String>;
-    /// Makes an ordinary account for `user` mode, as `setup` offers: a
+    /// Makes an ordinary account for the commands, as `setup` offers: a
     /// group and a home of its own, no login, marked with
     /// [`crate::account::MADE_MARK`].
     fn add_user(&self, name: &str) -> Result<(), String>;
@@ -356,9 +356,9 @@ fn supported(sys: &dyn System, what: &str) -> Result<(), String> {
 }
 
 /// Writes the command's audit entry, when the state folder is there to hold
-/// it. Root writes it, so the files are given back to the folder's owner.
+/// it. It is written as the folder's owner ([`as_owner_of`]): root does not
+/// write through a link that the node's user put there.
 fn audit(
-    sys: &dyn System,
     paths: &NodePaths,
     event: &str,
     steps: &[String],
@@ -369,34 +369,19 @@ fn audit(
         return;
     }
     let log = AuditLog::new(paths.audit_log());
-    let given = |()| -> Result<(), String> {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            let m = std::fs::metadata(&paths.state_dir).map_err(|e| e.to_string())?;
-            for f in [log.path().to_path_buf(), log.old_path()] {
-                if f.exists() {
-                    sys.give(&f, m.uid(), m.gid())?;
-                }
-            }
-        }
-        #[cfg(not(unix))]
-        let _ = sys;
-        Ok(())
-    };
-    let written = log
-        .node(event, steps, r.as_ref().err().map(String::as_str))
-        .map_err(|e| e.to_string())
-        .and_then(given);
+    let written = as_owner_of(&paths.state_dir).and_then(|_owner| {
+        log.node(event, steps, r.as_ref().err().map(String::as_str))
+            .map_err(|e| e.to_string())
+    });
     if let Err(e) = written {
         let _ = writeln!(out, "the audit log cannot be written: {e}");
     }
 }
 
-/// `install`: the user, the folders, the account of `user` mode, the
+/// `install`: the user, the folders, the account of the commands, the
 /// program, the unit, the running service, in that order. `invoker` is the
 /// account that ran install (`SUDO_USER`, else root); it becomes the account
-/// of `user` mode unless one is chosen already. Running it again puts back
+/// of the commands unless one is chosen already. Running it again puts back
 /// what is missing and restarts the service.
 pub fn install(
     layout: &Layout,
@@ -411,7 +396,7 @@ pub fn install(
         out,
     };
     let r = install_steps(layout, sys, exe, invoker, &mut steps);
-    audit(sys, &layout.paths, "install", &steps.done, &r, steps.out);
+    audit(&layout.paths, "install", &steps.done, &r, steps.out);
     r?;
     let _ = writeln!(
         steps.out,
@@ -454,9 +439,11 @@ fn install_steps(
     for dir in dirs {
         nerve_transport::files::create_private_dir(dir)
             .map_err(|e| format!("{}: {e}", dir.display()))?;
+        // An earlier install's folder may hold what its user put there; it
+        // is changed as that user, and a link in its place is refused.
+        let _owner = as_owner_of(dir)?;
         set_mode(dir, 0o700)?;
     }
-    default_account(layout, sys, invoker, steps);
     // The folders may be left from an earlier install, whose user had
     // another uid: everything in them is given to this one.
     for dir in dirs {
@@ -467,6 +454,7 @@ fn install_steps(
         layout.paths.config_dir.display(),
         layout.paths.state_dir.display()
     ));
+    default_account(layout, sys, invoker, steps);
     let real = |p: &Path| std::fs::canonicalize(p).ok();
     if real(exe).is_some() && real(exe) == real(&layout.bin) {
         steps.did(format!(
@@ -490,19 +478,22 @@ fn install_steps(
     Ok(())
 }
 
-/// The account of `user` mode at install: the one chosen before, else
+/// The account of the commands at install: the one chosen before, else
 /// `invoker`. What fails here is said and left to `setup`; the node then
-/// runs no user-mode command until an account is chosen.
+/// runs no command until an account is chosen.
 fn default_account(layout: &Layout, sys: &dyn System, invoker: &str, steps: &mut Steps) {
     let p = &layout.paths;
     let r = (|| {
+        // Written as the folders' owner, so the files are the node's and
+        // root follows no link in them.
+        let _owner = as_owner_of(&p.state_dir)?;
         let mut store = SettingsStore::open(
             p.config_file(),
             p.config_key(),
             AuditLog::new(p.audit_log()),
         )?;
         if let Some(u) = &store.config().machine.user {
-            return Ok(format!("user mode runs commands as {u}, as chosen before"));
+            return Ok(format!("commands run as {u}, as chosen before"));
         }
         let a = usable_account(sys, p, invoker)?;
         store
@@ -514,19 +505,17 @@ fn default_account(layout: &Layout, sys: &dyn System, invoker: &str, steps: &mut
         if a.uid == 0 {
             let _ = writeln!(steps.out, "{}", crate::account::root_warning());
         }
-        Ok::<_, String>(format!(
-            "user mode runs commands as {invoker}, who ran install"
-        ))
+        Ok::<_, String>(format!("commands run as {invoker}, who ran install"))
     })();
     match r {
         Ok(step) => steps.did(step),
         Err(e) => steps.did(format!(
-            "no account for user mode: {e}; `sudo nerve-node setup` chooses one"
+            "no account for commands: {e}; `sudo nerve-node setup` chooses one"
         )),
     }
 }
 
-/// `name` as the account of `user` mode, or why not: it must exist, and
+/// `name` as the account of the commands, or why not: it must exist, and
 /// must not be the node's own user nor reach the node's folders, where the
 /// keys are. Root is allowed: the caller warns.
 pub fn usable_account(sys: &dyn System, paths: &NodePaths, name: &str) -> Result<Account, String> {
@@ -559,7 +548,7 @@ pub fn usable_account(sys: &dyn System, paths: &NodePaths, name: &str) -> Result
     Ok(a)
 }
 
-/// The account `setup` chose for `user` mode, and whether it made it.
+/// The account `setup` chose for the commands, and whether it made it.
 #[derive(Debug, PartialEq, Eq)]
 pub struct Chosen {
     pub name: String,
@@ -567,7 +556,7 @@ pub struct Chosen {
 }
 
 /// The account step of `setup` on the installed node: which account
-/// `user` mode runs commands as. Enter keeps `current`, else takes
+/// the node runs commands as. Enter keeps `current`, else takes
 /// `suggested` (the account that runs setup). An account that does not
 /// exist is made when the owner says yes. `None`: nothing changes.
 pub fn choose_account(
@@ -583,7 +572,7 @@ pub fn choose_account(
         input,
         out,
         &format!(
-            "Account that commands in user mode run as [{}]: ",
+            "Account that commands from centers run as [{}]: ",
             default.unwrap_or("none")
         ),
     )?;
@@ -592,7 +581,7 @@ pub fn choose_account(
         ("", None) => {
             let _ = writeln!(
                 out,
-                "No account: user mode runs no command until one is chosen."
+                "No account: the node runs no command until one is chosen."
             );
             return Ok(None);
         }
@@ -647,7 +636,7 @@ pub fn uninstall(
     };
     let r = uninstall_steps(layout, sys, purge, &mut steps);
     // With --purge the log went with the state folder.
-    audit(sys, &layout.paths, "uninstall", &steps.done, &r, steps.out);
+    audit(&layout.paths, "uninstall", &steps.done, &r, steps.out);
     if r.is_ok() && steps.done.is_empty() {
         let _ = writeln!(
             steps.out,
@@ -763,7 +752,7 @@ pub async fn update(
         out,
     };
     let r = update_steps(layout, sys, from, &mut steps).await;
-    audit(sys, &layout.paths, "update", &steps.done, &r, steps.out);
+    audit(&layout.paths, "update", &steps.done, &r, steps.out);
     r
 }
 
@@ -991,6 +980,52 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
     }
 }
 
+/// Root's file access as the owner of `dir`, on this thread, while the
+/// result lives ([`crate::account::FsAs`]): what root writes into a folder
+/// of the node's user then cannot reach through a link that user made more
+/// than that user may. A link in place of `dir` is refused. Nothing changes
+/// for another caller than root, or a folder of root's.
+fn as_owner_of(dir: &Path) -> Result<Option<impl Drop>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::symlink_metadata(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        if m.file_type().is_symlink() {
+            return Err(format!(
+                "{} is a link; the node's folders are folders, and root does not follow it",
+                dir.display()
+            ));
+        }
+        if nerve_transport::net::euid() != 0 || m.uid() == 0 {
+            return Ok(None);
+        }
+        let owner = Account {
+            name: format!("uid {}", m.uid()),
+            uid: m.uid(),
+            gid: m.gid(),
+            comment: String::new(),
+            home: dir.to_path_buf(),
+            groups: vec![m.gid()],
+        };
+        crate::account::FsAs::new(&owner)
+            .map(Some)
+            .map_err(|e| format!("cannot write as the owner of {}: {e}", dir.display()))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = dir;
+        Ok(None::<NoDrop>)
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+struct NoDrop;
+#[cfg(not(target_os = "linux"))]
+impl Drop for NoDrop {
+    fn drop(&mut self) {}
+}
+
+#[cfg(not(target_os = "linux"))]
 fn chown(path: &Path, uid: u32, gid: u32) -> Result<(), String> {
     #[cfg(unix)]
     {
@@ -1005,15 +1040,57 @@ fn chown(path: &Path, uid: u32, gid: u32) -> Result<(), String> {
 }
 
 /// Gives `path` and everything below it to `uid`:`gid`. Links are changed
-/// themselves and never followed.
+/// themselves and never followed. On Linux each folder is opened without
+/// following a link and read through its descriptor, so a folder that the
+/// node's user swaps for a link meanwhile is not walked.
 fn chown_tree(path: &Path, uid: u32, gid: u32) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        chown_below(path, path, uid, gid)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        chown_tree_by_path(path, uid, gid)
+    }
+}
+
+/// [`chown_tree`] on Linux: `at` is the path to open (below a folder's
+/// descriptor), `shown` the one errors name.
+#[cfg(target_os = "linux")]
+fn chown_below(at: &Path, shown: &Path, uid: u32, gid: u32) -> Result<(), String> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let err = |e: std::io::Error| format!("{}: {e}", shown.display());
+    let dir = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(at);
+    let dir = match dir {
+        Ok(d) => d,
+        // A file or a link: changed itself.
+        Err(e) if matches!(e.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP)) => {
+            return std::os::unix::fs::lchown(at, Some(uid), Some(gid)).map_err(err);
+        }
+        Err(e) => return Err(err(e)),
+    };
+    std::os::unix::fs::fchown(&dir, Some(uid), Some(gid)).map_err(err)?;
+    let fd = PathBuf::from(format!("/proc/self/fd/{}", dir.as_raw_fd()));
+    for e in std::fs::read_dir(&fd).map_err(err)? {
+        let name = e.map_err(err)?.file_name();
+        chown_below(&fd.join(&name), &shown.join(&name), uid, gid)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn chown_tree_by_path(path: &Path, uid: u32, gid: u32) -> Result<(), String> {
     chown(path, uid, gid)?;
     let meta = std::fs::symlink_metadata(path).map_err(|e| format!("{}: {e}", path.display()))?;
     if meta.is_dir() {
         let entries = std::fs::read_dir(path).map_err(|e| format!("{}: {e}", path.display()))?;
         for e in entries {
             let e = e.map_err(|e| format!("{}: {e}", path.display()))?;
-            chown_tree(&e.path(), uid, gid)?;
+            chown_tree_by_path(&e.path(), uid, gid)?;
         }
     }
     Ok(())
@@ -1283,7 +1360,7 @@ mod tests {
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("made the user nerve"), "{out}");
         assert!(
-            out.contains("user mode runs commands as alice, who ran install"),
+            out.contains("commands run as alice, who ran install"),
             "{out}"
         );
         assert!(!out.contains("Warning"), "{out}");
@@ -1306,7 +1383,7 @@ mod tests {
         let unit = std::fs::read_to_string(&l.unit).unwrap();
         assert_eq!(unit, l.unit_text());
         assert!(unit.contains("\nUser=nerve\n"), "{unit}");
-        // The one privilege: switching to the account of user mode. Nothing
+        // The one privilege: switching to the account of the commands. Nothing
         // narrows the bounding set or sets no_new_privs, which an allowed
         // sudo command needs.
         let caps: Vec<&str> = unit
@@ -1340,7 +1417,7 @@ mod tests {
         assert!(
             String::from_utf8(out.clone())
                 .unwrap()
-                .contains("user mode runs commands as alice, as chosen before")
+                .contains("commands run as alice, as chosen before")
         );
         assert_eq!(std::fs::read(&l.bin).unwrap(), b"nerve-node 1.0.1\n");
         assert_eq!(
@@ -1366,9 +1443,9 @@ mod tests {
         let mut out = Vec::new();
         install(&l, &sys, Path::new("/bin/true"), "root", &mut out).unwrap();
         let out = String::from_utf8(out).unwrap();
-        assert!(out.contains("user mode runs commands as root"), "{out}");
+        assert!(out.contains("commands run as root"), "{out}");
         assert!(
-            out.contains("Warning: commands from a center in user mode then run as root")
+            out.contains("Warning: commands from a center then run as root")
                 && out.contains("You are responsible"),
             "{out}"
         );
@@ -1386,7 +1463,7 @@ mod tests {
             let mut out = Vec::new();
             install(&l, &sys, Path::new("/bin/true"), who, &mut out).unwrap();
             let out = String::from_utf8(out).unwrap();
-            assert!(out.contains("no account for user mode"), "{out}");
+            assert!(out.contains("no account for commands"), "{out}");
             assert!(out.contains("sudo nerve-node setup"), "{out}");
             assert_eq!(user(&l), None);
             assert!(l.unit.is_file());
@@ -1407,7 +1484,7 @@ mod tests {
     }
 
     #[test]
-    fn setup_chooses_or_makes_the_account_of_user_mode() {
+    fn setup_chooses_or_makes_the_account_of_the_commands() {
         let d = tempfile::tempdir().unwrap();
         let sys = Fake::new();
         let l = installed(d.path(), &sys, "1.0.0");
@@ -1455,11 +1532,11 @@ mod tests {
         assert!(e.contains("node's own user"), "{e}");
     }
 
-    /// The account of user mode cannot read the keys: they are 0600 in
+    /// The account of the commands cannot read the keys: they are 0600 in
     /// folders private to `nerve`. An account that could open those folders
     /// is refused.
     #[test]
-    fn the_account_of_user_mode_cannot_read_the_keys() {
+    fn the_account_of_the_commands_cannot_read_the_keys() {
         use std::os::unix::fs::PermissionsExt;
         let d = tempfile::tempdir().unwrap();
         // Open down to the node's folders, as / and /etc are.
@@ -1501,6 +1578,63 @@ mod tests {
         assert!(crate::account::reaches(&key, &account));
         let e = usable_account(&sys, &l.paths, &name).unwrap_err();
         assert!(e.contains("could open"), "{e}");
+    }
+
+    /// A link in place of one of the node's folders, as the node's user could
+    /// leave one, is refused: install neither changes nor writes through it.
+    #[test]
+    fn install_follows_no_link_in_place_of_a_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = layout(d.path());
+        let elsewhere = d.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::set_permissions(&elsewhere, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::create_dir_all(&l.home).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &l.paths.state_dir).unwrap();
+        let mut out = Vec::new();
+        let e = install(&l, &sys, Path::new("/bin/true"), "alice", &mut out).unwrap_err();
+        assert!(e.contains("is a link"), "{e}");
+        assert_eq!(mode(&elsewhere), 0o755);
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+        assert!(!l.unit.exists());
+        // Nor is the audit entry written through it.
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("the audit log cannot be written"), "{out}");
+    }
+
+    /// The walk that gives the folders away changes a link itself and does
+    /// not go through it.
+    #[test]
+    fn chown_tree_does_not_walk_through_links() {
+        let d = tempfile::tempdir().unwrap();
+        let tree = d.path().join("tree");
+        let outside = d.path().join("outside");
+        std::fs::create_dir_all(tree.join("sub")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(tree.join("sub/f"), "x").unwrap();
+        std::os::unix::fs::symlink(&outside, tree.join("link")).unwrap();
+        // A folder it may not read stops the walk with its name: the walk
+        // reached it through `tree/sub`, and would through `link` if it
+        // followed links.
+        std::fs::create_dir(outside.join("closed")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            outside.join("closed"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+        let me = me();
+        let r = chown_tree(&tree, me.uid, me.gid);
+        std::fs::set_permissions(
+            outside.join("closed"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        r.unwrap();
+        // The tree given as a link is changed as a link only.
+        chown_tree(&tree.join("link"), me.uid, me.gid).unwrap();
     }
 
     #[test]

@@ -180,7 +180,10 @@ folders.
   under two names in `target`, so a file in a folder named exactly `target`
   inside the folder passes the check when every one of its names lies in
   such a folder of the same granted folder, under the same grants, and the
-  node finds no granted folder moved or renamed in that sync. Any other
+  node finds no granted folder moved or renamed in that sync. So a built
+  Rust project you rename or move needs `cargo clean` before its entry can
+  come off at its new place; until then the record of the entry stays stale
+  and that pairing's commands stop. Any other
   second name is still refused, also a `target` file whose other name lies
   outside the folder or under another grant, and one whose names Windows
   cannot list. Other tools' links are refused too: pnpm links

@@ -2058,10 +2058,12 @@ mod tests {
 
     /// On Windows: a project whose `target` holds links between names of
     /// its own, as cargo builds them, gets its grant, changes it and loses
-    /// it, also after a move. A link from `target` to a file outside the
-    /// project (also one below a folder named `target` there) still stops a
-    /// change, a take-off and a take-off after a move, and the outside
-    /// file's list stays as it was.
+    /// it. A link from `target` to a file outside the project (also one
+    /// below a folder named `target` there) still stops a change and a
+    /// take-off, and the outside file's list stays as it was. After a move,
+    /// a sync gives no pass for `target` (it finds a granted folder moved),
+    /// so cargo's own links stop the take-off where the project is now too,
+    /// until `target` is clean of links.
     #[cfg(windows)]
     #[test]
     fn a_built_project_keeps_working() {
@@ -2122,14 +2124,35 @@ mod tests {
         assert!(refused(&s), "{s:?}");
         assert!(carries(&proj, &lab, "rwx"), "{}", icacls(&proj));
 
-        // Moved: the take-off where it is now is refused too.
+        // Moved: no pass, so cargo's own link stops the take-off where the
+        // project is now.
         std::fs::rename(&proj, &proj2).unwrap();
+        let cargo_refused = |s: &Synced| {
+            s.errors.len() == 1
+                && s.errors[0].contains("hard links")
+                && (s.errors[0].contains("target\\debug\\demo.exe")
+                    || s.errors[0].contains("target\\debug\\deps\\demo-0123.exe"))
+        };
+        let s = windows_sync(&paths, &want(Some("rwx")));
+        assert!(cargo_refused(&s), "{s:?}");
+        assert!(s.refusal(&lab).is_some(), "{s:?}");
+        assert!(carries(&proj2, &lab, "rwx"), "{}", icacls(&proj2));
+        assert_eq!(icacls(&secret), before);
+
+        // Cleaned of cargo's links (as `cargo clean` does): the outside
+        // link still stops it.
+        for f in [
+            "target\\debug\\demo.exe",
+            "target\\debug\\deps\\demo-0123.exe",
+        ] {
+            std::fs::remove_file(proj2.join(f)).unwrap();
+        }
         let s = windows_sync(&paths, &want(Some("rwx")));
         assert!(refused(&s), "{s:?}");
         assert!(carries(&proj2, &lab, "rwx"), "{}", icacls(&proj2));
         assert_eq!(icacls(&secret), before);
 
-        // Without the outside link, the moved project loses its grant.
+        // Without any link, the moved project loses its grant.
         std::fs::remove_file(proj2.join("target\\debug\\s")).unwrap();
         let s = windows_sync(&paths, &want(Some("rwx")));
         assert!(s.errors.is_empty() && s.stale.is_empty(), "{s:?}");

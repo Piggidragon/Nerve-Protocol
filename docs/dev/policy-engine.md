@@ -158,9 +158,12 @@ command in an AppContainer, one per center (`nerve_sandbox::appcontainer`):
   a command linked there from a `w`-only folder. So before such a change on
   a folder commands may write in, or one that holds such a folder,
   `grants::sync` walks it and refuses while a file below has more than one
-  name (a removal stays stale). It does not tell a command's link from a
-  build tool's (cargo's `target`, pnpm, uv, a local `git clone`), so those
-  are refused too; the user docs give the ways around. A link a command of
+  name (a removal stays stale). One exception is for build tools: a file
+  below a folder named exactly `target`, `node_modules` or `.venv` passes
+  when all its names (`appcontainer::all_names`, compared resolved) lie in
+  such folders of the walked folder, so cargo's `target` works. A link to
+  anywhere else is refused, a build tool's too (pnpm's store, uv's cache, a
+  local `git clone`); the user docs give the ways around. A link a command of
   any pairing that may write there makes between the walk and the change
   still gets through: a documented limit, with its own issue for a
   race-free design. Inside a folder with `w` a

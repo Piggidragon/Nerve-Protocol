@@ -765,6 +765,69 @@ pub mod appcontainer {
         Ok(info.nNumberOfLinks)
     }
 
+    /// Every name (hard link) of the file at `path`, as whole paths on its
+    /// volume. Windows lists them without the volume, so each is joined to
+    /// the folder the volume of `path` is reached by (`C:\`, or a folder it
+    /// is mounted in).
+    pub fn all_names(path: &Path) -> io::Result<Vec<PathBuf>> {
+        use windows_sys::Win32::Foundation::{ERROR_HANDLE_EOF, ERROR_MORE_DATA};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FindClose, FindFirstFileNameW, FindNextFileNameW, GetVolumePathNameW,
+        };
+        let p = wide(path.as_os_str());
+        let mut vol = vec![0u16; 1024];
+        // SAFETY: a NUL-terminated path and a buffer of the length given.
+        check(unsafe { GetVolumePathNameW(p.as_ptr(), vol.as_mut_ptr(), vol.len() as u32) })?;
+        let n = vol.iter().position(|&c| c == 0).unwrap_or(vol.len());
+        let volume = PathBuf::from(std::ffi::OsString::from_wide(&vol[..n]));
+        let mut buf = vec![0u16; 512];
+        let mut out = Vec::new();
+        let mut take = |buf: &[u16], len: u32| {
+            let name = &buf[..(len as usize).min(buf.len())];
+            let name = name.split(|&c| c == 0).next().unwrap_or(name);
+            let name = std::ffi::OsString::from_wide(name);
+            let rest = name.to_string_lossy();
+            out.push(volume.join(rest.trim_start_matches('\\')));
+        };
+        let more = |e: &io::Error| e.raw_os_error() == Some(ERROR_MORE_DATA as i32);
+        // The first name, with a buffer as large as Windows asks for.
+        let h = loop {
+            let mut len = buf.len() as u32;
+            // SAFETY: a NUL-terminated path and a buffer of `len` u16s.
+            let h = unsafe { FindFirstFileNameW(p.as_ptr(), 0, &mut len, buf.as_mut_ptr()) };
+            if h != INVALID_HANDLE_VALUE {
+                take(&buf, len);
+                break h;
+            }
+            let e = io::Error::last_os_error();
+            if !more(&e) {
+                return Err(e);
+            }
+            buf.resize(len as usize + 1, 0);
+        };
+        let rest = loop {
+            let mut len = buf.len() as u32;
+            // SAFETY: the search handle from above and a buffer of `len` u16s.
+            if unsafe { FindNextFileNameW(h, &mut len, buf.as_mut_ptr()) } != 0 {
+                take(&buf, len);
+                continue;
+            }
+            let e = io::Error::last_os_error();
+            if more(&e) {
+                buf.resize(len as usize + 1, 0);
+                continue;
+            }
+            break if e.raw_os_error() == Some(ERROR_HANDLE_EOF as i32) {
+                Ok(())
+            } else {
+                Err(e)
+            };
+        };
+        // SAFETY: the search handle from above, closed once.
+        unsafe { FindClose(h) };
+        rest.map(|()| out)
+    }
+
     /// What is at `path` (its [`FileId`], `None` where the volume gives
     /// none), and whether its own entries for the container `name` are
     /// exactly those [`set`] puts on for `masks`. NotFound when nothing is

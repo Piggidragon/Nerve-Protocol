@@ -274,21 +274,62 @@ fn held(folders: &mut impl Folders, path: &Path) -> Option<String> {
     }
 }
 
+/// The folders build tools fill with hard links between names of their
+/// own: cargo's `target`, `node_modules`, a Python `.venv`. Matched by the
+/// whole name of a folder, never by a start of one.
+#[cfg(any(windows, test))]
+const BUILD_FOLDERS: [&str; 3] = ["target", "node_modules", ".venv"];
+
+/// Whether a folder of `rest` (a path below another, without its last
+/// part, the file's name) is named as one of [`BUILD_FOLDERS`].
+#[cfg(any(windows, test))]
+fn in_build_folder(rest: &Path) -> bool {
+    let mut parts: Vec<_> = rest.components().collect();
+    parts.pop();
+    parts
+        .iter()
+        .any(|c| BUILD_FOLDERS.iter().any(|b| c.as_os_str() == *b))
+}
+
 /// The first file below the folder `dir` with more than one name, by
-/// `names`, and how many it has; `None` for a file or when there is none.
+/// `count`, and how many it has; `None` for a file or when there is none.
 /// Only plain folders are walked into: a link or junction below `dir` is
 /// not followed, and is checked as itself like every other entry that is
-/// not a folder (`names` opens it as itself), so a file that is a reparse
+/// not a folder (`count` opens it as itself), so a file that is a reparse
 /// point of another kind is checked too.
+///
+/// One exception, for what build tools make: a file below a build folder
+/// of `dir` ([`BUILD_FOLDERS`]) whose every name (`names`, resolved) lies
+/// inside `dir`, each below a build folder of it, passes. Such a link has
+/// all its names under the same grant and gains nothing from the change. A
+/// file with a name anywhere else, outside `dir` too, is still found.
 #[cfg(any(windows, test))]
 fn linked_below(
     dir: &Path,
-    names: &dyn Fn(&Path) -> io::Result<u64>,
+    count: &dyn Fn(&Path) -> io::Result<u64>,
+    names: &dyn Fn(&Path) -> io::Result<Vec<PathBuf>>,
 ) -> io::Result<Option<(PathBuf, u64)>> {
     // `dir` itself as the change reaches it: through a link of the owner's.
     if !std::fs::metadata(dir)?.is_dir() {
         return Ok(None);
     }
+    // The place the names are compared with; one that cannot be resolved
+    // holds no name, so nothing passes.
+    let real_dir = nerve_policy::paths::resolve(dir).ok();
+    let own = |path: &Path| -> io::Result<bool> {
+        let Some(real_dir) = &real_dir else {
+            return Ok(false);
+        };
+        let rest = path.strip_prefix(dir).unwrap_or(path);
+        if !in_build_folder(rest) {
+            return Ok(false);
+        }
+        let depth = real_dir.components().count();
+        Ok(names(path)?.iter().all(|n| {
+            let rest: PathBuf = n.components().skip(depth).collect();
+            within(n, real_dir) && !within(real_dir, n) && in_build_folder(&rest)
+        }))
+    };
     let gone = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
     let mut todo = vec![dir.to_path_buf()];
     while let Some(d) = todo.pop() {
@@ -309,9 +350,17 @@ fn linked_below(
                 todo.push(path);
                 continue;
             }
-            match names(&path) {
-                Ok(n) if n > 1 => return Ok(Some((path, n))),
-                Ok(_) => {}
+            let n = match count(&path) {
+                Ok(n) => n,
+                Err(e) if gone(&e) => continue,
+                Err(e) => return Err(e),
+            };
+            if n < 2 {
+                continue;
+            }
+            match own(&path) {
+                Ok(true) => {}
+                Ok(false) => return Ok(Some((path, n))),
                 Err(e) if gone(&e) => {}
                 Err(e) => return Err(e),
             }
@@ -700,9 +749,11 @@ impl Folders for Acls {
     }
 
     fn linked(&mut self, dir: &Path) -> io::Result<Option<(PathBuf, u64)>> {
-        linked_below(dir, &|p| {
-            nerve_sandbox::appcontainer::names(p).map(u64::from)
-        })
+        linked_below(
+            dir,
+            &|p| nerve_sandbox::appcontainer::names(p).map(u64::from),
+            &|p| nerve_sandbox::appcontainer::all_names(p),
+        )
     }
 }
 
@@ -1267,6 +1318,28 @@ mod tests {
         assert!(f.on("/d2").is_empty() && f.on("/d2/in").is_empty());
     }
 
+    /// The names of a file on Linux, for the walk: every path below `root`
+    /// that is the same file (Linux has no call that lists them).
+    #[cfg(unix)]
+    fn names_below(root: &Path, p: &Path) -> io::Result<Vec<PathBuf>> {
+        use std::os::unix::fs::MetadataExt;
+        let m = std::fs::symlink_metadata(p)?;
+        let mut out = Vec::new();
+        let mut todo = vec![root.to_path_buf()];
+        while let Some(d) = todo.pop() {
+            for e in std::fs::read_dir(&d)? {
+                let path = e?.path();
+                let n = std::fs::symlink_metadata(&path)?;
+                if n.is_dir() {
+                    todo.push(path);
+                } else if (n.dev(), n.ino()) == (m.dev(), m.ino()) {
+                    out.push(path);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// The walk finds a file with a second name below a folder, also deep
     /// down, and does not follow a link out of the folder.
     #[cfg(unix)]
@@ -1274,26 +1347,87 @@ mod tests {
     fn the_walk_finds_a_file_with_a_second_name() {
         use std::os::unix::fs::MetadataExt;
         let d = tempfile::tempdir().unwrap();
-        let (dir, outside) = (d.path().join("dir"), d.path().join("outside"));
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let (dir, outside) = (root.join("dir"), root.join("outside"));
         std::fs::create_dir_all(dir.join("a/b")).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
         std::fs::write(dir.join("a/b/one.txt"), "x").unwrap();
         std::fs::write(outside.join("secret.txt"), "x").unwrap();
         std::fs::hard_link(outside.join("secret.txt"), outside.join("again.txt")).unwrap();
         std::os::unix::fs::symlink(&outside, dir.join("a/link")).unwrap();
-        let names = |p: &Path| std::fs::symlink_metadata(p).map(|m| m.nlink());
-        assert_eq!(linked_below(&dir, &names).unwrap(), None);
+        let count = |p: &Path| std::fs::symlink_metadata(p).map(|m| m.nlink());
+        let names = |p: &Path| names_below(&root, p);
+        assert_eq!(linked_below(&dir, &count, &names).unwrap(), None);
         assert_eq!(
-            linked_below(&dir.join("a/b/one.txt"), &names).unwrap(),
+            linked_below(&dir.join("a/b/one.txt"), &count, &names).unwrap(),
             None
         );
         std::fs::hard_link(outside.join("secret.txt"), dir.join("a/b/s")).unwrap();
         assert_eq!(
-            linked_below(&dir, &names).unwrap(),
+            linked_below(&dir, &count, &names).unwrap(),
             Some((dir.join("a/b/s"), 3))
         );
         std::fs::remove_file(dir.join("a/b/s")).unwrap();
-        assert_eq!(linked_below(&dir, &names).unwrap(), None);
+        assert_eq!(linked_below(&dir, &count, &names).unwrap(), None);
+    }
+
+    /// A file in a build folder (`target`, `node_modules`, `.venv`) whose
+    /// names all lie in build folders of the same project passes, as cargo
+    /// makes them. A link from such a folder to a file outside the project,
+    /// a link between a build folder and another folder of the project, and
+    /// a folder whose name only starts like one are still found.
+    #[cfg(unix)]
+    #[test]
+    fn build_folders_pass_with_their_own_links_only() {
+        use std::os::unix::fs::MetadataExt;
+        let d = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let (proj, outside) = (root.join("proj"), root.join("outside"));
+        let count = |p: &Path| std::fs::symlink_metadata(p).map(|m| m.nlink());
+        let names = |p: &Path| names_below(&root, p);
+        let link = |from: &str, to: &str| {
+            let (from, to) = (proj.join(from), proj.join(to));
+            for p in [&from, &to] {
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            }
+            std::fs::write(&from, "x").unwrap();
+            std::fs::hard_link(&from, &to).unwrap();
+        };
+        std::fs::create_dir_all(&outside).unwrap();
+        link("target/debug/demo", "target/debug/deps/demo-0123");
+        link("node_modules/a/index.js", "node_modules/b/index.js");
+        link(".venv/lib/x.py", ".venv/lib/y.py");
+        assert_eq!(linked_below(&proj, &count, &names).unwrap(), None);
+
+        // A name outside the project, from node_modules.
+        std::fs::write(outside.join("secret.txt"), "x").unwrap();
+        let s = proj.join("node_modules/a/s");
+        std::fs::hard_link(outside.join("secret.txt"), &s).unwrap();
+        assert_eq!(
+            linked_below(&proj, &count, &names).unwrap(),
+            Some((s.clone(), 2))
+        );
+        std::fs::remove_file(&s).unwrap();
+
+        // A name in the project outside any build folder.
+        link("target/debug/lib.rlib", "src/lib.rlib");
+        let found = linked_below(&proj, &count, &names).unwrap();
+        assert!(
+            found.as_ref().is_some_and(|(p, _)| p.ends_with("lib.rlib")),
+            "{found:?}"
+        );
+        std::fs::remove_file(proj.join("src/lib.rlib")).unwrap();
+        assert_eq!(linked_below(&proj, &count, &names).unwrap(), None);
+
+        // A folder named like one only at the start.
+        link("targets/a", "targets/b");
+        let found = linked_below(&proj, &count, &names).unwrap();
+        assert!(
+            found
+                .as_ref()
+                .is_some_and(|(p, _)| p.starts_with(proj.join("targets"))),
+            "{found:?}"
+        );
     }
 
     /// Without a state folder and with nothing wanted, a sync makes neither
@@ -1694,6 +1828,102 @@ mod tests {
         nerve_sandbox::appcontainer::look(path, container, m)
             .unwrap()
             .1
+    }
+
+    /// On Windows: a project whose build folders (`target`, `node_modules`,
+    /// `.venv`) hold links between names of their own gets its grant,
+    /// changes it and loses it, also after a move. A link from
+    /// `node_modules` to a file outside the project still stops a change, a
+    /// take-off and a take-off after a move, and the outside file's list
+    /// stays as it was.
+    #[cfg(windows)]
+    #[test]
+    fn build_folders_with_their_own_links_keep_working() {
+        let d = tempfile::tempdir().unwrap();
+        let root = canonical(d.path());
+        let paths = NodePaths::new(root.join("config"), root.join("state"));
+        let (proj, proj2, outside) = (root.join("proj"), root.join("proj2"), root.join("outside"));
+        let link = |from: &str, to: &str| {
+            let (from, to) = (proj.join(from), proj.join(to));
+            for p in [&from, &to] {
+                std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            }
+            std::fs::write(&from, "x").unwrap();
+            std::fs::hard_link(&from, &to).unwrap();
+        };
+        link(
+            "target\\debug\\demo.exe",
+            "target\\debug\\deps\\demo-0123.exe",
+        );
+        link("node_modules\\a\\index.js", "node_modules\\b\\index.js");
+        link(".venv\\Lib\\x.py", ".venv\\Lib\\y.py");
+        std::fs::create_dir_all(&outside).unwrap();
+        let lab = container(&paths, "lab");
+        let platform = crate::paths::platform();
+        let config = |flags: Option<&str>| {
+            let mut cfg = NodeConfig::default();
+            cfg.centers.push(match flags {
+                Some(a) => center("lab", &[(&proj, a)]),
+                None => center("lab", &[]),
+            });
+            cfg
+        };
+        let want = |flags: Option<&str>| wanted(&config(flags), &paths, &root, &platform);
+
+        // Put on and changed.
+        let s = windows_sync(&paths, &want(Some("rw")));
+        assert!(s.errors.is_empty(), "{s:?}");
+        assert!(carries(&proj, &lab, "rw"), "{}", icacls(&proj));
+        let s = windows_sync(&paths, &want(Some("rwx")));
+        assert!(s.errors.is_empty(), "{s:?}");
+        assert!(carries(&proj, &lab, "rwx"), "{}", icacls(&proj));
+
+        // A link from node_modules to a file outside: a change and a
+        // take-off are refused.
+        let secret = outside.join("secret.txt");
+        std::fs::write(&secret, "secret").unwrap();
+        std::fs::hard_link(&secret, proj.join("node_modules\\a\\s")).unwrap();
+        let before = icacls(&secret);
+        let refused = |s: &Synced| {
+            s.errors.len() == 1
+                && s.errors[0].contains("node_modules")
+                && s.errors[0].contains("hard links")
+        };
+        let s = windows_sync(&paths, &want(Some("rw")));
+        assert!(refused(&s), "{s:?}");
+        assert!(s.refusal(&lab).is_some(), "{s:?}");
+        assert!(carries(&proj, &lab, "rwx"), "{}", icacls(&proj));
+        let s = windows_sync(&paths, &want(None));
+        assert!(refused(&s), "{s:?}");
+        assert!(carries(&proj, &lab, "rwx"), "{}", icacls(&proj));
+
+        // Moved: the take-off where it is now is refused too.
+        std::fs::rename(&proj, &proj2).unwrap();
+        let s = windows_sync(&paths, &want(Some("rwx")));
+        assert!(refused(&s), "{s:?}");
+        assert!(carries(&proj2, &lab, "rwx"), "{}", icacls(&proj2));
+        assert_eq!(icacls(&secret), before);
+
+        // Without the outside link, the moved project loses its grant.
+        std::fs::remove_file(proj2.join("node_modules\\a\\s")).unwrap();
+        let s = windows_sync(&paths, &want(Some("rwx")));
+        assert!(s.errors.is_empty() && s.stale.is_empty(), "{s:?}");
+        assert_eq!(s.removed, 1, "{s:?}");
+        assert!(!carries(&proj2, &lab, "rwx"), "{}", icacls(&proj2));
+
+        // Back in place: put on again, then taken off.
+        std::fs::rename(&proj2, &proj).unwrap();
+        let s = windows_sync(&paths, &want(Some("rwx")));
+        assert!(s.errors.is_empty(), "{s:?}");
+        assert!(carries(&proj, &lab, "rwx"), "{}", icacls(&proj));
+        let s = windows_sync(&paths, &want(None));
+        assert!(s.errors.is_empty() && s.stale.is_empty(), "{s:?}");
+        assert_eq!(s.removed, 1, "{s:?}");
+        let s = remove_all(&paths, &["lab".into()]);
+        assert!(s.errors.is_empty(), "{s:?}");
+        for p in [&proj, &secret] {
+            assert!(!icacls(p).contains("S-1-15-2-"), "{}", icacls(p));
+        }
     }
 
     /// On Windows: a folder inside a writable one, configured in another

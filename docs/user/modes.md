@@ -111,7 +111,7 @@ folders.
   ([platforms](platforms.md#no-control-socket)), and gives its folders their
   entries again until then.
 - `uninstall` takes off the entries of the node in your own folders (not
-  those of a folder that holds hard links, see below)
+  those of a folder that holds hard links the check refuses, see below)
   (`%USERPROFILE%\.config\nerve` and `.local\state\nerve`, or those you name
   with `--config-dir` and `--state-dir`). Once a service is installed, the CLI
   reaches the service, so name the folders to change the node you run
@@ -176,17 +176,19 @@ folders.
   write-only folder whose files commands must not read on a drive where the
   pairing can write nowhere that it can also read or run programs, also
   through a folder above.
-- Build tools make hard links of their own, and the check refuses those too:
-  cargo builds each program under two names in `target`, pnpm links
-  `node_modules` to its store, uv links a `.venv` to its cache, and a local
-  `git clone` links its objects. A folder that holds such links does not get
-  its entry, and its entry is not changed or taken off. A refused removal
-  stops that pairing's commands, and `uninstall` leaves the entry on, until
-  the links are gone. Keep them out of granted folders: `CARGO_TARGET_DIR`
-  outside the folder, `UV_LINK_MODE=copy`, pnpm's
-  `package-import-method=copy`, `git clone --no-hardlinks`. Or remove them
-  (`cargo clean`, delete `node_modules` or `.venv`) before you add, change
-  or remove the folder.
+- Build tools make hard links of their own. A file in a folder named
+  exactly `target`, `node_modules` or `.venv` inside the folder passes the
+  check when all its names lie in such folders of the same granted folder,
+  as cargo makes them in `target`. Any other second name is still refused,
+  also one in such a folder whose other name lies outside the granted folder:
+  pnpm links `node_modules` to its store, uv links a `.venv` to its cache,
+  and a local `git clone` links its objects. A folder that holds such links
+  does not get its entry, and its entry is not changed or taken off. A
+  refused removal stops that pairing's commands, and `uninstall` leaves the
+  entry on, until the links are gone. Keep them out of granted folders:
+  pnpm's `package-import-method=copy`, `UV_LINK_MODE=copy`, `git clone
+  --no-hardlinks`. Or remove them (delete `node_modules` or `.venv`) before
+  you add, change or remove the folder.
 
 `nerve-node status` cannot ask the running node on Windows
 ([platforms](platforms.md#no-control-socket)). The node names its

@@ -1268,7 +1268,8 @@ impl Link {
     /// The AppContainer of this center's commands, once the folder grants
     /// follow `cfg` (crate::grants); `home` is the `~` of the rules. A grant
     /// of this center's container that its folders no longer give and that
-    /// could not be taken off stops the command.
+    /// could not be taken off stops the command, and so does a record of the
+    /// grants that cannot be read (`Synced::refusal`).
     async fn container(
         &self,
         cfg: &NodeConfig,
@@ -1282,14 +1283,8 @@ impl Link {
             tracing::warn!("folder grants: {e}");
         }
         let name = crate::grants::container(&self.shared.paths, &self.name);
-        if let Some(g) = synced.stale.iter().find(|g| g.container == name) {
-            return Err(RpcError::new(
-                ErrorCode::Unavailable,
-                format!(
-                    "the command was not run: {} keeps a grant for this center's commands that its folders no longer give, and it could not be taken off",
-                    nerve_policy::paths::to_wire(&g.path)
-                ),
-            ));
+        if let Some(why) = synced.refusal(&name) {
+            return Err(RpcError::new(ErrorCode::Unavailable, why));
         }
         Ok(nerve_sandbox::ContainerSpec { name })
     }

@@ -417,6 +417,53 @@ pub mod acl {
         m
     }
 
+    /// Which file or folder carries a grant, whatever its name: the serial
+    /// number of its volume and its file ID there. A move or a rename on the
+    /// volume keeps both, and keeps the object's own access list, grants
+    /// and all. Written as `<volume>:<file>` in hex.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct FileId {
+        pub volume: u64,
+        pub file: [u8; 16],
+    }
+
+    impl std::fmt::Display for FileId {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{:016x}:", self.volume)?;
+            self.file.iter().try_for_each(|b| write!(f, "{b:02x}"))
+        }
+    }
+
+    impl std::str::FromStr for FileId {
+        type Err = String;
+
+        fn from_str(s: &str) -> Result<FileId, String> {
+            let bad = || format!("not a file ID: {s}");
+            let (volume, file) = s.split_once(':').ok_or_else(bad)?;
+            if volume.len() != 16 || file.len() != 32 || !file.is_ascii() {
+                return Err(bad());
+            }
+            let volume = u64::from_str_radix(volume, 16).map_err(|_| bad())?;
+            let mut out = [0u8; 16];
+            for (i, b) in out.iter_mut().enumerate() {
+                *b = u8::from_str_radix(&file[2 * i..2 * i + 2], 16).map_err(|_| bad())?;
+            }
+            Ok(FileId { volume, file: out })
+        }
+    }
+
+    /// Where an object of a [`FileId`] is now.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum Found {
+        /// At this path.
+        At(std::path::PathBuf),
+        /// Nowhere: it was deleted, and its grants with it.
+        Gone,
+        /// Its volume is not on this machine now (a drive taken away), so
+        /// nothing reaches it; it may come back.
+        Away,
+    }
+
     /// The command line that hands `args` to `program` so that it reads
     /// them back as they are (`CommandLineToArgvW`'s rules, as Rust's own
     /// `Command` writes it on Windows): an argument with a space or a tab, or
@@ -468,17 +515,19 @@ pub mod appcontainer {
 
     use std::ffi::{OsStr, c_void};
     use std::io;
-    use std::os::windows::ffi::OsStrExt;
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::ffi::{OsStrExt, OsStringExt};
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
     use std::path::{Path, PathBuf};
     use std::ptr::{null, null_mut};
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GENERIC_ALL, HANDLE, HANDLE_FLAG_INHERIT, LocalFree, SetHandleInformation,
+        CloseHandle, GENERIC_ALL, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree,
+        SetHandleInformation,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        GetNamedSecurityInfoW, SDDL_REVISION_1, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+        GetNamedSecurityInfoW, GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
+        SetNamedSecurityInfoW,
     };
     use windows_sys::Win32::Security::Isolation::{
         CreateAppContainerProfile, DeleteAppContainerProfile,
@@ -495,6 +544,12 @@ pub mod appcontainer {
         TokenUser, UNPROTECTED_DACL_SECURITY_INFORMATION, WinCapabilityInternetClientServerSid,
         WinCapabilityInternetClientSid, WinCapabilityPrivateNetworkClientServerSid,
     };
+    use windows_sys::Win32::Storage::FileSystem::{
+        ExtendedFileIdType, FILE_FLAG_BACKUP_SEMANTICS, FILE_ID_128, FILE_ID_DESCRIPTOR,
+        FILE_ID_DESCRIPTOR_0, FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FileIdInfo, GetFileInformationByHandleEx,
+        GetFinalPathNameByHandleW, GetLogicalDrives, OpenFileById, READ_CONTROL,
+    };
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
         GetCurrentProcess, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
@@ -503,7 +558,7 @@ pub mod appcontainer {
         STARTUPINFOEXW, UpdateProcThreadAttribute, WaitForSingleObject,
     };
 
-    use super::acl::{Masks, command_line};
+    use super::acl::{FileId, Found, Masks, command_line};
 
     const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
     const ACCESS_DENIED_ACE_TYPE: u8 = 1;
@@ -555,6 +610,228 @@ pub mod appcontainer {
             // SAFETY: the pointer came from LocalAlloc (or is null).
             unsafe { LocalFree(self.0) };
         }
+    }
+
+    /// The entries [`set`] puts on for `masks`, as (ACE flags, mask): on a
+    /// folder one for itself and the folders below, one for the files below;
+    /// on a file one.
+    fn entries(is_dir: bool, m: Masks) -> Vec<(u32, u32)> {
+        let all = if is_dir {
+            vec![
+                (CONTAINER_INHERIT_ACE, m.dir),
+                (OBJECT_INHERIT_ACE | INHERIT_ONLY_ACE, m.file),
+            ]
+        } else {
+            vec![(0, m.file)]
+        };
+        all.into_iter().filter(|(_, mask)| *mask != 0).collect()
+    }
+
+    /// The ACEs of `dacl`, each from its header.
+    fn aces(dacl: *mut ACL) -> io::Result<Vec<*const ACE_HEADER>> {
+        let mut info = ACL_SIZE_INFORMATION::default();
+        // SAFETY: a valid ACL and a buffer of the size given.
+        check(unsafe {
+            GetAclInformation(
+                dacl,
+                &mut info as *mut _ as *mut c_void,
+                size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        })?;
+        (0..info.AceCount)
+            .map(|i| {
+                let mut ace: *mut c_void = null_mut();
+                // SAFETY: `i` is below the ACE count; the ACE lies in `dacl`.
+                check(unsafe { GetAce(dacl, i, &mut ace) })?;
+                Ok(ace as *const ACE_HEADER)
+            })
+            .collect()
+    }
+
+    /// Whether `ace` is an entry of the list's own (not inherited) that
+    /// allows or denies something to `sid`.
+    ///
+    /// SAFETY: `ace` points to an ACE of a valid list.
+    unsafe fn own_for(ace: *const ACE_HEADER, sid: &Sid) -> bool {
+        // SAFETY: every ACE starts with its header.
+        let h = unsafe { &*ace };
+        if u32::from(h.AceFlags) & INHERITED_ACE != 0 {
+            return false;
+        }
+        matches!(h.AceType, ACCESS_ALLOWED_ACE_TYPE | ACCESS_DENIED_ACE_TYPE)
+            // SAFETY: an allowed or denied ACE has its SID at SidStart.
+            && unsafe {
+                let a = ace as *const ACCESS_ALLOWED_ACE;
+                EqualSid(&raw const (*a).SidStart as PSID, sid.0) != 0
+            }
+    }
+
+    /// `path` opened for `access` alone, a folder as well as a file, while
+    /// others may keep it open for anything.
+    fn open(path: &Path, access: u32) -> io::Result<std::fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .access_mode(access)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+    }
+
+    fn id_of(f: &std::fs::File) -> io::Result<FileId> {
+        let mut info = FILE_ID_INFO::default();
+        // SAFETY: an open handle and a buffer of the size given.
+        check(unsafe {
+            GetFileInformationByHandleEx(
+                f.as_raw_handle(),
+                FileIdInfo,
+                &mut info as *mut _ as *mut c_void,
+                size_of::<FILE_ID_INFO>() as u32,
+            )
+        })?;
+        Ok(FileId {
+            volume: info.VolumeSerialNumber,
+            file: info.FileId.Identifier,
+        })
+    }
+
+    /// Which object is at `path` now.
+    pub fn file_id(path: &Path) -> io::Result<FileId> {
+        id_of(&open(path, FILE_READ_ATTRIBUTES)?)
+    }
+
+    /// What is at `path` (its [`FileId`], `None` where the volume gives
+    /// none), and whether its own entries for the container `name` are
+    /// exactly those [`set`] puts on for `masks`. NotFound when nothing is
+    /// there.
+    pub fn look(path: &Path, name: &str, masks: Masks) -> io::Result<(Option<FileId>, bool)> {
+        let sid = Sid::derive(name)?;
+        let f = open(path, READ_CONTROL | FILE_READ_ATTRIBUTES)?;
+        let id = id_of(&f).ok();
+        let is_dir = f.metadata()?.is_dir();
+        let mut dacl: *mut ACL = null_mut();
+        let mut sd: PSECURITY_DESCRIPTOR = null_mut();
+        // SAFETY: an open handle and out pointers to locals; the descriptor
+        // is freed with LocalFree, and `dacl` points into it.
+        let e = unsafe {
+            GetSecurityInfo(
+                f.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut sd,
+            )
+        };
+        if e != 0 {
+            return Err(io::Error::from_raw_os_error(e as i32));
+        }
+        let _sd = Local(sd);
+        if dacl.is_null() {
+            return Ok((id, false));
+        }
+        let mut have = Vec::new();
+        for ace in aces(dacl)? {
+            // SAFETY: the ACE lies in `dacl`, valid while `_sd` lives; an
+            // allowed or denied ACE has its mask after the header.
+            unsafe {
+                if own_for(ace, &sid) {
+                    let a = ace as *const ACCESS_ALLOWED_ACE;
+                    have.push(((*ace).AceType, u32::from((*ace).AceFlags), (*a).Mask));
+                }
+            }
+        }
+        let mut want: Vec<_> = entries(is_dir, masks)
+            .into_iter()
+            .map(|(flags, mask)| (ACCESS_ALLOWED_ACE_TYPE, flags, mask))
+            .collect();
+        have.sort_unstable();
+        want.sort_unstable();
+        Ok((id, have == want))
+    }
+
+    /// The path of the object open as `f`.
+    fn final_path(f: &std::fs::File) -> io::Result<PathBuf> {
+        let mut buf = vec![0u16; 512];
+        loop {
+            // SAFETY: an open handle and a buffer of the length given.
+            let n = unsafe {
+                GetFinalPathNameByHandleW(f.as_raw_handle(), buf.as_mut_ptr(), buf.len() as u32, 0)
+            } as usize;
+            if n == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            if n < buf.len() {
+                buf.truncate(n);
+                return Ok(PathBuf::from(std::ffi::OsString::from_wide(&buf)));
+            }
+            // Too short: `n` is the length it needs.
+            buf.resize(n, 0);
+        }
+    }
+
+    /// Where the object `id` is now ([`Found`]). Its volume is looked for at
+    /// the drive of `near`, a path it had, and then at every drive letter.
+    pub fn locate(id: &FileId, near: &Path) -> io::Result<Found> {
+        use std::path::Component;
+        let mut roots: Vec<PathBuf> = Vec::new();
+        let root: PathBuf = near
+            .components()
+            .take_while(|c| matches!(c, Component::Prefix(_) | Component::RootDir))
+            .collect();
+        if !root.as_os_str().is_empty() {
+            roots.push(root);
+        }
+        // SAFETY: no arguments.
+        let drives = unsafe { GetLogicalDrives() };
+        roots.extend(
+            (0..26u8)
+                .filter(|i| drives & (1 << i) != 0)
+                .map(|i| PathBuf::from(format!("{}:\\", char::from(b'A' + i)))),
+        );
+        for root in roots {
+            let Ok(r) = open(&root, FILE_READ_ATTRIBUTES) else {
+                continue;
+            };
+            if id_of(&r).ok().map(|v| v.volume) != Some(id.volume) {
+                continue;
+            }
+            let desc = FILE_ID_DESCRIPTOR {
+                dwSize: size_of::<FILE_ID_DESCRIPTOR>() as u32,
+                Type: ExtendedFileIdType,
+                Anonymous: FILE_ID_DESCRIPTOR_0 {
+                    ExtendedFileId: FILE_ID_128 {
+                        Identifier: id.file,
+                    },
+                },
+            };
+            // SAFETY: a handle on the volume and a valid descriptor; the
+            // handle returned is owned by the File below.
+            let h = unsafe {
+                OpenFileById(
+                    r.as_raw_handle(),
+                    &desc,
+                    FILE_READ_ATTRIBUTES,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    null(),
+                    FILE_FLAG_BACKUP_SEMANTICS,
+                )
+            };
+            if h == INVALID_HANDLE_VALUE {
+                let e = io::Error::last_os_error();
+                // No such file (NTFS says the ID is not valid).
+                return match e.raw_os_error() {
+                    Some(2 | 3 | 87) => Ok(Found::Gone),
+                    _ => Err(e),
+                };
+            }
+            // SAFETY: a handle this function owns.
+            let f = unsafe { std::fs::File::from_raw_handle(h) };
+            return final_path(&f).map(Found::At);
+        }
+        Ok(Found::Away)
     }
 
     /// Puts the grants of `masks` for the container `name` on `path`, in
@@ -637,20 +914,9 @@ pub mod appcontainer {
             // new one has room for all of them.
             check(unsafe { AddAce(new, ACL_REVISION_DS, u32::MAX, ace, u32::from(h.AceSize)) })?;
         }
-        if let Some(m) = masks {
-            let add = |flags: u32, mask: u32| {
-                if mask == 0 {
-                    return Ok(());
-                }
-                // SAFETY: the list has room for two more of these ACEs.
-                check(unsafe { AddAccessAllowedAceEx(new, ACL_REVISION_DS, flags, mask, sid.0) })
-            };
-            if is_dir {
-                add(CONTAINER_INHERIT_ACE, m.dir)?;
-                add(OBJECT_INHERIT_ACE | INHERIT_ONLY_ACE, m.file)?;
-            } else {
-                add(0, m.file)?;
-            }
+        for (flags, mask) in masks.map(|m| entries(is_dir, m)).unwrap_or_default() {
+            // SAFETY: the list has room for two more of these ACEs.
+            check(unsafe { AddAccessAllowedAceEx(new, ACL_REVISION_DS, flags, mask, sid.0) })?;
         }
         // A list that did not inherit keeps not inheriting.
         let keep = if control & SE_DACL_PROTECTED != 0 {
@@ -1133,6 +1399,29 @@ mod tests {
         assert_eq!(all.file, r.file | w.file | x.file);
     }
 
+    /// A file ID reads back as it was written, and nothing else reads as
+    /// one.
+    #[test]
+    fn file_ids_round_trip() {
+        use acl::FileId;
+        let id = FileId {
+            volume: 0x0123_4567_89ab_cdef,
+            file: *b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\xff",
+        };
+        let text = id.to_string();
+        assert_eq!(text, "0123456789abcdef:000102030405060708090a0b0c0d0eff");
+        assert_eq!(text.parse::<FileId>(), Ok(id));
+        for bad in [
+            "",
+            "0123456789abcdef",
+            "0123456789abcdef:00",
+            "0123456789abcdeg:000102030405060708090a0b0c0d0eff",
+            "0123456789abcdef:000102030405060708090a0b0c0d0eé",
+        ] {
+            assert!(bad.parse::<FileId>().is_err(), "{bad}");
+        }
+    }
+
     /// The command line reads back as the arguments given, by the rules of
     /// `CommandLineToArgvW`.
     #[test]
@@ -1263,6 +1552,52 @@ mod tests {
         assert_ne!(run(r"type sub\in.txt > copy2.txt".into()), 0);
         assert!(!granted.join("copy2.txt").exists());
         appcontainer::remove_profile(&name).unwrap();
+    }
+
+    /// A grant goes along when its folder is renamed: `look` sees it at the
+    /// new name and nothing at the old one, `locate` finds the folder by its
+    /// file ID, and finds it gone once it is deleted. A volume that is not
+    /// here is away.
+    #[cfg(windows)]
+    #[test]
+    fn a_granted_folder_is_found_again_by_its_file_id() {
+        use std::io::ErrorKind::NotFound;
+        let base = tempfile::tempdir().unwrap();
+        let (a, b) = (base.path().join("a"), base.path().join("b"));
+        std::fs::create_dir(&a).unwrap();
+        let file = base.path().join("file.txt");
+        std::fs::write(&file, "x").unwrap();
+        let name = format!("nerve.test.id.{}", std::process::id());
+        let m = acl::masks(true, true, false);
+        let other = acl::masks(true, false, false);
+        for p in [&a, &file] {
+            assert!(!appcontainer::look(p, &name, m).unwrap().1);
+            appcontainer::set(p, &name, Some(m)).unwrap();
+            assert!(appcontainer::look(p, &name, m).unwrap().1, "{p:?}");
+            assert!(!appcontainer::look(p, &name, other).unwrap().1, "{p:?}");
+        }
+        let id = appcontainer::look(&a, &name, m).unwrap().0.unwrap();
+        assert_eq!(appcontainer::file_id(&a).unwrap(), id);
+        std::fs::rename(&a, &b).unwrap();
+        assert_eq!(
+            appcontainer::look(&a, &name, m).unwrap_err().kind(),
+            NotFound
+        );
+        assert!(appcontainer::look(&b, &name, m).unwrap().1, "it went along");
+        let acl::Found::At(now) = appcontainer::locate(&id, &a).unwrap() else {
+            panic!("not found")
+        };
+        assert_eq!(appcontainer::file_id(&now).unwrap(), id);
+        appcontainer::set(&now, &name, None).unwrap();
+        assert!(!appcontainer::look(&b, &name, m).unwrap().1);
+        std::fs::remove_dir(&b).unwrap();
+        assert_eq!(appcontainer::locate(&id, &a).unwrap(), acl::Found::Gone);
+        let away = acl::FileId {
+            volume: !id.volume,
+            ..id
+        };
+        assert_eq!(appcontainer::locate(&away, &a).unwrap(), acl::Found::Away);
+        appcontainer::set(&file, &name, None).unwrap();
     }
 
     /// The flags are independent in the container too: a folder with `w`

@@ -15,13 +15,15 @@ libc.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock.workspace = true
 
-# The AppContainer a Windows command runs in, and the grants on its folders.
+# The AppContainer a Windows command runs in, and the grants on its folders
+# (Storage_FileSystem finds a granted folder again by its file ID).
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
     "Win32_Security_Authorization",
     "Win32_Security_Isolation",
+    "Win32_Storage_FileSystem",
     "Win32_System_Threading",
 ] }
 

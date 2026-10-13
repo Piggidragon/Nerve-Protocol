@@ -136,10 +136,19 @@ command in an AppContainer, one per center (`nerve_sandbox::appcontainer`):
   are Landlock's (`exec::folder_sets`), the own folders and protected entries
   cut out the same way. The grants follow the folders, whatever the mode: the
   node syncs them at start, on a change of its config and before each
-  `folder` command, the CLI when it writes the config, and `uninstall` takes
-  them off. A record in the state folder (`grants.json`) finds them again.
+  `folder` command, and the CLI when it writes the config. `uninstall` takes
+  off those of the node in the invoking user's own folders; the installed
+  service puts none on.
+- A record in the state folder (`grants.json`) finds them again. It holds the
+  file ID of each grant's object, since the grant is in that object's own
+  access list and goes with it: a grant on a moved or renamed folder comes off
+  where the folder is now. A sync checks that each wanted grant is still on,
+  and puts it on again on a folder made anew. A lock file
+  (`grants.json.lock`) keeps the CLI and a running node from writing over each
+  other's record, and a grant is recorded before it goes on.
 - A grant that should be off and cannot be taken off stops the commands of its
-  container.
+  container. A record that cannot be read stops the commands of every
+  container, since no grant in it could be found again.
 - The container's SID is derived from its name. Windows starts no process in a
   container without a profile, so the shim makes one for the user it runs as;
   the node removes it with the container's last grant.

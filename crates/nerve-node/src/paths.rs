@@ -30,19 +30,25 @@ impl NodePaths {
     /// ([`crate::service::Layout`]): the commands then reach the node that
     /// runs.
     pub fn from_args(config_dir: Option<PathBuf>, state_dir: Option<PathBuf>) -> NodePaths {
-        let env = |k: &str| {
-            std::env::var_os(k)
-                .filter(|v| !v.is_empty())
-                .map(PathBuf::from)
-        };
-        let config_dir = config_dir.or_else(|| env("NERVE_CONFIG_DIR"));
-        let state_dir = state_dir.or_else(|| env("NERVE_STATE_DIR"));
+        let config_dir = config_dir.or_else(|| env_dir("NERVE_CONFIG_DIR"));
+        let state_dir = state_dir.or_else(|| env_dir("NERVE_STATE_DIR"));
         if config_dir.is_none() && state_dir.is_none() {
             let layout = crate::service::Layout::system();
             if layout.installed() {
                 return layout.paths;
             }
         }
+        Self::by_hand_or(config_dir, state_dir)
+    }
+
+    /// The folders of a node this user runs by hand, without naming them:
+    /// [`NodePaths::from_args`] with none given, also once a service is
+    /// installed.
+    pub fn by_hand() -> NodePaths {
+        Self::by_hand_or(env_dir("NERVE_CONFIG_DIR"), env_dir("NERVE_STATE_DIR"))
+    }
+
+    fn by_hand_or(config_dir: Option<PathBuf>, state_dir: Option<PathBuf>) -> NodePaths {
         let home = home_dir();
         NodePaths {
             config_dir: config_dir.unwrap_or_else(|| home.join(".config/nerve")),
@@ -84,6 +90,13 @@ impl NodePaths {
     pub fn own(&self) -> Vec<PathBuf> {
         vec![self.config_dir.clone(), self.state_dir.clone()]
     }
+}
+
+/// A folder named by the environment variable `key`, if it is set.
+fn env_dir(key: &str) -> Option<PathBuf> {
+    std::env::var_os(key)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
 }
 
 /// The owner's home directory.

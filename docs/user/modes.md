@@ -106,10 +106,24 @@ folders.
 - The node gives each folder a permission entry for the pairing's container,
   with the folder's rights. Everything below the folder inherits it. Adding a
   large folder takes as long as changing its permissions with `icacls`.
-- `folder rm` and `folder set` change the entry, and removing the pairing or
-  `uninstall` takes it off. A running node takes changes from the CLI at its
-  next start ([platforms](platforms.md#no-control-socket)), and gives its
-  folders their entries again until then.
+- `folder rm` and `folder set` change the entry, and removing the pairing
+  takes it off. A running node takes changes from the CLI at its next start
+  ([platforms](platforms.md#no-control-socket)), and gives its folders their
+  entries again until then.
+- `uninstall` takes off the entries of the node in your own folders
+  (`%USERPROFILE%\.config\nerve` and `.local\state\nerve`, or those you name
+  with `--config-dir` and `--state-dir`). Once a service is installed, the CLI
+  reaches the service, so name the folders to change the node you run
+  yourself. Before you delete its folders, remove its pairings: the record of
+  the entries is in its state folder.
+- A granted folder you move or rename on the same drive takes its entry
+  along, as Windows keeps its permissions. At its next sync (at start, on a
+  change, before a command, and when the CLI changes the config) the node
+  finds it by its file ID and takes the entry off where it is now. A granted
+  folder you delete and make again gets its entry back at the next sync.
+- A file or folder you move out of a granted folder on the same drive keeps
+  the entry it inherited. `icacls <path> /reset` gives it the permissions of
+  its new place.
 - The flags stay independent: `w` without `r` writes but neither reads nor
   lists, `x` runs programs and reads files by name but does not list.
 - The node's own folders and the [protected paths](protected-paths.md) get no
@@ -126,8 +140,12 @@ folders.
   gets another program outside the container to do for it, such as a service
   or the task scheduler.
 
-With the node running, `nerve-node status` reads
-`daemon: running (confinement appcontainer)`.
+`nerve-node status` cannot ask the running node on Windows
+([platforms](platforms.md#no-control-socket)). The node names its
+confinement when it starts, in its output and its [log](logs.md):
+`node daemon running (…, confinement appcontainer, …)`. The center sees it in
+the node's `exec` state, `confinement appcontainer`, or `none` on the
+installed service.
 
 ## `user` mode
 

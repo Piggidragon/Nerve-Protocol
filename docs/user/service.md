@@ -267,8 +267,10 @@ goes back. The old program goes once nothing runs it, or at the next restart
 of Windows when `update` ran from it.
 
 `uninstall` stops and removes the service, the user `nerve` and its profile,
-the folder grants of `folder` mode ([modes](modes.md#what-a-command-can-reach-in-folder-mode-windows)),
-and the program. Without `--purge` the folders and the stored password stay,
+and the program. It also takes off the folder grants of `folder` mode that a
+node you ran yourself put on
+([modes](modes.md#what-a-command-can-reach-in-folder-mode-windows)); the
+service puts none on. Without `--purge` the folders and the stored password stay,
 open to the administrators only. A later `install` takes them up again.
 `--purge` deletes them. Run from the installed program, `uninstall` cannot
 delete that file at once: it moves it aside, and Windows deletes it at its

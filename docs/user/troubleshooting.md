@@ -21,6 +21,7 @@ names its reason.
 | `the working directory is not in a folder that allows running` | `folder` mode, and no folder with `x` holds the working directory | `nerve-node folder set <path> +x` |
 | `commands cannot be confined on this machine` | `folder` mode on a machine without Landlock, or on the installed Windows service | Use `allowlist` or `user` mode. See [platforms](platforms.md) |
 | `... keeps a grant for this center's commands that its folders no longer give` | Windows: the node could not take a removed folder's grant off | Check that you may change that folder's permissions. The node tries again before each command |
+| `the node cannot tell which folders carry grants for the commands` | Windows: the record of the folder grants (`grants.json` in the state folder) cannot be read, so no `folder` command runs | See the reason. If the file is damaged: `icacls <folder>` lists a folder's grants as `S-1-15-2-…` entries, `icacls <folder> /remove *S-1-15-2-…` takes one off. Once none is left, delete the file |
 | `the config is saved, but the folder grants do not follow it` | Windows: a folder's permissions could not be changed | See the reason. The node tries again when it starts and before each command |
 | `… is protected (…)` | The path is [protected](protected-paths.md) | Grant a folder at it, with the right it needs |
 | `… is denied (…)` | A deny rule matches | `nerve-node rule rm deny …` |

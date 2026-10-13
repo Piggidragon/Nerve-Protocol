@@ -1320,8 +1320,22 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
         Cmd::Uninstall { purge } => {
             let layout = Layout::system();
             owner_check(&[&layout.paths]).await?;
+            // The node run by hand: the one named, or the one in this
+            // user's default folders.
             #[cfg(windows)]
-            return crate::winsvc::uninstall(&layout, &crate::win_host::WinHost, purge, out);
+            let by_hand = if paths == layout.paths {
+                NodePaths::by_hand()
+            } else {
+                paths
+            };
+            #[cfg(windows)]
+            return crate::winsvc::uninstall(
+                &layout,
+                &by_hand,
+                &crate::win_host::WinHost,
+                purge,
+                out,
+            );
             #[cfg(not(windows))]
             crate::service::uninstall(&layout, &Host, purge, out)
         }

@@ -590,6 +590,10 @@ mod tests {
         starts: Cell<bool>,
         /// What a program says that the service cannot keep running.
         broken: RefCell<Option<String>>,
+        /// The program the service was registered with.
+        program: RefCell<Option<PathBuf>>,
+        /// What the program said each time the service started it.
+        started: RefCell<Vec<String>>,
         /// The folders and whom they were opened to.
         secured: RefCell<Vec<(PathBuf, Option<String>)>>,
     }
@@ -606,6 +610,8 @@ mod tests {
                 service: Cell::new(None),
                 starts: Cell::new(true),
                 broken: RefCell::new(None),
+                program: RefCell::new(None),
+                started: RefCell::new(Vec::new()),
                 secured: RefCell::new(Vec::new()),
             }
         }
@@ -675,13 +681,19 @@ mod tests {
         }
         fn put_service(&self, layout: &Layout, _: &str) -> Result<(), String> {
             self.call(format!("put {}", layout.bin.display()));
+            *self.program.borrow_mut() = Some(layout.bin.clone());
             if self.service.get().is_none() {
                 self.service.set(Some(false));
             }
             Ok(())
         }
+        /// Starts whatever is in the program's place right now, as Windows
+        /// does; a later rename does not change what runs.
         fn start(&self) -> Result<(), String> {
             self.call("start");
+            let program = self.program.borrow().clone().ok_or("not registered")?;
+            let runs = self.version_of(&program)?;
+            self.started.borrow_mut().push(runs);
             self.service.set(Some(true));
             Ok(())
         }
@@ -697,11 +709,14 @@ mod tests {
             self.service.set(None);
             Ok(())
         }
-        fn wait_running(&self, layout: &Layout) -> Result<(), String> {
-            let broken = self.broken.borrow().clone();
-            if self.starts.get() && broken != self.version_of(&layout.bin).ok() {
+        /// Judges the program the last start started, not what is in its
+        /// place now.
+        fn wait_running(&self, _: &Layout) -> Result<(), String> {
+            let runs = self.started.borrow().last().cloned();
+            if self.starts.get() && runs.is_some() && *self.broken.borrow() != runs {
                 Ok(())
             } else {
+                self.service.set(Some(false));
                 Err("the service stopped at its start".into())
             }
         }
@@ -1101,6 +1116,7 @@ mod tests {
         );
         assert_eq!(std::fs::read(&l.bin).unwrap(), b"nerve-node 1.2.0\n");
         assert_eq!(sys.calls()[calls..], ["stop", "start"]);
+        assert_eq!(sys.started.borrow().last().unwrap(), "nerve-node 1.2.0");
         for (p, b) in before {
             let now = std::fs::read(&p).unwrap();
             if p == l.paths.audit_log() {
@@ -1144,6 +1160,7 @@ mod tests {
         std::fs::write(&new, "nerve-node 2.0.0\n").unwrap();
         sys.starts.set(false);
         let calls = sys.calls().len();
+        let starts = sys.started.borrow().len();
         let e = update(&l, &sys, Some(&new), &mut Vec::new())
             .await
             .unwrap_err();
@@ -1151,6 +1168,11 @@ mod tests {
         assert!(e.contains("the old one does not either"), "{e}");
         // The old program is started again, even though here it fails too.
         assert_eq!(sys.calls()[calls..], ["stop", "start", "stop", "start"]);
+        assert_eq!(
+            sys.started.borrow()[starts..],
+            ["nerve-node 2.0.0", "nerve-node 1.2.0"]
+        );
+        assert_eq!(sys.service.get(), Some(false));
         assert_eq!(std::fs::read(&l.bin).unwrap(), b"nerve-node 1.2.0\n");
         assert!(!staged(&l.bin).exists() && !previous(&l.bin).exists());
         let a = audit_events(&l);
@@ -1173,6 +1195,7 @@ mod tests {
         std::fs::write(&new, "nerve-node 2.0.0\n").unwrap();
         *sys.broken.borrow_mut() = Some("nerve-node 2.0.0".into());
         let calls = sys.calls().len();
+        let starts = sys.started.borrow().len();
         let e = update(&l, &sys, Some(&new), &mut Vec::new())
             .await
             .unwrap_err();
@@ -1183,6 +1206,10 @@ mod tests {
         // The new program was started and stopped, then the old one started
         // after it was put back: the node is up again.
         assert_eq!(sys.calls()[calls..], ["stop", "start", "stop", "start"]);
+        assert_eq!(
+            sys.started.borrow()[starts..],
+            ["nerve-node 2.0.0", "nerve-node 1.2.0"]
+        );
         assert_eq!(sys.service.get(), Some(true));
         let a = audit_events(&l);
         assert!(

@@ -28,7 +28,6 @@ serde_json.workspace = true
 # `env` lets every flag come from the MCP client entry's environment as well.
 clap = { workspace = true, features = ["env"] }
 tracing.workspace = true
-tracing-subscriber.workspace = true
 ring.workspace = true
 
 [target.'cfg(unix)'.dependencies]

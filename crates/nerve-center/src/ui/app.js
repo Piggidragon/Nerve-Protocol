@@ -32,7 +32,9 @@ const ICONS = {
   plug: "<path d=\"M12 22v-5\"/><path d=\"M9 8V2\"/><path d=\"M15 8V2\"/><path d=\"M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z\"/>",
   info: "<circle cx=\"12\" cy=\"12\" r=\"10\"/><path d=\"M12 16v-4\"/><path d=\"M12 8h.01\"/>",
   chev: "<path d=\"m6 9 6 6 6-6\"/>",
-  help: "<circle cx=\"12\" cy=\"12\" r=\"10\"/><path d=\"M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3\"/><path d=\"M12 17h.01\"/>"
+  help: "<circle cx=\"12\" cy=\"12\" r=\"10\"/><path d=\"M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3\"/><path d=\"M12 17h.01\"/>",
+  log: "<path d=\"M15 12h-5\"/><path d=\"M15 8h-5\"/><path d=\"M19 17V5a2 2 0 0 0-2-2H4\"/><path d=\"M8 21h12a2 2 0 0 0 2-2v-1a1 1 0 0 0-1-1H11a1 1 0 0 0-1 1v1a2 2 0 1 1-4 0V5a2 2 0 1 0-4 0v2a1 1 0 0 0 1 1h3\"/>",
+  download: "<path d=\"M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4\"/><polyline points=\"7 10 12 15 17 10\"/><line x1=\"12\" x2=\"12\" y1=\"15\" y2=\"3\"/>"
 };
 
 const SVG = "http://www.w3.org/2000/svg";
@@ -40,6 +42,7 @@ const PAGES = {
   overview: { title: "Overview", view: pageOverview },
   stats: { title: "Statistics", view: pageStats },
   audit: { title: "Audit", view: pageAudit },
+  log: { title: "Log", view: pageLog },
   help: { title: "Help", view: pageHelp },
   settings: { title: "Settings", view: pageSettings },
 };
@@ -49,7 +52,7 @@ let lastSig = null;
 let busy = false;
 let down = false;
 let settingsRun = 0;
-const state = { overview: null, stats: null, statsNode: null, audit: null, help: null, pairing: null, settings: null, newToken: null };
+const state = { overview: null, stats: null, statsNode: null, audit: null, log: null, help: null, pairing: null, settings: null, newToken: null };
 
 const $ = (id) => document.getElementById(id);
 
@@ -567,7 +570,137 @@ function auditRow(d, n) {
     cut ? el("p", { class: "meta" }, "The target was cut to its start, so no rule can name it.") : null);
 }
 
+// ---- Log ----
+
+// The levels the page filters by, most to least verbose: a level shows itself
+// and what is more severe. The log keeps the level set in Settings; this only
+// narrows what is shown.
+const LOG_LEVELS = [
+  { value: "debug", text: "Everything" },
+  { value: "info", text: "Info and above" },
+  { value: "warn", text: "Warnings and errors" },
+  { value: "error", text: "Errors only" },
+];
+const LOG_TONE = { error: "down", warn: "warn", info: "", debug: "" };
+// What the page asks for. `node` is a machine's id, "-" for what is about no
+// machine, null for all.
+const logFilter = { level: "debug", node: null, q: "", live: true };
+let logRun = 0;
+let logTimer = null;
+let logNodes = [];
+
+// The boxes of the page are made once and kept: draw() leaves them in place
+// when the entries change, so a search typed into the field or a list being
+// used is not cut off by the next poll.
+const logLevelPicker = picker({
+  label: "Level", search: "Search levels", none: "No level matches.",
+  onpick: (level) => { logFilter.level = level; logLevelPicker.set(LOG_LEVELS, level); logLoad(); },
+});
+const logNodePicker = picker({
+  label: "Machine", search: "Search machines", none: "No machine matches.",
+  onpick: (node) => { logFilter.node = node; logNodePicker.set(logNodes, node); logLoad(); },
+});
+const logSearch = el("input", { class: "input", type: "search", placeholder: "Search the messages", autocomplete: "off", spellcheck: "false" });
+logSearch.addEventListener("input", () => {
+  clearTimeout(logTimer);
+  logTimer = setTimeout(() => { logFilter.q = logSearch.value; logLoad(); }, 250);
+});
+const logLiveDot = el("span", { class: "dot up" });
+const logLiveText = el("span", {}, "Live");
+const logLive = el("button", { type: "button", class: "btn ghost", "aria-pressed": "true", title: "Pause or resume the updates", onclick: () => setLogLive(!logFilter.live) }, logLiveDot, logLiveText);
+const logDownload = el("a", { class: "btn ghost", href: "/api/log/download", download: "nerve-center-log.jsonl", title: "The whole log file, one JSON object per line" }, icon("download", "sm"), "Download the file");
+const logParts = {
+  head: el("div"),
+  bar: el("div", { class: "card log-bar" }, el("div", { class: "form-row" },
+    logLevelPicker.root, logNodePicker.root,
+    el("label", { class: "field" }, el("span", { class: "label" }, "Search"), logSearch),
+    el("div", { class: "log-tools" }, logLive, logDownload))),
+  rows: el("div"),
+};
+
+function setLogLive(on) {
+  logFilter.live = on;
+  logLive.setAttribute("aria-pressed", String(on));
+  logLiveDot.className = "dot" + (on ? " up" : "");
+  logLiveText.textContent = on ? "Live" : "Paused";
+  if (on) logLoad();
+}
+
+function logPath() {
+  const p = new URLSearchParams();
+  if (logFilter.level !== "debug") p.set("level", logFilter.level);
+  if (logFilter.node) p.set("node", logFilter.node);
+  if (logFilter.q.trim()) p.set("q", logFilter.q.trim());
+  const q = p.toString();
+  return "/api/log" + (q ? "?" + q : "");
+}
+
+// Asks for the entries the filters want. An answer that comes after a newer
+// question is dropped.
+async function logLoad() {
+  const run = ++logRun;
+  try {
+    const l = await api("GET", logPath());
+    if (run !== logRun) return;
+    state.log = l;
+    if (current() === "log") draw(false);
+  } catch (e) {
+    // A center that cannot be reached is told by the poll of the overview.
+    if (!e.auth && !(e instanceof TypeError)) notify(e.message, "error");
+  }
+}
+
+function clock(ms) {
+  const d = new Date(ms);
+  const t = d.toLocaleTimeString(undefined, { hourCycle: "h23" });
+  return d.toDateString() === new Date().toDateString() ? t : `${d.toLocaleDateString()} ${t}`;
+}
+
+function logRow(e) {
+  return el("div", { class: "log-row " + e.level },
+    el("span", { class: "log-when mono", title: when(e.ts) }, clock(e.ts)),
+    pill(LOG_TONE[e.level] || "", e.level),
+    e.node ? el("span", { class: "chip", title: e.node_id || "" }, e.node) : null,
+    el("span", { class: "log-msg" }, e.msg));
+}
+
+// What the center did and saw, newest first, as the center kept it.
+function pageLog() {
+  const l = state.log;
+  if (!l) return [empty("Loading…")];
+  const machines = l.nodes.slice().sort((a, b) => a.name.localeCompare(b.name));
+  // A machine the log no longer remembers cannot be filtered by.
+  if (logFilter.node !== null && logFilter.node !== "-" && !machines.some((n) => n.id === logFilter.node)) logFilter.node = null;
+  logLevelPicker.set(LOG_LEVELS, logFilter.level);
+  logNodes = [
+    { value: null, text: "All machines" },
+    { value: "-", text: "The center itself" },
+    ...machines.map((n) => ({ value: n.id, text: n.paired ? n.name : `${n.name} (removed)` })),
+  ];
+  logNodePicker.set(logNodes, logFilter.node);
+  logDownload.hidden = !l.file;
+  const count = (level) => l.entries.filter((e) => e.level === level).length;
+  const stats = [[l.entries.length, l.entries.length === 1 ? "entry shown" : "entries shown"]];
+  if (count("error")) stats.push([count("error"), "errors", "danger"]);
+  if (count("warn")) stats.push([count("warn"), count("warn") === 1 ? "warning" : "warnings", "warn"]);
+  logParts.head.replaceChildren(head("log", "Log",
+    `Links, pairing, changes, refused and failed calls, and errors, newest first. The center keeps the level ${l.level}; change that in Settings.`, stats));
+  const filtered = logFilter.level !== "debug" || logFilter.node !== null || logFilter.q.trim() !== "";
+  logParts.rows.replaceChildren(l.entries.length
+    ? el("div", { class: "card log-rows" }, l.entries.map(logRow))
+    : empty(filtered ? "Nothing matches these filters." : "The log is empty."));
+  return [logParts.head, logParts.bar, logParts.rows];
+}
+
 // ---- Settings ----
+
+// The levels the center can keep its log at, for the Settings page.
+const SETTINGS_LEVELS = [
+  { value: "error", text: "Error" },
+  { value: "warn", text: "Warn" },
+  { value: "info", text: "Info (the default)" },
+  { value: "debug", text: "Debug" },
+];
 
 function pageSettings() {
   const s = state.settings;
@@ -577,6 +710,12 @@ function pageSettings() {
   const name = el("input", { class: "input", type: "text", maxlength: "64", value: s.center.name, id: "c-name" });
   const days = el("input", { class: "input num", type: "number", min: "1", max: "366", value: s.center.retention_days, id: "c-days" });
   const pairMinutes = el("input", { class: "input num", type: "number", min: "1", max: "1440", value: s.center.pair_code_minutes, id: "c-pair-minutes" });
+  let logLevel = s.center.log_level;
+  const levelPicker = picker({
+    label: "Log level", search: "Search levels", none: "No level matches.",
+    onpick: (level) => { logLevel = level; levelPicker.set(SETTINGS_LEVELS, level); },
+  });
+  levelPicker.set(SETTINGS_LEVELS, logLevel);
   return [
     head("settings", "Settings", "The center, the tokens harnesses use, and each machine's own settings."),
     section("Center", null, null, el("div", { class: "card" },
@@ -584,8 +723,11 @@ function pageSettings() {
         el("label", { class: "field" }, el("span", { class: "label" }, "Name"), name),
         el("label", { class: "field" }, el("span", { class: "label" }, "Keep statistics for (days)"), days),
         el("label", { class: "field" }, el("span", { class: "label" }, "Pairing code valid for (minutes, at most 1440)"), pairMinutes)),
+      el("div", { class: "form-row" }, levelPicker.root),
+      el("p", { class: "meta" }, "Debug adds detail for tracking down a problem and makes the log file grow faster. What the log holds is on the Log page."),
+      s.center.log_level_pinned ? el("p", { class: "meta" }, `The --log option (NERVE_LOG) sets the level at every start and wins over this setting. This run keeps the level ${s.center.log_level_now}.`) : null,
       el("div", { class: "actions" }, el("button", { type: "button", class: "btn primary", onclick: act(async () => {
-        await api("POST", "/api/center", { name: name.value, retention_days: Number(days.value), pair_code_minutes: Number(pairMinutes.value) });
+        await api("POST", "/api/center", { name: name.value, retention_days: Number(days.value), pair_code_minutes: Number(pairMinutes.value), log_level: logLevel });
         notify("Saved.");
       }) }, "Save")))),
     section("Harness tokens", "A token lets an AI harness call this center over HTTP.", null,
@@ -735,7 +877,7 @@ function current() {
 
 function signature(page) {
   const minute = Math.floor(Date.now() / 60000);
-  return JSON.stringify([page, state.overview, page === "stats" ? state.stats : page === "audit" ? state.audit : page === "help" ? !!state.help : null, state.pairing, minute]);
+  return JSON.stringify([page, state.overview, page === "stats" ? state.stats : page === "audit" ? state.audit : page === "log" ? state.log : page === "help" ? !!state.help : null, state.pairing, minute]);
 }
 
 function draw(force) {
@@ -790,6 +932,9 @@ async function tick() {
     if (down) notify("Connected to the center again.");
     down = false;
     draw(false);
+    // The log asks for itself, so that a filter changed meanwhile is not
+    // answered with the old filter's entries.
+    if (page === "log" && logFilter.live) logLoad();
   } catch (e) {
     if (!e.auth && !down) notify("Cannot reach the center. Trying again.", "error");
     down = !e.auth;
@@ -809,6 +954,8 @@ function setNav(open) {
 function go() {
   const page = current();
   statsPicker.close();
+  logLevelPicker.close();
+  logNodePicker.close();
   for (const a of document.querySelectorAll("[data-page]")) {
     if (a.dataset.page === page) a.setAttribute("aria-current", "page");
     else a.removeAttribute("aria-current");
@@ -817,6 +964,7 @@ function go() {
   setNav(false);
   state.newToken = null;
   lastSig = null;
+  if (page === "log" && !logFilter.live) setLogLive(true);
   const p = $("page");
   p.classList.remove("enter");
   void p.offsetWidth;

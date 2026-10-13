@@ -47,6 +47,9 @@ output_cap_bytes = 16777216 # for stdout and for stderr each; a result carries 1
 [connection]
 proxy = "http://proxy:3128" # set with `nerve-node proxy set`
 
+[log]
+level = "info"              # error | warn | info | debug: how much the node logs
+
 [[center]]
 name = "lab"
 url = "https://lab.example:7443"

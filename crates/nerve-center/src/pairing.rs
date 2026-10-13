@@ -34,6 +34,15 @@ struct Open {
 #[derive(Debug)]
 pub struct Taken(Open);
 
+/// Codes that ended without a pairing, counted for the log.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Lost {
+    /// Their time ran out.
+    pub expired: u32,
+    /// Wrong codes used up their tries.
+    pub out_of_tries: u32,
+}
+
 /// What the owner's page is told about the code on its screen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
@@ -49,6 +58,7 @@ pub enum Outcome {
 #[derive(Debug, Default)]
 pub struct Codes {
     open: Vec<Open>,
+    lost: Lost,
     /// Codes [`Codes::take`] took out and nobody has finished yet.
     taking: Vec<String>,
     /// Codes that paired a node: the code, the node and when the record ends
@@ -71,8 +81,22 @@ impl Codes {
     }
 
     fn prune(&mut self, now: Instant) {
-        self.open.retain(|o| now < o.expires && o.tries < TRIES);
+        self.open.retain(|o| {
+            if now >= o.expires {
+                self.lost.expired += 1;
+            } else if o.tries >= TRIES {
+                self.lost.out_of_tries += 1;
+            }
+            now < o.expires && o.tries < TRIES
+        });
         self.paired.retain(|(_, _, until)| now < *until);
+    }
+
+    /// Drops the codes that ran out and says how many did since the last
+    /// time this was asked, however they were noticed.
+    pub fn sweep(&mut self, now: Instant) -> Lost {
+        self.prune(now);
+        std::mem::take(&mut self.lost)
     }
 
     /// Checks `code` without using it up. A wrong code costs every open code
@@ -292,6 +316,41 @@ mod tests {
         // The tenth wrong try used up both codes.
         assert_eq!(c.check(&a, now), Err(CodeError::Refused));
         assert_eq!(c.check(&b, now), Err(CodeError::Refused));
+    }
+
+    #[test]
+    fn codes_that_run_out_are_counted_once() {
+        let mut c = Codes::default();
+        let now = Instant::now();
+        let _a = c.create(now, TEN_MINUTES);
+        let _b = c.create(now, TEN_MINUTES);
+        let long = c.create(now, 24 * HOUR);
+        let used = c.create(now, TEN_MINUTES);
+        assert_eq!(c.sweep(now), Lost::default());
+        // A used code is not lost.
+        assert!(c.take(&used, now).is_ok());
+        // Past ten minutes two ran out, whether noticed by a try or a sweep.
+        assert_eq!(c.check("wrong", now + TEN_MINUTES), Err(CodeError::Refused));
+        assert_eq!(
+            c.sweep(now + TEN_MINUTES),
+            Lost {
+                expired: 2,
+                out_of_tries: 0
+            }
+        );
+        assert_eq!(c.sweep(now + TEN_MINUTES), Lost::default());
+        // The long one is used up by wrong tries, and counted for that.
+        for _ in 0..TRIES {
+            let _ = c.check("wrong", now + TEN_MINUTES);
+        }
+        assert_eq!(c.check(&long, now + TEN_MINUTES), Err(CodeError::Refused));
+        assert_eq!(
+            c.sweep(now + TEN_MINUTES),
+            Lost {
+                expired: 0,
+                out_of_tries: 1
+            }
+        );
     }
 
     #[test]

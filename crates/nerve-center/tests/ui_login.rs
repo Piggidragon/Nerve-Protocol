@@ -168,3 +168,27 @@ async fn without_a_web_ui_nothing_is_asked() {
         .unwrap();
     assert!(r.ui.is_none());
 }
+
+/// The token from a flag is kept out of every line, also where a message
+/// quotes it and no pattern would catch it.
+#[tokio::test]
+async fn the_harness_token_from_a_flag_stays_out_of_the_log() {
+    let token = "plain-words-for-a-token";
+    let d = tempfile::tempdir().unwrap();
+    let r = start(d.path(), &["--ui", "127.0.0.1:0", "--harness-token", token])
+        .await
+        .unwrap();
+    r.center.log().record(
+        nerve_transport::log::Level::Warn,
+        None,
+        &format!("the proxy said {token} is not allowed"),
+    );
+    let file = std::fs::read_to_string(d.path().join("log.jsonl")).unwrap();
+    assert!(
+        file.contains("the proxy said [redacted] is not allowed"),
+        "{file}"
+    );
+    assert!(!file.contains(token), "{file}");
+    // The startup line is in it too, and names no token.
+    assert!(file.contains("web UI at http://"), "{file}");
+}

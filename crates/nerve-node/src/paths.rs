@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use nerve_policy::protected::{Platform, WinFolders};
 
 /// The node's config directory (`node.toml`, keys) and state directory
-/// (control socket, audit log, the config's MAC key). Tests point both at
+/// (control socket, audit log, log, the config's MAC key). Tests point both at
 /// temporary folders.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NodePaths {
@@ -57,6 +57,12 @@ impl NodePaths {
 
     pub fn audit_log(&self) -> PathBuf {
         self.state_dir.join("audit.jsonl")
+    }
+
+    /// The log (docs/user/logs.md): what the node did, apart from the audit
+    /// log, which is what it decided.
+    pub fn log_file(&self) -> PathBuf {
+        nerve_transport::log::file_in(&self.state_dir)
     }
 
     /// The key of the MAC over `node.toml`. It is not beside the file it

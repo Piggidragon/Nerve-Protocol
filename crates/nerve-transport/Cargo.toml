@@ -1,6 +1,6 @@
 [package]
 name = "nerve-transport"
-description = "Nerve Protocol transport: TLS pinning, loopback rule, CONNECT proxies, WebSocket link, node keys, small HTTP, control sockets."
+description = "Nerve Protocol transport: TLS pinning, loopback rule, CONNECT proxies, WebSocket link, node keys, small HTTP, control sockets, the log."
 version.workspace = true
 edition.workspace = true
 repository.workspace = true
@@ -19,6 +19,9 @@ httparse.workspace = true
 ring.workspace = true
 base64.workspace = true
 rcgen.workspace = true
+# The log both programs write: a tracing layer and the subscriber that holds it.
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

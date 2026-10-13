@@ -202,7 +202,9 @@ pub trait Folders {
     ) -> io::Result<Option<String>>;
     /// The first file below the folder `dir` with more than one name (hard
     /// links), and how many it has; `None` for a file or when there is none.
-    fn linked(&mut self, dir: &Path) -> io::Result<Option<(PathBuf, u64)>>;
+    /// `grants` are the paths of every wanted and recorded grant, for the
+    /// build-folder exception (`linked_below`).
+    fn linked(&mut self, dir: &Path, grants: &[PathBuf]) -> io::Result<Option<(PathBuf, u64)>>;
 }
 
 /// What [`Folders::look`] saw at a path.
@@ -258,8 +260,8 @@ fn written_in(path: &Path, want: &[Grant], record: &[Grant]) -> bool {
 /// more than one name (a hard link) shares its list with its other names,
 /// which may be in a folder the commands may only write. Commands may have
 /// linked it there, so the change is refused until the link is gone.
-fn held(folders: &mut impl Folders, path: &Path) -> Option<String> {
-    match folders.linked(path) {
+fn held(folders: &mut impl Folders, path: &Path, grants: &[PathBuf]) -> Option<String> {
+    match folders.linked(path, grants) {
         Ok(None) => None,
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
         Ok(Some((file, names))) => Some(format!(
@@ -274,21 +276,19 @@ fn held(folders: &mut impl Folders, path: &Path) -> Option<String> {
     }
 }
 
-/// The folders build tools fill with hard links between names of their
-/// own: cargo's `target`, `node_modules`, a Python `.venv`. Matched by the
+/// The folder cargo fills with hard links between names of its own: each
+/// program and test is built under two names in `target`. Matched by the
 /// whole name of a folder, never by a start of one.
 #[cfg(any(windows, test))]
-const BUILD_FOLDERS: [&str; 3] = ["target", "node_modules", ".venv"];
+const BUILD_FOLDER: &str = "target";
 
 /// Whether a folder of `rest` (a path below another, without its last
-/// part, the file's name) is named as one of [`BUILD_FOLDERS`].
+/// part, the file's name) is named [`BUILD_FOLDER`].
 #[cfg(any(windows, test))]
 fn in_build_folder(rest: &Path) -> bool {
     let mut parts: Vec<_> = rest.components().collect();
     parts.pop();
-    parts
-        .iter()
-        .any(|c| BUILD_FOLDERS.iter().any(|b| c.as_os_str() == *b))
+    parts.iter().any(|c| c.as_os_str() == BUILD_FOLDER)
 }
 
 /// The first file below the folder `dir` with more than one name, by
@@ -298,14 +298,18 @@ fn in_build_folder(rest: &Path) -> bool {
 /// not a folder (`count` opens it as itself), so a file that is a reparse
 /// point of another kind is checked too.
 ///
-/// One exception, for what build tools make: a file below a build folder
-/// of `dir` ([`BUILD_FOLDERS`]) whose every name (`names`, resolved) lies
-/// inside `dir`, each below a build folder of it, passes. Such a link has
-/// all its names under the same grant and gains nothing from the change. A
-/// file with a name anywhere else, outside `dir` too, is still found.
+/// One exception, for what cargo makes: a file below a [`BUILD_FOLDER`] of
+/// `dir` passes when `names` lists all of its names (as many as `count`
+/// gives), every one inside `dir` (compared resolved), below a build folder
+/// of it, and held by exactly the same of `grants` (the paths of every
+/// wanted and recorded grant, of any container) as the walked name. Such a
+/// link gains nothing from the change: every name gets the same rights. A
+/// file with a name anywhere else is still found, and so is one whose
+/// names cannot all be listed.
 #[cfg(any(windows, test))]
 fn linked_below(
     dir: &Path,
+    grants: &[PathBuf],
     count: &dyn Fn(&Path) -> io::Result<u64>,
     names: &dyn Fn(&Path) -> io::Result<Vec<PathBuf>>,
 ) -> io::Result<Option<(PathBuf, u64)>> {
@@ -316,7 +320,16 @@ fn linked_below(
     // The place the names are compared with; one that cannot be resolved
     // holds no name, so nothing passes.
     let real_dir = nerve_policy::paths::resolve(dir).ok();
-    let own = |path: &Path| -> io::Result<bool> {
+    // The grants that hold a place, by their place in `grants`.
+    let held_by = |p: &Path| -> Vec<usize> {
+        grants
+            .iter()
+            .enumerate()
+            .filter(|(_, g)| within(p, g))
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let own = |path: &Path, n: u64| -> io::Result<bool> {
         let Some(real_dir) = &real_dir else {
             return Ok(false);
         };
@@ -325,10 +338,16 @@ fn linked_below(
             return Ok(false);
         }
         let depth = real_dir.components().count();
-        Ok(names(path)?.iter().all(|n| {
-            let rest: PathBuf = n.components().skip(depth).collect();
-            within(n, real_dir) && !within(real_dir, n) && in_build_folder(&rest)
-        }))
+        let mine = held_by(&real_dir.join(rest));
+        let all = names(path)?;
+        Ok(all.len() as u64 >= n
+            && all.iter().all(|name| {
+                let rest: PathBuf = name.components().skip(depth).collect();
+                within(name, real_dir)
+                    && !within(real_dir, name)
+                    && in_build_folder(&rest)
+                    && held_by(name) == mine
+            }))
     };
     let gone = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
     let mut todo = vec![dir.to_path_buf()];
@@ -358,11 +377,20 @@ fn linked_below(
             if n < 2 {
                 continue;
             }
-            match own(&path) {
+            match own(&path, n) {
                 Ok(true) => {}
                 Ok(false) => return Ok(Some((path, n))),
-                Err(e) if gone(&e) => {}
-                Err(e) => return Err(e),
+                // Gone meanwhile; a listing that fails for a file that is
+                // still there (a path too long for it, say) passes nothing.
+                Err(e)
+                    if gone(&e)
+                        && matches!(std::fs::symlink_metadata(&path), Err(m) if gone(&m)) => {}
+                Err(e) => {
+                    return Err(io::Error::other(format!(
+                        "cannot list the names of {}: {e}",
+                        path.display()
+                    )));
+                }
             }
         }
     }
@@ -474,6 +502,8 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
         Err(e) => return out.not_known(e),
     };
     let mut out = out;
+    // Where every wanted and recorded grant is, for the hard-link check.
+    let places: Vec<PathBuf> = want.iter().chain(&record).map(|g| g.path.clone()).collect();
     let gone = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
     let mut kept: Vec<Grant> = Vec::new();
     let mut changed = false;
@@ -509,7 +539,7 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
                 None => {
                     // Taking it off passes the change down too.
                     let hold = written_in(&old.path, want, &record)
-                        .then(|| held(folders, &old.path))
+                        .then(|| held(folders, &old.path, &places))
                         .flatten();
                     match hold.map_or_else(
                         || folders.set(&old.path, &old.container, None, false),
@@ -554,7 +584,7 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
                 let hold = (old.access.write
                     || written_in(&old.path, want, &record)
                     || written_in(&now, want, &record))
-                .then(|| held(folders, &now))
+                .then(|| held(folders, &now, &places))
                 .flatten();
                 match hold.map_or_else(
                     || folders.set(&now, &old.container, None, false),
@@ -623,7 +653,7 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
                 for w in todo {
                     // Refused before anything changed: what was there stays.
                     if let Some(why) = written_in(&w.path, want, &record)
-                        .then(|| held(folders, &w.path))
+                        .then(|| held(folders, &w.path, &places))
                         .flatten()
                     {
                         out.errors.push(why);
@@ -748,9 +778,10 @@ impl Folders for Acls {
         Ok(id.map(|i| i.to_string()))
     }
 
-    fn linked(&mut self, dir: &Path) -> io::Result<Option<(PathBuf, u64)>> {
+    fn linked(&mut self, dir: &Path, grants: &[PathBuf]) -> io::Result<Option<(PathBuf, u64)>> {
         linked_below(
             dir,
+            grants,
             &|p| nerve_sandbox::appcontainer::names(p).map(u64::from),
             &|p| nerve_sandbox::appcontainer::all_names(p),
         )
@@ -933,7 +964,11 @@ mod tests {
             }
             Ok(Some(id))
         }
-        fn linked(&mut self, dir: &Path) -> io::Result<Option<(PathBuf, u64)>> {
+        fn linked(
+            &mut self,
+            dir: &Path,
+            _grants: &[PathBuf],
+        ) -> io::Result<Option<(PathBuf, u64)>> {
             Ok(self
                 .linked
                 .iter()
@@ -1357,77 +1392,140 @@ mod tests {
         std::os::unix::fs::symlink(&outside, dir.join("a/link")).unwrap();
         let count = |p: &Path| std::fs::symlink_metadata(p).map(|m| m.nlink());
         let names = |p: &Path| names_below(&root, p);
-        assert_eq!(linked_below(&dir, &count, &names).unwrap(), None);
-        assert_eq!(
-            linked_below(&dir.join("a/b/one.txt"), &count, &names).unwrap(),
-            None
-        );
+        let walk = |d: &Path| linked_below(d, std::slice::from_ref(&dir), &count, &names).unwrap();
+        assert_eq!(walk(&dir), None);
+        assert_eq!(walk(&dir.join("a/b/one.txt")), None);
         std::fs::hard_link(outside.join("secret.txt"), dir.join("a/b/s")).unwrap();
-        assert_eq!(
-            linked_below(&dir, &count, &names).unwrap(),
-            Some((dir.join("a/b/s"), 3))
-        );
+        assert_eq!(walk(&dir), Some((dir.join("a/b/s"), 3)));
         std::fs::remove_file(dir.join("a/b/s")).unwrap();
-        assert_eq!(linked_below(&dir, &count, &names).unwrap(), None);
+        assert_eq!(walk(&dir), None);
     }
 
-    /// A file in a build folder (`target`, `node_modules`, `.venv`) whose
-    /// names all lie in build folders of the same project passes, as cargo
-    /// makes them. A link from such a folder to a file outside the project,
-    /// a link between a build folder and another folder of the project, and
-    /// a folder whose name only starts like one are still found.
+    /// A project with real hard links: `proj` granted, `drop` outside it.
     #[cfg(unix)]
-    #[test]
-    fn build_folders_pass_with_their_own_links_only() {
-        use std::os::unix::fs::MetadataExt;
-        let d = tempfile::tempdir().unwrap();
-        let root = std::fs::canonicalize(d.path()).unwrap();
-        let (proj, outside) = (root.join("proj"), root.join("outside"));
-        let count = |p: &Path| std::fs::symlink_metadata(p).map(|m| m.nlink());
-        let names = |p: &Path| names_below(&root, p);
-        let link = |from: &str, to: &str| {
-            let (from, to) = (proj.join(from), proj.join(to));
+    struct Project {
+        _d: tempfile::TempDir,
+        root: PathBuf,
+        proj: PathBuf,
+    }
+
+    #[cfg(unix)]
+    impl Project {
+        fn new() -> Project {
+            let d = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(d.path()).unwrap();
+            let proj = root.join("proj");
+            std::fs::create_dir_all(&proj).unwrap();
+            Project { _d: d, root, proj }
+        }
+        /// Makes the file `from` (below the root) and links it as `to`.
+        fn link(&self, from: &str, to: &str) -> PathBuf {
+            let (from, to) = (self.root.join(from), self.root.join(to));
             for p in [&from, &to] {
                 std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             }
-            std::fs::write(&from, "x").unwrap();
+            if !from.exists() {
+                std::fs::write(&from, "x").unwrap();
+            }
             std::fs::hard_link(&from, &to).unwrap();
+            to
+        }
+        /// The walk of `proj` with these grants (below the root).
+        fn walk(&self, grants: &[&str]) -> Option<(PathBuf, u64)> {
+            use std::os::unix::fs::MetadataExt;
+            let grants: Vec<PathBuf> = grants.iter().map(|g| self.root.join(g)).collect();
+            let count = |p: &Path| std::fs::symlink_metadata(p).map(|m| m.nlink());
+            let names = |p: &Path| names_below(&self.root, p);
+            linked_below(&self.proj, &grants, &count, &names).unwrap()
+        }
+    }
+
+    /// A file in a `target` folder whose names all lie in `target` folders of
+    /// the same project, under the same grants, passes, as cargo makes them.
+    /// `node_modules` and `.venv` get no such pass, and neither does a folder
+    /// whose name only starts like `target`, a link from `target` to another
+    /// folder of the project, or one to a file outside it, also when that
+    /// file lies in a folder named `target` too.
+    #[cfg(unix)]
+    #[test]
+    fn target_passes_with_its_own_links_only() {
+        let p = Project::new();
+        p.link("proj/target/debug/demo", "proj/target/debug/deps/demo-0123");
+        assert_eq!(p.walk(&["proj"]), None);
+
+        for (from, to) in [
+            (
+                "proj/node_modules/a/index.js",
+                "proj/node_modules/b/index.js",
+            ),
+            ("proj/.venv/lib/x.py", "proj/.venv/lib/y.py"),
+            ("proj/target/debug/lib.rlib", "proj/src/lib.rlib"),
+            ("proj/targets/a", "proj/targets/b"),
+            ("drop/target/secret", "proj/target/debug/s"),
+        ] {
+            let to = p.link(from, to);
+            // Also where no grant holds the folder, as for a folder that
+            // was moved: then only the place of each name counts.
+            for grants in [&["proj", "drop"][..], &[]] {
+                let found = p.walk(grants);
+                assert!(found.is_some(), "{from} -> {}: {found:?}", to.display());
+            }
+            std::fs::remove_file(&to).unwrap();
+            assert_eq!(p.walk(&["proj", "drop"]), None, "{from}");
+        }
+    }
+
+    /// Two names in `target` folders of the project that lie under
+    /// different grants are refused: the change would give the file the
+    /// rights of each, so a command could read through one what it may only
+    /// write through the other. Also with grants of two pairings.
+    #[cfg(unix)]
+    #[test]
+    fn target_links_between_two_grants_are_refused() {
+        let p = Project::new();
+        let x = p.link("proj/target/secret.bin", "proj/target/work/x");
+        assert_eq!(p.walk(&["proj"]), None, "one grant holds both");
+        assert!(p.walk(&["proj", "proj/target/work"]).is_some());
+        assert!(
+            p.walk(&["proj", "proj/target", "proj/target/work"])
+                .is_some()
+        );
+        std::fs::remove_file(&x).unwrap();
+        assert_eq!(p.walk(&["proj", "proj/target/work"]), None);
+    }
+
+    /// A file whose names cannot all be listed passes nothing: a listing
+    /// that fails while the file is there (as for a path too long for it)
+    /// stops the walk, and a listing with fewer names than the file has
+    /// finds it.
+    #[cfg(unix)]
+    #[test]
+    fn names_that_cannot_be_listed_pass_nothing() {
+        let p = Project::new();
+        let x = p.link("proj/target/a", "proj/target/b");
+        let grants = [p.proj.clone()];
+        let count = |_: &Path| Ok(2);
+        let failing =
+            |_: &Path| -> io::Result<Vec<PathBuf>> { Err(io::ErrorKind::NotFound.into()) };
+        let e = linked_below(&p.proj, &grants, &count, &failing).unwrap_err();
+        assert_ne!(e.kind(), io::ErrorKind::NotFound, "{e}");
+        let short = |q: &Path| -> io::Result<Vec<PathBuf>> { Ok(vec![q.to_path_buf()]) };
+        assert!(
+            linked_below(&p.proj, &grants, &count, &short)
+                .unwrap()
+                .is_some()
+        );
+        // Gone meanwhile (removed while its names are listed): the walk
+        // goes on.
+        let vanish = |q: &Path| -> io::Result<Vec<PathBuf>> {
+            std::fs::remove_file(q)?;
+            Err(io::ErrorKind::NotFound.into())
         };
-        std::fs::create_dir_all(&outside).unwrap();
-        link("target/debug/demo", "target/debug/deps/demo-0123");
-        link("node_modules/a/index.js", "node_modules/b/index.js");
-        link(".venv/lib/x.py", ".venv/lib/y.py");
-        assert_eq!(linked_below(&proj, &count, &names).unwrap(), None);
-
-        // A name outside the project, from node_modules.
-        std::fs::write(outside.join("secret.txt"), "x").unwrap();
-        let s = proj.join("node_modules/a/s");
-        std::fs::hard_link(outside.join("secret.txt"), &s).unwrap();
         assert_eq!(
-            linked_below(&proj, &count, &names).unwrap(),
-            Some((s.clone(), 2))
+            linked_below(&p.proj, &grants, &count, &vanish).unwrap(),
+            None
         );
-        std::fs::remove_file(&s).unwrap();
-
-        // A name in the project outside any build folder.
-        link("target/debug/lib.rlib", "src/lib.rlib");
-        let found = linked_below(&proj, &count, &names).unwrap();
-        assert!(
-            found.as_ref().is_some_and(|(p, _)| p.ends_with("lib.rlib")),
-            "{found:?}"
-        );
-        std::fs::remove_file(proj.join("src/lib.rlib")).unwrap();
-        assert_eq!(linked_below(&proj, &count, &names).unwrap(), None);
-
-        // A folder named like one only at the start.
-        link("targets/a", "targets/b");
-        let found = linked_below(&proj, &count, &names).unwrap();
-        assert!(
-            found
-                .as_ref()
-                .is_some_and(|(p, _)| p.starts_with(proj.join("targets"))),
-            "{found:?}"
-        );
+        assert!(!x.exists() || !p.proj.join("target/a").exists());
     }
 
     /// Without a state folder and with nothing wanted, a sync makes neither
@@ -1830,15 +1928,15 @@ mod tests {
             .1
     }
 
-    /// On Windows: a project whose build folders (`target`, `node_modules`,
-    /// `.venv`) hold links between names of their own gets its grant,
-    /// changes it and loses it, also after a move. A link from
-    /// `node_modules` to a file outside the project still stops a change, a
-    /// take-off and a take-off after a move, and the outside file's list
-    /// stays as it was.
+    /// On Windows: a project whose `target` holds links between names of
+    /// its own, as cargo builds them, gets its grant, changes it and loses
+    /// it, also after a move. A link from `target` to a file outside the
+    /// project (also one below a folder named `target` there) still stops a
+    /// change, a take-off and a take-off after a move, and the outside
+    /// file's list stays as it was.
     #[cfg(windows)]
     #[test]
-    fn build_folders_with_their_own_links_keep_working() {
+    fn a_built_project_keeps_working() {
         let d = tempfile::tempdir().unwrap();
         let root = canonical(d.path());
         let paths = NodePaths::new(root.join("config"), root.join("state"));
@@ -1855,8 +1953,6 @@ mod tests {
             "target\\debug\\demo.exe",
             "target\\debug\\deps\\demo-0123.exe",
         );
-        link("node_modules\\a\\index.js", "node_modules\\b\\index.js");
-        link(".venv\\Lib\\x.py", ".venv\\Lib\\y.py");
         std::fs::create_dir_all(&outside).unwrap();
         let lab = container(&paths, "lab");
         let platform = crate::paths::platform();
@@ -1878,15 +1974,16 @@ mod tests {
         assert!(s.errors.is_empty(), "{s:?}");
         assert!(carries(&proj, &lab, "rwx"), "{}", icacls(&proj));
 
-        // A link from node_modules to a file outside: a change and a
-        // take-off are refused.
-        let secret = outside.join("secret.txt");
+        // A link from target to a file outside: a change and a take-off
+        // are refused.
+        let secret = outside.join("target\\secret.txt");
+        std::fs::create_dir_all(secret.parent().unwrap()).unwrap();
         std::fs::write(&secret, "secret").unwrap();
-        std::fs::hard_link(&secret, proj.join("node_modules\\a\\s")).unwrap();
+        std::fs::hard_link(&secret, proj.join("target\\debug\\s")).unwrap();
         let before = icacls(&secret);
         let refused = |s: &Synced| {
             s.errors.len() == 1
-                && s.errors[0].contains("node_modules")
+                && s.errors[0].contains("target\\debug\\s")
                 && s.errors[0].contains("hard links")
         };
         let s = windows_sync(&paths, &want(Some("rw")));
@@ -1905,7 +2002,7 @@ mod tests {
         assert_eq!(icacls(&secret), before);
 
         // Without the outside link, the moved project loses its grant.
-        std::fs::remove_file(proj2.join("node_modules\\a\\s")).unwrap();
+        std::fs::remove_file(proj2.join("target\\debug\\s")).unwrap();
         let s = windows_sync(&paths, &want(Some("rwx")));
         assert!(s.errors.is_empty() && s.stale.is_empty(), "{s:?}");
         assert_eq!(s.removed, 1, "{s:?}");

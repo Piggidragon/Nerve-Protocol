@@ -765,21 +765,54 @@ pub mod appcontainer {
         Ok(info.nNumberOfLinks)
     }
 
+    /// `path` whole and with the `\\?\` prefix, which Windows takes past
+    /// the 260 characters of a plain path, as Rust's own file calls do.
+    fn verbatim(path: &Path) -> io::Result<Vec<u16>> {
+        let abs: Vec<u16> = std::path::absolute(path)?
+            .as_os_str()
+            .encode_wide()
+            .collect();
+        let w = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        let out = if abs.starts_with(&w(r"\\?\")) || abs.starts_with(&w(r"\\.\")) {
+            abs
+        } else if let Some(rest) = abs.strip_prefix(&w(r"\\")[..]) {
+            [w(r"\\?\UNC\"), rest.to_vec()].concat()
+        } else {
+            [w(r"\\?\"), abs].concat()
+        };
+        Ok(out.into_iter().chain(std::iter::once(0)).collect())
+    }
+
+    /// `path` without the `\\?\` prefix, as the policy compares paths.
+    fn plain(path: Vec<u16>) -> PathBuf {
+        let w = |s: &str| s.encode_utf16().collect::<Vec<u16>>();
+        let out = if let Some(rest) = path.strip_prefix(&w(r"\\?\UNC\")[..]) {
+            [w(r"\\"), rest.to_vec()].concat()
+        } else if let Some(rest) = path.strip_prefix(&w(r"\\?\")[..]) {
+            rest.to_vec()
+        } else {
+            path
+        };
+        PathBuf::from(std::ffi::OsString::from_wide(&out))
+    }
+
     /// Every name (hard link) of the file at `path`, as whole paths on its
     /// volume. Windows lists them without the volume, so each is joined to
     /// the folder the volume of `path` is reached by (`C:\`, or a folder it
-    /// is mounted in).
+    /// is mounted in). `path` goes to Windows with the `\\?\` prefix, so a
+    /// path past 260 characters is listed too; the names come back without
+    /// it.
     pub fn all_names(path: &Path) -> io::Result<Vec<PathBuf>> {
         use windows_sys::Win32::Foundation::{ERROR_HANDLE_EOF, ERROR_MORE_DATA};
         use windows_sys::Win32::Storage::FileSystem::{
             FindClose, FindFirstFileNameW, FindNextFileNameW, GetVolumePathNameW,
         };
-        let p = wide(path.as_os_str());
-        let mut vol = vec![0u16; 1024];
+        let p = verbatim(path)?;
+        let mut vol = vec![0u16; p.len() + 64];
         // SAFETY: a NUL-terminated path and a buffer of the length given.
         check(unsafe { GetVolumePathNameW(p.as_ptr(), vol.as_mut_ptr(), vol.len() as u32) })?;
         let n = vol.iter().position(|&c| c == 0).unwrap_or(vol.len());
-        let volume = PathBuf::from(std::ffi::OsString::from_wide(&vol[..n]));
+        let volume = plain(vol[..n].to_vec());
         let mut buf = vec![0u16; 512];
         let mut out = Vec::new();
         let mut take = |buf: &[u16], len: u32| {

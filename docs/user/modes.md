@@ -176,17 +176,19 @@ folders.
   write-only folder whose files commands must not read on a drive where the
   pairing can write nowhere that it can also read or run programs, also
   through a folder above.
-- Build tools make hard links of their own. A file in a folder named
-  exactly `target`, `node_modules` or `.venv` inside the folder passes the
-  check when all its names lie in such folders of the same granted folder,
-  as cargo makes them in `target`. Any other second name is still refused,
-  also one in such a folder whose other name lies outside the granted folder:
-  pnpm links `node_modules` to its store, uv links a `.venv` to its cache,
-  and a local `git clone` links its objects. A folder that holds such links
-  does not get its entry, and its entry is not changed or taken off. A
-  refused removal stops that pairing's commands, and `uninstall` leaves the
-  entry on, until the links are gone. Keep them out of granted folders:
-  pnpm's `package-import-method=copy`, `UV_LINK_MODE=copy`, `git clone
+- Build tools make hard links of their own. cargo builds each program
+  under two names in `target`, so a file in a folder named exactly `target`
+  inside the folder passes the check when every one of its names lies in
+  such a folder of the same granted folder, under the same grants. Any other
+  second name is still refused, also a `target` file whose other name lies
+  outside the folder or under another grant, and one whose names Windows
+  cannot list. Other tools' links are refused too: pnpm links
+  `node_modules` to its store, uv links a `.venv` to its cache, and a local
+  `git clone` links its objects. A folder that holds such links does not get
+  its entry, and its entry is not changed or taken off. A refused removal
+  stops that pairing's commands, and `uninstall` leaves the entry on, until
+  the links are gone. Keep them out of granted folders: pnpm's
+  `package-import-method=copy`, `UV_LINK_MODE=copy`, `git clone
   --no-hardlinks`. Or remove them (delete `node_modules` or `.venv`) before
   you add, change or remove the folder.
 

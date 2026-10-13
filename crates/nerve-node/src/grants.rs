@@ -84,6 +84,22 @@ pub fn wanted(cfg: &NodeConfig, paths: &NodePaths, home: &Path, platform: &Platf
         .collect()
 }
 
+/// The grants a node wants on this machine: [`wanted`], or none on the
+/// installed service (`installed`), whose commands run as another account
+/// and never in a container (crate::daemon), so their grants come off.
+pub fn wanted_on(
+    installed: bool,
+    cfg: &NodeConfig,
+    paths: &NodePaths,
+    home: &Path,
+    platform: &Platform,
+) -> Vec<Grant> {
+    if installed {
+        return Vec::new();
+    }
+    wanted(cfg, paths, home, platform)
+}
+
 /// What [`sync`] left.
 #[derive(Debug, Default)]
 pub struct Synced {
@@ -207,7 +223,8 @@ pub fn sync(
 pub fn apply(paths: &NodePaths, cfg: &NodeConfig, home: &Path) -> Synced {
     #[cfg(windows)]
     {
-        let want = wanted(cfg, paths, home, &crate::paths::platform());
+        let installed = crate::service::is_service_node(paths);
+        let want = wanted_on(installed, cfg, paths, home, &crate::paths::platform());
         windows_sync(paths, &want)
     }
     #[cfg(not(windows))]
@@ -225,10 +242,10 @@ pub fn remove_all(paths: &NodePaths, centers: &[String]) -> Synced {
         let mut s = windows_sync(paths, &[]);
         for c in centers {
             let name = container(paths, c);
-            if !s.emptied.contains(&name) {
-                if let Err(e) = nerve_sandbox::appcontainer::remove_profile(&name) {
-                    s.errors.push(e.to_string());
-                }
+            if !s.emptied.contains(&name)
+                && let Err(e) = nerve_sandbox::appcontainer::remove_profile(&name)
+            {
+                s.errors.push(e.to_string());
             }
         }
         s
@@ -472,6 +489,10 @@ mod tests {
                 access: Access::parse("r").unwrap(),
             }]
         );
+        // The installed service runs no command in a container, so it
+        // wants none of these, and those it has come off.
+        assert_eq!(wanted_on(false, &cfg, &paths, &home, &Platform::Unix), want);
+        assert!(wanted_on(true, &cfg, &paths, &home, &Platform::Unix).is_empty());
     }
 
     /// The access list of `path` as icacls prints it.

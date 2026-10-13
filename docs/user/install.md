@@ -55,6 +55,16 @@ In PowerShell, compare each hash with its line in `SHA256SUMS`:
 Then rename the files to `nerve-center.exe` and `nerve-node.exe` and put them
 in a folder on your `PATH`.
 
+To run the node as a service that starts with the machine, let it install
+itself instead, in a terminal opened with "Run as administrator"
+([service](service.md#windows)):
+
+```powershell
+.\nerve-node-x86_64-windows.exe install
+```
+
+`install` puts the program at `C:\Program Files\Nerve\nerve-node.exe`.
+
 ## Build from source
 
 See [building](../dev/building.md).
@@ -68,7 +78,8 @@ See [building](../dev/building.md).
 | Center: identity, paired machines, statistics, [log](logs.md) | `$XDG_STATE_HOME/nerve-center`, else `~/.local/state/nerve-center` | `%LOCALAPPDATA%\nerve-center` | `--state-dir`, `NERVE_STATE_DIR` |
 
 A node [installed as a service](service.md) keeps its files in `/etc/nerve`
-and `/var/lib/nerve/state`. Without `--config-dir` and `--state-dir` the
+and `/var/lib/nerve/state`, on Windows in `C:\ProgramData\Nerve\config` and
+`C:\ProgramData\Nerve\state`. Without `--config-dir` and `--state-dir` the
 commands use those folders.
 
 Both programs read `NERVE_STATE_DIR`. On a machine that runs both, set it per

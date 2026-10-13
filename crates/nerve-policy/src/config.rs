@@ -115,7 +115,7 @@ pub enum SecretStorage {
     /// A 0600 key file per center below the config directory.
     #[default]
     File,
-    /// The system keyring. Not done in 0.0.1.
+    /// The system keyring. Not done.
     Keyring,
 }
 

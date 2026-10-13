@@ -14,25 +14,29 @@ fn main() {
     // takes its level from `node.toml`.
     nerve_transport::log::install(nerve_transport::log::Level::Info, true);
     let cli = nerve_node::cli::Cli::parse();
+    // The installed node on Windows runs under the service control manager,
+    // which takes the main thread.
+    #[cfg(windows)]
+    if let Some(log) = nerve_node::cli::service_log(&cli) {
+        std::process::exit(nerve_node::win_service::serve(
+            Box::new(move || run(cli)),
+            log,
+        ));
+    }
+    if let Err(e) = run(cli) {
+        eprintln!("nerve-node: {e}");
+        std::process::exit(1);
+    }
+}
+
+fn run(cli: nerve_node::cli::Cli) -> Result<(), String> {
     // Before the runtime starts threads: root's command on the installed
     // node runs as the node's user.
-    if let Err(e) = nerve_node::cli::settle_user(&cli) {
-        eprintln!("nerve-node: {e}");
-        std::process::exit(1);
-    }
-    let rt = match tokio::runtime::Builder::new_multi_thread()
+    nerve_node::cli::settle_user(&cli)?;
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
-    {
-        Ok(rt) => rt,
-        Err(e) => {
-            eprintln!("nerve-node: cannot start the runtime: {e}");
-            std::process::exit(1);
-        }
-    };
+        .map_err(|e| format!("cannot start the runtime: {e}"))?;
     let mut out = std::io::stdout();
-    if let Err(e) = rt.block_on(nerve_node::cli::execute(cli, &mut out)) {
-        eprintln!("nerve-node: {e}");
-        std::process::exit(1);
-    }
+    rt.block_on(nerve_node::cli::execute(cli, &mut out))
 }

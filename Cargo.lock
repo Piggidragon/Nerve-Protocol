@@ -941,7 +941,7 @@ dependencies = [
 
 [[package]]
 name = "nerve-center"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "clap",
  "futures-util",
@@ -963,7 +963,7 @@ dependencies = [
 
 [[package]]
 name = "nerve-conformance"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "futures-util",
  "nerve-proto",
@@ -976,7 +976,7 @@ dependencies = [
 
 [[package]]
 name = "nerve-node"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -1003,7 +1003,7 @@ dependencies = [
 
 [[package]]
 name = "nerve-policy"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "globset",
  "nerve-proto",
@@ -1017,7 +1017,7 @@ dependencies = [
 
 [[package]]
 name = "nerve-proto"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -1025,7 +1025,7 @@ dependencies = [
 
 [[package]]
 name = "nerve-sandbox"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "landlock",
  "libc",
@@ -1037,7 +1037,7 @@ dependencies = [
 
 [[package]]
 name = "nerve-transport"
-version = "0.0.1"
+version = "0.0.2"
 dependencies = [
  "base64 0.22.1",
  "httparse",

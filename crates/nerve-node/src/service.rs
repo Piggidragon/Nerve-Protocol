@@ -52,20 +52,49 @@ pub struct Layout {
 }
 
 impl Layout {
-    /// The places on this machine.
+    /// The places on this machine. On Windows the program goes to
+    /// `%ProgramFiles%\Nerve` and the folders to `%ProgramData%\Nerve`; the
+    /// service is registered with the service control manager, so there is
+    /// no unit file ([`crate::winsvc`]).
     pub fn system() -> Layout {
+        let release = concat!(env!("CARGO_PKG_REPOSITORY"), "/releases/latest/download").into();
+        if cfg!(windows) {
+            let var = |k: &str, or: &str| {
+                std::env::var_os(k)
+                    .filter(|v| !v.is_empty())
+                    .map_or_else(|| PathBuf::from(or), PathBuf::from)
+            };
+            let data = var("ProgramData", "C:\\ProgramData").join("Nerve");
+            return Layout {
+                unit: PathBuf::new(),
+                bin: var("ProgramFiles", "C:\\Program Files")
+                    .join("Nerve")
+                    .join("nerve-node.exe"),
+                paths: NodePaths::new(data.join("config"), data.join("state")),
+                home: data,
+                release,
+            };
+        }
         Layout {
             unit: PathBuf::from("/etc/systemd/system").join(UNIT_NAME),
             bin: "/usr/local/bin/nerve-node".into(),
             home: "/var/lib/nerve".into(),
             paths: NodePaths::new("/etc/nerve", "/var/lib/nerve/state"),
-            release: concat!(env!("CARGO_PKG_REPOSITORY"), "/releases/latest/download").into(),
+            release,
         }
     }
 
-    /// Whether `install` put the node here: its unit is in place.
+    /// Whether `install` put the node here: its unit is in place, or on
+    /// Windows its service is registered.
     pub fn installed(&self) -> bool {
-        cfg!(target_os = "linux") && self.unit.is_file()
+        #[cfg(windows)]
+        {
+            crate::win_host::service_registered()
+        }
+        #[cfg(not(windows))]
+        {
+            cfg!(target_os = "linux") && self.unit.is_file()
+        }
     }
 
     /// The service unit. The node runs as its own user with the folders
@@ -117,13 +146,13 @@ pub fn is_service_node(paths: &NodePaths) -> bool {
     if *paths == Layout::system().paths {
         return true;
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
-        let me = nerve_transport::net::euid();
+        let me = crate::account::own_uid();
         me != 0
             && matches!(crate::account::lookup(USER), Ok(Some(a)) if a.uid == me && a.comment == USER_MARK)
     }
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     false
 }
 
@@ -351,13 +380,13 @@ fn failure(o: &std::process::Output) -> String {
 }
 
 /// The steps a command did, shown as they are done and audited at its end.
-struct Steps<'a> {
-    done: Vec<String>,
-    out: &'a mut dyn Write,
+pub(crate) struct Steps<'a> {
+    pub(crate) done: Vec<String>,
+    pub(crate) out: &'a mut dyn Write,
 }
 
 impl Steps<'_> {
-    fn did(&mut self, step: impl Into<String>) {
+    pub(crate) fn did(&mut self, step: impl Into<String>) {
         let step = step.into();
         let _ = writeln!(self.out, "{step}");
         self.done.push(step);
@@ -386,7 +415,7 @@ fn supported(sys: &dyn System, what: &str) -> Result<(), String> {
 /// root (by `uninstall`, or one an earlier uninstall left) is written as
 /// root, so the log must be a plain file of one name there: a link that was
 /// given away with the folder would otherwise be followed with root's rights.
-fn audit(
+pub(crate) fn audit(
     paths: &NodePaths,
     event: &str,
     steps: &[String],
@@ -764,22 +793,6 @@ fn uninstall_steps(
             layout.unit.display()
         ));
     }
-    // Windows folder mode put grants for the commands' AppContainers on
-    // the owner's folders (crate::grants); none stays behind the node.
-    let centers: Vec<String> =
-        SettingsStore::peek(&layout.paths.config_file(), &layout.paths.config_key())
-            .map(|c| c.centers.iter().map(|c| c.name.clone()).collect())
-            .unwrap_or_default();
-    let synced = crate::grants::remove_all(&layout.paths, &centers);
-    for e in &synced.errors {
-        let _ = writeln!(steps.out, "warning: {e}");
-    }
-    if synced.removed > 0 {
-        steps.did(format!(
-            "took {} folder grants of the commands off",
-            synced.removed
-        ));
-    }
     let folders = [
         &layout.paths.config_dir,
         &layout.home,
@@ -826,10 +839,10 @@ fn uninstall_steps(
 
 /// A version as `nerve-node --version` prints it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct Version(u64, u64, u64);
+pub(crate) struct Version(u64, u64, u64);
 
 impl Version {
-    fn parse(said: &str) -> Option<Version> {
+    pub(crate) fn parse(said: &str) -> Option<Version> {
         let v = said.trim().strip_prefix("nerve-node ")?;
         let mut parts = v.split('.').map(|p| p.parse::<u64>().ok());
         let v = Version(parts.next()??, parts.next()??, parts.next()??);
@@ -956,9 +969,10 @@ async fn update_steps(
 }
 
 /// The release file of this machine's program.
-fn asset_name() -> Result<String, String> {
+pub(crate) fn asset_name() -> Result<String, String> {
     match std::env::consts::ARCH {
-        arch @ ("x86_64" | "aarch64") => Ok(format!("nerve-node-{arch}-linux")),
+        "x86_64" if cfg!(windows) => Ok("nerve-node-x86_64-windows.exe".into()),
+        arch @ ("x86_64" | "aarch64") if !cfg!(windows) => Ok(format!("nerve-node-{arch}-linux")),
         other => Err(format!(
             "the releases have no program for {other}; build one (docs/dev/building.md) and give it with --from"
         )),
@@ -967,7 +981,7 @@ fn asset_name() -> Result<String, String> {
 
 /// Downloads `asset` from the release at `base` and checks it against the
 /// release's `SHA256SUMS`.
-async fn fetch_release(base: &str, asset: &str) -> Result<Vec<u8>, String> {
+pub(crate) async fn fetch_release(base: &str, asset: &str) -> Result<Vec<u8>, String> {
     nerve_transport::init_crypto();
     let sums = download(&format!("{base}/SHA256SUMS"), SUMS_MAX).await?;
     let want = String::from_utf8_lossy(&sums)
@@ -1055,7 +1069,7 @@ fn split_url(url: &str) -> Result<(nerve_proto::link::CenterUrl, String), String
 
 /// Writes `data` to `path` through a temporary file beside it and a rename,
 /// with `mode`.
-fn write_file(path: &Path, data: &[u8], mode: u32) -> Result<(), String> {
+pub(crate) fn write_file(path: &Path, data: &[u8], mode: u32) -> Result<(), String> {
     let at = |e: std::io::Error| format!("{}: {e}", path.display());
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).map_err(at)?;
@@ -1329,6 +1343,13 @@ pub fn check_access(paths: &NodePaths) -> Result<(), String> {
                 "the node is installed as a service, and its files belong to the user {USER}: run `sudo nerve-node …`"
             ));
         }
+    }
+    // Only `nerve` and the administrators may open the folders.
+    #[cfg(windows)]
+    if !crate::win_host::is_admin() && crate::win_user::current_user().as_deref() != Ok(USER) {
+        return Err(format!(
+            "the node is installed as a service, and its files are open to the user {USER} and the administrators only: run `nerve-node …` in a terminal opened with \"Run as administrator\""
+        ));
     }
     Ok(())
 }

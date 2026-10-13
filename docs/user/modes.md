@@ -92,7 +92,11 @@ every command.
 
 Each pairing's commands run in an AppContainer of their own. Windows lets a
 process there open only what is granted to that container, and what it opens
-to every AppContainer:
+to every AppContainer. This holds for a node you run yourself. The
+[installed service](service.md#windows) runs every command as another account,
+and does not start the AppContainer as that account yet: there `folder` mode
+runs no command (`confinement none`), and the service puts no grants on
+folders.
 
 | A command can | Where |
 |---|---|

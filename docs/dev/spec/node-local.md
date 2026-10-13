@@ -77,7 +77,12 @@ be a plain file with one name; a link or a hard link in its place is not
 written to, and the command says so.
 
 `node.toml` is written private to the owner (mode 0600 on Unix). The daemon
-refuses to run as root unless `machine.allow_root = true`.
+refuses to run as root, or in an elevated token on Windows, unless
+`machine.allow_root = true`; when it runs that way, it logs a warning at
+start (stderr and the node's log file, not the center) that commands then run
+with full rights (on Unix unless `machine.user` names another account; an
+elevated administrator on Windows cannot start a command as another account,
+so its commands keep the node's token), and the owner is responsible.
 
 These two folders are the node's own. No call of a center reaches them, in
 any mode and whatever the rules, folders or `protected.allow` say (§3), and
@@ -97,7 +102,7 @@ Every file the node writes is signed: its first line is
 It sits in the state folder rather than beside `node.toml`, so the key does
 not hang on a setting of the file it checks, and whatever could read the
 config folder would still not hold it. `machine.secret_storage = "keyring"`
-is not done in 0.0.1, for this key as for the center keys.
+is not done, for this key as for the center keys.
 
 A file whose MAC is missing or does not match was changed outside the
 owner's path. It is refused and the refusal is audited (§6): at start-up the
@@ -113,7 +118,7 @@ take another file at its next start: with the key gone, an unsigned file
 counts as one from before the MAC and is signed. The start-up audits that as
 `signed`. In `folder` mode Landlock keeps commands out of the state folder.
 
-On Windows there is no control socket in 0.0.1: the CLI writes the signed
+On Windows there is no control socket: the CLI writes the signed
 file itself, and a running node takes the change at its next start. After
 a change no daemon answered for, the CLI says so in one line ("takes effect
 at the next start of the node").
@@ -239,7 +244,9 @@ again.
   sudo allow list has an entry). On Windows a command runs in an AppContainer
   of its center, which reaches the system folders Windows opens to every
   AppContainer and the paths of the same sets as on Linux, each by a grant
-  for the container on the folder with the rights of its flags. `allow` rules do not count. On Linux a command
+  for the container on the folder with the rights of its flags; the
+  installed Windows service, whose commands run as another account, has no
+  such confinement yet and refuses them. `allow` rules do not count. On Linux a command
   reads the system folders and its `r` folders, writes its `w` folders and
   runs programs from the system folders and its `x` folders (Landlock), each
   flag with its own rule. A folder with `w` and not `r` can be written but
@@ -429,16 +436,16 @@ discarded), run as the account the commands run as (§1, `machine.user` on
 the installed node, else the node's own user), so the password is that
 account's and refuses a wrong one with `invalid_args`; the switch then stays
 as it was. Turning it off drops the password. The password is kept in memory
-only (`secret_storage` at rest is not done in 0.0.1), so a restarted node, or
+only (`secret_storage` at rest is not done), so a restarted node, or
 a `node.toml` that says `on` without a password held, has the switch off. It
 never reaches a center: the node replaces every copy in an outgoing frame and
 in the audit log with `[redacted]`. `machine.sudo` changes only through the
 switch; a value written into the file is turned off at start-up, since no
-password is held. The switch works on Linux only in 0.0.1.
+password is held. The switch works on Linux only.
 
 ## 5. Control socket
 
-`<state>/run/ctl.sock` (Unix only in 0.0.1; on Windows the CLI writes the
+`<state>/run/ctl.sock` (Unix only; on Windows the CLI writes the
 signed `node.toml` itself, §1). One JSON object per line: the client sends
 `{"method", "params"}`, the server answers `{"ok": value}` or
 `{"error": "text"}`, or, for streaming methods, several `{"item": value}`
@@ -461,7 +468,7 @@ or root may talk to it. Methods:
 `owner.check` are refused from a process that runs below a command the node
 started for a center, so on Linux an agent cannot change its own policy
 through the socket, nor install, set up, update or remove the node.
-**Windows in 0.0.1 has no socket and no sandbox:** the CLI signs node.toml
+**Windows has no socket and no sandbox:** the CLI signs node.toml
 itself, so a command the node runs for a center can change the policy, and
 the change applies at the next start. On Windows, allow commands only to
 centers you would also give `settings = write`.

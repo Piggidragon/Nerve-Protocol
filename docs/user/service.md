@@ -1,10 +1,15 @@
 # Run the node as a service
 
-On Linux with systemd, `nerve-node` installs itself as a service. The service
-starts with the machine and runs under a user of its own, `nerve`, which owns
-the node's config and state folders. `install`, `update` and `uninstall` need
-root. On Windows and on Linux without systemd, run `nerve-node run` under your
-own service manager ([pairing](pairing.md#keep-it-running)).
+On Linux with systemd and on Windows, `nerve-node` installs itself as a
+service. The service starts with the machine and runs under a user of its own,
+`nerve`, which owns the node's config and state folders. `install`, `update`
+and `uninstall` need root, on Windows an administrator. On Linux without
+systemd, run `nerve-node run` under your own service manager
+([pairing](pairing.md#keep-it-running)). A node you start yourself as root, or
+elevated on Windows, is refused unless `machine.allow_root` is set, and warns
+at start when it runs
+([root and administrator](platforms.md#root-and-administrator)). Windows
+differs in a few places; see [Windows](#windows).
 
 ## Install
 
@@ -174,11 +179,111 @@ the old uid gets the keys. The account of the commands stays, also one that
 comes back with its pairings, rules and audit log. `--purge` deletes them,
 keys and audit log included.
 
+## Windows
+
+Run these commands in a terminal opened with "Run as administrator":
+
+```powershell
+.\nerve-node-x86_64-windows.exe install
+& "C:\Program Files\Nerve\nerve-node.exe" setup
+Restart-Service nerve-node
+```
+
+`install` does this, and says each step:
+
+1. Makes the local user `nerve`, with a long random password that nobody
+   types; the service manager keeps it. `nerve` may log on as a service and
+   in no other way, and does not show on the sign-in screen. A `nerve` user
+   that `install` did not make is refused.
+2. Makes the folders and gives them an access list of their own: `nerve`,
+   SYSTEM and the administrators, nothing inherited from the folders above.
+3. Sets the account that commands run as: the account that runs `install`.
+   An account chosen before stays. It asks once for that account's password
+   and stores it with DPAPI in the config folder, so only what can open that
+   folder can read it. A stored password that still works is not asked for
+   again.
+4. Copies the program to `C:\Program Files\Nerve\nerve-node.exe`.
+5. Registers the service `nerve-node`, which runs as `nerve`, starts with the
+   machine and starts again after a failure, and starts it. It waits until
+   the node runs.
+
+| What | Where |
+|---|---|
+| `node.toml`, one key per center, the stored password | `C:\ProgramData\Nerve\config` |
+| Audit log, [log](logs.md), config key | `C:\ProgramData\Nerve\state` |
+| The program | `C:\Program Files\Nerve\nerve-node.exe` |
+
+The other commands work on the installed node from an administrator's
+terminal. Windows has no control socket, so the service takes a change at
+its next start: `Restart-Service nerve-node`. `setup` asks no account
+there, and `--create-user` is refused.
+
+To run the commands as another account, an ordinary one, name it and run
+`install` again; it asks for that account's password:
+
+```powershell
+& "C:\Program Files\Nerve\nerve-node.exe" config set machine.user bob
+.\nerve-node-x86_64-windows.exe install
+```
+
+### The account commands run as on Windows
+
+Every command, and the node's file work for a center, runs as that account,
+logged on with its stored password. It must be a local account that has
+signed in once, so it has a profile folder. A command gets the account's
+environment, its profile folder as working folder when the call names none,
+and a job object that ends it with every process it started. While the
+account is not signed in, its registry (`HKCU`) is not loaded: a command
+then gets the usual folders of its profile (`APPDATA`, `TEMP` and so on),
+but not the variables the account set itself. An
+administrator's command runs as UAC gives it to a sign-in: the
+Administrators group only denies. Before a command starts, the node checks
+that the account can open neither the node's folders nor a file in them, and
+refuses it if it can. `install` checks the same.
+
+`folder` mode runs no command on the service yet: its AppContainer is not
+started as another account ([modes](modes.md#what-a-command-can-reach-in-folder-mode-windows)).
+Use `allowlist` or `user` mode for its centers.
+
+UAC is no security boundary: a command of an administrator can get the
+group's rights back and read the keys. `install` warns about an account in
+Administrators or Backup Operators. Choose an ordinary account as above.
+
+If the account's password changes, commands fail until `install` runs again
+and asks for the new one. A Microsoft account works with its Microsoft
+password, which can change outside the machine.
+
+To start a process as that account, the service keeps two privileges,
+`SeAssignPrimaryTokenPrivilege` and `SeIncreaseQuotaPrivilege`. Windows
+takes every other privilege from it, `SeImpersonatePrivilege` included. No
+command gets them.
+
+### Update and uninstall on Windows
+
+`update` downloads `nerve-node-x86_64-windows.exe` and checks it as above.
+It stops the service, moves the old program aside, puts the new one in its
+place and starts the service; if the new one does not start, the old one
+goes back. The old program goes once nothing runs it, or at the next restart
+of Windows when `update` ran from it.
+
+`uninstall` stops and removes the service, the user `nerve` and its profile,
+the folder grants of `folder` mode ([modes](modes.md#what-a-command-can-reach-in-folder-mode-windows)),
+and the program. Without `--purge` the folders and the stored password stay,
+open to the administrators only. A later `install` takes them up again.
+`--purge` deletes them. Run from the installed program, `uninstall` cannot
+delete that file at once: it moves it aside, and Windows deletes it at its
+next start. Where Windows
+still holds the profile of `nerve` (Windows Search can), `uninstall` says how
+to remove it after a restart.
+
 ## The rules for these commands
 
 - `install`, `setup`, `update` and `uninstall` are refused from a command the
   node runs for a center, as every other change of the node's settings is.
-  An agent cannot install, update or remove the node.
+  An agent cannot install, update or remove the node. On Windows, without a
+  control socket, the node cannot be asked; there these commands need an
+  administrator, which a command gets only through an account in
+  Administrators (the UAC warning above).
 - Each is written to the [audit log](audit.md) with the steps it did, and the
   error that stopped it, if any. `uninstall --purge` deletes the log with the
   rest.

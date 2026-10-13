@@ -1,6 +1,6 @@
 //! Confinement for the commands a node runs (docs/dev/policy-engine.md).
 //!
-//! 0.0.1 confines with Landlock on Linux, in `folders` mode: a command reads
+//! The sandbox confines with Landlock on Linux, in `folders` mode: a command reads
 //! the system directories and the folders flagged `r`, writes only the `w`
 //! folders, and runs programs only from the system directories and the `x`
 //! folders. The rules are applied in a small shim, `nerve-node __exec-shim`,
@@ -15,7 +15,7 @@
 //! on the center's folders for their flags ([`acl`]) and takes them off when a
 //! folder goes. The shim starts the command in the container and waits for it.
 //!
-//! Everything else in this area is a stub in 0.0.1 (see [`stubs`]).
+//! Everything else in this area is a stub (see [`stubs`]).
 
 use std::path::PathBuf;
 
@@ -491,10 +491,9 @@ pub mod appcontainer {
         GetAclInformation, GetLengthSid, GetSecurityDescriptorControl, GetTokenInformation,
         INHERIT_ONLY_ACE, INHERITED_ACE, InitializeAcl, OBJECT_INHERIT_ACE,
         PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
-        SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, TOKEN_ELEVATION,
-        TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenUser, UNPROTECTED_DACL_SECURITY_INFORMATION,
-        WinCapabilityInternetClientServerSid, WinCapabilityInternetClientSid,
-        WinCapabilityPrivateNetworkClientServerSid,
+        SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
+        TokenUser, UNPROTECTED_DACL_SECURITY_INFORMATION, WinCapabilityInternetClientServerSid,
+        WinCapabilityInternetClientSid, WinCapabilityPrivateNetworkClientServerSid,
     };
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
@@ -806,28 +805,6 @@ pub mod appcontainer {
         }
     }
 
-    /// Whether this process runs with an administrator's elevated token, so
-    /// that a command it starts outside a container may do anything on the
-    /// machine.
-    pub fn elevated() -> bool {
-        let Ok(token) = Token::open() else {
-            return false;
-        };
-        let mut e = TOKEN_ELEVATION::default();
-        let mut len = 0u32;
-        // SAFETY: a buffer of the size given for this class.
-        let ok = unsafe {
-            GetTokenInformation(
-                token.0,
-                TokenElevation,
-                &mut e as *mut _ as *mut c_void,
-                size_of::<TOKEN_ELEVATION>() as u32,
-                &mut len,
-            )
-        };
-        ok != 0 && e.TokenIsElevated != 0
-    }
-
     /// The SID of the user this process runs as, as text.
     fn user_sid() -> io::Result<String> {
         let token = Token::open()?;
@@ -1067,11 +1044,11 @@ pub mod appcontainer {
     }
 }
 
-/// What 0.0.1 does not do. Each returns an error ending in
+/// What the sandbox does not do. Each returns an error ending in
 /// [`stubs::NOT_DONE`], so callers and the CLI say so plainly instead of
 /// pretending.
 pub mod stubs {
-    pub const NOT_DONE: &str = "not done in 0.0.1";
+    pub const NOT_DONE: &str = "not done";
 
     /// A cgroup per command (memory, process count, kill of the whole tree).
     pub fn cgroup() -> Result<(), String> {

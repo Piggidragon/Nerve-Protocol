@@ -19,7 +19,7 @@ names its reason.
 | `… chains commands or holds an expression …` | A wildcard rule does not cover commands with `;`, `&`, `\|`, `$`, quotes and the like | Add an exact rule for the whole line, or use `folder` mode |
 | `outside the folders that allow reading` or `… writing` | `folder` mode, and no folder grants `r` or `w` there | `nerve-node folder add <path> +r +w` |
 | `the working directory is not in a folder that allows running` | `folder` mode, and no folder with `x` holds the working directory | `nerve-node folder set <path> +x` |
-| `commands cannot be confined on this machine` | `folder` mode on a machine without Landlock | Use `allowlist` or `user` mode. See [platforms](platforms.md) |
+| `commands cannot be confined on this machine` | `folder` mode on a machine without Landlock, or on the installed Windows service | Use `allowlist` or `user` mode. See [platforms](platforms.md) |
 | `... keeps a grant for this center's commands that its folders no longer give` | Windows: the node could not take a removed folder's grant off | Check that you may change that folder's permissions. The node tries again before each command |
 | `the config is saved, but the folder grants do not follow it` | Windows: a folder's permissions could not be changed | See the reason. The node tries again when it starts and before each command |
 | `… is protected (…)` | The path is [protected](protected-paths.md) | Grant a folder at it, with the right it needs |
@@ -61,15 +61,15 @@ Without a flag, the node is dialling. The wait grows from 1 to 60 seconds. If
 
 If `status` says `daemon: not running`, start `nerve-node run`. On a node
 [installed as a service](service.md), start the service instead:
-`sudo systemctl start nerve-node`. A node started there by hand lacks the
-two capabilities the service has, so it cannot switch to the account
-commands run as and runs no command at all.
+`sudo systemctl start nerve-node`, on Windows `Start-Service nerve-node`. A
+node started there by hand lacks the privileges the service has, so it
+cannot switch to the account commands run as and runs no command at all.
 
 ## The node will not start
 
 | Message | Fix |
 |---|---|
-| `refusing to run as root; set machine.allow_root = true to allow it` | Run as a normal user, or set `machine.allow_root` |
+| `refusing to run as root; set machine.allow_root = true to allow it` | Run as a normal user (on Windows: not elevated), or set `machine.allow_root` |
 | `node.toml is refused: its MAC does not match …` | Look at the file, then `nerve-node config accept`. See [config](config.md) |
 
 ## The center will not start

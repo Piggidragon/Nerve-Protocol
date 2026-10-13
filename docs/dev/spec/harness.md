@@ -5,7 +5,7 @@ server; nodes connect to it as [protocol.md](protocol.md) describes. This page
 is what a harness, and whoever writes its MCP entry, can rely on.
 
 > **Integration.** Harnesses get Nerve through MCP only: the MCP server is the
-> whole integration surface in 0.0.1. Native plugins for harnesses are a
+> whole integration surface. Native plugins for harnesses are a
 > backlog item. Nothing waits for a person: a call the node's policy does not
 > allow is refused at once.
 
@@ -47,7 +47,7 @@ it relays its stdio over `<state>/run/harness.sock` (mode 0600 in a 0700
 folder; the owner also checks the peer's uid) and each harness gets its own
 session. When the owner's own harness goes, the owner keeps running until the
 attached harnesses have ended too. A second instance with `--mcp http` or
-`none` refuses to start. Windows has no attach in 0.0.1: the second instance
+`none` refuses to start. Windows has no attach: the second instance
 fails when it cannot bind the node port.
 
 ## 3. MCP
@@ -172,7 +172,7 @@ with its token: deleting the token in the UI stops the cookie that logged in
 with it. A token that is lost is replaced by starting once with
 `--ui-no-login` on loopback and making a new one. Every change needs the CSRF
 header from `/api/session`. Pairing shows the link and the code; a QR code is
-not offered in 0.0.1.
+not offered.
 
 ## 8. What the center keeps
 

@@ -6,10 +6,11 @@ behaves the same except where this page says so.
 | | Linux | Windows |
 |---|---|---|
 | Shell for commands | `/bin/sh -c` | Windows PowerShell 5.1 (`powershell.exe -NoProfile -Command`) |
-| `folder` mode runs commands | Yes, confined by Landlock | Yes, confined by an AppContainer |
+| `folder` mode runs commands | Yes, confined by Landlock | Yes, confined by an AppContainer; not yet on the [installed service](service.md#windows) |
 | `allowlist` and `user` mode run commands | Yes | Yes, in a Job Object, not confined to folders |
 | Sudo switch | Yes | No |
 | Control socket | Yes | No |
+| Install as a service | Yes, with systemd | Yes |
 | Config folder | `~/.config/nerve` | `%USERPROFILE%\.config\nerve` |
 
 ## Linux
@@ -20,8 +21,8 @@ behaves the same except where this page says so.
 - Commands run with `no_new_privs`, so setuid programs cannot gain privileges.
   Only a command on the [sudo list](sudo.md) runs without it.
 - When a call ends, the node kills the command's whole process group.
-- A node that runs as root is refused. To allow it, run
-  `nerve-node config set machine.allow_root true`.
+- A node that runs as root is refused unless `machine.allow_root` is set
+  ([root and administrator](#root-and-administrator)).
 
 ## Windows
 
@@ -35,11 +36,42 @@ behaves the same except where this page says so.
 - A Job Object does not limit file access. It is not a sandbox. In `folder`
   mode the command also runs in an AppContainer, which is. See
   [modes](modes.md#what-a-command-can-reach-in-folder-mode-windows).
-- A node that runs as an administrator (elevated) logs a warning when it
-  starts: its commands run as one too, and in `folder` mode only their
-  AppContainer holds them.
 - Output that is not UTF-8 is read in the console code page.
 - Paths in rules and over the wire look like `/c/Users/x`.
+- A node that runs elevated (as an administrator) is refused unless
+  `machine.allow_root` is set ([root and administrator](#root-and-administrator)).
+
+### Root and administrator
+
+A node with full rights hands those rights to every command a center runs:
+root on Linux, an elevated administrator token on Windows. On Linux a root
+node can run the commands as the account `machine.user` names instead; on
+Windows an elevated node cannot start a command as another account, so
+commands run with the node's own token (`machine.user` there is for the
+[installed service](service.md#windows)). So on both platforms it is refused
+at start unless you allow it:
+
+```
+nerve-node config set machine.allow_root true
+```
+
+The refusal is the same message on both: `refusing to run as root; set
+machine.allow_root = true to allow it`.
+
+On Windows the node counts as elevated when its token is elevated: a
+PowerShell started with "Run as administrator", a scheduled task that runs
+with highest privileges, an account such as SYSTEM, or an administrator's
+session over SSH, which Windows OpenSSH gives the full, elevated token. An
+administrator at the desktop whose PowerShell was not started elevated (a
+UAC-filtered session) is a normal user to the node, and needs no setting.
+
+When the node runs with full rights because you allowed it, it says so with a
+warning at start: in the stderr output and in the node's log file. The
+center's Log page shows the center's own log and does not carry it. Commands
+from a center then run with full rights on the machine (on Linux unless
+`machine.user` names another account for them), and you are responsible for
+what they do. On Windows, in `folder` mode, their AppContainer still holds
+them to their folders.
 
 ### No control socket
 
@@ -48,7 +80,9 @@ A running node cannot be told about changes. The CLI writes the signed
 that the node runs for a center can therefore change the node's own policy.
 
 Allow commands on Windows only for centers you would also give the
-[settings grant](settings-grant.md).
+[settings grant](settings-grant.md), or [install the node as a
+service](service.md#windows): its commands run as another account, which
+cannot open the node's folders.
 
 ### Windows protected paths
 

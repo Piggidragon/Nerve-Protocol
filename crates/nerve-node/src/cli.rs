@@ -87,7 +87,7 @@ pub enum Cmd {
     Panic,
     /// Let the node work again after `panic`.
     Unlock,
-    /// Install the node as a service that starts with the machine and runs under a user of its own (Linux, as root).
+    /// Install the node as a service that starts with the machine and runs under a user of its own (Linux as root, Windows as administrator).
     Install,
     /// Name the node, choose the account commands run as (installed node), pair the first center and choose its mode, one question at a time.
     Setup {
@@ -352,7 +352,7 @@ pub struct Help {
 const SECTIONS: &[(&str, &str, &[&[&str]])] = &[
     (
         "Install and set up",
-        "Run the node as a service under a user of its own (Linux, with sudo), set it up and keep it current.",
+        "Run the node as a service under a user of its own (Linux with sudo, Windows as administrator), set it up and keep it current.",
         &[&["install", "uninstall"], &["setup"], &["update"]],
     ),
     (
@@ -889,7 +889,7 @@ const NEXT_START: &str = "takes effect at the next start of the node";
 
 /// Runs one command line, writing what it shows to `out`. A change made
 /// while no daemon answers on the control socket (none runs, or Windows,
-/// which has no socket in 0.0.1) is only in the file, so the output says
+/// which has no socket) is only in the file, so the output says
 /// when it counts.
 pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
     let service = cli.cmd.is_service();
@@ -947,12 +947,28 @@ pub fn settle_user(cli: &Cli) -> Result<(), String> {
     )
 }
 
-/// The account that ran this command through sudo, else root.
+/// The account that ran this command through sudo, else root. On Windows
+/// the account this command runs as.
 fn invoker() -> String {
+    #[cfg(windows)]
+    if let Ok(me) = crate::win_user::current_user() {
+        return me;
+    }
     std::env::var("SUDO_USER")
         .ok()
         .filter(|u| !u.is_empty())
         .unwrap_or_else(|| "root".into())
+}
+
+/// On Windows, `run` on the installed node's folders runs under the service
+/// control manager (crate::win_service): the node's log file, where a start
+/// that fails is said. `None` for any other command.
+pub fn service_log(cli: &Cli) -> Option<PathBuf> {
+    if !matches!(cli.cmd, Cmd::Run) {
+        return None;
+    }
+    let paths = NodePaths::from_args(cli.config_dir.clone(), cli.state_dir.clone());
+    crate::service::is_service_node(&paths).then(|| paths.log_file())
 }
 
 /// The rule of the other owner commands (docs/dev/spec/node-local.md §5):
@@ -1266,24 +1282,47 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             let layout = Layout::system();
             owner_check(&[&paths, &layout.paths]).await?;
             let exe = std::env::current_exe().map_err(|e| format!("this program: {e}"))?;
+            #[cfg(windows)]
+            return crate::winsvc::install(
+                &layout,
+                &crate::win_host::WinHost,
+                &exe,
+                &invoker(),
+                out,
+            );
+            #[cfg(not(windows))]
             crate::service::install(&layout, &Host, &exe, &invoker(), out)
         }
         Cmd::Setup { create_user } => {
             owner_check(&[&paths]).await?;
+            // Windows takes the account of the commands, and its password,
+            // at install.
+            if cfg!(windows) && create_user.is_some() {
+                return Err(
+                    "on Windows the account commands run as is the one that runs `nerve-node install`, which asks for its password; --create-user does not go with it".into(),
+                );
+            }
             let mut input = std::io::BufReader::new(std::io::stdin());
             let layout = Layout::system();
-            let machine = (layout.installed() && paths == layout.paths)
+            let machine = (!cfg!(windows) && layout.installed() && paths == layout.paths)
                 .then_some(&Host as &dyn crate::service::System);
             setup(&paths, machine, create_user.as_deref(), &mut input, out).await
         }
         Cmd::Update { from } => {
             let layout = Layout::system();
             owner_check(&[&layout.paths]).await?;
+            #[cfg(windows)]
+            return crate::winsvc::update(&layout, &crate::win_host::WinHost, from.as_deref(), out)
+                .await;
+            #[cfg(not(windows))]
             crate::service::update(&layout, &Host, from.as_deref(), out).await
         }
         Cmd::Uninstall { purge } => {
             let layout = Layout::system();
             owner_check(&[&layout.paths]).await?;
+            #[cfg(windows)]
+            return crate::winsvc::uninstall(&layout, &crate::win_host::WinHost, purge, out);
+            #[cfg(not(windows))]
             crate::service::uninstall(&layout, &Host, purge, out)
         }
     }

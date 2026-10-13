@@ -84,7 +84,7 @@ fn descriptor(key: &NodeKey, name: &str) -> Value {
     json!({
         "nerve": "0",
         "node": {"id": key.node_id(), "name": name, "platform": "linux", "arch": "x86_64",
-                 "software": {"name": "fake-node", "version": "0.0.1"}},
+                 "software": {"name": "fake-node", "version": "x.y.z"}},
         "rev": 1,
         "summary": "A fake node.",
         "capabilities": [
@@ -135,7 +135,7 @@ async fn handshake(r: &Running, key: &NodeKey) -> (WebSocketStream<BoxIo>, Messa
         "node_id": key.node_id(),
         "auth": {"sig": key.sign_connect(&center_id, &nonce)},
         "versions": ["0"],
-        "software": {"name": "fake-node", "version": "0.0.1"},
+        "software": {"name": "fake-node", "version": "x.y.z"},
         "rev": 1,
     });
     send(&mut ws, Message::notification(method::HELLO, hello)).await;
@@ -896,7 +896,7 @@ async fn a_node_that_drops_and_comes_back_is_in_the_log() {
             "the node paired (linux/x86_64); its code is used up"
         )
     );
-    assert_eq!(line(1), (Level::Info, "link up (node software 0.0.1)"));
+    assert_eq!(line(1), (Level::Info, "link up (node software x.y.z)"));
     // Told by the code that came back, then what it was.
     let calls: Vec<_> = got
         .iter()
@@ -940,10 +940,10 @@ async fn a_node_that_drops_and_comes_back_is_in_the_log() {
         .filter(|(_, m)| m.starts_with("link up"))
         .collect();
     assert_eq!(ups.len(), 4);
-    assert_eq!(ups[0].1, "link up (node software 0.0.1)");
+    assert_eq!(ups[0].1, "link up (node software x.y.z)");
     for (_, m) in &ups[1..] {
         assert!(
-            m.starts_with("link up again after ") && m.ends_with(" (node software 0.0.1)"),
+            m.starts_with("link up again after ") && m.ends_with(" (node software x.y.z)"),
             "{m}"
         );
     }

@@ -39,6 +39,10 @@ pub struct NodeOptions {
     /// ran. The daemon adds the file in the state folder and sets the level
     /// from `node.toml`.
     pub log: Option<Arc<Log>>,
+    /// Whether the process counts as having full rights (root, an elevated
+    /// token), instead of asking the system. A test sets it: the same test
+    /// must pass for a developer who runs it elevated.
+    pub full_rights: Option<bool>,
 }
 
 impl NodeOptions {
@@ -49,6 +53,7 @@ impl NodeOptions {
             home: home_dir(),
             ctl: true,
             log: nerve_transport::log::global(),
+            full_rights: None,
         }
     }
 }
@@ -151,6 +156,18 @@ impl CenterState {
     }
 }
 
+/// How this node confines the commands of folder mode. The installed
+/// Windows service runs every command as another account (crate::win_user),
+/// and the AppContainer is not wired for that account yet (its profile and
+/// window station are made for the user the shim runs as), so there folder
+/// mode has no confinement and runs no command.
+fn confinement_for(detected: Confinement, service: bool) -> Confinement {
+    Confinement {
+        appcontainer: detected.appcontainer && !service,
+        ..detected
+    }
+}
+
 /// Everything the daemon's tasks share.
 /// How long a looked-up account is used before it is looked up again.
 const ACCOUNT_FRESH: std::time::Duration = std::time::Duration::from_secs(5);
@@ -213,7 +230,7 @@ impl Shared {
         };
         crate::account::for_commands(
             cfg.machine.user.as_deref(),
-            nerve_transport::net::euid(),
+            crate::account::own_uid(),
             self.service,
             crate::account::can_switch(),
             cached,
@@ -368,6 +385,13 @@ impl Daemon {
     /// Starts the daemon: loads the config, serves the control socket, dials
     /// every center that is not paused, revoked or unknown.
     pub async fn start(opts: NodeOptions) -> Result<Daemon, String> {
+        let full = opts.full_rights.unwrap_or_else(crate::rights::full_rights);
+        Daemon::start_with(opts, full).await
+    }
+
+    /// [`Daemon::start`] for a process whose rights are `full_rights`: root,
+    /// or an elevated token on Windows. A test cannot be root.
+    async fn start_with(opts: NodeOptions, full_rights: bool) -> Result<Daemon, String> {
         nerve_transport::init_crypto();
         let paths = opts.paths.clone();
         // Both exist before the first command runs, so Landlock can leave
@@ -393,11 +417,8 @@ impl Daemon {
         store.on_change(|by, version, changes| {
             nerve_transport::log::emit(Level::Info, None, &describe_change(by, version, changes));
         });
-        #[cfg(unix)]
-        if nerve_transport::net::euid() == 0 && !cfg.machine.allow_root {
-            return Err(
-                "refusing to run as root; set machine.allow_root = true to allow it".into(),
-            );
+        if let Some(warning) = crate::rights::check(full_rights, cfg.machine.allow_root)? {
+            tracing::warn!("{warning}");
         }
         #[cfg(unix)]
         if opts.ctl
@@ -416,11 +437,16 @@ impl Daemon {
                 "this is the installed node, started without CAP_SETUID and CAP_SETGID: it runs no command; start it as the service: `sudo systemctl start nerve-node`"
             );
         }
-        // A node that runs elevated runs its commands so too, as root does
-        // on Linux with machine.allow_root.
+        // The stored password of the account the commands run as is in the
+        // config folder (crate::win_user).
         #[cfg(windows)]
-        if nerve_sandbox::appcontainer::elevated() {
-            tracing::warn!("{}", crate::account::root_warning());
+        {
+            crate::win_user::init(&paths.config_dir);
+            if service && crate::account::own_uid() != 0 && !crate::account::can_switch() {
+                tracing::warn!(
+                    "this is the installed node, started without SeAssignPrimaryTokenPrivilege: it runs no command; start it as the service: `Start-Service nerve-node`"
+                );
+            }
         }
         let shared = Arc::new(Shared {
             paths: paths.clone(),
@@ -428,7 +454,7 @@ impl Daemon {
             exe: opts.exe,
             home: opts.home,
             platform: crate::paths::platform(),
-            confinement: Confinement::detect(),
+            confinement: confinement_for(Confinement::detect(), service),
             store: Mutex::new(store),
             changed,
             centers: Mutex::default(),
@@ -518,7 +544,17 @@ impl Daemon {
                 }
             }
         }
-        #[cfg(not(unix))]
+        // Under the service control manager, its stop request ends the node.
+        #[cfg(windows)]
+        {
+            crate::win_service::running();
+            if crate::win_service::is_service() {
+                crate::win_service::stop_requested().await;
+            } else {
+                let _ = tokio::signal::ctrl_c().await;
+            }
+        }
+        #[cfg(not(any(unix, windows)))]
         let _ = tokio::signal::ctrl_c().await;
         d.stop().await;
         Ok(())
@@ -612,7 +648,7 @@ async fn start_ctl(shared: Arc<Shared>) -> Result<JoinHandle<()>, String> {
 
 #[cfg(not(unix))]
 async fn start_ctl(_shared: Arc<Shared>) -> Result<JoinHandle<()>, String> {
-    // Not done in 0.0.1: a named pipe. The CLI writes the signed file itself,
+    // Not done: a named pipe. The CLI writes the signed file itself,
     // and the running node takes it at its next start.
     Ok(tokio::spawn(async {}))
 }
@@ -843,6 +879,89 @@ mod tests {
         (d, Daemon::start(opts).await.unwrap())
     }
 
+    fn options(d: &tempfile::TempDir, log: &Arc<Log>) -> NodeOptions {
+        let paths = NodePaths::new(d.path().join("config"), d.path().join("state"));
+        let mut opts = NodeOptions::new(paths);
+        opts.home = d.path().to_path_buf();
+        opts.ctl = false;
+        opts.log = Some(log.clone());
+        opts
+    }
+
+    fn warnings(log: &Log) -> Vec<String> {
+        let q = nerve_transport::log::Query {
+            limit: usize::MAX,
+            ..Default::default()
+        };
+        log.entries(&q)
+            .into_iter()
+            .filter(|(_, e)| e.level == Level::Warn)
+            .map(|(_, e)| e.msg)
+            .collect()
+    }
+
+    /// A node with full rights (root, or an elevated token) is refused
+    /// without `machine.allow_root`, and warned about in the log with it.
+    #[tokio::test]
+    async fn full_rights_are_refused_without_allow_root_and_warned_about_with_it() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let log = Log::new(Level::Info);
+        let sub = tracing_subscriber::Registry::default().with(log.layer());
+        let _guard = tracing::subscriber::set_default(sub);
+        let d = tempfile::tempdir().unwrap();
+
+        let err = Daemon::start_with(options(&d, &log), true).await.err();
+        assert_eq!(err.as_deref(), Some(crate::rights::REFUSED));
+        assert!(warnings(&log).is_empty());
+
+        let paths = NodePaths::new(d.path().join("config"), d.path().join("state"));
+        for dir in [&paths.state_dir, &paths.config_dir] {
+            nerve_transport::files::create_private_dir(dir).unwrap();
+        }
+        let mut store = SettingsStore::open(
+            paths.config_file(),
+            paths.config_key(),
+            AuditLog::new(paths.audit_log()),
+        )
+        .unwrap();
+        store
+            .update(|c| {
+                c.machine.allow_root = true;
+                Ok(())
+            })
+            .unwrap();
+        let daemon = Daemon::start_with(options(&d, &log), true).await.unwrap();
+        let w = warnings(&log);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("full rights") && w[0].contains("You are responsible"));
+        // The warning also reaches the node's log file.
+        let file = std::fs::read_to_string(paths.log_file()).unwrap();
+        assert!(file.contains("You are responsible"), "{file}");
+        daemon.stop().await;
+
+        // A node without full rights is not asked anything.
+        let log = Log::new(Level::Info);
+        let d = tempfile::tempdir().unwrap();
+        let daemon = Daemon::start_with(options(&d, &log), false).await.unwrap();
+        assert!(warnings(&log).is_empty());
+        daemon.stop().await;
+    }
+
+    /// `Daemon::start` takes the rights from the options when a test sets
+    /// them, whoever runs the test.
+    #[tokio::test]
+    async fn start_takes_the_rights_from_the_options() {
+        let log = Log::new(Level::Info);
+        let d = tempfile::tempdir().unwrap();
+        let mut o = options(&d, &log);
+        o.full_rights = Some(true);
+        let err = Daemon::start(o).await.err();
+        assert_eq!(err.as_deref(), Some(crate::rights::REFUSED));
+        let mut o = options(&d, &log);
+        o.full_rights = Some(false);
+        Daemon::start(o).await.unwrap().stop().await;
+    }
+
     #[tokio::test]
     async fn refuses_settings_from_below_a_command() {
         let (_d, daemon) = daemon().await;
@@ -980,5 +1099,31 @@ node_id = "n1"
         let text = describe_leaf("a.b", &Value::Null, &Value::String(long));
         assert_eq!(text.chars().count(), "a.b: unset -> ".len() + 81);
         assert!(text.ends_with('…'));
+    }
+}
+
+#[cfg(test)]
+mod confinement_tests {
+    use super::*;
+
+    /// The installed Windows service runs commands as another account, for
+    /// which the AppContainer is not wired: folder mode is not confined there
+    /// and runs no command. Landlock and a node run by hand keep theirs.
+    #[test]
+    fn the_installed_service_runs_no_command_in_an_appcontainer() {
+        let windows = Confinement {
+            landlock_abi: None,
+            appcontainer: true,
+        };
+        assert!(confinement_for(windows, false).appcontainer);
+        let installed = confinement_for(windows, true);
+        assert!(!installed.available(), "{installed:?}");
+        assert_eq!(installed.describe(), "none");
+        let linux = Confinement {
+            landlock_abi: Some(4),
+            appcontainer: false,
+        };
+        assert_eq!(confinement_for(linux, true), linux);
+        assert_eq!(confinement_for(linux, false), linux);
     }
 }

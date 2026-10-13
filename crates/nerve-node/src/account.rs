@@ -15,19 +15,16 @@ use crate::service::Account;
 pub const MADE_MARK: &str = "Nerve user mode";
 
 /// What a command of the installed node gets while no account is chosen.
+#[cfg(not(windows))]
 pub const NONE_CHOSEN: &str = "this node runs commands as an account of their own, and none is chosen: `sudo nerve-node setup` chooses one (machine.user)";
+/// What a command of the installed node gets while no account is chosen:
+/// on Windows `install` takes it, with its password.
+#[cfg(windows)]
+pub const NONE_CHOSEN: &str = "this node runs commands as an account of their own, and none is chosen: `nerve-node install`, run again as administrator by that account, sets it (machine.user)";
 
-/// The warning for root (on Windows an administrator) as the account of
-/// the commands.
+/// The warning for root as the account of the commands.
 pub fn root_warning() -> String {
-    let (who, holds) = if cfg!(windows) {
-        ("an administrator", "their AppContainer")
-    } else {
-        ("root", "Landlock")
-    };
-    format!(
-        "Warning: commands from a center then run as {who}, with every right on this machine, the node's keys included; in folder mode only {holds} still holds them. You are responsible for what they do."
-    )
+    "Warning: commands from a center then run as root, with every right on this machine, the node's keys included; in folder mode only Landlock still holds them. You are responsible for what they do.".into()
 }
 
 /// Groups whose members get root without a password and without a setuid
@@ -82,6 +79,14 @@ pub fn makeable_name(name: &str) -> bool {
 /// Looks `name` up in the system's account database. `getent` and `id` ask
 /// it through NSS, which the static program cannot do itself.
 pub fn lookup(name: &str) -> Result<Option<Account>, String> {
+    #[cfg(windows)]
+    return crate::win_user::lookup(name);
+    #[cfg(not(windows))]
+    lookup_nss(name)
+}
+
+#[cfg(not(windows))]
+fn lookup_nss(name: &str) -> Result<Option<Account>, String> {
     if !nerve_policy::config::valid_account_name(name) {
         return Err(format!("{name:?} is not an account name"));
     }
@@ -129,6 +134,7 @@ pub fn parse_passwd(line: &str) -> Option<Account> {
     })
 }
 
+#[cfg(not(windows))]
 fn stderr_or_status(o: &std::process::Output) -> String {
     let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
     if err.is_empty() {
@@ -194,9 +200,15 @@ pub fn for_commands(
     if !can_switch && service {
         // Started by hand, or by a systemd without AmbientCapabilities=:
         // unsetting machine.user would run the commands as the keys' owner.
-        return Err(format!(
-            "machine.user is {name}, but this installed node runs as uid {own_uid} without CAP_SETUID and CAP_SETGID and cannot switch to it; start it as the service: `sudo systemctl start nerve-node`"
-        ));
+        return Err(if cfg!(windows) {
+            format!(
+                "machine.user is {name}, but this installed node runs without SeAssignPrimaryTokenPrivilege and cannot start a command as it; start it as the service: `Start-Service nerve-node`"
+            )
+        } else {
+            format!(
+                "machine.user is {name}, but this installed node runs as uid {own_uid} without CAP_SETUID and CAP_SETGID and cannot switch to it; start it as the service: `sudo systemctl start nerve-node`"
+            )
+        });
     }
     if !can_switch {
         return Err(format!(
@@ -206,9 +218,28 @@ pub fn for_commands(
     Ok(Some(a))
 }
 
+/// The number of the account this process runs as: its uid, on Windows the
+/// last part of its SID (SYSTEM is 0, as root is).
+pub fn own_uid() -> u32 {
+    #[cfg(windows)]
+    return crate::win_user::own_uid();
+    #[cfg(not(windows))]
+    nerve_transport::net::euid()
+}
+
 /// Whether this process may switch to another account: root, or a process
-/// with CAP_SETUID and CAP_SETGID in effect, as the installed service.
+/// with CAP_SETUID and CAP_SETGID in effect, as the installed service. On
+/// Windows: SYSTEM, or a process that holds the privileges to start a
+/// process with another account's token, as the installed service.
 pub fn can_switch() -> bool {
+    #[cfg(windows)]
+    return crate::win_user::can_switch();
+    #[cfg(not(windows))]
+    can_switch_unix()
+}
+
+#[cfg(not(windows))]
+fn can_switch_unix() -> bool {
     if nerve_transport::net::euid() == 0 {
         return true;
     }
@@ -596,7 +627,12 @@ mod tests {
             NONE_CHOSEN
         );
         let e = for_commands(Some("alice"), 990, true, false, db).unwrap_err();
-        assert!(e.contains("systemctl start"), "{e}");
+        let start = if cfg!(windows) {
+            "Start-Service nerve-node"
+        } else {
+            "systemctl start"
+        };
+        assert!(e.contains(start), "{e}");
         assert!(!e.contains("unset machine.user"), "{e}");
         // As root it runs as root, which `machine.allow_root` allowed.
         assert_eq!(for_commands(None, 0, true, false, db).unwrap(), None);

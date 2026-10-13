@@ -4,7 +4,10 @@ On Linux with systemd, `nerve-node` installs itself as a service. The service
 starts with the machine and runs under a user of its own, `nerve`, which owns
 the node's config and state folders. `install`, `update` and `uninstall` need
 root. On Windows and on Linux without systemd, run `nerve-node run` under your
-own service manager ([pairing](pairing.md#keep-it-running)).
+own service manager ([pairing](pairing.md#keep-it-running)). A node you start
+that way as root, or elevated on Windows, is refused unless
+`machine.allow_root` is set, and warns at start when it runs
+([root and administrator](platforms.md#root-and-administrator)).
 
 ## Install
 

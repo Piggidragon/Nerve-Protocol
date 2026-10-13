@@ -125,6 +125,13 @@ pub trait Secrets: Send {
     /// [`Secrets::storage`], is saved: copies every secret there and reads
     /// each copy back. An error refuses the change; nothing is saved then.
     fn copy(&mut self, cfg: &NodeConfig) -> Result<(), String>;
+    /// Before [`SettingsStore::reload`] takes in `cfg`, which another
+    /// writer saved with the secrets in another place than
+    /// [`Secrets::storage`]: an error refuses the reload, and the config in
+    /// force stays as it is.
+    fn may_reload(&self, _cfg: &NodeConfig) -> Result<(), String> {
+        Ok(())
+    }
     /// `cfg` is saved: the secrets are in its place from now on, and the
     /// old copies go.
     fn moved(&mut self, cfg: &NodeConfig);
@@ -355,7 +362,9 @@ impl SettingsStore {
     /// Reads the file again because the owner asks (SIGHUP, the control
     /// socket's `reload`). Only a file the node signed is applied, and never
     /// an older version than the one in force; anything else is refused and
-    /// audited, and the old config stays in force.
+    /// audited, and the old config stays in force. It stays too while a
+    /// move of the secrets the file names is refused
+    /// ([`Secrets::may_reload`]).
     pub fn reload(&mut self) -> Result<bool, String> {
         let text = read_file(&self.path)?.ok_or_else(|| self.refuse("the file is missing"))?;
         let fresh = verified(&text, &self.key).map_err(|why| self.refuse(&why))?;
@@ -368,6 +377,7 @@ impl SettingsStore {
         // Another writer saved a file that keeps the secrets elsewhere, and
         // copied them there first.
         if fresh.machine.secret_storage != self.secrets.storage() {
+            self.secrets.may_reload(&fresh)?;
             self.secrets.moved(&fresh);
         }
         let changed = fresh != self.config;

@@ -120,7 +120,11 @@ nerve-node config set machine.secret_storage file
 
 The change moves the keys at once: each is copied, read back, and only then
 deleted where it was. If the keyring cannot take them, nothing changes. On
-Windows, while the node runs, the old copies stay until its next start.
+Windows, while the node runs, the old copies stay until its next start. On
+Linux, a node that runs but does not answer on its control socket (it is
+still starting, say) keeps its keys in files until it is restarted, so
+`config set` refuses to move them into the keyring then: stop the node, or
+wait until it has started, and set it again.
 
 A keyring hands its entries to any program of the node's user that asks,
 through the user's D-Bus session. So with `keyring` on Linux the node keeps

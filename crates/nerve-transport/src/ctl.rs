@@ -97,6 +97,14 @@ mod unix {
     /// Like [`serve`], on a socket [`bind`] made already. Binding once
     /// matters: a socket dropped and bound again can look in use while a
     /// child forked meanwhile still holds the old one.
+    ///
+    /// A connection that cannot be taken for want of descriptors or memory
+    /// (EMFILE once a process of the user holds the node's open files) or
+    /// that went before it was taken does not end the serving: the socket
+    /// stays, and the next connection is taken once they are back. Ending
+    /// would leave the node without its socket until it restarts, and the
+    /// CLI would take a running node for none (keyring review round 4,
+    /// finding 1). Only another error ends it.
     pub async fn serve_on<F, Fut>(listener: UnixListener, handler: F) -> std::io::Result<()>
     where
         F: Fn(CtlRequest, Peer) -> Fut + Send + Sync + 'static,
@@ -104,8 +112,22 @@ mod unix {
     {
         let handler = Arc::new(handler);
         let me = crate::net::euid();
+        let mut failing = false;
         loop {
-            let (stream, _) = listener.accept().await?;
+            let stream = match listener.accept().await {
+                Ok((stream, _)) => stream,
+                Err(e) if passing(&e) => {
+                    // Once per run of failures: they come as fast as the
+                    // pause allows.
+                    if !std::mem::replace(&mut failing, true) {
+                        tracing::warn!("the control socket cannot take a connection now: {e}");
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            failing = false;
             let handler = handler.clone();
             tokio::spawn(async move {
                 let peer = match stream.peer_cred() {
@@ -121,6 +143,23 @@ mod unix {
                 let _ = connection(stream, peer, handler).await;
             });
         }
+    }
+
+    /// Whether `accept` failed for a while only: out of descriptors, buffers
+    /// or memory, or a connection that went before it was taken.
+    fn passing(e: &std::io::Error) -> bool {
+        matches!(
+            e.raw_os_error(),
+            Some(
+                libc::EMFILE
+                    | libc::ENFILE
+                    | libc::ENOBUFS
+                    | libc::ENOMEM
+                    | libc::ECONNABORTED
+                    | libc::EINTR
+                    | libc::EPROTO
+            )
+        )
     }
 
     pub async fn bind(path: &Path) -> std::io::Result<UnixListener> {
@@ -298,6 +337,88 @@ mod unix {
                     .unwrap_err(),
                 NOT_RUNNING
             );
+        }
+
+        /// Set in the process `serving_outlasts_running_out_of_descriptors`
+        /// starts for itself.
+        #[cfg(target_os = "linux")]
+        const OUT_OF_DESCRIPTORS: &str = "NERVE_TEST_CTL_OUT_OF_DESCRIPTORS";
+
+        /// With no descriptor left to take a connection, the server goes
+        /// on and answers once they are back (keyring review round 4,
+        /// finding 1). The limit on open files holds for a whole process,
+        /// so the test runs again in a process of its own.
+        #[cfg(target_os = "linux")]
+        #[test]
+        fn serving_outlasts_running_out_of_descriptors() {
+            if std::env::var_os(OUT_OF_DESCRIPTORS).is_none() {
+                let name = format!(
+                    "{}::serving_outlasts_running_out_of_descriptors",
+                    module_path!().split_once("::").unwrap().1
+                );
+                let out = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", &name, "--test-threads=1"])
+                    .env(OUT_OF_DESCRIPTORS, "1")
+                    .output()
+                    .unwrap();
+                assert!(
+                    out.status.success(),
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                assert!(
+                    String::from_utf8_lossy(&out.stdout).contains("1 passed"),
+                    "the test did not run in its own process"
+                );
+                return;
+            }
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                use std::os::unix::io::AsRawFd;
+                let d = tempfile::tempdir().unwrap();
+                let p = d.path().join("ctl.sock");
+                let listener = bind(&p).await.unwrap();
+                // Connections that wait to be taken; each needs a descriptor.
+                let waiting: Vec<_> = (0..8)
+                    .map(|_| std::os::unix::net::UnixStream::connect(&p).unwrap())
+                    .collect();
+                let mut old = libc::rlimit {
+                    rlim_cur: 0,
+                    rlim_max: 0,
+                };
+                // SAFETY: the limits of this process, into a local.
+                assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut old) }, 0);
+                // The lowest free descriptor becomes the limit: none is left.
+                let next = std::fs::File::open("/dev/null").unwrap().as_raw_fd();
+                let none = libc::rlimit {
+                    rlim_cur: next as libc::rlim_t,
+                    rlim_max: old.rlim_max,
+                };
+                // SAFETY: as above.
+                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &none) }, 0);
+                let server =
+                    tokio::spawn(serve_on(listener, |_, _| async { Reply::Ok(json!("up")) }));
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                assert!(
+                    std::fs::File::open("/dev/null").is_err(),
+                    "a descriptor was left"
+                );
+                assert!(!server.is_finished(), "the server stopped");
+                drop(waiting);
+                // SAFETY: as above.
+                assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &old) }, 0);
+                let v = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    call(&p, "status", json!({})),
+                )
+                .await
+                .expect("an answer in time");
+                assert_eq!(v, Ok(json!("up")));
+            });
         }
 
         #[cfg(target_os = "linux")]

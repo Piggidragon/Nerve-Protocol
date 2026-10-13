@@ -369,7 +369,8 @@ pub fn remove_center_key(
 /// moves the keys only while it holds that lock too; when a node holds it
 /// (on Windows, which has no control socket to ask that node, or one that is
 /// starting), the old copies stay for that node to read until its next
-/// start, which finishes the move.
+/// start, which finishes the move. On Linux a move into the keyring is
+/// refused then (`defers_keyring`).
 pub struct NodeSecrets {
     paths: NodePaths,
     storage: SecretStorage,
@@ -380,6 +381,15 @@ pub struct NodeSecrets {
     held: Option<KeysLock>,
     /// The move in progress leaves the old copies to the next start.
     defer: bool,
+    /// Whether a move into the keyring may be left to the next start of a
+    /// node that holds [`KeysLock`]. Not on Linux: that node did not answer
+    /// on its control socket (it starts, or its socket stopped), so it goes
+    /// on with the keys in files in memory, and every `folder` mode command
+    /// it starts gets a sandbox that leaves the session bus open while the
+    /// keys are in the keyring; its count of such commands is not in this
+    /// process either (review round 4, finding 1). On Windows `folder` mode
+    /// runs no command.
+    defers_keyring: bool,
     /// The running node's count of commands its Landlock does not keep off
     /// the session bus (crate::daemon::Shared::open_to_bus): while one runs,
     /// the keys do not go into the keyring.
@@ -398,6 +408,7 @@ impl NodeSecrets {
             locks: false,
             held: None,
             defer: false,
+            defers_keyring: false,
             open_to_bus: None,
         }
     }
@@ -413,10 +424,12 @@ impl NodeSecrets {
 
     /// For a CLI that writes `node.toml` itself: each write takes
     /// [`KeysLock`] and is refused when the file changed since it was read,
-    /// and a move leaves the old copies to a node that holds the lock.
+    /// and a move leaves the old copies to a node that holds the lock; on
+    /// Linux a move into the keyring is refused then.
     pub fn for_cli(paths: &NodePaths) -> NodeSecrets {
         NodeSecrets {
             locks: true,
+            defers_keyring: !cfg!(target_os = "linux"),
             ..NodeSecrets::new(paths)
         }
     }
@@ -472,6 +485,34 @@ impl NodeSecrets {
         left
     }
 
+    /// With the keys going `to` the keyring while the running node counts
+    /// `folder` mode commands that started with them in files: how many
+    /// run and why that keeps the keys out, then how a message says they
+    /// ended. Such a command got its sandbox while the keys were in their
+    /// files, and a Landlock domain does not change while it runs: with the
+    /// keys in the keyring it would reach them for the rest of its life.
+    /// The store lock a move or a reload holds keeps a new one from
+    /// starting until it is over (review round 3, finding 1).
+    fn open_commands(&self, to: SecretStorage) -> Option<(String, &'static str)> {
+        let open = self
+            .open_to_bus
+            .as_ref()
+            .map_or(0, |n| n.load(Ordering::SeqCst));
+        if to != SecretStorage::Keyring || open == 0 {
+            return None;
+        }
+        let one = open == 1;
+        Some((
+            format!(
+                "{open} folder mode {} that started while the node's keys were in their files, and {} sandbox does not keep {} off the session bus the keyring answers on",
+                if one { "command runs" } else { "commands run" },
+                if one { "its" } else { "their" },
+                if one { "it" } else { "them" },
+            ),
+            if one { "it has" } else { "they have" },
+        ))
+    }
+
     /// Ends a move: without anything left behind, the mark goes.
     fn finish(&self, left: Vec<String>) {
         for e in &left {
@@ -523,26 +564,15 @@ impl Secrets for NodeSecrets {
 
     fn copy(&mut self, cfg: &NodeConfig) -> Result<(), String> {
         let to = cfg.machine.secret_storage;
-        // Such a command got its sandbox while the keys were in their
-        // files, and a Landlock domain does not change while it runs: with
-        // the keys in the keyring it would reach them for the rest of its
-        // life. The store lock this runs under keeps a new one from
-        // starting until the move is over (review round 3, finding 1).
-        let open = self
-            .open_to_bus
-            .as_ref()
-            .map_or(0, |n| n.load(Ordering::SeqCst));
-        if to == SecretStorage::Keyring && open > 0 {
+        if let Some((open, ended)) = self.open_commands(to) {
             return Err(format!(
-                "{open} folder mode {} that started while the node's keys were in their files, and {} sandbox does not keep {} off the session bus the keyring answers on; the node's keys stay in their files, and nothing was changed. Wait until {} ended, or end every command with `nerve-node panic`, change it again, then `nerve-node unlock`",
-                if open == 1 {
-                    "command runs"
-                } else {
-                    "commands run"
-                },
-                if open == 1 { "its" } else { "their" },
-                if open == 1 { "it" } else { "them" },
-                if open == 1 { "it has" } else { "they have" },
+                "{open}; the node's keys stay in their files, and nothing was changed. Wait until {ended} ended, or end every command with `nerve-node panic`, change it again, then `nerve-node unlock`"
+            ));
+        }
+        if to == SecretStorage::Keyring && self.defer && !self.defers_keyring {
+            return Err(format!(
+                "another nerve-node holds {}: a node runs for this state folder but does not answer on its control socket, or a command moves its keys. That node would go on with its keys in files and give its folder mode commands a sandbox for that, so the node's keys stay in their files, and nothing was changed. Stop the node, or wait until it has started, then change it again",
+                self.paths.keys_lock().display()
             ));
         }
         nerve_transport::files::write_private(
@@ -597,6 +627,18 @@ impl Secrets for NodeSecrets {
         Ok(())
     }
 
+    /// Another writer moved the keys into the keyring: the running node
+    /// does not follow while it counts a command that would reach them
+    /// there (review round 4, finding 1).
+    fn may_reload(&self, cfg: &NodeConfig) -> Result<(), String> {
+        match self.open_commands(cfg.machine.secret_storage) {
+            Some((open, ended)) => Err(format!(
+                "node.toml keeps the node's keys in the system keyring, but {open}; the node goes on with the config in force, which keeps them in their files. Wait until {ended} ended, then reload again"
+            )),
+            None => Ok(()),
+        }
+    }
+
     fn moved(&mut self, cfg: &NodeConfig) {
         self.storage = cfg.machine.secret_storage;
         if !self.defer {
@@ -610,7 +652,8 @@ impl Secrets for NodeSecrets {
 
     /// The CLI's: every write it makes holds [`KeysLock`] where no node
     /// holds it, so a move and a write of another CLI do not cross; a move
-    /// made while a node holds it leaves the old copies to that node.
+    /// made while a node holds it leaves the old copies to that node, or is
+    /// refused (`defers_keyring`).
     fn begin(&mut self) -> Result<bool, String> {
         if !self.locks {
             return Ok(false);
@@ -1055,10 +1098,10 @@ mod tests {
         let (_d, paths) = node();
         paired(&paths, SecretStorage::File, &["home"]);
         // A running node holds the lock: a CLI that writes the file itself
-        // (on Windows, or while the node starts) leaves it the old copies.
+        // (on Windows) leaves it the old copies.
         let running = KeysLock::try_take(&paths).unwrap().unwrap();
         assert!(KeysLock::try_take(&paths).unwrap().is_none());
-        let mut s = cli_store(&paths);
+        let mut s = windows_cli_store(&paths);
         set_storage(&mut s, SecretStorage::Keyring).unwrap();
         assert!(paths.config_key().exists() && paths.key_file("home").exists());
         assert!(in_keyring(&paths, Key::Center("home")).is_some());
@@ -1167,6 +1210,85 @@ mod tests {
         .unwrap()
     }
 
+    /// The CLI's store as on Windows, where a move into the keyring is left
+    /// to the next start of a node that holds the lock.
+    fn windows_cli_store(paths: &NodePaths) -> SettingsStore {
+        SettingsStore::open_with(
+            paths.config_file(),
+            Box::new(NodeSecrets {
+                defers_keyring: true,
+                ..NodeSecrets::for_cli(paths)
+            }),
+            AuditLog::new(paths.audit_log()),
+        )
+        .unwrap()
+    }
+
+    /// On Linux a CLI that finds a node holding the lock does not move the
+    /// keys into the keyring: that node did not answer on its control
+    /// socket, so it would go on giving its folder mode commands a sandbox
+    /// for keys in files (review round 4, finding 1).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cli_does_not_move_the_keys_into_the_keyring_past_a_silent_node() {
+        let (_d, paths) = node();
+        drop(paired(&paths, SecretStorage::File, &["home"]));
+        let files = || {
+            [
+                paths.config_file(),
+                paths.config_key(),
+                paths.key_file("home"),
+            ]
+            .map(|f| std::fs::read(f).unwrap())
+        };
+        let before = files();
+        let running = KeysLock::try_take(&paths).unwrap().unwrap();
+        let mut s = cli_store(&paths);
+        let asked = store::calls();
+        let e = set_storage(&mut s, SecretStorage::Keyring).unwrap_err();
+        assert_eq!(store::calls(), asked, "the keyring was asked");
+        assert!(e.contains("does not answer on its control socket"), "{e}");
+        assert!(e.contains("nothing was changed"), "{e}");
+        assert_eq!(files(), before);
+        assert!(!paths.keys_moving().exists());
+        assert_eq!(in_keyring(&paths, Key::Config), None);
+        assert_eq!(in_keyring(&paths, Key::Center("home")), None);
+        assert_eq!(s.config().machine.secret_storage, SecretStorage::File);
+        // Once no node holds the lock, the move goes through.
+        drop(running);
+        set_storage(&mut s, SecretStorage::Keyring).unwrap();
+        assert!(in_keyring(&paths, Key::Center("home")).is_some());
+        assert!(!paths.key_file("home").exists());
+    }
+
+    /// A running node does not take in a file that another writer saved
+    /// with the keys in the keyring while it counts a folder mode command
+    /// that started with them in files (review round 4, finding 1).
+    #[test]
+    fn a_reload_into_the_keyring_waits_for_the_commands_that_reach_the_bus() {
+        let (_d, paths) = node();
+        drop(paired(&paths, SecretStorage::File, &["home"]));
+        let count = Arc::new(AtomicUsize::new(1));
+        let mut running = SettingsStore::open_with(
+            paths.config_file(),
+            Box::new(NodeSecrets::for_node(&paths, count.clone())),
+            AuditLog::new(paths.audit_log()),
+        )
+        .unwrap();
+        let mut other = open(&paths).unwrap();
+        set_storage(&mut other, SecretStorage::Keyring).unwrap();
+        let e = running.reload().unwrap_err();
+        assert!(e.contains("1 folder mode command runs"), "{e}");
+        assert!(e.contains("reload again"), "{e}");
+        assert_eq!(running.config().machine.secret_storage, SecretStorage::File);
+        count.store(0, Ordering::SeqCst);
+        assert!(running.reload().unwrap());
+        assert_eq!(
+            running.config().machine.secret_storage,
+            SecretStorage::Keyring
+        );
+    }
+
     /// A CLI with no node running moves the keys at once, holding the lock
     /// meanwhile; a node that read the config before that, and starts
     /// after it, leaves the keys alone.
@@ -1216,7 +1338,7 @@ mod tests {
         paired(&paths, SecretStorage::File, &["home"]);
         // Saved with `keyring`, the old copies left, and no mark of it.
         let running = KeysLock::try_take(&paths).unwrap().unwrap();
-        let mut s = cli_store(&paths);
+        let mut s = windows_cli_store(&paths);
         set_storage(&mut s, SecretStorage::Keyring).unwrap();
         drop((s, running));
         std::fs::remove_file(paths.keys_moving()).unwrap();

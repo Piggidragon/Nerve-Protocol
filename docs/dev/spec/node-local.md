@@ -165,7 +165,10 @@ A running node holds `<state>/keys.lock` for its life. A CLI that writes
 `node.toml` itself (no daemon answers: on Windows always, on Linux while a
 node starts) moves the keys only while it holds that lock too. When a node
 holds it, step 4 is left to that node's next start, and the running node goes
-on reading its keys where they were. At start-up, with `node.toml` checked
+on reading its keys where they were. On Linux a move into the keyring is
+refused then: that node goes on with the keys in files, so its `folder` mode
+commands would get a sandbox for keys in files while they are in the keyring,
+and the CLI does not see its count of such commands (below). At start-up, with `node.toml` checked
 and the lock held, the node finishes a move by the config in force: a key
 still in the other place moves into the configured one. That covers a move
 `keys.moving` marks and one a crash stopped; with `keyring`, keys still in
@@ -212,7 +215,9 @@ root. The running node counts these commands, and a move of the keys into
 the keyring is refused while one runs: nothing moves, and the refusal says
 how many run. The command is counted first and looks at the keys' place
 then, under the store lock that a move holds, so a command whose config was
-taken before a move that finished first does not start either. A process
+taken before a move that finished first does not start either. A reload
+(SIGHUP, `reload`) of a file that another writer saved with `keyring` is
+refused the same way while one runs, and the config in force stays. A process
 that a command takes out of its process group (`setsid`) outlives its call
 and is not counted.
 
@@ -591,7 +596,9 @@ signed `node.toml` itself, §1). One JSON object per line: the client sends
 `{"method", "params"}`, the server answers `{"ok": value}` or
 `{"error": "text"}`, or, for streaming methods, several `{"item": value}`
 lines until it closes. The socket is 0600 in a 0700 folder; only its own user
-or root may talk to it. Methods:
+or root may talk to it. A connection the node cannot take for want of
+descriptors or memory does not end the socket: the node takes the next one
+once they are back. Methods:
 
 | Method | Params | |
 |---|---|---|

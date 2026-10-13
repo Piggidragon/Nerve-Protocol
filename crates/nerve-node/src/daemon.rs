@@ -668,6 +668,12 @@ impl Daemon {
         self.shared.status()
     }
 
+    /// How many `folder` mode commands run now that the keys do not move
+    /// into the keyring past ([`Shared::open_to_bus`]).
+    pub fn open_to_bus(&self) -> usize {
+        self.shared.open_to_bus.load(Ordering::SeqCst)
+    }
+
     /// Reads the config file again (what SIGHUP does). Only a file the node
     /// signed is applied; any other is refused and the old config stays.
     pub fn reload(&self) -> Result<bool, String> {

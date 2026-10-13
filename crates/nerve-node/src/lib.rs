@@ -18,6 +18,7 @@ mod job;
 mod link;
 pub mod pair;
 pub mod paths;
+pub mod rights;
 mod secrets;
 pub mod service;
 mod sudo;

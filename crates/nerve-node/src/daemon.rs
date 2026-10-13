@@ -39,6 +39,10 @@ pub struct NodeOptions {
     /// ran. The daemon adds the file in the state folder and sets the level
     /// from `node.toml`.
     pub log: Option<Arc<Log>>,
+    /// Whether the process counts as having full rights (root, an elevated
+    /// token), instead of asking the system. A test sets it: the same test
+    /// must pass for a developer who runs it elevated.
+    pub full_rights: Option<bool>,
 }
 
 impl NodeOptions {
@@ -49,6 +53,7 @@ impl NodeOptions {
             home: home_dir(),
             ctl: true,
             log: nerve_transport::log::global(),
+            full_rights: None,
         }
     }
 }
@@ -367,6 +372,13 @@ impl Daemon {
     /// Starts the daemon: loads the config, serves the control socket, dials
     /// every center that is not paused, revoked or unknown.
     pub async fn start(opts: NodeOptions) -> Result<Daemon, String> {
+        let full = opts.full_rights.unwrap_or_else(crate::rights::full_rights);
+        Daemon::start_with(opts, full).await
+    }
+
+    /// [`Daemon::start`] for a process whose rights are `full_rights`: root,
+    /// or an elevated token on Windows. A test cannot be root.
+    async fn start_with(opts: NodeOptions, full_rights: bool) -> Result<Daemon, String> {
         nerve_transport::init_crypto();
         let paths = opts.paths.clone();
         // Both exist before the first command runs, so Landlock can leave
@@ -392,11 +404,8 @@ impl Daemon {
         store.on_change(|by, version, changes| {
             nerve_transport::log::emit(Level::Info, None, &describe_change(by, version, changes));
         });
-        #[cfg(unix)]
-        if nerve_transport::net::euid() == 0 && !cfg.machine.allow_root {
-            return Err(
-                "refusing to run as root; set machine.allow_root = true to allow it".into(),
-            );
+        if let Some(warning) = crate::rights::check(full_rights, cfg.machine.allow_root)? {
+            tracing::warn!("{warning}");
         }
         #[cfg(unix)]
         if opts.ctl
@@ -842,6 +851,89 @@ mod tests {
         let mut opts = NodeOptions::new(paths);
         opts.home = d.path().to_path_buf();
         (d, Daemon::start(opts).await.unwrap())
+    }
+
+    fn options(d: &tempfile::TempDir, log: &Arc<Log>) -> NodeOptions {
+        let paths = NodePaths::new(d.path().join("config"), d.path().join("state"));
+        let mut opts = NodeOptions::new(paths);
+        opts.home = d.path().to_path_buf();
+        opts.ctl = false;
+        opts.log = Some(log.clone());
+        opts
+    }
+
+    fn warnings(log: &Log) -> Vec<String> {
+        let q = nerve_transport::log::Query {
+            limit: usize::MAX,
+            ..Default::default()
+        };
+        log.entries(&q)
+            .into_iter()
+            .filter(|(_, e)| e.level == Level::Warn)
+            .map(|(_, e)| e.msg)
+            .collect()
+    }
+
+    /// A node with full rights (root, or an elevated token) is refused
+    /// without `machine.allow_root`, and warned about in the log with it.
+    #[tokio::test]
+    async fn full_rights_are_refused_without_allow_root_and_warned_about_with_it() {
+        use tracing_subscriber::layer::SubscriberExt;
+        let log = Log::new(Level::Info);
+        let sub = tracing_subscriber::Registry::default().with(log.layer());
+        let _guard = tracing::subscriber::set_default(sub);
+        let d = tempfile::tempdir().unwrap();
+
+        let err = Daemon::start_with(options(&d, &log), true).await.err();
+        assert_eq!(err.as_deref(), Some(crate::rights::REFUSED));
+        assert!(warnings(&log).is_empty());
+
+        let paths = NodePaths::new(d.path().join("config"), d.path().join("state"));
+        for dir in [&paths.state_dir, &paths.config_dir] {
+            nerve_transport::files::create_private_dir(dir).unwrap();
+        }
+        let mut store = SettingsStore::open(
+            paths.config_file(),
+            paths.config_key(),
+            AuditLog::new(paths.audit_log()),
+        )
+        .unwrap();
+        store
+            .update(|c| {
+                c.machine.allow_root = true;
+                Ok(())
+            })
+            .unwrap();
+        let daemon = Daemon::start_with(options(&d, &log), true).await.unwrap();
+        let w = warnings(&log);
+        assert_eq!(w.len(), 1, "{w:?}");
+        assert!(w[0].contains("full rights") && w[0].contains("You are responsible"));
+        // The warning also reaches the node's log file.
+        let file = std::fs::read_to_string(paths.log_file()).unwrap();
+        assert!(file.contains("You are responsible"), "{file}");
+        daemon.stop().await;
+
+        // A node without full rights is not asked anything.
+        let log = Log::new(Level::Info);
+        let d = tempfile::tempdir().unwrap();
+        let daemon = Daemon::start_with(options(&d, &log), false).await.unwrap();
+        assert!(warnings(&log).is_empty());
+        daemon.stop().await;
+    }
+
+    /// `Daemon::start` takes the rights from the options when a test sets
+    /// them, whoever runs the test.
+    #[tokio::test]
+    async fn start_takes_the_rights_from_the_options() {
+        let log = Log::new(Level::Info);
+        let d = tempfile::tempdir().unwrap();
+        let mut o = options(&d, &log);
+        o.full_rights = Some(true);
+        let err = Daemon::start(o).await.err();
+        assert_eq!(err.as_deref(), Some(crate::rights::REFUSED));
+        let mut o = options(&d, &log);
+        o.full_rights = Some(false);
+        Daemon::start(o).await.unwrap().stop().await;
     }
 
     #[tokio::test]

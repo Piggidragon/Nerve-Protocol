@@ -5,8 +5,11 @@ service. The service starts with the machine and runs under a user of its own,
 `nerve`, which owns the node's config and state folders. `install`, `update`
 and `uninstall` need root, on Windows an administrator. On Linux without
 systemd, run `nerve-node run` under your own service manager
-([pairing](pairing.md#keep-it-running)). Windows differs in a few places; see
-[Windows](#windows).
+([pairing](pairing.md#keep-it-running)). A node you start yourself as root, or
+elevated on Windows, is refused unless `machine.allow_root` is set, and warns
+at start when it runs
+([root and administrator](platforms.md#root-and-administrator)). Windows
+differs in a few places; see [Windows](#windows).
 
 ## Install
 

@@ -24,6 +24,8 @@ fn options(root: &Path) -> NodeOptions {
     let mut o = NodeOptions::new(NodePaths::new(root.join("config"), root.join("state")));
     o.home = root.join("home");
     std::fs::create_dir_all(&o.home).unwrap();
+    // Not the rights of whoever runs the tests: an elevated run must pass.
+    o.full_rights = Some(false);
     // NERVE_NODE_BIN lets the built tests run on another machine.
     o.exe = Some(
         std::env::var_os("NERVE_NODE_BIN")

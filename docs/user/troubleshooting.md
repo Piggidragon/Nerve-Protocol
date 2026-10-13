@@ -67,7 +67,7 @@ cannot switch to the account commands run as and runs no command at all.
 
 | Message | Fix |
 |---|---|
-| `refusing to run as root; set machine.allow_root = true to allow it` | Run as a normal user, or set `machine.allow_root` |
+| `refusing to run as root; set machine.allow_root = true to allow it` | Run as a normal user (on Windows: not elevated), or set `machine.allow_root` |
 | `node.toml is refused: its MAC does not match …` | Look at the file, then `nerve-node config accept`. See [config](config.md) |
 
 ## The center will not start

@@ -163,7 +163,8 @@ pub fn event(e: Event, text: &str) -> Result<(), String> {
 
 /// Writes each panic to the Event Log, then does what the hook before did. A
 /// panic in the body's thread ends the program ([`run_body`]), and the
-/// manager starts it again; one elsewhere leaves the node running. The log
+/// service's recovery settings start it again (three times a day at most);
+/// one elsewhere leaves the node running. The log
 /// file is left alone here: the panic may have come while its lock was held.
 fn watch_crashes() {
     static ONCE: Once = Once::new();
@@ -189,7 +190,7 @@ fn crash_text(info: &std::panic::PanicHookInfo<'_>) -> String {
         .unwrap_or_default();
     if BODY_THREAD.with(|b| b.get()) {
         format!(
-            "The Nerve node crashed (a panic{at}): {what}. The service ends, and Windows starts it again. Its log is {}.",
+            "The Nerve node crashed (a panic{at}): {what}. The service ends; its recovery settings start it again, three times a day at most. Its log is {}.",
             log_path()
         )
     } else {
@@ -407,8 +408,7 @@ mod tests {
         let got = entry_with(&marker);
         assert!(got.starts_with("Information 1 test entry"), "{got}");
         assert!(!got.contains("hunter22"), "{got}");
-        // A value on the next line goes too, as in the log (PR #71 review
-        // round 1, finding 1).
+        // A value on the next line goes too, as in the log.
         event(
             Event::NotStarted,
             &format!("test lines {marker}z token:\nhunter23"),
@@ -454,8 +454,7 @@ mod tests {
     }
 
     /// A panic in the body ends the program and writes one crash, not a
-    /// second one for the frame that cannot unwind (PR #71 review round 1,
-    /// finding 2).
+    /// second one for the frame that cannot unwind.
     #[test]
     fn a_crash_of_the_body_is_one_entry() {
         let marker = nerve_transport::keys::random_token(12);
@@ -476,6 +475,13 @@ mod tests {
         assert_eq!(crashes.len(), 1, "{all:#?}");
         assert!(
             crashes[0].starts_with("Error 4 The Nerve node crashed (a panic at "),
+            "{}",
+            crashes[0]
+        );
+        // The failure actions restart it a few times only; the entry
+        // promises no more.
+        assert!(
+            crashes[0].contains("start it again, three times a day at most"),
             "{}",
             crashes[0]
         );

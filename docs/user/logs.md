@@ -56,14 +56,18 @@ Application**, source `nerve-node`:
 | 1 | Information | The node started. The entry names the log file |
 | 2 | Information | The node stopped, because the service was stopped or Windows shut down |
 | 3 | Error | The node did not start: it refused to (for example `refusing to run as root`, or a `node.toml` whose MAC does not match) or could not. The entry says why |
-| 4 | Error | The node crashed: a panic in its main thread ended it, and Windows starts the service again. Or a part of the node panicked and the node runs on; the entry says which. Or the node stopped with an error after it ran |
+| 4 | Error | The node crashed: a panic in its main thread ended it. The service's recovery settings start it again, three times a day at most; after that it stays stopped. Or a part of the node panicked and the node runs on; the entry says which. Or the node stopped with an error after it ran |
 
 The log file has the details. In PowerShell (Windows PowerShell or
 PowerShell 7):
 
 ```powershell
-Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'nerve-node' } -MaxEvents 20
+Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='nerve-node']]]" -MaxEvents 20 | Format-List TimeCreated, Id, Message
 ```
+
+After `uninstall` the entries stay, but Windows no longer shows their text:
+`Message` is empty. Their text is still in them; replace `Format-List …`
+with `ForEach-Object { "$($_.TimeCreated) $($_.Id) $($_.Properties.Value)" }`.
 
 Every user of the machine can read the Application log, so these entries are
 redacted like the log ([below](#what-is-never-in-it)). A node you start

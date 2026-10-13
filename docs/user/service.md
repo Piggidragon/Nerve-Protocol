@@ -264,8 +264,10 @@ command gets them.
 `update` downloads `nerve-node-x86_64-windows.exe` and checks it as above.
 It stops the service, moves the old program aside, puts the new one in its
 place and starts the service; if the new one does not start, the old one
-goes back. The old program goes once nothing runs it, or at the next restart
-of Windows when `update` ran from it. `update` also registers the Event Log
+goes back. The old program goes once nothing holds it, or at the next
+restart of Windows when Windows still holds it: when `update` ran from it, or
+when the Event Log read the text of the node's entries from it. `install`
+over an installed node moves the old program aside the same way. `update` also registers the Event Log
 source `nerve-node` again. A node installed by a program that did not
 register it yet gets it from the installed program:
 `& "C:\Program Files\Nerve\nerve-node.exe" install`, or the next `update`.

@@ -85,8 +85,10 @@ pub trait WinSystem {
     /// rights.
     fn version_of(&self, program: &Path) -> Result<String, String>;
     /// Removes the program file and its folder when that is empty; `false`
-    /// when the program runs (this command started from it): it then moves
-    /// aside to a `nerve-node.*.del` beside it and goes at the next restart.
+    /// when Windows holds the program (this command started from it, or the
+    /// Event Log reads the text of the node's entries from it): it then
+    /// moves aside to a `nerve-node.*.del` beside it and goes at the next
+    /// restart.
     fn remove_program(&self, path: &Path) -> Result<bool, String>;
 }
 
@@ -217,6 +219,12 @@ fn install_steps(
         ));
     } else {
         let program = std::fs::read(exe).map_err(|e| format!("{}: {e}", exe.display()))?;
+        // Once someone read the node's entries, the Event Log holds the
+        // installed program as their message file: it cannot be written
+        // over then, but it can be moved aside.
+        if layout.bin.exists() {
+            sys.remove_program(&layout.bin)?;
+        }
         write_file(&layout.bin, &program, 0o755)?;
         steps.did(format!("put the program at {}", layout.bin.display()));
     }
@@ -446,7 +454,7 @@ fn uninstall_steps(
             steps.did(format!("removed the program {}", layout.bin.display()));
         } else {
             steps.did(format!(
-                "removed the program {}; this command runs from it, so Windows deletes the file at its next start",
+                "removed the program {}; Windows holds it (this command runs from it, or the Event Log reads it), so Windows deletes the file at its next start",
                 layout.bin.display()
             ));
         }
@@ -621,6 +629,8 @@ mod tests {
         secured: RefCell<Vec<(PathBuf, Option<String>)>>,
         /// The message file of the Event Log source, while it is registered.
         event_source: RefCell<Option<PathBuf>>,
+        /// The programs removed, in order.
+        removed: RefCell<Vec<PathBuf>>,
     }
 
     impl Fake {
@@ -639,6 +649,7 @@ mod tests {
                 started: RefCell::new(Vec::new()),
                 secured: RefCell::new(Vec::new()),
                 event_source: RefCell::new(None),
+                removed: RefCell::new(Vec::new()),
             }
         }
 
@@ -804,6 +815,7 @@ mod tests {
             Ok(text.lines().next().unwrap_or_default().to_string())
         }
         fn remove_program(&self, path: &Path) -> Result<bool, String> {
+            self.removed.borrow_mut().push(path.to_path_buf());
             std::fs::remove_file(path).map_err(|e| e.to_string())?;
             Ok(true)
         }
@@ -932,6 +944,13 @@ mod tests {
         let mut out = Vec::new();
         install(&l, &sys, &exe, "bob", &mut out).unwrap();
         assert!(!aside.exists());
+        // The old program is removed, or moved aside where the Event Log
+        // holds it, before the new one takes its place: written over, a
+        // held file refuses.
+        assert_eq!(
+            sys.removed.borrow().as_slice(),
+            std::slice::from_ref(&l.bin)
+        );
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("stopped the service nerve-node"), "{out}");
         assert!(out.contains("the user nerve is there already"), "{out}");
@@ -1182,8 +1201,7 @@ mod tests {
         assert_eq!(audit_events(&l).last().unwrap()["event"], "update");
         assert!(!staged(&l.bin).exists() && !previous(&l.bin).exists());
         // The same program again changes nothing, but registers the Event
-        // Log source of a node installed before there was one (PR #71 review
-        // round 1, finding 3).
+        // Log source of a node installed before there was one.
         *sys.event_source.borrow_mut() = None;
         let calls = sys.calls().len();
         let mut out = Vec::new();

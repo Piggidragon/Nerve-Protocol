@@ -77,12 +77,13 @@ The installed node on Windows also writes its start, its stop, a start that
 fails and a crash to the Application log, as the source `nerve-node`
 (`crate::win_service::event`, ids in `crate::eventlog`). It does so only when
 the service control manager started it. `running()` writes the start once the
-daemon runs; `service_main` writes the stop, or, when the node's body returned
-an error, "did not start" before `running()` and "stopped with an error"
-after it. A panic hook writes a crash and calls the hook it replaced; it does
+daemon runs; `run_body`, which `service_main` calls, writes the stop, or,
+when the body returned an error, "did not start" before `running()` and
+"stopped with an error" after it. A panic hook writes a crash and calls the hook it replaced; it does
 not touch the log file, whose lock the panicking thread may hold. A panic in
 the body's thread (`run_body`) is caught there and ends the program with
-`abort`, so the service's failure actions start it again and the frame of
+`abort`, so the service's failure actions start it again (three times a day
+at most, as `install` sets them; the entry says so) and the frame of
 `service_main`, which cannot unwind, adds no second panic. A panic on another
 thread, such as a task tokio catches, is written as a part of the node that
 panicked; the node runs on. The text goes through `log::scrub`, as a line of
@@ -96,6 +97,12 @@ windows-msvc; `install` and `update` register `nerve-node.exe` as the message fi
 `HKLM\SYSTEM\CurrentControlSet\Services\EventLog\Application\nerve-node`,
 and `uninstall` removes the key. A windows-gnu build has no table, and the
 Event Viewer then shows the text with a note that the description is missing.
+
+Once someone read the entries, the Event Log service holds the program open
+as their message file. It cannot be written over or deleted then, but it can
+be renamed: `install` moves an installed program aside (`remove_program`, to
+`nerve-node.*.del`, deleted at the next restart) before it writes the new
+one, as `update` and `uninstall` already did.
 
 ## Redaction
 

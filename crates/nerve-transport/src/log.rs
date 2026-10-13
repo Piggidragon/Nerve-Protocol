@@ -1396,7 +1396,7 @@ mod tests {
     }
 
     /// A line made elsewhere than in a `Log` is flat, redacted and cut as an
-    /// entry is (PR #71 review round 1, finding 1).
+    /// entry is.
     #[test]
     fn scrub_flattens_before_it_redacts() {
         for text in [

@@ -1,6 +1,7 @@
 //! The sudo switch end to end: a real node daemon, the conformance fake
 //! center and a fake `sudo` (machine.sudo_path) that checks the password on
-//! stdin like `sudo -S` does. Linux only, like the switch.
+//! stdin like `sudo -S` does. Linux only: Windows has no sudo program
+//! (crate::winsudo, tests/win_sudo.rs).
 #![cfg(target_os = "linux")]
 
 use std::path::{Path, PathBuf};

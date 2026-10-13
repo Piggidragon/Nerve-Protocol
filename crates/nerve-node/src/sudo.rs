@@ -1,9 +1,9 @@
 //! The node's sudo switch (docs/dev/spec/node-local.md §4, docs/dev/spec/protocol.md §7.4.1).
 //!
 //! The switch is on only while the node holds a sudo password that `sudo -v`
-//! accepted. The password lives in memory only: a restarted node starts with
-//! the switch off. It is never part of a document, a result or the audit log,
-//! and every outgoing frame is scrubbed of it.
+//! accepted. On Linux the password lives in memory only: a restarted node
+//! starts with the switch off. It is never part of a document, a result or
+//! the audit log, and every outgoing frame is scrubbed of it.
 //!
 //! On Windows the password is the one of the account the commands run as,
 //! checked by a logon that must hold the Administrators group, and the node

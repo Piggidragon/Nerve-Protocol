@@ -1472,8 +1472,10 @@ async fn setup_steps(
         );
     }
     // Keys in a keyring that does not answer: nothing can be read, so that
-    // comes first.
-    if crate::secrets::stated_storage(paths) == SecretStorage::Keyring {
+    // comes first. The installed node on Windows asks no keyring: its keys
+    // go into files below.
+    let windows_service = crate::secrets::windows_service(paths);
+    if crate::secrets::stated_storage(paths) == SecretStorage::Keyring && !windows_service {
         let me = crate::keyring_setup::me()?;
         crate::keyring_setup::ensure(keyring, &me, Some(input), out)?;
         after_keyring_answers(paths, machine, out).await?;
@@ -1522,19 +1524,29 @@ async fn setup_steps(
         account_chosen(paths, chosen, out, steps).await?;
     }
 
-    // Where the keys go, before pairing makes one.
+    // Where the keys go, before pairing makes one. The installed node on
+    // Windows is not asked: the keyring setup could reach is not the
+    // service's (crate::secrets::KEYRING_WINDOWS_SERVICE).
     let now = read_config(paths).await?.0.machine.secret_storage;
-    let answer = ask(
-        input,
-        out,
-        &format!(
-            "Where the node keeps its keys: file (files only the node's user can read) or keyring (the system keyring) [{}]: ",
-            enum_str(&now)
-        ),
-    )?;
-    let storage = match answer.as_str() {
-        "" => now,
-        a => parse_enum::<SecretStorage>(a, "file or keyring")?,
+    let storage = if windows_service {
+        let _ = writeln!(
+            out,
+            "The node keeps its keys in files: on Windows the installed node runs as nerve, whose Credential Manager setup cannot reach."
+        );
+        SecretStorage::File
+    } else {
+        let answer = ask(
+            input,
+            out,
+            &format!(
+                "Where the node keeps its keys: file (files only the node's user can read) or keyring (the system keyring) [{}]: ",
+                enum_str(&now)
+            ),
+        )?;
+        match answer.as_str() {
+            "" => now,
+            a => parse_enum::<SecretStorage>(a, "file or keyring")?,
+        }
     };
     if storage != now {
         if storage == SecretStorage::Keyring {
@@ -3072,6 +3084,44 @@ mod tests {
         assert!(out.contains("[keyring]"), "{out}");
         let (r, _) = setup_with(&paths, "\nwallet\n");
         assert!(r.unwrap_err().contains("file or keyring"));
+    }
+
+    /// The installed node on Windows keeps its keys in files: `config set`
+    /// refuses the keyring and changes nothing, and setup does not ask
+    /// where the keys go but takes keys left in the keyring into files.
+    #[test]
+    fn the_installed_node_on_windows_keeps_its_keys_in_files() {
+        let (_d, paths) = setup(&["home"]);
+        let key = nerve_transport::keys::NodeKey::generate().unwrap();
+        crate::secrets::store_center_key(&paths, SecretStorage::File, "home", &key).unwrap();
+        let set = |to: &str| run(&paths, &["config", "set", "machine.secret_storage", to]);
+        // Moved there before it was the installed node.
+        set("keyring").unwrap();
+        crate::secrets::windows_service_for_tests::pretend(&paths);
+        let (r, out) = setup_with(&paths, "\n\n\n");
+        r.unwrap();
+        assert!(!out.contains("Where the node keeps its keys"), "{out}");
+        assert!(out.contains("The node keeps its keys in files"), "{out}");
+        assert!(out.contains("the node's keys are in files now"), "{out}");
+        assert_eq!(load(&paths).machine.secret_storage, SecretStorage::File);
+        assert_eq!(config_key_at(&paths), (true, false));
+        assert!(paths.key_file("home").exists());
+        let e = set("keyring").unwrap_err();
+        assert!(e.contains("cannot be \"keyring\""), "{e}");
+        assert!(
+            e.contains(
+                "go to the Credential Manager of the account that runs them, not to that of nerve"
+            ),
+            "{e}"
+        );
+        assert!(e.contains("nothing was changed"), "{e}");
+        assert_eq!(load(&paths).machine.secret_storage, SecretStorage::File);
+        assert_eq!(config_key_at(&paths), (true, false));
+        // Asked again, setup leaves the files as they are.
+        let (r, out) = setup_with(&paths, "\n\n\n");
+        r.unwrap();
+        assert!(!out.contains("are in files now"), "{out}");
+        assert_eq!(load(&paths).machine.secret_storage, SecretStorage::File);
     }
 
     /// Where no keyring answers, setup offers to install one: no keeps the

@@ -112,6 +112,10 @@ The node has a key per center and the key for the MAC above.
   config folder and `config.key` in the state folder.
 - `keyring`: the system keyring, the Credential Manager on Windows and the
   Secret Service (GNOME Keyring, KWallet) on Linux. No copy stays in a file.
+  Not on the node installed as a service on Windows: it runs as `nerve`,
+  whose Credential Manager the commands you run as an administrator cannot
+  reach, so it keeps its keys in files
+  ([service](service.md#windows)).
 
 ```sh
 nerve-node config set machine.secret_storage keyring

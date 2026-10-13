@@ -139,6 +139,22 @@ the config's MAC and its key per center.
 
 The proxy's header values are in the keyring either way (§2).
 
+The installed node on Windows (the service, which runs as `nerve`) keeps its
+keys in files. The Credential Manager is one per account, and the CLI that
+writes the config there runs as an administrator, so a move into the keyring
+would put the keys in that administrator's Credential Manager, out of the
+service's reach. The node counts as installed on the folders `install` uses,
+or when it runs as `nerve`. On it:
+
+- A change to `keyring` is refused before anything moves, by whatever
+  writes the config (`config set`, `config accept`, a center's
+  `settings.set`); `node.toml` and the keys stay as they were.
+- `setup` asks no place and asks no keyring; it moves keys left in the
+  keyring into files.
+- `install`, and the node at its start, refuse a `node.toml` that says
+  `keyring`. The message names the file and the command that moves the keys
+  into files, run as the account that put them in the keyring.
+
 The node looks for the key that checks `node.toml` where that file says,
 read before its MAC is checked. A file that names another place than the one
 its key is in does not check, and is refused like any changed file.

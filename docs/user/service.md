@@ -137,7 +137,9 @@ in brackets.
 3. Where the node keeps its keys: `file` or `keyring`
    ([keys](config.md#where-the-node-keeps-its-keys)). With `keyring` and no
    keyring that answers, it offers to install one where `nerve` has no
-   desktop, and then restarts the node if it had found none before.
+   desktop, and then restarts the node if it had found none before. Not
+   asked on the installed node on Windows, which keeps them in files
+   ([Windows](#windows)).
 4. A pairing link from the center's web UI. Enter skips it. The node shows
    the center and asks before it pairs, as `center add` does.
 5. The mode of that center: `allowlist`, `folder` or `user`
@@ -229,6 +231,21 @@ The other commands work on the installed node from an administrator's
 terminal. Windows has no control socket, so the service takes a change at
 its next start: `Restart-Service nerve-node`. `setup` asks no account
 there, and `--create-user` is refused.
+
+The installed node on Windows keeps its keys in files. The service runs as
+`nerve`, and the Credential Manager is one per account: keys that `setup` or
+`config set` put in the keyring would be in the Credential Manager of the
+administrator who ran them, where the service does not find them. So `setup`
+does not ask where the keys go, and takes keys it finds in the keyring into
+files; `config set machine.secret_storage keyring` is refused and changes
+nothing. A `node.toml` that keeps the keys in the keyring is refused by
+`install`, before it changes anything, and the service does not start with
+one. Move the keys into files first, as the account that put them in the
+keyring, in a terminal opened with "Run as administrator":
+
+```powershell
+& "C:\Program Files\Nerve\nerve-node.exe" config set machine.secret_storage file
+```
 
 To run the commands as another account, an ordinary one, name it and run
 `install` again; it asks for that account's password:

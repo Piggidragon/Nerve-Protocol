@@ -16,6 +16,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use nerve_policy::audit::AuditLog;
+use nerve_policy::config::SecretStorage;
 use nerve_policy::settings::SettingsStore;
 
 use crate::service::{
@@ -160,6 +161,15 @@ fn install_steps(
     invoker: &str,
     steps: &mut Steps,
 ) -> Result<(), String> {
+    // The service would look for keys in the keyring in the Credential
+    // Manager of nerve, and they are in that of whoever moved them there.
+    if crate::secrets::stated_storage(&layout.paths) == SecretStorage::Keyring {
+        return Err(crate::secrets::keyring_windows_service(
+            &layout.paths,
+            "install changed nothing",
+            "run `nerve-node install` again",
+        ));
+    }
     // A running service holds the program and the folders' files.
     if sys.service()? == Some(true) {
         sys.stop()?;
@@ -824,6 +834,44 @@ mod tests {
         let p = new_password();
         assert!(p.len() >= 32 && p.starts_with("Nn1-"), "{p}");
         assert_ne!(p, new_password());
+    }
+
+    /// A node.toml that keeps the keys in the keyring is refused before
+    /// install changes anything: the service, as nerve, would not find
+    /// keys that are in another account's Credential Manager.
+    #[test]
+    fn install_refuses_keys_in_the_keyring() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = layout(d.path());
+        // Left by a node run on these folders before.
+        std::fs::create_dir_all(&l.paths.config_dir).unwrap();
+        std::fs::create_dir_all(&l.paths.state_dir).unwrap();
+        std::fs::write(
+            l.paths.config_file(),
+            "[machine]\nsecret_storage = \"keyring\"\n",
+        )
+        .unwrap();
+        let exe = d.path().join("Downloads/nerve-node-x86_64-windows.exe");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "nerve-node 1.0.0\n").unwrap();
+        let e = install(&l, &sys, &exe, "alice", &mut Vec::new()).unwrap_err();
+        assert!(e.contains("install changed nothing"), "{e}");
+        assert!(e.contains("Credential Manager"), "{e}");
+        assert!(
+            e.contains("`nerve-node config set machine.secret_storage file`"),
+            "{e}"
+        );
+        assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+        assert!(sys.secured.borrow().is_empty());
+        assert!(!l.bin.exists());
+        let a = audit_events(&l);
+        assert_eq!(a.len(), 1);
+        assert!(
+            a[0]["error"].as_str().unwrap().contains("keyring"),
+            "{}",
+            a[0]
+        );
     }
 
     #[test]

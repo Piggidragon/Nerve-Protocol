@@ -538,6 +538,17 @@ impl Daemon {
             nerve_transport::files::create_private_dir(dir)
                 .map_err(|e| format!("{}: {e}", dir.display()))?;
         }
+        // The installed node on Windows would look for its keys in the
+        // Credential Manager of its own account, which holds none of them.
+        if crate::secrets::windows_service(&paths)
+            && crate::secrets::stated_storage(&paths) == SecretStorage::Keyring
+        {
+            return Err(crate::secrets::keyring_windows_service(
+                &paths,
+                "the node does not start",
+                "`Restart-Service nerve-node` starts it",
+            ));
+        }
         let keys = match crate::secrets::KeysLock::try_take(&paths)? {
             Some(l) => l,
             None => {
@@ -1217,6 +1228,41 @@ mod tests {
         let mut opts = NodeOptions::new(paths);
         opts.home = d.path().to_path_buf();
         (d, Daemon::start(opts).await.unwrap())
+    }
+
+    /// The installed node on Windows does not start with its keys in the
+    /// keyring: they are in the Credential Manager of whoever moved them
+    /// there, and the message says how to get them back into files.
+    #[tokio::test]
+    async fn the_installed_node_on_windows_refuses_keys_in_the_keyring() {
+        let d = tempfile::tempdir().unwrap();
+        let log = Log::new(Level::Info);
+        let opts = options(&d, &log);
+        let paths = opts.paths.clone();
+        let mut store = SettingsStore::open_with(
+            paths.config_file(),
+            Box::new(crate::secrets::NodeSecrets::new(&paths)),
+            AuditLog::new(paths.audit_log()),
+        )
+        .unwrap();
+        store
+            .update(|c| {
+                c.machine.secret_storage = SecretStorage::Keyring;
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        crate::secrets::windows_service_for_tests::pretend(&paths);
+        let Err(e) = Daemon::start(opts).await else {
+            panic!("the node started");
+        };
+        assert!(e.contains("the node does not start"), "{e}");
+        assert!(e.contains("Credential Manager"), "{e}");
+        assert!(
+            e.contains("`nerve-node config set machine.secret_storage file`"),
+            "{e}"
+        );
+        assert!(e.contains("Restart-Service nerve-node"), "{e}");
     }
 
     fn options(d: &tempfile::TempDir, log: &Arc<Log>) -> NodeOptions {

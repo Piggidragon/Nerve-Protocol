@@ -291,6 +291,63 @@ pub fn stated_storage(paths: &NodePaths) -> SecretStorage {
         .unwrap_or_default()
 }
 
+/// Why the installed node on Windows keeps its keys in files. The service
+/// runs as its own account, `nerve`, and the Credential Manager is one per
+/// account: `setup` and `config set` run as an administrator, so whatever
+/// they put in the keyring would be in that administrator's, where the
+/// service never finds it.
+pub const KEYRING_WINDOWS_SERVICE: &str = "the installed node on Windows is the service nerve-node, which runs as the account nerve, and the Credential Manager is one per account: keys that `setup` or `config set` put in the system keyring go to the Credential Manager of the account that runs them, not to that of nerve, and the service does not find them. The installed node on Windows keeps its keys in files (machine.secret_storage = \"file\"), which only nerve and the administrators can open";
+
+/// Whether the node at `paths` is the installed node on Windows, whose keys
+/// may not go into the keyring ([`KEYRING_WINDOWS_SERVICE`]).
+pub fn windows_service(paths: &NodePaths) -> bool {
+    #[cfg(test)]
+    if windows_service_for_tests::is(paths) {
+        return true;
+    }
+    cfg!(windows) && crate::service::is_service_node(paths)
+}
+
+/// The nodes a test has the other code take for the installed node on
+/// Windows, on every platform.
+#[cfg(test)]
+pub(crate) mod windows_service_for_tests {
+    use std::collections::HashSet;
+    use std::path::PathBuf;
+    use std::sync::{LazyLock, Mutex};
+
+    use crate::paths::NodePaths;
+
+    static NODES: LazyLock<Mutex<HashSet<PathBuf>>> = LazyLock::new(Mutex::default);
+
+    /// The node at `paths` counts as the installed node on Windows.
+    pub fn pretend(paths: &NodePaths) {
+        NODES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(paths.config_dir.clone());
+    }
+
+    pub fn is(paths: &NodePaths) -> bool {
+        NODES
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&paths.config_dir)
+    }
+}
+
+/// The refusal of the installed node on Windows, or of its install, when
+/// `node.toml` keeps the keys in the keyring: they are in the Credential
+/// Manager of whoever moved them there, not in that of `nerve`.
+///
+/// `what` says what does not happen, `then` what to do after the move.
+pub fn keyring_windows_service(paths: &NodePaths, what: &str, then: &str) -> String {
+    format!(
+        "{} keeps the node's keys in the system keyring (machine.secret_storage = \"keyring\"), but {KEYRING_WINDOWS_SERVICE}. So {what}. Move the keys into files as the account that put them in the keyring, in a terminal opened with \"Run as administrator\": `nerve-node config set machine.secret_storage file`; then {then}",
+        paths.config_file().display()
+    )
+}
+
 /// The node key for `center` from where `storage` keeps it.
 pub fn center_key(
     paths: &NodePaths,
@@ -564,6 +621,11 @@ impl Secrets for NodeSecrets {
 
     fn copy(&mut self, cfg: &NodeConfig) -> Result<(), String> {
         let to = cfg.machine.secret_storage;
+        if to == SecretStorage::Keyring && windows_service(&self.paths) {
+            return Err(format!(
+                "machine.secret_storage cannot be \"keyring\" here: {KEYRING_WINDOWS_SERVICE}; nothing was changed"
+            ));
+        }
         if let Some((open, ended)) = self.open_commands(to) {
             return Err(format!(
                 "{open}; the node's keys stay in their files, and nothing was changed. Wait until {ended} ended, or end every command with `nerve-node panic`, change it again, then `nerve-node unlock`"

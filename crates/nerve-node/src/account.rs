@@ -7,14 +7,12 @@
 //! CAP_SETGID, the one privilege it has, and every command it starts drops
 //! both before it runs.
 
-use std::path::Path;
-#[cfg(target_os = "linux")]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::service::Account;
 
 /// The comment `setup` gives an account it makes for the commands.
-pub const MADE_MARK: &str = "Nerve commands";
+pub const MADE_MARK: &str = "Nerve user mode";
 
 /// What a command of the installed node gets while no account is chosen.
 pub const NONE_CHOSEN: &str = "this node runs commands as an account of their own, and none is chosen: `sudo nerve-node setup` chooses one (machine.user)";
@@ -22,6 +20,46 @@ pub const NONE_CHOSEN: &str = "this node runs commands as an account of their ow
 /// The warning for root as the account of the commands.
 pub fn root_warning() -> String {
     "Warning: commands from a center then run as root, with every right on this machine, the node's keys included; in folder mode only Landlock still holds them. You are responsible for what they do.".into()
+}
+
+/// Groups whose members get root without a password and without a setuid
+/// program, so `no_new_privs` does not hold them: a container or a VM with
+/// the host's `/` in it, or the raw disks.
+pub const ROOT_GROUPS: &[&str] = &["docker", "lxd", "incus-admin", "libvirt", "disk"];
+
+/// The warning for an account in one of [`ROOT_GROUPS`].
+pub fn group_warning(name: &str, groups: &[String]) -> String {
+    format!(
+        "Warning: {name} is in the group {}, which gets root without a password; a command from a center can then get root and read the node's keys. Choose an account outside it, or you are responsible for what commands do.",
+        groups.join(", ")
+    )
+}
+
+/// The groups of [`ROOT_GROUPS`] that `account` is in, by name.
+pub fn root_groups(account: &Account) -> Vec<String> {
+    // getent prints the groups it finds, and fails only for the others.
+    match plain("getent").arg("group").args(ROOT_GROUPS).output() {
+        Ok(o) => root_groups_in(&String::from_utf8_lossy(&o.stdout), &account.groups),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// The groups in `getent group` lines whose id is one of `groups`.
+pub fn root_groups_in(lines: &str, groups: &[u32]) -> Vec<String> {
+    lines
+        .lines()
+        .filter_map(|l| {
+            let mut f = l.split(':');
+            let name = f.next()?;
+            let gid: u32 = f.nth(1)?.parse().ok()?;
+            (ROOT_GROUPS.contains(&name) && groups.contains(&gid)).then(|| name.to_string())
+        })
+        .collect()
+}
+
+/// The home `setup` gives an account it makes.
+pub fn made_home(name: &str) -> PathBuf {
+    Path::new("/home").join(name)
 }
 
 /// Whether `setup` may make an account of this name: what `useradd` takes
@@ -114,18 +152,20 @@ fn plain(program: &str) -> std::process::Command {
 
 /// The account a command (and the sudo switch) runs as, from
 /// `machine.user` (`user`): `None` runs it as the node's own user, as a
-/// node that a person runs does. A node that can switch accounts and is not
-/// root (the installed service) runs no command until an account is
+/// node that a person runs does. The installed service (`service`: its
+/// folders or its user, however it was started), and any other node that
+/// can switch accounts and is not root, runs no command until an account is
 /// chosen, and none as itself, since it owns the keys. Root is allowed: the
 /// owner chose it and was warned.
 pub fn for_commands(
     user: Option<&str>,
     own_uid: u32,
+    service: bool,
     can_switch: bool,
     lookup: impl Fn(&str) -> Result<Option<Account>, String>,
 ) -> Result<Option<Account>, String> {
     let Some(name) = user else {
-        if can_switch && own_uid != 0 {
+        if (service || can_switch) && own_uid != 0 {
             return Err(NONE_CHOSEN.into());
         }
         return Ok(None);
@@ -141,6 +181,13 @@ pub fn for_commands(
         }
         return Err(format!(
             "machine.user {name} is the node's own user, which can read the node's keys; no command runs as it"
+        ));
+    }
+    if !can_switch && service {
+        // Started by hand, or by a systemd without AmbientCapabilities=:
+        // unsetting machine.user would run the commands as the keys' owner.
+        return Err(format!(
+            "machine.user is {name}, but this installed node runs as uid {own_uid} without CAP_SETUID and CAP_SETGID and cannot switch to it; start it as the service: `sudo systemctl start nerve-node`"
         ));
     }
     if !can_switch {
@@ -498,30 +545,62 @@ mod tests {
     #[test]
     fn the_account_of_the_commands() {
         // Chosen: the service (uid 990, may switch) runs the command as it.
-        let a = for_commands(Some("alice"), 990, true, db).unwrap().unwrap();
+        let a = for_commands(Some("alice"), 990, false, true, db)
+            .unwrap()
+            .unwrap();
         assert_eq!((a.name.as_str(), a.uid), ("alice", 1000));
         // Root is allowed; the owner was warned when choosing it.
         assert_eq!(
-            for_commands(Some("root"), 990, true, db)
+            for_commands(Some("root"), 990, false, true, db)
                 .unwrap()
                 .unwrap()
                 .uid,
             0
         );
         // None chosen: the service runs none, a person's node runs it as itself.
-        assert_eq!(for_commands(None, 990, true, db).unwrap_err(), NONE_CHOSEN);
-        assert_eq!(for_commands(None, 1000, false, db).unwrap(), None);
-        assert_eq!(for_commands(None, 0, true, db).unwrap(), None);
+        assert_eq!(
+            for_commands(None, 990, false, true, db).unwrap_err(),
+            NONE_CHOSEN
+        );
+        assert_eq!(for_commands(None, 1000, false, false, db).unwrap(), None);
+        assert_eq!(for_commands(None, 0, false, true, db).unwrap(), None);
         // Refused: an account that does not exist, the node's own user, and
         // any switch the node cannot make.
-        let e = for_commands(Some("bob"), 990, true, db).unwrap_err();
+        let e = for_commands(Some("bob"), 990, false, true, db).unwrap_err();
         assert!(e.contains("bob") && e.contains("does not exist"), "{e}");
-        let e = for_commands(Some("nerve"), 990, true, db).unwrap_err();
+        let e = for_commands(Some("nerve"), 990, false, true, db).unwrap_err();
         assert!(e.contains("node's own user"), "{e}");
-        let e = for_commands(Some("alice"), 1001, false, db).unwrap_err();
+        let e = for_commands(Some("alice"), 1001, false, false, db).unwrap_err();
         assert!(e.contains("cannot switch"), "{e}");
         // A root node asked to run as root just does.
-        assert_eq!(for_commands(Some("root"), 0, true, db).unwrap(), None);
+        assert_eq!(
+            for_commands(Some("root"), 0, false, true, db).unwrap(),
+            None
+        );
+    }
+
+    /// The installed node started without its two capabilities (by hand, as
+    /// `nerve`) runs no command, and never as itself.
+    #[test]
+    fn the_installed_node_without_its_capabilities_runs_nothing() {
+        assert_eq!(
+            for_commands(None, 990, true, false, db).unwrap_err(),
+            NONE_CHOSEN
+        );
+        let e = for_commands(Some("alice"), 990, true, false, db).unwrap_err();
+        assert!(e.contains("systemctl start"), "{e}");
+        assert!(!e.contains("unset machine.user"), "{e}");
+        // As root it runs as root, which `machine.allow_root` allowed.
+        assert_eq!(for_commands(None, 0, true, false, db).unwrap(), None);
+    }
+
+    #[test]
+    fn groups_that_get_root_are_found_by_their_id() {
+        let lines = "docker:x:998:alice\ndisk:x:6:\nlibvirt:x:120:\nusers:x:100:\n";
+        assert_eq!(root_groups_in(lines, &[1000, 998, 6]), ["docker", "disk"]);
+        assert!(root_groups_in(lines, &[1000, 100]).is_empty());
+        let w = group_warning("alice", &["docker".into()]);
+        assert!(w.contains("alice is in the group docker"), "{w}");
     }
 
     #[test]

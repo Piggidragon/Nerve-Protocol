@@ -157,6 +157,8 @@ const ACCOUNT_FRESH: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub(crate) struct Shared {
     pub paths: NodePaths,
+    /// Whether this is the installed service (crate::service::is_service_node).
+    pub service: bool,
     pub exe: Option<PathBuf>,
     pub home: PathBuf,
     /// Which protected list applies, and where its system folders are.
@@ -212,6 +214,7 @@ impl Shared {
         crate::account::for_commands(
             cfg.machine.user.as_deref(),
             nerve_transport::net::euid(),
+            self.service,
             crate::account::can_switch(),
             cached,
         )
@@ -405,8 +408,16 @@ impl Daemon {
         }
         let (changed, _) = watch::channel(0);
         let (stop, _) = watch::channel(false);
+        let service = crate::service::is_service_node(&paths);
+        #[cfg(unix)]
+        if service && nerve_transport::net::euid() != 0 && !crate::account::can_switch() {
+            tracing::warn!(
+                "this is the installed node, started without CAP_SETUID and CAP_SETGID: it runs no command; start it as the service: `sudo systemctl start nerve-node`"
+            );
+        }
         let shared = Arc::new(Shared {
             paths: paths.clone(),
+            service,
             exe: opts.exe,
             home: opts.home,
             platform: crate::paths::platform(),

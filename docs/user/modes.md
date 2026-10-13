@@ -99,7 +99,9 @@ On a node [installed as a service](service.md#the-account-commands-run-as)
 the node runs as its own user, `nerve`, and commands in every mode run as
 the account you chose at `install` or `setup` instead. In `user` mode they
 can do what that account can do, and cannot read the node's keys or change
-its state. In `folder` mode they are the same account, held to their
+its state, unless that account can become root (root itself, or a member
+of a group such as `docker`; see
+[the account commands run as](service.md#the-account-commands-run-as)). In `folder` mode they are the same account, held to their
 folders.
 
 ## Which mode

@@ -927,27 +927,41 @@ mod tests {
         assert_eq!(r["stderr"], "", "the prompt is left out: {r}");
     }
 
+    /// Writes an executable script at `path` from another process. Written
+    /// here, its descriptor would leak into a command that another test
+    /// thread forks meanwhile, and running the script would fail with "Text
+    /// file busy" until that command execs.
+    #[cfg(target_os = "linux")]
+    fn write_script(path: &Path, text: &str) {
+        use std::io::Write;
+        let mut c = std::process::Command::new("sh")
+            .args(["-c", "cat > \"$0\" && chmod 755 \"$0\""])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        c.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
+        assert!(c.wait().unwrap().success(), "cannot write {path:?}");
+    }
+
     /// A fake sudo at `dir/sudo`: with `asks` it prints its `-p` prompt to
     /// stderr and reads the password like `sudo -S`, else it asks for none
     /// (NOPASSWD, root). Either way it runs the command as its child.
     #[cfg(target_os = "linux")]
     fn fake_sudo(dir: &Path, asks: bool) -> String {
-        use std::os::unix::fs::PermissionsExt;
         let ask = if asks {
             "printf %s \"$p\" >&2\nIFS= read -r pw\n[ \"$pw\" = right-pw ] || exit 1\n"
         } else {
             ""
         };
         let sudo = dir.join("sudo");
-        std::fs::write(
+        write_script(
             &sudo,
-            format!(
+            &format!(
                 "#!/bin/sh\nwhile [ $# -gt 0 ]; do case \"$1\" in -S|-k) shift ;; \
                  -p) p=\"$2\"; shift 2 ;; *) break ;; esac; done\n{ask}\"$@\"\n"
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         sudo.display().to_string()
     }
 
@@ -956,20 +970,17 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn the_sudo_check_runs_as_the_chosen_account() {
-        use std::os::unix::fs::PermissionsExt;
         let d = tempfile::tempdir().unwrap();
         let seen = d.path().join("seen");
         let sudo = d.path().join("sudo");
         // Like sudo -v: takes the password of the user it runs as.
-        std::fs::write(
+        write_script(
             &sudo,
-            format!(
+            &format!(
                 "#!/bin/sh\nIFS= read -r pw\necho \"$USER $(id -u)\" > '{}'\n[ \"$pw\" = \"pw-of-$USER\" ]\n",
                 seen.display()
             ),
-        )
-        .unwrap();
-        std::fs::set_permissions(&sudo, std::fs::Permissions::from_mode(0o755)).unwrap();
+        );
         let sudo = sudo.display().to_string();
         // SAFETY: plain getters.
         let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };

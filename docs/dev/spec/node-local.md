@@ -53,17 +53,24 @@ groups (`setfsuid`, `setfsgid`, and `setgroups` as a plain system call, all
 per thread on Linux); the audit entry is written as `nerve` again. So a
 file the node makes for a center belongs to the account, and `~` in rules
 and in the protected list is the account's home. With root as the account
-the file-system ids are root's without root's capabilities. The CLI, which
+the file-system ids are root's without root's capabilities
+(`CAP_DAC_OVERRIDE`, `CAP_DAC_READ_SEARCH`, `CAP_FOWNER`), so these checks
+and the `fs` actions reach only what root owns or what the permission bits
+open to others; a command itself is really root. The CLI, which
 runs as `nerve` on the installed node, keeps a folder it may not look into
 in its normal form (`folder add`), unresolved. A node not installed as a
 service runs commands as its own user and refuses a `machine.user` it
-cannot switch to.
+cannot switch to. The installed node is known by its folders or its user,
+not by its capabilities: started without them (by hand, as `nerve`), it
+runs no command at all, and none as itself while no account is chosen.
 
 `install`, `update` and `uninstall` run as root and write into folders
 that belong to `nerve`: they write there as the folder's owner (the
 thread's file-system ids), refuse a link in place of one of the node's
 folders, and give the folders away by walking them through descriptors
-opened without following links.
+opened without following links. A file with more than one name (a hard
+link) is not given away: the walk stops there with an error, since its
+other name may be outside the node's folders.
 
 `node.toml` is written private to the owner (mode 0600 on Unix). The daemon
 refuses to run as root unless `machine.allow_root = true`.

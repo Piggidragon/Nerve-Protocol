@@ -57,7 +57,11 @@ nothing is allowed yet.
 Without a flag, the node is dialling. The wait grows from 1 to 60 seconds. If
 `nerve-node status` says `LOCKED (panic)`, run `nerve-node unlock`.
 
-If `status` says `daemon: not running`, start `nerve-node run`.
+If `status` says `daemon: not running`, start `nerve-node run`. On a node
+[installed as a service](service.md), start the service instead:
+`sudo systemctl start nerve-node`. A node started there by hand lacks the
+two capabilities the service has, so it cannot switch to the account
+commands run as and runs no command at all.
 
 ## The node will not start
 

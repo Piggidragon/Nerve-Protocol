@@ -108,6 +108,25 @@ WantedBy=multi-user.target
     }
 }
 
+/// Whether a node on `paths` is the installed service, however it was
+/// started: on the installed folders, or as the user `install` made. Such a
+/// node runs commands only as the account `machine.user` names, never as
+/// itself ([`crate::account::for_commands`]), even without the two
+/// capabilities the unit gives it.
+pub fn is_service_node(paths: &NodePaths) -> bool {
+    if *paths == Layout::system().paths {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        let me = nerve_transport::net::euid();
+        me != 0
+            && matches!(crate::account::lookup(USER), Ok(Some(a)) if a.uid == me && a.comment == USER_MARK)
+    }
+    #[cfg(not(unix))]
+    false
+}
+
 /// A user account.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Account {
@@ -128,13 +147,15 @@ pub trait System {
     /// Whether systemd runs this machine.
     fn has_systemd(&self) -> bool;
     fn account(&self, name: &str) -> Result<Option<Account>, String>;
+    /// The groups of [`crate::account::ROOT_GROUPS`] the account is in.
+    fn root_groups(&self, account: &Account) -> Vec<String>;
     /// Makes a system user with a group of the same name, the home given
     /// (not created) and no login, marked with [`USER_MARK`].
     fn add_account(&self, name: &str, home: &Path) -> Result<(), String>;
     /// Makes an ordinary account for the commands, as `setup` offers: a
-    /// group and a home of its own, no login, marked with
+    /// group of its own, the home given (created), no login, marked with
     /// [`crate::account::MADE_MARK`].
-    fn add_user(&self, name: &str) -> Result<(), String>;
+    fn add_user(&self, name: &str, home: &Path) -> Result<(), String>;
     /// Removes the user and its group.
     fn remove_account(&self, name: &str) -> Result<(), String>;
     fn systemctl(&self, args: &[&str]) -> Result<(), String>;
@@ -163,18 +184,22 @@ impl System for Host {
         crate::account::lookup(name)
     }
 
-    fn add_user(&self, name: &str) -> Result<(), String> {
+    fn root_groups(&self, account: &Account) -> Vec<String> {
+        crate::account::root_groups(account)
+    }
+
+    fn add_user(&self, name: &str, home: &Path) -> Result<(), String> {
         let mut c = std::process::Command::new("useradd");
-        c.args([
-            "--user-group",
-            "--create-home",
-            "--shell",
-            no_login(),
-            "--comment",
-            crate::account::MADE_MARK,
-            "--",
-            name,
-        ]);
+        c.args(["--user-group", "--create-home", "--home-dir"])
+            .arg(home)
+            .args([
+                "--shell",
+                no_login(),
+                "--comment",
+                crate::account::MADE_MARK,
+                "--",
+                name,
+            ]);
         // setup runs as the node's user and keeps root only as its saved
         // id ([`become_owner`]); useradd gets it back.
         #[cfg(target_os = "linux")]
@@ -502,9 +527,7 @@ fn default_account(layout: &Layout, sys: &dyn System, invoker: &str, steps: &mut
                 Ok(())
             })
             .map_err(|e| e.to_string())?;
-        if a.uid == 0 {
-            let _ = writeln!(steps.out, "{}", crate::account::root_warning());
-        }
+        warn_about(sys, &a, steps.out);
         Ok::<_, String>(format!("commands run as {invoker}, who ran install"))
     })();
     match r {
@@ -546,6 +569,19 @@ pub fn usable_account(sys: &dyn System, paths: &NodePaths, name: &str) -> Result
         }
     }
     Ok(a)
+}
+
+/// Warns when `a` as the account of the commands lets them get root: root
+/// itself, or an account in a group that gets root without a password.
+fn warn_about(sys: &dyn System, a: &Account, out: &mut dyn Write) {
+    if a.uid == 0 {
+        let _ = writeln!(out, "{}", crate::account::root_warning());
+        return;
+    }
+    let groups = sys.root_groups(a);
+    if !groups.is_empty() {
+        let _ = writeln!(out, "{}", crate::account::group_warning(&a.name, &groups));
+    }
 }
 
 /// The account `setup` chose for the commands, and whether it made it.
@@ -610,15 +646,45 @@ pub fn choose_account(
         if !matches!(yes.as_str(), "y" | "Y" | "yes") {
             return Err(format!("there is no account {name}; nothing changed"));
         }
-        sys.add_user(&name)?;
+        sys.add_user(&name, &crate::account::made_home(&name))?;
         let _ = writeln!(out, "made the account {name}");
         made = true;
     }
     let a = usable_account(sys, paths, &name)?;
-    if a.uid == 0 {
-        let _ = writeln!(out, "{}", crate::account::root_warning());
-    }
+    warn_about(sys, &a, out);
     Ok(Some(Chosen { name, made }))
+}
+
+/// `setup --create-user`: `name` becomes the account of the commands
+/// without a question, made as [`choose_account`] makes one when it is not
+/// there. An account that is there is taken if the node can use it.
+pub fn create_account(
+    sys: &dyn System,
+    paths: &NodePaths,
+    name: &str,
+    out: &mut dyn Write,
+) -> Result<Chosen, String> {
+    if !nerve_policy::config::valid_account_name(name) || !crate::account::makeable_name(name) {
+        return Err(format!(
+            "{name:?} is not a name setup makes accounts with: a-z, 0-9, _ and -, starting with a letter or _"
+        ));
+    }
+    if name == USER {
+        return Err(format!(
+            "{name} is the node's own user, which owns its keys; choose another account"
+        ));
+    }
+    let made = sys.account(name)?.is_none();
+    if made {
+        sys.add_user(name, &crate::account::made_home(name))?;
+        let _ = writeln!(out, "made the account {name}");
+    }
+    let a = usable_account(sys, paths, name)?;
+    warn_about(sys, &a, out);
+    Ok(Chosen {
+        name: name.to_string(),
+        made,
+    })
 }
 
 /// `uninstall`: stops and removes the service, then the folders (deleted
@@ -1067,9 +1133,10 @@ fn chown_below(at: &Path, shown: &Path, uid: u32, gid: u32) -> Result<(), String
         .open(at);
     let dir = match dir {
         Ok(d) => d,
-        // A file or a link: changed itself.
+        // A file or a link: changed itself, through a descriptor of the
+        // entry (not followed), so the file checked is the one changed.
         Err(e) if matches!(e.raw_os_error(), Some(libc::ENOTDIR | libc::ELOOP)) => {
-            return std::os::unix::fs::lchown(at, Some(uid), Some(gid)).map_err(err);
+            return chown_entry(at, uid, gid).map_err(|e| format!("{}: {e}", shown.display()));
         }
         Err(e) => return Err(err(e)),
     };
@@ -1078,6 +1145,41 @@ fn chown_below(at: &Path, shown: &Path, uid: u32, gid: u32) -> Result<(), String
     for e in std::fs::read_dir(&fd).map_err(err)? {
         let name = e.map_err(err)?.file_name();
         chown_below(&fd.join(&name), &shown.join(&name), uid, gid)?;
+    }
+    Ok(())
+}
+
+/// Gives the file or link at `at` (not followed) to `uid`:`gid`. A file
+/// with more than one name is refused: its other name can be anywhere on
+/// the same file system, as a hard link the node's user made to a file of
+/// root's.
+#[cfg(target_os = "linux")]
+fn chown_entry(at: &Path, uid: u32, gid: u32) -> Result<(), String> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let f = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(at)
+        .map_err(|e| e.to_string())?;
+    let m = f.metadata().map_err(|e| e.to_string())?;
+    if m.nlink() > 1 {
+        return Err(
+            "it has another name (a hard link), which may be outside the node's folders; remove it and run this again".into(),
+        );
+    }
+    // SAFETY: an empty NUL-terminated path with AT_EMPTY_PATH on an open
+    // descriptor: the call changes that inode.
+    let r = unsafe {
+        libc::fchownat(
+            std::os::fd::AsRawFd::as_raw_fd(&f),
+            c"".as_ptr(),
+            uid,
+            gid,
+            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if r != 0 {
+        return Err(std::io::Error::last_os_error().to_string());
     }
     Ok(())
 }
@@ -1183,13 +1285,13 @@ pub fn check_access(paths: &NodePaths) -> Result<(), String> {
 }
 
 #[cfg(all(test, target_os = "linux"))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;
 
     /// A machine in a temporary folder: the user is the test's own, and
     /// systemctl and the node's start are recorded.
-    struct Fake {
+    pub(crate) struct Fake {
         user: RefCell<Option<Account>>,
         /// The other accounts of the machine.
         others: RefCell<Vec<Account>>,
@@ -1198,20 +1300,23 @@ mod tests {
         given: RefCell<Vec<(PathBuf, u32)>>,
         /// Whether a node started by the service answers.
         starts: std::cell::Cell<bool>,
+        /// The accounts in a group that gets root, and that group.
+        root_groups: RefCell<Vec<(String, String)>>,
     }
 
     impl Fake {
-        fn new() -> Fake {
+        pub(crate) fn new() -> Fake {
             Fake {
                 user: RefCell::new(None),
                 others: RefCell::new(vec![other("alice", 4242), other("root", 0)]),
                 calls: RefCell::new(Vec::new()),
                 given: RefCell::new(Vec::new()),
                 starts: std::cell::Cell::new(true),
+                root_groups: RefCell::new(Vec::new()),
             }
         }
 
-        fn calls(&self) -> Vec<String> {
+        pub(crate) fn calls(&self) -> Vec<String> {
             self.calls.borrow().clone()
         }
     }
@@ -1259,11 +1364,22 @@ mod tests {
                 .find(|a| a.name == name)
                 .cloned())
         }
-        fn add_user(&self, name: &str) -> Result<(), String> {
-            self.calls.borrow_mut().push(format!("useradd {name}"));
+        fn root_groups(&self, account: &Account) -> Vec<String> {
+            self.root_groups
+                .borrow()
+                .iter()
+                .filter(|(a, _)| *a == account.name)
+                .map(|(_, g)| g.clone())
+                .collect()
+        }
+        fn add_user(&self, name: &str, home: &Path) -> Result<(), String> {
+            self.calls
+                .borrow_mut()
+                .push(format!("useradd {name} {}", home.display()));
             let uid = 5000 + self.others.borrow().len() as u32;
             self.others.borrow_mut().push(Account {
                 comment: crate::account::MADE_MARK.into(),
+                home: home.into(),
                 ..other(name, uid)
             });
             Ok(())
@@ -1510,7 +1626,7 @@ mod tests {
         let (r, out) = choose(&sys, &l, Some("alice"), "bob\ny\n");
         assert_eq!(r.unwrap(), chosen("bob", true));
         assert!(out.contains("There is no account bob. Make it"), "{out}");
-        assert!(sys.calls().contains(&"useradd bob".to_string()));
+        assert!(sys.calls().contains(&"useradd bob /home/bob".to_string()));
         // Root: allowed, with the warning.
         let (r, out) = choose(&sys, &l, Some("alice"), "root\n");
         assert_eq!(r.unwrap(), chosen("root", false));
@@ -1518,6 +1634,27 @@ mod tests {
             out.contains("run as root") && out.contains("You are responsible"),
             "{out}"
         );
+        // An account in a group that gets root: allowed, with a warning.
+        sys.root_groups
+            .borrow_mut()
+            .push(("carol".into(), "docker".into()));
+        let (r, out) = choose(
+            &sys,
+            &l,
+            Some("alice"),
+            "carol
+",
+        );
+        assert_eq!(r.unwrap(), chosen("carol", false));
+        assert!(out.contains("carol is in the group docker"), "{out}");
+        let (_, out) = choose(
+            &sys,
+            &l,
+            Some("carol"),
+            "alice
+",
+        );
+        assert!(!out.contains("Warning"), "{out}");
         // Refused: one that is not there and is not to be made, a name
         // useradd would not take, the node's own user.
         let made = sys.calls().len();
@@ -1530,6 +1667,65 @@ mod tests {
         assert_eq!(sys.calls().len(), made, "nothing was made");
         let e = choose(&sys, &l, None, "nerve\n").0.unwrap_err();
         assert!(e.contains("node's own user"), "{e}");
+    }
+
+    /// The installed node is known by its folders, not by how it started.
+    #[test]
+    fn the_installed_folders_make_the_service_node() {
+        assert!(is_service_node(&Layout::system().paths));
+        let d = tempfile::tempdir().unwrap();
+        assert!(!is_service_node(&NodePaths::new(
+            d.path().join("c"),
+            d.path().join("s")
+        )));
+    }
+
+    /// `setup --create-user`: makes the account without a question, by the
+    /// rules of the interactive step.
+    #[test]
+    fn create_user_makes_the_account_without_asking() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = installed(d.path(), &sys, "1.0.0");
+        let create = |name: &str| {
+            let mut out = Vec::new();
+            let r = create_account(&sys, &l.paths, name, &mut out);
+            (r, String::from_utf8(out).unwrap())
+        };
+        let (r, out) = create("bob");
+        assert_eq!(
+            r.unwrap(),
+            Chosen {
+                name: "bob".into(),
+                made: true
+            }
+        );
+        assert!(out.contains("made the account bob"), "{out}");
+        assert!(sys.calls().contains(&"useradd bob /home/bob".to_string()));
+        let bob = sys.account("bob").unwrap().unwrap();
+        assert_eq!(bob.home, Path::new("/home/bob"));
+        assert_eq!(bob.comment, "Nerve user mode");
+        // There already, and usable: taken, not made again.
+        let made = sys.calls().len();
+        assert!(!create("bob").0.unwrap().made);
+        assert!(!create("alice").0.unwrap().made);
+        // Refused, with nothing made: nerve, the node's user under another
+        // name, and names useradd would not take.
+        sys.others.borrow_mut().push(Account {
+            name: "svc".into(),
+            ..me()
+        });
+        for (name, why) in [
+            ("nerve", "node's own user"),
+            ("svc", "node's own user"),
+            ("Bob", "not a name setup makes"),
+            ("a:b", "not a name setup makes"),
+            ("-x", "not a name setup makes"),
+        ] {
+            let e = create(name).0.unwrap_err();
+            assert!(e.contains(why), "{name}: {e}");
+        }
+        assert_eq!(sys.calls().len(), made, "nothing was made");
     }
 
     /// The account of the commands cannot read the keys: they are 0600 in
@@ -1637,6 +1833,24 @@ mod tests {
         chown_tree(&tree.join("link"), me.uid, me.gid).unwrap();
     }
 
+    /// A file with a second name, which the node's user could have made to
+    /// a file of root's, is not given away.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn chown_tree_gives_no_hard_linked_file_away() {
+        let d = tempfile::tempdir().unwrap();
+        let tree = d.path().join("tree");
+        std::fs::create_dir_all(tree.join("sub")).unwrap();
+        let outside = d.path().join("shadow");
+        std::fs::write(&outside, "x").unwrap();
+        std::fs::hard_link(&outside, tree.join("sub/x")).unwrap();
+        let me = me();
+        let e = chown_tree(&tree, me.uid, me.gid).unwrap_err();
+        assert!(e.contains("sub/x") && e.contains("hard link"), "{e}");
+        std::fs::remove_file(&outside).unwrap();
+        chown_tree(&tree, me.uid, me.gid).unwrap();
+    }
+
     #[test]
     fn install_refuses_a_user_it_did_not_make_and_needs_root() {
         let d = tempfile::tempdir().unwrap();
@@ -1662,7 +1876,10 @@ mod tests {
             fn account(&self, _: &str) -> Result<Option<Account>, String> {
                 unreachable!()
             }
-            fn add_user(&self, _: &str) -> Result<(), String> {
+            fn root_groups(&self, _: &Account) -> Vec<String> {
+                unreachable!()
+            }
+            fn add_user(&self, _: &str, _: &Path) -> Result<(), String> {
                 unreachable!()
             }
             fn add_account(&self, _: &str, _: &Path) -> Result<(), String> {

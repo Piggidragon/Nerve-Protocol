@@ -81,7 +81,11 @@ account's home.
 
 No command can read the node's keys: they are private to `nerve`. Before a
 command starts, the node checks that its account cannot open the node's
-folders, and refuses to run it if it can.
+folders, and refuses to run it if it can. That holds as long as the account
+cannot become root. Root itself can, and so can an account in a group that
+gets root without a password: `docker`, `lxd`, `incus-admin`, `libvirt` or
+`disk`. `install` and `setup` warn about such an account. Choose one
+outside these groups, or a command can read the keys after all.
 
 - No account chosen: the node runs no command, and says that
   `sudo nerve-node setup` chooses one.
@@ -90,6 +94,13 @@ folders, and refuses to run it if it can.
 - Root is allowed, with a warning: commands from a center then run as root,
   with every right on the machine, the node's keys included; in `folder`
   mode only Landlock still holds them. You are responsible for what they do.
+  The node's own file work for a center (`fs`, and the checks of a call's
+  paths and working folder) is not a command, though: it is done as root
+  without root's right to override permissions, which the service does not
+  have. It reaches only what root owns or what is open to everyone, so a
+  call into another user's home (often mode 0750) fails with "permission
+  denied". Choose that user's account instead, or let a command do the
+  work.
 
 ### The one privilege the service keeps
 
@@ -109,8 +120,8 @@ in brackets.
 1. The node's name, as centers show it. The host name by default.
 2. The account that [commands run as](#the-account-commands-run-as), on an
    installed node. It must exist, or setup offers to make it: an ordinary
-   account with a group and a home (`/home/<name>`) of its own and no
-   login. Choosing root shows the warning above.
+   account with a group and a home (`/home/<name>`) of its own, no login,
+   and the comment `Nerve user mode`. Choosing root shows the warning above.
 3. A pairing link from the center's web UI. Enter skips it. The node shows
    the center and asks before it pairs, as `center add` does.
 4. The mode of that center: `allowlist`, `folder` or `user`
@@ -119,6 +130,18 @@ in brackets.
 Each answer is saved when you give it, through the running node, like every
 other command. You can stop setup at any point and run it again. It works on
 a node that is not installed as well.
+
+To choose the account without the question, name it:
+
+```sh
+sudo nerve-node setup --create-user nerve-work
+```
+
+Setup then makes the account as above if it is not there, runs commands as
+it, and asks the other questions. An account that is there already is
+taken if the node can use it. `nerve`, an account that could open the
+node's folders, and a name other than a-z, 0-9, `_` and `-` are refused
+before anything changes. `--create-user` works on an installed node only.
 
 ## Update
 

@@ -90,7 +90,11 @@ pub enum Cmd {
     /// Install the node as a service that starts with the machine and runs under a user of its own (Linux, as root).
     Install,
     /// Name the node, choose the account commands run as (installed node), pair the first center and choose its mode, one question at a time.
-    Setup,
+    Setup {
+        /// Run commands as this account instead of asking, and make it if it is not there: a group and a home (/home/NAME) of its own, no login (installed node).
+        #[arg(long, value_name = "NAME")]
+        create_user: Option<String>,
+    },
     /// Replace the installed program with the latest release and restart the service; config, keys and audit log stay.
     Update {
         /// Take the new program from this file instead of downloading the latest release.
@@ -926,7 +930,7 @@ pub fn settle_user(cli: &Cli) -> Result<(), String> {
     }
     crate::service::become_owner(
         &NodePaths::from_args(cli.config_dir.clone(), cli.state_dir.clone()),
-        matches!(cli.cmd, Cmd::Setup),
+        matches!(cli.cmd, Cmd::Setup { .. }),
     )
 }
 
@@ -1251,10 +1255,13 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             let exe = std::env::current_exe().map_err(|e| format!("this program: {e}"))?;
             crate::service::install(&layout, &Host, &exe, &invoker(), out)
         }
-        Cmd::Setup => {
+        Cmd::Setup { create_user } => {
             owner_check(&[&paths]).await?;
             let mut input = std::io::BufReader::new(std::io::stdin());
-            setup(&paths, &mut input, out).await
+            let layout = Layout::system();
+            let machine = (layout.installed() && paths == layout.paths)
+                .then_some(&Host as &dyn crate::service::System);
+            setup(&paths, machine, create_user.as_deref(), &mut input, out).await
         }
         Cmd::Update { from } => {
             let layout = Layout::system();
@@ -1273,14 +1280,18 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
 /// center and that center's mode. Each answer is saved when it is given,
 /// through the same owner path as the other commands (the running node, or
 /// the signed `node.toml`), so setup can stop anywhere and run again; Enter
-/// keeps what is there. The steps done are audited.
+/// keeps what is there. The steps done are audited. `machine` is there on
+/// the installed node, where setup also chooses the account of the
+/// commands: `create_user` names it (and makes it) instead of asking.
 pub async fn setup(
     paths: &NodePaths,
+    machine: Option<&dyn crate::service::System>,
+    create_user: Option<&str>,
     input: &mut dyn BufRead,
     out: &mut dyn Write,
 ) -> Result<(), String> {
     let mut steps = Vec::new();
-    let r = setup_steps(paths, input, out, &mut steps).await;
+    let r = setup_steps(paths, machine, create_user, input, out, &mut steps).await;
     let log = AuditLog::new(paths.audit_log());
     if let Err(e) = log.node("setup", &steps, r.as_ref().err().map(String::as_str)) {
         let _ = writeln!(out, "the audit log cannot be written: {e}");
@@ -1288,14 +1299,49 @@ pub async fn setup(
     r
 }
 
+/// Saves the account setup chose for the commands, if it chose one.
+async fn account_chosen(
+    paths: &NodePaths,
+    chosen: Option<crate::service::Chosen>,
+    out: &mut dyn Write,
+    steps: &mut Vec<String>,
+) -> Result<(), String> {
+    let Some(c) = chosen else {
+        return Ok(());
+    };
+    if c.made {
+        steps.push(format!("made the account {}", c.name));
+    }
+    edit(paths, |cfg| {
+        cfg.machine.user = Some(c.name.clone());
+        Ok(())
+    })
+    .await?;
+    let _ = writeln!(out, "commands run as {}", c.name);
+    steps.push(format!("commands run as {}", c.name));
+    Ok(())
+}
+
 async fn setup_steps(
     paths: &NodePaths,
+    machine: Option<&dyn crate::service::System>,
+    create_user: Option<&str>,
     input: &mut dyn BufRead,
     out: &mut dyn Write,
     steps: &mut Vec<String>,
 ) -> Result<(), String> {
-    let _ = writeln!(out, "Set up this node. Enter keeps what is in [brackets].");
+    if create_user.is_some() && machine.is_none() {
+        return Err(
+            "--create-user chooses the account commands run as on a node installed as a service (`sudo nerve-node install`); this node runs them as its own user".into(),
+        );
+    }
     let (cfg, _) = read_config(paths).await?;
+    if let (Some(sys), Some(name)) = (machine, create_user) {
+        let c = crate::service::create_account(sys, paths, name, out)?;
+        let chosen = (c.made || cfg.machine.user.as_deref() != Some(name)).then_some(c);
+        account_chosen(paths, chosen, out, steps).await?;
+    }
+    let _ = writeln!(out, "Set up this node. Enter keeps what is in [brackets].");
     let current = crate::descriptor::node_name(&cfg);
     let name = ask(
         input,
@@ -1317,30 +1363,20 @@ async fn setup_steps(
     }
 
     // The account of the commands, where the node can switch to one: the
-    // installed service.
-    let layout = Layout::system();
-    if layout.installed() && *paths == layout.paths {
+    // installed service. Named on the command line, it was chosen first.
+    if let Some(sys) = machine
+        && create_user.is_none()
+    {
         let suggested = Some(invoker()).filter(|u| u != "root");
         let chosen = crate::service::choose_account(
-            &Host,
+            sys,
             paths,
             cfg.machine.user.as_deref(),
             suggested.as_deref(),
             input,
             out,
         )?;
-        if let Some(c) = chosen {
-            if c.made {
-                steps.push(format!("made the account {}", c.name));
-            }
-            edit(paths, |cfg| {
-                cfg.machine.user = Some(c.name.clone());
-                Ok(())
-            })
-            .await?;
-            let _ = writeln!(out, "commands run as {}", c.name);
-            steps.push(format!("commands run as {}", c.name));
-        }
+        account_chosen(paths, chosen, out, steps).await?;
     }
 
     let link = ask(
@@ -2530,18 +2566,81 @@ mod tests {
             assert!(e.contains("--config-dir and --state-dir do not go"), "{e}");
             assert!(!e.contains("not done"), "{e}");
         }
-        assert!(Cli::try_parse_from(["nerve-node", "setup", "--create-user"]).is_err());
     }
 
     fn setup_with(paths: &NodePaths, answers: &str) -> (Result<(), String>, String) {
+        setup_on(paths, None, None, answers)
+    }
+
+    fn setup_on(
+        paths: &NodePaths,
+        machine: Option<&dyn crate::service::System>,
+        create_user: Option<&str>,
+        answers: &str,
+    ) -> (Result<(), String>, String) {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let mut out = Vec::new();
         let mut input = std::io::Cursor::new(answers.as_bytes().to_vec());
-        let r = rt.block_on(super::setup(paths, &mut input, &mut out));
+        let r = rt.block_on(super::setup(
+            paths,
+            machine,
+            create_user,
+            &mut input,
+            &mut out,
+        ));
         (r, String::from_utf8(out).unwrap())
+    }
+
+    /// `setup --create-user NAME` makes the account and runs commands as it
+    /// without the question, and asks the other questions as before.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setup_creates_the_account_of_the_commands_when_asked() {
+        use crate::service::System;
+        let cli = Cli::try_parse_from(["nerve-node", "setup", "--create-user", "bob"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Setup { create_user: Some(ref n) } if n == "bob"));
+        assert!(Cli::try_parse_from(["nerve-node", "setup", "--create-user"]).is_err());
+        let (_d, paths) = setup(&["home"]);
+        let sys = crate::service::tests::Fake::new();
+        // Name, no link, user mode for the one center: no account question.
+        let (r, out) = setup_on(&paths, Some(&sys), Some("bob"), "lab-pc\n\nuser\n");
+        r.unwrap();
+        assert!(!out.contains("Account that commands"), "{out}");
+        assert!(out.contains("commands run as bob"), "{out}");
+        assert!(sys.calls().contains(&"useradd bob /home/bob".to_string()));
+        assert_eq!(
+            sys.account("bob").unwrap().unwrap().home,
+            Path::new("/home/bob")
+        );
+        let cfg = SettingsStore::peek(&paths.config_file(), &paths.config_key()).unwrap();
+        assert_eq!(cfg.machine.user.as_deref(), Some("bob"));
+        assert_eq!(cfg.node.name.as_deref(), Some("lab-pc"));
+        assert_eq!(cfg.center("home").unwrap().policy.mode, Mode::User);
+        let steps = node_audit(&paths)[0]["steps"].to_string();
+        assert!(steps.contains("made the account bob"), "{steps}");
+        // Refused before any question: nerve, a bad name, and a node not
+        // installed as a service.
+        for (machine, name, why) in [
+            (Some(&sys as &dyn System), "nerve", "node's own user"),
+            (Some(&sys), "Bob!", "not a name setup makes"),
+            (None, "carol", "installed as a service"),
+        ] {
+            let (r, out) = setup_on(&paths, machine, Some(name), "");
+            let e = r.unwrap_err();
+            assert!(e.contains(why), "{name}: {e}");
+            assert!(!out.contains("Account that commands"), "{out}");
+        }
+        assert_eq!(
+            SettingsStore::peek(&paths.config_file(), &paths.config_key())
+                .unwrap()
+                .machine
+                .user
+                .as_deref(),
+            Some("bob")
+        );
     }
 
     fn node_audit(paths: &NodePaths) -> Vec<Value> {

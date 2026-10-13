@@ -8,7 +8,7 @@
 //! Unix the node's `fs.read` and `fs.write` then open that resolved path one
 //! component at a time without following a symlink, so a symlink that appears
 //! between check and use fails the call. The other `fs` actions, and every action
-//! on Windows, go by the resolved path as it is then (not done).
+//! on Windows, go by the resolved path as it is then.
 
 use std::fs;
 use std::io;
@@ -527,8 +527,7 @@ mod tests {
         assert_eq!(parse_device_path("/c/Users").unwrap(), Path::new(native));
     }
 
-    /// A model that sends `C:\...` for a Windows node is told the wire form
-    /// (Windows review round 3, finding 4).
+    /// A model that sends `C:\...` for a Windows node is told the wire form.
     #[test]
     fn a_drive_letter_path_is_told_the_wire_form() {
         for s in ["C:\\Users\\x\\a.txt", "c:/Users/x"] {

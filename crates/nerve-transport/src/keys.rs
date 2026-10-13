@@ -2,9 +2,9 @@
 //! (docs/dev/spec/protocol.md §2 and §4.2); and the secret key of the MAC the node keeps
 //! over its own config file ([`MacKey`]).
 //!
-//! The key is kept as a 0600 file next to the node's config. Keeping it in
-//! the system keyring (`machine.secret_storage = "keyring"`) is not done yet;
-//! see the README's list of what is missing.
+//! The key is kept as a 0600 file next to the node's config.
+//! `machine.secret_storage = "keyring"` does not move it: only the proxy's
+//! header values go to the system keyring.
 
 use ring::rand::SystemRandom;
 use ring::signature::{ED25519, Ed25519KeyPair, KeyPair, UnparsedPublicKey};

@@ -125,8 +125,7 @@ fn path_param(windows: bool) -> Value {
 }
 
 /// The `cwd` argument of `exec.run`: it takes the same wire form as an `fs`
-/// path, so a Windows node says so here as well (Windows final round,
-/// finding 2). A Unix node's stays as it was.
+/// path, so a Windows node says so here as well. A Unix node's is unchanged.
 fn cwd_param(windows: bool) -> Value {
     if windows {
         json!({"type": "string",
@@ -703,8 +702,7 @@ mod tests {
 
     /// Where commands cannot be confined (Windows, Linux without Landlock),
     /// folder mode refuses every command, so it offers no exec tool; a sudo
-    /// entry still runs by its list (Windows review of PR #19, round 2,
-    /// finding 3).
+    /// entry still runs by its list.
     #[test]
     fn folder_mode_offers_no_exec_where_commands_cannot_be_confined() {
         let cfg = NodeConfig::default();
@@ -732,8 +730,7 @@ mod tests {
 
     /// `exec.signal` actuates: the descriptor offers it exactly where the
     /// policy lets a signal through, in folder and user mode only with
-    /// `caps.exec.signal = on`, in allowlist mode by an allow rule (code
-    /// review 2 of PR #19, finding 4).
+    /// `caps.exec.signal = on`, in allowlist mode by an allow rule.
     #[test]
     fn exec_signal_is_offered_where_the_policy_allows_it() {
         use nerve_policy::protected::{Platform, Protected};
@@ -801,7 +798,7 @@ mod tests {
     }
 
     /// A Windows node's `fs` tools say how a drive is written on the wire,
-    /// so a model does not send `C:\...` (Windows review round 3, finding 4).
+    /// so a model does not send `C:\...`.
     #[test]
     fn a_windows_node_shows_the_wire_form_of_a_path() {
         let win = path_param(true);

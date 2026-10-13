@@ -588,6 +588,8 @@ mod tests {
         service: Cell<Option<bool>>,
         /// Whether a node started by the service runs.
         starts: Cell<bool>,
+        /// What a program says that the service cannot keep running.
+        broken: RefCell<Option<String>>,
         /// The folders and whom they were opened to.
         secured: RefCell<Vec<(PathBuf, Option<String>)>>,
     }
@@ -603,6 +605,7 @@ mod tests {
                 calls: RefCell::new(Vec::new()),
                 service: Cell::new(None),
                 starts: Cell::new(true),
+                broken: RefCell::new(None),
                 secured: RefCell::new(Vec::new()),
             }
         }
@@ -694,8 +697,9 @@ mod tests {
             self.service.set(None);
             Ok(())
         }
-        fn wait_running(&self, _: &Layout) -> Result<(), String> {
-            if self.starts.get() {
+        fn wait_running(&self, layout: &Layout) -> Result<(), String> {
+            let broken = self.broken.borrow().clone();
+            if self.starts.get() && broken != self.version_of(&layout.bin).ok() {
                 Ok(())
             } else {
                 Err("the service stopped at its start".into())
@@ -1139,10 +1143,14 @@ mod tests {
         }
         std::fs::write(&new, "nerve-node 2.0.0\n").unwrap();
         sys.starts.set(false);
+        let calls = sys.calls().len();
         let e = update(&l, &sys, Some(&new), &mut Vec::new())
             .await
             .unwrap_err();
         assert!(e.contains("did not start"), "{e}");
+        assert!(e.contains("the old one does not either"), "{e}");
+        // The old program is started again, even though here it fails too.
+        assert_eq!(sys.calls()[calls..], ["stop", "start", "stop", "start"]);
         assert_eq!(std::fs::read(&l.bin).unwrap(), b"nerve-node 1.2.0\n");
         assert!(!staged(&l.bin).exists() && !previous(&l.bin).exists());
         let a = audit_events(&l);
@@ -1151,6 +1159,34 @@ mod tests {
         assert!(last["error"].as_str().unwrap().contains("did not start"));
         assert!(
             last["steps"]
+                .to_string()
+                .contains("put nerve-node 1.2.0 back")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_starts_the_old_program_again_when_the_new_one_does_not_start() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = installed(d.path(), &sys, "1.2.0");
+        let new = d.path().join("new.exe");
+        std::fs::write(&new, "nerve-node 2.0.0\n").unwrap();
+        *sys.broken.borrow_mut() = Some("nerve-node 2.0.0".into());
+        let calls = sys.calls().len();
+        let e = update(&l, &sys, Some(&new), &mut Vec::new())
+            .await
+            .unwrap_err();
+        assert!(e.contains("did not start"), "{e}");
+        assert!(e.contains("the old one runs again"), "{e}");
+        assert_eq!(std::fs::read(&l.bin).unwrap(), b"nerve-node 1.2.0\n");
+        assert!(!staged(&l.bin).exists() && !previous(&l.bin).exists());
+        // The new program was started and stopped, then the old one started
+        // after it was put back: the node is up again.
+        assert_eq!(sys.calls()[calls..], ["stop", "start", "stop", "start"]);
+        assert_eq!(sys.service.get(), Some(true));
+        let a = audit_events(&l);
+        assert!(
+            a.last().unwrap()["steps"]
                 .to_string()
                 .contains("put nerve-node 1.2.0 back")
         );

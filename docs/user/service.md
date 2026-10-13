@@ -204,14 +204,19 @@ Restart-Service nerve-node
    again.
 4. Copies the program to `C:\Program Files\Nerve\nerve-node.exe`.
 5. Registers the service `nerve-node`, which runs as `nerve`, starts with the
-   machine and starts again after a failure, and starts it. It waits until
-   the node runs.
+   machine and starts again after a failure.
+6. Registers the source `nerve-node` in the Windows Event Log, then starts
+   the service. It waits until the node runs.
 
 | What | Where |
 |---|---|
 | `node.toml`, one key per center, the stored password | `C:\ProgramData\Nerve\config` |
 | Audit log, [log](logs.md), config key | `C:\ProgramData\Nerve\state` |
 | The program | `C:\Program Files\Nerve\nerve-node.exe` |
+| Start, stop, a start that fails, a crash | The Windows Event Log, Application, source `nerve-node` ([logs](logs.md#the-windows-event-log)) |
+
+The service writes its log to `C:\ProgramData\Nerve\state\log.jsonl`. When
+it does not start, the Event Viewer says why, and the log has the rest.
 
 The other commands work on the installed node from an administrator's
 terminal. Windows has no control socket, so the service takes a change at
@@ -262,8 +267,9 @@ place and starts the service; if the new one does not start, the old one
 goes back. The old program goes once nothing runs it, or at the next restart
 of Windows when `update` ran from it.
 
-`uninstall` stops and removes the service, the user `nerve` and its profile,
-and the program. Without `--purge` the folders and the stored password stay,
+`uninstall` stops and removes the service, the source `nerve-node` of the
+Event Log (its entries stay), the user `nerve` and its profile, and the
+program. Without `--purge` the folders and the stored password stay,
 open to the administrators only. A later `install` takes them up again.
 `--purge` deletes them. Run from the installed program, `uninstall` cannot
 delete that file at once: it moves it aside, and Windows deletes it at its

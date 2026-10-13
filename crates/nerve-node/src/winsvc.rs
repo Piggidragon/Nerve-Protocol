@@ -57,6 +57,13 @@ pub trait WinSystem {
     /// Stops the service and waits until it has; a stopped one is fine.
     fn stop(&self) -> Result<(), String>;
     fn delete_service(&self) -> Result<(), String>;
+    /// Registers the source of the node's entries in the Windows Event Log,
+    /// with `layout.bin` as the file that holds their text
+    /// ([`crate::eventlog`]), or changes it.
+    fn put_event_source(&self, layout: &Layout) -> Result<(), String>;
+    /// Removes that source; `false` when it was not registered. The entries
+    /// stay in the log.
+    fn delete_event_source(&self) -> Result<bool, String>;
     /// Waits until the node the service started runs.
     fn wait_running(&self, layout: &Layout) -> Result<(), String>;
     /// Asks for a password, without echo on a console.
@@ -232,6 +239,12 @@ fn install_steps(
     steps.did(format!(
         "registered the service {SERVICE_NAME}, which runs as {USER} and starts with the machine"
     ));
+    sys.put_event_source(layout)?;
+    steps.did(format!(
+        "registered the source {} in the Windows Event Log (Application): the service's start, stop and failures go there as well as to {}",
+        crate::eventlog::SOURCE,
+        layout.paths.log_file().display()
+    ));
     sys.start()?;
     sys.wait_running(layout)?;
     steps.did(format!("the service {SERVICE_NAME} runs"));
@@ -378,6 +391,12 @@ fn uninstall_steps(
         sys.stop()?;
         sys.delete_service()?;
         steps.did(format!("stopped and removed the service {SERVICE_NAME}"));
+    }
+    if sys.delete_event_source()? {
+        steps.did(format!(
+            "removed the source {} from the Windows Event Log; its entries stay",
+            crate::eventlog::SOURCE
+        ));
     }
     let folders = [
         &layout.paths.config_dir,
@@ -596,6 +615,8 @@ mod tests {
         started: RefCell<Vec<String>>,
         /// The folders and whom they were opened to.
         secured: RefCell<Vec<(PathBuf, Option<String>)>>,
+        /// The message file of the Event Log source, while it is registered.
+        event_source: RefCell<Option<PathBuf>>,
     }
 
     impl Fake {
@@ -613,6 +634,7 @@ mod tests {
                 program: RefCell::new(None),
                 started: RefCell::new(Vec::new()),
                 secured: RefCell::new(Vec::new()),
+                event_source: RefCell::new(None),
             }
         }
 
@@ -708,6 +730,15 @@ mod tests {
             self.call("delete");
             self.service.set(None);
             Ok(())
+        }
+        fn put_event_source(&self, layout: &Layout) -> Result<(), String> {
+            self.call("event source");
+            *self.event_source.borrow_mut() = Some(layout.bin.clone());
+            Ok(())
+        }
+        fn delete_event_source(&self) -> Result<bool, String> {
+            self.call("no event source");
+            Ok(self.event_source.borrow_mut().take().is_some())
         }
         /// Judges the program the last start started, not what is in its
         /// place now.
@@ -855,8 +886,16 @@ mod tests {
                 "add nerve".to_string(),
                 "logon alice".into(),
                 format!("put {}", l.bin.display()),
+                "event source".into(),
                 "start".into(),
             ]
+        );
+        // The Event Log takes the text of the node's entries from the
+        // installed program.
+        assert_eq!(*sys.event_source.borrow(), Some(l.bin.clone()));
+        assert!(
+            out.contains("registered the source nerve-node in the Windows Event Log"),
+            "{out}"
         );
         // The folders are nerve's; the program is in place.
         let secured = sys.secured.borrow().clone();
@@ -878,7 +917,7 @@ mod tests {
         assert_eq!(a.len(), 1);
         assert_eq!(a[0]["event"], "install");
         assert!(a[0].get("error").is_none());
-        assert_eq!(a[0]["steps"].as_array().unwrap().len(), 6, "{}", a[0]);
+        assert_eq!(a[0]["steps"].as_array().unwrap().len(), 7, "{}", a[0]);
         // Again, as another administrator: the account is reset, the
         // service stopped and started, the account of the commands and its
         // stored password kept without a question.
@@ -1015,11 +1054,16 @@ mod tests {
         assert_eq!(sys.service.get(), None);
         assert!(sys.account(USER).unwrap().is_none());
         assert!(
-            sys.calls()
-                .ends_with(&["stop".into(), "delete".into(), "remove nerve".into()]),
+            sys.calls().ends_with(&[
+                "stop".into(),
+                "delete".into(),
+                "no event source".into(),
+                "remove nerve".into()
+            ]),
             "{:?}",
             sys.calls()
         );
+        assert_eq!(*sys.event_source.borrow(), None);
         // The config, the stored password and the state stay, open to the
         // administrators only, and the audit log has both commands.
         assert_eq!(
@@ -1037,6 +1081,10 @@ mod tests {
             .collect();
         assert_eq!(events, ["install", "uninstall"]);
         let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("removed the source nerve-node from the Windows Event Log"),
+            "{out}"
+        );
         assert!(out.contains("uninstall --purge"), "{out}");
         assert!(out.contains("removed the program"), "{out}");
     }
@@ -1057,7 +1105,9 @@ mod tests {
             assert!(!p.exists(), "{p:?}");
         }
         assert_eq!(sys.service.get(), None);
+        assert_eq!(*sys.event_source.borrow(), None);
         assert!(sys.account(USER).unwrap().is_none());
+        // Nothing left, the source included: nothing is said to be removed.
         let mut out = Vec::new();
         uninstall(&l, &sys, true, &mut out).unwrap();
         assert!(

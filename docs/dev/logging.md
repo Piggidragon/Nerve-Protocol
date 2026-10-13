@@ -70,6 +70,28 @@ not the daemon writes no log file.
   from the config it holds on every pass, so any writer (the CLI, a reload)
   is followed within a second.
 
+## The Windows Event Log
+
+The installed node on Windows also writes its start, its stop, a start that
+fails and a crash to the Application log, as the source `nerve-node`
+(`crate::win_service::event`, ids in `crate::eventlog`). It does so only when
+the service control manager started it. `running()` writes the start once the
+daemon runs; `service_main` writes the stop, or, when the node's body returned
+an error, "did not start" before `running()` and "stopped with an error"
+after it. A panic hook writes a crash and calls the hook it replaced; it does
+not touch the log file, whose lock the panicking thread may hold. A panic in
+the service's thread ends the program, and the service's failure actions
+start it again. The text goes through `redact` and is cut as a log line is,
+since every user may read the Application log.
+
+The Event Viewer takes an entry's text from the source's message file.
+`build.rs` writes a `.res` file with one message table (`%1` for each id,
+`eventlog::resource`) and links it into every program of the crate on
+windows-msvc; `install` registers `nerve-node.exe` as the message file under
+`HKLM\SYSTEM\CurrentControlSet\Services\EventLog\Application\nerve-node`,
+and `uninstall` removes the key. A windows-gnu build has no table, and the
+Event Viewer then shows the text with a note that the description is missing.
+
 ## Redaction
 
 `redact` works on every message before it is kept:

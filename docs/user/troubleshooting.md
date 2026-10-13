@@ -70,6 +70,12 @@ cannot switch to the account commands run as and runs no command at all.
 | `refusing to run as root; set machine.allow_root = true to allow it` | Run as a normal user (on Windows: not elevated), or set `machine.allow_root` |
 | `node.toml is refused: its MAC does not match …` | Look at the file, then `nerve-node config accept`. See [config](config.md) |
 
+A node installed as a service says why in its [log](logs.md):
+`journalctl -u nerve-node` on Linux. On Windows the Event Viewer has an error
+from the source `nerve-node` under **Windows Logs > Application**, and
+`C:\ProgramData\Nerve\state\log.jsonl` has the rest
+([Windows Event Log](logs.md#the-windows-event-log)).
+
 ## The center will not start
 
 | Message | Cause | Fix |

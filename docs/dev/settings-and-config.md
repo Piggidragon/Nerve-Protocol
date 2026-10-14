@@ -67,8 +67,9 @@ center reads, or the node refuses the whole change and names the field.
    remove from it or change `protected.allow`, and its folders may not widen
    access at a protected place ([policy engine](policy-engine.md#protected-paths)).
 9. Turning a `sense` action on, by `caps` or an allow rule, and doing so for
-   a capability no attached provider offers now, which may sense once one
-   does. A center can switch these off, never on.
+   a capability no attached provider offers now, or for an action an offered
+   capability does not have now, which may sense once it comes. A center can
+   switch these off, never on.
 10. The programs that may attach as capability providers,
     `providers.allowed` ([node-local §7](spec/node-local.md#7-capability-providers)).
 

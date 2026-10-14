@@ -105,21 +105,41 @@ impl Providers {
             .collect()
     }
 
-    /// The capabilities only the owner may turn on or allow, as a test of
-    /// a capability id: one an attached provider offers with an action that
-    /// senses, and one that is neither the node's own nor offered now. The
-    /// node cannot tell what such a capability will do once a provider
-    /// offers it, so a center's entry for it waits for the owner.
+    /// What only the owner may turn on or allow, as a test of a `caps` key
+    /// or an allow rule's scope (`cap` or `cap.action`): a capability an
+    /// attached provider offers with an action that senses; one that is
+    /// neither the node's own nor offered now; and an action that an offered
+    /// capability does not have now. The node cannot tell what such a
+    /// capability or action will do once a provider offers it, so a center's
+    /// entry for it waits for the owner. Only an entry for a whole capability
+    /// that is offered and does not sense passes; a later attach that adds a
+    /// sense action to it is not caught.
     pub fn owner_only(&self) -> impl Fn(&str) -> bool + use<> {
         let mut sensing = BTreeSet::new();
-        let mut offered = BTreeSet::new();
+        let mut offered: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
         for c in lock(&self.attached).values().flat_map(|a| a.caps.iter()) {
-            offered.insert(c.id.clone());
+            offered.insert(c.id.clone(), c.actions.keys().cloned().collect());
             if c.actions.values().any(|a| a.effect == Effect::Sense) {
                 sensing.insert(c.id.clone());
             }
         }
-        move |cap| sensing.contains(cap) || !(BUILT_IN.contains(&cap) || offered.contains(cap))
+        move |scope| {
+            let (cap, action) = match scope.split_once('.') {
+                Some((c, a)) => (c, Some(a)),
+                None => (scope, None),
+            };
+            if BUILT_IN.contains(&cap) {
+                return false;
+            }
+            if sensing.contains(cap) {
+                return true;
+            }
+            match (offered.get(cap), action) {
+                (None, _) => true,
+                (Some(actions), Some(a)) => !actions.contains(a),
+                (Some(_), None) => false,
+            }
+        }
     }
 
     /// What `status` shows of them.

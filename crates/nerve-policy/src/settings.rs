@@ -521,9 +521,10 @@ impl SettingsStore {
     }
 
     /// `settings.set` from `center`: the whole document, checked against
-    /// `if_version`. `is_sense(cap)` says whether a capability senses
-    /// (camera, microphone, screen), or may for all the node knows: only the
-    /// owner may turn those on.
+    /// `if_version`. `is_sense(scope)` says whether a capability (`cap`) or
+    /// an action (`cap.action`) senses (camera, microphone, screen), or may for
+    /// all the node knows: only the owner may turn those on. It gets the
+    /// whole scope of a `caps` key or an allow rule.
     /// `protected(opts)` is this node's protected list with a center's
     /// options: only the owner may release an entry of it.
     pub fn set_center_document(
@@ -627,8 +628,7 @@ fn client_only(
     }
     let (o, n) = (&old.policy, &new.policy);
     for (key, setting) in &n.caps {
-        let cap = key.split('.').next().unwrap_or(key);
-        if *setting == CapSetting::On && o.caps.get(key) != Some(&CapSetting::On) && is_sense(cap) {
+        if *setting == CapSetting::On && o.caps.get(key) != Some(&CapSetting::On) && is_sense(key) {
             return Err(format!(
                 "policy.caps.{key}: only the owner can turn sensing on, and a capability the node does not offer now may sense"
             ));
@@ -638,7 +638,7 @@ fn client_only(
     // whatever `caps` says; so adding one for it is the owner's call as well.
     for rule in n.allow.iter().filter(|r| !o.allow.contains(r)) {
         let scope = rule.split(':').next().unwrap_or(rule);
-        if is_sense(scope.split('.').next().unwrap_or(scope)) {
+        if is_sense(scope) {
             return Err(format!(
                 "policy.allow {rule}: only the owner can turn sensing on, and a capability the node does not offer now may sense"
             ));
@@ -986,20 +986,55 @@ mod tests {
         let mut new = doc(&s);
         new["policy"]["caps"] = json!({"camera": "on"});
         let e = s
-            .set_center_document("home", new, v, |c| c == "camera", unix)
+            .set_center_document(
+                "home",
+                new,
+                v,
+                |c| c.split('.').next() == Some("camera"),
+                unix,
+            )
             .unwrap_err();
         assert!(matches!(&e, SetError::Forbidden(m) if m.contains("policy.caps.camera")));
         // An allow rule is no way round that.
         let mut new = doc(&s);
         new["policy"]["allow"] = json!(["camera.snap"]);
         let e = s
-            .set_center_document("home", new, v, |c| c == "camera", unix)
+            .set_center_document(
+                "home",
+                new,
+                v,
+                |c| c.split('.').next() == Some("camera"),
+                unix,
+            )
             .unwrap_err();
         assert!(matches!(&e, SetError::Forbidden(m) if m.contains("policy.allow")));
+        // The check gets the whole scope: an action of a capability can be
+        // the owner's alone while another action of it is not.
+        let snap = |scope: &str| scope == "lamp.snap";
+        for (key, value) in [
+            ("allow", json!(["lamp.snap"])),
+            ("caps", json!({"lamp.snap": "on"})),
+        ] {
+            let mut new = doc(&s);
+            new["policy"][key] = value;
+            let e = s
+                .set_center_document("home", new, v, snap, unix)
+                .unwrap_err();
+            assert!(
+                matches!(&e, SetError::Forbidden(m) if m.contains("lamp.snap")),
+                "{e:?}"
+            );
+        }
         let mut new = doc(&s);
-        new["policy"]["allow"] = json!(["fs.read:/a/*", "exec.run:ls"]);
-        s.set_center_document("home", new, v, |c| c == "camera", unix)
-            .unwrap();
+        new["policy"]["allow"] = json!(["fs.read:/a/*", "exec.run:ls", "lamp.on:lamp.on"]);
+        s.set_center_document(
+            "home",
+            new,
+            v,
+            |c| c.split('.').next() == Some("camera") || snap(c),
+            unix,
+        )
+        .unwrap();
         let v = s.version();
         let mut new = doc(&s);
         new["policy"]["protected"] = json!({"allow": ["~/.ssh"]});

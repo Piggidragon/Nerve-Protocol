@@ -74,6 +74,13 @@ async fn linked(center: &mut FakeCenter) -> Conn<TcpStream> {
     fake_center::handshake(&mut inc.conn, &center.center_id, &paired)
         .await
         .expect("handshake");
+    // Answered once the node serves the link, with the rev it compares to:
+    // a provider that attaches from now on changes it.
+    inc.conn
+        .call("describe", json!({"detail": "summary"}), WAIT)
+        .await
+        .unwrap()
+        .expect("describe");
     inc.conn
 }
 
@@ -318,8 +325,9 @@ async fn a_cancel_reaches_the_provider_and_a_leaving_provider_fails_its_calls() 
 }
 
 /// A center with the settings grant may not allow or turn on a capability
-/// that senses, nor one no provider offers now, which may sense once one
-/// does: only the owner may. One that is offered and does not sense, it may.
+/// that senses, nor one no provider offers now, nor an action an offered
+/// capability does not have now, which may sense once it comes: only the
+/// owner may. One that is offered and does not sense, it may.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_center_may_not_allow_a_sensing_provider_itself() {
     let dir = tempfile::tempdir().unwrap();
@@ -396,14 +404,22 @@ async fn a_center_may_not_allow_a_sensing_provider_itself() {
         .await;
     // Attached once answered; default deny shows the center nothing of it.
     assert!(p.next().await.unwrap().get("ok").is_some());
-    for change in ["allow=camera.snap", "caps=camera"] {
+    // Nor an action the lamp does not have now: it may sense once it does.
+    for change in [
+        "allow=camera.snap",
+        "caps=camera",
+        "allow=lamp.snap",
+        "caps=lamp.snap",
+    ] {
         refused(set(&mut conn, change).await);
     }
     let paths: PathBuf = daemon.paths().config_file();
     assert!(!std::fs::read_to_string(&paths).unwrap().contains("camera"));
-    // The lamp is offered and does not sense.
+    assert!(!std::fs::read_to_string(&paths).unwrap().contains("snap"));
+    // The lamp is offered and does not sense: its action and the whole of it.
     set(&mut conn, "allow=lamp.on").await.expect("allowed");
     assert!(std::fs::read_to_string(&paths).unwrap().contains("lamp.on"));
+    set(&mut conn, "caps=lamp").await.expect("allowed");
     daemon.stop().await;
 }
 

@@ -300,8 +300,11 @@ Drop and grace:
   WebSocket frame): the frame would be sent again on every resume, so the
   receiver ends the link with `bye {reason: "protocol_error"}`. That `bye`
   may not arrive: the receiver closes with the rest of the frame unread, and
-  the reset this makes can drop it (Windows does). The sender then sees a
-  dropped connection; its next hello finds the link ended.
+  the reset this makes can drop it (Windows does). The sender, center or
+  node, then sees a dropped connection and keeps the link like any dropped
+  one. The node's next hello ends it on both sides: the node names a new link
+  (it ended the link itself) or is answered `resumed: false` (the center
+  did). Without a next hello, the grace ends it.
 - The node offers the link in the hello of its next connection while the
   grace lasts and it still keeps every frame the center may lack. Once it
   sent that hello it keeps the link until the `welcome` comes (at most the

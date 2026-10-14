@@ -1560,6 +1560,9 @@ async fn a_frame_over_the_limit_ends_a_resumable_link() {
         !ended.starts_with("bye ") || ended == "bye protocol_error",
         "{ended}"
     );
+    // Linux delivers the bye before the reset.
+    #[cfg(not(windows))]
+    assert_eq!(ended, "bye protocol_error");
     // The link is not parked: the call fails at once.
     let (text_out, failed) = reply_text(call).await;
     assert!(failed, "{text_out}");

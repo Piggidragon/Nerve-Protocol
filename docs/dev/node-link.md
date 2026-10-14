@@ -75,12 +75,16 @@ address change or a short outage loses no output. Exact rules:
   link was down) goes as `withdrawn {id}` instead, so it does not run late.
 - What a frame carries of the sudo password is taken out once, when the frame
   is numbered; a kept frame does not wait for a later scrub.
-- A link not resumed within 30 seconds, one that ended with a bye, one whose
-  connection broke on a frame the receiver cannot take (it would come again on
-  every resume), and a link with a center or node that cannot resume end at
-  once: the center fails the
+- A link not resumed within 30 seconds, one that ended with a bye, and a link
+  with a center or node that cannot resume end at once: the center fails the
   calls with `connection_lost`, and the node kills the commands started on
   that link.
+- A frame the receiver cannot take (over its limit, or broken) would come
+  again on every resume, so the receiver ends the link at once with
+  `bye protocol_error`. That bye can be lost, as the receiver closes with the
+  frame unread (Windows drops it on the reset). The sender then keeps the link
+  as dropped, until the node's next hello ends it (a new link id, or
+  `resumed: false`) or the grace does.
 
 The node keeps its side in `LinkHandle` (`crates/nerve-node/src/daemon.rs`)
 and the dropped link in `Parked` (`link.rs`); the center keeps it in its

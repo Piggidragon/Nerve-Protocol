@@ -79,8 +79,10 @@ The node confines commands with Landlock:
   can ask one that runs commands on request, such as the user's systemd session
   or a tmux server, to run a program outside the sandbox, and that program
   reads the node's files and changes its settings through the control socket.
-  Run the commands as another account to keep them out: see
-  [Linux](platforms.md#linux).
+  Run the commands as another account, one that is neither root nor can
+  become root, to keep them from the node's files and settings: see
+  [Linux](platforms.md#linux). A [sudo](sudo.md) command is root and is not
+  kept out.
 - A command with `w` on a folder can put a link in place of a folder inside
   it, and a link would give that folder's rights in a place you never named.
   So a folder is left out of the sets, and the node logs a warning, when its

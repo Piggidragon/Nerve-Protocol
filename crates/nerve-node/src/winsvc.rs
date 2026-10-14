@@ -116,9 +116,15 @@ fn remove_grants(
     whose: &str,
     kept: bool,
 ) {
-    let node_ids: Vec<String> = SettingsStore::peek(&paths.config_file(), &paths.config_key())
-        .map(|c| c.centers.iter().map(|c| c.node_id.clone()).collect())
-        .unwrap_or_default();
+    // The pairings name their containers' profiles, also those the record
+    // does not, as when the state folder was deleted.
+    let node_ids = crate::grants::node_ids(paths).unwrap_or_else(|e| {
+        let _ = writeln!(
+            steps.out,
+            "warning: the profiles of the commands' AppContainers cannot be found: {e}"
+        );
+        Vec::new()
+    });
     let synced = sys.remove_grants(paths, &node_ids);
     for e in &synced.errors {
         let _ = writeln!(steps.out, "warning: {e}");
@@ -475,9 +481,12 @@ fn uninstall_steps(
     // owner's folders (crate::grants); none stays behind the node. Their
     // record is in the state folder, so this comes before a purge. The
     // node run by hand keeps its folders; if it runs again, it puts its
-    // grants on again.
+    // grants on again. Its config alone names the profiles of its
+    // containers when its state folder is gone.
     remove_grants(&layout.paths, sys, steps, "the commands", !purge);
-    if *by_hand != layout.paths && crate::grants::record_file(by_hand).exists() {
+    if *by_hand != layout.paths
+        && (crate::grants::record_file(by_hand).exists() || by_hand.config_file().exists())
+    {
         let whose = format!("the node run by hand ({})", by_hand.state_dir.display());
         remove_grants(by_hand, sys, steps, &whose, true);
     }
@@ -1402,6 +1411,94 @@ pub(crate) mod tests {
         );
         assert!(out.contains(&did), "{out}");
         assert!(hand.config_file().exists() && hand.state_dir.exists());
+    }
+
+    /// Pairs the node at `paths` with centers named `names`, whose pairings
+    /// are `n-<name>`; the config is signed with the key in its state folder.
+    fn paired(paths: &NodePaths, names: &[&str]) {
+        let mut store = SettingsStore::open(
+            paths.config_file(),
+            paths.config_key(),
+            AuditLog::new(paths.audit_log()),
+        )
+        .unwrap();
+        store
+            .update(|c| {
+                for name in names {
+                    c.centers.push(nerve_policy::CenterEntry {
+                        name: name.to_string(),
+                        url: "https://center.example".into(),
+                        pin: None,
+                        center_id: String::new(),
+                        node_id: format!("n-{name}"),
+                        settings: Default::default(),
+                        paused: false,
+                        revoked: false,
+                        unknown: false,
+                        policy: Default::default(),
+                    });
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// A state folder deleted without uninstall takes the record of the
+    /// grants and the key of the config's MAC with it; the pairings in the
+    /// config still name the profiles of their containers, so uninstall
+    /// removes them.
+    #[test]
+    fn uninstall_finds_the_containers_without_the_state_folder() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = installed(d.path(), &sys, "1.0.0");
+        paired(&l.paths, &["lab", "home"]);
+        std::fs::remove_dir_all(&l.paths.state_dir).unwrap();
+        let mut out = Vec::new();
+        uninstall(&l, &by_hand(d.path()), &sys, false, &mut out).unwrap();
+        let call = format!(
+            "remove grants n-lab,n-home of {}",
+            l.paths.state_dir.display()
+        );
+        assert!(sys.calls().contains(&call), "{:?}", sys.calls());
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("warning"), "{out}");
+    }
+
+    /// So it does for the node run by hand, whose state folder is gone
+    /// while its config stays.
+    #[test]
+    fn uninstall_finds_the_containers_of_the_node_run_by_hand_without_its_state_folder() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = installed(d.path(), &sys, "1.0.0");
+        let hand = by_hand(d.path());
+        paired(&hand, &["lab"]);
+        std::fs::remove_dir_all(&hand.state_dir).unwrap();
+        uninstall(&l, &hand, &sys, true, &mut Vec::new()).unwrap();
+        let call = format!("remove grants n-lab of {}", hand.state_dir.display());
+        assert!(sys.calls().contains(&call), "{:?}", sys.calls());
+        assert!(hand.config_file().exists() && !hand.state_dir.exists());
+    }
+
+    /// A config that cannot be read names no pairing, and uninstall says
+    /// so and goes on.
+    #[test]
+    fn uninstall_says_when_the_pairings_cannot_be_read() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = installed(d.path(), &sys, "1.0.0");
+        std::fs::write(l.paths.config_file(), "[[center]\n").unwrap();
+        let mut out = Vec::new();
+        uninstall(&l, &by_hand(d.path()), &sys, true, &mut out).unwrap();
+        let call = format!("remove grants  of {}", l.paths.state_dir.display());
+        assert!(sys.calls().contains(&call), "{:?}", sys.calls());
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("warning: the profiles of the commands' AppContainers cannot be found"),
+            "{out}"
+        );
+        assert!(!l.paths.state_dir.exists());
     }
 
     /// Grants on a drive that is not connected stay on: uninstall says so,

@@ -764,19 +764,62 @@ pub fn apply(paths: &NodePaths, cfg: &NodeConfig, home: &Path) -> Synced {
     }
 }
 
+/// The ids of the pairings in the config at `paths`, which name the
+/// profiles of their containers ([`container`]) also when the state folder,
+/// and the record of the grants in it, is gone. The file is read without
+/// its MAC: the key is in the state folder or the keyring, which may be
+/// gone too, and an id read here only leads to a container of this node.
+/// A missing file names none.
+pub fn node_ids(paths: &NodePaths) -> Result<Vec<String>, String> {
+    // Only the ids: a config that fails a check of its own still names its
+    // pairings.
+    #[derive(Deserialize)]
+    struct Config {
+        #[serde(default, rename = "center")]
+        centers: Vec<Pairing>,
+    }
+    #[derive(Deserialize)]
+    struct Pairing {
+        node_id: String,
+    }
+    let file = paths.config_file();
+    let text = match std::fs::read_to_string(&file) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("{}: {e}", file.display())),
+    };
+    let c: Config = toml::from_str(&text).map_err(|e| format!("{}: {e}", file.display()))?;
+    Ok(c.centers.into_iter().map(|p| p.node_id).collect())
+}
+
+/// Removes the profile of the container of the pairing `node_id`, which
+/// goes with the pairing: the record of the grants names a container only
+/// while it has grants, and is lost with the state folder.
+pub fn forget(paths: &NodePaths, node_id: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        nerve_sandbox::appcontainer::remove_profile(&container(paths, node_id))
+            .map_err(|e| e.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (paths, node_id);
+        Ok(())
+    }
+}
+
 /// Takes off every grant the node put on, and the profiles of its
-/// containers: those in the record and those of the pairings `node_ids`.
-/// For uninstall.
+/// containers: those in the record and those of the pairings `node_ids`
+/// ([`node_ids`]), which are found without the record. For uninstall.
 pub fn remove_all(paths: &NodePaths, node_ids: &[String]) -> Synced {
     #[cfg(windows)]
     {
         let mut s = windows_sync(paths, &[]);
         for n in node_ids {
-            let name = container(paths, n);
-            if !s.emptied.contains(&name)
-                && let Err(e) = nerve_sandbox::appcontainer::remove_profile(&name)
+            if !s.emptied.contains(&container(paths, n))
+                && let Err(e) = forget(paths, n)
             {
-                s.errors.push(e.to_string());
+                s.errors.push(e);
             }
         }
         s
@@ -1825,6 +1868,46 @@ mod tests {
         let a = grant("c1", "/w/a", "r");
         sync(&file, std::slice::from_ref(&a), &mut f);
         assert_eq!(recorded(&file), [a]);
+    }
+
+    /// The pairings' ids come from the config without its MAC key, which
+    /// went with the state folder, and so do the names of their containers;
+    /// a node without a config has none.
+    #[test]
+    fn the_pairings_are_found_without_the_state_folder() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("config"), d.path().join("state"));
+        assert_eq!(node_ids(&paths).unwrap(), Vec::<String>::new());
+        let mut store = nerve_policy::SettingsStore::open(
+            paths.config_file(),
+            paths.config_key(),
+            nerve_policy::audit::AuditLog::new(paths.audit_log()),
+        )
+        .unwrap();
+        store
+            .update(|c| {
+                for name in ["lab", "home"] {
+                    c.centers.push(nerve_policy::CenterEntry {
+                        url: "https://center.example".into(),
+                        ..center(name, &[])
+                    });
+                }
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        let names: Vec<String> = [node("lab"), node("home")]
+            .iter()
+            .map(|n| container(&paths, n))
+            .collect();
+        std::fs::remove_dir_all(&paths.state_dir).unwrap();
+        let ids = node_ids(&paths).unwrap();
+        assert_eq!(ids, [node("lab"), node("home")]);
+        let found: Vec<String> = ids.iter().map(|n| container(&paths, n)).collect();
+        assert_eq!(found, names);
+        assert!(forget(&paths, &node("lab")).is_ok());
+        std::fs::write(paths.config_file(), "[[center]]\nnode_id = 1\n").unwrap();
+        assert!(node_ids(&paths).unwrap_err().contains("node.toml"));
     }
 
     /// Each grant is in the record before it goes on, and stays in it when

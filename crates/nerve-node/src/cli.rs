@@ -1048,7 +1048,16 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
         Cmd::Center(CenterCmd::Rm(center)) => {
             let (cfg, _) = read_config(&paths).await?;
             let name = pick_center(&cfg, &center)?;
+            let gone = std::sync::Mutex::new(Vec::new());
             let cfg = edit(&paths, |c| {
+                let mut g = gone.lock().unwrap_or_else(|p| p.into_inner());
+                g.clear();
+                g.extend(
+                    c.centers
+                        .iter()
+                        .filter(|e| e.name == name)
+                        .map(|e| e.node_id.clone()),
+                );
                 c.centers.retain(|e| e.name != name);
                 Ok(())
             })
@@ -1059,6 +1068,19 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                 crate::secrets::remove_center_key(&paths, cfg.machine.secret_storage, &name)
             {
                 w(out, format!("the node key for {name} was not deleted: {e}"));
+            }
+            // So is the profile of its container on Windows (crate::grants),
+            // also when the record of the grants does not name it.
+            for id in gone.into_inner().unwrap_or_else(|p| p.into_inner()) {
+                if cfg.centers.iter().any(|c| c.node_id == id) {
+                    continue;
+                }
+                if let Err(e) = crate::grants::forget(&paths, &id) {
+                    w(
+                        out,
+                        format!("the AppContainer profile of {name} was not removed: {e}"),
+                    );
+                }
             }
             w(out, format!("unpaired {name}"));
             Ok(())
@@ -2849,6 +2871,31 @@ mod tests {
         assert!(!load(&paths).center("a").unwrap().paused);
         run(&paths, &["center", "rm", "--center", "b"]).unwrap();
         assert!(load(&paths).center("b").is_none());
+    }
+
+    /// On Windows: `center rm` removes the profile of the pairing's
+    /// AppContainer also when the record of the grants does not name it,
+    /// as after the state folder was deleted.
+    #[cfg(windows)]
+    #[test]
+    fn center_rm_removes_the_profile_the_record_does_not_name() {
+        let (_d, paths) = setup(&["home"]);
+        let name = crate::grants::container(&paths, "n");
+        let profile = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap())
+            .join("Packages")
+            .join(&name);
+        // Starting a command in the container makes its profile; whether
+        // the command runs does not matter here.
+        let _ = nerve_sandbox::appcontainer::run(
+            Path::new("cmd.exe"),
+            &["/C".into(), "exit 0".into()],
+            &name,
+        );
+        assert!(profile.exists(), "{}", profile.display());
+        assert!(!crate::grants::record_file(&paths).exists());
+        let out = run(&paths, &["center", "rm"]).unwrap();
+        assert!(!out.contains("profile"), "{out}");
+        assert!(!profile.exists(), "{}", profile.display());
     }
 
     #[test]

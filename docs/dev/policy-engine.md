@@ -230,7 +230,7 @@ center's local name):
   (`appcontainer::run`).
 
 What the container does not stop, in short (the user docs list each point with
-how it was checked on Windows 10, build 10.0.26300, and what was not:
+how it was checked on Windows 11 Pro 26H2, build 10.0.26300, and what was not:
 [modes](../user/modes.md#what-the-appcontainer-does-not-stop)):
 
 - The network: out to the internet and the local network, no filter by
@@ -255,7 +255,14 @@ how it was checked on Windows 10, build 10.0.26300, and what was not:
   container. Links and permission entries: above.
 - A `sudo` command (installed service only) is started by `winsudo` outside
   the container, whatever the folders say (`exec_run`: `folder` is false for
-  it); the sudo list alone gates it, also where `folder` mode runs nothing else.
+  it). The folders do not gate it: the switch, the sudo list, the deny rules
+  and the protected paths do (`decide`), also where `folder` mode runs nothing
+  else.
+- Not decided yet, whether to block further: filtering the environment the
+  command inherits, the reads of `HKCU\Environment`, and the refusal text for
+  keys in the keyring, which names Landlock and the session bus on Windows
+  too. The network and the reads of the Windows folder and Program Files are
+  what a container is for and stay. The open ones are for follow-up issues.
 - Not checked: the Credential Manager and DPAPI for the user (the test session
   could not use them), the clipboard against a real desktop, ALPC ports and
   COM servers, network shares. With the node's keys in the Credential

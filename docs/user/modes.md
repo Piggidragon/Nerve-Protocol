@@ -158,7 +158,7 @@ folders.
 - The flags stay independent: `w` without `r` writes but neither reads nor
   lists, `x` runs programs and reads files by name but does not list. Hard
   links and the permissions a command gives what it makes are the
-  exceptions, see "What the AppContainer does not stop" below.
+  exceptions, see the bullets on permission entries and hard links below.
 - Deleting and renaming need `r` and `w`, since Windows allows a move with
   the same right as a delete: a command must not move what it cannot read
   to a folder where it can. So in a folder with `w` but not `r`, a command
@@ -266,7 +266,7 @@ The container keeps a command out of the files you did not grant. It is not
 a box around everything else. This is what a `folder` mode command can still
 do on Windows, as far as the owner might expect otherwise. Each point says
 how it is known. "Checked" means a command was started in an AppContainer
-the way the node starts one, on Windows 10 Pro (build 10.0.26300) from an
+the way the node starts one, on Windows 11 Pro (26H2, build 10.0.26300) from an
 elevated administrator session over SSH; that is one machine, and Windows
 and other software may open more or less to AppContainers elsewhere. "Code"
 means it follows from the node's code. What is marked "not checked" is not
@@ -361,9 +361,9 @@ known.
   outside (checked). It made a junction to a folder inside its own folder and
   was refused one to `C:\Windows`, `C:\Program Files` and `C:\Users`
   (checked), and a symbolic link needs a privilege it does not have
-  (checked). What that means for a folder inside another granted folder, and
-  for hard links, is in the list above. The permission entries a command
-  gives what it makes are there too.
+  (checked). What that means for a folder inside another granted folder, for
+  hard links and for the permission entries a command gives what it makes is
+  in the bullets of the section above.
 - **The sudo path.** A command on the [sudo list](sudo.md#sudo-on-windows)
   runs as the account commands run as, with that account's administrator
   token, in a job but not in an AppContainer, and in every mode (code). The

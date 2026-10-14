@@ -459,8 +459,10 @@ user name and password in `connection.proxy` is refused on load, without the val
 file, accept it (`nerve-node config accept`) and run `nerve-node proxy set`
 again.
 
-`center add` sends its pair request through the same proxy as the link, with
-the same values, when the center is `https`; a proxy that fails stops the
+`center add` sends its pair request through the same proxy as the link
+(`connection.proxy`, else `HTTPS_PROXY`/`NO_PROXY` of the environment it
+runs in, which may differ from the daemon's), with the same values, when the
+center is `https`; a proxy that fails stops the
 pairing and nothing is stored.
 
 `nerve-node proxy set https://<user>:<password>@<host>:<port> [--pin <pin>]`
@@ -518,10 +520,12 @@ turns it on, and a center reads and changes nothing of it, grant or not.
 - `nerve-node relay ls` shows the relay, its pin, its nodes with their
   centers and, from the running node, its tunnels: the node, its address,
   the center and since when.
-  `status` carries the same under `relay` (§5). On Windows, whose control
-  pipe takes folder changes only, the tunnels are in the node's log: a line
-  for each tunnel that opens, closes (how long, how many bytes) or is
-  refused.
+  `status` carries the same under `relay` (§5); on Windows `relay ls` asks
+  the control pipe's `status` for them. `relay rm`, `relay off` and `relay
+  set-centers` say whether their cut is in force: "now" when a running node
+  took the change; on Windows, where the CLI writes the file for the next
+  start, that a running node keeps its tunnels until then and must be
+  restarted to cut them now.
 - A tunnel goes to one of this node's centers whose URL is `https` and
   that has not revoked it or answered 401, and is on the node's list when
   it has one, matched by host (without case)
@@ -537,7 +541,20 @@ turns it on, and a center reads and changes nothing of it, grant or not.
   the peer's address, start, end, why it ended and the bytes each way. A
   refused `CONNECT` is no tunnel and only in the log.
 - At most 64 connections at once wait for their `CONNECT` to be decided (15
-  seconds for the head); one over that is closed unread.
+  seconds for TLS and the head), and at most 4 of them from one address; one
+  over either is closed unread. A connection refused without a valid token
+  (plain HTTP, no or a wrong token, over a limit) is logged at `debug`; at
+  `warn` the log gets one line a minute with how many there were and the
+  last address, so a flood of them cannot rotate the log. Refusals of a node
+  with its token, and every tunnel, are logged at `info`.
+- A tunnel quiet for 90 seconds (by the monotonic clock, so a step of the
+  wall clock changes nothing) is closed.
+- An `https` center paired at a loopback address or `localhost` is a
+  target. A center paired at a name is dialled on the addresses the name
+  resolves to, and when one of them is loopback or unspecified the tunnel
+  is refused (`502`, the log says why): the relay does not reach this
+  machine's own ports by a name. When the relay dials through its own
+  proxy, the proxy resolves the name.
 - The relay dials a center through this node's own proxy when it has one,
   so relays chain. It never reads what it carries, and no rule, folder or
   mode of this node applies to a tunnel: the relayed node's calls are

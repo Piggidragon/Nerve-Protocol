@@ -105,9 +105,13 @@ its keys in files, so it can be a relayed node.
 The relay tunnels only to the centers it is paired with itself, over
 `https`, and not to one that removed it (`bye revoked`) or no longer knows
 it, and only to the ones on the node's list when it has one. Nothing else of
-the relay's machine or network can be reached through it: no other port, no
-center on its own loopback. A paused center is still reached: pausing stops
-the relay's own link, not the links it carries.
+the relay's machine or network can be reached through it: no other port,
+and no `http` center on its own loopback. An `https` center the relay is
+paired with at `127.0.0.1`, `[::1]` or `localhost` (a center on the relay's
+own machine) is reached. A center paired at a name is not reached on the
+relay's own machine: if the name resolves to a loopback address there, the
+tunnel is refused. A paused center is still reached: pausing stops the
+relay's own link, not the links it carries.
 
 If the relay itself reaches its centers through a proxy or another relay, it
 dials through that one too. Each relay in such a chain follows the same
@@ -123,7 +127,8 @@ nerve-node relay set 0.0.0.0:7490 --max-links 16 --max-links-per-node 4
 unless you set it. `--max-links-per-node` is the number per node, 4 unless
 you set it; a node needs one per center it is paired with. A tunnel that
 carries nothing for 90 seconds is closed (a live link sends something every
-20 seconds).
+20 seconds). At most 4 connections from one address may wait for the relay's
+answer at once, so one machine cannot keep everyone else out.
 
 ## Who is connected
 
@@ -143,7 +148,9 @@ tunnel lab-pc from 10.0.0.7:51544 to center home for 2 h 5 min
 in the [audit log](audit.md) when it ends: the node, its address, the
 center, when it started and ended, why it ended and how much it carried;
 never a token. The node's [log](logs.md) also has a line for every tunnel
-that opens, closes or is refused.
+that opens or closes, and for each refusal of a node with its token.
+Connections without a valid token are counted and told in one line a
+minute.
 
 ## Cut a node off
 
@@ -161,9 +168,10 @@ Each of these ends the tunnels it concerns at once:
 
 Windows has no control socket, so a `relay` change is in `node.toml` and
 takes effect at the next start of the node (`Restart-Service nerve-node` for
-the installed node). `relay ls` shows the relay's settings but not who is
-connected; that is in the audit log and the node's log. Windows Firewall
-must let other machines reach the relay's port.
+the installed node). Until then the running node keeps the tunnels it
+carries: `relay rm` and `relay off` say so, and you restart the node to cut
+them now. `relay ls` asks the running node who is connected. Windows
+Firewall must let other machines reach the relay's port.
 
 ## What to know
 

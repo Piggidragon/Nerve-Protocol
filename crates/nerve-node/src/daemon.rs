@@ -790,6 +790,12 @@ impl Daemon {
         self.shared.status()
     }
 
+    /// The relay's state, for a test.
+    #[cfg(test)]
+    pub(crate) fn relay(&self) -> &crate::relay::Relays {
+        &self.shared.relay
+    }
+
     /// Changes the config in force as the owner's CLI does over the control
     /// socket, for tests whose daemon has none (or runs on Windows).
     #[cfg(test)]

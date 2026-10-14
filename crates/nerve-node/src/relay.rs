@@ -44,6 +44,13 @@ use crate::daemon::{Shared, lock};
 /// connection is closed at once, so a peer without a token cannot hold the
 /// relay's memory or descriptors.
 const UNDECIDED: usize = 64;
+/// Of those, from one address: a peer that holds its connections open
+/// without a word cannot take the slots of every other node.
+const UNDECIDED_PER_PEER: usize = 4;
+/// Connections refused without a valid token are told in the log at most
+/// this often, counted: a peer that makes them as fast as it can must not
+/// push the rest of the log out.
+const TOKENLESS_EVERY: Duration = Duration::from_secs(60);
 /// A tunnel that carries no byte either way this long is closed. A link pings
 /// every 20 seconds (spec §4.4), so only a dead one stays this quiet.
 const IDLE: Duration = Duration::from_secs(90);
@@ -60,6 +67,13 @@ pub(crate) struct Relays {
     tunnels: Mutex<HashMap<u64, Tunnel>>,
     next: AtomicU64,
     undecided: Arc<Semaphore>,
+    /// Undecided connections per peer address.
+    peers: Mutex<HashMap<std::net::IpAddr, usize>>,
+    /// Refusals without a valid token not told in the log yet, and when the
+    /// last line about them was.
+    tokenless: Mutex<(u64, Option<std::time::Instant>)>,
+    /// How long a tunnel may be quiet ([`IDLE`]; a test shortens it).
+    idle_ms: AtomicU64,
 }
 
 impl Default for Relays {
@@ -70,6 +84,9 @@ impl Default for Relays {
             tunnels: Mutex::default(),
             next: AtomicU64::new(1),
             undecided: Arc::new(Semaphore::new(UNDECIDED)),
+            peers: Mutex::default(),
+            tokenless: Mutex::default(),
+            idle_ms: AtomicU64::new(IDLE.as_millis() as u64),
         }
     }
 }
@@ -107,6 +124,50 @@ impl Relays {
                 "since_ms": t.since_ms,
             })).collect::<Vec<_>>(),
         })
+    }
+
+    /// Counts a connection refused without a valid token, and says how many
+    /// to tell in the log when a line is due: the first, then at most one
+    /// per [`TOKENLESS_EVERY`] with the count since the last.
+    fn note_tokenless(&self, now: std::time::Instant) -> Option<u64> {
+        let mut t = lock(&self.tokenless);
+        t.0 += 1;
+        match t.1 {
+            Some(at) if now.duration_since(at) < TOKENLESS_EVERY => None,
+            _ => {
+                let n = t.0;
+                *t = (0, Some(now));
+                Some(n)
+            }
+        }
+    }
+
+    /// Takes one of the undecided slots of `peer`, unless it holds its
+    /// share.
+    fn take_peer(&self, peer: std::net::IpAddr) -> bool {
+        let mut peers = lock(&self.peers);
+        let n = peers.entry(peer).or_insert(0);
+        if *n >= UNDECIDED_PER_PEER {
+            return false;
+        }
+        *n += 1;
+        true
+    }
+
+    fn give_peer(&self, peer: std::net::IpAddr) {
+        let mut peers = lock(&self.peers);
+        if let Some(n) = peers.get_mut(&peer) {
+            *n -= 1;
+            if *n == 0 {
+                peers.remove(&peer);
+            }
+        }
+    }
+
+    /// Shortens the idle span, for a test.
+    #[cfg(test)]
+    pub(crate) fn set_idle(&self, d: Duration) {
+        self.idle_ms.store(d.as_millis() as u64, Ordering::Relaxed);
     }
 
     fn set_status(&self, s: impl Into<String>, bound: Option<SocketAddr>) {
@@ -245,15 +306,16 @@ async fn serve(
         tokio::select! {
             got = listener.accept() => match got {
                 Ok((io, peer)) => {
-                    // A connection over the limit is closed unread.
-                    let Ok(permit) = shared.relay.undecided.clone().try_acquire_owned() else {
+                    // A connection over the limits is closed unread.
+                    let Some(slot) = Undecided::take(shared, peer) else {
                         tracing::debug!("relay: too many undecided connections; closed one from {peer}");
+                        tokenless(shared, peer);
                         continue;
                     };
                     let _ = io.set_nodelay(true);
                     let (shared, acceptor) = (shared.clone(), acceptor.clone());
                     tokio::spawn(async move {
-                        connection(shared, acceptor, io, peer, permit).await;
+                        connection(shared, acceptor, io, peer, slot).await;
                     });
                 }
                 // One connection the node cannot take does not end the relay.
@@ -452,13 +514,49 @@ async fn refuse<W: tokio::io::AsyncWrite + Unpin>(io: &mut W, r: &Refusal) {
     let _ = resp.write(io).await;
 }
 
+/// One undecided connection: a slot of the relay's and one of its peer's,
+/// both given back when it is dropped.
+struct Undecided {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+    shared: Arc<Shared>,
+    peer: std::net::IpAddr,
+}
+
+impl Undecided {
+    fn take(shared: &Arc<Shared>, peer: SocketAddr) -> Option<Undecided> {
+        let permit = shared.relay.undecided.clone().try_acquire_owned().ok()?;
+        let ip = peer.ip().to_canonical();
+        shared.relay.take_peer(ip).then(|| Undecided {
+            _permit: permit,
+            shared: shared.clone(),
+            peer: ip,
+        })
+    }
+}
+
+impl Drop for Undecided {
+    fn drop(&mut self) {
+        self.shared.relay.give_peer(self.peer);
+    }
+}
+
+/// Tells a connection refused without a valid token in the log, counted
+/// ([`Relays::note_tokenless`]).
+fn tokenless(shared: &Shared, peer: SocketAddr) {
+    if let Some(n) = shared.relay.note_tokenless(std::time::Instant::now()) {
+        tracing::warn!(
+            "relay: refused {n} connection(s) without a valid relay token, the last from {peer}; such refusals are told at most once a minute"
+        );
+    }
+}
+
 /// One connection to the relay: TLS, its `CONNECT`, then the tunnel.
 async fn connection(
     shared: Arc<Shared>,
     acceptor: Acceptor,
     mut tcp: TcpStream,
     peer: SocketAddr,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    slot: Undecided,
 ) {
     // A TLS handshake starts with a handshake record (22). Anything else is
     // a client that speaks plain HTTP: it is told so, and nothing it sent
@@ -469,10 +567,19 @@ async fn connection(
     match peeked {
         Ok(Ok(1)) if first[0] == 0x16 => {}
         Ok(Ok(1)) => {
-            tracing::warn!(
+            tracing::debug!(
                 "relay: refused a plain HTTP connection from {peer}; its token, if it sent one, crossed the network in the clear"
             );
+            tokenless(&shared, peer);
+            // The request is read and dropped first: a socket closed with
+            // bytes unread is reset (Windows does so at once), and the reset
+            // would take the answer with it.
+            let _ = read_request_head(&mut tcp).await;
             refuse(&mut tcp, &PLAIN).await;
+            let _ = tcp.shutdown().await;
+            let mut rest = [0u8; 512];
+            let drained = async { while matches!(tcp.read(&mut rest).await, Ok(n) if n > 0) {} };
+            let _ = tokio::time::timeout(Duration::from_secs(1), drained).await;
             return;
         }
         _ => return,
@@ -498,10 +605,14 @@ async fn connection(
     let grant = match decide(&cfg, &req) {
         Ok(g) => g,
         Err(r) => {
-            if r == NO_TOKEN {
-                tracing::warn!(
-                    "relay: refused a tunnel from {peer}: no relay node with that name and token"
+            // Without a valid token a peer may only cost a counted line.
+            if node_of(&cfg, req.header("proxy-authorization")).is_none() {
+                tracing::debug!(
+                    "relay: refused a tunnel from {peer} to {}: {}",
+                    clip(&req.path),
+                    r.why
                 );
+                tokenless(&shared, peer);
             } else {
                 tracing::info!(
                     "relay: refused a tunnel from {peer} to {}: {}",
@@ -525,7 +636,8 @@ async fn connection(
     // The relay dials as the node's own link does: through its proxy, or
     // another relay, when it has one.
     let dialled = match crate::link::proxy_for(&shared.paths, &cfg, &grant.url).await {
-        Ok(proxy) => nerve_transport::net::reach(&grant.url, proxy.as_ref()).await,
+        Ok(Some(proxy)) => nerve_transport::net::reach(&grant.url, Some(&proxy)).await,
+        Ok(None) => dial_center(&grant.url).await,
         Err(e) => Err(format!("bad proxy: {e}")),
     };
     let center = match dialled {
@@ -551,7 +663,7 @@ async fn connection(
     if io.write_all(ok).await.is_err() || io.flush().await.is_err() {
         return;
     }
-    drop(permit);
+    drop(slot);
     tracing::info!(
         "relay: {} from {peer} to center {}: tunnel open",
         grant.node,
@@ -580,6 +692,56 @@ async fn connection(
     }
 }
 
+/// Whether `host` names this machine itself: a loopback address, or
+/// `localhost`.
+fn names_loopback(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.to_canonical().is_loopback())
+}
+
+/// The addresses a tunnel to `host` may use: all of them, unless the name
+/// resolved to this machine (loopback, or the unspecified address) while it
+/// does not name it. A center paired at a name is out there; when that name
+/// turns to this machine, the tunnel would reach whatever listens here.
+fn tunnel_addrs(host: &str, addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, String> {
+    let here = |a: &SocketAddr| {
+        let ip = a.ip().to_canonical();
+        ip.is_loopback() || ip.is_unspecified()
+    };
+    if !names_loopback(host) && addrs.iter().any(here) {
+        return Err(format!(
+            "{host} resolves to this machine, where the relay tunnels only to a center paired at a loopback address"
+        ));
+    }
+    if addrs.is_empty() {
+        return Err(format!("{host} resolves to no address"));
+    }
+    Ok(addrs)
+}
+
+/// Dials a center of this node straight, on the addresses [`tunnel_addrs`]
+/// lets a tunnel use.
+async fn dial_center(url: &CenterUrl) -> Result<BoxIo, String> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((url.host.as_str(), url.port))
+        .await
+        .map_err(|e| format!("cannot resolve {}: {e}", url.host))?
+        .collect();
+    let mut last = String::new();
+    for a in tunnel_addrs(&url.host, addrs)? {
+        match tokio::time::timeout(Duration::from_secs(15), TcpStream::connect(a)).await {
+            Ok(Ok(s)) => {
+                let _ = s.set_nodelay(true);
+                return Ok(Box::new(s));
+            }
+            Ok(Err(e)) => last = format!("{a}: {e}"),
+            Err(_) => last = format!("{a}: timed out"),
+        }
+    }
+    Err(format!("cannot connect to {url}: {last}"))
+}
+
 /// A target as the log shows it: cut, since a peer chooses it.
 fn clip(s: &str) -> String {
     let mut out: String = s.chars().take(80).collect();
@@ -598,11 +760,20 @@ async fn pump(
     node: BoxIo,
     center: BoxIo,
 ) -> (u64, u64, &'static str) {
-    let last = AtomicU64::new(crate::now_ms());
+    // The time since the tunnel opened, on the monotonic clock: a step of
+    // the wall clock neither keeps a dead tunnel nor ends a live one.
+    let opened = std::time::Instant::now();
+    let last = AtomicU64::new(0);
+    let idle_ms = shared.relay.idle_ms.load(Ordering::Relaxed);
     let (up, down) = (AtomicU64::new(0), AtomicU64::new(0));
     let (nr, nw) = tokio::io::split(node);
     let (cr, cw) = tokio::io::split(center);
-    let both = async { tokio::join!(copy(nr, cw, &up, &last), copy(cr, nw, &down, &last)) };
+    let both = async {
+        tokio::join!(
+            copy(nr, cw, &up, (&last, opened)),
+            copy(cr, nw, &down, (&last, opened))
+        )
+    };
     let mut changed = shared.changed.subscribe();
     let mut stop = shared.stop.subscribe();
     // A change between the grant and here is in the config already.
@@ -628,10 +799,11 @@ async fn pump(
         }
     };
     let idle = async {
+        let tick = Duration::from_millis((idle_ms / 3).clamp(1, 5000));
         loop {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-            let quiet = crate::now_ms().saturating_sub(last.load(Ordering::Relaxed));
-            if quiet >= IDLE.as_millis() as u64 {
+            tokio::time::sleep(tick).await;
+            let now = opened.elapsed().as_millis() as u64;
+            if now.saturating_sub(last.load(Ordering::Relaxed)) >= idle_ms {
                 return;
             }
         }
@@ -653,7 +825,7 @@ async fn copy(
     mut from: tokio::io::ReadHalf<BoxIo>,
     mut to: tokio::io::WriteHalf<BoxIo>,
     count: &AtomicU64,
-    last: &AtomicU64,
+    (last, opened): (&AtomicU64, std::time::Instant),
 ) {
     let mut buf = vec![0u8; 16 * 1024];
     loop {
@@ -665,7 +837,7 @@ async fn copy(
             break;
         }
         count.fetch_add(n as u64, Ordering::Relaxed);
-        last.store(crate::now_ms(), Ordering::Relaxed);
+        last.store(opened.elapsed().as_millis() as u64, Ordering::Relaxed);
     }
     let _ = to.shutdown().await;
 }
@@ -746,8 +918,18 @@ mod tests {
     }
 
     async fn jump(centers: Vec<CenterEntry>, more: impl FnOnce(&mut NodeConfig)) -> Jump {
+        jump_with(centers, more, false).await
+    }
+
+    /// [`jump`], with its control socket (or pipe) when `ctl`.
+    async fn jump_with(
+        centers: Vec<CenterEntry>,
+        more: impl FnOnce(&mut NodeConfig),
+        ctl: bool,
+    ) -> Jump {
         let dir = tempfile::tempdir().unwrap();
-        let o = options(dir.path());
+        let mut o = options(dir.path());
+        o.ctl = ctl;
         let (token, hash) = new_token();
         let mut cfg = NodeConfig {
             centers,
@@ -1785,5 +1967,173 @@ mod tests {
             }
         });
         (at, seen)
+    }
+
+    /// Refusals without a valid token cost one log line a minute, with
+    /// their count, however many come.
+    #[test]
+    fn refusals_without_a_token_are_told_counted_once_a_minute() {
+        let r = Relays::default();
+        let t0 = std::time::Instant::now();
+        assert_eq!(r.note_tokenless(t0), Some(1));
+        for i in 1..10_000u64 {
+            assert_eq!(r.note_tokenless(t0 + Duration::from_millis(i)), None);
+        }
+        assert_eq!(
+            r.note_tokenless(t0 + TOKENLESS_EVERY + Duration::from_secs(1)),
+            Some(10_000)
+        );
+        assert_eq!(r.note_tokenless(t0 + TOKENLESS_EVERY * 2), None);
+    }
+
+    /// A name that resolves to this machine is no way to it: only a center
+    /// paired at a loopback address (or `localhost`) is reached there.
+    #[test]
+    fn a_tunnel_reaches_this_machine_only_at_a_center_paired_there() {
+        let a = |s: &str| -> SocketAddr { s.parse().unwrap() };
+        assert!(tunnel_addrs("127.0.0.1", vec![a("127.0.0.1:7443")]).is_ok());
+        assert!(tunnel_addrs("::1", vec![a("[::1]:7443")]).is_ok());
+        assert!(tunnel_addrs("LocalHost", vec![a("127.0.0.1:7443")]).is_ok());
+        assert!(tunnel_addrs("center.example", vec![a("192.0.2.7:7443")]).is_ok());
+        for addrs in [
+            vec![a("127.0.0.1:7443")],
+            vec![a("192.0.2.7:7443"), a("[::1]:7443")],
+            vec![a("[::ffff:127.0.0.1]:7443")],
+            vec![a("0.0.0.0:7443")],
+        ] {
+            let e = tunnel_addrs("center.example", addrs.clone()).unwrap_err();
+            assert!(e.contains("resolves to this machine"), "{addrs:?}: {e}");
+        }
+        assert!(tunnel_addrs("center.example", vec![]).is_err());
+    }
+
+    /// A tunnel quiet for the idle span is closed and audited as such; one
+    /// that carries a byte now and then stays.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_quiet_tunnel_is_closed_and_a_busy_one_stays() {
+        let home = echo().await;
+        let home_at = format!("127.0.0.1:{}", port(&home));
+        serve_echo(home);
+        let j = jump(vec![center("home", format!("https://{home_at}"))], |_| {}).await;
+        j.daemon.relay().set_idle(Duration::from_millis(600));
+        let lab = basic("lab", &j.token);
+        let (_, _, quiet) = connect(j.addr, &j.pin, &home_at, Some(&lab)).await;
+        let (_, _, busy) = connect(j.addr, &j.pin, &home_at, Some(&lab)).await;
+        let (mut quiet, mut busy) = (quiet.unwrap(), busy.unwrap());
+        round_trip(&mut quiet, b"once").await;
+        let started = std::time::Instant::now();
+        while started.elapsed() < Duration::from_millis(2000) {
+            round_trip(&mut busy, b"ping").await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
+        assert!(ends(&mut quiet, QUIET).await, "a quiet tunnel stayed open");
+        assert!(!ends(&mut busy, QUIET).await, "a busy tunnel was closed");
+        round_trip(&mut busy, b"still").await;
+        let audited = nerve_policy::audit::AuditLog::new(j.daemon.paths().audit_log())
+            .read()
+            .unwrap();
+        assert!(
+            audited
+                .iter()
+                .any(|v| v["kind"] == "relay" && v["reason"] == "quiet too long"),
+            "{audited:?}"
+        );
+        j.daemon.stop().await;
+    }
+
+    /// One address holds a few undecided connections at most: a peer that
+    /// keeps its connections open without a word does not lock others out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_address_cannot_hold_the_relay_for_everyone() {
+        let home = echo().await;
+        let home_at = format!("127.0.0.1:{}", port(&home));
+        serve_echo(home);
+        let j = jump(vec![center("home", format!("https://{home_at}"))], |_| {}).await;
+        let from = |ip: &str| {
+            let ip: std::net::IpAddr = ip.parse().unwrap();
+            let addr = j.addr;
+            async move {
+                let s = tokio::net::TcpSocket::new_v4().ok()?;
+                s.bind(SocketAddr::new(ip, 0)).ok()?;
+                s.connect(addr).await.ok()
+            }
+        };
+        let mut held = Vec::new();
+        for _ in 0..UNDECIDED_PER_PEER {
+            let Some(s) = from("127.0.0.2").await else {
+                eprintln!("  (no 127.0.0.2 here; nothing to show)");
+                j.daemon.stop().await;
+                return;
+            };
+            held.push(s);
+        }
+        // Let the relay take them all before the next one.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let mut over = from("127.0.0.2").await.unwrap();
+        let mut b = [0u8; 1];
+        let closed = tokio::time::timeout(Duration::from_secs(2), over.read(&mut b)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0)) | Ok(Err(_))),
+            "a fifth silent connection of one address was held: {closed:?}"
+        );
+        // Another address goes on as before.
+        let lab = basic("lab", &j.token);
+        let (status, head, t) = connect(j.addr, &j.pin, &home_at, Some(&lab)).await;
+        assert_eq!(status, 200, "{head}");
+        round_trip(&mut t.unwrap(), b"through").await;
+        drop(held);
+        j.daemon.stop().await;
+    }
+
+    /// `relay ls` asks the running node (its socket, on Windows its pipe)
+    /// and names the tunnels; `relay rm` says when they end: at once where
+    /// the node took the change, else at its next start (Windows).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn relay_ls_names_the_tunnels_and_rm_says_when_they_end() {
+        use clap::Parser;
+        let home = echo().await;
+        let home_at = format!("127.0.0.1:{}", port(&home));
+        serve_echo(home);
+        let j = jump_with(
+            vec![center("home", format!("https://{home_at}"))],
+            |_| {},
+            true,
+        )
+        .await;
+        let paths = j.daemon.paths().clone();
+        let cli = |args: &[&str]| {
+            let mut argv = vec![
+                "nerve-node".to_string(),
+                "--config-dir".into(),
+                paths.config_dir.display().to_string(),
+                "--state-dir".into(),
+                paths.state_dir.display().to_string(),
+            ];
+            argv.extend(args.iter().map(|s| s.to_string()));
+            async move {
+                let cli = crate::cli::Cli::try_parse_from(argv).unwrap();
+                let mut out = Vec::new();
+                crate::cli::execute(cli, &mut out).await.unwrap();
+                String::from_utf8(out).unwrap()
+            }
+        };
+        let lab = basic("lab", &j.token);
+        let (_, _, t) = connect(j.addr, &j.pin, &home_at, Some(&lab)).await;
+        let mut t = t.unwrap();
+        round_trip(&mut t, b"up").await;
+        let ls = cli(&["relay", "ls"]).await;
+        assert!(
+            ls.contains("tunnel lab from 127.0.0.1:") && ls.contains(" to center home for "),
+            "{ls}"
+        );
+        let rm = cli(&["relay", "rm", "lab"]).await;
+        if cfg!(windows) {
+            assert!(rm.contains("Restart-Service nerve-node"), "{rm}");
+            assert!(!rm.contains("end now"), "{rm}");
+        } else {
+            assert_eq!(rm, "relay node lab removed\nits tunnels end now\n");
+            assert!(ends(&mut t, WAIT).await, "the tunnel outlived its token");
+        }
+        j.daemon.stop().await;
     }
 }

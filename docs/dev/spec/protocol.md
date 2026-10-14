@@ -188,7 +188,12 @@ message layer: the relay carries bytes, never messages.
     the node a list of centers, one on that list. A center off the list MUST
     get the same answer as one the relay does not have. The relay MUST NOT
     open a tunnel anywhere else: not to an `http` center (it is on the
-    relay's loopback), not to any other port of its machine or network;
+    relay's loopback), not to any other port of its machine or network. An
+    `https` center the relay is paired with at a loopback address (or
+    `localhost`) is a target; a center paired at a name is not reached on
+    this machine: when the relay dials it directly and the name resolves to
+    a loopback or unspecified address, the tunnel is refused with `502`.
+    Through the relay's own proxy the next hop resolves the name;
   - `503` when it is off, when its node is locked, or when a limit is reached
     (tunnels at once over all nodes, and per node);
   - `502` when it cannot reach the center;
@@ -197,10 +202,14 @@ message layer: the relay carries bytes, never messages.
 - The relay dials the center as its own link would, through its own proxy if
   it has one (§4.7). A chain of relays follows the same rules at each hop:
   each one tunnels only to centers it is paired with itself.
+- A relay keeps at most a few undecided connections (TLS and the `CONNECT`
+  head, 15 seconds at most) per peer address, and a bounded number in all;
+  one over either is closed unread. Refusals without a valid token are not
+  logged one by one but counted, so a peer cannot flood the relay's log.
 - A relay MUST end a tunnel when its owner turns the relay off, takes the
   node's token away or the center off the node's list, unpairs the center or
   locks the node, and when the tunnel carried nothing either way for 90
-  seconds (a link pings every 20 seconds, §4.4).
+  seconds by the monotonic clock (a link pings every 20 seconds, §4.4).
 - A relay keeps no token in clear at rest. `nerve-node` keeps the SHA-256 of
   each token in `node.toml`. The relayed node keeps its token with its own
   keys.

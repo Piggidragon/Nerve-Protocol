@@ -2865,6 +2865,7 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
             })
             .await?;
             w(out, "relay off".into());
+            cut_note(paths, out, "every tunnel ends").await;
             Ok(())
         }
         RelayCmd::Add { name, centers } => {
@@ -2930,6 +2931,7 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
                 out,
                 format!("relay node {name} may reach {}", reach_of(&centers)),
             );
+            cut_note(paths, out, "its tunnels to other centers end").await;
             Ok(())
         }
         RelayCmd::Rm { name } => {
@@ -2942,7 +2944,8 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
                 Ok(())
             })
             .await?;
-            w(out, format!("relay node {name} removed; its tunnels end"));
+            w(out, format!("relay node {name} removed"));
+            cut_note(paths, out, "its tunnels end").await;
             Ok(())
         }
         RelayCmd::Ls => {
@@ -2955,7 +2958,13 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
                     Err(e) if e == nerve_transport::ctl::NOT_RUNNING => None,
                     Err(e) => return Err(e),
                 };
-            #[cfg(not(unix))]
+            // Windows: the control pipe answers `status` too.
+            #[cfg(windows)]
+            let live = crate::pipe::call(paths, "status", json!({}))
+                .await
+                .ok()
+                .map(|v| v["relay"].clone());
+            #[cfg(not(any(unix, windows)))]
             let live: Option<Value> = None;
             match (&r.listen, &live) {
                 (None, _) => w(out, "relay off".into()),
@@ -3003,18 +3012,28 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
                         );
                     }
                 }
-                None if r.listen.is_some() => w(
-                    out,
-                    if cfg!(unix) {
-                        "no node runs here, so no tunnel is open".into()
-                    } else {
-                        "who is connected is in the node's log (the control pipe on Windows takes folder changes only)".into()
-                    },
-                ),
+                None if r.listen.is_some() => {
+                    w(out, "no node runs here, so no tunnel is open".into())
+                }
                 None => {}
             }
             Ok(())
         }
+    }
+}
+
+/// Says whether a relay change that cuts tunnels (`what`, cut now) is in force: a
+/// node that took it ends them now; on Windows, where the CLI writes the
+/// file and the running node reads it at its next start, they go on until
+/// then; with no node running there is none.
+async fn cut_note(paths: &NodePaths, out: &mut dyn Write, what: &str) {
+    if daemon_answers(paths, false).await {
+        let _ = writeln!(out, "{what} now");
+    } else if cfg!(windows) {
+        let _ = writeln!(
+            out,
+            "a running node takes this change at its next start and keeps the tunnels it carries until then: restart it (`Restart-Service nerve-node` for the installed node) to cut them now"
+        );
     }
 }
 

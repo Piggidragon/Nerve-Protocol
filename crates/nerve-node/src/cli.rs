@@ -3625,7 +3625,7 @@ mod tests {
         let mut cfg = NodeConfig::default();
         let mut home = entry("home");
         home.node_id = "n-home".into();
-        home.policy.folders.push(Folder {
+        home.policy.folders.push(nerve_policy::config::Folder {
             path: real.display().to_string(),
             access: Access::parse("rw").unwrap(),
         });

@@ -549,7 +549,14 @@ pub const NOT_CONFINED: &str = "commands cannot be confined on this machine";
 
 /// Why `folder` mode runs no command with the keys in the keyring where
 /// [`keys_kept_from_commands`] does not hold.
+#[cfg(not(windows))]
 pub const KEYRING_NOT_CONFINED: &str = "commands cannot be confined on this machine while the node's keys are in the system keyring: Landlock here (below ABI 9, Linux 7.1) cannot keep a command off the session bus the keyring answers on, so folder mode runs no command unless commands run as another account than root; `nerve-node config set machine.secret_storage file` brings them back";
+
+/// The text of [`KEYRING_NOT_CONFINED`] on Windows, where commands run in an
+/// AppContainer and the keys are in the Credential Manager: neither Landlock
+/// nor the session bus exist there.
+#[cfg(windows)]
+pub const KEYRING_NOT_CONFINED: &str = "commands cannot be confined on this machine while the node's keys are in the system keyring: the AppContainer here is not known to keep a command from the Credential Manager the keys are in, so folder mode runs no command; `nerve-node config set machine.secret_storage file` brings them back";
 
 /// Whether a confined command of `account` (`None`: the node's own user)
 /// cannot reach the node's keys where `storage` keeps them. Files are out of
@@ -2265,6 +2272,22 @@ node_id = "n1"
 #[cfg(test)]
 mod confinement_tests {
     use super::*;
+
+    /// The refusal for keys in the keyring names what applies on the platform:
+    /// Landlock and the session bus on Linux, the AppContainer and the
+    /// Credential Manager on Windows, and not the other's.
+    #[test]
+    fn the_keyring_refusal_names_the_platform_it_is_for() {
+        let text = KEYRING_NOT_CONFINED;
+        assert!(text.contains("`nerve-node config set machine.secret_storage file`"));
+        #[cfg(windows)]
+        {
+            assert!(text.contains("AppContainer") && text.contains("Credential Manager"));
+            assert!(!text.contains("Landlock") && !text.contains("session bus"));
+        }
+        #[cfg(not(windows))]
+        assert!(text.contains("Landlock") && text.contains("session bus"));
+    }
 
     /// The installed Windows service runs commands as another account, for
     /// which the AppContainer is not wired: folder mode is not confined there

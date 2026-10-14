@@ -44,7 +44,8 @@ nerve-node rule rm allow 'git status' --wildcard
 ```
 
 `rule rm` takes the same arguments as `rule add`. It also takes an entry as
-`rule ls` prints it, such as `'exec.run:git *'`.
+`rule ls` prints it, such as `'exec.run:git *'`. When the arguments could mean two entries on the list, `rule rm`
+names both and removes none: remove one as `rule ls` shows it.
 
 ## Rules for files and other actions
 

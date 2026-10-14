@@ -846,24 +846,34 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
             wildcard,
             center,
         } => {
+            let removed = std::sync::Mutex::new(String::new());
             let name = edit_center(paths, &center, |e| {
                 let l = list.of(&mut e.policy);
                 // An entry copied from `ls` goes as it is, so rules for
-                // files and other actions can be removed too.
-                let rule = if l.contains(&command) {
-                    command.clone()
-                } else {
-                    list.command_rule(&command, wildcard)?
+                // files and other actions can be removed too. The arguments
+                // of `add` stand for the command rule they made.
+                let made = list.command_rule(&command, wildcard);
+                let rule = match made {
+                    Ok(made) if made != command && l.contains(&command) && l.contains(&made) => {
+                        return Err(format!(
+                            "both {command:?} and {made:?} are on the {}: remove one of them as `rule ls` shows it",
+                            list.label()
+                        ));
+                    }
+                    _ if l.contains(&command) => command.clone(),
+                    made => made?,
                 };
                 let before = l.len();
                 l.retain(|r| *r != rule);
                 if l.len() == before {
                     return Err(format!("{rule:?} is not on the {}", list.label()));
                 }
+                *removed.lock().unwrap() = rule;
                 Ok(())
             })
             .await?;
-            let _ = writeln!(out, "{name}: removed from the {}", list.label());
+            let removed = removed.into_inner().unwrap();
+            let _ = writeln!(out, "{name}: removed {removed:?} from the {}", list.label());
         }
         RuleCmd::Ls { list, center } => {
             let (cfg, _) = read_config(paths).await?;
@@ -3582,6 +3592,31 @@ mod tests {
             load(&paths).centers[0].policy.allow,
             ["exec.run:git status"]
         );
+        // With the working rule on the list as well (added as the refusal
+        // says), the arguments name neither of the two: the user picks one.
+        let broken = "exec.run:fs:~/private/[*]";
+        run(
+            &paths,
+            &["config", "add", "center.home.policy.deny", broken],
+        )
+        .unwrap();
+        run(
+            &paths,
+            &["config", "add", "center.home.policy.deny", "fs:~/private/*"],
+        )
+        .unwrap();
+        let e = run(&paths, &["rule", "rm", "deny", "fs:~/private/*"]).unwrap_err();
+        assert!(
+            e.contains(broken) && e.contains("\"fs:~/private/*\""),
+            "{e}"
+        );
+        let out = run(&paths, &["rule", "rm", "deny", broken]).unwrap();
+        assert!(out.contains(broken), "{out}");
+        assert_eq!(
+            load(&paths).centers[0].policy.deny,
+            ["exec.run:git status", "exec.run:rm *", "fs:~/private/*"]
+        );
+        run(&paths, &["rule", "rm", "deny", "fs:~/private/*"]).unwrap();
         // A colon in a command that is not a scope stays a command.
         run(&paths, &["rule", "add", "allow", "C:\\tools\\x.exe"]).unwrap();
         run(&paths, &["rule", "rm", "allow", "C:\\tools\\x.exe"]).unwrap();

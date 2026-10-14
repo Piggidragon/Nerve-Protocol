@@ -9,7 +9,10 @@
 //! The node keeps the config in memory and signs every file it writes with a
 //! MAC whose key no command of a center can read. The file is read at start-up
 //! and when the owner asks for it; a file the node did not sign (one a command
-//! rewrote, say) is refused, audited, and changes nothing.
+//! rewrote, say) is refused, audited, and changes nothing. So is a signed file
+//! older than the last one the node saved or took: the node keeps that version
+//! in the state folder ([`VERSION_FILE`]), so an earlier file put back in the
+//! config folder is refused at the next start as it is on a reload.
 //!
 //! Where the MAC key is kept is not the store's business: it asks a
 //! [`Secrets`], which also moves the node's other secrets when
@@ -108,6 +111,51 @@ fn verified(text: &str, key: &MacKey) -> Result<NodeConfig, String> {
     }
 }
 
+/// The file in the state folder that holds the highest version of `node.toml`
+/// the node has saved or taken (docs/dev/spec/node-local.md §1). The config
+/// folder holds the signed files, the state folder the version that says
+/// which of them is the last: whoever puts an earlier signed file back in the
+/// config folder does not reach it.
+pub const VERSION_FILE: &str = "config.version";
+
+/// The version recorded at `path`; `None` when there is no record. A record
+/// that is no number is an error: it is not taken for none, which would let
+/// whoever damaged it have an older file accepted.
+pub fn read_version(path: &Path) -> Result<Option<u64>, String> {
+    let Some(text) = read_file(path)? else {
+        return Ok(None);
+    };
+    text.trim().parse().map(Some).map_err(|_| {
+        format!(
+            "{} holds no version number; delete it and the node records the version of node.toml again",
+            path.display()
+        )
+    })
+}
+
+/// Raises the record at `path` to `version`. A record that is as high already
+/// stays, so the version never goes down; one that cannot be read is
+/// written again.
+pub fn record_version(path: &Path, version: u64) -> Result<(), String> {
+    if matches!(read_version(path), Ok(Some(last)) if last >= version) {
+        return Ok(());
+    }
+    nerve_transport::files::write_private(path, format!("{version}\n").as_bytes())
+        .map_err(|e| format!("{}: {e}", path.display()))
+}
+
+/// Whether a signed file of this `version` may be taken: not when it is
+/// older than the last one the node saved or took. The text says what to
+/// tell the owner.
+fn not_older(secrets: &dyn Secrets, version: u64) -> Result<(), String> {
+    match secrets.accepted_version()? {
+        Some(last) if version < last => Err(format!(
+            "its version {version} is older than the last this node accepted ({last}), so an earlier file was put back"
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Where the node keeps the key of its config's MAC and its other secrets
 /// (`machine.secret_storage`, docs/dev/spec/node-local.md §1), as the store
 /// sees it: the key, and a move of everything when a saved config names
@@ -121,6 +169,12 @@ pub trait Secrets: Send {
     /// never replaced: it would turn every file it signed into one the node
     /// refuses.
     fn mac_key_or_new(&self) -> Result<MacKey, String>;
+    /// The highest version of `node.toml` the node has saved or taken
+    /// ([`VERSION_FILE`]); `None` before there is one. A signed file below it
+    /// is an older one put back.
+    fn accepted_version(&self) -> Result<Option<u64>, String>;
+    /// Raises that version to `version` ([`record_version`]).
+    fn accept_version(&self, version: u64) -> Result<(), String>;
     /// Before `cfg`, whose `machine.secret_storage` differs from
     /// [`Secrets::storage`], is saved: copies every secret there and reads
     /// each copy back. An error refuses the change; nothing is saved then.
@@ -165,6 +219,15 @@ impl Secrets for KeyFile {
 
     fn mac_key_or_new(&self) -> Result<MacKey, String> {
         MacKey::load_or_create(&self.0)
+    }
+
+    /// The record is beside the key, in the state folder.
+    fn accepted_version(&self) -> Result<Option<u64>, String> {
+        read_version(&self.0.with_file_name(VERSION_FILE))
+    }
+
+    fn accept_version(&self, version: u64) -> Result<(), String> {
+        record_version(&self.0.with_file_name(VERSION_FILE), version)
     }
 
     fn copy(&mut self, _cfg: &NodeConfig) -> Result<(), String> {
@@ -249,11 +312,18 @@ impl SettingsStore {
             config: NodeConfig::default(),
             observer: None,
         };
+        // The versions a file of this node had stay behind it: the next one
+        // continues them, or the node would refuse its own file at its next
+        // start.
+        let last = s.secrets.accepted_version()?.unwrap_or(0);
         let Some(text) = text else {
+            s.config.version = last;
             return Ok(s);
         };
         if first && unseal(&text).0.is_none() {
-            let c = NodeConfig::parse(&text).map_err(|e| format!("{}: {e}", s.path.display()))?;
+            let mut c =
+                NodeConfig::parse(&text).map_err(|e| format!("{}: {e}", s.path.display()))?;
+            c.version = c.version.max(last);
             s.write(&c, None).map_err(|e| e.to_string())?;
             s.config = c;
             let _ = s
@@ -261,7 +331,12 @@ impl SettingsStore {
                 .config("signed", &s.path, "has no MAC; signed as it was");
             return Ok(s);
         }
-        s.config = verified(&text, &s.key).map_err(|why| s.refuse(&why))?;
+        let cfg = verified(&text, &s.key).map_err(|why| s.refuse(&why))?;
+        not_older(s.secrets.as_ref(), cfg.version).map_err(|why| s.refuse(&why))?;
+        // A file saved by a node that did not record it (an earlier version
+        // of nerve-node, or a record that could not be written).
+        s.remember(cfg.version);
+        s.config = cfg;
         Ok(s)
     }
 
@@ -313,7 +388,9 @@ impl SettingsStore {
             )
         };
         match secrets.mac_key()? {
-            Some(key) => verified(&text, &key).map_err(refused),
+            Some(key) => verified(&text, &key)
+                .and_then(|c| not_older(secrets, c.version).map(|()| c))
+                .map_err(refused),
             // The node signs such a file the first time it opens it.
             None if unseal(&text).0.is_none() => {
                 NodeConfig::parse(&text).map_err(|e| format!("{}: {e}", path.display()))
@@ -359,7 +436,8 @@ impl SettingsStore {
 
     /// Reads the file again because the owner asks (SIGHUP, the control
     /// socket's `reload`). Only a file the node signed is applied, and never
-    /// an older version than the one in force; anything else is refused and
+    /// an older version than the one in force or the last one recorded
+    /// ([`VERSION_FILE`]); anything else is refused and
     /// audited, and the old config stays in force. It stays too while a
     /// move of the secrets the file names is refused
     /// ([`Secrets::may_reload`]).
@@ -372,6 +450,9 @@ impl SettingsStore {
                 fresh.version, self.config.version
             )));
         }
+        // The in-force version can lag the record: a CLI that wrote the file
+        // itself raised it.
+        not_older(self.secrets.as_ref(), fresh.version).map_err(|why| self.refuse(&why))?;
         // Another writer saved a file that keeps the secrets elsewhere, and
         // copied them there first.
         if fresh.machine.secret_storage != self.secrets.storage() {
@@ -379,6 +460,7 @@ impl SettingsStore {
             self.secrets.moved(&fresh);
         }
         let changed = fresh != self.config;
+        self.remember(fresh.version);
         self.config = fresh;
         Ok(changed)
     }
@@ -393,7 +475,11 @@ impl SettingsStore {
             .ok_or_else(missing)?;
         let mut new = NodeConfig::parse(unseal(&text).1)
             .map_err(|e| SetError::Invalid(format!("{}: {e}", self.path.display())))?;
-        new.version = self.config.version.max(new.version) + 1;
+        // Above every version the node has had, so an earlier file the owner
+        // takes is the newest one now, and the record never goes down. A
+        // record that cannot be read is written again.
+        let last = self.secrets.accepted_version().ok().flatten().unwrap_or(0);
+        new.version = self.config.version.max(new.version).max(last) + 1;
         // Taken as it is: whoever wrote it last.
         self.write(&new, None)?;
         let changes = diff(&to_json(&self.config), &to_json(&new));
@@ -471,7 +557,25 @@ impl SettingsStore {
                 .map_err(|e| format!("{}: {e}", dir.display()))?;
         }
         nerve_transport::files::write_private(&self.path, sealed(&self.key, c).as_bytes())
-            .map_err(|e| format!("{}: {e}", self.path.display()))
+            .map_err(|e| format!("{}: {e}", self.path.display()))?;
+        // After the file, never before: a record ahead of a file that was not
+        // saved would make the node refuse the file it has.
+        self.remember(c.version);
+        Ok(())
+    }
+
+    /// Raises the record of the last version saved or taken. The file is
+    /// saved by now, so a record that cannot be written is audited and no
+    /// reason to undo anything: it only lags, and the next start records
+    /// the version.
+    fn remember(&self, version: u64) {
+        if let Err(e) = self.secrets.accept_version(version) {
+            let _ = self.audit.config(
+                "not_recorded",
+                &self.path,
+                &format!("version {version} is not recorded: {e}"),
+            );
+        }
     }
 
     /// Replaces the whole config as the owner; `if_version` guards against a
@@ -505,7 +609,7 @@ impl SettingsStore {
         if new == self.config {
             return Ok(());
         }
-        new.version = self.config.version + 1;
+        new.version = self.next_version();
         self.write(&new, Some(self.config.version))
             .map_err(|e| e.to_string())?;
         self.config = new;
@@ -594,13 +698,27 @@ impl SettingsStore {
         if new == self.config {
             return Ok(self.config.version);
         }
-        new.version = self.config.version + 1;
+        new.version = self.next_version();
         self.write(&new, Some(self.config.version))?;
         let changes = diff(&to_json(&self.config), &to_json(&new));
         let version = new.version;
         self.config = new;
         self.changed(&by.label(), version, &changes);
         Ok(version)
+    }
+
+    /// The version of the file this store saves next: above the one in force
+    /// and above the record. Another writer may have saved the file
+    /// meanwhile and raised the record past the version in force (the CLI on
+    /// Windows, which has no socket to ask the node, or on Linux before the
+    /// node's socket is up). This store's save replaces that file, as it
+    /// always did; but numbered by its own version alone it would land below
+    /// the record, and the node would refuse its own file at its next start
+    /// as an earlier one put back. A record that cannot be read counts as
+    /// none; the save writes it again.
+    fn next_version(&self) -> u64 {
+        let last = self.secrets.accepted_version().ok().flatten().unwrap_or(0);
+        self.config.version.max(last) + 1
     }
 }
 
@@ -1443,6 +1561,12 @@ mod tests {
         fn mac_key_or_new(&self) -> Result<MacKey, String> {
             MacKey::load_or_create(&self.key)
         }
+        fn accepted_version(&self) -> Result<Option<u64>, String> {
+            read_version(&self.key.with_file_name(VERSION_FILE))
+        }
+        fn accept_version(&self, version: u64) -> Result<(), String> {
+            record_version(&self.key.with_file_name(VERSION_FILE), version)
+        }
         fn copy(&mut self, _cfg: &NodeConfig) -> Result<(), String> {
             self.note("copy");
             if self.fail {
@@ -1572,6 +1696,266 @@ mod tests {
         assert!(s.reload().is_err());
         assert_eq!(s.config().limits.max_running, 5);
         assert_eq!(refusals(&s), 2);
+    }
+
+    /// `s` changed once more, so that its version goes up by one.
+    fn bump(s: &mut SettingsStore) -> u64 {
+        let n = s.config().limits.max_running;
+        s.update(|c| {
+            c.limits.max_running = n + 1;
+            Ok(())
+        })
+        .unwrap()
+    }
+
+    fn recorded(dir: &Path) -> Option<u64> {
+        read_version(&dir.join(VERSION_FILE)).unwrap()
+    }
+
+    /// An earlier signed `node.toml` put back in the config folder passes the
+    /// MAC, so only the version the node recorded in the state folder tells
+    /// it from the file it saved last: a start refuses it, audits that, and
+    /// the owner can still take it with `config accept`.
+    #[test]
+    fn an_earlier_signed_file_put_back_is_refused_at_open() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = store(d.path(), SettingsGrant::Off);
+        let earlier = std::fs::read(s.path()).unwrap();
+        let earlier_cfg = s.config().clone();
+        let last = bump(&mut s);
+        assert!(last > earlier_cfg.version);
+        assert_eq!(recorded(d.path()), Some(last));
+        drop(s);
+
+        std::fs::write(d.path().join("node.toml"), &earlier).unwrap();
+        let e = reopen(d.path()).err().expect("the earlier file is refused");
+        assert!(
+            e.contains("older than the last this node accepted") && e.contains("config accept"),
+            "{e}"
+        );
+        // The CLI's read-only view refuses it the same way.
+        let e = SettingsStore::peek(&d.path().join("node.toml"), &d.path().join("config.key"))
+            .unwrap_err();
+        assert!(e.contains("older"), "{e}");
+        let log = AuditLog::new(d.path().join("audit.jsonl")).read().unwrap();
+        let refused: Vec<_> = log.iter().filter(|v| v["event"] == "refused").collect();
+        assert_eq!(refused.len(), 1, "{log:?}");
+        assert!(refused[0]["reason"].as_str().unwrap().contains("older"));
+        // Nothing was changed by the refusal.
+        assert_eq!(std::fs::read(d.path().join("node.toml")).unwrap(), earlier);
+        assert_eq!(recorded(d.path()), Some(last));
+
+        // The owner looks at it and takes it: its content is in force, under
+        // a version above every one before, so the next-older file is
+        // refused in turn.
+        let (taken, v) = SettingsStore::open_accepting(
+            d.path().join("node.toml"),
+            d.path().join("config.key"),
+            AuditLog::new(d.path().join("audit.jsonl")),
+        )
+        .unwrap();
+        assert!(v > last, "{v} {last}");
+        assert_eq!(taken.config().limits, earlier_cfg.limits);
+        assert_eq!(recorded(d.path()), Some(v));
+        assert_eq!(reopen(d.path()).unwrap().version(), v);
+    }
+
+    /// The record follows every saved change, and a file the node did not
+    /// record (one from before it kept a record) is taken and recorded.
+    #[test]
+    fn the_version_is_recorded_with_every_save() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(recorded(d.path()), None);
+        let mut s = store(d.path(), SettingsGrant::Off);
+        assert_eq!(recorded(d.path()), Some(s.version()));
+        let v = bump(&mut s);
+        assert_eq!(recorded(d.path()), Some(v));
+        // A change that changes nothing saves nothing.
+        s.update(|_| Ok(())).unwrap();
+        assert_eq!(recorded(d.path()), Some(v));
+        // The record holds no secret and is private to the owner.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(d.path().join(VERSION_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        drop(s);
+        // No record: the file in the config folder is the last one there is.
+        std::fs::remove_file(d.path().join(VERSION_FILE)).unwrap();
+        assert_eq!(reopen(d.path()).unwrap().version(), v);
+        assert_eq!(recorded(d.path()), Some(v));
+        // A newer file that another writer saved raises it when the node
+        // takes it on a reload.
+        let mut s = reopen(d.path()).unwrap();
+        let mut cfg = s.config().clone();
+        cfg.version += 3;
+        std::fs::write(s.path(), sealed(&s.key, &cfg)).unwrap();
+        assert_eq!(s.reload(), Ok(true));
+        assert_eq!(recorded(d.path()), Some(cfg.version));
+    }
+
+    /// With no `node.toml` (the owner removed the config folder to start
+    /// over, the state folder stayed) the versions go on from the record:
+    /// the next file the node saves is not an older one.
+    #[test]
+    fn a_node_without_a_file_goes_on_from_the_record() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = store(d.path(), SettingsGrant::Off);
+        let last = bump(&mut s);
+        drop(s);
+        std::fs::remove_file(d.path().join("node.toml")).unwrap();
+        let mut s = reopen(d.path()).unwrap();
+        assert_eq!(s.version(), last);
+        let v = bump(&mut s);
+        assert!(v > last);
+        drop(s);
+        assert_eq!(reopen(d.path()).unwrap().version(), v);
+
+        // A hand-written file with no MAC, taken once when there is no key
+        // yet, is saved above the record as well.
+        std::fs::remove_file(d.path().join("config.key")).unwrap();
+        let mut plain = NodeConfig::default();
+        plain.limits.max_running = 3;
+        plain.save(&d.path().join("node.toml")).unwrap();
+        let s = reopen(d.path()).unwrap();
+        assert_eq!(s.config().limits.max_running, 3);
+        assert!(s.version() >= v);
+        let again = s.version();
+        drop(s);
+        assert_eq!(reopen(d.path()).unwrap().version(), again);
+    }
+
+    /// A reload takes no file below the record either, also when it is not
+    /// below the version in force: a CLI that wrote the file itself raised
+    /// the record past a node that did not see it yet.
+    #[test]
+    fn reload_refuses_a_file_below_the_record() {
+        let d = tempfile::tempdir().unwrap();
+        let mut running = store(d.path(), SettingsGrant::Off);
+        let middle = std::fs::read(running.path()).unwrap();
+        let mut cli = reopen(d.path()).unwrap();
+        bump(&mut cli);
+        let newest = bump(&mut cli);
+        assert_eq!(recorded(d.path()), Some(newest));
+        // `middle` is the version `running` holds, so it is not older than
+        // the one in force.
+        std::fs::write(running.path(), middle).unwrap();
+        let e = running.reload().unwrap_err();
+        assert!(e.contains("older than the last this node accepted"), "{e}");
+        assert_eq!(refusals(&running), 1);
+        // The newest file is taken, and the record stays where it is.
+        std::fs::write(running.path(), sealed(&cli.key, cli.config())).unwrap();
+        assert_eq!(running.reload(), Ok(true));
+        assert_eq!(running.version(), newest);
+        assert_eq!(recorded(d.path()), Some(newest));
+    }
+
+    /// Another writer saved the file while a node holds its config in memory
+    /// (the CLI on Windows, which has no socket to ask the node), and raised
+    /// the record by more than one. The node's own next save must go above
+    /// the record, or its next start refuses the node's own file as an
+    /// earlier one put back, whatever kind of write it was.
+    #[test]
+    fn a_running_nodes_save_goes_above_the_record_another_writer_raised() {
+        type Save = fn(&mut SettingsStore) -> Result<(), String>;
+        let saves: [(&str, Save); 4] = [
+            ("mark", |s| s.mark(|c| c.centers[0].revoked = true)),
+            ("update", |s| {
+                s.update(|c| {
+                    c.limits.max_running = 9;
+                    Ok(())
+                })
+                .map(drop)
+                .map_err(|e| e.to_string())
+            }),
+            ("sudo of a center", |s| {
+                s.set_sudo(Writer::Center("home"), Sudo::On)
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            }),
+            ("settings.set of a center", |s| {
+                let v = s.version();
+                let mut new = doc(s);
+                new["policy"]["caps"] = json!({"exec": "off"});
+                s.set_center_document("home", new, v, |_| false, unix)
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            }),
+        ];
+        for (what, save) in saves {
+            let d = tempfile::tempdir().unwrap();
+            let mut running = store(d.path(), SettingsGrant::Write);
+            let mut cli = reopen(d.path()).unwrap();
+            bump(&mut cli);
+            let newest = bump(&mut cli);
+            assert!(newest > running.version() + 1, "{what}");
+            save(&mut running).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert!(running.version() > newest, "{what}");
+            assert_eq!(recorded(d.path()), Some(running.version()), "{what}");
+            let v = running.version();
+            drop(running);
+            // Its own file starts again, and nothing was refused.
+            let again = reopen(d.path()).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(again.version(), v, "{what}");
+            assert_eq!(refusals(&again), 0, "{what}");
+        }
+    }
+
+    /// A record that is no number is not taken for none: it would let
+    /// whoever damaged it have an older file accepted. The owner takes the
+    /// file, or deletes the record.
+    #[test]
+    fn a_damaged_record_is_refused_and_taking_the_file_writes_it_again() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = store(d.path(), SettingsGrant::Off);
+        let v = bump(&mut s);
+        std::fs::write(d.path().join(VERSION_FILE), "x7\n").unwrap();
+        let e = reopen(d.path()).err().expect("a damaged record is refused");
+        assert!(
+            e.contains(VERSION_FILE) && e.contains("version number"),
+            "{e}"
+        );
+        let (_, taken) = SettingsStore::open_accepting(
+            d.path().join("node.toml"),
+            d.path().join("config.key"),
+            AuditLog::new(d.path().join("audit.jsonl")),
+        )
+        .unwrap();
+        assert_eq!(taken, v + 1);
+        assert_eq!(recorded(d.path()), Some(taken));
+        assert!(reopen(d.path()).is_ok());
+    }
+
+    /// The file is saved first: a record that cannot be written afterwards is
+    /// audited and does not undo the change.
+    #[test]
+    fn a_record_that_cannot_be_written_is_audited_and_the_change_stays() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = store(d.path(), SettingsGrant::Off);
+        let before = recorded(d.path()).unwrap();
+        std::fs::remove_file(d.path().join(VERSION_FILE)).unwrap();
+        std::fs::create_dir(d.path().join(VERSION_FILE)).unwrap();
+        let v = bump(&mut s);
+        assert!(v > before);
+        assert_eq!(s.version(), v);
+        let log = s.audit().read().unwrap();
+        let note = log
+            .iter()
+            .find(|e| e["event"] == "not_recorded")
+            .expect("the failure is audited");
+        assert!(
+            note["reason"].as_str().unwrap().contains(VERSION_FILE),
+            "{note}"
+        );
+        // The record lags until the next start, which records the version.
+        std::fs::remove_dir(d.path().join(VERSION_FILE)).unwrap();
+        drop(s);
+        assert_eq!(reopen(d.path()).unwrap().version(), v);
+        assert_eq!(recorded(d.path()), Some(v));
     }
 
     #[test]

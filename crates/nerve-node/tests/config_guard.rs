@@ -270,6 +270,78 @@ async fn a_file_with_a_wrong_mac_is_refused_at_start_up() {
     node.stop().await;
 }
 
+/// An earlier `node.toml` the node signed itself passes the MAC check, so
+/// whoever can write the config folder can put it back (issue #57). The node
+/// keeps the last version it saved in the state folder and refuses an older
+/// file at its start.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_earlier_signed_file_put_back_is_refused_at_start_up() {
+    let dir = tempfile::tempdir().unwrap();
+    let center = FakeCenter::start(false).await.unwrap();
+    let o = options(dir.path());
+    nerve_node::pair::pair(&o.paths, &center.link(), Some("lab"))
+        .await
+        .unwrap();
+    // A first start signs what pairing wrote; that is the earlier file.
+    Daemon::start(o.clone()).await.unwrap().stop().await;
+    let file = o.paths.config_file();
+    let earlier = std::fs::read(&file).unwrap();
+    let earlier_cfg = NodeConfig::load(&file).unwrap();
+    owner_edit(&o.paths, |c| c.limits.max_running = 3).await;
+    let latest = std::fs::read(&file).unwrap();
+    let latest_cfg = NodeConfig::load(&file).unwrap();
+    assert!(latest_cfg.version > earlier_cfg.version);
+    assert_eq!(
+        std::fs::read_to_string(o.paths.config_version())
+            .unwrap()
+            .trim(),
+        latest_cfg.version.to_string()
+    );
+    // The file the node saved last starts as before.
+    Daemon::start(o.clone()).await.unwrap().stop().await;
+
+    // The earlier file is back, with its own valid MAC.
+    std::fs::write(&file, &earlier).unwrap();
+    let e = match Daemon::start(o.clone()).await {
+        Ok(d) => {
+            d.stop().await;
+            panic!("a node started on an earlier signed file");
+        }
+        Err(e) => e,
+    };
+    assert!(
+        e.contains("older than the last this node accepted") && e.contains("config accept"),
+        "{e}"
+    );
+    let refused = config_events(&o, "refused");
+    assert_eq!(refused.len(), 1, "{refused:?}");
+    assert!(
+        refused[0]["reason"].as_str().unwrap().contains("older"),
+        "{refused:?}"
+    );
+    // The CLI refuses to work on it as well, and the file is as it was put.
+    assert!(cli(&o.paths, &["center", "ls"]).await.is_err());
+    assert_eq!(std::fs::read(&file).unwrap(), earlier);
+
+    // A running node does not take it back either, also when a restart
+    // is not what brought it.
+    std::fs::write(&file, &latest).unwrap();
+    let node = Daemon::start(o.clone()).await.unwrap();
+    std::fs::write(&file, &earlier).unwrap();
+    let e = node.reload().expect_err("the earlier file is refused");
+    assert!(e.contains("older"), "{e}");
+    assert_eq!(node.config(), latest_cfg);
+    node.stop().await;
+
+    // The owner looks at it and takes it. It is in force then, under a
+    // version above every one before it.
+    cli(&o.paths, &["config", "accept"]).await.unwrap();
+    let node = Daemon::start(o.clone()).await.unwrap();
+    assert_eq!(node.config().limits, earlier_cfg.limits);
+    assert!(node.config().version > latest_cfg.version);
+    node.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn an_owner_change_through_the_local_interface_is_applied_and_signed() {
     let dir = tempfile::tempdir().unwrap();

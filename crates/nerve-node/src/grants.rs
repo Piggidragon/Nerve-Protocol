@@ -45,6 +45,7 @@ use nerve_policy::config::{Access, NodeConfig};
 use nerve_policy::paths::within;
 use nerve_policy::protected::Platform;
 pub use nerve_sandbox::acl::Found;
+use nerve_sandbox::acl::{Untouched, untouched_by};
 #[cfg(any(windows, test))]
 use nerve_sandbox::inherit::Walked;
 use serde::{Deserialize, Serialize};
@@ -211,8 +212,10 @@ pub trait Folders {
     /// had, or takes it off (`None`); NotFound when nothing is there. With
     /// `own`, a grant goes on only an object of its own at `path` (not a
     /// link or junction to elsewhere, not a file with other names, and with
-    /// a list that inherits); otherwise it is refused (InvalidInput) and
-    /// nothing changes. The change passes down to what is below `path`;
+    /// a list that inherits); otherwise it is refused and nothing changes.
+    /// A refusal, and nothing at `path`, are marked as such
+    /// ([`Untouched`]); every other error may come after a part of the
+    /// change was made. The change passes down to what is below `path`;
     /// `links` says which files with more than one name it may reach there,
     /// and one it may not stops it as it gets there (an error; what it
     /// changed stays). With `whole` it goes into every folder below, also
@@ -674,7 +677,12 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
             Links::Any
         }
     };
-    let gone = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
+    // A change that changed nothing at all is marked so (`acl::untouched`):
+    // gone (nothing at its path) or refused before it wrote. An error of
+    // any other origin, whatever its kind, may come after a part of the
+    // change was written.
+    let gone = |e: &io::Error| untouched_by(e) == Some(Untouched::Gone);
+    let refusal = |e: &io::Error| untouched_by(e) == Some(Untouched::Refused);
     // A place where a change may have stopped part way: what it changed
     // below the folder does not show on the folders above it, so the next
     // change there goes into every folder below, also one back to the flags
@@ -896,7 +904,7 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
                         Err(e) if gone(&e) => {}
                         // Refused before anything changed: what was there
                         // stays.
-                        Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+                        Err(e) if refusal(&e) => {
                             out.errors.push(format!("{}: {e}", w.path.display()));
                             keep_replaced(w, &mut out, &mut kept, false);
                         }
@@ -1213,6 +1221,7 @@ fn windows_sync(paths: &NodePaths, want: &[Grant], report: &mut dyn FnMut(&str))
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nerve_sandbox::acl::untouched;
 
     fn grant(container: &str, path: &str, access: &str) -> Grant {
         Grant {
@@ -1394,10 +1403,8 @@ mod tests {
             if access.is_some() {
                 self.asked.push((path.into(), own));
                 if own && self.foreign.iter().any(|m| m == path) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "not an object of its own",
-                    ));
+                    let e = io::Error::new(io::ErrorKind::InvalidInput, "not an object of its own");
+                    return Err(untouched(Untouched::Refused, e));
                 }
             }
             if let (Some(file), Some(_)) = (&self.record, access) {
@@ -1407,12 +1414,19 @@ mod tests {
                     path.display()
                 );
             }
-            let id = self.id(path).ok_or(io::ErrorKind::NotFound)?;
+            let id = self
+                .id(path)
+                .ok_or_else(|| untouched(Untouched::Gone, io::ErrorKind::NotFound.into()))?;
             if self.locked.iter().any(|m| m == path) {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
+            // Of a kind a refusal has, as an error from deep in a walk may
+            // be: it says nothing about whether the change was made.
             if self.cut.iter().any(|m| m == path) {
-                return Err(io::Error::other("it stopped part way"));
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "it stopped part way",
+                ));
             }
             self.on.retain(|(i, c, _)| !(*i == id && c == container));
             if let Some(a) = access {
@@ -2359,6 +2373,32 @@ mod tests {
         let s = sync(&file, &[], &mut f);
         assert_eq!(s.stale.len(), 1, "{s:?}");
         assert_eq!(marks(), [true]);
+    }
+
+    /// An error of the kind a refusal has, from a change that stopped part
+    /// way, is not taken for one that changed nothing: a first grant stays
+    /// recorded and marked, and comes off when the folder is no longer
+    /// wanted. Only an error marked as a refusal changes nothing
+    /// ([`Untouched`]; `inside_a_writable_folder_a_grant_goes_on_an_object_of_its_own`).
+    #[test]
+    fn a_first_grant_that_stopped_part_way_stays_recorded() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("grants.json");
+        let mut f = Fake::default();
+        f.make("/w/a");
+        f.cut.push("/w/a".into());
+        let a = grant("c1", "/w/a", "rw");
+        let s = sync(&file, std::slice::from_ref(&a), &mut f);
+        assert_eq!(s.errors.len(), 1, "{s:?}");
+        let record = read_record(&file).unwrap();
+        assert_eq!(record.len(), 1, "{record:?}");
+        assert!(record[0].unfinished, "{record:?}");
+        f.cut.clear();
+        f.changes.clear();
+        let s = sync(&file, &[], &mut f);
+        assert!(s.errors.is_empty(), "{s:?}");
+        assert_eq!(s.removed, 1, "{s:?}");
+        assert!(read_record(&file).unwrap().is_empty());
     }
 
     /// Each change checks for hard links where commands write at, above or

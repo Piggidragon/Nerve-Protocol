@@ -536,6 +536,48 @@ pub mod acl {
         }
     }
 
+    /// Why a change of a grant changed nothing at all: it was refused
+    /// before it wrote anything, or nothing was at its path. Marked on the
+    /// error ([`untouched`]): only such a change may be taken for one that
+    /// did not happen. An error from anywhere else may come after a part of
+    /// the change was written, whatever its kind.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Untouched {
+        Refused,
+        Gone,
+    }
+
+    #[derive(Debug)]
+    struct Marked {
+        why: Untouched,
+        message: String,
+    }
+
+    impl std::fmt::Display for Marked {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+
+    impl std::error::Error for Marked {}
+
+    /// `e`, of its kind and with its message, marked as a change that
+    /// changed nothing (`why`).
+    pub fn untouched(why: Untouched, e: std::io::Error) -> std::io::Error {
+        std::io::Error::new(
+            e.kind(),
+            Marked {
+                why,
+                message: e.to_string(),
+            },
+        )
+    }
+
+    /// What `e` is marked as ([`untouched`]), if anything.
+    pub fn untouched_by(e: &std::io::Error) -> Option<Untouched> {
+        e.get_ref()?.downcast_ref::<Marked>().map(|m| m.why)
+    }
+
     /// Where an object of a [`FileId`] is now.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum Found {
@@ -1958,7 +2000,7 @@ pub mod appcontainer {
         every: bool,
         write: bool,
         below: Below,
-    ) -> io::Result<(Walked, Option<(PathBuf, u32)>)> {
+    ) -> io::Result<(Walked, Option<inherit::Stop>)> {
         let mut volume = Volume::new()?;
         let top = Obj {
             h: f.as_raw_handle(),
@@ -2032,11 +2074,14 @@ pub mod appcontainer {
     ) -> io::Result<(Option<FileId>, Walked)> {
         let sid = Sid::derive(name)?;
         // The change goes through this handle, on the object it opened.
-        let f = open(path, READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES)?;
+        let f = open(path, READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES).map_err(gone)?;
         let refuse = |why: String| {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("the node puts no grant on it, since {why}"),
+            Err(acl::untouched(
+                acl::Untouched::Refused,
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("the node puts no grant on it, since {why}"),
+                ),
             ))
         };
         if own
@@ -2055,10 +2100,17 @@ pub mod appcontainer {
             // The walk writes the list of `path` itself last.
             let (w, stopped) = pass(&f, path, &next, next.changed, every, true, below)?;
             walked = w;
-            if let Some((file, n)) = stopped {
+            if let Some(stop) = stopped {
+                let folder = if stop.top_written {
+                    // Made in the folder while the walk was below it.
+                    "after the folder itself got the change"
+                } else {
+                    "with the folder itself as it was"
+                };
                 return Err(io::Error::other(format!(
-                    "{} below it has {n} names (hard links), and the change would reach them all; it stopped there, with the folder itself as it was",
-                    file.display()
+                    "{} below it has {} names (hard links), and the change would reach them all; it stopped there, {folder}",
+                    stop.path.display(),
+                    stop.names
                 )));
             }
         } else if next.changed {
@@ -2081,14 +2133,23 @@ pub mod appcontainer {
         below: Below,
     ) -> io::Result<(Option<(PathBuf, u32)>, Walked)> {
         let sid = Sid::derive(name)?;
-        let f = open(path, READ_CONTROL | FILE_READ_ATTRIBUTES)?;
+        let f = open(path, READ_CONTROL | FILE_READ_ATTRIBUTES).map_err(gone)?;
         let next = next(&f, &sid, masks)?;
         let every = masks.is_none() || whole;
         if !next.is_dir || !(next.changed || every) {
             return Ok((None, Walked::default()));
         }
         let (walked, found) = pass(&f, path, &next, false, every, false, below)?;
-        Ok((found, walked))
+        Ok((found.map(|s| (s.path, s.names)), walked))
+    }
+
+    /// `e`, marked as nothing at the path where it says so.
+    fn gone(e: io::Error) -> io::Error {
+        if e.kind() == io::ErrorKind::NotFound {
+            acl::untouched(acl::Untouched::Gone, e)
+        } else {
+            e
+        }
     }
 
     /// HRESULTs of the profile calls.

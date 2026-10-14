@@ -236,9 +236,11 @@ folders.
   such a change the node checks those files and refuses if one has more
   than one name, and it checks each file again right before it changes it,
   by the names the file has then: a link a command makes in between stops
-  the change there. What it changed by then stays changed, the folder
-  itself keeps its old entry, and the next sync refuses the change until
-  the link is gone. A file whose permissions the change leaves as they are
+  the change there. What it changed by then stays changed, and the folder
+  itself keeps its old entry; only a link made in the folder itself while
+  the change was below it is found after the folder got its new entry, and
+  the message says so. The node goes through the whole folder again at its
+  next sync, and refuses the change until the link is gone. A file whose permissions the change leaves as they are
   is not reached, so a link to it stops nothing. Hard links only
   work within one drive. So put a
   write-only folder whose files commands must not read on a drive where the

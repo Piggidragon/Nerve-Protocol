@@ -140,9 +140,24 @@ struct Frame<O: Objects> {
     listed: Option<HashSet<Entry>>,
 }
 
-/// `e` with the path it is about.
+/// `e` with the path it is about. Not of `e`'s kind: an error from the
+/// walk may come after it wrote a part of the change, so a caller must not
+/// read it as one that changed nothing (a refusal, a folder gone).
 fn about(path: &Path, e: io::Error) -> io::Error {
-    io::Error::new(e.kind(), format!("{}: {e}", path.display()))
+    io::Error::other(format!("{}: {e}", path.display()))
+}
+
+/// Where [`pass_down`] stopped: a file with more than one name that may
+/// not change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stop {
+    /// The file, by the names walked.
+    pub path: PathBuf,
+    /// How many names it has.
+    pub names: u32,
+    /// Whether the list of `top` was written already: the file was made
+    /// in it while the walk was below it, and found once it was written.
+    pub top_written: bool,
 }
 
 /// Passes the list `list` of the folder `top` (at `path`) down to what is
@@ -151,10 +166,11 @@ fn about(path: &Path, e: io::Error) -> io::Error {
 ///
 /// Stops at the first file with more than one name whose list would change
 /// and that [`Walk::links`] refuses, also where its path no longer leads to
-/// it (when it is asked at all), and gives it with its count of names: a
-/// walk that writes leaves what it wrote and writes no folder above it,
-/// `top` neither. An object that is gone meanwhile is skipped. An error
-/// names the object it is about.
+/// it (when it is asked at all), and gives it ([`Stop`]): a walk that
+/// writes leaves what it wrote and writes no folder above it, and `top`
+/// neither, unless the file was found in `top` after `top` was written. An
+/// object that is gone meanwhile is skipped. An error names the object it
+/// is about, and is never of a kind that says nothing changed ([`about`]).
 pub fn pass_down<O: Objects>(
     objects: &mut O,
     top: O::Obj,
@@ -162,9 +178,10 @@ pub fn pass_down<O: Objects>(
     path: &Path,
     write_top: bool,
     mut walk: Walk,
-) -> io::Result<(Walked, Option<(PathBuf, u32)>)> {
+) -> io::Result<(Walked, Option<Stop>)> {
     let gone = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
     let mut walked = Walked::default();
+    let mut top_written = false;
     let writes = walk.write;
     let open_frame = |objects: &mut O,
                       obj: O::Obj,
@@ -196,7 +213,7 @@ pub fn pass_down<O: Objects>(
             let mut done = stack.pop().expect("a frame");
             if done.write && walk.write {
                 match objects.write(&done.obj, &done.list) {
-                    Ok(()) => {}
+                    Ok(()) => top_written |= stack.is_empty(),
                     Err(e) if gone(&e) => continue,
                     Err(e) => return Err(about(&done.path, e)),
                 }
@@ -262,10 +279,15 @@ pub fn pass_down<O: Objects>(
         {
             let passes = objects.at(&obj, &path).map_err(|e| about(&path, e))? && {
                 let names = objects.names_of(&obj).map_err(|e| about(&path, e))?;
-                links(&path, kind.names, &names)?
+                links(&path, kind.names, &names).map_err(|e| about(&path, e))?
             };
             if !passes {
-                return Ok((walked, Some((path, kind.names))));
+                let stop = Stop {
+                    path,
+                    names: kind.names,
+                    top_written,
+                };
+                return Ok((walked, Some(stop)));
             }
         }
         if walk.write {
@@ -319,6 +341,9 @@ mod tests {
         /// is made, with its folder's list as it is then; one there already
         /// is replaced (a file saved by a rename over it).
         made: Vec<(String, String)>,
+        /// Objects that cannot be looked at, with an error of a kind that
+        /// would say nothing changed.
+        failing: Vec<String>,
     }
 
     impl Fake {
@@ -378,7 +403,7 @@ mod tests {
         }
 
         /// Gives the root its own `entries` and passes them down.
-        fn grant(&mut self, entries: &[&str], every: bool) -> (Walked, Option<(PathBuf, u32)>) {
+        fn grant(&mut self, entries: &[&str], every: bool) -> (Walked, Option<Stop>) {
             self.grant_with(entries, every, true, None, &mut |_| {})
         }
 
@@ -389,7 +414,7 @@ mod tests {
             write: bool,
             links: Option<Links<'a>>,
             progress: &'a mut dyn FnMut(Walked),
-        ) -> (Walked, Option<(PathBuf, u32)>) {
+        ) -> (Walked, Option<Stop>) {
             let list = List {
                 own: entries.iter().map(|e| e.to_string()).collect(),
                 inherited: self.nodes[0].inherited.clone(),
@@ -414,8 +439,12 @@ mod tests {
         }
 
         /// Makes `path` in its folder, with the folder's list as it is now,
-        /// in place of what is there.
+        /// in place of what is there; ending in `=`, a file with two names.
         fn make(&mut self, path: &str) {
+            let (path, names) = match path.strip_suffix('=') {
+                Some(p) => (p, 2),
+                None => (path, 1),
+            };
             let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
             let parent = if dir.is_empty() { 0 } else { self.find(dir) };
             let p = &self.nodes[parent];
@@ -430,7 +459,7 @@ mod tests {
             }
             self.nodes.push(Node {
                 name: path.into(),
-                names: 1,
+                names,
                 inherited,
                 ..Default::default()
             });
@@ -492,6 +521,9 @@ mod tests {
 
         fn kind(&mut self, obj: &usize) -> io::Result<Kind> {
             let n = &self.nodes[*obj];
+            if self.failing.contains(&n.name) {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
             Ok(Kind {
                 folder: n.folder,
                 link: n.link,
@@ -530,6 +562,15 @@ mod tests {
             let mut all = vec![Path::new("/top").join(&n.name)];
             all.extend((1..n.names).map(|i| PathBuf::from(format!("/elsewhere/{i}"))));
             Ok(all)
+        }
+    }
+
+    /// Where a walk stopped, at a file with two names.
+    fn stop(path: &str, top_written: bool) -> Stop {
+        Stop {
+            path: path.into(),
+            names: 2,
+            top_written,
         }
     }
 
@@ -688,13 +729,13 @@ mod tests {
         // Looked at only.
         let mut f = Fake::new(tree);
         let (_, found) = f.grant_with(&["g"], false, false, Some(&mut refuse), &mut |_| {});
-        assert_eq!(found, Some((PathBuf::from("/top/a/y"), 2)));
+        assert_eq!(found, Some(stop("/top/a/y", false)));
         assert!(f.written.is_empty() && f.has("a/x").is_empty());
 
         // Changed: what was written before stays, nothing above it.
         let mut f = Fake::new(tree);
         let (_, found) = f.grant_with(&["g"], false, true, Some(&mut refuse), &mut |_| {});
-        assert_eq!(found, Some((PathBuf::from("/top/a/y"), 2)));
+        assert_eq!(found, Some(stop("/top/a/y", false)));
         assert_eq!(f.written, ["a/x"]);
         assert!(f.nodes[0].own.is_empty(), "the folder itself stays");
 
@@ -729,7 +770,7 @@ mod tests {
             Some(&mut |_, _, _| Ok(true)),
             &mut |_| {},
         );
-        assert_eq!(found, Some((PathBuf::from("/top/a/y"), 2)));
+        assert_eq!(found, Some(stop("/top/a/y", false)));
         let (w, found) = f.grant_with(&["g"], false, true, None, &mut |_| {});
         assert_eq!(found, None);
         assert_eq!(w.changed, 6);
@@ -765,6 +806,48 @@ mod tests {
             let (w, _) = f.grant(after, every);
             assert_eq!(w.changed, 0, "{after:?}");
         }
+    }
+
+    /// A file with a second name made in the granted folder while the walk
+    /// is below it is found once the folder is written: the walk stops
+    /// there and says the folder has its new list already.
+    #[test]
+    fn a_link_made_in_the_folder_during_the_walk_is_found_after_its_write() {
+        let mut f = Fake::new(&["a/", "a/x"]);
+        f.made = vec![("a/x".into(), "l=".into())];
+        let (_, found) = f.grant_with(
+            &["g"],
+            false,
+            true,
+            Some(&mut |_, _, _| Ok(false)),
+            &mut |_| {},
+        );
+        assert_eq!(found, Some(stop("/top/l", true)));
+        assert_eq!(f.nodes[0].own.iter().collect::<Vec<_>>(), ["g"]);
+        assert!(f.has("l").is_empty(), "the link itself is not written");
+    }
+
+    /// An error from inside the walk names the object, and is never of a
+    /// kind that says nothing changed: what came before it was written.
+    #[test]
+    fn an_error_in_the_walk_is_not_taken_for_nothing_changed() {
+        let mut f = Fake::new(&["a/", "a/x", "a/y"]);
+        f.failing.push("a/y".into());
+        let list = List {
+            own: ["g".to_string()].into(),
+            inherited: Default::default(),
+        };
+        let walk = Walk {
+            write: true,
+            every: false,
+            links: None,
+            progress: &mut |_| {},
+        };
+        let e = pass_down(&mut f, 0, list, Path::new("/top"), true, walk).unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::Other, "{e}");
+        let at = Path::new("/top").join("a").join("y");
+        assert!(e.to_string().contains(&at.display().to_string()), "{e}");
+        assert_eq!(f.written, ["a/x"]);
     }
 
     /// The progress is told every [`STEP`] objects.

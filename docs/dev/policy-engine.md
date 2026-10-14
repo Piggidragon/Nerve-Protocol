@@ -218,7 +218,14 @@ center's local name):
   such file again on the handle it writes through, by the names that
   handle gives (`NtQueryInformationFile` with the hard-link classes, each
   name's folder found by its file ID), not by its path, and stops there,
-  with the folder's own list as it was (`grants::Links`, #76). One
+  with the folder's own list as it was (`grants::Links`, #76); a link made
+  in the granted folder itself while the walk was below it is found when
+  that folder is listed again after its write, and the error says the
+  folder has the change already (`inherit::Stop::top_written`). Only an
+  error marked `acl::Untouched` (refused before a write, nothing at the
+  path) counts as a change that changed nothing; every error from inside
+  the walk is of kind `Other`, so the grant stays recorded and marked
+  `unfinished`. One
   exception is for cargo: a file below a
   folder named exactly `target` passes when all its names are listed
   (as many as the file has; a failed listing refuses), every

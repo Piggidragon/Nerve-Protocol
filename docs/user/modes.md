@@ -130,8 +130,20 @@ folders.
 | Read, write, run programs | each folder by its rights |
 
 - The node gives each folder a permission entry for the pairing's container,
-  with the folder's rights. Everything below the folder inherits it. Adding a
-  large folder takes as long as changing its permissions with `icacls`.
+  with the folder's rights. Everything below the folder inherits it. Windows
+  keeps the permissions of each file and folder, so the node writes the
+  entry into each one below the folder: the first grant of a large folder,
+  changing its rights and taking it off take a while. A change goes only as
+  far as it changes something: putting the same entry on again changes
+  nothing, a later change skips the parts of the folder it leaves as they
+  are, and a folder whose permissions do not inherit keeps the change out
+  of itself and of what is below it. A change that stopped part way (you
+  stopped the CLI or the node, or it failed) goes through the whole folder
+  again at the next sync; until it is done, the node treats the folder as
+  having the flags it was heading for as well, and where the change is
+  refused, the pairing's commands do not run. A change that takes more than a few seconds says
+  how far it is: the CLI prints it, a running node writes it to its log,
+  and a command waits for it.
 - `folder rm` and `folder set` change the entry, and removing the pairing
   takes it off. That is the node's entry on the folder: permissions a
   command gave what it made there stay (see "What the AppContainer does not
@@ -221,12 +233,18 @@ folders.
   and `S-1-15-3-…` entry, and `ALL APPLICATION PACKAGES` as `*S-1-15-2-1`.
 - A hard link is one file under two names, and both share one access list.
   When the node grants, changes or moves a folder that commands may write
-  in, or a folder that holds one, Windows passes the change to everything
-  below it, and that includes hard links. Before such a change the node
-  checks the folder and refuses if a file below it has more than one name.
-  A command of any pairing that may write in that folder can still make a
-  link between the check and the change, and the file it links then gets
-  the folder's rights. Hard links only work within one drive. So put a
+  in, or a folder that holds one, the change passes to the files below it
+  whose permissions it changes, and that would include hard links. Before
+  such a change the node checks those files and refuses if one has more
+  than one name, and it checks each file again right before it changes it,
+  by the names the file has then: a link a command makes in between stops
+  the change there. What it changed by then stays changed, and the folder
+  itself keeps its old entry; only a link made in the folder itself while
+  the change was below it is found after the folder got its new entry, and
+  the message says so. The node goes through the whole folder again at its
+  next sync, and refuses the change until the link is gone. A file whose permissions the change leaves as they are
+  is not reached, so a link to it stops nothing. Hard links only
+  work within one drive. So put a
   write-only folder whose files commands must not read on a drive where the
   pairing can write nowhere that it can also read or run programs, also
   through a folder above.

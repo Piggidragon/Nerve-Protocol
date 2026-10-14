@@ -76,20 +76,22 @@ pub const CREATE_USER_HINT_ROOT: &str = "An account only the node uses is the bo
 /// tag from, `NOPASSWD` for plain command paths such as `apt`, and a
 /// default bound to such commands or to other users to run as.
 pub fn lists_no_password(listing: &str) -> bool {
+    let case_insensitive = !has_setting(listing, "!case_insensitive_user");
     listing.lines().any(|line| {
         let line = line.trim();
         if let Some((_, cmds)) = line.split_once("NOPASSWD:") {
-            return rule_runs_as_root(line) && nopasswd_may_run_true(cmds);
+            return rule_runs_as_root(line, case_insensitive) && nopasswd_may_run_true(cmds);
         }
-        default_may_skip_password(line)
+        default_may_skip_password(line, case_insensitive)
     })
 }
 
 /// Whether the members of a runas list (`ALL, !root`) may include root:
 /// the last member that names root, or something the list does not read
 /// (`ALL`, a group, `#00`), decides. A plain name, but `root` in any
-/// case, is another user.
-fn may_be_root(members: &[&str]) -> bool {
+/// case, is another user. `case_insensitive` is sudo's setting of that
+/// name.
+fn may_be_root(members: &[&str], case_insensitive: bool) -> bool {
     let mut root = false;
     for m in members {
         let (negated, name) = match m.strip_prefix('!') {
@@ -101,9 +103,13 @@ fn may_be_root(members: &[&str]) -> bool {
             && name
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
-        // sudo matches user names without regard to case by default.
+        // sudo matches user names without regard to case by default
+        // (`case_insensitive_user`): a name like `ROOT` may be root, which
+        // errs towards a probe. A negation takes root out only when it
+        // names root for certain.
         let is_root = name.eq_ignore_ascii_case("root") || name == "#0";
-        if (plain && !is_root) || (negated && !is_root) {
+        let sure = name == "root" || name == "#0" || case_insensitive && is_root;
+        if (plain && !is_root) || (negated && !sure) {
             continue;
         }
         root = !negated;
@@ -111,23 +117,28 @@ fn may_be_root(members: &[&str]) -> bool {
     root
 }
 
-/// Whether sudo, run as an account `-n`, stays out of PAM, so that a
-/// probe of an account that needs a password costs one log line and no
-/// authentication attempt. sudo 1.9 refuses before PAM, unless
-/// `noninteractive_auth` is set (a `listing` entry); sudo-rs (`version`,
-/// the first line of `sudo -V`) calls PAM, and a failure counter such as
-/// pam_faillock counts the probe.
-pub fn probe_stays_out_of_pam(version: &str, listing: &str) -> bool {
-    let rs = version.trim_start().starts_with("sudo-rs");
-    let set = listing
+/// Whether the listing names a setting among its defaults.
+fn has_setting(listing: &str, setting: &str) -> bool {
+    listing
         .lines()
         .flat_map(|l| l.split([',', ' ']))
-        .any(|e| e == "noninteractive_auth");
-    !rs && !set
+        .any(|e| e == setting)
+}
+
+/// Whether sudo, run as an account `-n`, stays out of PAM, so that a
+/// probe of an account that needs a password costs one log line and no
+/// authentication attempt. Only sudo 1.9 is known to: it refuses before
+/// PAM, unless `noninteractive_auth` is set (a `listing` entry). `version`
+/// is what `sudo -V` printed on stdout when it succeeded. Anything else
+/// (sudo-rs, which calls PAM and prints its version on stderr up to
+/// 0.2.10, no output, another sudo) is not known to, and a failure
+/// counter such as pam_faillock would count the probe.
+pub fn probe_stays_out_of_pam(version: &str, listing: &str) -> bool {
+    version.starts_with("Sudo version ") && !has_setting(listing, "noninteractive_auth")
 }
 
 /// Whether a rule line (`(ALL : ALL) NOPASSWD: ALL`) may run as root.
-fn rule_runs_as_root(line: &str) -> bool {
+fn rule_runs_as_root(line: &str, case_insensitive: bool) -> bool {
     let Some(inner) = line
         .strip_prefix('(')
         .and_then(|l| l.split_once(')'))
@@ -136,7 +147,10 @@ fn rule_runs_as_root(line: &str) -> bool {
         return true;
     };
     let users = inner.split(':').next().unwrap_or("");
-    may_be_root(&users.split(',').map(str::trim).collect::<Vec<_>>())
+    may_be_root(
+        &users.split(',').map(str::trim).collect::<Vec<_>>(),
+        case_insensitive,
+    )
 }
 
 /// Whether a command may be `true`: anything but the path of a program
@@ -191,7 +205,7 @@ fn nopasswd_may_run_true(cmds: &str) -> bool {
 /// `!authenticate`. One bound to commands (`Defaults!/usr/bin/apt …`) or
 /// to users to run as (`Defaults>postgres …`) holds only when its binding
 /// may include `true` or root.
-fn default_may_skip_password(line: &str) -> bool {
+fn default_may_skip_password(line: &str, case_insensitive: bool) -> bool {
     if line.contains("exempt_group=") {
         return true;
     }
@@ -230,7 +244,10 @@ fn default_may_skip_password(line: &str) -> bool {
                 }
             }
             let m = members(&text[..end]);
-            may_be_root(&m.iter().map(String::as_str).collect::<Vec<_>>())
+            may_be_root(
+                &m.iter().map(String::as_str).collect::<Vec<_>>(),
+                case_insensitive,
+            )
         }
         Some('!') => members(&line["Defaults!".len()..at])
             .iter()
@@ -950,6 +967,9 @@ mod tests {
             "    (root) NOPASSWD: /usr/bin/id, PASSWD: /usr/bin/apt, NOPASSWD: ALL\n",
             "    (ALL) NOPASSWD: /usr/bin/true\n",
             "    (ROOT) NOPASSWD: ALL\n",
+            // With exact matching `!ROOT` does not exclude root.
+            "    !case_insensitive_user\n    (ALL, !ROOT) NOPASSWD: ALL\n",
+            "    !case_insensitive_user\n    Defaults>ALL, !ROOT !authenticate\n",
             "    (Root, nobody) NOPASSWD: ALL\n",
             "    Defaults>Root !authenticate\n",
             "    NOPASSWD: ALL\n",
@@ -972,6 +992,7 @@ mod tests {
             "    Defaults!sudoedit !authenticate\n",
             "    Defaults>r6svc !lecture, !authenticate\n",
             "    (ALL, !ROOT) NOPASSWD: ALL\n",
+            "    Defaults>ALL, !ROOT !authenticate\n",
             "    (ALL, !root) NOPASSWD: ALL\n",
             "    (ALL : ALL) NOPASSWD: /usr/bin/id, PASSWD: ALL\n",
         ] {
@@ -1028,7 +1049,10 @@ mod tests {
     fn a_probe_is_made_only_where_sudo_stays_out_of_pam() {
         let defaults = "Matching Defaults entries for alice on h:\n    env_reset, mail_badpass\n";
         assert!(probe_stays_out_of_pam("Sudo version 1.9.15p5\n", defaults));
-        assert!(!probe_stays_out_of_pam("sudo-rs 0.2.2\n", defaults));
+        // sudo-rs, on either stream, nothing, or another program.
+        assert!(!probe_stays_out_of_pam("sudo-rs 0.2.13\n", defaults));
+        assert!(!probe_stays_out_of_pam("", defaults));
+        assert!(!probe_stays_out_of_pam("usage: sudo\n", defaults));
         let set = "    env_reset, noninteractive_auth, mail_badpass\n";
         assert!(!probe_stays_out_of_pam("Sudo version 1.9.15p5\n", set));
         // Turned off, it is not set.

@@ -255,15 +255,18 @@ impl System for Host {
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
         regain_root(&mut v);
-        let Ok(v) = v.output() else {
-            return true;
+        // Only a sudo that says so on stdout is known to stay out of PAM.
+        let version = match v.output() {
+            Ok(v) if v.status.success() => String::from_utf8_lossy(&v.stdout).into_owned(),
+            _ => String::new(),
         };
-        if !crate::account::probe_stays_out_of_pam(&String::from_utf8_lossy(&v.stdout), &listing) {
+        if !crate::account::probe_stays_out_of_pam(&version, &listing) {
             return true;
         }
         // The account's own sudo, which `-n` never lets ask, and `-k`
         // keeps from taking the ticket its owner has just made by typing
-        // the password for this command.
+        // the password for this command. As root, whatever `runas_default`
+        // says: that is what the rules were read for.
         let mut c = std::process::Command::new("sudo");
         c.args([
             "-n",
@@ -273,6 +276,8 @@ impl System for Host {
             "sudo",
             "-n",
             "-k",
+            "-u",
+            "root",
             "--",
             "true",
         ])

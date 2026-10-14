@@ -109,10 +109,10 @@ decide whether that is tried at all: an account whose rules surely need a
 password for root, `NOPASSWD` for plain commands such as `apt` or for
 another user to run as included, is not run as, so sudo logs no failed
 login. One whose rules may grant it but a later rule asks for the password
-is run as, and sudo logs it. Where the account's sudo calls PAM even with
-`-n` (sudo-rs, or `noninteractive_auth` set), a probe would count as a failed
-login, which can lock the account (pam_faillock), so none is made and the
-rules alone decide the warning. The account that ran `sudo`, the one its owner
+is run as, and sudo logs it. Only sudo 1.9 without `noninteractive_auth` is
+known to stay out of PAM with `-n`. Elsewhere (sudo-rs, an unknown sudo) a
+probe would count as a failed login, which can lock the account
+(pam_faillock), so none is made and the rules alone decide the warning. The account that ran `sudo`, the one its owner
 logs in as, is such an account too (see [platforms](platforms.md#linux)).
 `install` and `setup` warn about such an account, whether they take it or it
 is chosen already, and suggest an account made for the node, also for root.

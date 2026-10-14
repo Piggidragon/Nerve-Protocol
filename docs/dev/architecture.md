@@ -79,7 +79,7 @@ No call of any center reaches these two folders. See
 | `crates/nerve-sandbox` | Confinement for commands: Landlock on Linux, an AppContainer on Windows |
 | `crates/nerve-node` | The `nerve-node` binary: daemon and CLI |
 | `crates/nerve-center` | The `nerve-center` binary: links, MCP server, web UI |
-| `crates/nerve-conformance` | The conformance suite, an echo node and a fake center |
+| `crates/nerve-conformance` | The conformance suite: center, node and harness parts, an echo node and a fake center |
 
 A wire change, its spec text and both ends change together.
 

@@ -38,6 +38,25 @@ pub fn descriptor(node_id: &str, name: &str) -> Descriptor {
     .expect("the echo descriptor is well formed")
 }
 
+/// The descriptor the harness part's nodes offer: the echo node's, plus
+/// `mirror`, an `echo` twin with a profile (so two nodes share one tool), and a
+/// `settings` capability, which a center must never turn into a tool.
+pub fn harness_descriptor(node_id: &str, name: &str) -> Descriptor {
+    let mut d = serde_json::to_value(descriptor(node_id, name)).expect("a descriptor is JSON");
+    let caps = d["capabilities"].as_array_mut().expect("capabilities");
+    let say = caps[1]["actions"]["say"].clone();
+    caps.push(
+        json!({"id": "mirror", "profile": "mirror", "exposure": "on",
+        "summary": "Says back what it is sent, with a profile.",
+        "actions": {"say": say}}),
+    );
+    caps.push(
+        json!({"id": "settings", "exposure": "on", "summary": "Not a tool.",
+        "actions": {"get": {"effect": "read", "summary": "Never offered to a harness."}}}),
+    );
+    serde_json::from_value(d).expect("the harness descriptor is well formed")
+}
+
 /// A paired echo node.
 pub struct Echo {
     pub key: NodeKey,
@@ -189,7 +208,7 @@ pub fn handle(m: &str, p: &Map<String, Value>, d: &Descriptor) -> Result<Value, 
             let inv: Invoke = params(p)?;
             inv.check()?;
             match (inv.cap.as_str(), inv.action.as_str()) {
-                ("echo", "say") => match inv.args.get("text").and_then(Value::as_str) {
+                ("echo" | "mirror", "say") => match inv.args.get("text").and_then(Value::as_str) {
                     Some(t) if inv.args.len() == 1 => Ok(json!({"text": t})),
                     _ => Err(RpcError::invalid_args("say takes {text}")),
                 },

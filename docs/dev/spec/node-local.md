@@ -661,10 +661,11 @@ signed `node.toml` itself, §1). One JSON object per line: the client sends
 `{"method", "params"}`, the server answers `{"ok": value}` or
 `{"error": "text"}`, or, for streaming methods, several `{"item": value}`
 lines until it closes. The socket is 0600 in a 0700 folder; only its own user
-or root may talk to it. That leaves out a command the node runs as that very
-user (a node a person runs, with no `machine.user`): Landlock stops a process
-connecting to a socket file only from ABI 9 on, and `setsid` takes a process
-out of the tree below its command. So the node makes a token at each start,
+or root may talk to it. That does not keep out a command the node runs as
+that very user (a node a person runs, with no `machine.user`) or as root:
+Landlock stops a process connecting to a socket file only from ABI 9 on, and
+`setsid` takes a process out of the tree below its command. So the node makes
+a token at each start,
 `<state>/run/ctl.token` (0600), and answers a request only if it carries it
 (`{"method", "params", "token"}`). The CLI reads the file and sends it. The
 file lies in the node's own folders, which a `folder` mode command's rules
@@ -685,8 +686,11 @@ session (`systemd-run --user`) is one, a tmux or screen server another
 (`tmux run-shell`, its socket in `/tmp`); there are more. A connect rule
 (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`, ABI 9) that leaves out only the session
 does not close them, and the node sets none while the keys are in files
-(`exec.rs`). `machine.user` is the boundary: the commands run as another
-account.
+(`exec.rs`). The boundary is `machine.user`: the commands run as another
+account that is neither root nor can become root (`docker`, `lxd`,
+`incus-admin`, `libvirt`, `disk`; user docs, service.md "The account commands
+run as"). Root passes the socket's uid check, and an account that becomes
+root is root.
 
 A connection the node cannot take (for want of
 descriptors, memory or epoll watches, or for any other reason of that one
@@ -708,12 +712,15 @@ Methods:
 
 Every method is refused from a process that runs below a command the node
 started for a center, the reading ones (`status`, `config.read`,
-`sudo.status`) too, as they hand over the whole config. So on Linux an agent
-cannot read its own policy, change it through the socket, nor install, set
-up, update or remove the node. The token also keeps out a process that left
-the command's tree. A command without a sandbox (`allowlist` and `user`
-mode) can read the token file as it can read `node.toml`, so for it only the
-tree decides, and only while the command runs.
+`sudo.status`) too, as they hand over the whole config. That catches the
+processes that stay below the command, in any mode. A `folder` mode command
+is kept out by the token as well, including a process it left behind, as far
+as the sandbox holds (above). A command without a sandbox (`allowlist` and
+`user` mode, sudo commands) can read the token file as it can read
+`node.toml`, and can leave the tree at once (`( … & )`, `setsid -f`, a
+daemon fork), while the command still runs. For such a command the socket is
+no boundary at any time, as the node's files are none; the refusal stops what
+stays below it.
 **Windows has no socket and no sandbox:** the CLI signs node.toml
 itself, so a command the node runs for a center can change the policy, and
 the change applies at the next start. On Windows, allow commands only to

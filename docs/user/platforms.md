@@ -21,18 +21,24 @@ behaves the same except where this page says so.
 - Commands run with `no_new_privs`, so setuid programs cannot gain privileges.
   Only a command on the [sudo list](sudo.md) runs without it.
 - When a call ends, the node kills the command's whole process group.
-- A command cannot read or change the node's settings through its control
-  socket: the node answers only programs that can read its token in the state
-  folder, which `folder` mode keeps from a command, and refuses a command that
-  runs without that sandbox while it runs. This holds as far as the sandbox
-  does. While the commands run as the node's own user, `folder` mode is no
-  boundary against that user's other programs. A command can ask any of them
-  that runs commands for whoever connects to its socket to run a program
-  outside the sandbox: the user's systemd and D-Bus session
-  (`systemd-run --user`), a tmux or screen server, and others. Such a program
-  is the user's own process and reads the node's files and token. To keep
-  commands from the node's files and socket, run them as another account:
-  `machine.user`, or [the installed service](service.md).
+- A `folder` mode command cannot read or change the node's settings through
+  its control socket: the node answers only programs that can read its token
+  in the state folder, which the mode's sandbox keeps from a command. This
+  holds as far as the sandbox does. While the commands run as the node's own
+  user, `folder` mode is no boundary against that user's other programs. A
+  command can ask any of them that runs commands for whoever connects to its
+  socket to run a program outside the sandbox: the user's systemd and D-Bus
+  session (`systemd-run --user`), a tmux or screen server, and others. Such a
+  program is the user's own process and reads the node's files and token.
+- A command of `allowlist` or `user` mode, or a [sudo](sudo.md) command, has no
+  sandbox, so it can read the token and the node's files as the user can. The
+  node refuses its requests only from processes that stay below the command,
+  and a command can leave that tree at once (`( … & )`, `setsid -f`). The
+  control socket is no boundary against such a command.
+- To keep commands from the node's files and socket, run them as another
+  account: `machine.user`, or [the installed service](service.md). The account
+  must be neither root nor one that can become root (`docker`, `lxd`, …); see
+  [the account commands run as](service.md#the-account-commands-run-as).
 - A node that runs as root is refused unless `machine.allow_root` is set
   ([root and administrator](#root-and-administrator)).
 

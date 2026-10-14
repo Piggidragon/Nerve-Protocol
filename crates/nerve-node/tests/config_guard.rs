@@ -425,8 +425,9 @@ async fn a_command_cannot_read_the_config_over_the_control_socket() {
 }
 
 /// A command with no sandbox (`user` mode) can read the token file, as it can
-/// read the config file: while it runs, the node knows it by its place in the
-/// process tree and refuses it.
+/// read the config file: the node refuses what stays below the command in the
+/// process tree. A process that leaves the tree is not caught, which is why
+/// the socket is no boundary against such a command.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_command_without_a_sandbox_is_refused_while_it_runs() {
     let dir = tempfile::tempdir().unwrap();

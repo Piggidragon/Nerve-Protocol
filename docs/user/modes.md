@@ -125,9 +125,11 @@ commands run as: it follows the path, refuses a link inside a `w` folder as
 above, and stores and records the real place (the command says so when that
 is not the path you gave). A folder it stored at the place a link leads to is
 listed there: give `folder rm` and `folder set` the path `folder ls` shows,
-since the CLI cannot see the link. With no node running, or where the node
-cannot tell either (a `w` folder it cannot resolve, or no account chosen), the
-folder is stored as given and not recorded, a record it had stays, and
+since the CLI cannot see the link. Given the link, they say `is not a
+folder of this center` and add that the account cannot look into the path and
+which path to use, naming the folders of the center that could be it. With no
+node running, or where the node cannot tell either (a `w` folder it cannot
+resolve, or no account chosen), the folder is stored as given and not recorded, a record it had stays, and
 `folder add` says so (`note: … is stored as given and not recorded …`): start
 the node, and add the folder again. Check for links (`find <folder> -type l`
 on Linux, `dir /AL /S <folder>` on Windows) before you take `w` off the folder

@@ -5,6 +5,8 @@
 //! [`apply_to`]. Both sides check a change the same way, and the config
 //! checks the result ([`NodeConfig::validate`]) wherever it is saved.
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -256,6 +258,48 @@ impl FolderChange {
             | FolderChange::Set { path, .. }
             | FolderChange::Rm { path, .. } => path,
         }
+    }
+}
+
+/// The most folders named in the hint when none of them lies beside the path.
+const HINT_MAX: usize = 3;
+
+/// The error for a path no folder of the center has. When the node may not
+/// even look at the path (the installed node's CLI runs as `nerve`, which
+/// cannot read the account's home, so a link there was kept as typed and
+/// not resolved), the folder may be listed under the path the link leads
+/// to: the message names the folders `folder ls` shows that could be it,
+/// the ones beside the path first, or, with none to name, that `folder ls`
+/// shows it. The lookup itself is `stored_folder`'s, in the CLI.
+pub fn not_a_folder(path: &str, folders: &[Folder]) -> String {
+    let plain = format!("{path} is not a folder of this center");
+    let refused = matches!(
+        std::fs::symlink_metadata(path),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied
+    );
+    if !refused {
+        return plain;
+    }
+    if folders.is_empty() {
+        return plain;
+    }
+    let parent = Path::new(path).parent();
+    let beside: Vec<&str> = folders
+        .iter()
+        .filter(|f| Path::new(&f.path).parent() == parent)
+        .map(|f| f.path.as_str())
+        .collect();
+    let named = if beside.is_empty() && folders.len() <= HINT_MAX {
+        folders.iter().map(|f| f.path.as_str()).collect()
+    } else {
+        beside
+    };
+    let hint = format!(
+        "{plain}; this account cannot look into it, so if it is a link, use the path `nerve-node folder ls` shows for the folder"
+    );
+    match named.is_empty() {
+        true => hint,
+        false => format!("{hint}: {}", named.join(", ")),
     }
 }
 
@@ -542,5 +586,52 @@ mod tests {
                 .unwrap_err()
                 .contains("name what the center may do")
         );
+    }
+
+    /// A path the node's account may not look into may be a link to a listed
+    /// folder: the error then names the folders `folder ls` shows, the ones
+    /// beside the path first, and says what to look for when none is named.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_the_node_cannot_look_into_points_to_the_listed_folders() {
+        use std::os::unix::fs::PermissionsExt;
+        if nerve_transport::net::euid() == 0 {
+            return; // root looks into every folder
+        }
+        let d = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(d.path()).unwrap().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let link = home.join("linkproj").display().to_string();
+        let folder = |p: &str| Folder {
+            path: p.into(),
+            access: Access::parse("r").unwrap(),
+        };
+        let beside = format!("{}/proj", home.display());
+        let plain = format!("{link} is not a folder of this center");
+        let hint = format!(
+            "{plain}; this account cannot look into it, so if it is a link, use the path `nerve-node folder ls` shows for the folder"
+        );
+        let few = [folder(&beside), folder("/srv/a")];
+        let many: Vec<Folder> = ["/srv/a", "/srv/b", "/srv/c", "/data/work"]
+            .map(folder)
+            .into();
+        // While the node can look at the path, it is a plain miss.
+        assert_eq!(not_a_folder(&link, &few), plain);
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let got = [
+            not_a_folder(&link, &[]),
+            not_a_folder(&link, &few),
+            not_a_folder(&link, &[folder("/srv/a"), folder("/srv/b")]),
+            not_a_folder(&link, &many),
+        ];
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // No folder at all: nothing to point to.
+        assert_eq!(got[0], plain);
+        // A folder beside the path is named alone.
+        assert_eq!(got[1], format!("{hint}: {beside}"));
+        // None beside, and no more than a few in all: every folder.
+        assert_eq!(got[2], format!("{hint}: /srv/a, /srv/b"));
+        // None beside and more than a few: still the hint, with no names.
+        assert_eq!(got[3], hint);
     }
 }

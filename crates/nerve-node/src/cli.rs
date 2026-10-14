@@ -2222,7 +2222,7 @@ fn stored_folder(folders: &[Folder], path: &Path) -> Result<String, String> {
         return Ok(f);
     }
     let real = resolve_folder(path)?;
-    stored(Path::new(&real)).ok_or_else(|| format!("{real} is not a folder of this center"))
+    stored(Path::new(&real)).ok_or_else(|| crate::folder_change::not_a_folder(&real, folders))
 }
 
 /// Folders are stored resolved (symlinks followed), the way the policy
@@ -3276,6 +3276,80 @@ mod tests {
             e.contains("Too many levels") || e.contains("symlink"),
             "{e}"
         );
+    }
+
+    /// The installed node's CLI runs as `nerve`, which cannot look into the
+    /// owner's home: a link there stays as typed, and the folder `folder add`
+    /// stored at the place the link leads to is not found. `folder set` and
+    /// `folder rm` then name the path `folder ls` shows (issue #98), also where
+    /// the center has more folders than the hint would list.
+    #[cfg(unix)]
+    #[test]
+    fn folder_set_and_rm_name_the_listed_folder_for_a_link_the_cli_cannot_look_into() {
+        use std::os::unix::fs::PermissionsExt;
+        if nerve_transport::net::euid() == 0 {
+            return; // root looks into every folder
+        }
+        let (d, paths) = setup(&["home"]);
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let (home, data) = (root.join("home"), root.join("data"));
+        let (proj, work) = (home.join("proj"), data.join("work"));
+        for p in [&proj, &work] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        let (link, far) = (home.join("linkproj"), home.join("sub").join("linkwork"));
+        std::fs::create_dir(home.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&proj, &link).unwrap();
+        std::os::unix::fs::symlink(&work, &far).unwrap();
+        for p in [&proj, &work] {
+            run(&paths, &["folder", "add", p.to_str().unwrap(), "+r"]).unwrap();
+        }
+        let listed = |n: usize| load(&paths).centers[0].policy.folders.len() == n;
+        // While the CLI can look at the link, it finds the folder.
+        let out = run(&paths, &["folder", "set", link.to_str().unwrap(), "+x"]).unwrap();
+        assert!(
+            out.contains(&format!("folder {} r-x", proj.display())),
+            "{out}"
+        );
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let mut errors = Vec::new();
+        for args in [["set", "+w"], ["rm", ""]] {
+            let mut cmd = vec!["folder", args[0], link.to_str().unwrap()];
+            if !args[1].is_empty() {
+                cmd.push(args[1]);
+            }
+            errors.push(run(&paths, &cmd).unwrap_err());
+        }
+        // Only folders far from the path are listed, and more than the hint
+        // would name: it still says what to do.
+        for n in ["a", "b"] {
+            let p = root.join(n);
+            std::fs::create_dir(&p).unwrap();
+            run(&paths, &["folder", "add", p.to_str().unwrap(), "+r"]).unwrap();
+        }
+        errors.push(run(&paths, &["folder", "rm", far.to_str().unwrap()]).unwrap_err());
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for e in &errors[..2] {
+            assert!(
+                e.starts_with(&format!(
+                    "{} is not a folder of this center",
+                    link.display()
+                )),
+                "{e}"
+            );
+            assert!(
+                e.ends_with(&format!(
+                    "`nerve-node folder ls` shows for the folder: {}",
+                    proj.display()
+                )),
+                "{e}"
+            );
+        }
+        let e = &errors[2];
+        assert!(e.contains("this account cannot look into it"), "{e}");
+        assert!(e.ends_with("shows for the folder"), "{e}");
+        // The refused calls changed nothing.
+        assert!(listed(4));
     }
 
     /// A link a command may have put inside a folder it can write in is not

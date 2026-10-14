@@ -134,11 +134,14 @@ folders.
   keeps the permissions of each file and folder, so the node writes the
   entry into each one below the folder: the first grant of a large folder,
   changing its rights and taking it off take a while. A change goes only as
-  far as it changes something: putting the same entry on again looks only at
-  what is right below the folder, and a folder whose permissions do not
-  inherit keeps the change out of itself and of what is below it. A change
-  that takes more than a few seconds says how far it is: the CLI prints it,
-  a running node writes it to its log, and a command waits for it.
+  far as it changes something: putting the same entry on again changes
+  nothing, a later change skips the parts of the folder it leaves as they
+  are, and a folder whose permissions do not inherit keeps the change out
+  of itself and of what is below it. A change that stopped part way (you
+  stopped the CLI or the node, or it failed) goes through the whole folder
+  again at the next sync. A change that takes more than a few seconds says
+  how far it is: the CLI prints it, a running node writes it to its log,
+  and a command waits for it.
 - `folder rm` and `folder set` change the entry, and removing the pairing
   takes it off. That is the node's entry on the folder: permissions a
   command gave what it made there stay (see "What the AppContainer does not
@@ -231,10 +234,12 @@ folders.
   in, or a folder that holds one, the change passes to the files below it
   whose permissions it changes, and that would include hard links. Before
   such a change the node checks those files and refuses if one has more
-  than one name, and it checks each file again right before it changes it:
-  a link a command makes in between stops the change there. What it
-  changed by then stays changed, the folder itself keeps its old entry, and
-  the next sync refuses the change until the link is gone. Hard links only
+  than one name, and it checks each file again right before it changes it,
+  by the names the file has then: a link a command makes in between stops
+  the change there. What it changed by then stays changed, the folder
+  itself keeps its old entry, and the next sync refuses the change until
+  the link is gone. A file whose permissions the change leaves as they are
+  is not reached, so a link to it stops nothing. Hard links only
   work within one drive. So put a
   write-only folder whose files commands must not read on a drive where the
   pairing can write nowhere that it can also read or run programs, also

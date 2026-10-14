@@ -162,19 +162,36 @@ center's local name):
   inherited ones from the folder it is in now, so a granted folder moved
   out of another one loses that one's entries), writes it with
   `SetKernelObjectSecurity`, which passes nothing down, and passes the
-  change down itself (`nerve_sandbox::inherit`): each object is opened
-  through its folder's handle (`NtOpenFile`, as itself, never through a
-  link), its new list is what Windows works out for an object made there
-  (`CreatePrivateObjectSecurityEx` with `SEF_DACL_AUTO_INHERIT`: its own
-  entries, and those it inherits from the folder's new list), and it is
-  written only when its entries change. Below an object whose list stays,
-  or one whose list does not inherit, nothing changes, so the walk does not
-  go there. Each folder is written after everything below it, so a folder
-  whose list is right has everything below it right, also after a walk that
-  stopped half way. Taking a grant off goes into every folder all the same,
-  since Windows' own walk, which earlier versions used, writes a folder
-  before what is below it. A link or junction gets the change on its own
-  list and is not followed. A change that takes long tells how far it is
+  change down itself (`nerve_sandbox::inherit`): each object is listed and
+  opened through its folder's handle (`NtOpenFile`, as itself, never
+  through a link), and opened for `WRITE_DAC` only when its list changes.
+  Its new list is what Windows works out for an object made there
+  (`CreatePrivateObjectSecurityEx` with `SEF_DACL_AUTO_INHERIT`, given only
+  the object's own entries, since it keeps every entry it is given as one
+  of the object's own): its own entries, and those it inherits from the
+  folder's new list. A list in the older form, without
+  `SE_DACL_AUTO_INHERITED` and with no entry marked inherited (as in folders
+  made under such a folder, a test's temporary folder for one), first gets
+  its inherited entries told by the list of the folder it inherited them
+  from (`ConvertToAutoInheritPrivateObjectSecurity`, as `SetSecurityInfo`
+  does). One whose entries do not match comes out as its own and keeps its
+  list. Each write asks for `SE_DACL_AUTO_INHERIT_REQ`, without which
+  Windows drops `SE_DACL_AUTO_INHERITED`. An object is written only when
+  its entries change. Below an object whose list stays, or one whose list
+  does not inherit, nothing changes, so the walk does not go there. Each
+  folder is written after everything below it, so a folder whose list is
+  right has everything below it right, also after a walk that stopped half
+  way; it is listed again once written, and what was made in it meanwhile
+  (with its old list, also a file saved over an old name, by its file ID)
+  is walked too. The folders above what a stopped walk changed do not show
+  it, so `grants::sync` marks a grant `unfinished` in the record before it
+  changes its folder and takes the mark off once the change is done; the
+  next change at a marked place goes into every folder (`whole`), also one
+  back to flags the folder still shows. Taking a grant off goes into every
+  folder all the same, since Windows' own walk, which earlier versions
+  used, writes a folder before what is below it. A link or junction gets
+  the change on its own list and is not followed. An error names the
+  object it is about. A change that takes long tells how far it is
   (`grants::paced`: after 3 s, then every 15 s, and how it ended), on stderr
   in the CLI and in the log of a running node.
 - A record in the state folder (`grants.json`) finds them again. It holds the
@@ -198,10 +215,13 @@ center's local name):
   `grants::sync` walks what the change reaches (`appcontainer::reaches`,
   the same walk without writing) and refuses while a file there has more
   than one name (a removal stays stale). The change itself judges each
-  such file again on the handle it writes through, and stops there, with
-  the folder's own list as it was (`grants::Links`). One exception is for cargo: a file below a
-  folder named exactly `target` passes when `appcontainer::all_names` lists
-  all its names (as many as the file has; a failed listing refuses), every
+  such file again on the handle it writes through, by the names that
+  handle gives (`NtQueryInformationFile` with the hard-link classes, each
+  name's folder found by its file ID), not by its path, and stops there,
+  with the folder's own list as it was (`grants::Links`, #76). One
+  exception is for cargo: a file below a
+  folder named exactly `target` passes when all its names are listed
+  (as many as the file has; a failed listing refuses), every
   one, compared resolved, lies in such a folder of the walked folder, and
   each is held by exactly the same wanted and recorded grants as the walked
   name. That compares grant paths, while a grant's entry goes with its

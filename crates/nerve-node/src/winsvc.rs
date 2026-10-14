@@ -946,6 +946,7 @@ pub(crate) mod tests {
                     path: p.clone(),
                     access: nerve_policy::config::Access::ALL,
                     id: None,
+                    unfinished: false,
                 })
                 .collect();
             crate::grants::Synced {

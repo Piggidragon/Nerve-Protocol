@@ -12,18 +12,27 @@
 //!
 //! A folder's list is written after everything below it. So a folder whose
 //! list is as it should be has everything below it as it should be too, also
-//! when an earlier walk stopped half way. Taking a grant off walks through
+//! when an earlier walk stopped half way. What is made in a folder while the
+//! walk is below it takes the folder's old list, so the folder is listed
+//! again once it is written, and what is new there is walked too; what is
+//! made after that takes the new list. Taking a grant off walks through
 //! every folder all the same ([`Walk::every`]): Windows' own walk, which
 //! earlier nodes used, writes a folder before what is below it, so one that
 //! stopped half way left folders without the grant above objects that still
-//! carry it.
+//! carry it. So does a change after one that stopped half way, since the
+//! folders above what that one changed do not show it (`grants::sync`).
 //!
 //! Plain logic over [`Objects`], so it is tested on every platform; the
 //! objects and their lists are Windows' (`appcontainer`).
 
+use std::collections::HashSet;
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
+
+/// An entry of a folder: its name, and the file ID of the object, where the
+/// volume gives one.
+pub type Entry = (OsString, Option<[u8; 16]>);
 
 /// What the walk looks at and changes.
 pub trait Objects {
@@ -31,8 +40,8 @@ pub trait Objects {
     type Obj;
     /// An access list, as the walk passes it down.
     type List;
-    /// The names in the folder `dir`.
-    fn names(&mut self, dir: &Self::Obj) -> io::Result<Vec<OsString>>;
+    /// The entries of the folder `dir`.
+    fn entries(&mut self, dir: &Self::Obj) -> io::Result<Vec<Entry>>;
     /// The object `name` in the folder `dir`, as itself: a link or junction
     /// is not followed. `None` when it is gone.
     fn open(&mut self, dir: &Self::Obj, name: &OsStr) -> io::Result<Option<Self::Obj>>;
@@ -47,9 +56,12 @@ pub trait Objects {
     ) -> io::Result<Derived<Self::List>>;
     /// Writes `list` as the list of `obj`, and nothing below it.
     fn write(&mut self, obj: &Self::Obj, list: &Self::List) -> io::Result<()>;
-    /// Whether `path` leads to `obj` now, so that what is looked up by the
-    /// path (the names of a file) is about `obj`.
+    /// Whether `path` leads to `obj` now: the walk judges a file with more
+    /// than one name by the path it found it at.
     fn at(&mut self, obj: &Self::Obj, path: &Path) -> io::Result<bool>;
+    /// Every name of `obj` (its hard links) as a whole path, as the object
+    /// itself gives them, not as a path leads to it.
+    fn names_of(&mut self, obj: &Self::Obj) -> io::Result<Vec<PathBuf>>;
 }
 
 /// What an object is.
@@ -93,7 +105,7 @@ pub struct Walked {
 
 /// Whether a file with more than one name (hard links) may change
 /// ([`Walk::links`]).
-pub type Links<'a> = &'a mut dyn FnMut(&Path, u32) -> io::Result<bool>;
+pub type Links<'a> = &'a mut dyn FnMut(&Path, u32, &[PathBuf]) -> io::Result<bool>;
 
 /// [`Walk::progress`] is told after every this many objects.
 pub const STEP: u64 = 256;
@@ -102,11 +114,12 @@ pub const STEP: u64 = 256;
 pub struct Walk<'a> {
     /// Write the lists; otherwise only look at what the change reaches.
     pub write: bool,
-    /// Go into folders whose list stays as well (taking a grant off).
+    /// Go into folders whose list stays as well.
     pub every: bool,
     /// Whether a file with more than one name (hard links) may change: its
-    /// path by the names walked, and how many names it has. Its list is
-    /// shared by all of them. `None`: any may.
+    /// path by the names walked, how many names it has, and those names
+    /// ([`Objects::names_of`]). Its list is shared by all of them. `None`:
+    /// any may.
     pub links: Option<Links<'a>>,
     /// Told how far the walk is, now and then.
     pub progress: &'a mut dyn FnMut(Walked),
@@ -122,42 +135,90 @@ struct Frame<O: Objects> {
     todo: Vec<OsString>,
     /// Whether its list is written once what is below it is done.
     write: bool,
+    /// Its entries when they were listed, where it is written: what is not
+    /// among them once it is written was made meanwhile.
+    listed: Option<HashSet<Entry>>,
+}
+
+/// `e` with the path it is about.
+fn about(path: &Path, e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), format!("{}: {e}", path.display()))
 }
 
 /// Passes the list `list` of the folder `top` (at `path`) down to what is
-/// below it, as far as it changes something. The caller writes `top`'s own
-/// list, after this returned with nothing found.
+/// below it, as far as it changes something, and writes it as `top`'s own
+/// list last when `write_top` says so.
 ///
 /// Stops at the first file with more than one name whose list would change
 /// and that [`Walk::links`] refuses, also where its path no longer leads to
-/// it (when it is asked at all), and gives it with its count of names: a walk that writes leaves what
-/// it wrote and writes no folder above it. An object that is gone meanwhile
-/// is skipped.
+/// it (when it is asked at all), and gives it with its count of names: a
+/// walk that writes leaves what it wrote and writes no folder above it,
+/// `top` neither. An object that is gone meanwhile is skipped. An error
+/// names the object it is about.
 pub fn pass_down<O: Objects>(
     objects: &mut O,
     top: O::Obj,
     list: O::List,
     path: &Path,
+    write_top: bool,
     mut walk: Walk,
 ) -> io::Result<(Walked, Option<(PathBuf, u32)>)> {
     let gone = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
     let mut walked = Walked::default();
-    let mut todo = objects.names(&top)?;
-    todo.reverse();
-    let mut stack: Vec<Frame<O>> = vec![Frame {
-        obj: top,
-        list,
-        path: path.to_path_buf(),
-        todo,
-        write: false,
-    }];
+    let writes = walk.write;
+    let open_frame = |objects: &mut O,
+                      obj: O::Obj,
+                      list: O::List,
+                      path: PathBuf,
+                      write: bool|
+     -> io::Result<Frame<O>> {
+        let entries = match objects.entries(&obj) {
+            Ok(e) => e,
+            Err(e) if gone(&e) => Vec::new(),
+            Err(e) => return Err(about(&path, e)),
+        };
+        let mut todo: Vec<OsString> = entries.iter().map(|(n, _)| n.clone()).collect();
+        todo.reverse();
+        let listed = (write && writes).then(|| entries.into_iter().collect());
+        Ok(Frame {
+            obj,
+            list,
+            path,
+            todo,
+            write,
+            listed,
+        })
+    };
+    let first = open_frame(objects, top, list, path.to_path_buf(), write_top)?;
+    let mut stack: Vec<Frame<O>> = vec![first];
     while let Some(frame) = stack.last_mut() {
         let Some(name) = frame.todo.pop() else {
-            let done = stack.pop().expect("a frame");
+            let mut done = stack.pop().expect("a frame");
             if done.write && walk.write {
                 match objects.write(&done.obj, &done.list) {
-                    Err(e) if !gone(&e) => return Err(e),
-                    _ => {}
+                    Ok(()) => {}
+                    Err(e) if gone(&e) => continue,
+                    Err(e) => return Err(about(&done.path, e)),
+                }
+                // What was made in it while the walk was below it took its
+                // old list; what is made from now on takes the new one.
+                if let Some(listed) = done.listed.take() {
+                    let now = match objects.entries(&done.obj) {
+                        Ok(e) => e,
+                        Err(e) if gone(&e) => Vec::new(),
+                        Err(e) => return Err(about(&done.path, e)),
+                    };
+                    let mut new: Vec<OsString> = now
+                        .into_iter()
+                        .filter(|e| !listed.contains(e))
+                        .map(|(n, _)| n)
+                        .collect();
+                    if !new.is_empty() {
+                        new.reverse();
+                        done.todo = new;
+                        done.write = false;
+                        stack.push(done);
+                    }
                 }
             }
             continue;
@@ -167,7 +228,7 @@ pub fn pass_down<O: Objects>(
             Ok(Some(o)) => o,
             Ok(None) => continue,
             Err(e) if gone(&e) => continue,
-            Err(e) => return Err(e),
+            Err(e) => return Err(about(&path, e)),
         };
         // Told when the objects so far are done.
         if walked.seen > 0 && walked.seen % STEP == 0 {
@@ -180,7 +241,7 @@ pub fn pass_down<O: Objects>(
         let (kind, derived) = match derived {
             Ok(d) => d,
             Err(e) if gone(&e) => continue,
-            Err(e) => return Err(e),
+            Err(e) => return Err(about(&path, e)),
         };
         let (list, write) = match derived {
             Derived::Kept => continue,
@@ -192,30 +253,24 @@ pub fn pass_down<O: Objects>(
             }
         };
         if kind.walked() {
-            let mut todo = match objects.names(&obj) {
-                Ok(t) => t,
-                Err(e) if gone(&e) => Vec::new(),
-                Err(e) => return Err(e),
-            };
-            todo.reverse();
-            stack.push(Frame {
-                obj,
-                list,
-                path,
-                todo,
-                write,
-            });
+            let next = open_frame(objects, obj, list, path, write)?;
+            stack.push(next);
             continue;
         }
         if kind.names > 1
             && let Some(links) = walk.links.as_mut()
-            && !(objects.at(&obj, &path)? && links(&path, kind.names)?)
         {
-            return Ok((walked, Some((path, kind.names))));
+            let passes = objects.at(&obj, &path).map_err(|e| about(&path, e))? && {
+                let names = objects.names_of(&obj).map_err(|e| about(&path, e))?;
+                links(&path, kind.names, &names)?
+            };
+            if !passes {
+                return Ok((walked, Some((path, kind.names))));
+            }
         }
         if walk.write {
             match objects.write(&obj, &list) {
-                Err(e) if !gone(&e) => return Err(e),
+                Err(e) if !gone(&e) => return Err(about(&path, e)),
                 _ => {}
             }
         }
@@ -260,6 +315,10 @@ mod tests {
         vanished: Vec<String>,
         /// Files whose path leads elsewhere by the time it is checked.
         moved: Vec<String>,
+        /// Made while the walk runs: when the first is opened, the second
+        /// is made, with its folder's list as it is then; one there already
+        /// is replaced (a file saved by a rename over it).
+        made: Vec<(String, String)>,
     }
 
     impl Fake {
@@ -335,11 +394,15 @@ mod tests {
                 own: entries.iter().map(|e| e.to_string()).collect(),
                 inherited: self.nodes[0].inherited.clone(),
             };
-            let r = pass_down(
+            // The folder's own list is written when it changes, as
+            // `appcontainer::set_below` does.
+            let changed = list.own != self.nodes[0].own;
+            pass_down(
                 self,
                 0,
-                list.clone(),
+                list,
                 Path::new("/top"),
+                changed,
                 Walk {
                     write,
                     every,
@@ -347,11 +410,32 @@ mod tests {
                     progress,
                 },
             )
-            .unwrap();
-            if write && r.1.is_none() {
-                self.nodes[0].own = list.own;
+            .unwrap()
+        }
+
+        /// Makes `path` in its folder, with the folder's list as it is now,
+        /// in place of what is there.
+        fn make(&mut self, path: &str) {
+            let (dir, name) = path.rsplit_once('/').unwrap_or(("", path));
+            let parent = if dir.is_empty() { 0 } else { self.find(dir) };
+            let p = &self.nodes[parent];
+            let inherited = p.own.union(&p.inherited).cloned().collect();
+            let old = p
+                .children
+                .iter()
+                .position(|c| self.nodes[*c].name.rsplit('/').next() == Some(name));
+            if let Some(o) = old {
+                let c = self.nodes[parent].children.remove(o);
+                self.nodes[c].name.push_str("~old");
             }
-            r
+            self.nodes.push(Node {
+                name: path.into(),
+                names: 1,
+                inherited,
+                ..Default::default()
+            });
+            let i = self.nodes.len() - 1;
+            self.nodes[parent].children.push(i);
         }
 
         /// The entries `name` inherited.
@@ -368,13 +452,14 @@ mod tests {
         type Obj = usize;
         type List = List;
 
-        fn names(&mut self, dir: &usize) -> io::Result<Vec<OsString>> {
+        fn entries(&mut self, dir: &usize) -> io::Result<Vec<Entry>> {
             Ok(self.nodes[*dir]
                 .children
                 .iter()
                 .map(|c| {
                     let n = &self.nodes[*c].name;
-                    OsString::from(n.rsplit('/').next().unwrap())
+                    let id = (*c as u128).to_le_bytes();
+                    (OsString::from(n.rsplit('/').next().unwrap()), Some(id))
                 })
                 .collect())
         }
@@ -392,7 +477,16 @@ mod tests {
             if self.vanished.contains(&full) {
                 return Ok(None);
             }
-            self.opened.push(full);
+            self.opened.push(full.clone());
+            let made: Vec<String> = self
+                .made
+                .iter()
+                .filter(|(when, _)| *when == full)
+                .map(|(_, path)| path.clone())
+                .collect();
+            for path in made {
+                self.make(&path);
+            }
             Ok(Some(i))
         }
 
@@ -430,12 +524,19 @@ mod tests {
         fn at(&mut self, obj: &usize, _: &Path) -> io::Result<bool> {
             Ok(!self.moved.contains(&self.nodes[*obj].name))
         }
+
+        fn names_of(&mut self, obj: &usize) -> io::Result<Vec<PathBuf>> {
+            let n = &self.nodes[*obj];
+            let mut all = vec![Path::new("/top").join(&n.name)];
+            all.extend((1..n.names).map(|i| PathBuf::from(format!("/elsewhere/{i}"))));
+            Ok(all)
+        }
     }
 
     const TREE: &[&str] = &["a/", "a/b/", "a/b/f", "a/g", "c/", "c/h", "i"];
 
     /// A grant reaches every object below its folder once, and each folder
-    /// is written after everything below it.
+    /// is written after everything below it, the granted one last.
     #[test]
     fn a_change_reaches_everything_below_and_folders_last() {
         let mut f = Fake::new(TREE);
@@ -457,8 +558,10 @@ mod tests {
             .iter()
             .map(|p| p.trim_end_matches('/').into())
             .collect();
+        all.push(String::new());
         all.sort();
         assert_eq!(written, all, "each once");
+        assert_eq!(f.written.last().map(String::as_str), Some(""));
         let at = |n: &str| f.written.iter().position(|w| w == n).unwrap();
         assert!(at("a/b/f") < at("a/b") && at("a/b") < at("a") && at("a/g") < at("a"));
         assert!(at("c/h") < at("c"));
@@ -575,8 +678,10 @@ mod tests {
     fn a_file_with_a_second_name_stops_the_change() {
         let tree = &["a/", "a/x", "a/y=", "a/z", "b/", "b/l="];
         let asked = std::cell::RefCell::new(Vec::new());
-        let mut refuse = |p: &Path, n: u32| {
+        let mut refuse = |p: &Path, n: u32, names: &[PathBuf]| {
             asked.borrow_mut().push((p.to_path_buf(), n));
+            // Judged by the names the file itself gives.
+            assert!(names.contains(&p.to_path_buf()) && names.len() == n as usize);
             Ok(false)
         };
 
@@ -595,7 +700,13 @@ mod tests {
 
         // Let pass.
         let mut f = Fake::new(tree);
-        let (w, found) = f.grant_with(&["g"], false, true, Some(&mut |_, _| Ok(true)), &mut |_| {});
+        let (w, found) = f.grant_with(
+            &["g"],
+            false,
+            true,
+            Some(&mut |_, _, _| Ok(true)),
+            &mut |_| {},
+        );
         assert_eq!(found, None);
         assert_eq!(w.changed, 6);
 
@@ -615,13 +726,45 @@ mod tests {
             &["g"],
             false,
             false,
-            Some(&mut |_, _| Ok(true)),
+            Some(&mut |_, _, _| Ok(true)),
             &mut |_| {},
         );
         assert_eq!(found, Some((PathBuf::from("/top/a/y"), 2)));
         let (w, found) = f.grant_with(&["g"], false, true, None, &mut |_| {});
         assert_eq!(found, None);
         assert_eq!(w.changed, 6);
+    }
+
+    /// What is made in a folder while the walk is below it takes the
+    /// folder's old list; the folder is listed again once it is written, so
+    /// the walk reaches it too, also a file saved in place of one the walk
+    /// had passed already (a new object by an old name). This holds for the
+    /// granted folder itself, for a narrowing, and for taking a grant off.
+    #[test]
+    fn what_is_made_during_the_walk_gets_the_change() {
+        for (before, after, every) in [
+            (&["g"][..], &["g2"][..], false),
+            (&["g"][..], &[][..], true),
+        ] {
+            let mut f = Fake::new(&["a/", "a/b/", "a/b/f", "a/g", "a/z", "c/", "c/h"]);
+            f.grant(before, false);
+            // Made while the walk is below `a`: in `a`, in the granted
+            // folder, and `a/g` saved anew after the walk passed it.
+            f.made = vec![
+                ("a/b/f".into(), "a/new".into()),
+                ("a/b/f".into(), "top-new".into()),
+                ("a/z".into(), "a/g".into()),
+            ];
+            f.grant(after, every);
+            let want: Vec<String> = after.iter().map(|e| e.to_string()).collect();
+            for n in ["a/new", "top-new", "a/g", "a/b/f", "c/h"] {
+                assert_eq!(f.has(n), want, "{n} after {after:?}");
+            }
+            // A second walk changes nothing, as the folders are right.
+            f.made.clear();
+            let (w, _) = f.grant(after, every);
+            assert_eq!(w.changed, 0, "{after:?}");
+        }
     }
 
     /// The progress is told every [`STEP`] objects.

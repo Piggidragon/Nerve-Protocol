@@ -216,8 +216,12 @@ Drop and grace:
   link on ends it; a handshake that fails leaves it to the next connection
   while the grace lasts.
 - The center carries the link on when it still holds the link the hello names
-  for that node, and `got` lies between what the node acknowledged and what
-  the center sent, and the center keeps every frame after `got`. Otherwise it
+  for that node, it has read at least one counted frame of it, `got` lies
+  between what the node acknowledged and what the center sent, and the center
+  keeps every frame after `got`. The node sends nothing counted before it
+  reads the `welcome`, so a link of which the center read nothing may be one
+  whose `resumed: false` the node never got; the node then still holds the
+  older link of that id, which must not be taken for the new one. Otherwise it
   answers `resumed: false` and ends the link it held: its calls fail with
   `connection_lost`. A held link that does not answer the ping of §4.3 is
   replaced, and may be carried on the same way. A frame that arrives later on

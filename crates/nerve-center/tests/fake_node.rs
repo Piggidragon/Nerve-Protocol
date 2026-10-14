@@ -1562,3 +1562,40 @@ async fn a_frame_over_the_limit_ends_a_resumable_link() {
     assert_eq!(resume_of(&welcome), json!({"resumed": false, "got": 0}));
     r.stop().await;
 }
+
+/// A link whose welcome the node may never have read (the center read
+/// nothing of it) is not carried on: the node may still hold an older link
+/// of that id, and the two would answer each other's calls.
+#[tokio::test]
+async fn a_link_the_node_never_took_up_is_not_resumed() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    let key = NodeKey::generate().unwrap();
+    assert_eq!(pair(&r, &key, "box-1").await.0, 200);
+    // The center starts a new link under the offered id.
+    let (mut ws, welcome) = handshake_with(
+        &r,
+        &key,
+        json!({"resume": {"link": link_id('e'), "got": 3}}),
+    )
+    .await;
+    assert_eq!(resume_of(&welcome), json!({"resumed": false, "got": 0}));
+    // Its describe goes out, and the connection drops before the node sent
+    // anything counted.
+    let (_, m, _) = request(&mut ws).await;
+    assert_eq!(m, method::DESCRIBE);
+    drop(ws);
+    let c = r.center.clone();
+    let node = key.node_id();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(c.link(&node).is_none());
+    // The node, which held an older link of that id, offers it again.
+    let (_ws, welcome) = handshake_with(
+        &r,
+        &key,
+        json!({"resume": {"link": link_id('e'), "got": 1}}),
+    )
+    .await;
+    assert_eq!(resume_of(&welcome), json!({"resumed": false, "got": 0}));
+    r.stop().await;
+}

@@ -68,6 +68,9 @@ address change or a short outage loses no output. Exact rules:
 - On the resume each side sends again only what the other side's count shows
   it never read. A call the node read is never sent again, so nothing runs
   twice; one it did not read has not run and is sent again.
+- The center carries on only a link of which it read something: the node
+  sends nothing before it reads the welcome, so a link whose welcome may have
+  been lost is never taken for an older link of the same id.
 - A request the center no longer waits for (timed out or cancelled while the
   link was down) goes as `withdrawn {id}` instead, so it does not run late.
 - What a frame carries of the sudo password is taken out once, when the frame

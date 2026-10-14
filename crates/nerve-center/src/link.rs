@@ -245,11 +245,15 @@ impl Link {
         if self.is_closed() {
             return Err("the link ended".into());
         }
-        let again = w
-            .replay
-            .as_mut()
-            .ok_or("the link cannot resume")?
-            .resume(got)?;
+        let replay = w.replay.as_mut().ok_or("the link cannot resume")?;
+        // The node sends nothing counted before it reads the welcome. A link
+        // of which nothing was read may be one whose welcome the node never
+        // got: the node then still holds the older link of that id, which
+        // this one must not be taken for.
+        if replay.got() == 0 {
+            return Err("the node never took this link up".into());
+        }
+        let again = replay.resume(got)?;
         // A request nobody waits for any more (its caller timed out or
         // cancelled) is not delivered late: it goes as `withdrawn`, which
         // keeps the count and which the node ignores.

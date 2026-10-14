@@ -1392,6 +1392,10 @@ mod tests {
         /// Paths whose folder is replaced by a new one right after it is
         /// looked at (once).
         replace_after_look: Vec<PathBuf>,
+        /// Paths whose folder is moved to `<path>.old` right after it is
+        /// looked at or found (once), with a new one made in its place
+        /// where the flag says so.
+        move_after_look: Vec<(PathBuf, bool)>,
         /// Each change made or tried: its path, whether it checks for hard
         /// links ([`Links::Passing`]), and whether it goes into every
         /// folder below (`whole`).
@@ -1410,6 +1414,17 @@ mod tests {
             for (p, _) in &mut self.at {
                 if p == Path::new(from) {
                     *p = to.into();
+                }
+            }
+        }
+        /// The move of `move_after_look` at `path`, if one is due.
+        fn move_after(&mut self, path: &Path) {
+            if let Some(i) = self.move_after_look.iter().position(|(m, _)| m == path) {
+                let (_, remake) = self.move_after_look.remove(i);
+                let p = path.display().to_string();
+                self.mv(&p, &format!("{p}.old"));
+                if remake {
+                    self.make(&p);
                 }
             }
         }
@@ -1474,6 +1489,7 @@ mod tests {
                     granted,
                 }
             });
+            self.move_after(path);
             if let Some(i) = self.replace_after_look.iter().position(|m| m == path) {
                 self.replace_after_look.remove(i);
                 let p = path.display().to_string();
@@ -1489,11 +1505,15 @@ mod tests {
             if self.lost.iter().any(|i| i == id) {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
-            Ok(self
+            let found = self
                 .at
                 .iter()
                 .find(|(_, i)| i == id)
-                .map_or(Found::Gone, |(p, _)| Found::At(p.clone())))
+                .map_or(Found::Gone, |(p, _)| Found::At(p.clone()));
+            if let Found::At(p) = &found {
+                self.move_after(p);
+            }
+            Ok(found)
         }
         fn set(
             &mut self,
@@ -1506,11 +1526,18 @@ mod tests {
             expect: Option<&str>,
         ) -> io::Result<Option<String>> {
             self.sets += 1;
-            if let Some(e) = expect
-                && self.id(path).as_deref() != Some(e)
-            {
-                let e = io::Error::new(io::ErrorKind::InvalidInput, "another folder");
-                return Err(untouched(Untouched::Refused, e));
+            // As `set_below`: nothing at the path is gone, but where an
+            // object was recorded, it is not there, which is refused; so is
+            // another object.
+            match (expect, self.id(path)) {
+                (None, None) => {
+                    return Err(untouched(Untouched::Gone, io::ErrorKind::NotFound.into()));
+                }
+                (Some(e), now) if now.as_deref() != Some(e) => {
+                    let e = io::Error::new(io::ErrorKind::InvalidInput, "another folder");
+                    return Err(untouched(Untouched::Refused, e));
+                }
+                _ => {}
             }
             let checked = matches!(links, Links::Passing(_));
             self.changes.push((path.into(), checked, whole));
@@ -2707,6 +2734,55 @@ mod tests {
         let s = sync(&file, std::slice::from_ref(&a), &mut f);
         assert!(s.errors.is_empty(), "{s:?}");
         assert_eq!(f.on("/w/a"), [("c1".to_string(), a.access)]);
+    }
+
+    /// A take-off at its path, a take-off where a moved folder is now, and
+    /// a replacement each go only through the recorded object: one whose
+    /// folder is moved away right after the sync found it, with or without
+    /// a new folder in its place, is refused with nothing written and the
+    /// record kept, and the next sync takes the grant off where the folder
+    /// went.
+    #[test]
+    fn take_offs_and_replacements_go_only_through_the_recorded_object() {
+        let (r, rw) = (grant("c1", "/w/a", "r"), grant("c1", "/w/a", "rw"));
+        for remake in [false, true] {
+            for case in ["take-off", "moved take-off", "replacement"] {
+                let d = tempfile::tempdir().unwrap();
+                let file = d.path().join("grants.json");
+                let mut f = Fake::default();
+                f.make("/w/a");
+                let first = if case == "replacement" { &r } else { &rw };
+                sync(&file, std::slice::from_ref(first), &mut f);
+                // Where the change finds the folder: at its path, or where
+                // it was moved before this sync.
+                let at = if case == "moved take-off" {
+                    f.mv("/w/a", "/x/a");
+                    "/x/a"
+                } else {
+                    "/w/a"
+                };
+                f.move_after_look.push((at.into(), remake));
+                let want: &[Grant] = if case == "replacement" {
+                    std::slice::from_ref(&rw)
+                } else {
+                    &[]
+                };
+                let s = sync(&file, want, &mut f);
+                let what = format!("{case}, remade {remake}: {s:?}");
+                assert_eq!(s.errors.len(), 1, "{what}");
+                assert_eq!(s.stale.len(), 1, "{what}");
+                let old = format!("{at}.old");
+                assert_eq!(f.on(&old), [("c1".to_string(), first.access)], "{what}");
+                if remake {
+                    assert!(f.on(at).is_empty(), "nothing written: {what}");
+                }
+                assert_eq!(read_record(&file).unwrap().len(), 1, "{what}");
+                let s = sync(&file, &[], &mut f);
+                assert!(s.errors.is_empty(), "{case}, remade {remake}: {s:?}");
+                assert!(f.all().is_empty(), "{case}, remade {remake}: {:?}", f.all());
+                assert!(read_record(&file).unwrap().is_empty());
+            }
+        }
     }
 
     /// A first grant that stopped part way, failing or with the node's end,

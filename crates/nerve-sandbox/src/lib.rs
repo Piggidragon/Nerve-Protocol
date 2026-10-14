@@ -2066,9 +2066,9 @@ pub mod appcontainer {
     /// that. Taking grants off always does.
     ///
     /// With `expect`, the change goes only through that object: one at
-    /// `path` that is another (the folder was replaced since its id was
-    /// recorded) is refused before anything is written, so the record and
-    /// the object a change wrote always agree.
+    /// `path` that is another, or nothing there (the folder was replaced or
+    /// moved since its id was recorded), is refused before anything is
+    /// written, so the record and the object a change wrote always agree.
     pub fn set_below(
         path: &Path,
         name: &str,
@@ -2079,8 +2079,6 @@ pub mod appcontainer {
         below: Below,
     ) -> io::Result<(Option<FileId>, Walked)> {
         let sid = Sid::derive(name)?;
-        // The change goes through this handle, on the object it opened.
-        let f = open(path, READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES).map_err(gone)?;
         let refuse = |why: String| {
             Err(acl::untouched(
                 acl::Untouched::Refused,
@@ -2089,6 +2087,19 @@ pub mod appcontainer {
                     format!("the node puts no grant on it, since {why}"),
                 ),
             ))
+        };
+        // The change goes through this handle, on the object it opened.
+        let f = match open(path, READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES) {
+            Ok(f) => f,
+            // The recorded object is not at the path (moved away meanwhile):
+            // not "nothing there" for the record, which the next sync finds
+            // again where it went.
+            Err(e) if expect.is_some() && e.kind() == io::ErrorKind::NotFound => {
+                return refuse(
+                    "the folder recorded for it is not there now (it was moved meanwhile); the next sync looks again".into(),
+                );
+            }
+            Err(e) => return Err(gone(e)),
         };
         if let Some(want) = expect
             && id_of(&f).ok() != Some(want)
@@ -3184,6 +3195,17 @@ mod tests {
             .unwrap_err();
         assert_eq!(acl::untouched_by(&e), Some(acl::Untouched::Refused), "{e}");
         assert!(has(&top.join("a\\f.txt")), "nothing taken off");
+        // The recorded folder moved away, nothing at the path: refused too,
+        // not taken for nothing there.
+        let below = appcontainer::Below {
+            links: None,
+            progress: &mut |_| {},
+        };
+        let missing = top.join("moved-away");
+        let e =
+            appcontainer::set_below(&missing, &name, None, false, false, Some(elsewhere), below)
+                .unwrap_err();
+        assert_eq!(acl::untouched_by(&e), Some(acl::Untouched::Refused), "{e}");
         let other = set(Some(acl::masks(true, false, false)), false);
         assert_eq!(other.changed, 5, "{other:?}");
         set(None, false);

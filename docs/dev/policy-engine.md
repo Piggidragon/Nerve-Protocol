@@ -193,7 +193,8 @@ center's local name):
   path before it goes on, so a first grant that stopped part way is found
   where its folder went, as any other. Each change goes only through the
   object recorded for its place (`set_below`'s `expect`): one replaced
-  since is refused before any write, marked `acl::Untouched::Refused`, and
+  since, or nothing at the path where it was moved away, is refused before
+  any write, marked `acl::Untouched::Refused`, and
   the next sync looks again. Where the record cannot be marked, only
   take-offs run, here and where moved folders are now (one goes into
   every folder, and one that stops gives less, never more), so `uninstall`

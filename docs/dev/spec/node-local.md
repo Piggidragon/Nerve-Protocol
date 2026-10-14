@@ -137,7 +137,8 @@ the config's MAC and its key per center.
   `config-key:<state folder>` and `center-key:<name>:<config folder>`. Each
   holds the key's hex text. No copy stays in a file.
 
-The proxy's header values are in the keyring either way (§2).
+The proxy's header values are in the keyring either way (§2), except on the
+installed node on Windows, which takes none (§2, Proxy).
 
 Two kinds of node keep their keys in files whatever is asked:
 
@@ -412,6 +413,23 @@ unreadable entry, or one without a value for a named header, stops the link
 with a status that names the entry, and the node does not dial directly
 instead (fail closed).
 
+The installed node on Windows (§1, where the keys are: the folders `install`
+uses, or the account `nerve`) takes no header value and no password either,
+though its keyring answers. The service runs as `nerve`, the Credential
+Manager is one per account, and `proxy set` runs as an administrator, so the
+values would be in the administrator's Credential Manager, out of the
+service's reach. The node keeps no proxy secret in a file, so there is nowhere
+else for them. `proxy set` with a header or a password refuses before it asks
+the keyring, and changes nothing (`node.toml`, the keyring); a proxy without
+either works, and its `proxy set` deletes the entry of an earlier call, as it
+does anywhere. Reading is as consistent: with headers named in `node.toml`
+(set before the install) the link stops with `bad proxy:` and the same reason
+(in the center's status and in the log; Windows has no control socket, so
+`status` shows no link status there and the log is the only place), and
+`proxy ls` shows it, both without asking the keyring: an entry may be in the
+administrator's Credential Manager, but the service does not find it, so
+`proxy ls` must not call the values good.
+
 A `node.toml` that holds header values (`headers = { Name = "value" }`) or a
 user name and password in `connection.proxy` is refused on load, without the values in the message: take them out of the
 file, accept it (`nerve-node config accept`) and run `nerve-node proxy set`
@@ -671,6 +689,20 @@ or root may talk to it. A connection the node cannot take (for want of
 descriptors, memory or epoll watches, or for any other reason of that one
 connection) does not end the socket: the node takes the next one once the
 cause is gone. Only an error that says the listener itself is broken ends it.
+A connection carries one request: the node closes it after the answer (for a
+streaming method, after the last item), closes one that sends no request line
+within 30 s, and serves at most 64 at once; one over that is answered with
+`{"error": "the node does not take connections now; try again"}` and closed.
+
+What a client makes of a connect that fails: only a missing socket (ENOENT)
+and a refused connect (ECONNREFUSED) mean that no node runs, and only then may
+the CLI write `node.toml` itself. A queue that is full (EAGAIN) means a node
+runs and takes no connection now (`the node does not take connections now; try
+again`): the command fails and writes nothing. Any other connect error names
+itself and decides nothing about a node. A call that gets no answer in 90 s
+gives up (`the node did not answer in time; try again`). A caller that maps
+every connect error to "not running" would write the file and report a change
+the running node never got.
 Methods:
 
 | Method | Params | |

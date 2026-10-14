@@ -19,6 +19,7 @@ use nerve_policy::audit::AuditLog;
 use nerve_policy::config::SecretStorage;
 use nerve_policy::settings::SettingsStore;
 
+use crate::paths::NodePaths;
 use crate::service::{
     Account, Layout, Steps, USER, USER_MARK, Version, asset_name, audit, fetch_release, write_file,
 };
@@ -95,6 +96,56 @@ pub trait WinSystem {
     /// moves aside to a `nerve-node.*.del` beside it and goes at the next
     /// restart.
     fn remove_program(&self, path: &Path) -> Result<bool, String>;
+    /// Takes the folder grants of folder mode off, those in the record on
+    /// `paths` and those of the pairings `node_ids`
+    /// (crate::grants::remove_all).
+    fn remove_grants(
+        &self,
+        paths: &crate::paths::NodePaths,
+        node_ids: &[String],
+    ) -> crate::grants::Synced;
+}
+
+/// Takes the folder grants of the node at `paths` off, for uninstall.
+/// `kept`: whether its record stays (no purge of its state folder), so that
+/// another uninstall finds the grants left on a drive that is not here.
+fn remove_grants(
+    paths: &NodePaths,
+    sys: &dyn WinSystem,
+    steps: &mut Steps,
+    whose: &str,
+    kept: bool,
+) {
+    let node_ids: Vec<String> = SettingsStore::peek(&paths.config_file(), &paths.config_key())
+        .map(|c| c.centers.iter().map(|c| c.node_id.clone()).collect())
+        .unwrap_or_default();
+    let synced = sys.remove_grants(paths, &node_ids);
+    for e in &synced.errors {
+        let _ = writeln!(steps.out, "warning: {e}");
+    }
+    if synced.removed > 0 {
+        steps.did(format!(
+            "took {} folder grants of {whose} off",
+            synced.removed
+        ));
+    }
+    if !synced.away.is_empty() {
+        let at: Vec<String> = synced
+            .away
+            .iter()
+            .map(|g| g.path.display().to_string())
+            .collect();
+        let then = if kept {
+            "connect their drives and run `nerve-node uninstall` again to take them off"
+        } else {
+            "their record goes with --purge, so once their drives are connected, take them off with `icacls <folder> /reset`"
+        };
+        steps.did(format!(
+            "left {} folder grants of {whose} on, on drives that are not connected now ({}): {then}",
+            at.len(),
+            at.join(", ")
+        ));
+    }
 }
 
 /// The plain text [`SECRET_FILE`] holds: the account's name and password.
@@ -381,9 +432,12 @@ pub fn admin_warning(name: &str, groups: &[String]) -> String {
 /// `uninstall`: stops and removes the service, then the folders (deleted
 /// with `purge`, the stored password with them, else kept and open to the
 /// administrators only, without the sudo password), the user and the
-/// program.
+/// program. The folder grants of folder mode come off: the service's, and
+/// those of the node this user runs by hand at `by_hand`, the only node
+/// whose commands run in a container (crate::grants).
 pub fn uninstall(
     layout: &Layout,
+    by_hand: &NodePaths,
     sys: &dyn WinSystem,
     purge: bool,
     out: &mut dyn Write,
@@ -393,7 +447,7 @@ pub fn uninstall(
         done: Vec::new(),
         out,
     };
-    let r = uninstall_steps(layout, sys, purge, &mut steps);
+    let r = uninstall_steps(layout, by_hand, sys, purge, &mut steps);
     // With --purge the log went with the state folder.
     audit(&layout.paths, "uninstall", &steps.done, &r, steps.out);
     if r.is_ok() && steps.done.is_empty() {
@@ -407,6 +461,7 @@ pub fn uninstall(
 
 fn uninstall_steps(
     layout: &Layout,
+    by_hand: &NodePaths,
     sys: &dyn WinSystem,
     purge: bool,
     steps: &mut Steps,
@@ -415,6 +470,16 @@ fn uninstall_steps(
         sys.stop()?;
         sys.delete_service()?;
         steps.did(format!("stopped and removed the service {SERVICE_NAME}"));
+    }
+    // Folder mode put grants for the commands' AppContainers on the
+    // owner's folders (crate::grants); none stays behind the node. Their
+    // record is in the state folder, so this comes before a purge. The
+    // node run by hand keeps its folders; if it runs again, it puts its
+    // grants on again.
+    remove_grants(&layout.paths, sys, steps, "the commands", !purge);
+    if *by_hand != layout.paths && crate::grants::record_file(by_hand).exists() {
+        let whose = format!("the node run by hand ({})", by_hand.state_dir.display());
+        remove_grants(by_hand, sys, steps, &whose, true);
     }
     if sys.delete_event_source()? {
         steps.did(format!(
@@ -651,6 +716,8 @@ pub(crate) mod tests {
         started: RefCell<Vec<String>>,
         /// The folders and whom they were opened to.
         secured: RefCell<Vec<(PathBuf, Option<String>)>>,
+        /// Granted folders on drives that are not connected.
+        away: RefCell<Vec<PathBuf>>,
         /// The message file of the Event Log source, while it is registered.
         event_source: RefCell<Option<PathBuf>>,
         /// The programs removed, in order.
@@ -676,6 +743,7 @@ pub(crate) mod tests {
                 program: RefCell::new(None),
                 started: RefCell::new(Vec::new()),
                 secured: RefCell::new(Vec::new()),
+                away: RefCell::new(Vec::new()),
                 event_source: RefCell::new(None),
                 removed: RefCell::new(Vec::new()),
             }
@@ -860,6 +928,34 @@ pub(crate) mod tests {
             std::fs::remove_file(path).map_err(|e| e.to_string())?;
             Ok(true)
         }
+        fn remove_grants(&self, paths: &NodePaths, node_ids: &[String]) -> crate::grants::Synced {
+            // The record is in the state folder, which a purge deletes.
+            let recorded = crate::grants::record_file(paths).exists();
+            self.call(format!(
+                "remove grants {} of {}",
+                node_ids.join(","),
+                paths.state_dir.display()
+            ));
+            let away = self
+                .away
+                .borrow()
+                .iter()
+                .filter(|_| recorded)
+                .map(|p| crate::grants::Grant {
+                    container: "nerve.away".into(),
+                    path: p.clone(),
+                    access: nerve_policy::config::Access::ALL,
+                    id: None,
+                    unfinished: false,
+                    toward: Vec::new(),
+                })
+                .collect();
+            crate::grants::Synced {
+                removed: usize::from(recorded),
+                away,
+                ..Default::default()
+            }
+        }
     }
 
     pub(crate) fn layout(root: &Path) -> Layout {
@@ -871,6 +967,12 @@ pub(crate) mod tests {
             home: data,
             release: "http://127.0.0.1:1/none".into(),
         }
+    }
+
+    /// The folders of alice's node run by hand.
+    fn by_hand(root: &Path) -> NodePaths {
+        let home = root.join("Users/alice");
+        NodePaths::new(home.join(".config/nerve"), home.join(".local/state/nerve"))
     }
 
     /// Installs a "program" saying `version`, as alice with her password.
@@ -1135,7 +1237,7 @@ pub(crate) mod tests {
             ),
             (
                 "uninstall",
-                uninstall(&l, &not_admin, false, &mut Vec::new()),
+                uninstall(&l, &by_hand(d.path()), &not_admin, false, &mut Vec::new()),
             ),
         ] {
             let e = e.unwrap_err();
@@ -1157,7 +1259,7 @@ pub(crate) mod tests {
         std::fs::write(&sudo, "sealed").unwrap();
         sys.secured.borrow_mut().clear();
         let mut out = Vec::new();
-        uninstall(&l, &sys, false, &mut out).unwrap();
+        uninstall(&l, &by_hand(d.path()), &sys, false, &mut out).unwrap();
         // No sudo password stays behind: an install over the folders
         // starts with sudo off.
         assert!(!sudo.exists());
@@ -1168,6 +1270,7 @@ pub(crate) mod tests {
             sys.calls().ends_with(&[
                 "stop".into(),
                 "delete".into(),
+                format!("remove grants  of {}", l.paths.state_dir.display()),
                 "no event source".into(),
                 "remove nerve".into()
             ]),
@@ -1201,12 +1304,135 @@ pub(crate) mod tests {
         assert!(out.contains("removed the stored sudo password"), "{out}");
     }
 
+    /// Folder mode's grants come off at uninstall, those of every center,
+    /// and before a purge deletes their record with the state folder.
+    #[test]
+    fn uninstall_takes_the_folder_grants_off_before_the_state_goes() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = installed(d.path(), &sys, "1.0.0");
+        let mut store = SettingsStore::open(
+            l.paths.config_file(),
+            l.paths.config_key(),
+            AuditLog::new(l.paths.audit_log()),
+        )
+        .unwrap();
+        store
+            .update(|c| {
+                for name in ["lab", "home"] {
+                    c.centers.push(nerve_policy::CenterEntry {
+                        name: name.into(),
+                        url: "https://center.example".into(),
+                        pin: None,
+                        center_id: String::new(),
+                        node_id: format!("n-{name}"),
+                        settings: Default::default(),
+                        paused: false,
+                        revoked: false,
+                        unknown: false,
+                        policy: Default::default(),
+                    });
+                }
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        std::fs::write(crate::grants::record_file(&l.paths), "[]").unwrap();
+        let mut out = Vec::new();
+        uninstall(&l, &by_hand(d.path()), &sys, true, &mut out).unwrap();
+        let call = format!(
+            "remove grants n-lab,n-home of {}",
+            l.paths.state_dir.display()
+        );
+        assert!(sys.calls().contains(&call), "{:?}", sys.calls());
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("took 1 folder grants of the commands off"),
+            "{out}"
+        );
+        assert!(!l.paths.state_dir.exists());
+        // No node ran by hand, so it has no grants to take off.
+        assert!(
+            !sys.calls().iter().any(|c| c.contains(".local")),
+            "{:?}",
+            sys.calls()
+        );
+    }
+
+    /// The grants of the node run by hand come off at uninstall too: the
+    /// installed service puts none on, so those are the only ones there
+    /// are. Its folders stay.
+    #[test]
+    fn uninstall_takes_the_grants_of_the_node_run_by_hand_off() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = installed(d.path(), &sys, "1.0.0");
+        let hand = by_hand(d.path());
+        let mut store = SettingsStore::open(
+            hand.config_file(),
+            hand.config_key(),
+            AuditLog::new(hand.audit_log()),
+        )
+        .unwrap();
+        store
+            .update(|c| {
+                c.centers.push(nerve_policy::CenterEntry {
+                    name: "lab".into(),
+                    url: "https://center.example".into(),
+                    pin: None,
+                    center_id: String::new(),
+                    node_id: "n-lab".into(),
+                    settings: Default::default(),
+                    paused: false,
+                    revoked: false,
+                    unknown: false,
+                    policy: Default::default(),
+                });
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        std::fs::write(crate::grants::record_file(&hand), "[]").unwrap();
+        let mut out = Vec::new();
+        uninstall(&l, &hand, &sys, true, &mut out).unwrap();
+        let call = format!("remove grants n-lab of {}", hand.state_dir.display());
+        assert!(sys.calls().contains(&call), "{:?}", sys.calls());
+        let out = String::from_utf8(out).unwrap();
+        let did = format!(
+            "took 1 folder grants of the node run by hand ({}) off",
+            hand.state_dir.display()
+        );
+        assert!(out.contains(&did), "{out}");
+        assert!(hand.config_file().exists() && hand.state_dir.exists());
+    }
+
+    /// Grants on a drive that is not connected stay on: uninstall says so,
+    /// and how they come off, by another uninstall while their record stays.
+    #[test]
+    fn uninstall_names_the_grants_left_on_drives_that_are_not_here() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = installed(d.path(), &sys, "1.0.0");
+        let hand = by_hand(d.path());
+        std::fs::create_dir_all(&hand.state_dir).unwrap();
+        std::fs::write(crate::grants::record_file(&hand), "[]").unwrap();
+        sys.away.borrow_mut().push(PathBuf::from(r"E:\proj"));
+        let mut out = Vec::new();
+        uninstall(&l, &hand, &sys, true, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        let left = format!(
+            "left 1 folder grants of the node run by hand ({}) on, on drives that are not connected now (E:\\proj): connect their drives and run `nerve-node uninstall` again",
+            hand.state_dir.display()
+        );
+        assert!(out.contains(&left), "{out}");
+    }
+
     #[test]
     fn uninstall_purge_deletes_the_folders_and_the_password_and_leaves_a_foreign_user() {
         let d = tempfile::tempdir().unwrap();
         let sys = Fake::new();
         let l = installed(d.path(), &sys, "1.0.0");
-        uninstall(&l, &sys, true, &mut Vec::new()).unwrap();
+        uninstall(&l, &by_hand(d.path()), &sys, true, &mut Vec::new()).unwrap();
         for p in [
             &l.bin,
             &l.home,
@@ -1221,7 +1447,7 @@ pub(crate) mod tests {
         assert!(sys.account(USER).unwrap().is_none());
         // Nothing left, the source included: nothing is said to be removed.
         let mut out = Vec::new();
-        uninstall(&l, &sys, true, &mut out).unwrap();
+        uninstall(&l, &by_hand(d.path()), &sys, true, &mut out).unwrap();
         assert!(
             String::from_utf8(out)
                 .unwrap()
@@ -1231,7 +1457,7 @@ pub(crate) mod tests {
             .borrow_mut()
             .push(account("nerve", 1010, "someone"));
         let mut out = Vec::new();
-        uninstall(&l, &sys, true, &mut out).unwrap();
+        uninstall(&l, &by_hand(d.path()), &sys, true, &mut out).unwrap();
         assert!(sys.account(USER).unwrap().is_some());
         assert!(
             String::from_utf8(out)

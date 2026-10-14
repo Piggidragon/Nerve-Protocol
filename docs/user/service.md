@@ -256,6 +256,11 @@ first install:
 .\nerve-node-x86_64-windows.exe --config-dir "C:\ProgramData\Nerve\config" --state-dir "C:\ProgramData\Nerve\state" config set machine.secret_storage file
 ```
 
+The same account problem keeps the proxy's values out of reach: the installed
+node on Windows takes a proxy only if it needs no header and no password.
+`proxy set` with either is refused and changes nothing
+([proxy](proxy.md#on-the-node-installed-as-a-service-on-windows)).
+
 To run the commands as another account, an ordinary one, name it and run
 `install` again; it asks for that account's password:
 
@@ -278,6 +283,10 @@ administrator's command runs as UAC gives it to a sign-in: the
 Administrators group only denies. Before a command starts, the node checks
 that the account can open neither the node's folders nor a file in them, and
 refuses it if it can. `install` checks the same.
+
+`folder` mode runs no command on the service yet: its AppContainer is not
+started as another account ([modes](modes.md#what-a-command-can-reach-in-folder-mode-windows)).
+Use `allowlist` or `user` mode for its centers.
 
 UAC is no security boundary: a command of an administrator can get the
 group's rights back and read the keys. `install` warns about an account in
@@ -309,7 +318,10 @@ register it yet gets it from the installed program:
 
 `uninstall` stops and removes the service, the source `nerve-node` of the
 Event Log (its entries stay), the user `nerve` and its profile, and the
-program. Without `--purge` the folders and the stored password stay,
+program. It also takes off the folder grants of `folder` mode that a node
+you ran yourself put on
+([modes](modes.md#what-a-command-can-reach-in-folder-mode-windows)); the
+service puts none on. Without `--purge` the folders and the stored password stay,
 open to the administrators only; the [sudo](sudo.md#sudo-on-windows)
 password goes, so sudo is off after a later `install`. A later `install`
 takes them up again.

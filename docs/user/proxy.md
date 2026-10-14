@@ -35,6 +35,31 @@ error. `proxy ls` prints header names only.
 A user name and password in the URL become a `Proxy-Authorization: Basic`
 header. Do not give that header yourself in the same call.
 
+## On the node installed as a service on Windows
+
+The installed node on Windows runs as the account `nerve`, and the Credential
+Manager is one per account. `proxy set` runs as an administrator, so a header
+value or a password would go to the administrator's Credential Manager, where
+the service does not find it. The node keeps them nowhere else (not in a
+file), so the installed node on Windows takes a proxy that needs neither:
+
+```powershell
+nerve-node proxy set http://proxy.example:3128
+```
+
+`proxy set` with `--header`, or with a user name and password in the URL, is
+refused there and changes nothing. If the proxy needs a login, the installed
+node on Windows cannot use it.
+
+A header set before the node was installed (or by an older version) is not read
+by the service: the link stays down. `proxy ls` says so under the header's
+name, with the reason. `nerve-node status` cannot show it: Windows has no
+control socket, so `status` shows no link status there. The service's
+[log](logs.md) has the reason as an `error` line with `bad proxy:`, in
+`C:\ProgramData\Nerve\state\log.jsonl`. Set the proxy again without the header,
+or remove it with `proxy rm`; either deletes the old entry from the Credential
+Manager of the account that runs it.
+
 ## Environment variables
 
 Without `proxy set`, the node uses `HTTPS_PROXY` and `NO_PROXY`. A user name or
@@ -44,11 +69,14 @@ password in `HTTPS_PROXY` is refused. Use `proxy set` for those.
 
 The node does not fall back to a direct connection. If the proxy is down, the
 link stays down. If a keyring entry is missing or unreadable, the link stays
-down and `nerve-node status` shows `bad proxy:` with the reason.
+down and `nerve-node status` shows `bad proxy:` with the reason. Windows has no
+control socket, so there the reason is in `proxy ls` and in the node's
+[log](logs.md).
 
 On a Linux machine with no Secret Service (no desktop session), `proxy set`
 with a header or a password refuses and changes nothing. A proxy without
-either works there.
+either works there. The same holds for the node installed as a service on
+Windows ([above](#on-the-node-installed-as-a-service-on-windows)).
 
 A `node.toml` that holds header values or a login in the file is refused when
 it loads. Take the values out of the file, run `nerve-node config accept`,

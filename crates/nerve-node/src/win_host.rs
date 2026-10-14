@@ -854,6 +854,14 @@ impl WinSystem for WinHost {
             Err(e) => Err(at(e)),
         }
     }
+
+    fn remove_grants(
+        &self,
+        paths: &crate::paths::NodePaths,
+        node_ids: &[String],
+    ) -> crate::grants::Synced {
+        crate::grants::remove_all(paths, node_ids, &mut |m| eprintln!("{m}"))
+    }
 }
 
 /// Lets Windows delete `path` at its next start.

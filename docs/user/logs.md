@@ -125,8 +125,8 @@ whole call.
 
 | Level | Lines |
 |---|---|
-| `error` | A key or the center's address or the proxy cannot be used, so the node stops dialling that center. The audit log or `node.toml` cannot be written. The control socket stopped |
-| `warn` | The node cannot reach a center (the first time after a link, the rest are `debug`). A handshake failed. A link closed without a bye, or went quiet. A center said bye because of a duplicate or an error, or ended the pairing, or does not know this node. A reload of `node.toml` was refused. A call failed |
+| `error` | A key or the center's address or the proxy cannot be used, so the node stops dialling that center. The audit log or `node.toml` cannot be written. The control socket's listener broke, so the socket stopped |
+| `warn` | The node cannot reach a center (the first time after a link, the rest are `debug`). A handshake failed. A link closed without a bye, or went quiet. A center said bye because of a duplicate or an error, or ended the pairing, or does not know this node. A reload of `node.toml` was refused. A call failed. The control socket cannot take a connection now (it takes the next one once the cause is gone) |
 | `info` | The node started and stopped. It linked to a center, and when it will dial again after a link ended, with the wait. A center said bye, or the node closed the link and why. A change to the settings, by whom, the new version and each setting that changed. A call was refused, with the reason. A call failed because of its own arguments or the files it named |
 | `debug` | Each dial. The dials that follow a failed one. A reload that changed nothing |
 

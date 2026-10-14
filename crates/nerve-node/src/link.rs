@@ -1216,7 +1216,7 @@ impl Link {
         inv: &Invoke,
     ) -> Result<Value, RpcError> {
         // The installed node runs every command as the account the owner
-        // chose (crate::account), from its home; folder mode adds Landlock.
+        // chose (crate::account), from its home; folder mode confines it.
         // A missing account stops the command after the call is decided and
         // audited.
         let account = self.shared.command_account(cfg);
@@ -1266,11 +1266,19 @@ impl Link {
             rc.command = exec::sudo_line(&self.shared.sudo_path(), args, &prompt);
             sudo = Some(exec::SudoInput { password, prompt });
         }
+        // Folder mode confines: Landlock on Linux, the pairing's AppContainer
+        // on Windows, by the answer the gate went by.
+        let folder = sudo.is_none() && by_folders && unconfined.is_none();
+        let container = if folder && self.shared.confinement.appcontainer {
+            Some(self.container(entry, cfg, &home).await?)
+        } else {
+            None
+        };
         let guard = Running::start(self, id.clone(), cfg.limits.max_running as usize)?;
         // The account's home is the `~` of its rules: its own shell
         // profiles and keys stay out of them.
         let own = self.shared.own(cfg);
-        let landlock = (sudo.is_none() && by_folders && unconfined.is_none()).then(|| {
+        let landlock = (folder && self.shared.confinement.landlock_abi.is_some()).then(|| {
             // The folders' entries are listed as the account.
             let _as = act_as(known.as_ref()).ok().flatten();
             // The folders a command of any center may write: a link it puts
@@ -1294,6 +1302,7 @@ impl Link {
         let opts = RunOptions {
             shell: cfg.machine.shell.clone(),
             landlock,
+            container,
             exe: self.shared.exe.clone().unwrap_or_default(),
             output_cap: (cfg.limits.output_cap_bytes as usize).min(exec::OUTPUT_HARD_CAP),
             sudo,
@@ -1311,6 +1320,39 @@ impl Link {
             );
         }
         r
+    }
+}
+
+impl Link {
+    /// The AppContainer of the commands of this pairing (`entry`), once the
+    /// folder grants follow `cfg` (crate::grants); `home` is the `~` of the
+    /// rules. A grant of this pairing's container that its folders no longer
+    /// give and that could not be taken off stops the command, and so does a
+    /// record of the grants that cannot be read (`Synced::refusal`).
+    async fn container(
+        &self,
+        entry: &CenterEntry,
+        cfg: &NodeConfig,
+        home: &std::path::Path,
+    ) -> Result<nerve_sandbox::ContainerSpec, RpcError> {
+        let (paths, cfg, home) = (self.shared.paths.clone(), cfg.clone(), home.to_path_buf());
+        // A change that takes long holds the command; the log says how far
+        // it is.
+        let synced = tokio::task::spawn_blocking(move || {
+            crate::grants::apply(&paths, &cfg, &home, &mut |m| {
+                tracing::info!("folder grants: {m}")
+            })
+        })
+        .await
+        .map_err(|e| RpcError::internal(e.to_string()))?;
+        for e in &synced.errors {
+            tracing::warn!("folder grants: {e}");
+        }
+        let name = crate::grants::container(&self.shared.paths, &entry.node_id);
+        if let Some(why) = synced.refusal(&name) {
+            return Err(RpcError::new(ErrorCode::Unavailable, why));
+        }
+        Ok(nerve_sandbox::ContainerSpec { name })
     }
 }
 
@@ -1503,6 +1545,31 @@ mod tests {
         assert!(status.contains(&entry), "{status}");
         assert!(status.contains("proxy set"), "{status}");
         // Fail closed: neither the proxy nor the center was dialled.
+        let quiet = Duration::from_millis(300);
+        assert!(tokio::time::timeout(quiet, proxy.accept()).await.is_err());
+        assert!(tokio::time::timeout(quiet, center.accept()).await.is_err());
+        daemon.stop().await;
+    }
+
+    /// The installed node on Windows runs as `nerve`: a value an
+    /// administrator's `proxy set` left in the Credential Manager is not
+    /// found by the service, so the status says why, and neither the proxy
+    /// nor the center is dialled.
+    #[tokio::test]
+    async fn on_the_installed_node_on_windows_header_values_stop_the_link_and_say_why() {
+        let (d, paths, center, proxy) = behind_a_proxy().await;
+        let headers = [("X-Key".to_string(), "s3cret-value".to_string())];
+        crate::secrets::store_proxy_headers(&paths, &headers).unwrap();
+        crate::secrets::for_tests::pretend_windows_service(&paths);
+        let daemon = start(&d, &paths).await;
+        let status = settled_status(&daemon).await;
+        assert!(status.starts_with("bad proxy: "), "{status}");
+        assert!(
+            status.contains("not to that of nerve")
+                && status.contains("`nerve-node proxy set <url>`"),
+            "{status}"
+        );
+        assert!(!status.contains("s3cret"), "{status}");
         let quiet = Duration::from_millis(300);
         assert!(tokio::time::timeout(quiet, proxy.accept()).await.is_err());
         assert!(tokio::time::timeout(quiet, center.accept()).await.is_err());

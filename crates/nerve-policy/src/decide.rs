@@ -57,8 +57,8 @@ pub struct Call<'a> {
 pub struct Env<'a> {
     pub home: &'a Path,
     pub protected: &'a Protected,
-    /// Why commands run in `folder` mode cannot be confined (Landlock) here,
-    /// or `None` when they can. When they cannot, a command in a folder that
+    /// Why commands run in `folder` mode cannot be confined (Landlock, a
+    /// Windows AppContainer) here, or `None` when they can. When they cannot, a command in a folder that
     /// allows running is refused with this reason.
     pub unconfined: Option<&'a str>,
     /// The node's sudo switch: on only while the node holds a sudo password

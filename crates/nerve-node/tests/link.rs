@@ -3,7 +3,7 @@
 //! and one that no rule allows, folder mode where allow rules do not count,
 //! the 401 stop, and the conformance node checks.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -457,7 +457,8 @@ async fn passes_the_conformance_node_checks() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn folder_mode_confines_commands_to_their_folders() {
-    if !nerve_sandbox::Confinement::detect().available() {
+    // Every Windows has AppContainers; Linux may lack Landlock.
+    if !cfg!(windows) && !nerve_sandbox::Confinement::detect().available() {
         eprintln!("skipped: Landlock is not available here");
         return;
     }
@@ -470,7 +471,13 @@ async fn folder_mode_confines_commands_to_their_folders() {
     let work = dir.path().join("home").join("work");
     std::fs::create_dir_all(&work).unwrap();
     let work = std::fs::canonicalize(&work).unwrap();
+    // As the node keeps a folder: on Windows without the `\\?\` prefix.
+    let work = PathBuf::from(nerve_policy::paths::win::strip_verbatim(
+        &work.display().to_string(),
+    ));
     let outside = dir.path().join("outside.txt");
+    let secret = dir.path().join("secret.txt");
+    std::fs::write(&secret, "the secret").unwrap();
     owner_edit(&o.paths, |c| {
         let p = &mut c.centers[0].policy;
         p.mode = nerve_policy::Mode::Folder;
@@ -488,22 +495,33 @@ async fn folder_mode_confines_commands_to_their_folders() {
         .await
         .unwrap()
         .expect("get");
+    let kind = if cfg!(windows) {
+        "appcontainer"
+    } else {
+        "landlock"
+    };
     assert!(
-        state["confinement"]
-            .as_str()
-            .unwrap()
-            .starts_with("landlock"),
+        state["confinement"].as_str().unwrap().starts_with(kind),
         "{state}"
     );
-    let command = format!(
-        "sh -c 'echo in > inside.txt; echo out > {}'",
-        outside.display()
-    );
+    let command = if cfg!(windows) {
+        format!(
+            "Set-Content inside.txt in; Get-Content -LiteralPath '{}'; Set-Content -LiteralPath '{}' out",
+            secret.display(),
+            outside.display()
+        )
+    } else {
+        format!(
+            "sh -c 'echo in > inside.txt; cat {}; echo out > {}'",
+            secret.display(),
+            outside.display()
+        )
+    };
     let r = conn
         .call(
             "invoke",
             json!({"cap": "exec", "action": "run",
-                   "args": {"command": command, "cwd": work.display().to_string()}}),
+                   "args": {"command": command, "cwd": nerve_policy::paths::to_wire(&work)}}),
             WAIT,
         )
         .await
@@ -511,8 +529,14 @@ async fn folder_mode_confines_commands_to_their_folders() {
         .expect("the command runs");
     assert_ne!(r["exit_code"], 0, "{r}");
     assert_eq!(
-        std::fs::read_to_string(work.join("inside.txt")).unwrap(),
-        "in\n"
+        std::fs::read_to_string(work.join("inside.txt"))
+            .unwrap_or_else(|e| panic!("{e}: {r}"))
+            .trim_end(),
+        "in"
+    );
+    assert!(
+        !r["stdout"].as_str().unwrap().contains("the secret"),
+        "the read outside the folder was blocked: {r}"
     );
     assert!(
         !outside.exists(),
@@ -521,7 +545,78 @@ async fn folder_mode_confines_commands_to_their_folders() {
     node.stop().await;
 }
 
+/// Windows folder mode: a command whose working folder is outside the
+/// folders is refused and audited, and the folder's grant for the center's
+/// AppContainer is there while the folder is, and gone with it.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn windows_folder_grants_follow_the_folders() {
+    let icacls = |p: &Path| {
+        let o = std::process::Command::new("icacls")
+            .arg(p)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&o.stdout).into_owned()
+    };
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let o = options(dir.path());
+    let paths = o.paths.clone();
+    nerve_node::pair::pair(&o.paths, &center.link(), Some("lab"))
+        .await
+        .unwrap();
+    let real = |p: &Path| {
+        PathBuf::from(nerve_policy::paths::win::strip_verbatim(
+            &std::fs::canonicalize(p).unwrap().display().to_string(),
+        ))
+    };
+    std::fs::create_dir_all(dir.path().join("home").join("work")).unwrap();
+    std::fs::create_dir_all(dir.path().join("elsewhere")).unwrap();
+    let work = real(&dir.path().join("home").join("work"));
+    let elsewhere = real(&dir.path().join("elsewhere"));
+    owner_edit(&o.paths, |c| {
+        let p = &mut c.centers[0].policy;
+        p.mode = nerve_policy::Mode::Folder;
+        p.folders.push(nerve_policy::config::Folder {
+            path: work.display().to_string(),
+            access: nerve_policy::config::Access::ALL,
+        });
+    })
+    .await;
+    assert!(icacls(&work).contains("S-1-15-2-"), "{}", icacls(&work));
+    let node = Daemon::start(o).await.unwrap();
+    let mut conn = linked(&mut center).await;
+    let mut run = async |cwd: &Path| {
+        conn.call(
+            "invoke",
+            json!({"cap": "exec", "action": "run",
+                   "args": {"command": "Set-Content here.txt x",
+                            "cwd": nerve_policy::paths::to_wire(cwd)}}),
+            WAIT,
+        )
+        .await
+        .unwrap()
+    };
+    let r = run(&work).await.expect("a command in its folder runs");
+    assert_eq!(r["exit_code"], 0, "{r}");
+    assert!(work.join("here.txt").exists());
+    let e = run(&elsewhere).await.unwrap_err();
+    assert_eq!(nerve_conformance::wire::code_of(&e), "forbidden");
+    assert!(!elsewhere.join("here.txt").exists());
+    node.stop().await;
+    let log = std::fs::read_to_string(paths.audit_log()).unwrap();
+    let refused = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .find(|v| v["action"] == "run" && v["decision"] == "forbidden");
+    assert!(refused.is_some(), "the refusal is audited: {log}");
+
+    owner_edit(&paths, |c| c.centers[0].policy.folders.clear()).await;
+    assert!(!icacls(&work).contains("S-1-15-2-"), "{}", icacls(&work));
+}
+
 /// Runs `command` in `cwd` as an `exec.run` and answers its result.
+#[cfg(target_os = "linux")]
 async fn run_in(conn: &mut Conn<TcpStream>, cwd: &Path, command: &str) -> Value {
     conn.call(
         "invoke",
@@ -539,6 +634,7 @@ async fn run_in(conn: &mut Conn<TcpStream>, cwd: &Path, command: &str) -> Value 
 /// next command's rules must not grant the nested folder's rights there:
 /// Landlock follows a link in a rule's path, so the command would read and
 /// write the place the link leads to.
+#[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
 async fn folder_mode_gives_no_rule_where_a_command_linked_a_nested_folder() {
     if !nerve_sandbox::Confinement::detect().available() {

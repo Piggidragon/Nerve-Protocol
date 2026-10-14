@@ -61,7 +61,7 @@ through its control socket.
 |---|---|
 | Config folder | `node.toml`, signed. `keys/<name>.key`, one Ed25519 key per center, mode 0600 |
 | State folder | `audit.jsonl`, `log.jsonl`, `run/ctl.sock`, `run/ctl.token`, `config.key` (the key of the config's MAC), `keys.lock` |
-| System keyring | With `machine.secret_storage = "keyring"`: the center keys and the config's key instead of their files. Always: the proxy's header values |
+| System keyring | With `machine.secret_storage = "keyring"`: the center keys and the config's key instead of their files. The proxy's header values, always (the installed node on Windows takes none, see node-local §2) |
 
 No call of any center reaches these two folders. See
 [settings and config](settings-and-config.md). The center keeps `tls.pem`,
@@ -76,7 +76,7 @@ No call of any center reaches these two folders. See
 | `crates/nerve-proto` | Wire types and codecs, no I/O |
 | `crates/nerve-transport` | TLS with pinning, `CONNECT` proxies, WebSocket, the node's Ed25519 identity, the sealed sudo password, a small HTTP/1.1 server, local control sockets |
 | `crates/nerve-policy` | The node's config, the decision engine, rules, protected paths, settings, the audit log |
-| `crates/nerve-sandbox` | Landlock confinement for commands |
+| `crates/nerve-sandbox` | Confinement for commands: Landlock on Linux, an AppContainer on Windows |
 | `crates/nerve-node` | The `nerve-node` binary: daemon and CLI |
 | `crates/nerve-center` | The `nerve-center` binary: links, MCP server, web UI |
 | `crates/nerve-conformance` | The conformance suite, an echo node and a fake center |

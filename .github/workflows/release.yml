@@ -8,9 +8,11 @@
 # CHANGELOG.md), a pre-release of a version that is released already. It picks the commit (the head of the branch when the run
 # starts) and the tag, then runs fmt, clippy and the tests. Every build job
 # checks out that commit, so a push to the branch during the run changes
-# nothing. `publish` is the only job that may write: it tags the commit and
-# publishes the release only after every check and build passed, so a failed
-# run leaves no tag. Tags are never moved or reused.
+# nothing. `conformance` runs the conformance suite against the Linux binaries
+# that were built (the ones that will be released), on a runner of their own
+# architecture. `publish` is the only job that may write: it tags the commit
+# and publishes the release only after every check, build and the conformance
+# run passed, so a failed run leaves no tag. Tags are never moved or reused.
 #
 # No secrets: nothing is signed (the node's `update` checks a download against
 # SHA256SUMS). The actions are pinned by commit.
@@ -225,6 +227,50 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # The conformance suite (crates/nerve-conformance) against the binaries that
+  # were built, not against the source: the end-to-end tests start the real
+  # `nerve-center` and `nerve-node` from NERVE_CENTER_BIN and NERVE_NODE_BIN
+  # instead of building them. The static musl binaries are what users run, so a
+  # defect that only they have (a missing system file, a libc difference, a
+  # strip that broke something) fails the release here. Each architecture runs
+  # on a native runner, like its build. The test code is built from the commit
+  # being released.
+  conformance:
+    needs: [check, linux]
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    env:
+      SUFFIX: ${{ matrix.arch }}-linux
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.check.outputs.sha }}
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: nerve-${{ env.SUFFIX }}
+          path: dist
+      # The artifact does not keep the executable bit.
+      - name: The released binaries
+        run: |
+          chmod +x dist/*
+          ls -l dist
+      - name: Conformance suite
+        env:
+          NERVE_CENTER_BIN: ${{ github.workspace }}/dist/nerve-center-${{ env.SUFFIX }}
+          NERVE_NODE_BIN: ${{ github.workspace }}/dist/nerve-node-${{ env.SUFFIX }}
+        run: cargo test --locked -p nerve-conformance --no-fail-fast
+
   windows:
     needs: check
     runs-on: windows-2025
@@ -275,7 +321,7 @@ jobs:
   # before there is a tag. If anything here fails, the last step removes the
   # draft and the tag this run created, and nothing else (see there).
   publish:
-    needs: [check, linux, windows]
+    needs: [check, linux, windows, conformance]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

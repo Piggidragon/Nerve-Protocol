@@ -40,7 +40,12 @@ workflow from" on `main` and fill in:
    `aarch64-unknown-linux-musl` (static) and `x86_64-pc-windows-msvc` (static C
    runtime). Each Linux binary must be static. Each binary must print its
    version from `--version`, and it must equal the one given.
-3. Publishes a GitHub Release with the six binaries and `SHA256SUMS`. A release
+3. Runs the conformance suite (`cargo test -p nerve-conformance`) against the
+   Linux binaries that were just built, the ones to be released, with
+   `NERVE_CENTER_BIN` and `NERVE_NODE_BIN` set to them. `x86_64` runs on an
+   x86_64 runner and `aarch64` on an arm64 runner. The Windows binaries are
+   built but not run by the workflow.
+4. Publishes a GitHub Release with the six binaries and `SHA256SUMS`. A release
    is marked latest. A pre-release is marked as a pre-release.
 
 The binaries are not signed. The workflow uses no secrets. Only its last job

@@ -1485,6 +1485,8 @@ pub async fn run(
     // from others while it runs, and refuses every caller (crate::pipe).
     #[cfg(windows)]
     let _jobless = job.is_none().then(crate::job::Jobless::count);
+    #[cfg(windows)]
+    crate::win_stop::hear_ctrl_c();
     let mut child = cmd.spawn().map_err(|e| {
         RpcError::new(
             ErrorCode::Unavailable,
@@ -1658,6 +1660,7 @@ async fn run_as(
     // The command's own token also starts the helper that asks it to end
     // (crate::win_stop).
     let token = elevated.unwrap_or(token);
+    crate::win_stop::hear_ctrl_c();
     let child = crate::win_user::spawn(&token, &line, Some(&call.cwd), Some(&account.home))
         .map_err(|e| {
             unavailable(format!(

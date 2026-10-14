@@ -410,7 +410,10 @@ dropped link and the call's return end the job at once. A command of another
 account (installed node) is asked by a helper started with that account's
 token. A command without a job (the walk) is not asked. A process started
 with Ctrl+C ignored (`start /b` in cmd, a new process group) does not hear
-it.
+it. Whether a process ignores Ctrl+C passes on to the processes it starts,
+so the node stops ignoring it before it starts its first command; a node
+started with it ignored (over ssh, by `start /b`) hears Ctrl+C on its own
+console from then on.
 
 ### Proxy
 

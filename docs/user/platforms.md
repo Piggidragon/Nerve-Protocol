@@ -69,7 +69,10 @@ behaves the same except where this page says so.
 - Windows has no signals. A timeout, `term` and `int` send Ctrl+C to the
   command's console (each command has one of its own, without a window) and
   ask its windows to close, then end the job 3 seconds later. `kill` ends the
-  job at once. See [what ends a command](stop.md#what-ends-a-command).
+  job at once. See [what ends a command](stop.md#what-ends-a-command). A node
+  started with Ctrl+C ignored, as cmd's `start /b` starts it, stops ignoring
+  it at its first command, so that its commands hear it: Ctrl+C in that
+  console then stops the node too.
 - A process that another program starts for the command, such as WMI, a
   service or the task scheduler, belongs to that program and is not in the job.
 - A Job Object does not limit file access. It is not a sandbox. In `folder`

@@ -23,7 +23,7 @@ use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 use std::time::Duration;
 
 use windows_sys::Win32::Foundation::{HANDLE, HWND, LPARAM, STILL_ACTIVE, WAIT_OBJECT_0};
@@ -57,6 +57,21 @@ pub enum Asker {
     Own(PathBuf),
     /// As the account the command runs as, with `token`, the command's own.
     As(PathBuf, Arc<Token>),
+}
+
+/// Lets the commands the node starts from now on hear Ctrl+C. Whether a
+/// process ignores Ctrl+C passes on to the processes it starts, also through
+/// a console of their own, and a node may be started with it ignored (as
+/// over ssh, or by cmd's `start /b`): none of its commands could then be
+/// asked to end. So the node stops ignoring it before its first command.
+/// Ctrl+C on the node's own console then reaches the node too, which ends
+/// as it does in a terminal.
+pub fn hear_ctrl_c() {
+    static ONCE: Once = Once::new();
+    // SAFETY: a plain call that sets this process's own Ctrl+C state.
+    ONCE.call_once(|| unsafe {
+        SetConsoleCtrlHandler(None, 0);
+    });
 }
 
 /// Asks the processes in `job` to end (blocking, up to [`HELPER_WAIT`]);

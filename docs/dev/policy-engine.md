@@ -347,8 +347,9 @@ how it was checked on Windows 11 Pro 26H2, build 10.0.26300, and what was not:
   command inherits (#89) and the reads of `HKCU\Environment` (#90). The
   network and the reads of the Windows folder and Program Files are what a
   container is for and stay.
-- Known wrong text: the refusal for keys in the keyring names Landlock and the
-  session bus on Windows too; a text per platform is tracked in #91.
+- The refusal for keys in the keyring has a text per platform
+  (`KEYRING_NOT_CONFINED`): on Windows it names the AppContainer and the
+  Credential Manager, not Landlock and the session bus.
 - Not checked: the Credential Manager and DPAPI for the user (the test session
   could not use them), the clipboard against a real desktop, ALPC ports and
   COM servers, network shares. With the node's keys in the Credential

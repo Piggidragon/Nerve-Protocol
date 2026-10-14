@@ -59,7 +59,7 @@ fn harness_part_passes_against_nerve_center() {
     let report = block_on(harness_part::run(&target));
     assert!(report.ok(), "{report}");
     // Every check ran; a count that shrinks silently would hide a lost check.
-    assert_eq!(report.outcomes.len(), 35, "{report}");
+    assert_eq!(report.outcomes.len(), 36, "{report}");
 }
 
 /// The name of the tool for `cap.action` and the arguments that pick `node`

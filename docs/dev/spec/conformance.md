@@ -133,6 +133,7 @@ JSON is a failure of the check, not an empty result.
 | 4 | a call to a node that is offline is `error unavailable`, and its tools stay listed |
 | 5 | two sessions have two ids; a node sees one `ctx.session` per session, so a node that two sessions use sees two |
 | 5 | `DELETE /mcp` ends the session (204), and the ended session is 404 |
+| 5 | `session.end` goes to every node the session used (checked for a session that used two) |
 | 5 | `session.end` names the session's `ctx.session` to a node it used, only for the ended session and not for another session on that node, and is not sent to a node it never used |
 | 5 | the other session goes on, and still reaches the node |
 

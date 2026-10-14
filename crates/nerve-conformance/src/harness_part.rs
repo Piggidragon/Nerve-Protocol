@@ -883,7 +883,7 @@ pub async fn run(target: &Target) -> Report {
     const SENT: &str = "session.end names the session's ctx.session to a node it used";
     const ONLY: &str = "session.end names the ended session only, not another one on the node";
     const NOT_SENT: &str = "a node the session never used is not sent its session.end";
-    match ids {
+    match ids.clone() {
         Ok((id1, id2)) => {
             r.check(
                 "harness 5",
@@ -935,13 +935,48 @@ pub async fn run(target: &Target) -> Report {
         .await,
     );
 
+    // Session 2 used both nodes, and both are still online: its end must reach
+    // each of them.
+    const ALL: &str = "session.end goes to every node the session used";
+    match ids {
+        Ok((_, id2)) => {
+            let res = match s2.end().await {
+                Ok(204) => eventually(|| async {
+                    ensure(
+                        a.ended().contains(&id2) && b.ended().contains(&id2),
+                        format!(
+                            "session.end for the session did not reach both nodes (A {:?}, B {:?})",
+                            a.ended(),
+                            b.ended()
+                        ),
+                    )
+                })
+                .await,
+                Ok(st) => Err(format!("DELETE /mcp answered {st}")),
+                Err(e) => Err(e),
+            };
+            r.check("harness 5", ALL, res);
+        }
+        Err(_) => r.skip("harness 5", ALL, "no two session ids"),
+    }
+
     // harness 4: a node that left keeps its tools, and a call is `unavailable`.
+    // A third session, as the second has ended.
+    let s3 = match Session::open(t, LATEST).await {
+        Ok((s, _)) => s,
+        Err(e) => {
+            r.check("harness 4", "a third session opens", Err(e));
+            a.leave().await;
+            b.leave().await;
+            return r;
+        }
+    };
     b.leave().await;
     r.check(
         "harness 4",
         "a call to a node that is offline is `error unavailable`",
         eventually(|| async {
-            let res = s2
+            let res = s3
                 .call("mirror_say", json!({"node": B, "text": "gone"}))
                 .await?;
             check_error_result(&res, "unavailable")
@@ -952,14 +987,14 @@ pub async fn run(target: &Target) -> Report {
         "harness 4",
         "the tools of a node that is offline stay listed",
         async {
-            let tools = s2.tools().await?;
+            let tools = s3.tools().await?;
             check_shared_tool(&tools, "mirror_say", &[A, B])?;
             check_node_tool(&tools, &format!("{B}_echo_say"))
         }
         .await,
     );
 
-    let _ = s2.end().await;
+    let _ = s3.end().await;
     a.leave().await;
     r
 }

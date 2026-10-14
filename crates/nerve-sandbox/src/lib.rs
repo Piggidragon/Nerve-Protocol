@@ -1236,7 +1236,7 @@ pub mod appcontainer {
     /// `path` with each short (8.3) name in it written out, as the final
     /// path of what it names has them; links and junctions stay as they
     /// are. `path` itself when that fails.
-    fn long_path(path: &Path) -> PathBuf {
+    pub fn long_path(path: &Path) -> PathBuf {
         let p = wide(path.as_os_str());
         let mut buf = vec![0u16; 512];
         loop {

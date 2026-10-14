@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use nerve_policy::audit::AuditLog;
-use nerve_policy::config::{Access, CapSetting, SecretStorage, SettingsGrant};
+use nerve_policy::config::{Access, CapSetting, Folder, SecretStorage, SettingsGrant};
 use nerve_policy::{Mode, NodeConfig, SetError, SettingsStore, rules, sudo_command};
 use nerve_proto::link::PairLink;
 
@@ -1328,12 +1328,12 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             center,
         }) => {
             let (changes, center) = take_center_flag(changes, center)?;
-            let change = FolderChange::Set {
-                path: resolve_folder(&path)?,
-                given: path.display().to_string(),
-                changes,
-            };
-            let a = change_folder(&paths, &center, &change).await?;
+            let a = change_stored_folder(&paths, &center, &path, |at| FolderChange::Set {
+                path: at.clone(),
+                given: at,
+                changes: changes.clone(),
+            })
+            .await?;
             let access = a.access.unwrap_or(Access::NONE);
             w(
                 out,
@@ -1349,11 +1349,11 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             Ok(())
         }
         Cmd::Folder(FolderCmd::Rm { path, center }) => {
-            let change = FolderChange::Rm {
-                path: resolve_folder(&path)?,
-                given: path.display().to_string(),
-            };
-            let a = change_folder(&paths, &center, &change).await?;
+            let a = change_stored_folder(&paths, &center, &path, |at| FolderChange::Rm {
+                path: at.clone(),
+                given: at,
+            })
+            .await?;
             w(out, format!("{}: removed {}", a.center, a.path));
             Ok(())
         }
@@ -1649,7 +1649,7 @@ async fn setup_steps(
     }
     let (cfg, _) = read_config(paths).await?;
     if let (Some(sys), Some(name)) = (machine, create_user) {
-        let c = crate::service::create_account(sys, paths, name, out)?;
+        let c = crate::service::create_account(sys, paths, name, &invoker(), out)?;
         let chosen = (c.made || cfg.machine.user.as_deref() != Some(name)).then_some(c);
         account_chosen(paths, chosen, out, steps).await?;
     }
@@ -1679,12 +1679,14 @@ async fn setup_steps(
     if let Some(sys) = machine
         && create_user.is_none()
     {
-        let suggested = Some(invoker()).filter(|u| u != "root");
+        let who = invoker();
+        let suggested = Some(who.as_str()).filter(|u| *u != "root");
         let chosen = crate::service::choose_account(
             sys,
             paths,
             cfg.machine.user.as_deref(),
-            suggested.as_deref(),
+            suggested,
+            &who,
             input,
             out,
         )?;
@@ -1909,26 +1911,108 @@ async fn add_folder(
     };
     // The rights are checked before the folder is looked at.
     let access = FolderChange::new_rights(rights)?;
-    let change = FolderChange::Add {
-        path: resolve_folder(path)?,
-        access,
+    let (cfg, _) = read_config(paths).await?;
+    let name = pick_center(&cfg, center)?;
+    let given = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| e.to_string())?
+            .join(path)
     };
-    let a = change_folder(paths, center, &change).await?;
+    let given = nerve_policy::paths::normal_folder(&given.display().to_string())?;
+    // A running node judges the path as the account the commands run as,
+    // which this command may not be (the installed node's CLI runs as the
+    // node's own user): it follows the links on the path a link at a time,
+    // refuses one a command may have put inside a `w` folder, and stores and
+    // records the real place, all in one step.
+    #[cfg(unix)]
+    let asked = {
+        let params = json!({"center": name, "path": given, "access": access.to_string()});
+        match nerve_transport::ctl::call(&paths.ctl_socket(), "folder.add", params).await {
+            Ok(v) => Some((
+                v["stored"].as_str().unwrap_or(&given).to_string(),
+                v["recorded"] == true,
+                v["mode"].as_str().map(str::to_string),
+            )),
+            Err(e) if e == nerve_transport::ctl::NOT_RUNNING => None,
+            Err(e) => return Err(e),
+        }
+    };
+    #[cfg(not(unix))]
+    let asked: Option<(String, bool, Option<String>)> = None;
+    let (stored, recorded, mode) = match asked {
+        Some(a) => a,
+        None => {
+            // No node to ask (on Windows the node's pipe takes the change but
+            // not the judging): judge the path here, as this process sees it.
+            let settled = crate::exec::settle(&cfg, &crate::paths::home_dir(), Path::new(&given));
+            let (stored, recorded) = match settled {
+                crate::exec::Settled::Refused(why) => {
+                    return Err(crate::daemon::refusal(&given, &why));
+                }
+                crate::exec::Settled::At(place) => (place.display().to_string(), true),
+                crate::exec::Settled::Unknown => (given.clone(), false),
+            };
+            let change = FolderChange::Add {
+                path: stored.clone(),
+                access,
+                recorded,
+            };
+            let a = change_folder(paths, center, &change).await?;
+            (stored, recorded, Some(a.mode.as_str().to_string()))
+        }
+    };
     w(
         out,
-        format!("{}: folder {} {}", a.center, a.path, access.to_chmod()),
+        format!("{name}: folder {stored} {}", access.to_chmod()),
     );
-    if a.mode != Mode::Folder {
+    if !recorded {
         w(
             out,
             format!(
-                "note: folders count in folder mode; {} is in {} mode (`nerve-node mode set folder`)",
-                a.center,
-                a.mode.as_str()
+                "note: {stored} is stored as given and not recorded at its real place, since this command cannot tell where its path leads (the installed node's CLI may not look into the account's home) and no running node could: a link that replaces the folder later is followed once no `w` folder shows it, see modes.md \"A folder keeps the place you added\"; start the node and add the folder again"
+            ),
+        );
+    } else if !same_folder(&stored, &given) {
+        w(
+            out,
+            format!("note: {given} leads to {stored}; the folder is stored there"),
+        );
+    }
+    if let Some(mode) = mode.filter(|m| m != Mode::Folder.as_str()) {
+        w(
+            out,
+            format!(
+                "note: folders count in folder mode; {name} is in {mode} mode (`nerve-node mode set folder`)"
             ),
         );
     }
     Ok(())
+}
+
+/// Whether two folder paths name one place.
+fn same_folder(a: &str, b: &str) -> bool {
+    use nerve_policy::paths::within;
+    within(Path::new(a), Path::new(b)) && within(Path::new(b), Path::new(a))
+}
+
+/// `folder set` and `folder rm`: the change `make` builds for the stored
+/// folder `path` means ([`stored_folder`]), made as [`change_folder`] makes
+/// it. The folder is looked up on the config as the CLI reads it, then named
+/// by its stored path, so that a change to the file in between ends in "not
+/// a folder of this center" and never in another folder.
+async fn change_stored_folder(
+    paths: &NodePaths,
+    center: &CenterArg,
+    path: &Path,
+    make: impl FnOnce(String) -> FolderChange,
+) -> Result<Applied, String> {
+    let (cfg, _) = read_config(paths).await?;
+    let name = pick_center(&cfg, center)?;
+    let folders = &cfg.center(&name).expect("picked above").policy.folders;
+    let at = stored_folder(folders, path)?;
+    change_folder(paths, center, &make(at)).await
 }
 
 /// Changes a center's folders. On Windows a running node takes the change
@@ -2105,6 +2189,40 @@ fn enum_str<T: serde::Serialize>(v: &T) -> String {
 
 fn parse_enum<T: serde::de::DeserializeOwned>(s: &str, choices: &str) -> Result<T, String> {
     serde_json::from_value(json!(s)).map_err(|_| format!("{s:?}: expected {choices}"))
+}
+
+/// The path of the stored folder `folder set` and `folder rm` mean by `path`,
+/// found before the path is resolved, which fails where a dangling link or a
+/// loop of links stands now. In this order: the folder the path is spelled as
+/// (made absolute and tidy, no link followed); the folder its resolution lands
+/// at, a link at a time (`folder add` stored the real place of a path through
+/// a link of the owner's, and a link may have replaced that place since); the
+/// folder at the real place the path leads to.
+fn stored_folder(folders: &[Folder], path: &Path) -> Result<String, String> {
+    use nerve_policy::paths::within;
+    let same = |a: &Path, b: &Path| within(a, b) && within(b, a);
+    let stored = |p: &Path| {
+        folders
+            .iter()
+            .find(|f| same(p, Path::new(&f.path)))
+            .map(|f| f.path.clone())
+    };
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| e.to_string())?
+            .join(path)
+    };
+    let spelled = nerve_policy::paths::normal_folder(&abs.display().to_string()).ok();
+    if let Some(f) = spelled.and_then(|s| stored(Path::new(&s))) {
+        return Ok(f);
+    }
+    if let Some(f) = crate::exec::lands_at(&abs, |p| stored(p).is_some()).and_then(|p| stored(&p)) {
+        return Ok(f);
+    }
+    let real = resolve_folder(path)?;
+    stored(Path::new(&real)).ok_or_else(|| crate::folder_change::not_a_folder(&real, folders))
 }
 
 /// Folders are stored resolved (symlinks followed), the way the policy
@@ -2944,6 +3062,361 @@ mod tests {
             assert_eq!(folders().len(), 1, "added again, not twice");
             assert_eq!(folders()[0].access.to_string(), want, "{rights:?}");
         }
+    }
+
+    /// `folder add` records the place it stores, so that a link which
+    /// replaces the folder later is refused (`exec::folder_sets`). Adding it
+    /// again, also through a link of the owner's, keeps one entry; `folder
+    /// set` keeps it, and `folder rm` takes it away with the folder.
+    #[cfg(unix)]
+    #[test]
+    fn folder_add_records_the_place_and_rm_forgets_it() {
+        let (d, paths) = setup(&["home"]);
+        let work = d.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink(&work, &link).unwrap();
+        let real = nerve_policy::paths::resolve(&work)
+            .unwrap()
+            .display()
+            .to_string();
+        let (work, link) = (work.to_str().unwrap(), link.to_str().unwrap());
+        let places = || load(&paths).centers[0].policy.places.clone();
+        assert!(places().is_empty());
+        run(&paths, &["folder", "add", work, "+r"]).unwrap();
+        assert_eq!(places(), std::slice::from_ref(&real));
+        // The same place again, and by a link: one folder, one entry.
+        run(&paths, &["folder", "add", link, "+rw"]).unwrap();
+        run(&paths, &["folder", "set", work, "+x"]).unwrap();
+        assert_eq!(load(&paths).centers[0].policy.folders.len(), 1);
+        assert_eq!(places(), std::slice::from_ref(&real));
+        run(&paths, &["folder", "rm", link]).unwrap();
+        assert!(load(&paths).centers[0].policy.folders.is_empty());
+        assert!(places().is_empty());
+        // Added once more, it is recorded once more.
+        run(&paths, &["folder", "add", work, "+r"]).unwrap();
+        assert_eq!(places(), std::slice::from_ref(&real));
+    }
+
+    /// A folder the CLI cannot look into (the installed node's CLI runs as
+    /// `nerve`, a home may be closed to it) is stored as given and cannot be
+    /// recorded here: with no running node to judge it as the account, the
+    /// command says so.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_the_cli_cannot_judge_is_added_with_a_note_and_no_record() {
+        use std::os::unix::fs::PermissionsExt;
+        if nerve_transport::net::euid() == 0 {
+            return; // root looks into every folder
+        }
+        let (d, paths) = setup(&["home"]);
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join("proj")).unwrap();
+        let proj = home.join("proj");
+        let closed = std::fs::Permissions::from_mode(0o000);
+        std::fs::set_permissions(&home, closed).unwrap();
+        let out = run(&paths, &["folder", "add", proj.to_str().unwrap(), "+rw"]);
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let out = out.unwrap();
+        assert!(out.contains("not recorded at its real place"), "{out}");
+        assert!(out.contains(&proj.display().to_string()), "{out}");
+        let policy = load(&paths).centers[0].policy.clone();
+        assert_eq!(policy.folders.len(), 1);
+        assert!(policy.places.is_empty(), "{policy:?}");
+        // One it could judge says nothing of the kind.
+        let out = run(&paths, &["folder", "add", proj.to_str().unwrap(), "+rw"]).unwrap();
+        assert!(!out.contains("not recorded"), "{out}");
+        assert_eq!(load(&paths).centers[0].policy.places.len(), 1);
+        // Added again where it cannot look, the rights change and the record
+        // it has stays: a record only narrows, and the node checks it as the
+        // account before each command.
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let out = run(&paths, &["folder", "add", proj.to_str().unwrap(), "+r"]);
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(out.unwrap().contains("not recorded at its real place"));
+        let policy = load(&paths).centers[0].policy.clone();
+        assert_eq!(policy.folders.len(), 1);
+        assert_eq!(policy.folders[0].access.to_string(), "r");
+        assert_eq!(policy.places, [proj.display().to_string()]);
+    }
+
+    /// In the state the new warning reports, a link has replaced a recorded
+    /// folder and its real place is another folder. `folder set` and `folder
+    /// rm` act on the folder the path is spelled as (also with a trailing
+    /// slash), name it, and leave the folder the link leads to alone; a path
+    /// that is a link to a folder still finds the folder at its real place.
+    #[cfg(unix)]
+    #[test]
+    fn folder_set_and_rm_find_a_folder_a_link_replaced_by_its_spelling() {
+        let (d, paths) = setup(&["home"]);
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let (work, docs) = (root.join("work"), root.join("docs"));
+        let bin = work.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir(&docs).unwrap();
+        for (p, rights) in [(&work, "+rw"), (&bin, "+r"), (&docs, "+r")] {
+            run(&paths, &["folder", "add", p.to_str().unwrap(), rights]).unwrap();
+        }
+        std::fs::remove_dir(&bin).unwrap();
+        std::os::unix::fs::symlink(&docs, &bin).unwrap();
+        let folders = || load(&paths).centers[0].policy.clone();
+        let access = |p: &Path| {
+            let policy = folders();
+            let f = policy.folders.iter().find(|f| Path::new(&f.path) == p);
+            f.map(|f| f.access.to_string())
+        };
+        let spelled = format!("{}/", bin.display());
+
+        let out = run(&paths, &["folder", "set", &spelled, "+x"]).unwrap();
+        assert!(
+            out.contains(&format!("folder {} r-x", bin.display())),
+            "{out}"
+        );
+        assert_eq!(access(&bin).as_deref(), Some("rx"));
+        assert_eq!(access(&docs).as_deref(), Some("r"));
+
+        let out = run(&paths, &["folder", "rm", &spelled]).unwrap();
+        assert!(out.contains(&format!("removed {}", bin.display())), "{out}");
+        assert_eq!(access(&bin), None);
+        assert_eq!(access(&docs).as_deref(), Some("r"));
+        assert!(!folders().is_placed(&bin.display().to_string()));
+        assert!(folders().is_placed(&docs.display().to_string()));
+
+        // The owner's own link to a folder finds the folder it leads to.
+        let to_docs = root.join("to-docs");
+        std::os::unix::fs::symlink(&docs, &to_docs).unwrap();
+        let out = run(&paths, &["folder", "rm", to_docs.to_str().unwrap()]).unwrap();
+        assert!(
+            out.contains(&format!("removed {}", docs.display())),
+            "{out}"
+        );
+        assert_eq!(access(&docs), None);
+        assert_eq!(access(&work).as_deref(), Some("rw"));
+    }
+
+    /// `folder rm` and `folder set` find the stored folder by the path the
+    /// owner gave `folder add`, when that went through a link of the owner's
+    /// and the stored place has been replaced by a link since; and where a
+    /// dangling link or a loop of links stands in the folder's place, which
+    /// resolving the path would refuse. A folder the path only passes is not
+    /// the folder it names.
+    #[cfg(unix)]
+    #[test]
+    fn folder_rm_and_set_reach_a_folder_through_links_and_where_none_resolves() {
+        let (d, paths) = setup(&["home"]);
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let (work, docs, data) = (root.join("work"), root.join("docs"), root.join("data"));
+        let (real, code) = (data.join("real"), root.join("code"));
+        for p in [&work.join("bin"), &work.join("sub"), &docs, &real] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        std::os::unix::fs::symlink(&real, &code).unwrap();
+        for (p, rights) in [
+            (&work, "+rw"),
+            (&work.join("bin"), "+r"),
+            (&code, "+r"),
+            (&docs, "+r"),
+        ] {
+            run(&paths, &["folder", "add", p.to_str().unwrap(), rights]).unwrap();
+        }
+        let listed = || -> Vec<String> {
+            load(&paths).centers[0]
+                .policy
+                .folders
+                .iter()
+                .map(|f| f.path.clone())
+                .collect()
+        };
+        let has = |p: &Path| listed().contains(&p.display().to_string());
+        assert!(has(&real) && !has(&code), "stored at the real place");
+
+        // The stored place is replaced by a link to `docs`: `code`, the path
+        // the owner gave, still names the stored folder and not `docs`.
+        std::fs::remove_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&docs, &real).unwrap();
+        let out = run(&paths, &["folder", "set", code.to_str().unwrap(), "+x"]).unwrap();
+        assert!(
+            out.contains(&format!("folder {} r-x", real.display())),
+            "{out}"
+        );
+        let out = run(&paths, &["folder", "rm", code.to_str().unwrap()]).unwrap();
+        assert!(
+            out.contains(&format!("removed {}", real.display())),
+            "{out}"
+        );
+        assert!(!has(&real) && has(&docs));
+
+        // A folder the path only passes is not the folder it names.
+        let e = run(
+            &paths,
+            &["folder", "rm", work.join("sub").to_str().unwrap()],
+        )
+        .unwrap_err();
+        assert!(e.contains("not a folder of this center"), "{e}");
+        assert!(has(&work));
+
+        // A dangling link, and then a loop, stand where `work/bin` was.
+        let bin = work.join("bin");
+        std::fs::remove_dir(&bin).unwrap();
+        std::os::unix::fs::symlink(root.join("nowhere"), &bin).unwrap();
+        let out = run(&paths, &["folder", "set", bin.to_str().unwrap(), "-r"]).unwrap();
+        assert!(
+            out.contains(&format!("folder {} ---", bin.display())),
+            "{out}"
+        );
+        std::fs::remove_file(&bin).unwrap();
+        std::os::unix::fs::symlink(&bin, &bin).unwrap();
+        let out = run(&paths, &["folder", "rm", bin.to_str().unwrap()]).unwrap();
+        assert!(out.contains(&format!("removed {}", bin.display())), "{out}");
+        assert!(!has(&bin) && has(&work) && has(&docs));
+        // What is not stored under any spelling still says why.
+        let e = run(&paths, &["folder", "rm", bin.to_str().unwrap()]).unwrap_err();
+        assert!(
+            e.contains("Too many levels") || e.contains("symlink"),
+            "{e}"
+        );
+    }
+
+    /// The installed node's CLI runs as `nerve`, which cannot look into the
+    /// owner's home: a link there stays as typed, and the folder `folder add`
+    /// stored at the place the link leads to is not found. `folder set` and
+    /// `folder rm` then name the path `folder ls` shows (issue #98), also where
+    /// the center has more folders than the hint would list.
+    #[cfg(unix)]
+    #[test]
+    fn folder_set_and_rm_name_the_listed_folder_for_a_link_the_cli_cannot_look_into() {
+        use std::os::unix::fs::PermissionsExt;
+        if nerve_transport::net::euid() == 0 {
+            return; // root looks into every folder
+        }
+        let (d, paths) = setup(&["home"]);
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let (home, data) = (root.join("home"), root.join("data"));
+        let (proj, work) = (home.join("proj"), data.join("work"));
+        for p in [&proj, &work] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        let (link, far) = (home.join("linkproj"), home.join("sub").join("linkwork"));
+        std::fs::create_dir(home.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&proj, &link).unwrap();
+        std::os::unix::fs::symlink(&work, &far).unwrap();
+        for p in [&proj, &work] {
+            run(&paths, &["folder", "add", p.to_str().unwrap(), "+r"]).unwrap();
+        }
+        let listed = |n: usize| load(&paths).centers[0].policy.folders.len() == n;
+        // While the CLI can look at the link, it finds the folder.
+        let out = run(&paths, &["folder", "set", link.to_str().unwrap(), "+x"]).unwrap();
+        assert!(
+            out.contains(&format!("folder {} r-x", proj.display())),
+            "{out}"
+        );
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let mut errors = Vec::new();
+        for args in [["set", "+w"], ["rm", ""]] {
+            let mut cmd = vec!["folder", args[0], link.to_str().unwrap()];
+            if !args[1].is_empty() {
+                cmd.push(args[1]);
+            }
+            errors.push(run(&paths, &cmd).unwrap_err());
+        }
+        // Only folders far from the path are listed, and more than the hint
+        // would name: it still says what to do.
+        for n in ["a", "b"] {
+            let p = root.join(n);
+            std::fs::create_dir(&p).unwrap();
+            run(&paths, &["folder", "add", p.to_str().unwrap(), "+r"]).unwrap();
+        }
+        errors.push(run(&paths, &["folder", "rm", far.to_str().unwrap()]).unwrap_err());
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for e in &errors[..2] {
+            assert!(
+                e.starts_with(&format!(
+                    "{} is not a folder of this center",
+                    link.display()
+                )),
+                "{e}"
+            );
+            assert!(
+                e.ends_with(&format!(
+                    "`nerve-node folder ls` shows for the folder: {}",
+                    proj.display()
+                )),
+                "{e}"
+            );
+        }
+        let e = &errors[2];
+        assert!(e.contains("this account cannot look into it"), "{e}");
+        assert!(e.ends_with("shows for the folder"), "{e}");
+        // The refused calls changed nothing.
+        assert!(listed(4));
+    }
+
+    /// A link a command may have put inside a folder it can write in is not
+    /// followed by `folder add`: it would store, and record, whatever the link
+    /// leads to, past the check that keeps such a folder out of the sandbox.
+    /// A link of the owner's elsewhere is followed, as before.
+    #[cfg(unix)]
+    #[test]
+    fn folder_add_does_not_follow_a_link_inside_a_write_folder() {
+        let (d, paths) = setup(&["home"]);
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let (work, docs) = (root.join("work"), root.join("docs"));
+        let bin = work.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir(&docs).unwrap();
+        run(&paths, &["folder", "add", work.to_str().unwrap(), "+rw"]).unwrap();
+        // The folder is a plain one first, and then a command replaces it.
+        run(&paths, &["folder", "add", bin.to_str().unwrap(), "+r"]).unwrap();
+        std::fs::remove_dir(&bin).unwrap();
+        std::os::unix::fs::symlink(&docs, &bin).unwrap();
+        let before = load(&paths).centers[0].policy.clone();
+        let e = run(&paths, &["folder", "add", bin.to_str().unwrap(), "+rx"]).unwrap_err();
+        assert!(e.contains("link") && e.contains("may write"), "{e}");
+        let policy = load(&paths).centers[0].policy.clone();
+        assert_eq!(
+            policy, before,
+            "nothing changed, the record of `bin` included"
+        );
+        assert!(policy.is_placed(&bin.display().to_string()));
+        assert!(!policy.is_placed(&docs.display().to_string()));
+        assert!(!policy.is_placed(&docs.display().to_string()));
+        // A link of the owner's outside every write folder is followed.
+        let to_docs = root.join("to-docs");
+        std::os::unix::fs::symlink(&docs, &to_docs).unwrap();
+        run(&paths, &["folder", "add", to_docs.to_str().unwrap(), "+r"]).unwrap();
+        assert!(
+            load(&paths).centers[0]
+                .policy
+                .is_placed(&docs.display().to_string())
+        );
+    }
+
+    /// On Windows, a junction a command may have put inside a folder it can
+    /// write in is not followed by `folder add` either.
+    #[cfg(windows)]
+    #[test]
+    fn folder_add_does_not_follow_a_junction_inside_a_write_folder() {
+        let (d, paths) = setup(&["home"]);
+        let root = nerve_policy::paths::resolve(d.path()).unwrap();
+        let (work, docs) = (root.join("work"), root.join("docs"));
+        let bin = work.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir(&docs).unwrap();
+        run(&paths, &["folder", "add", work.to_str().unwrap(), "+rw"]).unwrap();
+        std::fs::remove_dir(&bin).unwrap();
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&bin)
+            .arg(&docs)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+        let e = run(&paths, &["folder", "add", bin.to_str().unwrap(), "+rx"]).unwrap_err();
+        assert!(e.contains("link") && e.contains("may write"), "{e}");
+        let policy = load(&paths).centers[0].policy.clone();
+        assert_eq!(policy.folders.len(), 1, "nothing was stored: {policy:?}");
+        assert!(!policy.is_placed(&docs.display().to_string()));
     }
 
     #[test]

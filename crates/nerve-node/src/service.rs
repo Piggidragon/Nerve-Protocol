@@ -179,6 +179,11 @@ pub trait System {
     fn account(&self, name: &str) -> Result<Option<Account>, String>;
     /// The groups of [`crate::account::ROOT_GROUPS`] the account is in.
     fn root_groups(&self, account: &Account) -> Vec<String>;
+    /// Whether `account` gets root through sudo without a password
+    /// (`sudo -n true`, run as it).
+    fn sudo_without_password(&self, _account: &Account) -> bool {
+        false
+    }
     /// Makes a system user with a group of the same name, the home given
     /// (not created) and no login, marked with [`USER_MARK`].
     fn add_account(&self, name: &str, home: &Path) -> Result<(), String>;
@@ -222,6 +227,65 @@ impl System for Host {
 
     fn root_groups(&self, account: &Account) -> Vec<String> {
         crate::account::root_groups(account)
+    }
+
+    fn sudo_without_password(&self, account: &Account) -> bool {
+        // Sudo run as root for the account, so no password is asked for
+        // the switch. The rules come first: an account whose rules surely
+        // grant no root command without a password is never run as,
+        // because its sudo would log a failed login and mail root about it.
+        // The rules are read to err towards running as the account.
+        let mut list = std::process::Command::new("sudo");
+        list.args(["-n", "-l", "-U", &account.name])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        regain_root(&mut list);
+        let Ok(o) = list.output() else {
+            return false;
+        };
+        let listing = String::from_utf8_lossy(&o.stdout);
+        if !crate::account::lists_no_password(&listing) {
+            return false;
+        }
+        // Where the account's sudo would call PAM even with `-n` (sudo-rs,
+        // `noninteractive_auth`), a probe counts as a failed login that
+        // can lock the account (pam_faillock): the rules say alone.
+        let mut v = std::process::Command::new("sudo");
+        v.arg("-V")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        regain_root(&mut v);
+        // Only a sudo that says so on stdout is known to stay out of PAM.
+        let version = match v.output() {
+            Ok(v) if v.status.success() => String::from_utf8_lossy(&v.stdout).into_owned(),
+            _ => String::new(),
+        };
+        if !crate::account::probe_stays_out_of_pam(&version, &listing) {
+            return true;
+        }
+        // The account's own sudo, which `-n` never lets ask, and `-k`
+        // keeps from taking the ticket its owner has just made by typing
+        // the password for this command. As root, whatever `runas_default`
+        // says: that is what the rules were read for.
+        let mut c = std::process::Command::new("sudo");
+        c.args([
+            "-n",
+            "-u",
+            &account.name,
+            "--",
+            "sudo",
+            "-n",
+            "-k",
+            "-u",
+            "root",
+            "--",
+            "true",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+        regain_root(&mut c);
+        c.status().is_ok_and(|s| s.success())
     }
 
     fn add_user(&self, name: &str, home: &Path) -> Result<(), String> {
@@ -520,7 +584,8 @@ fn plain_log(log: &Path) -> Result<(), String> {
 /// `install`: the user, the folders, the account of the commands, the
 /// program, the unit, the running service, in that order. `invoker` is the
 /// account that ran install (`SUDO_USER`, else root); it becomes the account
-/// of the commands unless one is chosen already. Running it again puts back
+/// of the commands unless one is chosen already, and the account chosen is
+/// warned about when it gets root. Running it again puts back
 /// what is missing and restarts the service.
 pub fn install(
     layout: &Layout,
@@ -681,6 +746,11 @@ fn default_account(layout: &Layout, sys: &dyn System, invoker: &str, steps: &mut
             AuditLog::new(p.audit_log()),
         )?;
         if let Some(u) = &store.config().machine.user {
+            // An earlier install or setup chose it; its warning holds
+            // today as well.
+            if let Ok(Some(a)) = sys.account(u) {
+                warn_about(sys, &a, invoker, steps.out);
+            }
             return Ok(format!("commands run as {u}, as chosen before"));
         }
         let a = usable_account(sys, p, invoker)?;
@@ -690,7 +760,7 @@ fn default_account(layout: &Layout, sys: &dyn System, invoker: &str, steps: &mut
                 Ok(())
             })
             .map_err(|e| e.to_string())?;
-        warn_about(sys, &a, steps.out);
+        warn_about(sys, &a, invoker, steps.out);
         Ok::<_, String>(format!("commands run as {invoker}, who ran install"))
     })();
     match r {
@@ -735,15 +805,17 @@ pub fn usable_account(sys: &dyn System, paths: &NodePaths, name: &str) -> Result
 }
 
 /// Warns when `a` as the account of the commands lets them get root: root
-/// itself, or an account in a group that gets root without a password.
-fn warn_about(sys: &dyn System, a: &Account, out: &mut dyn Write) {
-    if a.uid == 0 {
-        let _ = writeln!(out, "{}", crate::account::root_warning());
-        return;
-    }
-    let groups = sys.root_groups(a);
-    if !groups.is_empty() {
-        let _ = writeln!(out, "{}", crate::account::group_warning(&a.name, &groups));
+/// itself, the account that ran sudo (`invoker`), an account in a group
+/// that gets root without a password, or one with sudo that asks for none.
+/// It never stops the command that calls it.
+fn warn_about(sys: &dyn System, a: &Account, invoker: &str, out: &mut dyn Write) {
+    let groups = if a.uid == 0 {
+        Vec::new()
+    } else {
+        sys.root_groups(a)
+    };
+    for w in crate::account::root_warnings(a, invoker, &groups, || sys.sudo_without_password(a)) {
+        let _ = writeln!(out, "{w}");
     }
 }
 
@@ -757,12 +829,15 @@ pub struct Chosen {
 /// The account step of `setup` on the installed node: which account
 /// the node runs commands as. Enter keeps `current`, else takes
 /// `suggested` (the account that runs setup). An account that does not
-/// exist is made when the owner says yes. `None`: nothing changes.
+/// exist is made when the owner says yes. `None`: nothing changes. The
+/// account that stays is warned about as well as one chosen, with
+/// `invoker` the account that ran sudo.
 pub fn choose_account(
     sys: &dyn System,
     paths: &NodePaths,
     current: Option<&str>,
     suggested: Option<&str>,
+    invoker: &str,
     input: &mut dyn BufRead,
     out: &mut dyn Write,
 ) -> Result<Option<Chosen>, String> {
@@ -787,6 +862,9 @@ pub fn choose_account(
         (a, _) => a.to_string(),
     };
     if current == Some(name.as_str()) {
+        if let Ok(Some(a)) = sys.account(&name) {
+            warn_about(sys, &a, invoker, out);
+        }
         return Ok(None);
     }
     if !nerve_policy::config::valid_account_name(&name) {
@@ -814,7 +892,7 @@ pub fn choose_account(
         made = true;
     }
     let a = usable_account(sys, paths, &name)?;
-    warn_about(sys, &a, out);
+    warn_about(sys, &a, invoker, out);
     Ok(Some(Chosen { name, made }))
 }
 
@@ -825,6 +903,7 @@ pub fn create_account(
     sys: &dyn System,
     paths: &NodePaths,
     name: &str,
+    invoker: &str,
     out: &mut dyn Write,
 ) -> Result<Chosen, String> {
     if !nerve_policy::config::valid_account_name(name) || !crate::account::makeable_name(name) {
@@ -843,7 +922,7 @@ pub fn create_account(
         let _ = writeln!(out, "made the account {name}");
     }
     let a = usable_account(sys, paths, name)?;
-    warn_about(sys, &a, out);
+    warn_about(sys, &a, invoker, out);
     Ok(Chosen {
         name: name.to_string(),
         made,
@@ -1485,6 +1564,8 @@ pub(crate) mod tests {
         starts: std::cell::Cell<bool>,
         /// The accounts in a group that gets root, and that group.
         root_groups: RefCell<Vec<(String, String)>>,
+        /// The accounts whose sudo asks for no password.
+        sudo_without_password: RefCell<Vec<String>>,
         /// Whether the node's user keeps a session (a keyring's linger).
         lingers: std::cell::Cell<bool>,
     }
@@ -1498,6 +1579,7 @@ pub(crate) mod tests {
                 given: RefCell::new(Vec::new()),
                 starts: std::cell::Cell::new(true),
                 root_groups: RefCell::new(Vec::new()),
+                sudo_without_password: RefCell::new(Vec::new()),
                 lingers: std::cell::Cell::new(false),
             }
         }
@@ -1557,6 +1639,9 @@ pub(crate) mod tests {
                 .filter(|(a, _)| *a == account.name)
                 .map(|(_, g)| g.clone())
                 .collect()
+        }
+        fn sudo_without_password(&self, account: &Account) -> bool {
+            self.sudo_without_password.borrow().contains(&account.name)
         }
         fn add_user(&self, name: &str, home: &Path) -> Result<(), String> {
             self.calls
@@ -1674,7 +1759,10 @@ pub(crate) mod tests {
             out.contains("commands run as alice, who ran install"),
             "{out}"
         );
-        assert!(!out.contains("Warning"), "{out}");
+        // The account that ran sudo is no boundary: the warning is there,
+        // and install went on.
+        assert!(out.contains("alice is the account that ran sudo"), "{out}");
+        assert!(out.contains("setup --create-user nerve-work"), "{out}");
         let cfg = SettingsStore::peek(&l.paths.config_file(), &l.paths.config_key()).unwrap();
         assert_eq!(cfg.machine.user.as_deref(), Some("alice"));
         assert!(out.contains("sudo nerve-node setup"), "{out}");
@@ -1914,7 +2002,15 @@ pub(crate) mod tests {
     ) -> (Result<Option<Chosen>, String>, String) {
         let mut out = Vec::new();
         let mut input = std::io::Cursor::new(typed.as_bytes().to_vec());
-        let r = choose_account(sys, &l.paths, current, Some("alice"), &mut input, &mut out);
+        let r = choose_account(
+            sys,
+            &l.paths,
+            current,
+            Some("alice"),
+            "alice",
+            &mut input,
+            &mut out,
+        );
         (r, String::from_utf8(out).unwrap())
     }
 
@@ -1934,13 +2030,15 @@ pub(crate) mod tests {
         let (r, out) = choose(&sys, &l, None, "\n");
         assert_eq!(r.unwrap(), chosen("alice", false));
         assert!(out.contains("[alice]"), "{out}");
-        assert_eq!(choose(&sys, &l, Some("alice"), "\n").0.unwrap(), None);
-        // Chosen: another account that exists.
+        // Kept: nothing changes, and the warning is said again.
+        let (r, out) = choose(&sys, &l, Some("alice"), "\n");
+        assert_eq!(r.unwrap(), None);
+        assert!(out.contains("alice is the account that ran sudo"), "{out}");
+        // Chosen: another account that exists, and a boundary.
         sys.others.borrow_mut().push(other("carol", 4343));
-        assert_eq!(
-            choose(&sys, &l, Some("alice"), "carol\n").0.unwrap(),
-            chosen("carol", false)
-        );
+        let (r, out) = choose(&sys, &l, Some("alice"), "carol\n");
+        assert_eq!(r.unwrap(), chosen("carol", false));
+        assert!(!out.contains("Warning"), "{out}");
         // Made: setup asks, then makes it.
         let (r, out) = choose(&sys, &l, Some("alice"), "bob\ny\n");
         assert_eq!(r.unwrap(), chosen("bob", true));
@@ -1966,6 +2064,7 @@ pub(crate) mod tests {
         );
         assert_eq!(r.unwrap(), chosen("carol", false));
         assert!(out.contains("carol is in the group docker"), "{out}");
+        assert!(out.contains("--create-user nerve-work"), "{out}");
         let (_, out) = choose(
             &sys,
             &l,
@@ -1973,7 +2072,7 @@ pub(crate) mod tests {
             "alice
 ",
         );
-        assert!(!out.contains("Warning"), "{out}");
+        assert!(out.contains("alice is the account that ran sudo"), "{out}");
         // Refused: one that is not there and is not to be made, a name
         // useradd would not take, the node's own user.
         let made = sys.calls().len();
@@ -1986,6 +2085,67 @@ pub(crate) mod tests {
         assert_eq!(sys.calls().len(), made, "nothing was made");
         let e = choose(&sys, &l, None, "nerve\n").0.unwrap_err();
         assert!(e.contains("node's own user"), "{e}");
+    }
+
+    /// An account whose sudo asks for no password is warned about by
+    /// install and by setup, kept or chosen, and neither stops.
+    #[test]
+    fn a_sudo_without_a_password_is_warned_about() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        sys.others.borrow_mut().push(other("carol", 4343));
+        sys.sudo_without_password.borrow_mut().push("carol".into());
+        // Install, for the account chosen before as for a new one.
+        let l = layout(d.path());
+        let install_as = |who: &str| {
+            let mut out = Vec::new();
+            install(&l, &sys, Path::new("/bin/true"), who, &mut out).unwrap();
+            String::from_utf8(out).unwrap()
+        };
+        let out = install_as("carol");
+        assert!(
+            out.contains("carol may use sudo without a password"),
+            "{out}"
+        );
+        assert!(
+            out.contains("sudo nerve-node setup --create-user nerve-work"),
+            "{out}"
+        );
+        assert!(out.contains("commands run as carol"), "{out}");
+        let out = install_as("alice");
+        assert!(
+            out.contains("commands run as carol, as chosen before"),
+            "{out}"
+        );
+        assert!(
+            out.contains("carol may use sudo without a password"),
+            "{out}"
+        );
+        assert!(!out.contains("alice is the account"), "{out}");
+        // Setup: kept, chosen, and made with --create-user.
+        let (r, out) = choose(&sys, &l, Some("carol"), "\n");
+        assert_eq!(r.unwrap(), None);
+        assert!(
+            out.contains("carol may use sudo without a password"),
+            "{out}"
+        );
+        let (r, out) = choose(&sys, &l, Some("bob"), "carol\n");
+        assert!(r.unwrap().is_some());
+        assert!(
+            out.contains("carol may use sudo without a password"),
+            "{out}"
+        );
+        let mut out = Vec::new();
+        create_account(&sys, &l.paths, "carol", "alice", &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("carol may use sudo without a password"),
+            "{out}"
+        );
+        // An account made for the node is a boundary.
+        let mut out = Vec::new();
+        create_account(&sys, &l.paths, "nerve-work", "alice", &mut out).unwrap();
+        assert!(!String::from_utf8(out).unwrap().contains("Warning"));
     }
 
     /// The installed node is known by its folders, not by how it started.
@@ -2008,7 +2168,7 @@ pub(crate) mod tests {
         let l = installed(d.path(), &sys, "1.0.0");
         let create = |name: &str| {
             let mut out = Vec::new();
-            let r = create_account(&sys, &l.paths, name, &mut out);
+            let r = create_account(&sys, &l.paths, name, "alice", &mut out);
             (r, String::from_utf8(out).unwrap())
         };
         let (r, out) = create("bob");

@@ -25,7 +25,14 @@ const CHANGES_MAX: usize = 64;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FolderChange {
     /// Adds the folder with these rights, or replaces the rights it had.
-    Add { path: String, access: Access },
+    /// `recorded` says the CLI settled `path` at its real place, so the
+    /// center's record of places gets the folder (`CenterPolicy::places`);
+    /// without it a record the folder has stays as it is.
+    Add {
+        path: String,
+        access: Access,
+        recorded: bool,
+    },
     /// Changes the rights of a folder the center has, left to right (`=rwx`,
     /// `+x`, `-w`).
     Set {
@@ -60,6 +67,8 @@ struct Params {
     given: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     access: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recorded: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     changes: Option<Vec<String>>,
 }
@@ -104,12 +113,18 @@ impl FolderChange {
             path: String::new(),
             given: None,
             access: None,
+            recorded: None,
             changes: None,
         };
         match self {
-            FolderChange::Add { path, access } => {
+            FolderChange::Add {
+                path,
+                access,
+                recorded,
+            } => {
                 p.path = path.clone();
                 p.access = Some(access.to_string());
+                p.recorded = Some(*recorded);
             }
             FolderChange::Set {
                 path,
@@ -148,8 +163,8 @@ impl FolderChange {
         if let Some(g) = &p.given {
             check("given", g)?;
         }
-        let change = match (method, p.given, p.access, p.changes) {
-            ("folder.add", None, Some(access), None) => {
+        let change = match (method, p.given, p.access, p.recorded, p.changes) {
+            ("folder.add", None, Some(access), recorded, None) => {
                 let access = Access::parse(&access)?;
                 if access.is_none() {
                     return Err("a new folder grants some right: r, w or x".into());
@@ -157,9 +172,10 @@ impl FolderChange {
                 FolderChange::Add {
                     path: p.path,
                     access,
+                    recorded: recorded.unwrap_or(false),
                 }
             }
-            ("folder.set", Some(given), None, Some(changes)) => {
+            ("folder.set", Some(given), None, None, Some(changes)) => {
                 if changes.is_empty() {
                     return Err("name what to change: =rwx, +x or -w".into());
                 }
@@ -176,7 +192,7 @@ impl FolderChange {
                     changes,
                 }
             }
-            ("folder.rm", Some(given), None, None) => FolderChange::Rm {
+            ("folder.rm", Some(given), None, None, None) => FolderChange::Rm {
                 path: p.path,
                 given,
             },
@@ -192,12 +208,21 @@ impl FolderChange {
     /// it, `None` for a removed one.
     pub fn apply(&self, e: &mut CenterEntry) -> Result<Option<Access>, String> {
         match self {
-            FolderChange::Add { path, access } => {
-                e.policy.folders.retain(|f| f.path != *path);
+            FolderChange::Add {
+                path,
+                access,
+                recorded,
+            } => {
+                // The same place in another spelling is the same folder: one
+                // entry, as `validate` keeps it.
+                e.policy.folders.retain(|f| !same_place(&f.path, path));
                 e.policy.folders.push(Folder {
                     path: path.clone(),
                     access: *access,
                 });
+                if *recorded {
+                    e.policy.set_placed(path, true);
+                }
                 Ok(Some(*access))
             }
             FolderChange::Set {
@@ -205,15 +230,12 @@ impl FolderChange {
                 given,
                 changes,
             } => {
-                let Some(i) = e
+                let f = e
                     .policy
                     .folders
-                    .iter()
-                    .position(|f| f.path == *path || f.path == *given)
-                else {
-                    return Err(not_a_folder(path, &e.policy.folders));
-                };
-                let f = &mut e.policy.folders[i];
+                    .iter_mut()
+                    .find(|f| f.path == *path || f.path == *given)
+                    .ok_or_else(|| format!("{path} is not a folder of this center"))?;
                 f.access = changes.iter().try_fold(f.access, |a, c| a.change(c))?;
                 Ok(Some(f.access))
             }
@@ -223,7 +245,7 @@ impl FolderChange {
                     .folders
                     .retain(|f| f.path != *path && f.path != *given);
                 if e.policy.folders.len() == before {
-                    return Err(not_a_folder(path, &e.policy.folders));
+                    return Err(format!("{path} is not a folder of this center"));
                 }
                 Ok(None)
             }
@@ -247,14 +269,18 @@ const HINT_MAX: usize = 3;
 /// cannot read the account's home, so a link there was kept as typed and
 /// not resolved), the folder may be listed under the path the link leads
 /// to: the message names the folders `folder ls` shows that could be it,
-/// the ones beside the path first. The lookup itself stays as it is.
-fn not_a_folder(path: &str, folders: &[Folder]) -> String {
+/// the ones beside the path first, or, with none to name, that `folder ls`
+/// shows it. The lookup itself is `stored_folder`'s, in the CLI.
+pub fn not_a_folder(path: &str, folders: &[Folder]) -> String {
     let plain = format!("{path} is not a folder of this center");
     let refused = matches!(
         std::fs::symlink_metadata(path),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied
     );
     if !refused {
+        return plain;
+    }
+    if folders.is_empty() {
         return plain;
     }
     let parent = Path::new(path).parent();
@@ -268,13 +294,20 @@ fn not_a_folder(path: &str, folders: &[Folder]) -> String {
     } else {
         beside
     };
-    if named.is_empty() {
-        return plain;
+    let hint = format!(
+        "{plain}; this account cannot look into it, so if it is a link, use the path `nerve-node folder ls` shows for the folder"
+    );
+    match named.is_empty() {
+        true => hint,
+        false => format!("{hint}: {}", named.join(", ")),
     }
-    format!(
-        "{plain}; this account cannot look into it, so if it is a link, use the path `nerve-node folder ls` shows for the folder: {}",
-        named.join(", ")
-    )
+}
+
+/// Whether two folder paths name one place, compared as the policy does.
+fn same_place(a: &str, b: &str) -> bool {
+    use nerve_policy::paths::within;
+    let (a, b) = (std::path::Path::new(a), std::path::Path::new(b));
+    within(a, b) && within(b, a)
 }
 
 /// The center a per-center command means: the one named, or the only one.
@@ -351,6 +384,12 @@ mod tests {
             FolderChange::Add {
                 path: "/srv/a".into(),
                 access: FolderChange::new_rights(&["+r".into(), "+x".into()]).unwrap(),
+                recorded: false,
+            },
+            FolderChange::Add {
+                path: "/srv/a".into(),
+                access: FolderChange::new_rights(&["+w".into()]).unwrap(),
+                recorded: true,
             },
             FolderChange::Set {
                 path: "/srv/a".into(),
@@ -370,6 +409,22 @@ mod tests {
                 assert_eq!(got_center.as_deref(), center);
             }
         }
+    }
+
+    /// An `add` that does not say it was recorded is not.
+    #[test]
+    fn an_add_without_the_record_records_nothing() {
+        let (_, got) =
+            FolderChange::from_request("folder.add", json!({"path": "/srv/a", "access": "r"}))
+                .unwrap();
+        assert_eq!(
+            got,
+            FolderChange::Add {
+                path: "/srv/a".into(),
+                access: Access::parse("r").unwrap(),
+                recorded: false,
+            }
+        );
     }
 
     /// A request is checked as the CLI checks what it was given, and one that
@@ -413,6 +468,12 @@ mod tests {
             json!({"path": "/srv/a", "given": "a", "sudo": "on"}),
         );
         assert!(e.contains("unknown field"), "{e}");
+        // The record goes with an `add` only.
+        let e = refused(
+            "folder.rm",
+            json!({"path": "/srv/a", "given": "a", "recorded": true}),
+        );
+        assert!(e.contains("bad parameters for folder.rm"), "{e}");
         refused("folder.rm", json!({"path": "/srv/a"}));
         refused("folder.add", json!({"path": "", "access": "r"}));
         refused("folder.add", json!({"path": "/srv/\0a", "access": "r"}));
@@ -433,6 +494,7 @@ mod tests {
         let add = FolderChange::Add {
             path: "/srv/a".into(),
             access: Access::parse("rw").unwrap(),
+            recorded: false,
         };
         let a = apply_to(&mut one, None, &add).unwrap();
         assert_eq!(
@@ -444,15 +506,37 @@ mod tests {
                 mode: Mode::Allowlist,
             }
         );
-        // Adding it again replaces its rights.
+        assert!(one.center("home").unwrap().policy.places.is_empty());
+        // Adding it again replaces its rights, and records the place the CLI
+        // settled it at.
         let again = FolderChange::Add {
             path: "/srv/a".into(),
             access: Access::parse("x").unwrap(),
+            recorded: true,
         };
         apply_to(&mut one, Some("home"), &again).unwrap();
-        let folders = &one.center("home").unwrap().policy.folders;
-        assert_eq!(folders.len(), 1);
-        assert_eq!(folders[0].access.to_chmod(), "--x");
+        let policy = &one.center("home").unwrap().policy;
+        assert_eq!(policy.folders.len(), 1);
+        assert_eq!(policy.folders[0].access.to_chmod(), "--x");
+        assert_eq!(policy.places, ["/srv/a"]);
+        // The same place in another spelling is the same folder; a change
+        // that records nothing leaves the record it has.
+        let spelled = FolderChange::Add {
+            path: "/srv//a/".into(),
+            access: Access::parse("r").unwrap(),
+            recorded: false,
+        };
+        apply_to(&mut one, Some("home"), &spelled).unwrap();
+        let policy = &one.center("home").unwrap().policy;
+        assert_eq!(policy.folders.len(), 1);
+        assert_eq!(policy.folders[0].path, "/srv//a/");
+        assert_eq!(policy.places, ["/srv/a"]);
+        let again = FolderChange::Add {
+            path: "/srv/a".into(),
+            access: Access::parse("x").unwrap(),
+            recorded: false,
+        };
+        apply_to(&mut one, Some("home"), &again).unwrap();
         // A folder saved as typed is found by that spelling.
         let set = FolderChange::Set {
             path: "/elsewhere".into(),
@@ -489,77 +573,6 @@ mod tests {
     }
 
     /// `folder add` takes rights that each start with `+`, and some right.
-    /// A link in a folder the node's account may not look into stays as
-    /// typed, so the folder (kept under the path it leads to) is not found;
-    /// the error names the path `folder ls` shows.
-    #[cfg(unix)]
-    #[test]
-    fn a_path_the_node_cannot_look_into_names_the_listed_folder() {
-        use std::os::unix::fs::PermissionsExt;
-        if nerve_transport::net::euid() == 0 {
-            return; // root looks into every folder
-        }
-        let d = tempfile::tempdir().unwrap();
-        let home = std::fs::canonicalize(d.path()).unwrap().join("home");
-        let proj = home.join("proj");
-        std::fs::create_dir_all(&proj).unwrap();
-        let (proj, link) = (
-            proj.display().to_string(),
-            home.join("linkproj").display().to_string(),
-        );
-        let mut cfg = config(&["home"]);
-        let add = FolderChange::Add {
-            path: proj.clone(),
-            access: Access::parse("r").unwrap(),
-        };
-        apply_to(&mut cfg, None, &add).unwrap();
-        let set = FolderChange::Set {
-            path: link.clone(),
-            given: link.clone(),
-            changes: vec!["+w".into()],
-        };
-        let rm = FolderChange::Rm {
-            path: link.clone(),
-            given: link.clone(),
-        };
-        // While the node can look at the path, it is a plain miss.
-        let plain = format!("{link} is not a folder of this center");
-        assert_eq!(apply_to(&mut cfg, None, &set).unwrap_err(), plain);
-        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o000)).unwrap();
-        let (s, r) = (
-            apply_to(&mut cfg, None, &set),
-            apply_to(&mut cfg, None, &rm),
-        );
-        // The folders beside the path are named; none beside, and no more
-        // than a few in all, every folder is.
-        let other = FolderChange::Add {
-            path: "/srv/a".into(),
-            access: Access::parse("r").unwrap(),
-        };
-        apply_to(&mut cfg, None, &other).unwrap();
-        let beside = apply_to(&mut cfg, None, &set).unwrap_err();
-        let far = format!("{}/elsewhere/link", home.display());
-        let far_set = FolderChange::Set {
-            path: far.clone(),
-            given: far,
-            changes: vec!["+w".into()],
-        };
-        let far_err = apply_to(&mut cfg, None, &far_set).unwrap_err();
-        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
-        for e in [s.unwrap_err(), r.unwrap_err(), beside] {
-            assert!(e.starts_with(&plain), "{e}");
-            assert!(
-                e.ends_with(&format!(
-                    "`nerve-node folder ls` shows for the folder: {proj}"
-                )),
-                "{e}"
-            );
-        }
-        assert!(far_err.ends_with(&format!("{proj}, /srv/a")), "{far_err}");
-        // Nothing was changed by the refused calls.
-        assert_eq!(cfg.center("home").unwrap().policy.folders.len(), 2);
-    }
-
     #[test]
     fn a_new_folder_names_its_rights() {
         let rights = |r: &[&str]| {
@@ -573,5 +586,52 @@ mod tests {
                 .unwrap_err()
                 .contains("name what the center may do")
         );
+    }
+
+    /// A path the node's account may not look into may be a link to a listed
+    /// folder: the error then names the folders `folder ls` shows, the ones
+    /// beside the path first, and says what to look for when none is named.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_the_node_cannot_look_into_points_to_the_listed_folders() {
+        use std::os::unix::fs::PermissionsExt;
+        if nerve_transport::net::euid() == 0 {
+            return; // root looks into every folder
+        }
+        let d = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(d.path()).unwrap().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let link = home.join("linkproj").display().to_string();
+        let folder = |p: &str| Folder {
+            path: p.into(),
+            access: Access::parse("r").unwrap(),
+        };
+        let beside = format!("{}/proj", home.display());
+        let plain = format!("{link} is not a folder of this center");
+        let hint = format!(
+            "{plain}; this account cannot look into it, so if it is a link, use the path `nerve-node folder ls` shows for the folder"
+        );
+        let few = [folder(&beside), folder("/srv/a")];
+        let many: Vec<Folder> = ["/srv/a", "/srv/b", "/srv/c", "/data/work"]
+            .map(folder)
+            .into();
+        // While the node can look at the path, it is a plain miss.
+        assert_eq!(not_a_folder(&link, &few), plain);
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let got = [
+            not_a_folder(&link, &[]),
+            not_a_folder(&link, &few),
+            not_a_folder(&link, &[folder("/srv/a"), folder("/srv/b")]),
+            not_a_folder(&link, &many),
+        ];
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        // No folder at all: nothing to point to.
+        assert_eq!(got[0], plain);
+        // A folder beside the path is named alone.
+        assert_eq!(got[1], format!("{hint}: {beside}"));
+        // None beside, and no more than a few in all: every folder.
+        assert_eq!(got[2], format!("{hint}: /srv/a, /srv/b"));
+        // None beside and more than a few: still the hint, with no names.
+        assert_eq!(got[3], hint);
     }
 }

@@ -258,6 +258,63 @@ impl Shared {
         }
     }
 
+    /// `folder add` for the CLI (`folder.add`): judges the folder at `path`
+    /// (absolute, as given) as the account the commands run as, stores it at
+    /// its real place with `access` and records it. The installed node's CLI
+    /// runs as the node's own user, which may not look into that account's
+    /// home or resolve a `w` folder there, so it cannot judge the links on the
+    /// path; the node looks as the account does, as it does before a command
+    /// ([`crate::exec::settle`]). Nothing changes when the path crosses a link
+    /// inside a `w` folder (an error with the reason). Where the node cannot
+    /// tell either, the folder is stored as given and not recorded, and a
+    /// record it had stays.
+    #[cfg(unix)]
+    pub fn add_folder(
+        &self,
+        center: &str,
+        path: &str,
+        access: nerve_policy::config::Access,
+    ) -> Result<AddedFolder, String> {
+        use crate::exec::Settled;
+        use crate::folder_change::{FolderChange, apply_to};
+        let cfg = self.config();
+        if cfg.center(center).is_none() {
+            return Err(format!("no center named {center}"));
+        }
+        let given = nerve_policy::paths::normal_folder(path)?;
+        let account = self.command_account(&cfg).unwrap_or(None);
+        let home = account
+            .as_ref()
+            .map_or_else(|| self.home.clone(), |a| a.home.clone());
+        let settled = {
+            let _as = crate::link::act_as(account.as_ref()).map_err(|e| e.message)?;
+            crate::exec::settle(&cfg, &home, std::path::Path::new(&given))
+        };
+        let (stored, recorded) = match settled {
+            Settled::Refused(why) => return Err(refusal(path, &why)),
+            Settled::At(place) => (place.display().to_string(), true),
+            Settled::Unknown => (given, false),
+        };
+        let change = FolderChange::Add {
+            path: stored.clone(),
+            access,
+            recorded,
+        };
+        let mut applied = None;
+        lock(&self.store)
+            .update(|c| {
+                applied = Some(apply_to(c, Some(center), &change)?);
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+        self.bump();
+        Ok(AddedFolder {
+            stored,
+            recorded,
+            mode: applied.expect("applied when update succeeds").mode,
+        })
+    }
+
     pub fn bump(&self) {
         self.changed.send_modify(|v| *v += 1);
         self.tell_confinement(&self.config());
@@ -890,6 +947,26 @@ async fn start_ctl(_shared: Arc<Shared>) -> Result<JoinHandle<()>, String> {
     Ok(tokio::spawn(async {}))
 }
 
+/// What [`Shared::add_folder`] stored.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+pub struct AddedFolder {
+    /// The path the folder is stored at.
+    pub stored: String,
+    /// Whether it is recorded at its real place (`CenterPolicy::places`).
+    pub recorded: bool,
+    /// The center's mode, for the CLI's note on folders counting in folder
+    /// mode only.
+    pub mode: nerve_policy::Mode,
+}
+
+/// The message of a refused `folder add`, for the CLI and the node alike.
+pub fn refusal(path: &str, why: &str) -> String {
+    format!(
+        "{path}: {why}. A command may have put a link there: look at it (`ls -l`, `dir /AL`), add the place you mean by its own path, or remove the link"
+    )
+}
+
 /// Why the pipe refuses a folder change while `node.toml` (version
 /// `on_disk`) holds changes the node (version `in_force`) has not taken.
 fn file_ahead(on_disk: u64, in_force: u64) -> String {
@@ -1089,6 +1166,25 @@ pub(crate) fn control(
                     Reply::Err(format!("conflict: the config changed (version {current})"))
                 }
                 Err(e) => Reply::Err(e.to_string()),
+            }
+        }
+        "folder.add" => {
+            let (Some(center), Some(path), Some(access)) =
+                (str_of("center"), str_of("path"), str_of("access"))
+            else {
+                return Reply::Err("center, path and access are needed".into());
+            };
+            let access = match nerve_policy::config::Access::parse(&access) {
+                Ok(a) => a,
+                Err(e) => return Reply::Err(e),
+            };
+            match shared.add_folder(&center, &path, access) {
+                Ok(a) => Reply::Ok(json!({
+                    "stored": a.stored,
+                    "recorded": a.recorded,
+                    "mode": a.mode.as_str(),
+                })),
+                Err(e) => Reply::Err(e),
             }
         }
         "config.accept" => {
@@ -1642,6 +1738,7 @@ mod tests {
         let add = FolderChange::Add {
             path: folder.clone(),
             access: Access::parse("rx").unwrap(),
+            recorded: true,
         };
         let before = s.config().version;
         let ticks = *s.changed.borrow();
@@ -1672,6 +1769,17 @@ mod tests {
         };
         assert_eq!(folders().len(), 1);
         assert_eq!(folders()[0].access.to_chmod(), "r-x");
+        // The place the CLI settled the folder at is recorded with it.
+        let places = || {
+            daemon
+                .config()
+                .center("home")
+                .unwrap()
+                .policy
+                .places
+                .clone()
+        };
+        assert_eq!(places(), std::slice::from_ref(&folder));
         assert!(*s.changed.borrow() > ticks, "the links were not told");
         let paths = daemon.paths();
         let saved = SettingsStore::peek(&paths.config_file(), &paths.config_key()).unwrap();
@@ -1684,6 +1792,7 @@ mod tests {
         let v = call(1000, set.method(), set.params(None)).await.unwrap();
         assert_eq!(v["access"], "rw");
         assert_eq!(folders()[0].access.to_chmod(), "rw-");
+        assert_eq!(places(), std::slice::from_ref(&folder));
         // The same checks as the CLI's: a folder the center does not have,
         // a right that is none, a path that is not absolute, and no other
         // change than a folder's.
@@ -1715,6 +1824,7 @@ mod tests {
         let v = call(1000, rm.method(), rm.params(None)).await.unwrap();
         assert_eq!(v["access"], Value::Null);
         assert!(folders().is_empty());
+        assert!(places().is_empty());
         assert!(call(1000, "status", json!({})).await.is_ok());
         daemon.stop().await;
     }
@@ -1764,6 +1874,7 @@ mod tests {
         let add = FolderChange::Add {
             path: d.path().join("work").display().to_string(),
             access: Access::parse("r").unwrap(),
+            recorded: false,
         };
         let r = pipe_control(&s, add.method(), add.params(None), false).await;
         let Reply::Err(e) = r else {
@@ -1790,6 +1901,119 @@ mod tests {
         assert!(matches!(r, Reply::Ok(_)), "refused");
         assert_eq!(saved().mode, nerve_policy::Mode::Folder);
         assert_eq!(saved().folders.len(), 1);
+        daemon.stop().await;
+    }
+
+    /// `folder.add` judges, stores and records a folder in one step, for a CLI
+    /// that may not look where the node does (the installed node's CLI runs
+    /// as the node's own user, not as the account): a path through a link of
+    /// the account is stored at the place it leads to, one through a link
+    /// inside a `w` folder is refused and nothing changes, and a dangling link
+    /// is refused as it always was.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_node_judges_stores_and_records_a_folder_it_is_asked_to_add() {
+        use nerve_policy::config::{Access, Folder};
+        use nerve_transport::ctl::Reply;
+        let (d, daemon) = daemon().await;
+        let s = daemon.shared.clone();
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let (work, other, wdir) = (root.join("work"), root.join("other"), root.join("wdir"));
+        let (link2, dangling) = (root.join("link2"), root.join("dangling"));
+        for dir in [&work, &other, &wdir] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        std::os::unix::fs::symlink(&other, &link2).unwrap();
+        std::os::unix::fs::symlink(root.join("nowhere"), &dangling).unwrap();
+        // A link a command could have put inside a folder it may write in.
+        let bin = wdir.join("bin");
+        std::os::unix::fs::symlink(&other, &bin).unwrap();
+        lock(&s.store)
+            .update(|c| {
+                c.centers.push(nerve_policy::CenterEntry {
+                    name: "home".into(),
+                    url: "https://center.example".into(),
+                    pin: None,
+                    center_id: "c".into(),
+                    node_id: "n".into(),
+                    settings: Default::default(),
+                    paused: false,
+                    revoked: false,
+                    unknown: false,
+                    policy: nerve_policy::CenterPolicy {
+                        folders: vec![Folder {
+                            path: wdir.display().to_string(),
+                            access: Access::parse("rw").unwrap(),
+                        }],
+                        ..Default::default()
+                    },
+                });
+                Ok(())
+            })
+            .unwrap();
+        let ask = |center: &str, p: &std::path::Path, access: &str, pid| {
+            let params = json!({
+                "center": center,
+                "path": p.display().to_string(),
+                "access": access,
+            });
+            control(&s, "folder.add", params, pid)
+        };
+        let add = |p: &std::path::Path, access: &str| {
+            let Reply::Ok(v) = ask("home", p, access, None) else {
+                panic!("folder.add of {} failed", p.display())
+            };
+            (
+                v["stored"].as_str().unwrap().to_string(),
+                v["recorded"].as_bool().unwrap(),
+                v["mode"].as_str().unwrap().to_string(),
+            )
+        };
+        let refused = |p: &std::path::Path| {
+            let Reply::Err(e) = ask("home", p, "r", None) else {
+                panic!("folder.add of {} was not refused", p.display())
+            };
+            e
+        };
+        let policy = || s.config().centers[0].policy.clone();
+        let listed = |p: &std::path::Path| {
+            policy()
+                .folders
+                .iter()
+                .find(|f| std::path::Path::new(&f.path) == p)
+                .map(|f| f.access.to_string())
+        };
+        // Its own place: stored where it is, recorded, with the center's mode.
+        let (work_s, other_s) = (work.display().to_string(), other.display().to_string());
+        assert_eq!(add(&work, "r"), (work_s.clone(), true, "allowlist".into()));
+        assert_eq!(policy().places, std::slice::from_ref(&work_s));
+        // Through a link of the account: stored at the place it leads to, with
+        // the access it was given, and recorded there. Never stored as given.
+        assert_eq!(
+            add(&link2, "rw"),
+            (other_s.clone(), true, "allowlist".into())
+        );
+        assert_eq!(listed(&link2), None);
+        assert_eq!(listed(&other).as_deref(), Some("rw"));
+        assert!(policy().is_placed(&other_s));
+        // Again with other rights: one entry, one record.
+        add(&other, "x");
+        assert_eq!(listed(&other).as_deref(), Some("x"));
+        assert_eq!(policy().places.len(), 2);
+        // Refused, and nothing changes: a link inside a `w` folder (a command
+        // may have put it there), and a dangling link.
+        let before = policy();
+        let why = refused(&bin);
+        assert!(why.contains("link") && why.contains("may write"), "{why}");
+        assert!(refused(&dangling).contains("dangling"));
+        assert_eq!(policy(), before);
+        // Only a center of the node, and only the owner asks.
+        assert!(matches!(ask("lab", &work, "r", None), Reply::Err(e) if e.contains("no center")));
+        let me = std::process::id();
+        lock(&s.commands).insert(me, "home".into());
+        assert!(
+            matches!(ask("home", &work, "r", Some(me)), Reply::Err(e) if e.starts_with("refused"))
+        );
         daemon.stop().await;
     }
 

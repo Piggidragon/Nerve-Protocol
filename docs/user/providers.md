@@ -53,7 +53,9 @@ the [settings grant](settings-grant.md) can allow a provider's action itself
 while the provider is attached, except one that senses (a camera, a
 microphone): only you turn those on. While no provider offers a capability
 or one of its actions, only you can allow it or turn it on, as the node
-cannot tell yet what it does.
+cannot tell yet what it does. An entry a center wrote while the capability
+did not sense stays when a new version of the program makes it sense: after
+such an update, check `nerve-node rule ls allow` and `nerve-node cap ls`.
 
 When the program exits, its capabilities leave the centers' tool lists, and a
 call that was waiting for it fails with `unavailable`.

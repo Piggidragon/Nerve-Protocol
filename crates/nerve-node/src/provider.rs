@@ -111,9 +111,10 @@ impl Providers {
     /// neither the node's own nor offered now; and an action that an offered
     /// capability does not have now. The node cannot tell what such a
     /// capability or action will do once a provider offers it, so a center's
-    /// entry for it waits for the owner. Only an entry for a whole capability
-    /// that is offered and does not sense passes; a later attach that adds a
-    /// sense action to it is not caught.
+    /// entry for it waits for the owner. An entry for an offered capability
+    /// that does not sense, or for one of its actions, passes; the node cannot
+    /// check it ahead, so it still counts when a provider later offers that
+    /// capability or action with a sense action under the same name.
     pub fn owner_only(&self) -> impl Fn(&str) -> bool + use<> {
         let mut sensing = BTreeSet::new();
         let mut offered: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();

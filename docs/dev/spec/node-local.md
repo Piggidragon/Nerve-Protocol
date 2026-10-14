@@ -1001,9 +1001,12 @@ that no attached provider offers now, and an action (`cap.action`) that an
 offered capability does not have now: the node knows the effects only of what
 an attached provider offers, so what it does not know may sense once it comes.
 Only the owner adds those (`settings.set` refuses the document with
-`forbidden`). What stays open: an `on` entry or an allow rule for a whole
-capability (`cap`), written while it did not sense, counts as well when its
-provider comes back with a sense action under the same id.
+`forbidden`). What stays open: an `on` entry or an allow rule for a
+capability or for one of its actions, written while it did not sense, still
+counts when a provider later offers it with a sense action under the same
+name (a new version of the program that makes `screen.info` sense). The node
+cannot tell a center's entry from the owner's then; the owner checks the
+entries after such an update.
 
 ### Detach
 

@@ -227,24 +227,45 @@ fn ok(got: Result<Result<Value, nerve_proto::RpcError>, String>) -> Result<Value
     }
 }
 
-/// Waits for `node/descriptor_changed`, skipping everything else.
-async fn descriptor_changed(conn: &mut Conn) -> Result<(), String> {
+/// The descriptor's `rev` now.
+async fn rev(conn: &mut Conn) -> Result<u64, String> {
+    let d = ok(conn
+        .call(method::DESCRIBE, json!({"detail": "summary"}), WAIT)
+        .await)?;
+    d["rev"].as_u64().ok_or_else(|| format!("no rev in {d}"))
+}
+
+/// Waits for a `node/descriptor_changed` that names another rev than
+/// `before`, skipping everything else: one an earlier change sent (a
+/// `settings.set`) names `before` itself, as `before` was read after it.
+/// The rev it names must be the one `describe` gives then.
+async fn descriptor_changed(conn: &mut Conn, before: u64) -> Result<(), String> {
     let deadline = tokio::time::Instant::now() + WAIT;
-    loop {
+    let changed = loop {
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
         match conn.recv(left).await {
             Recv::Msg(Message::Notification { method: m, params })
                 if m == method::EVENT
                     && params["cap"] == "node"
-                    && params["name"] == "descriptor_changed" =>
+                    && params["name"] == "descriptor_changed"
+                    && params["data"]["rev"] != json!(before) =>
             {
-                return Ok(());
+                break params["data"]["rev"].clone();
             }
             Recv::Msg(_) => {}
-            Recv::Timeout => return Err("no node/descriptor_changed within 15 s".into()),
+            Recv::Timeout => {
+                return Err(format!(
+                    "no node/descriptor_changed from rev {before} within 15 s"
+                ));
+            }
             other => return Err(format!("the link ended: {other:?}")),
         }
-    }
+    };
+    let now = rev(conn).await?;
+    ensure(
+        changed == json!(now),
+        format!("descriptor_changed named rev {changed}, describe gives {now}"),
+    )
 }
 
 /// The capability `CAP` of the descriptor now, if listed.
@@ -338,6 +359,9 @@ async fn steps(
     .await)
     .map_err(|e| format!("settings set: {e}"))?;
 
+    // Read after that change, so only a later one names another rev.
+    let before = rev(conn).await?;
+
     let stranger = format!("{}-stranger", setup.provider);
     step(match hello(&setup.socket, &stranger).await {
         Ok((_, Err(_))) => Ok(()),
@@ -359,7 +383,7 @@ async fn steps(
         Err(e) => Err(e),
     })?;
 
-    step(descriptor_changed(conn).await)?;
+    step(descriptor_changed(conn, before).await)?;
 
     step(actions(conn, &setup.provider).await.and_then(|actions| {
         ensure(
@@ -420,11 +444,12 @@ async fn steps(
         .await,
     )?;
 
+    let before = rev(conn).await?;
     let _ = stop.send(());
     let _ = served.await;
     step(
         async {
-            descriptor_changed(conn).await?;
+            descriptor_changed(conn, before).await?;
             match listed(conn).await? {
                 None => Ok(()),
                 Some(c) => Err(format!("still listed: {c}")),

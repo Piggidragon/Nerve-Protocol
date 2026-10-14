@@ -8,7 +8,7 @@
 //! and doing that between `fork` and `exec` of a multi-threaded async node is
 //! not safe, while the shim is single-threaded.
 //!
-//! On Windows a `folders` command runs in an AppContainer, one per center
+//! On Windows a `folders` command runs in an AppContainer, one per pairing
 //! ([`appcontainer`]): a process there opens only what carries a grant for the
 //! container's SID, and what Windows opens to every AppContainer (the system
 //! folders and Program Files, for reading and running). The node puts grants

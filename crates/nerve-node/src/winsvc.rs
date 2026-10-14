@@ -83,11 +83,12 @@ pub trait WinSystem {
     /// aside to a `nerve-node.*.del` beside it and goes at the next restart.
     fn remove_program(&self, path: &Path) -> Result<bool, String>;
     /// Takes the folder grants of folder mode off, those in the record on
-    /// `paths` and those of `centers` (crate::grants::remove_all).
+    /// `paths` and those of the pairings `node_ids`
+    /// (crate::grants::remove_all).
     fn remove_grants(
         &self,
         paths: &crate::paths::NodePaths,
-        centers: &[String],
+        node_ids: &[String],
     ) -> crate::grants::Synced;
 }
 
@@ -101,10 +102,10 @@ fn remove_grants(
     whose: &str,
     kept: bool,
 ) {
-    let centers: Vec<String> = SettingsStore::peek(&paths.config_file(), &paths.config_key())
-        .map(|c| c.centers.iter().map(|c| c.name.clone()).collect())
+    let node_ids: Vec<String> = SettingsStore::peek(&paths.config_file(), &paths.config_key())
+        .map(|c| c.centers.iter().map(|c| c.node_id.clone()).collect())
         .unwrap_or_default();
-    let synced = sys.remove_grants(paths, &centers);
+    let synced = sys.remove_grants(paths, &node_ids);
     for e in &synced.errors {
         let _ = writeln!(steps.out, "warning: {e}");
     }
@@ -840,12 +841,12 @@ mod tests {
             std::fs::remove_file(path).map_err(|e| e.to_string())?;
             Ok(true)
         }
-        fn remove_grants(&self, paths: &NodePaths, centers: &[String]) -> crate::grants::Synced {
+        fn remove_grants(&self, paths: &NodePaths, node_ids: &[String]) -> crate::grants::Synced {
             // The record is in the state folder, which a purge deletes.
             let recorded = crate::grants::record_file(paths).exists();
             self.call(format!(
                 "remove grants {} of {}",
-                centers.join(","),
+                node_ids.join(","),
                 paths.state_dir.display()
             ));
             let away = self
@@ -1166,7 +1167,7 @@ mod tests {
                         url: "https://center.example".into(),
                         pin: None,
                         center_id: String::new(),
-                        node_id: String::new(),
+                        node_id: format!("n-{name}"),
                         settings: Default::default(),
                         paused: false,
                         revoked: false,
@@ -1181,7 +1182,10 @@ mod tests {
         std::fs::write(crate::grants::record_file(&l.paths), "[]").unwrap();
         let mut out = Vec::new();
         uninstall(&l, &by_hand(d.path()), &sys, true, &mut out).unwrap();
-        let call = format!("remove grants lab,home of {}", l.paths.state_dir.display());
+        let call = format!(
+            "remove grants n-lab,n-home of {}",
+            l.paths.state_dir.display()
+        );
         assert!(sys.calls().contains(&call), "{:?}", sys.calls());
         let out = String::from_utf8(out).unwrap();
         assert!(
@@ -1219,7 +1223,7 @@ mod tests {
                     url: "https://center.example".into(),
                     pin: None,
                     center_id: String::new(),
-                    node_id: String::new(),
+                    node_id: "n-lab".into(),
                     settings: Default::default(),
                     paused: false,
                     revoked: false,
@@ -1233,7 +1237,7 @@ mod tests {
         std::fs::write(crate::grants::record_file(&hand), "[]").unwrap();
         let mut out = Vec::new();
         uninstall(&l, &hand, &sys, true, &mut out).unwrap();
-        let call = format!("remove grants lab of {}", hand.state_dir.display());
+        let call = format!("remove grants n-lab of {}", hand.state_dir.display());
         assert!(sys.calls().contains(&call), "{:?}", sys.calls());
         let out = String::from_utf8(out).unwrap();
         let did = format!(

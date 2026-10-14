@@ -1229,7 +1229,7 @@ impl Link {
             && entry.policy.mode_at(crate::now_ms()) == Mode::Folder
             && self.shared.confined();
         let container = if folder && self.shared.confinement.appcontainer {
-            Some(self.container(cfg, &home).await?)
+            Some(self.container(entry, cfg, &home).await?)
         } else {
             None
         };
@@ -1265,13 +1265,14 @@ impl Link {
 }
 
 impl Link {
-    /// The AppContainer of this center's commands, once the folder grants
-    /// follow `cfg` (crate::grants); `home` is the `~` of the rules. A grant
-    /// of this center's container that its folders no longer give and that
-    /// could not be taken off stops the command, and so does a record of the
-    /// grants that cannot be read (`Synced::refusal`).
+    /// The AppContainer of the commands of this pairing (`entry`), once the
+    /// folder grants follow `cfg` (crate::grants); `home` is the `~` of the
+    /// rules. A grant of this pairing's container that its folders no longer
+    /// give and that could not be taken off stops the command, and so does a
+    /// record of the grants that cannot be read (`Synced::refusal`).
     async fn container(
         &self,
+        entry: &CenterEntry,
         cfg: &NodeConfig,
         home: &std::path::Path,
     ) -> Result<nerve_sandbox::ContainerSpec, RpcError> {
@@ -1282,7 +1283,7 @@ impl Link {
         for e in &synced.errors {
             tracing::warn!("folder grants: {e}");
         }
-        let name = crate::grants::container(&self.shared.paths, &self.name);
+        let name = crate::grants::container(&self.shared.paths, &entry.node_id);
         if let Some(why) = synced.refusal(&name) {
             return Err(RpcError::new(ErrorCode::Unavailable, why));
         }

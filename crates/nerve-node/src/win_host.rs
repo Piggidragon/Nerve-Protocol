@@ -802,9 +802,9 @@ impl WinSystem for WinHost {
     fn remove_grants(
         &self,
         paths: &crate::paths::NodePaths,
-        centers: &[String],
+        node_ids: &[String],
     ) -> crate::grants::Synced {
-        crate::grants::remove_all(paths, centers)
+        crate::grants::remove_all(paths, node_ids)
     }
 }
 

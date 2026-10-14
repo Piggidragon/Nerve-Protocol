@@ -90,7 +90,9 @@ every command.
 
 ## What a command can reach in `folder` mode (Windows)
 
-Each pairing's commands run in an AppContainer of their own. Windows lets a
+Each pairing's commands run in an AppContainer of their own. A new pairing
+gets a new one, also when you pair the same center again under the same
+name. Windows lets a
 process there open only what is granted to that container, and what it opens
 to every AppContainer. This holds for a node you run yourself. The
 [installed service](service.md#windows) runs every command as another account,
@@ -176,8 +178,9 @@ folders.
   `icacls` shows as `APPLICATION PACKAGE AUTHORITY\Your …`). The node
   neither sees nor removes these. They stay when you remove the folder,
   change its flags, remove the pairing or run `uninstall`. An entry for the
-  container counts again when that center is paired again with the same
-  state folder. The other two kinds count at once, for every pairing of the
+  container belongs to that pairing: no later pairing runs in that
+  container, also not one of the same center or under the same name. The
+  other two kinds count at once, for every pairing of the
   node and for every app on the machine that runs in an AppContainer (for
   a capability: every such app that has it). In a
   folder with `w` but not `r`, a command can make a folder that lets it

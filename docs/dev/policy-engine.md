@@ -124,7 +124,10 @@ rules and runs the command.
 
 On Windows, each command runs in a Job Object that ends all its processes with
 it. A Job Object limits no file access. So in `folder` mode the shim starts the
-command in an AppContainer, one per center (`nerve_sandbox::appcontainer`):
+command in an AppContainer, one per pairing (`nerve_sandbox::appcontainer`;
+`grants::container` names it from the state folder and the pairing's
+`node_id`, which the node makes fresh at each pairing, never from the
+center's local name):
 
 | Access | Allowed |
 |---|---|
@@ -178,8 +181,10 @@ command in an AppContainer, one per center (`nerve_sandbox::appcontainer`):
   and -3) are not the node's. Those for ALL APPLICATION PACKAGES or a
   capability count at once for every pairing and every AppContainer app. `appcontainer::set` rewrites only the granted folder's own
   list, so they outlive a take-off, a narrowing, removing the pairing and
-  `uninstall` (the SID comes back with the same center and state folder),
-  and with `rw` the propagation alone can pass one to a linked owner's file.
+  `uninstall`. An entry for the container's SID is bound to that pairing:
+  no later pairing, also not one of the same center or under the same
+  name, runs in that container. With `rw` the propagation alone can pass
+  one to a linked owner's file.
   In a `w`-only folder they let a command read what is saved later into a
   folder it made. The user docs name this limit and the `icacls` clean-up.
   Taking a container's own explicit entries off below the folder in the

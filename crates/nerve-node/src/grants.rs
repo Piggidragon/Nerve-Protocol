@@ -1,5 +1,5 @@
 //! The folder grants of Windows folder mode (docs/user/modes.md). Each
-//! center's commands run in an AppContainer of their own
+//! pairing's commands run in an AppContainer of their own
 //! (`nerve_sandbox::appcontainer`), which reaches only what carries a grant
 //! for its SID. The node puts those grants on the center's folders, with the
 //! rights of their flags (`exec::container_grants`), so the grants follow
@@ -69,11 +69,15 @@ pub fn record_file(paths: &NodePaths) -> PathBuf {
     paths.state_dir.join("grants.json")
 }
 
-/// The AppContainer of `center`'s commands on the node at `paths`: one per
-/// center and per node, so neither reaches another's folders. A name of 30
-/// characters of `[a-z0-9.]`, within Windows' 64.
-pub fn container(paths: &NodePaths, center: &str) -> String {
-    let seed = format!("{}\n{center}", paths.state_dir.display());
+/// The AppContainer of the commands of the pairing `node_id` (the node's id
+/// at its center, made fresh at each pairing) on the node at `paths`: one
+/// per pairing and per node, so neither reaches another's folders. Not by
+/// the center's name: a command may give what it makes entries of its own
+/// for its container, which the node does not take off, and a later
+/// pairing, also of the same center or under the same name, must not find
+/// them. A name of 30 characters of `[a-z0-9.]`, within Windows' 64.
+pub fn container(paths: &NodePaths, node_id: &str) -> String {
+    let seed = format!("{}\n{node_id}", paths.state_dir.display());
     let d = ring::digest::digest(&ring::digest::SHA256, seed.as_bytes());
     let hex: String = d.as_ref()[..12]
         .iter()
@@ -100,7 +104,7 @@ pub fn wanted(cfg: &NodeConfig, paths: &NodePaths, home: &Path, platform: &Platf
     cfg.centers
         .iter()
         .flat_map(|c| {
-            let name = container(paths, &c.name);
+            let name = container(paths, &c.node_id);
             crate::exec::container_grants(&c.policy, home, &own, platform, &writable)
                 .into_iter()
                 .filter(|(_, a)| *a != Access::NONE)
@@ -761,13 +765,14 @@ pub fn apply(paths: &NodePaths, cfg: &NodeConfig, home: &Path) -> Synced {
 }
 
 /// Takes off every grant the node put on, and the profiles of its
-/// containers: those in the record and those of `centers`. For uninstall.
-pub fn remove_all(paths: &NodePaths, centers: &[String]) -> Synced {
+/// containers: those in the record and those of the pairings `node_ids`.
+/// For uninstall.
+pub fn remove_all(paths: &NodePaths, node_ids: &[String]) -> Synced {
     #[cfg(windows)]
     {
         let mut s = windows_sync(paths, &[]);
-        for c in centers {
-            let name = container(paths, c);
+        for n in node_ids {
+            let name = container(paths, n);
             if !s.emptied.contains(&name)
                 && let Err(e) = nerve_sandbox::appcontainer::remove_profile(&name)
             {
@@ -778,7 +783,7 @@ pub fn remove_all(paths: &NodePaths, centers: &[String]) -> Synced {
     }
     #[cfg(not(windows))]
     {
-        let _ = (paths, centers);
+        let _ = (paths, node_ids);
         Synced::default()
     }
 }
@@ -1888,20 +1893,63 @@ mod tests {
         assert!(why.contains(&file.display().to_string()), "{why}");
     }
 
-    /// Each center has a container of its own, and so has each node.
+    /// Each pairing has a container of its own, and so has each node.
     #[test]
-    fn containers_differ_by_center_and_node() {
+    fn containers_differ_by_pairing_and_node() {
         let p = NodePaths::new("/n1/config", "/n1/state");
         let q = NodePaths::new("/n2/config", "/n2/state");
-        let a = container(&p, "lab");
-        assert_eq!(a, container(&p, "lab"));
-        assert_ne!(a, container(&p, "home"));
-        assert_ne!(a, container(&q, "lab"));
+        let a = container(&p, &node("lab"));
+        assert_eq!(a, container(&p, &node("lab")));
+        assert_ne!(a, container(&p, &node("home")));
+        assert_ne!(a, container(&q, &node("lab")));
         assert!(a.len() <= 64, "{a}");
         assert!(
             a.bytes()
                 .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.'),
             "{a}"
+        );
+    }
+
+    /// A pairing's container is its own, not its center's name's: a later
+    /// pairing under the same name on the same node (also of the same
+    /// center) runs in another one. Entries a command of the first gave what
+    /// it made, which the node does not take off, then do not count for the
+    /// second; the first's grant comes off and the second's goes on.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_pairing_under_the_same_name_gets_a_container_of_its_own() {
+        let d = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let (home, work) = (root.join("home"), root.join("work"));
+        for p in [&home, &work] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        let paths = NodePaths::new(root.join("cfg"), root.join("state"));
+        let pairing = |node_id: &str| {
+            let mut c = center("lab", &[(&work, "rw")]);
+            c.node_id = node_id.into();
+            let mut cfg = NodeConfig::default();
+            cfg.centers.push(c);
+            wanted(&cfg, &paths, &home, &Platform::Unix)
+        };
+        let (first, second) = (pairing("n1"), pairing("n2"));
+        assert_eq!(first.len(), 1, "{first:?}");
+        assert_eq!(second.len(), 1, "{second:?}");
+        assert_eq!(first[0].container, container(&paths, "n1"));
+        assert_eq!(second[0].container, container(&paths, "n2"));
+        assert_ne!(first[0].container, second[0].container);
+
+        let file = record_file(&paths);
+        let mut f = Fake::default();
+        let at = work.display().to_string();
+        f.make(&at);
+        let r = sync(&file, &first, &mut f);
+        assert!(r.errors.is_empty(), "{r:?}");
+        let r = sync(&file, &second, &mut f);
+        assert!(r.errors.is_empty(), "{r:?}");
+        assert_eq!(
+            f.on(&at),
+            [(second[0].container.clone(), Access::parse("rw").unwrap())]
         );
     }
 
@@ -1934,7 +1982,7 @@ mod tests {
                 url: String::new(),
                 pin: None,
                 center_id: String::new(),
-                node_id: String::new(),
+                node_id: node(name),
                 settings: Default::default(),
                 paused: false,
                 revoked: false,
@@ -1946,8 +1994,8 @@ mod tests {
             });
         }
         let want = wanted(&cfg, &paths, &home, &Platform::Unix);
-        let lab = container(&paths, "lab");
-        let home_c = container(&paths, "home");
+        let lab = container(&paths, &node("lab"));
+        let home_c = container(&paths, &node("home"));
         // `work` holds the config folder: its other entries instead.
         assert!(
             want.contains(&Grant {
@@ -1980,13 +2028,18 @@ mod tests {
     }
 
     /// A center named `name` with these folders.
+    /// The node id of the test pairing with the center `name`.
+    fn node(name: &str) -> String {
+        format!("node-{name}")
+    }
+
     fn center(name: &str, folders: &[(&Path, &str)]) -> nerve_policy::CenterEntry {
         nerve_policy::CenterEntry {
             name: name.into(),
             url: String::new(),
             pin: None,
             center_id: String::new(),
-            node_id: String::new(),
+            node_id: node(name),
             settings: Default::default(),
             paused: false,
             revoked: false,
@@ -2030,7 +2083,10 @@ mod tests {
             &[(&work, "rw"), (&bin, "rwx"), (&outbox, "w")],
         ));
         cfg.centers.push(center("home", &[(&bin, "r")]));
-        let (lab, home) = (container(&paths, "lab"), container(&paths, "home"));
+        let (lab, home) = (
+            container(&paths, &node("lab")),
+            container(&paths, &node("home")),
+        );
         let g = |c: &str, p: &Path, a: &str| Grant {
             container: c.into(),
             path: p.into(),
@@ -2098,7 +2154,7 @@ mod tests {
             "lab",
             &[(&work, "rw"), (&bin, "rwx"), (&outbox, "w")],
         ));
-        let lab = container(&paths, "lab");
+        let lab = container(&paths, &node("lab"));
         let g = |p: &Path, a: &str| Grant {
             container: lab.clone(),
             path: p.into(),
@@ -2148,7 +2204,7 @@ mod tests {
         std::fs::create_dir_all(work.join("sub")).unwrap();
         let (before, root) = (icacls(&work.join("sub")), icacls(&work));
         let want = [Grant {
-            container: container(&paths, "lab"),
+            container: container(&paths, &node("lab")),
             path: work.clone(),
             access: Access::ALL,
             id: None,
@@ -2161,7 +2217,7 @@ mod tests {
             "{}",
             icacls(&work)
         );
-        let s = remove_all(&paths, &["lab".into()]);
+        let s = remove_all(&paths, &[node("lab")]);
         assert!(s.errors.is_empty(), "{s:?}");
         assert_eq!(s.removed, 1);
         assert!(!icacls(&work).contains("S-1-15-2-"), "{}", icacls(&work));
@@ -2229,7 +2285,7 @@ mod tests {
             "target\\debug\\deps\\demo-0123.exe",
         );
         std::fs::create_dir_all(&outside).unwrap();
-        let lab = container(&paths, "lab");
+        let lab = container(&paths, &node("lab"));
         let platform = crate::paths::platform();
         let config = |flags: Option<&str>| {
             let mut cfg = NodeConfig::default();
@@ -2312,7 +2368,7 @@ mod tests {
         let s = windows_sync(&paths, &want(None));
         assert!(s.errors.is_empty() && s.stale.is_empty(), "{s:?}");
         assert_eq!(s.removed, 1, "{s:?}");
-        let s = remove_all(&paths, &["lab".into()]);
+        let s = remove_all(&paths, &[node("lab")]);
         assert!(s.errors.is_empty(), "{s:?}");
         for p in [&proj, &secret] {
             assert!(!icacls(p).contains("S-1-15-2-"), "{}", icacls(p));
@@ -2363,7 +2419,7 @@ mod tests {
             "lab",
             &[(&work, "rw"), (&bin, "rwx"), (&outbox, "w")],
         ));
-        let lab = container(&paths, "lab");
+        let lab = container(&paths, &node("lab"));
         let platform = crate::paths::platform();
         let want = wanted(&cfg, &paths, &root, &platform);
         assert_eq!(want.len(), 3, "{want:?}");
@@ -2392,7 +2448,7 @@ mod tests {
         let s = windows_sync(&paths, &wanted(&cfg, &paths, &root, &platform));
         assert!(s.errors.is_empty(), "{s:?}");
         assert!(carries(&bin, &lab, "rwx"), "{}", icacls(&bin));
-        let s = remove_all(&paths, &["lab".into()]);
+        let s = remove_all(&paths, &[node("lab")]);
         assert!(s.errors.is_empty(), "{s:?}");
     }
 
@@ -2407,7 +2463,7 @@ mod tests {
         let (work, moved) = (d.path().join("work"), d.path().join("moved"));
         std::fs::create_dir_all(work.join("sub")).unwrap();
         let want = [Grant {
-            container: container(&paths, "lab"),
+            container: container(&paths, &node("lab")),
             path: work.clone(),
             access: Access::ALL,
             id: None,
@@ -2439,7 +2495,7 @@ mod tests {
         assert!(!icacls(&work).contains("S-1-15-2-"), "{}", icacls(&work));
         windows_sync(&paths, &want);
         assert!(icacls(&work).contains("S-1-15-2-"), "{}", icacls(&work));
-        let s = remove_all(&paths, &["lab".into()]);
+        let s = remove_all(&paths, &[node("lab")]);
         assert!(s.errors.is_empty(), "{s:?}");
         assert!(!icacls(&work).contains("S-1-15-2-"), "{}", icacls(&work));
     }

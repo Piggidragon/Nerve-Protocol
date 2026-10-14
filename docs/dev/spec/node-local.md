@@ -8,8 +8,8 @@ same way and so the owner knows what each setting does.
 
 | What | Default | Override |
 |---|---|---|
-| `node.toml` and one key per center (`keys/<name>.key`) | `~/.config/nerve` | `--config-dir`, `NERVE_CONFIG_DIR` |
-| control socket `run/ctl.sock`, audit log `audit.jsonl`, log `log.jsonl`, the config's MAC key `config.key`, `keys.lock`, `keys.moving` | `~/.local/state/nerve` | `--state-dir`, `NERVE_STATE_DIR` |
+| `node.toml` and one key per center (`keys/<name>.key`); on Windows also `sudo.dpapi` and, on the installed node, `command-account.dpapi` | `~/.config/nerve` | `--config-dir`, `NERVE_CONFIG_DIR` |
+| control socket `run/ctl.sock` and its token `run/ctl.token`, audit log `audit.jsonl`, log `log.jsonl`, the config's MAC key `config.key`, `keys.lock`, `keys.moving`; on Windows the record of the folder grants `grants.json` and its lock `grants.json.lock` | `~/.local/state/nerve` | `--state-dir`, `NERVE_STATE_DIR` |
 
 With `machine.secret_storage = "keyring"` the keys are in the system keyring
 instead of `keys/` and `config.key` ([where the keys are](#where-the-keys-are)).
@@ -60,8 +60,10 @@ the file-system ids are root's without root's capabilities
 (`CAP_DAC_OVERRIDE`, `CAP_DAC_READ_SEARCH`, `CAP_FOWNER`), so these checks
 and the `fs` actions reach only what root owns or what the permission bits
 open to others; a command itself is really root. The CLI, which
-runs as `nerve` on the installed node, keeps a folder it may not look into
-in its normal form (`folder add`), unresolved. A node not installed as a
+runs as `nerve` on the installed node, cannot judge a folder it may not look
+into: with a node running, `folder add` is done by the node as the account
+(`folder.add`, §5); with none, the folder is kept in its normal form,
+unresolved, and not recorded. A node not installed as a
 service runs commands as its own user and refuses a `machine.user` it
 cannot switch to. The installed node is known by its folders or its user,
 not by its capabilities: started without them (by hand, as `nerve`), it
@@ -120,8 +122,9 @@ take another file at its next start: with the key gone, an unsigned file
 counts as a first file and is signed. The start-up audits that as
 `signed`. In `folder` mode Landlock keeps commands out of the state folder.
 
-On Windows there is no control socket: the CLI writes the signed
-file itself, and a running node takes the change at its next start. After
+On Windows there is no control socket. A running node takes the folder
+changes over its control pipe (§5); for every other change the CLI writes
+the signed file itself, and a running node takes it at its next start. After
 a change no daemon answered for, the CLI says so in one line ("takes effect
 at the next start of the node").
 
@@ -137,7 +140,8 @@ the config's MAC and its key per center.
   `config-key:<state folder>` and `center-key:<name>:<config folder>`. Each
   holds the key's hex text. No copy stays in a file.
 
-The proxy's header values are in the keyring either way (§2).
+The proxy's header values are in the keyring either way (§2), except on the
+installed node on Windows, which takes none (§2, Proxy).
 
 Two kinds of node keep their keys in files whatever is asked:
 
@@ -160,10 +164,10 @@ Two kinds of node keep their keys in files whatever is asked:
 On such a node:
 
 - A change to `keyring` is refused before anything moves, by whatever
-  writes the config (`config set`, setup, a center's `settings.set`, `config
-  accept`); `node.toml` and the keys stay as they were. This refusal comes
-  before the count of running commands below, as it holds whatever runs. A
-  running node does not reload a file another writer saved with `keyring`.
+  writes the config (`config set`, setup, `config accept`); `node.toml` and
+  the keys stay as they were. This refusal comes before the count of running
+  commands below, as it holds whatever runs. A running node does not reload a
+  file another writer saved with `keyring`.
 - `config accept` refuses a file that says `keyring`, even when the keys are
   in the keyring already, so nothing would move.
 - `setup` does not ask where the keys go. It prints a warning with the
@@ -354,6 +358,7 @@ unknown = false             # the center answered 401
 mode = "allowlist"          # allowlist | folder | user (the default is allowlist)
 until = 1790000000000  # optional, folder and user: ms since the epoch; then allowlist
 folders = [{ path = "/home/u/proj", access = "rwx" }]  # folder mode; r w x in any mix, "" for none
+places = ["/home/u/proj"]  # folders `folder add` recorded at their real place; the owner's, a center's write keeps it
 caps = { "fs.write" = "off" }   # on | off | hidden
 protected = { extra = [], allow = [] }  # a center may add to extra; only the owner removes or releases,
                                         # also by a folder at or inside an entry
@@ -427,6 +432,24 @@ When the daemon dials through the proxy it reads the entry; a missing or
 unreadable entry, or one without a value for a named header, stops the link
 with a status that names the entry, and the node does not dial directly
 instead (fail closed).
+
+The installed node on Windows (§1, where the keys are: the folders `install`
+uses, or the account `nerve`) takes no header value and no password either,
+though its keyring answers. The service runs as `nerve`, the Credential
+Manager is one per account, and `proxy set` runs as an administrator, so the
+values would be in the administrator's Credential Manager, out of the
+service's reach. The node keeps no proxy secret in a file, so there is nowhere
+else for them. `proxy set` with a header or a password refuses before it asks
+the keyring, and changes nothing (`node.toml`, the keyring); a proxy without
+either works, and its `proxy set` deletes the entry of an earlier call, as it
+does anywhere. Reading is as consistent: with headers named in `node.toml`
+(set before the install) the link stops with `bad proxy:` and the same reason
+(in the center's status and in the log; on Windows `status` does not ask the
+node, whose pipe takes folder changes only, so it shows no link status there
+and the log is the only place), and
+`proxy ls` shows it, both without asking the keyring: an entry may be in the
+administrator's Credential Manager, but the service does not find it, so
+`proxy ls` must not call the values good.
 
 A `node.toml` that holds header values (`headers = { Name = "value" }`) or a
 user name and password in `connection.proxy` is refused on load, without the values in the message: take them out of the
@@ -591,8 +614,26 @@ answer. For each call the node takes the center's policy and, in this order:
    it leads to with its flags, and a folder that has become such a link
    since is left out of a command's Landlock rules, as is a folder whose path
    crosses a link that lies inside a `w` folder of any center (a command may
-   have put the link there). Only the `w` folders in the config count, and a
-   command that runs without Landlock can make a link elsewhere. A folder
+   have put the link there). A folder the owner added with `folder add` is
+   stored by its resolved path and listed in `policy.places`; such a folder
+   is also left out when its path resolves to another place now, whatever the
+   `w` folders say, and a center's settings document cannot change the list.
+   `folder add` itself does not follow a link that lies inside a `w` folder
+   of any center: it refuses, so that a link a command made is not stored,
+   and recorded, at its target. It judges and resolves in one pass
+   (`exec::settle`): a link is judged by the folder that holds it as spelled
+   and as it resolves, either inside a `w` folder refuses it and so does a
+   holder that is not the place it was looked at as, and the place the pass
+   ends at must resolve to itself, so that what is stored is what was looked
+   at. A `w` folder that cannot be resolved only makes a clean walk "cannot
+   tell" (the folder is stored as given, not recorded). On Windows the walk
+   goes through a `subst` drive's folder name by name (`QueryDosDeviceW`),
+   never through the drive resolved, writes out the short names of the
+   folder it maps, and refuses a path with a drive but no root or that is not
+   on a drive letter. A link target is taken the same way: a drive, a volume
+   root (as the drive or folder it is mounted at), or refused.
+   For a folder without an entry only the `w` folders in the config count,
+   and a command that runs without Landlock can make a link elsewhere. A folder
    that holds a protected entry gives a command in `folder` mode none of it:
    its Landlock rules take the folder's other entries, level by level down
    to the protected one, in the read, write and run sets alike, so the
@@ -669,8 +710,8 @@ holds the kept password again when `machine.sudo` says on and the file is
 the current account's. A sudo command runs what followed `sudo` in the
 shell, started with a fresh batch logon's full token (`CreateProcessAsUserW`)
 with the account's own environment, in a job like every command; the check
-that the account cannot open the node's folders does not apply to it. Without
-a control channel, `nerve-node sudo on` (elevated) checks the password,
+that the account cannot open the node's folders does not apply to it. The
+control pipe takes folder changes only, so `nerve-node sudo on` (elevated) checks the password,
 writes the file and sets `machine.sudo` in the signed file, which the service
 takes at its next start; `nerve-node sudo off` removes the file, and the
 running node drops a held password whose file is gone within a second and
@@ -678,15 +719,75 @@ switches off. `uninstall` removes the file.
 
 ## 5. Control socket
 
-`<state>/run/ctl.sock` (Unix only; on Windows the CLI writes the
-signed `node.toml` itself, §1). One JSON object per line: the client sends
-`{"method", "params"}`, the server answers `{"ok": value}` or
+`<state>/run/ctl.sock` (Unix; Windows has the control pipe below). One
+JSON object per line: the client sends
+`{"method", "params", "token"}` (the token is explained below), the server answers `{"ok": value}` or
 `{"error": "text"}`, or, for streaming methods, several `{"item": value}`
 lines until it closes. The socket is 0600 in a 0700 folder; only its own user
-or root may talk to it. A connection the node cannot take (for want of
+or root may talk to it. That does not keep out a command the node runs as
+that very user (a node a person runs, with no `machine.user`) or as root:
+Landlock stops a process connecting to a socket file only from ABI 9 on, and
+`setsid` takes a process out of the tree below its command. So the node makes
+a token at each start,
+`<state>/run/ctl.token` (0600), and answers a request only if it carries it.
+The CLI reads the file and sends it. The
+file lies in the node's own folders, which a `folder` mode command's rules
+leave out, so such a command, and a process it left behind, are refused for
+every method.
+
+The one answer without the token is `status`: `{"ok": {"running": true}}`,
+nothing of the config. `update` of 0.0.2 asks it that way to wait for the
+node it restarted, and puts the old program back if it does not answer `ok`;
+since 0.0.3 `install`, `update` and `setup` send the token.
+
+The token holds as far as the sandbox does. While the commands run as the
+node's own user, `folder` mode is no boundary against that user's other
+programs: any of them that runs commands for whoever connects to its socket
+runs them outside the sandbox, as the user's own process, which reads the
+token, `node.toml` and the keys as the CLI does. The user's systemd and D-Bus
+session (`systemd-run --user`) is one, a tmux or screen server another
+(`tmux run-shell`, its socket in `/tmp`); there are more. A connect rule
+(`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`, ABI 9) that leaves out only the session
+does not close them, and the node sets none while the keys are in files
+(`exec.rs`). The boundary is `machine.user`: the commands run as another
+account that only the node uses and that gets root in no way without a
+password: not root, not in `docker`, `lxd`, `incus-admin`, `libvirt` or
+`disk`, no `NOPASSWD` sudo, and nobody works as it and uses `sudo` or `su`
+from it (user docs, service.md "The account commands run as"). Root passes
+the socket's uid check, and an account that becomes root is root.
+`no_new_privs` and Landlock hold the command's own process tree only: a
+program the account's user manager or a tmux or screen server starts for it
+has neither, and the command can type into the tmux or screen panes of a
+person who works as the account, where sudo has a live ticket, and change
+what their shell runs. So for such an account every command is root, not
+only the sudo commands. `install` takes the account that ran `sudo`, the one
+its owner logs in as, so that default is no boundary whatever its sudo asks
+for; `setup --create-user` makes an account for the node. The node's own sudo
+calls pass `-k` and leave no ticket, so a node-only account may be a sudoer
+with a password for the sudo switch. Where `machine.user` is such an account,
+the boundary keeps out every command but a sudo command: that one runs as
+root whatever account `machine.user` names (no `no_new_privs`, and the unit
+keeps the capabilities it needs), so it reads the token, passes the uid check
+and can leave the tree.
+
+A connection the node cannot take (for want of
 descriptors, memory or epoll watches, or for any other reason of that one
 connection) does not end the socket: the node takes the next one once the
 cause is gone. Only an error that says the listener itself is broken ends it.
+A connection carries one request: the node closes it after the answer (for a
+streaming method, after the last item), closes one that sends no request line
+within 30 s, and serves at most 64 at once; one over that is answered with
+`{"error": "the node does not take connections now; try again"}` and closed.
+
+What a client makes of a connect that fails: only a missing socket (ENOENT)
+and a refused connect (ECONNREFUSED) mean that no node runs, and only then may
+the CLI write `node.toml` itself. A queue that is full (EAGAIN) means a node
+runs and takes no connection now (`the node does not take connections now; try
+again`): the command fails and writes nothing. Any other connect error names
+itself and decides nothing about a node. A call that gets no answer in 90 s
+gives up (`the node did not answer in time; try again`). A caller that maps
+every connect error to "not running" would write the file and report a change
+the running node never got.
 Methods:
 
 | Method | Params | |
@@ -695,20 +796,91 @@ Methods:
 | `config.read` | | `node.toml` and its `version` |
 | `config.write` | `config`, `if_version` | replaces it when the version matches |
 | `config.accept` | | takes `node.toml` as it is after it was refused, and signs it (§1) |
+| `folder.add` | `center`, `path`, `access` | `folder add`, done by the node so that it is judged as the account commands run as (`exec::settle`): the path is followed a link at a time and must resolve to itself, the folder is stored at that place with `access` (replacing the entry there) and recorded in `policy.places`; `{stored, recorded, mode}`. An error, with nothing changed, when the path crosses a link inside a `w` folder of any center, leads nowhere, or changed while it was looked at. Where the node cannot tell either (a folder it may not look into, or a `w` folder it cannot resolve) the folder is stored as given, `recorded` is false, and a record it had stays. The CLI uses it whenever a node runs |
 | `reload` | | rereads `node.toml`; only a file the node signed is applied (§1) |
 | `sudo.status` | | `{sudo: "on"|"off"}` |
 | `sudo.on` | `password` | checks it with `sudo -v` and turns the switch on (§4) |
 | `sudo.off` | | turns the switch off and drops the password |
 | `owner.check` | | changes nothing; the CLI asks it before `install`, `setup`, `update` and `uninstall` |
 
-`config.write`, `config.accept`, `reload`, `sudo.on`, `sudo.off` and
-`owner.check` are refused from a process that runs below a command the node
-started for a center, so on Linux an agent cannot change its own policy
-through the socket, nor install, set up, update or remove the node.
-**Windows has no socket and no sandbox:** the CLI signs node.toml
-itself, so a command the node runs for a center can change the policy, and
-the change applies at the next start. On Windows, allow commands only to
-centers you would also give `settings = write`.
+Every method is refused from a process that runs below a command the node
+started for a center, the reading ones (`status`, `config.read`,
+`sudo.status`) too, as they hand over the whole config. That catches the
+processes that stay below the command, in any mode. A `folder` mode command
+is kept out by the token as well, including a process it left behind, as far
+as the sandbox holds (above). A command without a sandbox (`allowlist` and
+`user` mode) can read the token file as it can read `node.toml`, and a sudo
+command is root and reads it and passes the uid check, whatever account
+`machine.user` names. Both can leave the tree at once (`( … & )`,
+`setsid -f`, a daemon fork), while the command still runs. For such a command
+the socket is no boundary at any time, as the node's files are none; the
+refusal stops what stays below it.
+
+### The control pipe (Windows)
+
+`\\.\pipe\nerve-node-<hash>`, where the hash is the first 16 bytes of the
+SHA-256 of the state folder's real path in lower case, in hex: one pipe per
+state folder. The lines and the connection rules are those of the socket: one
+request per connection, 30 s for it, at most 64 at once, `the node does not
+take connections now; try again` over that. Only a missing pipe
+(`ERROR_FILE_NOT_FOUND`) means that no node runs. The CLI sets no 90 s limit
+on the answer: a folder change brings the folder grants in line before it is
+answered, which takes long on a large folder. Methods:
+
+| Method | Params | |
+|---|---|---|
+| `status` | | as on the socket |
+| `folder.add` | `center`?, `path`, `access` (`r`, `w`, `x`, at least one), `recorded` | adds the folder, or replaces its rights (the same place in another spelling is the same folder); with `recorded` the folder is also entered in `policy.places`, as the real place the CLI settled it at |
+| `folder.set` | `center`?, `path`, `given`, `changes` (1 to 64 of `=rwx`, `+x`, `-w`) | changes the rights of a folder the center has |
+| `folder.rm` | `center`?, `path`, `given` | takes a folder away |
+
+`path` is the folder as the CLI judged it: for `add` the real place it
+settled the path at (`exec::settle`, as this process sees it: the pipe takes
+the change, not the judging, which on Windows is the CLI's alone), for `set`
+and `rm` the stored folder it found (`stored_folder`). `given` is the folder
+as typed or, after that lookup, the stored path again; `set` and `rm` find the
+folder by either. A `rm` takes the folder's `places` entry with it (the
+config's validation drops an entry that names no folder). Without `center`
+the only paired center is meant.
+While `node.toml` is newer than the config in force (the CLI wrote another
+change there for the next start), a folder change is refused: the node saves
+its whole config and would undo that change.
+A field the method does not take refuses the request. The node checks a
+change as the CLI does when it writes the file, saves it, brings the folder
+grants in line, and answers `{center, path, access, mode, version}`
+(`access` is `null` after `rm`).
+
+Who may write:
+
+- The DACL (`D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;<node account>)`) lets
+  SYSTEM, the administrators (elevated) and the node's account open the
+  pipe. An AppContainer gets no access, nor does a command account whose
+  token has the administrators deny-only. Remote clients are refused
+  (`PIPE_REJECT_REMOTE_CLIENTS`).
+- Every request from a process in the job object of a command the node runs
+  is refused, `status` included: the node lists the processes of every job
+  it holds open (`JobObjectBasicProcessIdList`, nested jobs included) and
+  looks for the caller's process id (`GetNamedPipeClientProcessId`). While
+  a command runs without a job, and for a caller whose id Windows does not
+  tell, every request is refused.
+- The node makes the first instance with `FILE_FLAG_FIRST_PIPE_INSTANCE`
+  and makes the next one before it hands a connection on, so the pipe always
+  has one of its own. A node that cannot make the pipe (another process made
+  one of that name first) logs it and runs on without it.
+- The CLI opens the pipe for identification only and sends nothing unless
+  its owner is SYSTEM, the administrators or the node's account (`nerve` for
+  the installed node, else the CLI's own). When the pipe is another's and no
+  node holds `keys.lock` (none runs), the CLI writes the change to
+  `node.toml` itself, as with no pipe at all; with a node running it stops
+  with an error that says how to free the name.
+
+Not covered: a process another program starts for a command (the task
+scheduler, WMI) is in no job of the node's; it opens the pipe only if its
+account may. A sudo command (an administrator token) and a command of a node
+run by hand (the node's own account) pass the DACL; the job check stops them
+on the pipe, but they can still change `node.toml` itself. On Windows, allow
+commands only to centers you would also give `settings = write`, or install
+the node as a service.
 
 ## 6. Audit log
 

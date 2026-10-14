@@ -1,6 +1,7 @@
 //! The `nerve-node` command line (docs/dev/settings-and-config.md). Commands talk to the
-//! running daemon over the control socket; when none runs they edit the
-//! config file directly through the same [`SettingsStore`], which signs it.
+//! running daemon over the control socket (on Windows the folder changes
+//! over its control pipe, crate::pipe); when none runs they edit the config
+//! file directly through the same [`SettingsStore`], which signs it.
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -16,6 +17,7 @@ use nerve_policy::{Mode, NodeConfig, SetError, SettingsStore, rules, sudo_comman
 use nerve_proto::link::PairLink;
 
 use crate::daemon::{Daemon, NodeOptions};
+use crate::folder_change::{Applied, FolderChange};
 use crate::paths::NodePaths;
 use crate::service::{Host, Layout};
 
@@ -313,7 +315,7 @@ pub enum ConfigCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum ProxyCmd {
-    /// Reach centers through an HTTP proxy. Header values and a password are kept in the system keyring, never in node.toml.
+    /// Reach centers through an HTTP proxy. Header values and a password are kept in the system keyring, never in node.toml; the installed node on Windows takes neither.
     Set {
         /// The proxy, http://host:port, or http://user:password@host:port when it wants a login.
         url: String,
@@ -633,26 +635,70 @@ pub async fn read_config(paths: &NodePaths) -> Result<(NodeConfig, Option<u64>),
 }
 
 /// Changes the config: through the daemon (retrying when someone else wrote
-/// meanwhile), or directly in the file when no daemon runs.
+/// meanwhile), or directly in the file when no daemon runs. An error also
+/// when the config is saved but the folder grants do not follow it.
 pub async fn edit(
     paths: &NodePaths,
     f: impl Fn(&mut NodeConfig) -> Result<(), String>,
 ) -> Result<NodeConfig, String> {
+    let saved = edit_saved(paths, f).await?;
+    match grants_failed(&saved.grants) {
+        Some(e) => Err(e),
+        None => Ok(saved.cfg),
+    }
+}
+
+/// The config [`edit_saved`] saved, and what the folder grants did when no
+/// daemon took the change (nothing when one did).
+pub struct Saved {
+    pub cfg: NodeConfig,
+    pub grants: crate::grants::Synced,
+}
+
+/// Why the folder grants do not follow a saved config, if they do not.
+fn grants_failed(s: &crate::grants::Synced) -> Option<String> {
+    s.errors
+        .first()
+        .map(|e| format!("the config is saved, but the folder grants do not follow it: {e}"))
+}
+
+/// [`edit`], which is also done when the folder grants do not follow.
+pub async fn edit_saved(
+    paths: &NodePaths,
+    f: impl Fn(&mut NodeConfig) -> Result<(), String>,
+) -> Result<Saved, String> {
     #[cfg(unix)]
-    for _ in 0..5 {
+    {
         let sock = paths.ctl_socket();
-        let read = match nerve_transport::ctl::call(&sock, "config.read", json!({})).await {
-            Ok(v) => v,
-            Err(e) if e == nerve_transport::ctl::NOT_RUNNING => break,
-            Err(e) => return Err(e),
-        };
-        let mut cfg = NodeConfig::parse(read["config"].as_str().unwrap_or_default())?;
-        f(&mut cfg)?;
-        let params = json!({"config": cfg.to_toml(), "if_version": read["version"]});
-        match nerve_transport::ctl::call(&sock, "config.write", params).await {
-            Ok(_) => return Ok(cfg),
-            Err(e) if e.starts_with("conflict") => continue,
-            Err(e) => return Err(e),
+        let mut conflicts = 0;
+        loop {
+            let read = match nerve_transport::ctl::call(&sock, "config.read", json!({})).await {
+                Ok(v) => v,
+                // Only a node that is not there leaves the file to the CLI.
+                Err(e) if e == nerve_transport::ctl::NOT_RUNNING => break,
+                Err(e) => return Err(e),
+            };
+            let mut cfg = NodeConfig::parse(read["config"].as_str().unwrap_or_default())?;
+            f(&mut cfg)?;
+            let params = json!({"config": cfg.to_toml(), "if_version": read["version"]});
+            match nerve_transport::ctl::call(&sock, "config.write", params).await {
+                Ok(_) => {
+                    return Ok(Saved {
+                        cfg,
+                        grants: Default::default(),
+                    });
+                }
+                Err(e) if e.starts_with("conflict") => {
+                    conflicts += 1;
+                    // A node that answered has the file: writing it here
+                    // would be undone by its next write, and the change
+                    // reported as made.
+                    if conflicts == 5 {
+                        return Err("the config keeps changing; try again".into());
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         }
     }
     let mut store = SettingsStore::open_with(
@@ -666,14 +712,12 @@ pub async fn edit(
             // No daemon took the change, so the folder grants of Windows
             // folder mode follow it here (crate::grants); a running node
             // brings them in line with its own config again before a
-            // command.
-            let synced = crate::grants::apply(paths, &cfg, &crate::paths::home_dir());
-            if let Some(e) = synced.errors.first() {
-                return Err(format!(
-                    "the config is saved, but the folder grants do not follow it: {e}"
-                ));
-            }
-            Ok(cfg)
+            // command. A change that takes long says how far it is here.
+            let grants =
+                crate::grants::apply_outside(paths, &cfg, &crate::paths::home_dir(), &mut |m| {
+                    eprintln!("{m}")
+                });
+            Ok(Saved { cfg, grants })
         }
         Err(SetError::Conflict { .. }) => Err("the config changed meanwhile; try again".into()),
         Err(e) => Err(e.to_string()),
@@ -682,23 +726,7 @@ pub async fn edit(
 
 /// The center a per-center command means: the one named, or the only one.
 pub fn pick_center(cfg: &NodeConfig, given: &CenterArg) -> Result<String, String> {
-    if let Some(n) = &given.center {
-        return cfg
-            .center(n)
-            .map(|c| c.name.clone())
-            .ok_or_else(|| format!("no center named {n}"));
-    }
-    match cfg.centers.as_slice() {
-        [] => Err("no center is paired".into()),
-        [one] => Ok(one.name.clone()),
-        many => Err(format!(
-            "several centers are paired; pick one with --center ({})",
-            many.iter()
-                .map(|c| c.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
-    }
+    crate::folder_change::pick_center(cfg, given.center.as_deref())
 }
 
 /// Changes one center's entry.
@@ -794,10 +822,31 @@ impl List {
         }
     }
 
-    /// The entry a command line stands for. The allow and deny lists hold
-    /// `exec.run` rules; the sudo list holds the sudo command lines, and takes
-    /// the command with or without the `sudo` in front.
+    /// The entry a command line stands for, for `rule add`: the same as
+    /// [`List::command_rule`], but a line in the pattern form of `config add`
+    /// (`fs.read:~/notes/*`, `fs:~/private/*`) is refused. As a command it
+    /// would become a rule that never matches. A single letter before the `:`
+    /// is a drive (`C:\tools\x.exe`), not a capability.
     fn entry(self, command: &str, wildcard: bool) -> Result<String, String> {
+        if matches!(self, List::Allow | List::Deny)
+            && let Some((scope, _)) = command.trim().split_once(':')
+            && (scope.contains('.') || scope.len() > 1)
+            && rules::valid_scope(scope)
+        {
+            return Err(format!(
+                "`{scope}:` is the pattern form for files and other actions, not a command: add it with `nerve-node config add center.<name>.policy.{}`",
+                self.word()
+            ));
+        }
+        self.command_rule(command, wildcard)
+    }
+
+    /// The rule a command line stands for. The allow and deny lists hold
+    /// `exec.run` rules; the sudo list holds the sudo command lines, and takes
+    /// the command with or without the `sudo` in front. `rule rm` uses it
+    /// as it is, so the rules an older `rule add` made from the pattern form
+    /// can be removed with the arguments that made them.
+    fn command_rule(self, command: &str, wildcard: bool) -> Result<String, String> {
         match self {
             List::Allow if sudo_command(command).is_some() => {
                 Err("a sudo command goes on the sudo list: `nerve-node rule add sudo`".into())
@@ -838,24 +887,37 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
             wildcard,
             center,
         } => {
+            let removed = std::sync::Mutex::new(String::new());
             let name = edit_center(paths, &center, |e| {
+                let name = e.name.clone();
                 let l = list.of(&mut e.policy);
                 // An entry copied from `ls` goes as it is, so rules for
-                // files and other actions can be removed too.
-                let rule = if l.contains(&command) {
-                    command.clone()
-                } else {
-                    list.entry(&command, wildcard)?
+                // files and other actions can be removed too. The arguments
+                // of `add` stand for the command rule they made.
+                let made = list.command_rule(&command, wildcard);
+                let rule = match made {
+                    Ok(made) if made != command && l.contains(&command) && l.contains(&made) => {
+                        return Err(format!(
+                            "both {command:?} and {made:?} are on the {}: remove {made:?} first with `nerve-node rule rm {word} '{made}' --center {center}`, and then {command:?} with `nerve-node rule rm {word} '{command}' --center {center}`",
+                            list.label(),
+                            word = list.word(),
+                            center = name
+                        ));
+                    }
+                    _ if l.contains(&command) => command.clone(),
+                    made => made?,
                 };
                 let before = l.len();
                 l.retain(|r| *r != rule);
                 if l.len() == before {
                     return Err(format!("{rule:?} is not on the {}", list.label()));
                 }
+                *removed.lock().unwrap() = rule;
                 Ok(())
             })
             .await?;
-            let _ = writeln!(out, "{name}: removed from the {}", list.label());
+            let removed = removed.into_inner().unwrap();
+            let _ = writeln!(out, "{name}: removed {removed:?} from the {}", list.label());
         }
         RuleCmd::Ls { list, center } => {
             let (cfg, _) = read_config(paths).await?;
@@ -892,8 +954,8 @@ const NEXT_START: &str = "takes effect at the next start of the node";
 
 /// Runs one command line, writing what it shows to `out`. A change made
 /// while no daemon answers on the control socket (none runs, or Windows,
-/// which has no socket) is only in the file, so the output says
-/// when it counts.
+/// whose pipe takes folder changes only) is only in the file, so the output
+/// says when it counts.
 pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
     let service = cli.cmd.is_service();
     if service && (cli.config_dir.is_some() || cli.state_dir.is_some()) {
@@ -914,11 +976,17 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
     let own_say = cfg!(windows) && matches!(cli.cmd, Cmd::Sudo(_));
     let before = (!matches!(cli.cmd, Cmd::Run) && !service && !own_say)
         .then(|| std::fs::read(paths.config_file()).ok());
+    // On Windows the running node takes folder changes over its pipe, and
+    // nothing else yet.
+    let folders = matches!(
+        cli.cmd,
+        Cmd::Folder(FolderCmd::Add { .. } | FolderCmd::Set { .. } | FolderCmd::Rm { .. })
+    );
     let r = command(paths.clone(), cli.cmd, out).await;
     if r.is_ok()
         && let Some(before) = before
         && std::fs::read(paths.config_file()).ok() != before
-        && !daemon_answers(&paths).await
+        && !daemon_answers(&paths, folders).await
     {
         let _ = writeln!(out, "the change is in node.toml; it {NEXT_START}");
     }
@@ -998,18 +1066,24 @@ async fn owner_check(paths: &[&NodePaths]) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether a daemon answers on the control socket; it then took every
-/// change at once.
-async fn daemon_answers(paths: &NodePaths) -> bool {
+/// Whether a daemon runs on the control socket; it then took every change
+/// at once. One that takes no connection now runs all the same; a socket
+/// that cannot be reached at all is none. On Windows it takes only `folders`
+/// changes over its pipe, so only those count as taken when it answers.
+async fn daemon_answers(paths: &NodePaths, folders: bool) -> bool {
     #[cfg(unix)]
     {
-        nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({}))
-            .await
-            .is_ok()
+        let _ = folders;
+        let outcome = nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await;
+        nerve_transport::ctl::node_is_there(&outcome).unwrap_or(false)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = paths;
+        folders && crate::pipe::call(paths, "status", json!({})).await.is_ok()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (paths, folders);
         false
     }
 }
@@ -1048,11 +1122,24 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
         Cmd::Center(CenterCmd::Rm(center)) => {
             let (cfg, _) = read_config(&paths).await?;
             let name = pick_center(&cfg, &center)?;
-            let cfg = edit(&paths, |c| {
+            let gone = std::sync::Mutex::new(Vec::new());
+            // Saved also when the folder grants of the other pairings do not
+            // follow: the pairing is gone then, so its key and profile go
+            // now, or nothing names them later.
+            let saved = edit_saved(&paths, |c| {
+                let mut g = gone.lock().unwrap_or_else(|p| p.into_inner());
+                g.clear();
+                g.extend(
+                    c.centers
+                        .iter()
+                        .filter(|e| e.name == name)
+                        .map(|e| e.node_id.clone()),
+                );
                 c.centers.retain(|e| e.name != name);
                 Ok(())
             })
             .await?;
+            let cfg = &saved.cfg;
             // The center is gone either way; a key that stays behind is
             // said, not hidden.
             if let Err(e) =
@@ -1060,8 +1147,51 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             {
                 w(out, format!("the node key for {name} was not deleted: {e}"));
             }
+            // So is the profile of its container on Windows (crate::grants):
+            // with its last grant when the record names it, else found by
+            // the pairing. A node that runs still serves the center until it
+            // starts again, so there it stays.
+            let mut p = saved.grants.profiles.clone();
+            let mut ours = Vec::new();
+            for id in gone.into_inner().unwrap_or_else(|p| p.into_inner()) {
+                if cfg.centers.iter().any(|c| c.node_id == id) {
+                    continue;
+                }
+                ours.extend(crate::grants::containers(&paths, &id));
+                p.merge(crate::grants::forget(&paths, &id));
+            }
+            let of = |n: &String| {
+                if ours.contains(n) {
+                    format!("{n} of {name}")
+                } else {
+                    n.clone()
+                }
+            };
+            for n in &p.removed {
+                w(out, format!("removed the AppContainer profile {}", of(n)));
+            }
+            if let Some(why) = &p.why {
+                for n in &p.kept {
+                    w(
+                        out,
+                        format!(
+                            "the AppContainer profile {} stays, since {why}: once the node stopped, remove it by hand (docs/user/modes.md)",
+                            of(n)
+                        ),
+                    );
+                }
+            }
+            for e in &p.errors {
+                w(
+                    out,
+                    format!("the AppContainer profile of {name} was not removed: {e}"),
+                );
+            }
             w(out, format!("unpaired {name}"));
-            Ok(())
+            match grants_failed(&saved.grants) {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
         }
         Cmd::Center(CenterCmd::Ls) => {
             let (cfg, _) = read_config(&paths).await?;
@@ -1095,6 +1225,17 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                         }
                     ),
                 );
+                // Which `nerve.*` profile is this pairing's: the others
+                // belong to other nodes or are left over (docs/user/modes.md).
+                if cfg!(windows) {
+                    w(
+                        out,
+                        format!(
+                            "  AppContainer {}",
+                            crate::grants::profile_name(&paths, &c.node_id)
+                        ),
+                    );
+                }
             }
             Ok(())
         }
@@ -1187,23 +1328,17 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             center,
         }) => {
             let (changes, center) = take_center_flag(changes, center)?;
-            let real = resolve_folder(&path)?;
-            let given = path.display().to_string();
-            let access = std::cell::Cell::new(Access::NONE);
-            let name = edit_center(&paths, &center, |e| {
-                let f = e
-                    .policy
-                    .folders
-                    .iter_mut()
-                    .find(|f| f.path == real || f.path == given)
-                    .ok_or_else(|| format!("{real} is not a folder of this center"))?;
-                f.access = changes.iter().try_fold(f.access, |a, c| a.change(c))?;
-                access.set(f.access);
-                Ok(())
+            let a = change_stored_folder(&paths, &center, &path, |at| FolderChange::Set {
+                path: at.clone(),
+                given: at,
+                changes: changes.clone(),
             })
             .await?;
-            let access = access.get();
-            w(out, format!("{name}: folder {real} {}", access.to_chmod()));
+            let access = a.access.unwrap_or(Access::NONE);
+            w(
+                out,
+                format!("{}: folder {} {}", a.center, a.path, access.to_chmod()),
+            );
             if access.is_none() {
                 w(
                     out,
@@ -1214,20 +1349,12 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             Ok(())
         }
         Cmd::Folder(FolderCmd::Rm { path, center }) => {
-            let real = resolve_folder(&path)?;
-            let given = path.display().to_string();
-            let name = edit_center(&paths, &center, |e| {
-                let before = e.policy.folders.len();
-                e.policy
-                    .folders
-                    .retain(|f| f.path != real && f.path != given);
-                if e.policy.folders.len() == before {
-                    return Err(format!("{real} is not a folder of this center"));
-                }
-                Ok(())
+            let a = change_stored_folder(&paths, &center, &path, |at| FolderChange::Rm {
+                path: at.clone(),
+                given: at,
             })
             .await?;
-            w(out, format!("{name}: removed {real}"));
+            w(out, format!("{}: removed {}", a.center, a.path));
             Ok(())
         }
         Cmd::Folder(FolderCmd::Ls { center }) => {
@@ -1432,8 +1559,16 @@ async fn after_keyring_answers(
     out: &mut dyn Write,
 ) -> Result<(), String> {
     #[cfg(unix)]
-    if let Ok(status) = nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await {
-        return restart_for_keyring(&status, paths, machine, out);
+    match nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await {
+        Ok(status) => return restart_for_keyring(&status, paths, machine, out),
+        Err(e) if e == nerve_transport::ctl::NOT_RUNNING => {}
+        Err(e) => {
+            let _ = writeln!(
+                out,
+                "the running node was not asked whether it found a keyring ({e}); restart it if it did not"
+            );
+            return Ok(());
+        }
     }
     #[cfg(not(unix))]
     let _ = (paths, machine, out);
@@ -1514,7 +1649,7 @@ async fn setup_steps(
     }
     let (cfg, _) = read_config(paths).await?;
     if let (Some(sys), Some(name)) = (machine, create_user) {
-        let c = crate::service::create_account(sys, paths, name, out)?;
+        let c = crate::service::create_account(sys, paths, name, &invoker(), out)?;
         let chosen = (c.made || cfg.machine.user.as_deref() != Some(name)).then_some(c);
         account_chosen(paths, chosen, out, steps).await?;
     }
@@ -1544,12 +1679,14 @@ async fn setup_steps(
     if let Some(sys) = machine
         && create_user.is_none()
     {
-        let suggested = Some(invoker()).filter(|u| u != "root");
+        let who = invoker();
+        let suggested = Some(who.as_str()).filter(|u| *u != "root");
         let chosen = crate::service::choose_account(
             sys,
             paths,
             cfg.machine.user.as_deref(),
-            suggested.as_deref(),
+            suggested,
+            &who,
             input,
             out,
         )?;
@@ -1772,45 +1909,149 @@ async fn add_folder(
     let w = |out: &mut dyn Write, s: String| {
         let _ = writeln!(out, "{s}");
     };
-    // Nothing is the default, and a folder that grants nothing is
-    // never what was meant, so it is refused.
-    let access = rights.iter().try_fold(Access::NONE, |a, r| {
-        if r.starts_with('+') {
-            a.change(r)
-        } else {
-            Err(format!("{r:?}: a new folder takes +r, +w or +x"))
+    // The rights are checked before the folder is looked at.
+    let access = FolderChange::new_rights(rights)?;
+    let (cfg, _) = read_config(paths).await?;
+    let name = pick_center(&cfg, center)?;
+    let given = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| e.to_string())?
+            .join(path)
+    };
+    let given = nerve_policy::paths::normal_folder(&given.display().to_string())?;
+    // A running node judges the path as the account the commands run as,
+    // which this command may not be (the installed node's CLI runs as the
+    // node's own user): it follows the links on the path a link at a time,
+    // refuses one a command may have put inside a `w` folder, and stores and
+    // records the real place, all in one step.
+    #[cfg(unix)]
+    let asked = {
+        let params = json!({"center": name, "path": given, "access": access.to_string()});
+        match nerve_transport::ctl::call(&paths.ctl_socket(), "folder.add", params).await {
+            Ok(v) => Some((
+                v["stored"].as_str().unwrap_or(&given).to_string(),
+                v["recorded"] == true,
+                v["mode"].as_str().map(str::to_string),
+            )),
+            Err(e) if e == nerve_transport::ctl::NOT_RUNNING => None,
+            Err(e) => return Err(e),
         }
-    })?;
-    if access.is_none() {
-        return Err(
-            "name what the center may do in the folder: +r (read), +w (write), +x (run commands)"
-                .into(),
-        );
-    }
-    let real = resolve_folder(path)?;
-    let mode = std::cell::Cell::new(Mode::Folder);
-    let name = edit_center(paths, center, |e| {
-        e.policy.folders.retain(|f| f.path != real);
-        e.policy.folders.push(Folder {
-            path: real.clone(),
-            access,
-        });
-        mode.set(e.policy.mode);
-        Ok(())
-    })
-    .await?;
-    w(out, format!("{name}: folder {real} {}", access.to_chmod()));
-    let mode = mode.get();
-    if mode != Mode::Folder {
+    };
+    #[cfg(not(unix))]
+    let asked: Option<(String, bool, Option<String>)> = None;
+    let (stored, recorded, mode) = match asked {
+        Some(a) => a,
+        None => {
+            // No node to ask (on Windows the node's pipe takes the change but
+            // not the judging): judge the path here, as this process sees it.
+            let settled = crate::exec::settle(&cfg, &crate::paths::home_dir(), Path::new(&given));
+            let (stored, recorded) = match settled {
+                crate::exec::Settled::Refused(why) => {
+                    return Err(crate::daemon::refusal(&given, &why));
+                }
+                crate::exec::Settled::At(place) => (place.display().to_string(), true),
+                crate::exec::Settled::Unknown => (given.clone(), false),
+            };
+            let change = FolderChange::Add {
+                path: stored.clone(),
+                access,
+                recorded,
+            };
+            let a = change_folder(paths, center, &change).await?;
+            (stored, recorded, Some(a.mode.as_str().to_string()))
+        }
+    };
+    w(
+        out,
+        format!("{name}: folder {stored} {}", access.to_chmod()),
+    );
+    if !recorded {
         w(
             out,
             format!(
-                "note: folders count in folder mode; {name} is in {} mode (`nerve-node mode set folder`)",
-                mode.as_str()
+                "note: {stored} is stored as given and not recorded at its real place, since this command cannot tell where its path leads (the installed node's CLI may not look into the account's home) and no running node could: a link that replaces the folder later is followed once no `w` folder shows it, see modes.md \"A folder keeps the place you added\"; start the node and add the folder again"
+            ),
+        );
+    } else if !same_folder(&stored, &given) {
+        w(
+            out,
+            format!("note: {given} leads to {stored}; the folder is stored there"),
+        );
+    }
+    if let Some(mode) = mode.filter(|m| m != Mode::Folder.as_str()) {
+        w(
+            out,
+            format!(
+                "note: folders count in folder mode; {name} is in {mode} mode (`nerve-node mode set folder`)"
             ),
         );
     }
     Ok(())
+}
+
+/// Whether two folder paths name one place.
+fn same_folder(a: &str, b: &str) -> bool {
+    use nerve_policy::paths::within;
+    within(Path::new(a), Path::new(b)) && within(Path::new(b), Path::new(a))
+}
+
+/// `folder set` and `folder rm`: the change `make` builds for the stored
+/// folder `path` means ([`stored_folder`]), made as [`change_folder`] makes
+/// it. The folder is looked up on the config as the CLI reads it, then named
+/// by its stored path, so that a change to the file in between ends in "not
+/// a folder of this center" and never in another folder.
+async fn change_stored_folder(
+    paths: &NodePaths,
+    center: &CenterArg,
+    path: &Path,
+    make: impl FnOnce(String) -> FolderChange,
+) -> Result<Applied, String> {
+    let (cfg, _) = read_config(paths).await?;
+    let name = pick_center(&cfg, center)?;
+    let folders = &cfg.center(&name).expect("picked above").policy.folders;
+    let at = stored_folder(folders, path)?;
+    change_folder(paths, center, &make(at)).await
+}
+
+/// Changes a center's folders. On Windows a running node takes the change
+/// over its control pipe and makes it itself, folder grants included
+/// (crate::pipe); a node that does not run, and the other platforms, take
+/// it as every other change ([`edit`]).
+async fn change_folder(
+    paths: &NodePaths,
+    center: &CenterArg,
+    change: &FolderChange,
+) -> Result<Applied, String> {
+    #[cfg(windows)]
+    match crate::pipe::call(
+        paths,
+        change.method(),
+        change.params(center.center.as_deref()),
+    )
+    .await
+    {
+        Ok(v) => {
+            return serde_json::from_value(v)
+                .map_err(|e| format!("the node's answer is not understood: {e}"));
+        }
+        // A node that runs holds the keys' lock.
+        Err(e)
+            if crate::pipe::file_instead(&e, || {
+                !matches!(crate::secrets::KeysLock::try_take(paths), Ok(Some(_)))
+            }) => {}
+        Err(e) => return Err(e),
+    }
+    let (cfg, _) = read_config(paths).await?;
+    let name = pick_center(&cfg, center)?;
+    let applied = std::cell::RefCell::new(None);
+    edit(paths, |c| {
+        *applied.borrow_mut() = Some(crate::folder_change::apply_to(c, Some(&name), change)?);
+        Ok(())
+    })
+    .await?;
+    Ok(applied.into_inner().expect("applied when edit succeeds"))
 }
 
 /// `nerve-node sudo on|off|status`. The password lives in the running
@@ -1948,6 +2189,40 @@ fn enum_str<T: serde::Serialize>(v: &T) -> String {
 
 fn parse_enum<T: serde::de::DeserializeOwned>(s: &str, choices: &str) -> Result<T, String> {
     serde_json::from_value(json!(s)).map_err(|_| format!("{s:?}: expected {choices}"))
+}
+
+/// The path of the stored folder `folder set` and `folder rm` mean by `path`,
+/// found before the path is resolved, which fails where a dangling link or a
+/// loop of links stands now. In this order: the folder the path is spelled as
+/// (made absolute and tidy, no link followed); the folder its resolution lands
+/// at, a link at a time (`folder add` stored the real place of a path through
+/// a link of the owner's, and a link may have replaced that place since); the
+/// folder at the real place the path leads to.
+fn stored_folder(folders: &[Folder], path: &Path) -> Result<String, String> {
+    use nerve_policy::paths::within;
+    let same = |a: &Path, b: &Path| within(a, b) && within(b, a);
+    let stored = |p: &Path| {
+        folders
+            .iter()
+            .find(|f| same(p, Path::new(&f.path)))
+            .map(|f| f.path.clone())
+    };
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| e.to_string())?
+            .join(path)
+    };
+    let spelled = nerve_policy::paths::normal_folder(&abs.display().to_string()).ok();
+    if let Some(f) = spelled.and_then(|s| stored(Path::new(&s))) {
+        return Ok(f);
+    }
+    if let Some(f) = crate::exec::lands_at(&abs, |p| stored(p).is_some()).and_then(|p| stored(&p)) {
+        return Ok(f);
+    }
+    let real = resolve_folder(path)?;
+    stored(Path::new(&real)).ok_or_else(|| crate::folder_change::not_a_folder(&real, folders))
 }
 
 /// Folders are stored resolved (symlinks followed), the way the policy
@@ -2198,11 +2473,22 @@ async fn config_cmd(paths: &NodePaths, c: ConfigCmd, out: &mut dyn Write) -> Res
 /// the kernel here and the account `cfg` runs commands as tell.
 async fn tell_folder_commands(paths: &NodePaths, cfg: &NodeConfig, out: &mut dyn Write) {
     #[cfg(unix)]
-    if let Ok(v) = nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await {
-        if v["folder_commands_off"] == crate::daemon::KEYRING_NOT_CONFINED {
-            let _ = writeln!(out, "{}", folder_commands_off());
+    match nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await {
+        Ok(v) => {
+            if v["folder_commands_off"] == crate::daemon::KEYRING_NOT_CONFINED {
+                let _ = writeln!(out, "{}", folder_commands_off());
+            }
+            return;
         }
-        return;
+        Err(e) if e == nerve_transport::ctl::NOT_RUNNING => {}
+        // The node that runs knows, and was not asked.
+        Err(e) => {
+            let _ = writeln!(
+                out,
+                "the running node was not asked whether folder mode still runs commands ({e}); `nerve-node status` shows it"
+            );
+            return;
+        }
     }
     if keyring_turns_commands_off(nerve_sandbox::Confinement::detect(), || {
         node_command_account(paths, cfg)
@@ -2262,8 +2548,9 @@ fn keyring_turns_commands_off(
 
 /// `proxy set|rm|ls`. The header values, and a user name and password given
 /// in the URL, go into the system keyring ([`crate::secrets`]); `node.toml`
-/// keeps the URL without them and the header names. Nothing here prints,
-/// logs or audits a value.
+/// keeps the URL without them and the header names. The installed node on
+/// Windows refuses them, as the service does not read the keyring of the
+/// account that runs this. Nothing here prints, logs or audits a value.
 async fn proxy_cmd(paths: &NodePaths, c: ProxyCmd, out: &mut dyn Write) -> Result<(), String> {
     match c {
         ProxyCmd::Set { url, headers } => {
@@ -2777,6 +3064,361 @@ mod tests {
         }
     }
 
+    /// `folder add` records the place it stores, so that a link which
+    /// replaces the folder later is refused (`exec::folder_sets`). Adding it
+    /// again, also through a link of the owner's, keeps one entry; `folder
+    /// set` keeps it, and `folder rm` takes it away with the folder.
+    #[cfg(unix)]
+    #[test]
+    fn folder_add_records_the_place_and_rm_forgets_it() {
+        let (d, paths) = setup(&["home"]);
+        let work = d.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink(&work, &link).unwrap();
+        let real = nerve_policy::paths::resolve(&work)
+            .unwrap()
+            .display()
+            .to_string();
+        let (work, link) = (work.to_str().unwrap(), link.to_str().unwrap());
+        let places = || load(&paths).centers[0].policy.places.clone();
+        assert!(places().is_empty());
+        run(&paths, &["folder", "add", work, "+r"]).unwrap();
+        assert_eq!(places(), std::slice::from_ref(&real));
+        // The same place again, and by a link: one folder, one entry.
+        run(&paths, &["folder", "add", link, "+rw"]).unwrap();
+        run(&paths, &["folder", "set", work, "+x"]).unwrap();
+        assert_eq!(load(&paths).centers[0].policy.folders.len(), 1);
+        assert_eq!(places(), std::slice::from_ref(&real));
+        run(&paths, &["folder", "rm", link]).unwrap();
+        assert!(load(&paths).centers[0].policy.folders.is_empty());
+        assert!(places().is_empty());
+        // Added once more, it is recorded once more.
+        run(&paths, &["folder", "add", work, "+r"]).unwrap();
+        assert_eq!(places(), std::slice::from_ref(&real));
+    }
+
+    /// A folder the CLI cannot look into (the installed node's CLI runs as
+    /// `nerve`, a home may be closed to it) is stored as given and cannot be
+    /// recorded here: with no running node to judge it as the account, the
+    /// command says so.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_the_cli_cannot_judge_is_added_with_a_note_and_no_record() {
+        use std::os::unix::fs::PermissionsExt;
+        if nerve_transport::net::euid() == 0 {
+            return; // root looks into every folder
+        }
+        let (d, paths) = setup(&["home"]);
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let home = root.join("home");
+        std::fs::create_dir_all(home.join("proj")).unwrap();
+        let proj = home.join("proj");
+        let closed = std::fs::Permissions::from_mode(0o000);
+        std::fs::set_permissions(&home, closed).unwrap();
+        let out = run(&paths, &["folder", "add", proj.to_str().unwrap(), "+rw"]);
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let out = out.unwrap();
+        assert!(out.contains("not recorded at its real place"), "{out}");
+        assert!(out.contains(&proj.display().to_string()), "{out}");
+        let policy = load(&paths).centers[0].policy.clone();
+        assert_eq!(policy.folders.len(), 1);
+        assert!(policy.places.is_empty(), "{policy:?}");
+        // One it could judge says nothing of the kind.
+        let out = run(&paths, &["folder", "add", proj.to_str().unwrap(), "+rw"]).unwrap();
+        assert!(!out.contains("not recorded"), "{out}");
+        assert_eq!(load(&paths).centers[0].policy.places.len(), 1);
+        // Added again where it cannot look, the rights change and the record
+        // it has stays: a record only narrows, and the node checks it as the
+        // account before each command.
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let out = run(&paths, &["folder", "add", proj.to_str().unwrap(), "+r"]);
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(out.unwrap().contains("not recorded at its real place"));
+        let policy = load(&paths).centers[0].policy.clone();
+        assert_eq!(policy.folders.len(), 1);
+        assert_eq!(policy.folders[0].access.to_string(), "r");
+        assert_eq!(policy.places, [proj.display().to_string()]);
+    }
+
+    /// In the state the new warning reports, a link has replaced a recorded
+    /// folder and its real place is another folder. `folder set` and `folder
+    /// rm` act on the folder the path is spelled as (also with a trailing
+    /// slash), name it, and leave the folder the link leads to alone; a path
+    /// that is a link to a folder still finds the folder at its real place.
+    #[cfg(unix)]
+    #[test]
+    fn folder_set_and_rm_find_a_folder_a_link_replaced_by_its_spelling() {
+        let (d, paths) = setup(&["home"]);
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let (work, docs) = (root.join("work"), root.join("docs"));
+        let bin = work.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir(&docs).unwrap();
+        for (p, rights) in [(&work, "+rw"), (&bin, "+r"), (&docs, "+r")] {
+            run(&paths, &["folder", "add", p.to_str().unwrap(), rights]).unwrap();
+        }
+        std::fs::remove_dir(&bin).unwrap();
+        std::os::unix::fs::symlink(&docs, &bin).unwrap();
+        let folders = || load(&paths).centers[0].policy.clone();
+        let access = |p: &Path| {
+            let policy = folders();
+            let f = policy.folders.iter().find(|f| Path::new(&f.path) == p);
+            f.map(|f| f.access.to_string())
+        };
+        let spelled = format!("{}/", bin.display());
+
+        let out = run(&paths, &["folder", "set", &spelled, "+x"]).unwrap();
+        assert!(
+            out.contains(&format!("folder {} r-x", bin.display())),
+            "{out}"
+        );
+        assert_eq!(access(&bin).as_deref(), Some("rx"));
+        assert_eq!(access(&docs).as_deref(), Some("r"));
+
+        let out = run(&paths, &["folder", "rm", &spelled]).unwrap();
+        assert!(out.contains(&format!("removed {}", bin.display())), "{out}");
+        assert_eq!(access(&bin), None);
+        assert_eq!(access(&docs).as_deref(), Some("r"));
+        assert!(!folders().is_placed(&bin.display().to_string()));
+        assert!(folders().is_placed(&docs.display().to_string()));
+
+        // The owner's own link to a folder finds the folder it leads to.
+        let to_docs = root.join("to-docs");
+        std::os::unix::fs::symlink(&docs, &to_docs).unwrap();
+        let out = run(&paths, &["folder", "rm", to_docs.to_str().unwrap()]).unwrap();
+        assert!(
+            out.contains(&format!("removed {}", docs.display())),
+            "{out}"
+        );
+        assert_eq!(access(&docs), None);
+        assert_eq!(access(&work).as_deref(), Some("rw"));
+    }
+
+    /// `folder rm` and `folder set` find the stored folder by the path the
+    /// owner gave `folder add`, when that went through a link of the owner's
+    /// and the stored place has been replaced by a link since; and where a
+    /// dangling link or a loop of links stands in the folder's place, which
+    /// resolving the path would refuse. A folder the path only passes is not
+    /// the folder it names.
+    #[cfg(unix)]
+    #[test]
+    fn folder_rm_and_set_reach_a_folder_through_links_and_where_none_resolves() {
+        let (d, paths) = setup(&["home"]);
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let (work, docs, data) = (root.join("work"), root.join("docs"), root.join("data"));
+        let (real, code) = (data.join("real"), root.join("code"));
+        for p in [&work.join("bin"), &work.join("sub"), &docs, &real] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        std::os::unix::fs::symlink(&real, &code).unwrap();
+        for (p, rights) in [
+            (&work, "+rw"),
+            (&work.join("bin"), "+r"),
+            (&code, "+r"),
+            (&docs, "+r"),
+        ] {
+            run(&paths, &["folder", "add", p.to_str().unwrap(), rights]).unwrap();
+        }
+        let listed = || -> Vec<String> {
+            load(&paths).centers[0]
+                .policy
+                .folders
+                .iter()
+                .map(|f| f.path.clone())
+                .collect()
+        };
+        let has = |p: &Path| listed().contains(&p.display().to_string());
+        assert!(has(&real) && !has(&code), "stored at the real place");
+
+        // The stored place is replaced by a link to `docs`: `code`, the path
+        // the owner gave, still names the stored folder and not `docs`.
+        std::fs::remove_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&docs, &real).unwrap();
+        let out = run(&paths, &["folder", "set", code.to_str().unwrap(), "+x"]).unwrap();
+        assert!(
+            out.contains(&format!("folder {} r-x", real.display())),
+            "{out}"
+        );
+        let out = run(&paths, &["folder", "rm", code.to_str().unwrap()]).unwrap();
+        assert!(
+            out.contains(&format!("removed {}", real.display())),
+            "{out}"
+        );
+        assert!(!has(&real) && has(&docs));
+
+        // A folder the path only passes is not the folder it names.
+        let e = run(
+            &paths,
+            &["folder", "rm", work.join("sub").to_str().unwrap()],
+        )
+        .unwrap_err();
+        assert!(e.contains("not a folder of this center"), "{e}");
+        assert!(has(&work));
+
+        // A dangling link, and then a loop, stand where `work/bin` was.
+        let bin = work.join("bin");
+        std::fs::remove_dir(&bin).unwrap();
+        std::os::unix::fs::symlink(root.join("nowhere"), &bin).unwrap();
+        let out = run(&paths, &["folder", "set", bin.to_str().unwrap(), "-r"]).unwrap();
+        assert!(
+            out.contains(&format!("folder {} ---", bin.display())),
+            "{out}"
+        );
+        std::fs::remove_file(&bin).unwrap();
+        std::os::unix::fs::symlink(&bin, &bin).unwrap();
+        let out = run(&paths, &["folder", "rm", bin.to_str().unwrap()]).unwrap();
+        assert!(out.contains(&format!("removed {}", bin.display())), "{out}");
+        assert!(!has(&bin) && has(&work) && has(&docs));
+        // What is not stored under any spelling still says why.
+        let e = run(&paths, &["folder", "rm", bin.to_str().unwrap()]).unwrap_err();
+        assert!(
+            e.contains("Too many levels") || e.contains("symlink"),
+            "{e}"
+        );
+    }
+
+    /// The installed node's CLI runs as `nerve`, which cannot look into the
+    /// owner's home: a link there stays as typed, and the folder `folder add`
+    /// stored at the place the link leads to is not found. `folder set` and
+    /// `folder rm` then name the path `folder ls` shows (issue #98), also where
+    /// the center has more folders than the hint would list.
+    #[cfg(unix)]
+    #[test]
+    fn folder_set_and_rm_name_the_listed_folder_for_a_link_the_cli_cannot_look_into() {
+        use std::os::unix::fs::PermissionsExt;
+        if nerve_transport::net::euid() == 0 {
+            return; // root looks into every folder
+        }
+        let (d, paths) = setup(&["home"]);
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let (home, data) = (root.join("home"), root.join("data"));
+        let (proj, work) = (home.join("proj"), data.join("work"));
+        for p in [&proj, &work] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        let (link, far) = (home.join("linkproj"), home.join("sub").join("linkwork"));
+        std::fs::create_dir(home.join("sub")).unwrap();
+        std::os::unix::fs::symlink(&proj, &link).unwrap();
+        std::os::unix::fs::symlink(&work, &far).unwrap();
+        for p in [&proj, &work] {
+            run(&paths, &["folder", "add", p.to_str().unwrap(), "+r"]).unwrap();
+        }
+        let listed = |n: usize| load(&paths).centers[0].policy.folders.len() == n;
+        // While the CLI can look at the link, it finds the folder.
+        let out = run(&paths, &["folder", "set", link.to_str().unwrap(), "+x"]).unwrap();
+        assert!(
+            out.contains(&format!("folder {} r-x", proj.display())),
+            "{out}"
+        );
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let mut errors = Vec::new();
+        for args in [["set", "+w"], ["rm", ""]] {
+            let mut cmd = vec!["folder", args[0], link.to_str().unwrap()];
+            if !args[1].is_empty() {
+                cmd.push(args[1]);
+            }
+            errors.push(run(&paths, &cmd).unwrap_err());
+        }
+        // Only folders far from the path are listed, and more than the hint
+        // would name: it still says what to do.
+        for n in ["a", "b"] {
+            let p = root.join(n);
+            std::fs::create_dir(&p).unwrap();
+            run(&paths, &["folder", "add", p.to_str().unwrap(), "+r"]).unwrap();
+        }
+        errors.push(run(&paths, &["folder", "rm", far.to_str().unwrap()]).unwrap_err());
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for e in &errors[..2] {
+            assert!(
+                e.starts_with(&format!(
+                    "{} is not a folder of this center",
+                    link.display()
+                )),
+                "{e}"
+            );
+            assert!(
+                e.ends_with(&format!(
+                    "`nerve-node folder ls` shows for the folder: {}",
+                    proj.display()
+                )),
+                "{e}"
+            );
+        }
+        let e = &errors[2];
+        assert!(e.contains("this account cannot look into it"), "{e}");
+        assert!(e.ends_with("shows for the folder"), "{e}");
+        // The refused calls changed nothing.
+        assert!(listed(4));
+    }
+
+    /// A link a command may have put inside a folder it can write in is not
+    /// followed by `folder add`: it would store, and record, whatever the link
+    /// leads to, past the check that keeps such a folder out of the sandbox.
+    /// A link of the owner's elsewhere is followed, as before.
+    #[cfg(unix)]
+    #[test]
+    fn folder_add_does_not_follow_a_link_inside_a_write_folder() {
+        let (d, paths) = setup(&["home"]);
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let (work, docs) = (root.join("work"), root.join("docs"));
+        let bin = work.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir(&docs).unwrap();
+        run(&paths, &["folder", "add", work.to_str().unwrap(), "+rw"]).unwrap();
+        // The folder is a plain one first, and then a command replaces it.
+        run(&paths, &["folder", "add", bin.to_str().unwrap(), "+r"]).unwrap();
+        std::fs::remove_dir(&bin).unwrap();
+        std::os::unix::fs::symlink(&docs, &bin).unwrap();
+        let before = load(&paths).centers[0].policy.clone();
+        let e = run(&paths, &["folder", "add", bin.to_str().unwrap(), "+rx"]).unwrap_err();
+        assert!(e.contains("link") && e.contains("may write"), "{e}");
+        let policy = load(&paths).centers[0].policy.clone();
+        assert_eq!(
+            policy, before,
+            "nothing changed, the record of `bin` included"
+        );
+        assert!(policy.is_placed(&bin.display().to_string()));
+        assert!(!policy.is_placed(&docs.display().to_string()));
+        assert!(!policy.is_placed(&docs.display().to_string()));
+        // A link of the owner's outside every write folder is followed.
+        let to_docs = root.join("to-docs");
+        std::os::unix::fs::symlink(&docs, &to_docs).unwrap();
+        run(&paths, &["folder", "add", to_docs.to_str().unwrap(), "+r"]).unwrap();
+        assert!(
+            load(&paths).centers[0]
+                .policy
+                .is_placed(&docs.display().to_string())
+        );
+    }
+
+    /// On Windows, a junction a command may have put inside a folder it can
+    /// write in is not followed by `folder add` either.
+    #[cfg(windows)]
+    #[test]
+    fn folder_add_does_not_follow_a_junction_inside_a_write_folder() {
+        let (d, paths) = setup(&["home"]);
+        let root = nerve_policy::paths::resolve(d.path()).unwrap();
+        let (work, docs) = (root.join("work"), root.join("docs"));
+        let bin = work.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir(&docs).unwrap();
+        run(&paths, &["folder", "add", work.to_str().unwrap(), "+rw"]).unwrap();
+        std::fs::remove_dir(&bin).unwrap();
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&bin)
+            .arg(&docs)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+        let e = run(&paths, &["folder", "add", bin.to_str().unwrap(), "+rx"]).unwrap_err();
+        assert!(e.contains("link") && e.contains("may write"), "{e}");
+        let policy = load(&paths).centers[0].policy.clone();
+        assert_eq!(policy.folders.len(), 1, "nothing was stored: {policy:?}");
+        assert!(!policy.is_placed(&docs.display().to_string()));
+    }
+
     #[test]
     fn folder_set_applies_its_changes_left_to_right() {
         let (d, paths) = setup(&["home"]);
@@ -2849,6 +3491,154 @@ mod tests {
         assert!(!load(&paths).center("a").unwrap().paused);
         run(&paths, &["center", "rm", "--center", "b"]).unwrap();
         assert!(load(&paths).center("b").is_none());
+    }
+
+    /// On Windows: `center rm` removes the profile of the pairing's
+    /// AppContainer also when the record of the grants does not name it,
+    /// as after the state folder was deleted.
+    #[cfg(windows)]
+    #[test]
+    fn center_rm_removes_the_profile_the_record_does_not_name() {
+        let (_d, paths) = setup(&["home"]);
+        let name = crate::grants::container(&paths, "n");
+        let profile = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap())
+            .join("Packages")
+            .join(&name);
+        // Starting a command in the container makes its profile; whether
+        // the command runs does not matter here.
+        let _ = nerve_sandbox::appcontainer::run(
+            Path::new("cmd.exe"),
+            &["/C".into(), "exit 0".into()],
+            &name,
+        );
+        assert!(profile.exists(), "{}", profile.display());
+        assert!(!crate::grants::record_file(&paths).exists());
+        let ls = run(&paths, &["center", "ls"]).unwrap();
+        assert!(ls.contains(&format!("AppContainer {name}")), "{ls}");
+        let out = run(&paths, &["center", "rm"]).unwrap();
+        assert!(
+            out.contains(&format!("removed the AppContainer profile {name} of home")),
+            "{out}"
+        );
+        assert!(!profile.exists(), "{}", profile.display());
+    }
+
+    /// On Windows: a node that spelled its state folder with `/`, as the
+    /// default one is, is found by the folder typed with `\`.
+    #[cfg(windows)]
+    #[test]
+    fn center_rm_finds_the_profile_of_the_state_folder_spelled_otherwise() {
+        let (d, paths) = setup(&["home"]);
+        let spelled = NodePaths::new(
+            &paths.config_dir,
+            PathBuf::from(format!("{}/s", d.path().display())),
+        );
+        assert_eq!(spelled.state_dir, paths.state_dir);
+        let name = crate::grants::container(&spelled, "n");
+        assert_ne!(name, crate::grants::container(&paths, "n"));
+        let profile = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap())
+            .join("Packages")
+            .join(&name);
+        let _ = nerve_sandbox::appcontainer::run(
+            Path::new("cmd.exe"),
+            &["/C".into(), "exit 0".into()],
+            &name,
+        );
+        assert!(profile.exists(), "{}", profile.display());
+        let ls = run(&paths, &["center", "ls"]).unwrap();
+        assert!(ls.contains(&format!("AppContainer {name}")), "{ls}");
+        let out = run(&paths, &["center", "rm"]).unwrap();
+        assert!(out.contains(&name), "{out}");
+        assert!(!profile.exists(), "{}", profile.display());
+    }
+
+    /// The profile folder of the container `name`, made by starting a
+    /// command in it; whether the command runs does not matter.
+    #[cfg(windows)]
+    fn profile_of(name: &str) -> PathBuf {
+        let _ = nerve_sandbox::appcontainer::run(
+            Path::new("cmd.exe"),
+            &["/C".into(), "exit 0".into()],
+            name,
+        );
+        let profile = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap())
+            .join("Packages")
+            .join(name);
+        assert!(profile.exists(), "{}", profile.display());
+        profile
+    }
+
+    /// On Windows: the profile of a pairing with folder entries goes with
+    /// their grants at `center rm`, which says so, and stays while the node
+    /// runs, which it says too.
+    #[cfg(windows)]
+    #[test]
+    fn center_rm_names_the_profile_that_goes_with_the_last_grant() {
+        let (d, paths) = setup(&["home"]);
+        let work = d.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        run(&paths, &["folder", "add", work.to_str().unwrap(), "+rw"]).unwrap();
+        assert!(crate::grants::record_file(&paths).exists());
+        let name = crate::grants::container(&paths, "n");
+        let profile = profile_of(&name);
+        // A node that runs holds the lock.
+        let held = crate::secrets::KeysLock::try_take(&paths).unwrap().unwrap();
+        let out = run(&paths, &["center", "rm"]).unwrap();
+        drop(held);
+        assert!(
+            out.contains(&format!(
+                "the AppContainer profile {name} of home stays, since the node at"
+            )),
+            "{out}"
+        );
+        assert!(profile.exists(), "{}", profile.display());
+        nerve_sandbox::appcontainer::remove_profile(&name).unwrap();
+
+        let (d, paths) = setup(&["home"]);
+        let work = d.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        run(&paths, &["folder", "add", work.to_str().unwrap(), "+rw"]).unwrap();
+        let name = crate::grants::container(&paths, "n");
+        let profile = profile_of(&name);
+        let out = run(&paths, &["center", "rm"]).unwrap();
+        assert!(
+            out.contains(&format!("removed the AppContainer profile {name} of home")),
+            "{out}"
+        );
+        assert!(!profile.exists(), "{}", profile.display());
+    }
+
+    /// On Windows: when the grants of the pairings that stay do not follow
+    /// (a hard link below a folder they write), `center rm` still removes
+    /// the pairing's profile, as nothing names it once the pairing is gone,
+    /// and then says what failed.
+    #[cfg(windows)]
+    #[test]
+    fn center_rm_removes_the_profile_when_the_other_grants_do_not_follow() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("c"), d.path().join("s"));
+        let work = d.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        std::fs::write(work.join("a.txt"), "x").unwrap();
+        std::fs::hard_link(work.join("a.txt"), work.join("b.txt")).unwrap();
+        let real = nerve_policy::paths::resolve(&work).unwrap();
+        let mut cfg = NodeConfig::default();
+        let mut home = entry("home");
+        home.node_id = "n-home".into();
+        home.policy.folders.push(nerve_policy::config::Folder {
+            path: real.display().to_string(),
+            access: Access::parse("rw").unwrap(),
+        });
+        let mut lab = entry("lab");
+        lab.node_id = "n-lab".into();
+        cfg.centers = vec![home, lab];
+        cfg.save(&paths.config_file()).unwrap();
+        let name = crate::grants::container(&paths, "n-lab");
+        let profile = profile_of(&name);
+        let e = run(&paths, &["center", "rm", "--center", "lab"]).unwrap_err();
+        assert!(e.contains("the folder grants do not follow"), "{e}");
+        assert!(load(&paths).center("lab").is_none());
+        assert!(!profile.exists(), "{}", profile.display());
     }
 
     #[test]
@@ -3433,6 +4223,187 @@ mod tests {
         assert!(r.unwrap_err().contains("nerve://pair"));
     }
 
+    /// A control socket whose queue is full and that nothing accepts from: a
+    /// node that runs but takes no connection now. Dropped, the socket is
+    /// gone with it.
+    #[cfg(unix)]
+    struct BusyNode {
+        _listener: std::os::unix::net::UnixListener,
+        _queued: Vec<tokio::net::UnixStream>,
+    }
+
+    #[cfg(unix)]
+    impl BusyNode {
+        async fn start(paths: &NodePaths) -> BusyNode {
+            use std::os::unix::io::AsRawFd;
+            let sock = paths.ctl_socket();
+            std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+            let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            // SAFETY: listen on a socket this test owns; a backlog of one is
+            // full after a few connections, and nothing accepts them.
+            assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+            let mut queued = vec![];
+            while let Ok(s) = tokio::net::UnixStream::connect(&sock).await {
+                queued.push(s);
+                assert!(queued.len() < 100, "the queue never filled");
+            }
+            BusyNode {
+                _listener: listener,
+                _queued: queued,
+            }
+        }
+
+        fn stop(self, paths: &NodePaths) {
+            drop(self);
+            std::fs::remove_file(paths.ctl_socket()).unwrap();
+        }
+    }
+
+    /// A node that runs but takes no connection now (its queue is full) is
+    /// not "not running": `panic` and `sudo off` must not write the file and
+    /// report the change as done while the node never got it.
+    #[cfg(unix)]
+    #[test]
+    fn a_busy_node_is_not_taken_for_none() {
+        let (_d, paths) = setup(&["home"]);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let node = rt.block_on(BusyNode::start(&paths));
+        let before = std::fs::read(paths.config_file()).unwrap();
+        let busy = nerve_transport::ctl::BUSY;
+        for args in [
+            &["panic"][..],
+            &["sudo", "off"],
+            &["rule", "add", "allow", "ls"],
+        ] {
+            let e = run(&paths, args).unwrap_err();
+            assert_eq!(e, busy, "{args:?}");
+        }
+        assert_eq!(std::fs::read(paths.config_file()).unwrap(), before);
+        assert!(!load(&paths).locked);
+        // Gone, the node is none, and the same commands go to the file.
+        node.stop(&paths);
+        run(&paths, &["panic"]).unwrap();
+        assert!(load(&paths).locked);
+    }
+
+    /// A node that answers but keeps refusing the write with a conflict (the
+    /// settings change under the CLI) is a node that did not get the change:
+    /// `panic` fails and the file stays as it is. Writing the file here
+    /// would be undone by the node's next write, with the change reported as
+    /// made.
+    #[cfg(unix)]
+    #[test]
+    fn a_node_that_always_answers_conflict_does_not_get_the_file_written() {
+        use nerve_transport::ctl::{Reply, serve};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_d, paths) = setup(&["home"]);
+        let text = std::fs::read_to_string(paths.config_file()).unwrap();
+        let writes = std::sync::Arc::new(AtomicUsize::new(0));
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (sock, counted) = (paths.ctl_socket(), writes.clone());
+        rt.spawn(async move {
+            let _ = serve(&sock, move |req, _| {
+                let (text, counted) = (text.clone(), counted.clone());
+                async move {
+                    match req.method.as_str() {
+                        "config.read" => Reply::Ok(json!({"config": text, "version": 7})),
+                        "config.write" => {
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            Reply::Err("conflict: the config changed (version 8)".into())
+                        }
+                        _ => Reply::Ok(json!({})),
+                    }
+                }
+            })
+            .await;
+        });
+        while !paths.ctl_socket().exists() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let before = std::fs::read(paths.config_file()).unwrap();
+        let e = run(&paths, &["panic"]).unwrap_err();
+        assert!(e.contains("keeps changing"), "{e}");
+        assert_eq!(writes.load(Ordering::SeqCst), 5);
+        assert_eq!(std::fs::read(paths.config_file()).unwrap(), before);
+        assert!(!load(&paths).locked);
+    }
+
+    /// The callers that only ask whether a node runs take a busy one for a
+    /// node: it is not told that a change waits for the next start, and a
+    /// second node does not start beside it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_busy_node_still_counts_as_running() {
+        let (d, paths) = setup(&["home"]);
+        assert!(!daemon_answers(&paths, false).await);
+        let node = BusyNode::start(&paths).await;
+        assert!(daemon_answers(&paths, false).await);
+        let mut out = Vec::new();
+        after_keyring_answers(&paths, None, &mut out).await.unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("was not asked whether it found a keyring"),
+            "{out}"
+        );
+        let cfg = NodeConfig::load(&paths.config_file()).unwrap();
+        let mut out = Vec::new();
+        tell_folder_commands(&paths, &cfg, &mut out).await;
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("was not asked whether folder mode"), "{out}");
+        let mut opts = crate::NodeOptions::new(paths.clone());
+        opts.home = d.path().to_path_buf();
+        let e = crate::Daemon::start(opts)
+            .await
+            .err()
+            .expect("a second node");
+        assert!(e.contains("already runs"), "{e}");
+        node.stop(&paths);
+        assert!(!daemon_answers(&paths, false).await);
+        // A socket that cannot be reached at all is neither a node nor the
+        // lack of one: the start says what is wrong.
+        std::fs::remove_dir_all(paths.state_dir.join("run")).unwrap();
+        std::fs::write(paths.state_dir.join("run"), b"").unwrap();
+        assert!(!daemon_answers(&paths, false).await);
+        let mut opts = crate::NodeOptions::new(paths.clone());
+        opts.home = d.path().to_path_buf();
+        let e = crate::Daemon::start(opts).await.err().expect("no socket");
+        assert!(e.contains("cannot tell whether a node runs"), "{e}");
+        assert!(!e.contains("already runs"), "{e}");
+    }
+
+    /// With several centers the commands the ambiguous `rule rm` prints name
+    /// the center, so they work as printed.
+    #[test]
+    fn the_rm_refusal_names_the_center_it_means() {
+        let (_d, paths) = setup(&["home", "work"]);
+        let made = "exec.run:exec.run:git [*]";
+        for rule in ["exec.run:git *", made] {
+            let list = "center.work.policy.allow";
+            run(&paths, &["config", "add", list, rule]).unwrap();
+        }
+        let args = ["rule", "rm", "allow", "exec.run:git *", "--center", "work"];
+        let e = run(&paths, &args).unwrap_err();
+        assert!(
+            e.contains(&format!("rule rm allow '{made}' --center work")),
+            "{e}"
+        );
+        assert!(
+            e.contains("rule rm allow 'exec.run:git *' --center work"),
+            "{e}"
+        );
+        // Run as printed.
+        run(&paths, &["rule", "rm", "allow", made, "--center", "work"]).unwrap();
+        run(&paths, &args).unwrap();
+        assert!(load(&paths).center("work").unwrap().policy.allow.is_empty());
+    }
+
     #[test]
     fn the_three_lists_add_remove_and_show() {
         let (_d, paths) = setup(&["home"]);
@@ -3455,6 +4426,85 @@ mod tests {
         // A sudo command is not an allow rule.
         let e = run(&paths, &["rule", "add", "allow", "sudo apt update"]).unwrap_err();
         assert!(e.contains("rule add sudo"), "{e}");
+        // The `cap.action:pattern` form is for `config add`; as a command it
+        // would become a rule that never matches.
+        for list in ["allow", "deny"] {
+            let e = run(&paths, &["rule", "add", list, "exec.run:echo *"]).unwrap_err();
+            assert!(e.contains("config add"), "{e}");
+        }
+        let e = run(&paths, &["rule", "add", "allow", "fs.read:~/notes/*"]).unwrap_err();
+        assert!(e.contains("policy.allow"), "{e}");
+        // So is the form with a capability alone, which the docs show.
+        for (list, rule) in [("deny", "fs:~/private/*"), ("allow", "exec:git *")] {
+            let e = run(&paths, &["rule", "add", list, rule]).unwrap_err();
+            assert!(e.contains("config add"), "{e}");
+        }
+        assert_eq!(
+            load(&paths).centers[0].policy.allow,
+            ["exec.run:git status"]
+        );
+        // With the working rule on the list as well (added as the refusal
+        // says), the arguments name neither of the two: the user picks one.
+        let broken = "exec.run:fs:~/private/[*]";
+        run(
+            &paths,
+            &["config", "add", "center.home.policy.deny", broken],
+        )
+        .unwrap();
+        run(
+            &paths,
+            &["config", "add", "center.home.policy.deny", "fs:~/private/*"],
+        )
+        .unwrap();
+        let e = run(&paths, &["rule", "rm", "deny", "fs:~/private/*"]).unwrap_err();
+        assert!(
+            e.contains(broken) && e.contains("\"fs:~/private/*\""),
+            "{e}"
+        );
+        // The refusal's own instructions work, also for an entry as `ls`
+        // shows the working one.
+        assert!(
+            e.contains(&format!("rule rm deny '{broken}' --center home")),
+            "{e}"
+        );
+        let out = run(&paths, &["rule", "rm", "deny", broken]).unwrap();
+        assert!(out.contains(broken), "{out}");
+        assert_eq!(
+            load(&paths).centers[0].policy.deny,
+            ["exec.run:git status", "exec.run:rm *", "fs:~/private/*"]
+        );
+        run(&paths, &["rule", "rm", "deny", "fs:~/private/*"]).unwrap();
+        for rule in ["exec.run:git *", "exec.run:exec.run:git [*]"] {
+            let list = "center.home.policy.allow";
+            run(&paths, &["config", "add", list, rule]).unwrap();
+        }
+        let e = run(&paths, &["rule", "rm", "allow", "exec.run:git *"]).unwrap_err();
+        assert!(
+            e.contains("rule rm allow 'exec.run:exec.run:git [*]'"),
+            "{e}"
+        );
+        run(
+            &paths,
+            &["rule", "rm", "allow", "exec.run:exec.run:git [*]"],
+        )
+        .unwrap();
+        run(&paths, &["rule", "rm", "allow", "exec.run:git *"]).unwrap();
+        // A colon in a command that is not a scope stays a command.
+        run(&paths, &["rule", "add", "allow", "C:\\tools\\x.exe"]).unwrap();
+        run(&paths, &["rule", "rm", "allow", "C:\\tools\\x.exe"]).unwrap();
+        // The rule an older `rule add` made of the pattern form goes with the
+        // arguments that made it.
+        let broken = "exec.run:exec.run:echo [*]";
+        run(
+            &paths,
+            &["config", "add", "center.home.policy.allow", broken],
+        )
+        .unwrap();
+        run(&paths, &["rule", "rm", "allow", "exec.run:echo *"]).unwrap();
+        assert_eq!(
+            load(&paths).centers[0].policy.allow,
+            ["exec.run:git status"]
+        );
         // A command with a glob character in it is allowed as itself.
         run(&paths, &["rule", "add", "allow", "rm *"]).unwrap();
         assert!(load(&paths).centers[0].policy.allow[1].contains("[*]"));
@@ -3745,6 +4795,91 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The installed node on Windows runs as `nerve`, whose Credential
+    /// Manager is not the administrator's that `proxy set` writes to. So
+    /// a header or a password is refused, with the keyring left alone and
+    /// nothing changed; a proxy that needs neither works, and its call
+    /// takes an entry left by an earlier `proxy set` away.
+    #[test]
+    fn on_the_installed_node_on_windows_proxy_set_refuses_header_values_and_a_password() {
+        let (_d, paths) = setup(&["home"]);
+        // Set as an administrator before the node was installed.
+        run(
+            &paths,
+            &[
+                "proxy",
+                "set",
+                "http://127.0.0.1:3128",
+                "--header",
+                "X-Old: o1d-value",
+            ],
+        )
+        .unwrap();
+        crate::secrets::for_tests::pretend_windows_service(&paths);
+        let before = std::fs::read_to_string(paths.config_file()).unwrap();
+        let held = keyring_entry(&paths);
+        assert!(held.is_some());
+        let asked = crate::secrets::store::calls();
+        for args in [
+            &[
+                "proxy",
+                "set",
+                "http://127.0.0.1:3129",
+                "--header",
+                "X-Key: s3cret-value",
+            ][..],
+            &["proxy", "set", "http://alice:pa55w0rd@127.0.0.1:3129"],
+        ] {
+            let e = run(&paths, args).unwrap_err();
+            assert!(
+                e.contains(
+                    "go to the Credential Manager of the account that runs it, not to that of nerve"
+                ),
+                "{e}"
+            );
+            assert!(e.contains("nothing was changed"), "{e}");
+            assert!(e.contains("`nerve-node proxy set <url>`"), "{e}");
+            assert!(!e.contains("s3cret") && !e.contains("pa55w0rd"), "{e}");
+            assert!(!e.contains("alice"), "{e}");
+        }
+        // The keyring was not asked, and node.toml and the old entry stayed.
+        assert_eq!(crate::secrets::store::calls(), asked);
+        assert_eq!(
+            std::fs::read_to_string(paths.config_file()).unwrap(),
+            before
+        );
+        assert_eq!(keyring_entry(&paths), held);
+
+        // The entry an administrator's keyring holds is not what the service
+        // reads, so `proxy ls` does not call it good.
+        let ls = run(&paths, &["proxy", "ls"]).unwrap();
+        assert!(ls.contains("header X-Old\n"), "{ls}");
+        assert!(!ls.contains("its value is in the system keyring"), "{ls}");
+        assert!(ls.contains("the link cannot use this proxy"), "{ls}");
+        assert!(ls.contains("the service does not find them"), "{ls}");
+        assert!(!ls.contains("o1d-value"), "{ls}");
+
+        // A proxy that needs neither works, and takes the old entry away.
+        let next = format!("the change is in node.toml; it {NEXT_START}\n");
+        let out = run(&paths, &["proxy", "set", "http://127.0.0.1:3129"]).unwrap();
+        assert_eq!(out, format!("proxy http://127.0.0.1:3129\n{next}"));
+        let cfg = load(&paths);
+        assert_eq!(
+            cfg.connection.proxy.as_deref(),
+            Some("http://127.0.0.1:3129")
+        );
+        assert!(cfg.connection.headers.is_empty());
+        assert_eq!(keyring_entry(&paths), None);
+        assert_eq!(
+            run(&paths, &["proxy", "ls"]).unwrap(),
+            "proxy http://127.0.0.1:3129\n"
+        );
+        assert_eq!(
+            run(&paths, &["proxy", "rm"]).unwrap(),
+            format!("no proxy\n{next}")
+        );
     }
 
     fn files_below(dir: &Path) -> Vec<PathBuf> {

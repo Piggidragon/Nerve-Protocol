@@ -425,6 +425,17 @@ pub struct CenterPolicy {
     pub until: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub folders: Vec<Folder>,
+    /// The folders (by path) the node recorded at their real place when the
+    /// owner added them (`folder add` stores the resolved path): they led
+    /// nowhere else then. A recorded folder whose path leads elsewhere now,
+    /// since something put a link in its way, is left out of a command's
+    /// sandbox (`nerve-node` `exec::folder_sets`), whether or not a `w`
+    /// folder still lets a command put links there. Only the owner changes
+    /// the record: a center's settings keep it as it was. A folder without an
+    /// entry (added before the record existed, or set by a center or by hand)
+    /// is followed wherever its path leads.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub places: Vec<String>,
     /// `cap` or `cap.action` → setting; `cap.action` wins over `cap`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub caps: BTreeMap<String, CapSetting>,
@@ -489,6 +500,12 @@ fn short_name(seg: &str) -> bool {
         && !ext.contains('.')
 }
 
+/// Whether two folder paths name one place, compared as the policy does.
+fn same_place(a: &str, b: &str) -> bool {
+    let (a, b) = (Path::new(a), Path::new(b));
+    within(a, b) && within(b, a)
+}
+
 impl CenterPolicy {
     /// The mode in force at `now_ms`: a `folder` or `user` whose limit has
     /// passed is `allowlist`.
@@ -496,6 +513,21 @@ impl CenterPolicy {
         match self.mode {
             Mode::Folder | Mode::User if self.until.is_some_and(|u| u <= now_ms) => Mode::Allowlist,
             m => m,
+        }
+    }
+
+    /// Whether the folder at `path` was recorded at its real place
+    /// ([`CenterPolicy::places`]).
+    pub fn is_placed(&self, path: &str) -> bool {
+        self.places.iter().any(|p| same_place(p, path))
+    }
+
+    /// Records the folder at `path` as being at its real place, or, with
+    /// `placed` false, forgets that it was.
+    pub fn set_placed(&mut self, path: &str, placed: bool) {
+        self.places.retain(|p| !same_place(p, path));
+        if placed {
+            self.places.push(path.to_string());
         }
     }
 
@@ -674,10 +706,7 @@ impl CenterPolicy {
                 return Err(format!("folder {:?} is not absolute", f.path));
             }
             let path = crate::paths::normal_folder(&f.path)?;
-            let same = |g: &&Folder| {
-                let (p, q) = (Path::new(&path), Path::new(&g.path));
-                within(p, q) && within(q, p)
-            };
+            let same = |g: &&Folder| same_place(&path, &g.path);
             match folders.iter().find(same) {
                 Some(g) if g.access == f.access => {}
                 Some(g) => {
@@ -695,6 +724,14 @@ impl CenterPolicy {
                 }),
             }
         }
+        // The record follows the folders: an entry that names none (the
+        // folder was removed) is dropped, and the others take the form of
+        // the folder they name.
+        self.places = folders
+            .iter()
+            .filter(|f| self.is_placed(&f.path))
+            .map(|f| f.path.clone())
+            .collect();
         self.folders = folders;
         for rule in self.allow.iter().chain(&self.deny) {
             crate::rules::validate(rule)?;
@@ -1102,6 +1139,44 @@ sudo_allow = ["sudo apt update"]
         );
         let tidy = NodeConfig::parse(&center("folders = [{ path = \"/a//b/\", access = \"r\" }]"));
         assert_eq!(tidy.unwrap().centers[0].policy.folders[0].path, "/a/b");
+    }
+
+    /// The record of the folders' real places (`places`) follows the
+    /// folders: it names a folder in the form the folder has, drops what
+    /// names no folder, and a config without it reads as before.
+    #[cfg(not(windows))]
+    #[test]
+    fn the_record_of_real_places_follows_the_folders() {
+        let text = center(
+            "folders = [{ path = \"/a/b\", access = \"r\" }, { path = \"/c\", access = \"rw\" }]\nplaces = [\"/a//b/\", \"/gone\", \"/a/b\"]",
+        );
+        let cfg = NodeConfig::parse(&text).unwrap();
+        let p = &cfg.centers[0].policy;
+        assert_eq!(p.places, ["/a/b"]);
+        assert!(p.is_placed("/a/b") && p.is_placed("/a//b/"));
+        assert!(!p.is_placed("/c") && !p.is_placed("/gone"));
+        // It is saved and read again as it is.
+        assert_eq!(NodeConfig::parse(&cfg.to_toml()).unwrap(), cfg);
+
+        // A config from before the record has none, and writes none.
+        let old = center("folders = [{ path = \"/a/b\", access = \"r\" }]");
+        let old = NodeConfig::parse(&old).unwrap();
+        assert!(old.centers[0].policy.places.is_empty());
+        assert!(!old.to_toml().contains("places"));
+
+        // Recording and forgetting one place; the other stays. A place
+        // recorded twice, in two spellings, is one entry.
+        let mut p = cfg.centers[0].policy.clone();
+        p.set_placed("/c", true);
+        p.set_placed("/c/", true);
+        assert_eq!(p.places, ["/a/b", "/c/"]);
+        assert!(p.is_placed("/c"));
+        p.set_placed("/a/b", false);
+        assert!(!p.is_placed("/a/b") && p.is_placed("/c"));
+        // A folder taken out of the list takes its record along.
+        p.folders.retain(|f| f.path != "/c");
+        p.validate().unwrap();
+        assert!(p.places.is_empty());
     }
 
     #[test]

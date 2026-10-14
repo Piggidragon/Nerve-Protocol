@@ -315,3 +315,226 @@ async fn an_owner_change_through_the_local_interface_is_applied_and_signed() {
     assert_eq!(node.config(), cfg);
     node.stop().await;
 }
+
+/// A paired node in `folder` mode, run by a person (its commands run as the
+/// node's own user, so the control socket takes their connections). The home
+/// is a read-write folder and the folder of the `nerve-node` binary one to
+/// run programs from: a command can then use the CLI to talk to the socket,
+/// as any program of the user can. `None` where Landlock is missing.
+async fn folder_node(dir: &Path) -> Option<(FakeCenter, NodeOptions)> {
+    if !nerve_sandbox::Confinement::detect().available() {
+        eprintln!("skipped: Landlock is not available here");
+        return None;
+    }
+    let center = FakeCenter::start(false).await.unwrap();
+    let o = options(dir);
+    nerve_node::pair::pair(&o.paths, &center.link(), Some("lab"))
+        .await
+        .unwrap();
+    let bin_dir = std::fs::canonicalize(o.exe.as_ref().unwrap().parent().unwrap()).unwrap();
+    let home = o.home.clone();
+    let config_dir = std::fs::canonicalize(&o.paths.config_dir).unwrap();
+    std::fs::create_dir_all(home.join("work/extra")).unwrap();
+    owner_edit(&o.paths, |c| {
+        let p = &mut c.centers[0].policy;
+        p.mode = nerve_policy::Mode::Folder;
+        for (path, access) in [
+            (&home, nerve_policy::config::Access::ALL),
+            // Names the config folder itself, as the test above does.
+            (&config_dir, nerve_policy::config::Access::ALL),
+            (
+                &bin_dir,
+                nerve_policy::config::Access {
+                    execute: true,
+                    ..nerve_policy::config::Access::NONE
+                },
+            ),
+        ] {
+            p.folders.push(nerve_policy::config::Folder {
+                path: path.display().to_string(),
+                access,
+            });
+        }
+    })
+    .await;
+    Some((center, o))
+}
+
+/// The command line of the CLI as a command would run it: it finds the
+/// node's folders where they are by default, below `HOME`. A path to them in
+/// the command line itself would be refused before any rule.
+fn nerve(o: &NodeOptions, args: &str) -> String {
+    format!(
+        "HOME={} {} {args}",
+        o.home.display(),
+        o.exe.as_ref().unwrap().display(),
+    )
+}
+
+async fn run_command(conn: &mut Conn<TcpStream>, cwd: &Path, command: &str) -> Value {
+    conn.call(
+        "invoke",
+        json!({"cap": "exec", "action": "run", "args": {
+            "command": command, "cwd": wire(cwd)}}),
+        WAIT,
+    )
+    .await
+    .unwrap()
+    .expect("the command runs")
+}
+
+/// What the owner sees of the config, for a command to be kept from.
+const CENTER_SHOWN: &str = "lab";
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_cannot_read_the_config_over_the_control_socket() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some((mut center, o)) = folder_node(dir.path()).await else {
+        return;
+    };
+    let paths = o.paths.clone();
+    let work = o.home.join("work");
+    let node = Daemon::start(o.clone()).await.unwrap();
+    let mut conn = linked(&mut center).await;
+
+    // The owner reads it through the same CLI.
+    let owner = cli(&paths, &["center", "ls"]).await.unwrap();
+    assert!(owner.contains(CENTER_SHOWN), "{owner}");
+    assert!(
+        cli(&paths, &["status"])
+            .await
+            .unwrap()
+            .contains(CENTER_SHOWN)
+    );
+
+    // The sandbox keeps the command from the config file, but its rules do
+    // not stop a connection to the socket (with the keys in files they leave
+    // connecting alone), and the command runs as the node's own user. It
+    // must get nothing from it.
+    let r = run_command(&mut conn, &work, &nerve(&o, "center ls")).await;
+    let shown = format!("{}{}", r["stdout"], r["stderr"]);
+    assert!(!shown.contains(CENTER_SHOWN), "{r}");
+    assert!(shown.contains("refused"), "{r}");
+    assert_ne!(r["exit_code"], 0, "{r}");
+    // `status` is answered without the token, but only that a node runs.
+    let r = run_command(&mut conn, &work, &nerve(&o, "status")).await;
+    let shown = format!("{}{}", r["stdout"], r["stderr"]);
+    assert!(!shown.contains(CENTER_SHOWN), "{r}");
+    assert!(shown.contains("running"), "{r}");
+    node.stop().await;
+}
+
+/// A command with no sandbox (`user` mode) can read the token file, as it can
+/// read the config file: the node refuses what stays below the command in the
+/// process tree. A process that leaves the tree is not caught, which is why
+/// the socket is no boundary against such a command.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_without_a_sandbox_is_refused_while_it_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some((mut center, o)) = folder_node(dir.path()).await else {
+        return;
+    };
+    owner_edit(&o.paths, |c| {
+        c.centers[0].policy.mode = nerve_policy::Mode::User
+    })
+    .await;
+    let paths = o.paths.clone();
+    let work = o.home.join("work");
+    let node = Daemon::start(o.clone()).await.unwrap();
+    let mut conn = linked(&mut center).await;
+    let before = node.config();
+
+    // It reads the token, so only its place in the tree refuses it. The
+    // path to the token is built at run time, as in the test above.
+    let r = run_command(
+        &mut conn,
+        &o.home,
+        &format!(
+            "(cd .local/state && cat nerve/run/ctl.token) > /dev/null && {}",
+            nerve(&o, "center ls")
+        ),
+    )
+    .await;
+    let shown = format!("{}{}", r["stdout"], r["stderr"]);
+    assert!(!shown.contains(CENTER_SHOWN), "{r}");
+    assert!(shown.contains("comes from a command"), "{r}");
+    let extra = work.join("extra");
+    let r = run_command(
+        &mut conn,
+        &work,
+        &nerve(&o, &format!("folder add {} +rw", extra.display())),
+    )
+    .await;
+    assert!(format!("{r}").contains("comes from a command"), "{r}");
+    assert_eq!(node.config(), before);
+    // The owner's, from outside any command, is answered.
+    assert!(
+        cli(&paths, &["center", "ls"])
+            .await
+            .unwrap()
+            .contains(CENTER_SHOWN)
+    );
+    node.stop().await;
+}
+
+/// A process a command takes out of its process group (`setsid`) outlives the
+/// call, and with it the node's record of the command it descends from. The
+/// config stays the owner's all the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_process_that_outlives_its_command_cannot_change_the_config() {
+    let dir = tempfile::tempdir().unwrap();
+    let Some((mut center, o)) = folder_node(dir.path()).await else {
+        return;
+    };
+    let paths = o.paths.clone();
+    let work = o.home.join("work");
+    let extra = work.join("extra");
+    let node = Daemon::start(o.clone()).await.unwrap();
+    let mut conn = linked(&mut center).await;
+    let before = node.config();
+
+    // The survivor leaves its group, says so with `started`, waits for the
+    // file `go`, which comes once the call has returned, and then asks the
+    // node to add a folder to the center's policy. It lets go of the output
+    // the call waits for.
+    let change = nerve(&o, &format!("folder add {} +rw", extra.display()));
+    let r = run_command(
+        &mut conn,
+        &work,
+        &format!(
+            "setsid sh -c 'touch started; while [ ! -f go ]; do sleep 0.05; done; \
+             {change} > result.txt 2>&1; echo \"exit $?\" >> result.txt' \
+             > /dev/null 2>&1 < /dev/null & \
+             while [ ! -f started ]; do sleep 0.05; done"
+        ),
+    )
+    .await;
+    assert_eq!(r["exit_code"], 0, "{r}");
+    std::fs::write(work.join("go"), "").unwrap();
+    let result = work.join("result.txt");
+    let deadline = std::time::Instant::now() + WAIT;
+    let text = loop {
+        let text = std::fs::read_to_string(&result).unwrap_or_default();
+        if text.contains("exit ") {
+            break text;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the survivor did not finish: {text}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert!(
+        !text.contains("exit 0") && text.contains("refused"),
+        "the survivor changed the config: {text}"
+    );
+    assert_eq!(node.config(), before, "{text}");
+    assert_eq!(NodeConfig::load(&o.paths.config_file()).unwrap(), before);
+
+    // The owner's CLI still changes it.
+    cli(&paths, &["folder", "add", extra.to_str().unwrap(), "+rw"])
+        .await
+        .unwrap();
+    assert_ne!(node.config(), before);
+    node.stop().await;
+}

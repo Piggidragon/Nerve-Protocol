@@ -21,6 +21,10 @@ nerve-node unlock      # work again
 `panic` locks the node in `node.toml`. The lock stays after a restart until you
 run `unlock`. Only you can unlock. A center can never unlock.
 
+If `panic` says the node does not take connections now, or that the config
+keeps changing, the lock was not set. Try again; if it keeps failing, stop the
+node itself (`systemctl stop nerve-node`, or Ctrl-C for a node you started).
+
 ## Pause
 
 ```sh

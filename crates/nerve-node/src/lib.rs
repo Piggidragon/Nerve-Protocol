@@ -15,6 +15,7 @@ pub mod descriptor;
 #[cfg_attr(not(test), allow(dead_code))]
 mod eventlog;
 pub mod exec;
+mod folder_change;
 pub mod fs;
 pub mod grants;
 // The job is Windows-only in use; its choices are tested everywhere.
@@ -24,6 +25,9 @@ pub mod keyring_setup;
 mod link;
 pub mod pair;
 pub mod paths;
+// The control pipe is Windows-only in use; its rules are tested everywhere.
+#[cfg_attr(not(windows), allow(dead_code))]
+mod pipe;
 pub mod rights;
 mod secrets;
 pub mod service;

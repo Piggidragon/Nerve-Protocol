@@ -31,6 +31,15 @@ for it.
    nerve-node sudo on
    ```
 
+   On a node installed as a service, `install` takes the account that ran
+   `sudo`. That account is no boundary: its owner logs in as it, and a
+   command can reach what the owner does with sudo. If it has `NOPASSWD`
+   sudo, every command is root. `install` and `setup` warn about this and
+   suggest `sudo nerve-node setup --create-user nerve-work`. An account made
+   that way has no password and no sudoers entry, so `sudo on` does not work
+   for it until you give it both. A node-only account that needs a password
+   for sudo and gets root no other way is fine.
+
 3. Look or turn it off:
 
    ```sh
@@ -102,9 +111,9 @@ administrator" gives, not the token UAC gives its other commands. So:
   Neither takes the account out of Administrators: do that yourself to close
   the other way to the administrator rights again. `sudo off` reminds you.
 
-Run the commands in a terminal opened with "Run as administrator". Windows
-has no control socket, so `sudo on` takes effect when the service starts
-again. `sudo off` takes effect at once: the running service drops the
+Run the commands in a terminal opened with "Run as administrator". The
+[control pipe](platforms.md#the-control-pipe) on Windows takes folder changes
+only, so `sudo on` takes effect when the service starts again. `sudo off` takes effect at once: the running service drops the
 password within a second.
 
 ```powershell

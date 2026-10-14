@@ -1,7 +1,8 @@
 # `nerve-node` commands
 
 Run them as a normal user on the machine, or with `sudo` when the node is
-[installed as a service](service.md). `nerve-node --help` and
+[installed as a service](service.md) (on Windows, in a terminal opened with
+"Run as administrator"). `nerve-node --help` and
 `nerve-node <command> --help` list the same. The center's web UI has a Help
 page with them too.
 
@@ -50,7 +51,8 @@ center is paired.
 
 | Command | Does | Page |
 |---|---|---|
-| `install` | Install the node as a service under its own user (Linux, root) | [service](service.md#install) |
-| `setup` | Name the node, choose the account of user mode, choose where the keys are, pair the first center, choose its mode | [service](service.md#setup) |
+| `install` | Install the node as a service under its own user (Linux as root, Windows as administrator) | [service](service.md#install) |
+| `setup` | Name the node, choose the account commands run as, choose where the keys are, pair the first center, choose its mode | [service](service.md#setup) |
+| `setup --create-user <name>` | Make an account only the node uses, and run commands as it (Linux, installed node) | [service](service.md#setup) |
 | `update [--from FILE]` | Put the latest release in place and restart the service | [service](service.md#update) |
 | `uninstall [--purge]` | Remove the service, its user and the program | [service](service.md#uninstall) |

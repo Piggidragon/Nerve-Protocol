@@ -1,7 +1,8 @@
 //! The few Win32 calls the node makes itself: the process table and ending a
 //! process (crate::tree), the job object a command runs in (crate::job), and
 //! the console code page that command output is written in (crate::exec),
-//! and whether the node's own token is elevated (crate::rights).
+//! whether the node's own token is elevated (crate::rights), and which
+//! processes are in the jobs of its commands (crate::pipe).
 //! Declared here against kernel32, which every Windows program links; only
 //! the job object and the token come from windows-sys, whose structures are
 //! too easy to get wrong by hand.
@@ -9,6 +10,7 @@
 use std::ffi::c_void;
 use std::io;
 
+use windows_sys::Win32::Foundation::ERROR_MORE_DATA;
 use windows_sys::Win32::Security::{
     GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation,
 };
@@ -184,7 +186,82 @@ pub fn running(pid: u32) -> bool {
 /// JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE ends every process still in it when
 /// the last handle closes, so a node that dies leaves no command behind. It
 /// allows no breakaway: a process in it cannot start a child outside it.
+/// Every job open is in [`LIVE`] from the moment it is made, before any
+/// process is in it.
 pub struct Job(Handle);
+
+/// The handles of the jobs open now ([`Job`]): only commands run in one.
+/// A job leaves the list under its lock before it is closed, so a handle
+/// read under the lock is open.
+static LIVE: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
+
+fn live() -> std::sync::MutexGuard<'static, Vec<usize>> {
+    LIVE.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether `caller` may be a process of a command the node runs
+/// ([`crate::job::from_a_command`]): it is in a job the node holds open, or
+/// a command runs without a job, so its processes cannot be told apart.
+pub fn from_a_command(caller: Option<u32>) -> bool {
+    let live = live();
+    let jobs: Vec<Listed> = live.iter().map(|&h| Listed(h as Handle)).collect();
+    let jobless = std::iter::repeat_n(None, crate::job::jobless());
+    crate::job::from_a_command(caller, jobs.iter().map(Some).chain(jobless))
+}
+
+/// A job of [`LIVE`], read while its lock is held.
+struct Listed(Handle);
+
+impl crate::job::Members for Listed {
+    fn pids(&self) -> io::Result<Vec<u32>> {
+        process_ids(self.0)
+    }
+}
+
+// The ids follow the counts where crate::job::listed_ids reads them.
+const _: () = assert!(
+    std::mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList) == crate::job::IDS_AT
+);
+
+/// The ids of the processes in job `job` now, those of jobs nested in it
+/// included.
+fn process_ids(job: Handle) -> io::Result<Vec<u32>> {
+    let word = std::mem::size_of::<usize>();
+    let mut room = 64usize;
+    for _ in 0..8 {
+        let bytes = crate::job::IDS_AT + room * word;
+        // Words, so the buffer is aligned for the structure.
+        let mut buf = vec![0usize; bytes.div_ceil(word)];
+        // SAFETY: the job is open; the buffer holds `bytes` bytes.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                job,
+                JobObjectBasicProcessIdList,
+                buf.as_mut_ptr().cast(),
+                bytes as u32,
+                std::ptr::null_mut(),
+            )
+        } != 0;
+        if !ok {
+            let e = io::Error::last_os_error();
+            if e.raw_os_error() != Some(ERROR_MORE_DATA as i32) {
+                return Err(e);
+            }
+        }
+        // SAFETY: the buffer holds `bytes` initialised bytes.
+        let list = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), bytes) };
+        match crate::job::listed_ids(list) {
+            Ok(Some(ids)) if ok => return Ok(ids),
+            Err(e) if ok => return Err(io::Error::other(e)),
+            // Processes came meanwhile: room for them and some more.
+            _ => {
+                let in_job = u32::from_ne_bytes(list[..4].try_into().expect("four bytes"));
+                room = room.max(in_job as usize) * 2;
+            }
+        }
+    }
+    Err(io::Error::other("the job's processes kept changing"))
+}
 
 // SAFETY: a job handle may be used and closed from any thread.
 unsafe impl Send for Job {}
@@ -215,6 +292,7 @@ impl Job {
         if !ok {
             return Err(io::Error::last_os_error());
         }
+        live().push(job.0 as usize);
         Ok(job)
     }
 
@@ -259,30 +337,9 @@ impl Job {
     /// another process as soon as its process exits: the caller opens it
     /// and checks [`Job::holds`] before it trusts it.
     pub fn pids(&self) -> Vec<u32> {
-        // The list's two counts, then one ULONG_PTR per pid.
-        let head = std::mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList);
-        let words = head.div_ceil(std::mem::size_of::<usize>()) + MAX_JOB_PIDS;
-        let mut buf = vec![0usize; words];
-        let list = buf.as_mut_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>();
-        // SAFETY: the job is open and the buffer, aligned for the list, is
-        // valid for its length in bytes. With more processes than fit the
-        // call fails with ERROR_MORE_DATA and still fills the list.
-        unsafe {
-            QueryInformationJobObject(
-                self.0,
-                JobObjectBasicProcessIdList,
-                list.cast(),
-                (words * std::mem::size_of::<usize>()) as u32,
-                std::ptr::null_mut(),
-            )
-        };
-        // SAFETY: the list is in the buffer, zeroed where Windows wrote
-        // nothing, and its count is held to what the buffer holds.
-        unsafe {
-            let n = ((*list).NumberOfProcessIdsInList as usize).min(MAX_JOB_PIDS);
-            let ids = (&raw const (*list).ProcessIdList).cast::<usize>();
-            (0..n).map(|i| *ids.add(i) as u32).collect()
-        }
+        let mut pids = process_ids(self.0).unwrap_or_default();
+        pids.truncate(MAX_JOB_PIDS);
+        pids
     }
 
     /// Whether `process` (a handle with PROCESS_QUERY_LIMITED_INFORMATION)
@@ -300,6 +357,7 @@ pub const MAX_JOB_PIDS: usize = 1024;
 
 impl Drop for Job {
     fn drop(&mut self) {
+        live().retain(|&h| h != self.0 as usize);
         // SAFETY: the handle came from CreateJobObjectW and is closed once.
         unsafe { CloseHandle(self.0) };
     }

@@ -6,6 +6,17 @@ use std::path::{Path, PathBuf};
 
 use nerve_policy::protected::{Platform, WinFolders};
 
+/// The pipe name for a state folder: a hash of the folder, so the name says
+/// nothing of the account's paths and is never too long.
+fn pipe_name(dir: &str) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, dir.to_lowercase().as_bytes());
+    let hex: String = digest.as_ref()[..16]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    format!(r"\\.\pipe\nerve-node-{hex}")
+}
+
 /// The node's config directory (`node.toml`, keys) and state directory
 /// (control socket, audit log, log, the config's MAC key). Tests point both at
 /// temporary folders.
@@ -67,6 +78,17 @@ impl NodePaths {
 
     pub fn ctl_socket(&self) -> PathBuf {
         self.state_dir.join("run").join("ctl.sock")
+    }
+
+    /// The control pipe of a node on Windows (crate::pipe): one per state
+    /// folder, as the socket is. The folder is named by its real path,
+    /// whatever spelling the CLI was given, and without case, as Windows
+    /// treats it.
+    pub fn ctl_pipe(&self) -> String {
+        let dir = std::fs::canonicalize(&self.state_dir)
+            .or_else(|_| std::path::absolute(&self.state_dir))
+            .unwrap_or_else(|_| self.state_dir.clone());
+        pipe_name(&dir.to_string_lossy())
     }
 
     pub fn audit_log(&self) -> PathBuf {
@@ -312,6 +334,22 @@ pub fn windows_folders(
 mod tests {
     use super::*;
 
+    /// One pipe per state folder, the same for every spelling of it.
+    #[test]
+    fn the_pipe_is_the_state_folders() {
+        let name = pipe_name(r"C:\ProgramData\nerve\state");
+        assert!(name.starts_with(r"\\.\pipe\nerve-node-"), "{name}");
+        assert_eq!(name.len(), r"\\.\pipe\nerve-node-".len() + 32);
+        assert_eq!(name, pipe_name(r"c:\programdata\NERVE\state"));
+        assert_ne!(name, pipe_name(r"C:\ProgramData\nerve\state2"));
+        let d = tempfile::tempdir().unwrap();
+        let state = d.path().join("state");
+        std::fs::create_dir(&state).unwrap();
+        let given = NodePaths::new(d.path().join("config"), &state);
+        let other = NodePaths::new("x", d.path().join("state/../state"));
+        assert_eq!(given.ctl_pipe(), other.ctl_pipe());
+    }
+
     #[test]
     fn windows_folders_come_from_the_environment_and_their_usual_place() {
         let env = |vars: &'static [(&'static str, &'static str)]| {
@@ -391,7 +429,10 @@ mod tests {
     }
 
     /// With the keys in the keyring, the session bus and GNOME Keyring's folder
-    /// are the node's own too.
+    /// are the node's own too. Unix only: the places are Linux's (the daemon
+    /// asks for them on Linux alone), and the paths here are Unix paths, which
+    /// are not absolute on Windows.
+    #[cfg(unix)]
     #[test]
     fn the_keyring_places_are_the_session_bus_and_the_keyring_folder() {
         let env = |k: &str| {

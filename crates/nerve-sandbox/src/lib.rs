@@ -12,14 +12,18 @@
 //! ([`appcontainer`]): a process there opens only what carries a grant for the
 //! container's SID, and what Windows opens to every AppContainer (the system
 //! folders and Program Files, for reading and running). The node puts grants
-//! on the center's folders for their flags ([`acl`]) and takes them off when a
-//! folder goes. The shim starts the command in the container and waits for it.
+//! on the center's folders for their flags ([`acl`]), passes them down to what
+//! is below a folder as far as they change it ([`inherit`]), and takes them
+//! off when a folder goes. The shim starts the command in the container and
+//! waits for it.
 //!
 //! Neither limits a command's memory or process count by cgroup.
 
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+pub mod inherit;
 
 /// The argument that selects the shim in the `nerve-node` binary. Hidden from
 /// `--help`.
@@ -65,9 +69,112 @@ pub struct ShimSpec {
 /// `Work:` rooted at the working folder puts it where it belongs; paths
 /// below it work, relative or under `Work:\`, and so do whole paths to
 /// files.
-pub const POWERSHELL_START: &str = "$null = New-PSDrive -Name Work -PSProvider FileSystem \
-     -Root ([Environment]::CurrentDirectory) -Scope Global -ErrorAction Stop; \
-     Set-Location Work:\\ -ErrorAction Stop; ";
+///
+/// `cd` (`Set-Location`) and `pushd` (`Push-Location`) to a whole path, or
+/// up out of such a drive, would check the folders above it all the same.
+/// So functions stand in for the cmdlets: a folder below one of these
+/// drives is taken as a path on that drive, and any other folder the
+/// command can see gets a drive `Work2:`, `Work3:`, … of its own. The
+/// drives open nothing: the container still decides what the command reads
+/// and writes. A folder the command cannot see goes to the cmdlet as a
+/// whole path and fails as before, also when `..` named it: the cmdlet
+/// would stop `..` at the drive's root and stay there without an error.
+/// A path with a wildcard has the part before its first wildcard resolved
+/// so; the rest goes on with the wildcard. The cmdlet's errors are the
+/// function's, so a failed `cd` sets `$?` and the exit code as the cmdlet
+/// does, whatever the error action. Other commands keep `..` on the drive.
+/// The text has no `"`, which the Windows command line would escape.
+pub const POWERSHELL_START: &str = concat!(
+    r"$null = New-PSDrive -Name Work -PSProvider FileSystem ",
+    r"-Root ([Environment]::CurrentDirectory) -Scope Global -ErrorAction Stop; ",
+    r"Set-Location Work:\ -ErrorAction Stop; ",
+    // Whether the folder `full` is `root` or below it.
+    r"function global:NerveUnder([string]$full, [string]$root) { ",
+    r"$f = $full.TrimEnd('\', '/'); $r = $root.TrimEnd('\', '/'); ",
+    r"$f -eq $r -or $f.StartsWith($r + '\', 'OrdinalIgnoreCase') }; ",
+    // The path on a Work drive for the folder `p` names literally, the
+    // whole path of a folder the command cannot see, or nothing where the
+    // cmdlet takes `p` as it is: another drive or provider, `~`, `\`, `-`
+    // and `+`. A relative path is resolved here as well, since the cmdlet
+    // would keep its `..` on the drive (`..\app` on `Work:\` is `Work:\app`).
+    r"function global:NerveFolder([string]$p) { ",
+    r"$p = $p -replace '^(Microsoft\.PowerShell\.Core\\)?FileSystem::', ''; ",
+    r"if ($p -match '^([A-Za-z]:[\\/]|[\\/][\\/])') { $base = '' } ",
+    r"elseif ($p -notmatch '^(~|[\\/])|^[+-]$|:' -and $PWD.Provider.Name -eq 'FileSystem') { ",
+    r"$base = $PWD.ProviderPath } ",
+    r"else { return $null }; ",
+    r"try { $full = [IO.Path]::GetFullPath([IO.Path]::Combine($base, $p)) } catch { return $null }; ",
+    r"$best = $null; ",
+    r"foreach ($d in Get-PSDrive -PSProvider FileSystem) { ",
+    r"if ($d.Name -match '^Work\d*$' -and (NerveUnder $full $d.Root) -and ",
+    r"(-not $best -or $d.Root.Length -gt $best.Root.Length)) { $best = $d } }; ",
+    r"if (-not $best) { ",
+    r"if (-not [IO.Directory]::Exists($full)) { return $full }; ",
+    // `Ignore`, not `SilentlyContinue`: that would leave an error in `$Error`.
+    r"$n = 2; while (Get-PSDrive -Name ('Work' + $n) -ErrorAction Ignore) { $n++ }; ",
+    r"try { $best = New-PSDrive -Name ('Work' + $n) -PSProvider FileSystem -Root $full ",
+    r"-Scope Global -ErrorAction Stop } catch { return $full } }; ",
+    r"$best.Name + ':\' + $full.TrimEnd('\', '/').Substring($best.Root.TrimEnd('\', '/').Length).TrimStart('\', '/') }; ",
+    // Runs the cmdlet `cmd` with the parameters `bound`, its path moved
+    // onto a Work drive where NerveFolder finds one. A `-Path` loses its
+    // escapes (`` b`[1`] `` is the folder `b[1]`); one with a wildcard is
+    // moved up to its first wildcard and keeps the rest, unless all before
+    // it is `\` or `/`, the root of the drive it stands on. The cmdlet always
+    // writes its errors, so that the function can write them again under
+    // the caller's error action: one the cmdlet keeps quiet leaves `$?`
+    // true. An object other than a string `piped` to the untyped `Path` is
+    // bound as the cmdlet binds it: its `Path`, or else its `PSPath` as
+    // `-LiteralPath` (a folder from `Get-ChildItem` would otherwise be its
+    // bare name).
+    r"function global:NerveGo([string]$cmd, $bound, [bool]$piped) { ",
+    r"$a = @{}; foreach ($k in $bound.Keys) { $a[$k] = $bound[$k] }; ",
+    r"$o = $a['Path']; if ($piped -and $null -ne $o -and $o -isnot [string]) { ",
+    r"$q = $o.PSObject.Properties; if ($q['Path']) { $a['Path'] = $q['Path'].Value } ",
+    r"else { foreach ($n in 'PSPath', 'LiteralPath', 'LP') { if ($q[$n]) { ",
+    r"$null = $a.Remove('Path'); $a['LiteralPath'] = [string]$q[$n].Value; break } } } }; ",
+    r"foreach ($k in 'Path', 'LiteralPath') { if (-not $a[$k]) { continue }; ",
+    r"$v = [string]$a[$k]; $tail = $null; ",
+    r"if ($k -eq 'Path') { $s = $v -split '[\\/]'; $i = 0; ",
+    r"while ($i -lt $s.Count -and ",
+    r"-not [Management.Automation.WildcardPattern]::ContainsWildcardCharacters($s[$i])) { $i++ }; ",
+    r"if ($i -lt $s.Count) { if ($i -eq 0 -or ($i -eq 1 -and $s[0] -eq '')) { continue }; ",
+    r"$v = $s[0..($i - 1)] -join '\'; $tail = $s[$i..($s.Count - 1)] -join '\' }; ",
+    r"$v = [Management.Automation.WildcardPattern]::Unescape($v) }; ",
+    r"$m = NerveFolder $v; ",
+    r"if ($m) { $a.Remove('Path'); $a.Remove('LiteralPath'); ",
+    r"if ($null -ne $tail) { $a['Path'] = ",
+    r"[Management.Automation.WildcardPattern]::Escape($m.TrimEnd('\', '/')) + '\' + $tail } ",
+    r"else { $a['LiteralPath'] = $m } } }; ",
+    r"$a['ErrorAction'] = 'Continue'; & $cmd @a }; ",
+    // The cmdlets' own parameters, as Windows PowerShell 5.1 and PowerShell
+    // 7 have them; the aliases `cd`, `chdir`, `sl` and `pushd` find these
+    // functions before the cmdlets. An error a command inside a function
+    // writes leaves `$?` true, so the cmdlet's errors are written again as
+    // the function's own. `Path` has no type: `[string]` would turn `$null`,
+    // which Windows PowerShell 5.1 refuses, into `''`, which it ignores.
+    r"function global:Set-Location { [CmdletBinding(DefaultParameterSetName = 'Path')] param(",
+    r"[Parameter(ParameterSetName = 'Path', Position = 0, ValueFromPipeline = $true, ",
+    r"ValueFromPipelineByPropertyName = $true)] $Path, ",
+    r"[Parameter(ParameterSetName = 'LiteralPath', Mandatory = $true, ",
+    r"ValueFromPipelineByPropertyName = $true)] [Alias('PSPath', 'LP')] [string]$LiteralPath, ",
+    r"[switch]$PassThru, ",
+    r"[Parameter(ParameterSetName = 'Stack', ValueFromPipelineByPropertyName = $true)] [string]$StackName) ",
+    r"process { NerveGo 'Microsoft.PowerShell.Management\Set-Location' $PSBoundParameters ",
+    r"$PSCmdlet.MyInvocation.ExpectingInput 2>&1 | ",
+    r"ForEach-Object { if ($_ -is [Management.Automation.ErrorRecord]) { $PSCmdlet.WriteError($_) } ",
+    r"else { $_ } } } }; ",
+    r"function global:Push-Location { [CmdletBinding(DefaultParameterSetName = 'Path')] param(",
+    r"[Parameter(ParameterSetName = 'Path', Position = 0, ValueFromPipeline = $true, ",
+    r"ValueFromPipelineByPropertyName = $true)] $Path, ",
+    r"[Parameter(ParameterSetName = 'LiteralPath', Mandatory = $true, ",
+    r"ValueFromPipelineByPropertyName = $true)] [Alias('PSPath', 'LP')] [string]$LiteralPath, ",
+    r"[switch]$PassThru, ",
+    r"[Parameter(ValueFromPipelineByPropertyName = $true)] [string]$StackName) ",
+    r"process { NerveGo 'Microsoft.PowerShell.Management\Push-Location' $PSBoundParameters ",
+    r"$PSCmdlet.MyInvocation.ExpectingInput 2>&1 | ",
+    r"ForEach-Object { if ($_ -is [Management.Automation.ErrorRecord]) { $PSCmdlet.WriteError($_) } ",
+    r"else { $_ } } } }; ",
+);
 
 /// The AppContainer a Windows command runs in. Its SID is derived from the
 /// name, so the node's grants and the shim's process agree on it without a
@@ -546,6 +653,48 @@ pub mod acl {
         }
     }
 
+    /// Why a change of a grant changed nothing at all: it was refused
+    /// before it wrote anything, or nothing was at its path. Marked on the
+    /// error ([`untouched`]): only such a change may be taken for one that
+    /// did not happen. An error from anywhere else may come after a part of
+    /// the change was written, whatever its kind.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Untouched {
+        Refused,
+        Gone,
+    }
+
+    #[derive(Debug)]
+    struct Marked {
+        why: Untouched,
+        message: String,
+    }
+
+    impl std::fmt::Display for Marked {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.message)
+        }
+    }
+
+    impl std::error::Error for Marked {}
+
+    /// `e`, of its kind and with its message, marked as a change that
+    /// changed nothing (`why`).
+    pub fn untouched(why: Untouched, e: std::io::Error) -> std::io::Error {
+        std::io::Error::new(
+            e.kind(),
+            Marked {
+                why,
+                message: e.to_string(),
+            },
+        )
+    }
+
+    /// What `e` is marked as ([`untouched`]), if anything.
+    pub fn untouched_by(e: &std::io::Error) -> Option<Untouched> {
+        e.get_ref()?.downcast_ref::<Marked>().map(|m| m.why)
+    }
+
     /// Where an object of a [`FileId`] is now.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub enum Found {
@@ -614,13 +763,24 @@ pub mod appcontainer {
     use std::path::{Path, PathBuf};
     use std::ptr::{null, null_mut};
 
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::{
+        FILE_LINK_ENTRY_FULL_ID_INFORMATION, FILE_LINK_ENTRY_INFORMATION,
+        FILE_LINKS_FULL_ID_INFORMATION, FILE_LINKS_INFORMATION, FILE_OPEN_FOR_BACKUP_INTENT,
+        FILE_OPEN_REPARSE_POINT, FILE_SYNCHRONOUS_IO_NONALERT, FileHardLinkFullIdInformation,
+        FileHardLinkInformation, NtOpenFile, NtQueryInformationFile,
+    };
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GENERIC_ALL, HANDLE, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE, LocalFree,
-        SetHandleInformation,
+        CloseHandle, ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_LEVEL, ERROR_INVALID_PARAMETER,
+        ERROR_NO_MORE_FILES, ERROR_NOT_SUPPORTED, GENERIC_ALL, HANDLE, HANDLE_FLAG_INHERIT,
+        INVALID_HANDLE_VALUE, LocalFree, NTSTATUS, RtlNtStatusToDosError, STATUS_BUFFER_OVERFLOW,
+        STATUS_BUFFER_TOO_SMALL, STATUS_DELETE_PENDING, STATUS_INVALID_INFO_CLASS,
+        STATUS_INVALID_PARAMETER, STATUS_NOT_SUPPORTED, STATUS_OBJECT_NAME_NOT_FOUND,
+        SetHandleInformation, UNICODE_STRING,
     };
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
-        GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT, SetSecurityInfo,
+        GetSecurityInfo, SDDL_REVISION_1, SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::Isolation::{
         CreateAppContainerProfile, DeleteAppContainerProfile,
@@ -629,22 +789,35 @@ pub mod appcontainer {
     use windows_sys::Win32::Security::{
         ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_REVISION_DS, ACL_SIZE_INFORMATION,
         AclSizeInformation, AddAccessAllowedAceEx, AddAce, CONTAINER_INHERIT_ACE,
-        CreateWellKnownSid, DACL_SECURITY_INFORMATION, EqualSid, FreeSid, GetAce,
-        GetAclInformation, GetLengthSid, GetSecurityDescriptorControl, GetTokenInformation,
-        INHERIT_ONLY_ACE, INHERITED_ACE, InitializeAcl, OBJECT_INHERIT_ACE,
-        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_PROTECTED,
-        SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, SID_AND_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
-        TokenUser, UNPROTECTED_DACL_SECURITY_INFORMATION, WinCapabilityInternetClientServerSid,
-        WinCapabilityInternetClientSid, WinCapabilityPrivateNetworkClientServerSid,
+        ConvertToAutoInheritPrivateObjectSecurity, CreatePrivateObjectSecurityEx,
+        CreateWellKnownSid, DACL_SECURITY_INFORMATION, DestroyPrivateObjectSecurity, EqualSid,
+        FreeSid, GENERIC_MAPPING, GROUP_SECURITY_INFORMATION, GetAce, GetAclInformation,
+        GetKernelObjectSecurity, GetLengthSid, GetSecurityDescriptorControl,
+        GetSecurityDescriptorDacl, GetSecurityDescriptorGroup, GetSecurityDescriptorLength,
+        GetSecurityDescriptorOwner, GetTokenInformation, INHERIT_ONLY_ACE, INHERITED_ACE,
+        InitializeAcl, InitializeSecurityDescriptor, MakeSelfRelativeSD, OBJECT_INHERIT_ACE,
+        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SE_DACL_AUTO_INHERIT_REQ,
+        SE_DACL_AUTO_INHERITED, SE_DACL_PROTECTED, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES,
+        SECURITY_DESCRIPTOR, SEF_AVOID_OWNER_CHECK, SEF_AVOID_PRIVILEGE_CHECK,
+        SEF_DACL_AUTO_INHERIT, SID_AND_ATTRIBUTES, SetKernelObjectSecurity,
+        SetSecurityDescriptorControl, SetSecurityDescriptorDacl, SetSecurityDescriptorGroup,
+        SetSecurityDescriptorOwner, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        WinCapabilityInternetClientServerSid, WinCapabilityInternetClientSid,
+        WinCapabilityPrivateNetworkClientServerSid,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, ExtendedFileIdType, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_ID_128, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0,
-        FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        FileIdInfo, FindFirstVolumeW, FindNextVolumeW, FindVolumeClose, GetFileInformationByHandle,
-        GetFileInformationByHandleEx, GetFinalPathNameByHandleW, GetLogicalDrives,
-        GetLongPathNameW, OpenFileById, READ_CONTROL, WRITE_DAC,
+        BY_HANDLE_FILE_INFORMATION, ExtendedFileIdType, FILE_ALL_ACCESS, FILE_ATTRIBUTE_DIRECTORY,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_TAG_INFO, FILE_FLAG_BACKUP_SEMANTICS,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_FULL_DIR_INFO, FILE_GENERIC_EXECUTE, FILE_GENERIC_READ,
+        FILE_GENERIC_WRITE, FILE_ID_128, FILE_ID_DESCRIPTOR, FILE_ID_DESCRIPTOR_0,
+        FILE_ID_EXTD_DIR_INFO, FILE_ID_INFO, FILE_LIST_DIRECTORY, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO,
+        FileAttributeTagInfo, FileFullDirectoryInfo, FileIdExtdDirectoryInfo, FileIdInfo,
+        FileStandardInfo, FindFirstVolumeW, FindNextVolumeW, FindVolumeClose,
+        GetFileInformationByHandle, GetFileInformationByHandleEx, GetFinalPathNameByHandleW,
+        GetLogicalDrives, GetLongPathNameW, OpenFileById, READ_CONTROL, SYNCHRONIZE, WRITE_DAC,
     };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
         GetCurrentProcess, GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList,
@@ -654,6 +827,7 @@ pub mod appcontainer {
     };
 
     use super::acl::{self, FileId, Found, Masks, command_line, entries};
+    use crate::inherit::{self, Derived, Kind, Objects, Walk, Walked};
 
     // The flags of `acl::entries` are Windows' own.
     const _: () = assert!(
@@ -766,11 +940,15 @@ pub mod appcontainer {
     }
 
     fn id_of(f: &std::fs::File) -> io::Result<FileId> {
+        id_by(f.as_raw_handle())
+    }
+
+    fn id_by(h: HANDLE) -> io::Result<FileId> {
         let mut info = FILE_ID_INFO::default();
         // SAFETY: an open handle and a buffer of the size given.
         check(unsafe {
             GetFileInformationByHandleEx(
-                f.as_raw_handle(),
+                h,
                 FileIdInfo,
                 &mut info as *mut _ as *mut c_void,
                 size_of::<FILE_ID_INFO>() as u32,
@@ -787,15 +965,21 @@ pub mod appcontainer {
         id_of(&open(path, FILE_READ_ATTRIBUTES)?)
     }
 
+    /// `path` opened for `access` alone, as [`open`] does, but a link or
+    /// junction at `path` as itself, not followed.
+    fn open_itself(path: &Path, access: u32) -> io::Result<std::fs::File> {
+        use std::os::windows::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .access_mode(access)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+    }
+
     /// How many names (hard links) the object at `path` has. A link or
     /// junction at `path` is opened as itself, not followed.
     pub fn names(path: &Path) -> io::Result<u32> {
-        use std::os::windows::fs::OpenOptionsExt;
-        let f = std::fs::OpenOptions::new()
-            .access_mode(FILE_READ_ATTRIBUTES)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
-            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
-            .open(path)?;
+        let f = open_itself(path, FILE_READ_ATTRIBUTES)?;
         let mut info = BY_HANDLE_FILE_INFORMATION::default();
         // SAFETY: an open handle and a buffer for the answer.
         check(unsafe { GetFileInformationByHandle(f.as_raw_handle(), &mut info) })?;
@@ -1066,7 +1250,7 @@ pub mod appcontainer {
     /// `path` with each short (8.3) name in it written out, as the final
     /// path of what it names has them; links and junctions stay as they
     /// are. `path` itself when that fails.
-    fn long_path(path: &Path) -> PathBuf {
+    pub fn long_path(path: &Path) -> PathBuf {
         let p = wide(path.as_os_str());
         let mut buf = vec![0u16; 512];
         loop {
@@ -1108,72 +1292,729 @@ pub mod appcontainer {
         Ok(None)
     }
 
-    /// Puts the grants of `masks` for the container `name` on `path`, in
-    /// place of any it had (`None` takes them off). They are inherited by
-    /// everything below `path`, and Windows passes the change on to what is
-    /// there now. Other entries of the access list stay as they are.
-    ///
-    /// With `own`, grants go on only an object of its own at `path`: none
-    /// on a link or junction to elsewhere, on a file with other names, or on
-    /// one whose list does not inherit. A command may have put what is
-    /// there, where it may write; the grant would then reach what it
-    /// leads to. A refusal is InvalidInput, and changes nothing. The
-    /// [`FileId`] of the object it changed, as its handle names it, when
-    /// the volume names one.
-    pub fn set(
-        path: &Path,
-        name: &str,
-        masks: Option<Masks>,
-        own: bool,
-    ) -> io::Result<Option<FileId>> {
-        let sid = Sid::derive(name)?;
-        // The change goes through this handle, on the object it opened.
-        let f = open(path, READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES)?;
-        let refuse = |why: String| {
-            Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("the node puts no grant on it, since {why}"),
-            ))
-        };
-        if own
-            && masks.is_some()
-            && let Some(why) = not_own(&f, path)?
-        {
-            return refuse(why);
+    /// A handle, closed when dropped unless it is borrowed.
+    struct Obj {
+        h: HANDLE,
+        owned: bool,
+    }
+
+    impl Drop for Obj {
+        fn drop(&mut self) {
+            if self.owned {
+                // SAFETY: a handle this module opened, closed once.
+                unsafe { CloseHandle(self.h) };
+            }
         }
-        let is_dir = f.metadata()?.is_dir();
-        let mut dacl: *mut ACL = null_mut();
-        let mut sd: PSECURITY_DESCRIPTOR = null_mut();
-        // SAFETY: an open handle and out pointers to locals; the descriptor
-        // is freed with LocalFree, and `dacl` points into it.
-        let e = unsafe {
-            GetSecurityInfo(
-                f.as_raw_handle(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION,
-                null_mut(),
-                null_mut(),
-                &mut dacl,
-                null_mut(),
-                &mut sd,
+    }
+
+    /// The error of an NTSTATUS, by Windows' own error code for it.
+    fn nt_error(status: NTSTATUS) -> io::Error {
+        // SAFETY: a plain conversion.
+        io::Error::from_raw_os_error(unsafe { RtlNtStatusToDosError(status) } as i32)
+    }
+
+    /// What is called `name` in the folder open as `dir`, opened through
+    /// that handle and as itself: a link or junction is not followed, and a
+    /// folder on the way that was moved or replaced meanwhile does not count.
+    /// An empty name opens `dir` again. `None` when nothing is there, or it
+    /// is being deleted.
+    fn open_in(dir: HANDLE, name: &[u16], access: u32) -> io::Result<Option<Obj>> {
+        let bytes = (name.len() * 2) as u16;
+        let us = UNICODE_STRING {
+            Length: bytes,
+            MaximumLength: bytes,
+            Buffer: name.as_ptr() as *mut u16,
+        };
+        let attrs = OBJECT_ATTRIBUTES {
+            Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+            RootDirectory: dir,
+            ObjectName: &us,
+            Attributes: 0,
+            SecurityDescriptor: null(),
+            SecurityQualityOfService: null(),
+        };
+        let mut h: HANDLE = null_mut();
+        let mut status_block = IO_STATUS_BLOCK::default();
+        // SAFETY: the attributes point to a name that lives through the
+        // call; the handle it returns is owned by the Obj below.
+        let status = unsafe {
+            NtOpenFile(
+                &mut h,
+                access | SYNCHRONIZE,
+                &attrs,
+                &mut status_block,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_OPEN_REPARSE_POINT
+                    | FILE_OPEN_FOR_BACKUP_INTENT
+                    | FILE_SYNCHRONOUS_IO_NONALERT,
             )
         };
-        if e != 0 {
-            return Err(io::Error::from_raw_os_error(e as i32));
+        match status {
+            s if s >= 0 => Ok(Some(Obj { h, owned: true })),
+            STATUS_OBJECT_NAME_NOT_FOUND | STATUS_DELETE_PENDING => Ok(None),
+            s => Err(nt_error(s)),
         }
-        let _sd = Local(sd);
-        if dacl.is_null() {
+    }
+
+    const SECURITY_DESCRIPTOR_REVISION: u32 = 1;
+
+    /// The control bits of a list that [`Sd::with`] keeps.
+    const DACL_BITS: u16 = SE_DACL_PROTECTED | SE_DACL_AUTO_INHERITED;
+
+    /// A security descriptor in a buffer of its own, self-relative.
+    #[derive(Clone)]
+    struct Sd(Vec<u64>);
+
+    impl Sd {
+        fn ptr(&self) -> PSECURITY_DESCRIPTOR {
+            self.0.as_ptr() as PSECURITY_DESCRIPTOR
+        }
+
+        /// A copy of the descriptor at `sd`.
+        ///
+        /// SAFETY: `sd` is a valid self-relative descriptor.
+        unsafe fn copy(sd: PSECURITY_DESCRIPTOR) -> Sd {
+            // SAFETY: as the caller says.
+            let len = unsafe { GetSecurityDescriptorLength(sd) } as usize;
+            let mut buf = vec![0u64; len.div_ceil(8)];
+            // SAFETY: the descriptor is `len` bytes long, the buffer as long
+            // or longer.
+            unsafe {
+                std::ptr::copy_nonoverlapping(sd as *const u8, buf.as_mut_ptr() as *mut u8, len)
+            };
+            Sd(buf)
+        }
+
+        /// The owner, group and access list of the object open as `h`.
+        fn of(h: HANDLE) -> io::Result<Sd> {
+            let info =
+                OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION;
+            let mut buf = vec![0u64; 64];
+            loop {
+                let mut need = 0u32;
+                // SAFETY: an open handle and a buffer of the size given.
+                let ok = unsafe {
+                    GetKernelObjectSecurity(
+                        h,
+                        info,
+                        buf.as_mut_ptr() as PSECURITY_DESCRIPTOR,
+                        (buf.len() * 8) as u32,
+                        &mut need,
+                    )
+                };
+                if ok != 0 {
+                    return Ok(Sd(buf));
+                }
+                let e = io::Error::last_os_error();
+                if e.raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+                    return Err(e);
+                }
+                buf.resize((need as usize).div_ceil(8), 0);
+            }
+        }
+
+        /// The owner and group of `like`, the access list `dacl`, and of
+        /// `control` the bits [`DACL_BITS`].
+        fn with(like: &Sd, dacl: *mut ACL, control: u16) -> io::Result<Sd> {
+            let mut abs = SECURITY_DESCRIPTOR::default();
+            let p = &mut abs as *mut SECURITY_DESCRIPTOR as PSECURITY_DESCRIPTOR;
+            let (mut owner, mut group): (PSID, PSID) = (null_mut(), null_mut());
+            let mut defaulted = 0;
+            // SAFETY: a descriptor on the stack; the owner, group and list
+            // it points to live in `like` and `dacl` until the copy below is
+            // made.
+            unsafe {
+                check(GetSecurityDescriptorOwner(
+                    like.ptr(),
+                    &mut owner,
+                    &mut defaulted,
+                ))?;
+                check(GetSecurityDescriptorGroup(
+                    like.ptr(),
+                    &mut group,
+                    &mut defaulted,
+                ))?;
+                check(InitializeSecurityDescriptor(
+                    p,
+                    SECURITY_DESCRIPTOR_REVISION,
+                ))?;
+                check(SetSecurityDescriptorOwner(p, owner, 0))?;
+                check(SetSecurityDescriptorGroup(p, group, 0))?;
+                check(SetSecurityDescriptorDacl(p, 1, dacl, 0))?;
+                check(SetSecurityDescriptorControl(
+                    p,
+                    DACL_BITS,
+                    control & DACL_BITS,
+                ))?;
+            }
+            let mut len = 0u32;
+            // SAFETY: asks for the length only.
+            unsafe { MakeSelfRelativeSD(p, null_mut(), &mut len) };
+            let mut buf = vec![0u64; (len as usize).div_ceil(8)];
+            // SAFETY: a buffer of `len` bytes or more.
+            check(unsafe {
+                MakeSelfRelativeSD(p, buf.as_mut_ptr() as PSECURITY_DESCRIPTOR, &mut len)
+            })?;
+            Ok(Sd(buf))
+        }
+
+        /// Whether an entry of its access list is marked inherited.
+        fn marks_inherited(&self) -> io::Result<bool> {
+            let (mut present, mut defaulted) = (0, 0);
+            let mut dacl: *mut ACL = null_mut();
+            // SAFETY: a valid descriptor; `dacl` points into it.
+            check(unsafe {
+                GetSecurityDescriptorDacl(self.ptr(), &mut present, &mut dacl, &mut defaulted)
+            })?;
+            if present == 0 || dacl.is_null() {
+                return Ok(false);
+            }
+            // SAFETY: each ACE lies in `dacl` and starts with its header.
+            Ok(aces(dacl)?
+                .iter()
+                .any(|a| u32::from(unsafe { (**a).AceFlags }) & INHERITED_ACE != 0))
+        }
+
+        /// Writes its access list as the list of the object open as `h`,
+        /// and nothing below it: unlike SetSecurityInfo, this passes nothing
+        /// down. Windows keeps the mark that its inherited entries are
+        /// marked (SE_DACL_AUTO_INHERITED) only when the write asks for it.
+        fn write(&self, h: HANDLE) -> io::Result<()> {
+            let sd = self.clone();
+            if sd.control()? & SE_DACL_AUTO_INHERITED != 0 {
+                // SAFETY: a valid descriptor of our own.
+                check(unsafe {
+                    SetSecurityDescriptorControl(
+                        sd.ptr(),
+                        SE_DACL_AUTO_INHERIT_REQ,
+                        SE_DACL_AUTO_INHERIT_REQ,
+                    )
+                })?;
+            }
+            // SAFETY: a handle opened for WRITE_DAC, and a valid descriptor.
+            check(unsafe { SetKernelObjectSecurity(h, DACL_SECURITY_INFORMATION, sd.ptr()) })
+        }
+
+        fn control(&self) -> io::Result<u16> {
+            let (mut control, mut revision) = (0u16, 0u32);
+            // SAFETY: a valid descriptor.
+            check(unsafe {
+                GetSecurityDescriptorControl(self.ptr(), &mut control, &mut revision)
+            })?;
+            Ok(control)
+        }
+
+        /// The entries of its access list, byte for byte; `None` without one.
+        fn entries(&self) -> io::Result<Option<Vec<u8>>> {
+            let (mut present, mut defaulted) = (0, 0);
+            let mut dacl: *mut ACL = null_mut();
+            // SAFETY: a valid descriptor; `dacl` points into it.
+            check(unsafe {
+                GetSecurityDescriptorDacl(self.ptr(), &mut present, &mut dacl, &mut defaulted)
+            })?;
+            if present == 0 || dacl.is_null() {
+                return Ok(None);
+            }
+            ace_bytes(dacl).map(Some)
+        }
+    }
+
+    /// The entries of `dacl`, byte for byte.
+    fn ace_bytes(dacl: *mut ACL) -> io::Result<Vec<u8>> {
+        let mut out = Vec::new();
+        for ace in aces(dacl)? {
+            // SAFETY: each ACE lies in `dacl` and is as long as its header
+            // says.
+            unsafe {
+                out.extend_from_slice(std::slice::from_raw_parts(
+                    ace as *const u8,
+                    usize::from((*ace).AceSize),
+                ))
+            };
+        }
+        Ok(out)
+    }
+
+    /// The tag bit of a reparse point that names another place (a junction
+    /// or a symbolic link); other reparse points, such as those of cloud
+    /// files, are the object itself.
+    const NAME_SURROGATE: u32 = 0x2000_0000;
+
+    /// The access mapping of files and folders, by which Windows writes out
+    /// a generic right of an entry a file or folder inherits.
+    const FILE_MAPPING: GENERIC_MAPPING = GENERIC_MAPPING {
+        GenericRead: FILE_GENERIC_READ,
+        GenericWrite: FILE_GENERIC_WRITE,
+        GenericExecute: FILE_GENERIC_EXECUTE,
+        GenericAll: FILE_ALL_ACCESS,
+    };
+
+    /// What is below a folder, as a change of its list passes down to it
+    /// ([`inherit`]): each object opened through its folder's handle, and
+    /// the list it gets worked out by Windows, as when the object is made.
+    struct Volume {
+        /// This process' token, which Windows asks for in that.
+        token: Obj,
+    }
+
+    impl Volume {
+        fn new() -> io::Result<Volume> {
+            Ok(Volume {
+                token: process_token()?,
+            })
+        }
+    }
+
+    /// This process' token, which Windows asks for as it works out what an
+    /// object inherits.
+    fn process_token() -> io::Result<Obj> {
+        let mut token: HANDLE = null_mut();
+        // SAFETY: this process' own token, owned by the Obj below.
+        check(unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) })?;
+        Ok(Obj {
+            h: token,
+            owned: true,
+        })
+    }
+
+    /// `sd` with only the entries of its access list that it did not
+    /// inherit.
+    fn explicit(sd: &Sd) -> io::Result<Sd> {
+        let (mut present, mut defaulted) = (0, 0);
+        let mut dacl: *mut ACL = null_mut();
+        // SAFETY: a valid descriptor; `dacl` points into it.
+        check(unsafe {
+            GetSecurityDescriptorDacl(sd.ptr(), &mut present, &mut dacl, &mut defaulted)
+        })?;
+        if present == 0 || dacl.is_null() {
+            return Ok(sd.clone());
+        }
+        let mut info = ACL_SIZE_INFORMATION::default();
+        // SAFETY: a valid ACL and a buffer of the size given.
+        check(unsafe {
+            GetAclInformation(
+                dacl,
+                &mut info as *mut _ as *mut c_void,
+                size_of::<ACL_SIZE_INFORMATION>() as u32,
+                AclSizeInformation,
+            )
+        })?;
+        let size = info.AclBytesInUse.max(size_of::<ACL>() as u32);
+        let mut buf = vec![0u32; (size as usize).div_ceil(4)];
+        let new = buf.as_mut_ptr() as *mut ACL;
+        // SAFETY: the buffer holds `size` bytes.
+        check(unsafe { InitializeAcl(new, size, ACL_REVISION_DS) })?;
+        for ace in aces(dacl)? {
+            // SAFETY: the ACE lies in `dacl` and is as long as its header
+            // says; the new list has room for all of them.
+            unsafe {
+                if u32::from((*ace).AceFlags) & INHERITED_ACE == 0 {
+                    check(AddAce(
+                        new,
+                        ACL_REVISION_DS,
+                        u32::MAX,
+                        ace as *const c_void,
+                        u32::from((*ace).AceSize),
+                    ))?;
+                }
+            }
+        }
+        Sd::with(sd, new, sd.control()?)
+    }
+
+    /// `sd` with the entries it inherited from a folder whose list is
+    /// `parent` marked so. A list written before Windows marked inherited
+    /// entries (no SE_DACL_AUTO_INHERITED, as in folders made that way, and
+    /// those below them) has them unmarked; Windows tells them by what
+    /// `parent` gives, as `SetSecurityInfo` does.
+    fn marked(parent: &Sd, sd: &Sd, is_dir: bool) -> io::Result<Sd> {
+        if sd.control()? & SE_DACL_AUTO_INHERITED != 0 || sd.marks_inherited()? {
+            return Ok(sd.clone());
+        }
+        let mut made: PSECURITY_DESCRIPTOR = null_mut();
+        // SAFETY: two valid descriptors and an out pointer the call sets to
+        // a descriptor it allocated, freed with DestroyPrivateObjectSecurity.
+        check(unsafe {
+            ConvertToAutoInheritPrivateObjectSecurity(
+                parent.ptr(),
+                sd.ptr(),
+                &mut made,
+                null(),
+                is_dir,
+                &FILE_MAPPING,
+            )
+        })?;
+        // SAFETY: the descriptor just made, copied, then freed once.
+        Ok(unsafe {
+            let copy = Sd::copy(made);
+            DestroyPrivateObjectSecurity(&made);
+            copy
+        })
+    }
+
+    /// The list of an object with the descriptor `own` (a folder:
+    /// `is_dir`) in a folder whose list is `parent`: its own entries as they
+    /// are, and those it inherits from `parent`, as Windows works them out
+    /// for an object it makes there. `was` is the list of the folder it
+    /// inherited its present entries from, by which those are told.
+    fn inherited(parent: &Sd, was: &Sd, own: &Sd, is_dir: bool, token: &Obj) -> io::Result<Sd> {
+        // Windows takes every entry of the descriptor it starts from as one
+        // of the object's own, so only those go in.
+        let own = explicit(&marked(was, own, is_dir)?)?;
+        let mut made: PSECURITY_DESCRIPTOR = null_mut();
+        // SAFETY: two valid descriptors, a token that may be queried, and an
+        // out pointer the call sets to a descriptor it allocated, freed with
+        // DestroyPrivateObjectSecurity.
+        check(unsafe {
+            CreatePrivateObjectSecurityEx(
+                parent.ptr(),
+                own.ptr(),
+                &mut made,
+                null(),
+                i32::from(is_dir),
+                SEF_DACL_AUTO_INHERIT | SEF_AVOID_OWNER_CHECK | SEF_AVOID_PRIVILEGE_CHECK,
+                token.h,
+                &FILE_MAPPING,
+            )
+        })?;
+        // SAFETY: the descriptor just made, copied, then freed once.
+        Ok(unsafe {
+            let copy = Sd::copy(made);
+            DestroyPrivateObjectSecurity(&made);
+            copy
+        })
+    }
+
+    /// The list of the folder the object open as `f` is in now, by its
+    /// final path; `None` for the root of a volume, or where it cannot be
+    /// read.
+    fn parent_list(f: &std::fs::File) -> Option<Sd> {
+        let now = final_path(f).ok()?;
+        let parent = open(now.parent()?, READ_CONTROL).ok()?;
+        Sd::of(parent.as_raw_handle()).ok()
+    }
+
+    /// A folder's list as the walk passes it down: as it is to be, and as
+    /// it was, by which what is below it tells what it inherited.
+    #[derive(Clone)]
+    struct Lists {
+        new: Sd,
+        was: Sd,
+    }
+
+    impl Objects for Volume {
+        type Obj = Obj;
+        type List = Lists;
+
+        fn entries(&mut self, dir: &Obj) -> io::Result<Vec<inherit::Entry>> {
+            match list_dir(dir, true) {
+                // A volume that gives no file IDs in a listing (a share,
+                // say): by name alone.
+                Err(e)
+                    if [
+                        ERROR_INVALID_PARAMETER,
+                        ERROR_NOT_SUPPORTED,
+                        ERROR_INVALID_LEVEL,
+                    ]
+                    .iter()
+                    .any(|c| e.raw_os_error() == Some(*c as i32)) =>
+                {
+                    list_dir(dir, false)
+                }
+                r => r,
+            }
+        }
+
+        fn open(&mut self, dir: &Obj, name: &OsStr) -> io::Result<Option<Obj>> {
+            let name: Vec<u16> = name.encode_wide().collect();
+            open_in(dir.h, &name, READ_CONTROL | FILE_READ_ATTRIBUTES)
+        }
+
+        fn kind(&mut self, obj: &Obj) -> io::Result<Kind> {
+            let mut tag = FILE_ATTRIBUTE_TAG_INFO::default();
+            let mut standard = FILE_STANDARD_INFO::default();
+            // SAFETY: an open handle and buffers of the sizes given.
+            unsafe {
+                check(GetFileInformationByHandleEx(
+                    obj.h,
+                    FileAttributeTagInfo,
+                    &mut tag as *mut _ as *mut c_void,
+                    size_of::<FILE_ATTRIBUTE_TAG_INFO>() as u32,
+                ))?;
+                check(GetFileInformationByHandleEx(
+                    obj.h,
+                    FileStandardInfo,
+                    &mut standard as *mut _ as *mut c_void,
+                    size_of::<FILE_STANDARD_INFO>() as u32,
+                ))?;
+            }
+            let reparse = tag.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0;
+            Ok(Kind {
+                folder: tag.FileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
+                link: reparse && tag.ReparseTag & NAME_SURROGATE != 0,
+                names: standard.NumberOfLinks,
+            })
+        }
+
+        fn derive(&mut self, parent: &Lists, obj: &Obj, kind: &Kind) -> io::Result<Derived<Lists>> {
+            let now = Sd::of(obj.h)?;
+            if now.control()? & SE_DACL_PROTECTED != 0 {
+                return Ok(Derived::Kept);
+            }
+            let new = inherited(&parent.new, &parent.was, &now, kind.folder, &self.token)?;
+            Ok(if now.entries()? == new.entries()? {
+                Derived::Same(Lists {
+                    new: now.clone(),
+                    was: now,
+                })
+            } else {
+                Derived::Changed(Lists { new, was: now })
+            })
+        }
+
+        fn write(&mut self, obj: &Obj, list: &Lists) -> io::Result<()> {
+            let list = &list.new;
+            // Opened for the change only now, on the same object: one the
+            // node may read but not change stops a walk only where its list
+            // changes.
+            let Some(w) = open_in(obj.h, &[], WRITE_DAC)? else {
+                return Err(io::ErrorKind::NotFound.into());
+            };
+            list.write(w.h)
+        }
+
+        fn at(&mut self, obj: &Obj, path: &Path) -> io::Result<bool> {
+            let there = match open_itself(path, FILE_READ_ATTRIBUTES) {
+                Ok(f) => f,
+                Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+                Err(e) => return Err(e),
+            };
+            Ok(id_by(obj.h)? == id_of(&there)?)
+        }
+
+        fn names_of(&mut self, obj: &Obj) -> io::Result<Vec<PathBuf>> {
+            // By 128-bit IDs where the volume gives them (ReFS); NTFS gives
+            // 64-bit ones only, which are the low half of its 128-bit IDs.
+            let (buf, full) = match link_info(obj.h, FileHardLinkFullIdInformation) {
+                Err(s)
+                    if [
+                        STATUS_INVALID_PARAMETER,
+                        STATUS_INVALID_INFO_CLASS,
+                        STATUS_NOT_SUPPORTED,
+                    ]
+                    .contains(&s) =>
+                {
+                    (
+                        link_info(obj.h, FileHardLinkInformation).map_err(nt_error)?,
+                        false,
+                    )
+                }
+                r => (r.map_err(nt_error)?, true),
+            };
+            let mut out = Vec::new();
+            // SAFETY: Windows filled the buffer: a header, then entries of
+            // the class asked for, each at the offset the one before gives,
+            // with its name after its fields.
+            unsafe {
+                let (count, mut at) = if full {
+                    let head = buf.as_ptr() as *const FILE_LINKS_FULL_ID_INFORMATION;
+                    (
+                        (*head).EntriesReturned,
+                        &raw const (*head).Entry as *const u8,
+                    )
+                } else {
+                    let head = buf.as_ptr() as *const FILE_LINKS_INFORMATION;
+                    (
+                        (*head).EntriesReturned,
+                        &raw const (*head).Entry as *const u8,
+                    )
+                };
+                for _ in 0..count {
+                    let (next, parent, name) = if full {
+                        let e = at as *const FILE_LINK_ENTRY_FULL_ID_INFORMATION;
+                        let len = (*e).FileNameLength as usize;
+                        let name =
+                            std::slice::from_raw_parts(&raw const (*e).FileName as *const u16, len);
+                        ((*e).NextEntryOffset, (*e).ParentFileId.Identifier, name)
+                    } else {
+                        let e = at as *const FILE_LINK_ENTRY_INFORMATION;
+                        let len = (*e).FileNameLength as usize;
+                        let name =
+                            std::slice::from_raw_parts(&raw const (*e).FileName as *const u16, len);
+                        let mut id = [0u8; 16];
+                        id[..8].copy_from_slice(&(*e).ParentFileId.to_le_bytes());
+                        ((*e).NextEntryOffset, id, name)
+                    };
+                    let folder = folder_by_id(obj.h, parent)?;
+                    out.push(folder.join(std::ffi::OsString::from_wide(name)));
+                    if next == 0 {
+                        break;
+                    }
+                    at = at.add(next as usize);
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    /// The names (hard links) of the object open as `h`, as Windows gives
+    /// them in `class`; the NTSTATUS where it does not.
+    fn link_info(h: HANDLE, class: i32) -> Result<Vec<u64>, NTSTATUS> {
+        let mut buf = vec![0u64; 512];
+        loop {
+            let mut status_block = IO_STATUS_BLOCK::default();
+            // SAFETY: an open handle and a buffer of the size given.
+            let status = unsafe {
+                NtQueryInformationFile(
+                    h,
+                    &mut status_block,
+                    buf.as_mut_ptr() as *mut c_void,
+                    (buf.len() * 8) as u32,
+                    class,
+                )
+            };
+            if status == STATUS_BUFFER_OVERFLOW || status == STATUS_BUFFER_TOO_SMALL {
+                // SAFETY: the buffer starts with a header of either class,
+                // which says how much it needs.
+                let need =
+                    unsafe { (*(buf.as_ptr() as *const FILE_LINKS_INFORMATION)).BytesNeeded };
+                let len = (need as usize).div_ceil(8).max(buf.len() * 2);
+                buf.resize(len, 0);
+                continue;
+            }
+            if status < 0 {
+                return Err(status);
+            }
+            return Ok(buf);
+        }
+    }
+
+    /// The entries of the folder open as `dir`, with their file IDs
+    /// (`ids`), or by name alone.
+    fn list_dir(dir: &Obj, ids: bool) -> io::Result<Vec<inherit::Entry>> {
+        let Some(list) = open_in(dir.h, &[], FILE_LIST_DIRECTORY)? else {
+            return Err(io::ErrorKind::NotFound.into());
+        };
+        let class = if ids {
+            FileIdExtdDirectoryInfo
+        } else {
+            FileFullDirectoryInfo
+        };
+        let mut buf = vec![0u64; 8 * 1024];
+        let mut out = Vec::new();
+        loop {
+            // SAFETY: a handle that may list the folder, and a buffer of the
+            // size given.
+            let ok = unsafe {
+                GetFileInformationByHandleEx(
+                    list.h,
+                    class,
+                    buf.as_mut_ptr() as *mut c_void,
+                    (buf.len() * 8) as u32,
+                )
+            };
+            if ok == 0 {
+                let e = io::Error::last_os_error();
+                if e.raw_os_error() == Some(ERROR_NO_MORE_FILES as i32) {
+                    return Ok(out);
+                }
+                return Err(e);
+            }
+            let mut at = 0usize;
+            loop {
+                // SAFETY: Windows filled the buffer with entries of `class`,
+                // each at the offset the one before gives and aligned for it,
+                // with its name right after its fields.
+                let (next, name, id) = unsafe {
+                    let base = (buf.as_ptr() as *const u8).add(at);
+                    if ids {
+                        let e = base as *const FILE_ID_EXTD_DIR_INFO;
+                        let len = (*e).FileNameLength as usize / 2;
+                        let name =
+                            std::slice::from_raw_parts(&raw const (*e).FileName as *const u16, len);
+                        let id = Some((*e).FileId.Identifier);
+                        ((*e).NextEntryOffset as usize, name, id)
+                    } else {
+                        let e = base as *const FILE_FULL_DIR_INFO;
+                        let len = (*e).FileNameLength as usize / 2;
+                        let name =
+                            std::slice::from_raw_parts(&raw const (*e).FileName as *const u16, len);
+                        ((*e).NextEntryOffset as usize, name, None)
+                    }
+                };
+                let dot = u16::from(b'.');
+                if name != [dot] && name != [dot, dot] {
+                    out.push((std::ffi::OsString::from_wide(name), id));
+                }
+                if next == 0 {
+                    break;
+                }
+                at += next;
+            }
+        }
+    }
+
+    /// The path of the folder with the file ID `id`, on the volume of the
+    /// object open as `near`, without the `\\?\` prefix.
+    fn folder_by_id(near: HANDLE, id: [u8; 16]) -> io::Result<PathBuf> {
+        let desc = FILE_ID_DESCRIPTOR {
+            dwSize: size_of::<FILE_ID_DESCRIPTOR>() as u32,
+            Type: ExtendedFileIdType,
+            Anonymous: FILE_ID_DESCRIPTOR_0 {
+                ExtendedFileId: FILE_ID_128 { Identifier: id },
+            },
+        };
+        // SAFETY: a handle on the volume and a valid descriptor; the handle
+        // returned is owned by the File below.
+        let h = unsafe {
+            OpenFileById(
+                near,
+                &desc,
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                null(),
+                FILE_FLAG_BACKUP_SEMANTICS,
+            )
+        };
+        if h == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: a handle this function owns.
+        let f = unsafe { std::fs::File::from_raw_handle(h) };
+        let p = final_path(&f)?;
+        Ok(plain(p.as_os_str().encode_wide().collect()))
+    }
+
+    /// The list of the object open as `f` with the grants of `masks` for
+    /// `sid` in place of those it had (`None`: without any), as [`set`]
+    /// puts it on.
+    struct Next {
+        sd: Sd,
+        /// The list it has now.
+        was: Sd,
+        is_dir: bool,
+        /// Its list does not inherit.
+        protected: bool,
+        /// Its entries change.
+        changed: bool,
+    }
+
+    fn next(f: &std::fs::File, sid: &Sid, masks: Option<Masks>) -> io::Result<Next> {
+        let is_dir = f.metadata()?.is_dir();
+        let now = Sd::of(f.as_raw_handle())?;
+        let (mut present, mut defaulted) = (0, 0);
+        let mut dacl: *mut ACL = null_mut();
+        // SAFETY: a valid descriptor; `dacl` points into it, valid while
+        // `now` lives.
+        check(unsafe {
+            GetSecurityDescriptorDacl(now.ptr(), &mut present, &mut dacl, &mut defaulted)
+        })?;
+        if present == 0 || dacl.is_null() {
             return Err(io::Error::other(
                 "it has no access list, so everyone may open it; the node does not give it one",
             ));
         }
-        let (mut control, mut revision) = (0u16, 0u32);
-        // SAFETY: the descriptor is valid while `_sd` lives.
-        check(unsafe { GetSecurityDescriptorControl(sd, &mut control, &mut revision) })?;
-        let protected = control & SE_DACL_PROTECTED != 0;
-        if own && masks.is_some() && protected {
-            return refuse("its permissions do not inherit from its folder".into());
-        }
+        let control = now.control()?;
         let mut info = ACL_SIZE_INFORMATION::default();
         // SAFETY: a valid ACL and a buffer of the size given.
         check(unsafe {
@@ -1194,57 +2035,262 @@ pub mod appcontainer {
         let new = buf.as_mut_ptr() as *mut ACL;
         // SAFETY: the buffer holds `size` bytes.
         check(unsafe { InitializeAcl(new, size, ACL_REVISION_DS) })?;
-        for i in 0..info.AceCount {
-            let mut ace: *mut c_void = null_mut();
-            // SAFETY: `i` is below the ACE count; the ACE lies in `dacl`.
-            check(unsafe { GetAce(dacl, i, &mut ace) })?;
-            // SAFETY: every ACE starts with its header.
-            let h = unsafe { &*(ace as *const ACE_HEADER) };
-            // Inherited entries are Windows' to set: it derives them from
-            // the parent again when the list is written.
-            if u32::from(h.AceFlags) & INHERITED_ACE != 0 {
-                continue;
-            }
-            let plain = matches!(h.AceType, ACCESS_ALLOWED_ACE_TYPE | ACCESS_DENIED_ACE_TYPE);
+        let old = aces(dacl)?;
+        // SAFETY: every ACE starts with its header.
+        let inherited_ace =
+            |ace: *const ACE_HEADER| u32::from(unsafe { (*ace).AceFlags }) & INHERITED_ACE != 0;
+        let copy = |ace: *const ACE_HEADER| {
+            // SAFETY: the ACE and its size come from the old list, and the
+            // new one has room for all of them.
+            check(unsafe {
+                AddAce(
+                    new,
+                    ACL_REVISION_DS,
+                    u32::MAX,
+                    ace as *const c_void,
+                    u32::from((*ace).AceSize),
+                )
+            })
+        };
+        // Its own entries but the container's, then the container's new
+        // ones, then the inherited entries, as Windows keeps a list's own
+        // entries before those it inherited.
+        for &ace in old.iter().filter(|a| !inherited_ace(**a)) {
+            // SAFETY: the ACE lies in `dacl`, valid while `now` lives.
+            let plain = matches!(
+                unsafe { (*ace).AceType },
+                ACCESS_ALLOWED_ACE_TYPE | ACCESS_DENIED_ACE_TYPE
+            );
             // SAFETY: an allowed or denied ACE has its SID at SidStart.
             let ours = plain
                 && unsafe {
                     let a = ace as *const ACCESS_ALLOWED_ACE;
                     EqualSid(&raw const (*a).SidStart as PSID, sid.0) != 0
                 };
-            if ours {
-                continue;
+            if !ours {
+                copy(ace)?;
             }
-            // SAFETY: the ACE and its size come from the old list, and the
-            // new one has room for all of them.
-            check(unsafe { AddAce(new, ACL_REVISION_DS, u32::MAX, ace, u32::from(h.AceSize)) })?;
         }
         for (flags, mask) in add {
             // SAFETY: the list has room for each of these ACEs.
             check(unsafe { AddAccessAllowedAceEx(new, ACL_REVISION_DS, flags, mask, sid.0) })?;
         }
-        // A list that did not inherit keeps not inheriting.
-        let keep = if protected {
-            PROTECTED_DACL_SECURITY_INFORMATION
-        } else {
-            UNPROTECTED_DACL_SECURITY_INFORMATION
-        };
-        // SAFETY: an open handle and a valid ACL.
-        let e = unsafe {
-            SetSecurityInfo(
-                f.as_raw_handle(),
-                SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION | keep,
-                null_mut(),
-                null_mut(),
-                new,
-                null(),
-            )
-        };
-        if e != 0 {
-            return Err(io::Error::from_raw_os_error(e as i32));
+        for &ace in old.iter().filter(|a| inherited_ace(**a)) {
+            copy(ace)?;
         }
-        Ok(id_of(&f).ok())
+        let mut sd = Sd::with(&now, new, control)?;
+        // The inherited entries as Windows works them out from the folder it
+        // is in now, as SetSecurityInfo does: a folder moved here from a
+        // granted one keeps that one's entries until its list is written
+        // so. Where that folder cannot be read, they stay as they are.
+        let protected = control & SE_DACL_PROTECTED != 0;
+        if !protected && let Some(parent) = parent_list(f) {
+            sd = inherited(&parent, &parent, &sd, is_dir, &process_token()?)?;
+        }
+        Ok(Next {
+            changed: sd.entries()? != Some(ace_bytes(dacl)?),
+            sd,
+            was: now.clone(),
+            is_dir,
+            protected,
+        })
+    }
+
+    /// What a change of a grant asks of what it reaches below its folder.
+    pub struct Below<'a> {
+        /// Whether a file with more than one name (hard links) whose list
+        /// changes may change ([`Walk::links`]); `None`: any may.
+        pub links: Option<inherit::Links<'a>>,
+        /// Told how far the change is, now and then.
+        pub progress: &'a mut dyn FnMut(Walked),
+    }
+
+    /// Passes the list `next` of the folder open as `f` (at `path`) down
+    /// ([`inherit::pass_down`]), into every folder with `every`, and
+    /// writes it on the folder last with `write_top`; only looks with
+    /// `write` false.
+    fn pass(
+        f: &std::fs::File,
+        path: &Path,
+        next: &Next,
+        write_top: bool,
+        every: bool,
+        write: bool,
+        below: Below,
+    ) -> io::Result<(Walked, Option<inherit::Stop>)> {
+        let mut volume = Volume::new()?;
+        let top = Obj {
+            h: f.as_raw_handle(),
+            owned: false,
+        };
+        let lists = Lists {
+            new: next.sd.clone(),
+            was: next.was.clone(),
+        };
+        inherit::pass_down(
+            &mut volume,
+            top,
+            lists,
+            path,
+            write_top && write,
+            Walk {
+                write,
+                every,
+                links: below.links,
+                progress: below.progress,
+            },
+        )
+    }
+
+    /// Puts the grants of `masks` for the container `name` on `path`, in
+    /// place of any it had (`None` takes them off). Other entries of the
+    /// access list stay as they are. [`set_below`] without its checks.
+    pub fn set(
+        path: &Path,
+        name: &str,
+        masks: Option<Masks>,
+        own: bool,
+    ) -> io::Result<Option<FileId>> {
+        let below = Below {
+            links: None,
+            progress: &mut |_| {},
+        };
+        set_below(path, name, masks, own, false, None, below).map(|(id, _)| id)
+    }
+
+    /// Puts the grants of `masks` for the container `name` on `path`, in
+    /// place of any it had (`None` takes them off). They are inherited by
+    /// everything below `path`, and the change passes down to what is there
+    /// now as far as it changes something ([`inherit`]), before the list of
+    /// `path` itself is written. Other entries of the access list stay as
+    /// they are.
+    ///
+    /// With `own`, grants go on only an object of its own at `path`: none
+    /// on a link or junction to elsewhere, on a file with other names, or on
+    /// one whose list does not inherit. A command may have put what is
+    /// there, where it may write; the grant would then reach what it
+    /// leads to. A refusal is InvalidInput, and changes nothing. The
+    /// [`FileId`] of the object it changed, as its handle names it, when
+    /// the volume names one, and how far the change went below it.
+    ///
+    /// A file below with more than one name that `below.links` refuses as
+    /// the change reaches it stops the change there, as an error: what it
+    /// changed below `path` stays, and `path` keeps its list.
+    ///
+    /// With `whole`, the change goes into every folder below, also where
+    /// the list of `path` stays as it is: an earlier change there may have
+    /// stopped part way, and the folders above what it changed do not show
+    /// that. Taking grants off always does.
+    ///
+    /// With `expect`, the change goes only through that object: one at
+    /// `path` that is another, or nothing there (the folder was replaced or
+    /// moved since its id was recorded), is refused before anything is
+    /// written, so the record and the object a change wrote always agree.
+    pub fn set_below(
+        path: &Path,
+        name: &str,
+        masks: Option<Masks>,
+        own: bool,
+        whole: bool,
+        expect: Option<FileId>,
+        below: Below,
+    ) -> io::Result<(Option<FileId>, Walked)> {
+        let sid = Sid::derive(name)?;
+        let refuse = |why: String| {
+            Err(acl::untouched(
+                acl::Untouched::Refused,
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("the node puts no grant on it, since {why}"),
+                ),
+            ))
+        };
+        // The change goes through this handle, on the object it opened.
+        let f = match open(path, READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES) {
+            Ok(f) => f,
+            // The recorded object is not at the path (moved away meanwhile):
+            // not "nothing there" for the record, which the next sync finds
+            // again where it went.
+            Err(e) if expect.is_some() && e.kind() == io::ErrorKind::NotFound => {
+                return refuse(
+                    "the folder recorded for it is not there now (it was moved meanwhile); the next sync looks again".into(),
+                );
+            }
+            Err(e) => return Err(gone(e)),
+        };
+        if let Some(want) = expect
+            && id_of(&f).ok() != Some(want)
+        {
+            return refuse(
+                "it is another folder than the one recorded (it was replaced meanwhile); the next sync looks again".into(),
+            );
+        }
+        if own
+            && masks.is_some()
+            && let Some(why) = not_own(&f, path)?
+        {
+            return refuse(why);
+        }
+        let next = next(&f, &sid, masks)?;
+        if own && masks.is_some() && next.protected {
+            return refuse("its permissions do not inherit from its folder".into());
+        }
+        let every = masks.is_none() || whole;
+        let mut walked = Walked::default();
+        if next.is_dir && (next.changed || every) {
+            // The walk writes the list of `path` itself last.
+            let (w, stopped) = pass(&f, path, &next, next.changed, every, true, below)?;
+            walked = w;
+            if let Some(stop) = stopped {
+                let folder = if stop.top_written {
+                    // Made in the folder while the walk was below it.
+                    "after the folder itself got the change"
+                } else {
+                    "with the folder itself as it was"
+                };
+                return Err(io::Error::other(format!(
+                    "{} below it has {} names (hard links), and the change would reach them all; it stopped there, {folder}",
+                    stop.path.display(),
+                    stop.names
+                )));
+            }
+        } else if next.changed {
+            next.sd.write(f.as_raw_handle())?;
+        }
+        Ok((id_of(&f).ok(), walked))
+    }
+
+    /// The first file below the folder `path` with more than one name (hard
+    /// links) whose list [`set_below`] would change for the container
+    /// `name` and `masks`, and that `below.links` refuses (also one whose
+    /// path no longer leads to it), with how many names it has; and how far
+    /// it looked. Changes nothing. `None` for a file, and where the change
+    /// reaches no such file. `whole` as for [`set_below`].
+    pub fn reaches(
+        path: &Path,
+        name: &str,
+        masks: Option<Masks>,
+        whole: bool,
+        below: Below,
+    ) -> io::Result<(Option<(PathBuf, u32)>, Walked)> {
+        let sid = Sid::derive(name)?;
+        let f = open(path, READ_CONTROL | FILE_READ_ATTRIBUTES).map_err(gone)?;
+        let next = next(&f, &sid, masks)?;
+        let every = masks.is_none() || whole;
+        if !next.is_dir || !(next.changed || every) {
+            return Ok((None, Walked::default()));
+        }
+        let (walked, found) = pass(&f, path, &next, false, every, false, below)?;
+        Ok((found.map(|s| (s.path, s.names)), walked))
+    }
+
+    /// `e`, marked as nothing at the path where it says so.
+    fn gone(e: io::Error) -> io::Error {
+        if e.kind() == io::ErrorKind::NotFound {
+            acl::untouched(acl::Untouched::Gone, e)
+        } else {
+            e
+        }
     }
 
     /// HRESULTs of the profile calls.
@@ -2157,6 +3203,177 @@ mod tests {
         std::fs::remove_dir(&link).unwrap();
     }
 
+    /// A grant passes down to what is below its folder as far as it changes
+    /// something: put on again with the same flags, it walks nothing, and
+    /// asked to go through every folder (`whole`) it changes nothing. A
+    /// folder whose list does not inherit, what is below it, and what a
+    /// junction leads to keep out of it; taking it off leaves every list as
+    /// it was before. A file below with a second name that `links` refuses,
+    /// judged by the names the file itself gives, stops the change before
+    /// the folder's own list, and `reaches` finds it and changes nothing. A
+    /// folder whose list does not inherit keeps not inheriting when it gets
+    /// a grant of its own and loses it again.
+    #[cfg(windows)]
+    #[test]
+    fn a_grant_passes_down_as_far_as_it_changes_something() {
+        use std::ffi::OsStr;
+        use std::path::{Path, PathBuf};
+        let base = tempfile::tempdir().unwrap();
+        let (top, outside) = (base.path().join("top"), base.path().join("outside"));
+        for d in [top.join("a\\b"), top.join("closed\\in"), outside.clone()] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        for f in [
+            top.join("a\\b\\deep.txt"),
+            top.join("a\\f.txt"),
+            top.join("closed\\in\\x.txt"),
+            outside.join("o.txt"),
+        ] {
+            std::fs::write(f, "x").unwrap();
+        }
+        let run = |args: &[&OsStr]| {
+            let o = std::process::Command::new("cmd")
+                .arg("/C")
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "{o:?}");
+            String::from_utf8_lossy(&o.stdout).into_owned()
+        };
+        let closed = top.join("closed");
+        run(&[
+            "icacls".as_ref(),
+            closed.as_ref(),
+            "/inheritance:d".as_ref(),
+        ]);
+        let j = top.join("j");
+        run(&[
+            "mklink".as_ref(),
+            "/J".as_ref(),
+            j.as_ref(),
+            outside.as_ref(),
+        ]);
+        let icacls = |p: &Path| run(&["icacls".as_ref(), p.as_ref()]);
+        let has = |p: &Path| icacls(p).contains("S-1-15-2-");
+        let protected = |p: &Path| {
+            let o = std::process::Command::new("powershell.exe")
+                .args(["-NoProfile", "-Command"])
+                .arg(format!(
+                    "(Get-Acl -LiteralPath '{}').AreAccessRulesProtected",
+                    p.display()
+                ))
+                .output()
+                .unwrap();
+            String::from_utf8_lossy(&o.stdout).trim() == "True"
+        };
+        let all = ["", "a", "a\\b", "a\\b\\deep.txt", "a\\f.txt", "closed"];
+        let lists = || all.map(|p| icacls(&top.join(p)));
+        let at_first = lists();
+        let name = format!("nerve.test.pass.{}", std::process::id());
+        let m = acl::masks(true, true, false);
+        let set = |masks: Option<acl::Masks>, whole: bool| {
+            let below = appcontainer::Below {
+                links: None,
+                progress: &mut |_| {},
+            };
+            appcontainer::set_below(&top, &name, masks, false, whole, None, below)
+                .unwrap()
+                .1
+        };
+
+        let first = set(Some(m), false);
+        for p in ["a\\b\\deep.txt", "a\\f.txt", "a\\b"] {
+            assert!(has(&top.join(p)), "{p}");
+        }
+        for p in [
+            top.join("closed"),
+            top.join("closed\\in\\x.txt"),
+            outside.join("o.txt"),
+        ] {
+            assert!(!has(&p), "{p:?}");
+        }
+        // a, a\b, deep.txt, f.txt and the junction itself.
+        assert_eq!(first.changed, 5, "{first:?}");
+        assert_eq!(set(Some(m), false), inherit::Walked::default());
+        let whole = set(Some(m), true);
+        assert_eq!(whole.changed, 0, "{whole:?}");
+        assert_eq!(
+            whole.seen, 6,
+            "a, a\\b, deep.txt, f.txt, closed, j: {whole:?}"
+        );
+        // Through another object than the one at the path: refused, and
+        // nothing written.
+        let elsewhere = appcontainer::file_id(&outside).unwrap();
+        let below = appcontainer::Below {
+            links: None,
+            progress: &mut |_| {},
+        };
+        let e = appcontainer::set_below(&top, &name, None, false, false, Some(elsewhere), below)
+            .unwrap_err();
+        assert_eq!(acl::untouched_by(&e), Some(acl::Untouched::Refused), "{e}");
+        assert!(has(&top.join("a\\f.txt")), "nothing taken off");
+        // The recorded folder moved away, nothing at the path: refused too,
+        // not taken for nothing there.
+        let below = appcontainer::Below {
+            links: None,
+            progress: &mut |_| {},
+        };
+        let missing = top.join("moved-away");
+        let e =
+            appcontainer::set_below(&missing, &name, None, false, false, Some(elsewhere), below)
+                .unwrap_err();
+        assert_eq!(acl::untouched_by(&e), Some(acl::Untouched::Refused), "{e}");
+        let other = set(Some(acl::masks(true, false, false)), false);
+        assert_eq!(other.changed, 5, "{other:?}");
+        set(None, false);
+        assert_eq!(lists(), at_first, "every list as it was");
+
+        // A folder that does not inherit, granted itself.
+        assert!(protected(&closed));
+        appcontainer::set(&closed, &name, Some(m), false).unwrap();
+        assert!(has(&closed) && protected(&closed), "{}", icacls(&closed));
+        appcontainer::set(&closed, &name, None, false).unwrap();
+        assert!(!has(&closed) && protected(&closed), "{}", icacls(&closed));
+
+        let linked = top.join("a\\b\\l.txt");
+        let o = outside.join("o.txt");
+        std::fs::hard_link(&o, &linked).unwrap();
+        let before = icacls(&o);
+        let mut asked: Vec<Vec<PathBuf>> = Vec::new();
+        let mut no = |_: &Path, _: u32, names: &[PathBuf]| -> std::io::Result<bool> {
+            asked.push(names.to_vec());
+            Ok(false)
+        };
+        let mut quiet = |_: inherit::Walked| {};
+        let below = appcontainer::Below {
+            links: Some(&mut no),
+            progress: &mut quiet,
+        };
+        let (found, _) = appcontainer::reaches(&top, &name, Some(m), false, below).unwrap();
+        assert_eq!(found, Some((linked.clone(), 2)));
+        assert!(!has(&top.join("a\\f.txt")), "nothing changed");
+        let below = appcontainer::Below {
+            links: Some(&mut no),
+            progress: &mut quiet,
+        };
+        let e =
+            appcontainer::set_below(&top, &name, Some(m), false, false, None, below).unwrap_err();
+        assert!(e.to_string().contains("hard links"), "{e}");
+        let names = asked.first().unwrap();
+        for n in ["outside\\o.txt", "top\\a\\b\\l.txt"] {
+            assert!(names.iter().any(|p| p.ends_with(n)), "{n}: {names:?}");
+        }
+        assert!(
+            !appcontainer::look(&top, &name, m).unwrap().1,
+            "the folder stays"
+        );
+        assert_eq!(icacls(&o), before);
+        std::fs::remove_file(&linked).unwrap();
+        set(None, false);
+        assert_eq!(lists(), at_first, "every list as it was");
+        std::fs::remove_dir(&j).unwrap();
+    }
+
     /// A folder on a volume mounted in a folder (no drive letter) is found
     /// again by its file ID after a rename, and so it is once the volume
     /// has no path at all but its own name. Makes a virtual disk, so it
@@ -2281,6 +3498,185 @@ mod tests {
         assert!(refused.contains("UnauthorizedAccess"), "{refused} {log}");
         appcontainer::set(&granted, &name, None, false).unwrap();
         appcontainer::remove_profile(&name).unwrap();
+    }
+
+    /// In the container, `cd` and `pushd` go to whole paths of the folders
+    /// the command may see, and with `..` up out of its working folder into
+    /// one of them, and native programs start there. A folder it may not
+    /// see stays refused, with `$?` false and the location kept, also when
+    /// `..` names it or the error action keeps the error quiet. An escaped
+    /// `-Path`, one with `..` before a wildcard and one with a wildcard
+    /// right after `\` go where the cmdlet would take them, `cd $null`
+    /// fails as the cmdlet does, a new drive leaves `$Error` empty, and a
+    /// folder piped to `cd` or `pushd` is bound as the cmdlet binds it.
+    #[cfg(windows)]
+    #[test]
+    fn powershell_changes_to_whole_paths_in_an_appcontainer() {
+        let base = tempfile::tempdir().unwrap();
+        let (granted, other, hidden) = (
+            base.path().join("granted"),
+            base.path().join("other"),
+            base.path().join("hidden"),
+        );
+        for d in [
+            &granted.join("app").join("b[1]"),
+            &granted.join("app").join("lib"),
+            &granted.join("app").join("sub").join("lib"),
+            &granted.join("lib"),
+            &granted.join("sub"),
+            &other,
+            &hidden,
+        ] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let name = format!("nerve.test.cd.{}", std::process::id());
+        for d in [&granted, &other] {
+            appcontainer::set(d, &name, Some(acl::masks(true, true, true)), false).unwrap();
+        }
+        let (g, o, h) = (granted.display(), other.display(), hidden.display());
+        let ps = |cwd: &std::path::Path, script: String| {
+            run_in_container(
+                &name,
+                cwd,
+                "powershell.exe",
+                &["-NoProfile", "-Command", &script],
+            )
+        };
+        let (code, log) = ps(
+            &granted.join("app"),
+            format!(
+                "{POWERSHELL_START}Get-ChildItem '{g}' -Directory -Filter lib | cd; \
+                 Set-Content pipe.txt (cmd /c cd); cd '{g}\\app'; \
+                 Get-Item -LiteralPath 'b[1]' | pushd; Set-Content -LiteralPath pb.txt (cmd /c cd); popd; \
+                 cd 'b`[1`]'; Set-Content -LiteralPath br.txt (cmd /c cd); \
+                 cd ..; $Error.Clear(); cd ..\\l*; $errors = $Error.Count; \
+                 Set-Content lib.txt (cmd /c cd); Set-Content '{g}\\errors.txt' $errors; \
+                 cd '{g}\\app'; cd sub; cd \\l*; Set-Content root.txt (cmd /c cd); cd '{g}\\app'; \
+                 cd ..\\app\\..\\sub; Set-Content climb.txt (cmd /c cd); \
+                 cd ..\\app; Set-Content app.txt (cmd /c cd); \
+                 cd ..; Set-Content up.txt (cmd /c cd); \
+                 cd '{g}\\sub'; Set-Content here.txt (cmd /c cd); \
+                 cd '{o}'; Set-Content there.txt (cmd /c cd); \
+                 pushd '{g}\\app'; Set-Content back.txt (cmd /c cd); popd; \
+                 Set-Content popped.txt (cmd /c cd); \
+                 cd '{h}'; $ok = $?; Set-Content '{g}\\hidden.txt' $ok; \
+                 Set-Content '{g}\\stayed.txt' (cmd /c cd); \
+                 try {{ cd '{h}' -ErrorAction Stop; Set-Content wrong.txt x }} \
+                 catch {{ Set-Content '{g}\\refused.txt' $_.Exception.GetType().Name }}"
+            ),
+        );
+        assert_eq!(code, 0, "{log}");
+        let read = |p: std::path::PathBuf, log: &str| {
+            std::fs::read_to_string(&p)
+                .unwrap_or_else(|e| panic!("{}: {e}: {log}", p.display()))
+                .trim()
+                .to_string()
+        };
+        let (sub, app) = (granted.join("sub"), granted.join("app"));
+        let bracket = app.join("b[1]");
+        assert_eq!(
+            read(bracket.join("br.txt"), &log),
+            bracket.display().to_string()
+        );
+        assert_eq!(
+            read(bracket.join("pb.txt"), &log),
+            bracket.display().to_string()
+        );
+        let lib = granted.join("lib");
+        assert_eq!(read(lib.join("lib.txt"), &log), lib.display().to_string());
+        // A folder piped from `Get-ChildItem` is its whole path, not its name.
+        assert_eq!(read(lib.join("pipe.txt"), &log), lib.display().to_string());
+        // A `cd` that made a drive leaves nothing in `$Error`.
+        assert_eq!(read(granted.join("errors.txt"), &log), "0");
+        // `\l*` is `lib` at the root of `Work:`, not below `sub`.
+        let root = app.join("lib");
+        assert_eq!(
+            read(root.join("root.txt"), &log),
+            root.display().to_string()
+        );
+        assert_eq!(read(sub.join("climb.txt"), &log), sub.display().to_string());
+        assert_eq!(read(app.join("app.txt"), &log), app.display().to_string());
+        assert_eq!(read(granted.join("up.txt"), &log), g.to_string());
+        assert_eq!(read(sub.join("here.txt"), &log), sub.display().to_string());
+        assert_eq!(read(other.join("there.txt"), &log), o.to_string());
+        assert_eq!(read(app.join("back.txt"), &log), app.display().to_string());
+        assert_eq!(read(other.join("popped.txt"), &log), o.to_string());
+        assert_eq!(read(granted.join("hidden.txt"), &log), "False");
+        assert_eq!(read(granted.join("stayed.txt"), &log), o.to_string());
+        assert!(granted.join("refused.txt").exists(), "{log}");
+        assert!(!other.join("wrong.txt").exists() && !hidden.join("wrong.txt").exists());
+
+        // The folder above `other` is not granted: `cd ..` fails and stays,
+        // and a command that ends with it fails, also with its errors kept
+        // quiet. `cd $null` fails as Windows PowerShell's own `cd` does.
+        let (code, log) = ps(
+            &other,
+            format!(
+                "{POWERSHELL_START}cd $null; $ok = $?; Set-Content null.txt $ok; \
+                 cd ..; $ok = $?; Set-Content up.txt $ok; \
+                 Set-Content where.txt (cmd /c cd); \
+                 $ErrorActionPreference = 'SilentlyContinue'; cd ..; $ok = $?; \
+                 Set-Content quiet.txt $ok; cd '{h}' -ErrorAction Ignore"
+            ),
+        );
+        assert_eq!(code, 1, "{log}");
+        assert_eq!(read(other.join("null.txt"), &log), "False");
+        assert_eq!(read(other.join("up.txt"), &log), "False");
+        assert_eq!(read(other.join("where.txt"), &log), o.to_string());
+        assert_eq!(read(other.join("quiet.txt"), &log), "False");
+        for d in [&granted, &other] {
+            appcontainer::set(d, &name, None, false).unwrap();
+        }
+        appcontainer::remove_profile(&name).unwrap();
+    }
+
+    /// The start of a PowerShell command in a container stands in for `cd`
+    /// and `pushd`, and is whole: no `"`, which the Windows command line
+    /// would escape, and its brackets close outside its quoted strings.
+    #[test]
+    fn the_powershell_start_takes_over_cd_and_pushd() {
+        for f in [
+            "function global:Set-Location",
+            "function global:Push-Location",
+        ] {
+            assert!(POWERSHELL_START.contains(f), "{f}");
+        }
+        for cmd in [
+            r"& $cmd @a",
+            r"$PSCmdlet.WriteError($_)",
+            r"{ return $full }",
+            r"[Management.Automation.WildcardPattern]::Unescape($v)",
+            r"$s = $v -split '[\\/]'",
+            r"$a['ErrorAction'] = 'Continue'; & $cmd @a",
+            r"-ErrorAction Ignore) { $n++ }",
+            r"$PSCmdlet.MyInvocation.ExpectingInput 2>&1",
+            r"$a['LiteralPath'] = [string]$q[$n].Value",
+            r"($i -eq 1 -and $s[0] -eq '')",
+            r"ValueFromPipelineByPropertyName = $true)] $Path, ",
+            r"'Microsoft.PowerShell.Management\Set-Location'",
+            r"'Microsoft.PowerShell.Management\Push-Location'",
+        ] {
+            assert!(POWERSHELL_START.contains(cmd), "{cmd}");
+        }
+        assert!(!POWERSHELL_START.contains('"'));
+        assert!(POWERSHELL_START.ends_with("; "));
+        let (mut quoted, mut open) = (false, Vec::new());
+        for c in POWERSHELL_START.chars() {
+            match c {
+                '\'' => quoted = !quoted,
+                '(' | '{' | '[' if !quoted => open.push(c),
+                ')' | '}' | ']' if !quoted => {
+                    let want = match c {
+                        ')' => '(',
+                        '}' => '{',
+                        _ => '[',
+                    };
+                    assert_eq!(open.pop(), Some(want), "{POWERSHELL_START}");
+                }
+                _ => {}
+            }
+        }
+        assert!(!quoted && open.is_empty(), "{POWERSHELL_START}");
     }
 
     /// Runs `script` in `/bin/sh` under `spec`; whether it succeeded.

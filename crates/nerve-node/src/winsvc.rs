@@ -116,9 +116,15 @@ fn remove_grants(
     whose: &str,
     kept: bool,
 ) {
-    let node_ids: Vec<String> = SettingsStore::peek(&paths.config_file(), &paths.config_key())
-        .map(|c| c.centers.iter().map(|c| c.node_id.clone()).collect())
-        .unwrap_or_default();
+    // The pairings name their containers' profiles, also those the record
+    // does not, as when the state folder was deleted.
+    let node_ids = crate::grants::node_ids(paths).unwrap_or_else(|e| {
+        let _ = writeln!(
+            steps.out,
+            "warning: the profiles of the commands' AppContainers cannot be found: {e}"
+        );
+        Vec::new()
+    });
     let synced = sys.remove_grants(paths, &node_ids);
     for e in &synced.errors {
         let _ = writeln!(steps.out, "warning: {e}");
@@ -144,6 +150,25 @@ fn remove_grants(
             "left {} folder grants of {whose} on, on drives that are not connected now ({}): {then}",
             at.len(),
             at.join(", ")
+        ));
+    }
+    let p = &synced.profiles;
+    if !p.removed.is_empty() {
+        steps.did(format!(
+            "removed the AppContainer profiles of {whose} ({})",
+            p.removed.join(", ")
+        ));
+    }
+    if !p.kept.is_empty() {
+        let then = if kept {
+            "stop it and run `nerve-node uninstall` again to remove them"
+        } else {
+            "its config goes with --purge, so once it stopped, remove them by hand (docs/user/modes.md)"
+        };
+        steps.did(format!(
+            "left the AppContainer profiles of {whose} ({}), since {}: {then}",
+            p.kept.join(", "),
+            p.why.as_deref().unwrap_or("its node may run")
         ));
     }
 }
@@ -475,9 +500,12 @@ fn uninstall_steps(
     // owner's folders (crate::grants); none stays behind the node. Their
     // record is in the state folder, so this comes before a purge. The
     // node run by hand keeps its folders; if it runs again, it puts its
-    // grants on again.
+    // grants on again. Its config alone names the profiles of its
+    // containers when its state folder is gone.
     remove_grants(&layout.paths, sys, steps, "the commands", !purge);
-    if *by_hand != layout.paths && crate::grants::record_file(by_hand).exists() {
+    if *by_hand != layout.paths
+        && (crate::grants::record_file(by_hand).exists() || by_hand.config_file().exists())
+    {
         let whose = format!("the node run by hand ({})", by_hand.state_dir.display());
         remove_grants(by_hand, sys, steps, &whose, true);
     }
@@ -722,6 +750,9 @@ pub(crate) mod tests {
         event_source: RefCell<Option<PathBuf>>,
         /// The programs removed, in order.
         removed: RefCell<Vec<PathBuf>>,
+        /// The state folders of nodes that run: their containers' profiles
+        /// stay.
+        running: RefCell<Vec<PathBuf>>,
     }
 
     impl Fake {
@@ -746,6 +777,7 @@ pub(crate) mod tests {
                 away: RefCell::new(Vec::new()),
                 event_source: RefCell::new(None),
                 removed: RefCell::new(Vec::new()),
+                running: RefCell::new(Vec::new()),
             }
         }
 
@@ -946,11 +978,28 @@ pub(crate) mod tests {
                     path: p.clone(),
                     access: nerve_policy::config::Access::ALL,
                     id: None,
+                    unfinished: false,
+                    toward: Vec::new(),
                 })
                 .collect();
+            // A profile per pairing, named after it.
+            let names: Vec<String> = node_ids.iter().map(|n| format!("nerve.{n}")).collect();
+            let profiles = if self.running.borrow().contains(&paths.state_dir) {
+                crate::grants::Profiles {
+                    why: (!names.is_empty()).then(|| "the node runs".into()),
+                    kept: names,
+                    ..Default::default()
+                }
+            } else {
+                crate::grants::Profiles {
+                    removed: names,
+                    ..Default::default()
+                }
+            };
             crate::grants::Synced {
                 removed: usize::from(recorded),
                 away,
+                profiles,
                 ..Default::default()
             }
         }
@@ -1402,6 +1451,136 @@ pub(crate) mod tests {
         );
         assert!(out.contains(&did), "{out}");
         assert!(hand.config_file().exists() && hand.state_dir.exists());
+    }
+
+    /// Pairs the node at `paths` with centers named `names`, whose pairings
+    /// are `n-<name>`; the config is signed with the key in its state folder.
+    fn paired(paths: &NodePaths, names: &[&str]) {
+        let mut store = SettingsStore::open(
+            paths.config_file(),
+            paths.config_key(),
+            AuditLog::new(paths.audit_log()),
+        )
+        .unwrap();
+        store
+            .update(|c| {
+                for name in names {
+                    c.centers.push(nerve_policy::CenterEntry {
+                        name: name.to_string(),
+                        url: "https://center.example".into(),
+                        pin: None,
+                        center_id: String::new(),
+                        node_id: format!("n-{name}"),
+                        settings: Default::default(),
+                        paused: false,
+                        revoked: false,
+                        unknown: false,
+                        policy: Default::default(),
+                    });
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// A state folder deleted without uninstall takes the record of the
+    /// grants and the key of the config's MAC with it; the pairings in the
+    /// config still name the profiles of their containers, so uninstall
+    /// removes them.
+    #[test]
+    fn uninstall_finds_the_containers_without_the_state_folder() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = installed(d.path(), &sys, "1.0.0");
+        paired(&l.paths, &["lab", "home"]);
+        std::fs::remove_dir_all(&l.paths.state_dir).unwrap();
+        let mut out = Vec::new();
+        uninstall(&l, &by_hand(d.path()), &sys, false, &mut out).unwrap();
+        let call = format!(
+            "remove grants n-lab,n-home of {}",
+            l.paths.state_dir.display()
+        );
+        assert!(sys.calls().contains(&call), "{:?}", sys.calls());
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("warning"), "{out}");
+    }
+
+    /// So it does for the node run by hand, whose state folder is gone
+    /// while its config stays.
+    #[test]
+    fn uninstall_finds_the_containers_of_the_node_run_by_hand_without_its_state_folder() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = installed(d.path(), &sys, "1.0.0");
+        let hand = by_hand(d.path());
+        paired(&hand, &["lab"]);
+        std::fs::remove_dir_all(&hand.state_dir).unwrap();
+        let mut out = Vec::new();
+        uninstall(&l, &hand, &sys, true, &mut out).unwrap();
+        let call = format!("remove grants n-lab of {}", hand.state_dir.display());
+        assert!(sys.calls().contains(&call), "{:?}", sys.calls());
+        assert!(hand.config_file().exists() && !hand.state_dir.exists());
+        let out = String::from_utf8(out).unwrap();
+        let did = format!(
+            "removed the AppContainer profiles of the node run by hand ({}) (nerve.n-lab)",
+            hand.state_dir.display()
+        );
+        assert!(out.contains(&did), "{out}");
+    }
+
+    /// Uninstall on a machine where only a node run by hand is says which
+    /// of its profiles it removed, not that there was nothing to do.
+    #[test]
+    fn uninstall_of_only_a_node_run_by_hand_names_the_profiles_it_removed() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let hand = by_hand(d.path());
+        paired(&hand, &["lab"]);
+        let mut out = Vec::new();
+        uninstall(&layout(d.path()), &hand, &sys, false, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("(nerve.n-lab)"), "{out}");
+        assert!(!out.contains("nothing to uninstall"), "{out}");
+    }
+
+    /// The profiles of a node that runs stay, as its commands use them;
+    /// uninstall says which and how they go.
+    #[test]
+    fn uninstall_leaves_the_profiles_of_a_node_that_runs_and_says_so() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = installed(d.path(), &sys, "1.0.0");
+        let hand = by_hand(d.path());
+        paired(&hand, &["lab"]);
+        sys.running.borrow_mut().push(hand.state_dir.clone());
+        let mut out = Vec::new();
+        uninstall(&l, &hand, &sys, false, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        let left = format!(
+            "left the AppContainer profiles of the node run by hand ({}) (nerve.n-lab), since the node runs: stop it and run `nerve-node uninstall` again",
+            hand.state_dir.display()
+        );
+        assert!(out.contains(&left), "{out}");
+    }
+
+    /// A config that cannot be read names no pairing, and uninstall says
+    /// so and goes on.
+    #[test]
+    fn uninstall_says_when_the_pairings_cannot_be_read() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = installed(d.path(), &sys, "1.0.0");
+        std::fs::write(l.paths.config_file(), "[[center]\n").unwrap();
+        let mut out = Vec::new();
+        uninstall(&l, &by_hand(d.path()), &sys, true, &mut out).unwrap();
+        let call = format!("remove grants  of {}", l.paths.state_dir.display());
+        assert!(sys.calls().contains(&call), "{:?}", sys.calls());
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("warning: the profiles of the commands' AppContainers cannot be found"),
+            "{out}"
+        );
+        assert!(!l.paths.state_dir.exists());
     }
 
     /// Grants on a drive that is not connected stay on: uninstall says so,

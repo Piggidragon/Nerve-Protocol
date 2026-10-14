@@ -34,7 +34,7 @@ No grant lets a center change:
 - pairing and unpairing, the node's keys, the list of centers
 - the grant itself
 - `panic` and `unlock`, or an unpause (you resume with `center resume`)
-- machine settings: the shell, `allow_root`, the sudo path
+- machine settings: the shell, `allow_root`, the sudo path, the account commands run as, where the keys are, the log level
 - the proxy and its secrets
 - another center's pairing
 - the sudo password. A center only passes it on, sealed
@@ -45,6 +45,12 @@ No grant lets a center change:
 
 A change that touches one of these is refused as a whole, and the refusal names
 the field.
+
+One more field is yours, and a change to it is not refused but dropped: the
+node's record of the folders it recorded at their real place (`places` in the
+policy, see [modes](modes.md#a-folder-keeps-the-place-you-added)). The
+settings document shows it, and a center that saves the document with another
+value there changes nothing; an entry goes only with its folder.
 
 ## Without the grant
 

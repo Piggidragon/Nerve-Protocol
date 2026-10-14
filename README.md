@@ -20,12 +20,17 @@ On a Linux machine the agent may use, install the node as a service (use
 curl -LO https://github.com/Piggidragon/Nerve-Protocol/releases/latest/download/nerve-node-x86_64-linux
 chmod +x nerve-node-x86_64-linux
 sudo ./nerve-node-x86_64-linux install
-sudo nerve-node setup
+sudo nerve-node setup --create-user nerve-work
 ```
 
 `install` puts the program at `/usr/local/bin/nerve-node` and starts it as a
-service under a user of its own ([service](docs/user/service.md)). The center
-is `nerve-center-x86_64-linux` (or `-aarch64-linux`, `-x86_64-windows.exe`)
+service under a user of its own ([service](docs/user/service.md)).
+`--create-user nerve-work` makes an account only the node uses and runs the
+commands of a center as it: the account that ran `sudo` is no boundary
+([why](docs/user/service.md#the-account-commands-run-as)). On Windows, install
+from a terminal opened as administrator
+([Windows](docs/user/service.md#windows)). The center is
+`nerve-center-x86_64-linux` (or `-aarch64-linux`, `-x86_64-windows.exe`)
 from the same release.
 
 ## Quick start

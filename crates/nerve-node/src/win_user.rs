@@ -39,7 +39,7 @@ use windows_sys::Win32::Security::Cryptography::{
 };
 use windows_sys::Win32::Security::{
     AdjustTokenPrivileges, CreateRestrictedToken, CreateWellKnownSid, DISABLE_MAX_PRIVILEGE,
-    EqualSid, GetSecurityDescriptorDacl, GetSidSubAuthority, GetSidSubAuthorityCount,
+    EqualSid, GetLengthSid, GetSecurityDescriptorDacl, GetSidSubAuthority, GetSidSubAuthorityCount,
     GetTokenInformation, ImpersonateLoggedOnUser, IsWellKnownSid, LOGON32_LOGON,
     LOGON32_LOGON_BATCH, LOGON32_LOGON_INTERACTIVE, LOGON32_PROVIDER_DEFAULT, LUID_AND_ATTRIBUTES,
     LogonUserW, LookupAccountSidW, LookupPrivilegeValueW, PSECURITY_DESCRIPTOR, PSID, RevertToSelf,
@@ -228,6 +228,19 @@ pub fn own_uid() -> u32 {
             return 0;
         }
         rid(sid)
+    }
+}
+
+/// The SID of the account this process runs as.
+pub(crate) fn own_sid() -> io::Result<Vec<u8>> {
+    let t = process_token(TOKEN_QUERY)?;
+    let buf = token_info(t.raw(), TokenUser)?;
+    // SAFETY: the buffer holds a TOKEN_USER, whose SID points into it; the
+    // SID is copied while the buffer lives.
+    unsafe {
+        let sid = (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid;
+        let len = GetLengthSid(sid) as usize;
+        Ok(std::slice::from_raw_parts(sid.cast::<u8>(), len).to_vec())
     }
 }
 

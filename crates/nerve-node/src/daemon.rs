@@ -258,6 +258,63 @@ impl Shared {
         }
     }
 
+    /// `folder add` for the CLI (`folder.add`): judges the folder at `path`
+    /// (absolute, as given) as the account the commands run as, stores it at
+    /// its real place with `access` and records it. The installed node's CLI
+    /// runs as the node's own user, which may not look into that account's
+    /// home or resolve a `w` folder there, so it cannot judge the links on the
+    /// path; the node looks as the account does, as it does before a command
+    /// ([`crate::exec::settle`]). Nothing changes when the path crosses a link
+    /// inside a `w` folder (an error with the reason). Where the node cannot
+    /// tell either, the folder is stored as given and not recorded, and a
+    /// record it had stays.
+    #[cfg(unix)]
+    pub fn add_folder(
+        &self,
+        center: &str,
+        path: &str,
+        access: nerve_policy::config::Access,
+    ) -> Result<AddedFolder, String> {
+        use crate::exec::Settled;
+        use crate::folder_change::{FolderChange, apply_to};
+        let cfg = self.config();
+        if cfg.center(center).is_none() {
+            return Err(format!("no center named {center}"));
+        }
+        let given = nerve_policy::paths::normal_folder(path)?;
+        let account = self.command_account(&cfg).unwrap_or(None);
+        let home = account
+            .as_ref()
+            .map_or_else(|| self.home.clone(), |a| a.home.clone());
+        let settled = {
+            let _as = crate::link::act_as(account.as_ref()).map_err(|e| e.message)?;
+            crate::exec::settle(&cfg, &home, std::path::Path::new(&given))
+        };
+        let (stored, recorded) = match settled {
+            Settled::Refused(why) => return Err(refusal(path, &why)),
+            Settled::At(place) => (place.display().to_string(), true),
+            Settled::Unknown => (given, false),
+        };
+        let change = FolderChange::Add {
+            path: stored.clone(),
+            access,
+            recorded,
+        };
+        let mut applied = None;
+        lock(&self.store)
+            .update(|c| {
+                applied = Some(apply_to(c, Some(center), &change)?);
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+        self.bump();
+        Ok(AddedFolder {
+            stored,
+            recorded,
+            mode: applied.expect("applied when update succeeds").mode,
+        })
+    }
+
     pub fn bump(&self) {
         self.changed.send_modify(|v| *v += 1);
         self.tell_confinement(&self.config());
@@ -410,7 +467,8 @@ impl Shared {
         self.bump();
     }
 
-    // Only the Unix control socket asks this; Windows has none.
+    // Only the Unix control socket asks this; Windows' pipe asks the jobs of
+    // the commands (crate::win::from_a_command).
     /// Whether `pid` runs below a command the node started for a center: such
     /// a process must not change the node's settings.
     #[cfg_attr(not(unix), allow(dead_code))]
@@ -491,7 +549,14 @@ pub const NOT_CONFINED: &str = "commands cannot be confined on this machine";
 
 /// Why `folder` mode runs no command with the keys in the keyring where
 /// [`keys_kept_from_commands`] does not hold.
+#[cfg(not(windows))]
 pub const KEYRING_NOT_CONFINED: &str = "commands cannot be confined on this machine while the node's keys are in the system keyring: Landlock here (below ABI 9, Linux 7.1) cannot keep a command off the session bus the keyring answers on, so folder mode runs no command unless commands run as another account than root; `nerve-node config set machine.secret_storage file` brings them back";
+
+/// The text of [`KEYRING_NOT_CONFINED`] on Windows, where commands run in an
+/// AppContainer and the keys are in the Credential Manager: neither Landlock
+/// nor the session bus exist there.
+#[cfg(windows)]
+pub const KEYRING_NOT_CONFINED: &str = "commands cannot be confined on this machine while the node's keys are in the system keyring: the AppContainer here is not known to keep a command from the Credential Manager the keys are in, so folder mode runs no command; `nerve-node config set machine.secret_storage file` brings them back";
 
 /// Whether a confined command of `account` (`None`: the node's own user)
 /// cannot reach the node's keys where `storage` keeps them. Files are out of
@@ -528,6 +593,16 @@ pub struct Daemon {
     /// Held while the node runs: a CLI moves the keys only while no node
     /// reads them.
     _keys: crate::secrets::KeysLock,
+}
+
+/// Whether a node runs on the control socket. One that takes no connection
+/// now (its queue is full) runs all the same. A socket that cannot be
+/// reached at all says neither way: its error comes back as the start's.
+#[cfg(unix)]
+async fn node_runs(paths: &NodePaths) -> Result<bool, String> {
+    let outcome = nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await;
+    nerve_transport::ctl::node_is_there(&outcome)
+        .map_err(|e| format!("cannot tell whether a node runs for this state directory: {e}"))
 }
 
 impl Daemon {
@@ -575,11 +650,7 @@ impl Daemon {
             Some(l) => l,
             None => {
                 #[cfg(unix)]
-                if opts.ctl
-                    && nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({}))
-                        .await
-                        .is_ok()
-                {
+                if opts.ctl && node_runs(&paths).await? {
                     return Err("a node daemon already runs for this state directory".into());
                 }
                 // A command that moves the keys holds it for a moment.
@@ -621,11 +692,7 @@ impl Daemon {
             tracing::warn!("{warning}");
         }
         #[cfg(unix)]
-        if opts.ctl
-            && nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({}))
-                .await
-                .is_ok()
-        {
+        if opts.ctl && node_runs(&paths).await? {
             return Err("a node daemon already runs for this state directory".into());
         }
         let (changed, _) = watch::channel(0);
@@ -735,7 +802,9 @@ impl Daemon {
         let _ = tokio::time::timeout(Duration::from_secs(5), self.supervisor).await;
         if let Some(c) = self.ctl {
             c.abort();
-            let _ = std::fs::remove_file(self.shared.paths.ctl_socket());
+            let socket = self.shared.paths.ctl_socket();
+            let _ = std::fs::remove_file(nerve_transport::ctl::token_file(&socket));
+            let _ = std::fs::remove_file(socket);
         }
         tracing::info!("node daemon stopped");
     }
@@ -793,7 +862,9 @@ async fn supervise(shared: Arc<Shared>) {
             granted = Some(cfg.version);
             let (s, c) = (shared.clone(), cfg.clone());
             tokio::task::spawn_blocking(move || {
-                let synced = crate::grants::apply(&s.paths, &c, &s.rules_home(&c));
+                let synced = crate::grants::apply(&s.paths, &c, &s.rules_home(&c), &mut |m| {
+                    tracing::info!("folder grants: {m}")
+                });
                 for e in synced.errors {
                     tracing::warn!("folder grants: {e}");
                 }
@@ -837,18 +908,18 @@ async fn start_ctl(shared: Arc<Shared>) -> Result<JoinHandle<()>, String> {
     let listener = nerve_transport::ctl::bind(&path)
         .await
         .map_err(|e| format!("{}: {e}", path.display()))?;
+    // A command of the node's own user in `folder` mode can connect to the
+    // socket where Landlock does not reach it, and a process it left behind
+    // (`setsid`) is below no command the node knows. The token is in the
+    // own folders, which its rules leave out.
+    let token = nerve_transport::ctl::write_token(&path)
+        .map_err(|e| format!("{}: {e}", nerve_transport::ctl::token_file(&path).display()))?;
     let s = shared.clone();
     let task = tokio::spawn(async move {
         let r = nerve_transport::ctl::serve_on(listener, move |req, peer| {
             let s = s.clone();
-            async move {
-                match req.method.as_str() {
-                    // Checking the password runs `sudo -v`, so it cannot
-                    // block inside `control`.
-                    "sudo.on" => sudo_on(&s, req.params, peer.pid).await,
-                    m => control(&s, m, req.params, peer.pid),
-                }
-            }
+            let token = token.clone();
+            async move { answer(&s, &token, req, peer).await }
         })
         .await;
         if let Err(e) = r {
@@ -860,25 +931,168 @@ async fn start_ctl(shared: Arc<Shared>) -> Result<JoinHandle<()>, String> {
     Ok(task)
 }
 
-#[cfg(not(unix))]
+/// Windows: the control pipe (crate::pipe). A node whose pipe cannot be
+/// made runs on without it, as a node without a channel did before: the CLI
+/// then writes the signed file, which the node takes at its next start.
+/// Failing the start instead would let any account that takes the pipe's
+/// name first keep the node from running.
+#[cfg(windows)]
+async fn start_ctl(shared: Arc<Shared>) -> Result<JoinHandle<()>, String> {
+    match crate::pipe::serve(shared) {
+        Ok(task) => Ok(task),
+        Err(e) => {
+            tracing::error!(
+                "{e}; a change from the CLI takes effect at the next start of the node"
+            );
+            Ok(tokio::spawn(async {}))
+        }
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 async fn start_ctl(_shared: Arc<Shared>) -> Result<JoinHandle<()>, String> {
-    // Windows has no control channel (no named pipe). The CLI writes the
-    // signed file itself, and the running node takes it at its next start.
     Ok(tokio::spawn(async {}))
 }
 
-/// Methods that change something: refused from below a center's command.
-/// `owner.check` changes nothing itself: the CLI asks it before `install`,
-/// `setup`, `update` and `uninstall`, which change the node.
+/// What [`Shared::add_folder`] stored.
 #[cfg(unix)]
-const MUTATING: &[&str] = &[
-    "config.write",
-    "config.accept",
-    "reload",
-    "sudo.on",
-    "sudo.off",
-    "owner.check",
-];
+#[derive(Debug, PartialEq, Eq)]
+pub struct AddedFolder {
+    /// The path the folder is stored at.
+    pub stored: String,
+    /// Whether it is recorded at its real place (`CenterPolicy::places`).
+    pub recorded: bool,
+    /// The center's mode, for the CLI's note on folders counting in folder
+    /// mode only.
+    pub mode: nerve_policy::Mode,
+}
+
+/// The message of a refused `folder add`, for the CLI and the node alike.
+pub fn refusal(path: &str, why: &str) -> String {
+    format!(
+        "{path}: {why}. A command may have put a link there: look at it (`ls -l`, `dir /AL`), add the place you mean by its own path, or remove the link"
+    )
+}
+
+/// Why the pipe refuses a folder change while `node.toml` (version
+/// `on_disk`) holds changes the node (version `in_force`) has not taken.
+fn file_ahead(on_disk: u64, in_force: u64) -> String {
+    format!(
+        "node.toml holds changes the running node takes at its next start (version {on_disk} there, {in_force} in force), and this change would undo them; nothing was changed. Restart the node (`Restart-Service nerve-node` for the installed node), then change the folder again"
+    )
+}
+
+/// Why a request from a process of a command the node runs is refused.
+const FROM_A_COMMAND: &str =
+    "refused: this request comes from a command the node runs for a center";
+
+/// One request on Windows' control pipe (crate::pipe): the status, and the
+/// changes to a center's folders, checked and made as the CLI makes them on
+/// the file (crate::folder_change). The node then brings the folder grants
+/// in line before it answers, as the CLI does after it wrote the file.
+/// Nothing is taken from a process of a command the node runs, not even the
+/// status. The socket's other methods are not served here yet.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) async fn pipe_control(
+    shared: &Arc<Shared>,
+    method: &str,
+    params: Value,
+    from_command: bool,
+) -> nerve_transport::ctl::Reply {
+    use nerve_transport::ctl::Reply;
+    if from_command {
+        return Reply::Err(FROM_A_COMMAND.into());
+    }
+    match method {
+        "status" => Reply::Ok(shared.status()),
+        "folder.add" | "folder.set" | "folder.rm" => {
+            let (center, change) =
+                match crate::folder_change::FolderChange::from_request(method, params) {
+                    Ok(r) => r,
+                    Err(e) => return Reply::Err(e),
+                };
+            let mut applied = None;
+            let r = {
+                let mut store = lock(&shared.store);
+                // On Windows the CLI writes every other change to the file
+                // for the next start. The node saves its whole config, so a
+                // file newer than it would lose that change: it is refused
+                // instead.
+                match store.version_on_disk() {
+                    Ok(on_disk) if on_disk > store.version() => {
+                        return Reply::Err(file_ahead(on_disk, store.version()));
+                    }
+                    Ok(_) => {}
+                    Err(e) => return Reply::Err(format!("cannot read node.toml: {e}")),
+                }
+                store.update(|cfg| {
+                    applied = Some(crate::folder_change::apply_to(
+                        cfg,
+                        center.as_deref(),
+                        &change,
+                    )?);
+                    Ok(())
+                })
+            };
+            let version = match r {
+                Ok(v) => v,
+                Err(e) => return Reply::Err(e.to_string()),
+            };
+            shared.bump();
+            if shared.confinement.appcontainer {
+                let s = shared.clone();
+                let synced = tokio::task::spawn_blocking(move || {
+                    let cfg = s.config();
+                    crate::grants::apply(&s.paths, &cfg, &s.rules_home(&cfg), &mut |m| {
+                        tracing::info!("folder grants: {m}")
+                    })
+                })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|s| s.errors.into_iter().next().map_or(Ok(()), Err));
+                if let Err(e) = synced {
+                    return Reply::Err(format!(
+                        "the config is saved, but the folder grants do not follow it: {e}"
+                    ));
+                }
+            }
+            let mut answer = serde_json::to_value(applied).unwrap_or_default();
+            answer["version"] = json!(version);
+            Reply::Ok(answer)
+        }
+        other => Reply::Err(format!("unknown method {other}")),
+    }
+}
+
+/// Why a request without the control socket's token is refused.
+#[cfg(unix)]
+const NO_TOKEN: &str = "refused: this request does not carry the control socket's token, which only the owner's own programs can read";
+
+/// One request that came in on the control socket, from `peer`: only one
+/// that carries the socket's `token` is answered.
+#[cfg(unix)]
+async fn answer(
+    shared: &Arc<Shared>,
+    token: &str,
+    req: nerve_transport::ctl::CtlRequest,
+    peer: nerve_transport::ctl::Peer,
+) -> nerve_transport::ctl::Reply {
+    if !nerve_transport::ctl::token_ok(token, req.token.as_deref()) {
+        // `update` of 0.0.2 asks `status` without a token to wait for the
+        // restarted node, and puts the old program back when it does not
+        // answer `ok`. That a node runs tells nothing the socket does not.
+        if req.method == "status" {
+            return nerve_transport::ctl::Reply::Ok(json!({"running": true}));
+        }
+        return nerve_transport::ctl::Reply::Err(NO_TOKEN.into());
+    }
+    match req.method.as_str() {
+        // Checking the password runs `sudo -v`, so it cannot block inside
+        // `control`.
+        "sudo.on" => sudo_on(shared, req.params, peer.pid).await,
+        m => control(shared, m, req.params, peer.pid),
+    }
+}
 
 /// `sudo.on {password}`: the CLI on this machine turns the switch on. The
 /// socket is the owner's only, so the password travels in the clear here.
@@ -890,9 +1104,7 @@ async fn sudo_on(
 ) -> nerve_transport::ctl::Reply {
     use nerve_transport::ctl::Reply;
     if shared.below_command(pid) {
-        return Reply::Err(
-            "refused: this request comes from a command the node runs for a center".into(),
-        );
+        return Reply::Err(FROM_A_COMMAND.into());
     }
     let Some(password) = params.get("password").and_then(Value::as_str) else {
         return Reply::Err("password is missing".into());
@@ -906,7 +1118,11 @@ async fn sudo_on(
     }
 }
 
-/// One control-socket request.
+/// One control-socket request. Every method is refused from below a center's
+/// command: the reading ones too, as `status` and `config.read` hand over the
+/// whole config, which the command's sandbox keeps from it as a file.
+/// `owner.check` changes nothing itself: the CLI asks it before `install`,
+/// `setup`, `update` and `uninstall`, which change the node.
 #[cfg(unix)]
 pub(crate) fn control(
     shared: &Arc<Shared>,
@@ -915,10 +1131,8 @@ pub(crate) fn control(
     pid: Option<u32>,
 ) -> nerve_transport::ctl::Reply {
     use nerve_transport::ctl::Reply;
-    if MUTATING.contains(&method) && shared.below_command(pid) {
-        return Reply::Err(
-            "refused: this request comes from a command the node runs for a center".into(),
-        );
+    if shared.below_command(pid) {
+        return Reply::Err(FROM_A_COMMAND.into());
     }
     let str_of = |k: &str| params.get(k).and_then(Value::as_str).map(str::to_string);
     match method {
@@ -959,6 +1173,25 @@ pub(crate) fn control(
                     Reply::Err(format!("conflict: the config changed (version {current})"))
                 }
                 Err(e) => Reply::Err(e.to_string()),
+            }
+        }
+        "folder.add" => {
+            let (Some(center), Some(path), Some(access)) =
+                (str_of("center"), str_of("path"), str_of("access"))
+            else {
+                return Reply::Err("center, path and access are needed".into());
+            };
+            let access = match nerve_policy::config::Access::parse(&access) {
+                Ok(a) => a,
+                Err(e) => return Reply::Err(e),
+            };
+            match shared.add_folder(&center, &path, access) {
+                Ok(a) => Reply::Ok(json!({
+                    "stored": a.stored,
+                    "recorded": a.recorded,
+                    "mode": a.mode.as_str(),
+                })),
+                Err(e) => Reply::Err(e),
             }
         }
         "config.accept" => {
@@ -1453,6 +1686,344 @@ mod tests {
         daemon.stop().await;
     }
 
+    /// A job of a command, as the pipe asks it: the processes it holds.
+    struct FakeJob(Vec<u32>);
+
+    impl crate::job::Members for FakeJob {
+        fn pids(&self) -> std::io::Result<Vec<u32>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// Windows' control pipe, with a stream for the pipe and a fake job for
+    /// the commands: a folder change reaches the running node, which makes
+    /// it, saves it and answers; a caller in a command's job is refused
+    /// whatever it asks, and the pipe serves no other change.
+    #[tokio::test]
+    async fn the_pipe_takes_folder_changes_and_refuses_commands() {
+        use crate::folder_change::FolderChange;
+        use nerve_policy::config::Access;
+        use nerve_transport::ctl::{CtlRequest, call_on, serve_stream};
+        let (d, daemon) = daemon().await;
+        let s = daemon.shared.clone();
+        lock(&s.store)
+            .update(|c| {
+                c.centers.push(nerve_policy::CenterEntry {
+                    name: "home".into(),
+                    url: "http://127.0.0.1:1".into(),
+                    pin: None,
+                    center_id: "id-home".into(),
+                    node_id: "n".into(),
+                    settings: Default::default(),
+                    paused: true,
+                    revoked: false,
+                    unknown: false,
+                    policy: Default::default(),
+                });
+                Ok(())
+            })
+            .unwrap();
+        let folder = d.path().join("work").display().to_string();
+        // One connection of a caller with `pid`, served as crate::pipe
+        // serves it, while a command runs whose job holds the process 4242.
+        let call = |pid: u32, method: &'static str, params: Value| {
+            let (client, server) = tokio::io::duplex(64 * 1024);
+            let (s, job) = (s.clone(), Arc::new(FakeJob(vec![4242])));
+            tokio::spawn(serve_stream(
+                server,
+                Some(pid),
+                Arc::new(move |req: CtlRequest, pid: Option<u32>| {
+                    let (s, job) = (s.clone(), job.clone());
+                    async move {
+                        let from_command = crate::job::from_a_command(pid, [Some(&*job)]);
+                        pipe_control(&s, &req.method, req.params, from_command).await
+                    }
+                }),
+            ));
+            call_on(client, method, params)
+        };
+        let add = FolderChange::Add {
+            path: folder.clone(),
+            access: Access::parse("rx").unwrap(),
+            recorded: true,
+        };
+        let before = s.config().version;
+        let ticks = *s.changed.borrow();
+        // From the command's job: refused, the status too, and nothing
+        // changed.
+        for (method, params) in [(add.method(), add.params(None)), ("status", json!({}))] {
+            let e = call(4242, method, params).await.unwrap_err();
+            assert_eq!(e, FROM_A_COMMAND);
+        }
+        assert_eq!(s.config().version, before);
+        // From the owner's CLI: made, saved and answered.
+        let v = call(1000, add.method(), add.params(Some("home")))
+            .await
+            .unwrap();
+        assert_eq!(v["center"], "home");
+        assert_eq!(v["path"], folder);
+        assert_eq!(v["access"], "rx");
+        assert_eq!(v["mode"], "allowlist");
+        assert_eq!(v["version"], before + 1);
+        let folders = || {
+            daemon
+                .config()
+                .center("home")
+                .unwrap()
+                .policy
+                .folders
+                .clone()
+        };
+        assert_eq!(folders().len(), 1);
+        assert_eq!(folders()[0].access.to_chmod(), "r-x");
+        // The place the CLI settled the folder at is recorded with it.
+        let places = || {
+            daemon
+                .config()
+                .center("home")
+                .unwrap()
+                .policy
+                .places
+                .clone()
+        };
+        assert_eq!(places(), std::slice::from_ref(&folder));
+        assert!(*s.changed.borrow() > ticks, "the links were not told");
+        let paths = daemon.paths();
+        let saved = SettingsStore::peek(&paths.config_file(), &paths.config_key()).unwrap();
+        assert_eq!(saved.center("home").unwrap().policy.folders, folders());
+        let set = FolderChange::Set {
+            path: folder.clone(),
+            given: folder.clone(),
+            changes: vec!["-x".into(), "+w".into()],
+        };
+        let v = call(1000, set.method(), set.params(None)).await.unwrap();
+        assert_eq!(v["access"], "rw");
+        assert_eq!(folders()[0].access.to_chmod(), "rw-");
+        assert_eq!(places(), std::slice::from_ref(&folder));
+        // The same checks as the CLI's: a folder the center does not have,
+        // a right that is none, a path that is not absolute, and no other
+        // change than a folder's.
+        let rm_other = FolderChange::Rm {
+            path: "/elsewhere".into(),
+            given: "/elsewhere".into(),
+        };
+        let e = call(1000, rm_other.method(), rm_other.params(None))
+            .await
+            .unwrap_err();
+        assert_eq!(e, "/elsewhere is not a folder of this center");
+        let e = call(1000, "folder.add", json!({"path": folder, "access": ""}))
+            .await
+            .unwrap_err();
+        assert!(e.contains("grants some right"), "{e}");
+        let e = call(1000, "folder.add", json!({"path": "work", "access": "r"}))
+            .await
+            .unwrap_err();
+        assert!(e.contains("not absolute"), "{e}");
+        let e = call(1000, "config.write", json!({"config": ""}))
+            .await
+            .unwrap_err();
+        assert_eq!(e, "unknown method config.write");
+        assert_eq!(folders()[0].access.to_chmod(), "rw-");
+        let rm = FolderChange::Rm {
+            path: folder.clone(),
+            given: folder.clone(),
+        };
+        let v = call(1000, rm.method(), rm.params(None)).await.unwrap();
+        assert_eq!(v["access"], Value::Null);
+        assert!(folders().is_empty());
+        assert!(places().is_empty());
+        assert!(call(1000, "status", json!({})).await.is_ok());
+        daemon.stop().await;
+    }
+
+    /// On Windows the CLI writes every change but the folders' to node.toml
+    /// for the next start. A folder change over the pipe after that is
+    /// refused: the node would save its own config over the file and lose
+    /// the CLI's change.
+    #[tokio::test]
+    async fn a_pipe_change_does_not_undo_a_change_waiting_in_the_file() {
+        use crate::folder_change::FolderChange;
+        use nerve_policy::config::Access;
+        use nerve_transport::ctl::Reply;
+        let (d, daemon) = daemon().await;
+        let s = daemon.shared.clone();
+        let paths = daemon.paths().clone();
+        lock(&s.store)
+            .update(|c| {
+                c.centers.push(nerve_policy::CenterEntry {
+                    name: "home".into(),
+                    url: "http://127.0.0.1:1".into(),
+                    pin: None,
+                    center_id: "id-home".into(),
+                    node_id: "n".into(),
+                    settings: Default::default(),
+                    paused: true,
+                    revoked: false,
+                    unknown: false,
+                    policy: Default::default(),
+                });
+                Ok(())
+            })
+            .unwrap();
+        // The CLI's way for a change no pipe takes (cli::edit).
+        let mut cli = SettingsStore::open_with(
+            paths.config_file(),
+            Box::new(crate::secrets::NodeSecrets::for_cli(&paths)),
+            AuditLog::new(paths.audit_log()),
+        )
+        .unwrap();
+        cli.update(|c| {
+            c.center_mut("home").unwrap().policy.mode = nerve_policy::Mode::Folder;
+            Ok(())
+        })
+        .unwrap();
+        let in_force = s.config().version;
+        let add = FolderChange::Add {
+            path: d.path().join("work").display().to_string(),
+            access: Access::parse("r").unwrap(),
+            recorded: false,
+        };
+        let r = pipe_control(&s, add.method(), add.params(None), false).await;
+        let Reply::Err(e) = r else {
+            panic!("the pipe took a change over the CLI's")
+        };
+        assert_eq!(e, file_ahead(in_force + 1, in_force));
+        assert!(e.contains("Restart the node"), "{e}");
+        let saved = || {
+            SettingsStore::peek(&paths.config_file(), &paths.config_key())
+                .unwrap()
+                .center("home")
+                .unwrap()
+                .policy
+                .clone()
+        };
+        assert_eq!(saved().mode, nerve_policy::Mode::Folder);
+        assert!(saved().folders.is_empty());
+        assert_eq!(s.config().version, in_force);
+        // Once the node has the file's change (a restart; here a reload),
+        // and after a write of the node's own, the pipe takes changes again.
+        s.reload().unwrap();
+        s.mark_center("home", |c| c.unknown = true);
+        let r = pipe_control(&s, add.method(), add.params(None), false).await;
+        assert!(matches!(r, Reply::Ok(_)), "refused");
+        assert_eq!(saved().mode, nerve_policy::Mode::Folder);
+        assert_eq!(saved().folders.len(), 1);
+        daemon.stop().await;
+    }
+
+    /// `folder.add` judges, stores and records a folder in one step, for a CLI
+    /// that may not look where the node does (the installed node's CLI runs
+    /// as the node's own user, not as the account): a path through a link of
+    /// the account is stored at the place it leads to, one through a link
+    /// inside a `w` folder is refused and nothing changes, and a dangling link
+    /// is refused as it always was.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_node_judges_stores_and_records_a_folder_it_is_asked_to_add() {
+        use nerve_policy::config::{Access, Folder};
+        use nerve_transport::ctl::Reply;
+        let (d, daemon) = daemon().await;
+        let s = daemon.shared.clone();
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let (work, other, wdir) = (root.join("work"), root.join("other"), root.join("wdir"));
+        let (link2, dangling) = (root.join("link2"), root.join("dangling"));
+        for dir in [&work, &other, &wdir] {
+            std::fs::create_dir(dir).unwrap();
+        }
+        std::os::unix::fs::symlink(&other, &link2).unwrap();
+        std::os::unix::fs::symlink(root.join("nowhere"), &dangling).unwrap();
+        // A link a command could have put inside a folder it may write in.
+        let bin = wdir.join("bin");
+        std::os::unix::fs::symlink(&other, &bin).unwrap();
+        lock(&s.store)
+            .update(|c| {
+                c.centers.push(nerve_policy::CenterEntry {
+                    name: "home".into(),
+                    url: "https://center.example".into(),
+                    pin: None,
+                    center_id: "c".into(),
+                    node_id: "n".into(),
+                    settings: Default::default(),
+                    paused: false,
+                    revoked: false,
+                    unknown: false,
+                    policy: nerve_policy::CenterPolicy {
+                        folders: vec![Folder {
+                            path: wdir.display().to_string(),
+                            access: Access::parse("rw").unwrap(),
+                        }],
+                        ..Default::default()
+                    },
+                });
+                Ok(())
+            })
+            .unwrap();
+        let ask = |center: &str, p: &std::path::Path, access: &str, pid| {
+            let params = json!({
+                "center": center,
+                "path": p.display().to_string(),
+                "access": access,
+            });
+            control(&s, "folder.add", params, pid)
+        };
+        let add = |p: &std::path::Path, access: &str| {
+            let Reply::Ok(v) = ask("home", p, access, None) else {
+                panic!("folder.add of {} failed", p.display())
+            };
+            (
+                v["stored"].as_str().unwrap().to_string(),
+                v["recorded"].as_bool().unwrap(),
+                v["mode"].as_str().unwrap().to_string(),
+            )
+        };
+        let refused = |p: &std::path::Path| {
+            let Reply::Err(e) = ask("home", p, "r", None) else {
+                panic!("folder.add of {} was not refused", p.display())
+            };
+            e
+        };
+        let policy = || s.config().centers[0].policy.clone();
+        let listed = |p: &std::path::Path| {
+            policy()
+                .folders
+                .iter()
+                .find(|f| std::path::Path::new(&f.path) == p)
+                .map(|f| f.access.to_string())
+        };
+        // Its own place: stored where it is, recorded, with the center's mode.
+        let (work_s, other_s) = (work.display().to_string(), other.display().to_string());
+        assert_eq!(add(&work, "r"), (work_s.clone(), true, "allowlist".into()));
+        assert_eq!(policy().places, std::slice::from_ref(&work_s));
+        // Through a link of the account: stored at the place it leads to, with
+        // the access it was given, and recorded there. Never stored as given.
+        assert_eq!(
+            add(&link2, "rw"),
+            (other_s.clone(), true, "allowlist".into())
+        );
+        assert_eq!(listed(&link2), None);
+        assert_eq!(listed(&other).as_deref(), Some("rw"));
+        assert!(policy().is_placed(&other_s));
+        // Again with other rights: one entry, one record.
+        add(&other, "x");
+        assert_eq!(listed(&other).as_deref(), Some("x"));
+        assert_eq!(policy().places.len(), 2);
+        // Refused, and nothing changes: a link inside a `w` folder (a command
+        // may have put it there), and a dangling link.
+        let before = policy();
+        let why = refused(&bin);
+        assert!(why.contains("link") && why.contains("may write"), "{why}");
+        assert!(refused(&dangling).contains("dangling"));
+        assert_eq!(policy(), before);
+        // Only a center of the node, and only the owner asks.
+        assert!(matches!(ask("lab", &work, "r", None), Reply::Err(e) if e.contains("no center")));
+        let me = std::process::id();
+        lock(&s.commands).insert(me, "home".into());
+        assert!(
+            matches!(ask("home", &work, "r", Some(me)), Reply::Err(e) if e.starts_with("refused"))
+        );
+        daemon.stop().await;
+    }
+
     #[tokio::test]
     async fn refuses_settings_from_below_a_command() {
         let (_d, daemon) = daemon().await;
@@ -1467,17 +2038,122 @@ mod tests {
         lock(&s.commands).insert(me, "home".into());
         let r = control(&s, "config.write", write.clone(), Some(me));
         assert!(matches!(r, nerve_transport::ctl::Reply::Err(e) if e.starts_with("refused")));
-        let r = control(&s, "status", json!({}), Some(me));
-        assert!(matches!(r, nerve_transport::ctl::Reply::Ok(_)));
+        // What reads the config is refused as well: `status` and
+        // `config.read` hand it over whole.
+        for method in ["status", "config.read", "sudo.status"] {
+            let r = control(&s, method, json!({}), Some(me));
+            assert!(
+                matches!(&r, nerve_transport::ctl::Reply::Err(e) if e.starts_with("refused")),
+                "{method} answered a command"
+            );
+        }
         // What install, setup, update and uninstall ask first.
         let r = control(&s, "owner.check", json!({}), Some(me));
         assert!(matches!(r, nerve_transport::ctl::Reply::Err(e) if e.starts_with("refused")));
         lock(&s.commands).clear();
+        let r = control(&s, "status", json!({}), Some(me));
+        assert!(matches!(r, nerve_transport::ctl::Reply::Ok(_)));
         let r = control(&s, "config.write", write, Some(me));
         assert!(matches!(r, nerve_transport::ctl::Reply::Ok(_)));
         let r = control(&s, "owner.check", json!({}), Some(me));
         assert!(matches!(r, nerve_transport::ctl::Reply::Ok(_)));
         daemon.stop().await;
+    }
+
+    /// What `install`, `update` and `setup` run to wait for the node they
+    /// restarted: with the token, and as `update` of 0.0.2 sent it, without.
+    /// A node that does not answer them makes `update` put the old program
+    /// back.
+    #[tokio::test]
+    async fn the_installers_find_the_node_they_restarted() {
+        use crate::service::System;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (_d, daemon) = daemon().await;
+        let paths = daemon.paths().clone();
+        let p = paths.clone();
+        tokio::task::spawn_blocking(move || crate::service::Host.wait_running(&p))
+            .await
+            .unwrap()
+            .unwrap();
+        // 0.0.2 counts the node as running when the reply holds `"ok"`.
+        let stream = tokio::net::UnixStream::connect(paths.ctl_socket())
+            .await
+            .unwrap();
+        let (r, mut w) = stream.into_split();
+        w.write_all(b"{\"method\":\"status\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        let mut line = String::new();
+        tokio::io::BufReader::new(r)
+            .read_line(&mut line)
+            .await
+            .unwrap();
+        assert!(line.contains("\"ok\""), "{line}");
+        daemon.stop().await;
+    }
+
+    /// A process that is no longer below a command (it left the command's
+    /// tree, or the command ended) is told from the owner's by the token
+    /// in the state folder, which the owner's CLI reads and a sandboxed
+    /// command cannot.
+    #[tokio::test]
+    async fn answers_only_requests_that_carry_the_token() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (_d, daemon) = daemon().await;
+        let socket = daemon.paths().ctl_socket();
+        let token_file = nerve_transport::ctl::token_file(&socket);
+        let token = std::fs::read_to_string(&token_file).unwrap();
+        assert!(token.len() >= 32, "{token}");
+        // The same user's own file, as the socket is.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&token_file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        // The CLI's call reads the token and is answered ...
+        let v = nerve_transport::ctl::call(&socket, "status", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(v["locked"], false);
+        // ... a request without it, or with another, is refused for every
+        // method, though it comes from the node's own user and below no
+        // command. Only `status` is answered, with nothing of the config.
+        let ask = |method: &'static str, given: Option<&'static str>| {
+            let socket = socket.clone();
+            async move {
+                let mut request = json!({"method": method, "params": {}});
+                if let Some(t) = given {
+                    request["token"] = t.into();
+                }
+                let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+                let (r, mut w) = stream.into_split();
+                w.write_all(format!("{request}\n").as_bytes())
+                    .await
+                    .unwrap();
+                let mut line = String::new();
+                tokio::io::BufReader::new(r)
+                    .read_line(&mut line)
+                    .await
+                    .unwrap();
+                serde_json::from_str::<Value>(&line).unwrap()
+            }
+        };
+        for given in [None, Some("wrong"), Some("short"), Some("")] {
+            for method in ["config.read", "config.write", "sudo.status", "owner.check"] {
+                let reply = ask(method, given).await;
+                let error = reply["error"].as_str().unwrap_or_default();
+                assert!(error.starts_with("refused"), "{method} {given:?}: {reply}");
+            }
+            let reply = ask("status", given).await;
+            assert_eq!(reply, json!({"ok": {"running": true}}), "{given:?}");
+        }
+        // A new start makes a new token, and a stop takes the file away.
+        let mut opts = NodeOptions::new(daemon.paths().clone());
+        opts.home = daemon.shared.home.clone();
+        daemon.stop().await;
+        assert!(!token_file.exists());
+        let again = Daemon::start(opts).await.unwrap();
+        assert_ne!(std::fs::read_to_string(&token_file).unwrap(), token);
+        again.stop().await;
     }
 
     #[tokio::test]
@@ -1596,6 +2272,22 @@ node_id = "n1"
 #[cfg(test)]
 mod confinement_tests {
     use super::*;
+
+    /// The refusal for keys in the keyring names what applies on the platform:
+    /// Landlock and the session bus on Linux, the AppContainer and the
+    /// Credential Manager on Windows, and not the other's.
+    #[test]
+    fn the_keyring_refusal_names_the_platform_it_is_for() {
+        let text = KEYRING_NOT_CONFINED;
+        assert!(text.contains("`nerve-node config set machine.secret_storage file`"));
+        #[cfg(windows)]
+        {
+            assert!(text.contains("AppContainer") && text.contains("Credential Manager"));
+            assert!(!text.contains("Landlock") && !text.contains("session bus"));
+        }
+        #[cfg(not(windows))]
+        assert!(text.contains("Landlock") && text.contains("session bus"));
+    }
 
     /// The installed Windows service runs commands as another account, for
     /// which the AppContainer is not wired: folder mode is not confined there

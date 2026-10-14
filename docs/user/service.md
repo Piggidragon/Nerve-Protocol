@@ -100,20 +100,23 @@ command starts, the node checks that its account cannot open the node's
 folders, and refuses to run it if it can. That holds as long as the account
 cannot become root. Root itself can, and so can an account in a group that
 gets root without a password: `docker`, `lxd`, `incus-admin`, `libvirt` or
-`disk`. So can an account that may use `sudo` without a password
-(its sudo rules grant every command with `NOPASSWD`, or turn `authenticate`
-off, or exempt its group, and `sudo -n -k true`, run as the account,
-succeeds). An account whose rules name no such thing, `NOPASSWD` for single
-commands included, is not run as, so sudo logs no failed login. One whose
-rules do but a later rule asks for the password is, and sudo logs it. The
-account that ran `sudo`, the one its owner logs in as, is such an account
-too (see [platforms](platforms.md#linux)). `install` and `setup` warn
-about such an account, whether they take it or it is chosen already, and
-suggest an account made for the node, also for root. `NOPASSWD` for a
-single command can be root as well (`apt`, `systemctl`, a shell, an editor),
-and they do not see that: check `sudo -l -U <account>` yourself. Choose one
-outside these groups and without such rules, or a command can read the keys
-after all.
+`disk`. So can an account that may use `sudo` without a password:
+`install` and `setup` read its sudo rules (`sudo -l -U <account>`) and, when
+they may give root a command without a password (`NOPASSWD` for anything but
+plain command paths, `authenticate` turned off, an `exempt_group`), run
+`sudo -n -k true` as the account. If that succeeds, they warn. The rules
+decide whether that is tried at all: an account whose rules surely need a
+password for root, `NOPASSWD` for plain commands such as `apt` or for
+another user to run as included, is not run as, so sudo logs no failed
+login. One whose rules may grant it but a later rule asks for the password
+is run as, and sudo logs it. The account that ran `sudo`, the one its owner
+logs in as, is such an account too (see [platforms](platforms.md#linux)).
+`install` and `setup` warn about such an account, whether they take it or it
+is chosen already, and suggest an account made for the node, also for root.
+`NOPASSWD` for a single command can be root as well (`apt`, `systemctl`, a
+shell, an editor), and they do not see that: check `sudo -l -U <account>`
+yourself. Choose one outside these groups and without such rules, or a
+command can read the keys after all.
 
 - No account chosen: the node runs no command, and says that
   `sudo nerve-node setup` chooses one.

@@ -231,10 +231,10 @@ impl System for Host {
 
     fn sudo_without_password(&self, account: &Account) -> bool {
         // Sudo run as root for the account, so no password is asked for
-        // the switch. The rules come first: an account whose rules grant
-        // no command without a password is never run as, because its sudo
-        // would log a failed login and mail root about it. An account
-        // whose rules do, but a later one asks, is still run as.
+        // the switch. The rules come first: an account whose rules surely
+        // grant no root command without a password is never run as,
+        // because its sudo would log a failed login and mail root about it.
+        // The rules are read to err towards running as the account.
         let mut list = std::process::Command::new("sudo");
         list.args(["-n", "-l", "-U", &account.name])
             .stdin(std::process::Stdio::null())
@@ -243,9 +243,7 @@ impl System for Host {
         let Ok(o) = list.output() else {
             return false;
         };
-        let groups = crate::account::group_names(account);
-        let listing = String::from_utf8_lossy(&o.stdout);
-        if !crate::account::lists_no_password(&listing, &groups, &account.groups) {
+        if !crate::account::lists_no_password(&String::from_utf8_lossy(&o.stdout)) {
             return false;
         }
         // The account's own sudo, which `-n` never lets ask, and `-k`

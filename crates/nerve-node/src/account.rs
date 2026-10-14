@@ -65,86 +65,132 @@ pub const CREATE_USER_HINT: &str = "An account only the node uses is the boundar
 pub const CREATE_USER_HINT_ROOT: &str = "An account only the node uses is the boundary: `nerve-node setup --create-user nerve-work` makes one and runs commands as it.";
 
 /// Whether the rules `sudo -l -U <name>` lists may let the account use
-/// sudo without a password, so that a probe is worth making: a rule that
-/// grants every command (`ALL`) with `NOPASSWD`, `!authenticate` (not one
-/// for a single command), or `exempt_group=` naming a group of the account
-/// (`names` from `id -Gn`, `gids` from `id -G`). Such a list costs sudo no
-/// failed login. It is a gate only: a later rule can still ask for the
-/// password, and the probe decides. An account with `NOPASSWD` for single
-/// commands, such as `apt`, is not probed.
-pub fn lists_no_password(listing: &str, names: &[String], gids: &[u32]) -> bool {
+/// sudo without a password, so that a probe is worth making. The probe
+/// does the judging; this only keeps it away from accounts that surely
+/// need a password, because a probe of those makes sudo log a failed login
+/// and mail root. So it errs towards `true`: only what it reads with
+/// certainty as not applying to `true` as root is passed over. It says
+/// `true` for `NOPASSWD` on anything but plain command paths, for
+/// `!authenticate`, and for any `exempt_group`; it says `false` for a rule
+/// that runs as another user than root, one a later `PASSWD:` takes the
+/// tag from, `NOPASSWD` for plain command paths such as `apt`, and a
+/// default bound to such commands or to other users to run as.
+pub fn lists_no_password(listing: &str) -> bool {
     listing.lines().any(|line| {
         let line = line.trim();
         if let Some((_, cmds)) = line.split_once("NOPASSWD:") {
-            return cmds.split(',').any(|c| {
-                // Tags such as `SETENV:` come before the command.
-                let c = c.trim();
-                c.rsplit(' ').next() == Some("ALL")
-            });
+            return rule_runs_as_root(line) && nopasswd_may_run_true(cmds);
         }
-        let Some(settings) = bound_settings(line) else {
-            return false;
-        };
-        settings.split(',').any(|entry| {
-            let entry = entry.trim();
-            match entry.split_once('=') {
-                Some(("exempt_group", g)) => {
-                    let g = g.trim_matches('"').trim_start_matches('%');
-                    // A gid is printed as `\#27`.
-                    match g.trim_start_matches('\\').strip_prefix('#') {
-                        Some(n) => n.parse().is_ok_and(|n| gids.contains(&n)),
-                        None => names.iter().any(|x| x == g),
-                    }
-                }
-                _ => entry == "!authenticate",
-            }
-        })
+        default_may_skip_password(line)
     })
 }
 
-/// The settings of a line of the listing that holds for this probe, which
-/// runs `true` as root, or `None`. A default bound to commands
-/// (`Defaults!/usr/bin/apt …`) or to a user to run as (`Defaults>postgres
-/// …`) holds only when its binding names all commands or root. sudo
-/// prints the members of a binding with a comma and a space
-/// (`Defaults>nobody, root !authenticate`), and ends it at the first word
-/// that does not follow a comma.
-fn bound_settings(line: &str) -> Option<&str> {
-    let Some(bound) = line.strip_prefix("Defaults") else {
-        return Some(line);
-    };
-    let Some(kind @ ('!' | '>')) = bound.chars().next() else {
-        return Some(line);
-    };
-    let mut rest = &bound[1..];
-    let mut members = Vec::new();
-    loop {
-        let rest_trimmed = rest.trim_start();
-        let end = rest_trimmed.find(' ').unwrap_or(rest_trimmed.len());
-        let word = &rest_trimmed[..end];
-        rest = &rest_trimmed[end..];
-        members.extend(word.split(',').filter(|m| !m.is_empty()));
-        if !word.ends_with(',') {
-            break;
+/// Whether the members of a runas list (`ALL, !root`) may include root:
+/// the last member that names root, or something the list does not read
+/// (`ALL`, a group, `#00`), decides. A plain name is another user.
+fn may_be_root(members: &[&str]) -> bool {
+    let mut root = false;
+    for m in members {
+        let (negated, name) = match m.strip_prefix('!') {
+            Some(n) => (true, n.trim()),
+            None => (false, *m),
+        };
+        let plain = name != "ALL"
+            && !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+        if (plain && name != "root") || (negated && !matches!(name, "root" | "#0")) {
+            continue;
         }
+        root = !negated;
     }
-    let has = |n: &str| members.contains(&n);
-    let all = has("ALL") || kind == '>' && (has("root") || has("#0"));
-    // `!root` takes root out again.
-    let out = kind == '>' && (has("!root") || has("!#0"));
-    (all && !out).then_some(rest)
+    root
 }
 
-/// The names of the groups `account` is in, as `id -Gn` prints them.
-pub fn group_names(account: &Account) -> Vec<String> {
-    // `id` exits 1 when a group has no name and still prints the names it
-    // found, with the number of that one: the names are all there.
-    match plain("id").args(["-Gn", "--", &account.name]).output() {
-        Ok(o) => String::from_utf8_lossy(&o.stdout)
-            .split_whitespace()
-            .map(String::from)
-            .collect(),
-        Err(_) => Vec::new(),
+/// Whether a rule line (`(ALL : ALL) NOPASSWD: ALL`) may run as root.
+fn rule_runs_as_root(line: &str) -> bool {
+    let Some(inner) = line
+        .strip_prefix('(')
+        .and_then(|l| l.split_once(')'))
+        .map(|(i, _)| i)
+    else {
+        return true;
+    };
+    let users = inner.split(':').next().unwrap_or("");
+    may_be_root(&users.split(',').map(str::trim).collect::<Vec<_>>())
+}
+
+/// Whether a command may be `true`: anything but the path of a program
+/// with no pattern in it, as `/usr/bin/apt update`.
+fn may_match_true(cmd: &str) -> bool {
+    let cmd = cmd.trim();
+    if cmd.starts_with('!') {
+        return false;
+    }
+    let program = cmd.split(' ').next().unwrap_or("");
+    !(program.starts_with('/')
+        && !program.contains(['*', '?', '[', ']', '^', '$', '\\'])
+        && !program.ends_with('/')
+        && program.rsplit('/').next() != Some("true"))
+}
+
+/// Whether the commands after `NOPASSWD:` may include `true`: those under
+/// the tag, which `PASSWD:` takes away again.
+fn nopasswd_may_run_true(cmds: &str) -> bool {
+    let mut nopasswd = true;
+    cmds.split(',').any(|item| {
+        let mut item = item.trim();
+        // Tags (`SETENV:`) come before the command.
+        while let Some((tag, rest)) = item.split_once(' ')
+            && tag.ends_with(':')
+            && tag.chars().all(|c| c.is_ascii_uppercase() || c == ':')
+        {
+            match tag {
+                "PASSWD:" => nopasswd = false,
+                "NOPASSWD:" => nopasswd = true,
+                _ => {}
+            }
+            item = rest.trim_start();
+        }
+        nopasswd && !item.is_empty() && may_match_true(item)
+    })
+}
+
+/// Whether a default of the listing may let root's `true` run without a
+/// password: `exempt_group` (the account's groups are not read), or
+/// `!authenticate`. One bound to commands (`Defaults!/usr/bin/apt …`) or
+/// to users to run as (`Defaults>postgres …`) holds only when its binding
+/// may include `true` or root.
+fn default_may_skip_password(line: &str) -> bool {
+    if line.contains("exempt_group=") {
+        return true;
+    }
+    let flag = "!authenticate";
+    let Some(at) = line.match_indices(flag).map(|(i, _)| i).find(|&i| {
+        let before = line[..i].chars().next_back();
+        let after = line[i + flag.len()..].chars().next();
+        matches!(before, None | Some(' ' | ',')) && matches!(after, None | Some(' ' | ','))
+    }) else {
+        return false;
+    };
+    let Some(bound) = line.strip_prefix("Defaults") else {
+        return true;
+    };
+    // sudo prints a binding's members with a comma and a space, and a
+    // member may hold spaces, so the binding is all that lies before the
+    // flag.
+    let members = |from: usize| {
+        line[from..at]
+            .split(',')
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .collect::<Vec<_>>()
+    };
+    match bound.chars().next() {
+        Some('>') => may_be_root(&members("Defaults>".len())),
+        Some('!') => members("Defaults!".len()).iter().any(|c| may_match_true(c)),
+        _ => true,
     }
 }
 
@@ -841,58 +887,82 @@ mod tests {
     }
 
     /// The rules sudo lists for an account say whether a probe is worth
-    /// making: a password sudoer, a sudoer with `NOPASSWD` for single
-    /// commands and an account without rules are not.
+    /// making. It errs towards one: only an account whose rules surely
+    /// give root no command without a password is passed over, so that
+    /// sudo does not log a failed login for it.
     #[test]
     fn a_sudo_listing_tells_whether_no_password_is_asked() {
-        let wheel = ["alice".to_string(), "wheel".to_string()];
-        let yes = |l: &str| lists_no_password(l, &wheel, &[27]);
-        assert!(yes(
-            "User alice may run the following commands on h:\n    (ALL) NOPASSWD: ALL\n"
-        ));
-        assert!(yes("    (root) NOPASSWD: SETENV: ALL\n"));
-        assert!(yes(
-            "    (ALL : ALL) ALL\n    (ALL) NOPASSWD: /usr/bin/id, ALL\n"
-        ));
-        assert!(yes(
-            "Matching Defaults entries for alice on h:\n    env_reset, !authenticate\n"
-        ));
-        assert!(yes(
-            "Runas and Command-specific defaults for alice:\n    Defaults>root !authenticate\n"
-        ));
-        assert!(yes("    env_reset, exempt_group=wheel\n"));
-        // A few commands without a password: `true` is not one of them.
-        assert!(!yes(
-            "    (ALL : ALL) ALL\n    (root) NOPASSWD: /usr/bin/apt, /usr/bin/systemctl\n"
-        ));
-        assert!(yes(
-            "Runas and Command-specific defaults for alice:\n    Defaults!ALL !authenticate\n"
-        ));
-        assert!(!yes(
-            "Runas and Command-specific defaults for alice:\n    Defaults!/usr/bin/apt !authenticate\n"
-        ));
-        // Bound to a user to run as: only root or everyone counts, in
-        // whatever place sudo prints it, and not when `!root` follows.
-        assert!(yes("    Defaults>root,postgres !authenticate\n"));
-        assert!(yes("    Defaults>root, nobody !authenticate\n"));
-        assert!(yes("    Defaults>nobody, root !authenticate\n"));
-        assert!(yes("    Defaults>#0 !authenticate\n"));
-        assert!(yes("    Defaults!/usr/bin/apt, ALL !authenticate\n"));
-        assert!(yes("    Defaults>ALL, !postgres !authenticate\n"));
-        assert!(!yes("    Defaults>ALL, !root !authenticate\n"));
-        assert!(!yes("    Defaults>nobody, postgres !authenticate\n"));
-        assert!(yes("    Defaults>ALL !authenticate\n"));
-        assert!(!yes("    Defaults>postgres !authenticate\n"));
-        // A group by its gid is printed with an escaped `#`.
-        assert!(yes("    env_reset, exempt_group=\\#27\n"));
-        assert!(!yes("    env_reset, exempt_group=\\#28\n"));
-        // Another group's exemption.
-        assert!(!yes("    env_reset, exempt_group=admins\n"));
-        assert!(!yes(
-            "User alice may run the following commands on h:\n    (ALL : ALL) ALL\n"
-        ));
-        assert!(!yes("User bob is not allowed to run sudo on h.\n"));
-        assert!(!yes(""));
+        let yes = lists_no_password;
+        let no = |l: &str| !lists_no_password(l);
+        // NOPASSWD for root, for ALL or for anything but a plain path.
+        for l in [
+            "User alice may run the following commands on h:\n    (ALL) NOPASSWD: ALL\n",
+            "    (root) NOPASSWD: SETENV: ALL\n",
+            "    (ALL : ALL) ALL\n    (ALL) NOPASSWD: /usr/bin/id, ALL\n",
+            "    (ALL) NOPASSWD: ^.*$\n",
+            "    (ALL) NOPASSWD: /usr/bin/*\n",
+            "    (ALL, !root, ALL) NOPASSWD: ALL\n",
+            "    (root) NOPASSWD: /usr/bin/id, PASSWD: /usr/bin/apt, NOPASSWD: ALL\n",
+            "    (ALL) NOPASSWD: /usr/bin/true\n",
+            "    NOPASSWD: ALL\n",
+        ] {
+            assert!(yes(l), "{l}");
+        }
+        // Another user to run as, or a command that is a plain path, or a
+        // PASSWD: tag that takes it back: a password is asked for root's
+        // `true`.
+        for l in [
+            "    (ALL : ALL) ALL\n    (root) NOPASSWD: /usr/bin/apt, /usr/bin/systemctl\n",
+            "    (root) NOPASSWD: /usr/bin/apt update, !/usr/bin/id\n",
+            "    (r5svc) NOPASSWD: ALL\n",
+            "    (ALL, !root) NOPASSWD: ALL\n",
+            "    (ALL : ALL) NOPASSWD: /usr/bin/id, PASSWD: ALL\n",
+        ] {
+            assert!(no(l), "{l}");
+        }
+        // Defaults that turn authentication off or exempt a group, as sudo
+        // prints them.
+        for l in [
+            "Matching Defaults entries for alice on h:\n    env_reset, !authenticate\n",
+            "    Defaults>root !authenticate\n",
+            "    Defaults>root,postgres !authenticate\n",
+            "    Defaults>root, nobody !authenticate\n",
+            "    Defaults>nobody, root !authenticate\n",
+            "    Defaults>#0 !authenticate\n",
+            "    Defaults>#00 !authenticate\n",
+            "    Defaults>%root !authenticate\n",
+            "    Defaults>ALL !authenticate\n",
+            "    Defaults>!root, ALL !authenticate\n",
+            "    Defaults>ALL, !postgres !authenticate\n",
+            "    Defaults!ALL !authenticate\n",
+            "    Defaults!/usr/bin/apt, ALL !authenticate\n",
+            "    Defaults!/usr/bin/apt update, ALL !authenticate\n",
+            "    Defaults!ALL, /usr/bin/apt update !authenticate\n",
+            "    Defaults!/usr/bin/* !authenticate\n",
+            "    env_reset, exempt_group=sudo\n",
+            "    env_reset, exempt_group=SUDO\n",
+            "    env_reset, exempt_group=\"r5 grp\"\n",
+            "    env_reset, exempt_group=\\#27\n",
+        ] {
+            assert!(yes(l), "{l}");
+        }
+        for l in [
+            "Runas and Command-specific defaults for alice:\n    Defaults!/usr/bin/apt !authenticate\n",
+            "    Defaults>postgres !authenticate\n",
+            "    Defaults>nobody, postgres !authenticate\n",
+            "    Defaults>ALL, !root !authenticate\n",
+            "    Defaults>root, !root !authenticate\n",
+        ] {
+            assert!(no(l), "{l}");
+        }
+        // Nothing to run as.
+        for l in [
+            "User alice may run the following commands on h:\n    (ALL : ALL) ALL\n",
+            "User bob is not allowed to run sudo on h.\n",
+            "",
+        ] {
+            assert!(no(l), "{l}");
+        }
     }
 
     #[test]

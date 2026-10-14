@@ -362,45 +362,87 @@ pub fn write_folders(cfg: &NodeConfig, home: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Why resolving `path` leads out of its own place: a link on the way lies at
-/// or inside a place where commands may write (`writable`, resolved). `path`
-/// is walked component by component; once the resolved prefix is at or inside
-/// a `writable` place, a component that resolves elsewhere than its plain
-/// name is a link a command may have put there, and the folder is left out.
-/// Above that boundary the links are the owner's and are followed, the
-/// boundary's own component (the write folder itself may be a link of the
-/// owner's) among them. Places are judged resolved, so a writable folder
-/// reached by one spelling catches a folder configured by another.
+/// Why resolving `path` leads out of its own place: a link the resolution
+/// crosses lies at or inside a place where commands may write (`writable`,
+/// resolved), and a command may have put it there. `path` is resolved the way
+/// the system does, a link at a time: its target is spliced into the rest of
+/// the path, so a link of the owner's that leads into a write folder is
+/// followed down to where it ends and every link on that way is judged too,
+/// not only the ones in the spelling `path` has. Above a write folder the
+/// links are the owner's and are followed, the write folder's own place (it
+/// may be a link of the owner's) among them.
 fn led_away(path: &Path, writable: &[PathBuf]) -> Option<String> {
-    use std::path::Component;
-    let comps: Vec<_> = path.components().collect();
-    // The root is the first step.
-    let roots = comps
-        .iter()
-        .take_while(|c| matches!(c, Component::Prefix(_) | Component::RootDir))
-        .count()
-        .max(1);
-    let mut inside = false;
-    for i in roots..=comps.len() {
-        let here = real(&comps[..i].iter().collect::<PathBuf>());
-        // The place this component names without following a link of its
-        // own: the resolved parent plus the component's name.
-        let plain = if i == roots {
-            here.clone()
-        } else {
-            real(&comps[..i - 1].iter().collect::<PathBuf>()).join(comps[i - 1].as_os_str())
-        };
-        if inside && !(within(&here, &plain) && within(&plain, &here)) {
-            return Some(format!(
-                "it leads to {} through a link inside a folder where commands may write",
-                here.display()
-            ));
-        }
-        if !inside && writable.iter().any(|w| within(&here, w)) {
-            inside = true;
+    // The most links one resolution may cross, as the kernel's limit.
+    const LINKS: usize = 40;
+    let mut here = PathBuf::new();
+    let mut todo = steps(path);
+    let mut crossed = 0;
+    while let Some(step) = todo.pop() {
+        match step {
+            Step::Top(top) => here = top,
+            Step::Up => {
+                here.pop();
+            }
+            Step::Name(name) => {
+                let at = here.join(&name);
+                // A name that cannot be looked at (missing, or behind a
+                // folder that cannot be searched) is no link; `real_folder`
+                // has judged whether the path resolves at all.
+                let link = std::fs::symlink_metadata(&at).is_ok_and(|m| m.is_symlink());
+                if !link {
+                    here = at;
+                    continue;
+                }
+                if writable.iter().any(|w| within(&here, w)) {
+                    return Some(format!(
+                        "it passes through the link {} inside a folder where commands may write",
+                        at.display()
+                    ));
+                }
+                crossed += 1;
+                let target = std::fs::read_link(&at).ok().filter(|_| crossed <= LINKS);
+                match target {
+                    Some(t) => todo.extend(steps(&t)),
+                    None => {
+                        return Some(format!(
+                            "it cannot be resolved through the link {}",
+                            at.display()
+                        ));
+                    }
+                }
+            }
         }
     }
     None
+}
+
+/// One step of a path, as [`led_away`] takes it.
+enum Step {
+    /// Where an absolute path starts: the root, with the drive on Windows.
+    Top(PathBuf),
+    /// One level up.
+    Up,
+    Name(std::ffi::OsString),
+}
+
+/// The steps of `p`, the last first, so that `pop` gives the next one.
+fn steps(p: &Path) -> Vec<Step> {
+    use std::path::Component;
+    let mut top = PathBuf::new();
+    let mut out = Vec::new();
+    for c in p.components() {
+        match c {
+            Component::Prefix(_) | Component::RootDir => top.push(c.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => out.push(Step::Up),
+            Component::Normal(n) => out.push(Step::Name(n.to_os_string())),
+        }
+    }
+    if !top.as_os_str().is_empty() {
+        out.insert(0, Step::Top(top));
+    }
+    out.reverse();
+    out
 }
 
 /// `p` resolved; `p` itself when it cannot be resolved.
@@ -1802,6 +1844,60 @@ mod tests {
         std::os::unix::fs::symlink(&docs, &bin).unwrap();
         let spec = landlock_spec(&policy, &home, &[], &[home.join("w")]);
         assert!(!spec_reaches(&spec, &docs), "{spec:?}");
+    }
+
+    /// A link of the owner's that leads into a write folder is followed down
+    /// to where it ends, and the links on that way are judged too: a command
+    /// that replaces the folder the owner's link leads to, or one above it,
+    /// by a link of its own gets no rule for the place that leads to.
+    #[test]
+    fn a_link_put_below_an_owners_link_into_a_write_folder_gets_no_rule() {
+        let d = tempfile::tempdir().unwrap();
+        let (home, work, docs) = nested_home(&d);
+        let bin = work.join("bin");
+        let writable = [work.clone()];
+
+        // The owner's relative link to `work/bin`, beside the write folder.
+        std::os::unix::fs::symlink("work/bin", home.join("tools")).unwrap();
+        let policy = CenterPolicy {
+            folders: vec![folder(&work, "rw"), folder(&home.join("tools"), "rx")],
+            ..Default::default()
+        };
+        let spec = landlock_spec(&policy, &home, &[], &writable);
+        assert!(spec.read.contains(&bin), "{spec:?}");
+        std::fs::remove_dir(&bin).unwrap();
+        std::os::unix::fs::symlink(&docs, &bin).unwrap();
+        let spec = landlock_spec(&policy, &home, &[], &writable);
+        assert!(!spec_reaches(&spec, &docs), "{spec:?}");
+        assert!(spec.write.contains(&work), "{spec:?}");
+
+        // The only folder of another center leads through two levels, and the
+        // command replaces the upper one.
+        std::fs::remove_file(&bin).unwrap();
+        std::fs::create_dir_all(work.join("a/b")).unwrap();
+        std::fs::create_dir_all(docs.join("b")).unwrap();
+        std::os::unix::fs::symlink(work.join("a/b"), home.join("proj")).unwrap();
+        let reader = CenterPolicy {
+            folders: vec![folder(&home.join("proj"), "r")],
+            ..Default::default()
+        };
+        let spec = landlock_spec(&reader, &home, &[], &writable);
+        assert!(spec.read.contains(&work.join("a/b")), "{spec:?}");
+        std::fs::remove_dir_all(work.join("a")).unwrap();
+        std::os::unix::fs::symlink(&docs, work.join("a")).unwrap();
+        let spec = landlock_spec(&reader, &home, &[], &writable);
+        assert!(!spec_reaches(&spec, &docs), "{spec:?}");
+    }
+
+    /// Links that lead into one another are no way to a folder.
+    #[test]
+    fn a_loop_of_links_is_led_away() {
+        let d = tempfile::tempdir().unwrap();
+        let (home, work, _) = nested_home(&d);
+        std::os::unix::fs::symlink("two", home.join("one")).unwrap();
+        std::os::unix::fs::symlink("one", home.join("two")).unwrap();
+        assert!(led_away(&home.join("one"), &[]).is_some());
+        assert!(led_away(&work, &[]).is_none());
     }
 
     /// The write folders that bound the others are those of every center

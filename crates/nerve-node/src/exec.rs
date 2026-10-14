@@ -748,7 +748,7 @@ pub struct Ender {
     #[cfg(unix)]
     uid: Option<u32>,
     #[cfg(windows)]
-    ending: crate::job::Ending<crate::win::Job, Option<std::sync::Arc<crate::tree::Watch>>>,
+    ending: crate::job::Ending<crate::job::Held, Option<std::sync::Arc<crate::tree::Watch>>>,
 }
 
 impl Ender {
@@ -763,21 +763,51 @@ impl Ender {
         self.ending.has_job()
     }
 
-    /// Signals the command's processes. On Windows every signal ends them.
+    /// Signals the command's processes. Windows has no signals: `kill` ends
+    /// them, `term` and `int` ask them to end (crate::win_stop) and end what
+    /// is left after [`crate::job::GRACE`], in the background.
     pub fn signal(&self, sig: Sig) {
         #[cfg(windows)]
         {
-            let _ = sig;
-            self.ending.end(|w| {
+            let walk = |w: &Option<std::sync::Arc<crate::tree::Watch>>| {
                 if let Some(w) = w {
                     w.kill();
                 }
-            });
+            };
+            if sig == Sig::Kill {
+                self.ending.end(walk);
+                return;
+            }
+            // The copy holds the job open until it is ended.
+            let ending = self.ending.clone();
+            let stop = std::thread::Builder::new()
+                .name("exec-stop".into())
+                .spawn(move || ending.stop(crate::job::GRACE, walk));
+            if stop.is_err() {
+                self.ending.end(walk);
+            }
         }
         #[cfg(unix)]
         kill_group(self.pid, sig, self.uid);
         #[cfg(not(any(unix, windows)))]
         kill_group(self.pid, sig);
+    }
+
+    /// Windows, on a timeout: asks the command's processes to end and gives
+    /// them [`crate::job::GRACE`] while `work`, the call's wait for the
+    /// command, goes on reading its output. The caller ends what is left.
+    #[cfg(windows)]
+    async fn grace<F: std::future::Future + Unpin>(&self, work: &mut F) {
+        let ending = self.ending.clone();
+        let mut ask = tokio::task::spawn_blocking(move || ending.ask());
+        let asked = tokio::select! {
+            r = &mut ask => r.unwrap_or(false),
+            // The command ended while it was asked.
+            _ = &mut *work => return,
+        };
+        if asked {
+            let _ = tokio::time::timeout(crate::job::GRACE, work).await;
+        }
     }
 }
 
@@ -799,7 +829,7 @@ impl Group {
     /// `job` is the shell's job; without one the processes below the shell
     /// are recorded while it runs.
     #[cfg(windows)]
-    fn start(pid: Option<u32>, job: Option<std::sync::Arc<crate::win::Job>>) -> Group {
+    fn start(pid: Option<u32>, job: Option<std::sync::Arc<crate::job::Held>>) -> Group {
         use crate::job::Ending;
         Group(pid.map(|pid| Ender {
             pid,
@@ -1097,13 +1127,15 @@ pub async fn run(
     cmd.process_group(0);
     // The shell starts suspended and runs only once it is in its job, so
     // nothing it starts escapes the job. No console is needed for this, so
-    // a node that runs as a service does the same.
+    // a node that runs as a service does the same. It gets a console of its
+    // own, which a stop sends Ctrl+C (crate::win_stop).
     #[cfg(windows)]
     let job = crate::job::make();
     #[cfg(windows)]
-    if job.is_some() {
-        cmd.creation_flags(crate::job::SUSPENDED);
-    }
+    cmd.creation_flags(match job {
+        Some(_) => crate::job::CONSOLE | crate::job::SUSPENDED,
+        None => crate::job::CONSOLE,
+    });
     let mut child = cmd.spawn().map_err(|e| {
         RpcError::new(
             ErrorCode::Unavailable,
@@ -1125,8 +1157,12 @@ pub async fn run(
     #[cfg(windows)]
     let job = match job {
         Some(job) => Some(
-            crate::job::adopt(job, &mut child)
-                .map_err(|e| RpcError::new(ErrorCode::Unavailable, e))?,
+            crate::job::adopt(
+                job,
+                &mut child,
+                crate::win_stop::Asker::Own(opts.exe.clone()),
+            )
+            .map_err(|e| RpcError::new(ErrorCode::Unavailable, e))?,
         ),
         None => None,
     };
@@ -1165,10 +1201,17 @@ pub async fn run(
         let (o, e, st) = tokio::join!(capped(stdout, cap), err, child.wait());
         (o, e, st)
     };
+    tokio::pin!(work);
     let (out, err, status, timed_out) = match call.timeout {
-        Some(t) => match tokio::time::timeout(t, work).await {
+        Some(t) => match tokio::time::timeout(t, &mut work).await {
             Ok((o, e, s)) => (o, e, Some(s), false),
-            Err(_) => ((Vec::new(), false), (Vec::new(), false), None, true),
+            Err(_) => {
+                #[cfg(windows)]
+                if let Some(e) = &group.0 {
+                    e.grace(&mut work).await;
+                }
+                ((Vec::new(), false), (Vec::new(), false), None, true)
+            }
         },
         None => {
             let (o, e, s) = work.await;
@@ -1228,14 +1271,14 @@ async fn run_as(
     let token = crate::win_user::token_for(account)
         .map_err(|e| unavailable(format!("cannot start as {}: {e}", account.name)))?;
     let elevated = match &opts.sudo {
-        Some(s) => Some(
+        Some(s) => Some(std::sync::Arc::new(
             crate::win_user::sudo_token(&account.name, &s.password).map_err(|e| {
                 unavailable(format!(
                     "cannot start as {} with its administrator rights: {e}",
                     account.name
                 ))
             })?,
-        ),
+        )),
         None => None,
     };
     let reach = match elevated {
@@ -1263,19 +1306,17 @@ async fn run_as(
         ))
     })?;
     let line = windows_command_line(program, args);
-    let child = crate::win_user::spawn(
-        elevated.as_ref().unwrap_or(token.as_ref()),
-        &line,
-        Some(&call.cwd),
-        Some(&account.home),
-    )
-    .map_err(|e| {
-        unavailable(format!(
-            "cannot start as {} in {}: {e}",
-            account.name,
-            to_wire(&call.cwd)
-        ))
-    })?;
+    // The command's own token also starts the helper that asks it to end
+    // (crate::win_stop).
+    let token = elevated.unwrap_or(token);
+    let child = crate::win_user::spawn(&token, &line, Some(&call.cwd), Some(&account.home))
+        .map_err(|e| {
+            unavailable(format!(
+                "cannot start as {} in {}: {e}",
+                account.name,
+                to_wire(&call.cwd)
+            ))
+        })?;
     if let Err(e) = job.assign(child.process()) {
         child.kill();
         return Err(unavailable(crate::job::assign_error(
@@ -1283,14 +1324,15 @@ async fn run_as(
             &e,
         )));
     }
-    let job = std::sync::Arc::new(job);
     if let Err(e) = child.resume() {
         job.terminate();
         return Err(unavailable(format!(
             "the command was not run: its shell could not be resumed ({e})"
         )));
     }
-    let group = Group::start(Some(child.pid), Some(job));
+    let asker = crate::win_stop::Asker::As(opts.exe.clone(), token);
+    let job = crate::job::Held::new(job, child.handle().ok(), asker);
+    let group = Group::start(Some(child.pid), Some(std::sync::Arc::new(job)));
     if let Some(e) = &group.0 {
         started(e);
     }
@@ -1311,10 +1353,14 @@ async fn run_as(
             }
         )
     };
+    tokio::pin!(work);
     let (out, err, code) = match call.timeout {
-        Some(t) => match tokio::time::timeout(t, work).await {
+        Some(t) => match tokio::time::timeout(t, &mut work).await {
             Ok(r) => r,
             Err(_) => {
+                if let Some(e) = &group.0 {
+                    e.grace(&mut work).await;
+                }
                 drop(group);
                 return Err(RpcError::new(
                     ErrorCode::Timeout,

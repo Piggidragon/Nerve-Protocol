@@ -776,6 +776,12 @@ impl Spawned {
         self.process.as_raw_handle()
     }
 
+    /// A handle of its own to the process, which keeps its pid from going
+    /// to another process while it is open.
+    pub fn handle(&self) -> io::Result<OwnedHandle> {
+        self.process.try_clone()
+    }
+
     pub fn resume(&self) -> io::Result<()> {
         // SAFETY: the main thread of the process, started suspended.
         if unsafe { ResumeThread(self.thread.as_raw_handle() as HANDLE) } == u32::MAX {

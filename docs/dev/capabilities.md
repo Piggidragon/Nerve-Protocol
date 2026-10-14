@@ -85,7 +85,9 @@ allow rule names them.
 - `exec.signal` is offered only where the policy allows it: by an allow rule in
   `allowlist` mode, with `caps.exec.signal = on` in `folder` and `user` mode.
 - A timeout, `cancel` or `session.end` kills the command's process group. On
-  Windows they end the command's Job Object.
+  Windows they end the command's Job Object; a timeout, and `exec.signal`
+  with `term` or `int`, first ask the command to end (Ctrl+C, `WM_CLOSE`) and
+  end the job 3 seconds later ([node-local](spec/node-local.md#commands)).
 
 ## Messages
 

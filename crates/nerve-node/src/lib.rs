@@ -38,6 +38,8 @@ mod win_host;
 #[cfg(windows)]
 pub mod win_service;
 #[cfg(windows)]
+pub mod win_stop;
+#[cfg(windows)]
 mod win_user;
 // The Windows sudo switch and install steps are Windows-only in use;
 // tested everywhere.

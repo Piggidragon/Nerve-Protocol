@@ -31,12 +31,17 @@ behaves the same except where this page says so.
   and only then runs, so every process it starts is in the job. Ending the job
   ends all of them. The job closes with the node, so a node that dies leaves no
   command running.
+- Windows has no signals. A timeout, `term` and `int` send Ctrl+C to the
+  command's console (each command has one of its own, without a window) and
+  ask its windows to close, then end the job 3 seconds later. `kill` ends the
+  job at once. See [what ends a command](stop.md#what-ends-a-command).
 - A process that another program starts for the command, such as WMI, a
   service or the task scheduler, belongs to that program and is not in the job.
 - A Job Object does not limit file access. It is not a sandbox. In `folder`
   mode the command also runs in an AppContainer, which is. See
   [modes](modes.md#what-a-command-can-reach-in-folder-mode-windows).
-- Output that is not UTF-8 is read in the console code page.
+- Output that is not UTF-8 is read in the OEM code page, the one a new
+  console starts with.
 - A [sudo](sudo.md#sudo-on-windows) command runs with the elevated token of
   the account commands run as, which must be an administrator. Every other
   command of that account runs with the token UAC filtered. UAC is no

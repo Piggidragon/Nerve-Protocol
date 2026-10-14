@@ -158,8 +158,13 @@ impl FolderChange {
                 }
             }
             ("folder.set", Some(given), None, Some(changes)) => {
-                if changes.is_empty() || changes.len() > CHANGES_MAX {
+                if changes.is_empty() {
                     return Err("name what to change: =rwx, +x or -w".into());
+                }
+                if changes.len() > CHANGES_MAX {
+                    return Err(format!(
+                        "at most {CHANGES_MAX} changes at once; =rwx sets the rights in one"
+                    ));
                 }
                 // Each is checked here, before the config is touched.
                 changes.iter().try_fold(Access::NONE, |a, c| a.change(c))?;
@@ -348,10 +353,11 @@ mod tests {
             json!({"path": "/srv/a", "given": "a", "changes": ["x"]}),
         );
         assert!(e.contains("start with =, + or -"), "{e}");
-        refused(
+        let e = refused(
             "folder.set",
             json!({"path": "/srv/a", "given": "a", "changes": vec!["+r"; CHANGES_MAX + 1]}),
         );
+        assert!(e.starts_with("at most 64 changes"), "{e}");
         // What another method takes, a field the node does not know, a
         // field missing, or no path.
         let e = refused(

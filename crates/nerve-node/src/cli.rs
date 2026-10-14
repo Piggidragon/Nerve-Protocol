@@ -1801,7 +1801,11 @@ async fn change_folder(
             return serde_json::from_value(v)
                 .map_err(|e| format!("the node's answer is not understood: {e}"));
         }
-        Err(e) if e == nerve_transport::ctl::NOT_RUNNING => {}
+        // A node that runs holds the keys' lock.
+        Err(e)
+            if crate::pipe::file_instead(&e, || {
+                !matches!(crate::secrets::KeysLock::try_take(paths), Ok(Some(_)))
+            }) => {}
         Err(e) => return Err(e),
     }
     let (cfg, _) = read_config(paths).await?;

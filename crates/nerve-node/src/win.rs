@@ -218,16 +218,21 @@ impl crate::job::Members for Listed {
     }
 }
 
+// The ids follow the counts where crate::job::listed_ids reads them.
+const _: () = assert!(
+    std::mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList) == crate::job::IDS_AT
+);
+
 /// The ids of the processes in job `job` now, those of jobs nested in it
 /// included.
 fn process_ids(job: Handle) -> io::Result<Vec<u32>> {
-    let head = std::mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList);
+    let word = std::mem::size_of::<usize>();
     let mut room = 64usize;
     for _ in 0..8 {
-        let bytes = head + room * std::mem::size_of::<usize>();
-        let mut buf = vec![0usize; bytes.div_ceil(std::mem::size_of::<usize>())];
-        // SAFETY: the job is open; the buffer holds `bytes` bytes, aligned
-        // for the structure.
+        let bytes = crate::job::IDS_AT + room * word;
+        // Words, so the buffer is aligned for the structure.
+        let mut buf = vec![0usize; bytes.div_ceil(word)];
+        // SAFETY: the job is open; the buffer holds `bytes` bytes.
         let ok = unsafe {
             QueryInformationJobObject(
                 job,
@@ -237,28 +242,23 @@ fn process_ids(job: Handle) -> io::Result<Vec<u32>> {
                 std::ptr::null_mut(),
             )
         } != 0;
-        // SAFETY: the buffer starts with the structure's counts.
-        let list = unsafe { &*buf.as_ptr().cast::<JOBOBJECT_BASIC_PROCESS_ID_LIST>() };
-        let more = if ok {
-            list.NumberOfAssignedProcesses > list.NumberOfProcessIdsInList
-        } else {
+        if !ok {
             let e = io::Error::last_os_error();
             if e.raw_os_error() != Some(ERROR_MORE_DATA as i32) {
                 return Err(e);
             }
-            true
-        };
-        if more {
-            // Processes came meanwhile: room for them and some more.
-            room = room.max(list.NumberOfAssignedProcesses as usize) * 2;
-            continue;
         }
-        let n = (list.NumberOfProcessIdsInList as usize).min(room);
-        // SAFETY: the list holds `n` ids after the counts, within the buffer.
-        let ids = unsafe {
-            std::slice::from_raw_parts(buf.as_ptr().cast::<u8>().add(head).cast::<usize>(), n)
-        };
-        return Ok(ids.iter().map(|&id| id as u32).collect());
+        // SAFETY: the buffer holds `bytes` initialised bytes.
+        let list = unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), bytes) };
+        match crate::job::listed_ids(list) {
+            Ok(Some(ids)) if ok => return Ok(ids),
+            Err(e) if ok => return Err(io::Error::other(e)),
+            // Processes came meanwhile: room for them and some more.
+            _ => {
+                let in_job = u32::from_ne_bytes(list[..4].try_into().expect("four bytes"));
+                room = room.max(in_job as usize) * 2;
+            }
+        }
     }
     Err(io::Error::other("the job's processes kept changing"))
 }

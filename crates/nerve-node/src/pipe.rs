@@ -35,6 +35,21 @@
 //! for identification only and talks to it only when its owner is SYSTEM,
 //! the administrators or the node's account ([`trusted_owner`]).
 
+/// How the CLI's error starts when the pipe of the node's name is another
+/// account's.
+pub const NOT_THE_NODES: &str = "the control pipe is not the node's";
+
+/// Whether the CLI makes a folder change in node.toml itself after the pipe
+/// call failed with `e`: when no node made a pipe, and when the pipe is
+/// another account's but no node runs (`node_runs`, asked only then), so a
+/// pipe someone made of the node's name does not keep the owner from
+/// changing folders with the node stopped. Any other failure is the
+/// answer.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn file_instead(e: &str, node_runs: impl FnOnce() -> bool) -> bool {
+    e == nerve_transport::ctl::NOT_RUNNING || (e.starts_with(NOT_THE_NODES) && !node_runs())
+}
+
 /// The pipe's DACL in SDDL: full access for SYSTEM, the administrators and
 /// `own` (the SID of the node's account, `S-1-5-…`), nothing for anyone
 /// else. `P` keeps out anything inherited.
@@ -84,7 +99,7 @@ mod sys {
 
     use nerve_transport::ctl::NOT_RUNNING;
 
-    use super::{dacl_text, trusted_owner};
+    use super::{NOT_THE_NODES, dacl_text, trusted_owner};
     use crate::daemon::Shared;
     use crate::paths::NodePaths;
     use crate::win_user::{well_known_sid, wide};
@@ -302,7 +317,7 @@ mod sys {
         if !trusted_owner(&owner, &system, &admins, node.as_ref()) {
             let who = crate::win_host::sid_text(&owner).unwrap_or_else(|e| e);
             return Err(format!(
-                "the control pipe {name} is not the node's: its owner is {who}; nothing was sent to it"
+                "{NOT_THE_NODES}: {name} belongs to {who}, so nothing was sent to it. Another process made it before the node started, and the node runs without its pipe: end that process and restart the node (docs/user/troubleshooting.md, \"The control pipe is not the node's\"). With the node stopped, folder changes go to node.toml"
             ));
         }
         nerve_transport::ctl::call_on(client, method, params).await
@@ -327,6 +342,35 @@ mod tests {
         // No entry for everyone, the users, the network or an AppContainer.
         for other in ["WD", "BU", "AU", "NU", "AC", "S-1-15-"] {
             assert!(!dacl_text(nerve).contains(other), "{other}");
+        }
+    }
+
+    /// The CLI writes the file itself when no node made the pipe, and when
+    /// another account's pipe holds the name but no node runs; with a node
+    /// running, or for any other failure, it does not.
+    #[test]
+    fn the_cli_writes_the_file_only_where_no_node_takes_the_change() {
+        use nerve_transport::ctl::NOT_RUNNING;
+        let foreign = format!("{NOT_THE_NODES}: \\\\.\\pipe\\nerve-node-1 belongs to S-1-5-21-9");
+        let asked = std::cell::Cell::new(false);
+        let asked = &asked;
+        let runs = |r| {
+            move || {
+                asked.set(true);
+                r
+            }
+        };
+        assert!(file_instead(NOT_RUNNING, runs(true)));
+        assert!(!asked.get(), "asked whether a node runs without need");
+        assert!(file_instead(&foreign, runs(false)));
+        assert!(!file_instead(&foreign, runs(true)));
+        for other in [
+            "refused: this request comes from a command the node runs for a center",
+            "the running node lets only the administrators, SYSTEM and its own account change it",
+            "cannot reach the running node: All pipe instances are busy. (os error 231)",
+            "/srv/a is not a folder of this center",
+        ] {
+            assert!(!file_instead(other, runs(false)), "{other}");
         }
     }
 

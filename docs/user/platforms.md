@@ -87,8 +87,10 @@ opened with "Run as administrator"), SYSTEM and the node's own account can
 open the pipe, and the node refuses every request from a process of a
 command it runs. The pipe takes no other change yet: for those the CLI
 writes the signed `node.toml` itself, and the node takes them at its next
-start. A command that the node runs for a center can therefore change the
-node's own policy where it can write that file.
+start. Until then the node refuses folder changes, which would undo them:
+restart it first ([troubleshooting](troubleshooting.md#restart-the-node-then-change-the-folder-again-windows)).
+A command that the node runs for a center can change the node's own policy
+where it can write that file.
 
 Allow commands on Windows only for centers you would also give the
 [settings grant](settings-grant.md), or [install the node as a

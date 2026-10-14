@@ -884,6 +884,14 @@ async fn start_ctl(_shared: Arc<Shared>) -> Result<JoinHandle<()>, String> {
     Ok(tokio::spawn(async {}))
 }
 
+/// Why the pipe refuses a folder change while `node.toml` (version
+/// `on_disk`) holds changes the node (version `in_force`) has not taken.
+fn file_ahead(on_disk: u64, in_force: u64) -> String {
+    format!(
+        "node.toml holds changes the running node takes at its next start (version {on_disk} there, {in_force} in force), and this change would undo them; nothing was changed. Restart the node (`Restart-Service nerve-node` for the installed node), then change the folder again"
+    )
+}
+
 /// Why a request from a process of a command the node runs is refused.
 const FROM_A_COMMAND: &str =
     "refused: this request comes from a command the node runs for a center";
@@ -914,14 +922,28 @@ pub(crate) async fn pipe_control(
                     Err(e) => return Reply::Err(e),
                 };
             let mut applied = None;
-            let r = lock(&shared.store).update(|cfg| {
-                applied = Some(crate::folder_change::apply_to(
-                    cfg,
-                    center.as_deref(),
-                    &change,
-                )?);
-                Ok(())
-            });
+            let r = {
+                let mut store = lock(&shared.store);
+                // On Windows the CLI writes every other change to the file
+                // for the next start. The node saves its whole config, so a
+                // file newer than it would lose that change: it is refused
+                // instead.
+                match store.version_on_disk() {
+                    Ok(on_disk) if on_disk > store.version() => {
+                        return Reply::Err(file_ahead(on_disk, store.version()));
+                    }
+                    Ok(_) => {}
+                    Err(e) => return Reply::Err(format!("cannot read node.toml: {e}")),
+                }
+                store.update(|cfg| {
+                    applied = Some(crate::folder_change::apply_to(
+                        cfg,
+                        center.as_deref(),
+                        &change,
+                    )?);
+                    Ok(())
+                })
+            };
             let version = match r {
                 Ok(v) => v,
                 Err(e) => return Reply::Err(e.to_string()),
@@ -1665,6 +1687,80 @@ mod tests {
         assert_eq!(v["access"], Value::Null);
         assert!(folders().is_empty());
         assert!(call(1000, "status", json!({})).await.is_ok());
+        daemon.stop().await;
+    }
+
+    /// On Windows the CLI writes every change but the folders' to node.toml
+    /// for the next start. A folder change over the pipe after that is
+    /// refused: the node would save its own config over the file and lose
+    /// the CLI's change.
+    #[tokio::test]
+    async fn a_pipe_change_does_not_undo_a_change_waiting_in_the_file() {
+        use crate::folder_change::FolderChange;
+        use nerve_policy::config::Access;
+        use nerve_transport::ctl::Reply;
+        let (d, daemon) = daemon().await;
+        let s = daemon.shared.clone();
+        let paths = daemon.paths().clone();
+        lock(&s.store)
+            .update(|c| {
+                c.centers.push(nerve_policy::CenterEntry {
+                    name: "home".into(),
+                    url: "http://127.0.0.1:1".into(),
+                    pin: None,
+                    center_id: "id-home".into(),
+                    node_id: "n".into(),
+                    settings: Default::default(),
+                    paused: true,
+                    revoked: false,
+                    unknown: false,
+                    policy: Default::default(),
+                });
+                Ok(())
+            })
+            .unwrap();
+        // The CLI's way for a change no pipe takes (cli::edit).
+        let mut cli = SettingsStore::open_with(
+            paths.config_file(),
+            Box::new(crate::secrets::NodeSecrets::for_cli(&paths)),
+            AuditLog::new(paths.audit_log()),
+        )
+        .unwrap();
+        cli.update(|c| {
+            c.center_mut("home").unwrap().policy.mode = nerve_policy::Mode::Folder;
+            Ok(())
+        })
+        .unwrap();
+        let in_force = s.config().version;
+        let add = FolderChange::Add {
+            path: d.path().join("work").display().to_string(),
+            access: Access::parse("r").unwrap(),
+        };
+        let r = pipe_control(&s, add.method(), add.params(None), false).await;
+        let Reply::Err(e) = r else {
+            panic!("the pipe took a change over the CLI's")
+        };
+        assert_eq!(e, file_ahead(in_force + 1, in_force));
+        assert!(e.contains("Restart the node"), "{e}");
+        let saved = || {
+            SettingsStore::peek(&paths.config_file(), &paths.config_key())
+                .unwrap()
+                .center("home")
+                .unwrap()
+                .policy
+                .clone()
+        };
+        assert_eq!(saved().mode, nerve_policy::Mode::Folder);
+        assert!(saved().folders.is_empty());
+        assert_eq!(s.config().version, in_force);
+        // Once the node has the file's change (a restart; here a reload),
+        // and after a write of the node's own, the pipe takes changes again.
+        s.reload().unwrap();
+        s.mark_center("home", |c| c.unknown = true);
+        let r = pipe_control(&s, add.method(), add.params(None), false).await;
+        assert!(matches!(r, Reply::Ok(_)), "refused");
+        assert_eq!(saved().mode, nerve_policy::Mode::Folder);
+        assert_eq!(saved().folders.len(), 1);
         daemon.stop().await;
     }
 

@@ -705,6 +705,9 @@ state folder. The lines are those of the socket. Methods:
 
 `path` is the folder resolved by the CLI, `given` as typed; `set` and `rm`
 find the folder by either. Without `center` the only paired center is meant.
+While `node.toml` is newer than the config in force (the CLI wrote another
+change there for the next start), a folder change is refused: the node saves
+its whole config and would undo that change.
 A field the method does not take refuses the request. The node checks a
 change as the CLI does when it writes the file, saves it, brings the folder
 grants in line, and answers `{center, path, access, mode, version}`
@@ -729,7 +732,10 @@ Who may write:
   one of that name first) logs it and runs on without it.
 - The CLI opens the pipe for identification only and sends nothing unless
   its owner is SYSTEM, the administrators or the node's account (`nerve` for
-  the installed node, else the CLI's own).
+  the installed node, else the CLI's own). When the pipe is another's and no
+  node holds `keys.lock` (none runs), the CLI writes the change to
+  `node.toml` itself, as with no pipe at all; with a node running it stops
+  with an error that says how to free the name.
 
 Not covered: a process another program starts for a command (the task
 scheduler, WMI) is in no job of the node's; it opens the pipe only if its

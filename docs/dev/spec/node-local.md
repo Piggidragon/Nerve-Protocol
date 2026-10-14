@@ -590,7 +590,10 @@ answer. For each call the node takes the center's policy and, in this order:
    holder that is not the place it was looked at as, and the place the pass
    ends at must resolve to itself, so that what is stored is what was looked
    at. A `w` folder that cannot be resolved only makes a clean walk "cannot
-   tell" (the folder is stored as given, not recorded).
+   tell" (the folder is stored as given, not recorded). On Windows the walk
+   goes through a `subst` drive's folder name by name (`QueryDosDeviceW`),
+   never through the drive resolved, and refuses a path with a drive but no
+   root.
    For a folder without an entry only the `w` folders in the config count,
    and a command that runs without Landlock can make a link elsewhere. A folder
    that holds a protected entry gives a command in `folder` mode none of it:

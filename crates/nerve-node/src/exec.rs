@@ -521,6 +521,11 @@ fn settle_by(
             }
         }
     }
+    // A drive-relative path (`C:sub`) leads to the drive's current folder,
+    // which no walk of the path can judge.
+    if !path.is_absolute() {
+        return Settled::Refused("the path must be absolute".into());
+    }
     let path = &long_names(path);
     // A link to nothing could point anywhere once something is made there.
     if let Err(e @ nerve_policy::paths::PathError::DanglingSymlink(_)) = resolve(path) {
@@ -595,8 +600,24 @@ fn walk_by(
     let mut crossed = 0;
     while let Some(step) = todo.pop() {
         match step {
-            // The drive, as it resolves (a `subst` drive leads to a folder).
-            Step::Top(top) => here = real(&top),
+            Step::Top(top) => {
+                // A `subst` drive is a name for a folder, and the folder may
+                // hold a junction: the walk goes through its names one by one
+                // like through a link, not through the resolved drive.
+                #[cfg(windows)]
+                if let Some(mapped) = subst_target(&top) {
+                    crossed += 1;
+                    if crossed > LINKS {
+                        return Err(format!(
+                            "it cannot be resolved through the drive {}",
+                            top.display()
+                        ));
+                    }
+                    todo.extend(steps(&mapped));
+                    continue;
+                }
+                here = top;
+            }
             Step::Up => {
                 here.pop();
             }
@@ -640,6 +661,35 @@ fn walk_by(
         }
     }
     Ok(here)
+}
+
+/// The folder the drive `top` (`Z:\`) is made to name by `subst`, as a path;
+/// `None` for a drive of a volume, and for what is no drive letter.
+#[cfg(windows)]
+fn subst_target(top: &Path) -> Option<PathBuf> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW;
+    let text = top.to_string_lossy();
+    let text = nerve_policy::paths::win::strip_verbatim(&text);
+    let letter = text.get(..2).filter(|l| {
+        let b = l.as_bytes();
+        b[0].is_ascii_alphabetic() && b[1] == b':'
+    })?;
+    let name: Vec<u16> = std::ffi::OsStr::new(letter)
+        .encode_wide()
+        .chain([0])
+        .collect();
+    let mut buf = vec![0u16; 1024];
+    // SAFETY: a NUL-terminated name and a buffer of the length given.
+    let n = unsafe { QueryDosDeviceW(name.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+    if n == 0 {
+        return None;
+    }
+    // The first of the NUL-separated names; a subst drive gives `\??\<path>`.
+    let first = &buf[..buf.iter().position(|&c| c == 0).unwrap_or(n as usize)];
+    let target = String::from_utf16_lossy(first);
+    let path = target.strip_prefix("\\??\\")?;
+    (path.as_bytes().get(1) == Some(&b':')).then(|| PathBuf::from(path))
 }
 
 /// `p` with the short (8.3) names in it written out, as the final path of
@@ -2708,29 +2758,103 @@ mod windows_tests {
         assert_eq!(at(&target), Settled::At(place.clone()));
 
         // A `subst` drive: the drive is a folder.
-        let Some(letter) = ('R'..='Z')
-            .rev()
-            .find(|c| !Path::new(&format!("{c}:\\")).exists())
-        else {
+        let Some(drive) = Subst::new(&base) else {
             return;
         };
-        let drive = format!("{letter}:");
-        let made = std::process::Command::new("subst")
-            .arg(&drive)
-            .arg(&base)
+        assert_eq!(at(&drive.join("proj")), Settled::At(place));
+    }
+
+    /// A `subst` drive on a free letter, unmapped when dropped.
+    struct Subst(String);
+
+    impl Subst {
+        fn new(base: &Path) -> Option<Subst> {
+            let letter = ('R'..='Z')
+                .rev()
+                .find(|c| !Path::new(&format!("{c}:\\")).exists())?;
+            let drive = format!("{letter}:");
+            let made = std::process::Command::new("subst")
+                .arg(&drive)
+                .arg(base)
+                .output()
+                .unwrap();
+            assert!(made.status.success(), "{made:?}");
+            Some(Subst(drive))
+        }
+
+        /// A path on the drive.
+        fn join(&self, rest: &str) -> PathBuf {
+            PathBuf::from(format!("{}\\{rest}", self.0))
+        }
+    }
+
+    impl Drop for Subst {
+        fn drop(&mut self) {
+            let _ = std::process::Command::new("subst")
+                .args([self.0.as_str(), "/d"])
+                .output();
+        }
+    }
+
+    /// A `subst` drive is walked through the folder it maps, name by name: a
+    /// junction a command put in place of that folder, inside a `w` folder,
+    /// is refused like any other, where resolving the drive would have
+    /// followed it. A path with a drive but no root (`C:sub`) leads to the
+    /// drive's current folder, which no walk can judge, and is refused.
+    #[test]
+    fn a_subst_drive_is_walked_through_its_folder_name_by_name() {
+        let d = tempfile::tempdir().unwrap();
+        let root = PathBuf::from(nerve_policy::paths::win::strip_verbatim(
+            &std::fs::canonicalize(d.path()).unwrap().to_string_lossy(),
+        ));
+        let (work, secret) = (root.join("work"), root.join("secret"));
+        let project = work.join("project");
+        for dir in [project.join("inner"), secret.join("inner")] {
+            std::fs::create_dir_all(dir).unwrap();
+        }
+        let mut cfg = NodeConfig::default();
+        cfg.centers.push(nerve_policy::CenterEntry {
+            name: "lab".into(),
+            url: "https://center.example".into(),
+            pin: None,
+            center_id: "c".into(),
+            node_id: "n".into(),
+            settings: Default::default(),
+            paused: false,
+            revoked: false,
+            unknown: false,
+            policy: CenterPolicy {
+                folders: vec![Folder {
+                    path: work.display().to_string(),
+                    access: Access::parse("rw").unwrap(),
+                }],
+                ..Default::default()
+            },
+        });
+        let at = |p: &Path| settle(&cfg, &root, p);
+        assert!(matches!(at(Path::new("C:sub")), Settled::Refused(_)));
+        let Some(drive) = Subst::new(&project) else {
+            return;
+        };
+        let inner = nerve_policy::paths::resolve(&project.join("inner")).unwrap();
+        assert_eq!(at(&drive.join("inner")), Settled::At(inner));
+        // A command replaces the mapped folder by a junction to `secret`.
+        std::fs::rename(&project, work.join("old")).unwrap();
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&project)
+            .arg(&secret)
             .output()
             .unwrap();
         assert!(made.status.success(), "{made:?}");
-        struct Unmap(String);
-        impl Drop for Unmap {
-            fn drop(&mut self) {
-                let _ = std::process::Command::new("subst")
-                    .args([self.0.as_str(), "/d"])
-                    .output();
-            }
+        for path in [drive.join("inner"), drive.join("")] {
+            let Settled::Refused(why) = at(&path) else {
+                panic!("{} was followed through the junction", path.display())
+            };
+            assert!(why.contains("may write"), "{why}");
         }
-        let _unmap = Unmap(drive.clone());
-        assert_eq!(at(Path::new(&format!("{drive}\\proj"))), Settled::At(place));
+        // The same folder by its own path is refused alike.
+        assert!(matches!(at(&project.join("inner")), Settled::Refused(_)));
     }
 
     #[test]

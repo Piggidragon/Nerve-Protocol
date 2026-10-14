@@ -84,9 +84,11 @@ may talk to it, and only a request that carries the token the node wrote to
 `<state>/run/ctl.token` at its start: the CLI reads it, a `folder` mode command
 cannot, as the state folder is out of its rules. A request without the token
 gets an answer only to `status`, and only `{"running": true}`. The token is as
-safe as the sandbox: a program a command starts outside it over the user's
-session (`systemd-run --user`) is the user's own and reads the token too, which
-only `machine.user` (commands as another account) keeps out. It is the node's
+safe as the sandbox: while the commands run as the node's own user, any other
+program of that user that runs commands on request over a socket (the user's
+systemd session, a tmux or screen server) runs them outside it, and reads the
+token too. Only `machine.user` (commands as another account) keeps that out.
+It is the node's
 only way in besides its center links. The client sends one JSON object per line,
 `{"method", "params", "token"}`, and gets `{"ok": value}` or
 `{"error": "text"}`. A streaming method answers with several `{"item": value}`

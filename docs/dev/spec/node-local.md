@@ -672,17 +672,21 @@ leave out, so such a command, and a process it left behind, are refused for
 every method.
 
 The one answer without the token is `status`: `{"ok": {"running": true}}`,
-nothing of the config. `install`, `update` and `setup` of 0.0.2 ask it that
-way to wait for the node they restarted, and `update` puts the old program
-back if it does not answer `ok`; since this version they send the token.
+nothing of the config. `update` of 0.0.2 asks it that way to wait for the
+node it restarted, and puts the old program back if it does not answer `ok`;
+since this version `install`, `update` and `setup` send the token.
 
-The token holds as far as the sandbox does. A program the command starts
-outside it, over the user's session (`systemd-run --user`, the D-Bus session
-bus), is the user's own process: it reads the token, `node.toml` and the keys
-as the CLI does. Landlock stops a command connecting to those sockets only
-from ABI 9 on, and the node sets no such rule while the keys are in files
-(`exec.rs`). Against a node that runs as the commands' own user, `folder` mode
-is no boundary on such a machine; `machine.user` is.
+The token holds as far as the sandbox does. While the commands run as the
+node's own user, `folder` mode is no boundary against that user's other
+programs: any of them that runs commands for whoever connects to its socket
+runs them outside the sandbox, as the user's own process, which reads the
+token, `node.toml` and the keys as the CLI does. The user's systemd and D-Bus
+session (`systemd-run --user`) is one, a tmux or screen server another
+(`tmux run-shell`, its socket in `/tmp`); there are more. A connect rule
+(`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`, ABI 9) that leaves out only the session
+does not close them, and the node sets none while the keys are in files
+(`exec.rs`). `machine.user` is the boundary: the commands run as another
+account.
 
 A connection the node cannot take (for want of
 descriptors, memory or epoll watches, or for any other reason of that one

@@ -855,10 +855,9 @@ async fn answer(
     peer: nerve_transport::ctl::Peer,
 ) -> nerve_transport::ctl::Reply {
     if !nerve_transport::ctl::token_ok(token, req.token.as_deref()) {
-        // `install`, `update` and `setup` of 0.0.2 ask `status` without a
-        // token to wait for the restarted node, and put the old program back
-        // when it does not answer `ok`. That a node runs tells nothing the
-        // socket does not.
+        // `update` of 0.0.2 asks `status` without a token to wait for the
+        // restarted node, and puts the old program back when it does not
+        // answer `ok`. That a node runs tells nothing the socket does not.
         if req.method == "status" {
             return nerve_transport::ctl::Reply::Ok(json!({"running": true}));
         }
@@ -1485,8 +1484,9 @@ mod tests {
     }
 
     /// What `install`, `update` and `setup` run to wait for the node they
-    /// restarted: with the token, and as 0.0.2 sent it, without. A node that
-    /// does not answer them makes `update` put the old program back.
+    /// restarted: with the token, and as `update` of 0.0.2 sent it, without.
+    /// A node that does not answer them makes `update` put the old program
+    /// back.
     #[tokio::test]
     async fn the_installers_find_the_node_they_restarted() {
         use crate::service::System;

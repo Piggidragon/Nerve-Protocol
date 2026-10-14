@@ -25,14 +25,14 @@ behaves the same except where this page says so.
   socket: the node answers only programs that can read its token in the state
   folder, which `folder` mode keeps from a command, and refuses a command that
   runs without that sandbox while it runs. This holds as far as the sandbox
-  does. When the node runs as the user the commands run as, a command can ask
-  that user's session (`systemd-run --user`, the D-Bus session) to start a
-  program, which runs outside the sandbox and reads the node's files and
-  token as the user does. Landlock keeps a command from connecting to that
-  session only from ABI 9 (Linux 7.1) on, and the node does not set that rule
-  while the keys are in files. To keep commands from the node's files and
-  socket on such a machine, run them as another account: `machine.user`, or
-  [the installed service](service.md).
+  does. While the commands run as the node's own user, `folder` mode is no
+  boundary against that user's other programs. A command can ask any of them
+  that runs commands for whoever connects to its socket to run a program
+  outside the sandbox: the user's systemd and D-Bus session
+  (`systemd-run --user`), a tmux or screen server, and others. Such a program
+  is the user's own process and reads the node's files and token. To keep
+  commands from the node's files and socket, run them as another account:
+  `machine.user`, or [the installed service](service.md).
 - A node that runs as root is refused unless `machine.allow_root` is set
   ([root and administrator](#root-and-administrator)).
 

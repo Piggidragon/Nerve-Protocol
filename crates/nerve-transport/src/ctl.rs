@@ -28,6 +28,18 @@ pub struct CtlRequest {
 /// The longest request line read.
 const LINE_BYTES: usize = 1024 * 1024;
 
+/// How long a connection may wait for its request line. A caller sends it
+/// at once.
+const IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How many connections are served at once; one over it is answered with
+/// [`BUSY`] and closed. With a request per connection and [`IDLE`] this
+/// keeps a process of the node's user, which can connect, from using up
+/// the node's descriptors with idle connections. It can still fill the
+/// places for a while; the CLI is then told the node is busy and writes
+/// nothing, and the way to stop the node anyway is to stop its process.
+pub const MAX_CONNECTIONS: usize = 64;
+
 /// What a handler sends back: one answer, or items of a following call.
 pub enum Reply {
     Ok(Value),
@@ -39,41 +51,65 @@ pub enum Reply {
 /// Error when nothing listens.
 pub const NOT_RUNNING: &str = "not running";
 
+/// Error when a node listens but takes no connection now: its places are
+/// taken, or its queue is full (EAGAIN).
+pub const BUSY: &str = "the node does not take connections now; try again";
+
 /// Serves one connection whose caller is `peer` (what the transport could
-/// tell of it): a request per line, each answered before the next is read.
-/// A line past [`LINE_BYTES`], or more than 64 of them in bytes, ends it.
+/// tell of it): one request, answered, and the connection ends. One that
+/// sends nothing for [`IDLE`] ends unanswered.
 pub async fn serve_stream<S, P, F, Fut>(stream: S, peer: P, handler: Arc<F>) -> std::io::Result<()>
 where
     S: AsyncRead + AsyncWrite,
-    P: Copy,
+    F: Fn(CtlRequest, P) -> Fut,
+    Fut: std::future::Future<Output = Reply>,
+{
+    serve_stream_within(stream, peer, handler, IDLE).await
+}
+
+/// [`serve_stream`], with `idle` as the time the request may take.
+async fn serve_stream_within<S, P, F, Fut>(
+    stream: S,
+    peer: P,
+    handler: Arc<F>,
+    idle: std::time::Duration,
+) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite,
     F: Fn(CtlRequest, P) -> Fut,
     Fut: std::future::Future<Output = Reply>,
 {
     let (r, mut w) = tokio::io::split(stream);
     let mut lines = BufReader::new(r.take(LINE_BYTES as u64 * 64));
-    loop {
-        let mut line = String::new();
-        if lines.read_line(&mut line).await? == 0 {
-            return Ok(());
-        }
-        if line.len() > LINE_BYTES {
-            return Ok(());
-        }
-        let reply = match serde_json::from_str::<CtlRequest>(&line) {
-            Ok(req) => handler(req, peer).await,
-            Err(e) => Reply::Err(format!("bad request: {e}")),
-        };
-        match reply {
-            Reply::Ok(v) => write_line(&mut w, &json!({"ok": v})).await?,
-            Reply::Err(e) => write_line(&mut w, &json!({"error": e})).await?,
-            Reply::Follow(mut rx) => {
-                while let Some(item) = rx.recv().await {
-                    write_line(&mut w, &json!({"item": item})).await?;
-                }
+    // One request per connection: every client sends one, and a connection
+    // that stays for more would be a place held.
+    let mut line = String::new();
+    // No request in time, like none at all, ends the connection.
+    match tokio::time::timeout(idle, lines.read_line(&mut line)).await {
+        Ok(read) => {
+            if read? == 0 {
                 return Ok(());
             }
         }
+        Err(_) => return Ok(()),
     }
+    if line.len() > LINE_BYTES {
+        return Ok(());
+    }
+    let reply = match serde_json::from_str::<CtlRequest>(&line) {
+        Ok(req) => handler(req, peer).await,
+        Err(e) => Reply::Err(format!("bad request: {e}")),
+    };
+    match reply {
+        Reply::Ok(v) => write_line(&mut w, &json!({"ok": v})).await?,
+        Reply::Err(e) => write_line(&mut w, &json!({"error": e})).await?,
+        Reply::Follow(mut rx) => {
+            while let Some(item) = rx.recv().await {
+                write_line(&mut w, &json!({"item": item})).await?;
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn write_line<W: AsyncWrite + Unpin>(w: &mut W, v: &Value) -> std::io::Result<()> {
@@ -90,15 +126,30 @@ pub async fn call_on<S: AsyncRead + AsyncWrite>(
     method: &str,
     params: Value,
 ) -> Result<Value, String> {
+    call_stream(stream, method, params, |e| e.to_string()).await
+}
+
+/// [`call_on`], saying an error after the connect with `io_error`.
+async fn call_stream<S: AsyncRead + AsyncWrite>(
+    stream: S,
+    method: &str,
+    params: Value,
+    io_error: fn(&std::io::Error) -> String,
+) -> Result<Value, String> {
     let (r, mut w) = tokio::io::split(stream);
-    write_line(&mut w, &json!({"method": method, "params": params}))
-        .await
-        .map_err(|e| e.to_string())?;
+    // A node over its places answers BUSY and closes, possibly before the
+    // request is written: read the answer all the same.
+    let sent = write_line(&mut w, &json!({"method": method, "params": params})).await;
     let mut line = String::new();
     BufReader::new(r.take(LINE_BYTES as u64))
         .read_line(&mut line)
         .await
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| io_error(&e))?;
+    if line.is_empty()
+        && let Err(e) = sent
+    {
+        return Err(io_error(&e));
+    }
     answer(&line)
 }
 
@@ -161,7 +212,19 @@ mod unix {
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::net::{UnixListener, UnixStream};
 
-    use super::{CtlRequest, NOT_RUNNING, Peer, Reply, answer, serve_stream, write_line};
+    use super::{
+        BUSY, CtlRequest, IDLE, MAX_CONNECTIONS, NOT_RUNNING, Peer, Reply, answer, call_stream,
+        serve_stream_within, write_line,
+    };
+
+    /// How long [`call`] waits for an answer. The slowest handler, the check
+    /// of a sudo password, ends after 30 s itself. A node that does not
+    /// accept (it is out of descriptors) never answers a call that sits in
+    /// its queue.
+    const ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
+
+    /// Error when [`call`] got no answer in time.
+    pub const NO_ANSWER: &str = "the node did not answer in time; try again";
 
     /// Binds `path` and serves every connection with `handler`. A stale socket
     /// file is replaced; a live one (another node running) is an error.
@@ -191,7 +254,23 @@ mod unix {
         F: Fn(CtlRequest, Peer) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Reply> + Send + 'static,
     {
+        serve_limited(listener, handler, IDLE, MAX_CONNECTIONS).await
+    }
+
+    /// [`serve_on`], with `idle` as the time a connection may wait for its
+    /// request and `max` connections served at once.
+    async fn serve_limited<F, Fut>(
+        listener: UnixListener,
+        handler: F,
+        idle: std::time::Duration,
+        max: usize,
+    ) -> std::io::Result<()>
+    where
+        F: Fn(CtlRequest, Peer) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Reply> + Send + 'static,
+    {
         let handler = Arc::new(handler);
+        let places = Arc::new(tokio::sync::Semaphore::new(max));
         let me = crate::net::euid();
         let mut failing = false;
         loop {
@@ -209,8 +288,19 @@ mod unix {
                 Err(e) => return Err(e),
             };
             failing = false;
+            let Ok(place) = places.clone().try_acquire_owned() else {
+                // Said without waiting: the caller has written its request
+                // and may find the connection reset when it reads.
+                // A fresh connection has room for the line; `writable` only
+                // lets tokio learn that.
+                if stream.writable().await.is_ok() {
+                    let _ = stream.try_write(format!("{}\n", json!({"error": BUSY})).as_bytes());
+                }
+                continue;
+            };
             let handler = handler.clone();
             tokio::spawn(async move {
+                let _place = place;
                 let peer = match stream.peer_cred() {
                     Ok(c) => Peer {
                         uid: c.uid(),
@@ -221,7 +311,7 @@ mod unix {
                 if peer.uid != me && peer.uid != 0 {
                     return;
                 }
-                let _ = serve_stream(stream, peer, handler).await;
+                let _ = serve_stream_within(stream, peer, handler, idle).await;
             });
         }
     }
@@ -262,13 +352,68 @@ mod unix {
         Ok(listener)
     }
 
-    /// One call: sends the request and returns the answer; [`NOT_RUNNING`]
-    /// when nothing listens on `path`.
+    /// The start of the error for a connect that failed for any other reason.
+    pub const CANNOT_CONNECT: &str = "cannot connect to the node's control socket";
+
+    /// What a failed connect means. Only a missing socket (ENOENT) and one
+    /// nobody listens on (ECONNREFUSED) say that no node runs: any other
+    /// error leaves the node that may run unknown, and a caller that took it
+    /// for none would write the change into the file and call it done.
+    fn connect_error(e: &std::io::Error) -> String {
+        match e.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+                NOT_RUNNING.to_string()
+            }
+            std::io::ErrorKind::WouldBlock => BUSY.to_string(),
+            _ => format!("{CANNOT_CONNECT}: {e}"),
+        }
+    }
+
+    /// One call: sends the request and returns the answer.
     pub async fn call(path: &Path, method: &str, params: Value) -> Result<Value, String> {
+        call_within(path, method, params, ANSWER_WAIT).await
+    }
+
+    async fn call_within(
+        path: &Path,
+        method: &str,
+        params: Value,
+        limit: std::time::Duration,
+    ) -> Result<Value, String> {
+        tokio::time::timeout(limit, call_unlimited(path, method, params))
+            .await
+            .unwrap_or_else(|_| Err(NO_ANSWER.to_string()))
+    }
+
+    async fn call_unlimited(path: &Path, method: &str, params: Value) -> Result<Value, String> {
         let stream = UnixStream::connect(path)
             .await
-            .map_err(|_| NOT_RUNNING.to_string())?;
-        super::call_on(stream, method, params).await
+            .map_err(|e| connect_error(&e))?;
+        call_stream(stream, method, params, io_error).await
+    }
+
+    /// What an error after a connect says. A connection the node reset or
+    /// closed on the caller is the node over its places.
+    fn io_error(e: &std::io::Error) -> String {
+        match e.kind() {
+            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe => {
+                BUSY.to_string()
+            }
+            _ => e.to_string(),
+        }
+    }
+
+    /// Whether the outcome of a call says that a node is there: an answer, a
+    /// refusal, a node that takes no connection now or answers too late. Only
+    /// a missing socket or a refused connect says none. A connect that failed
+    /// for any other reason says nothing either way, and comes back as the
+    /// error (a socket path too long, a folder in the way).
+    pub fn node_is_there(outcome: &Result<Value, String>) -> Result<bool, String> {
+        match outcome {
+            Err(e) if e == NOT_RUNNING => Ok(false),
+            Err(e) if e.starts_with(CANNOT_CONNECT) => Err(e.clone()),
+            _ => Ok(true),
+        }
     }
 
     /// A following call: every item goes to `each` until the server closes.
@@ -280,13 +425,11 @@ mod unix {
     ) -> Result<(), String> {
         let stream = UnixStream::connect(path)
             .await
-            .map_err(|_| NOT_RUNNING.to_string())?;
+            .map_err(|e| connect_error(&e))?;
         let (r, mut w) = stream.into_split();
-        write_line(&mut w, &json!({"method": method, "params": params}))
-            .await
-            .map_err(|e| e.to_string())?;
+        let sent = write_line(&mut w, &json!({"method": method, "params": params})).await;
         let mut lines = BufReader::new(r).lines();
-        while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
+        while let Some(line) = lines.next_line().await.map_err(|e| io_error(&e))? {
             let v: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
             if let Some(item) = v.get("item") {
                 each(item.clone());
@@ -295,12 +438,13 @@ mod unix {
                 return Ok(());
             }
         }
-        Ok(())
+        sent.map_err(|e| io_error(&e))
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::sync::mpsc;
 
         #[tokio::test]
@@ -356,6 +500,218 @@ mod unix {
                     .unwrap_err(),
                 NOT_RUNNING
             );
+        }
+
+        /// A listener whose queue is full answers `connect` with EAGAIN: the
+        /// node runs, it only takes no connection now. That is not "not
+        /// running", which sends a caller on to change the file itself.
+        #[tokio::test]
+        async fn a_node_with_a_full_queue_is_not_taken_for_none() {
+            let d = tempfile::tempdir().unwrap();
+            let p = d.path().join("ctl.sock");
+            let listener = bind(&p).await.unwrap();
+            // A backlog of one: a few connections fill it, and nothing
+            // accepts them.
+            {
+                use std::os::unix::io::AsRawFd;
+                // SAFETY: listen on a socket this test owns.
+                assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+            }
+            let mut queued = vec![];
+            loop {
+                match UnixStream::connect(&p).await {
+                    Ok(s) => queued.push(s),
+                    Err(e) => {
+                        assert_eq!(e.kind(), std::io::ErrorKind::WouldBlock, "{e}");
+                        break;
+                    }
+                }
+                assert!(queued.len() < 100, "the queue never filled");
+            }
+            let busy = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                call(&p, "status", json!({})),
+            )
+            .await
+            .expect("an answer in time");
+            assert_eq!(busy, Err(BUSY.to_string()));
+            let followed = follow(&p, "status", json!({}), |_| {}).await;
+            assert_eq!(followed, Err(BUSY.to_string()));
+            // A socket file nobody listens on is no node.
+            drop(listener);
+            drop(queued);
+            // A process forked meanwhile (the descriptor test below forks
+            // this binary) holds a copy of the listener until it execs, so
+            // the socket may take a moment to be gone.
+            let mut gone = call(&p, "status", json!({})).await;
+            for _ in 0..200 {
+                if gone == Err(NOT_RUNNING.to_string()) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                gone = call(&p, "status", json!({})).await;
+            }
+            assert_eq!(gone, Err(NOT_RUNNING.to_string()));
+            // Any other error says what it is.
+            let under_a_file = d.path().join("run/ctl.sock");
+            std::fs::write(d.path().join("run"), b"").unwrap();
+            let e = call(&under_a_file, "status", json!({})).await.unwrap_err();
+            assert!(e.starts_with(CANNOT_CONNECT), "{e}");
+            // Only a connect that failed for another reason is no answer to
+            // whether a node is there.
+            assert_eq!(node_is_there(&Err(e.clone())), Err(e.clone()));
+            assert_eq!(node_is_there(&Err(NOT_RUNNING.into())), Ok(false));
+            assert_eq!(node_is_there(&Err(BUSY.into())), Ok(true));
+            assert_eq!(node_is_there(&Err(NO_ANSWER.into())), Ok(true));
+            assert_eq!(node_is_there(&Ok(json!(1))), Ok(true));
+            assert_ne!(e, NOT_RUNNING);
+        }
+
+        /// A call that sits in the queue of a node that never accepts ends
+        /// with its own error, and a connection that sends nothing is closed
+        /// by the node.
+        #[tokio::test]
+        async fn waits_for_an_answer_and_for_a_request_end() {
+            let d = tempfile::tempdir().unwrap();
+            let p = d.path().join("ctl.sock");
+            let silent = bind(&p).await.unwrap();
+            // Bounded here, so that a call without its limit fails this test
+            // and does not hang it.
+            let r = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                call_within(
+                    &p,
+                    "status",
+                    json!({}),
+                    std::time::Duration::from_millis(200),
+                ),
+            )
+            .await
+            .expect("call_within ends by itself");
+            assert_eq!(r, Err(NO_ANSWER.to_string()));
+            drop(silent);
+
+            let p = d.path().join("idle.sock");
+            let listener = bind(&p).await.unwrap();
+            tokio::spawn(serve_limited(
+                listener,
+                |_, _| async { Reply::Ok(json!("up")) },
+                std::time::Duration::from_millis(200),
+                MAX_CONNECTIONS,
+            ));
+            let mut idle = UnixStream::connect(&p).await.unwrap();
+            let mut byte = [0u8; 1];
+            let eof = tokio::time::timeout(std::time::Duration::from_secs(5), idle.read(&mut byte))
+                .await
+                .expect("the node closes a connection that sends nothing");
+            assert_eq!(eof.unwrap(), 0);
+            assert_eq!(call(&p, "status", json!({})).await, Ok(json!("up")));
+        }
+
+        /// A process that can connect holds no more than `max` places, and a
+        /// connection that sends a request every few moments is closed after
+        /// its answer, so it cannot stay and use up the node's descriptors.
+        #[tokio::test]
+        async fn connections_are_bounded_and_serve_one_request() {
+            let d = tempfile::tempdir().unwrap();
+            let p = d.path().join("ctl.sock");
+            let listener = bind(&p).await.unwrap();
+            tokio::spawn(serve_limited(
+                listener,
+                |_, _| async { Reply::Ok(json!("up")) },
+                std::time::Duration::from_secs(30),
+                2,
+            ));
+            // Two places held without a word; a call over them is told the
+            // node is busy, with the request written or not.
+            let held = [
+                UnixStream::connect(&p).await.unwrap(),
+                UnixStream::connect(&p).await.unwrap(),
+            ];
+            // Let the node take both before the third comes.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            for _ in 0..20 {
+                let r = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    call(&p, "status", json!({})),
+                )
+                .await
+                .expect("the node answers a call over its places");
+                assert_eq!(r, Err(BUSY.to_string()));
+            }
+            // A connection that only listens is told the same and closed.
+            let mut told = String::new();
+            let mut over = UnixStream::connect(&p).await.unwrap();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                over.read_to_string(&mut told),
+            )
+            .await
+            .expect("the node closes the connection")
+            .unwrap();
+            assert_eq!(told, format!("{{\"error\":\"{BUSY}\"}}\n"));
+            // A request too big for the socket's buffer fails its write when
+            // the node closes the connection; the answer is read all the
+            // same and the failed write is not what the caller is told.
+            for _ in 0..5 {
+                let r = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    call(&p, "config.write", json!({"config": "x".repeat(4 << 20)})),
+                )
+                .await
+                .expect("the node answers a big call over its places");
+                assert_eq!(r, Err(BUSY.to_string()));
+            }
+            drop(held);
+            // A place is free again once its holder is gone.
+            let mut v = Err(String::new());
+            for _ in 0..100 {
+                v = call(&p, "status", json!({})).await;
+                if v.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert_eq!(v, Ok(json!("up")));
+            // The connection ends with its answer: a second request on it
+            // gets none.
+            let mut s = UnixStream::connect(&p).await.unwrap();
+            s.write_all(b"{\"method\":\"a\"}\n{\"method\":\"b\"}\n")
+                .await
+                .unwrap();
+            let mut got = String::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                s.read_to_string(&mut got),
+            )
+            .await
+            .expect("the node closes the connection")
+            .unwrap();
+            assert_eq!(got, "{\"ok\":\"up\"}\n");
+        }
+
+        /// A node that closes a connection on the caller without a word (the
+        /// request unread, so the close is a reset or the write breaks) is a
+        /// node that does not take the call now.
+        #[tokio::test]
+        async fn a_connection_closed_on_the_caller_reads_as_busy() {
+            let d = tempfile::tempdir().unwrap();
+            let p = d.path().join("ctl.sock");
+            let listener = bind(&p).await.unwrap();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    drop(stream);
+                }
+            });
+            for _ in 0..10 {
+                let r = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    call(&p, "config.write", json!({"config": "x".repeat(4 << 20)})),
+                )
+                .await
+                .expect("the call ends");
+                assert_eq!(r, Err(BUSY.to_string()));
+            }
         }
 
         /// Set in the process `serving_outlasts_running_out_of_descriptors`
@@ -482,7 +838,7 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub use unix::{bind, call, follow, serve, serve_on};
+pub use unix::{CANNOT_CONNECT, NO_ANSWER, bind, call, follow, node_is_there, serve, serve_on};
 
 #[cfg(test)]
 mod tests {
@@ -516,17 +872,22 @@ mod tests {
             call_on(client, "nope", json!({})).await.unwrap_err(),
             "unknown method"
         );
-        // A line that is no request is answered, and the connection goes on.
+        // A line that is no request is answered, and the connection ends
+        // with its answer.
         let (mut client, server) = tokio::io::duplex(4096);
-        serve(server);
-        client.write_all(b"{\"params\": 1}\n").await.unwrap();
-        let mut lines = BufReader::new(&mut client);
-        let mut line = String::new();
-        lines.read_line(&mut line).await.unwrap();
+        let task = serve(server);
+        client
+            .write_all(b"{\"params\": 1}\n{\"method\": \"echo\"}\n")
+            .await
+            .unwrap();
+        let mut got = String::new();
+        client.read_to_string(&mut got).await.unwrap();
         assert!(
-            answer(&line).unwrap_err().starts_with("bad request"),
-            "{line}"
+            answer(&got).unwrap_err().starts_with("bad request"),
+            "{got}"
         );
+        assert_eq!(got.lines().count(), 1, "{got}");
+        task.await.unwrap().unwrap();
         // A server that reads the call and closes without a word gives no
         // answer.
         let (client, server) = tokio::io::duplex(4096);
@@ -540,18 +901,33 @@ mod tests {
         );
     }
 
-    /// A line longer than a request may be ends the connection unanswered.
+    /// A line longer than a request may be ends the connection unanswered,
+    /// and so does a connection that sends nothing in time.
     #[tokio::test]
-    async fn an_overlong_line_ends_the_connection() {
+    async fn an_overlong_or_idle_connection_ends_unanswered() {
+        let handler = Arc::new(|_: CtlRequest, _: ()| async { Reply::Ok(json!("taken")) });
         let (client, server) = tokio::io::duplex(64 * 1024);
-        let task = tokio::spawn(serve_stream(
-            server,
-            (),
-            Arc::new(|_: CtlRequest, _: ()| async { Reply::Ok(json!("taken")) }),
-        ));
+        let task = tokio::spawn(serve_stream(server, (), handler.clone()));
         let long = "x".repeat(LINE_BYTES + 1);
         let r = call_on(client, "echo", json!({"pad": long})).await;
         assert_eq!(r.unwrap_err(), "the node closed without answering");
+        task.await.unwrap().unwrap();
+        let (mut client, server) = tokio::io::duplex(4096);
+        let task = tokio::spawn(serve_stream_within(
+            server,
+            (),
+            handler,
+            std::time::Duration::from_millis(100),
+        ));
+        let mut got = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            client.read_to_string(&mut got),
+        )
+        .await
+        .expect("the connection ends")
+        .unwrap();
+        assert_eq!(got, "");
         task.await.unwrap().unwrap();
     }
 }

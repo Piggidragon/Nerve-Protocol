@@ -29,15 +29,26 @@
 //! not. Where they write, though, they can put something in place of a
 //! granted folder inside it, such as a junction to another folder; a grant
 //! goes on there only on a folder of its own ([`Folders::set`]).
+//!
+//! A change of a grant passes down to what is below its folder only as far
+//! as it changes something (`nerve_sandbox::inherit`), and looks for hard
+//! links only there (`held`). The first grant of a large folder still
+//! reaches every file in it, so a change that takes long says how far it is
+//! ([`apply`]).
 
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+#[cfg(any(windows, test))]
+use std::time::{Duration, Instant};
 
 use nerve_policy::config::{Access, NodeConfig};
 use nerve_policy::paths::within;
 use nerve_policy::protected::Platform;
 pub use nerve_sandbox::acl::Found;
+use nerve_sandbox::acl::{Untouched, untouched_by};
+#[cfg(any(windows, test))]
+use nerve_sandbox::inherit::Walked;
 use serde::{Deserialize, Serialize};
 
 use crate::paths::NodePaths;
@@ -55,9 +66,42 @@ pub struct Grant {
     /// volume names no object.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
+    /// A change of the grant on its folder started and may have stopped
+    /// part way (it failed, or the node stopped): what it changed below the
+    /// folder does not show on the folders above it. The next change there
+    /// goes into every folder below ([`sync`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unfinished: bool,
+    /// The flags of each change that may have stopped part way since the
+    /// last one that finished: what it wrote below the folder may give
+    /// those, whatever the folder shows. Empty once a change finished.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub toward: Vec<Access>,
 }
 
 impl Grant {
+    /// Every set of flags the grant may give somewhere below its folder:
+    /// its own, and where a change stopped part way, those it was heading
+    /// for.
+    fn states(&self) -> impl Iterator<Item = Access> + '_ {
+        std::iter::once(self.access).chain(self.toward.iter().copied())
+    }
+
+    /// The grant marked as one whose change may stop part way, heading for
+    /// `to` (`None`: taken off, which gives nothing).
+    fn heading(&self, to: Option<Access>) -> Grant {
+        let mut g = Grant {
+            unfinished: true,
+            ..self.clone()
+        };
+        if let Some(a) = to
+            && !g.toward.contains(&a)
+        {
+            g.toward.push(a);
+        }
+        g
+    }
+
     fn same_place(&self, other: &Grant) -> bool {
         self.container == other.container
             && within(&self.path, &other.path)
@@ -114,6 +158,8 @@ pub fn wanted(cfg: &NodeConfig, paths: &NodePaths, home: &Path, platform: &Platf
                     path,
                     access,
                     id: None,
+                    unfinished: false,
+                    toward: Vec::new(),
                 })
         })
         .collect()
@@ -195,25 +241,55 @@ pub trait Folders {
     /// had, or takes it off (`None`); NotFound when nothing is there. With
     /// `own`, a grant goes on only an object of its own at `path` (not a
     /// link or junction to elsewhere, not a file with other names, and with
-    /// a list that inherits); otherwise it is refused (InvalidInput) and
-    /// nothing changes. The id of the object it changed, when the volume
-    /// names one.
+    /// a list that inherits); otherwise it is refused and nothing changes.
+    /// A refusal, and nothing at `path`, are marked as such
+    /// ([`Untouched`]); every other error may come after a part of the
+    /// change was made. The change passes down to what is below `path`;
+    /// `links` says which files with more than one name it may reach there,
+    /// and one it may not stops it as it gets there (an error; what it
+    /// changed stays). With `whole` it goes into every folder below, also
+    /// where the list of `path` stays as it is ([`Grant::unfinished`]).
+    /// With `expect` (a recorded id), it goes only through that object, and
+    /// is refused before any write where another one is at `path` now. The
+    /// id of the object it changed, when the volume names one.
+    #[allow(clippy::too_many_arguments)]
     fn set(
         &mut self,
         path: &Path,
         container: &str,
         access: Option<Access>,
         own: bool,
+        links: Links,
+        whole: bool,
+        expect: Option<&str>,
     ) -> io::Result<Option<String>>;
     /// The first file below the folder `dir` with more than one name (hard
-    /// links), and how many it has; `None` for a file or when there is none.
-    /// `grants` are the paths of every wanted and recorded grant, for the
-    /// pass for cargo's `target` (`linked_below`); `None` gives no pass.
+    /// links) that a change of `container`'s grant there to `access` would
+    /// reach, and how many names it has; `None` for a file or when there is
+    /// none. A file that passes for cargo's `target` with `grants` (the
+    /// paths of every wanted and recorded grant, `Judge`) is not
+    /// one; `None` gives no pass. `whole` as for [`Folders::set`]. Changes
+    /// nothing.
     fn linked(
         &mut self,
         dir: &Path,
+        container: &str,
+        access: Option<Access>,
+        whole: bool,
         grants: Option<&[PathBuf]>,
     ) -> io::Result<Option<(PathBuf, u64)>>;
+}
+
+/// Which files with more than one name (hard links) a change of a grant
+/// may reach below its folder.
+#[derive(Debug, Clone, Copy)]
+pub enum Links<'a> {
+    /// Any: no command writes at, above or below the folder
+    /// (`written_in`), so none linked a file there.
+    Any,
+    /// Only those that pass for cargo's `target` with these grant paths
+    /// (`Judge`); none without them.
+    Passing(Option<&'a [PathBuf]>),
 }
 
 /// What [`Folders::look`] saw at a path.
@@ -251,26 +327,40 @@ fn write_record(file: &Path, grants: &[Grant]) -> Result<(), String> {
 fn open_to_commands(path: &Path, want: &[Grant], record: &[Grant]) -> bool {
     want.iter()
         .chain(record)
-        .any(|g| g.access.write && within(path, &g.path) && !within(&g.path, path))
+        .any(|g| g.states().any(|a| a.write) && within(path, &g.path) && !within(&g.path, path))
 }
 
 /// Whether commands may write in `path` or below it: a folder a container
-/// may write, by a wanted or a recorded grant, is `path`, holds it, or lies
-/// inside it. A change of its list that Windows passes down then reaches
-/// what commands put there, also through a writable folder below it.
+/// may write, by a wanted or a recorded grant (also by the flags a change
+/// that stopped part way was heading for, [`Grant::states`]), is `path`,
+/// holds it, or lies inside it. A change of its list that Windows passes
+/// down then reaches what commands put there, also through a writable
+/// folder below it.
 fn written_in(path: &Path, want: &[Grant], record: &[Grant]) -> bool {
     want.iter()
         .chain(record)
-        .any(|g| g.access.write && (within(path, &g.path) || within(&g.path, path)))
+        .any(|g| g.states().any(|a| a.write) && (within(path, &g.path) || within(&g.path, path)))
 }
 
-/// Why the list of `path` must not be changed now, if it must not: Windows
-/// passes the change down to everything below `path`, and a file there with
-/// more than one name (a hard link) shares its list with its other names,
-/// which may be in a folder the commands may only write. Commands may have
-/// linked it there, so the change is refused until the link is gone.
-fn held(folders: &mut impl Folders, path: &Path, grants: Option<&[PathBuf]>) -> Option<String> {
-    match folders.linked(path, grants) {
+/// Why the list of `path` must not be changed now for `container` and
+/// `access`, if it must not: the change passes down to what is below
+/// `path`, and a file there with more than one name (a hard link) shares
+/// its list with its other names, which may be in a folder the commands may
+/// only write. Commands may have linked it there, so the change is refused
+/// until the link is gone. Only the files the change reaches count, and
+/// only where `links` asks for it.
+fn held(
+    folders: &mut impl Folders,
+    path: &Path,
+    container: &str,
+    access: Option<Access>,
+    whole: bool,
+    links: Links,
+) -> Option<String> {
+    let Links::Passing(grants) = links else {
+        return None;
+    };
+    match folders.linked(path, container, access, whole, grants) {
         Ok(None) => None,
         Err(e) if e.kind() == io::ErrorKind::NotFound => None,
         Ok(Some((file, names))) => Some(format!(
@@ -301,27 +391,19 @@ fn in_build_folder(rest: &Path) -> bool {
 }
 
 /// The first file below the folder `dir` with more than one name, by
-/// `count`, and how many it has; `None` for a file or when there is none.
-/// Only plain folders are walked into: a link or junction below `dir` is
-/// not followed, and is checked as itself like every other entry that is
-/// not a folder (`count` opens it as itself), so a file that is a reparse
-/// point of another kind is checked too.
+/// `count`, that does not pass ([`Judge`]), and how many names it has;
+/// `None` for a file or when there is none. Only plain folders are walked
+/// into: a link or junction below `dir` is not followed, and is checked as
+/// itself like every other entry that is not a folder (`count` opens it as
+/// itself), so a file that is a reparse point of another kind is checked
+/// too.
 ///
-/// One exception, for what cargo makes: a file below a [`BUILD_FOLDER`] of
-/// `dir` passes when `names` lists all of its names (as many as `count`
-/// gives), every one inside `dir` (compared resolved), below a build folder
-/// of it, and held by exactly the same of `grants` (the paths of every
-/// wanted and recorded grant, of any container) as the walked name. Such a
-/// link gains nothing from the change: every name gets the same rights from
-/// the node's grants. A command may also give a folder it makes an entry of
-/// its own, which the change then passes to a file linked into it; `sync`
-/// gives `grants` only where every container that may write may read too
-/// ([`pass`]), so such an entry opens nothing it could not read already. A
-/// file with a name anywhere else is still found, and so is one whose
-/// names cannot all be listed. Without `grants` (a granted folder is not
-/// where its record says, or one at, above or inside `dir` may be written
-/// but not read, `sync`) nothing passes.
-#[cfg(any(windows, test))]
+/// The fake volume of the tests walks the whole folder so. On Windows the
+/// walk goes only as far as the change reaches
+/// (`nerve_sandbox::appcontainer::reaches`), which skips what the change
+/// leaves as it is, and judges each file with more than one name it reaches
+/// the same way.
+#[cfg(all(test, unix))]
 fn linked_below(
     dir: &Path,
     grants: Option<&[PathBuf]>,
@@ -332,38 +414,7 @@ fn linked_below(
     if !std::fs::metadata(dir)?.is_dir() {
         return Ok(None);
     }
-    // The place the names are compared with; one that cannot be resolved
-    // holds no name, so nothing passes.
-    let real_dir = nerve_policy::paths::resolve(dir).ok();
-    // The grants that hold a place, by their place in `grants`.
-    let held_by = |grants: &[PathBuf], p: &Path| -> Vec<usize> {
-        grants
-            .iter()
-            .enumerate()
-            .filter(|(_, g)| within(p, g))
-            .map(|(i, _)| i)
-            .collect()
-    };
-    let own = |path: &Path, n: u64| -> io::Result<bool> {
-        let (Some(real_dir), Some(grants)) = (&real_dir, grants) else {
-            return Ok(false);
-        };
-        let rest = path.strip_prefix(dir).unwrap_or(path);
-        if !in_build_folder(rest) {
-            return Ok(false);
-        }
-        let depth = real_dir.components().count();
-        let mine = held_by(grants, &real_dir.join(rest));
-        let all = names(path)?;
-        Ok(all.len() as u64 >= n
-            && all.iter().all(|name| {
-                let rest: PathBuf = name.components().skip(depth).collect();
-                within(name, real_dir)
-                    && !within(real_dir, name)
-                    && in_build_folder(&rest)
-                    && held_by(grants, name) == mine
-            }))
-    };
+    let judge = Judge::new(dir, grants);
     let gone = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
     let mut todo = vec![dir.to_path_buf()];
     while let Some(d) = todo.pop() {
@@ -389,31 +440,118 @@ fn linked_below(
                 Err(e) if gone(&e) => continue,
                 Err(e) => return Err(e),
             };
-            if n < 2 {
-                continue;
-            }
-            match own(&path, n) {
-                Ok(true) => {}
-                Ok(false) => return Ok(Some((path, n))),
-                // Gone meanwhile; a listing that fails for a file that is
-                // still there (a path too long for it, say) passes nothing.
-                Err(e)
-                    if gone(&e)
-                        && matches!(std::fs::symlink_metadata(&path), Err(m) if gone(&m)) => {}
-                Err(e) => {
-                    return Err(io::Error::other(format!(
-                        "cannot list the names of {}: {e}",
-                        path.display()
-                    )));
-                }
+            if n >= 2 && !judge.passes(&path, n, names)? {
+                return Ok(Some((path, n)));
             }
         }
     }
     Ok(None)
 }
 
+/// Whether a file below the folder `dir` with more than one name may be
+/// changed all the same. Only one kind does, for what cargo makes: a file
+/// below a [`BUILD_FOLDER`] of `dir` passes when its names are all listed
+/// (as many as it has), every one inside `dir` (compared resolved),
+/// below a build folder of it, and held by exactly the same of `grants`
+/// (the paths of every wanted and recorded grant, of any container) as the
+/// walked name. Such a link gains nothing from the change: every name gets
+/// the same rights from the node's grants. A command may also give a folder
+/// it makes an entry of its own, which the change then passes to a file
+/// linked into it; `sync` gives `grants` only where every container that
+/// may write may read too ([`pass`]), so such an entry opens nothing it
+/// could not read already. A file with a name anywhere else does not pass,
+/// and neither does one whose names cannot all be listed. Without `grants`
+/// (a granted folder is not where its record says, or one at, above or
+/// inside `dir` may be written but not read, `sync`) nothing passes.
+#[cfg(any(windows, test))]
+struct Judge<'a> {
+    dir: &'a Path,
+    /// The place the names are compared with; one that cannot be resolved
+    /// holds no name, so nothing passes.
+    real_dir: Option<PathBuf>,
+    grants: Option<&'a [PathBuf]>,
+}
+
+#[cfg(any(windows, test))]
+impl<'a> Judge<'a> {
+    fn new(dir: &'a Path, grants: Option<&'a [PathBuf]>) -> Judge<'a> {
+        Judge {
+            dir,
+            real_dir: nerve_policy::paths::resolve(dir).ok(),
+            grants,
+        }
+    }
+
+    /// Whether the file at `path` (below `dir`) may pass at all, before its
+    /// names are looked at.
+    fn may(&self, path: &Path) -> bool {
+        let rest = path.strip_prefix(self.dir).unwrap_or(path);
+        self.real_dir.is_some() && self.grants.is_some() && in_build_folder(rest)
+    }
+
+    /// Whether the file at `path` (below `dir`), with `n` names, passes:
+    /// `all` are its names. The change, which holds the file open, gives
+    /// them as the file itself has them, not by its path: so where a command
+    /// removed the name the walk found, the names it has left count.
+    fn holds(&self, path: &Path, n: u64, all: &[PathBuf]) -> bool {
+        let (Some(real_dir), Some(grants)) = (&self.real_dir, self.grants) else {
+            return false;
+        };
+        if !self.may(path) {
+            return false;
+        }
+        // The grants that hold a place, by their place in `grants`.
+        let held_by = |p: &Path| -> Vec<usize> {
+            grants
+                .iter()
+                .enumerate()
+                .filter(|(_, g)| within(p, g))
+                .map(|(i, _)| i)
+                .collect()
+        };
+        let rest = path.strip_prefix(self.dir).unwrap_or(path);
+        let depth = real_dir.components().count();
+        let mine = held_by(&real_dir.join(rest));
+        all.len() as u64 >= n
+            && all.iter().all(|name| {
+                let rest: PathBuf = name.components().skip(depth).collect();
+                within(name, real_dir)
+                    && !within(real_dir, name)
+                    && in_build_folder(&rest)
+                    && held_by(name) == mine
+            })
+    }
+
+    /// Whether the file at `path`, with `n` names, passes in a walk by path,
+    /// its names listed by `names`. A file gone meanwhile passes, as such a
+    /// walk no longer reaches it; one whose names cannot be listed while it
+    /// is there (a path too long for it, say) is an error.
+    #[cfg(all(test, unix))]
+    fn passes(
+        &self,
+        path: &Path,
+        n: u64,
+        names: &dyn Fn(&Path) -> io::Result<Vec<PathBuf>>,
+    ) -> io::Result<bool> {
+        let gone = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
+        if !self.may(path) {
+            return Ok(false);
+        }
+        match names(path) {
+            Ok(all) => Ok(self.holds(path, n, &all)),
+            Err(e) if gone(&e) && matches!(std::fs::symlink_metadata(path), Err(m) if gone(&m)) => {
+                Ok(true)
+            }
+            Err(e) => Err(io::Error::other(format!(
+                "cannot list the names of {}: {e}",
+                path.display()
+            ))),
+        }
+    }
+}
+
 /// The grant paths for the pass for cargo's `target` in a walk of `dir`
-/// (`linked_below`): `places`, or none when a wanted or recorded grant of
+/// (`Judge`): `places`, or none when a wanted or recorded grant of
 /// any container at, above or inside `dir` may write but not read. A
 /// command that may make a folder there may give it an entry of its own,
 /// read for its container, say, and a change of `dir` passes that entry to
@@ -426,7 +564,7 @@ fn pass<'a>(
     record: &[Grant],
 ) -> Option<&'a [PathBuf]> {
     let blind = want.iter().chain(record).any(|g| {
-        g.access.write && !g.access.read && (within(dir, &g.path) || within(&g.path, dir))
+        g.states().any(|a| a.write && !a.read) && (within(dir, &g.path) || within(&g.path, dir))
     });
     if blind { None } else { places }
 }
@@ -556,7 +694,7 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
         seen.push((here, found));
     }
     // Where every wanted and recorded grant is, for the hard-link check's
-    // pass for cargo's `target` (`linked_below`). It compares the grants by
+    // pass for cargo's `target` (`Judge`). It compares the grants by
     // their paths, while a grant's entry goes with its folder: so when a
     // granted folder is somewhere else now, or cannot be told, the paths do
     // not show what holds a name, and this sync gives no pass.
@@ -566,9 +704,85 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
     let places: Option<Vec<PathBuf>> =
         settled.then(|| want.iter().chain(&record).map(|g| g.path.clone()).collect());
     let pass_at = |dir: &Path| pass(dir, places.as_deref(), want, &record);
-    let gone = |e: &io::Error| e.kind() == io::ErrorKind::NotFound;
-    let mut kept: Vec<Grant> = Vec::new();
+    // The files with more than one name a change of `dir` may reach.
+    let links_at = |dir: &Path| {
+        if written_in(dir, want, &record) {
+            Links::Passing(pass_at(dir))
+        } else {
+            Links::Any
+        }
+    };
+    // A change that changed nothing at all is marked so (`acl::untouched`):
+    // gone (nothing at its path) or refused before it wrote. An error of
+    // any other origin, whatever its kind, may come after a part of the
+    // change was written.
+    let gone = |e: &io::Error| untouched_by(e) == Some(Untouched::Gone);
+    let refusal = |e: &io::Error| untouched_by(e) == Some(Untouched::Refused);
+    // A place where a change may have stopped part way: what it changed
+    // below the folder does not show on the folders above it, so the next
+    // change there goes into every folder below, also one back to the flags
+    // the folder shows. Only a mark on the object at the place now counts:
+    // that of a folder moved away is about its walk where it is now (whose
+    // take-off goes into every folder anyway), not about one made anew in
+    // its place.
+    let marked_here: Vec<bool> = record
+        .iter()
+        .zip(&seen)
+        .map(|(o, (here, _))| o.unfinished && at_path(o, here))
+        .collect();
+    let unfinished_at = |g: &Grant| {
+        record
+            .iter()
+            .zip(&marked_here)
+            .any(|(o, m)| *m && o.same_place(g))
+    };
+    // Whether the sync changes the folder of a recorded grant: it is taken
+    // off, here or where its folder is now, or replaced. Each such grant is
+    // marked in the record before anything changes, and the mark goes once
+    // the change is done; so a change that stops part way, also by the
+    // node's own end, leaves its mark.
+    let changes =
+        |old: &Grant, (here, found): &(io::Result<Option<Look>>, Option<io::Result<Found>>)| {
+            if at_path(old, here) {
+                !want
+                    .iter()
+                    .any(|w| w.same_place(old) && w.access == old.access)
+                    || !matches!(here, Ok(Some(l)) if l.granted)
+                    || unfinished_at(old)
+            } else {
+                matches!(found, Some(Ok(Found::At(_))))
+            }
+        };
     let mut changed = false;
+    let mut unmarkable = false;
+    if record.iter().zip(&seen).any(|(old, s)| changes(old, s)) {
+        let marked: Vec<Grant> = record
+            .iter()
+            .zip(&seen)
+            .map(|(old, s)| {
+                if changes(old, s) {
+                    let to = want.iter().find(|w| w.same_place(old)).map(|w| w.access);
+                    old.heading(to)
+                } else {
+                    old.clone()
+                }
+            })
+            .collect();
+        if let Err(e) = write_record(file, &marked) {
+            // Only take-offs run then, here and where moved folders are
+            // now: one goes into every folder, and one that stops part way
+            // gives less, never more. Puts and replacements wait for a sync
+            // that can mark them, and a grant one would change is stale
+            // where it may give flags that are not wanted.
+            out.errors.push(e);
+            unmarkable = true;
+        } else {
+            // The record is written again at the end, with the marks of
+            // what was done taken off.
+            changed = true;
+        }
+    }
+    let mut kept: Vec<Grant> = Vec::new();
     // The wanted grants that are on as they should be.
     let mut done = vec![false; want.len()];
     // Recorded grants at their path that a wanted one replaces below.
@@ -581,21 +795,32 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
                 // Another record of the same object holds the place.
                 Some(i) if done[i] => changed = true,
                 Some(i)
-                    if want[i].access == old.access && look.as_ref().is_some_and(|l| l.granted) =>
+                    if want[i].access == old.access
+                        && look.as_ref().is_some_and(|l| l.granted)
+                        && !unfinished_at(old) =>
                 {
                     done[i] = true;
                     let id = old.id.clone().or_else(|| look.and_then(|l| l.id));
                     changed |= id != old.id;
                     kept.push(Grant { id, ..old.clone() });
                 }
+                Some(i) if unmarkable => {
+                    if old.states().any(|a| a != want[i].access) {
+                        out.stale.push(old.clone());
+                    }
+                    kept.push(old.clone());
+                }
                 Some(_) => replaced.push(old.clone()),
                 None => {
                     // Taking it off passes the change down too.
-                    let hold = written_in(&old.path, want, &record)
-                        .then(|| held(folders, &old.path, pass_at(&old.path)))
-                        .flatten();
+                    let links = links_at(&old.path);
+                    let hold = held(folders, &old.path, &old.container, None, false, links);
+                    let refused = hold.is_some();
                     match hold.map_or_else(
-                        || folders.set(&old.path, &old.container, None, false),
+                        || {
+                            let id = old.id.as_deref();
+                            folders.set(&old.path, &old.container, None, false, links, false, id)
+                        },
                         |why| Err(io::Error::other(why)),
                     ) {
                         Ok(_) => {
@@ -609,7 +834,10 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
                                 old.path.display()
                             ));
                             out.stale.push(old.clone());
-                            kept.push(old.clone());
+                            kept.push(Grant {
+                                unfinished: old.unfinished || !(refused || refusal(&e)),
+                                ..old.clone()
+                            });
                         }
                     }
                 }
@@ -630,13 +858,21 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
                 // still holds what was below it under its old path), or write
                 // where it is now, and taking the grant off passes the change
                 // down.
-                let hold = (old.access.write
+                let links = if old.states().any(|a| a.write)
                     || written_in(&old.path, want, &record)
-                    || written_in(&now, want, &record))
-                .then(|| held(folders, &now, pass_at(&now)))
-                .flatten();
+                    || written_in(&now, want, &record)
+                {
+                    Links::Passing(pass_at(&now))
+                } else {
+                    Links::Any
+                };
+                let hold = held(folders, &now, &old.container, None, false, links);
+                let refused = hold.is_some();
                 match hold.map_or_else(
-                    || folders.set(&now, &old.container, None, false),
+                    || {
+                        let id = old.id.as_deref();
+                        folders.set(&now, &old.container, None, false, links, false, id)
+                    },
                     |why| Err(io::Error::other(why)),
                 ) {
                     Ok(_) => {
@@ -651,7 +887,10 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
                             old.path.display()
                         ));
                         out.stale.push(old.clone());
-                        kept.push(old.clone());
+                        kept.push(Grant {
+                            unfinished: old.unfinished || !(refused || refusal(&e)),
+                            ..old.clone()
+                        });
                     }
                 }
             }
@@ -665,14 +904,21 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
             }
         }
     }
-    // What was on at a place stays on when its replacement fails: stale
-    // when its flags are not the wanted ones.
-    let keep_replaced = |w: &Grant, out: &mut Synced, kept: &mut Vec<Grant>| {
+    // What was on at a place stays on when its replacement fails, and
+    // unfinished where the replacement may have stopped part way (`cut`):
+    // stale when any flags it may give below its folder are not the wanted
+    // ones, also those of an earlier change that stopped there.
+    let keep_replaced = |w: &Grant, out: &mut Synced, kept: &mut Vec<Grant>, cut: bool| {
         for o in replaced.iter().filter(|o| o.same_place(w)) {
-            if o.access != w.access {
+            let o = if cut {
+                o.heading(Some(w.access))
+            } else {
+                o.clone()
+            };
+            if o.states().any(|a| a != w.access) {
                 out.stale.push(o.clone());
             }
-            kept.push(o.clone());
+            kept.push(o);
         }
     };
     let todo: Vec<&Grant> = want
@@ -681,43 +927,80 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
         .filter(|(_, d)| !**d)
         .map(|(w, _)| w)
         .collect();
-    if !todo.is_empty() {
+    if !todo.is_empty() && !unmarkable {
+        // A new grant is recorded with the object at its path, as one that
+        // goes on is: should its change stop part way and the folder be
+        // moved, the next sync finds it where it is now.
+        let ids: Vec<Option<String>> = todo
+            .iter()
+            .map(|w| {
+                if replaced.iter().any(|o| o.same_place(w)) {
+                    return None;
+                }
+                match folders.look(&w.path, &w.container, w.access) {
+                    Ok(Some(l)) => l.id,
+                    _ => None,
+                }
+            })
+            .collect();
+        // Recorded, and marked, before they go on.
         let mut ahead = kept.clone();
-        ahead.extend(replaced.iter().cloned());
+        ahead.extend(replaced.iter().map(|o| {
+            let to = todo.iter().find(|w| w.same_place(o)).map(|w| w.access);
+            o.heading(to)
+        }));
         ahead.extend(
             todo.iter()
-                .filter(|w| !replaced.iter().any(|o| o.same_place(w)))
-                .map(|w| (*w).clone()),
+                .zip(&ids)
+                .filter(|(w, _)| !replaced.iter().any(|o| o.same_place(w)))
+                .map(|(w, id)| Grant {
+                    unfinished: true,
+                    id: id.clone(),
+                    ..(*w).clone()
+                }),
         );
         match write_record(file, &ahead) {
             Err(e) => {
                 // Nothing goes on.
                 out.errors.push(e);
                 for w in &todo {
-                    keep_replaced(w, &mut out, &mut kept);
+                    keep_replaced(w, &mut out, &mut kept, false);
                 }
             }
             Ok(()) => {
                 changed = true;
-                for w in todo {
+                for (w, id) in todo.into_iter().zip(ids) {
                     // Refused before anything changed: what was there stays.
-                    if let Some(why) = written_in(&w.path, want, &record)
-                        .then(|| held(folders, &w.path, pass_at(&w.path)))
-                        .flatten()
-                    {
+                    let links = links_at(&w.path);
+                    let whole = unfinished_at(w);
+                    let access = Some(w.access);
+                    if let Some(why) = held(folders, &w.path, &w.container, access, whole, links) {
                         out.errors.push(why);
-                        keep_replaced(w, &mut out, &mut kept);
+                        keep_replaced(w, &mut out, &mut kept, false);
                         continue;
                     }
                     let own = open_to_commands(&w.path, want, &record);
-                    match folders.set(&w.path, &w.container, Some(w.access), own) {
+                    // Only through the object recorded for the place.
+                    let expect = replaced
+                        .iter()
+                        .find(|o| o.same_place(w))
+                        .map_or(id.clone(), |o| o.id.clone());
+                    match folders.set(
+                        &w.path,
+                        &w.container,
+                        access,
+                        own,
+                        links,
+                        whole,
+                        expect.as_deref(),
+                    ) {
                         Ok(id) => kept.push(Grant { id, ..w.clone() }),
                         Err(e) if gone(&e) => {}
                         // Refused before anything changed: what was there
                         // stays.
-                        Err(e) if e.kind() == io::ErrorKind::InvalidInput => {
+                        Err(e) if refusal(&e) => {
                             out.errors.push(format!("{}: {e}", w.path.display()));
-                            keep_replaced(w, &mut out, &mut kept);
+                            keep_replaced(w, &mut out, &mut kept, false);
                         }
                         Err(e) => {
                             out.errors.push(format!(
@@ -726,9 +1009,13 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
                             ));
                             // It may be on in part, or what was there stays.
                             if !replaced.iter().any(|o| o.same_place(w)) {
-                                kept.push(w.clone());
+                                kept.push(Grant {
+                                    unfinished: true,
+                                    id,
+                                    ..w.clone()
+                                });
                             }
-                            keep_replaced(w, &mut out, &mut kept);
+                            keep_replaced(w, &mut out, &mut kept, true);
                         }
                     }
                 }
@@ -742,7 +1029,10 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
         .collect();
     out.emptied.sort();
     out.emptied.dedup();
-    if changed && let Err(e) = write_record(file, &kept) {
+    if changed
+        && !unmarkable
+        && let Err(e) = write_record(file, &kept)
+    {
         out.errors.push(e);
     }
     out
@@ -751,27 +1041,34 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
 /// Brings the grants on this machine in line with `cfg` ([`wanted`],
 /// [`sync`]), and removes the profile of a container left without grants.
 /// Nothing to do where commands are not confined by grants (Linux).
-pub fn apply(paths: &NodePaths, cfg: &NodeConfig, home: &Path) -> Synced {
+/// `report` is told how far a change is once it takes long (`Pace`): it
+/// passes down to every file and folder below the folder that it changes.
+pub fn apply(
+    paths: &NodePaths,
+    cfg: &NodeConfig,
+    home: &Path,
+    report: &mut dyn FnMut(&str),
+) -> Synced {
     #[cfg(windows)]
     {
         let installed = crate::service::is_service_node(paths);
         let want = wanted_on(installed, cfg, paths, home, &crate::paths::platform());
-        windows_sync(paths, &want)
+        windows_sync(paths, &want, report)
     }
     #[cfg(not(windows))]
     {
-        let _ = (paths, cfg, home);
+        let _ = (paths, cfg, home, report);
         Synced::default()
     }
 }
 
 /// Takes off every grant the node put on, and the profiles of its
 /// containers: those in the record and those of the pairings `node_ids`.
-/// For uninstall.
-pub fn remove_all(paths: &NodePaths, node_ids: &[String]) -> Synced {
+/// For uninstall; `report` as for [`apply`].
+pub fn remove_all(paths: &NodePaths, node_ids: &[String], report: &mut dyn FnMut(&str)) -> Synced {
     #[cfg(windows)]
     {
-        let mut s = windows_sync(paths, &[]);
+        let mut s = windows_sync(paths, &[], report);
         for n in node_ids {
             let name = container(paths, n);
             if !s.emptied.contains(&name)
@@ -784,17 +1081,151 @@ pub fn remove_all(paths: &NodePaths, node_ids: &[String]) -> Synced {
     }
     #[cfg(not(windows))]
     {
-        let _ = (paths, node_ids);
+        let _ = (paths, node_ids, report);
         Synced::default()
     }
 }
 
-/// The folders' access lists on Windows.
+/// What a change of a grant is doing, as its progress names it.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy)]
+enum Doing {
+    /// Looking for hard links it would reach ([`held`]).
+    Check,
+    Put,
+    Remove,
+}
+
+/// When a change that takes long tells how far it is: first after
+/// [`Pace::FIRST`], then every [`Pace::EVERY`].
+#[cfg(any(windows, test))]
+struct Pace {
+    start: Instant,
+    /// When it tells next, from `start`.
+    next: Duration,
+    told: bool,
+}
+
+#[cfg(any(windows, test))]
+impl Pace {
+    const FIRST: Duration = Duration::from_secs(3);
+    const EVERY: Duration = Duration::from_secs(15);
+
+    fn new(start: Instant) -> Pace {
+        Pace {
+            start,
+            next: Pace::FIRST,
+            told: false,
+        }
+    }
+
+    /// Whether to tell at `now`, and if so whether it is the first time.
+    fn due(&mut self, now: Instant) -> Option<bool> {
+        let gone = now.saturating_duration_since(self.start);
+        if gone < self.next {
+            return None;
+        }
+        self.next = gone + Pace::EVERY;
+        let first = !self.told;
+        self.told = true;
+        Some(first)
+    }
+}
+
+/// How far the change of the grant on `path` is.
+#[cfg(any(windows, test))]
+fn progress_text(doing: Doing, path: &Path, w: Walked, first: bool) -> String {
+    let path = path.display();
+    let (what, done) = match doing {
+        Doing::Check => (format!("checking {path} for hard links"), "to change"),
+        Doing::Put => (format!("putting the grant on {path}"), "changed"),
+        Doing::Remove => (format!("taking the grant off {path}"), "changed"),
+    };
+    let so_far = format!(
+        "{} files and folders looked at, {} {done} so far",
+        w.seen, w.changed
+    );
+    match (first, doing) {
+        (true, Doing::Check) => format!(
+            "{what} takes a while: the node looks at each file and folder below it whose permissions the change reaches ({so_far})"
+        ),
+        (true, _) => format!(
+            "{what} takes a while: Windows keeps the permissions of each file and folder, so the node changes each one below it that the change reaches ({so_far})"
+        ),
+        (false, _) => format!("still {what}: {so_far}"),
+    }
+}
+
+/// How the change of the grant on `path` ended after `took`: with `w`, or
+/// with an error (`None`), which the sync gives.
+#[cfg(any(windows, test))]
+fn done_text(doing: Doing, path: &Path, w: Option<Walked>, took: Duration) -> String {
+    let path = path.display();
+    let secs = took.as_secs();
+    let (what, did, changed) = match doing {
+        Doing::Check => (
+            format!("checking {path} for hard links"),
+            format!("checked {path} for hard links"),
+            "to change",
+        ),
+        Doing::Put => (
+            format!("putting the grant on {path}"),
+            format!("put the grant on {path}"),
+            "changed",
+        ),
+        Doing::Remove => (
+            format!("taking the grant off {path}"),
+            format!("took the grant off {path}"),
+            "changed",
+        ),
+    };
+    match w {
+        Some(w) => format!(
+            "{did} in {secs} s: {} files and folders looked at, {} {changed}",
+            w.seen, w.changed
+        ),
+        None => format!("{what} stopped after {secs} s"),
+    }
+}
+
+/// Runs `run` with a progress that tells `report` how far it is once it
+/// takes long ([`Pace`], by the clock `now`), and how it ended.
+#[cfg(any(windows, test))]
+fn paced<T>(
+    report: &mut dyn FnMut(&str),
+    doing: Doing,
+    path: &Path,
+    now: &dyn Fn() -> Instant,
+    run: impl FnOnce(&mut dyn FnMut(Walked)) -> io::Result<(T, Walked)>,
+) -> io::Result<T> {
+    let start = now();
+    let mut pace = Pace::new(start);
+    let r = run(&mut |w| {
+        if let Some(first) = pace.due(now()) {
+            report(&progress_text(doing, path, w, first));
+        }
+    });
+    if pace.told {
+        let w = r.as_ref().ok().map(|(_, w)| *w);
+        report(&done_text(
+            doing,
+            path,
+            w,
+            now().saturating_duration_since(start),
+        ));
+    }
+    r.map(|(t, _)| t)
+}
+
+/// The folders' access lists on Windows; `report` is told how far a change
+/// is once it takes long ([`paced`]).
 #[cfg(windows)]
-struct Acls;
+struct Acls<'a> {
+    report: &'a mut dyn FnMut(&str),
+}
 
 #[cfg(windows)]
-impl Folders for Acls {
+impl Folders for Acls<'_> {
     fn look(&mut self, path: &Path, container: &str, access: Access) -> io::Result<Option<Look>> {
         use nerve_sandbox::{acl, appcontainer};
         let masks = acl::masks(access.read, access.write, access.execute);
@@ -819,32 +1250,68 @@ impl Folders for Acls {
         container: &str,
         access: Option<Access>,
         own: bool,
+        links: Links,
+        whole: bool,
+        expect: Option<&str>,
     ) -> io::Result<Option<String>> {
         use nerve_sandbox::{acl, appcontainer};
         let masks = access.map(|a| acl::masks(a.read, a.write, a.execute));
+        let expect = expect
+            .map(|e| e.parse::<acl::FileId>().map_err(io::Error::other))
+            .transpose()?;
+        let judge = match links {
+            Links::Passing(grants) => Some(Judge::new(path, grants)),
+            Links::Any => None,
+        };
+        // Each file with more than one name is judged again as the change
+        // gets to it, by the names it has then, so a link a command made
+        // after the check stops it.
+        let mut check = judge
+            .as_ref()
+            .map(|j| move |p: &Path, n: u32, all: &[PathBuf]| Ok(j.holds(p, n.into(), all)));
+        let doing = if access.is_some() {
+            Doing::Put
+        } else {
+            Doing::Remove
+        };
         // The object changed, as its handle names it: the path may lead
         // elsewhere by now.
-        let id = appcontainer::set(path, container, masks, own)?;
+        let id = paced(self.report, doing, path, &Instant::now, |progress| {
+            let below = appcontainer::Below {
+                links: check.as_mut().map(|c| c as nerve_sandbox::inherit::Links),
+                progress,
+            };
+            appcontainer::set_below(path, container, masks, own, whole, expect, below)
+        })?;
         Ok(id.map(|i| i.to_string()))
     }
 
     fn linked(
         &mut self,
         dir: &Path,
+        container: &str,
+        access: Option<Access>,
+        whole: bool,
         grants: Option<&[PathBuf]>,
     ) -> io::Result<Option<(PathBuf, u64)>> {
-        linked_below(
-            dir,
-            grants,
-            &|p| nerve_sandbox::appcontainer::names(p).map(u64::from),
-            &|p| nerve_sandbox::appcontainer::all_names(p),
-        )
+        use nerve_sandbox::{acl, appcontainer};
+        let masks = access.map(|a| acl::masks(a.read, a.write, a.execute));
+        let judge = Judge::new(dir, grants);
+        let mut links = |p: &Path, n: u32, all: &[PathBuf]| Ok(judge.holds(p, n.into(), all));
+        let found = paced(self.report, Doing::Check, dir, &Instant::now, |progress| {
+            let below = appcontainer::Below {
+                links: Some(&mut links),
+                progress,
+            };
+            appcontainer::reaches(dir, container, masks, whole, below)
+        })?;
+        Ok(found.map(|(p, n)| (p, n.into())))
     }
 }
 
 #[cfg(windows)]
-fn windows_sync(paths: &NodePaths, want: &[Grant]) -> Synced {
-    let mut s = sync(&record_file(paths), want, &mut Acls);
+fn windows_sync(paths: &NodePaths, want: &[Grant], report: &mut dyn FnMut(&str)) -> Synced {
+    let mut s = sync(&record_file(paths), want, &mut Acls { report });
     for c in &s.emptied {
         if let Err(e) = nerve_sandbox::appcontainer::remove_profile(c) {
             s.errors.push(e.to_string());
@@ -856,6 +1323,7 @@ fn windows_sync(paths: &NodePaths, want: &[Grant]) -> Synced {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use nerve_sandbox::acl::untouched;
 
     fn grant(container: &str, path: &str, access: &str) -> Grant {
         Grant {
@@ -863,13 +1331,18 @@ mod tests {
             path: path.into(),
             access: Access::parse(access).unwrap(),
             id: None,
+            unfinished: false,
+            toward: Vec::new(),
         }
     }
 
-    /// A grant as the record holds it, without the object's id.
+    /// A grant as the record holds it, without the object's id and the
+    /// marks of a change that stopped (tested on their own).
     fn plain(g: &Grant) -> Grant {
         Grant {
             id: None,
+            unfinished: false,
+            toward: Vec::new(),
             ..g.clone()
         }
     }
@@ -907,6 +1380,27 @@ mod tests {
         sets: usize,
         /// The record, when a sync must have written it before a change.
         record: Option<PathBuf>,
+        /// Whether each change must find its place marked unfinished in
+        /// `record` first.
+        marked: bool,
+        /// Paths where a change stops part way: it fails after changing
+        /// what is below the folder, and the folder keeps its list.
+        cut: Vec<PathBuf>,
+        /// Paths where the process ends during a change (a panic, as the
+        /// CLI stopped by Ctrl-C or a node killed): only what the sync
+        /// wrote before stays.
+        die: Vec<PathBuf>,
+        /// Paths whose folder is replaced by a new one right after it is
+        /// looked at (once).
+        replace_after_look: Vec<PathBuf>,
+        /// Paths whose folder is moved to `<path>.old` right after it is
+        /// looked at or found (once), with a new one made in its place
+        /// where the flag says so.
+        move_after_look: Vec<(PathBuf, bool)>,
+        /// Each change made or tried: its path, whether it checks for hard
+        /// links ([`Links::Passing`]), and whether it goes into every
+        /// folder below (`whole`).
+        changes: Vec<(PathBuf, bool, bool)>,
         next: usize,
     }
 
@@ -921,6 +1415,17 @@ mod tests {
             for (p, _) in &mut self.at {
                 if p == Path::new(from) {
                     *p = to.into();
+                }
+            }
+        }
+        /// The move of `move_after_look` at `path`, if one is due.
+        fn move_after(&mut self, path: &Path) {
+            if let Some(i) = self.move_after_look.iter().position(|(m, _)| m == path) {
+                let (_, remake) = self.move_after_look.remove(i);
+                let p = path.display().to_string();
+                self.mv(&p, &format!("{p}.old"));
+                if remake {
+                    self.make(&p);
                 }
             }
         }
@@ -954,6 +1459,8 @@ mod tests {
                     path: self.at.iter().find(|(_, j)| j == i).unwrap().0.clone(),
                     access: *a,
                     id: None,
+                    unfinished: false,
+                    toward: Vec::new(),
                 })
                 .collect();
             all.sort_by(|a, b| a.path.cmp(&b.path));
@@ -971,7 +1478,7 @@ mod tests {
             if self.unseen.iter().any(|m| m == path) {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
-            Ok(self.id(path).map(|id| {
+            let look = self.id(path).map(|id| {
                 let granted = self
                     .on
                     .iter()
@@ -982,7 +1489,15 @@ mod tests {
                     id: Some(id),
                     granted,
                 }
-            }))
+            });
+            self.move_after(path);
+            if let Some(i) = self.replace_after_look.iter().position(|m| m == path) {
+                self.replace_after_look.remove(i);
+                let p = path.display().to_string();
+                self.rm(&p);
+                self.make(&p);
+            }
+            Ok(look)
         }
         fn locate(&mut self, id: &str, _near: &Path) -> io::Result<Found> {
             if self.away {
@@ -991,11 +1506,15 @@ mod tests {
             if self.lost.iter().any(|i| i == id) {
                 return Err(io::ErrorKind::PermissionDenied.into());
             }
-            Ok(self
+            let found = self
                 .at
                 .iter()
                 .find(|(_, i)| i == id)
-                .map_or(Found::Gone, |(p, _)| Found::At(p.clone())))
+                .map_or(Found::Gone, |(p, _)| Found::At(p.clone()));
+            if let Found::At(p) = &found {
+                self.move_after(p);
+            }
+            Ok(found)
         }
         fn set(
             &mut self,
@@ -1003,15 +1522,42 @@ mod tests {
             container: &str,
             access: Option<Access>,
             own: bool,
+            links: Links,
+            whole: bool,
+            expect: Option<&str>,
         ) -> io::Result<Option<String>> {
             self.sets += 1;
+            // As `set_below`: nothing at the path is gone, but where an
+            // object was recorded, it is not there, which is refused; so is
+            // another object.
+            match (expect, self.id(path)) {
+                (None, None) => {
+                    return Err(untouched(Untouched::Gone, io::ErrorKind::NotFound.into()));
+                }
+                (Some(e), now) if now.as_deref() != Some(e) => {
+                    let e = io::Error::new(io::ErrorKind::InvalidInput, "another folder");
+                    return Err(untouched(Untouched::Refused, e));
+                }
+                _ => {}
+            }
+            let checked = matches!(links, Links::Passing(_));
+            self.changes.push((path.into(), checked, whole));
+            if self.marked {
+                let file = self.record.as_ref().expect("a record to look at");
+                assert!(
+                    read_record(file)
+                        .unwrap()
+                        .iter()
+                        .any(|g| g.path == path && g.container == container && g.unfinished),
+                    "{} is changed before it is marked",
+                    path.display()
+                );
+            }
             if access.is_some() {
                 self.asked.push((path.into(), own));
                 if own && self.foreign.iter().any(|m| m == path) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "not an object of its own",
-                    ));
+                    let e = io::Error::new(io::ErrorKind::InvalidInput, "not an object of its own");
+                    return Err(untouched(Untouched::Refused, e));
                 }
             }
             if let (Some(file), Some(_)) = (&self.record, access) {
@@ -1021,9 +1567,22 @@ mod tests {
                     path.display()
                 );
             }
-            let id = self.id(path).ok_or(io::ErrorKind::NotFound)?;
+            let id = self
+                .id(path)
+                .ok_or_else(|| untouched(Untouched::Gone, io::ErrorKind::NotFound.into()))?;
             if self.locked.iter().any(|m| m == path) {
                 return Err(io::ErrorKind::PermissionDenied.into());
+            }
+            // Of a kind a refusal has, as an error from deep in a walk may
+            // be: it says nothing about whether the change was made.
+            if self.die.iter().any(|m| m == path) {
+                panic!("the node stops during the change of {}", path.display());
+            }
+            if self.cut.iter().any(|m| m == path) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "it stopped part way",
+                ));
             }
             self.on.retain(|(i, c, _)| !(*i == id && c == container));
             if let Some(a) = access {
@@ -1034,6 +1593,9 @@ mod tests {
         fn linked(
             &mut self,
             dir: &Path,
+            _: &str,
+            _: Option<Access>,
+            _: bool,
             grants: Option<&[PathBuf]>,
         ) -> io::Result<Option<(PathBuf, u64)>> {
             #[cfg(unix)]
@@ -1773,6 +2335,36 @@ mod tests {
         assert!(r.errors.is_empty() && r.removed == 1, "{r:?}");
     }
 
+    /// A change to `w` without `r` that stopped part way may have given
+    /// that below the folder: until a change there finishes, cargo's links
+    /// get no pass there, also on the change back.
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_change_to_write_only_gives_no_pass() {
+        let p = Project::new();
+        let file = p.root.join("grants.json");
+        let mut f = Fake {
+            walk: Some(p.root.clone()),
+            ..Default::default()
+        };
+        let proj = p.proj.display().to_string();
+        f.make(&proj);
+        let (rw, w) = (grant("lab", &proj, "rw"), grant("lab", &proj, "w"));
+        let r = sync(&file, std::slice::from_ref(&rw), &mut f);
+        assert!(r.errors.is_empty(), "{r:?}");
+        f.cut.push(p.proj.clone());
+        sync(&file, std::slice::from_ref(&w), &mut f);
+        f.cut.clear();
+        p.link("proj/target/debug/demo", "proj/target/debug/deps/demo-0123");
+        let r = sync(&file, std::slice::from_ref(&rw), &mut f);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.contains("permissions of") && e.contains("hard links")),
+            "{r:?}"
+        );
+    }
+
     /// A file whose names cannot all be listed passes nothing: a listing
     /// that fails while the file is there (as for a path too long for it)
     /// stops the walk, and a listing with fewer names than the file has
@@ -1807,6 +2399,34 @@ mod tests {
         assert!(!x.exists() || !p.proj.join("target/a").exists());
     }
 
+    /// A file the change holds open is judged by the names it has, as the
+    /// file gives them: cargo's own pair passes, a file linked in from
+    /// outside does not, and neither does it once a command removed the
+    /// name the walk found, leaving it with its name outside only. A walk by
+    /// path lets that one pass, as it no longer reaches it; the change,
+    /// which holds it open, would.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_file_is_judged_by_the_names_it_has() {
+        let p = Project::new();
+        let grants = [p.proj.clone()];
+        let names = |q: &Path| names_below(&p.root, q);
+        let judge = Judge::new(&p.proj, Some(&grants));
+        let pair = p.link("proj/target/debug/demo", "proj/target/debug/deps/demo-0123");
+        assert!(judge.holds(&pair, 2, &names(&pair).unwrap()));
+        let x = p.link("drop/target/secret", "proj/target/debug/x");
+        let both = names(&x).unwrap();
+        assert_eq!(both.len(), 2);
+        assert!(!judge.holds(&x, 2, &both));
+        std::fs::remove_file(&x).unwrap();
+        let left = names(&p.root.join("drop/target/secret")).unwrap();
+        assert!(!judge.holds(&x, 2, &left));
+        assert!(
+            judge.passes(&x, 2, &names).unwrap(),
+            "a walk by path does not reach it"
+        );
+    }
+
     /// Without a state folder and with nothing wanted, a sync makes neither
     /// the folder nor its lock file: uninstall on a machine where no node
     /// ran leaves nothing behind. Something wanted makes them.
@@ -1819,7 +2439,7 @@ mod tests {
         let s = sync(&file, &[], &mut f);
         assert!(s.errors.is_empty() && s.unknown.is_none(), "{s:?}");
         assert!(!paths.state_dir.exists());
-        let s = remove_all(&paths, &[]);
+        let s = remove_all(&paths, &[], &mut |_| {});
         assert!(s.errors.is_empty() && s.unknown.is_none(), "{s:?}");
         assert!(!paths.state_dir.exists());
         f.make("/w/a");
@@ -1876,6 +2496,528 @@ mod tests {
         rx.recv_timeout(std::time::Duration::from_secs(20)).unwrap();
         assert!(t.join().unwrap().errors.is_empty());
         assert_eq!(recorded(&file), [grant("c1", "/w/a", "r")]);
+    }
+
+    /// A change that stopped part way (it failed after it changed what is
+    /// below the folder, or the node stopped) leaves its grant marked in the
+    /// record, and the next change there goes into every folder below: also
+    /// one back to the flags the folder still shows, where a sync would see
+    /// nothing to do. Each change finds its grant marked before it starts,
+    /// and a finished change leaves no mark.
+    #[test]
+    fn a_change_that_stopped_part_way_is_walked_again_whole() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("grants.json");
+        let mut f = Fake {
+            record: Some(file.clone()),
+            marked: true,
+            ..Default::default()
+        };
+        f.make("/w/a");
+        let (r, rw) = (grant("c1", "/w/a", "r"), grant("c1", "/w/a", "rw"));
+        let s = sync(&file, std::slice::from_ref(&r), &mut f);
+        assert!(s.errors.is_empty(), "{s:?}");
+        let marks = || -> Vec<bool> {
+            read_record(&file)
+                .unwrap()
+                .iter()
+                .map(|g| g.unfinished)
+                .collect()
+        };
+        assert_eq!(marks(), [false]);
+
+        // Widened, stopped part way: the folder keeps `r`.
+        f.cut.push("/w/a".into());
+        let s = sync(&file, std::slice::from_ref(&rw), &mut f);
+        assert_eq!(s.errors.len(), 1, "{s:?}");
+        assert_eq!(f.on("/w/a"), [("c1".to_string(), r.access)]);
+        assert!(marks().iter().all(|m| *m), "{:?}", read_record(&file));
+
+        // The record keeps the flags it was heading for.
+        let record = read_record(&file).unwrap();
+        assert_eq!(record[0].toward, [rw.access], "{record:?}");
+
+        // Back to `r`: the folder shows it, and yet the change goes through
+        // every folder below, to take the `rw` the stopped one left there;
+        // and as commands may have written there, it checks for hard links.
+        f.cut.clear();
+        f.changes.clear();
+        let s = sync(&file, std::slice::from_ref(&r), &mut f);
+        assert!(s.errors.is_empty() && s.stale.is_empty(), "{s:?}");
+        assert_eq!(f.changes, [(PathBuf::from("/w/a"), true, true)]);
+        assert!(read_record(&file).unwrap()[0].toward.is_empty());
+        assert_eq!(marks(), [false]);
+        f.changes.clear();
+        sync(&file, std::slice::from_ref(&r), &mut f);
+        assert!(f.changes.is_empty(), "done");
+
+        // The node stopped during a change: the record holds its mark.
+        let mut stopped = read_record(&file).unwrap();
+        stopped[0].unfinished = true;
+        write_record(&file, &stopped).unwrap();
+        let s = sync(&file, std::slice::from_ref(&r), &mut f);
+        assert!(s.errors.is_empty(), "{s:?}");
+        assert_eq!(f.changes, [(PathBuf::from("/w/a"), false, true)]);
+        assert_eq!(marks(), [false]);
+
+        // A take-off that stops part way stays marked too.
+        f.cut.push("/w/a".into());
+        let s = sync(&file, &[], &mut f);
+        assert_eq!(s.stale.len(), 1, "{s:?}");
+        assert_eq!(marks(), [true]);
+    }
+
+    /// After a widening to `w` stopped part way, a change back that a hard
+    /// link below refuses leaves the grant stale, so its commands do not
+    /// run: what the stopped change wrote may give them `w`, which the user
+    /// took away. Once the link is gone, the change goes through.
+    #[test]
+    fn a_refused_change_after_a_stopped_widening_is_stale() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("grants.json");
+        let mut f = Fake::default();
+        f.make("/w/a");
+        let (r, rw) = (grant("c1", "/w/a", "r"), grant("c1", "/w/a", "rw"));
+        sync(&file, std::slice::from_ref(&r), &mut f);
+        f.cut.push("/w/a".into());
+        sync(&file, std::slice::from_ref(&rw), &mut f);
+        f.cut.clear();
+        f.linked.push("/w/a/sub/l".into());
+        let s = sync(&file, std::slice::from_ref(&r), &mut f);
+        assert!(
+            s.errors.len() == 1 && s.errors[0].contains("hard links"),
+            "{s:?}"
+        );
+        assert!(s.refusal("c1").is_some(), "{s:?}");
+        f.linked.clear();
+        let s = sync(&file, std::slice::from_ref(&r), &mut f);
+        assert!(s.errors.is_empty() && s.stale.is_empty(), "{s:?}");
+        assert!(s.refusal("c1").is_none());
+    }
+
+    /// The node ended during a widening (killed, or the CLI stopped): the
+    /// record it wrote before the change holds the mark and the flags the
+    /// change was heading for, so the change back goes into every folder
+    /// and checks for hard links.
+    #[test]
+    fn a_change_the_node_died_in_is_walked_again_whole_and_checked() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("grants.json");
+        let mut f = Fake::default();
+        f.make("/w/a");
+        let (r, rw) = (grant("c1", "/w/a", "r"), grant("c1", "/w/a", "rw"));
+        sync(&file, std::slice::from_ref(&r), &mut f);
+        f.die.push("/w/a".into());
+        let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sync(&file, std::slice::from_ref(&rw), &mut f)
+        }));
+        assert!(died.is_err());
+        let record = read_record(&file).unwrap();
+        assert!(
+            record
+                .iter()
+                .any(|g| g.access == r.access && g.unfinished && g.toward == [rw.access]),
+            "{record:?}"
+        );
+        f.die.clear();
+        f.changes.clear();
+        let s = sync(&file, std::slice::from_ref(&r), &mut f);
+        assert!(s.errors.is_empty(), "{s:?}");
+        assert_eq!(f.changes, [(PathBuf::from("/w/a"), true, true)]);
+    }
+
+    /// Where the record cannot be marked before a change, only take-offs
+    /// run, here and where moved folders are now; puts and replacements
+    /// wait, and a grant one would change is stale where it may give flags
+    /// that are not wanted, as one whose widening stopped and is wanted
+    /// back.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_that_cannot_be_marked_leaves_what_gives_more_stale() {
+        use std::os::unix::fs::PermissionsExt;
+        let read_only = |dir: &Path, on: bool| {
+            let mode = if on { 0o500 } else { 0o700 };
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let (r, rw) = (grant("c1", "/w/a", "r"), grant("c1", "/w/a", "rw"));
+
+        // A widening stopped, then the old flags wanted again.
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("grants.json");
+        let mut f = Fake::default();
+        f.make("/w/a");
+        sync(&file, std::slice::from_ref(&r), &mut f);
+        f.cut.push("/w/a".into());
+        sync(&file, std::slice::from_ref(&rw), &mut f);
+        f.cut.clear();
+        read_only(d.path(), true);
+        let s = sync(&file, std::slice::from_ref(&r), &mut f);
+        read_only(d.path(), false);
+        assert!(!s.errors.is_empty(), "{s:?}");
+        assert!(s.refusal("c1").is_some(), "{s:?}");
+
+        // Moved away, the config unchanged: taken off where it is now, as
+        // a take-off needs no mark; nothing goes on at the old path.
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("grants.json");
+        let mut f = Fake::default();
+        f.make("/w/a");
+        sync(&file, std::slice::from_ref(&rw), &mut f);
+        f.mv("/w/a", "/x/private");
+        f.make("/w/a");
+        read_only(d.path(), true);
+        let s = sync(&file, std::slice::from_ref(&rw), &mut f);
+        read_only(d.path(), false);
+        assert!(!s.errors.is_empty(), "{s:?}");
+        assert_eq!(s.removed, 1, "{s:?}");
+        assert!(f.on("/x/private").is_empty() && f.on("/w/a").is_empty());
+
+        // Taken off the pairing, as by `uninstall`: every grant comes off.
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("grants.json");
+        let mut f = Fake::default();
+        f.make("/w/a");
+        f.make("/w/b");
+        sync(&file, &[rw.clone(), grant("c2", "/w/b", "r")], &mut f);
+        read_only(d.path(), true);
+        let s = sync(&file, &[], &mut f);
+        read_only(d.path(), false);
+        assert!(!s.errors.is_empty(), "{s:?}");
+        assert_eq!(s.removed, 2, "{s:?}");
+        assert!(s.stale.is_empty(), "{s:?}");
+        assert!(f.all().is_empty(), "{:?}", f.all());
+
+        // Moved where it cannot be found, or to a volume that is away, while
+        // another pairing's folder is taken off: lost is stale, away is
+        // named, as without the record's trouble.
+        for away in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            let file = d.path().join("grants.json");
+            let mut f = Fake::default();
+            let id = f.make("/w/a");
+            f.make("/w/b");
+            let b = grant("c2", "/w/b", "r");
+            sync(&file, &[rw.clone(), b], &mut f);
+            f.mv("/w/a", "/x/a");
+            if away {
+                f.away = true;
+            } else {
+                f.lost.push(id);
+            }
+            read_only(d.path(), true);
+            let s = sync(&file, std::slice::from_ref(&rw), &mut f);
+            read_only(d.path(), false);
+            assert!(!s.errors.is_empty(), "{s:?}");
+            if away {
+                assert_eq!(s.away.len(), 1, "{s:?}");
+            } else {
+                assert!(s.refusal("c1").is_some(), "{s:?}");
+            }
+        }
+    }
+
+    /// A change goes only through the object recorded for its place: one
+    /// whose folder was replaced after the sync looked (`rm -rf dist &&
+    /// mkdir dist`) is refused before anything is written, and the next
+    /// sync puts the grant on the new folder.
+    #[test]
+    fn a_change_goes_only_through_the_recorded_object() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("grants.json");
+        let mut f = Fake::default();
+        f.make("/w/a");
+        f.replace_after_look.push("/w/a".into());
+        let a = grant("c1", "/w/a", "rw");
+        let s = sync(&file, std::slice::from_ref(&a), &mut f);
+        assert_eq!(s.errors.len(), 1, "{s:?}");
+        assert!(f.all().is_empty(), "nothing written: {:?}", f.all());
+        assert!(read_record(&file).unwrap().is_empty());
+        let s = sync(&file, std::slice::from_ref(&a), &mut f);
+        assert!(s.errors.is_empty(), "{s:?}");
+        assert_eq!(f.on("/w/a"), [("c1".to_string(), a.access)]);
+    }
+
+    /// A take-off at its path, a take-off where a moved folder is now, and
+    /// a replacement each go only through the recorded object: one whose
+    /// folder is moved away right after the sync found it, with or without
+    /// a new folder in its place, is refused with nothing written and the
+    /// record kept, and the next sync takes the grant off where the folder
+    /// went.
+    #[test]
+    fn take_offs_and_replacements_go_only_through_the_recorded_object() {
+        let (r, rw) = (grant("c1", "/w/a", "r"), grant("c1", "/w/a", "rw"));
+        for remake in [false, true] {
+            for case in ["take-off", "moved take-off", "replacement"] {
+                let d = tempfile::tempdir().unwrap();
+                let file = d.path().join("grants.json");
+                let mut f = Fake::default();
+                f.make("/w/a");
+                let first = if case == "replacement" { &r } else { &rw };
+                sync(&file, std::slice::from_ref(first), &mut f);
+                // Where the change finds the folder: at its path, or where
+                // it was moved before this sync.
+                let at = if case == "moved take-off" {
+                    f.mv("/w/a", "/x/a");
+                    "/x/a"
+                } else {
+                    "/w/a"
+                };
+                f.move_after_look.push((at.into(), remake));
+                let want: &[Grant] = if case == "replacement" {
+                    std::slice::from_ref(&rw)
+                } else {
+                    &[]
+                };
+                let s = sync(&file, want, &mut f);
+                let what = format!("{case}, remade {remake}: {s:?}");
+                assert_eq!(s.errors.len(), 1, "{what}");
+                assert_eq!(s.stale.len(), 1, "{what}");
+                let old = format!("{at}.old");
+                assert_eq!(f.on(&old), [("c1".to_string(), first.access)], "{what}");
+                if remake {
+                    assert!(f.on(at).is_empty(), "nothing written: {what}");
+                }
+                assert_eq!(read_record(&file).unwrap().len(), 1, "{what}");
+                let s = sync(&file, &[], &mut f);
+                assert!(s.errors.is_empty(), "{case}, remade {remake}: {s:?}");
+                assert!(f.all().is_empty(), "{case}, remade {remake}: {:?}", f.all());
+                assert!(read_record(&file).unwrap().is_empty());
+            }
+        }
+    }
+
+    /// A first grant that stopped part way, failing or with the node's end,
+    /// is recorded with its folder's object: moved before the next sync,
+    /// it is found where it is now and taken off there.
+    #[test]
+    fn a_first_grant_that_stopped_is_found_where_its_folder_went() {
+        for die in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            let file = d.path().join("grants.json");
+            let mut f = Fake::default();
+            f.make("/w/a");
+            let a = grant("c1", "/w/a", "rw");
+            if die {
+                f.die.push("/w/a".into());
+                let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    sync(&file, std::slice::from_ref(&a), &mut f)
+                }));
+                assert!(died.is_err());
+            } else {
+                f.cut.push("/w/a".into());
+                sync(&file, std::slice::from_ref(&a), &mut f);
+            }
+            let record = read_record(&file).unwrap();
+            assert!(record[0].id.is_some(), "{die}: {record:?}");
+            f.die.clear();
+            f.cut.clear();
+            f.mv("/w/a", "/x/a");
+            f.changes.clear();
+            let s = sync(&file, &[], &mut f);
+            assert!(s.errors.is_empty(), "{die}: {s:?}");
+            assert_eq!(s.removed, 1, "{die}: {s:?}");
+            assert_eq!(f.changes, [(PathBuf::from("/x/a"), true, false)], "{die}");
+            assert!(read_record(&file).unwrap().is_empty());
+        }
+    }
+
+    /// The mark of a folder moved away whose take-off stopped is about its
+    /// walk where it is now: a folder made anew at its old path gets its
+    /// grant once, and is not walked again at each sync.
+    #[test]
+    fn a_moved_folders_mark_does_not_hold_the_new_one() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("grants.json");
+        let mut f = Fake::default();
+        f.make("/w/a");
+        let rw = grant("c1", "/w/a", "rw");
+        sync(&file, std::slice::from_ref(&rw), &mut f);
+        f.mv("/w/a", "/x/a");
+        f.make("/w/a");
+        f.cut.push("/x/a".into());
+        let s = sync(&file, std::slice::from_ref(&rw), &mut f);
+        assert_eq!(s.stale.len(), 1, "{s:?}");
+        assert_eq!(f.on("/w/a"), [("c1".to_string(), rw.access)]);
+        for _ in 0..2 {
+            f.changes.clear();
+            sync(&file, std::slice::from_ref(&rw), &mut f);
+            assert!(
+                f.changes.iter().all(|(p, _, _)| p == Path::new("/x/a")),
+                "{:?}",
+                f.changes
+            );
+        }
+    }
+
+    /// After a widening of `/w/a` stopped, a grant asked for inside it goes
+    /// on an object of its own only: commands may have written there.
+    #[test]
+    fn a_grant_inside_a_stopped_widening_goes_on_an_object_of_its_own() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("grants.json");
+        let mut f = Fake::default();
+        f.make("/w/a");
+        f.make("/w/a/n");
+        let (r, rw) = (grant("c1", "/w/a", "r"), grant("c1", "/w/a", "rw"));
+        sync(&file, std::slice::from_ref(&r), &mut f);
+        f.cut.push("/w/a".into());
+        sync(&file, std::slice::from_ref(&rw), &mut f);
+        f.cut.clear();
+        f.asked.clear();
+        sync(&file, &[r.clone(), grant("c1", "/w/a/n", "r")], &mut f);
+        assert!(
+            f.asked.contains(&(PathBuf::from("/w/a/n"), true)),
+            "{:?}",
+            f.asked
+        );
+    }
+
+    /// An error of the kind a refusal has, from a change that stopped part
+    /// way, is not taken for one that changed nothing: a first grant stays
+    /// recorded and marked, and comes off when the folder is no longer
+    /// wanted. Only an error marked as a refusal changes nothing
+    /// ([`Untouched`]; `inside_a_writable_folder_a_grant_goes_on_an_object_of_its_own`).
+    #[test]
+    fn a_first_grant_that_stopped_part_way_stays_recorded() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("grants.json");
+        let mut f = Fake::default();
+        f.make("/w/a");
+        f.cut.push("/w/a".into());
+        let a = grant("c1", "/w/a", "rw");
+        let s = sync(&file, std::slice::from_ref(&a), &mut f);
+        assert_eq!(s.errors.len(), 1, "{s:?}");
+        let record = read_record(&file).unwrap();
+        assert_eq!(record.len(), 1, "{record:?}");
+        assert!(record[0].unfinished, "{record:?}");
+        f.cut.clear();
+        f.changes.clear();
+        let s = sync(&file, &[], &mut f);
+        assert!(s.errors.is_empty(), "{s:?}");
+        assert_eq!(s.removed, 1, "{s:?}");
+        assert!(read_record(&file).unwrap().is_empty());
+    }
+
+    /// Each change checks for hard links where commands write at, above or
+    /// below its folder, as it makes it, and only there: putting on, taking
+    /// off, and taking off where a moved folder is now.
+    #[test]
+    fn each_change_checks_for_hard_links_where_commands_write() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("grants.json");
+        let mut f = Fake::default();
+        for p in ["/w", "/w/sub", "/r", "/m"] {
+            f.make(p);
+        }
+        let want = [
+            grant("c1", "/w", "rw"),
+            grant("c1", "/w/sub", "r"),
+            grant("c1", "/r", "r"),
+            grant("c2", "/m", "rw"),
+        ];
+        let s = sync(&file, &want, &mut f);
+        assert!(s.errors.is_empty(), "{s:?}");
+        let checked = |f: &Fake| -> Vec<(String, bool)> {
+            let mut c: Vec<(String, bool)> = f
+                .changes
+                .iter()
+                .map(|(p, c, _)| (p.display().to_string(), *c))
+                .collect();
+            c.sort();
+            c
+        };
+        let expect = |pairs: &[(&str, bool)]| -> Vec<(String, bool)> {
+            pairs.iter().map(|(p, c)| (p.to_string(), *c)).collect()
+        };
+        assert_eq!(
+            checked(&f),
+            expect(&[("/m", true), ("/r", false), ("/w", true), ("/w/sub", true)])
+        );
+
+        // Taken off, and `/m` moved: where it is now, it is checked, as
+        // commands wrote in it.
+        f.changes.clear();
+        f.mv("/m", "/m2");
+        let s = sync(&file, &want[..1], &mut f);
+        assert!(s.errors.is_empty(), "{s:?}");
+        assert_eq!(
+            checked(&f),
+            expect(&[("/m2", true), ("/r", false), ("/w/sub", true)])
+        );
+    }
+
+    /// A change that takes long tells how far it is: first after a few
+    /// seconds, with why it takes long, then now and then, and how it ended.
+    /// A quick one says nothing.
+    #[test]
+    fn a_long_change_tells_how_far_it_is() {
+        let start = Instant::now();
+        let clock = std::cell::Cell::new(start);
+        let now = || clock.get();
+        let path = Path::new("/w/big");
+        // Passes `secs` (from the start), 256 more objects done at each, and
+        // ends as `ok` says.
+        let run = |doing: Doing, secs: &[u64], ok: bool| {
+            clock.set(start);
+            let mut told = Vec::new();
+            let r = paced(
+                &mut |m: &str| told.push(m.to_string()),
+                doing,
+                path,
+                &now,
+                |progress| {
+                    let mut w = Walked::default();
+                    for s in secs {
+                        w.seen += 256;
+                        w.changed += 256;
+                        clock.set(start + Duration::from_secs(*s));
+                        progress(w);
+                    }
+                    if ok {
+                        Ok(((), w))
+                    } else {
+                        Err(io::Error::other("refused"))
+                    }
+                },
+            );
+            assert_eq!(r.is_ok(), ok);
+            told
+        };
+
+        assert!(run(Doing::Put, &[1, 2], true).is_empty());
+
+        let told = run(Doing::Put, &[1, 4, 10, 19, 20, 35], true);
+        assert_eq!(told.len(), 4, "{told:#?}");
+        assert!(
+            told[0].starts_with("putting the grant on /w/big takes a while: Windows keeps")
+                && told[0].ends_with("(512 files and folders looked at, 512 changed so far)"),
+            "{told:#?}"
+        );
+        assert_eq!(
+            told[1],
+            "still putting the grant on /w/big: 1024 files and folders looked at, 1024 changed so far"
+        );
+        assert!(told[2].contains(": 1536 files"), "{told:#?}");
+        assert_eq!(
+            told[3],
+            "put the grant on /w/big in 35 s: 1536 files and folders looked at, 1536 changed"
+        );
+
+        let told = run(Doing::Remove, &[5], false);
+        assert_eq!(told.len(), 2, "{told:#?}");
+        assert!(told[0].starts_with("taking the grant off /w/big takes a while"));
+        assert_eq!(told[1], "taking the grant off /w/big stopped after 5 s");
+
+        let told = run(Doing::Check, &[3], true);
+        assert!(
+            told[0].starts_with("checking /w/big for hard links takes a while")
+                && told[0].contains("256 to change so far"),
+            "{told:#?}"
+        );
+        assert_eq!(
+            told[1],
+            "checked /w/big for hard links in 3 s: 256 files and folders looked at, 256 to change"
+        );
     }
 
     /// A record that cannot be read stops the sync, since the grants in it
@@ -2004,6 +3146,8 @@ mod tests {
                 path: work.join("file.txt"),
                 access: Access::ALL,
                 id: None,
+                unfinished: false,
+                toward: Vec::new(),
             }),
             "{want:?}"
         );
@@ -2020,6 +3164,8 @@ mod tests {
                 path: other.clone(),
                 access: Access::parse("r").unwrap(),
                 id: None,
+                unfinished: false,
+                toward: Vec::new(),
             }]
         );
         // The installed service runs no command in a container, so it
@@ -2093,6 +3239,8 @@ mod tests {
             path: p.into(),
             access: Access::parse(a).unwrap(),
             id: None,
+            unfinished: false,
+            toward: Vec::new(),
         };
         let sorted = |mut v: Vec<Grant>| {
             v.sort_by(|a, b| (&a.container, &a.path).cmp(&(&b.container, &b.path)));
@@ -2161,6 +3309,8 @@ mod tests {
             path: p.into(),
             access: Access::parse(a).unwrap(),
             id: None,
+            unfinished: false,
+            toward: Vec::new(),
         };
         let sorted = |mut v: Vec<Grant>| {
             v.sort_by(|a, b| a.path.cmp(&b.path));
@@ -2209,8 +3359,10 @@ mod tests {
             path: work.clone(),
             access: Access::ALL,
             id: None,
+            unfinished: false,
+            toward: Vec::new(),
         }];
-        let s = windows_sync(&paths, &want);
+        let s = windows_sync(&paths, &want, &mut |_| {});
         assert!(s.errors.is_empty(), "{s:?}");
         // Inherited below the folder too.
         assert!(
@@ -2218,7 +3370,7 @@ mod tests {
             "{}",
             icacls(&work)
         );
-        let s = remove_all(&paths, &[node("lab")]);
+        let s = remove_all(&paths, &[node("lab")], &mut |_| {});
         assert!(s.errors.is_empty(), "{s:?}");
         assert_eq!(s.removed, 1);
         assert!(!icacls(&work).contains("S-1-15-2-"), "{}", icacls(&work));
@@ -2261,11 +3413,12 @@ mod tests {
     /// On Windows: a project whose `target` holds links between names of
     /// its own, as cargo builds them, gets its grant, changes it and loses
     /// it. A link from `target` to a file outside the project (also one
-    /// below a folder named `target` there) still stops a change and a
-    /// take-off, and the outside file's list stays as it was. After a move,
-    /// a sync gives no pass for `target` (it finds a granted folder moved),
-    /// so cargo's own links stop the take-off where the project is now too,
-    /// until `target` is clean of links.
+    /// below a folder named `target` there) stops a change that would reach
+    /// that file, and its list stays as it was; a take-off that leaves the
+    /// file's list as it is goes through. After a move, a sync gives no pass
+    /// for `target` (it finds a granted folder moved), so cargo's own links
+    /// stop the take-off where the project is now too, until `target` is
+    /// clean of links.
     #[cfg(windows)]
     #[test]
     fn a_built_project_keeps_working() {
@@ -2299,18 +3452,27 @@ mod tests {
         let want = |flags: Option<&str>| wanted(&config(flags), &paths, &root, &platform);
 
         // Put on and changed.
-        let s = windows_sync(&paths, &want(Some("rw")));
+        let s = windows_sync(&paths, &want(Some("rw")), &mut |_| {});
         assert!(s.errors.is_empty(), "{s:?}");
         assert!(carries(&proj, &lab, "rw"), "{}", icacls(&proj));
-        let s = windows_sync(&paths, &want(Some("rwx")));
+        let s = windows_sync(&paths, &want(Some("rwx")), &mut |_| {});
         assert!(s.errors.is_empty(), "{s:?}");
         assert!(carries(&proj, &lab, "rwx"), "{}", icacls(&proj));
 
-        // A link from target to a file outside: a change and a take-off
-        // are refused.
+        // A link from target to a file outside: a change that would reach
+        // it is refused.
         let secret = outside.join("target\\secret.txt");
         std::fs::create_dir_all(secret.parent().unwrap()).unwrap();
         std::fs::write(&secret, "secret").unwrap();
+        // Its permissions marked inherited, as Windows keeps them in a
+        // user's folders. A test's temporary folder has them unmarked, and a
+        // file whose unmarked permissions differ from what the folder it is
+        // linked into gives keeps them as its own: the change would not
+        // reach it, and nothing would be refused.
+        let marks = "nerve.test.marks";
+        let m = nerve_sandbox::acl::masks(true, false, false);
+        nerve_sandbox::appcontainer::set(&outside, marks, Some(m), false).unwrap();
+        nerve_sandbox::appcontainer::set(&outside, marks, None, false).unwrap();
         std::fs::hard_link(&secret, proj.join("target\\debug\\s")).unwrap();
         let before = icacls(&secret);
         let refused = |s: &Synced| {
@@ -2318,12 +3480,25 @@ mod tests {
                 && s.errors[0].contains("target\\debug\\s")
                 && s.errors[0].contains("hard links")
         };
-        let s = windows_sync(&paths, &want(Some("rw")));
+        let s = windows_sync(&paths, &want(Some("rw")), &mut |_| {});
         assert!(refused(&s), "{s:?}");
         assert!(s.refusal(&lab).is_some(), "{s:?}");
         assert!(carries(&proj, &lab, "rwx"), "{}", icacls(&proj));
-        let s = windows_sync(&paths, &want(None));
+        // Taken off: the file gets from `target` what it has from the
+        // folder outside, so its list stays, and nothing stops the take-off.
+        let s = windows_sync(&paths, &want(None), &mut |_| {});
+        assert!(s.errors.is_empty() && s.stale.is_empty(), "{s:?}");
+        assert_eq!(s.removed, 1, "{s:?}");
+        assert!(!carries(&proj, &lab, "rwx"), "{}", icacls(&proj));
+        assert_eq!(icacls(&secret), before);
+        // Put on again, it would reach the file: refused.
+        let s = windows_sync(&paths, &want(Some("rwx")), &mut |_| {});
         assert!(refused(&s), "{s:?}");
+        assert!(!carries(&proj, &lab, "rwx"), "{}", icacls(&proj));
+        assert_eq!(icacls(&secret), before);
+        std::fs::remove_file(proj.join("target\\debug\\s")).unwrap();
+        let s = windows_sync(&paths, &want(Some("rwx")), &mut |_| {});
+        assert!(s.errors.is_empty(), "{s:?}");
         assert!(carries(&proj, &lab, "rwx"), "{}", icacls(&proj));
 
         // Moved: no pass, so cargo's own link stops the take-off where the
@@ -2335,41 +3510,35 @@ mod tests {
                 && (s.errors[0].contains("target\\debug\\demo.exe")
                     || s.errors[0].contains("target\\debug\\deps\\demo-0123.exe"))
         };
-        let s = windows_sync(&paths, &want(Some("rwx")));
+        let s = windows_sync(&paths, &want(Some("rwx")), &mut |_| {});
         assert!(cargo_refused(&s), "{s:?}");
         assert!(s.refusal(&lab).is_some(), "{s:?}");
         assert!(carries(&proj2, &lab, "rwx"), "{}", icacls(&proj2));
         assert_eq!(icacls(&secret), before);
 
-        // Cleaned of cargo's links (as `cargo clean` does): the outside
-        // link still stops it.
+        // Cleaned of cargo's links (as `cargo clean` does).
         for f in [
             "target\\debug\\demo.exe",
             "target\\debug\\deps\\demo-0123.exe",
         ] {
             std::fs::remove_file(proj2.join(f)).unwrap();
         }
-        let s = windows_sync(&paths, &want(Some("rwx")));
-        assert!(refused(&s), "{s:?}");
-        assert!(carries(&proj2, &lab, "rwx"), "{}", icacls(&proj2));
-        assert_eq!(icacls(&secret), before);
 
         // Without any link, the moved project loses its grant.
-        std::fs::remove_file(proj2.join("target\\debug\\s")).unwrap();
-        let s = windows_sync(&paths, &want(Some("rwx")));
+        let s = windows_sync(&paths, &want(Some("rwx")), &mut |_| {});
         assert!(s.errors.is_empty() && s.stale.is_empty(), "{s:?}");
         assert_eq!(s.removed, 1, "{s:?}");
         assert!(!carries(&proj2, &lab, "rwx"), "{}", icacls(&proj2));
 
         // Back in place: put on again, then taken off.
         std::fs::rename(&proj2, &proj).unwrap();
-        let s = windows_sync(&paths, &want(Some("rwx")));
+        let s = windows_sync(&paths, &want(Some("rwx")), &mut |_| {});
         assert!(s.errors.is_empty(), "{s:?}");
         assert!(carries(&proj, &lab, "rwx"), "{}", icacls(&proj));
-        let s = windows_sync(&paths, &want(None));
+        let s = windows_sync(&paths, &want(None), &mut |_| {});
         assert!(s.errors.is_empty() && s.stale.is_empty(), "{s:?}");
         assert_eq!(s.removed, 1, "{s:?}");
-        let s = remove_all(&paths, &[node("lab")]);
+        let s = remove_all(&paths, &[node("lab")], &mut |_| {});
         assert!(s.errors.is_empty(), "{s:?}");
         for p in [&proj, &secret] {
             assert!(!icacls(p).contains("S-1-15-2-"), "{}", icacls(p));
@@ -2424,7 +3593,7 @@ mod tests {
         let platform = crate::paths::platform();
         let want = wanted(&cfg, &paths, &root, &platform);
         assert_eq!(want.len(), 3, "{want:?}");
-        let s = windows_sync(&paths, &want);
+        let s = windows_sync(&paths, &want, &mut |_| {});
         assert!(s.errors.is_empty(), "{s:?}");
         std::fs::remove_dir(&bin).unwrap();
         junction(&bin, &outbox);
@@ -2435,21 +3604,21 @@ mod tests {
                 .all(|g| !within(&g.path, &bin) && g.access != Access::ALL),
             "{now:?}"
         );
-        let s = windows_sync(&paths, &now);
+        let s = windows_sync(&paths, &now, &mut |_| {});
         assert!(s.errors.is_empty() && s.stale.is_empty(), "{s:?}");
         assert!(carries(&outbox, &lab, "w"), "{}", icacls(&outbox));
 
-        let s = windows_sync(&paths, &want);
+        let s = windows_sync(&paths, &want, &mut |_| {});
         assert_eq!(s.errors.len(), 1, "{s:?}");
         assert!(s.errors[0].contains("junction"), "{s:?}");
         assert!(carries(&outbox, &lab, "w"), "{}", icacls(&outbox));
 
         std::fs::remove_dir(&bin).unwrap();
         std::fs::create_dir(&bin).unwrap();
-        let s = windows_sync(&paths, &wanted(&cfg, &paths, &root, &platform));
+        let s = windows_sync(&paths, &wanted(&cfg, &paths, &root, &platform), &mut |_| {});
         assert!(s.errors.is_empty(), "{s:?}");
         assert!(carries(&bin, &lab, "rwx"), "{}", icacls(&bin));
-        let s = remove_all(&paths, &[node("lab")]);
+        let s = remove_all(&paths, &[node("lab")], &mut |_| {});
         assert!(s.errors.is_empty(), "{s:?}");
     }
 
@@ -2468,12 +3637,14 @@ mod tests {
             path: work.clone(),
             access: Access::ALL,
             id: None,
+            unfinished: false,
+            toward: Vec::new(),
         }];
-        let s = windows_sync(&paths, &want);
+        let s = windows_sync(&paths, &want, &mut |_| {});
         assert!(s.errors.is_empty(), "{s:?}");
         std::fs::rename(&work, &moved).unwrap();
         assert!(icacls(&moved).contains("S-1-15-2-"), "{}", icacls(&moved));
-        let s = windows_sync(&paths, &[]);
+        let s = windows_sync(&paths, &[], &mut |_| {});
         assert!(s.errors.is_empty() && s.stale.is_empty(), "{s:?}");
         assert_eq!(s.removed, 1);
         assert!(!icacls(&moved).contains("S-1-15-2-"), "{}", icacls(&moved));
@@ -2484,19 +3655,19 @@ mod tests {
         );
 
         std::fs::create_dir_all(&work).unwrap();
-        windows_sync(&paths, &want);
+        windows_sync(&paths, &want, &mut |_| {});
         std::fs::remove_dir_all(&work).unwrap();
         std::fs::create_dir_all(&work).unwrap();
         assert!(!icacls(&work).contains("S-1-15-2-"), "{}", icacls(&work));
-        let s = windows_sync(&paths, &want);
+        let s = windows_sync(&paths, &want, &mut |_| {});
         assert!(s.errors.is_empty() && s.stale.is_empty(), "{s:?}");
         assert!(icacls(&work).contains("S-1-15-2-"), "{}", icacls(&work));
         // The same folder, with its grant taken off by hand: it comes back.
         nerve_sandbox::appcontainer::set(&work, &want[0].container, None, false).unwrap();
         assert!(!icacls(&work).contains("S-1-15-2-"), "{}", icacls(&work));
-        windows_sync(&paths, &want);
+        windows_sync(&paths, &want, &mut |_| {});
         assert!(icacls(&work).contains("S-1-15-2-"), "{}", icacls(&work));
-        let s = remove_all(&paths, &[node("lab")]);
+        let s = remove_all(&paths, &[node("lab")], &mut |_| {});
         assert!(s.errors.is_empty(), "{s:?}");
         assert!(!icacls(&work).contains("S-1-15-2-"), "{}", icacls(&work));
     }

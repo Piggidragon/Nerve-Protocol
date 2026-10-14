@@ -860,7 +860,7 @@ impl WinSystem for WinHost {
         paths: &crate::paths::NodePaths,
         node_ids: &[String],
     ) -> crate::grants::Synced {
-        crate::grants::remove_all(paths, node_ids)
+        crate::grants::remove_all(paths, node_ids, &mut |m| eprintln!("{m}"))
     }
 }
 

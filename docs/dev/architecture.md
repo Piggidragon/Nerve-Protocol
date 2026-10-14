@@ -61,7 +61,7 @@ through its control socket.
 |---|---|
 | Config folder | `node.toml`, signed. `keys/<name>.key`, one Ed25519 key per center, mode 0600 |
 | State folder | `audit.jsonl`, `log.jsonl`, `run/ctl.sock`, `config.key` (the key of the config's MAC), `keys.lock` |
-| System keyring | With `machine.secret_storage = "keyring"`: the center keys and the config's key instead of their files. Always: the proxy's header values |
+| System keyring | With `machine.secret_storage = "keyring"`: the center keys and the config's key instead of their files. The proxy's header values, always (the installed node on Windows takes none, see node-local §2) |
 
 No call of any center reaches these two folders. See
 [settings and config](settings-and-config.md). The center keeps `tls.pem`,

@@ -35,7 +35,9 @@ behaves the same except where this page says so.
   service or the task scheduler, belongs to that program and is not in the job.
 - A Job Object does not limit file access. It is not a sandbox. In `folder`
   mode the command also runs in an AppContainer, which is. See
-  [modes](modes.md#what-a-command-can-reach-in-folder-mode-windows).
+  [modes](modes.md#what-a-command-can-reach-in-folder-mode-windows), and for
+  what the container does not stop,
+  [the list there](modes.md#what-the-appcontainer-does-not-stop).
 - Output that is not UTF-8 is read in the console code page.
 - A [sudo](sudo.md#sudo-on-windows) command runs with the elevated token of
   the account commands run as, which must be an administrator. Every other

@@ -257,6 +257,11 @@ first install:
 .\nerve-node-x86_64-windows.exe --config-dir "C:\ProgramData\Nerve\config" --state-dir "C:\ProgramData\Nerve\state" config set machine.secret_storage file
 ```
 
+The same account problem keeps the proxy's values out of reach: the installed
+node on Windows takes a proxy only if it needs no header and no password.
+`proxy set` with either is refused and changes nothing
+([proxy](proxy.md#on-the-node-installed-as-a-service-on-windows)).
+
 To run the commands as another account, an ordinary one, name it and run
 `install` again; it asks for that account's password:
 

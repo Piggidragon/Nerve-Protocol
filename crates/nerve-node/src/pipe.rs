@@ -189,13 +189,18 @@ mod sys {
     /// Takes connections one after another. The next instance is made
     /// before a connected one is handed on, so the pipe always has one of
     /// the node's and its name cannot pass to another process while the node
-    /// runs.
+    /// runs. As on the socket, at most
+    /// [`nerve_transport::ctl::MAX_CONNECTIONS`] are served at once; one over
+    /// them is told [`nerve_transport::ctl::BUSY`] and closed.
     async fn accept(
         shared: Arc<Shared>,
         name: String,
         sd: Descriptor,
         mut listening: NamedPipeServer,
     ) {
+        let places = Arc::new(tokio::sync::Semaphore::new(
+            nerve_transport::ctl::MAX_CONNECTIONS,
+        ));
         let mut failing = false;
         loop {
             if let Err(e) = listening.connect().await {
@@ -224,9 +229,18 @@ mod sys {
             };
             failing = false;
             let conn = std::mem::replace(&mut listening, next);
+            let Ok(place) = places.clone().try_acquire_owned() else {
+                // Said without waiting; the client reads it as its answer.
+                if conn.writable().await.is_ok() {
+                    let busy = serde_json::json!({"error": nerve_transport::ctl::BUSY});
+                    let _ = conn.try_write(format!("{busy}\n").as_bytes());
+                }
+                continue;
+            };
             let pid = client_pid(&conn);
             let s = shared.clone();
             tokio::spawn(async move {
+                let _place = place;
                 let handler = Arc::new(move |req: nerve_transport::ctl::CtlRequest, pid| {
                     let s = s.clone();
                     async move {

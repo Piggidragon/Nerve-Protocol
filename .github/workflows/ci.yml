@@ -141,6 +141,9 @@ jobs:
       #   hosted runner (the log shows PowerShell cmdlets "not recognized" in
       #   the container). The cause is not known yet. They pass on the Windows
       #   test VM (issue #105).
+      # - a_cancel_ends_a_chain_of_processes_that_hand_over_and_exit is a
+      #   timing flake under load: it waits a fixed 4 seconds for hops to
+      #   start, and it passes when run alone (issue #107).
       # TMP and TEMP point at the runner's temp folder, a long-name path
       # (D:\a\_temp). The default is C:\Users\RUNNER~1\AppData\Local\Temp, and
       # tempfile hands out that 8.3 short form: a test that compares it with the
@@ -160,3 +163,4 @@ jobs:
           --skip powershell_changes_to_whole_paths_in_an_appcontainer
           --skip an_appcontainer_keeps_write_and_execute_apart_from_read
           --skip an_appcontainer_moves_only_what_it_reads_and_writes
+          --skip a_cancel_ends_a_chain_of_processes_that_hand_over_and_exit

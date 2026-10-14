@@ -781,26 +781,36 @@ impl List {
         }
     }
 
-    /// The entry a command line stands for. The allow and deny lists hold
-    /// `exec.run` rules; the sudo list holds the sudo command lines, and takes
-    /// the command with or without the `sudo` in front.
+    /// The entry a command line stands for, for `rule add`: the same as
+    /// [`List::command_rule`], but a line in the pattern form of `config add`
+    /// (`fs.read:~/notes/*`, `fs:~/private/*`) is refused. As a command it
+    /// would become a rule that never matches. A single letter before the `:`
+    /// is a drive (`C:\tools\x.exe`), not a capability.
     fn entry(self, command: &str, wildcard: bool) -> Result<String, String> {
+        if matches!(self, List::Allow | List::Deny)
+            && let Some((scope, _)) = command.trim().split_once(':')
+            && (scope.contains('.') || scope.len() > 1)
+            && rules::valid_scope(scope)
+        {
+            return Err(format!(
+                "`{scope}:` is the pattern form for files and other actions, not a command: add it with `nerve-node config add center.<name>.policy.{}`",
+                self.word()
+            ));
+        }
+        self.command_rule(command, wildcard)
+    }
+
+    /// The rule a command line stands for. The allow and deny lists hold
+    /// `exec.run` rules; the sudo list holds the sudo command lines, and takes
+    /// the command with or without the `sudo` in front. `rule rm` uses it
+    /// as it is, so the rules an older `rule add` made from the pattern form
+    /// can be removed with the arguments that made them.
+    fn command_rule(self, command: &str, wildcard: bool) -> Result<String, String> {
         match self {
             List::Allow if sudo_command(command).is_some() => {
                 Err("a sudo command goes on the sudo list: `nerve-node rule add sudo`".into())
             }
-            List::Allow | List::Deny => {
-                if let Some((scope, _)) = command.trim().split_once(':')
-                    && scope.contains('.')
-                    && rules::valid_scope(scope)
-                {
-                    return Err(format!(
-                        "`{scope}:` is the pattern form for files and other actions, not a command: add it with `nerve-node config add center.<name>.policy.{}`",
-                        self.word()
-                    ));
-                }
-                rules::rule_for("exec", "run", command, wildcard)
-            }
+            List::Allow | List::Deny => rules::rule_for("exec", "run", command, wildcard),
             List::Sudo if sudo_command(command).is_some() => {
                 rules::sudo_rule_for(command, wildcard)
             }
@@ -843,7 +853,7 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
                 let rule = if l.contains(&command) {
                     command.clone()
                 } else {
-                    list.entry(&command, wildcard)?
+                    list.command_rule(&command, wildcard)?
                 };
                 let before = l.len();
                 l.retain(|r| *r != rule);
@@ -3488,6 +3498,11 @@ mod tests {
         }
         let e = run(&paths, &["rule", "add", "allow", "fs.read:~/notes/*"]).unwrap_err();
         assert!(e.contains("policy.allow"), "{e}");
+        // So is the form with a capability alone, which the docs show.
+        for (list, rule) in [("deny", "fs:~/private/*"), ("allow", "exec:git *")] {
+            let e = run(&paths, &["rule", "add", list, rule]).unwrap_err();
+            assert!(e.contains("config add"), "{e}");
+        }
         assert_eq!(
             load(&paths).centers[0].policy.allow,
             ["exec.run:git status"]
@@ -3495,6 +3510,19 @@ mod tests {
         // A colon in a command that is not a scope stays a command.
         run(&paths, &["rule", "add", "allow", "C:\\tools\\x.exe"]).unwrap();
         run(&paths, &["rule", "rm", "allow", "C:\\tools\\x.exe"]).unwrap();
+        // The rule an older `rule add` made of the pattern form goes with the
+        // arguments that made it.
+        let broken = "exec.run:exec.run:echo [*]";
+        run(
+            &paths,
+            &["config", "add", "center.home.policy.allow", broken],
+        )
+        .unwrap();
+        run(&paths, &["rule", "rm", "allow", "exec.run:echo *"]).unwrap();
+        assert_eq!(
+            load(&paths).centers[0].policy.allow,
+            ["exec.run:git status"]
+        );
         // A command with a glob character in it is allowed as itself.
         run(&paths, &["rule", "add", "allow", "rm *"]).unwrap();
         assert!(load(&paths).centers[0].policy.allow[1].contains("[*]"));

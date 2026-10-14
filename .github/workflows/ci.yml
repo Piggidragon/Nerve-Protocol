@@ -18,7 +18,9 @@
 #
 # The cargo cache is saved by the runs on main as well, because a pull request
 # can only read the caches of its own branch and of main: without them every
-# new pull request would start cold.
+# new pull request would start cold. A cache is saved once per key (the
+# toolchain and Cargo.lock) and only by a run whose job passed, so the first
+# green run on main after a lock file change saves it.
 name: CI
 
 on:
@@ -30,10 +32,11 @@ on:
 permissions:
   contents: read
 
-# A new push to a pull request replaces its run that is still going. Runs on
-# main are never cancelled: each commit there gets its result and its cache.
+# A new push to a pull request replaces its run that is still going. A push to
+# main has a group of its own (its commit), so no run on main waits behind
+# another or is replaced by a later one: each commit there gets its result.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.ref }}-${{ github.event_name == 'push' && github.sha || '' }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 defaults:
@@ -93,6 +96,13 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 45
     steps:
+      # The Windows image sets core.autocrlf=true, so a checkout would write CRLF
+      # line endings: include_str! would embed a CRLF page and a test that looks
+      # for "\n" in it would fail. The repository is LF everywhere.
+      - name: Check out with LF line endings
+        run: |
+          git config --global core.autocrlf false
+          git config --global core.eol lf
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -119,8 +129,16 @@ jobs:
       #   Unix paths and fails on Windows (issue #96);
       # - the_daemon_logs_its_links_changes_and_failed_calls never sees the
       #   settings change logged on Windows, a run on a Windows test machine
-      #   fails the same way (no issue yet).
+      #   fails the same way (issue #99).
+      # TMP and TEMP point at the runner's temp folder, a long-name path
+      # (D:\a\_temp). The default is C:\Users\RUNNER~1\AppData\Local\Temp, and
+      # tempfile hands out that 8.3 short form: a test that compares it with the
+      # long form the node walks finds no match, and an AppContainer is denied
+      # the short-name path of the folder it was granted.
       - name: Tests
+        env:
+          TMP: ${{ runner.temp }}
+          TEMP: ${{ runner.temp }}
         run: >-
           cargo test --locked --workspace --no-fail-fast --
           --skip the_keyring_places_are_the_session_bus_and_the_keyring_folder

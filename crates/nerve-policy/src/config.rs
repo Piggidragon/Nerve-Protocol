@@ -169,10 +169,20 @@ pub struct LogSection {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Connection {
-    /// `http://host:port`, never with a user name and password;
-    /// `HTTPS_PROXY`/`NO_PROXY` apply when unset.
+    /// `http://host:port` or `https://host:port` (a relay, protocol §4.8),
+    /// never with a user name and password; `HTTPS_PROXY`/`NO_PROXY` apply
+    /// when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
+    /// The pin of an `https://` proxy's certificate; without it the system's
+    /// roots check it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<String>,
+    /// The user name of an `https://` proxy (a relay: the relay node name).
+    /// Its password, the relay token, is kept with the node's own keys,
+    /// where `machine.secret_storage` says, never in this file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<String>,
     /// The names of the extra header lines for the proxy's `CONNECT`
     /// request. Their values are secrets and live in the system keyring
     /// (`nerve-node proxy set`), never in this file.
@@ -197,6 +207,10 @@ pub struct Relay {
     /// Tunnels at once of one relayed node.
     #[serde(default = "d_relay_links_per_node")]
     pub max_links_per_node: u32,
+    /// The pin of the relay's TLS certificate, whose key is kept with the
+    /// node's own keys; set when `nerve-node relay` makes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<String>,
     /// The nodes that may use the relay, each with the hash of its token.
     #[serde(default, rename = "node", skip_serializing_if = "Vec::is_empty")]
     pub nodes: Vec<RelayNode>,
@@ -213,6 +227,7 @@ impl Default for Relay {
     fn default() -> Relay {
         Relay {
             listen: None,
+            pin: None,
             max_links: d_relay_links(),
             max_links_per_node: d_relay_links_per_node(),
             nodes: Vec::new(),
@@ -230,6 +245,9 @@ impl Relay {
     }
 
     fn validate(&self) -> Result<(), String> {
+        if let Some(p) = &self.pin {
+            nerve_transport::tls::decode_pin(p).map_err(|e| format!("relay.pin: {e}"))?;
+        }
         if let Some(l) = &self.listen {
             l.parse::<std::net::SocketAddr>().map_err(|_| {
                 format!("relay.listen {l:?}: an address and a port, like 0.0.0.0:7490 or [::]:7490")
@@ -259,6 +277,17 @@ impl Relay {
                     n.name
                 ));
             }
+            let mut seen = std::collections::BTreeSet::new();
+            for c in &n.centers {
+                // A center that is no longer paired may stay named: the
+                // node then reaches it no more, and the file still loads.
+                if !valid_center_name(c) {
+                    return Err(format!("relay.node {}: {c:?} is not a center name", n.name));
+                }
+                if !seen.insert(c.as_str()) {
+                    return Err(format!("relay.node {} names the center {c} twice", n.name));
+                }
+            }
         }
         Ok(())
     }
@@ -273,6 +302,17 @@ pub struct RelayNode {
     pub name: String,
     /// The lowercase hex SHA-256 of its token.
     pub token_sha256: String,
+    /// The centers its tunnels may go to, by this node's names for them;
+    /// empty, every center a tunnel may go to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub centers: Vec<String>,
+}
+
+impl RelayNode {
+    /// Whether this node's tunnels may go to `center`.
+    pub fn may_reach(&self, center: &str) -> bool {
+        self.centers.is_empty() || self.centers.iter().any(|c| c == center)
+    }
 }
 
 /// Why a `node.toml` that keeps proxy secrets in the file is refused.
@@ -718,7 +758,35 @@ impl NodeConfig {
                 return Err(PROXY_SECRETS_IN_FILE.into());
             }
             nerve_transport::Proxy::parse(p, Vec::new())
+                .and_then(|p| p.pinned(self.connection.pin.clone()))
                 .map_err(|e| format!("connection.proxy: {e}"))?;
+        }
+        let https = self
+            .connection
+            .proxy
+            .as_deref()
+            .is_some_and(|p| p.to_ascii_lowercase().starts_with("https://"));
+        if !https && (self.connection.pin.is_some() || self.connection.login.is_some()) {
+            return Err("connection.pin and connection.login are for an https:// proxy".into());
+        }
+        if let Some(l) = &self.connection.login {
+            if !valid_login(l) {
+                return Err(
+                    "connection.login: 1 to 64 characters, no `:`, `@`, space or control character"
+                        .into(),
+                );
+            }
+            if self
+                .connection
+                .headers
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case("proxy-authorization"))
+            {
+                return Err(
+                    "connection.login makes the Proxy-Authorization header; connection.headers names it too"
+                        .into(),
+                );
+            }
         }
         let mut seen = std::collections::BTreeSet::new();
         for (i, h) in self.connection.headers.iter().enumerate() {
@@ -785,6 +853,15 @@ fn refuse_proxy_secrets(text: &str) -> Result<(), String> {
 /// Whether a URL carries a user name or password (`http://user:pass@host`).
 fn has_user_info(url: &str) -> bool {
     url.contains('@')
+}
+
+/// Whether `s` can be the user name of a proxy login: what Basic carries
+/// before its `:`.
+pub fn valid_login(s: &str) -> bool {
+    (1..=64).contains(&s.len())
+        && !s
+            .chars()
+            .any(|c| c == ':' || c == '@' || c.is_whitespace() || c.is_control())
 }
 
 /// A center's name as the CLI and the key file name use it.
@@ -951,7 +1028,19 @@ sudo_allow = ["sudo apt update"]
             ("[node]\nnmae = \"x\"\n", "unknown field"),
             ("[node]\nname = \"Bad Name\"\n", "node.name"),
             ("[limits]\nmax_running = 0\n", "max_running"),
-            ("[connection]\nproxy = \"https://p:1\"\n", "proxy"),
+            (
+                "[connection]\nproxy = \"http://p:1\"\npin = \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n",
+                "https",
+            ),
+            ("[connection]\nlogin = \"lab\"\n", "https"),
+            (
+                "[connection]\nproxy = \"https://p:1\"\nlogin = \"a:b\"\n",
+                "connection.login",
+            ),
+            (
+                "[connection]\nproxy = \"https://p:1\"\nlogin = \"lab\"\nheaders = [\"Proxy-Authorization\"]\n",
+                "names it too",
+            ),
             ("[machine]\nsudo = \"doas\"\n", "unknown variant"),
             ("[log]\nlevel = \"loud\"\n", "unknown variant"),
             ("[log]\nlvl = \"info\"\n", "unknown field"),

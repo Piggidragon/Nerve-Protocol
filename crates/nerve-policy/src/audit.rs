@@ -108,6 +108,19 @@ pub fn is_cut_target(target: &str) -> bool {
         && n.parse::<usize>().is_ok_and(|n| n > TARGET_MAX_CHARS)
 }
 
+/// A tunnel of the relay, as [`AuditLog::relay`] writes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayTunnel {
+    pub node: String,
+    pub center: String,
+    pub from: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
+    pub reason: String,
+    pub up: u64,
+    pub down: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct AuditLog {
     path: PathBuf,
@@ -259,6 +272,25 @@ impl AuditLog {
             v["error"] = e.into();
         }
         self.append(&v)
+    }
+
+    /// One tunnel the relay carried (docs/dev/spec/protocol.md §4.8): the
+    /// relayed node, the center, the peer's address, when it opened and
+    /// ended (ms since the epoch), why it ended and the bytes each way. No
+    /// token: the relay holds none in clear.
+    pub fn relay(&self, t: &RelayTunnel) -> std::io::Result<()> {
+        self.append(&json!({
+            "ts": nerve_proto::msg::now_ms(),
+            "kind": "relay",
+            "node": t.node,
+            "center": t.center,
+            "from": t.from,
+            "start": t.start_ms,
+            "end": t.end_ms,
+            "reason": t.reason,
+            "up": t.up,
+            "down": t.down,
+        }))
     }
 
     /// Every line, oldest first, the older file's included; lines that do

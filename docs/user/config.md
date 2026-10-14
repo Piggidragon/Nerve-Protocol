@@ -47,16 +47,18 @@ max_running = 16            # commands at once, over all centers
 output_cap_bytes = 16777216 # for stdout and for stderr each; a result carries 1 MiB at most
 
 [connection]
-proxy = "http://proxy:3128" # set with `nerve-node proxy set`
+proxy = "http://proxy:3128" # set with `nerve-node proxy set`; https://… for a relay
 
 [relay]                     # set with `nerve-node relay`; off without listen
 listen = "0.0.0.0:7490"
+pin = "…"                   # the pin of the relay's certificate, made by `relay set`
 max_links = 16              # tunnels at once, over all relayed nodes
 max_links_per_node = 4
 
 [[relay.node]]              # added by `nerve-node relay add`
 name = "lab-pc"
 token_sha256 = "…"          # the hash of its token; the token is in no file
+centers = ["home"]          # optional: the centers it may reach; every one without it
 
 [log]
 level = "info"              # error | warn | info | debug: how much the node logs

@@ -191,11 +191,25 @@ pub(crate) async fn proxy_for(
     // The keyring may block (the Secret Service asks to unlock), so off the
     // runtime's threads.
     let (paths, names) = (paths.clone(), cfg.connection.headers.clone());
-    let headers =
-        tokio::task::spawn_blocking(move || crate::secrets::proxy_headers(&paths, &names))
-            .await
-            .map_err(|e| format!("the keyring read stopped: {e}"))??;
-    Proxy::parse(p, headers).map(Some)
+    let (login, storage) = (cfg.connection.login.clone(), cfg.machine.secret_storage);
+    let headers = tokio::task::spawn_blocking(move || {
+        let mut headers = crate::secrets::proxy_headers(&paths, &names)?;
+        // The login of an https:// proxy (a relay token) is kept with the
+        // node's own keys, not with the header values.
+        if let Some(user) = login {
+            use base64::Engine;
+            let password = crate::secrets::proxy_login(&paths, storage)?;
+            let basic =
+                base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
+            headers.push(("Proxy-Authorization".into(), format!("Basic {basic}")));
+        }
+        Ok::<_, String>(headers)
+    })
+    .await
+    .map_err(|e| format!("the keyring read stopped: {e}"))??;
+    Proxy::parse(p, headers)?
+        .pinned(cfg.connection.pin.clone())
+        .map(Some)
 }
 
 /// What one read from the link gave.

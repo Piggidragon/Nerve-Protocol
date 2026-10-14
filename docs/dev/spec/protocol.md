@@ -156,27 +156,39 @@ its config, else `HTTPS_PROXY`/`NO_PROXY`). The inner TLS is still pinned. If
 the proxy fails the node does not fall back to a direct connection. The pair
 request (§3.2) to an `https` center goes through the same proxy.
 
+An `http://` proxy takes the `CONNECT` in plain HTTP. An `https://` proxy is
+reached over TLS of its own first, checked against `connection.pin` as a
+center's certificate is against its pin (§2.1), else against the system
+roots; the `CONNECT` and its `Proxy-Authorization` travel inside that TLS,
+and the link's own TLS to the center inside the tunnel.
+
 ### 4.8 Relays
 
 A node in a network that reaches no center MAY reach one through another
 node, its **relay** (a jump node). This is a transport binding below the
 message layer: the relay carries bytes, never messages.
 
-- The relayed node names the relay as its proxy (§4.7) and authenticates with
+- The relayed node names the relay as its `https://` proxy (§4.7) with the
+  pin of the relay's certificate, and authenticates with
   `Proxy-Authorization: Basic base64(<name>:<token>)`, the relay node name and
   token the relay's owner gave it. Everything above the tunnel is the relayed
   node's link as without a relay: TLS to the center with its pin, the
   `Nerve-Node` header and the signed `hello`, end to end.
-- A relay is off unless its owner turns it on. It answers `CONNECT host:port`
-  only:
+- A relay is off unless its owner turns it on. It speaks TLS only, with a
+  certificate of its own (its key kept as the node's other keys are). A
+  connection that does not start with a TLS handshake is answered `400` in
+  plain HTTP and closed; nothing it sent is used. Over TLS it answers
+  `CONNECT host:port` only:
   - `407` with `Proxy-Authenticate: Basic` unless the name and token are
     those of a node it knows. It MUST check this before it looks at the
     target, so a peer without a token learns nothing of its centers;
   - `403` unless `host:port` is the host (without case) and port of an
     `https` center the relay itself is paired with, that has not revoked it
-    and still knows it (no `bye revoked`, no 401). The relay MUST NOT open a
-    tunnel anywhere else: not to an `http` center (it is on the relay's
-    loopback), not to any other port of its machine or network;
+    and still knows it (no `bye revoked`, no 401), and, when the owner gave
+    the node a list of centers, one on that list. A center off the list MUST
+    get the same answer as one the relay does not have. The relay MUST NOT
+    open a tunnel anywhere else: not to an `http` center (it is on the
+    relay's loopback), not to any other port of its machine or network;
   - `503` when it is off, when its node is locked, or when a limit is reached
     (tunnels at once over all nodes, and per node);
   - `502` when it cannot reach the center;
@@ -186,18 +198,19 @@ message layer: the relay carries bytes, never messages.
   it has one (§4.7). A chain of relays follows the same rules at each hop:
   each one tunnels only to centers it is paired with itself.
 - A relay MUST end a tunnel when its owner turns the relay off, takes the
-  node's token away, unpairs the center or locks the node, and when the
-  tunnel carried nothing either way for 90 seconds (a link pings every 20
-  seconds, §4.4).
+  node's token away or the center off the node's list, unpairs the center or
+  locks the node, and when the tunnel carried nothing either way for 90
+  seconds (a link pings every 20 seconds, §4.4).
 - A relay keeps no token in clear at rest. `nerve-node` keeps the SHA-256 of
-  each token in `node.toml`.
+  each token in `node.toml`. The relayed node keeps its token with its own
+  keys.
+- The relay writes one audit entry per tunnel when it ends: the node, the
+  center, the peer's address, start, end, why it ended and the bytes each
+  way; never a token.
 - The relay can cut a relayed node off but cannot read or alter its link:
   an altered byte fails the TLS record, and the link ends before any message
   of it counts. The relayed node's policy is its own; the relay's policy is
   not asked, and no call runs on the relay for a tunnel.
-- The `CONNECT` itself is plain HTTP between the relayed node and the relay,
-  so the token is visible on that network. It opens a way to the relay's
-  centers' node port only, where a node still needs its own pairing.
 
 ## 5. Messages
 

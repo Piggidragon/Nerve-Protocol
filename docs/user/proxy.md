@@ -15,6 +15,22 @@ records. `center add` pairs through the proxy too.
 
 Another node can be the proxy: see [relay](relay.md).
 
+## A proxy over TLS
+
+An `https://` proxy is reached over TLS of its own, and the `CONNECT` and its
+login travel inside it. A relay is one; give the pin of its certificate, as
+`relay add` on the relay shows it:
+
+```sh
+nerve-node proxy set 'https://lab-pc:<token>@relay.example:7490' --pin <pin>
+```
+
+Without `--pin` the proxy's certificate must be one this machine trusts. The
+user name and password of an `https://` proxy are kept with the node's own
+keys, where `machine.secret_storage` says: a file in the config folder by
+default, or the system keyring ([config](config.md)). `proxy ls` shows the
+pin and the user name, never the password.
+
 ## A proxy that wants a login
 
 Put the user name and password in the URL, or send extra header lines on the

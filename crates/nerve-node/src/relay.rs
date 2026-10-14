@@ -7,11 +7,17 @@
 //! link. The relayed node's policy is its own, and this node's policy is not
 //! asked: no call of a center runs here for a tunnel.
 //!
-//! Off unless the owner sets `relay.listen`. A tunnel goes only to a center
+//! Off unless the owner sets `relay.listen`. The relay speaks TLS only, with
+//! a certificate of its own that the relayed node pins (its key is kept with
+//! the node's own keys); a plain HTTP `CONNECT` is answered with a refusal
+//! that says so, and nothing is tunnelled. A tunnel goes only to a center
 //! this node is paired with over https, and not to one that revoked or no
-//! longer knows it: the relay opens no way to anything else on this machine
-//! or its network. A tunnel ends when the owner turns the relay off, takes
-//! the node's token away, unpairs the center, or locks the node (`panic`).
+//! longer knows it, and only to the centers the owner picked for that node
+//! when it has a list: the relay opens no way to anything else on this
+//! machine or its network. A tunnel ends when the owner turns the relay off,
+//! takes the node's token away or the center off its list, unpairs the
+//! center, or locks the node (`panic`). Each tunnel is one entry in the
+//! audit log when it ends.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -25,9 +31,12 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 
 use nerve_policy::NodeConfig;
+use nerve_policy::config::RelayNode;
 use nerve_proto::link::CenterUrl;
+use nerve_transport::BoxIo;
 use nerve_transport::http::{Request, Response, read_request_head};
 use nerve_transport::log::span;
+use nerve_transport::tls::Acceptor;
 
 use crate::daemon::{Shared, lock};
 
@@ -86,7 +95,11 @@ impl Relays {
             "status": lock(&self.status).clone(),
             "max_links": cfg.relay.max_links,
             "max_links_per_node": cfg.relay.max_links_per_node,
-            "nodes": cfg.relay.nodes.iter().map(|n| n.name.clone()).collect::<Vec<_>>(),
+            "pin": cfg.relay.pin,
+            "nodes": cfg.relay.nodes.iter().map(|n| json!({
+                "name": n.name,
+                "centers": n.centers,
+            })).collect::<Vec<_>>(),
             "tunnels": tunnels.iter().map(|t| json!({
                 "node": t.node,
                 "center": t.center,
@@ -136,8 +149,8 @@ pub(crate) async fn run(shared: Arc<Shared>) {
                 shared.relay.set_status("off", None);
                 None
             }
-            Some(at) => match TcpListener::bind(&at).await {
-                Ok(listener) => {
+            Some(at) => match listen(&shared, &cfg, &at).await {
+                Ok((listener, acceptor)) => {
                     failed_on = None;
                     let bound = listener.local_addr().ok();
                     let shown = bound.map_or_else(|| at.clone(), |a| a.to_string());
@@ -145,7 +158,16 @@ pub(crate) async fn run(shared: Arc<Shared>) {
                     shared
                         .relay
                         .set_status(format!("listening on {shown}"), bound);
-                    serve(&shared, listener, &at, &mut changed, &mut stop).await;
+                    let pin = cfg.relay.pin.clone();
+                    serve(
+                        &shared,
+                        listener,
+                        acceptor,
+                        (&at, &pin),
+                        &mut changed,
+                        &mut stop,
+                    )
+                    .await;
                     tracing::info!("relay: stopped listening on {shown}");
                     shared.relay.set_status("off", None);
                     continue;
@@ -182,14 +204,40 @@ pub(crate) async fn run(shared: Arc<Shared>) {
     shared.relay.set_status("off", None);
 }
 
-/// Takes connections on `listener` until the relay's address changes, the
+/// The relay's listener and its TLS: the certificate's key from where the
+/// node keeps its keys. Without one the relay does not listen.
+async fn listen(
+    shared: &Arc<Shared>,
+    cfg: &NodeConfig,
+    at: &str,
+) -> Result<(TcpListener, Acceptor), String> {
+    // The keyring may block (the Secret Service asks to unlock), so off the
+    // runtime's threads.
+    let (paths, storage) = (shared.paths.clone(), cfg.machine.secret_storage);
+    let id = tokio::task::spawn_blocking(move || crate::secrets::relay_tls(&paths, storage))
+        .await
+        .map_err(|e| format!("the key read stopped: {e}"))??
+        .ok_or("the relay has no TLS certificate; `nerve-node relay set <address>` makes one")?;
+    if cfg.relay.pin.as_deref() != Some(id.pin().as_str()) {
+        return Err(
+            "the relay's TLS key is not the one relay.pin names; `nerve-node relay set <address>` makes a new one"
+                .into(),
+        );
+    }
+    let acceptor = Acceptor::new(&id)?;
+    let listener = TcpListener::bind(at).await.map_err(|e| e.to_string())?;
+    Ok((listener, acceptor))
+}
+
+/// Takes connections on `listener` until the relay's address or pin changes, the
 /// node is locked, or the daemon stops. Running tunnels go on: each checks
 /// the config itself. `changed` is the caller's, which saw the config the
 /// listener was made for, so a change made while it bound is not missed.
 async fn serve(
     shared: &Arc<Shared>,
     listener: TcpListener,
-    at: &str,
+    acceptor: Acceptor,
+    (at, pin): (&str, &Option<String>),
     changed: &mut tokio::sync::watch::Receiver<u64>,
     stop: &mut tokio::sync::watch::Receiver<bool>,
 ) {
@@ -203,9 +251,9 @@ async fn serve(
                         continue;
                     };
                     let _ = io.set_nodelay(true);
-                    let shared = shared.clone();
+                    let (shared, acceptor) = (shared.clone(), acceptor.clone());
                     tokio::spawn(async move {
-                        connection(shared, io, peer, permit).await;
+                        connection(shared, acceptor, io, peer, permit).await;
                     });
                 }
                 // One connection the node cannot take does not end the relay.
@@ -219,7 +267,8 @@ async fn serve(
                     return;
                 }
                 let cfg = shared.config();
-                if cfg.locked || cfg.relay.listen.as_deref() != Some(at) {
+                // A new certificate is listened with anew.
+                if cfg.locked || cfg.relay.listen.as_deref() != Some(at) || cfg.relay.pin != *pin {
                     return;
                 }
             }
@@ -255,6 +304,12 @@ const FULL: Refusal = Refusal {
     status: 503,
     why: "the relay carries as many tunnels as it may now",
 };
+/// The answer to a `CONNECT` in plain HTTP, before any TLS: the token came
+/// in the clear, and nothing is tunnelled.
+const PLAIN: Refusal = Refusal {
+    status: 400,
+    why: "the relay speaks TLS only: set it as an https:// proxy with its pin (`nerve-node relay ls` on the relay shows the pin)",
+};
 
 /// A `CONNECT` the relay grants: whose it is and where it goes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -274,20 +329,24 @@ fn decide(cfg: &NodeConfig, req: &Request) -> Result<Grant, Refusal> {
     if !req.method.eq_ignore_ascii_case("CONNECT") {
         return Err(NOT_CONNECT);
     }
-    let (node, token_sha256) = node_of(cfg, req.header("proxy-authorization")).ok_or(NO_TOKEN)?;
+    let node = node_of(cfg, req.header("proxy-authorization")).ok_or(NO_TOKEN)?;
     let (host, port) = authority(&req.path).ok_or(NOT_CONNECT)?;
-    let (center, url) = target(cfg, &host, port).ok_or(NOT_A_CENTER)?;
+    // A center the node may not reach is refused as one that is not there,
+    // so its list does not tell it what else the relay has.
+    let (center, url) = target(cfg, &host, port)
+        .filter(|(name, _)| node.may_reach(name))
+        .ok_or(NOT_A_CENTER)?;
     Ok(Grant {
-        node,
-        token_sha256,
+        node: node.name,
+        token_sha256: node.token_sha256,
         center,
         url,
     })
 }
 
-/// The relay node a `Proxy-Authorization: Basic` names, with the hash of
-/// its token, when the token is that node's.
-fn node_of(cfg: &NodeConfig, header: Option<&str>) -> Option<(String, String)> {
+/// The relay node a `Proxy-Authorization: Basic` names, when the token is
+/// that node's.
+fn node_of(cfg: &NodeConfig, header: Option<&str>) -> Option<RelayNode> {
     use base64::Engine;
     let (scheme, value) = header?.trim().split_once(' ')?;
     if !scheme.eq_ignore_ascii_case("basic") {
@@ -301,7 +360,7 @@ fn node_of(cfg: &NodeConfig, header: Option<&str>) -> Option<(String, String)> {
     let node = cfg.relay.node(name)?;
     // The hashes are of tokens of over 220 random bits: comparing them
     // plainly tells a guesser nothing about a token.
-    (token_hash(token) == node.token_sha256).then(|| (node.name.clone(), node.token_sha256.clone()))
+    (token_hash(token) == node.token_sha256).then(|| node.clone())
 }
 
 /// `host:port` of a `CONNECT`, with `[...]` around an IPv6 address.
@@ -342,7 +401,7 @@ fn still_granted(cfg: &NodeConfig, g: &Grant) -> bool {
         && cfg
             .relay
             .node(&g.node)
-            .is_some_and(|n| n.token_sha256 == g.token_sha256)
+            .is_some_and(|n| n.token_sha256 == g.token_sha256 && n.may_reach(&g.center))
         && target(cfg, &g.url.host, g.url.port).is_some_and(|(name, _)| name == g.center)
 }
 
@@ -385,7 +444,7 @@ fn count<'a>(
     Some(Counted { relays, id })
 }
 
-async fn refuse(io: &mut TcpStream, r: &Refusal) {
+async fn refuse<W: tokio::io::AsyncWrite + Unpin>(io: &mut W, r: &Refusal) {
     let mut resp = Response::text(r.status, r.why);
     if r.status == 407 {
         resp = resp.with_header("Proxy-Authenticate", &format!("Basic realm=\"{REALM}\""));
@@ -393,13 +452,41 @@ async fn refuse(io: &mut TcpStream, r: &Refusal) {
     let _ = resp.write(io).await;
 }
 
-/// One connection to the relay: its `CONNECT`, then the tunnel.
+/// One connection to the relay: TLS, its `CONNECT`, then the tunnel.
 async fn connection(
     shared: Arc<Shared>,
-    mut io: TcpStream,
+    acceptor: Acceptor,
+    mut tcp: TcpStream,
     peer: SocketAddr,
     permit: tokio::sync::OwnedSemaphorePermit,
 ) {
+    // A TLS handshake starts with a handshake record (22). Anything else is
+    // a client that speaks plain HTTP: it is told so, and nothing it sent
+    // is used.
+    let mut first = [0u8; 1];
+    let peeked =
+        tokio::time::timeout(nerve_transport::http::HEAD_TIMEOUT, tcp.peek(&mut first)).await;
+    match peeked {
+        Ok(Ok(1)) if first[0] == 0x16 => {}
+        Ok(Ok(1)) => {
+            tracing::warn!(
+                "relay: refused a plain HTTP connection from {peer}; its token, if it sent one, crossed the network in the clear"
+            );
+            refuse(&mut tcp, &PLAIN).await;
+            return;
+        }
+        _ => return,
+    }
+    let accepted =
+        tokio::time::timeout(nerve_transport::http::HEAD_TIMEOUT, acceptor.accept(tcp)).await;
+    let mut io: BoxIo = match accepted {
+        Ok(Ok(io)) => io,
+        Ok(Err(e)) => {
+            tracing::debug!("relay: TLS with {peer} failed: {e}");
+            return;
+        }
+        Err(_) => return,
+    };
     let req = match read_request_head(&mut io).await {
         Ok(r) => r,
         Err(e) => {
@@ -460,9 +547,8 @@ async fn connection(
             return;
         }
     };
-    let _ = center.set_nodelay(true);
     let ok = b"HTTP/1.1 200 Connection established\r\n\r\n";
-    if io.write_all(ok).await.is_err() {
+    if io.write_all(ok).await.is_err() || io.flush().await.is_err() {
         return;
     }
     drop(permit);
@@ -471,7 +557,7 @@ async fn connection(
         grant.node,
         grant.center
     );
-    let started = std::time::Instant::now();
+    let (started, start_ms) = (std::time::Instant::now(), crate::now_ms());
     let (up, down, why) = pump(&shared, &grant, io, center).await;
     tracing::info!(
         "relay: {} from {peer} to center {}: tunnel closed after {} ({why}; {up} bytes up, {down} down)",
@@ -479,6 +565,19 @@ async fn connection(
         grant.center,
         span(started.elapsed())
     );
+    let entry = nerve_policy::audit::RelayTunnel {
+        node: grant.node.clone(),
+        center: grant.center.clone(),
+        from: peer.to_string(),
+        start_ms,
+        end_ms: crate::now_ms(),
+        reason: why.into(),
+        up,
+        down,
+    };
+    if let Err(e) = lock(&shared.store).audit().relay(&entry) {
+        tracing::warn!("relay: the audit log did not take the tunnel's entry: {e}");
+    }
 }
 
 /// A target as the log shows it: cut, since a peer chooses it.
@@ -496,13 +595,13 @@ fn clip(s: &str) -> String {
 async fn pump(
     shared: &Arc<Shared>,
     g: &Grant,
-    node: TcpStream,
-    center: TcpStream,
+    node: BoxIo,
+    center: BoxIo,
 ) -> (u64, u64, &'static str) {
     let last = AtomicU64::new(crate::now_ms());
     let (up, down) = (AtomicU64::new(0), AtomicU64::new(0));
-    let (nr, nw) = node.into_split();
-    let (cr, cw) = center.into_split();
+    let (nr, nw) = tokio::io::split(node);
+    let (cr, cw) = tokio::io::split(center);
     let both = async { tokio::join!(copy(nr, cw, &up, &last), copy(cr, nw, &down, &last)) };
     let mut changed = shared.changed.subscribe();
     let mut stop = shared.stop.subscribe();
@@ -551,8 +650,8 @@ async fn pump(
 
 /// Copies one way until the reader ends, then ends the writer's side.
 async fn copy(
-    mut from: tokio::net::tcp::OwnedReadHalf,
-    mut to: tokio::net::tcp::OwnedWriteHalf,
+    mut from: tokio::io::ReadHalf<BoxIo>,
+    mut to: tokio::io::WriteHalf<BoxIo>,
     count: &AtomicU64,
     last: &AtomicU64,
 ) {
@@ -562,7 +661,7 @@ async fn copy(
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
-        if to.write_all(&buf[..n]).await.is_err() {
+        if to.write_all(&buf[..n]).await.is_err() || to.flush().await.is_err() {
             break;
         }
         count.fetch_add(n as u64, Ordering::Relaxed);
@@ -619,13 +718,31 @@ mod tests {
         o
     }
 
-    /// A jump node with `centers`, its relay on a free port of loopback and
-    /// one node `lab` that may use it.
+    /// A jump node with `centers`, its relay on a free port of loopback with
+    /// its TLS certificate (pin `pin`), and one node `lab` that may use it.
     struct Jump {
         _dir: tempfile::TempDir,
         daemon: Daemon,
         addr: SocketAddr,
+        pin: String,
         token: String,
+    }
+
+    fn relay_node(name: &str, hash: String, centers: &[&str]) -> RelayNode {
+        RelayNode {
+            name: name.into(),
+            token_sha256: hash,
+            centers: centers.iter().map(|c| c.to_string()).collect(),
+        }
+    }
+
+    /// A relay with its certificate: the key where the node keeps its keys
+    /// (files here), the pin in the config.
+    fn with_certificate(paths: &NodePaths, cfg: &mut NodeConfig) -> String {
+        let id = ServerIdentity::generate(&["127.0.0.1".into()]).unwrap();
+        crate::secrets::store_relay_tls(paths, cfg.machine.secret_storage, &id).unwrap();
+        cfg.relay.pin = Some(id.pin());
+        id.pin()
     }
 
     async fn jump(centers: Vec<CenterEntry>, more: impl FnOnce(&mut NodeConfig)) -> Jump {
@@ -637,11 +754,9 @@ mod tests {
             ..Default::default()
         };
         cfg.relay.listen = Some("127.0.0.1:0".into());
-        cfg.relay.nodes.push(nerve_policy::config::RelayNode {
-            name: "lab".into(),
-            token_sha256: hash,
-        });
+        cfg.relay.nodes.push(relay_node("lab", hash, &[]));
         more(&mut cfg);
+        let pin = with_certificate(&o.paths, &mut cfg);
         cfg.save(&o.paths.config_file()).unwrap();
         let daemon = Daemon::start(o).await.unwrap();
         let addr = listening(&daemon).await;
@@ -649,6 +764,7 @@ mod tests {
             _dir: dir,
             daemon,
             addr,
+            pin,
             token,
         }
     }
@@ -664,9 +780,38 @@ mod tests {
         panic!("the relay never listened: {}", daemon.status()["relay"]);
     }
 
-    /// Sends `CONNECT target` with `auth` and returns the answer's status and
-    /// the connection, read up to the end of the answer's head.
+    /// Sends `CONNECT target` with `auth` over TLS to the relay, pinned as a
+    /// relayed node pins it, and returns the answer's status, the refusal's
+    /// text and, when granted, the tunnel.
     async fn connect(
+        relay: SocketAddr,
+        pin: &str,
+        target: &str,
+        auth: Option<&str>,
+    ) -> (u16, String, Option<BoxIo>) {
+        let headers = auth
+            .map(|a| vec![("Proxy-Authorization".to_string(), a.to_string())])
+            .unwrap_or_default();
+        let proxy = nerve_transport::Proxy::parse(&format!("https://{relay}"), headers)
+            .unwrap()
+            .pinned(Some(pin.into()))
+            .unwrap();
+        let url = CenterUrl::parse(&format!("https://{target}")).unwrap();
+        match nerve_transport::net::reach(&url, Some(&proxy)).await {
+            Ok(t) => (200, String::new(), Some(t)),
+            Err(e) => {
+                let status = e
+                    .rsplit_once(": ")
+                    .and_then(|(_, r)| r.split(' ').next()?.parse().ok())
+                    .unwrap_or(0);
+                (status, e, None)
+            }
+        }
+    }
+
+    /// Sends `CONNECT target` with `auth` in plain HTTP, as an `http://`
+    /// proxy client does, and returns the answer's status and head.
+    async fn connect_plain(
         relay: SocketAddr,
         target: &str,
         auth: Option<&str>,
@@ -716,7 +861,7 @@ mod tests {
     }
 
     /// Whether the tunnel `s` ends within `wait`.
-    async fn ends(s: &mut TcpStream, wait: Duration) -> bool {
+    async fn ends(s: &mut BoxIo, wait: Duration) -> bool {
         let mut b = [0u8; 64];
         let deadline = tokio::time::Instant::now() + wait;
         loop {
@@ -728,8 +873,9 @@ mod tests {
         }
     }
 
-    async fn round_trip(s: &mut TcpStream, data: &[u8]) {
+    async fn round_trip(s: &mut BoxIo, data: &[u8]) {
         s.write_all(data).await.unwrap();
+        s.flush().await.unwrap();
         let mut got = vec![0u8; data.len()];
         tokio::time::timeout(WAIT, s.read_exact(&mut got))
             .await
@@ -778,10 +924,7 @@ mod tests {
         let (other_token, _) = new_token();
         let mut cfg = NodeConfig::default();
         cfg.relay.listen = Some("127.0.0.1:7490".into());
-        cfg.relay.nodes.push(nerve_policy::config::RelayNode {
-            name: "lab".into(),
-            token_sha256: hash.clone(),
-        });
+        cfg.relay.nodes.push(relay_node("lab", hash.clone(), &[]));
         cfg.centers
             .push(center("home", "https://Center.Example:8443".into()));
         cfg.centers
@@ -882,14 +1025,18 @@ mod tests {
         let good = basic("lab", &j.token);
         let target = format!("127.0.0.1:{}", port(&home));
 
-        let (status, head, _) = connect(j.addr, &target, None).await;
+        let (status, head, _) = connect(j.addr, &j.pin, &target, None).await;
         assert_eq!(status, 407, "{head}");
-        assert!(head.contains("Proxy-Authenticate: Basic"), "{head}");
-        let (status, _, _) = connect(j.addr, &target, Some(&basic("lab", "wrong"))).await;
+        let (status, _, _) = connect(j.addr, &j.pin, &target, Some(&basic("lab", "wrong"))).await;
         assert_eq!(status, 407);
         for l in [&other, &local, &gone] {
-            let (status, head, _) =
-                connect(j.addr, &format!("127.0.0.1:{}", port(l)), Some(&good)).await;
+            let (status, head, _) = connect(
+                j.addr,
+                &j.pin,
+                &format!("127.0.0.1:{}", port(l)),
+                Some(&good),
+            )
+            .await;
             assert_eq!(status, 403, "{head}");
             assert!(tokio::time::timeout(QUIET, l.accept()).await.is_err());
         }
@@ -901,8 +1048,9 @@ mod tests {
         );
 
         serve_echo(home);
-        let (status, head, mut t) = connect(j.addr, &target, Some(&good)).await;
+        let (status, head, t) = connect(j.addr, &j.pin, &target, Some(&good)).await;
         assert_eq!(status, 200, "{head}");
+        let mut t = t.unwrap();
         round_trip(&mut t, b"bytes only").await;
         let relay = j.daemon.status()["relay"].clone();
         assert_eq!(relay["status"], format!("listening on {}", j.addr));
@@ -937,18 +1085,16 @@ mod tests {
         )
         .await;
         let (token2, hash2) = new_token();
-        j.daemon.owner_edit(|c| {
-            c.relay.nodes.push(nerve_policy::config::RelayNode {
-                name: "lab2".into(),
-                token_sha256: hash2,
-            })
-        });
+        j.daemon
+            .owner_edit(|c| c.relay.nodes.push(relay_node("lab2", hash2, &[])));
         let (lab, lab2) = (basic("lab", &j.token), basic("lab2", &token2));
+        let (addr, pin) = (j.addr, j.pin.clone());
         let open = |target: &str, auth: &str| {
-            let (target, auth) = (target.to_string(), auth.to_string());
+            let (target, auth, pin) = (target.to_string(), auth.to_string(), pin.clone());
             async move {
-                let (status, head, mut t) = connect(j.addr, &target, Some(&auth)).await;
+                let (status, head, t) = connect(addr, &pin, &target, Some(&auth)).await;
                 assert_eq!(status, 200, "{head}");
+                let mut t = t.unwrap();
                 round_trip(&mut t, b"up").await;
                 t
             }
@@ -964,7 +1110,7 @@ mod tests {
             "lab2's tunnel ended with lab's token"
         );
         round_trip(&mut b, b"still").await;
-        let (status, _, _) = connect(j.addr, &home_at, Some(&lab)).await;
+        let (status, _, _) = connect(j.addr, &j.pin, &home_at, Some(&lab)).await;
         assert_eq!(status, 407);
 
         let mut w = open(&work_at, &lab2).await;
@@ -992,6 +1138,55 @@ mod tests {
         let mut w = open(&work_at, &lab2).await;
         j.daemon.owner_edit(|c| c.locked = true);
         assert!(ends(&mut w, WAIT).await, "a tunnel outlived panic");
+
+        // One audit entry per tunnel, with why it ended, and no token.
+        let entries = || {
+            nerve_policy::audit::AuditLog::new(j.daemon.paths().audit_log())
+                .read()
+                .unwrap()
+                .into_iter()
+                .filter(|v| v["kind"] == "relay")
+                .collect::<Vec<_>>()
+        };
+        let mut relayed = entries();
+        for _ in 0..200 {
+            if relayed.len() >= 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            relayed = entries();
+        }
+        let got: Vec<(String, String, String)> = relayed
+            .iter()
+            .map(|v| {
+                let s = |k: &str| v[k].as_str().unwrap_or_default().to_string();
+                (s("node"), s("center"), s("reason"))
+            })
+            .collect();
+        let cut = "cut off by the owner";
+        for want in [
+            ("lab", "home"),
+            ("lab2", "home"),
+            ("lab2", "work"),
+            ("lab2", "work"),
+        ] {
+            assert!(
+                got.iter()
+                    .any(|(n, c, r)| (n.as_str(), c.as_str()) == want && r == cut),
+                "{want:?} in {got:?}"
+            );
+        }
+        assert_eq!(got.len(), 4, "{got:?}");
+        for v in &relayed {
+            let end = v["end"].as_u64().unwrap();
+            assert!(v["start"].as_u64().unwrap() <= end, "{v}");
+            assert!(v["from"].as_str().unwrap().starts_with("127.0.0.1:"), "{v}");
+            assert!(v["up"].as_u64().unwrap() > 0, "{v}");
+        }
+        let log = std::fs::read_to_string(j.daemon.paths().audit_log()).unwrap();
+        for secret in [j.token.as_str(), token2.as_str()] {
+            assert!(!log.contains(secret), "a token is in the audit log");
+        }
         j.daemon.stop().await;
     }
 
@@ -1005,6 +1200,7 @@ mod tests {
         let o = options(dir.path());
         let mut cfg = NodeConfig::default();
         cfg.relay.listen = Some(at.clone());
+        with_certificate(&o.paths, &mut cfg);
         cfg.save(&o.paths.config_file()).unwrap();
         let daemon = Daemon::start(o).await.unwrap();
         let mut status = String::new();
@@ -1037,25 +1233,23 @@ mod tests {
         let j = jump(vec![center("home", format!("https://{home_at}"))], |c| {
             c.relay.max_links = 2;
             c.relay.max_links_per_node = 1;
-            c.relay.nodes.push(nerve_policy::config::RelayNode {
-                name: "lab2".into(),
-                token_sha256: hash2,
-            });
+            c.relay.nodes.push(relay_node("lab2", hash2, &[]));
         })
         .await;
         let (lab, lab2) = (basic("lab", &j.token), basic("lab2", &token2));
-        let (s, _, mut first) = connect(j.addr, &home_at, Some(&lab)).await;
+        let (s, _, first) = connect(j.addr, &j.pin, &home_at, Some(&lab)).await;
         assert_eq!(s, 200);
-        let (s, head, _) = connect(j.addr, &home_at, Some(&lab)).await;
+        let mut first = first.unwrap();
+        let (s, head, _) = connect(j.addr, &j.pin, &home_at, Some(&lab)).await;
         assert_eq!(s, 503, "a second tunnel of one node: {head}");
-        let (s, _, _second) = connect(j.addr, &home_at, Some(&lab2)).await;
+        let (s, _, _second) = connect(j.addr, &j.pin, &home_at, Some(&lab2)).await;
         assert_eq!(s, 200);
         round_trip(&mut first, b"x").await;
         drop(first);
         // The slot is free again once the tunnel is gone.
         let mut again = 0;
         for _ in 0..200 {
-            again = connect(j.addr, &home_at, Some(&lab)).await.0;
+            again = connect(j.addr, &j.pin, &home_at, Some(&lab)).await.0;
             if again == 200 {
                 break;
             }
@@ -1090,20 +1284,28 @@ mod tests {
         (at, pin)
     }
 
-    /// A relayed node: its proxy is the jump node at `relay`, with the
-    /// relay token of `lab` in the (test) keyring.
-    fn relayed(root: &std::path::Path, relay: SocketAddr, token: &str) -> NodeOptions {
+    /// A relayed node: its proxy is the jump node at `relay` over TLS pinned
+    /// to `pin`, with the login `lab` and its token kept with the node's keys
+    /// in `storage`.
+    fn relayed(
+        root: &std::path::Path,
+        relay: SocketAddr,
+        pin: &str,
+        token: &str,
+        storage: nerve_policy::config::SecretStorage,
+    ) -> NodeOptions {
         let o = options(root);
         let mut cfg = NodeConfig::default();
-        cfg.connection.proxy = Some(format!("http://{relay}"));
-        cfg.connection.headers = vec!["Proxy-Authorization".into()];
+        cfg.connection.proxy = Some(format!("https://{relay}"));
+        cfg.connection.pin = Some(pin.into());
+        cfg.connection.login = Some("lab".into());
+        cfg.machine.secret_storage = storage;
         #[cfg(unix)]
         {
             cfg.machine.sudo_path = Some(fake_sudo(root, SUDO_PASSWORD).display().to_string());
         }
         cfg.save(&o.paths.config_file()).unwrap();
-        let header = [("Proxy-Authorization".to_string(), basic("lab", token))];
-        crate::secrets::store_proxy_headers(&o.paths, &header).unwrap();
+        crate::secrets::store_proxy_login(&o.paths, storage, token).unwrap();
         o
     }
 
@@ -1145,16 +1347,15 @@ mod tests {
             let mut cfg = NodeConfig::default();
             cfg.centers.push(center("home", url.clone()));
             cfg.relay.listen = Some("127.0.0.1:0".into());
-            cfg.relay.nodes.push(nerve_policy::config::RelayNode {
-                name: "lab".into(),
-                token_sha256: hash,
-            });
+            cfg.relay.nodes.push(relay_node("lab", hash, &[]));
+            let relay_pin = with_certificate(&o.paths, &mut cfg);
             cfg.save(&o.paths.config_file()).unwrap();
             let jump = Daemon::start(o).await?;
             let relay = listening(&jump).await;
             lock(&held).push(jump);
-            // The relayed node pairs through it, with the link's code.
-            let o = relayed(&nd, relay, &token);
+            // The relayed node pairs through it over TLS, with the link's
+            // code.
+            let o = relayed(&nd, relay, &relay_pin, &token, Default::default());
             let link = PairLink {
                 center: CenterUrl::parse(&url)?,
                 code: link.code,
@@ -1290,7 +1491,13 @@ mod tests {
         })
         .await;
         let node_dir = tempfile::tempdir().unwrap();
-        let o = relayed(node_dir.path(), j.addr, &j.token);
+        let o = relayed(
+            node_dir.path(),
+            j.addr,
+            &j.pin,
+            &j.token,
+            Default::default(),
+        );
         let link = PairLink {
             center: CenterUrl::parse(&url).unwrap(),
             code: fake.code.clone(),
@@ -1356,5 +1563,227 @@ mod tests {
         assert!(status.starts_with("cannot connect"), "{status}");
         node.stop().await;
         j.daemon.stop().await;
+    }
+
+    /// A node limited to some centers reaches those and is refused the
+    /// others with the answer a center the relay does not have gets, so its
+    /// list tells it nothing of the rest; a change of the list ends its
+    /// tunnels to a center it took away.
+    #[test]
+    fn a_node_limited_to_some_centers_is_refused_the_others_as_if_they_were_not_there() {
+        let (token, hash) = new_token();
+        let mut cfg = NodeConfig::default();
+        cfg.relay.listen = Some("127.0.0.1:7490".into());
+        cfg.relay.nodes.push(relay_node("lab", hash, &["home"]));
+        cfg.centers
+            .push(center("home", "https://home.example:8443".into()));
+        cfg.centers
+            .push(center("work", "https://work.example:8443".into()));
+        let ask = |cfg: &NodeConfig, target: &str| {
+            let mut r = get(target);
+            r.headers
+                .insert("proxy-authorization".into(), basic("lab", &token));
+            decide(cfg, &r)
+        };
+        let g = ask(&cfg, "home.example:8443").unwrap();
+        assert_eq!(g.center, "home");
+        let other = ask(&cfg, "work.example:8443");
+        let missing = ask(&cfg, "none.example:8443");
+        assert_eq!(other, Err(NOT_A_CENTER));
+        assert_eq!(other, missing);
+        let mut moved = cfg.clone();
+        moved.relay.nodes[0].centers = vec!["work".into()];
+        assert!(!still_granted(&moved, &g));
+        let mut every = cfg.clone();
+        every.relay.nodes[0].centers.clear();
+        assert!(still_granted(&every, &g));
+        assert_eq!(ask(&every, "work.example:8443").unwrap().center, "work");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_node_limited_to_one_center_gets_a_tunnel_there_only() {
+        let (home, work) = (echo().await, echo().await);
+        let (home_at, work_at) = (
+            format!("127.0.0.1:{}", port(&home)),
+            format!("127.0.0.1:{}", port(&work)),
+        );
+        serve_echo(home);
+        let nowhere = echo().await;
+        let nowhere_at = format!("127.0.0.1:{}", port(&nowhere));
+        let j = jump(
+            vec![
+                center("home", format!("https://{home_at}")),
+                center("work", format!("https://{work_at}")),
+            ],
+            |c| c.relay.nodes[0].centers = vec!["home".into()],
+        )
+        .await;
+        let lab = basic("lab", &j.token);
+        let (status, head, t) = connect(j.addr, &j.pin, &home_at, Some(&lab)).await;
+        assert_eq!(status, 200, "{head}");
+        let mut t = t.unwrap();
+        round_trip(&mut t, b"home").await;
+        let (status, refused, _) = connect(j.addr, &j.pin, &work_at, Some(&lab)).await;
+        let (status2, missing, _) = connect(j.addr, &j.pin, &nowhere_at, Some(&lab)).await;
+        assert_eq!((status, status2), (403, 403));
+        assert_eq!(
+            refused.replace(&work_at, "<target>"),
+            missing.replace(&nowhere_at, "<target>")
+        );
+        for l in [&work, &nowhere] {
+            assert!(tokio::time::timeout(QUIET, l.accept()).await.is_err());
+        }
+        // `relay set-centers` takes home away: its tunnel ends.
+        j.daemon
+            .owner_edit(|c| c.relay.nodes[0].centers = vec!["work".into()]);
+        assert!(
+            ends(&mut t, WAIT).await,
+            "a tunnel outlived its center on the list"
+        );
+        j.daemon.stop().await;
+    }
+
+    /// The relay hop is TLS: whoever reads the network between the relayed
+    /// node and the relay sees neither the token nor the `CONNECT`, and the
+    /// node's link works through it with its token in the keyring, where
+    /// its keys are. A client that speaks plain HTTP to the relay is
+    /// refused, and nothing is tunnelled for it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_relay_hop_is_tls_and_a_plain_client_is_refused() {
+        let mut fake = FakeCenter::start(false).await.unwrap();
+        let (front, pin) = tls_front(fake.url.port).await;
+        let url = format!("https://127.0.0.1:{front}");
+        let j = jump(vec![center("home", url.clone())], |_| {}).await;
+        let tap = middle_tap(j.addr).await;
+        let node_dir = tempfile::tempdir().unwrap();
+        let keyring = nerve_policy::config::SecretStorage::Keyring;
+        let o = relayed(node_dir.path(), tap.0, &j.pin, &j.token, keyring);
+        let link = PairLink {
+            center: CenterUrl::parse(&url).unwrap(),
+            code: fake.code.clone(),
+            pin: Some(pin),
+        };
+        crate::pair::pair(&o.paths, &link, Some("home"))
+            .await
+            .unwrap();
+        let paired = fake.paired().expect("paired");
+        let node = Daemon::start(o.clone()).await.unwrap();
+        let mut inc = fake
+            .next_link(WAIT)
+            .await
+            .expect("the node dials through the relay");
+        fake_center::handshake(&mut inc.conn, &fake.center_id, &paired)
+            .await
+            .expect("handshake");
+        node.stop().await;
+        // The token is where the node's keys are: the keyring here.
+        let entry = crate::secrets::Entry::proxy_login(&o.paths);
+        assert_eq!(
+            crate::secrets::store::get(entry.account())
+                .unwrap()
+                .as_deref(),
+            Some(j.token.as_str())
+        );
+        assert!(!o.paths.proxy_login_file().exists());
+        let toml = std::fs::read_to_string(o.paths.config_file()).unwrap();
+        assert!(!toml.contains(&j.token), "{toml}");
+        // Nothing of the CONNECT crossed the tap in the clear.
+        let seen = String::from_utf8_lossy(&lock(&tap.1)).to_lowercase();
+        assert!(seen.len() > 1000, "the link did not go through the tap");
+        let basic_value = basic("lab", &j.token).to_lowercase();
+        for plain in [
+            j.token.as_str(),
+            basic_value.trim_start_matches("basic "),
+            "connect ",
+            "proxy-authorization",
+            &format!("127.0.0.1:{front}"),
+        ] {
+            assert!(
+                !seen.contains(&plain.to_lowercase()),
+                "{plain} passed in the clear"
+            );
+        }
+
+        // Plain HTTP to the relay: refused, the token is not taken.
+        let target = format!("127.0.0.1:{front}");
+        let (status, head, _) = connect_plain(j.addr, &target, Some(&basic("lab", &j.token))).await;
+        assert_eq!(status, 400, "{head}");
+        assert!(fake.next_link(QUIET).await.is_none());
+        // A node set to the relay as an http:// proxy says why it cannot link.
+        crate::cli::edit(&o.paths, |c| {
+            c.connection.proxy = Some(format!("http://{}", j.addr));
+            c.connection.pin = None;
+            c.connection.login = None;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let node = Daemon::start(o).await.unwrap();
+        let mut status = String::new();
+        for _ in 0..400 {
+            status = node.status()["centers"][0]["status"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            if status.starts_with("cannot connect") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(status.contains("400"), "{status}");
+        assert!(fake.next_link(QUIET).await.is_none());
+        node.stop().await;
+        assert!(
+            nerve_policy::audit::AuditLog::new(j.daemon.paths().audit_log())
+                .read()
+                .unwrap()
+                .iter()
+                .filter(|v| v["kind"] == "relay")
+                .count()
+                == 1,
+            "only the TLS tunnel is a tunnel"
+        );
+        j.daemon.stop().await;
+    }
+
+    /// A forwarder in front of `to` that keeps every byte it carries: what
+    /// someone on the network between a relayed node and its relay sees.
+    async fn middle_tap(to: SocketAddr) -> (SocketAddr, Arc<Mutex<Vec<u8>>>) {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = l.local_addr().unwrap();
+        let seen: Arc<Mutex<Vec<u8>>> = Arc::default();
+        let kept = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((s, _)) = l.accept().await {
+                let seen = kept.clone();
+                tokio::spawn(async move {
+                    let Ok(c) = TcpStream::connect(to).await else {
+                        return;
+                    };
+                    let (sr, sw) = s.into_split();
+                    let (cr, cw) = c.into_split();
+                    let one =
+                        |mut from: tokio::net::tcp::OwnedReadHalf,
+                         mut to: tokio::net::tcp::OwnedWriteHalf| {
+                            let seen = seen.clone();
+                            async move {
+                                let mut buf = vec![0u8; 16 * 1024];
+                                while let Ok(n) = from.read(&mut buf).await {
+                                    if n == 0 {
+                                        break;
+                                    }
+                                    lock(&seen).extend_from_slice(&buf[..n]);
+                                    if to.write_all(&buf[..n]).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                let _ = to.shutdown().await;
+                            }
+                        };
+                    tokio::join!(one(sr, cw), one(cr, sw));
+                });
+            }
+        });
+        (at, seen)
     }
 }

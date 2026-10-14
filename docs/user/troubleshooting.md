@@ -69,8 +69,10 @@ Through a [relay](relay.md), `status` names what the relay answered:
 
 | Message | Cause | Fix |
 |---|---|---|
+| `the proxy refused the tunnel to …: 400 …` | The node speaks plain HTTP to the relay, which speaks TLS only | `proxy set 'https://…' --pin <pin>`, the line `relay add` showed |
+| `TLS with the proxy …: its certificate does not carry the pinned key` | The pin in `proxy set` is not the relay's, or the relay made a new certificate | On the relay, `nerve-node relay ls` shows the pin |
 | `the proxy refused the tunnel to …: 407 …` | The relay does not know the name and token in `proxy set` | On the relay, `nerve-node relay ls`; make a new token with `relay rm` and `relay add` |
-| `the proxy refused the tunnel to …: 403 …` | The center's address is not one the relay is paired with over https | Pair with the URL the relay uses for that center |
+| `the proxy refused the tunnel to …: 403 …` | The center's address is not one the relay is paired with over https, or not one the relay's owner picked for this node | Pair with the URL the relay uses for that center; on the relay, `relay ls` shows the node's centers |
 | `the proxy refused the tunnel to …: 503 …` | The relay is off, locked, or carries as many tunnels as it may | On the relay, `nerve-node relay ls` and `status` |
 | `the proxy refused the tunnel to …: 502 …` | The relay cannot reach the center | Check the relay's own link |
 

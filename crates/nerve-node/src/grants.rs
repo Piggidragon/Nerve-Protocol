@@ -716,8 +716,21 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
     // A place where a change may have stopped part way: what it changed
     // below the folder does not show on the folders above it, so the next
     // change there goes into every folder below, also one back to the flags
-    // the folder shows.
-    let unfinished_at = |g: &Grant| record.iter().any(|o| o.unfinished && o.same_place(g));
+    // the folder shows. Only a mark on the object at the place now counts:
+    // that of a folder moved away is about its walk where it is now (whose
+    // take-off goes into every folder anyway), not about one made anew in
+    // its place.
+    let marked_here: Vec<bool> = record
+        .iter()
+        .zip(&seen)
+        .map(|(o, (here, _))| o.unfinished && at_path(o, here))
+        .collect();
+    let unfinished_at = |g: &Grant| {
+        record
+            .iter()
+            .zip(&marked_here)
+            .any(|(o, m)| *m && o.same_place(g))
+    };
     // Whether the sync changes the folder of a recorded grant: it is taken
     // off, here or where its folder is now, or replaced. Each such grant is
     // marked in the record before anything changes, and the mark goes once
@@ -750,14 +763,18 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
             })
             .collect();
         if let Err(e) = write_record(file, &marked) {
-            // Nothing changes: what should come off stays on.
+            // Nothing changes: what should come off stays on. Stale, but
+            // where the grant is still on the object at its path and every
+            // set of flags it may give there is wanted: a folder moved
+            // away keeps its grant where it is now, and a change that
+            // stopped part way may give the flags it was heading for.
             out.errors.push(e);
             for (old, s) in record.iter().zip(&seen) {
-                if changes(old, s)
-                    && !want
-                        .iter()
-                        .any(|w| w.same_place(old) && w.access == old.access)
-                {
+                let wanted = at_path(old, &s.0)
+                    && old
+                        .states()
+                        .all(|a| want.iter().any(|w| w.same_place(old) && w.access == a));
+                if changes(old, s) && !wanted {
                     out.stale.push(old.clone());
                 }
             }
@@ -1321,6 +1338,10 @@ mod tests {
         /// Paths where a change stops part way: it fails after changing
         /// what is below the folder, and the folder keeps its list.
         cut: Vec<PathBuf>,
+        /// Paths where the process ends during a change (a panic, as the
+        /// CLI stopped by Ctrl-C or a node killed): only what the sync
+        /// wrote before stays.
+        die: Vec<PathBuf>,
         /// Each change made or tried: its path, whether it checks for hard
         /// links ([`Links::Passing`]), and whether it goes into every
         /// folder below (`whole`).
@@ -1462,6 +1483,9 @@ mod tests {
             }
             // Of a kind a refusal has, as an error from deep in a walk may
             // be: it says nothing about whether the change was made.
+            if self.die.iter().any(|m| m == path) {
+                panic!("the node stops during the change of {}", path.display());
+            }
             if self.cut.iter().any(|m| m == path) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -2219,6 +2243,36 @@ mod tests {
         assert!(r.errors.is_empty() && r.removed == 1, "{r:?}");
     }
 
+    /// A change to `w` without `r` that stopped part way may have given
+    /// that below the folder: until a change there finishes, cargo's links
+    /// get no pass there, also on the change back.
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_change_to_write_only_gives_no_pass() {
+        let p = Project::new();
+        let file = p.root.join("grants.json");
+        let mut f = Fake {
+            walk: Some(p.root.clone()),
+            ..Default::default()
+        };
+        let proj = p.proj.display().to_string();
+        f.make(&proj);
+        let (rw, w) = (grant("lab", &proj, "rw"), grant("lab", &proj, "w"));
+        let r = sync(&file, std::slice::from_ref(&rw), &mut f);
+        assert!(r.errors.is_empty(), "{r:?}");
+        f.cut.push(p.proj.clone());
+        sync(&file, std::slice::from_ref(&w), &mut f);
+        f.cut.clear();
+        p.link("proj/target/debug/demo", "proj/target/debug/deps/demo-0123");
+        let r = sync(&file, std::slice::from_ref(&rw), &mut f);
+        assert!(
+            r.errors
+                .iter()
+                .any(|e| e.contains("permissions of") && e.contains("hard links")),
+            "{r:?}"
+        );
+    }
+
     /// A file whose names cannot all be listed passes nothing: a listing
     /// that fails while the file is there (as for a path too long for it)
     /// stops the walk, and a listing with fewer names than the file has
@@ -2447,6 +2501,133 @@ mod tests {
         let s = sync(&file, std::slice::from_ref(&r), &mut f);
         assert!(s.errors.is_empty() && s.stale.is_empty(), "{s:?}");
         assert!(s.refusal("c1").is_none());
+    }
+
+    /// The node ended during a widening (killed, or the CLI stopped): the
+    /// record it wrote before the change holds the mark and the flags the
+    /// change was heading for, so the change back goes into every folder
+    /// and checks for hard links.
+    #[test]
+    fn a_change_the_node_died_in_is_walked_again_whole_and_checked() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("grants.json");
+        let mut f = Fake::default();
+        f.make("/w/a");
+        let (r, rw) = (grant("c1", "/w/a", "r"), grant("c1", "/w/a", "rw"));
+        sync(&file, std::slice::from_ref(&r), &mut f);
+        f.die.push("/w/a".into());
+        let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sync(&file, std::slice::from_ref(&rw), &mut f)
+        }));
+        assert!(died.is_err());
+        let record = read_record(&file).unwrap();
+        assert!(
+            record
+                .iter()
+                .any(|g| g.access == r.access && g.unfinished && g.toward == [rw.access]),
+            "{record:?}"
+        );
+        f.die.clear();
+        f.changes.clear();
+        let s = sync(&file, std::slice::from_ref(&r), &mut f);
+        assert!(s.errors.is_empty(), "{s:?}");
+        assert_eq!(f.changes, [(PathBuf::from("/w/a"), true, true)]);
+    }
+
+    /// Where the record cannot be marked before a change, nothing changes,
+    /// and a grant is stale unless it is on the object at its path and
+    /// every set of flags it may give there is wanted: one whose widening
+    /// stopped and is wanted back, and one whose folder was moved away
+    /// while the config still names its old path.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_that_cannot_be_marked_leaves_what_gives_more_stale() {
+        use std::os::unix::fs::PermissionsExt;
+        let read_only = |dir: &Path, on: bool| {
+            let mode = if on { 0o500 } else { 0o700 };
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode)).unwrap();
+        };
+        let (r, rw) = (grant("c1", "/w/a", "r"), grant("c1", "/w/a", "rw"));
+
+        // A widening stopped, then the old flags wanted again.
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("grants.json");
+        let mut f = Fake::default();
+        f.make("/w/a");
+        sync(&file, std::slice::from_ref(&r), &mut f);
+        f.cut.push("/w/a".into());
+        sync(&file, std::slice::from_ref(&rw), &mut f);
+        f.cut.clear();
+        read_only(d.path(), true);
+        let s = sync(&file, std::slice::from_ref(&r), &mut f);
+        read_only(d.path(), false);
+        assert!(!s.errors.is_empty(), "{s:?}");
+        assert!(s.refusal("c1").is_some(), "{s:?}");
+
+        // Moved away, the config unchanged.
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("grants.json");
+        let mut f = Fake::default();
+        f.make("/w/a");
+        sync(&file, std::slice::from_ref(&rw), &mut f);
+        f.mv("/w/a", "/x/private");
+        read_only(d.path(), true);
+        let s = sync(&file, std::slice::from_ref(&rw), &mut f);
+        read_only(d.path(), false);
+        assert!(!s.errors.is_empty(), "{s:?}");
+        assert!(s.refusal("c1").is_some(), "{s:?}");
+        assert_eq!(f.on("/x/private"), [("c1".to_string(), rw.access)]);
+    }
+
+    /// The mark of a folder moved away whose take-off stopped is about its
+    /// walk where it is now: a folder made anew at its old path gets its
+    /// grant once, and is not walked again at each sync.
+    #[test]
+    fn a_moved_folders_mark_does_not_hold_the_new_one() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("grants.json");
+        let mut f = Fake::default();
+        f.make("/w/a");
+        let rw = grant("c1", "/w/a", "rw");
+        sync(&file, std::slice::from_ref(&rw), &mut f);
+        f.mv("/w/a", "/x/a");
+        f.make("/w/a");
+        f.cut.push("/x/a".into());
+        let s = sync(&file, std::slice::from_ref(&rw), &mut f);
+        assert_eq!(s.stale.len(), 1, "{s:?}");
+        assert_eq!(f.on("/w/a"), [("c1".to_string(), rw.access)]);
+        for _ in 0..2 {
+            f.changes.clear();
+            sync(&file, std::slice::from_ref(&rw), &mut f);
+            assert!(
+                f.changes.iter().all(|(p, _, _)| p == Path::new("/x/a")),
+                "{:?}",
+                f.changes
+            );
+        }
+    }
+
+    /// After a widening of `/w/a` stopped, a grant asked for inside it goes
+    /// on an object of its own only: commands may have written there.
+    #[test]
+    fn a_grant_inside_a_stopped_widening_goes_on_an_object_of_its_own() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("grants.json");
+        let mut f = Fake::default();
+        f.make("/w/a");
+        f.make("/w/a/n");
+        let (r, rw) = (grant("c1", "/w/a", "r"), grant("c1", "/w/a", "rw"));
+        sync(&file, std::slice::from_ref(&r), &mut f);
+        f.cut.push("/w/a".into());
+        sync(&file, std::slice::from_ref(&rw), &mut f);
+        f.cut.clear();
+        f.asked.clear();
+        sync(&file, &[r.clone(), grant("c1", "/w/a/n", "r")], &mut f);
+        assert!(
+            f.asked.contains(&(PathBuf::from("/w/a/n"), true)),
+            "{:?}",
+            f.asked
+        );
     }
 
     /// An error of the kind a refusal has, from a change that stopped part

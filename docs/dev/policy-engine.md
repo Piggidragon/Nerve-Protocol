@@ -187,7 +187,11 @@ center's local name):
   it, so `grants::sync` marks a grant `unfinished` in the record before it
   changes its folder and takes the mark off once the change is done; the
   next change at a marked place goes into every folder (`whole`), also one
-  back to flags the folder still shows. The mark keeps the flags each
+  back to flags the folder still shows; a mark counts for the object it
+  was made on, not for a folder made anew where a marked one was moved
+  away. Where the record cannot be marked, nothing changes, and a grant
+  is stale unless it is on the object at its path and every set of flags
+  it may give there is wanted. The mark keeps the flags each
   stopped change was heading for (`Grant::toward`): until a change there
   finishes, the place counts as written by those flags too (the hard-link
   check, `w` without `r` for the pass), and a refused change whose place

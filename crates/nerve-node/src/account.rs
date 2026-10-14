@@ -40,6 +40,56 @@ pub fn group_warning(name: &str, groups: &[String]) -> String {
     )
 }
 
+/// The warning for an account that gets root through its own sudo without
+/// a password (`NOPASSWD`).
+pub fn sudo_warning(name: &str) -> String {
+    format!(
+        "Warning: {name} may use sudo without a password, which gets root; a command from a center can then get root and read the node's keys. Choose an account that may not, or you are responsible for what commands do."
+    )
+}
+
+/// The warning for the account that ran `sudo`: the account its owner logs
+/// in as, whatever its sudo asks for.
+pub fn invoker_warning(name: &str) -> String {
+    format!(
+        "Warning: {name} is the account that ran sudo, the one its owner logs in as; the commands of a center run as it, so they can use its own programs (a tmux or screen server, its systemd user session) to reach what its owner does with sudo, and every command is then root. You are responsible for what commands do."
+    )
+}
+
+/// What `install` and `setup` suggest to anyone whose account is no
+/// boundary.
+pub const CREATE_USER_HINT: &str = "An account only the node uses is the boundary: `sudo nerve-node setup --create-user nerve-work` makes one and runs commands as it.";
+
+/// The warnings for `account` as the account of the commands, none when
+/// it is a boundary. Root has its own. Otherwise: it ran `sudo`
+/// (`invoker`), it is in a group of [`ROOT_GROUPS`] (`groups`), or
+/// `sudo_without_password` says its sudo needs no password; the reasons
+/// share the suggestion at the end.
+pub fn root_warnings(
+    account: &Account,
+    invoker: &str,
+    groups: &[String],
+    sudo_without_password: impl FnOnce() -> bool,
+) -> Vec<String> {
+    if account.uid == 0 {
+        return vec![root_warning()];
+    }
+    let mut w = Vec::new();
+    if account.name == invoker {
+        w.push(invoker_warning(&account.name));
+    }
+    if !groups.is_empty() {
+        w.push(group_warning(&account.name, groups));
+    }
+    if sudo_without_password() {
+        w.push(sudo_warning(&account.name));
+    }
+    if !w.is_empty() {
+        w.push(CREATE_USER_HINT.into());
+    }
+    w
+}
+
 /// The groups of [`ROOT_GROUPS`] that `account` is in, by name.
 pub fn root_groups(account: &Account) -> Vec<String> {
     // getent prints the groups it finds, and fails only for the others.
@@ -645,6 +695,44 @@ mod tests {
         assert!(root_groups_in(lines, &[1000, 100]).is_empty());
         let w = group_warning("alice", &["docker".into()]);
         assert!(w.contains("alice is in the group docker"), "{w}");
+    }
+
+    /// The account of the commands gets a warning for every way it gets
+    /// root, and the suggestion once; an account that is none of them gets
+    /// nothing, and root is not probed.
+    #[test]
+    fn an_account_that_gets_root_is_warned_about() {
+        let alice = account("alice", 1000);
+        let docker = ["docker".to_string()];
+        let no = || false;
+        let yes = || true;
+        // The account that ran sudo.
+        let w = root_warnings(&alice, "alice", &[], no);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w[0].contains("alice is the account that ran sudo"), "{w:?}");
+        assert!(w[1].contains("setup --create-user nerve-work"), "{w:?}");
+        // Another account that may use sudo without a password.
+        let w = root_warnings(&alice, "bob", &[], yes);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(
+            w[0].contains("alice may use sudo without a password"),
+            "{w:?}"
+        );
+        // One of the groups that get root.
+        let w = root_warnings(&alice, "bob", &docker, no);
+        assert!(w[0].contains("alice is in the group docker"), "{w:?}");
+        assert!(w[1].contains("--create-user nerve-work"), "{w:?}");
+        // All three: three reasons, one suggestion.
+        let w = root_warnings(&alice, "alice", &docker, yes);
+        assert_eq!(w.len(), 4, "{w:?}");
+        assert_eq!(w.iter().filter(|l| l.contains("--create-user")).count(), 1);
+        // A boundary: no warning, no suggestion.
+        assert!(root_warnings(&alice, "bob", &[], no).is_empty());
+        // Root has its warning, and nothing asks sudo about it.
+        let w = root_warnings(&account("root", 0), "alice", &[], || {
+            panic!("root is not probed")
+        });
+        assert_eq!(w, [root_warning()]);
     }
 
     #[test]

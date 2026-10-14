@@ -35,7 +35,11 @@ Whatever the downloaded file is called, `install` puts it in place as
 3. Sets the account that [commands run as](#the-account-commands-run-as):
    the account that ran `sudo`. An account chosen before stays. When you
    are logged in as root without `sudo`, it is root, and `install` warns
-   that commands from a center then run as root.
+   that commands from a center then run as root. It warns about the account
+   that ran `sudo` as well, since a person logs in as it, and about any
+   account that gets root without a password (below), and suggests
+   `sudo nerve-node setup --create-user nerve-work`. The warning does not
+   stop the install.
 4. Copies the program to `/usr/local/bin/nerve-node`.
 5. Writes the unit `/etc/systemd/system/nerve-node.service`, enables it and
    starts it. It waits until the node answers.
@@ -96,7 +100,11 @@ command starts, the node checks that its account cannot open the node's
 folders, and refuses to run it if it can. That holds as long as the account
 cannot become root. Root itself can, and so can an account in a group that
 gets root without a password: `docker`, `lxd`, `incus-admin`, `libvirt` or
-`disk`. `install` and `setup` warn about such an account. Choose one
+`disk`. So can an account that may use `sudo` without a password
+(`NOPASSWD`; `sudo -n true`, run as the account, succeeds), and the account
+that ran `sudo`, the one its owner logs in as (see [platforms](platforms.md#linux)).
+`install` and `setup` warn about such an account, whether they take it or it
+is chosen already, and suggest an account made for the node. Choose one
 outside these groups, or a command can read the keys after all.
 
 - No account chosen: the node runs no command, and says that

@@ -1649,7 +1649,7 @@ async fn setup_steps(
     }
     let (cfg, _) = read_config(paths).await?;
     if let (Some(sys), Some(name)) = (machine, create_user) {
-        let c = crate::service::create_account(sys, paths, name, out)?;
+        let c = crate::service::create_account(sys, paths, name, &invoker(), out)?;
         let chosen = (c.made || cfg.machine.user.as_deref() != Some(name)).then_some(c);
         account_chosen(paths, chosen, out, steps).await?;
     }
@@ -1679,12 +1679,14 @@ async fn setup_steps(
     if let Some(sys) = machine
         && create_user.is_none()
     {
-        let suggested = Some(invoker()).filter(|u| u != "root");
+        let who = invoker();
+        let suggested = Some(who.as_str()).filter(|u| *u != "root");
         let chosen = crate::service::choose_account(
             sys,
             paths,
             cfg.machine.user.as_deref(),
-            suggested.as_deref(),
+            suggested,
+            &who,
             input,
             out,
         )?;

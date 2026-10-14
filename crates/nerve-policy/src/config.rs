@@ -5,7 +5,8 @@
 //!
 //! What one center may read and change (with the settings grant `write`) is its
 //! [`CenterDocument`]: its policy and its `paused` flag. Everything else, the
-//! center list, pairing, grants, machine options, proxy, is client-only.
+//! center list, pairing, grants, machine options, proxy, relay, is
+//! client-only.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -33,6 +34,10 @@ pub struct NodeConfig {
     pub limits: Limits,
     #[serde(default)]
     pub connection: Connection,
+    /// The relay for other nodes (docs/dev/spec/protocol.md §4.8); off by
+    /// default.
+    #[serde(default, skip_serializing_if = "Relay::is_default")]
+    pub relay: Relay,
     #[serde(default)]
     pub log: LogSection,
     #[serde(default, rename = "center", skip_serializing_if = "Vec::is_empty")]
@@ -173,6 +178,101 @@ pub struct Connection {
     /// (`nerve-node proxy set`), never in this file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<String>,
+}
+
+/// The relay: this node takes `CONNECT` requests of other nodes and tunnels
+/// them to its own centers (docs/dev/spec/protocol.md §4.8). Only the owner
+/// sets it: it is a machine setting, not part of what a center reads or
+/// changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Relay {
+    /// The address the relay listens on, `ip:port`. The relay is off without
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<String>,
+    /// Tunnels at once, over every relayed node.
+    #[serde(default = "d_relay_links")]
+    pub max_links: u32,
+    /// Tunnels at once of one relayed node.
+    #[serde(default = "d_relay_links_per_node")]
+    pub max_links_per_node: u32,
+    /// The nodes that may use the relay, each with the hash of its token.
+    #[serde(default, rename = "node", skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<RelayNode>,
+}
+
+fn d_relay_links() -> u32 {
+    16
+}
+fn d_relay_links_per_node() -> u32 {
+    4
+}
+
+impl Default for Relay {
+    fn default() -> Relay {
+        Relay {
+            listen: None,
+            max_links: d_relay_links(),
+            max_links_per_node: d_relay_links_per_node(),
+            nodes: Vec::new(),
+        }
+    }
+}
+
+impl Relay {
+    fn is_default(&self) -> bool {
+        *self == Relay::default()
+    }
+
+    pub fn node(&self, name: &str) -> Option<&RelayNode> {
+        self.nodes.iter().find(|n| n.name == name)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if let Some(l) = &self.listen {
+            l.parse::<std::net::SocketAddr>().map_err(|_| {
+                format!("relay.listen {l:?}: an address and a port, like 0.0.0.0:7490 or [::]:7490")
+            })?;
+        }
+        if self.max_links == 0 || self.max_links_per_node == 0 {
+            return Err("relay.max_links and relay.max_links_per_node must be at least 1".into());
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for n in &self.nodes {
+            if !nerve_proto::valid_node_name(&n.name) {
+                return Err(format!(
+                    "relay.node name {:?}: 1 to 32 characters of a-z, 0-9 and -",
+                    n.name
+                ));
+            }
+            if !names.insert(n.name.as_str()) {
+                return Err(format!("relay.node names {:?} twice", n.name));
+            }
+            let hex = n
+                .token_sha256
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+            if n.token_sha256.len() != 64 || !hex {
+                return Err(format!(
+                    "relay.node {}: token_sha256 is 64 characters of lowercase hex",
+                    n.name
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A node that may use the relay. Its token is in no file: only its SHA-256
+/// is kept, so whoever reads `node.toml` cannot use the relay with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayNode {
+    /// The name the node gives as the user name of its `Proxy-Authorization`.
+    pub name: String,
+    /// The lowercase hex SHA-256 of its token.
+    pub token_sha256: String,
 }
 
 /// Why a `node.toml` that keeps proxy secrets in the file is refused.
@@ -633,6 +733,7 @@ impl NodeConfig {
                 return Err(format!("connection.headers names {h} twice"));
             }
         }
+        self.relay.validate()?;
         let mut names = std::collections::BTreeSet::new();
         for c in &mut self.centers {
             if !valid_center_name(&c.name) {
@@ -884,6 +985,63 @@ sudo_allow = ["sudo apt update"]
             assert!(NodeConfig::parse(&center(bad)).is_err(), "{bad}");
         }
         assert!(NodeConfig::parse(&center("allow = [\"fs:/a/*\"]")).is_ok());
+    }
+
+    /// The relay is off and out of the file unless the owner sets it; its
+    /// nodes are kept by name and token hash, and anything else is refused.
+    #[test]
+    fn the_relay_is_off_until_set_and_keeps_only_token_hashes() {
+        let c = NodeConfig::parse("").unwrap();
+        assert_eq!(c.relay, Relay::default());
+        assert_eq!(c.relay.listen, None);
+        assert!(!c.to_toml().contains("relay"), "{}", c.to_toml());
+        let hash = "a".repeat(64);
+        let text = format!(
+            "[relay]\nlisten = \"0.0.0.0:7490\"\nmax_links = 3\n\n[[relay.node]]\nname = \"lab-pc\"\ntoken_sha256 = \"{hash}\"\n"
+        );
+        let c = NodeConfig::parse(&text).unwrap();
+        assert_eq!(c.relay.listen.as_deref(), Some("0.0.0.0:7490"));
+        assert_eq!((c.relay.max_links, c.relay.max_links_per_node), (3, 4));
+        assert_eq!(c.relay.node("lab-pc").unwrap().token_sha256, hash);
+        assert_eq!(NodeConfig::parse(&c.to_toml()).unwrap(), c);
+        let node = |name: &str, h: &str| {
+            format!("[[relay.node]]\nname = \"{name}\"\ntoken_sha256 = \"{h}\"\n")
+        };
+        for (bad, why) in [
+            (
+                "[relay]\nlisten = \"relay.example:7490\"\n".to_string(),
+                "relay.listen",
+            ),
+            (
+                "[relay]\nlisten = \"0.0.0.0\"\n".to_string(),
+                "relay.listen",
+            ),
+            ("[relay]\nmax_links = 0\n".to_string(), "at least 1"),
+            (
+                "[relay]\nmax_links_per_node = 0\n".to_string(),
+                "at least 1",
+            ),
+            ("[relay]\ntoken = \"x\"\n".to_string(), "unknown field"),
+            (node("Lab PC", &hash), "relay.node name"),
+            (node("lab", &"A".repeat(64)), "token_sha256"),
+            (node("lab", "abc"), "token_sha256"),
+            (
+                format!("{}{}", node("lab", &hash), node("lab", &hash)),
+                "twice",
+            ),
+            (
+                format!(
+                    "[[relay.node]]\nname = \"lab\"\ntoken_sha256 = \"{hash}\"\ntoken = \"t\"\n"
+                ),
+                "unknown field",
+            ),
+        ] {
+            let e = NodeConfig::parse(&bad).unwrap_err();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
+        // A center reads and changes its policy and `paused`, nothing of this.
+        let doc = serde_json::json!({"relay": {"listen": "0.0.0.0:1"}});
+        assert!(serde_json::from_value::<CenterDocument>(doc).is_err());
     }
 
     /// A config with one center whose policy is `policy`.

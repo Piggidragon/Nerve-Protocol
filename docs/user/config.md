@@ -49,6 +49,15 @@ output_cap_bytes = 16777216 # for stdout and for stderr each; a result carries 1
 [connection]
 proxy = "http://proxy:3128" # set with `nerve-node proxy set`
 
+[relay]                     # set with `nerve-node relay`; off without listen
+listen = "0.0.0.0:7490"
+max_links = 16              # tunnels at once, over all relayed nodes
+max_links_per_node = 4
+
+[[relay.node]]              # added by `nerve-node relay add`
+name = "lab-pc"
+token_sha256 = "…"          # the hash of its token; the token is in no file
+
 [log]
 level = "info"              # error | warn | info | debug: how much the node logs
 

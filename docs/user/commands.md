@@ -21,6 +21,8 @@ center is paired.
 | `center pause`, `center resume` | Stop or restart the link to a center | [stop](stop.md#pause) |
 | `center grant settings write\|off` | Let a center change settings | [settings grant](settings-grant.md) |
 | `proxy set <url> [--header 'N: v']`, `proxy ls`, `proxy rm` | Dial centers through a proxy | [proxy](proxy.md) |
+| `relay set <ip:port>`, `relay off` | Let other nodes reach this node's centers through it | [relay](relay.md) |
+| `relay add <name>`, `relay rm <name>`, `relay ls` | Give a node a relay token, take it away, see who is connected | [relay](relay.md) |
 
 ## What a center may do
 

@@ -11,7 +11,9 @@ nerve-node proxy rm
 
 The node opens the TLS link to the center inside a `CONNECT` tunnel. The
 center's pin is still checked on that inner link, so the proxy sees only TLS
-records.
+records. `center add` pairs through the proxy too.
+
+Another node can be the proxy: see [relay](relay.md).
 
 ## A proxy that wants a login
 

@@ -236,6 +236,26 @@ impl ServerIdentity {
     }
 }
 
+/// The server side of TLS for one [`ServerIdentity`], for a listener outside
+/// the center: the tests put it in front of the conformance suite's fake
+/// center, which speaks plain HTTP.
+#[derive(Clone)]
+pub struct Acceptor(tokio_rustls::TlsAcceptor);
+
+impl Acceptor {
+    pub fn new(identity: &ServerIdentity) -> Result<Acceptor, String> {
+        Ok(Acceptor(tokio_rustls::TlsAcceptor::from(
+            identity.server_config()?,
+        )))
+    }
+
+    /// Runs the server's handshake on `tcp`.
+    pub async fn accept(&self, tcp: tokio::net::TcpStream) -> Result<crate::BoxIo, String> {
+        let tls = self.0.accept(tcp).await.map_err(|e| e.to_string())?;
+        Ok(Box::new(tls))
+    }
+}
+
 fn pem(label: &str, der: &[u8]) -> String {
     let b = base64::engine::general_purpose::STANDARD.encode(der);
     let mut s = format!("-----BEGIN {label}-----\n");

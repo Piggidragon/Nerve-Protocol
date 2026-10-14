@@ -374,16 +374,13 @@ async fn tunnel(proxy: &Proxy, host: &str, port: u16) -> Result<TcpStream, Strin
     }
 }
 
-/// Opens a connection to the center: TLS (pinned when `pin` is set), or plain
-/// TCP to a center on this machine. `proxy` is used for TLS centers only; a
-/// loopback center is never reached through one.
-pub async fn open(
-    url: &CenterUrl,
-    pin: Option<&str>,
-    proxy: Option<&Proxy>,
-) -> Result<BoxIo, String> {
-    let tcp = match proxy.filter(|_| url.tls) {
-        Some(p) => tunnel(p, &url.host, url.port).await?,
+/// The TCP connection under a link to `url`: through `proxy` for a TLS
+/// center, else straight to the addresses [`usable_addrs`] lets it use. A
+/// relay (docs/dev/spec/protocol.md §4.8) dials its centers this way too, so a
+/// relay behind a proxy or another relay goes on through it.
+pub async fn reach(url: &CenterUrl, proxy: Option<&Proxy>) -> Result<TcpStream, String> {
+    match proxy.filter(|_| url.tls) {
+        Some(p) => tunnel(p, &url.host, url.port).await,
         None => {
             let addrs: Vec<SocketAddr> = tokio::net::lookup_host((url.host.as_str(), url.port))
                 .await
@@ -393,9 +390,20 @@ pub async fn open(
             let addrs = usable_addrs(url.tls, named, addrs)?;
             dial(&url.host, url.port, addrs)
                 .await
-                .map_err(|e| format!("{url}: {e}"))?
+                .map_err(|e| format!("{url}: {e}"))
         }
-    };
+    }
+}
+
+/// Opens a connection to the center: TLS (pinned when `pin` is set), or plain
+/// TCP to a center on this machine. `proxy` is used for TLS centers only; a
+/// loopback center is never reached through one.
+pub async fn open(
+    url: &CenterUrl,
+    pin: Option<&str>,
+    proxy: Option<&Proxy>,
+) -> Result<BoxIo, String> {
+    let tcp = reach(url, proxy).await?;
     if !url.tls {
         #[cfg(target_os = "linux")]
         check_local_peer(&tcp)?;

@@ -65,6 +65,15 @@ nothing is allowed yet.
 Without a flag, the node is dialling. The wait grows from 1 to 60 seconds. If
 `nerve-node status` says `LOCKED (panic)`, run `nerve-node unlock`.
 
+Through a [relay](relay.md), `status` names what the relay answered:
+
+| Message | Cause | Fix |
+|---|---|---|
+| `the proxy refused the tunnel to …: 407 …` | The relay does not know the name and token in `proxy set` | On the relay, `nerve-node relay ls`; make a new token with `relay rm` and `relay add` |
+| `the proxy refused the tunnel to …: 403 …` | The center's address is not one the relay is paired with over https | Pair with the URL the relay uses for that center |
+| `the proxy refused the tunnel to …: 503 …` | The relay is off, locked, or carries as many tunnels as it may | On the relay, `nerve-node relay ls` and `status` |
+| `the proxy refused the tunnel to …: 502 …` | The relay cannot reach the center | Check the relay's own link |
+
 If `status` says `daemon: not running`, start `nerve-node run`. On Windows
 `status` does not ask the node yet: it says `daemon: not known (no control
 socket on Windows); a change takes effect at the next start of the node`

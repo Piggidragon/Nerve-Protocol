@@ -69,6 +69,9 @@ pub enum Cmd {
     /// Choose the proxy the node uses to reach centers.
     #[command(subcommand)]
     Proxy(ProxyCmd),
+    /// Let nodes that cannot reach a center themselves reach this node's centers through it.
+    #[command(subcommand)]
+    Relay(RelayCmd),
     /// Read or change any setting in node.toml by its name.
     #[command(subcommand)]
     Config(ConfigCmd),
@@ -329,6 +332,35 @@ pub enum ProxyCmd {
     Ls,
 }
 
+#[derive(Debug, Subcommand)]
+pub enum RelayCmd {
+    /// Turn the relay on: listen for other nodes at ADDRESS, like 0.0.0.0:7490. A node reaches only this node's own https centers through it.
+    Set {
+        /// The address and port to listen on, like 0.0.0.0:7490 or [::]:7490.
+        address: String,
+        /// Tunnels at once, over every relayed node (16 unless set).
+        #[arg(long, value_name = "N")]
+        max_links: Option<u32>,
+        /// Tunnels at once of one relayed node (4 unless set).
+        #[arg(long, value_name = "N")]
+        max_links_per_node: Option<u32>,
+    },
+    /// Turn the relay off: stop listening and end every tunnel. The nodes and their tokens stay.
+    Off,
+    /// Let a node use the relay: makes its token and shows it once.
+    Add {
+        /// The relayed node's name here, 1 to 32 of a-z, 0-9 and -.
+        name: String,
+    },
+    /// Take a node's token away and end its tunnels.
+    Rm {
+        /// The relayed node's name.
+        name: String,
+    },
+    /// Show the relay, the nodes that may use it and, on a running node, who is connected.
+    Ls,
+}
+
 /// The command list as `nerve-node --help` has it, for anything that shows
 /// the commands elsewhere (the center's help page). It is read from the
 /// [`Cli`] definition above, so a new command or flag shows up there by
@@ -360,7 +392,7 @@ const SECTIONS: &[(&str, &str, &[&[&str]])] = &[
     (
         "Pair and connect",
         "Link this machine to centers and choose how it reaches them.",
-        &[&["center"], &["proxy"]],
+        &[&["center"], &["proxy"], &["relay"]],
     ),
     (
         "What a center may do",
@@ -1291,6 +1323,17 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                             ),
                         );
                     }
+                    let relay = &v["relay"];
+                    if relay["listen"].is_string() {
+                        let tunnels = relay["tunnels"].as_array().map_or(0, Vec::len);
+                        w(
+                            out,
+                            format!(
+                                "relay: {}, {tunnels} tunnels open (`nerve-node relay ls` names them)",
+                                relay["status"].as_str().unwrap_or_default()
+                            ),
+                        );
+                    }
                     return Ok(());
                 }
                 Err(e) if e != nerve_transport::ctl::NOT_RUNNING => return Err(e),
@@ -1421,6 +1464,7 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
         }
         Cmd::Audit { follow, denied } => audit(&paths, follow, denied, out).await,
         Cmd::Proxy(c) => proxy_cmd(&paths, c, out).await,
+        Cmd::Relay(c) => relay_cmd(&paths, c, out).await,
         Cmd::Sudo(c) => sudo_cmd(&paths, c, out).await,
         Cmd::Install => {
             let layout = Layout::system();
@@ -2652,6 +2696,186 @@ async fn proxy_cmd(paths: &NodePaths, c: ProxyCmd, out: &mut dyn Write) -> Resul
             }
             Ok(())
         }
+    }
+}
+
+/// `relay set|off|add|rm|ls` (crate::relay). A token is shown once, by
+/// `add`; `node.toml` keeps only its hash.
+async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Result<(), String> {
+    let w = |out: &mut dyn Write, s: String| {
+        let _ = writeln!(out, "{s}");
+    };
+    match c {
+        RelayCmd::Set {
+            address,
+            max_links,
+            max_links_per_node,
+        } => {
+            let cfg = edit(paths, |c| {
+                c.relay.listen = Some(address.clone());
+                if let Some(n) = max_links {
+                    c.relay.max_links = n;
+                }
+                if let Some(n) = max_links_per_node {
+                    c.relay.max_links_per_node = n;
+                }
+                Ok(())
+            })
+            .await?;
+            w(
+                out,
+                format!(
+                    "relay on {address}: at most {} tunnels, {} per node",
+                    cfg.relay.max_links, cfg.relay.max_links_per_node
+                ),
+            );
+            if cfg.relay.nodes.is_empty() {
+                w(
+                    out,
+                    "no node may use it yet: `nerve-node relay add <name>` makes a token".into(),
+                );
+            }
+            Ok(())
+        }
+        RelayCmd::Off => {
+            edit(paths, |c| {
+                c.relay.listen = None;
+                Ok(())
+            })
+            .await?;
+            w(out, "relay off".into());
+            Ok(())
+        }
+        RelayCmd::Add { name } => {
+            if !nerve_proto::valid_node_name(&name) {
+                return Err(format!(
+                    "{name:?} is not a relay node name: 1 to 32 characters of a-z, 0-9 and -"
+                ));
+            }
+            let (token, hash) = crate::relay::new_token();
+            let cfg = edit(paths, |c| {
+                if c.relay.node(&name).is_some() {
+                    return Err(format!(
+                        "the relay knows a node {name} already; `nerve-node relay rm {name}` takes its token away first"
+                    ));
+                }
+                c.relay.nodes.push(nerve_policy::config::RelayNode {
+                    name: name.clone(),
+                    token_sha256: hash.clone(),
+                });
+                Ok(())
+            })
+            .await?;
+            let at = relay_address(cfg.relay.listen.as_deref());
+            w(
+                out,
+                format!("relay node {name} added; its token, shown only now:"),
+            );
+            w(out, format!("  {token}"));
+            w(out, format!("on {name}, run:"));
+            w(
+                out,
+                format!("  nerve-node proxy set 'http://{name}:{token}@{at}'"),
+            );
+            if cfg.relay.listen.is_none() {
+                w(
+                    out,
+                    "the relay is off: `nerve-node relay set <address>` turns it on".into(),
+                );
+            }
+            Ok(())
+        }
+        RelayCmd::Rm { name } => {
+            edit(paths, |c| {
+                let before = c.relay.nodes.len();
+                c.relay.nodes.retain(|n| n.name != name);
+                if c.relay.nodes.len() == before {
+                    return Err(format!("the relay knows no node {name}"));
+                }
+                Ok(())
+            })
+            .await?;
+            w(out, format!("relay node {name} removed; its tunnels end"));
+            Ok(())
+        }
+        RelayCmd::Ls => {
+            let (cfg, _) = read_config(paths).await?;
+            let r = &cfg.relay;
+            #[cfg(unix)]
+            let live =
+                match nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await {
+                    Ok(v) => Some(v["relay"].clone()),
+                    Err(e) if e == nerve_transport::ctl::NOT_RUNNING => None,
+                    Err(e) => return Err(e),
+                };
+            #[cfg(not(unix))]
+            let live: Option<Value> = None;
+            match (&r.listen, &live) {
+                (None, _) => w(out, "relay off".into()),
+                (Some(l), Some(v)) => w(
+                    out,
+                    format!(
+                        "relay on {l}: {}",
+                        v["status"].as_str().unwrap_or("not known")
+                    ),
+                ),
+                (Some(l), None) => w(out, format!("relay on {l}")),
+            }
+            w(
+                out,
+                format!(
+                    "at most {} tunnels, {} per node",
+                    r.max_links, r.max_links_per_node
+                ),
+            );
+            if r.nodes.is_empty() {
+                w(out, "no node may use it".into());
+            }
+            for n in &r.nodes {
+                w(out, format!("node {}", n.name));
+            }
+            match live {
+                Some(v) => {
+                    let now = crate::now_ms();
+                    for t in v["tunnels"].as_array().into_iter().flatten() {
+                        let since = t["since_ms"].as_u64().unwrap_or(now);
+                        w(
+                            out,
+                            format!(
+                                "tunnel {} from {} to center {} for {}",
+                                t["node"].as_str().unwrap_or_default(),
+                                t["from"].as_str().unwrap_or_default(),
+                                t["center"].as_str().unwrap_or_default(),
+                                nerve_transport::log::span(std::time::Duration::from_millis(
+                                    now.saturating_sub(since)
+                                )),
+                            ),
+                        );
+                    }
+                }
+                None if r.listen.is_some() => w(
+                    out,
+                    if cfg!(unix) {
+                        "no node runs here, so no tunnel is open".into()
+                    } else {
+                        "who is connected is in the node's log (the control pipe on Windows takes folder changes only)".into()
+                    },
+                ),
+                None => {}
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Where a relayed node finds the relay, for the line `relay add` shows:
+/// the listening address, or a placeholder where it listens on every
+/// address or is not set.
+fn relay_address(listen: Option<&str>) -> String {
+    match listen.and_then(|l| l.parse::<std::net::SocketAddr>().ok()) {
+        Some(a) if !a.ip().is_unspecified() => a.to_string(),
+        Some(a) => format!("<address of this machine>:{}", a.port()),
+        None => "<address of this machine>:<port>".into(),
     }
 }
 
@@ -4703,6 +4927,71 @@ mod tests {
             assert!(e.contains("run `nerve-node proxy set` again"), "{e}");
             assert!(!e.contains("s3cret"), "{e}");
         }
+    }
+
+    /// `relay add` shows a node's token once, with the line its node runs,
+    /// and `node.toml` keeps only the token's hash; `set`, `rm` and `off`
+    /// change the relay and nothing else.
+    #[test]
+    fn relay_add_shows_the_token_once_and_keeps_only_its_hash() {
+        let (_d, paths) = setup(&["home"]);
+        let out = run(
+            &paths,
+            &["relay", "set", "0.0.0.0:7490", "--max-links", "8"],
+        )
+        .unwrap();
+        assert!(
+            out.starts_with(
+                "relay on 0.0.0.0:7490: at most 8 tunnels, 4 per node\nno node may use it yet"
+            ),
+            "{out}"
+        );
+        let e = run(&paths, &["relay", "set", "relay.example:7490"]).unwrap_err();
+        assert!(e.contains("relay.listen"), "{e}");
+        assert_eq!(load(&paths).relay.listen.as_deref(), Some("0.0.0.0:7490"));
+
+        let out = run(&paths, &["relay", "add", "lab-pc"]).unwrap();
+        let token = out.lines().nth(1).unwrap().trim().to_string();
+        assert_eq!(token.len(), 43, "{out}");
+        assert!(
+            out.contains(&format!(
+                "on lab-pc, run:\n  nerve-node proxy set 'http://lab-pc:{token}@<address of this machine>:7490'\n"
+            )),
+            "{out}"
+        );
+        let file = std::fs::read_to_string(paths.config_file()).unwrap();
+        assert!(!file.contains(&token), "{file}");
+        let cfg = load(&paths);
+        assert_eq!(
+            cfg.relay.node("lab-pc").unwrap().token_sha256,
+            crate::relay::token_hash(&token)
+        );
+        assert_eq!(cfg.centers, vec![entry("home")]);
+        let e = run(&paths, &["relay", "add", "lab-pc"]).unwrap_err();
+        assert!(e.contains("relay rm lab-pc"), "{e}");
+        assert!(run(&paths, &["relay", "add", "Lab PC"]).is_err());
+
+        let ls = run(&paths, &["relay", "ls"]).unwrap();
+        assert!(
+            ls.starts_with("relay on 0.0.0.0:7490\nat most 8 tunnels, 4 per node\nnode lab-pc\n"),
+            "{ls}"
+        );
+        assert!(!ls.contains(&token), "{ls}");
+
+        let out = run(&paths, &["relay", "rm", "lab-pc"]).unwrap();
+        assert!(out.starts_with("relay node lab-pc removed"), "{out}");
+        assert!(load(&paths).relay.nodes.is_empty());
+        assert!(run(&paths, &["relay", "rm", "lab-pc"]).is_err());
+        let out = run(&paths, &["relay", "off"]).unwrap();
+        assert!(out.starts_with("relay off\n"), "{out}");
+        let cfg = load(&paths);
+        assert_eq!(cfg.relay.listen, None);
+        assert_eq!(cfg.relay.max_links, 8);
+        assert!(
+            run(&paths, &["relay", "ls"])
+                .unwrap()
+                .starts_with("relay off\n")
+        );
     }
 
     #[test]

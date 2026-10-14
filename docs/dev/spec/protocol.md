@@ -153,7 +153,51 @@ a link has lasted 60 seconds.
 
 A node MAY reach a center over an HTTP `CONNECT` proxy (`connection.proxy` in
 its config, else `HTTPS_PROXY`/`NO_PROXY`). The inner TLS is still pinned. If
-the proxy fails the node does not fall back to a direct connection.
+the proxy fails the node does not fall back to a direct connection. The pair
+request (§3.2) to an `https` center goes through the same proxy.
+
+### 4.8 Relays
+
+A node in a network that reaches no center MAY reach one through another
+node, its **relay** (a jump node). This is a transport binding below the
+message layer: the relay carries bytes, never messages.
+
+- The relayed node names the relay as its proxy (§4.7) and authenticates with
+  `Proxy-Authorization: Basic base64(<name>:<token>)`, the relay node name and
+  token the relay's owner gave it. Everything above the tunnel is the relayed
+  node's link as without a relay: TLS to the center with its pin, the
+  `Nerve-Node` header and the signed `hello`, end to end.
+- A relay is off unless its owner turns it on. It answers `CONNECT host:port`
+  only:
+  - `407` with `Proxy-Authenticate: Basic` unless the name and token are
+    those of a node it knows. It MUST check this before it looks at the
+    target, so a peer without a token learns nothing of its centers;
+  - `403` unless `host:port` is the host (without case) and port of an
+    `https` center the relay itself is paired with, that has not revoked it
+    and still knows it (no `bye revoked`, no 401). The relay MUST NOT open a
+    tunnel anywhere else: not to an `http` center (it is on the relay's
+    loopback), not to any other port of its machine or network;
+  - `503` when it is off, when its node is locked, or when a limit is reached
+    (tunnels at once over all nodes, and per node);
+  - `502` when it cannot reach the center;
+  - `200` once it has a connection to the center. From then on it copies
+    bytes both ways and nothing else.
+- The relay dials the center as its own link would, through its own proxy if
+  it has one (§4.7). A chain of relays follows the same rules at each hop:
+  each one tunnels only to centers it is paired with itself.
+- A relay MUST end a tunnel when its owner turns the relay off, takes the
+  node's token away, unpairs the center or locks the node, and when the
+  tunnel carried nothing either way for 90 seconds (a link pings every 20
+  seconds, §4.4).
+- A relay keeps no token in clear at rest. `nerve-node` keeps the SHA-256 of
+  each token in `node.toml`.
+- The relay can cut a relayed node off but cannot read or alter its link:
+  an altered byte fails the TLS record, and the link ends before any message
+  of it counts. The relayed node's policy is its own; the relay's policy is
+  not asked, and no call runs on the relay for a tunnel.
+- The `CONNECT` itself is plain HTTP between the relayed node and the relay,
+  so the token is visible on that network. It opens a way to the relay's
+  centers' node port only, where a node still needs its own pairing.
 
 ## 5. Messages
 

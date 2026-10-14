@@ -37,7 +37,10 @@ through its control socket.
    stricter. It cannot make the node more permissive, except by changing
    settings where the owner gave it the settings grant.
 2. **The node dials.** A node never listens for centers. Nodes behind NAT, on
-   laptops and in closed networks work without opening a port.
+   laptops and in closed networks work without opening a port. A node whose
+   owner turns on its relay listens for other nodes, and tunnels their TLS
+   bytes to its own centers only ([protocol §4.8](spec/protocol.md)); the
+   relayed node still dials, through it.
 3. **A center is a trust domain.** A node pairs with any number of centers and
    keeps their policy, sessions, audit entries and settings apart. A center
    cannot learn whether another center exists.
@@ -48,7 +51,8 @@ through its control socket.
 6. **The center is a gate and a router.** It has no agent loop, no model, no
    memory and no chat history. It stores no file contents, command output or
    node secrets. It does not relay messages between nodes, call one node from
-   another or install software on a node.
+   another or install software on a node. A node's relay carries bytes, not
+   messages, and no node calls another either.
 7. **Data from a node is data.** File contents, command output and tool
    results are untrusted content at the center and in the harness. The center
    marks every tool result as device content.

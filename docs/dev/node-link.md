@@ -63,7 +63,19 @@ A node can dial through an HTTP `CONNECT` proxy. The TLS link to the center
 runs inside the tunnel, and the pin applies to it, so the proxy sees only TLS
 records. If a configured proxy is down, the node does not dial directly.
 Secrets of the proxy are in the system keyring, never in `node.toml`. See the
-[proxy page](../user/proxy.md).
+[proxy page](../user/proxy.md). The pair request goes through the proxy too.
+
+## Relay
+
+A node that reaches no center can dial through another node, its relay
+([spec/protocol.md](spec/protocol.md) §4.8). The relayed node sets the relay
+as its proxy, with its relay token as the proxy's user name and password. The
+relay checks the token, tunnels only to its own `https` centers, and copies
+bytes. TLS, the pin and the signed `hello` stay end to end: the relay can cut
+the link but not read or change it. Code: `crates/nerve-node/src/relay.rs`;
+its tests run the conformance node part through a relay, and a proxy below
+the relay that reads and alters the bytes. See the
+[relay page](../user/relay.md).
 
 ## Several centers
 

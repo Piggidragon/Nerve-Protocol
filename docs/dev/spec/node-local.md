@@ -343,6 +343,15 @@ proxy = "http://proxy:3128" # optional; HTTP CONNECT, never with user:password@
 headers = ["X-Proxy-Token"] # names of extra headers on the CONNECT request;
                             # their values are in the system keyring
 
+[relay]                     # optional; the relay for other nodes (protocol §4.8)
+listen = "0.0.0.0:7490"     # ip:port; the relay is off without it
+max_links = 16              # tunnels at once, over every relayed node
+max_links_per_node = 4      # tunnels at once of one relayed node
+
+[[relay.node]]
+name = "lab-pc"             # the user name of its Proxy-Authorization
+token_sha256 = "<hex>"      # SHA-256 of its token; the token is in no file
+
 [[center]]
 name = "home"               # the owner's name; the CLI's --center
 url = "https://center.example:8443"
@@ -439,6 +448,48 @@ A `node.toml` that holds header values (`headers = { Name = "value" }`) or a
 user name and password in `connection.proxy` is refused on load, without the values in the message: take them out of the
 file, accept it (`nerve-node config accept`) and run `nerve-node proxy set`
 again.
+
+`center add` sends its pair request through the same proxy as the link, with
+the same values, when the center is `https`; a proxy that fails stops the
+pairing and nothing is stored.
+
+### Relay
+
+The node can be the relay of other nodes (protocol §4.8). Only the owner
+turns it on, and a center reads and changes nothing of it, grant or not.
+
+- `nerve-node relay set <ip:port> [--max-links N] [--max-links-per-node N]`
+  turns it on; `relay off` stops listening and ends every tunnel, and keeps
+  the nodes.
+- `nerve-node relay add <name>` makes a token for a relayed node: 43
+  characters of `a-z0-9`, shown once, with the line the relayed node runs,
+  `nerve-node proxy set 'http://<name>:<token>@<relay>:<port>'`. `node.toml`
+  keeps the token's SHA-256 only, and the log tells a change of
+  `relay.node` without its values. `relay rm <name>` takes the token away
+  and ends that node's tunnels.
+- `nerve-node relay ls` shows the relay, its nodes and, from the running
+  node, its tunnels: the node, its address, the center and since when.
+  `status` carries the same under `relay` (§5). On Windows, whose control
+  pipe takes folder changes only, the tunnels are in the node's log: a line
+  for each tunnel that opens, closes (how long, how many bytes) or is
+  refused.
+- A tunnel goes to one of this node's centers whose URL is `https` and
+  that has not revoked it or answered 401, matched by host (without case)
+  and port; the relayed node must have paired with the same host name or
+  address. A paused center is still a target: pausing stops this node's
+  own link, not the tunnels of others.
+- While the node is locked (`panic`) the relay does not listen. Any change
+  that takes a tunnel's grant away (the relay off, the token gone or
+  replaced, the center gone, revoked or unknown, `panic`) ends it at once.
+- At most 64 connections at once wait for their `CONNECT` to be decided (15
+  seconds for the head); one over that is closed unread.
+- The relay dials a center through this node's own proxy when it has one,
+  so relays chain. It never reads what it carries, and no rule, folder or
+  mode of this node applies to a tunnel: the relayed node's calls are
+  decided by the relayed node, by its own policy.
+
+On Windows a change made with `relay` is in the file and takes effect at
+the next start of the node, as every change but the folder changes there.
 
 ### Modes
 
@@ -776,7 +827,7 @@ Methods:
 
 | Method | Params | |
 |---|---|---|
-| `status` | | daemon and links |
+| `status` | | daemon and links; under `relay`, the relay's state and its tunnels (§2, Relay) |
 | `config.read` | | `node.toml` and its `version` |
 | `config.write` | `config`, `if_version` | replaces it when the version matches |
 | `config.accept` | | takes `node.toml` as it is after it was refused, and signs it (§1) |

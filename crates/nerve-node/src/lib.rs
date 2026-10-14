@@ -2,8 +2,9 @@
 //! owner's policy allows (docs/dev/).
 //!
 //! The daemon ([`daemon::Daemon`]) keeps one link per paired center, runs the
-//! `fs`, `exec`, `settings` and `audit` capabilities, and serves
-//! the control socket the CLI ([`cli`]) talks to. Tests start a daemon in
+//! `fs`, `exec`, `settings` and `audit` capabilities, serves
+//! the control socket the CLI ([`cli`]) talks to, and the relay for other
+//! nodes when the owner turns it on. Tests start a daemon in
 //! process with [`daemon::Daemon::start`] and pair with [`pair::pair`].
 
 pub mod account;
@@ -28,6 +29,7 @@ pub mod paths;
 // The control pipe is Windows-only in use; its rules are tested everywhere.
 #[cfg_attr(not(windows), allow(dead_code))]
 mod pipe;
+mod relay;
 pub mod rights;
 mod secrets;
 pub mod service;

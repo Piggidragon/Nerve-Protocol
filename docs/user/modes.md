@@ -71,8 +71,10 @@ pass: a link found inside a `w` folder is refused whenever it appears, and the
 place the pass ends at must resolve to itself, so a link swapped in meanwhile
 is refused too. On Windows a `subst` drive is followed through the folder it maps, name by
 name, so a junction on that folder is judged like any other; a path with a
-drive but no root (`C:sub`) is refused; and short (8.3) names, in the path or
-in a junction's target, are written out in full. The node records that it
+drive but no root (`C:sub`) and a path that is not on a drive letter (a share,
+`\\?\GLOBALROOT\…`) are refused; and short (8.3) names, in the path, in a
+junction's target or in the folder a `subst` drive maps, are written out in
+full. The node records that it
 stored the real place (`places` under the pairing's `policy` in `node.toml`).
 A command with `w` on a folder can put a link in place of a folder inside it,
 and a link would give that folder's rights in a place you never named. So the

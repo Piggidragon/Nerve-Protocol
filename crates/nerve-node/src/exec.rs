@@ -526,6 +526,22 @@ fn settle_by(
     if !path.is_absolute() {
         return Settled::Refused("the path must be absolute".into());
     }
+    // A folder that is not on a drive letter (a share, `\\?\GLOBALROOT\…`)
+    // can reach a folder a drive also names, and a junction on the way would
+    // be followed without being judged: only a drive's path is walked.
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        let on_drive = matches!(
+            path.components().next(),
+            Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+        );
+        if !on_drive {
+            return Settled::Refused(
+                "the folder must be on a drive; give its path as C:\\…".into(),
+            );
+        }
+    }
     let path = &long_names(path);
     // A link to nothing could point anywhere once something is made there.
     if let Err(e @ nerve_policy::paths::PathError::DanglingSymlink(_)) = resolve(path) {
@@ -613,7 +629,8 @@ fn walk_by(
                             top.display()
                         ));
                     }
-                    todo.extend(steps(&mapped));
+                    // `subst` keeps the folder as it was typed, short names too.
+                    todo.extend(steps(&long_names(&mapped)));
                     continue;
                 }
                 here = top;
@@ -2761,7 +2778,13 @@ mod windows_tests {
         let Some(drive) = Subst::new(&base) else {
             return;
         };
-        assert_eq!(at(&drive.join("proj")), Settled::At(place));
+        assert_eq!(at(&drive.join("proj")), Settled::At(place.clone()));
+        // The folder mapped by its short names: `subst` keeps them, and the
+        // walk writes them out.
+        let Some(short) = Subst::new(&short_name(&base)) else {
+            return;
+        };
+        assert_eq!(at(&short.join("proj")), Settled::At(place));
     }
 
     /// A `subst` drive on a free letter, unmapped when dropped.
@@ -2853,8 +2876,23 @@ mod windows_tests {
             };
             assert!(why.contains("may write"), "{why}");
         }
-        // The same folder by its own path is refused alike.
+        // The same folder by its own path is refused alike, and so is every
+        // other spelling of it that does not name a drive: a device path and a
+        // share would reach the junction without it being judged.
         assert!(matches!(at(&project.join("inner")), Settled::Refused(_)));
+        let letter = &drive.0;
+        let share = project.display().to_string().replacen(':', "$", 1);
+        for spelled in [
+            format!("\\\\?\\GLOBALROOT\\??\\{letter}\\inner"),
+            format!("\\\\?\\GLOBALROOT\\DosDevices\\{letter}\\inner"),
+            format!("\\\\?\\UNC\\localhost\\{share}\\inner"),
+        ] {
+            let given = nerve_policy::paths::normal_folder(&spelled).unwrap();
+            assert!(
+                matches!(at(Path::new(&given)), Settled::Refused(_)),
+                "{spelled} was followed"
+            );
+        }
     }
 
     #[test]

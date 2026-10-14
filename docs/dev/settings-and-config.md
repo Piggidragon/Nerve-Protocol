@@ -75,7 +75,14 @@ center reads, or the node refuses the whole change and names the field.
 8. Releasing a protected path: a center may add to `protected.extra`, not
    remove from it or change `protected.allow`, and its folders may not widen
    access at a protected place ([policy engine](policy-engine.md#protected-paths)).
-9. Turning a `sense` action on. A center can switch these off, never on.
+9. Turning a `sense` action on, by `caps` or an allow rule, or by taking away
+   an `off` or `hidden` entry or a deny rule that keeps it off; and doing so
+   for a capability no attached provider offers now, or for an action an
+   offered capability does not have now, which may sense once it comes. A
+   center can switch these off, never on, so it cannot take away its own deny
+   rule for such a capability either.
+10. The programs that may attach as capability providers,
+    `providers.allowed` ([node-local §7](spec/node-local.md#7-capability-providers)).
 
 One item is in the document a center reads and is still the owner's: the
 record of the folders' real places, `policy.places`
@@ -118,7 +125,8 @@ well. It is the node's
 only way in besides its center links. The client sends one JSON object per line,
 `{"method", "params", "token"}`, and gets `{"ok": value}` or
 `{"error": "text"}`. A streaming method answers with several `{"item": value}`
-lines.
+lines. Every connection carries one request, except a provider's, which stays
+after `hello` and carries its calls.
 
 | Method | Does |
 |---|---|
@@ -130,6 +138,7 @@ lines.
 | `sudo.status`, `sudo.on`, `sudo.off` | The sudo switch |
 | `folder.add` | `folder add`, judged by the node as the account commands run as; it stores and records the real place |
 | `owner.check` | Nothing; the CLI asks it before `install`, `setup`, `update` and `uninstall` |
+| `hello` | A capability provider attaches; its connection stays ([node-local §7](spec/node-local.md#7-capability-providers)) |
 
 Every method is refused from a process that runs below a command the node
 started for a center, the reading ones too. That catches the processes that

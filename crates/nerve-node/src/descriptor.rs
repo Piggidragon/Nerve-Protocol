@@ -423,7 +423,19 @@ fn exposure(entry: &CenterEntry, id: &str) -> Option<Exposure> {
 /// `folder` mode on a machine that cannot confine a command, and an action
 /// that senses or actuates (`exec.signal`), which no mode allows unless the
 /// owner set it to on. An action set to off stays, and fails `disabled`.
-fn offered(policy: &CenterPolicy, view: View, cap: &str, action: &str, effect: Effect) -> bool {
+///
+/// A provider's action (`provided`) is decided like the governed ones: in
+/// `allowlist` mode by the allow rules, sense and actuate only when on. It
+/// names no path, so no folder holds it: `folder` mode offers it only where
+/// the owner set it to on.
+fn offered(
+    policy: &CenterPolicy,
+    view: View,
+    cap: &str,
+    action: &str,
+    effect: Effect,
+    provided: bool,
+) -> bool {
     let View {
         mode,
         by_rules,
@@ -437,13 +449,16 @@ fn offered(policy: &CenterPolicy, view: View, cap: &str, action: &str, effect: E
     }
     // Only the policy-governed capabilities are decided by rules and modes;
     // `settings.pause` actuates as well and is no policy's business.
-    let governed = matches!(cap, "fs" | "exec");
+    let governed = provided || matches!(cap, "fs" | "exec");
     if by_rules
         && governed
         && mode != Mode::Allowlist
         && matches!(effect, Effect::Sense | Effect::Actuate)
         && setting != Some(CapSetting::On)
     {
+        return false;
+    }
+    if by_rules && provided && mode == Mode::Folder && setting != Some(CapSetting::On) {
         return false;
     }
     // Folder mode refuses every command it cannot confine, so it offers none;
@@ -478,20 +493,28 @@ struct View {
 /// it, so an action the policy cannot allow is not in it. `confined` says
 /// whether this machine can confine a command in `folder` mode (Landlock,
 /// a Windows AppContainer); where it cannot, folder mode offers no command.
+/// `provided` are the capabilities the attached providers add
+/// (crate::provider), each cut by the same policy.
 pub fn for_center(
     cfg: &NodeConfig,
     entry: &CenterEntry,
     now_ms: u64,
     confined: bool,
+    provided: &[Capability],
 ) -> Descriptor {
-    build(cfg, entry, now_ms, true, confined)
+    build(cfg, entry, now_ms, true, confined, provided)
 }
 
 /// Every action a call may name: [`for_center`] without the cut by allow
 /// rules. A call for an action no rule covers still reaches the policy, which
 /// refuses it and writes the audit entry; only hidden ones are unknown.
-pub fn for_call(cfg: &NodeConfig, entry: &CenterEntry, now_ms: u64) -> Descriptor {
-    build(cfg, entry, now_ms, false, true)
+pub fn for_call(
+    cfg: &NodeConfig,
+    entry: &CenterEntry,
+    now_ms: u64,
+    provided: &[Capability],
+) -> Descriptor {
+    build(cfg, entry, now_ms, false, true, provided)
 }
 
 fn build(
@@ -500,6 +523,7 @@ fn build(
     now_ms: u64,
     by_rules: bool,
     confined: bool,
+    provided: &[Capability],
 ) -> Descriptor {
     let mut caps = vec![node_cap()];
     if let Some(e) = exposure(entry, "fs") {
@@ -512,6 +536,16 @@ fn build(
         caps.push(settings_cap());
     }
     caps.push(audit_cap());
+    // A provider's capability is offered like the node's own: hidden, off
+    // or on by `caps`.
+    for c in provided {
+        if let Some(e) = exposure(entry, &c.id) {
+            caps.push(Capability {
+                exposure: e,
+                ..c.clone()
+            });
+        }
+    }
     // Actions the policy cannot allow are left out, so the center builds no
     // tool the node would refuse; off ones stay and fail `disabled`. A
     // capability with no action left goes too.
@@ -522,10 +556,13 @@ fn build(
     };
     for c in &mut caps {
         let id = c.id.clone();
+        let provided = c.provider != "node";
         c.actions
-            .retain(|a, decl| offered(&entry.policy, view, &id, a, decl.effect));
+            .retain(|a, decl| offered(&entry.policy, view, &id, a, decl.effect, provided));
     }
-    caps.retain(|c| !(matches!(c.id.as_str(), "fs" | "exec") && c.actions.is_empty()));
+    caps.retain(|c| {
+        !((c.provider != "node" || matches!(c.id.as_str(), "fs" | "exec")) && c.actions.is_empty())
+    });
     let name = node_name(cfg);
     let platform = std::env::consts::OS.to_string();
     let mut d = Descriptor {
@@ -588,7 +625,7 @@ mod tests {
         e.settings = SettingsGrant::Write;
         // Default deny shows no fs or exec tool; the names are checked on all.
         e.policy.mode = Mode::User;
-        let d = for_center(&NodeConfig::default(), &e, 0, true);
+        let d = for_center(&NodeConfig::default(), &e, 0, true, &[]);
         assert_eq!(d.check_names(), Ok(()));
         assert!(d.capabilities.len() >= 5);
     }
@@ -598,7 +635,7 @@ mod tests {
         let cfg = NodeConfig::default();
         let mut e = entry();
         e.policy.mode = Mode::User;
-        let d = for_center(&cfg, &e, 0, true);
+        let d = for_center(&cfg, &e, 0, true, &[]);
         let ids: Vec<&str> = d.capabilities.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, ["node", "fs", "exec", "audit"]);
         assert!(nerve_proto::descriptor::summary_words(&d.summary) < 60);
@@ -606,7 +643,7 @@ mod tests {
 
         e.policy.caps.insert("fs".into(), CapSetting::Off);
         assert_eq!(
-            for_center(&cfg, &e, 0, true)
+            for_center(&cfg, &e, 0, true, &[])
                 .capability("fs")
                 .unwrap()
                 .exposure,
@@ -616,12 +653,12 @@ mod tests {
         e.policy.caps.insert("exec".into(), CapSetting::Hidden);
         e.policy.caps.insert("fs.write".into(), CapSetting::Hidden);
         e.settings = SettingsGrant::Write;
-        let d2 = for_center(&cfg, &e, 0, true);
+        let d2 = for_center(&cfg, &e, 0, true, &[]);
         assert!(d2.capability("exec").is_none());
         assert!(d2.capability("settings").is_some());
         assert!(!d2.capability("fs").unwrap().actions.contains_key("write"));
         assert_ne!(d.rev, d2.rev);
-        assert_eq!(d2.rev, for_center(&cfg, &e, 0, true).rev);
+        assert_eq!(d2.rev, for_center(&cfg, &e, 0, true, &[]).rev);
     }
 
     fn actions(d: &Descriptor, cap: &str) -> Vec<String> {
@@ -638,7 +675,7 @@ mod tests {
     fn allowlist_without_rules_offers_no_tools() {
         let mut e = entry();
         e.settings = SettingsGrant::Write;
-        let d = for_center(&NodeConfig::default(), &e, 0, true);
+        let d = for_center(&NodeConfig::default(), &e, 0, true, &[]);
         assert!(d.capability("fs").is_none());
         assert!(d.capability("exec").is_none());
         assert!(d.capability("node").is_some());
@@ -651,24 +688,24 @@ mod tests {
         let cfg = NodeConfig::default();
         let mut e = entry();
         e.policy.allow = rules(&["exec.run:git *"]);
-        let d = for_center(&cfg, &e, 0, true);
+        let d = for_center(&cfg, &e, 0, true, &[]);
         assert_eq!(actions(&d, "exec"), ["run"]);
         assert!(d.capability("fs").is_none());
 
         // The scope decides, the pattern does not.
         e.policy.allow = rules(&["fs:~/notes/*"]);
-        let d = for_center(&cfg, &e, 0, true);
+        let d = for_center(&cfg, &e, 0, true, &[]);
         let mut fs = actions(&d, "fs");
         fs.sort();
         assert_eq!(fs, ["find", "grep", "list", "read", "stat", "write"]);
         assert!(d.capability("exec").is_none());
 
         e.policy.allow = rules(&["fs.read:/a/*"]);
-        assert_eq!(actions(&for_center(&cfg, &e, 0, true), "fs"), ["read"]);
+        assert_eq!(actions(&for_center(&cfg, &e, 0, true, &[]), "fs"), ["read"]);
 
         e.policy.allow = rules(&["exec"]);
         assert_eq!(
-            actions(&for_center(&cfg, &e, 0, true), "exec"),
+            actions(&for_center(&cfg, &e, 0, true, &[]), "exec"),
             ["run", "signal"]
         );
     }
@@ -678,7 +715,7 @@ mod tests {
         let cfg = NodeConfig::default();
         let mut e = entry();
         e.policy.sudo_allow = rules(&["sudo apt *"]);
-        let d = for_center(&cfg, &e, 0, true);
+        let d = for_center(&cfg, &e, 0, true, &[]);
         assert_eq!(actions(&d, "exec"), ["run"]);
         assert!(d.capability("fs").is_none());
     }
@@ -689,15 +726,23 @@ mod tests {
         let mut e = entry();
         for mode in [Mode::Folder, Mode::User] {
             e.policy.mode = mode;
-            let d = for_center(&cfg, &e, 0, true);
+            let d = for_center(&cfg, &e, 0, true, &[]);
             // `signal` actuates, which no mode allows by itself.
             assert_eq!(actions(&d, "exec"), ["run"]);
             assert_eq!(actions(&d, "fs").len(), 6);
         }
         // A folder or user mode that ran out is allowlist again.
         e.policy.until = Some(10);
-        assert!(for_center(&cfg, &e, 9, true).capability("fs").is_some());
-        assert!(for_center(&cfg, &e, 10, true).capability("fs").is_none());
+        assert!(
+            for_center(&cfg, &e, 9, true, &[])
+                .capability("fs")
+                .is_some()
+        );
+        assert!(
+            for_center(&cfg, &e, 10, true, &[])
+                .capability("fs")
+                .is_none()
+        );
     }
 
     /// Where commands cannot be confined (Linux without Landlock),
@@ -708,24 +753,24 @@ mod tests {
         let cfg = NodeConfig::default();
         let mut e = entry();
         e.policy.mode = Mode::Folder;
-        let d = for_center(&cfg, &e, 0, false);
+        let d = for_center(&cfg, &e, 0, false, &[]);
         assert!(d.capability("exec").is_none());
         assert_eq!(actions(&d, "fs").len(), 6);
         // Confined, as with Landlock or an AppContainer: offered.
-        let d = for_center(&cfg, &e, 0, true);
+        let d = for_center(&cfg, &e, 0, true, &[]);
         assert_eq!(actions(&d, "exec"), ["run"]);
         // User mode runs commands unconfined anyway.
         e.policy.mode = Mode::User;
-        let d = for_center(&cfg, &e, 0, false);
+        let d = for_center(&cfg, &e, 0, false, &[]);
         assert_eq!(actions(&d, "exec"), ["run"]);
         // A sudo entry runs by its list in every mode.
         e.policy.mode = Mode::Folder;
         e.policy.sudo_allow = rules(&["sudo apt *"]);
-        let d = for_center(&cfg, &e, 0, false);
+        let d = for_center(&cfg, &e, 0, false, &[]);
         assert_eq!(actions(&d, "exec"), ["run"]);
         // A call still reaches the policy, which refuses and audits it.
         e.policy.sudo_allow.clear();
-        assert!(for_call(&cfg, &e, 0).capability("exec").is_some());
+        assert!(for_call(&cfg, &e, 0, &[]).capability("exec").is_some());
     }
 
     /// `exec.signal` actuates: the descriptor offers it exactly where the
@@ -763,7 +808,7 @@ mod tests {
                     if on {
                         e.policy.caps.insert("exec.signal".into(), CapSetting::On);
                     }
-                    let shown = actions(&for_center(&cfg, &e, 0, true), "exec")
+                    let shown = actions(&for_center(&cfg, &e, 0, true, &[]), "exec")
                         .contains(&"signal".to_string());
                     let allowed = decide(&e.policy, &env, &call) == Decision::Allow;
                     assert_eq!(shown, allowed, "{mode:?} on={on} allow={allow:?}");
@@ -779,7 +824,114 @@ mod tests {
         let mut e = entry();
         e.settings = SettingsGrant::Write;
         e.policy.mode = Mode::User;
-        assert!(actions(&for_center(&cfg, &e, 0, true), "settings").contains(&"pause".to_string()));
+        assert!(
+            actions(&for_center(&cfg, &e, 0, true, &[]), "settings").contains(&"pause".to_string())
+        );
+    }
+
+    /// A provider's capability with one action of `effect`.
+    fn provided(effect: Effect) -> Capability {
+        let mut c = cap("echo", "", Exposure::On, "Says it back.");
+        c.provider = "desk".into();
+        c.actions.insert(
+            "say".into(),
+            action(effect, "Say it.", obj(json!({}), &[]), Value::Null),
+        );
+        c
+    }
+
+    /// A provider's action is offered exactly where the policy lets a call
+    /// of it through, for every effect, mode, `on` and allow rule: so the
+    /// center builds no tool for it that the node would refuse.
+    #[test]
+    fn a_provided_action_is_offered_where_the_policy_allows_it() {
+        use nerve_policy::protected::{Platform, Protected};
+        use nerve_policy::{Call, Decision, Env, decide};
+        let home = std::path::Path::new("/h");
+        let prot = Protected::new(&Platform::Unix, home, &[], &Default::default());
+        let env = Env {
+            home,
+            protected: &prot,
+            unconfined: None,
+            sudo: false,
+        };
+        let cfg = NodeConfig::default();
+        let effects = [
+            Effect::Read,
+            Effect::Write,
+            Effect::Execute,
+            Effect::Sense,
+            Effect::Actuate,
+        ];
+        for effect in effects {
+            let provided = [provided(effect)];
+            let call = Call {
+                cap: "echo",
+                action: "say",
+                effect,
+                targets: &[],
+                command: None,
+                cwd: None,
+                now_ms: 0,
+            };
+            for mode in [Mode::Allowlist, Mode::Folder, Mode::User] {
+                for on in [false, true] {
+                    for allow in [
+                        &[][..],
+                        &["echo.say"][..],
+                        &["echo"][..],
+                        &["echo.other"][..],
+                    ] {
+                        let mut e = entry();
+                        e.policy.mode = mode;
+                        e.policy.allow = rules(allow);
+                        if on {
+                            e.policy.caps.insert("echo.say".into(), CapSetting::On);
+                        }
+                        let d = for_center(&cfg, &e, 0, true, &provided);
+                        let shown = actions(&d, "echo") == ["say"];
+                        let allowed = decide(&e.policy, &env, &call) == Decision::Allow;
+                        let what = format!("{effect:?} {mode:?} on={on} allow={allow:?}");
+                        assert_eq!(shown, allowed, "{what}");
+                        // With no action left the capability is not listed.
+                        assert_eq!(d.capability("echo").is_some(), shown, "{what}");
+                        if shown {
+                            assert_eq!(d.capability("echo").unwrap().provider, "desk");
+                        }
+                        // A call reaches the policy whatever is shown.
+                        assert!(
+                            for_call(&cfg, &e, 0, &provided)
+                                .capability("echo")
+                                .is_some()
+                        );
+                    }
+                }
+            }
+        }
+        // Hidden is absent, off is listed and fails `disabled`, as for the
+        // node's own.
+        let provided = [provided(Effect::Read)];
+        let mut e = entry();
+        e.policy.mode = Mode::User;
+        e.policy.caps.insert("echo".into(), CapSetting::Off);
+        let d = for_center(&cfg, &e, 0, true, &provided);
+        assert_eq!(d.capability("echo").unwrap().exposure, Exposure::Off);
+        e.policy.caps.insert("echo".into(), CapSetting::Hidden);
+        assert!(
+            for_center(&cfg, &e, 0, true, &provided)
+                .capability("echo")
+                .is_none()
+        );
+        assert!(
+            for_call(&cfg, &e, 0, &provided)
+                .capability("echo")
+                .is_none()
+        );
+        // The rev follows: a provider that comes or goes is a new view.
+        e.policy.caps.clear();
+        let with = for_center(&cfg, &e, 0, true, &provided).rev;
+        let without = for_center(&cfg, &e, 0, true, &[]).rev;
+        assert_ne!(with, without);
     }
 
     #[test]
@@ -791,7 +943,7 @@ mod tests {
         e.policy
             .caps
             .insert("exec.signal".into(), CapSetting::Hidden);
-        let d = for_center(&cfg, &e, 0, true);
+        let d = for_center(&cfg, &e, 0, true, &[]);
         assert_eq!(d.capability("fs").unwrap().exposure, Exposure::Off);
         assert_eq!(actions(&d, "fs").len(), 6);
         assert_eq!(actions(&d, "exec"), ["run"]);
@@ -842,14 +994,14 @@ mod tests {
     fn a_rule_edit_changes_the_rev() {
         let cfg = NodeConfig::default();
         let mut e = entry();
-        let none = for_center(&cfg, &e, 0, true).rev;
+        let none = for_center(&cfg, &e, 0, true, &[]).rev;
         e.policy.allow = rules(&["exec.run:git *"]);
-        let one = for_center(&cfg, &e, 0, true).rev;
+        let one = for_center(&cfg, &e, 0, true, &[]).rev;
         // Another pattern of the same scope shows the same tools.
         e.policy.allow = rules(&["exec.run:ls *"]);
-        assert_eq!(for_center(&cfg, &e, 0, true).rev, one);
+        assert_eq!(for_center(&cfg, &e, 0, true, &[]).rev, one);
         e.policy.allow.clear();
-        assert_eq!(for_center(&cfg, &e, 0, true).rev, none);
+        assert_eq!(for_center(&cfg, &e, 0, true, &[]).rev, none);
         assert_ne!(none, one);
     }
 }

@@ -246,9 +246,17 @@ fn nerve_center_and_nerve_node_work_together() {
         click(&mcp, "deny", "fs", "write", "/nerve-e2e/a.txt", true),
         "fs.write:/nerve-e2e/*"
     );
-    assert_eq!(
-        click(&mcp, "allow", "camera", "snap", "camera.snap", false),
-        "camera.snap"
+    // No provider offers `camera` on this node, so it may sense for all the
+    // node knows: only the owner allows it. A deny rule is anyone's.
+    let (status, v) = button(
+        &mcp,
+        json!({"node_id": node_id, "list": "allow", "cap": "camera", "action": "snap",
+               "target": "camera.snap", "wildcard": false}),
+    );
+    assert_ne!(status, 200, "{v}");
+    assert!(
+        v.to_string().contains("only the owner can turn sensing on"),
+        "{v}"
     );
     assert_eq!(
         click(&mcp, "deny", "camera", "snap", "camera.snap", true),
@@ -269,10 +277,10 @@ fn nerve_center_and_nerve_node_work_together() {
         "exec.run:echo hi",
         "exec.run:echo *",
         "fs.read:/nerve-e2e/a.txt",
-        "camera.snap",
     ] {
         assert!(allow.contains(want), "{allow}");
     }
+    assert!(!allow.contains("camera"), "{allow}");
     assert_eq!(allow.matches("exec.run:echo hi").count(), 1, "{allow}");
     assert!(!allow.contains("rm"), "{allow}");
     let deny = list("deny");
@@ -545,5 +553,50 @@ fn node_part_passes_against_nerve_node() {
         .iter()
         .filter(|o| o.section.starts_with('7'));
     assert_eq!(profiles.count(), 19, "{report}");
+    drop(node);
+}
+
+/// The provider part against the real `nerve-node`: this test program
+/// attaches as the provider the owner allowed with `config add`.
+#[cfg(target_os = "linux")]
+#[test]
+fn provider_part_passes_against_nerve_node() {
+    use nerve_conformance::provider_part;
+    let root = tempfile::tempdir().unwrap();
+    let node = std::sync::Arc::new(std::sync::Mutex::new(Node::new(root.path())));
+    let n = node.clone();
+    let report = block_on(provider_part::run(move |link: PairLink| async move {
+        let link = link.render();
+        tokio::task::spawn_blocking(move || {
+            let mut node = n.lock().unwrap();
+            let (ok, out, err) = node.cli(&["center", "add", &link, "--yes"]);
+            if !ok {
+                return Err(format!("pair failed: {out}{err}"));
+            }
+            let (ok, out, err) = node.cli(&["center", "grant", "settings", "write"]);
+            if !ok {
+                return Err(format!("grant failed: {out}{err}"));
+            }
+            let exe = std::env::current_exe().unwrap();
+            let entry = format!("{{ name = \"conformance\", exe = \"{}\" }}", exe.display());
+            let (ok, out, err) = node.cli(&["config", "add", "providers.allowed", &entry]);
+            if !ok {
+                return Err(format!("allowing the provider failed: {out}{err}"));
+            }
+            node.start();
+            Ok(provider_part::Setup {
+                socket: node.state.join("run").join("ctl.sock"),
+                provider: "conformance".into(),
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }));
+    assert!(report.ok(), "{report}");
+    assert_eq!(
+        report.outcomes.len(),
+        provider_part::CHECKS.len(),
+        "{report}"
+    );
     drop(node);
 }

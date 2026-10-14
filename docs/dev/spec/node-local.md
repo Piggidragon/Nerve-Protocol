@@ -406,6 +406,9 @@ login = "lab-pc"            # optional, https:// only: the user; its password is
 headers = ["X-Proxy-Token"] # names of extra headers on the CONNECT request;
                             # their values are in the system keyring
 
+[providers]                 # programs that may add capabilities (§7); none by default
+allowed = [{ name = "desk", exe = "/usr/lib/nerve-desktop/nerve-desktop" }]
+
 [relay]                     # optional; the relay for other nodes (protocol §4.8)
 listen = "0.0.0.0:7490"     # ip:port; the relay is off without it
 pin = "<pin>"               # the pin of the relay's TLS certificate; its key is a node key
@@ -824,7 +827,10 @@ answer. For each call the node takes the center's policy and, in this order:
 6. Any other call in `allowlist` mode is allowed only when an `allow` rule
    matches (every path of the call needs one).
 7. In `folder` and `user` mode the mode itself decides (§Modes). `allow`
-   rules are not looked at.
+   rules are not looked at. An action that names no path and no command (a
+   provider's, §7) lies in no folder: `folder` mode allows it only where the
+   owner set it `on`, whatever its effect; `user` mode allows it as it allows
+   `fs` and `exec`, sense and actuate only with `on`.
 8. Protected paths (keys, shell profiles and the built-in list) are refused
    whatever allowed the call, `user` mode too. On Windows the built-in list
    also holds `%ProgramData%\ssh` (the OpenSSH server's config, host keys
@@ -888,15 +894,17 @@ answer. For each call the node takes the center's policy and, in this order:
 Every refusal names its reasons in the error and in the audit log.
 
 What the center is shown follows the same policy, so that its harness builds
-no tool the node would refuse. In `allowlist` mode an `fs` or `exec` action
-is in the descriptor only when an `allow` rule covers it by scope: `<cap>`
+no tool the node would refuse. In `allowlist` mode an `fs` or `exec` action,
+or one a provider adds (§7), is in the descriptor only when an `allow` rule
+covers it by scope: `<cap>`
 covers every action of the capability, `<cap>.<action>` that action, with or
 without a `:<pattern>`. The pattern is not looked at there; a rule may allow
 only some paths or commands, and each call is still decided as above.
 `exec.run` is also shown when `sudo_allow` has an entry, since a sudo command
 runs by that list alone. In `folder` and `user` mode the actions are shown as
 before and allow rules do not matter, except a sense or actuate action such
-as `exec.signal`, which is shown there only when the owner set it to `on`;
+as `exec.signal`, which is shown there only when the owner set it to `on`,
+and in `folder` mode a provider's action, which names no folder (step 7);
 deny rules never hide an action.
 `off` actions stay listed (exposure `off`), `hidden` ones and the actions
 left out here are absent, and a capability with no action left is absent.
@@ -1048,6 +1056,7 @@ Methods:
 | `sudo.on` | `password` | checks it with `sudo -v` and turns the switch on (§4) |
 | `sudo.off` | | turns the switch off and drops the password |
 | `owner.check` | | changes nothing; the CLI asks it before `install`, `setup`, `update` and `uninstall` |
+| `hello` | `role` (`provider`), `name`, `capabilities` | a capability provider attaches; the connection stays (§7) |
 
 Every method is refused from a process that runs below a command the node
 started for a center, the reading ones (`status`, `config.read`,
@@ -1150,3 +1159,107 @@ that makes refused calls cannot push out what the node allowed or changed.
 `nerve-node audit [--denied] [--follow]` shows both files, `audit.jsonl.1`
 first, and `--follow` finishes the old file after a move before it reads the
 new one.
+
+## 7. Capability providers
+
+A local program, such as a desktop app, can add capabilities to the node
+without talking to a center: it attaches to the node's control socket as a
+**provider**. Linux only for now: the node tells which program asks from
+`/proc/<pid>/exe`, and Windows' control pipe takes no provider.
+
+### Who may attach
+
+Only a program the owner names in `providers.allowed` (§2), by a name and the
+absolute path of its executable (`nerve-node config add providers.allowed
+'{ name = "desk", exe = "/usr/lib/nerve-desktop/nerve-desktop" }'`). None
+is allowed by default; only the owner changes the list, as no center document
+holds it. A name is 1 to 32 of `a-z`, `0-9` and `-`, and not `node`.
+
+The provider connects like the CLI: the socket's user check (its own user or
+root) and the token hold for it too, and so does the refusal of a process
+below a command of a center. Then it sends one request, `hello`:
+
+```json
+{"method": "hello", "token": "…",
+ "params": {"role": "provider", "name": "desk",
+            "capabilities": [{"id": "lamp", "summary": "The desk lamp.",
+                              "actions": {"on": {"effect": "write", "summary": "…",
+                                                 "params": {}, "result": {}}}}]}}
+```
+
+The node refuses it, with nothing attached, when:
+
+- `providers.allowed` names no provider `name`;
+- the process's executable, as the kernel resolved it, is not the one the
+  entry names once that is resolved (a link to the program is the program; a
+  program replaced since it started is not);
+- a provider of that name is attached already;
+- the fragment is not 1 to 16 capabilities of 1 to 64 actions each, with
+  names of letters, digits and `-`; a capability is named twice, takes the
+  name or the profile of one of the node's own (`node`, `fs`, `exec`,
+  `settings`, `audit`), or is added by another attached provider; or a
+  capability declares anything but `id`, `profile`, `summary` and `actions`
+  (no events, state or streams: the node forwards calls only, and the node,
+  not the provider, says `provider` and `exposure`).
+
+The check tells programs apart, not users: a process of the same user can
+still make the allowed program attach for it (`LD_PRELOAD`, `ptrace` where the
+system allows it). On the installed node the socket is `nerve`'s, so a
+program of a desktop user cannot attach there yet.
+
+### While it is attached
+
+The answer is `{"ok": {"name", "capabilities": [ids]}}`, and the connection
+stays. The node reads the provider's lines while it writes its own, so a
+provider may answer one call before it reads the next. The node lists each
+capability in every center's descriptor with
+`provider: <name>` and cuts it by that center's policy as its own (§3): `caps`
+hides it or turns it off; in `allowlist` mode an action is shown only when an
+allow rule covers it; in `folder` mode only where it is set `on`; sense and
+actuate only with `on`. The descriptor's `rev` changes, so every center gets
+`node/descriptor_changed`. `status` lists the attached providers.
+
+A center's call to such an action is decided and audited by the node like any
+other, with `<cap>.<action>` as its rule target, deny rules and `caps`
+included. Only an allowed call reaches the provider, as one line:
+
+```json
+{"id": 7, "method": "invoke", "params": {"cap": "lamp", "action": "on", "args": {}}}
+```
+
+The provider answers `{"id": 7, "ok": value}` or `{"id": 7, "error": "text",
+"code": "io"}`, one line each, at most 1 MiB. Of its codes `invalid_args`,
+`unavailable`, `busy`, `timeout`, `too_large`, `internal`, `conflict`,
+`bad_path` and `io` reach the center; any other becomes `internal`, as
+`forbidden` and `disabled` are the node's words. When the call ends before the
+answer (the center cancels it, its deadline passes, its session or link ends)
+the node sends `{"method": "cancel", "params": {"id": 7}}` and drops a late
+answer. The provider learns nothing of the center: not its name, its session
+or its policy.
+
+A center with the settings grant may add allow rules and `on` entries for a
+provider's capability like for any other, and take away `off` and `hidden`
+entries and deny rules, except for one that senses, one that no attached
+provider offers now, and an action (`cap.action`) that an offered capability
+does not have now: the node knows the effects only of what
+an attached provider offers, so what it does not know may sense once it comes.
+Only the owner adds or takes away those entries (`settings.set` refuses the
+document with `forbidden`), so a center cannot drop its own deny rule for such
+a capability either. What stays open: an `on` entry or an allow rule for a
+capability or for one of its actions, written while it did not sense, still
+counts when a provider later offers it with a sense action under the same
+name (a new version of the program that makes `screen.info` sense). The node
+cannot tell a center's entry from the owner's then; the owner checks the
+entries after such an update.
+
+### Detach
+
+The capabilities go when the connection does: the provider closes it or
+exits, sends a line that is no JSON or longer than 1 MiB, the owner takes it
+off `providers.allowed` or names another program for it, or the node stops.
+The descriptor's `rev` changes again, a call that waited for an answer fails
+`unavailable`, and a call that names the capability afterwards is
+`unknown_capability`. A provider that comes back sends `hello` again.
+
+A provider holds one of the socket's 64 places for as long as it is attached.
+

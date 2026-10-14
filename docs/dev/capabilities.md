@@ -47,7 +47,11 @@ Parameters, results and state are JSON Schema 2020-12.
 - Capability ids and action names use letters, digits and `-`, never `_`. The
   harness side joins names with `_`, and a `_` inside a name would make the tool
   name ambiguous. A center ignores a descriptor with such a name.
-- `provider` says which process serves the capability. It is always `node`.
+- `provider` says which process serves the capability: `node` for the node's
+  own, else the name of a local program the owner allowed to attach to the
+  node ([node-local §7](spec/node-local.md#7-capability-providers)). Such a
+  capability has actions only, and the node decides each call to it by the
+  center's policy before the program sees it.
 
 ## Effects
 
@@ -66,7 +70,8 @@ The center sets `readOnlyHint` on MCP tools for `read` and `sense`.
 
 `folder` and `user` mode do not cover `sense` and `actuate` actions. They run
 only when the owner set the action to `on`, or, in `allowlist` mode, when an
-allow rule names them.
+allow rule names them. A provider's action names no folder, so `folder` mode
+runs it only when it is set to `on`, whatever its effect.
 
 ## Built-in profiles
 

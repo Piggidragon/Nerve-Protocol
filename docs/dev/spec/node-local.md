@@ -61,7 +61,9 @@ the file-system ids are root's without root's capabilities
 and the `fs` actions reach only what root owns or what the permission bits
 open to others; a command itself is really root. The CLI, which
 runs as `nerve` on the installed node, keeps a folder it may not look into
-in its normal form (`folder add`), unresolved. A node not installed as a
+in its normal form (`folder add`), unresolved, until the running node
+resolves it as the account (`folder.place`, §5); with no node, or when the
+node cannot, it stays as given. A node not installed as a
 service runs commands as its own user and refuses a `machine.user` it
 cannot switch to. The installed node is known by its folders or its user,
 not by its capabilities: started without them (by hand, as `nerve`), it
@@ -580,6 +582,9 @@ answer. For each call the node takes the center's policy and, in this order:
    stored by its resolved path and listed in `policy.places`; such a folder
    is also left out when its path resolves to another place now, whatever the
    `w` folders say, and a center's settings document cannot change the list.
+   `folder add` itself does not follow a link that lies inside a `w` folder
+   of any center: it refuses, so that a link a command made is not stored,
+   and recorded, at its target.
    For a folder without an entry only the `w` folders in the config count,
    and a command that runs without Landlock can make a link elsewhere. A folder
    that holds a protected entry gives a command in `folder` mode none of it:
@@ -684,7 +689,7 @@ Methods:
 | `config.read` | | `node.toml` and its `version` |
 | `config.write` | `config`, `if_version` | replaces it when the version matches |
 | `config.accept` | | takes `node.toml` as it is after it was refused, and signs it (§1) |
-| `folder.place` | `center`, `path` | resolves the listed folder at `path` as the account commands run as, stores it at the place it leads to (replacing the entry, with its access, when that is another path) and records it in `policy.places`; `{placed, place}`, `placed` false when it cannot be resolved for the account. The CLI asks it after `folder add` for a folder it could not look into itself (the installed node's CLI runs as `nerve`) |
+| `folder.place` | `center`, `path` | resolves the listed folder at `path` as the account commands run as, stores it at the place it leads to (replacing the entry, with the access it has then, when that is another path) and records it in `policy.places`; `{placed, place}`. `placed` is false when it cannot be resolved for the account, and with a `why` when the path crosses a link inside a `w` folder (`exec::crosses_write_link`): then nothing changes. The CLI asks it after `folder add` for a folder it could not look into itself (the installed node's CLI runs as `nerve`) |
 | `reload` | | rereads `node.toml`; only a file the node signed is applied (§1) |
 | `sudo.status` | | `{sudo: "on"|"off"}` |
 | `sudo.on` | `password` | checks it with `sudo -v` and turns the switch on (§4) |

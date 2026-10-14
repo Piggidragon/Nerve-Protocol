@@ -60,9 +60,14 @@ the list. `folder rm` removes it.
 
 ### A folder keeps the place you added
 
-`folder add` follows the links on the path and stores the real place. The
-node records that it did (`places` under the pairing's `policy` in
-`node.toml`). A command with `w` on a folder can put a link in place of a
+`folder add` follows the links on the path and stores the real place, except
+a link that lies inside a folder where commands may write (a `w` folder of
+any pairing): a command may have put it there, and the folder would be stored
+at whatever it leads to. `folder add` then refuses and says which link. Look
+at it (`ls -l`, `dir /AL`): add the place you mean by its own path, or remove
+the link. (Once no `w` folder shows the link, it cannot be told from yours and
+is followed.) The node records that it stored the real place (`places` under
+the pairing's `policy` in `node.toml`). A command with `w` on a folder can put a link in place of a
 folder inside it, and a link would give that folder's rights in a place you
 never named. So the node looks at the path again before each command: a
 recorded folder whose path leads somewhere else now is left out of the
@@ -73,7 +78,8 @@ off the folder above or removed the pairing that had it. The folder is back
 once its path leads to the place you added again. To take the place the path
 leads to now, `folder rm` the folder and `folder add` it again. Name it with
 the path you gave to `folder add`, or the one `folder ls` shows (a trailing
-slash does not matter). `folder rm` and `folder set` find the entry also
+slash does not matter; on the installed node only the one `folder ls` shows
+works for a path that went through a link, see below). `folder rm` and `folder set` find the entry also
 through links of your own, and where the link that replaced it cannot be
 resolved (it dangles or loops), and act on that entry, not on the folder the
 link leads to now.
@@ -86,7 +92,11 @@ Not every folder is recorded. Folders added before the node kept this record
 have no entry, and neither have folders a center sets and folders you write
 into `node.toml` with `config set`. The node follows wherever their path
 leads, and the cautions about links below hold for them. To record such a
-folder, add it again with its rights. `nerve-node config get
+folder, first check that its path is not a link now (`ls -ld <path>`,
+`dir /AL <path>`, `find <path> -type l`): `folder add` follows a link outside
+the `w` folders and stores the place it leads to, and then the old entry stays
+beside the new one (`folder rm` it). Then add the folder again with its
+rights. `nerve-node config get
 center.<name>.policy.places` lists the recorded ones. A node from before this
 record refuses a `node.toml` that has `places`: remove the key
 (`nerve-node config unset center.<name>.policy.places`) before you go back to
@@ -98,10 +108,15 @@ links on a path there nor tell that a folder is its own place. `folder add`
 then asks the running node, which looks as the account the commands run as: it
 stores the real place the path leads to, as `folder add` does where it can
 look (the command says so when that is not the path you gave), and records it.
-With no node running, or when the node cannot resolve the path either (no
-account is chosen, or a link on it dangles), the folder is stored as given
-and not recorded, and `folder add` says so (`note: … is not recorded at its
-real place …`): start the node, fix the path, and add the folder again. Check
+A link inside a `w` folder is not followed there either: the folder stays as
+given, not recorded, and the command says why (`note: … is stored as given
+and not recorded: …`). With no node running, or when the node cannot resolve
+the path either (no account is chosen, or a link on it dangles), the folder is
+stored as given and not recorded, and `folder add` says so (`note: … is not
+recorded at its real place …`): start the node, fix the path, and add the
+folder again. A folder the node stored at the place a link leads to is listed
+there: give `folder rm` and `folder set` the path `folder ls` shows, since the
+CLI cannot see the link. Check
 for links (`find <folder> -type l` on Linux,
 `dir /AL /S <folder>` on Windows) before you take `w` off the folder above
 such a folder.

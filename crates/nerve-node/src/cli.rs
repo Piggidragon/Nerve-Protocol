@@ -1786,6 +1786,22 @@ async fn add_folder(
                 .into(),
         );
     }
+    // A link a command may have put in the path is not followed: the folder
+    // would be stored, and recorded, at whatever it leads to.
+    let (cfg, _) = read_config(paths).await?;
+    let given = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| e.to_string())?
+            .join(path)
+    };
+    if let Some(why) = crate::exec::crosses_write_link(&cfg, &crate::paths::home_dir(), &given) {
+        return Err(format!(
+            "{}: {why}. Look at the link (`ls -l`, `dir /AL`): add the place you mean by its own path, or remove the link",
+            path.display()
+        ));
+    }
     let real = resolve_folder(path)?;
     // The place the owner adds is recorded, so that a link which replaces
     // the folder later is refused (`exec::folder_sets`); adding it again
@@ -1809,27 +1825,36 @@ async fn add_folder(
     let asked = if placed {
         None
     } else {
-        record_by_node(paths, &name, &real).await
+        Some(record_by_node(paths, &name, &real).await)
     };
-    let stored = asked.clone().unwrap_or_else(|| real.clone());
+    let stored = match &asked {
+        Some(Ok(place)) => place.clone(),
+        _ => real.clone(),
+    };
     w(
         out,
         format!("{name}: folder {stored} {}", access.to_chmod()),
     );
-    if !placed && asked.is_none() {
-        w(
+    match &asked {
+        Some(Err(Some(why))) => w(
+            out,
+            format!(
+                "note: {real} is stored as given and not recorded: {why}, and a command may have put that link there. It stays out of the commands' sandbox while a `w` folder shows the link, and is followed once none does: `folder rm` it, or add the place you mean by its own path"
+            ),
+        ),
+        Some(Err(None)) => w(
             out,
             format!(
                 "note: {real} is not recorded at its real place, since this command cannot tell that it is (the installed node's CLI may not look into the account's home) and no running node could: a link that replaces the folder later is followed once no `w` folder shows it, see modes.md \"A folder keeps the place you added\""
             ),
-        );
-    } else if stored != real {
-        w(
+        ),
+        Some(Ok(place)) if *place != real => w(
             out,
             format!(
-                "note: {real} leads to {stored} for the account the commands run as; the folder is stored there"
+                "note: {real} leads to {place} for the account the commands run as; the folder is stored there"
             ),
-        );
+        ),
+        _ => {}
     }
     let mode = mode.get();
     if mode != Mode::Folder {
@@ -1848,23 +1873,30 @@ async fn add_folder(
 /// real place, which it judges as the account the commands run as
 /// (`folder.place`): this command may not look into that account's home. The
 /// answer is the place the folder is stored at and recorded now (`path`, or
-/// the real place the path leads to for that account). `None` when no node
-/// runs, this platform has no control socket, or the node cannot tell either.
-async fn record_by_node(paths: &NodePaths, center: &str, path: &str) -> Option<String> {
+/// the real place the path leads to for that account). Otherwise the reason
+/// when the node left the folder as it is, since its path crosses a link inside
+/// a `w` folder, and `None` when no node runs, this platform has no control
+/// socket, or the node cannot tell either.
+async fn record_by_node(
+    paths: &NodePaths,
+    center: &str,
+    path: &str,
+) -> Result<String, Option<String>> {
     #[cfg(unix)]
     {
         let params = json!({"center": center, "path": path});
         let v = nerve_transport::ctl::call(&paths.ctl_socket(), "folder.place", params)
             .await
-            .ok()?;
-        (v["placed"] == true)
-            .then(|| v["place"].as_str().map(str::to_string))
-            .flatten()
+            .map_err(|_| None)?;
+        match v["place"].as_str() {
+            Some(place) if v["placed"] == true => Ok(place.to_string()),
+            _ => Err(v["why"].as_str().map(str::to_string)),
+        }
     }
     #[cfg(not(unix))]
     {
         let _ = (paths, center, path);
-        None
+        Err(None)
     }
 }
 
@@ -3066,6 +3098,40 @@ mod tests {
         assert!(
             e.contains("Too many levels") || e.contains("symlink"),
             "{e}"
+        );
+    }
+
+    /// A link a command may have put inside a folder it can write in is not
+    /// followed by `folder add`: it would store, and record, whatever the link
+    /// leads to, past the check that keeps such a folder out of the sandbox.
+    /// A link of the owner's elsewhere is followed, as before.
+    #[cfg(unix)]
+    #[test]
+    fn folder_add_does_not_follow_a_link_inside_a_write_folder() {
+        let (d, paths) = setup(&["home"]);
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let (work, docs) = (root.join("work"), root.join("docs"));
+        let bin = work.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir(&docs).unwrap();
+        run(&paths, &["folder", "add", work.to_str().unwrap(), "+rw"]).unwrap();
+        // The folder is a plain one first, and then a command replaces it.
+        std::fs::remove_dir(&bin).unwrap();
+        std::os::unix::fs::symlink(&docs, &bin).unwrap();
+        let e = run(&paths, &["folder", "add", bin.to_str().unwrap(), "+rx"]).unwrap_err();
+        assert!(e.contains("link") && e.contains("may write"), "{e}");
+        let policy = load(&paths).centers[0].policy.clone();
+        assert_eq!(policy.folders.len(), 1, "nothing was stored: {policy:?}");
+        assert_eq!(policy.places, [work.display().to_string()]);
+        assert!(!policy.is_placed(&docs.display().to_string()));
+        // A link of the owner's outside every write folder is followed.
+        let to_docs = root.join("to-docs");
+        std::os::unix::fs::symlink(&docs, &to_docs).unwrap();
+        run(&paths, &["folder", "add", to_docs.to_str().unwrap(), "+r"]).unwrap();
+        assert!(
+            load(&paths).centers[0]
+                .policy
+                .is_placed(&docs.display().to_string())
         );
     }
 

@@ -465,6 +465,16 @@ pub fn write_folders(cfg: &NodeConfig, home: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
+/// Why a folder about to be added at `path` (as given, not resolved) must not
+/// be stored at the place it leads to: its path crosses a link inside a `w`
+/// folder of any center in `cfg` ([`led_away`], with [`write_folders`]), and a
+/// command may have put that link there. `folder add` would otherwise follow
+/// it and store, and record, whatever it leads to.
+pub fn crosses_write_link(cfg: &NodeConfig, home: &Path, path: &Path) -> Option<String> {
+    let bounds: Vec<PathBuf> = write_folders(cfg, home).iter().map(|w| real(w)).collect();
+    led_away(path, &bounds)
+}
+
 /// Why resolving `path` leads out of its own place: a link the resolution
 /// crosses lies at or inside a place where commands may write (`writable`,
 /// resolved), and a command may have put it there. `path` is resolved the way

@@ -265,10 +265,10 @@ impl Shared {
     /// cannot judge a folder there; the node looks as the account does, as it
     /// does before a command. A path that goes through a link of the account
     /// is stored at the place it leads to, as `folder add` does where it can
-    /// look. The answer is that place; `Ok(None)` when it cannot be told (no
-    /// account is chosen, or the path does not resolve for it).
+    /// look, unless the link lies inside a `w` folder: a command may have put
+    /// it there, so the entry stays as it is ([`Recorded::Refused`]).
     #[cfg(unix)]
-    pub fn record_place(&self, center: &str, path: &str) -> Result<Option<String>, String> {
+    pub fn record_place(&self, center: &str, path: &str) -> Result<Recorded, String> {
         use nerve_policy::paths::{resolve, within};
         let same = |a: &str, b: &str| {
             let (a, b) = (std::path::Path::new(a), std::path::Path::new(b));
@@ -278,40 +278,41 @@ impl Shared {
         let entry = cfg
             .center(center)
             .ok_or_else(|| format!("no center named {center}"))?;
-        let Some(listed) = entry.policy.folders.iter().find(|f| same(&f.path, path)) else {
+        if !entry.policy.folders.iter().any(|f| same(&f.path, path)) {
             return Err(format!("{path} is not a folder of {center}"));
-        };
-        let access = listed.access;
+        }
         let Ok(account) = self.command_account(&cfg) else {
-            return Ok(None);
+            return Ok(Recorded::Unknown);
         };
-        let place = {
+        let home = account
+            .as_ref()
+            .map_or_else(|| self.home.clone(), |a| a.home.clone());
+        let (place, crossed) = {
             let _as = crate::link::act_as(account.as_ref()).map_err(|e| e.message)?;
-            resolve(std::path::Path::new(path))
+            let at = std::path::Path::new(path);
+            (
+                resolve(at),
+                crate::exec::crosses_write_link(&cfg, &home, at),
+            )
         };
+        if let Some(why) = crossed {
+            return Ok(Recorded::Refused(why));
+        }
         let Ok(place) = place.map(|p| p.display().to_string()) else {
-            return Ok(None);
+            return Ok(Recorded::Unknown);
         };
+        // The folder is looked up again under the lock: the owner or a center
+        // may have changed it since the snapshot.
         lock(&self.store)
             .update(|c| {
-                let p = &mut c
-                    .center_mut(center)
+                c.center_mut(center)
                     .ok_or_else(|| format!("no center named {center}"))?
-                    .policy;
-                if !same(&place, path) {
-                    p.folders
-                        .retain(|f| !same(&f.path, path) && !same(&f.path, &place));
-                    p.folders.push(nerve_policy::config::Folder {
-                        path: place.clone(),
-                        access,
-                    });
-                }
-                p.set_placed(&place, true);
-                Ok(())
+                    .policy
+                    .store_at(path, &place)
             })
             .map_err(|e| e.to_string())?;
         self.bump();
-        Ok(Some(place))
+        Ok(Recorded::At(place))
     }
 
     pub fn bump(&self) {
@@ -923,6 +924,19 @@ async fn start_ctl(_shared: Arc<Shared>) -> Result<JoinHandle<()>, String> {
     Ok(tokio::spawn(async {}))
 }
 
+/// What [`Shared::record_place`] did.
+#[cfg(unix)]
+#[derive(Debug, PartialEq, Eq)]
+pub enum Recorded {
+    /// The folder is stored and recorded at this place.
+    At(String),
+    /// The path does not resolve for the account, or none is chosen.
+    Unknown,
+    /// Nothing changed: the path crosses a link inside a `w` folder, which a
+    /// command may have put there (the reason).
+    Refused(String),
+}
+
 /// Methods that change something: refused from below a center's command.
 /// `owner.check` changes nothing itself: the CLI asks it before `install`,
 /// `setup`, `update` and `uninstall`, which change the node.
@@ -1023,7 +1037,9 @@ pub(crate) fn control(
                 return Reply::Err("center and path are needed".into());
             };
             match shared.record_place(&center, &path) {
-                Ok(place) => Reply::Ok(json!({"placed": place.is_some(), "place": place})),
+                Ok(Recorded::At(place)) => Reply::Ok(json!({"placed": true, "place": place})),
+                Ok(Recorded::Unknown) => Reply::Ok(json!({"placed": false})),
+                Ok(Recorded::Refused(why)) => Reply::Ok(json!({"placed": false, "why": why})),
                 Err(e) => Reply::Err(e),
             }
         }
@@ -1541,6 +1557,10 @@ mod tests {
         std::os::unix::fs::symlink(&work, &link).unwrap();
         std::os::unix::fs::symlink(&other, &link2).unwrap();
         std::os::unix::fs::symlink(root.join("nowhere"), &dangling).unwrap();
+        // A link a command could have put inside a folder it may write in.
+        let (wdir, bin) = (root.join("wdir"), root.join("wdir/bin"));
+        std::fs::create_dir(&wdir).unwrap();
+        std::os::unix::fs::symlink(&other, &bin).unwrap();
         let folder = |p: &std::path::Path, access: &str| Folder {
             path: p.display().to_string(),
             access: Access::parse(access).unwrap(),
@@ -1562,6 +1582,8 @@ mod tests {
                             folder(&work, "r"),
                             folder(&link2, "rw"),
                             folder(&dangling, "x"),
+                            folder(&wdir, "rw"),
+                            folder(&bin, "rx"),
                         ],
                         ..Default::default()
                     },
@@ -1590,6 +1612,13 @@ mod tests {
                 v["place"].as_str().map(String::from),
             )
         };
+        let refused = |p: &std::path::Path| {
+            let Reply::Ok(v) = ask("home", p, None) else {
+                panic!("folder.place failed")
+            };
+            assert_eq!(v["placed"], false);
+            v["why"].as_str().map(String::from)
+        };
         // Its own place: recorded where it is.
         assert_eq!(place(&work), (true, Some(work.display().to_string())));
         assert_eq!(policy().places, [work.display().to_string()]);
@@ -1603,6 +1632,13 @@ mod tests {
         assert_eq!(place(&dangling), (false, None));
         assert_eq!(listed(&dangling).as_deref(), Some("x"));
         assert_eq!(policy().places.len(), 2);
+        // A link inside a folder commands may write in is not followed: the
+        // entry stays as it is and is not recorded.
+        let why = refused(&bin).expect("the reason");
+        assert!(why.contains("link") && why.contains("may write"), "{why}");
+        assert_eq!(listed(&bin).as_deref(), Some("rx"));
+        assert_eq!(policy().places.len(), 2);
+        assert_eq!(refused(&dangling), None);
         // Only a folder of the center, and only the owner asks.
         assert!(matches!(ask("home", &link, None), Reply::Err(e) if e.contains("not a folder")));
         assert!(matches!(ask("lab", &work, None), Reply::Err(e) if e.contains("no center")));

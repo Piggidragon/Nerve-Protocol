@@ -57,22 +57,73 @@ pub fn invoker_warning(name: &str) -> String {
 }
 
 /// What `install` and `setup` suggest to anyone whose account is no
-/// boundary.
+/// boundary and who runs them through `sudo`.
 pub const CREATE_USER_HINT: &str = "An account only the node uses is the boundary: `sudo nerve-node setup --create-user nerve-work` makes one and runs commands as it.";
 
-/// The same for root, who needs no `sudo` to run it.
+/// The same for whoever runs `install` or `setup` as root, with no `sudo`
+/// (it may not even be installed).
 pub const CREATE_USER_HINT_ROOT: &str = "An account only the node uses is the boundary: `nerve-node setup --create-user nerve-work` makes one and runs commands as it.";
 
-/// Whether the rules `sudo -l -U <name>` lists let the account use sudo
-/// without a password: a `NOPASSWD` tag or `!authenticate`. Such a list
-/// costs sudo no failed login; the probe that follows is made only for an
-/// account whose list has one.
-pub fn lists_no_password(listing: &str) -> bool {
-    listing.contains("NOPASSWD:") || listing.contains("!authenticate")
+/// Whether the rules `sudo -l -U <name>` lists may let the account use
+/// sudo without a password, so that a probe is worth making: a rule that
+/// grants every command (`ALL`) with `NOPASSWD`, `!authenticate` (not one
+/// for a single command), or `exempt_group=` naming one of `groups`. Such
+/// a list costs sudo no failed login. It is a gate only: a later rule can
+/// still ask for the password, and the probe decides. An account with
+/// `NOPASSWD` for single commands, such as `apt`, is not probed.
+pub fn lists_no_password(listing: &str, groups: &[String]) -> bool {
+    listing.lines().any(|line| {
+        let line = line.trim();
+        if let Some((_, cmds)) = line.split_once("NOPASSWD:") {
+            return cmds.split(',').any(|c| {
+                // Tags such as `SETENV:` come before the command.
+                let c = c.trim();
+                c.rsplit(' ').next() == Some("ALL")
+            });
+        }
+        // A default for one command (`Defaults!/usr/bin/apt …`) is not one
+        // for the account.
+        if line.starts_with("Defaults!") {
+            return false;
+        }
+        line.split(',').any(|entry| {
+            // `Defaults>root !authenticate` names a user before the flag.
+            let entry = entry.trim().rsplit(' ').next().unwrap_or("");
+            match entry.split_once('=') {
+                Some(("exempt_group", g)) => {
+                    let g = g.trim_matches('"').trim_start_matches('%');
+                    groups.iter().any(|x| x == g)
+                }
+                _ => entry == "!authenticate",
+            }
+        })
+    })
+}
+
+/// The names of the groups `account` is in, as `id -Gn` prints them.
+pub fn group_names(account: &Account) -> Vec<String> {
+    match plain("id").args(["-Gn", "--", &account.name]).output() {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .split_whitespace()
+            .map(String::from)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The suggestion for whoever runs `install` or `setup`: root runs it
+/// without `sudo`, anyone else through it.
+fn hint(invoker: &str) -> &'static str {
+    if invoker == "root" {
+        CREATE_USER_HINT_ROOT
+    } else {
+        CREATE_USER_HINT
+    }
 }
 
 /// The warnings for `account` as the account of the commands, none when
-/// it is a boundary. Root has its own, with the suggestion. Otherwise: it ran `sudo`
+/// it is a boundary. Root has its own. Each comes with the suggestion,
+/// as `invoker` runs it. Otherwise: it ran `sudo`
 /// (`invoker`), it is in a group of [`ROOT_GROUPS`] (`groups`), or
 /// `sudo_without_password` says its sudo needs no password; the reasons
 /// share the suggestion at the end.
@@ -83,7 +134,7 @@ pub fn root_warnings(
     sudo_without_password: impl FnOnce() -> bool,
 ) -> Vec<String> {
     if account.uid == 0 {
-        return vec![root_warning(), CREATE_USER_HINT_ROOT.into()];
+        return vec![root_warning(), hint(invoker).into()];
     }
     let mut w = Vec::new();
     if account.name == invoker {
@@ -96,7 +147,7 @@ pub fn root_warnings(
         w.push(sudo_warning(&account.name));
     }
     if !w.is_empty() {
-        w.push(CREATE_USER_HINT.into());
+        w.push(hint(invoker).into());
     }
     w
 }
@@ -740,34 +791,53 @@ mod tests {
         // A boundary: no warning, no suggestion.
         assert!(root_warnings(&alice, "bob", &[], no).is_empty());
         // Root has its warning, and nothing asks sudo about it.
-        let w = root_warnings(&account("root", 0), "alice", &[], || {
-            panic!("root is not probed")
-        });
+        let root = account("root", 0);
+        let w = root_warnings(&root, "root", &[], || panic!("root is not probed"));
         assert_eq!(w, [root_warning(), CREATE_USER_HINT_ROOT.to_string()]);
-        // Root needs no sudo for the suggestion; the others do.
+        // The suggestion follows who runs the command, not the account:
+        // root has no need of sudo, and may have none; anyone else has.
         assert!(!CREATE_USER_HINT_ROOT.contains("sudo"));
+        let w = root_warnings(&root, "alice", &[], no);
+        assert_eq!(w.last().map(String::as_str), Some(CREATE_USER_HINT));
+        let w = root_warnings(&alice, "root", &docker, no);
+        assert_eq!(w.last().map(String::as_str), Some(CREATE_USER_HINT_ROOT));
     }
 
     /// The rules sudo lists for an account say whether a probe is worth
-    /// making: a password sudoer and an account without rules are not.
+    /// making: a password sudoer, a sudoer with `NOPASSWD` for single
+    /// commands and an account without rules are not.
     #[test]
     fn a_sudo_listing_tells_whether_no_password_is_asked() {
-        assert!(lists_no_password(
+        let wheel = ["alice".to_string(), "wheel".to_string()];
+        let yes = |l: &str| lists_no_password(l, &wheel);
+        assert!(yes(
             "User alice may run the following commands on h:\n    (ALL) NOPASSWD: ALL\n"
         ));
-        assert!(lists_no_password(
-            "Matching Defaults entries for alice on h:\n    !authenticate\n"
+        assert!(yes("    (root) NOPASSWD: SETENV: ALL\n"));
+        assert!(yes(
+            "    (ALL : ALL) ALL\n    (ALL) NOPASSWD: /usr/bin/id, ALL\n"
         ));
-        assert!(lists_no_password(
-            "    (ALL : ALL) ALL\n    (root) NOPASSWD: /usr/bin/apt\n"
+        assert!(yes(
+            "Matching Defaults entries for alice on h:\n    env_reset, !authenticate\n"
         ));
-        assert!(!lists_no_password(
+        assert!(yes(
+            "Runas and Command-specific defaults for alice:\n    Defaults>root !authenticate\n"
+        ));
+        assert!(yes("    env_reset, exempt_group=wheel\n"));
+        // A few commands without a password: `true` is not one of them.
+        assert!(!yes(
+            "    (ALL : ALL) ALL\n    (root) NOPASSWD: /usr/bin/apt, /usr/bin/systemctl\n"
+        ));
+        assert!(!yes(
+            "Runas and Command-specific defaults for alice:\n    Defaults!/usr/bin/apt !authenticate\n"
+        ));
+        // Another group's exemption.
+        assert!(!yes("    env_reset, exempt_group=admins\n"));
+        assert!(!yes(
             "User alice may run the following commands on h:\n    (ALL : ALL) ALL\n"
         ));
-        assert!(!lists_no_password(
-            "User bob is not allowed to run sudo on h.\n"
-        ));
-        assert!(!lists_no_password(""));
+        assert!(!yes("User bob is not allowed to run sudo on h.\n"));
+        assert!(!yes(""));
     }
 
     #[test]

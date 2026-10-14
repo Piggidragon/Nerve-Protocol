@@ -101,10 +101,13 @@ folders, and refuses to run it if it can. That holds as long as the account
 cannot become root. Root itself can, and so can an account in a group that
 gets root without a password: `docker`, `lxd`, `incus-admin`, `libvirt` or
 `disk`. So can an account that may use `sudo` without a password
-(`NOPASSWD`: its sudo rules say so, and `sudo -n -k true`, run as the
-account, succeeds; an account that needs a password is not run as, so sudo
-logs no failed login), and the account that ran `sudo`, the one its owner
-logs in as (see [platforms](platforms.md#linux)). `install` and `setup` warn
+(its sudo rules grant every command with `NOPASSWD`, or turn `authenticate`
+off, or exempt its group, and `sudo -n -k true`, run as the account,
+succeeds). An account whose rules name no such thing, `NOPASSWD` for single
+commands included, is not run as, so sudo logs no failed login. One whose
+rules do but a later rule asks for the password is, and sudo logs it. The
+account that ran `sudo`, the one its owner logs in as, is such an account
+too (see [platforms](platforms.md#linux)). `install` and `setup` warn
 about such an account, whether they take it or it is chosen already, and
 suggest an account made for the node, also for root. Choose one
 outside these groups, or a command can read the keys after all.

@@ -793,7 +793,9 @@ async fn supervise(shared: Arc<Shared>) {
             granted = Some(cfg.version);
             let (s, c) = (shared.clone(), cfg.clone());
             tokio::task::spawn_blocking(move || {
-                let synced = crate::grants::apply(&s.paths, &c, &s.rules_home(&c));
+                let synced = crate::grants::apply(&s.paths, &c, &s.rules_home(&c), &mut |m| {
+                    tracing::info!("folder grants: {m}")
+                });
                 for e in synced.errors {
                     tracing::warn!("folder grants: {e}");
                 }

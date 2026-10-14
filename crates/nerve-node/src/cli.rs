@@ -666,8 +666,10 @@ pub async fn edit(
             // No daemon took the change, so the folder grants of Windows
             // folder mode follow it here (crate::grants); a running node
             // brings them in line with its own config again before a
-            // command.
-            let synced = crate::grants::apply(paths, &cfg, &crate::paths::home_dir());
+            // command. A change that takes long says how far it is here.
+            let synced = crate::grants::apply(paths, &cfg, &crate::paths::home_dir(), &mut |m| {
+                eprintln!("{m}")
+            });
             if let Some(e) = synced.errors.first() {
                 return Err(format!(
                     "the config is saved, but the folder grants do not follow it: {e}"

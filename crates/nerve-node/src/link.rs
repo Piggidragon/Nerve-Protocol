@@ -1336,9 +1336,15 @@ impl Link {
         home: &std::path::Path,
     ) -> Result<nerve_sandbox::ContainerSpec, RpcError> {
         let (paths, cfg, home) = (self.shared.paths.clone(), cfg.clone(), home.to_path_buf());
-        let synced = tokio::task::spawn_blocking(move || crate::grants::apply(&paths, &cfg, &home))
-            .await
-            .map_err(|e| RpcError::internal(e.to_string()))?;
+        // A change that takes long holds the command; the log says how far
+        // it is.
+        let synced = tokio::task::spawn_blocking(move || {
+            crate::grants::apply(&paths, &cfg, &home, &mut |m| {
+                tracing::info!("folder grants: {m}")
+            })
+        })
+        .await
+        .map_err(|e| RpcError::internal(e.to_string()))?;
         for e in &synced.errors {
             tracing::warn!("folder grants: {e}");
         }

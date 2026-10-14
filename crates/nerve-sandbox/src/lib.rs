@@ -2038,7 +2038,7 @@ pub mod appcontainer {
             links: None,
             progress: &mut |_| {},
         };
-        set_below(path, name, masks, own, false, below).map(|(id, _)| id)
+        set_below(path, name, masks, own, false, None, below).map(|(id, _)| id)
     }
 
     /// Puts the grants of `masks` for the container `name` on `path`, in
@@ -2064,12 +2064,18 @@ pub mod appcontainer {
     /// the list of `path` stays as it is: an earlier change there may have
     /// stopped part way, and the folders above what it changed do not show
     /// that. Taking grants off always does.
+    ///
+    /// With `expect`, the change goes only through that object: one at
+    /// `path` that is another (the folder was replaced since its id was
+    /// recorded) is refused before anything is written, so the record and
+    /// the object a change wrote always agree.
     pub fn set_below(
         path: &Path,
         name: &str,
         masks: Option<Masks>,
         own: bool,
         whole: bool,
+        expect: Option<FileId>,
         below: Below,
     ) -> io::Result<(Option<FileId>, Walked)> {
         let sid = Sid::derive(name)?;
@@ -2084,6 +2090,13 @@ pub mod appcontainer {
                 ),
             ))
         };
+        if let Some(want) = expect
+            && id_of(&f).ok() != Some(want)
+        {
+            return refuse(
+                "it is another folder than the one recorded (it was replaced meanwhile); the next sync looks again".into(),
+            );
+        }
         if own
             && masks.is_some()
             && let Some(why) = not_own(&f, path)?
@@ -3135,7 +3148,7 @@ mod tests {
                 links: None,
                 progress: &mut |_| {},
             };
-            appcontainer::set_below(&top, &name, masks, false, whole, below)
+            appcontainer::set_below(&top, &name, masks, false, whole, None, below)
                 .unwrap()
                 .1
         };
@@ -3160,6 +3173,17 @@ mod tests {
             whole.seen, 6,
             "a, a\\b, deep.txt, f.txt, closed, j: {whole:?}"
         );
+        // Through another object than the one at the path: refused, and
+        // nothing written.
+        let elsewhere = appcontainer::file_id(&outside).unwrap();
+        let below = appcontainer::Below {
+            links: None,
+            progress: &mut |_| {},
+        };
+        let e = appcontainer::set_below(&top, &name, None, false, false, Some(elsewhere), below)
+            .unwrap_err();
+        assert_eq!(acl::untouched_by(&e), Some(acl::Untouched::Refused), "{e}");
+        assert!(has(&top.join("a\\f.txt")), "nothing taken off");
         let other = set(Some(acl::masks(true, false, false)), false);
         assert_eq!(other.changed, 5, "{other:?}");
         set(None, false);
@@ -3193,7 +3217,8 @@ mod tests {
             links: Some(&mut no),
             progress: &mut quiet,
         };
-        let e = appcontainer::set_below(&top, &name, Some(m), false, false, below).unwrap_err();
+        let e =
+            appcontainer::set_below(&top, &name, Some(m), false, false, None, below).unwrap_err();
         assert!(e.to_string().contains("hard links"), "{e}");
         let names = asked.first().unwrap();
         for n in ["outside\\o.txt", "top\\a\\b\\l.txt"] {

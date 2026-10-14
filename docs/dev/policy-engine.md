@@ -191,11 +191,16 @@ center's local name):
   was made on, not for a folder made anew where a marked one was moved
   away; a new grant is recorded with the file ID of the object at its
   path before it goes on, so a first grant that stopped part way is found
-  where its folder went, as any other. Where the record cannot be marked,
-  nothing changes, and a grant is stale unless it is on the object at its
-  path and every set of flags it may give there is wanted; one whose
-  folder cannot be found is stale, and one on a volume that is away is
-  named, as in a sync that can write. The mark keeps the flags each
+  where its folder went, as any other. Each change goes only through the
+  object recorded for its place (`set_below`'s `expect`): one replaced
+  since is refused before any write, marked `acl::Untouched::Refused`, and
+  the next sync looks again. Where the record cannot be marked, only
+  take-offs run, here and where moved folders are now (one goes into
+  every folder, and one that stops gives less, never more), so `uninstall`
+  still takes the grants off; puts and replacements wait, and a grant one
+  would change is stale where it may give flags that are not wanted. One
+  whose folder cannot be found is stale, and one on a volume that is away
+  is named, as always. The mark keeps the flags each
   stopped change was heading for (`Grant::toward`): until a change there
   finishes, the place counts as written by those flags too (the hard-link
   check, `w` without `r` for the pass), and a refused change whose place

@@ -94,7 +94,7 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
                 return;
             }
         };
-        let proxy = match proxy_for(&shared, &cfg, &url).await {
+        let proxy = match proxy_for(&shared.paths, &cfg, &url).await {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!("center {name}: bad proxy: {e}; dialling stopped");
@@ -178,8 +178,10 @@ fn load_key(shared: &Shared, name: &str) -> Result<NodeKey, String> {
 
 /// The proxy to dial `url` through, its header values read from the system
 /// keyring. An error stops the dial: a configured proxy is never bypassed.
-async fn proxy_for(
-    shared: &Shared,
+/// The link, the pairing and the relay's own dials (crate::relay) all take
+/// it from here.
+pub(crate) async fn proxy_for(
+    paths: &crate::paths::NodePaths,
     cfg: &NodeConfig,
     url: &CenterUrl,
 ) -> Result<Option<Proxy>, String> {
@@ -188,12 +190,26 @@ async fn proxy_for(
     };
     // The keyring may block (the Secret Service asks to unlock), so off the
     // runtime's threads.
-    let (paths, names) = (shared.paths.clone(), cfg.connection.headers.clone());
-    let headers =
-        tokio::task::spawn_blocking(move || crate::secrets::proxy_headers(&paths, &names))
-            .await
-            .map_err(|e| format!("the keyring read stopped: {e}"))??;
-    Proxy::parse(p, headers).map(Some)
+    let (paths, names) = (paths.clone(), cfg.connection.headers.clone());
+    let (login, storage) = (cfg.connection.login.clone(), cfg.machine.secret_storage);
+    let headers = tokio::task::spawn_blocking(move || {
+        let mut headers = crate::secrets::proxy_headers(&paths, &names)?;
+        // The login of an https:// proxy (a relay token) is kept with the
+        // node's own keys, not with the header values.
+        if let Some(user) = login {
+            use base64::Engine;
+            let password = crate::secrets::proxy_login(&paths, storage)?;
+            let basic =
+                base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
+            headers.push(("Proxy-Authorization".into(), format!("Basic {basic}")));
+        }
+        Ok::<_, String>(headers)
+    })
+    .await
+    .map_err(|e| format!("the keyring read stopped: {e}"))??;
+    Proxy::parse(p, headers)?
+        .pinned(cfg.connection.pin.clone())
+        .map(Some)
 }
 
 /// What one read from the link gave.

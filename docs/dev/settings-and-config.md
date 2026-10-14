@@ -61,7 +61,8 @@ center reads, or the node refuses the whole change and names the field.
    `machine.sudo_path`, `machine.secret_storage`, `machine.user`.
 5. The sudo password. The node never returns it. A center only passes it on,
    sealed, when it switches sudo on.
-6. The proxy and its credentials.
+6. The proxy and its credentials, and the relay for other nodes with its
+   tokens.
 7. The local audit log.
 8. Releasing a protected path: a center may add to `protected.extra`, not
    remove from it or change `protected.allow`, and its folders may not widen

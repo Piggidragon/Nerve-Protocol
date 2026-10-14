@@ -76,6 +76,17 @@ impl NodePaths {
         self.config_dir.join("keys").join(format!("{center}.key"))
     }
 
+    /// The relay's TLS certificate and key (crate::relay), beside the
+    /// center keys; not a `.key` name, so no center's.
+    pub fn relay_tls_file(&self) -> PathBuf {
+        self.config_dir.join("keys").join("relay-tls.pem")
+    }
+
+    /// The password of an `https://` proxy, a relay token above all.
+    pub fn proxy_login_file(&self) -> PathBuf {
+        self.config_dir.join("keys").join("proxy-login.secret")
+    }
+
     pub fn ctl_socket(&self) -> PathBuf {
         self.state_dir.join("run").join("ctl.sock")
     }

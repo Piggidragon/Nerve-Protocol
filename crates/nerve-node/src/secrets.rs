@@ -7,9 +7,10 @@
 //! Windows has no keyring for them ([`PROXY_WINDOWS_SERVICE`]) and takes a
 //! proxy without header or password only.
 //!
-//! The node's own keys, the key of the config's MAC and the node key per
-//! center, are where `machine.secret_storage` says: 0600 files (`file`, the
-//! default) or the system keyring (`keyring`). A change moves them once,
+//! The node's own keys, the key of the config's MAC, the node key per
+//! center, the relay's TLS key and the password of an `https://` proxy (a
+//! relay token), are where `machine.secret_storage` says: 0600 files
+//! (`file`, the default) or the system keyring (`keyring`). A change moves them once,
 //! through the settings store ([`NodeSecrets`]): copied, read back, then the
 //! old copies go.
 //!
@@ -68,6 +69,20 @@ impl Entry {
                 "center-key:{center}:{}",
                 absolute(&paths.config_dir).display()
             ),
+        }
+    }
+
+    /// The entry with the relay's TLS certificate and key.
+    pub fn relay_tls(paths: &NodePaths) -> Entry {
+        Entry {
+            account: format!("relay-tls:{}", absolute(&paths.config_dir).display()),
+        }
+    }
+
+    /// The entry with the password of an `https://` proxy.
+    pub fn proxy_login(paths: &NodePaths) -> Entry {
+        Entry {
+            account: format!("proxy-login:{}", absolute(&paths.config_dir).display()),
         }
     }
 
@@ -173,6 +188,10 @@ enum Key<'a> {
     Config,
     /// The node key for a center.
     Center(&'a str),
+    /// The relay's TLS certificate and key, as PEM.
+    RelayTls,
+    /// The password of an `https://` proxy: the relay token.
+    ProxyLogin,
 }
 
 impl Key<'_> {
@@ -180,6 +199,8 @@ impl Key<'_> {
         match self {
             Key::Config => paths.config_key(),
             Key::Center(c) => paths.key_file(c),
+            Key::RelayTls => paths.relay_tls_file(),
+            Key::ProxyLogin => paths.proxy_login_file(),
         }
     }
 
@@ -187,6 +208,8 @@ impl Key<'_> {
         match self {
             Key::Config => Entry::config_key(paths),
             Key::Center(c) => Entry::center_key(paths, c),
+            Key::RelayTls => Entry::relay_tls(paths),
+            Key::ProxyLogin => Entry::proxy_login(paths),
         }
     }
 
@@ -195,14 +218,20 @@ impl Key<'_> {
         match self {
             Key::Config => "the key of the config's MAC".into(),
             Key::Center(c) => format!("the node key for center {c}"),
+            Key::RelayTls => "the relay's TLS key".into(),
+            Key::ProxyLogin => "the proxy's password (a relay token)".into(),
         }
     }
 }
 
-/// Every key of the node `cfg` describes: the config's and one per center.
+/// Every key of the node `cfg` describes: the config's, one per center, the
+/// relay's TLS key once the relay has a pin, and the proxy's password while
+/// the config names its user.
 fn keys(cfg: &NodeConfig) -> Vec<Key<'_>> {
     std::iter::once(Key::Config)
         .chain(cfg.centers.iter().map(|c| Key::Center(&c.name)))
+        .chain(cfg.relay.pin.is_some().then_some(Key::RelayTls))
+        .chain(cfg.connection.login.is_some().then_some(Key::ProxyLogin))
         .collect()
 }
 
@@ -556,6 +585,85 @@ pub fn remove_center_key(
         delete(paths, other(storage), key)?;
     }
     Ok(())
+}
+
+/// The text of `key` from where `storage` keeps it: with `keyring`, a key
+/// the keyring answers it does not hold is looked for in its file, where a
+/// move that has not finished left it. An unreachable keyring is an error,
+/// never a reason to read the file.
+fn read_secret(
+    paths: &NodePaths,
+    storage: SecretStorage,
+    key: Key,
+) -> Result<Option<String>, String> {
+    match get(paths, storage, key)? {
+        Some(t) => Ok(Some(t)),
+        None if storage == SecretStorage::Keyring => get(paths, SecretStorage::File, key),
+        None => Ok(None),
+    }
+}
+
+/// Deletes `key` where `storage` keeps it, and the copy in the other place
+/// a move may have left ([`remove_center_key`]).
+fn remove_secret(paths: &NodePaths, storage: SecretStorage, key: Key) -> Result<(), String> {
+    delete(paths, storage, key)?;
+    if storage == SecretStorage::Keyring || paths.keys_moving().exists() {
+        delete(paths, other(storage), key)?;
+    }
+    Ok(())
+}
+
+/// The relay's TLS identity, `None` when it has none yet.
+pub fn relay_tls(
+    paths: &NodePaths,
+    storage: SecretStorage,
+) -> Result<Option<nerve_transport::tls::ServerIdentity>, String> {
+    let Some(text) = read_secret(paths, storage, Key::RelayTls)? else {
+        return Ok(None);
+    };
+    nerve_transport::tls::ServerIdentity::from_pem(&text)
+        .map(Some)
+        .map_err(|e| format!("bad relay TLS key in {}: {e}", place(storage)))
+}
+
+/// Keeps the relay's TLS identity where `storage` says.
+pub fn store_relay_tls(
+    paths: &NodePaths,
+    storage: SecretStorage,
+    id: &nerve_transport::tls::ServerIdentity,
+) -> Result<(), String> {
+    put(paths, storage, Key::RelayTls, id.to_pem().trim())
+}
+
+/// The password of the `https://` proxy, the relay token. Missing is an
+/// error that says how to set it again; the text never shows it.
+pub fn proxy_login(paths: &NodePaths, storage: SecretStorage) -> Result<String, String> {
+    read_secret(paths, storage, Key::ProxyLogin)?.ok_or_else(|| {
+        format!(
+            "{} holds no password for the proxy's user; run `nerve-node proxy set` again",
+            match storage {
+                SecretStorage::File => format!("{}", paths.proxy_login_file().display()),
+                SecretStorage::Keyring =>
+                    format!("the system keyring entry {}", Entry::proxy_login(paths)),
+            }
+        )
+    })
+}
+
+/// Keeps the password of the `https://` proxy where `storage` says. Where
+/// that is the keyring and none answers, this fails as storing any of the
+/// node's keys does, and nothing is kept elsewhere.
+pub fn store_proxy_login(
+    paths: &NodePaths,
+    storage: SecretStorage,
+    password: &str,
+) -> Result<(), String> {
+    put(paths, storage, Key::ProxyLogin, password)
+}
+
+/// Deletes the password of the `https://` proxy, wherever it is.
+pub fn remove_proxy_login(paths: &NodePaths, storage: SecretStorage) -> Result<(), String> {
+    remove_secret(paths, storage, Key::ProxyLogin)
 }
 
 /// The node's own keys where `machine.secret_storage` says, for the
@@ -1339,6 +1447,52 @@ mod tests {
         // The change is audited as a setting.
         let audit = std::fs::read_to_string(paths.audit_log()).unwrap();
         assert!(audit.contains("machine.secret_storage"), "{audit}");
+    }
+
+    /// The relay's TLS key and an https:// proxy's password are keys of the
+    /// node like the others: they move with `machine.secret_storage`, both
+    /// ways, and read back the same.
+    #[test]
+    fn the_relay_key_and_the_proxy_password_move_with_the_other_keys() {
+        let (_d, paths) = node();
+        let mut s = paired(&paths, SecretStorage::File, &["home"]);
+        let id = nerve_transport::tls::ServerIdentity::generate(&[]).unwrap();
+        store_relay_tls(&paths, SecretStorage::File, &id).unwrap();
+        store_proxy_login(&paths, SecretStorage::File, "t0ken").unwrap();
+        s.update(|c| {
+            c.relay.pin = Some(id.pin());
+            c.connection.proxy = Some("https://relay.example:7490".into());
+            c.connection.login = Some("lab".into());
+            Ok(())
+        })
+        .unwrap();
+        set_storage(&mut s, SecretStorage::Keyring).unwrap();
+        assert!(in_keyring(&paths, Key::RelayTls).is_some());
+        assert_eq!(
+            in_keyring(&paths, Key::ProxyLogin).as_deref(),
+            Some("t0ken")
+        );
+        assert!(!paths.relay_tls_file().exists() && !paths.proxy_login_file().exists());
+        let back = relay_tls(&paths, SecretStorage::Keyring).unwrap().unwrap();
+        assert_eq!(back.pin(), id.pin());
+        assert_eq!(
+            proxy_login(&paths, SecretStorage::Keyring).unwrap(),
+            "t0ken"
+        );
+        set_storage(&mut s, SecretStorage::File).unwrap();
+        assert_eq!(in_keyring(&paths, Key::RelayTls), None);
+        assert_eq!(in_keyring(&paths, Key::ProxyLogin), None);
+        assert_eq!(
+            relay_tls(&paths, SecretStorage::File)
+                .unwrap()
+                .unwrap()
+                .pin(),
+            id.pin()
+        );
+        assert_eq!(proxy_login(&paths, SecretStorage::File).unwrap(), "t0ken");
+        remove_proxy_login(&paths, SecretStorage::File).unwrap();
+        let e = proxy_login(&paths, SecretStorage::File).unwrap_err();
+        assert!(e.contains("proxy set") && !e.contains("t0ken"), "{e}");
     }
 
     #[test]

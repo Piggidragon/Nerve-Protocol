@@ -101,5 +101,7 @@ With a `Setup::sudo_password` as well:
 ## Not covered
 
 Binary frames and blobs (§5.4), limits (§5.5), the duplicate-link rule (§4.3),
-liveness timing (§4.4), back-off (§4.6) and proxies (§4.7) have unit tests in
-the implementations but no conformance checks.
+liveness timing (§4.4), back-off (§4.6), proxies (§4.7) and relays (§4.8)
+have unit tests in the implementations but no conformance checks of their
+own. `nerve-node`'s relay tests run the node part against a node that reaches
+the fake center only through a relay (`crates/nerve-node/src/relay.rs`).

@@ -23,7 +23,14 @@ const CHANGES_MAX: usize = 64;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FolderChange {
     /// Adds the folder with these rights, or replaces the rights it had.
-    Add { path: String, access: Access },
+    /// `recorded` says the CLI settled `path` at its real place, so the
+    /// center's record of places gets the folder (`CenterPolicy::places`);
+    /// without it a record the folder has stays as it is.
+    Add {
+        path: String,
+        access: Access,
+        recorded: bool,
+    },
     /// Changes the rights of a folder the center has, left to right (`=rwx`,
     /// `+x`, `-w`).
     Set {
@@ -58,6 +65,8 @@ struct Params {
     given: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     access: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recorded: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     changes: Option<Vec<String>>,
 }
@@ -102,12 +111,18 @@ impl FolderChange {
             path: String::new(),
             given: None,
             access: None,
+            recorded: None,
             changes: None,
         };
         match self {
-            FolderChange::Add { path, access } => {
+            FolderChange::Add {
+                path,
+                access,
+                recorded,
+            } => {
                 p.path = path.clone();
                 p.access = Some(access.to_string());
+                p.recorded = Some(*recorded);
             }
             FolderChange::Set {
                 path,
@@ -146,8 +161,8 @@ impl FolderChange {
         if let Some(g) = &p.given {
             check("given", g)?;
         }
-        let change = match (method, p.given, p.access, p.changes) {
-            ("folder.add", None, Some(access), None) => {
+        let change = match (method, p.given, p.access, p.recorded, p.changes) {
+            ("folder.add", None, Some(access), recorded, None) => {
                 let access = Access::parse(&access)?;
                 if access.is_none() {
                     return Err("a new folder grants some right: r, w or x".into());
@@ -155,9 +170,10 @@ impl FolderChange {
                 FolderChange::Add {
                     path: p.path,
                     access,
+                    recorded: recorded.unwrap_or(false),
                 }
             }
-            ("folder.set", Some(given), None, Some(changes)) => {
+            ("folder.set", Some(given), None, None, Some(changes)) => {
                 if changes.is_empty() {
                     return Err("name what to change: =rwx, +x or -w".into());
                 }
@@ -174,7 +190,7 @@ impl FolderChange {
                     changes,
                 }
             }
-            ("folder.rm", Some(given), None, None) => FolderChange::Rm {
+            ("folder.rm", Some(given), None, None, None) => FolderChange::Rm {
                 path: p.path,
                 given,
             },
@@ -190,12 +206,21 @@ impl FolderChange {
     /// it, `None` for a removed one.
     pub fn apply(&self, e: &mut CenterEntry) -> Result<Option<Access>, String> {
         match self {
-            FolderChange::Add { path, access } => {
-                e.policy.folders.retain(|f| f.path != *path);
+            FolderChange::Add {
+                path,
+                access,
+                recorded,
+            } => {
+                // The same place in another spelling is the same folder: one
+                // entry, as `validate` keeps it.
+                e.policy.folders.retain(|f| !same_place(&f.path, path));
                 e.policy.folders.push(Folder {
                     path: path.clone(),
                     access: *access,
                 });
+                if *recorded {
+                    e.policy.set_placed(path, true);
+                }
                 Ok(Some(*access))
             }
             FolderChange::Set {
@@ -232,6 +257,13 @@ impl FolderChange {
             | FolderChange::Rm { path, .. } => path,
         }
     }
+}
+
+/// Whether two folder paths name one place, compared as the policy does.
+fn same_place(a: &str, b: &str) -> bool {
+    use nerve_policy::paths::within;
+    let (a, b) = (std::path::Path::new(a), std::path::Path::new(b));
+    within(a, b) && within(b, a)
 }
 
 /// The center a per-center command means: the one named, or the only one.
@@ -308,6 +340,12 @@ mod tests {
             FolderChange::Add {
                 path: "/srv/a".into(),
                 access: FolderChange::new_rights(&["+r".into(), "+x".into()]).unwrap(),
+                recorded: false,
+            },
+            FolderChange::Add {
+                path: "/srv/a".into(),
+                access: FolderChange::new_rights(&["+w".into()]).unwrap(),
+                recorded: true,
             },
             FolderChange::Set {
                 path: "/srv/a".into(),
@@ -327,6 +365,22 @@ mod tests {
                 assert_eq!(got_center.as_deref(), center);
             }
         }
+    }
+
+    /// An `add` that does not say it was recorded is not.
+    #[test]
+    fn an_add_without_the_record_records_nothing() {
+        let (_, got) =
+            FolderChange::from_request("folder.add", json!({"path": "/srv/a", "access": "r"}))
+                .unwrap();
+        assert_eq!(
+            got,
+            FolderChange::Add {
+                path: "/srv/a".into(),
+                access: Access::parse("r").unwrap(),
+                recorded: false,
+            }
+        );
     }
 
     /// A request is checked as the CLI checks what it was given, and one that
@@ -370,6 +424,12 @@ mod tests {
             json!({"path": "/srv/a", "given": "a", "sudo": "on"}),
         );
         assert!(e.contains("unknown field"), "{e}");
+        // The record goes with an `add` only.
+        let e = refused(
+            "folder.rm",
+            json!({"path": "/srv/a", "given": "a", "recorded": true}),
+        );
+        assert!(e.contains("bad parameters for folder.rm"), "{e}");
         refused("folder.rm", json!({"path": "/srv/a"}));
         refused("folder.add", json!({"path": "", "access": "r"}));
         refused("folder.add", json!({"path": "/srv/\0a", "access": "r"}));
@@ -390,6 +450,7 @@ mod tests {
         let add = FolderChange::Add {
             path: "/srv/a".into(),
             access: Access::parse("rw").unwrap(),
+            recorded: false,
         };
         let a = apply_to(&mut one, None, &add).unwrap();
         assert_eq!(
@@ -401,15 +462,37 @@ mod tests {
                 mode: Mode::Allowlist,
             }
         );
-        // Adding it again replaces its rights.
+        assert!(one.center("home").unwrap().policy.places.is_empty());
+        // Adding it again replaces its rights, and records the place the CLI
+        // settled it at.
         let again = FolderChange::Add {
             path: "/srv/a".into(),
             access: Access::parse("x").unwrap(),
+            recorded: true,
         };
         apply_to(&mut one, Some("home"), &again).unwrap();
-        let folders = &one.center("home").unwrap().policy.folders;
-        assert_eq!(folders.len(), 1);
-        assert_eq!(folders[0].access.to_chmod(), "--x");
+        let policy = &one.center("home").unwrap().policy;
+        assert_eq!(policy.folders.len(), 1);
+        assert_eq!(policy.folders[0].access.to_chmod(), "--x");
+        assert_eq!(policy.places, ["/srv/a"]);
+        // The same place in another spelling is the same folder; a change
+        // that records nothing leaves the record it has.
+        let spelled = FolderChange::Add {
+            path: "/srv//a/".into(),
+            access: Access::parse("r").unwrap(),
+            recorded: false,
+        };
+        apply_to(&mut one, Some("home"), &spelled).unwrap();
+        let policy = &one.center("home").unwrap().policy;
+        assert_eq!(policy.folders.len(), 1);
+        assert_eq!(policy.folders[0].path, "/srv//a/");
+        assert_eq!(policy.places, ["/srv/a"]);
+        let again = FolderChange::Add {
+            path: "/srv/a".into(),
+            access: Access::parse("x").unwrap(),
+            recorded: false,
+        };
+        apply_to(&mut one, Some("home"), &again).unwrap();
         // A folder saved as typed is found by that spelling.
         let set = FolderChange::Set {
             path: "/elsewhere".into(),

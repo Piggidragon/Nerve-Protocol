@@ -14,6 +14,7 @@ A pairing is a **center entry**. Its policy holds:
 | `mode` | `allowlist` (default), `folder` or `user` |
 | `until` | Optional end of `folder` or `user` mode. Then the entry is back in `allowlist` |
 | `folders` | A path and `access`: three independent flags `r`, `w`, `x` |
+| `places` | The folders (by path) `folder add` recorded at their real place. The owner's: a center's write keeps it |
 | `caps` | `on`, `off` or `hidden`, per capability or action |
 | `allow`, `deny` | Rules for every action |
 | `sudo_allow` | Rules for `sudo` commands |
@@ -102,10 +103,16 @@ and, per platform, system files that open the machine.
   is left out of the Landlock rules (`exec::led_away`). A link of the owner's
   that leads into a `w` folder is followed to its end and judged on the way.
   Links above the `w` folder, and the `w` folder itself, are the owner's and
-  are followed. Two gaps: only the `w` folders in the config count, so a link
-  made while a folder had `w` is followed again once `w` is taken off (#77),
+  are followed. Only the `w` folders in the config count there, so a link
+  made while a folder had `w` would be followed again once `w` is taken off,
   and a command that runs without Landlock (`user` mode, `sudo`, an
-  `allowlist` command) can make a link where no `w` folder is.
+  `allowlist` command) can make a link where no `w` folder is. The record
+  closes both for the folders `folder add` stored: it stores the resolved
+  path and lists it in `policy.places`, and `exec::replaced` leaves a
+  recorded folder out whenever its path resolves to another place now,
+  whoever made the link and whatever `w` is left. A folder without an
+  entry (older, set by a center, or written with `config set`) is followed as
+  before.
 - A folder that holds a protected entry gives a command none of it. Landlock
   cannot deny inside a rule, so the sandbox takes the folder's other entries,
   level by level, down to the protected one.

@@ -62,6 +62,7 @@ paused = false
 mode = "allowlist"          # allowlist | folder | user
 until = 1790000000000       # optional end of folder or user mode, ms since the epoch
 folders = [{ path = "/home/u/proj", access = "rwx" }]
+places = ["/home/u/proj"]   # written by `folder add`, not by hand
 caps = { "fs.write" = "off" }
 allow = ["exec.run:git status", "fs.read:~/notes/*"]
 deny = ["fs:~/private/*", "exec.run:rm *"]
@@ -71,7 +72,8 @@ protected = { extra = [], allow = [] }
 
 The file also holds a `version` that grows with every write, `locked`
 (set by `panic`), and per center the `url`, `pin`, `center_id` and `node_id`
-the pairing filled in. Unknown keys are refused.
+the pairing filled in. Unknown keys are refused. `places` is the node's
+record of the folders `folder add` stored ([modes](modes.md#a-folder-keeps-the-place-you-added)).
 
 ## Do not edit the file by hand
 

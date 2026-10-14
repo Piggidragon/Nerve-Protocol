@@ -72,7 +72,19 @@ The node confines commands with Landlock:
   command.
 - Landlock cannot run a file it may not read. So an `x` folder also lets a
   command read files there by name. It still cannot list the folder.
-- The node's own folders are in none of these sets.
+- The node's own folders are in none of these sets. That keeps a command from
+  the node's files, but only as far as Landlock reaches. While the commands
+  run as the node's own user (a node you run yourself, with no `machine.user`),
+  `folder` mode is no boundary against that user's other programs: a command
+  can ask one that runs commands on request, such as the user's systemd session
+  or a tmux server, to run a program outside the sandbox, and that program
+  reads the node's files and changes its settings through the control socket.
+  Run the commands as another account, one that only the node uses and that
+  gets root in no way without a password (not root, not in `docker` or a like
+  group, no `NOPASSWD` sudo, nobody works as it and uses sudo from it), to keep
+  them from the node's files and settings: see [Linux](platforms.md#linux).
+  The account that ran `install` is not such an account. A [sudo](sudo.md)
+  command is root and is not kept out.
 - A command with `w` on a folder can put a link in place of a folder inside
   it, and a link would give that folder's rights in a place you never named.
   So a folder is left out of the sets, and the node logs a warning, when its

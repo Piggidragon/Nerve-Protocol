@@ -7,6 +7,12 @@
 //!
 //! On Unix the socket is created 0600 in a 0700 folder, and every peer's
 //! credentials are read: only the socket's own user or root may talk to it.
+//! That does not tell the owner's programs from a sandboxed process of the
+//! same user: Landlock keeps a process from connecting to a socket file only
+//! from ABI 9 on, and a process that left the tree below its command (with
+//! `setsid`) is no longer known as one. So a server may also hand out a token
+//! ([`write_token`]): a file beside the socket that the client reads and sends
+//! with each request, which a process kept from the folder cannot read.
 //! Windows has a named pipe instead, with the same lines on it
 //! ([`serve_stream`], [`call_on`]); `nerve-node` makes it and checks who
 //! is on the other end.
@@ -23,6 +29,10 @@ pub struct CtlRequest {
     pub method: String,
     #[serde(default)]
     pub params: Value,
+    /// What the client read from [`token_file`], when it could. The pipe on
+    /// Windows has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 /// The longest request line read.
@@ -126,20 +136,23 @@ pub async fn call_on<S: AsyncRead + AsyncWrite>(
     method: &str,
     params: Value,
 ) -> Result<Value, String> {
-    call_stream(stream, method, params, |e| e.to_string()).await
+    call_stream(stream, json!({"method": method, "params": params}), |e| {
+        e.to_string()
+    })
+    .await
 }
 
-/// [`call_on`], saying an error after the connect with `io_error`.
+/// [`call_on`] with the whole `request`, saying an error after the connect
+/// with `io_error`.
 async fn call_stream<S: AsyncRead + AsyncWrite>(
     stream: S,
-    method: &str,
-    params: Value,
+    request: Value,
     io_error: fn(&std::io::Error) -> String,
 ) -> Result<Value, String> {
     let (r, mut w) = tokio::io::split(stream);
     // A node over its places answers BUSY and closes, possibly before the
     // request is written: read the answer all the same.
-    let sent = write_line(&mut w, &json!({"method": method, "params": params})).await;
+    let sent = write_line(&mut w, &request).await;
     let mut line = String::new();
     BufReader::new(r.take(LINE_BYTES as u64))
         .read_line(&mut line)
@@ -160,6 +173,11 @@ fn answer(line: &str) -> Result<Value, String> {
         return Err(e.to_string());
     }
     Ok(v.get("ok").cloned().unwrap_or(Value::Null))
+}
+
+/// The file that holds the token of the server on the socket `socket`.
+pub fn token_file(socket: &std::path::Path) -> std::path::PathBuf {
+    socket.with_file_name("ctl.token")
 }
 
 /// Who is on the other end of a control connection.
@@ -214,7 +232,7 @@ mod unix {
 
     use super::{
         BUSY, CtlRequest, IDLE, MAX_CONNECTIONS, NOT_RUNNING, Peer, Reply, answer, call_stream,
-        serve_stream_within, write_line,
+        serve_stream_within, token_file, write_line,
     };
 
     /// How long [`call`] waits for an answer. The slowest handler, the check
@@ -369,6 +387,40 @@ mod unix {
         }
     }
 
+    /// Makes a token for the server on `socket` that [`bind`] just made: a
+    /// new one per start, in [`token_file`], readable by its user only. The
+    /// server compares what requests carry with it ([`token_ok`]).
+    pub fn write_token(socket: &Path) -> std::io::Result<String> {
+        let token = crate::keys::random_token(32);
+        crate::files::write_private(&token_file(socket), token.as_bytes())?;
+        Ok(token)
+    }
+
+    /// Whether a request carries `token`, compared in time that depends only
+    /// on the lengths.
+    pub fn token_ok(token: &str, given: Option<&str>) -> bool {
+        given.is_some_and(|g| {
+            token.len() == g.len()
+                && token
+                    .bytes()
+                    .zip(g.bytes())
+                    .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+                    == 0
+        })
+    }
+
+    /// The request a client sends on the socket `path`. The token is read
+    /// after the connection is made: a server writes it right after it binds
+    /// the socket.
+    pub fn request_line(path: &Path, method: &str, params: Value) -> Value {
+        let token = std::fs::read_to_string(token_file(path)).ok();
+        json!(CtlRequest {
+            method: method.to_string(),
+            params,
+            token,
+        })
+    }
+
     /// One call: sends the request and returns the answer.
     pub async fn call(path: &Path, method: &str, params: Value) -> Result<Value, String> {
         call_within(path, method, params, ANSWER_WAIT).await
@@ -389,7 +441,7 @@ mod unix {
         let stream = UnixStream::connect(path)
             .await
             .map_err(|e| connect_error(&e))?;
-        call_stream(stream, method, params, io_error).await
+        call_stream(stream, request_line(path, method, params), io_error).await
     }
 
     /// What an error after a connect says. A connection the node reset or
@@ -427,7 +479,7 @@ mod unix {
             .await
             .map_err(|e| connect_error(&e))?;
         let (r, mut w) = stream.into_split();
-        let sent = write_line(&mut w, &json!({"method": method, "params": params})).await;
+        let sent = write_line(&mut w, &request_line(path, method, params)).await;
         let mut lines = BufReader::new(r).lines();
         while let Some(line) = lines.next_line().await.map_err(|e| io_error(&e))? {
             let v: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
@@ -714,6 +766,48 @@ mod unix {
             }
         }
 
+        #[test]
+        fn a_token_is_compared_whole() {
+            assert!(token_ok("abc", Some("abc")));
+            for given in [None, Some(""), Some("ab"), Some("abd"), Some("abcd")] {
+                assert!(!token_ok("abc", given), "{given:?}");
+            }
+        }
+
+        /// A client sends the token it finds beside the socket, and none where
+        /// there is no file; a token is new per start and the file is private.
+        #[tokio::test]
+        async fn a_call_carries_the_token_beside_the_socket() {
+            let d = tempfile::tempdir().unwrap();
+            let p = d.path().join("run/ctl.sock");
+            let listener = bind(&p).await.unwrap();
+            tokio::spawn(serve_on(listener, |req, _| async move {
+                if req.method == "follow" {
+                    let (tx, rx) = mpsc::channel(1);
+                    tx.try_send(json!(req.token)).unwrap();
+                    return Reply::Follow(rx);
+                }
+                Reply::Ok(json!(req.token))
+            }));
+            let items = |p: std::path::PathBuf| async move {
+                let mut got = vec![];
+                follow(&p, "follow", json!({}), |v| got.push(v))
+                    .await
+                    .unwrap();
+                got
+            };
+            assert_eq!(call(&p, "echo", json!({})).await.unwrap(), Value::Null);
+            assert_eq!(items(p.clone()).await, vec![Value::Null]);
+            let token = write_token(&p).unwrap();
+            assert_eq!(token_file(&p), d.path().join("run/ctl.token"));
+            assert_eq!(call(&p, "echo", json!({})).await.unwrap(), json!(token));
+            assert_eq!(items(p.clone()).await, vec![json!(token)]);
+            assert_ne!(write_token(&p).unwrap(), token);
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(token_file(&p)).unwrap().permissions();
+            assert_eq!(mode.mode() & 0o777, 0o600);
+        }
+
         /// Set in the process `serving_outlasts_running_out_of_descriptors`
         /// starts for itself.
         #[cfg(target_os = "linux")]
@@ -838,7 +932,10 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub use unix::{CANNOT_CONNECT, NO_ANSWER, bind, call, follow, node_is_there, serve, serve_on};
+pub use unix::{
+    CANNOT_CONNECT, NO_ANSWER, bind, call, follow, node_is_there, request_line, serve, serve_on,
+    token_ok, write_token,
+};
 
 #[cfg(test)]
 mod tests {

@@ -304,7 +304,14 @@ impl System for Host {
             let ask = || -> std::io::Result<bool> {
                 let mut s = std::os::unix::net::UnixStream::connect(paths.ctl_socket())?;
                 s.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
-                s.write_all(b"{\"method\":\"status\",\"params\":{}}\n")?;
+                // The node answers a request with the token it wrote at
+                // its start, which root can read.
+                let request = nerve_transport::ctl::request_line(
+                    &paths.ctl_socket(),
+                    "status",
+                    serde_json::json!({}),
+                );
+                s.write_all(format!("{request}\n").as_bytes())?;
                 let mut line = String::new();
                 BufReader::new(s).read_line(&mut line)?;
                 Ok(line.contains("\"ok\""))

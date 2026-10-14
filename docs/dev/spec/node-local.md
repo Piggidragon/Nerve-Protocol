@@ -9,7 +9,7 @@ same way and so the owner knows what each setting does.
 | What | Default | Override |
 |---|---|---|
 | `node.toml` and one key per center (`keys/<name>.key`) | `~/.config/nerve` | `--config-dir`, `NERVE_CONFIG_DIR` |
-| control socket `run/ctl.sock`, audit log `audit.jsonl`, log `log.jsonl`, the config's MAC key `config.key`, `keys.lock`, `keys.moving` | `~/.local/state/nerve` | `--state-dir`, `NERVE_STATE_DIR` |
+| control socket `run/ctl.sock` and its token `run/ctl.token`, audit log `audit.jsonl`, log `log.jsonl`, the config's MAC key `config.key`, `keys.lock`, `keys.moving` | `~/.local/state/nerve` | `--state-dir`, `NERVE_STATE_DIR` |
 
 With `machine.secret_storage = "keyring"` the keys are in the system keyring
 instead of `keys/` and `config.key` ([where the keys are](#where-the-keys-are)).
@@ -687,7 +687,53 @@ JSON object per line: the client sends
 `{"method", "params"}`, the server answers `{"ok": value}` or
 `{"error": "text"}`, or, for streaming methods, several `{"item": value}`
 lines until it closes. The socket is 0600 in a 0700 folder; only its own user
-or root may talk to it. A connection the node cannot take (for want of
+or root may talk to it. That does not keep out a command the node runs as
+that very user (a node a person runs, with no `machine.user`) or as root:
+Landlock stops a process connecting to a socket file only from ABI 9 on, and
+`setsid` takes a process out of the tree below its command. So the node makes
+a token at each start,
+`<state>/run/ctl.token` (0600), and answers a request only if it carries it
+(`{"method", "params", "token"}`). The CLI reads the file and sends it. The
+file lies in the node's own folders, which a `folder` mode command's rules
+leave out, so such a command, and a process it left behind, are refused for
+every method.
+
+The one answer without the token is `status`: `{"ok": {"running": true}}`,
+nothing of the config. `update` of 0.0.2 asks it that way to wait for the
+node it restarted, and puts the old program back if it does not answer `ok`;
+since this version `install`, `update` and `setup` send the token.
+
+The token holds as far as the sandbox does. While the commands run as the
+node's own user, `folder` mode is no boundary against that user's other
+programs: any of them that runs commands for whoever connects to its socket
+runs them outside the sandbox, as the user's own process, which reads the
+token, `node.toml` and the keys as the CLI does. The user's systemd and D-Bus
+session (`systemd-run --user`) is one, a tmux or screen server another
+(`tmux run-shell`, its socket in `/tmp`); there are more. A connect rule
+(`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`, ABI 9) that leaves out only the session
+does not close them, and the node sets none while the keys are in files
+(`exec.rs`). The boundary is `machine.user`: the commands run as another
+account that only the node uses and that gets root in no way without a
+password: not root, not in `docker`, `lxd`, `incus-admin`, `libvirt` or
+`disk`, no `NOPASSWD` sudo, and nobody works as it and uses `sudo` or `su`
+from it (user docs, service.md "The account commands run as"). Root passes
+the socket's uid check, and an account that becomes root is root.
+`no_new_privs` and Landlock hold the command's own process tree only: a
+program the account's user manager or a tmux or screen server starts for it
+has neither, and the command can type into the tmux or screen panes of a
+person who works as the account, where sudo has a live ticket, and change
+what their shell runs. So for such an account every command is root, not
+only the sudo commands. `install` takes the account that ran `sudo`, the one
+its owner logs in as, so that default is no boundary whatever its sudo asks
+for; `setup --create-user` makes an account for the node. The node's own sudo
+calls pass `-k` and leave no ticket, so a node-only account may be a sudoer
+with a password for the sudo switch. Where `machine.user` is such an account,
+the boundary keeps out every command but a sudo command: that one runs as
+root whatever account `machine.user` names (no `no_new_privs`, and the unit
+keeps the capabilities it needs), so it reads the token, passes the uid check
+and can leave the tree.
+
+A connection the node cannot take (for want of
 descriptors, memory or epoll watches, or for any other reason of that one
 connection) does not end the socket: the node takes the next one once the
 cause is gone. Only an error that says the listener itself is broken ends it.
@@ -719,10 +765,19 @@ Methods:
 | `sudo.off` | | turns the switch off and drops the password |
 | `owner.check` | | changes nothing; the CLI asks it before `install`, `setup`, `update` and `uninstall` |
 
-`config.write`, `config.accept`, `reload`, `sudo.on`, `sudo.off` and
-`owner.check` are refused from a process that runs below a command the node
-started for a center, so on Linux an agent cannot change its own policy
-through the socket, nor install, set up, update or remove the node.
+Every method is refused from a process that runs below a command the node
+started for a center, the reading ones (`status`, `config.read`,
+`sudo.status`) too, as they hand over the whole config. That catches the
+processes that stay below the command, in any mode. A `folder` mode command
+is kept out by the token as well, including a process it left behind, as far
+as the sandbox holds (above). A command without a sandbox (`allowlist` and
+`user` mode) can read the token file as it can read `node.toml`, and a sudo
+command is root and reads it and passes the uid check, whatever account
+`machine.user` names. Both can leave the tree at once (`( … & )`,
+`setsid -f`, a daemon fork), while the command still runs. For such a command
+the socket is no boundary at any time, as the node's files are none; the
+refusal stops what stays below it.
+
 ### The control pipe (Windows)
 
 `\\.\pipe\nerve-node-<hash>`, where the hash is the first 16 bytes of the

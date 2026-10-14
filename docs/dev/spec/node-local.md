@@ -996,12 +996,14 @@ answer. The provider learns nothing of the center: not its name, its session
 or its policy.
 
 A center with the settings grant may add allow rules and `on` entries for a
-provider's capability like for any other, except for one that senses, one
-that no attached provider offers now, and an action (`cap.action`) that an
-offered capability does not have now: the node knows the effects only of what
+provider's capability like for any other, and take away `off` and `hidden`
+entries and deny rules, except for one that senses, one that no attached
+provider offers now, and an action (`cap.action`) that an offered capability
+does not have now: the node knows the effects only of what
 an attached provider offers, so what it does not know may sense once it comes.
-Only the owner adds those (`settings.set` refuses the document with
-`forbidden`). What stays open: an `on` entry or an allow rule for a
+Only the owner adds or takes away those entries (`settings.set` refuses the
+document with `forbidden`), so a center cannot drop its own deny rule for such
+a capability either. What stays open: an `on` entry or an allow rule for a
 capability or for one of its actions, written while it did not sense, still
 counts when a provider later offers it with a sense action under the same
 name (a new version of the program that makes `screen.info` sense). The node

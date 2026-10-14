@@ -42,6 +42,12 @@ No grant lets a center change:
   to protect, never remove one, and its folders cannot open a protected place
   that yours do not
 - the audit log
+- the programs that may add capabilities ([providers](providers.md))
+- turning on what senses (a camera, a microphone): an allow rule or an `on`
+  switch for it, and taking away an `off` or `hidden` switch or a deny rule
+  that keeps it off. The same holds for a capability no program offers now,
+  or an action an offered one lacks, as the machine cannot tell yet whether it
+  senses
 
 A change that touches one of these is refused as a whole, and the refusal names
 the field.

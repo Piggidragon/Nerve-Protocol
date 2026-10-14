@@ -634,6 +634,18 @@ fn client_only(
             ));
         }
     }
+    // An `off` or `hidden` entry, kept or set by the owner under a wider
+    // `on`, is what keeps a sense action off: taking it away turns it on
+    // as surely as an `on` would.
+    for (key, setting) in &o.caps {
+        let kept = matches!(setting, CapSetting::Off | CapSetting::Hidden);
+        let still = matches!(n.caps.get(key), Some(CapSetting::Off | CapSetting::Hidden));
+        if kept && !still && is_sense(key) {
+            return Err(format!(
+                "policy.caps.{key}: only the owner can turn sensing on, and a capability the node does not offer now may sense"
+            ));
+        }
+    }
     // An allow rule would let a sense capability through in allowlist mode,
     // whatever `caps` says; so adding one for it is the owner's call as well.
     for rule in n.allow.iter().filter(|r| !o.allow.contains(r)) {
@@ -641,6 +653,16 @@ fn client_only(
         if is_sense(scope) {
             return Err(format!(
                 "policy.allow {rule}: only the owner can turn sensing on, and a capability the node does not offer now may sense"
+            ));
+        }
+    }
+    // And so is taking away a deny rule that keeps one off under a wider
+    // allow rule or mode.
+    for rule in o.deny.iter().filter(|r| !n.deny.contains(r)) {
+        let scope = rule.split(':').next().unwrap_or(rule);
+        if is_sense(scope) {
+            return Err(format!(
+                "policy.deny {rule}: only the owner can turn sensing on, and a capability the node does not offer now may sense"
             ));
         }
     }
@@ -976,6 +998,66 @@ mod tests {
         let last = log.last().unwrap();
         assert_eq!(last["by"], "center home");
         assert_eq!(last["changes"][0]["key"], "center");
+    }
+
+    /// What keeps a sense action off under a wider entry of the owner (an
+    /// `off` or `hidden` switch for it under a capability that is on, a deny
+    /// rule for it under an allow rule for the capability) is the owner's to
+    /// take away: without it the sense action runs. The same entries for
+    /// what does not sense are the center's.
+    #[test]
+    fn a_center_may_not_take_away_what_keeps_sensing_off() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = store(d.path(), SettingsGrant::Write);
+        s.update(|c| {
+            let p = &mut c.centers[0].policy;
+            p.caps.insert("camera".into(), CapSetting::On);
+            p.caps.insert("camera.snap".into(), CapSetting::Off);
+            p.caps.insert("camera.film".into(), CapSetting::Hidden);
+            p.caps.insert("fs.write".into(), CapSetting::Off);
+            p.allow = vec!["camera".into()];
+            p.deny = vec!["camera.snap".into(), "exec.run:rm *".into()];
+            Ok(())
+        })
+        .unwrap();
+        let senses = |scope: &str| scope.split('.').next() == Some("camera");
+        let v = s.version();
+        for (what, change) in [
+            (
+                "policy.caps.camera.snap",
+                json!({"caps": {"camera": "on", "camera.film": "hidden", "fs.write": "off"}}),
+            ),
+            (
+                "policy.caps.camera.snap",
+                json!({"caps": {"camera": "on", "camera.snap": "on", "camera.film": "hidden", "fs.write": "off"}}),
+            ),
+            (
+                "policy.caps.camera.film",
+                json!({"caps": {"camera": "on", "camera.snap": "off", "fs.write": "off"}}),
+            ),
+            (
+                "policy.deny camera.snap",
+                json!({"deny": ["exec.run:rm *"]}),
+            ),
+        ] {
+            let mut new = doc(&s);
+            for (k, val) in change.as_object().unwrap() {
+                new["policy"][k] = val.clone();
+            }
+            let e = s
+                .set_center_document("home", new, v, senses, unix)
+                .unwrap_err();
+            assert!(
+                matches!(&e, SetError::Forbidden(m) if m.contains(what)),
+                "{what}: {e:?}"
+            );
+        }
+        // Hidden instead of off still keeps it off; what does not sense goes.
+        let mut new = doc(&s);
+        new["policy"]["caps"] =
+            json!({"camera": "on", "camera.snap": "hidden", "camera.film": "off"});
+        new["policy"]["deny"] = json!(["camera.snap"]);
+        s.set_center_document("home", new, v, senses, unix).unwrap();
     }
 
     #[test]

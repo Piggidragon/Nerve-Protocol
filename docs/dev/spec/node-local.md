@@ -690,7 +690,10 @@ does not close them, and the node sets none while the keys are in files
 account that is neither root nor can become root (`docker`, `lxd`,
 `incus-admin`, `libvirt`, `disk`; user docs, service.md "The account commands
 run as"). Root passes the socket's uid check, and an account that becomes
-root is root.
+root is root. It keeps out every command but a sudo command: that one runs
+as root whatever account `machine.user` names (no `no_new_privs`, and the
+unit keeps the capabilities it needs), so it reads the token, passes the uid
+check and can leave the tree.
 
 A connection the node cannot take (for want of
 descriptors, memory or epoll watches, or for any other reason of that one
@@ -716,11 +719,12 @@ started for a center, the reading ones (`status`, `config.read`,
 processes that stay below the command, in any mode. A `folder` mode command
 is kept out by the token as well, including a process it left behind, as far
 as the sandbox holds (above). A command without a sandbox (`allowlist` and
-`user` mode, sudo commands) can read the token file as it can read
-`node.toml`, and can leave the tree at once (`( … & )`, `setsid -f`, a
-daemon fork), while the command still runs. For such a command the socket is
-no boundary at any time, as the node's files are none; the refusal stops what
-stays below it.
+`user` mode) can read the token file as it can read `node.toml`, and a sudo
+command is root and reads it and passes the uid check, whatever account
+`machine.user` names. Both can leave the tree at once (`( … & )`,
+`setsid -f`, a daemon fork), while the command still runs. For such a command
+the socket is no boundary at any time, as the node's files are none; the
+refusal stops what stays below it.
 **Windows has no socket and no sandbox:** the CLI signs node.toml
 itself, so a command the node runs for a center can change the policy, and
 the change applies at the next start. On Windows, allow commands only to

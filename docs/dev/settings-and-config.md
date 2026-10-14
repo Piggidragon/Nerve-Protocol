@@ -89,8 +89,10 @@ program of that user that runs commands on request over a socket (the user's
 systemd session, a tmux or screen server) runs them outside it, and reads the
 token too. Only `machine.user` keeps that out, with an account that is
 neither root nor can become root ([the account commands run
-as](../user/service.md#the-account-commands-run-as)). A command without a
-sandbox (`allowlist`, `user`, sudo) reads the token as well. It is the node's
+as](../user/service.md#the-account-commands-run-as)), and not for a
+[sudo](../user/sudo.md) command, which runs as root whatever the account.
+A command without a sandbox (`allowlist`, `user`, sudo) reads the token as
+well. It is the node's
 only way in besides its center links. The client sends one JSON object per line,
 `{"method", "params", "token"}`, and gets `{"ok": value}` or
 `{"error": "text"}`. A streaming method answers with several `{"item": value}`

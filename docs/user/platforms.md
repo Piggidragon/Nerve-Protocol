@@ -30,15 +30,20 @@ behaves the same except where this page says so.
   socket to run a program outside the sandbox: the user's systemd and D-Bus
   session (`systemd-run --user`), a tmux or screen server, and others. Such a
   program is the user's own process and reads the node's files and token.
-- A command of `allowlist` or `user` mode, or a [sudo](sudo.md) command, has no
-  sandbox, so it can read the token and the node's files as the user can. The
-  node refuses its requests only from processes that stay below the command,
-  and a command can leave that tree at once (`( … & )`, `setsid -f`). The
-  control socket is no boundary against such a command.
-- To keep commands from the node's files and socket, run them as another
-  account: `machine.user`, or [the installed service](service.md). The account
-  must be neither root nor one that can become root (`docker`, `lxd`, …); see
-  [the account commands run as](service.md#the-account-commands-run-as).
+- A command of `allowlist` or `user` mode has no sandbox, so it can read the
+  token and the node's files as the account it runs as can. The node refuses
+  its requests only from processes that stay below the command, and a command
+  can leave that tree at once (`( … & )`, `setsid -f`). The control socket is
+  no boundary against such a command.
+- A [sudo](sudo.md) command runs as root, whatever account the commands run
+  as. It reads the token and the node's files, passes the socket's uid check,
+  and can leave the tree the same way. The control socket is no boundary
+  against it, and neither is another account.
+- To keep the other commands from the node's files and socket, run them as
+  another account: `machine.user`, or [the installed service](service.md). The
+  account must be neither root nor one that can become root (`docker`, `lxd`,
+  …); see [the account commands run as](service.md#the-account-commands-run-as).
+  Sudo commands stay out of this: they are root.
 - A node that runs as root is refused unless `machine.allow_root` is set
   ([root and administrator](#root-and-administrator)).
 

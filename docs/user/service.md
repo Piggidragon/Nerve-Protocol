@@ -35,7 +35,11 @@ Whatever the downloaded file is called, `install` puts it in place as
 3. Sets the account that [commands run as](#the-account-commands-run-as):
    the account that ran `sudo`. An account chosen before stays. When you
    are logged in as root without `sudo`, it is root, and `install` warns
-   that commands from a center then run as root.
+   that commands from a center then run as root. It warns about the account
+   that ran `sudo` as well, since a person logs in as it, and about any
+   account that gets root without a password (below), and suggests
+   `sudo nerve-node setup --create-user nerve-work`. The warning does not
+   stop the install.
 4. Copies the program to `/usr/local/bin/nerve-node`.
 5. Writes the unit `/etc/systemd/system/nerve-node.service`, enables it and
    starts it. It waits until the node answers.
@@ -96,8 +100,26 @@ command starts, the node checks that its account cannot open the node's
 folders, and refuses to run it if it can. That holds as long as the account
 cannot become root. Root itself can, and so can an account in a group that
 gets root without a password: `docker`, `lxd`, `incus-admin`, `libvirt` or
-`disk`. `install` and `setup` warn about such an account. Choose one
-outside these groups, or a command can read the keys after all.
+`disk`. So can an account that may use `sudo` without a password:
+`install` and `setup` read its sudo rules (`sudo -l -U <account>`) and, when
+they may give root a command without a password (`NOPASSWD` for anything but
+plain command paths, `authenticate` turned off, an `exempt_group`), run
+`sudo -n -k true` as the account. If that succeeds, they warn. The rules
+decide whether that is tried at all: an account whose rules surely need a
+password for root, `NOPASSWD` for plain commands such as `apt` or for
+another user to run as included, is not run as, so sudo logs no failed
+login. One whose rules may grant it but a later rule asks for the password
+is run as, and sudo logs it. Only sudo 1.9 without `noninteractive_auth` is
+known to stay out of PAM with `-n`. Elsewhere (sudo-rs, an unknown sudo) a
+probe would count as a failed login, which can lock the account
+(pam_faillock), so none is made and the rules alone decide the warning. The account that ran `sudo`, the one its owner
+logs in as, is such an account too (see [platforms](platforms.md#linux)).
+`install` and `setup` warn about such an account, whether they take it or it
+is chosen already, and suggest an account made for the node, also for root.
+`NOPASSWD` for a single command can be root as well (`apt`, `systemctl`, a
+shell, an editor), and they do not see that: check `sudo -l -U <account>`
+yourself. Choose one outside these groups and without such rules, or a
+command can read the keys after all.
 
 - No account chosen: the node runs no command, and says that
   `sudo nerve-node setup` chooses one.
@@ -234,9 +256,10 @@ The service writes its log to `C:\ProgramData\Nerve\state\log.jsonl`. When
 it does not start, the Event Viewer says why, and the log has the rest.
 
 The other commands work on the installed node from an administrator's
-terminal. Windows has no control socket, so the service takes a change at
-its next start: `Restart-Service nerve-node`. `setup` asks no account
-there, and `--create-user` is refused.
+terminal. The service takes `folder add`, `folder set` and `folder rm` at
+once over its [control pipe](platforms.md#the-control-pipe), and every other
+change at its next start: `Restart-Service nerve-node`. `setup` asks no
+account there, and `--create-user` is refused.
 
 The installed node on Windows keeps its keys in files. The service runs as
 `nerve`, and the Credential Manager is one per account: keys that `setup` or
@@ -319,9 +342,10 @@ register it yet gets it from the installed program:
 `uninstall` stops and removes the service, the source `nerve-node` of the
 Event Log (its entries stay), the user `nerve` and its profile, and the
 program. It also takes off the folder grants of `folder` mode that a node
-you ran yourself put on
+you ran yourself put on, and removes the profiles of its AppContainers
 ([modes](modes.md#what-a-command-can-reach-in-folder-mode-windows)); the
-service puts none on. Without `--purge` the folders and the stored password stay,
+service puts none on. It names the profiles it removed, and those it left
+because that node runs. Without `--purge` the folders and the stored password stay,
 open to the administrators only; the [sudo](sudo.md#sudo-on-windows)
 password goes, so sudo is off after a later `install`. A later `install`
 takes them up again.

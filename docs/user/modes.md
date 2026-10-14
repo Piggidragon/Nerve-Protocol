@@ -58,6 +58,83 @@ Quote `'=rx'` so zsh leaves it alone. `folder add` on a path that is listed
 already replaces its rights. `folder set` leaves a folder with no rights in
 the list. `folder rm` removes it.
 
+### A folder keeps the place you added
+
+`folder add` follows the links on the path and stores the real place, except
+a link that lies inside a folder where commands may write (a `w` folder of
+any pairing): a command may have put it there, and the folder would be stored
+at whatever it leads to. `folder add` then refuses, changes nothing and says
+which link. Look at it (`ls -l`, `dir /AL`): add the place you mean by its own
+path, or remove the link. (Once no `w` folder shows the link, it cannot be
+told from yours and is followed.) The path is followed and checked in one
+pass: a link found inside a `w` folder is refused whenever it appears, and the
+place the pass ends at must resolve to itself, so a link swapped in meanwhile
+is refused too. On Windows a `subst` drive is followed through the folder it maps, name by
+name, so a junction on that folder is judged like any other; a path with a
+drive but no root (`C:sub`) and a path that is not on a drive letter (a share,
+`\\?\GLOBALROOT\…`) are refused, and so is a link whose target is not on a drive (a share, a
+device path); a link to a volume root (`\\?\Volume{…}\`), which is how Windows
+spells a volume mounted at a folder, is followed as the place the volume is
+mounted at; and short (8.3) names, in the path, in a junction's target or in
+the folder a `subst` drive maps, are written out in full. On Windows the CLI
+does that judging, as the account it runs as, and hands the place it settled
+to the running node over its [control pipe](platforms.md#the-control-pipe),
+which stores and records it; with no node running the CLI writes `node.toml`
+itself. The node records that it
+stored the real place (`places` under the pairing's `policy` in `node.toml`).
+A command with `w` on a folder can put a link in place of a folder inside it,
+and a link would give that folder's rights in a place you never named. So the
+node looks at the path again before each command: a recorded folder whose
+path leads somewhere else now is left out of the command's confinement, and
+the node logs a warning (`folder <path> left out of the command's sandbox: it
+was added at its own place and its path leads to <place> now …`). That holds
+whoever made the link, also after you took `w` off the folder above or removed
+the pairing that had it. The folder is back once its path leads to the place
+you added again. To take the place the path leads to now, `folder rm` the
+folder and `folder add` it again. Name it with the path you gave to
+`folder add`, or the one `folder ls` shows (a trailing slash does not matter;
+on the installed node only the one `folder ls` shows works for a path that
+went through a link, see below). `folder rm` and `folder set` find the entry
+also through links of your own, and where the link that replaced it cannot be
+resolved (it dangles or loops), and act on that entry, not on the folder the
+link leads to now.
+
+`folder rm` and `center rm` take the record away with the folder. A center
+with the [settings grant](settings-grant.md) cannot add or change entries of
+it, and one goes only with its folder.
+
+Not every folder is recorded. Folders added before the node kept this record
+have no entry, and neither have folders a center sets and folders you write
+into `node.toml` with `config set`. The node follows wherever their path
+leads, and the cautions about links below hold for them. To record such a
+folder, first check that its path is not a link now (`ls -ld <path>`,
+`dir /AL <path>`, `find <path> -type l`): `folder add` follows a link outside
+the `w` folders and stores the place it leads to, and then the old entry stays
+beside the new one (`folder rm` it). Then add the folder again with its
+rights. `nerve-node config get
+center.<name>.policy.places` lists the recorded ones. A node from before this
+record refuses a `node.toml` that has `places`: remove the key
+(`nerve-node config unset center.<name>.policy.places`) before you go back to
+it.
+
+On the [installed node](service.md) on Linux the CLI runs as the node's own
+user (`nerve`), which may not look into your home or resolve a folder there,
+so it cannot judge the links on a path there. With the node running,
+`folder add` is therefore done by the node, which looks as the account the
+commands run as: it follows the path, refuses a link inside a `w` folder as
+above, and stores and records the real place (the command says so when that
+is not the path you gave). A folder it stored at the place a link leads to is
+listed there: give `folder rm` and `folder set` the path `folder ls` shows,
+since the CLI cannot see the link. Given the link, they say `is not a
+folder of this center` and add that the account cannot look into the path and
+which path to use, naming the folders of the center that could be it. With no
+node running, or where the node cannot tell either (a `w` folder it cannot
+resolve, or no account chosen), the folder is stored as given and not recorded, a record it had stays, and
+`folder add` says so (`note: … is stored as given and not recorded …`): start
+the node, and add the folder again. Check for links (`find <folder> -type l`
+on Linux, `dir /AL /S <folder>` on Windows) before you take `w` off the folder
+above such a folder.
+
 ## What a command can reach in `folder` mode (Linux)
 
 The node confines commands with Landlock:
@@ -72,7 +149,19 @@ The node confines commands with Landlock:
   command.
 - Landlock cannot run a file it may not read. So an `x` folder also lets a
   command read files there by name. It still cannot list the folder.
-- The node's own folders are in none of these sets.
+- The node's own folders are in none of these sets. That keeps a command from
+  the node's files, but only as far as Landlock reaches. While the commands
+  run as the node's own user (a node you run yourself, with no `machine.user`),
+  `folder` mode is no boundary against that user's other programs: a command
+  can ask one that runs commands on request, such as the user's systemd session
+  or a tmux server, to run a program outside the sandbox, and that program
+  reads the node's files and changes its settings through the control socket.
+  Run the commands as another account, one that only the node uses and that
+  gets root in no way without a password (not root, not in `docker` or a like
+  group, no `NOPASSWD` sudo, nobody works as it and uses sudo from it), to keep
+  them from the node's files and settings: see [Linux](platforms.md#linux).
+  The account that ran `install` is not such an account. A [sudo](sudo.md)
+  command is root and is not kept out.
 - A command with `w` on a folder can put a link in place of a folder inside
   it, and a link would give that folder's rights in a place you never named.
   So a folder is left out of the sets, and the node logs a warning, when its
@@ -80,12 +169,15 @@ The node confines commands with Landlock:
   That holds for a link you made yourself too, and a link of yours that
   leads into the `w` folder is followed to its end and judged on the way.
   The folder is back once its path is a plain folder again. A link of your
-  own above the `w` folder is followed. Two gaps are left:
+  own above the `w` folder is followed. A folder you added with `folder add`
+  is also left out when a link has replaced it since, and stays out after you
+  take `w` off the folder above or remove the pairing that had it
+  ([above](#a-folder-keeps-the-place-you-added)). Two gaps are left, for the
+  folders that are not recorded there:
   - Only the `w` folders in the config count. If a command made a link while
     the outer folder had `w`, and you then take `w` off it (narrow it to `r`,
     or remove the pairing), the node follows the link again. Before you do,
-    look for links (`find <folder> -type l`). A fix that remembers the place
-    you judged when you added the folder is tracked in #77.
+    look for links (`find <folder> -type l`).
   - A command that runs without Landlock (`user` mode, `sudo`, and what an
     `allowlist` rule allows) can make a link wherever you can write, also
     where no `w` folder is, and the folder of another pairing there follows
@@ -147,9 +239,9 @@ folders.
 - `folder rm` and `folder set` change the entry, and removing the pairing
   takes it off. That is the node's entry on the folder: permissions a
   command gave what it made there stay (see "What the AppContainer does not
-  stop" below). A running node takes changes from the CLI at its next start
-  ([platforms](platforms.md#no-control-socket)), and gives its folders their
-  entries again until then.
+  stop" below). A running node takes these changes from the CLI at once,
+  over its [control pipe](platforms.md#the-control-pipe), and has changed
+  the entries when the CLI answers.
 - `uninstall` takes off the entries of the node in your own folders (not
   those of a folder that holds hard links the check refuses, see below)
   (`%USERPROFILE%\.config\nerve` and `.local\state\nerve`, or those you name
@@ -157,6 +249,42 @@ folders.
   reaches the service, so name the folders to change the node you run
   yourself. Before you delete its folders, remove its pairings: the record of
   the entries is in its state folder.
+- Each pairing's container has a profile in the account that ran the node:
+  a folder `%LOCALAPPDATA%\Packages\nerve.…` and a registry key.
+  `center ls` names each pairing's container (`AppContainer nerve.…`). The
+  profile goes with the container's last folder entry, with `center rm`,
+  and at `uninstall`, which say which profiles they removed. While the node
+  runs they keep its profiles and say so, as it still serves the pairing
+  until it starts again, and the other changes from the CLI keep them too;
+  stop the node first. The running node itself removes a profile when the
+  pairing's last granted folder is deleted or moved away. The name comes from the
+  path of the state folder and the pairing in `node.toml`, so the node
+  finds the profile as long as the config folder is there, also after the
+  state folder was deleted, and whether you type the folder with `\` or
+  `/`. If you deleted the state folder before you removed the pairings,
+  name both folders as they were and remove the pairings:
+  `nerve-node --config-dir <config> --state-dir <state> config accept`,
+  then `center rm` with the same folders for each pairing. Spell the state
+  folder exactly as the node had it: the same upper and lower case, no
+  `\` at the end, and absolute or relative as it was given (only `\` and
+  `/` may differ). Each `center rm` says
+  `removed the AppContainer profile nerve.…`, also when the grants of the
+  other pairings do not follow. To check first, run `center ls` with the
+  same folders: when the `AppContainer nerve.…` name it shows for a
+  pairing is not in the `Get-ChildItem` list below, that pairing never ran
+  a command in its container, or the state folder is spelled otherwise
+  than the node had it.
+- If the config folder is gone too, the node cannot tell which profiles
+  were its own. `Get-ChildItem $env:LOCALAPPDATA\Packages -Filter nerve.*`
+  lists the profiles of all nodes this account ran; those that `center ls`
+  of the nodes you still run (with their folders) does not name are left
+  over. Remove each, as that account, with
+  `[Nerve.Profile]::DeleteAppContainerProfile('nerve.…')` after
+  `Add-Type -Namespace Nerve -Name Profile -MemberDefinition '[DllImport("userenv.dll", CharSet = CharSet.Unicode)] public static extern int DeleteAppContainerProfile(string name);'`.
+  It returns 0 also for a name that has no profile, so check that the
+  folder is gone. A node that still runs makes the profile of its
+  container again at its next command, without what its commands kept
+  there.
 - A granted folder you move or rename on the same drive takes its entry
   along, as Windows keeps its permissions. At its next sync (at start, on a
   change, before a command, and when the CLI changes the config) the node
@@ -187,20 +315,30 @@ folders.
   names such a folder in its log (`left out of the command's sandbox: it
   passes through the link …`) and grants it once it is a plain folder again.
   A junction of yours that leads into the `w` folder is followed to its end
-  and judged on the way. One gap is
-  left here: if a command makes such a junction while the outer folder has
-  `w`, and you then take the `w` off that folder (narrow it to `r`, or
-  remove the pairing it belongs to), the node no longer knows commands could
-  write there and follows the junction again. Before you take `w` off a
-  folder or remove a pairing, check it for junctions and links
-  (`dir /AL /S <folder>`). A fix that remembers the place you judged when
-  you added the folder is tracked in #77.
+  and judged on the way. A folder you added with `folder add` stays out when
+  a junction has replaced it since, also after you took the `w` off the
+  folder above or removed the pairing that had it
+  ([above](#a-folder-keeps-the-place-you-added)). A folder without that
+  record (see there) is followed again once nothing shows commands could
+  write there: check it for junctions and links (`dir /AL /S <folder>`)
+  before you take `w` off the folder above or remove a pairing.
 - The node's own folders and the [protected paths](protected-paths.md) get no
   entry, also inside a folder you grant. That folder is granted as its other
   entries instead, as on Linux.
 - PowerShell starts on a drive `Work:` that is the working folder, because the
-  container may not look at the folders above it. Relative paths and native
-  programs work as usual. `cd` to a whole path above the folder does not.
+  container may not look at the folders above it. Whole paths, relative paths
+  below the working folder and native programs work as usual.
+- `cd` and `pushd` to the whole path of a folder the command may see, or with
+  `..` up out of the working folder into one, put PowerShell on a drive of
+  that folder (`Work2:`, `Work3:`, …), and native programs start in the folder
+  itself. These drives open nothing; the container decides what the command
+  reaches. `cd` to a folder the command may not see fails as any other access
+  does, also with `..`: PowerShell stays where it was, `$?` is false, and a
+  command that ends with that `cd` fails.
+- Other commands keep `..` on the drive they stand on: on `Work:\`,
+  `Get-Content ..\README.md` reads the working folder's own `README.md` or
+  fails, but does not read the one above it. Give them a whole path for a
+  folder above the one PowerShell stands in, or `cd` there first.
 - The command has the network, but not `localhost`. It has its own desktop,
   so it cannot reach your windows or clipboard, and Windows gives its
   container a folder of its own for temporary files.
@@ -271,8 +409,8 @@ folders.
   --no-hardlinks`. Or remove them (delete `node_modules` or `.venv`) before
   you add, change or remove the folder.
 
-`nerve-node status` cannot ask the running node on Windows
-([platforms](platforms.md#no-control-socket)). The node names its
+`nerve-node status` does not ask the running node on Windows yet
+([platforms](platforms.md#the-control-pipe)). The node names its
 confinement when it starts, in its output and its [log](logs.md):
 `node daemon running (…, confinement appcontainer, …)`. The center sees it in
 the node's `exec` state, `confinement appcontainer`, or `none` on the
@@ -319,8 +457,11 @@ known.
   `C:\ProgramData` and `C:\Windows\Temp`. A command also writes the
   container's own folder, `%LOCALAPPDATA%\Packages\<container>\AC` (it
   holds `Temp`), without any grant. It stays between the commands of the
-  pairing, and Windows deletes it with the container's profile, which the
-  node removes with the container's last grant (checked, code).
+  pairing, and Windows deletes it with the container's profile. The node
+  removes that profile with the container's last grant, a running node
+  too when the pairing's folders are gone at its sync; `center rm`,
+  `uninstall` and other changes from the CLI remove it only while the node
+  does not run (see above) (checked, code).
 - **The registry.** Checked: a command reads the machine part (`HKLM`, for
   example the Windows version), lists the keys of your `HKCU` and reads
   `HKCU\Environment`, which holds the environment variables you set for

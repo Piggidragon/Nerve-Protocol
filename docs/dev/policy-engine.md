@@ -14,6 +14,7 @@ A pairing is a **center entry**. Its policy holds:
 | `mode` | `allowlist` (default), `folder` or `user` |
 | `until` | Optional end of `folder` or `user` mode. Then the entry is back in `allowlist` |
 | `folders` | A path and `access`: three independent flags `r`, `w`, `x` |
+| `places` | The folders (by path) `folder add` recorded at their real place. The owner's: a center's write keeps it |
 | `caps` | `on`, `off` or `hidden`, per capability or action |
 | `allow`, `deny` | Rules for every action |
 | `sudo_allow` | Rules for `sudo` commands |
@@ -102,10 +103,16 @@ and, per platform, system files that open the machine.
   is left out of the Landlock rules (`exec::led_away`). A link of the owner's
   that leads into a `w` folder is followed to its end and judged on the way.
   Links above the `w` folder, and the `w` folder itself, are the owner's and
-  are followed. Two gaps: only the `w` folders in the config count, so a link
-  made while a folder had `w` is followed again once `w` is taken off (#77),
+  are followed. Only the `w` folders in the config count there, so a link
+  made while a folder had `w` would be followed again once `w` is taken off,
   and a command that runs without Landlock (`user` mode, `sudo`, an
-  `allowlist` command) can make a link where no `w` folder is.
+  `allowlist` command) can make a link where no `w` folder is. The record
+  closes both for the folders `folder add` stored: it stores the resolved
+  path and lists it in `policy.places`, and `exec::replaced` leaves a
+  recorded folder out whenever its path resolves to another place now,
+  whoever made the link and whatever `w` is left. A folder without an
+  entry (older, set by a center, or written with `config set`) is followed as
+  before.
 - A folder that holds a protected entry gives a command none of it. Landlock
   cannot deny inside a rule, so the sandbox takes the folder's other entries,
   level by level, down to the protected one.
@@ -294,7 +301,21 @@ center's local name):
   start without one.
 - PowerShell checks every folder above its working folder, which the
   container may not see, so a PowerShell command starts with a drive `Work:`
-  rooted at its working folder.
+  rooted at its working folder. Functions stand in for `Set-Location` and
+  `Push-Location`: a whole or relative path goes to the Work drive it lies
+  below, or to a new drive `Work2:`, `Work3:`, … rooted at that folder if the
+  command can see it, and otherwise to the cmdlet as a whole path, which
+  fails. Relative paths are resolved there too, since the cmdlet keeps `..`
+  on its drive (`..\app` on `Work:\` is `Work:\app`). A `-Path` loses its
+  escapes first; one with a wildcard has the part before its first wildcard
+  resolved so and keeps the rest, unless that part is `\` or `/` alone, the
+  root of the current drive. The cmdlet runs with `-ErrorAction Continue`, and
+  its errors are written again as the function's under the caller's error
+  action, so `$?` and the exit code stay as the cmdlet sets them
+  (`nerve_sandbox::POWERSHELL_START`). An object piped to them is bound as
+  the cmdlets bind it (its `Path`, or else its `PSPath` as `-LiteralPath`),
+  since their untyped `Path` would take it whole. Other cmdlets still keep
+  `..` on the drive they stand on.
 - The container has the network, as Landlock leaves it, but not the loopback
   address. Its token carries three capabilities, `internetClient`,
   `internetClientServer` and `privateNetworkClientServer`, and nothing else
@@ -333,8 +354,9 @@ how it was checked on Windows 11 Pro 26H2, build 10.0.26300, and what was not:
   command inherits (#89) and the reads of `HKCU\Environment` (#90). The
   network and the reads of the Windows folder and Program Files are what a
   container is for and stay.
-- Known wrong text: the refusal for keys in the keyring names Landlock and the
-  session bus on Windows too; a text per platform is tracked in #91.
+- The refusal for keys in the keyring has a text per platform
+  (`KEYRING_NOT_CONFINED`): on Windows it names the AppContainer and the
+  Credential Manager, not Landlock and the session bus.
 - Not checked: the Credential Manager and DPAPI for the user (the test session
   could not use them), the clipboard against a real desktop, ALPC ports and
   COM servers, network shares. With the node's keys in the Credential

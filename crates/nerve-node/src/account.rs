@@ -40,6 +40,263 @@ pub fn group_warning(name: &str, groups: &[String]) -> String {
     )
 }
 
+/// The warning for an account that gets root through its own sudo without
+/// a password (`NOPASSWD`).
+pub fn sudo_warning(name: &str) -> String {
+    format!(
+        "Warning: {name} may use sudo without a password, which gets root; a command from a center can then get root and read the node's keys. Choose an account that may not, or you are responsible for what commands do."
+    )
+}
+
+/// The warning for the account that ran `sudo`: the account its owner logs
+/// in as, whatever its sudo asks for.
+pub fn invoker_warning(name: &str) -> String {
+    format!(
+        "Warning: {name} is the account that ran sudo, the one its owner logs in as; the commands of a center run as it, so they can use its own programs (a tmux or screen server, its systemd user session) to reach what its owner does with sudo, and every command is then root. You are responsible for what commands do."
+    )
+}
+
+/// What `install` and `setup` suggest to anyone whose account is no
+/// boundary and who runs them through `sudo`.
+pub const CREATE_USER_HINT: &str = "An account only the node uses is the boundary: `sudo nerve-node setup --create-user nerve-work` makes one and runs commands as it.";
+
+/// The same for whoever runs `install` or `setup` as root, with no `sudo`
+/// (it may not even be installed).
+pub const CREATE_USER_HINT_ROOT: &str = "An account only the node uses is the boundary: `nerve-node setup --create-user nerve-work` makes one and runs commands as it.";
+
+/// Whether the rules `sudo -l -U <name>` lists may let the account use
+/// sudo without a password, so that a probe is worth making. The probe
+/// does the judging; this only keeps it away from accounts that surely
+/// need a password, because a probe of those makes sudo log a failed login
+/// and mail root. So it errs towards `true`: only what it reads with
+/// certainty as not applying to `true` as root is passed over. It says
+/// `true` for `NOPASSWD` on anything but plain command paths, for
+/// `!authenticate`, and for any `exempt_group`; it says `false` for a rule
+/// that runs as another user than root, one a later `PASSWD:` takes the
+/// tag from, `NOPASSWD` for plain command paths such as `apt`, and a
+/// default bound to such commands or to other users to run as.
+pub fn lists_no_password(listing: &str) -> bool {
+    let case_insensitive = !has_setting(listing, "!case_insensitive_user");
+    listing.lines().any(|line| {
+        let line = line.trim();
+        if let Some((_, cmds)) = line.split_once("NOPASSWD:") {
+            return rule_runs_as_root(line, case_insensitive) && nopasswd_may_run_true(cmds);
+        }
+        default_may_skip_password(line, case_insensitive)
+    })
+}
+
+/// Whether the members of a runas list (`ALL, !root`) may include root:
+/// the last member that names root, or something the list does not read
+/// (`ALL`, a group, `#00`), decides. A plain name, but `root` in any
+/// case, is another user. `case_insensitive` is sudo's setting of that
+/// name.
+fn may_be_root(members: &[&str], case_insensitive: bool) -> bool {
+    let mut root = false;
+    for m in members {
+        let (negated, name) = match m.strip_prefix('!') {
+            Some(n) => (true, n.trim()),
+            None => (false, *m),
+        };
+        let plain = name != "ALL"
+            && !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+        // sudo matches user names without regard to case by default
+        // (`case_insensitive_user`): a name like `ROOT` may be root, which
+        // errs towards a probe. A negation takes root out only when it
+        // names root for certain.
+        let is_root = name.eq_ignore_ascii_case("root") || name == "#0";
+        let sure = name == "root" || name == "#0" || case_insensitive && is_root;
+        if (plain && !is_root) || (negated && !sure) {
+            continue;
+        }
+        root = !negated;
+    }
+    root
+}
+
+/// Whether the listing names a setting among its defaults.
+fn has_setting(listing: &str, setting: &str) -> bool {
+    listing
+        .lines()
+        .flat_map(|l| l.split([',', ' ']))
+        .any(|e| e == setting)
+}
+
+/// Whether sudo, run as an account `-n`, stays out of PAM, so that a
+/// probe of an account that needs a password costs one log line and no
+/// authentication attempt. Only sudo 1.9 is known to: it refuses before
+/// PAM, unless `noninteractive_auth` is set (a `listing` entry). `version`
+/// is what `sudo -V` printed on stdout when it succeeded. Anything else
+/// (sudo-rs, which calls PAM and prints its version on stderr up to
+/// 0.2.10, no output, another sudo) is not known to, and a failure
+/// counter such as pam_faillock would count the probe.
+pub fn probe_stays_out_of_pam(version: &str, listing: &str) -> bool {
+    version.starts_with("Sudo version ") && !has_setting(listing, "noninteractive_auth")
+}
+
+/// Whether a rule line (`(ALL : ALL) NOPASSWD: ALL`) may run as root.
+fn rule_runs_as_root(line: &str, case_insensitive: bool) -> bool {
+    let Some(inner) = line
+        .strip_prefix('(')
+        .and_then(|l| l.split_once(')'))
+        .map(|(i, _)| i)
+    else {
+        return true;
+    };
+    let users = inner.split(':').next().unwrap_or("");
+    may_be_root(
+        &users.split(',').map(str::trim).collect::<Vec<_>>(),
+        case_insensitive,
+    )
+}
+
+/// Whether a command may be `true`: anything but the path of a program
+/// with no pattern in it, as `/usr/bin/apt update`.
+fn may_match_true(cmd: &str) -> bool {
+    let cmd = cmd.trim();
+    if cmd.starts_with('!') {
+        return false;
+    }
+    // A digest (`sha256:<hex> /usr/bin/apt`) comes before the path.
+    let cmd = match cmd.split_once(' ') {
+        Some((d, rest)) if d.starts_with("sha") && d.contains(':') => rest.trim_start(),
+        _ => cmd,
+    };
+    let program = cmd.split(' ').next().unwrap_or("");
+    // `sudoedit` and `list` match only `sudo -e` and `sudo -l`.
+    if matches!(program, "sudoedit" | "list") {
+        return false;
+    }
+    !(program.starts_with('/')
+        && !program.contains(['*', '?', '[', ']', '^', '$', '\\'])
+        && !program.ends_with('/')
+        && program.rsplit('/').next() != Some("true"))
+}
+
+/// Whether the commands after `NOPASSWD:` may include `true`: those under
+/// the tag, which `PASSWD:` takes away again.
+fn nopasswd_may_run_true(cmds: &str) -> bool {
+    let mut nopasswd = true;
+    cmds.split(',').any(|item| {
+        let mut item = item.trim();
+        // Tags (`SETENV:`) come before the command.
+        while let Some((tag, rest)) = item.split_once(' ')
+            && tag.ends_with(':')
+            && tag
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || matches!(c, ':' | '_'))
+        {
+            match tag {
+                "PASSWD:" => nopasswd = false,
+                "NOPASSWD:" => nopasswd = true,
+                _ => {}
+            }
+            item = rest.trim_start();
+        }
+        nopasswd && !item.is_empty() && may_match_true(item)
+    })
+}
+
+/// Whether a default of the listing may let root's `true` run without a
+/// password: `exempt_group` (the account's groups are not read), or
+/// `!authenticate`. One bound to commands (`Defaults!/usr/bin/apt …`) or
+/// to users to run as (`Defaults>postgres …`) holds only when its binding
+/// may include `true` or root.
+fn default_may_skip_password(line: &str, case_insensitive: bool) -> bool {
+    if line.contains("exempt_group=") {
+        return true;
+    }
+    let flag = "!authenticate";
+    let Some(at) = line.match_indices(flag).map(|(i, _)| i).find(|&i| {
+        let before = line[..i].chars().next_back();
+        let after = line[i + flag.len()..].chars().next();
+        matches!(before, None | Some(' ' | ',')) && matches!(after, None | Some(' ' | ','))
+    }) else {
+        return false;
+    };
+    let Some(bound) = line.strip_prefix("Defaults") else {
+        return true;
+    };
+    // sudo prints a binding's members with a comma and a space, and a
+    // member may hold spaces, so the binding is all that lies before the
+    // flag.
+    let members = |text: &str| {
+        text.split(',')
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(String::from)
+            .collect::<Vec<_>>()
+    };
+    match bound.chars().next() {
+        Some('>') => {
+            // User names hold no space: the members end at the first
+            // word that does not follow a comma, and other settings of
+            // the line may come before the flag.
+            let text = &line["Defaults>".len()..at];
+            let mut end = 0;
+            for word in text.split_inclusive(' ') {
+                end += word.len();
+                if !word.trim_end().ends_with(',') {
+                    break;
+                }
+            }
+            let m = members(&text[..end]);
+            may_be_root(
+                &m.iter().map(String::as_str).collect::<Vec<_>>(),
+                case_insensitive,
+            )
+        }
+        Some('!') => members(&line["Defaults!".len()..at])
+            .iter()
+            .any(|c| may_match_true(c)),
+        _ => true,
+    }
+}
+
+/// The suggestion for whoever runs `install` or `setup`: root runs it
+/// without `sudo`, anyone else through it.
+fn hint(invoker: &str) -> &'static str {
+    if invoker == "root" {
+        CREATE_USER_HINT_ROOT
+    } else {
+        CREATE_USER_HINT
+    }
+}
+
+/// The warnings for `account` as the account of the commands, none when
+/// it is a boundary. Root has its own. Each comes with the suggestion,
+/// as `invoker` runs it. Otherwise: it ran `sudo`
+/// (`invoker`), it is in a group of [`ROOT_GROUPS`] (`groups`), or
+/// `sudo_without_password` says its sudo needs no password; the reasons
+/// share the suggestion at the end.
+pub fn root_warnings(
+    account: &Account,
+    invoker: &str,
+    groups: &[String],
+    sudo_without_password: impl FnOnce() -> bool,
+) -> Vec<String> {
+    if account.uid == 0 {
+        return vec![root_warning(), hint(invoker).into()];
+    }
+    let mut w = Vec::new();
+    if account.name == invoker {
+        w.push(invoker_warning(&account.name));
+    }
+    if !groups.is_empty() {
+        w.push(group_warning(&account.name, groups));
+    }
+    if sudo_without_password() {
+        w.push(sudo_warning(&account.name));
+    }
+    if !w.is_empty() {
+        w.push(hint(invoker).into());
+    }
+    w
+}
+
 /// The groups of [`ROOT_GROUPS`] that `account` is in, by name.
 pub fn root_groups(account: &Account) -> Vec<String> {
     // getent prints the groups it finds, and fails only for the others.
@@ -645,6 +902,162 @@ mod tests {
         assert!(root_groups_in(lines, &[1000, 100]).is_empty());
         let w = group_warning("alice", &["docker".into()]);
         assert!(w.contains("alice is in the group docker"), "{w}");
+    }
+
+    /// The account of the commands gets a warning for every way it gets
+    /// root, and the suggestion once; an account that is none of them gets
+    /// nothing, and root is not probed.
+    #[test]
+    fn an_account_that_gets_root_is_warned_about() {
+        let alice = account("alice", 1000);
+        let docker = ["docker".to_string()];
+        let no = || false;
+        let yes = || true;
+        // The account that ran sudo.
+        let w = root_warnings(&alice, "alice", &[], no);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(w[0].contains("alice is the account that ran sudo"), "{w:?}");
+        assert!(w[1].contains("setup --create-user nerve-work"), "{w:?}");
+        // Another account that may use sudo without a password.
+        let w = root_warnings(&alice, "bob", &[], yes);
+        assert_eq!(w.len(), 2, "{w:?}");
+        assert!(
+            w[0].contains("alice may use sudo without a password"),
+            "{w:?}"
+        );
+        // One of the groups that get root.
+        let w = root_warnings(&alice, "bob", &docker, no);
+        assert!(w[0].contains("alice is in the group docker"), "{w:?}");
+        assert!(w[1].contains("--create-user nerve-work"), "{w:?}");
+        // All three: three reasons, one suggestion.
+        let w = root_warnings(&alice, "alice", &docker, yes);
+        assert_eq!(w.len(), 4, "{w:?}");
+        assert_eq!(w.iter().filter(|l| l.contains("--create-user")).count(), 1);
+        // A boundary: no warning, no suggestion.
+        assert!(root_warnings(&alice, "bob", &[], no).is_empty());
+        // Root has its warning, and nothing asks sudo about it.
+        let root = account("root", 0);
+        let w = root_warnings(&root, "root", &[], || panic!("root is not probed"));
+        assert_eq!(w, [root_warning(), CREATE_USER_HINT_ROOT.to_string()]);
+        // The suggestion follows who runs the command, not the account:
+        // root has no need of sudo, and may have none; anyone else has.
+        assert!(!CREATE_USER_HINT_ROOT.contains("sudo"));
+        let w = root_warnings(&root, "alice", &[], no);
+        assert_eq!(w.last().map(String::as_str), Some(CREATE_USER_HINT));
+        let w = root_warnings(&alice, "root", &docker, no);
+        assert_eq!(w.last().map(String::as_str), Some(CREATE_USER_HINT_ROOT));
+    }
+
+    /// The rules sudo lists for an account say whether a probe is worth
+    /// making. It errs towards one: only an account whose rules surely
+    /// give root no command without a password is passed over, so that
+    /// sudo does not log a failed login for it.
+    #[test]
+    fn a_sudo_listing_tells_whether_no_password_is_asked() {
+        let yes = lists_no_password;
+        let no = |l: &str| !lists_no_password(l);
+        // NOPASSWD for root, for ALL or for anything but a plain path.
+        for l in [
+            "User alice may run the following commands on h:\n    (ALL) NOPASSWD: ALL\n",
+            "    (root) NOPASSWD: SETENV: ALL\n",
+            "    (ALL : ALL) ALL\n    (ALL) NOPASSWD: /usr/bin/id, ALL\n",
+            "    (ALL) NOPASSWD: ^.*$\n",
+            "    (ALL) NOPASSWD: /usr/bin/*\n",
+            "    (ALL, !root, ALL) NOPASSWD: ALL\n",
+            "    (root) NOPASSWD: /usr/bin/id, PASSWD: /usr/bin/apt, NOPASSWD: ALL\n",
+            "    (ALL) NOPASSWD: /usr/bin/true\n",
+            "    (ROOT) NOPASSWD: ALL\n",
+            // With exact matching `!ROOT` does not exclude root.
+            "    !case_insensitive_user\n    (ALL, !ROOT) NOPASSWD: ALL\n",
+            "    !case_insensitive_user\n    Defaults>ALL, !ROOT !authenticate\n",
+            "    (Root, nobody) NOPASSWD: ALL\n",
+            "    Defaults>Root !authenticate\n",
+            "    NOPASSWD: ALL\n",
+        ] {
+            assert!(yes(l), "{l}");
+        }
+        // Another user to run as, or a command that is a plain path, or a
+        // PASSWD: tag that takes it back: a password is asked for root's
+        // `true`.
+        for l in [
+            "    (ALL : ALL) ALL\n    (root) NOPASSWD: /usr/bin/apt, /usr/bin/systemctl\n",
+            "    (root) NOPASSWD: /usr/bin/apt update, !/usr/bin/id\n",
+            "    (r5svc) NOPASSWD: ALL\n",
+            "    (root) NOPASSWD: LOG_OUTPUT: /usr/bin/apt\n",
+            "    (root) NOPASSWD: NOLOG_INPUT: LOG_OUTPUT: /usr/bin/apt update\n",
+            "    (root) NOPASSWD: sha256:0dba1f /usr/bin/apt\n",
+            "    (root) NOPASSWD: list\n",
+            "    (root) NOPASSWD: sudoedit\n",
+            "    (root) NOPASSWD: sudoedit /etc/hosts\n",
+            "    Defaults!sudoedit !authenticate\n",
+            "    Defaults>r6svc !lecture, !authenticate\n",
+            "    (ALL, !ROOT) NOPASSWD: ALL\n",
+            "    Defaults>ALL, !ROOT !authenticate\n",
+            "    (ALL, !root) NOPASSWD: ALL\n",
+            "    (ALL : ALL) NOPASSWD: /usr/bin/id, PASSWD: ALL\n",
+        ] {
+            assert!(no(l), "{l}");
+        }
+        // Defaults that turn authentication off or exempt a group, as sudo
+        // prints them.
+        for l in [
+            "Matching Defaults entries for alice on h:\n    env_reset, !authenticate\n",
+            "    Defaults>root !authenticate\n",
+            "    Defaults>root,postgres !authenticate\n",
+            "    Defaults>root, nobody !authenticate\n",
+            "    Defaults>nobody, root !authenticate\n",
+            "    Defaults>#0 !authenticate\n",
+            "    Defaults>#00 !authenticate\n",
+            "    Defaults>%root !authenticate\n",
+            "    Defaults>ALL !authenticate\n",
+            "    Defaults>!root, ALL !authenticate\n",
+            "    Defaults>ALL, !postgres !authenticate\n",
+            "    Defaults!ALL !authenticate\n",
+            "    Defaults!/usr/bin/apt, ALL !authenticate\n",
+            "    Defaults!/usr/bin/apt update, ALL !authenticate\n",
+            "    Defaults!ALL, /usr/bin/apt update !authenticate\n",
+            "    Defaults!/usr/bin/* !authenticate\n",
+            "    env_reset, exempt_group=sudo\n",
+            "    env_reset, exempt_group=SUDO\n",
+            "    env_reset, exempt_group=\"r5 grp\"\n",
+            "    env_reset, exempt_group=\\#27\n",
+        ] {
+            assert!(yes(l), "{l}");
+        }
+        for l in [
+            "Runas and Command-specific defaults for alice:\n    Defaults!/usr/bin/apt !authenticate\n",
+            "    Defaults>postgres !authenticate\n",
+            "    Defaults>nobody, postgres !authenticate\n",
+            "    Defaults>ALL, !root !authenticate\n",
+            "    Defaults>root, !root !authenticate\n",
+        ] {
+            assert!(no(l), "{l}");
+        }
+        // Nothing to run as.
+        for l in [
+            "User alice may run the following commands on h:\n    (ALL : ALL) ALL\n",
+            "User bob is not allowed to run sudo on h.\n",
+            "",
+        ] {
+            assert!(no(l), "{l}");
+        }
+    }
+
+    /// A probe is made as the account only where sudo's `-n` stays out of
+    /// PAM: not on sudo-rs, not with `noninteractive_auth`.
+    #[test]
+    fn a_probe_is_made_only_where_sudo_stays_out_of_pam() {
+        let defaults = "Matching Defaults entries for alice on h:\n    env_reset, mail_badpass\n";
+        assert!(probe_stays_out_of_pam("Sudo version 1.9.15p5\n", defaults));
+        // sudo-rs, on either stream, nothing, or another program.
+        assert!(!probe_stays_out_of_pam("sudo-rs 0.2.13\n", defaults));
+        assert!(!probe_stays_out_of_pam("", defaults));
+        assert!(!probe_stays_out_of_pam("usage: sudo\n", defaults));
+        let set = "    env_reset, noninteractive_auth, mail_badpass\n";
+        assert!(!probe_stays_out_of_pam("Sudo version 1.9.15p5\n", set));
+        // Turned off, it is not set.
+        let off = "    env_reset, !noninteractive_auth\n";
+        assert!(probe_stays_out_of_pam("Sudo version 1.9.15p5\n", off));
     }
 
     #[test]

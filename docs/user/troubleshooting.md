@@ -23,6 +23,7 @@ names its reason.
 | `... keeps a grant for this center's commands that its folders no longer give` | Windows: the node could not take a removed folder's grant off, or a granted folder was moved or renamed and the node could not take its entry off where it is now (the message names its old path) | Check that you may change that folder's permissions. For a moved or renamed folder, the node's log names the reason, often hard links: see the row on hard links below (a built Rust project needs `cargo clean`). The node tries again before each command |
 | `the node cannot tell which folders carry grants for the commands` | Windows: the record of the folder grants (`grants.json` in the state folder) cannot be read, so no `folder` command runs | See the reason. If the file is damaged: `icacls <folder>` lists a folder's grants as `S-1-15-2-…` entries, `icacls <folder> /remove *S-1-15-2-…` takes one off. Once none is left, delete the file |
 | `the node puts no grant on it, since …` | Windows: a folder granted inside another folder with `w` is now a junction or link to elsewhere, a file with a second name, or has permissions that do not inherit ([modes](modes.md#what-a-command-can-reach-in-folder-mode-windows)) | Put a plain folder there again (remove the junction; `icacls <path> /reset` makes its permissions inherit), or take the folder off the pairing. The node grants it at its next sync |
+| `folder … left out of the command's sandbox: it was added at its own place and its path leads to … now` | The folder was added with `folder add`, and a link or junction now stands in its path (a command with `w` on the folder above may have put it there). The node keeps the folder out until the path leads to the place you added again ([modes](modes.md#a-folder-keeps-the-place-you-added)) | Look at the link (`ls -l`, `dir /AL`). If you did not mean it, remove it. If the new place is the one you want, `nerve-node folder rm <path>` (the path `folder ls` shows; the one you gave to `folder add` too, except on the installed node when it went through a link) and `folder add` the place the path leads to now |
 | `the node does not change the permissions of …, since … below it has … names (hard links)`, or `… below it has … names (hard links), and the change would reach them all; it stopped there` | Windows: a file below a folder the commands may write in has a second name, and the change of the folder's permissions would reach it under every name ([modes](modes.md#what-a-command-can-reach-in-folder-mode-windows)) | `fsutil hardlink list <file>` shows its names. Links between names in `target` folders of the same folder, under the same grants, pass where no pairing has `w` without `r` on that folder or one above or inside it, except in a sync after a granted folder was moved or renamed: a built Rust project you renamed or moved needs `cargo clean` first. Others do not pass. Build tools make such links: pnpm's `node_modules` to its store, uv's `.venv` to its cache, a local `git clone`. Remove them (delete `node_modules` or `.venv`) or keep them out of the folder (pnpm `package-import-method=copy`, `UV_LINK_MODE=copy`, `git clone --no-hardlinks`) ([modes](modes.md#what-a-command-can-reach-in-folder-mode-windows)). A refused removal stops the pairing's commands until then. The node tries again before each command |
 | `the config is saved, but the folder grants do not follow it` | Windows: a folder's permissions could not be changed | See the reason. The node tries again when it starts and before each command |
 | `… is protected (…)` | The path is [protected](protected-paths.md) | Grant a folder at it, with the right it needs |
@@ -104,5 +105,23 @@ A command returns at most 1 MiB of stdout and 1 MiB of stderr. The result has
 ## A change did not apply
 
 If a command says `takes effect at the next start of the node`, no node was
-running to take it. Start `nerve-node run`. On Windows a running node always
-takes changes at its next start.
+running to take it. Start `nerve-node run`. On Windows a running node takes
+only folder changes at once; every other change it takes at its next start.
+
+### Restart the node, then change the folder again (Windows)
+
+`folder add`, `set` or `rm` says `node.toml holds changes the running node
+takes at its next start`: an earlier command changed something else, which
+waits in the file for the next start. The node saves its whole config with a
+folder change and would undo that change, so it refuses. Restart the node
+(`Restart-Service nerve-node` for the installed node) and run the folder
+command again.
+
+### The control pipe is not the node's (Windows)
+
+`folder add`, `set` or `rm` says `the control pipe is not the node's`: another
+process made a pipe of the node's name before the node started, and the node
+runs without its pipe (its log says `the control pipe … is taken`). The CLI
+sends that pipe nothing. Find the process with Sysinternals
+`handle.exe -a nerve-node-`, end it, and restart the node. With the node
+stopped, folder changes go to `node.toml` as every other change does.

@@ -68,6 +68,12 @@ center reads, or the node refuses the whole change and names the field.
    access at a protected place ([policy engine](policy-engine.md#protected-paths)).
 9. Turning a `sense` action on. A center can switch these off, never on.
 
+One item is in the document a center reads and is still the owner's: the
+record of the folders' real places, `policy.places`
+([policy engine](policy-engine.md#protected-paths)). The node does not refuse
+a write that differs there; it keeps the record as it was. The center adds no
+entry and changes none, and an entry goes only with its folder.
+
 Because the grant lets a center widen its rules up to `user` mode, a center
 with the grant is as strong as `user` mode on that machine.
 
@@ -80,10 +86,30 @@ command's Landlock rules leave them out, even when a granted folder holds them.
 ## Control socket
 
 `<state>/run/ctl.sock`, in a 0700 folder, mode 0600. Only its own user or root
-may talk to it. It is the node's only way in besides its center links. The
-client sends one JSON object per line, `{"method", "params"}`, and gets
-`{"ok": value}` or `{"error": "text"}`. A streaming method answers with several
-`{"item": value}` lines.
+may talk to it, and only a request that carries the token the node wrote to
+`<state>/run/ctl.token` at its start: the CLI reads it, a `folder` mode command
+cannot, as the state folder is out of its rules. A request without the token
+gets an answer only to `status`, and only `{"running": true}`. The token is as
+safe as the sandbox: while the commands run as the node's own user, any other
+program of that user that runs commands on request over a socket (the user's
+systemd session, a tmux or screen server) runs them outside it, and reads the
+token too. Only `machine.user` keeps that out, with an account that only the
+node uses and that gets root in no way without a password: not root, not in
+`docker`, `lxd`, `incus-admin`, `libvirt` or `disk`, no `NOPASSWD` sudo, and
+nobody works as it and uses `sudo` or `su` from it, as a command can leave
+`no_new_privs` and the sandbox through the account's own user manager or a
+tmux server, and type into the panes of a person who works as the account
+([the account commands run
+as](../user/service.md#the-account-commands-run-as)). `install` takes the
+account that ran `sudo`, which is none of these; `setup --create-user` makes
+one. And not for a [sudo](../user/sudo.md) command, which runs as root
+whatever the account.
+A command without a sandbox (`allowlist`, `user`, sudo) reads the token as
+well. It is the node's
+only way in besides its center links. The client sends one JSON object per line,
+`{"method", "params", "token"}`, and gets `{"ok": value}` or
+`{"error": "text"}`. A streaming method answers with several `{"item": value}`
+lines.
 
 | Method | Does |
 |---|---|
@@ -95,14 +121,18 @@ client sends one JSON object per line, `{"method", "params"}`, and gets
 | `sudo.status`, `sudo.on`, `sudo.off` | The sudo switch |
 | `owner.check` | Nothing; the CLI asks it before `install`, `setup`, `update` and `uninstall` |
 
-`config.write`, `config.accept`, `reload`, `sudo.on`, `sudo.off` and
-`owner.check` are refused from a process that runs below a command the node
-started for a center. On Linux an agent cannot change its own policy through
-the socket, nor install, set up, update or remove the node.
+Every method is refused from a process that runs below a command the node
+started for a center, the reading ones too. That catches the processes that
+stay below the command: one that leaves the tree (`( … & )`, `setsid -f`)
+is not caught, so for a command without a sandbox the socket is no boundary,
+as the node's files are none. For a `folder` mode command the token also
+holds, as far as the sandbox does.
 
-Windows has no control socket and no sandbox. The CLI signs `node.toml` itself,
-so a command the node runs for a center can change the policy. The change
-applies at the next start.
+Windows has no control socket. It has a control pipe with the same lines,
+which serves `status`, `folder.add`, `folder.set` and `folder.rm` only
+([node-local.md §5](spec/node-local.md#5-control-socket)). For every other
+change the CLI signs `node.toml` itself, and the change applies at the next
+start.
 
 ## The log level
 

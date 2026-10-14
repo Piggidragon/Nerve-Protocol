@@ -177,8 +177,7 @@ not run programs from its folders: the sandbox cannot grant the keyring's
 access and execute together. This holds whatever account runs the commands.
 So:
 
-- `config set machine.secret_storage keyring` is refused and changes nothing,
-  and so is a center's change of the setting.
+- `config set machine.secret_storage keyring` is refused and changes nothing.
 - `setup` does not ask where the keys go. It warns with the reason, keeps
   the keys in files, and moves keys it finds in the keyring into files.
 - `config accept` refuses a `node.toml` that says `keyring`. Change it to

@@ -119,6 +119,7 @@ lines.
 | `config.accept` | Take a refused `node.toml` as it is |
 | `reload` | Reread `node.toml` (only a file the node signed) |
 | `sudo.status`, `sudo.on`, `sudo.off` | The sudo switch |
+| `folder.add` | `folder add`, judged by the node as the account commands run as; it stores and records the real place |
 | `owner.check` | Nothing; the CLI asks it before `install`, `setup`, `update` and `uninstall` |
 
 Every method is refused from a process that runs below a command the node

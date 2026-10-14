@@ -2,7 +2,8 @@
 
 ## Build
 
-Needs Rust 1.88 or newer.
+Needs Rust 1.88 or newer (`rust-version` in `Cargo.toml`). Only 1.99.0, the
+toolchain of CI and the release, is tested; nothing checks 1.88.
 
 ```sh
 cargo build --release
@@ -23,8 +24,14 @@ builds anything ([releasing](releasing.md)).
 The `CI` workflow (`.github/workflows/ci.yml`) runs on every pull request and on
 every push to `main`. Its Linux job and its Windows job each run fmt, clippy and
 `cargo test --workspace`, so the tests that are compiled only on Windows (grants,
-the integrity level, the service steps, the job object, the AppContainer,
-Windows paths) run on a Windows runner. Both use the toolchain of the release
+the integrity level, the service steps, the job object, Windows paths) run on
+a Windows runner. Most of the AppContainer and grant end-to-end tests are
+skipped there for now, because they fail on the hosted runner (issues
+[#105](https://github.com/Piggidragon/Nerve-Protocol/issues/105) and
+[#106](https://github.com/Piggidragon/Nerve-Protocol/issues/106)): run them by
+hand on the Windows test machine. The same job skips
+`a_cancel_ends_a_chain_of_processes_that_hand_over_and_exit`, a timing flake
+([#107](https://github.com/Piggidragon/Nerve-Protocol/issues/107)). Both use the toolchain of the release
 and a cargo cache keyed by `Cargo.lock`, so a change to the lock file builds
 once from scratch.
 

@@ -34,7 +34,7 @@ No grant lets a center change:
 - pairing and unpairing, the node's keys, the list of centers
 - the grant itself
 - `panic` and `unlock`, or an unpause (you resume with `center resume`)
-- machine settings: the shell, `allow_root`, the sudo path
+- machine settings: the shell, `allow_root`, the sudo path, the account commands run as, where the keys are, the log level
 - the proxy and its secrets
 - another center's pairing
 - the sudo password. A center only passes it on, sealed

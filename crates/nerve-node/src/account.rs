@@ -87,7 +87,8 @@ pub fn lists_no_password(listing: &str) -> bool {
 
 /// Whether the members of a runas list (`ALL, !root`) may include root:
 /// the last member that names root, or something the list does not read
-/// (`ALL`, a group, `#00`), decides. A plain name is another user.
+/// (`ALL`, a group, `#00`), decides. A plain name, but `root` in any
+/// case, is another user.
 fn may_be_root(members: &[&str]) -> bool {
     let mut root = false;
     for m in members {
@@ -100,12 +101,29 @@ fn may_be_root(members: &[&str]) -> bool {
             && name
                 .chars()
                 .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
-        if (plain && name != "root") || (negated && !matches!(name, "root" | "#0")) {
+        // sudo matches user names without regard to case by default.
+        let is_root = name.eq_ignore_ascii_case("root") || name == "#0";
+        if (plain && !is_root) || (negated && !is_root) {
             continue;
         }
         root = !negated;
     }
     root
+}
+
+/// Whether sudo, run as an account `-n`, stays out of PAM, so that a
+/// probe of an account that needs a password costs one log line and no
+/// authentication attempt. sudo 1.9 refuses before PAM, unless
+/// `noninteractive_auth` is set (a `listing` entry); sudo-rs (`version`,
+/// the first line of `sudo -V`) calls PAM, and a failure counter such as
+/// pam_faillock counts the probe.
+pub fn probe_stays_out_of_pam(version: &str, listing: &str) -> bool {
+    let rs = version.trim_start().starts_with("sudo-rs");
+    let set = listing
+        .lines()
+        .flat_map(|l| l.split([',', ' ']))
+        .any(|e| e == "noninteractive_auth");
+    !rs && !set
 }
 
 /// Whether a rule line (`(ALL : ALL) NOPASSWD: ALL`) may run as root.
@@ -128,7 +146,16 @@ fn may_match_true(cmd: &str) -> bool {
     if cmd.starts_with('!') {
         return false;
     }
+    // A digest (`sha256:<hex> /usr/bin/apt`) comes before the path.
+    let cmd = match cmd.split_once(' ') {
+        Some((d, rest)) if d.starts_with("sha") && d.contains(':') => rest.trim_start(),
+        _ => cmd,
+    };
     let program = cmd.split(' ').next().unwrap_or("");
+    // `sudoedit` and `list` match only `sudo -e` and `sudo -l`.
+    if matches!(program, "sudoedit" | "list") {
+        return false;
+    }
     !(program.starts_with('/')
         && !program.contains(['*', '?', '[', ']', '^', '$', '\\'])
         && !program.ends_with('/')
@@ -144,7 +171,9 @@ fn nopasswd_may_run_true(cmds: &str) -> bool {
         // Tags (`SETENV:`) come before the command.
         while let Some((tag, rest)) = item.split_once(' ')
             && tag.ends_with(':')
-            && tag.chars().all(|c| c.is_ascii_uppercase() || c == ':')
+            && tag
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || matches!(c, ':' | '_'))
         {
             match tag {
                 "PASSWD:" => nopasswd = false,
@@ -180,16 +209,32 @@ fn default_may_skip_password(line: &str) -> bool {
     // sudo prints a binding's members with a comma and a space, and a
     // member may hold spaces, so the binding is all that lies before the
     // flag.
-    let members = |from: usize| {
-        line[from..at]
-            .split(',')
+    let members = |text: &str| {
+        text.split(',')
             .map(str::trim)
             .filter(|m| !m.is_empty())
+            .map(String::from)
             .collect::<Vec<_>>()
     };
     match bound.chars().next() {
-        Some('>') => may_be_root(&members("Defaults>".len())),
-        Some('!') => members("Defaults!".len()).iter().any(|c| may_match_true(c)),
+        Some('>') => {
+            // User names hold no space: the members end at the first
+            // word that does not follow a comma, and other settings of
+            // the line may come before the flag.
+            let text = &line["Defaults>".len()..at];
+            let mut end = 0;
+            for word in text.split_inclusive(' ') {
+                end += word.len();
+                if !word.trim_end().ends_with(',') {
+                    break;
+                }
+            }
+            let m = members(&text[..end]);
+            may_be_root(&m.iter().map(String::as_str).collect::<Vec<_>>())
+        }
+        Some('!') => members(&line["Defaults!".len()..at])
+            .iter()
+            .any(|c| may_match_true(c)),
         _ => true,
     }
 }
@@ -904,6 +949,9 @@ mod tests {
             "    (ALL, !root, ALL) NOPASSWD: ALL\n",
             "    (root) NOPASSWD: /usr/bin/id, PASSWD: /usr/bin/apt, NOPASSWD: ALL\n",
             "    (ALL) NOPASSWD: /usr/bin/true\n",
+            "    (ROOT) NOPASSWD: ALL\n",
+            "    (Root, nobody) NOPASSWD: ALL\n",
+            "    Defaults>Root !authenticate\n",
             "    NOPASSWD: ALL\n",
         ] {
             assert!(yes(l), "{l}");
@@ -915,6 +963,15 @@ mod tests {
             "    (ALL : ALL) ALL\n    (root) NOPASSWD: /usr/bin/apt, /usr/bin/systemctl\n",
             "    (root) NOPASSWD: /usr/bin/apt update, !/usr/bin/id\n",
             "    (r5svc) NOPASSWD: ALL\n",
+            "    (root) NOPASSWD: LOG_OUTPUT: /usr/bin/apt\n",
+            "    (root) NOPASSWD: NOLOG_INPUT: LOG_OUTPUT: /usr/bin/apt update\n",
+            "    (root) NOPASSWD: sha256:0dba1f /usr/bin/apt\n",
+            "    (root) NOPASSWD: list\n",
+            "    (root) NOPASSWD: sudoedit\n",
+            "    (root) NOPASSWD: sudoedit /etc/hosts\n",
+            "    Defaults!sudoedit !authenticate\n",
+            "    Defaults>r6svc !lecture, !authenticate\n",
+            "    (ALL, !ROOT) NOPASSWD: ALL\n",
             "    (ALL, !root) NOPASSWD: ALL\n",
             "    (ALL : ALL) NOPASSWD: /usr/bin/id, PASSWD: ALL\n",
         ] {
@@ -963,6 +1020,20 @@ mod tests {
         ] {
             assert!(no(l), "{l}");
         }
+    }
+
+    /// A probe is made as the account only where sudo's `-n` stays out of
+    /// PAM: not on sudo-rs, not with `noninteractive_auth`.
+    #[test]
+    fn a_probe_is_made_only_where_sudo_stays_out_of_pam() {
+        let defaults = "Matching Defaults entries for alice on h:\n    env_reset, mail_badpass\n";
+        assert!(probe_stays_out_of_pam("Sudo version 1.9.15p5\n", defaults));
+        assert!(!probe_stays_out_of_pam("sudo-rs 0.2.2\n", defaults));
+        let set = "    env_reset, noninteractive_auth, mail_badpass\n";
+        assert!(!probe_stays_out_of_pam("Sudo version 1.9.15p5\n", set));
+        // Turned off, it is not set.
+        let off = "    env_reset, !noninteractive_auth\n";
+        assert!(probe_stays_out_of_pam("Sudo version 1.9.15p5\n", off));
     }
 
     #[test]

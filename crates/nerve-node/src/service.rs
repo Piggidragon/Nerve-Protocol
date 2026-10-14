@@ -243,8 +243,23 @@ impl System for Host {
         let Ok(o) = list.output() else {
             return false;
         };
-        if !crate::account::lists_no_password(&String::from_utf8_lossy(&o.stdout)) {
+        let listing = String::from_utf8_lossy(&o.stdout);
+        if !crate::account::lists_no_password(&listing) {
             return false;
+        }
+        // Where the account's sudo would call PAM even with `-n` (sudo-rs,
+        // `noninteractive_auth`), a probe counts as a failed login that
+        // can lock the account (pam_faillock): the rules say alone.
+        let mut v = std::process::Command::new("sudo");
+        v.arg("-V")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        regain_root(&mut v);
+        let Ok(v) = v.output() else {
+            return true;
+        };
+        if !crate::account::probe_stays_out_of_pam(&String::from_utf8_lossy(&v.stdout), &listing) {
+            return true;
         }
         // The account's own sudo, which `-n` never lets ask, and `-k`
         // keeps from taking the ticket its owner has just made by typing

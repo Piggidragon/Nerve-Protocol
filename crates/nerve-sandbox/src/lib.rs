@@ -72,9 +72,12 @@ pub struct ShimSpec {
 /// drives is taken as a path on that drive, and any other folder the
 /// command can see gets a drive `Work2:`, `Work3:`, … of its own. The
 /// drives open nothing: the container still decides what the command reads
-/// and writes. A folder the command cannot see goes to the cmdlet as it was
-/// given and fails as before. The text has no `"`, which the Windows
-/// command line would escape.
+/// and writes. A folder the command cannot see goes to the cmdlet as a
+/// whole path and fails as before, also when `..` named it: the cmdlet
+/// would stop `..` at the drive's root and stay there without an error.
+/// The cmdlet's errors are the function's, so a failed `cd` sets `$?` and
+/// the exit code as the cmdlet does. The text has no `"`, which the
+/// Windows command line would escape.
 pub const POWERSHELL_START: &str = concat!(
     r"$null = New-PSDrive -Name Work -PSProvider FileSystem ",
     r"-Root ([Environment]::CurrentDirectory) -Scope Global -ErrorAction Stop; ",
@@ -83,28 +86,29 @@ pub const POWERSHELL_START: &str = concat!(
     r"function global:NerveUnder([string]$full, [string]$root) { ",
     r"$f = $full.TrimEnd('\', '/'); $r = $root.TrimEnd('\', '/'); ",
     r"$f -eq $r -or $f.StartsWith($r + '\', 'OrdinalIgnoreCase') }; ",
-    // The path on a Work drive for the folder `p` names, or nothing where
-    // the cmdlet takes `p` as it is: a wildcard, another drive or provider,
-    // `~`, `-` and `+`, or a relative path that stays on its drive.
+    // The path on a Work drive for the folder `p` names, the whole path of
+    // a folder the command cannot see, or nothing where the cmdlet takes `p`
+    // as it is: a wildcard, another drive or provider, `~`, `\`, `-` and
+    // `+`. A relative path is resolved here as well, since the cmdlet would
+    // keep its `..` on the drive (`Work:\..\app` is `Work:\app`).
     r"function global:NerveFolder([string]$p, [bool]$literal) { ",
     r"if (-not $p -or (-not $literal -and ",
     r"[Management.Automation.WildcardPattern]::ContainsWildcardCharacters($p))) { return $null }; ",
     r"$p = $p -replace '^(Microsoft\.PowerShell\.Core\\)?FileSystem::', ''; ",
-    r"if ($p -match '^([A-Za-z]:[\\/]|[\\/][\\/])') { $full = $p; $here = $null } ",
+    r"if ($p -match '^([A-Za-z]:[\\/]|[\\/][\\/])') { $base = '' } ",
     r"elseif ($p -notmatch '^(~|[\\/])|^[+-]$|:' -and $PWD.Provider.Name -eq 'FileSystem') { ",
-    r"$full = [IO.Path]::Combine($PWD.ProviderPath, $p); $here = $PWD.Drive.Root } ",
+    r"$base = $PWD.ProviderPath } ",
     r"else { return $null }; ",
-    r"try { $full = [IO.Path]::GetFullPath($full) } catch { return $null }; ",
-    r"if ($here -and (NerveUnder $full $here)) { return $null }; ",
+    r"try { $full = [IO.Path]::GetFullPath([IO.Path]::Combine($base, $p)) } catch { return $null }; ",
     r"$best = $null; ",
     r"foreach ($d in Get-PSDrive -PSProvider FileSystem) { ",
     r"if ($d.Name -match '^Work\d*$' -and (NerveUnder $full $d.Root) -and ",
     r"(-not $best -or $d.Root.Length -gt $best.Root.Length)) { $best = $d } }; ",
     r"if (-not $best) { ",
-    r"if (-not [IO.Directory]::Exists($full)) { return $null }; ",
+    r"if (-not [IO.Directory]::Exists($full)) { return $full }; ",
     r"$n = 2; while (Get-PSDrive -Name ('Work' + $n) -ErrorAction SilentlyContinue) { $n++ }; ",
     r"try { $best = New-PSDrive -Name ('Work' + $n) -PSProvider FileSystem -Root $full ",
-    r"-Scope Global -ErrorAction Stop } catch { return $null } }; ",
+    r"-Scope Global -ErrorAction Stop } catch { return $full } }; ",
     r"$best.Name + ':\' + $full.TrimEnd('\', '/').Substring($best.Root.TrimEnd('\', '/').Length).TrimStart('\', '/') }; ",
     // Runs the cmdlet `cmd` with the parameters `bound`, its path moved
     // onto a Work drive where NerveFolder finds one.
@@ -116,7 +120,9 @@ pub const POWERSHELL_START: &str = concat!(
     r"& $cmd @a }; ",
     // The cmdlets' own parameters, as Windows PowerShell 5.1 and PowerShell
     // 7 have them; the aliases `cd`, `chdir`, `sl` and `pushd` find these
-    // functions before the cmdlets.
+    // functions before the cmdlets. An error a command inside a function
+    // writes leaves `$?` true, so the cmdlet's errors are written again as
+    // the function's own.
     r"function global:Set-Location { [CmdletBinding(DefaultParameterSetName = 'Path')] param(",
     r"[Parameter(ParameterSetName = 'Path', Position = 0, ValueFromPipeline = $true, ",
     r"ValueFromPipelineByPropertyName = $true)] [string]$Path, ",
@@ -124,7 +130,9 @@ pub const POWERSHELL_START: &str = concat!(
     r"ValueFromPipelineByPropertyName = $true)] [Alias('PSPath', 'LP')] [string]$LiteralPath, ",
     r"[switch]$PassThru, ",
     r"[Parameter(ParameterSetName = 'Stack', ValueFromPipelineByPropertyName = $true)] [string]$StackName) ",
-    r"process { NerveGo 'Microsoft.PowerShell.Management\Set-Location' $PSBoundParameters } }; ",
+    r"process { NerveGo 'Microsoft.PowerShell.Management\Set-Location' $PSBoundParameters 2>&1 | ",
+    r"ForEach-Object { if ($_ -is [Management.Automation.ErrorRecord]) { $PSCmdlet.WriteError($_) } ",
+    r"else { $_ } } } }; ",
     r"function global:Push-Location { [CmdletBinding(DefaultParameterSetName = 'Path')] param(",
     r"[Parameter(ParameterSetName = 'Path', Position = 0, ValueFromPipeline = $true, ",
     r"ValueFromPipelineByPropertyName = $true)] [string]$Path, ",
@@ -132,7 +140,9 @@ pub const POWERSHELL_START: &str = concat!(
     r"ValueFromPipelineByPropertyName = $true)] [Alias('PSPath', 'LP')] [string]$LiteralPath, ",
     r"[switch]$PassThru, ",
     r"[Parameter(ValueFromPipelineByPropertyName = $true)] [string]$StackName) ",
-    r"process { NerveGo 'Microsoft.PowerShell.Management\Push-Location' $PSBoundParameters } }; ",
+    r"process { NerveGo 'Microsoft.PowerShell.Management\Push-Location' $PSBoundParameters 2>&1 | ",
+    r"ForEach-Object { if ($_ -is [Management.Automation.ErrorRecord]) { $PSCmdlet.WriteError($_) } ",
+    r"else { $_ } } } }; ",
 );
 
 /// The AppContainer a Windows command runs in. Its SID is derived from the
@@ -2336,9 +2346,10 @@ mod tests {
     }
 
     /// In the container, `cd` and `pushd` go to whole paths of the folders
-    /// the command may see and up out of its working folder into one of
-    /// them, and native programs start there; a folder it may not see
-    /// stays refused.
+    /// the command may see, and with `..` up out of its working folder into
+    /// one of them, and native programs start there. A folder it may not
+    /// see stays refused, with `$?` false and the location kept, also when
+    /// `..` names it.
     #[cfg(windows)]
     #[test]
     fn powershell_changes_to_whole_paths_in_an_appcontainer() {
@@ -2356,41 +2367,62 @@ mod tests {
             appcontainer::set(d, &name, Some(acl::masks(true, true, true)), false).unwrap();
         }
         let (g, o, h) = (granted.display(), other.display(), hidden.display());
-        let script = format!(
-            "{POWERSHELL_START}cd ..; Set-Content up.txt (cmd /c cd); \
-             cd '{g}\\sub'; Set-Content here.txt (cmd /c cd); \
-             cd '{o}'; Set-Content there.txt (cmd /c cd); \
-             pushd '{g}\\app'; Set-Content back.txt $PWD.ProviderPath; popd; \
-             Set-Content popped.txt (cmd /c cd); \
-             try {{ cd '{h}' -ErrorAction Stop; Set-Content wrong.txt x }} \
-             catch {{ Set-Content '{g}\\refused.txt' $_.Exception.GetType().Name }}"
-        );
-        let (code, log) = run_in_container(
-            &name,
+        let ps = |cwd: &std::path::Path, script: String| {
+            run_in_container(
+                &name,
+                cwd,
+                "powershell.exe",
+                &["-NoProfile", "-Command", &script],
+            )
+        };
+        let (code, log) = ps(
             &granted.join("app"),
-            "powershell.exe",
-            &["-NoProfile", "-Command", &script],
+            format!(
+                "{POWERSHELL_START}cd ..\\app\\..\\sub; Set-Content climb.txt (cmd /c cd); \
+                 cd ..\\app; Set-Content app.txt (cmd /c cd); \
+                 cd ..; Set-Content up.txt (cmd /c cd); \
+                 cd '{g}\\sub'; Set-Content here.txt (cmd /c cd); \
+                 cd '{o}'; Set-Content there.txt (cmd /c cd); \
+                 pushd '{g}\\app'; Set-Content back.txt (cmd /c cd); popd; \
+                 Set-Content popped.txt (cmd /c cd); \
+                 cd '{h}'; $ok = $?; Set-Content '{g}\\hidden.txt' $ok; \
+                 Set-Content '{g}\\stayed.txt' (cmd /c cd); \
+                 try {{ cd '{h}' -ErrorAction Stop; Set-Content wrong.txt x }} \
+                 catch {{ Set-Content '{g}\\refused.txt' $_.Exception.GetType().Name }}"
+            ),
         );
         assert_eq!(code, 0, "{log}");
-        let read = |p: std::path::PathBuf| {
+        let read = |p: std::path::PathBuf, log: &str| {
             std::fs::read_to_string(&p)
                 .unwrap_or_else(|e| panic!("{}: {e}: {log}", p.display()))
                 .trim()
                 .to_string()
         };
-        assert_eq!(read(granted.join("up.txt")), g.to_string());
-        assert_eq!(
-            read(granted.join("sub").join("here.txt")),
-            granted.join("sub").display().to_string()
-        );
-        assert_eq!(read(other.join("there.txt")), o.to_string());
-        assert_eq!(
-            read(granted.join("app").join("back.txt")),
-            granted.join("app").display().to_string()
-        );
-        assert_eq!(read(other.join("popped.txt")), o.to_string());
+        let (sub, app) = (granted.join("sub"), granted.join("app"));
+        assert_eq!(read(sub.join("climb.txt"), &log), sub.display().to_string());
+        assert_eq!(read(app.join("app.txt"), &log), app.display().to_string());
+        assert_eq!(read(granted.join("up.txt"), &log), g.to_string());
+        assert_eq!(read(sub.join("here.txt"), &log), sub.display().to_string());
+        assert_eq!(read(other.join("there.txt"), &log), o.to_string());
+        assert_eq!(read(app.join("back.txt"), &log), app.display().to_string());
+        assert_eq!(read(other.join("popped.txt"), &log), o.to_string());
+        assert_eq!(read(granted.join("hidden.txt"), &log), "False");
+        assert_eq!(read(granted.join("stayed.txt"), &log), o.to_string());
         assert!(granted.join("refused.txt").exists(), "{log}");
         assert!(!other.join("wrong.txt").exists() && !hidden.join("wrong.txt").exists());
+
+        // The folder above `other` is not granted: `cd ..` fails and stays,
+        // and a command that ends with it fails.
+        let (code, log) = ps(
+            &other,
+            format!(
+                "{POWERSHELL_START}cd ..; $ok = $?; Set-Content up.txt $ok; \
+                 Set-Content where.txt (cmd /c cd); cd .."
+            ),
+        );
+        assert_eq!(code, 1, "{log}");
+        assert_eq!(read(other.join("up.txt"), &log), "False");
+        assert_eq!(read(other.join("where.txt"), &log), o.to_string());
         for d in [&granted, &other] {
             appcontainer::set(d, &name, None, false).unwrap();
         }
@@ -2410,6 +2442,8 @@ mod tests {
         }
         for cmd in [
             r"& $cmd @a",
+            r"$PSCmdlet.WriteError($_)",
+            r"{ return $full }",
             r"'Microsoft.PowerShell.Management\Set-Location'",
             r"'Microsoft.PowerShell.Management\Push-Location'",
         ] {

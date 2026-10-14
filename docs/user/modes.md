@@ -193,7 +193,8 @@ folders.
   one, put PowerShell on a drive of that folder (`Work2:`, `Work3:`, …), and
   native programs start in the folder itself. These drives open nothing; the
   container decides what the command reaches. `cd` to a folder the command
-  may not see fails as any other access does.
+  may not see fails as any other access does, also with `..`: PowerShell stays
+  where it was, `$?` is false, and a command that ends with that `cd` fails.
 - The command has the network, but not `localhost`, and no folder for
   temporary files. It has its own desktop, so it cannot reach your windows or
   clipboard.

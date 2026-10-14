@@ -224,10 +224,13 @@ center's local name):
 - PowerShell checks every folder above its working folder, which the
   container may not see, so a PowerShell command starts with a drive `Work:`
   rooted at its working folder. Functions stand in for `Set-Location` and
-  `Push-Location`: a whole path, or a relative one that leaves its drive, goes
-  to the Work drive it lies below, or to a new drive `Work2:`, `Work3:`, …
-  rooted at that folder if the command can see it, and otherwise to the
-  cmdlet unchanged (`nerve_sandbox::POWERSHELL_START`).
+  `Push-Location`: a whole or relative path goes to the Work drive it lies
+  below, or to a new drive `Work2:`, `Work3:`, … rooted at that folder if the
+  command can see it, and otherwise to the cmdlet as a whole path, which
+  fails. Relative paths are resolved there too, since the cmdlet keeps `..`
+  on its drive (`Work:\..\app` is `Work:\app`). The cmdlet's errors are
+  written again as the function's, so `$?` and the exit code stay as the
+  cmdlet sets them (`nerve_sandbox::POWERSHELL_START`).
 - The container has the network, as Landlock leaves it, but not the loopback
   address.
 

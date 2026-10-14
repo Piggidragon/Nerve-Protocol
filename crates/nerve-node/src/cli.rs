@@ -3135,6 +3135,33 @@ mod tests {
         );
     }
 
+    /// On Windows, a junction a command may have put inside a folder it can
+    /// write in is not followed by `folder add` either.
+    #[cfg(windows)]
+    #[test]
+    fn folder_add_does_not_follow_a_junction_inside_a_write_folder() {
+        let (d, paths) = setup(&["home"]);
+        let root = nerve_policy::paths::resolve(d.path()).unwrap();
+        let (work, docs) = (root.join("work"), root.join("docs"));
+        let bin = work.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir(&docs).unwrap();
+        run(&paths, &["folder", "add", work.to_str().unwrap(), "+rw"]).unwrap();
+        std::fs::remove_dir(&bin).unwrap();
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&bin)
+            .arg(&docs)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+        let e = run(&paths, &["folder", "add", bin.to_str().unwrap(), "+rx"]).unwrap_err();
+        assert!(e.contains("link") && e.contains("may write"), "{e}");
+        let policy = load(&paths).centers[0].policy.clone();
+        assert_eq!(policy.folders.len(), 1, "nothing was stored: {policy:?}");
+        assert!(!policy.is_placed(&docs.display().to_string()));
+    }
+
     #[test]
     fn folder_set_applies_its_changes_left_to_right() {
         let (d, paths) = setup(&["home"]);

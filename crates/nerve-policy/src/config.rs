@@ -61,8 +61,10 @@ pub struct Machine {
     #[serde(default)]
     pub allow_root: bool,
     /// The node's sudo switch (one per node, not per center). The password
-    /// is never in this file; the node keeps it in memory while the switch
-    /// is on, so a restarted node starts with the switch off.
+    /// is never in this file. On Linux the node keeps it in memory only
+    /// while the switch is on, so a restarted node starts with the switch
+    /// off; the installed Windows node keeps it with DPAPI in `sudo.dpapi`
+    /// and holds it again at start (docs/dev/spec/node-local.md §4).
     #[serde(default)]
     pub sudo: Sudo,
     /// The `sudo` program; `sudo` from `PATH` when unset. Only the owner
@@ -112,11 +114,13 @@ impl Sudo {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SecretStorage {
-    /// A 0600 key file per center below the config directory.
+    /// 0600 files: a key file per center below the config directory, and
+    /// the key of the config's MAC in the state directory.
     #[default]
     File,
-    /// Accepted, but it changes nothing: the keys stay in files. Only the
-    /// proxy's header values go to the system keyring.
+    /// The system keyring (the Credential Manager on Windows, the Secret
+    /// Service on Linux), one entry per key and no copy in a file. A node
+    /// whose keyring does not answer refuses to start.
     Keyring,
 }
 

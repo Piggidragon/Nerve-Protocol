@@ -8,7 +8,7 @@ behaves the same except where this page says so.
 | Shell for commands | `/bin/sh -c` | Windows PowerShell 5.1 (`powershell.exe -NoProfile -Command`) |
 | `folder` mode runs commands | Yes, confined by Landlock | Yes, confined by an AppContainer; not yet on the [installed service](service.md#windows) |
 | `allowlist` and `user` mode run commands | Yes | Yes, in a Job Object, not confined to folders |
-| Sudo switch | Yes | No |
+| Sudo switch | Yes | On the [installed service](service.md#windows), with the administrator token of the account commands run as ([sudo on Windows](sudo.md#sudo-on-windows)) |
 | Control socket | Yes | No |
 | Install as a service | Yes, with systemd | Yes |
 | Config folder | `~/.config/nerve` | `%USERPROFILE%\.config\nerve` |
@@ -37,6 +37,11 @@ behaves the same except where this page says so.
   mode the command also runs in an AppContainer, which is. See
   [modes](modes.md#what-a-command-can-reach-in-folder-mode-windows).
 - Output that is not UTF-8 is read in the console code page.
+- A [sudo](sudo.md#sudo-on-windows) command runs with the elevated token of
+  the account commands run as, which must be an administrator. Every other
+  command of that account runs with the token UAC filtered. UAC is no
+  security boundary, so those commands can get the administrator rights back
+  as well.
 - Paths in rules and over the wire look like `/c/Users/x`.
 - A node that runs elevated (as an administrator) is refused unless
   `machine.allow_root` is set ([root and administrator](#root-and-administrator)).

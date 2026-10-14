@@ -73,6 +73,11 @@ The node confines commands with Landlock:
 - Landlock cannot run a file it may not read. So an `x` folder also lets a
   command read files there by name. It still cannot list the folder.
 - The node's own folders are in none of these sets.
+- With the keys in the system keyring, the node's D-Bus session and GNOME
+  Keyring's folder count as its own, and a command cannot connect to a
+  socket there ([keys](config.md#where-the-node-keeps-its-keys)). That needs
+  Linux 7.1. On an older kernel the keys stay in files
+  ([keys](config.md#an-older-linux-kernel)).
 - On a node installed as a service the command runs as the account
   commands run as ([service](service.md#the-account-commands-run-as)), and
   what that account may not open stays closed as well. Landlock only takes
@@ -86,7 +91,8 @@ nerve-node status
 
 The first line reads `daemon: running (confinement landlock v…)`. With
 `confinement none` the node cannot confine commands, so `folder` mode refuses
-every command.
+every command. A line `folder mode runs no command: …` says the same, and
+why.
 
 ## What a command can reach in `folder` mode (Windows)
 

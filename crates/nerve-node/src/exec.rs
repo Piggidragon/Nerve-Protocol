@@ -264,6 +264,7 @@ pub fn landlock_spec(policy: &CenterPolicy, home: &Path, own: &[PathBuf]) -> Lan
         read: leave_out(&[nerve_sandbox::system_dirs(), f.read].concat(), own),
         write: leave_out(&[nerve_sandbox::system_writable(), f.write].concat(), own),
         exec: leave_out(&[nerve_sandbox::system_dirs(), f.exec].concat(), own),
+        connect: None,
     }
 }
 
@@ -448,6 +449,15 @@ fn real(p: &Path) -> PathBuf {
     }
 }
 
+/// Where a command of `folders` mode may connect to socket files while the
+/// node's keys are in the keyring: anywhere but the folders in `own`, which
+/// then hold the session bus the keyring answers on
+/// (crate::paths::keyring_places). With the files the rule is not set, and
+/// commands connect where they did.
+pub fn connect_rule(own: &[PathBuf]) -> Vec<PathBuf> {
+    leave_out(&[PathBuf::from("/")], own)
+}
+
 /// `paths` without the folders in `own`. A Landlock rule grants a folder and
 /// everything below it and nothing can carve a hole into it, so a path inside
 /// an own folder is dropped, and a path that holds one is replaced by its
@@ -586,7 +596,14 @@ pub fn sudo_prompt() -> String {
 /// (`run`), and a command sudo starts without asking never gets it. The
 /// shell `exec`s sudo, so the process the node started is sudo itself and
 /// its first child is the command.
+///
+/// Windows has no sudo program: the line is what followed `sudo`, which
+/// the shell runs with the account's administrator token (`run`,
+/// crate::winsudo).
 pub fn sudo_line(sudo_path: &str, args: &str, prompt: &str) -> String {
+    if cfg!(windows) {
+        return args.to_string();
+    }
     format!(
         "exec {} -S -k -p {} {args}",
         sh_quote(sudo_path),
@@ -886,7 +903,7 @@ fn has_child(pid: u32) -> bool {
 
 #[cfg(not(target_os = "linux"))]
 fn has_child(_pid: u32) -> bool {
-    // The sudo switch is Linux only; elsewhere the wait or the end decides.
+    // Only Linux runs a sudo program; elsewhere the wait or the end decides.
     false
 }
 
@@ -930,6 +947,15 @@ pub async fn run(
     #[cfg(windows)]
     if let Some(a) = &opts.account {
         return run_as(call, opts, a, &program, &args, started).await;
+    }
+    // Only the installed node can start a command with the administrator
+    // token of the account commands run as (crate::winsudo).
+    #[cfg(windows)]
+    if opts.sudo.is_some() {
+        return Err(RpcError::new(
+            ErrorCode::Unavailable,
+            crate::winsudo::INSTALLED_ONLY,
+        ));
     }
     let mut cmd = match &shim {
         Some(_) => {
@@ -1116,7 +1142,9 @@ pub async fn run(
 /// starts suspended with the account's token in the call's folder, is put
 /// in a job of its own and runs only then. It does not start when its
 /// account can open the node's own folders, nor without a job: the node
-/// may not end another account's processes one by one, only the job.
+/// may not end another account's processes one by one, only the job. A
+/// sudo command starts with the account's administrator token instead
+/// (crate::winsudo), which can open every folder.
 #[cfg(windows)]
 async fn run_as(
     call: &RunCall,
@@ -1129,7 +1157,22 @@ async fn run_as(
     let unavailable = |m: String| RpcError::new(ErrorCode::Unavailable, m);
     let token = crate::win_user::token_for(account)
         .map_err(|e| unavailable(format!("cannot start as {}: {e}", account.name)))?;
-    match crate::win_user::reach(&token, &opts.own) {
+    let elevated = match &opts.sudo {
+        Some(s) => Some(
+            crate::win_user::sudo_token(&account.name, &s.password).map_err(|e| {
+                unavailable(format!(
+                    "cannot start as {} with its administrator rights: {e}",
+                    account.name
+                ))
+            })?,
+        ),
+        None => None,
+    };
+    let reach = match elevated {
+        Some(_) => Ok(None),
+        None => crate::win_user::reach(&token, &opts.own),
+    };
+    match reach {
         Ok(None) => {}
         Ok(Some(_)) => {
             return Err(unavailable(format!(
@@ -1150,14 +1193,19 @@ async fn run_as(
         ))
     })?;
     let line = windows_command_line(program, args);
-    let child = crate::win_user::spawn(&token, &line, Some(&call.cwd), Some(&account.home))
-        .map_err(|e| {
-            unavailable(format!(
-                "cannot start as {} in {}: {e}",
-                account.name,
-                to_wire(&call.cwd)
-            ))
-        })?;
+    let child = crate::win_user::spawn(
+        elevated.as_ref().unwrap_or(token.as_ref()),
+        &line,
+        Some(&call.cwd),
+        Some(&account.home),
+    )
+    .map_err(|e| {
+        unavailable(format!(
+            "cannot start as {} in {}: {e}",
+            account.name,
+            to_wire(&call.cwd)
+        ))
+    })?;
     if let Err(e) = job.assign(child.process()) {
         child.kill();
         return Err(unavailable(crate::job::assign_error(
@@ -1496,6 +1544,7 @@ mod tests {
         assert_eq!(r["stderr"], "", "the prompt is left out: {r}");
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn sudo_line_quotes_the_program() {
         assert_eq!(
@@ -1509,6 +1558,14 @@ mod tests {
         assert_ne!(p, sudo_prompt());
     }
 
+    /// Windows has no sudo program: the shell runs what followed `sudo`,
+    /// started with the administrator token.
+    #[cfg(windows)]
+    #[test]
+    fn sudo_line_is_the_command_on_windows() {
+        assert_eq!(sudo_line("sudo", "net session", "p:"), "net session");
+    }
+
     #[tokio::test]
     async fn timeout_kills_the_group() {
         let mut c = call("sleep 30 & sleep 30; wait");
@@ -1520,6 +1577,24 @@ mod tests {
         // SAFETY: signal 0 only checks whether the group exists.
         let alive = unsafe { libc::kill(-(pid as libc::pid_t), 0) } == 0;
         assert!(!alive, "the process group outlived the call");
+    }
+
+    /// With the keys in the keyring a command connects to socket files anywhere
+    /// but the node's own folders, the session bus's among them: no rule holds
+    /// those.
+    #[test]
+    fn the_connect_rule_leaves_the_own_folders_out() {
+        let d = tempfile::tempdir().unwrap();
+        let w = std::fs::canonicalize(d.path()).unwrap();
+        for dir in ["run/user/1000", "run/user/1001", "run/lock"] {
+            std::fs::create_dir_all(w.join(dir)).unwrap();
+        }
+        let bus = w.join("run/user/1000");
+        let got = connect_rule(std::slice::from_ref(&bus));
+        assert!(got.contains(&w.join("run/user/1001")), "{got:?}");
+        assert!(got.contains(&w.join("run/lock")), "{got:?}");
+        assert!(!got.iter().any(|p| bus.starts_with(p)), "{got:?}");
+        assert!(!got.iter().any(|p| p.starts_with(&bus)), "{got:?}");
     }
 
     #[test]

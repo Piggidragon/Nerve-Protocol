@@ -65,6 +65,8 @@ call's target: the whole command line, the resolved path, or `<cap>.<action>`.
   expression characters or a word that starts another shell or runs text as
   code is covered only by an allow rule that names the whole line.
 - A `sudo` command must be one simple command. Control characters are refused.
+  A wildcard sudo entry covers plain lines only, as a wildcard allow rule
+  does; any other line needs an entry that names it whole.
 
 ## Modes
 
@@ -222,8 +224,12 @@ password.
 
 - Off, no `sudo` command runs, even if the sudo list names it.
 - On, a `sudo` command runs only if the sudo list names it, in every mode.
-- The password is checked with `sudo -S -k -v` and kept in memory only. A
-  restart turns the switch off.
+- On Linux the password is checked with `sudo -S -k -v` and kept in memory
+  only. A restart turns the switch off.
+- On Windows the password is the one of the account commands run as. The
+  node checks it with a batch logon that must hold the Administrators group,
+  keeps it with DPAPI in the config folder (so a restart keeps the switch
+  on), and starts each sudo command with that logon's full token.
 - A center with the settings grant can switch it. The password then travels
   sealed from the owner's browser to the node. The node makes a one-shot offer
   with a fresh X25519 key and signs it with its pairing key. The browser derives

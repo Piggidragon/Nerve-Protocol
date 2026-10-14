@@ -17,6 +17,9 @@ record a call that worked.
 | Node | `log.jsonl` in the node's state folder |
 
 The state folders are listed under [where files live](install.md#where-files-live).
+A node [installed as a service](service.md) writes it to
+`/var/lib/nerve/state/log.jsonl`, on Windows to
+`C:\ProgramData\Nerve\state\log.jsonl`, beside its config and audit log.
 The file is readable by its owner only. At 5 MiB the program moves it to
 `log.jsonl.1`, which replaces the older copy, so a log takes at most about
 10 MiB. The node writes it while `nerve-node run` is running.
@@ -41,6 +44,35 @@ Each line is a JSON object:
 
 A node that comes back says how long it was away. After a link that went quiet,
 the time counts from the last frame the node sent.
+
+## The Windows Event Log
+
+The node installed as a service on Windows also writes four events to the
+Windows Event Log, so they show in the Event Viewer under **Windows Logs >
+Application**, source `nerve-node`:
+
+| ID | Kind | When |
+|---|---|---|
+| 1 | Information | The node started. The entry names the log file |
+| 2 | Information | The node stopped, because the service was stopped or Windows shut down |
+| 3 | Error | The node did not start: it refused to (for example `refusing to run as root`, or a `node.toml` whose MAC does not match) or could not. The entry says why |
+| 4 | Error | The node crashed: a panic in its main thread ended it. The service's recovery settings start it again, three times a day at most; after that it stays stopped. Or a part of the node panicked and the node runs on; the entry says which. Or the node stopped with an error after it ran |
+
+The log file has the details. In PowerShell (Windows PowerShell or
+PowerShell 7):
+
+```powershell
+Get-WinEvent -LogName Application -FilterXPath "*[System[Provider[@Name='nerve-node']]]" -MaxEvents 20 | Format-List TimeCreated, Id, Message
+```
+
+After `uninstall` the entries stay, but Windows no longer shows their text:
+`Message` is empty. Their text is still in them; replace `Format-List …`
+with `ForEach-Object { "$($_.TimeCreated) $($_.Id) $($_.Properties.Value)" }`.
+
+Every user of the machine can read the Application log, so these entries are
+redacted like the log ([below](#what-is-never-in-it)). A node you start
+yourself with `nerve-node run` writes no events. On Linux the journal has the
+service's output (`journalctl -u nerve-node`).
 
 ## Levels
 

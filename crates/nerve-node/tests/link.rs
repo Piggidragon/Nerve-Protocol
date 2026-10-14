@@ -615,6 +615,110 @@ async fn windows_folder_grants_follow_the_folders() {
     assert!(!icacls(&work).contains("S-1-15-2-"), "{}", icacls(&work));
 }
 
+/// A folder mode command that started with the keys in files is counted for as
+/// long as its `exec.run` runs: a move of the keys into the keyring is refused
+/// meanwhile and nothing moves, and the count is 0 again once the call
+/// answered. The count is checked before the move is asked for, so a node that
+/// does not count the command fails here without writing to the machine's
+/// keyring. The test, not a timer, ends the command, once the refusal was
+/// checked: a command that ended on its own before the move was asked for (a
+/// slow machine) would let the move go into the real keyring.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_keys_do_not_move_into_the_keyring_past_a_running_folder_command() {
+    let Some(abi) = nerve_sandbox::Confinement::detect().landlock_abi else {
+        eprintln!("skipped: Landlock is not available here");
+        return;
+    };
+    // Below ABI 9 the keys never go into the keyring, whatever runs.
+    if abi < 9 {
+        eprintln!("skipped: Landlock ABI {abi} here, below 9, keeps the keys in files");
+        return;
+    }
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let work = dir.path().join("home").join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    let work = std::fs::canonicalize(&work).unwrap();
+    let node = paired_node_with(dir.path(), &center, |p| {
+        p.mode = nerve_policy::Mode::Folder;
+        p.folders.push(nerve_policy::config::Folder {
+            path: work.display().to_string(),
+            access: nerve_policy::config::Access::ALL,
+        });
+    })
+    .await;
+    let mut conn = linked(&mut center).await;
+    let paths = node.paths().clone();
+    // Waits for `release`, bounded to about 30 s so a broken test does not
+    // hang for good; it fails if it was not released.
+    let command = "sh -c 'echo > started; i=0; \
+                   while [ ! -e release ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done; \
+                   [ -e release ]'";
+    let run = conn
+        .request(
+            "invoke",
+            json!({"cap": "exec", "action": "run",
+                   "args": {"command": command, "cwd": work.display().to_string()}}),
+        )
+        .await
+        .unwrap();
+    let started = work.join("started");
+    for _ in 0..200 {
+        if started.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(started.exists(), "the command did not start");
+    assert_eq!(node.open_to_bus(), 1, "the running command is not counted");
+
+    let files = || {
+        [
+            paths.config_file(),
+            paths.config_key(),
+            paths.key_file("lab"),
+        ]
+        .map(|f| std::fs::read(f).unwrap())
+    };
+    let before = files();
+    let e = nerve_node::cli::edit(&paths, |c| {
+        c.machine.secret_storage = nerve_policy::config::SecretStorage::Keyring;
+        Ok(())
+    })
+    .await
+    .expect_err("the keys moved past a running command");
+    assert!(e.contains("1 folder mode command runs"), "{e}");
+    assert!(e.contains("nothing was changed"), "{e}");
+    assert_eq!(files(), before);
+    assert!(!paths.keys_moving().exists());
+    assert_eq!(
+        node.config().machine.secret_storage,
+        nerve_policy::config::SecretStorage::File
+    );
+
+    assert_eq!(
+        node.open_to_bus(),
+        1,
+        "the command ended before its release"
+    );
+
+    std::fs::write(work.join("release"), b"").unwrap();
+    let mut others = Vec::new();
+    let ran = conn
+        .answer(run, WAIT, &mut others)
+        .await
+        .unwrap()
+        .expect("the command ran");
+    assert_eq!(ran["exit_code"], 0, "{ran}");
+    assert_eq!(
+        node.open_to_bus(),
+        0,
+        "the command is counted after it ended"
+    );
+    node.stop().await;
+}
+
 /// A walk (`grep`, `find`, `list`) leaves out what a direct read would refuse:
 /// a folder inside a readable one that has no `r` stays sealed, while the
 /// readable files beside it are still found.

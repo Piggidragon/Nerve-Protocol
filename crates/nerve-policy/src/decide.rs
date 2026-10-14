@@ -57,10 +57,10 @@ pub struct Call<'a> {
 pub struct Env<'a> {
     pub home: &'a Path,
     pub protected: &'a Protected,
-    /// Whether commands run in `folder` mode can be confined (Landlock, a
-    /// Windows AppContainer). When they cannot, a command in a folder that
-    /// allows running is refused.
-    pub confined: bool,
+    /// Why commands run in `folder` mode cannot be confined (Landlock, a
+    /// Windows AppContainer) here, or `None` when they can. When they cannot, a command in a folder that
+    /// allows running is refused with this reason.
+    pub unconfined: Option<&'a str>,
     /// The node's sudo switch: on only while the node holds a sudo password
     /// it has checked.
     pub sudo: bool,
@@ -131,19 +131,35 @@ const INNER_COMMAND: &[&str] = &[
 /// [`SHELL_CONTROL`] or [`EXPRESSION`] and no word of [`INNER_COMMAND`].
 /// Otherwise only a rule that names the line exactly covers it.
 fn plain_command(line: &str) -> bool {
+    not_plain(line).is_none()
+}
+
+/// What keeps `line` from being a plain command ([`plain_command`]): the
+/// first such character or word, quoted, for a refusal to name.
+fn not_plain(line: &str) -> Option<String> {
     // Control characters, the Unicode line breaks and the typographic quotes
     // PowerShell reads as quotes.
     let odd =
         |c: char| c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '\u{2018}'..='\u{201F}');
-    if line.contains(SHELL_CONTROL) || line.contains(EXPRESSION) || line.contains(odd) {
-        return false;
+    if let Some(c) = line
+        .chars()
+        .find(|c| SHELL_CONTROL.contains(c) || EXPRESSION.contains(c) || odd(*c))
+    {
+        // One the owner cannot see is named by its number.
+        return Some(if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+            format!("the invisible character U+{:04X}", u32::from(c))
+        } else {
+            format!("`{c}`")
+        });
     }
-    !line.split_whitespace().any(|w| {
-        let w = w.to_lowercase();
-        let name = w.rsplit('/').next().unwrap_or(&w);
-        let name = name.strip_suffix(".exe").unwrap_or(name);
-        INNER_COMMAND.contains(&w.as_str()) || INNER_COMMAND.contains(&name)
-    })
+    line.split_whitespace()
+        .find(|w| {
+            let w = w.to_lowercase();
+            let name = w.rsplit('/').next().unwrap_or(&w);
+            let name = name.strip_suffix(".exe").unwrap_or(name);
+            INNER_COMMAND.contains(&w.as_str()) || INNER_COMMAND.contains(&name)
+        })
+        .map(|w| format!("`{w}`"))
 }
 
 fn inside_folder<'f>(folders: &'f [Folder], path: &Path) -> Option<&'f Folder> {
@@ -304,9 +320,30 @@ fn by_sudo_list(policy: &CenterPolicy, call: &Call, reasons: &mut Vec<String>) -
         );
         return false;
     }
-    let ok = command_matches(&policy.sudo_allow, cmd);
+    // As for the allow rules: a wildcard entry covers no expression the
+    // shell runs and no word that starts another one (PowerShell runs the
+    // value of `@{a=...}`), only an entry that names the line exactly does.
+    // The command runs with full rights, so this holds on every platform.
+    let cmd = cmd.trim();
+    let wild = command_matches(&policy.sudo_allow, cmd);
+    let odd = not_plain(cmd);
+    let ok = match &odd {
+        None => wild,
+        Some(_) => {
+            let want = crate::rules::escape(cmd);
+            policy.sudo_allow.iter().any(|e| e.trim() == want)
+        }
+    };
     if !ok {
-        reasons.push("a sudo command runs only when the sudo allow list names it".into());
+        reasons.push(match odd.filter(|_| wild) {
+            // Words such as `start` start another command (`cmd /c start`,
+            // PowerShell's `start` is Start-Process), so a wildcard cannot
+            // say what they are handed.
+            Some(what) => format!(
+                "a wildcard sudo entry does not cover a line with {what}: it covers no expression character, invisible character or word that starts another command; add an entry for the whole line with `nerve-node rule add sudo`, without --wildcard"
+            ),
+            None => "a sudo command runs only when the sudo allow list names it".into(),
+        });
     }
     ok
 }
@@ -396,14 +433,14 @@ fn by_mode(
                     .cwd
                     .and_then(|c| inside_folder(&policy.folders, c))
                     .is_some_and(|f| f.access.execute);
-                if in_exec && !env.confined {
-                    reasons.push("commands cannot be confined on this machine".into());
+                if let (true, Some(why)) = (in_exec, env.unconfined) {
+                    reasons.push(why.into());
                 } else if !in_exec {
                     reasons.push(
                         "the working directory is not in a folder that allows running".into(),
                     );
                 }
-                in_exec && env.confined
+                in_exec && env.unconfined.is_none()
             }
         },
     }
@@ -485,7 +522,7 @@ mod tests {
             Env {
                 home: Path::new("/h"),
                 protected: &self.prot,
-                confined,
+                unconfined: (!confined).then_some("commands cannot be confined on this machine"),
                 sudo: false,
             }
         }
@@ -640,6 +677,20 @@ mod tests {
             &call(Effect::Execute, &exec_in, Some("make")),
         );
         assert_eq!(short(&d), "refused");
+        // The refusal names the node's reason.
+        let why = "kept off by the keyring";
+        let d = decide(
+            &policy(Mode::Folder),
+            &Env {
+                unconfined: Some(why),
+                ..x.env(false)
+            },
+            &call(Effect::Execute, &exec_in, Some("make")),
+        );
+        assert!(
+            matches!(&d, Decision::Forbidden(m) if m.contains(why)),
+            "{d:?}"
+        );
         // A limit that is still running changes nothing; one that has run out
         // leaves default deny, so a read in a folder needs a rule again.
         for mode in [Mode::Folder, Mode::User] {
@@ -1112,6 +1163,62 @@ mod tests {
         }
     }
 
+    /// A sudo command runs with full rights (the administrator token on
+    /// Windows, through PowerShell): a wildcard sudo entry covers no more
+    /// than a wildcard allow rule does, only an entry that names the line.
+    #[test]
+    fn a_wildcard_sudo_entry_covers_no_expression_or_inner_command() {
+        let x = T::new();
+        let on = x.sudo_on();
+        let e = t("/w/rw", false);
+        let sudo = |cmd| call(Effect::Execute, &e, Some(cmd));
+        let payload = "sudo choco install @{a=powershell -EncodedCommand AAAA}";
+        for mode in MODES {
+            let mut p = policy(mode);
+            p.sudo_allow = vec![crate::rules::sudo_rule_for("sudo choco install", true).unwrap()];
+            assert_eq!(p.sudo_allow, ["sudo choco *"]);
+            assert_eq!(run(&p, &on, &sudo("sudo choco install git -y")), "allow");
+            // The refusal names what kept the entry from covering the line.
+            for (line, what) in [
+                (payload, "`@`"),
+                ("sudo choco install powershell", "`powershell`"),
+                (
+                    "sudo choco install x -EncodedCommand AAAA",
+                    "`-EncodedCommand`",
+                ),
+                ("sudo choco install 'a b'", "`'`"),
+                ("sudo choco install a,b", "`,`"),
+                ("sudo choco start x", "`start`"),
+                // Invisible ones by their number.
+                (
+                    "sudo choco install x\u{2028}y",
+                    "the invisible character U+2028",
+                ),
+                ("sudo choco install x\ty", "the invisible character U+0009"),
+            ] {
+                let d = decide(&p, &on, &sudo(line));
+                // The hint quotes nothing: a line with `'` in `'…'` would
+                // be another line.
+                assert!(
+                    matches!(&d, Decision::Forbidden(m)
+                        if m.contains(&format!("does not cover a line with {what}:"))
+                            && m.contains("with `nerve-node rule add sudo`, without --wildcard")
+                            && !m.contains("'<")),
+                    "{mode:?} {line}: {d:?}"
+                );
+            }
+            // An entry that names the line exactly covers it.
+            p.sudo_allow
+                .push(crate::rules::sudo_rule_for(payload, false).unwrap());
+            assert_eq!(run(&p, &on, &sudo(payload)), "allow", "{mode:?}");
+            assert_eq!(
+                run(&p, &on, &sudo("sudo choco install @{a=1}")),
+                "refused",
+                "{mode:?}"
+            );
+        }
+    }
+
     #[test]
     fn sudo_needs_the_switch_and_a_sudo_allow_entry_in_every_mode() {
         let x = T::new();
@@ -1288,7 +1395,7 @@ mod tests {
         let env = Env {
             home: Path::new("C:\\Users\\u"),
             protected: &prot,
-            confined: false,
+            unconfined: Some("commands cannot be confined on this machine"),
             sudo: false,
         };
         let p = policy(Mode::User);

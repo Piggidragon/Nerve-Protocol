@@ -111,7 +111,9 @@ With a `Setup::sudo_password` as well:
 ## Harness part
 
 The section is that of [harness.md](harness.md). The part speaks MCP over HTTP,
-where a session is explicit; the rules are the same over stdio.
+where a session is explicit; the rules are the same over stdio. It reads a
+reply with a `Content-Length` and a chunked one alike, and a reply that is not
+JSON is a failure of the check, not an empty result.
 
 | § | Check |
 |---|---|
@@ -123,16 +125,16 @@ where a session is explicit; the rules are the same over stdio.
 | 4 | tool names keep `[A-Za-z0-9_-]` within 64 characters |
 | 4 | a capability with a profile is one tool, `<cap>_<action>`, with `node` as first required argument and an enum of exactly the nodes that offer it |
 | 4 | a capability without a profile is a tool per node, `<node>_<cap>_<action>`, with no `node` argument |
-| 4 | `node`, `settings` and `audit` are never tools |
-| 4 | a read action has `readOnlyHint` |
+| 4 | the actions of the capabilities `node`, `settings` and `audit` are never tools |
+| 4 | a read action has `readOnlyHint`, and a write action does not |
 | 4 | a result is device content (marked text, the object as `structuredContent`) |
 | 4 | a shared tool without `node` is `error invalid_args`; a failure on the node is `error <code>: <message>` |
 | 4 | a shared tool reaches the node `node` names |
 | 4 | a call to a node that is offline is `error unavailable`, and its tools stay listed |
-| 5 | two sessions have two ids; a node sees one `ctx.session` per session and another for the other session |
+| 5 | two sessions have two ids; a node sees one `ctx.session` per session, so a node that two sessions use sees two |
 | 5 | `DELETE /mcp` ends the session (204), and the ended session is 404 |
-| 5 | `session.end` names the session's `ctx.session` to a node it used, and is not sent to a node it never used |
-| 5 | the other session goes on |
+| 5 | `session.end` names the session's `ctx.session` to a node it used, only for the ended session and not for another session on that node, and is not sent to a node it never used |
+| 5 | the other session goes on, and still reaches the node |
 
 Not covered: `notifications/cancelled`, the stdio transport and attach, a node
 the owner disabled, exposure `off`, names cut to 64 characters and clashes (these

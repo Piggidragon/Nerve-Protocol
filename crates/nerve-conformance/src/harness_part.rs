@@ -54,7 +54,22 @@ pub struct Target {
 struct Reply {
     status: u16,
     session: Option<String>,
-    body: Value,
+    /// The body, with a chunked encoding undone.
+    body: String,
+}
+
+impl Reply {
+    /// The body as JSON. A body that is not JSON is an error, not `null`, so a
+    /// reply the part cannot read is not blamed on the rule being checked.
+    fn json(&self) -> Result<Value, String> {
+        serde_json::from_str(&self.body).map_err(|e| {
+            let head: String = self.body.chars().take(80).collect();
+            format!(
+                "the reply (status {}) is not JSON ({e}): {head:?}",
+                self.status
+            )
+        })
+    }
 }
 
 struct Req<'a> {
@@ -99,23 +114,67 @@ async fn http(addr: &str, r: Req<'_>) -> Result<Reply, String> {
     })
     .await
     .map_err(|_| format!("no answer from {addr} within {WAIT:?}"))??;
-    let text = String::from_utf8_lossy(&raw).to_string();
-    let (head, body) = text.split_once("\r\n\r\n").unwrap_or((&text, ""));
+    parse_reply(&raw)
+}
+
+/// An HTTP answer read to the end of the connection: the status, the session
+/// header and the body, whether it has a `Content-Length` or is chunked (a
+/// server that does not know the length of a body in advance sends it so).
+fn parse_reply(raw: &[u8]) -> Result<Reply, String> {
+    let at = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or("not an HTTP answer: no end of the head")?;
+    let head = String::from_utf8_lossy(&raw[..at]).to_string();
     let mut lines = head.lines();
     let status = lines
         .next()
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|c| c.parse().ok())
         .ok_or_else(|| format!("not an HTTP answer: {head:?}"))?;
-    let session = lines
+    let headers: Vec<(String, String)> = lines
         .filter_map(|l| l.split_once(':'))
-        .find(|(k, _)| k.trim().eq_ignore_ascii_case("mcp-session-id"))
-        .map(|(_, v)| v.trim().to_string());
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    let header = |name: &str| headers.iter().find(|(k, _)| k == name).map(|(_, v)| v);
+    let body = &raw[at + 4..];
+    let body = if header("transfer-encoding")
+        .is_some_and(|v| v.to_ascii_lowercase().contains("chunked"))
+    {
+        dechunk(body)?
+    } else {
+        body.to_vec()
+    };
     Ok(Reply {
         status,
-        session,
-        body: serde_json::from_str(body).unwrap_or(Value::Null),
+        session: header("mcp-session-id").cloned(),
+        body: String::from_utf8_lossy(&body).to_string(),
     })
+}
+
+/// The data of a chunked body (RFC 9112 §7.1), chunk extensions and trailers
+/// ignored.
+fn dechunk(mut raw: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::new();
+    loop {
+        let eol = raw
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or("a chunked body ends inside a chunk size")?;
+        let line = String::from_utf8_lossy(&raw[..eol]).to_string();
+        let size = line.split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size, 16)
+            .map_err(|_| format!("a chunked body has the chunk size {line:?}"))?;
+        raw = &raw[eol + 2..];
+        if size == 0 {
+            return Ok(out);
+        }
+        if raw.len() < size + 2 || &raw[size..size + 2] != b"\r\n" {
+            return Err("a chunked body ends inside a chunk".into());
+        }
+        out.extend_from_slice(&raw[..size]);
+        raw = &raw[size + 2..];
+    }
 }
 
 /// One MCP session over HTTP.
@@ -150,6 +209,7 @@ impl Session {
         )?;
         let id = reply
             .session
+            .clone()
             .ok_or("initialize answered without Mcp-Session-Id")?;
         let s = Session {
             addr: t.mcp_addr.clone(),
@@ -158,7 +218,7 @@ impl Session {
             next: AtomicU64::new(1),
         };
         s.notify("notifications/initialized").await?;
-        Ok((s, reply.body))
+        Ok((s, reply.json()?))
     }
 
     async fn raw(
@@ -201,11 +261,12 @@ impl Session {
         let body = json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params});
         let r = self.raw("POST", Some(&self.id), Some(&body)).await?;
         ensure(r.status == 200, format!("{method} answered {}", r.status))?;
+        let body = r.json()?;
         ensure(
-            r.body["id"] == json!(id),
-            format!("the reply names another id: {}", r.body),
+            body["id"] == json!(id),
+            format!("the reply names another id: {body}"),
         )?;
-        Ok(r.body)
+        Ok(body)
     }
 
     async fn ping(&self) -> Result<(), String> {
@@ -453,6 +514,17 @@ fn text_of(result: &Value) -> String {
         .filter_map(|c| c["text"].as_str())
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// `readOnlyHint` is set for a `read` or `sense` action and for no other:
+/// a harness may run a read-only tool without asking.
+fn check_read_only(tools: &[Value], name: &str, read_only: bool) -> Result<(), String> {
+    let t = tool(tools, name)?;
+    let hint = t["annotations"]["readOnlyHint"].as_bool().unwrap_or(false);
+    ensure(
+        hint == read_only,
+        format!("{name}: readOnlyHint is {hint}, wanted {read_only}: {t}"),
+    )
 }
 
 /// A result is device content: marked text, and the object as
@@ -708,12 +780,12 @@ pub async fn run(target: &Target) -> Report {
     r.check(
         "harness 4",
         "a read action has readOnlyHint",
-        tool(&tools, "mirror_say").and_then(|t| {
-            ensure(
-                t["annotations"]["readOnlyHint"] == json!(true),
-                t.to_string(),
-            )
-        }),
+        check_read_only(&tools, "mirror_say", true),
+    );
+    r.check(
+        "harness 4",
+        "a write action does not have readOnlyHint",
+        check_read_only(&tools, "mirror_set", false),
     );
     r.check(
         "harness 4",
@@ -733,7 +805,7 @@ pub async fn run(target: &Target) -> Report {
     );
 
     // Calls: the shared tool picks the node, a result is device content, a
-    // failure is `error <code>: <message>`. Session 1 calls A, session 2 B.
+    // failure is `error <code>: <message>`. Session 1 calls A.
     r.check(
         "harness 4",
         "a result is device content with the object as structuredContent",
@@ -763,27 +835,40 @@ pub async fn run(target: &Target) -> Report {
             .await
             .and_then(|res| check_error_result(&res, "invalid_args")),
     );
+    // Session 2 calls A as well, so a node is used by two sessions.
+    let calls_s1 = a.calls();
     r.check(
         "harness 4",
         "a shared tool reaches the node `node` names",
         async {
             let res = s2
-                .call("mirror_say", json!({"node": B, "text": "three"}))
+                .call("mirror_say", json!({"node": A, "text": "three"}))
                 .await?;
-            check_device_content(&res, B, "mirror.say", "three")
+            check_device_content(&res, A, "mirror.say", "three")?;
+            let res = s2
+                .call("mirror_say", json!({"node": B, "text": "four"}))
+                .await?;
+            check_device_content(&res, B, "mirror.say", "four")
         }
         .await,
     );
 
-    // harness 5: sessions.
+    // harness 5: sessions. Session 1 used A; session 2 used A and B.
     let (calls_a, calls_b) = (a.calls(), b.calls());
+    let ids = only(&calls_s1).and_then(|id1| {
+        let id2 = only(&calls_b)?;
+        ensure(id1 != id2, format!("both sessions are {id1}"))?;
+        let both: BTreeSet<String> = [id1.clone(), id2.clone()].into();
+        ensure(
+            calls_a == both,
+            format!("the node used by both sessions saw {calls_a:?}, wanted {both:?}"),
+        )?;
+        Ok((id1.clone(), id2.clone()))
+    });
     r.check(
         "harness 5",
-        "a node sees one ctx.session per MCP session, and another for another session",
-        only(&calls_a).and_then(|x| {
-            let y = only(&calls_b)?;
-            ensure(x != y, format!("both sessions are {x}"))
-        }),
+        "a node sees one ctx.session per MCP session, and two for two sessions",
+        ids.clone().map(|_| ()),
     );
     r.check(
         "harness 5",
@@ -796,38 +881,59 @@ pub async fn run(target: &Target) -> Report {
         status_is(s1.ping_as(Some(&s1.id)).await, 404),
     );
     const SENT: &str = "session.end names the session's ctx.session to a node it used";
+    const ONLY: &str = "session.end names the ended session only, not another one on the node";
     const NOT_SENT: &str = "a node the session never used is not sent its session.end";
-    match only(&calls_a) {
-        Ok(id) => {
+    match ids {
+        Ok((id1, id2)) => {
             r.check(
                 "harness 5",
                 SENT,
                 eventually(|| async {
                     ensure(
-                        a.ended().contains(id),
+                        a.ended().contains(&id1),
                         "the node was not sent session.end for the session",
                     )
                 })
                 .await,
             );
-            // `session.end` goes out node by node; a node the session never
-            // used would have it by now.
+            // `session.end` goes out node by node; one the session never used,
+            // or a session it did not end, would have it by now.
             tokio::time::sleep(Duration::from_millis(500)).await;
+            r.check(
+                "harness 5",
+                ONLY,
+                ensure(
+                    !a.ended().contains(&id2),
+                    "the node was sent session.end for the other session too",
+                ),
+            );
             r.check(
                 "harness 5",
                 NOT_SENT,
                 ensure(
-                    !b.ended().contains(id),
+                    b.ended().is_empty(),
                     "the other node was sent session.end too",
                 ),
             );
         }
         Err(_) => {
-            r.skip("harness 5", SENT, "no single session id");
-            r.skip("harness 5", NOT_SENT, "no single session id");
+            for name in [SENT, ONLY, NOT_SENT] {
+                r.skip("harness 5", name, "no two session ids");
+            }
         }
     }
-    r.check("harness 5", "the other session goes on", s2.ping().await);
+    r.check(
+        "harness 5",
+        "the other session goes on",
+        async {
+            s2.ping().await?;
+            let res = s2
+                .call("mirror_say", json!({"node": A, "text": "five"}))
+                .await?;
+            check_device_content(&res, A, "mirror.say", "five")
+        }
+        .await,
+    );
 
     // harness 4: a node that left keeps its tools, and a call is `unavailable`.
     b.leave().await;
@@ -922,6 +1028,54 @@ mod tests {
         assert!(check_node_tool(&[tool_json("a_echo_say", None)], "a_echo_say").is_ok());
         assert!(check_node_tool(&[tool_json("a_echo_say", Some(&["a"]))], "a_echo_say").is_err());
         assert!(check_node_tool(&[], "a_echo_say").is_err());
+    }
+
+    #[test]
+    fn read_only_hint_is_for_read_actions_only() {
+        let mut t = tool_json("mirror_say", None);
+        t["annotations"] = json!({"readOnlyHint": true});
+        assert!(check_read_only(&[t.clone()], "mirror_say", true).is_ok());
+        // Announced read-only, but it writes.
+        assert!(check_read_only(&[t.clone()], "mirror_say", false).is_err());
+        t["annotations"] = json!({"readOnlyHint": false});
+        assert!(check_read_only(&[t.clone()], "mirror_say", false).is_ok());
+        assert!(check_read_only(&[t.clone()], "mirror_say", true).is_err());
+        // No annotation at all means not read-only.
+        t["annotations"] = Value::Null;
+        assert!(check_read_only(&[t], "mirror_say", false).is_ok());
+        assert!(check_read_only(&[], "mirror_say", false).is_err());
+    }
+
+    #[test]
+    fn a_chunked_reply_is_read_like_one_with_a_length() {
+        let head = "HTTP/1.1 200 OK\r\nMcp-Session-Id: s-1\r\n";
+        let body = r#"{"id":1}"#;
+        let plain = format!("{head}Content-Length: {}\r\n\r\n{body}", body.len());
+        let chunked = format!(
+            "{head}Transfer-Encoding: chunked\r\n\r\n3\r\n{{\"i\r\n5;ext=1\r\nd\":1}}\r\n0\r\n\r\n"
+        );
+        for raw in [plain, chunked] {
+            let r = parse_reply(raw.as_bytes()).unwrap();
+            assert_eq!((r.status, r.session.as_deref()), (200, Some("s-1")));
+            assert_eq!(r.json().unwrap(), json!({"id": 1}), "{raw}");
+        }
+        // A body that is cut inside a chunk, or has a bad size, is an error.
+        let cut = format!("{head}Transfer-Encoding: chunked\r\n\r\n9\r\nabc");
+        assert!(parse_reply(cut.as_bytes()).is_err());
+        let bad = format!("{head}Transfer-Encoding: chunked\r\n\r\nzz\r\nabc\r\n0\r\n\r\n");
+        assert!(parse_reply(bad.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn a_body_that_is_not_json_is_an_error_not_null() {
+        let r = parse_reply(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello").unwrap();
+        assert!(r.json().unwrap_err().contains("not JSON"));
+        // An empty body (a 202) is not JSON either; callers that expect none
+        // do not ask for it.
+        let r = parse_reply(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\n\r\n").unwrap();
+        assert_eq!(r.status, 202);
+        assert!(r.json().is_err());
+        assert!(parse_reply(b"nonsense").is_err());
     }
 
     #[test]

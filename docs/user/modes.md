@@ -162,8 +162,10 @@ folders.
   `center ls` names each pairing's container (`AppContainer nerve.…`). The
   profile goes with the container's last folder entry, with `center rm`,
   and at `uninstall`, which say which profiles they removed. While the node
-  runs they keep its profiles, as it still serves the pairing until it
-  starts again, and say so; stop the node first. The name comes from the
+  runs they keep its profiles and say so, as it still serves the pairing
+  until it starts again, and the other changes from the CLI keep them too;
+  stop the node first. The running node itself removes a profile when the
+  pairing's last granted folder is deleted or moved away. The name comes from the
   path of the state folder and the pairing in `node.toml`, so the node
   finds the profile as long as the config folder is there, also after the
   state folder was deleted, and whether you type the folder with `\` or
@@ -353,9 +355,11 @@ known.
   `C:\ProgramData` and `C:\Windows\Temp`. A command also writes the
   container's own folder, `%LOCALAPPDATA%\Packages\<container>\AC` (it
   holds `Temp`), without any grant. It stays between the commands of the
-  pairing, and Windows deletes it with the container's profile, which the
-  node removes with the container's last grant, `center rm` and
-  `uninstall`, unless the node runs (see above) (checked, code).
+  pairing, and Windows deletes it with the container's profile. The node
+  removes that profile with the container's last grant, a running node
+  too when the pairing's folders are gone at its sync; `center rm`,
+  `uninstall` and other changes from the CLI remove it only while the node
+  does not run (see above) (checked, code).
 - **The registry.** Checked: a command reads the machine part (`HKLM`, for
   example the Windows version), lists the keys of your `HKCU` and reads
   `HKCU\Environment`, which holds the environment variables you set for

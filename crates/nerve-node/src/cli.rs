@@ -2958,12 +2958,15 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
                     Err(e) if e == nerve_transport::ctl::NOT_RUNNING => None,
                     Err(e) => return Err(e),
                 };
-            // Windows: the control pipe answers `status` too.
+            // Windows: the control pipe answers `status` too. Only a pipe
+            // that is not there means no node runs; any other error is
+            // said, not taken for "no tunnel".
             #[cfg(windows)]
-            let live = crate::pipe::call(paths, "status", json!({}))
-                .await
-                .ok()
-                .map(|v| v["relay"].clone());
+            let live = match crate::pipe::call(paths, "status", json!({})).await {
+                Ok(v) => Some(v["relay"].clone()),
+                Err(e) if e == nerve_transport::ctl::NOT_RUNNING => None,
+                Err(e) => return Err(format!("cannot ask the running node: {e}")),
+            };
             #[cfg(not(any(unix, windows)))]
             let live: Option<Value> = None;
             match (&r.listen, &live) {
@@ -3041,11 +3044,26 @@ async fn cut_note(paths: &NodePaths, out: &mut dyn Write, what: &str) {
 /// with, or one twice.
 fn relay_centers(cfg: &NodeConfig, centers: &[String]) -> Result<(), String> {
     for (i, c) in centers.iter().enumerate() {
-        if cfg.center(c).is_none() {
+        let Some(entry) = cfg.center(c) else {
             return Err(format!("no center named {c} is paired here"));
-        }
+        };
         if centers[..i].contains(c) {
             return Err(format!("--center {c} is given twice"));
+        }
+        // A tunnel reaches a host and port, not a center: a center there
+        // that is not on the list would be reached as well.
+        let at = |url: &str| {
+            nerve_proto::link::CenterUrl::parse(url)
+                .ok()
+                .map(|u| (u.host.to_ascii_lowercase(), u.port))
+        };
+        if let Some(other) = cfg.centers.iter().find(|o| {
+            o.name != entry.name && !centers.contains(&o.name) && at(&o.url) == at(&entry.url)
+        }) {
+            return Err(format!(
+                "the centers {c} and {} share one host and port, and a tunnel reaches the host and port, so the relay cannot keep them apart: name both or neither",
+                other.name
+            ));
         }
     }
     Ok(())
@@ -5165,6 +5183,15 @@ mod tests {
     #[test]
     fn relay_add_shows_the_token_once_and_keeps_only_its_hash() {
         let (_d, paths) = setup(&["home", "work"]);
+        // home and its neighbour share one address, behind one proxy.
+        let mut cfg = load(&paths);
+        cfg.centers[0].url = "https://h.example/a".into();
+        cfg.centers[1].url = "https://w.example".into();
+        let mut neighbour = entry("home-b");
+        neighbour.url = "https://H.example:443/b".into();
+        cfg.centers.push(neighbour);
+        cfg.save(&paths.config_file()).unwrap();
+        let paired = load(&paths).centers;
         let out = run(
             &paths,
             &["relay", "set", "0.0.0.0:7490", "--max-links", "8"],
@@ -5204,15 +5231,20 @@ mod tests {
         let node = cfg.relay.node("lab-pc").unwrap();
         assert_eq!(node.token_sha256, crate::relay::token_hash(&token));
         assert!(node.centers.is_empty());
-        assert_eq!(cfg.centers, vec![entry("home"), entry("work")]);
+        assert_eq!(cfg.centers, paired);
         let e = run(&paths, &["relay", "add", "lab-pc"]).unwrap_err();
         assert!(e.contains("relay rm lab-pc"), "{e}");
         assert!(run(&paths, &["relay", "add", "Lab PC"]).is_err());
 
         // A node limited to some centers; only paired ones can be named.
-        let out = run(&paths, &["relay", "add", "lab-2", "--center", "home"]).unwrap();
-        assert!(out.contains("it may reach the centers home\n"), "{out}");
-        assert_eq!(load(&paths).relay.node("lab-2").unwrap().centers, ["home"]);
+        // A list that splits one address is refused: the relay cannot keep
+        // the two apart.
+        let e = run(&paths, &["relay", "add", "lab-2", "--center", "home"]).unwrap_err();
+        assert!(e.contains("home and home-b share one host and port"), "{e}");
+        assert!(load(&paths).relay.node("lab-2").is_none());
+        let out = run(&paths, &["relay", "add", "lab-2", "--center", "work"]).unwrap();
+        assert!(out.contains("it may reach the centers work\n"), "{out}");
+        assert_eq!(load(&paths).relay.node("lab-2").unwrap().centers, ["work"]);
         let e = run(&paths, &["relay", "add", "lab-3", "--center", "elsewhere"]).unwrap_err();
         assert!(e.contains("no center named elsewhere"), "{e}");
         assert!(load(&paths).relay.node("lab-3").is_none());
@@ -5226,11 +5258,13 @@ mod tests {
                 "work",
                 "--center",
                 "home",
+                "--center",
+                "home-b",
             ],
         )
         .unwrap();
         assert!(
-            out.starts_with("relay node lab-2 may reach the centers work, home\n"),
+            out.starts_with("relay node lab-2 may reach the centers work, home, home-b\n"),
             "{out}"
         );
         assert!(
@@ -5244,7 +5278,7 @@ mod tests {
         let ls = run(&paths, &["relay", "ls"]).unwrap();
         assert!(
             ls.starts_with(&format!(
-                "relay on 0.0.0.0:7491\nat most 8 tunnels, 4 per node\npin {pin}\nnode lab-pc: every https center of this node\nnode lab-2: the centers work, home\n"
+                "relay on 0.0.0.0:7491\nat most 8 tunnels, 4 per node\npin {pin}\nnode lab-pc: every https center of this node\nnode lab-2: the centers work, home, home-b\n"
             )),
             "{ls}"
         );

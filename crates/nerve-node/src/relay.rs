@@ -10,11 +10,16 @@
 //! Off unless the owner sets `relay.listen`. The relay speaks TLS only, with
 //! a certificate of its own that the relayed node pins (its key is kept with
 //! the node's own keys); a plain HTTP `CONNECT` is answered with a refusal
-//! that says so, and nothing is tunnelled. A tunnel goes only to a center
-//! this node is paired with over https, and not to one that revoked or no
-//! longer knows it, and only to the centers the owner picked for that node
-//! when it has a list: the relay opens no way to anything else on this
-//! machine or its network. A tunnel ends when the owner turns the relay off,
+//! that says so, and nothing is tunnelled. A tunnel goes only to the host
+//! and port of a center this node is paired with over https, and not to one
+//! that revoked or no longer knows it, and only to the centers the owner
+//! picked for that node when it has a list. What a tunnel reaches is that
+//! host and port, from this machine's address: whatever is served there
+//! (other names and paths of a reverse proxy, other centers behind it) as
+//! much as the center, since the relay does not read what the node sends
+//! inside it. So centers that share a host and port are granted together
+//! or not at all. Other ports of this machine or its network are not
+//! reached. A tunnel ends when the owner turns the relay off,
 //! takes the node's token away or the center off its list, unpairs the
 //! center, or locks the node (`panic`). Each tunnel is one entry in the
 //! audit log when it ends.
@@ -51,6 +56,11 @@ const UNDECIDED_PER_PEER: usize = 4;
 /// this often, counted: a peer that makes them as fast as it can must not
 /// push the rest of the log out.
 const TOKENLESS_EVERY: Duration = Duration::from_secs(60);
+/// Tunnels one relay node may open a minute. Each is two log lines and an
+/// audit entry; a node needs one per center and redials after a second at
+/// the soonest (spec §4.6), so this is far above its use and far below a
+/// loop that would rotate the audit log.
+const OPENS_PER_MINUTE: usize = 30;
 /// A tunnel that carries no byte either way this long is closed. A link pings
 /// every 20 seconds (spec §4.4), so only a dead one stays this quiet.
 const IDLE: Duration = Duration::from_secs(90);
@@ -69,11 +79,18 @@ pub(crate) struct Relays {
     undecided: Arc<Semaphore>,
     /// Undecided connections per peer address.
     peers: Mutex<HashMap<std::net::IpAddr, usize>>,
-    /// Refusals without a valid token not told in the log yet, and when the
-    /// last line about them was.
-    tokenless: Mutex<(u64, Option<std::time::Instant>)>,
+    /// Refusals without a valid token, told counted.
+    tokenless: Tally,
+    /// Refusals of a node with its token for a limit (tunnels at once, opens
+    /// a minute), told counted.
+    held_back: Tally,
+    /// When each relay node opened its tunnels in the last minute.
+    opens: Mutex<HashMap<String, std::collections::VecDeque<std::time::Instant>>>,
     /// How long a tunnel may be quiet ([`IDLE`]; a test shortens it).
     idle_ms: AtomicU64,
+    /// How long a connection may stay undecided (the head timeout; a test
+    /// shortens it).
+    undecided_ms: AtomicU64,
 }
 
 impl Default for Relays {
@@ -85,8 +102,31 @@ impl Default for Relays {
             next: AtomicU64::new(1),
             undecided: Arc::new(Semaphore::new(UNDECIDED)),
             peers: Mutex::default(),
-            tokenless: Mutex::default(),
+            tokenless: Tally::default(),
+            held_back: Tally::default(),
+            opens: Mutex::default(),
             idle_ms: AtomicU64::new(IDLE.as_millis() as u64),
+            undecided_ms: AtomicU64::new(nerve_transport::http::HEAD_TIMEOUT.as_millis() as u64),
+        }
+    }
+}
+
+/// Refusals of one kind, told in the log counted: the first, then at most
+/// one line per [`TOKENLESS_EVERY`] with the count since the last.
+#[derive(Default)]
+struct Tally(Mutex<(u64, Option<std::time::Instant>)>);
+
+impl Tally {
+    fn note(&self, now: std::time::Instant) -> Option<u64> {
+        let mut t = lock(&self.0);
+        t.0 += 1;
+        match t.1 {
+            Some(at) if now.duration_since(at) < TOKENLESS_EVERY => None,
+            _ => {
+                let n = t.0;
+                *t = (0, Some(now));
+                Some(n)
+            }
         }
     }
 }
@@ -130,16 +170,25 @@ impl Relays {
     /// to tell in the log when a line is due: the first, then at most one
     /// per [`TOKENLESS_EVERY`] with the count since the last.
     fn note_tokenless(&self, now: std::time::Instant) -> Option<u64> {
-        let mut t = lock(&self.tokenless);
-        t.0 += 1;
-        match t.1 {
-            Some(at) if now.duration_since(at) < TOKENLESS_EVERY => None,
-            _ => {
-                let n = t.0;
-                *t = (0, Some(now));
-                Some(n)
-            }
+        self.tokenless.note(now)
+    }
+
+    /// Whether `node` may open another tunnel now, and if so counts it
+    /// ([`OPENS_PER_MINUTE`]).
+    fn may_open(&self, node: &str, now: std::time::Instant) -> bool {
+        let mut opens = lock(&self.opens);
+        let times = opens.entry(node.to_string()).or_default();
+        while times
+            .front()
+            .is_some_and(|t| now.duration_since(*t) >= Duration::from_secs(60))
+        {
+            times.pop_front();
         }
+        if times.len() >= OPENS_PER_MINUTE {
+            return false;
+        }
+        times.push_back(now);
+        true
     }
 
     /// Takes one of the undecided slots of `peer`, unless it holds its
@@ -168,6 +217,13 @@ impl Relays {
     #[cfg(test)]
     pub(crate) fn set_idle(&self, d: Duration) {
         self.idle_ms.store(d.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Shortens the time a connection may stay undecided, for a test.
+    #[cfg(test)]
+    pub(crate) fn set_undecided(&self, d: Duration) {
+        self.undecided_ms
+            .store(d.as_millis() as u64, Ordering::Relaxed);
     }
 
     fn set_status(&self, s: impl Into<String>, bound: Option<SocketAddr>) {
@@ -366,6 +422,10 @@ const FULL: Refusal = Refusal {
     status: 503,
     why: "the relay carries as many tunnels as it may now",
 };
+const TOO_OFTEN: Refusal = Refusal {
+    status: 503,
+    why: "this node opened as many tunnels as it may in a minute",
+};
 /// The answer to a `CONNECT` in plain HTTP, before any TLS: the token came
 /// in the clear, and nothing is tunnelled.
 const PLAIN: Refusal = Refusal {
@@ -378,7 +438,9 @@ const PLAIN: Refusal = Refusal {
 struct Grant {
     node: String,
     token_sha256: String,
+    /// The centers it reaches, as the log and the audit name them.
     center: String,
+    centers: Vec<String>,
     url: CenterUrl,
 }
 
@@ -395,13 +457,12 @@ fn decide(cfg: &NodeConfig, req: &Request) -> Result<Grant, Refusal> {
     let (host, port) = authority(&req.path).ok_or(NOT_CONNECT)?;
     // A center the node may not reach is refused as one that is not there,
     // so its list does not tell it what else the relay has.
-    let (center, url) = target(cfg, &host, port)
-        .filter(|(name, _)| node.may_reach(name))
-        .ok_or(NOT_A_CENTER)?;
+    let (centers, url) = reachable(cfg, &node, &host, port).ok_or(NOT_A_CENTER)?;
     Ok(Grant {
         node: node.name,
         token_sha256: node.token_sha256,
-        center,
+        center: centers.join(", "),
+        centers,
         url,
     })
 }
@@ -440,19 +501,39 @@ fn authority(target: &str) -> Option<(String, u16)> {
     Some((host.to_string(), port.parse().ok()?))
 }
 
-/// The center at `host:port` that a tunnel may go to: one this node is
-/// paired with over https that has not revoked it and still knows it. A
+/// The centers at `host:port` that a tunnel may go to: those this node is
+/// paired with over https that have not revoked it and still know it. A
 /// plain http center is on this machine's loopback; a tunnel there would
 /// open it to the network.
-fn target(cfg: &NodeConfig, host: &str, port: u16) -> Option<(String, CenterUrl)> {
+fn targets(cfg: &NodeConfig, host: &str, port: u16) -> Vec<(String, CenterUrl)> {
     cfg.centers
         .iter()
         .filter(|c| !c.revoked && !c.unknown)
-        .find_map(|c| {
+        .filter_map(|c| {
             let url = CenterUrl::parse(&c.url).ok()?;
             (url.tls && url.port == port && url.host.eq_ignore_ascii_case(host))
                 .then(|| (c.name.clone(), url))
         })
+        .collect()
+}
+
+/// The centers a tunnel of `node` to `host:port` reaches, and where to dial:
+/// every target at that address, and only when the node may reach each of
+/// them. Centers behind one reverse proxy share a host and port and differ
+/// in their path, which travels inside the TLS the relay does not read; so
+/// the relay cannot keep a node to one of them, and grants all or none.
+fn reachable(
+    cfg: &NodeConfig,
+    node: &RelayNode,
+    host: &str,
+    port: u16,
+) -> Option<(Vec<String>, CenterUrl)> {
+    let found = targets(cfg, host, port);
+    let (_, url) = found.first()?.clone();
+    found
+        .iter()
+        .all(|(name, _)| node.may_reach(name))
+        .then(|| (found.into_iter().map(|(n, _)| n).collect(), url))
 }
 
 /// Whether a granted tunnel may go on under `cfg`: the relay is on, the node
@@ -460,11 +541,11 @@ fn target(cfg: &NodeConfig, host: &str, port: u16) -> Option<(String, CenterUrl)
 fn still_granted(cfg: &NodeConfig, g: &Grant) -> bool {
     !cfg.locked
         && cfg.relay.listen.is_some()
-        && cfg
-            .relay
-            .node(&g.node)
-            .is_some_and(|n| n.token_sha256 == g.token_sha256 && n.may_reach(&g.center))
-        && target(cfg, &g.url.host, g.url.port).is_some_and(|(name, _)| name == g.center)
+        && cfg.relay.node(&g.node).is_some_and(|n| {
+            n.token_sha256 == g.token_sha256
+                && reachable(cfg, n, &g.url.host, g.url.port)
+                    .is_some_and(|(names, _)| names == g.centers)
+        })
 }
 
 /// Counts a tunnel while it lives, for `status` and the limits.
@@ -514,6 +595,20 @@ async fn refuse<W: tokio::io::AsyncWrite + Unpin>(io: &mut W, r: &Refusal) {
     let _ = resp.write(io).await;
 }
 
+/// Who a peer is for the undecided limit: its IPv4 address, or the /64 of
+/// its IPv6 address, which one machine holds whole and can spread its
+/// connections over.
+fn peer_key(ip: std::net::IpAddr) -> std::net::IpAddr {
+    match ip.to_canonical() {
+        std::net::IpAddr::V6(v6) => {
+            let mut o = v6.octets();
+            o[8..].fill(0);
+            std::net::IpAddr::V6(o.into())
+        }
+        v4 => v4,
+    }
+}
+
 /// One undecided connection: a slot of the relay's and one of its peer's,
 /// both given back when it is dropped.
 struct Undecided {
@@ -525,7 +620,7 @@ struct Undecided {
 impl Undecided {
     fn take(shared: &Arc<Shared>, peer: SocketAddr) -> Option<Undecided> {
         let permit = shared.relay.undecided.clone().try_acquire_owned().ok()?;
-        let ip = peer.ip().to_canonical();
+        let ip = peer_key(peer.ip());
         shared.relay.take_peer(ip).then(|| Undecided {
             _permit: permit,
             shared: shared.clone(),
@@ -537,6 +632,17 @@ impl Undecided {
 impl Drop for Undecided {
     fn drop(&mut self) {
         self.shared.relay.give_peer(self.peer);
+    }
+}
+
+/// Tells a refusal of a node with its token for a limit, counted.
+fn held_back(shared: &Shared, node: &str, peer: SocketAddr, r: &Refusal) {
+    tracing::debug!("relay: refused a tunnel of {node} from {peer}: {}", r.why);
+    if let Some(n) = shared.relay.held_back.note(std::time::Instant::now()) {
+        tracing::warn!(
+            "relay: refused {n} tunnel(s) of relay nodes for a limit, the last of {node} from {peer}: {}; such refusals are told at most once a minute",
+            r.why
+        );
     }
 }
 
@@ -561,20 +667,35 @@ async fn connection(
     // A TLS handshake starts with a handshake record (22). Anything else is
     // a client that speaks plain HTTP: it is told so, and nothing it sent
     // is used.
+    // One deadline for the first byte, TLS and the head together: an
+    // undecided connection holds its slot this long at most.
+    let deadline = tokio::time::Instant::now()
+        + Duration::from_millis(shared.relay.undecided_ms.load(Ordering::Relaxed));
     let mut first = [0u8; 1];
-    let peeked =
-        tokio::time::timeout(nerve_transport::http::HEAD_TIMEOUT, tcp.peek(&mut first)).await;
+    let peeked = tokio::time::timeout_at(deadline, tcp.peek(&mut first)).await;
     match peeked {
         Ok(Ok(1)) if first[0] == 0x16 => {}
         Ok(Ok(1)) => {
-            tracing::debug!(
-                "relay: refused a plain HTTP connection from {peer}; its token, if it sent one, crossed the network in the clear"
-            );
-            tokenless(&shared, peer);
             // The request is read and dropped first: a socket closed with
             // bytes unread is reset (Windows does so at once), and the reset
             // would take the answer with it.
-            let _ = read_request_head(&mut tcp).await;
+            let head = tokio::time::timeout_at(deadline, read_request_head(&mut tcp)).await;
+            let sent = head
+                .ok()
+                .and_then(Result::ok)
+                .and_then(|r| node_of(&shared.config(), r.header("proxy-authorization")));
+            match sent {
+                // A valid token crossed the network in the clear: the owner
+                // is told whose, to give that node a new one.
+                Some(n) => tracing::warn!(
+                    "relay: relay node {} sent its token in plain HTTP from {peer}, so it crossed the network in the clear; give it a new one (`nerve-node relay rm {0}`, then `relay add {0}`)",
+                    n.name
+                ),
+                None => {
+                    tracing::debug!("relay: refused a plain HTTP connection from {peer}");
+                    tokenless(&shared, peer);
+                }
+            }
             refuse(&mut tcp, &PLAIN).await;
             let _ = tcp.shutdown().await;
             let mut rest = [0u8; 512];
@@ -584,8 +705,7 @@ async fn connection(
         }
         _ => return,
     }
-    let accepted =
-        tokio::time::timeout(nerve_transport::http::HEAD_TIMEOUT, acceptor.accept(tcp)).await;
+    let accepted = tokio::time::timeout_at(deadline, acceptor.accept(tcp)).await;
     let mut io: BoxIo = match accepted {
         Ok(Ok(io)) => io,
         Ok(Err(e)) => {
@@ -594,10 +714,14 @@ async fn connection(
         }
         Err(_) => return,
     };
-    let req = match read_request_head(&mut io).await {
-        Ok(r) => r,
-        Err(e) => {
+    let req = match tokio::time::timeout_at(deadline, read_request_head(&mut io)).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => {
             tracing::debug!("relay: no request from {peer}: {e}");
+            return;
+        }
+        Err(_) => {
+            tracing::debug!("relay: no request from {peer} in time");
             return;
         }
     };
@@ -625,14 +749,18 @@ async fn connection(
         }
     };
     let Some(_counted) = count(&shared.relay, &cfg, &grant, peer) else {
-        tracing::warn!(
-            "relay: refused a tunnel of {} from {peer}: {}",
-            grant.node,
-            FULL.why
-        );
+        held_back(&shared, &grant.node, peer, &FULL);
         refuse(&mut io, &FULL).await;
         return;
     };
+    if !shared
+        .relay
+        .may_open(&grant.node, std::time::Instant::now())
+    {
+        held_back(&shared, &grant.node, peer, &TOO_OFTEN);
+        refuse(&mut io, &TOO_OFTEN).await;
+        return;
+    }
     // The relay dials as the node's own link does: through its proxy, or
     // another relay, when it has one.
     let dialled = match crate::link::proxy_for(&shared.paths, &cfg, &grant.url).await {
@@ -2134,6 +2262,134 @@ mod tests {
             assert_eq!(rm, "relay node lab removed\nits tunnels end now\n");
             assert!(ends(&mut t, WAIT).await, "the tunnel outlived its token");
         }
+        j.daemon.stop().await;
+    }
+
+    /// Centers behind one address (a reverse proxy with a path per center)
+    /// are granted together or not at all: the path travels inside the TLS
+    /// the relay does not read, so a list that splits them could not hold.
+    #[test]
+    fn centers_that_share_an_address_are_granted_together_or_not_at_all() {
+        let (token, hash) = new_token();
+        let mut cfg = NodeConfig::default();
+        cfg.relay.listen = Some("127.0.0.1:7490".into());
+        cfg.relay.nodes.push(relay_node("lab", hash, &[]));
+        cfg.centers
+            .push(center("a", "https://h.example:443/a".into()));
+        cfg.centers
+            .push(center("b", "https://h.example:443/b".into()));
+        cfg.centers
+            .push(center("c", "https://c.example:443".into()));
+        let ask = |cfg: &NodeConfig, target: &str| {
+            let mut r = get(target);
+            r.headers
+                .insert("proxy-authorization".into(), basic("lab", &token));
+            decide(cfg, &r)
+        };
+        let with = |list: &[&str]| {
+            let mut c = cfg.clone();
+            c.relay.nodes[0].centers = list.iter().map(|n| n.to_string()).collect();
+            c
+        };
+        let all = ask(&cfg, "h.example:443").unwrap();
+        assert_eq!((all.center.as_str(), all.centers.len()), ("a, b", 2));
+        for list in [&["a"][..], &["b"], &["c"]] {
+            assert_eq!(
+                ask(&with(list), "h.example:443"),
+                Err(NOT_A_CENTER),
+                "{list:?}"
+            );
+        }
+        assert_eq!(ask(&with(&["a", "b"]), "h.example:443").unwrap(), all);
+        assert_eq!(ask(&with(&["c"]), "c.example:443").unwrap().center, "c");
+        // Taking one of them off the list ends the tunnel to both.
+        assert!(still_granted(&with(&["a", "b"]), &all));
+        assert!(!still_granted(&with(&["a"]), &all));
+        // So does pairing another center at that address.
+        let mut more = cfg.clone();
+        more.centers
+            .push(center("d", "https://H.example:443/d".into()));
+        assert!(!still_granted(&more, &all));
+    }
+
+    /// A node opens a bounded number of tunnels a minute, so a token holder
+    /// cannot rotate the audit log by opening and closing them in a loop.
+    #[test]
+    fn a_node_opens_a_bounded_number_of_tunnels_a_minute() {
+        let r = Relays::default();
+        let t0 = std::time::Instant::now();
+        for i in 0..OPENS_PER_MINUTE {
+            assert!(
+                r.may_open("lab", t0 + Duration::from_millis(i as u64)),
+                "{i}"
+            );
+        }
+        assert!(!r.may_open("lab", t0 + Duration::from_secs(1)));
+        assert!(r.may_open("lab2", t0 + Duration::from_secs(1)));
+        assert!(r.may_open("lab", t0 + Duration::from_secs(61)));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_relay_refuses_a_node_that_opens_too_many_tunnels() {
+        let home = echo().await;
+        let home_at = format!("127.0.0.1:{}", port(&home));
+        serve_echo(home);
+        let j = jump(vec![center("home", format!("https://{home_at}"))], |c| {
+            c.relay.max_links = 64;
+            c.relay.max_links_per_node = 64;
+        })
+        .await;
+        let lab = basic("lab", &j.token);
+        let mut held = Vec::new();
+        for i in 0..OPENS_PER_MINUTE {
+            let (status, head, t) = connect(j.addr, &j.pin, &home_at, Some(&lab)).await;
+            assert_eq!(status, 200, "{i}: {head}");
+            held.push(t.unwrap());
+        }
+        let (status, head, _) = connect(j.addr, &j.pin, &home_at, Some(&lab)).await;
+        assert_eq!(status, 503, "{head}");
+        drop(held);
+        j.daemon.stop().await;
+    }
+
+    /// One machine is one peer: its IPv6 addresses count by their /64.
+    #[test]
+    fn a_peer_is_an_ipv4_address_or_an_ipv6_slash_64() {
+        let k = |s: &str| peer_key(s.parse().unwrap()).to_string();
+        assert_eq!(k("2001:db8:1:2:aaaa::1"), k("2001:db8:1:2:bbbb::9"));
+        assert_ne!(k("2001:db8:1:2::1"), k("2001:db8:1:3::1"));
+        assert_eq!(k("10.0.0.7"), "10.0.0.7");
+        assert_eq!(k("::ffff:10.0.0.7"), "10.0.0.7");
+        assert_ne!(k("10.0.0.7"), k("10.0.0.8"));
+    }
+
+    /// The first byte, TLS and the head share one deadline: a peer that is
+    /// slow at each step holds its slot no longer than that.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_undecided_connection_has_one_deadline_for_every_step() {
+        let j = jump(vec![], |_| {}).await;
+        j.daemon.relay().set_undecided(Duration::from_millis(1000));
+        let mut s = TcpStream::connect(j.addr).await.unwrap();
+        let started = std::time::Instant::now();
+        tokio::time::sleep(Duration::from_millis(900)).await;
+        // The start of a TLS record, then nothing more.
+        s.write_all(&[0x16]).await.unwrap();
+        let mut b = [0u8; 16];
+        let closed = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match s.read(&mut b).await {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) => continue,
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "the connection was held");
+        let took = started.elapsed();
+        assert!(
+            took < Duration::from_millis(1600),
+            "held for {took:?}, past the one deadline"
+        );
         j.daemon.stop().await;
     }
 }

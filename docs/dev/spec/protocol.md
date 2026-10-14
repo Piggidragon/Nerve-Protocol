@@ -185,8 +185,11 @@ message layer: the relay carries bytes, never messages.
   - `403` unless `host:port` is the host (without case) and port of an
     `https` center the relay itself is paired with, that has not revoked it
     and still knows it (no `bye revoked`, no 401), and, when the owner gave
-    the node a list of centers, one on that list. A center off the list MUST
-    get the same answer as one the relay does not have. The relay MUST NOT
+    the node a list of centers, every such center at that host and port is
+    on the list (centers behind one reverse proxy share it; the relay cannot
+    tell them apart, so it grants them together or not at all). A center off
+    the list MUST get the same answer as one the relay does not have. The
+    relay MUST NOT
     open a tunnel anywhere else: not to an `http` center (it is on the
     relay's loopback), not to any other port of its machine or network. An
     `https` center the relay is paired with at a loopback address (or
@@ -195,17 +198,26 @@ message layer: the relay carries bytes, never messages.
     a loopback or unspecified address, the tunnel is refused with `502`.
     Through the relay's own proxy the next hop resolves the name;
   - `503` when it is off, when its node is locked, or when a limit is reached
-    (tunnels at once over all nodes, and per node);
+    (tunnels at once over all nodes and per node, tunnels a node opens a
+    minute);
   - `502` when it cannot reach the center;
   - `200` once it has a connection to the center. From then on it copies
     bytes both ways and nothing else.
 - The relay dials the center as its own link would, through its own proxy if
   it has one (§4.7). A chain of relays follows the same rules at each hop:
   each one tunnels only to centers it is paired with itself.
-- A relay keeps at most a few undecided connections (TLS and the `CONNECT`
-  head, 15 seconds at most) per peer address, and a bounded number in all;
-  one over either is closed unread. Refusals without a valid token are not
-  logged one by one but counted, so a peer cannot flood the relay's log.
+- What a tunnel reaches is the center's host and port, from the relay's
+  address: whatever is served there (other names and paths of a reverse
+  proxy) as much as the center, since what goes inside the tunnel (the TLS
+  server name, the HTTP `Host`, the path) is the relayed node's. An owner
+  judges a token by that.
+- A relay keeps at most a few undecided connections per peer (an IPv4
+  address, or an IPv6 /64), and a bounded number in all; one over either is
+  closed unread. The first byte, TLS and the `CONNECT` head share one
+  deadline of 15 seconds. Refusals without a valid token are not logged one
+  by one but counted, so a peer cannot flood the relay's log; nor are a
+  node's refusals for a limit. A node opens a bounded number of tunnels a
+  minute, so one with a token cannot rotate the audit log either.
 - A relay MUST end a tunnel when its owner turns the relay off, takes the
   node's token away or the center off the node's list, unpairs the center or
   locks the node, and when the tunnel carried nothing either way for 90

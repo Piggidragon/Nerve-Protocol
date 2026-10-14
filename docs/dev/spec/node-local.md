@@ -530,7 +530,13 @@ turns it on, and a center reads and changes nothing of it, grant or not.
   that has not revoked it or answered 401, and is on the node's list when
   it has one, matched by host (without case)
   and port; the relayed node must have paired with the same host name or
-  address. A paused center is still a target: pausing stops this node's
+  address. Centers that share a host and port (one reverse proxy, a path
+  each) are all reached by a tunnel there: the relay grants it only when the
+  node may reach every one of them, a list that splits them is refused by
+  `relay add` and `set-centers`, and the log and the audit name them all
+  (`a, b`). A tunnel reaches whatever is served at that host and port, seen
+  from this machine's address (other names of the proxy too), since the
+  relay does not read what goes inside it. A paused center is still a target: pausing stops this node's
   own link, not the tunnels of others.
 - While the node is locked (`panic`) the relay does not listen. Any change
   that takes a tunnel's grant away (the relay off, the token gone or
@@ -541,12 +547,19 @@ turns it on, and a center reads and changes nothing of it, grant or not.
   the peer's address, start, end, why it ended and the bytes each way. A
   refused `CONNECT` is no tunnel and only in the log.
 - At most 64 connections at once wait for their `CONNECT` to be decided (15
-  seconds for TLS and the head), and at most 4 of them from one address; one
-  over either is closed unread. A connection refused without a valid token
-  (plain HTTP, no or a wrong token, over a limit) is logged at `debug`; at
-  `warn` the log gets one line a minute with how many there were and the
-  last address, so a flood of them cannot rotate the log. Refusals of a node
-  with its token, and every tunnel, are logged at `info`.
+  seconds in all for the first byte, TLS and the head), and at most 4 of them
+  from one peer (an IPv4 address, or an IPv6 /64); one over either is closed
+  unread. A connection refused without a valid token (plain HTTP, no or a
+  wrong token, over a limit) is logged at `debug`; at `warn` the log gets
+  one line a minute with how many there were and the last address, so a
+  flood of them cannot rotate the log. A valid token that came in plain
+  HTTP is told at `warn` with the node's name, to give it a new one.
+- A node opens at most 30 tunnels a minute; past that, and past the
+  tunnels at once, it gets `503`, logged at `debug` with one counted `warn`
+  line a minute. Each tunnel is an audit entry and two `info` lines, so a
+  node with its token cannot rotate the audit log or the log by opening and
+  closing tunnels. Other refusals of a node with its token are logged at
+  `info`.
 - A tunnel quiet for 90 seconds (by the monotonic clock, so a step of the
   wall clock changes nothing) is closed.
 - An `https` center paired at a loopback address or `localhost` is a

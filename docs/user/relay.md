@@ -104,9 +104,10 @@ its keys in files, so it can be a relayed node.
 
 The relay tunnels only to the centers it is paired with itself, over
 `https`, and not to one that removed it (`bye revoked`) or no longer knows
-it, and only to the ones on the node's list when it has one. Nothing else of
-the relay's machine or network can be reached through it: no other port,
-and no `http` center on its own loopback. An `https` center the relay is
+it, and only to the ones on the node's list when it has one. No other port of
+the relay's machine or network can be reached through it, and no `http`
+center on its own loopback; what a center's host and port serve besides the
+center is reached too ([below](#what-to-know)). An `https` center the relay is
 paired with at `127.0.0.1`, `[::1]` or `localhost` (a center on the relay's
 own machine) is reached. A center paired at a name is not reached on the
 relay's own machine: if the name resolves to a loopback address there, the
@@ -127,8 +128,9 @@ nerve-node relay set 0.0.0.0:7490 --max-links 16 --max-links-per-node 4
 unless you set it. `--max-links-per-node` is the number per node, 4 unless
 you set it; a node needs one per center it is paired with. A tunnel that
 carries nothing for 90 seconds is closed (a live link sends something every
-20 seconds). At most 4 connections from one address may wait for the relay's
-answer at once, so one machine cannot keep everyone else out.
+20 seconds). At most 4 connections from one address (IPv6: one /64) may wait
+for the relay's answer at once, 15 seconds at most, so one machine cannot
+keep everyone else out. A node opens at most 30 tunnels a minute.
 
 ## Who is connected
 
@@ -144,7 +146,8 @@ node lab-pc: the centers home
 tunnel lab-pc from 10.0.0.7:51544 to center home for 2 h 5 min
 ```
 
-`nerve-node status` shows the relay in one line. Every tunnel is one entry
+On Linux `nerve-node status` shows the relay in one line; on Windows
+`status` does not ask the node, `relay ls` does. Every tunnel is one entry
 in the [audit log](audit.md) when it ends: the node, its address, the
 center, when it started and ended, why it ended and how much it carried;
 never a token. The node's [log](logs.md) also has a line for every tunnel
@@ -177,6 +180,16 @@ Firewall must let other machines reach the relay's port.
 
 - The relay sees who connects, when, to which center and how much they
   send, but none of what they send.
-- Whoever holds a token reaches only the relay's centers' node port (those
-  on the node's list), where a node still needs a pairing of its own. Take a
-  token away with `relay rm` if you think it leaked.
+- A token reaches the host and port of the relay's centers (those on the
+  node's list), and what reaches them comes from the relay's address. If a
+  center sits behind a reverse proxy that serves other sites on the same
+  host and port, a token reaches those sites too, as the relay's machine
+  would: the relay cannot see which name or path a node asks for inside the
+  tunnel. Give a token only where that is acceptable, and take it away with
+  `relay rm` if you think it leaked.
+- Centers behind one address (`https://h.example/a`, `https://h.example/b`)
+  are reached together: `relay add --center a` is refused there unless you
+  name `b` too.
+- The `proxy set` line holds the token, so your shell keeps it in its
+  history (fish, bash, PowerShell's `ConsoleHost_history.txt`). Delete it
+  from there after you ran it.

@@ -237,8 +237,8 @@ impl ServerIdentity {
 }
 
 /// The server side of TLS for one [`ServerIdentity`], for a listener outside
-/// the center: the tests put it in front of the conformance suite's fake
-/// center, which speaks plain HTTP.
+/// the center: a node's relay (docs/dev/spec/protocol.md §4.8), and the tests,
+/// in front of the conformance suite's fake center, which speaks plain HTTP.
 #[derive(Clone)]
 pub struct Acceptor(tokio_rustls::TlsAcceptor);
 

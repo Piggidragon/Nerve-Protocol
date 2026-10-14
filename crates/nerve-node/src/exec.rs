@@ -1104,6 +1104,10 @@ pub async fn run(
     if job.is_some() {
         cmd.creation_flags(crate::job::SUSPENDED);
     }
+    // Without a job the control pipe cannot tell this command's processes
+    // from others while it runs, and refuses every caller (crate::pipe).
+    #[cfg(windows)]
+    let _jobless = job.is_none().then(crate::job::Jobless::count);
     let mut child = cmd.spawn().map_err(|e| {
         RpcError::new(
             ErrorCode::Unavailable,

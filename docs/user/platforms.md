@@ -9,7 +9,7 @@ behaves the same except where this page says so.
 | `folder` mode runs commands | Yes, confined by Landlock | Yes, confined by an AppContainer; not yet on the [installed service](service.md#windows) |
 | `allowlist` and `user` mode run commands | Yes | Yes, in a Job Object, not confined to folders |
 | Sudo switch | Yes | On the [installed service](service.md#windows), with the administrator token of the account commands run as ([sudo on Windows](sudo.md#sudo-on-windows)) |
-| Control socket | Yes | No |
+| Control socket | Yes | A control pipe that takes folder changes only |
 | Install as a service | Yes, with systemd | Yes |
 | Config folder | `~/.config/nerve` | `%USERPROFILE%\.config\nerve` |
 
@@ -80,11 +80,19 @@ from a center then run with full rights on the machine (on Linux unless
 what they do. On Windows, in `folder` mode, their AppContainer still holds
 them to their folders.
 
-### No control socket
+### The control pipe
 
-A running node cannot be told about changes. The CLI writes the signed
-`node.toml` itself, and the node takes a change at its next start. A command
-that the node runs for a center can therefore change the node's own policy.
+A running node on Windows takes `folder add`, `folder set` and `folder rm`
+from the CLI at once, over a named pipe, and brings the folders' permission
+entries in line before it answers. Only the administrators (in a terminal
+opened with "Run as administrator"), SYSTEM and the node's own account can
+open the pipe, and the node refuses every request from a process of a
+command it runs. The pipe takes no other change yet: for those the CLI
+writes the signed `node.toml` itself, and the node takes them at its next
+start. Until then the node refuses folder changes, which would undo them:
+restart it first ([troubleshooting](troubleshooting.md#restart-the-node-then-change-the-folder-again-windows)).
+A command that the node runs for a center can change the node's own policy
+where it can write that file.
 
 Allow commands on Windows only for centers you would also give the
 [settings grant](settings-grant.md), or [install the node as a

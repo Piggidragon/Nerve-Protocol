@@ -234,9 +234,10 @@ The service writes its log to `C:\ProgramData\Nerve\state\log.jsonl`. When
 it does not start, the Event Viewer says why, and the log has the rest.
 
 The other commands work on the installed node from an administrator's
-terminal. Windows has no control socket, so the service takes a change at
-its next start: `Restart-Service nerve-node`. `setup` asks no account
-there, and `--create-user` is refused.
+terminal. The service takes `folder add`, `folder set` and `folder rm` at
+once over its [control pipe](platforms.md#the-control-pipe), and every other
+change at its next start: `Restart-Service nerve-node`. `setup` asks no
+account there, and `--create-user` is refused.
 
 The installed node on Windows keeps its keys in files. The service runs as
 `nerve`, and the Credential Manager is one per account: keys that `setup` or

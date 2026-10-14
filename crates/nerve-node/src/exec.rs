@@ -514,11 +514,9 @@ pub async fn sudo_check(
             .env("LOGNAME", &a.name);
     }
     let as_whom = account.map_or(String::new(), |a| format!(" as {}", a.name));
-    let spawned = {
-        let _spawning = crate::spawn_gate::spawning();
-        cmd.spawn()
-    };
-    let mut child = spawned.map_err(|e| format!("cannot run {sudo_path}{as_whom}: {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("cannot run {sudo_path}{as_whom}: {e}"))?;
     let mut stdin = child.stdin.take().expect("piped");
     // sudo may exit before reading (no such user in sudoers); the exit
     // status says what matters.
@@ -880,11 +878,7 @@ pub async fn run(
     if job.is_some() {
         cmd.creation_flags(crate::job::SUSPENDED);
     }
-    let spawned = {
-        let _spawning = crate::spawn_gate::spawning();
-        cmd.spawn()
-    };
-    let mut child = spawned.map_err(|e| {
+    let mut child = cmd.spawn().map_err(|e| {
         RpcError::new(
             ErrorCode::Unavailable,
             match &opts.account {
@@ -1251,15 +1245,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     fn write_script(path: &Path, text: &str) {
         use std::io::Write;
-        let mut c = {
-            let _spawning = crate::spawn_gate::spawning();
-            std::process::Command::new("sh")
-                .args(["-c", "cat > \"$0\" && chmod 755 \"$0\""])
-                .arg(path)
-                .stdin(Stdio::piped())
-                .spawn()
-                .unwrap()
-        };
+        let mut c = std::process::Command::new("sh")
+            .args(["-c", "cat > \"$0\" && chmod 755 \"$0\""])
+            .arg(path)
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
         c.stdin.take().unwrap().write_all(text.as_bytes()).unwrap();
         assert!(c.wait().unwrap().success(), "cannot write {path:?}");
     }

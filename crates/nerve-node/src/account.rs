@@ -535,7 +535,6 @@ impl Drop for FsAs {
 /// node waits for it a short while at most.
 #[cfg(target_os = "linux")]
 pub fn kill_as(uid: u32, pgid: u32, sig: libc::c_int) {
-    let _spawning = crate::spawn_gate::spawning();
     // SAFETY: the child of a process with many threads makes plain system
     // calls only and leaves with _exit.
     unsafe {

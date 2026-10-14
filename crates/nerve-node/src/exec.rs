@@ -506,15 +506,22 @@ fn settle_by(
     path: &Path,
     resolve: impl Fn(&Path) -> Result<PathBuf, nerve_policy::paths::PathError>,
 ) -> Settled {
+    // The `w` folders that resolve judge the links as they are; one that
+    // cannot be resolved here only makes an answer of "fine" uncertain.
     let mut bounds = Vec::new();
+    let mut unresolved = false;
     for w in write_folders(cfg, home) {
         match real_checked(&w) {
             Ok(r) => bounds.push(r),
             // A `w` folder that is not there (yet) holds no link.
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => bounds.push(w),
-            Err(_) => return Settled::Unknown,
+            Err(_) => {
+                unresolved = true;
+                bounds.push(w);
+            }
         }
     }
+    let path = &long_names(path);
     // A link to nothing could point anywhere once something is made there.
     if let Err(e @ nerve_policy::paths::PathError::DanglingSymlink(_)) = resolve(path) {
         return Settled::Refused(e.to_string());
@@ -523,6 +530,9 @@ fn settle_by(
         Ok(p) => p,
         Err(why) => return Settled::Refused(why),
     };
+    if unresolved {
+        return Settled::Unknown;
+    }
     match resolve(&walked) {
         Ok(place) if within(&place, &walked) && within(&walked, &place) => Settled::At(place),
         Ok(place) => Settled::Refused(format!(
@@ -559,14 +569,34 @@ fn led_away(path: &Path, writable: &[PathBuf]) -> Option<String> {
 /// [`led_away`], and where the path ends when nothing leads it away: the path
 /// followed a link at a time, which is also what `folder add` stores.
 fn walk(path: &Path, writable: &[PathBuf]) -> Result<PathBuf, String> {
+    walk_by(path, writable, real)
+}
+
+/// [`walk`] with the resolution of the folder that holds a link given, which
+/// the tests replace to play a swap between two looks.
+///
+/// A link is judged by the folder that holds it as spelled (`here`, made only
+/// of names that were folders when looked at) and as it resolves now
+/// (`holder`): either inside a `w` folder refuses it, and so does a holder
+/// that is not the place `here` names, since a name of it was swapped for a
+/// link meanwhile. So a link seen inside a `w` folder is refused whatever the
+/// timing, and a `here` outside every `w` folder has no name a confined
+/// command can swap.
+fn walk_by(
+    path: &Path,
+    writable: &[PathBuf],
+    real: impl Fn(&Path) -> PathBuf,
+) -> Result<PathBuf, String> {
     // The most links one resolution may cross, as the kernel's limit.
     const LINKS: usize = 40;
+    let inside = |p: &Path| writable.iter().any(|w| within(p, w));
     let mut here = PathBuf::new();
     let mut todo = steps(path);
     let mut crossed = 0;
     while let Some(step) = todo.pop() {
         match step {
-            Step::Top(top) => here = top,
+            // The drive, as it resolves (a `subst` drive leads to a folder).
+            Step::Top(top) => here = real(&top),
             Step::Up => {
                 here.pop();
             }
@@ -581,16 +611,24 @@ fn walk(path: &Path, writable: &[PathBuf]) -> Result<PathBuf, String> {
                     continue;
                 }
                 let holder = real(&here);
-                if writable.iter().any(|w| within(&holder, w)) {
+                if inside(&here) || inside(&holder) {
                     return Err(format!(
                         "it passes through the link {} inside a folder where commands may write",
                         at.display()
                     ));
                 }
+                if !(within(&holder, &here) && within(&here, &holder)) {
+                    return Err(format!(
+                        "it passes through the link {}, and {} leads to {} where it was looked at as itself: a link was put there meanwhile",
+                        at.display(),
+                        here.display(),
+                        holder.display()
+                    ));
+                }
                 crossed += 1;
                 let target = std::fs::read_link(&at).ok().filter(|_| crossed <= LINKS);
                 match target {
-                    Some(t) => todo.extend(steps(&t)),
+                    Some(t) => todo.extend(steps(&long_names(&t))),
                     None => {
                         return Err(format!(
                             "it cannot be resolved through the link {}",
@@ -602,6 +640,36 @@ fn walk(path: &Path, writable: &[PathBuf]) -> Result<PathBuf, String> {
         }
     }
     Ok(here)
+}
+
+/// `p` with the short (8.3) names in it written out, as the final path of
+/// what it names has them (Windows; the existing part of `p`, links stay as
+/// they are); `p` as it is elsewhere, for a relative path, and where that
+/// fails.
+fn long_names(p: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if !p.is_absolute() {
+            return p.to_path_buf();
+        }
+        // The longest part that exists is expanded, the rest follows as it is.
+        let mut head = p;
+        let mut tail = Vec::new();
+        while std::fs::symlink_metadata(head).is_err() {
+            let (Some(parent), Some(name)) = (head.parent(), head.file_name()) else {
+                return p.to_path_buf();
+            };
+            tail.push(name);
+            head = parent;
+        }
+        let mut out = nerve_sandbox::appcontainer::long_path(head);
+        out.extend(tail.iter().rev());
+        out
+    }
+    #[cfg(not(windows))]
+    {
+        p.to_path_buf()
+    }
 }
 
 /// The first place the resolution of `path` lands at that `wanted` accepts,
@@ -2343,9 +2411,60 @@ mod tests {
         std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
         let settled = settle(&cfg, &home, &bin);
         let inside = settle(&cfg, &home, &closed.join("code/x"));
+        // With another `w` folder that does resolve, a link it holds is
+        // still refused, and only a path with no such link is not told.
+        entry = cfg.centers[0].clone();
+        entry.policy.folders.push(folder(&work, "rw"));
+        cfg.centers[0] = entry;
+        let lnk = work.join("lnk");
+        std::os::unix::fs::symlink(&docs, &lnk).unwrap();
+        let (kept, plain) = (
+            settle(&cfg, &home, &lnk),
+            settle(&cfg, &home, &work.join("plain")),
+        );
         std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(settled, Settled::Unknown);
         assert_eq!(inside, Settled::Unknown);
+        assert!(matches!(kept, Settled::Refused(w) if w.contains("may write")));
+        assert_eq!(plain, Settled::Unknown);
+    }
+
+    /// A link is judged by the folder that holds it as spelled and as it
+    /// resolves: a holder inside a `w` folder either way refuses it, and a
+    /// holder that is not the place it was looked at as (a name of it was
+    /// swapped for a link between the two looks, played here by a
+    /// resolution that leads elsewhere) refuses it too. Otherwise the link
+    /// of the owner's is followed.
+    #[test]
+    fn a_link_is_judged_by_its_holder_as_spelled_and_as_resolved() {
+        let d = tempfile::tempdir().unwrap();
+        let (home, work, docs) = nested_home(&d);
+        let (x, outside) = (work.join("x"), home.join("outside"));
+        std::fs::create_dir_all(&x).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&docs, x.join("name")).unwrap();
+        std::os::unix::fs::symlink(&docs, outside.join("name")).unwrap();
+        // Resolving anything but the root leads elsewhere (a swapped name).
+        let root = PathBuf::from("/");
+        let swapped = |p: &Path| {
+            if p == root.as_path() {
+                root.clone()
+            } else {
+                PathBuf::from("/nowhere")
+            }
+        };
+        let w = [work.clone()];
+        // The holder is inside the `w` folder as spelled, though it
+        // resolves outside it now: refused all the same.
+        let e = walk_by(&x.join("name"), &w, swapped).unwrap_err();
+        assert!(e.contains("may write"), "{e}");
+        // Outside every `w` folder but not the place it was looked at as.
+        let e = walk_by(&outside.join("name"), &w, swapped).unwrap_err();
+        assert!(e.contains("meanwhile"), "{e}");
+        // Nothing swapped: the link outside is the owner's and is followed,
+        // the one inside is not.
+        assert_eq!(walk_by(&outside.join("name"), &w, real), Ok(docs.clone()));
+        assert!(walk_by(&x.join("name"), &w, real).is_err());
     }
 
     /// `lands_at` follows a path a link at a time and answers with the first
@@ -2544,6 +2663,74 @@ mod windows_tests {
             cwd: cwd.to_path_buf(),
             timeout: Some(timeout),
         }
+    }
+
+    /// The short (8.3) spelling of `p`, which must exist.
+    fn short_name(p: &Path) -> PathBuf {
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+        let w: Vec<u16> = p.as_os_str().encode_wide().chain([0]).collect();
+        let mut buf = vec![0u16; 1024];
+        // SAFETY: a NUL-terminated path and a buffer of the length given.
+        let n = unsafe { GetShortPathNameW(w.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) };
+        assert!(n > 0 && (n as usize) < buf.len(), "no short name for {p:?}");
+        buf.truncate(n as usize);
+        PathBuf::from(std::ffi::OsString::from_wide(&buf))
+    }
+
+    /// A folder is settled at its real place when the path spells it another
+    /// way than the system does and nothing was swapped: a `subst` drive, and
+    /// a junction whose target is written with 8.3 names. Both stood in the
+    /// way of the end check, which compares spellings.
+    #[test]
+    fn a_folder_is_settled_at_its_real_place_through_a_subst_drive_and_a_short_name() {
+        let d = tempfile::tempdir().unwrap();
+        let root = PathBuf::from(nerve_policy::paths::win::strip_verbatim(
+            &std::fs::canonicalize(d.path()).unwrap().to_string_lossy(),
+        ));
+        let (base, cfg) = (root.join("Some Long Folder Name"), NodeConfig::default());
+        let real_dir = base.join("proj");
+        std::fs::create_dir_all(&real_dir).unwrap();
+        let at = |p: &Path| settle(&cfg, &root, p);
+        let place = nerve_policy::paths::resolve(&real_dir).unwrap();
+
+        // A junction to the folder, written with the short names.
+        let target = short_name(&base).join("proj");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(root.join("j8"))
+            .arg(&target)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+        assert_eq!(at(&root.join("j8")), Settled::At(place.clone()));
+        // The short spelling of the folder itself is written out.
+        assert_eq!(at(&target), Settled::At(place.clone()));
+
+        // A `subst` drive: the drive is a folder.
+        let Some(letter) = ('R'..='Z')
+            .rev()
+            .find(|c| !Path::new(&format!("{c}:\\")).exists())
+        else {
+            return;
+        };
+        let drive = format!("{letter}:");
+        let made = std::process::Command::new("subst")
+            .arg(&drive)
+            .arg(&base)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+        struct Unmap(String);
+        impl Drop for Unmap {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("subst")
+                    .args([self.0.as_str(), "/d"])
+                    .output();
+            }
+        }
+        let _unmap = Unmap(drive.clone());
+        assert_eq!(at(Path::new(&format!("{drive}\\proj"))), Settled::At(place));
     }
 
     #[test]

@@ -67,7 +67,10 @@ at whatever it leads to. `folder add` then refuses, changes nothing and says
 which link. Look at it (`ls -l`, `dir /AL`): add the place you mean by its own
 path, or remove the link. (Once no `w` folder shows the link, it cannot be
 told from yours and is followed.) The path is followed and checked in one
-pass, so a link swapped in meanwhile is refused too. The node records that it
+pass: a link found inside a `w` folder is refused whenever it appears, and the
+place the pass ends at must resolve to itself, so a link swapped in meanwhile
+is refused too. On Windows a `subst` drive and short (8.3) names, in the path
+or in a junction's target, are written out in full. The node records that it
 stored the real place (`places` under the pairing's `policy` in `node.toml`).
 A command with `w` on a folder can put a link in place of a folder inside it,
 and a link would give that folder's rights in a place you never named. So the

@@ -585,7 +585,12 @@ answer. For each call the node takes the center's policy and, in this order:
    `folder add` itself does not follow a link that lies inside a `w` folder
    of any center: it refuses, so that a link a command made is not stored,
    and recorded, at its target. It judges and resolves in one pass
-   (`exec::settle`), so that what is stored is what was looked at.
+   (`exec::settle`): a link is judged by the folder that holds it as spelled
+   and as it resolves, either inside a `w` folder refuses it and so does a
+   holder that is not the place it was looked at as, and the place the pass
+   ends at must resolve to itself, so that what is stored is what was looked
+   at. A `w` folder that cannot be resolved only makes a clean walk "cannot
+   tell" (the folder is stored as given, not recorded).
    For a folder without an entry only the `w` folders in the config count,
    and a command that runs without Landlock can make a link elsewhere. A folder
    that holds a protected entry gives a command in `folder` mode none of it:

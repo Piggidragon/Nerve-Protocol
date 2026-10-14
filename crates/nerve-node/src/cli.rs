@@ -3615,7 +3615,6 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn center_rm_removes_the_profile_when_the_other_grants_do_not_follow() {
-        use nerve_policy::config::Folder;
         let d = tempfile::tempdir().unwrap();
         let paths = NodePaths::new(d.path().join("c"), d.path().join("s"));
         let work = d.path().join("work");

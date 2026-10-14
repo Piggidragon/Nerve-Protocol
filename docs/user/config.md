@@ -238,5 +238,6 @@ node, the command says:
 the change is in node.toml; it takes effect at the next start of the node
 ```
 
-On Windows the node has no control socket, so a running node always takes a
-change at its next start.
+On Windows a running node takes `folder add`, `folder set` and `folder rm`
+at once ([the control pipe](platforms.md#the-control-pipe)); every other
+change it takes at its next start.

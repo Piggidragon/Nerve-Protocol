@@ -452,7 +452,7 @@ impl SettingsStore {
     /// The version of the file as it is now, read without checking its MAC
     /// (the version a write must not go behind): 0 for no file, and for one
     /// that names none.
-    fn version_on_disk(&self) -> Result<u64, String> {
+    pub fn version_on_disk(&self) -> Result<u64, String> {
         let Some(text) = read_file(&self.path)? else {
             return Ok(0);
         };

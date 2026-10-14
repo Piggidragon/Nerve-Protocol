@@ -161,6 +161,64 @@ center's local name):
   `folder` command, and the CLI when it writes the config. `uninstall` takes
   off those of the node in the invoking user's own folders; the installed
   service puts none on.
+- Windows writes inherited entries into each object when it is made, and a
+  later change of a folder's list reaches what is below it only when that
+  is written again. `SetSecurityInfo` does so for the whole tree, as
+  `icacls` does (#54). `appcontainer::set_below` works out the folder's
+  list as `SetSecurityInfo` did (the container's entries replaced, the
+  inherited ones from the folder it is in now, so a granted folder moved
+  out of another one loses that one's entries), writes it with
+  `SetKernelObjectSecurity`, which passes nothing down, and passes the
+  change down itself (`nerve_sandbox::inherit`): each object is listed and
+  opened through its folder's handle (`NtOpenFile`, as itself, never
+  through a link), and opened for `WRITE_DAC` only when its list changes.
+  Its new list is what Windows works out for an object made there
+  (`CreatePrivateObjectSecurityEx` with `SEF_DACL_AUTO_INHERIT`, given only
+  the object's own entries, since it keeps every entry it is given as one
+  of the object's own): its own entries, and those it inherits from the
+  folder's new list. A list in the older form, without
+  `SE_DACL_AUTO_INHERITED` and with no entry marked inherited (as in folders
+  made under such a folder, a test's temporary folder for one), first gets
+  its inherited entries told by the list of the folder it inherited them
+  from (`ConvertToAutoInheritPrivateObjectSecurity`, as `SetSecurityInfo`
+  does). One whose entries do not match comes out as its own and keeps its
+  list. Each write asks for `SE_DACL_AUTO_INHERIT_REQ`, without which
+  Windows drops `SE_DACL_AUTO_INHERITED`. An object is written only when
+  its entries change. Below an object whose list stays, or one whose list
+  does not inherit, nothing changes, so the walk does not go there. Each
+  folder is written after everything below it, so a folder whose list is
+  right has everything below it right, also after a walk that stopped half
+  way; it is listed again once written, and what was made in it meanwhile
+  (with its old list, also a file saved over an old name, by its file ID)
+  is walked too. The folders above what a stopped walk changed do not show
+  it, so `grants::sync` marks a grant `unfinished` in the record before it
+  changes its folder and takes the mark off once the change is done; the
+  next change at a marked place goes into every folder (`whole`), also one
+  back to flags the folder still shows; a mark counts for the object it
+  was made on, not for a folder made anew where a marked one was moved
+  away; a new grant is recorded with the file ID of the object at its
+  path before it goes on, so a first grant that stopped part way is found
+  where its folder went, as any other. Each change goes only through the
+  object recorded for its place (`set_below`'s `expect`): one replaced
+  since, or nothing at the path where it was moved away, is refused before
+  any write, marked `acl::Untouched::Refused`, and
+  the next sync looks again. Where the record cannot be marked, only
+  take-offs run, here and where moved folders are now (one goes into
+  every folder, and one that stops gives less, never more), so `uninstall`
+  still takes the grants off; puts and replacements wait, and a grant one
+  would change is stale where it may give flags that are not wanted. One
+  whose folder cannot be found is stale, and one on a volume that is away
+  is named, as always. The mark keeps the flags each
+  stopped change was heading for (`Grant::toward`): until a change there
+  finishes, the place counts as written by those flags too (the hard-link
+  check, `w` without `r` for the pass), and a refused change whose place
+  may give flags other than the wanted ones is stale. Taking a grant off goes into every
+  folder all the same, since Windows' own walk, which earlier versions
+  used, writes a folder before what is below it. A link or junction gets
+  the change on its own list and is not followed. An error names the
+  object it is about. A change that takes long tells how far it is
+  (`grants::paced`: after 3 s, then every 15 s, and how it ended), on stderr
+  in the CLI and in the log of a running node.
 - A record in the state folder (`grants.json`) finds them again. It holds the
   file ID of each grant's object, since the grant is in that object's own
   access list and goes with it: a grant on a moved or renamed folder comes off
@@ -179,10 +237,23 @@ center's local name):
   changed, one taken off, also where a moved folder is now) reaches a file
   a command linked there from a `w`-only folder. So before such a change on
   a folder commands may write in, or one that holds such a folder,
-  `grants::sync` walks it and refuses while a file below has more than one
-  name (a removal stays stale). One exception is for cargo: a file below a
-  folder named exactly `target` passes when `appcontainer::all_names` lists
-  all its names (as many as the file has; a failed listing refuses), every
+  `grants::sync` walks what the change reaches (`appcontainer::reaches`,
+  the same walk without writing) and refuses while a file there has more
+  than one name (a removal stays stale). The change itself judges each
+  such file again on the handle it writes through, by the names that
+  handle gives (`NtQueryInformationFile` with the hard-link classes, each
+  name's folder found by its file ID), not by its path, and stops there,
+  with the folder's own list as it was (`grants::Links`, #76); a link made
+  in the granted folder itself while the walk was below it is found when
+  that folder is listed again after its write, and the error says the
+  folder has the change already (`inherit::Stop::top_written`). Only an
+  error marked `acl::Untouched` (refused before a write, nothing at the
+  path) counts as a change that changed nothing; every error from inside
+  the walk is of kind `Other`, so the grant stays recorded and marked
+  `unfinished`. One
+  exception is for cargo: a file below a
+  folder named exactly `target` passes when all its names are listed
+  (as many as the file has; a failed listing refuses), every
   one, compared resolved, lies in such a folder of the walked folder, and
   each is held by exactly the same wanted and recorded grants as the walked
   name. That compares grant paths, while a grant's entry goes with its
@@ -212,8 +283,8 @@ center's local name):
   store, uv's cache, a local `git clone`); the user docs give the ways
   around. A link a command of
   any pairing that may write there makes between the walk and the change
-  still gets through: a documented limit, with its own issue for a
-  race-free design. Inside a folder with `w` a
+  shows on the file's handle as the change gets to it, and stops the
+  change. Inside a folder with `w` a
   command can put a junction or a hard link where a granted folder was, so a
   grant goes on there only on an object of its own (its final path is its
   path, one name, an inheriting list), through the handle the check opened;
@@ -230,9 +301,65 @@ center's local name):
   start without one.
 - PowerShell checks every folder above its working folder, which the
   container may not see, so a PowerShell command starts with a drive `Work:`
-  rooted at its working folder.
+  rooted at its working folder. Functions stand in for `Set-Location` and
+  `Push-Location`: a whole or relative path goes to the Work drive it lies
+  below, or to a new drive `Work2:`, `Work3:`, … rooted at that folder if the
+  command can see it, and otherwise to the cmdlet as a whole path, which
+  fails. Relative paths are resolved there too, since the cmdlet keeps `..`
+  on its drive (`..\app` on `Work:\` is `Work:\app`). A `-Path` loses its
+  escapes first; one with a wildcard has the part before its first wildcard
+  resolved so and keeps the rest, unless that part is `\` or `/` alone, the
+  root of the current drive. The cmdlet runs with `-ErrorAction Continue`, and
+  its errors are written again as the function's under the caller's error
+  action, so `$?` and the exit code stay as the cmdlet sets them
+  (`nerve_sandbox::POWERSHELL_START`). An object piped to them is bound as
+  the cmdlets bind it (its `Path`, or else its `PSPath` as `-LiteralPath`),
+  since their untyped `Path` would take it whole. Other cmdlets still keep
+  `..` on the drive they stand on.
 - The container has the network, as Landlock leaves it, but not the loopback
-  address.
+  address. Its token carries three capabilities, `internetClient`,
+  `internetClientServer` and `privateNetworkClientServer`, and nothing else
+  (`appcontainer::run`).
+
+What the container does not stop, in short (the user docs list each point with
+how it was checked on Windows 11 Pro 26H2, build 10.0.26300, and what was not:
+[modes](../user/modes.md#what-the-appcontainer-does-not-stop)):
+
+- The network: out to the internet and the local network, no filter by
+  address or port; not the machine itself (its loopback address, its own
+  address and its name). It can listen; the Windows Firewall decides who
+  reaches the port, the node adds no rule.
+- The environment: the shim passes the node's own to `CreateProcessW`
+  (`lpEnvironment` is null). Windows alone rewrites `TEMP`, `TMP` and
+  `LOCALAPPDATA` to the container's folder under `Packages\<name>\AC`, which
+  the container may write without a grant and Windows removes with the
+  profile.
+- What Windows opens to every AppContainer: the Windows folder, Program Files,
+  parts of `HKLM` and `HKCU` (reads only), pipes and other endpoints whose
+  security names ALL APPLICATION PACKAGES. Other processes of the user are not
+  visible to it; WMI, the task scheduler, the service manager and `RunAs`
+  refused it in the checks. The node blocks none of these itself.
+- The token: low integrity, `SeChangeNotifyPrivilege` and
+  `SeIncreaseWorkingSetPrivilege` only, also under an elevated node. No limit
+  on memory, CPU, disk or process count: the job only ends processes
+  (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`).
+- Files a command leaves in a `w` folder are run by others outside the
+  container. Links and permission entries: above.
+- A `sudo` command (installed service only) is started by `winsudo` outside
+  the container, whatever the folders say (`exec_run`: `folder` is false for
+  it). The folders do not gate it: the switch, the sudo list, the deny rules
+  and the protected paths do (`decide`), also where `folder` mode runs nothing
+  else.
+- Not decided yet, whether to block further: filtering the environment the
+  command inherits (#89) and the reads of `HKCU\Environment` (#90). The
+  network and the reads of the Windows folder and Program Files are what a
+  container is for and stay.
+- Known wrong text: the refusal for keys in the keyring names Landlock and the
+  session bus on Windows too; a text per platform is tracked in #91.
+- Not checked: the Credential Manager and DPAPI for the user (the test session
+  could not use them), the clipboard against a real desktop, ALPC ports and
+  COM servers, network shares. With the node's keys in the Credential
+  Manager, `folder` mode runs no command (`keys_kept_from_commands`).
 
 ## The sudo switch
 

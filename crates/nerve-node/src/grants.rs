@@ -3814,6 +3814,68 @@ mod tests {
         );
     }
 
+    /// Issue #77: a link a command put in place of a nested folder while the
+    /// outer folder had `w` gets no grant after that `w` is gone (the folder
+    /// narrowed to `r`, or its pairing removed), when the node recorded the
+    /// nested folder at its real place (`folder add`). Without the record
+    /// the link is followed, and the folder it leads to gets the grant.
+    #[cfg(unix)]
+    #[test]
+    fn a_link_put_in_place_of_a_recorded_folder_gets_no_grant_once_the_write_is_gone() {
+        let d = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let (work, outbox) = (root.join("work"), root.join("outbox"));
+        let bin = work.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&outbox).unwrap();
+        let paths = NodePaths::new(root.join("cfg"), root.join("state"));
+        let (lab, home) = (
+            container(&paths, &node("lab")),
+            container(&paths, &node("home")),
+        );
+        let mut cfg = NodeConfig::default();
+        cfg.centers
+            .push(center("lab", &[(&work, "rw"), (&bin, "rwx")]));
+        cfg.centers.push(center("home", &[(&bin, "r")]));
+        for c in &mut cfg.centers {
+            c.policy.set_placed(&bin.display().to_string(), true);
+        }
+        let reaches = |want: &[Grant], c: &str, p: &Path| {
+            want.iter().any(|g| g.container == c && within(&g.path, p))
+        };
+        let want = wanted(&cfg, &paths, &root, &Platform::Unix);
+        assert!(
+            reaches(&want, &lab, &bin) && reaches(&want, &home, &bin),
+            "{want:?}"
+        );
+
+        // A command of `lab` replaces `bin` by a link to the outbox.
+        std::fs::remove_dir(&bin).unwrap();
+        std::os::unix::fs::symlink(&outbox, &bin).unwrap();
+        let now = wanted(&cfg, &paths, &root, &Platform::Unix);
+        assert!(
+            !reaches(&now, &lab, &outbox) && !reaches(&now, &home, &outbox),
+            "{now:?}"
+        );
+
+        // `lab` has `r` on `work` only now: nothing shows the link any more,
+        // and the record still keeps the outbox clear.
+        cfg.centers[0].policy.folders[0].access = Access::parse("r").unwrap();
+        let narrowed = wanted(&cfg, &paths, &root, &Platform::Unix);
+        assert!(!reaches(&narrowed, &lab, &outbox), "{narrowed:?}");
+        assert!(!reaches(&narrowed, &home, &outbox), "{narrowed:?}");
+        assert!(reaches(&narrowed, &lab, &work), "{narrowed:?}");
+        // The pairing is removed: `home` keeps clear of the outbox too.
+        cfg.centers.remove(0);
+        let alone = wanted(&cfg, &paths, &root, &Platform::Unix);
+        assert!(!reaches(&alone, &home, &outbox), "{alone:?}");
+
+        // Without the record the link is followed once `w` is gone.
+        cfg.centers[0].policy.places.clear();
+        let loose = wanted(&cfg, &paths, &root, &Platform::Unix);
+        assert!(reaches(&loose, &home, &outbox), "{loose:?}");
+    }
+
     /// The access list of `path` as icacls prints it.
     #[cfg(windows)]
     fn icacls(path: &Path) -> String {
@@ -4094,6 +4156,66 @@ mod tests {
         assert!(s.errors[0].contains("junction"), "{s:?}");
         assert!(carries(&outbox, &lab, "w"), "{}", icacls(&outbox));
 
+        std::fs::remove_dir(&bin).unwrap();
+        std::fs::create_dir(&bin).unwrap();
+        let s = windows_sync(&paths, &wanted(&cfg, &paths, &root, &platform), &mut |_| {});
+        assert!(s.errors.is_empty(), "{s:?}");
+        assert!(carries(&bin, &lab, "rwx"), "{}", icacls(&bin));
+        let s = remove_all(&paths, &[node("lab")], &mut |_| {});
+        assert!(s.errors.is_empty(), "{s:?}");
+    }
+
+    /// On Windows, issue #77: a junction a command made in place of a granted
+    /// folder while the outer folder had `w` gets no grant after that `w` is
+    /// taken off, when the node recorded the folder at its real place; the
+    /// folder the junction leads to keeps its own list. A plain folder there
+    /// again gets its grant.
+    #[cfg(windows)]
+    #[test]
+    fn a_junction_in_place_of_a_recorded_folder_gets_no_grant_once_the_write_is_gone() {
+        let d = tempfile::tempdir().unwrap();
+        let root = canonical(d.path());
+        let paths = NodePaths::new(root.join("config"), root.join("state"));
+        let (work, outbox) = (root.join("work"), root.join("outbox"));
+        let bin = work.join("bin");
+        for p in [&bin, &outbox] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        let mut cfg = NodeConfig::default();
+        cfg.centers
+            .push(center("lab", &[(&work, "rw"), (&bin, "rwx")]));
+        cfg.centers[0]
+            .policy
+            .set_placed(&bin.display().to_string(), true);
+        let lab = container(&paths, &node("lab"));
+        let platform = crate::paths::platform();
+        let s = windows_sync(&paths, &wanted(&cfg, &paths, &root, &platform), &mut |_| {});
+        assert!(s.errors.is_empty(), "{s:?}");
+        assert!(carries(&bin, &lab, "rwx"), "{}", icacls(&bin));
+
+        // A command replaces `bin` by a junction to the outbox, and `w` is
+        // taken off `work`.
+        std::fs::remove_dir(&bin).unwrap();
+        junction(&bin, &outbox);
+        cfg.centers[0].policy.folders[0].access = Access::parse("r").unwrap();
+        let now = wanted(&cfg, &paths, &root, &platform);
+        assert!(now.iter().all(|g| !within(&g.path, &outbox)), "{now:?}");
+        let s = windows_sync(&paths, &now, &mut |_| {});
+        assert!(s.errors.is_empty() && s.stale.is_empty(), "{s:?}");
+        assert!(
+            !icacls(&outbox).contains("S-1-15-2-"),
+            "{}",
+            icacls(&outbox)
+        );
+        // Without the record the junction is followed.
+        cfg.centers[0].policy.places.clear();
+        let loose = wanted(&cfg, &paths, &root, &platform);
+        assert!(loose.iter().any(|g| within(&g.path, &outbox)), "{loose:?}");
+
+        // A plain folder at the recorded place gets its grant again.
+        cfg.centers[0]
+            .policy
+            .set_placed(&bin.display().to_string(), true);
         std::fs::remove_dir(&bin).unwrap();
         std::fs::create_dir(&bin).unwrap();
         let s = windows_sync(&paths, &wanted(&cfg, &paths, &root, &platform), &mut |_| {});

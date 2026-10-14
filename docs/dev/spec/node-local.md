@@ -60,8 +60,10 @@ the file-system ids are root's without root's capabilities
 (`CAP_DAC_OVERRIDE`, `CAP_DAC_READ_SEARCH`, `CAP_FOWNER`), so these checks
 and the `fs` actions reach only what root owns or what the permission bits
 open to others; a command itself is really root. The CLI, which
-runs as `nerve` on the installed node, keeps a folder it may not look into
-in its normal form (`folder add`), unresolved. A node not installed as a
+runs as `nerve` on the installed node, cannot judge a folder it may not look
+into: with a node running, `folder add` is done by the node as the account
+(`folder.add`, §5); with none, the folder is kept in its normal form,
+unresolved, and not recorded. A node not installed as a
 service runs commands as its own user and refuses a `machine.user` it
 cannot switch to. The installed node is known by its folders or its user,
 not by its capabilities: started without them (by hand, as `nerve`), it
@@ -356,6 +358,7 @@ unknown = false             # the center answered 401
 mode = "allowlist"          # allowlist | folder | user (the default is allowlist)
 until = 1790000000000  # optional, folder and user: ms since the epoch; then allowlist
 folders = [{ path = "/home/u/proj", access = "rwx" }]  # folder mode; r w x in any mix, "" for none
+places = ["/home/u/proj"]  # folders `folder add` recorded at their real place; the owner's, a center's write keeps it
 caps = { "fs.write" = "off" }   # on | off | hidden
 protected = { extra = [], allow = [] }  # a center may add to extra; only the owner removes or releases,
                                         # also by a folder at or inside an entry
@@ -595,8 +598,26 @@ answer. For each call the node takes the center's policy and, in this order:
    it leads to with its flags, and a folder that has become such a link
    since is left out of a command's Landlock rules, as is a folder whose path
    crosses a link that lies inside a `w` folder of any center (a command may
-   have put the link there). Only the `w` folders in the config count, and a
-   command that runs without Landlock can make a link elsewhere. A folder
+   have put the link there). A folder the owner added with `folder add` is
+   stored by its resolved path and listed in `policy.places`; such a folder
+   is also left out when its path resolves to another place now, whatever the
+   `w` folders say, and a center's settings document cannot change the list.
+   `folder add` itself does not follow a link that lies inside a `w` folder
+   of any center: it refuses, so that a link a command made is not stored,
+   and recorded, at its target. It judges and resolves in one pass
+   (`exec::settle`): a link is judged by the folder that holds it as spelled
+   and as it resolves, either inside a `w` folder refuses it and so does a
+   holder that is not the place it was looked at as, and the place the pass
+   ends at must resolve to itself, so that what is stored is what was looked
+   at. A `w` folder that cannot be resolved only makes a clean walk "cannot
+   tell" (the folder is stored as given, not recorded). On Windows the walk
+   goes through a `subst` drive's folder name by name (`QueryDosDeviceW`),
+   never through the drive resolved, writes out the short names of the
+   folder it maps, and refuses a path with a drive but no root or that is not
+   on a drive letter. A link target is taken the same way: a drive, a volume
+   root (as the drive or folder it is mounted at), or refused.
+   For a folder without an entry only the `w` folders in the config count,
+   and a command that runs without Landlock can make a link elsewhere. A folder
    that holds a protected entry gives a command in `folder` mode none of it:
    its Landlock rules take the folder's other entries, level by level down
    to the protected one, in the read, write and run sets alike, so the
@@ -759,6 +780,7 @@ Methods:
 | `config.read` | | `node.toml` and its `version` |
 | `config.write` | `config`, `if_version` | replaces it when the version matches |
 | `config.accept` | | takes `node.toml` as it is after it was refused, and signs it (§1) |
+| `folder.add` | `center`, `path`, `access` | `folder add`, done by the node so that it is judged as the account commands run as (`exec::settle`): the path is followed a link at a time and must resolve to itself, the folder is stored at that place with `access` (replacing the entry there) and recorded in `policy.places`; `{stored, recorded, mode}`. An error, with nothing changed, when the path crosses a link inside a `w` folder of any center, leads nowhere, or changed while it was looked at. Where the node cannot tell either (a folder it may not look into, or a `w` folder it cannot resolve) the folder is stored as given, `recorded` is false, and a record it had stays. The CLI uses it whenever a node runs |
 | `reload` | | rereads `node.toml`; only a file the node signed is applied (§1) |
 | `sudo.status` | | `{sudo: "on"|"off"}` |
 | `sudo.on` | `password` | checks it with `sudo -v` and turns the switch on (§4) |
@@ -792,12 +814,18 @@ answered, which takes long on a large folder. Methods:
 | Method | Params | |
 |---|---|---|
 | `status` | | as on the socket |
-| `folder.add` | `center`?, `path`, `access` (`r`, `w`, `x`, at least one) | adds the folder, or replaces its rights |
+| `folder.add` | `center`?, `path`, `access` (`r`, `w`, `x`, at least one), `recorded` | adds the folder, or replaces its rights (the same place in another spelling is the same folder); with `recorded` the folder is also entered in `policy.places`, as the real place the CLI settled it at |
 | `folder.set` | `center`?, `path`, `given`, `changes` (1 to 64 of `=rwx`, `+x`, `-w`) | changes the rights of a folder the center has |
 | `folder.rm` | `center`?, `path`, `given` | takes a folder away |
 
-`path` is the folder resolved by the CLI, `given` as typed; `set` and `rm`
-find the folder by either. Without `center` the only paired center is meant.
+`path` is the folder as the CLI judged it: for `add` the real place it
+settled the path at (`exec::settle`, as this process sees it: the pipe takes
+the change, not the judging, which on Windows is the CLI's alone), for `set`
+and `rm` the stored folder it found (`stored_folder`). `given` is the folder
+as typed or, after that lookup, the stored path again; `set` and `rm` find the
+folder by either. A `rm` takes the folder's `places` entry with it (the
+config's validation drops an entry that names no folder). Without `center`
+the only paired center is meant.
 While `node.toml` is newer than the config in force (the CLI wrote another
 change there for the next start), a folder change is refused: the node saves
 its whole config and would undo that change.

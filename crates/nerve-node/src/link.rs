@@ -1359,7 +1359,7 @@ impl Link {
 /// The node's file access as `account` on this thread while the result
 /// lives ([`crate::account::FsAs`]); nothing for the node's own user.
 #[cfg(target_os = "linux")]
-fn act_as(
+pub(crate) fn act_as(
     account: Option<&crate::service::Account>,
 ) -> Result<Option<crate::account::FsAs>, RpcError> {
     account
@@ -1393,7 +1393,7 @@ fn act_as(
 }
 
 #[cfg(not(any(target_os = "linux", windows)))]
-fn act_as(account: Option<&crate::service::Account>) -> Result<Option<()>, RpcError> {
+pub(crate) fn act_as(account: Option<&crate::service::Account>) -> Result<Option<()>, RpcError> {
     match account {
         Some(a) => Err(RpcError::new(
             ErrorCode::Unavailable,

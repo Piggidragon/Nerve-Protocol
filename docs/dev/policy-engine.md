@@ -225,7 +225,41 @@ center's local name):
   container may not see, so a PowerShell command starts with a drive `Work:`
   rooted at its working folder.
 - The container has the network, as Landlock leaves it, but not the loopback
-  address.
+  address. Its token carries three capabilities, `internetClient`,
+  `internetClientServer` and `privateNetworkClientServer`, and nothing else
+  (`appcontainer::run`).
+
+What the container does not stop, in short (the user docs list each point with
+how it was checked on Windows 10, build 10.0.26300, and what was not:
+[modes](../user/modes.md#what-the-appcontainer-does-not-stop)):
+
+- The network: out to the internet and the local network, no filter by
+  address or port; not the machine itself (its loopback address, its own
+  address and its name). It can listen; the Windows Firewall decides who
+  reaches the port, the node adds no rule.
+- The environment: the shim passes the node's own to `CreateProcessW`
+  (`lpEnvironment` is null). Windows alone rewrites `TEMP`, `TMP` and
+  `LOCALAPPDATA` to the container's folder under `Packages\<name>\AC`, which
+  the container may write without a grant and Windows removes with the
+  profile.
+- What Windows opens to every AppContainer: the Windows folder, Program Files,
+  parts of `HKLM` and `HKCU` (reads only), pipes and other endpoints whose
+  security names ALL APPLICATION PACKAGES. Other processes of the user are not
+  visible to it; WMI, the task scheduler, the service manager and `RunAs`
+  refused it in the checks. The node blocks none of these itself.
+- The token: low integrity, `SeChangeNotifyPrivilege` and
+  `SeIncreaseWorkingSetPrivilege` only, also under an elevated node. No limit
+  on memory, CPU, disk or process count: the job only ends processes
+  (`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`).
+- Files a command leaves in a `w` folder are run by others outside the
+  container. Links and permission entries: above.
+- A `sudo` command (installed service only) is started by `winsudo` outside
+  the container, whatever the folders say (`exec_run`: `folder` is false for
+  it); the sudo list alone gates it, also where `folder` mode runs nothing else.
+- Not checked: the Credential Manager and DPAPI for the user (the test session
+  could not use them), the clipboard against a real desktop, ALPC ports and
+  COM servers, network shares. With the node's keys in the Credential
+  Manager, `folder` mode runs no command (`keys_kept_from_commands`).
 
 ## The sudo switch
 

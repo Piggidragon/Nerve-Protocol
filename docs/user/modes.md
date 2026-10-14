@@ -189,13 +189,12 @@ folders.
 - PowerShell starts on a drive `Work:` that is the working folder, because the
   container may not look at the folders above it. Relative paths and native
   programs work as usual. `cd` to a whole path above the folder does not.
-- The command has the network, but not `localhost`, and no folder for
-  temporary files. It has its own desktop, so it cannot reach your windows or
-  clipboard.
-- What the AppContainer does not stop: what Windows opens to every
-  AppContainer (reading the system folders, the network), and work a command
-  gets another program outside the container to do for it, such as a service
-  or the task scheduler.
+- The command has the network, but not `localhost`. It has its own desktop,
+  so it cannot reach your windows or clipboard, and Windows gives its
+  container a folder of its own for temporary files.
+- What the AppContainer does not stop (the network, what Windows opens to
+  every AppContainer, the environment the command starts with, and more) has
+  [its own list](#what-the-appcontainer-does-not-stop) below.
 - A command sets the permissions of a folder or file it makes, as every
   Windows program may, so it can give them an entry of its own, of three
   kinds: for its pairing's container (`S-1-15-2-…`), for all AppContainers
@@ -260,6 +259,121 @@ confinement when it starts, in its output and its [log](logs.md):
 `node daemon running (…, confinement appcontainer, …)`. The center sees it in
 the node's `exec` state, `confinement appcontainer`, or `none` on the
 installed service.
+
+### What the AppContainer does not stop
+
+The container keeps a command out of the files you did not grant. It is not
+a box around everything else. This is what a `folder` mode command can still
+do on Windows, as far as the owner might expect otherwise. Each point says
+how it is known. "Checked" means a command was started in an AppContainer
+the way the node starts one, on Windows 10 Pro (build 10.0.26300) from an
+elevated administrator session over SSH; that is one machine, and Windows
+and other software may open more or less to AppContainers elsewhere. "Code"
+means it follows from the node's code. What is marked "not checked" is not
+known.
+
+- **The network.** The container has the capabilities `internetClient`,
+  `internetClientServer` and `privateNetworkClientServer` (code). Checked: a
+  command connects to the internet, resolves names and connects to other
+  machines of the local network. Nothing in the node filters by address or
+  port. So whatever a command may read it can send out, and it can download
+  into a folder where it may write and run what it fetched. It cannot reach
+  the machine itself: `127.0.0.1`, the machine's own network address and its
+  computer name all timed out (checked), so a service that listens only on
+  this machine is out of reach, and one on another machine is not. A command
+  can listen on a port (checked). Whether another machine gets through to it
+  is the Windows Firewall's say: with the firewall on and no rule for the
+  port it did not, with a rule for the port it did (checked). The node adds
+  no firewall rule (code).
+- **The environment.** The command starts with the node's environment: the node
+  clears nothing (code). Windows replaces `TEMP`, `TMP` and
+  `LOCALAPPDATA` with the container's own folder (checked). A secret in a
+  variable of the process that started the node, a token say, is visible to
+  every command. Start the node without such variables.
+- **Files outside the folders.** Windows opens its own folder and Program
+  Files to every AppContainer, and a command reads and runs programs there:
+  what Windows's permissions on a file below them leave to all AppContainers
+  is readable, also software settings you keep in Program Files. Checked:
+  `C:\Windows`, `C:\Program Files` and `C:\Program Files (x86)` list, and
+  a file below `C:\Windows` (the hosts file) reads. Refused: the listing of `C:\`, `C:\Users`, your profile and its
+  `Desktop` and `AppData`, `C:\ProgramData`, `C:\Windows\Temp` and
+  `C:\Windows\System32\config`, and writing to `C:\`, `C:\Users\Public`,
+  `C:\ProgramData` and `C:\Windows\Temp`. A command also writes the
+  container's own folder, `%LOCALAPPDATA%\Packages\<container>\AC` (it
+  holds `Temp`), without any grant. It stays between the commands of the
+  pairing, and Windows deletes it with the container's profile, which the
+  node removes with the container's last grant (checked, code).
+- **The registry.** Checked: a command reads the machine part (`HKLM`, for
+  example the Windows version), lists the keys of your `HKCU` and reads
+  `HKCU\Environment`, which holds the environment variables you set for
+  yourself. It was refused the `Run` key and every write it tried, to `HKCU`
+  and `HKLM`. This is not a map of the registry: Windows decides per key.
+- **Other processes of your user.** Checked: the container sees its own
+  processes only (two, in the test), could not look up a process of yours by
+  its number, and so could not stop it. Everything the command starts itself
+  stays in the container and in its job. Not checked: other ways to reach a
+  process, such as a window of the same desktop (it has its own).
+- **Work another program does for it.** Checked with the usual tools, none
+  of these got through: WMI (`Invoke-CimMethod Win32_Process Create`,
+  `tasklist`), the task scheduler (`schtasks /create`), the service manager
+  (`sc.exe`, `Start-Service`), `Start-Process -Verb RunAs`, `Start-Process`
+  on a document or a web address, and `Shell.Application` and
+  `WScript.Shell`. The node does not block these itself: a service, COM
+  server or pipe that Windows or a program on the machine opens to all
+  AppContainers can be used. What such a program starts is its own process,
+  outside the container and outside the job ([Windows](platforms.md#windows)).
+  Not checked: other interfaces, such as direct calls to a service or the
+  task scheduler without these tools.
+- **Named pipes.** Checked: the pipes of system services (`lsass`, `svcctl`,
+  `atsvc`, `srvsvc`, `wkssvc`, `ntsvcs`, `eventlog`, `InitShutdown`) and a
+  pipe a program of yours made with the default security were refused. The
+  RPC endpoint mapper (`epmapper`) and a pipe made open to all AppContainers
+  were opened. So a program of yours that makes a pipe open to all
+  AppContainers can be talked to. Not checked: other local endpoints (COM
+  servers, ALPC ports).
+- **The clipboard and your windows.** The command has a window station and
+  desktop of its own (code). Checked: reading the clipboard fails. Not
+  checked against a signed-in desktop with something on its clipboard: the
+  test session had no desktop.
+- **Credentials.** Not checked: the Credential Manager, since the test
+  session could not use it. The container has none of the capabilities for
+  your sign-in credentials or certificates (code), so it should not reach
+  network shares as you; not checked. With the node's keys in the
+  Credential Manager (`machine.secret_storage = keyring`) `folder` mode runs
+  no command on Windows (code, [keys](config.md#where-the-node-keeps-its-keys)).
+  Checked: a blob protected with DPAPI for the machine can be opened by the
+  command. A blob for your user could not be made in the test session, so
+  that is not checked. The node's own keys are files in folders that get no
+  grant (code).
+- **The token.** Checked: low integrity level, no privileges but
+  `SeChangeNotifyPrivilege` and `SeIncreaseWorkingSetPrivilege`, and
+  `Start-Process -Verb RunAs` was refused. That held in a session with the
+  administrator's elevated token, so a node you allowed to run elevated
+  ([root and administrator](platforms.md#root-and-administrator)) does not
+  hand that token to the command. The container does not limit memory, CPU,
+  disk or the number of processes; the job only ends them (code).
+- **What a granted folder allows.** The flags are the rights, and a command
+  in the folder is in the container too. A command with `w` can leave files
+  there that you, a build or an editor run later, outside the container: a
+  script, a build file, a Git hook, an install script of a package. The
+  container holds the command, not the files it writes. Links: a command
+  made a hard link to a file in its own folder and was refused one to a file
+  outside (checked). It made a junction to a folder inside its own folder and
+  was refused one to `C:\Windows`, `C:\Program Files` and `C:\Users`
+  (checked), and a symbolic link needs a privilege it does not have
+  (checked). What that means for a folder inside another granted folder, and
+  for hard links, is in the list above. The permission entries a command
+  gives what it makes are there too.
+- **The sudo path.** A command on the [sudo list](sudo.md#sudo-on-windows)
+  runs as the account commands run as, with that account's administrator
+  token, in a job but not in an AppContainer, and in every mode (code). The
+  folders do not apply to it: only the switch, the sudo list, the
+  [deny rules](rules.md#deny-a-command) and the
+  [protected paths](protected-paths.md) decide. On Windows sudo works on the
+  node installed as a service only, and there `folder` mode runs no other
+  command yet, since the AppContainer is not started for the service's
+  account. So on that node a `folder` mode command runs only when the sudo
+  list names it.
 
 ## `user` mode
 

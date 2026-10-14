@@ -684,7 +684,7 @@ Methods:
 | `config.read` | | `node.toml` and its `version` |
 | `config.write` | `config`, `if_version` | replaces it when the version matches |
 | `config.accept` | | takes `node.toml` as it is after it was refused, and signs it (§1) |
-| `folder.place` | `center`, `path` | records the listed folder at `path` in `policy.places` when it is its own place, judged as the account commands run as; `{placed}`. The CLI asks it after `folder add` for a folder it could not look into itself (the installed node's CLI runs as `nerve`) |
+| `folder.place` | `center`, `path` | resolves the listed folder at `path` as the account commands run as, stores it at the place it leads to (replacing the entry, with its access, when that is another path) and records it in `policy.places`; `{placed, place}`, `placed` false when it cannot be resolved for the account. The CLI asks it after `folder add` for a folder it could not look into itself (the installed node's CLI runs as `nerve`) |
 | `reload` | | rereads `node.toml`; only a file the node signed is applied (§1) |
 | `sudo.status` | | `{sudo: "on"|"off"}` |
 | `sudo.on` | `password` | checks it with `sudo -v` and turns the switch on (§4) |

@@ -524,6 +524,44 @@ fn led_away(path: &Path, writable: &[PathBuf]) -> Option<String> {
     None
 }
 
+/// The first place the resolution of `path` lands at that `wanted` accepts,
+/// taken a link at a time as [`led_away`] does: where `path` itself ends, and
+/// then where each link it ends at leads, the link itself judged before it is
+/// followed. A folder the path only passes does not count. `None` when no
+/// such place is accepted, and where the resolution runs out (a dangling
+/// link, a loop of links): it needs no part of the path to exist.
+pub fn lands_at(path: &Path, wanted: impl Fn(&Path) -> bool) -> Option<PathBuf> {
+    // The most links one resolution may cross, as the kernel's limit.
+    const LINKS: usize = 40;
+    let mut here = PathBuf::new();
+    let mut todo = steps(path);
+    let mut crossed = 0;
+    while let Some(step) = todo.pop() {
+        match step {
+            Step::Top(top) => here = top,
+            Step::Up => {
+                here.pop();
+            }
+            Step::Name(name) => {
+                let at = here.join(&name);
+                if todo.is_empty() && wanted(&at) {
+                    return Some(at);
+                }
+                let link = std::fs::symlink_metadata(&at).is_ok_and(|m| m.is_symlink());
+                if !link {
+                    here = at;
+                    continue;
+                }
+                crossed += 1;
+                todo.extend(steps(
+                    &std::fs::read_link(&at).ok().filter(|_| crossed <= LINKS)?,
+                ));
+            }
+        }
+    }
+    None
+}
+
 /// One step of a path, as [`led_away`] takes it.
 enum Step {
     /// Where an absolute path starts: the root, with the drive on Windows.
@@ -2139,6 +2177,38 @@ mod tests {
         std::os::unix::fs::symlink(&docs, work.join("a")).unwrap();
         let spec = landlock_spec(&reader, &home, &[], &writable);
         assert!(!spec_reaches(&spec, &docs), "{spec:?}");
+    }
+
+    /// `lands_at` follows a path a link at a time and answers with the first
+    /// place the path lands at that is wanted: its own end, then where each
+    /// link at an end leads, a link itself judged before it is followed. A
+    /// folder it only passes does not count, and a dangling link or a loop
+    /// ends it.
+    #[test]
+    fn a_path_lands_where_its_links_lead() {
+        let d = tempfile::tempdir().unwrap();
+        let (home, _, docs) = nested_home(&d);
+        let (real, code) = (home.join("data/real"), home.join("code"));
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink("data/real", &code).unwrap();
+        let at = |wanted: &Path| lands_at(&code, |p| p == wanted);
+        assert_eq!(at(&real), Some(real.clone()));
+        assert_eq!(at(&code), Some(code.clone()));
+        assert_eq!(at(&docs), None);
+        // The place itself is a link now: judged as a link, not followed.
+        std::fs::remove_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&docs, &real).unwrap();
+        assert_eq!(at(&real), Some(real.clone()));
+        assert_eq!(at(&docs), Some(docs.clone()));
+        // A folder passed on the way is not where the path lands.
+        assert_eq!(lands_at(&real.join("sub"), |p| p == real), None);
+        assert_eq!(lands_at(&home.join("data/gone"), |p| p == real), None);
+        // Dangling links and loops end it.
+        std::os::unix::fs::symlink(home.join("nowhere"), home.join("dangling")).unwrap();
+        assert_eq!(lands_at(&home.join("dangling"), |_| false), None);
+        std::os::unix::fs::symlink("two", home.join("one")).unwrap();
+        std::os::unix::fs::symlink("one", home.join("two")).unwrap();
+        assert_eq!(lands_at(&home.join("one"), |p| p == docs), None);
     }
 
     /// Links that lead into one another are no way to a folder.

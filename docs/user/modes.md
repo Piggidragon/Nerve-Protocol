@@ -71,10 +71,12 @@ of the command's sandbox: it was added at its own place and its path leads to
 <place> now …`). That holds whoever made the link, also after you took `w`
 off the folder above or removed the pairing that had it. The folder is back
 once its path leads to the place you added again. To take the place the path
-leads to now, `folder rm` the folder and `folder add` it again. Name it as
-it is stored, with the path you gave to `folder add` (a trailing slash does
-not matter): `folder rm` and `folder set` act on that entry, not on the
-folder the link leads to.
+leads to now, `folder rm` the folder and `folder add` it again. Name it with
+the path you gave to `folder add`, or the one `folder ls` shows (a trailing
+slash does not matter). `folder rm` and `folder set` find the entry also
+through links of your own, and where the link that replaced it cannot be
+resolved (it dangles or loops), and act on that entry, not on the folder the
+link leads to now.
 
 `folder rm` and `center rm` take the record away with the folder. A center
 with the [settings grant](settings-grant.md) cannot add or change entries of
@@ -91,12 +93,16 @@ record refuses a `node.toml` that has `places`: remove the key
 it.
 
 On the [installed node](service.md) on Linux the CLI runs as the node's own user
-(`nerve`), which may not look into your home, so it cannot tell that a folder
-there is its own place. `folder add` then asks the running node, which looks
-as the account the commands run as. With no node running, or when the node
-cannot tell either, the folder is stored but not recorded, and `folder add`
-says so (`note: … is not recorded at its real place …`): start the node and
-add the folder again. Check for links (`find <folder> -type l` on Linux,
+(`nerve`), which may not look into your home, so it can neither follow the
+links on a path there nor tell that a folder is its own place. `folder add`
+then asks the running node, which looks as the account the commands run as: it
+stores the real place the path leads to, as `folder add` does where it can
+look (the command says so when that is not the path you gave), and records it.
+With no node running, or when the node cannot resolve the path either (no
+account is chosen, or a link on it dangles), the folder is stored as given
+and not recorded, and `folder add` says so (`note: … is not recorded at its
+real place …`): start the node, fix the path, and add the folder again. Check
+for links (`find <folder> -type l` on Linux,
 `dir /AL /S <folder>` on Windows) before you take `w` off the folder above
 such a folder.
 

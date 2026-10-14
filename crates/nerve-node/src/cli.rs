@@ -1187,13 +1187,10 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             center,
         }) => {
             let (changes, center) = take_center_flag(changes, center)?;
-            let real = resolve_folder(&path)?;
-            let spelled = spelled_folder(&path);
             let access = std::cell::Cell::new(Access::NONE);
             let stored = std::cell::RefCell::new(String::new());
             let name = edit_center(&paths, &center, |e| {
-                let at = stored_folder(&e.policy.folders, &real, spelled.as_deref())
-                    .ok_or_else(|| format!("{real} is not a folder of this center"))?;
+                let at = stored_folder(&e.policy.folders, &path)?;
                 let f = e
                     .policy
                     .folders
@@ -1221,12 +1218,9 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             Ok(())
         }
         Cmd::Folder(FolderCmd::Rm { path, center }) => {
-            let real = resolve_folder(&path)?;
-            let spelled = spelled_folder(&path);
             let stored = std::cell::RefCell::new(String::new());
             let name = edit_center(&paths, &center, |e| {
-                let at = stored_folder(&e.policy.folders, &real, spelled.as_deref())
-                    .ok_or_else(|| format!("{real} is not a folder of this center"))?;
+                let at = stored_folder(&e.policy.folders, &path)?;
                 e.policy.folders.retain(|f| f.path != at);
                 *stored.borrow_mut() = at;
                 Ok(())
@@ -1809,12 +1803,31 @@ async fn add_folder(
         Ok(())
     })
     .await?;
-    w(out, format!("{name}: folder {real} {}", access.to_chmod()));
-    if !placed && !record_by_node(paths, &name, &real).await {
+    // What this command could not judge, the running node does as the
+    // account the commands run as; it stores the real place the path leads
+    // to, as this command does where it can look.
+    let asked = if placed {
+        None
+    } else {
+        record_by_node(paths, &name, &real).await
+    };
+    let stored = asked.clone().unwrap_or_else(|| real.clone());
+    w(
+        out,
+        format!("{name}: folder {stored} {}", access.to_chmod()),
+    );
+    if !placed && asked.is_none() {
         w(
             out,
             format!(
                 "note: {real} is not recorded at its real place, since this command cannot tell that it is (the installed node's CLI may not look into the account's home) and no running node could: a link that replaces the folder later is followed once no `w` folder shows it, see modes.md \"A folder keeps the place you added\""
+            ),
+        );
+    } else if stored != real {
+        w(
+            out,
+            format!(
+                "note: {real} leads to {stored} for the account the commands run as; the folder is stored there"
             ),
         );
     }
@@ -1833,21 +1846,25 @@ async fn add_folder(
 
 /// Asks the running node to record the folder at `path` of `center` at its
 /// real place, which it judges as the account the commands run as
-/// (`folder.place`): this command may not look into that account's home.
-/// False when no node runs, this platform has no control socket, or the node
-/// cannot tell either.
-async fn record_by_node(paths: &NodePaths, center: &str, path: &str) -> bool {
+/// (`folder.place`): this command may not look into that account's home. The
+/// answer is the place the folder is stored at and recorded now (`path`, or
+/// the real place the path leads to for that account). `None` when no node
+/// runs, this platform has no control socket, or the node cannot tell either.
+async fn record_by_node(paths: &NodePaths, center: &str, path: &str) -> Option<String> {
     #[cfg(unix)]
     {
         let params = json!({"center": center, "path": path});
-        nerve_transport::ctl::call(&paths.ctl_socket(), "folder.place", params)
+        let v = nerve_transport::ctl::call(&paths.ctl_socket(), "folder.place", params)
             .await
-            .is_ok_and(|v| v["placed"] == true)
+            .ok()?;
+        (v["placed"] == true)
+            .then(|| v["place"].as_str().map(str::to_string))
+            .flatten()
     }
     #[cfg(not(unix))]
     {
         let _ = (paths, center, path);
-        false
+        None
     }
 }
 
@@ -1988,29 +2005,38 @@ fn parse_enum<T: serde::de::DeserializeOwned>(s: &str, choices: &str) -> Result<
     serde_json::from_value(json!(s)).map_err(|_| format!("{s:?}: expected {choices}"))
 }
 
-/// `p` as it was spelled, made absolute and tidy but not resolved: the way a
-/// folder is stored when a link has replaced it since, whose real place
-/// (`resolve_folder`) is then another folder's.
-fn spelled_folder(p: &Path) -> Option<String> {
-    let abs = if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        std::env::current_dir().ok()?.join(p)
-    };
-    nerve_policy::paths::normal_folder(&abs.display().to_string()).ok()
-}
-
-/// The path of the stored folder `folder set` and `folder rm` mean: the one
-/// spelled that way, else the one at the real place the path leads to.
-fn stored_folder(folders: &[Folder], real: &str, spelled: Option<&str>) -> Option<String> {
+/// The path of the stored folder `folder set` and `folder rm` mean by `path`,
+/// found before the path is resolved, which fails where a dangling link or a
+/// loop of links stands now. In this order: the folder the path is spelled as
+/// (made absolute and tidy, no link followed); the folder its resolution lands
+/// at, a link at a time (`folder add` stored the real place of a path through
+/// a link of the owner's, and a link may have replaced that place since); the
+/// folder at the real place the path leads to.
+fn stored_folder(folders: &[Folder], path: &Path) -> Result<String, String> {
     use nerve_policy::paths::within;
-    let same =
-        |a: &str, b: &str| within(Path::new(a), Path::new(b)) && within(Path::new(b), Path::new(a));
-    folders
-        .iter()
-        .find(|f| spelled.is_some_and(|s| same(s, &f.path)))
-        .or_else(|| folders.iter().find(|f| f.path == real))
-        .map(|f| f.path.clone())
+    let same = |a: &Path, b: &Path| within(a, b) && within(b, a);
+    let stored = |p: &Path| {
+        folders
+            .iter()
+            .find(|f| same(p, Path::new(&f.path)))
+            .map(|f| f.path.clone())
+    };
+    let abs = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| e.to_string())?
+            .join(path)
+    };
+    let spelled = nerve_policy::paths::normal_folder(&abs.display().to_string()).ok();
+    if let Some(f) = spelled.and_then(|s| stored(Path::new(&s))) {
+        return Ok(f);
+    }
+    if let Some(f) = crate::exec::lands_at(&abs, |p| stored(p).is_some()).and_then(|p| stored(&p)) {
+        return Ok(f);
+    }
+    let real = resolve_folder(path)?;
+    stored(Path::new(&real)).ok_or_else(|| format!("{real} is not a folder of this center"))
 }
 
 /// Folders are stored resolved (symlinks followed), the way the policy
@@ -2958,6 +2984,89 @@ mod tests {
         );
         assert_eq!(access(&docs), None);
         assert_eq!(access(&work).as_deref(), Some("rw"));
+    }
+
+    /// `folder rm` and `folder set` find the stored folder by the path the
+    /// owner gave `folder add`, when that went through a link of the owner's
+    /// and the stored place has been replaced by a link since; and where a
+    /// dangling link or a loop of links stands in the folder's place, which
+    /// resolving the path would refuse. A folder the path only passes is not
+    /// the folder it names.
+    #[cfg(unix)]
+    #[test]
+    fn folder_rm_and_set_reach_a_folder_through_links_and_where_none_resolves() {
+        let (d, paths) = setup(&["home"]);
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let (work, docs, data) = (root.join("work"), root.join("docs"), root.join("data"));
+        let (real, code) = (data.join("real"), root.join("code"));
+        for p in [&work.join("bin"), &work.join("sub"), &docs, &real] {
+            std::fs::create_dir_all(p).unwrap();
+        }
+        std::os::unix::fs::symlink(&real, &code).unwrap();
+        for (p, rights) in [
+            (&work, "+rw"),
+            (&work.join("bin"), "+r"),
+            (&code, "+r"),
+            (&docs, "+r"),
+        ] {
+            run(&paths, &["folder", "add", p.to_str().unwrap(), rights]).unwrap();
+        }
+        let listed = || -> Vec<String> {
+            load(&paths).centers[0]
+                .policy
+                .folders
+                .iter()
+                .map(|f| f.path.clone())
+                .collect()
+        };
+        let has = |p: &Path| listed().contains(&p.display().to_string());
+        assert!(has(&real) && !has(&code), "stored at the real place");
+
+        // The stored place is replaced by a link to `docs`: `code`, the path
+        // the owner gave, still names the stored folder and not `docs`.
+        std::fs::remove_dir(&real).unwrap();
+        std::os::unix::fs::symlink(&docs, &real).unwrap();
+        let out = run(&paths, &["folder", "set", code.to_str().unwrap(), "+x"]).unwrap();
+        assert!(
+            out.contains(&format!("folder {} r-x", real.display())),
+            "{out}"
+        );
+        let out = run(&paths, &["folder", "rm", code.to_str().unwrap()]).unwrap();
+        assert!(
+            out.contains(&format!("removed {}", real.display())),
+            "{out}"
+        );
+        assert!(!has(&real) && has(&docs));
+
+        // A folder the path only passes is not the folder it names.
+        let e = run(
+            &paths,
+            &["folder", "rm", work.join("sub").to_str().unwrap()],
+        )
+        .unwrap_err();
+        assert!(e.contains("not a folder of this center"), "{e}");
+        assert!(has(&work));
+
+        // A dangling link, and then a loop, stand where `work/bin` was.
+        let bin = work.join("bin");
+        std::fs::remove_dir(&bin).unwrap();
+        std::os::unix::fs::symlink(root.join("nowhere"), &bin).unwrap();
+        let out = run(&paths, &["folder", "set", bin.to_str().unwrap(), "-r"]).unwrap();
+        assert!(
+            out.contains(&format!("folder {} ---", bin.display())),
+            "{out}"
+        );
+        std::fs::remove_file(&bin).unwrap();
+        std::os::unix::fs::symlink(&bin, &bin).unwrap();
+        let out = run(&paths, &["folder", "rm", bin.to_str().unwrap()]).unwrap();
+        assert!(out.contains(&format!("removed {}", bin.display())), "{out}");
+        assert!(!has(&bin) && has(&work) && has(&docs));
+        // What is not stored under any spelling still says why.
+        let e = run(&paths, &["folder", "rm", bin.to_str().unwrap()]).unwrap_err();
+        assert!(
+            e.contains("Too many levels") || e.contains("symlink"),
+            "{e}"
+        );
     }
 
     #[test]

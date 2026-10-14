@@ -258,48 +258,60 @@ impl Shared {
         }
     }
 
-    /// Records the folder at `path` of `center` at its real place, judged as
-    /// the account the commands run as (`folder.place`, asked by the CLI
-    /// after `folder add`). The installed node's CLI runs as the node's own
-    /// user, which may not look into that account's home, so it cannot judge
-    /// a folder there; the node looks as the account does, as it does before a
-    /// command. `Ok(false)` when the folder is not its own place for the
-    /// account, or no account is chosen to tell.
+    /// Stores the folder at `path` of `center` at its real place and records
+    /// it, judged as the account the commands run as (`folder.place`, asked by
+    /// the CLI after `folder add`). The installed node's CLI runs as the
+    /// node's own user, which may not look into that account's home, so it
+    /// cannot judge a folder there; the node looks as the account does, as it
+    /// does before a command. A path that goes through a link of the account
+    /// is stored at the place it leads to, as `folder add` does where it can
+    /// look. The answer is that place; `Ok(None)` when it cannot be told (no
+    /// account is chosen, or the path does not resolve for it).
     #[cfg(unix)]
-    pub fn record_place(&self, center: &str, path: &str) -> Result<bool, String> {
+    pub fn record_place(&self, center: &str, path: &str) -> Result<Option<String>, String> {
+        use nerve_policy::paths::{resolve, within};
+        let same = |a: &str, b: &str| {
+            let (a, b) = (std::path::Path::new(a), std::path::Path::new(b));
+            within(a, b) && within(b, a)
+        };
         let cfg = self.config();
         let entry = cfg
             .center(center)
             .ok_or_else(|| format!("no center named {center}"))?;
-        let at = std::path::Path::new(path);
-        let listed = |f: &&nerve_policy::config::Folder| {
-            let f = std::path::Path::new(&f.path);
-            nerve_policy::paths::within(f, at) && nerve_policy::paths::within(at, f)
-        };
-        if entry.policy.folders.iter().find(listed).is_none() {
+        let Some(listed) = entry.policy.folders.iter().find(|f| same(&f.path, path)) else {
             return Err(format!("{path} is not a folder of {center}"));
-        }
+        };
+        let access = listed.access;
         let Ok(account) = self.command_account(&cfg) else {
-            return Ok(false);
+            return Ok(None);
         };
-        let own = {
+        let place = {
             let _as = crate::link::act_as(account.as_ref()).map_err(|e| e.message)?;
-            nerve_policy::paths::is_own_place(std::path::Path::new(path))
+            resolve(std::path::Path::new(path))
         };
-        if !own {
-            return Ok(false);
-        }
+        let Ok(place) = place.map(|p| p.display().to_string()) else {
+            return Ok(None);
+        };
         lock(&self.store)
             .update(|c| {
-                let e = c
+                let p = &mut c
                     .center_mut(center)
-                    .ok_or_else(|| format!("no center named {center}"))?;
-                e.policy.set_placed(path, true);
+                    .ok_or_else(|| format!("no center named {center}"))?
+                    .policy;
+                if !same(&place, path) {
+                    p.folders
+                        .retain(|f| !same(&f.path, path) && !same(&f.path, &place));
+                    p.folders.push(nerve_policy::config::Folder {
+                        path: place.clone(),
+                        access,
+                    });
+                }
+                p.set_placed(&place, true);
                 Ok(())
             })
             .map_err(|e| e.to_string())?;
         self.bump();
-        Ok(true)
+        Ok(Some(place))
     }
 
     pub fn bump(&self) {
@@ -1011,7 +1023,7 @@ pub(crate) fn control(
                 return Reply::Err("center and path are needed".into());
             };
             match shared.record_place(&center, &path) {
-                Ok(placed) => Reply::Ok(json!({"placed": placed})),
+                Ok(place) => Reply::Ok(json!({"placed": place.is_some(), "place": place})),
                 Err(e) => Reply::Err(e),
             }
         }
@@ -1507,24 +1519,31 @@ mod tests {
         daemon.stop().await;
     }
 
-    /// `folder.place` records a folder the CLI could not judge itself (the
-    /// installed node's CLI runs as the node's own user, which may not look
-    /// into the account's home): the node looks as the account does, and
-    /// records the folder only when it is its own place there.
+    /// `folder.place` stores and records a folder the CLI could not judge
+    /// itself (the installed node's CLI runs as the node's own user, which
+    /// may not look into the account's home): the node looks as the account
+    /// does. A path that goes through a link of the account is stored at the
+    /// place it leads to, as `folder add` does where it can look, so that
+    /// asking again is not needed; one that does not resolve stays as it is.
     #[cfg(unix)]
     #[tokio::test]
-    async fn the_node_records_a_folder_at_its_real_place_when_asked() {
+    async fn the_node_stores_and_records_a_folder_at_its_real_place_when_asked() {
         use nerve_policy::config::{Access, Folder};
         use nerve_transport::ctl::Reply;
         let (d, daemon) = daemon().await;
         let s = daemon.shared.clone();
         let root = std::fs::canonicalize(d.path()).unwrap();
-        let (work, link) = (root.join("work"), root.join("link"));
+        let (work, other) = (root.join("work"), root.join("other"));
+        let (link, link2, dangling) =
+            (root.join("link"), root.join("link2"), root.join("dangling"));
         std::fs::create_dir(&work).unwrap();
+        std::fs::create_dir(&other).unwrap();
         std::os::unix::fs::symlink(&work, &link).unwrap();
-        let folder = |p: &std::path::Path| Folder {
+        std::os::unix::fs::symlink(&other, &link2).unwrap();
+        std::os::unix::fs::symlink(root.join("nowhere"), &dangling).unwrap();
+        let folder = |p: &std::path::Path, access: &str| Folder {
             path: p.display().to_string(),
-            access: Access::parse("r").unwrap(),
+            access: Access::parse(access).unwrap(),
         };
         lock(&s.store)
             .update(|c| {
@@ -1539,7 +1558,11 @@ mod tests {
                     revoked: false,
                     unknown: false,
                     policy: nerve_policy::CenterPolicy {
-                        folders: vec![folder(&work), folder(&link)],
+                        folders: vec![
+                            folder(&work, "r"),
+                            folder(&link2, "rw"),
+                            folder(&dangling, "x"),
+                        ],
                         ..Default::default()
                     },
                 });
@@ -1550,21 +1573,38 @@ mod tests {
             let params = json!({"center": center, "path": p.display().to_string()});
             control(&s, "folder.place", params, pid)
         };
-        let places = || s.config().centers[0].policy.places.clone();
-        let Reply::Ok(v) = ask("home", &work, None) else {
-            panic!("folder.place failed")
+        let policy = || s.config().centers[0].policy.clone();
+        let listed = |p: &std::path::Path| {
+            policy()
+                .folders
+                .iter()
+                .find(|f| std::path::Path::new(&f.path) == p)
+                .map(|f| f.access.to_string())
         };
-        assert_eq!(v["placed"], true);
-        assert_eq!(places(), [work.display().to_string()]);
-        // A folder spelled through a link is not its own place.
-        let Reply::Ok(v) = ask("home", &link, None) else {
-            panic!("folder.place failed")
+        let place = |p: &std::path::Path| {
+            let Reply::Ok(v) = ask("home", p, None) else {
+                panic!("folder.place failed")
+            };
+            (
+                v["placed"].as_bool().unwrap(),
+                v["place"].as_str().map(String::from),
+            )
         };
-        assert_eq!(v["placed"], false);
-        assert_eq!(places(), [work.display().to_string()]);
+        // Its own place: recorded where it is.
+        assert_eq!(place(&work), (true, Some(work.display().to_string())));
+        assert_eq!(policy().places, [work.display().to_string()]);
+        // Through a link of the account: stored at the place it leads to,
+        // with its access, and recorded there.
+        assert_eq!(place(&link2), (true, Some(other.display().to_string())));
+        assert_eq!(listed(&link2), None);
+        assert_eq!(listed(&other).as_deref(), Some("rw"));
+        assert!(policy().is_placed(&other.display().to_string()));
+        // A path that does not resolve for it is left as it is.
+        assert_eq!(place(&dangling), (false, None));
+        assert_eq!(listed(&dangling).as_deref(), Some("x"));
+        assert_eq!(policy().places.len(), 2);
         // Only a folder of the center, and only the owner asks.
-        let other = root.join("other");
-        assert!(matches!(ask("home", &other, None), Reply::Err(e) if e.contains("not a folder")));
+        assert!(matches!(ask("home", &link, None), Reply::Err(e) if e.contains("not a folder")));
         assert!(matches!(ask("lab", &work, None), Reply::Err(e) if e.contains("no center")));
         let me = std::process::id();
         lock(&s.commands).insert(me, "home".into());

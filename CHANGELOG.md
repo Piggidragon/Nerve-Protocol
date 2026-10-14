@@ -2,9 +2,14 @@
 
 ## 0.0.3
 
+### Upgrading from 0.0.2
+
+- A 0.0.2 `nerve-node` CLI talking to a 0.0.3 node on Linux is refused for everything except `status`, because it sends no control-socket token ([#83](https://github.com/Piggidragon/Nerve-Protocol/pull/83)). `update` of 0.0.2 still works, as it asks only `status`. After it, run the CLI from the 0.0.3 program too.
+- A 0.0.2 node refuses a `node.toml` that holds `places` under a pairing's `policy`, which 0.0.3 writes with `folder add` ([#88](https://github.com/Piggidragon/Nerve-Protocol/pull/88)). Before you go back to 0.0.2, remove the key with `nerve-node config unset center.<name>.policy.places` for each pairing.
+
 ### Folder mode on Windows
 
-- Commands in folder mode now run in an AppContainer of their own, so a command only reaches the folders you gave it ([#39](https://github.com/Piggidragon/Nerve-Protocol/issues/39), [#45](https://github.com/Piggidragon/Nerve-Protocol/pull/45)). `docs/user/modes.md` also lists what the AppContainer does not stop ([#86](https://github.com/Piggidragon/Nerve-Protocol/pull/86)).
+- Commands in folder mode now run in an AppContainer of their own, so a command only reaches the folders you gave it, on a node you run yourself; the installed Windows service still runs no command in folder mode ([#39](https://github.com/Piggidragon/Nerve-Protocol/issues/39), [#45](https://github.com/Piggidragon/Nerve-Protocol/pull/45)). `docs/user/modes.md` also lists what the AppContainer does not stop ([#86](https://github.com/Piggidragon/Nerve-Protocol/pull/86)).
 - PowerShell `cd`, `chdir`, `sl` and `pushd` work with whole paths in the container, not only inside the `Work:` drive ([#85](https://github.com/Piggidragon/Nerve-Protocol/pull/85)).
 - `folder add`, `folder set` and `folder rm` reach a running node at once, through a control pipe that a command cannot use ([#53](https://github.com/Piggidragon/Nerve-Protocol/issues/53), [#93](https://github.com/Piggidragon/Nerve-Protocol/pull/93)).
 - A large folder is walked only where the grant changes, so applying the same grant again is much faster ([#54](https://github.com/Piggidragon/Nerve-Protocol/issues/54), [#95](https://github.com/Piggidragon/Nerve-Protocol/pull/95)).
@@ -18,7 +23,7 @@
 
 ### Control socket and config
 
-- A sandboxed command can no longer read the node config over the control socket; the socket answers only requests that carry the owner's token ([#70](https://github.com/Piggidragon/Nerve-Protocol/issues/70), [#83](https://github.com/Piggidragon/Nerve-Protocol/pull/83)).
+- A sandboxed command can no longer read the node config over the control socket; the socket answers only requests that carry the owner's token, and refuses every request that comes from below a command the node runs ([#70](https://github.com/Piggidragon/Nerve-Protocol/issues/70), [#83](https://github.com/Piggidragon/Nerve-Protocol/pull/83)).
 - A busy control socket is no longer taken for a stopped node, and `panic` and `unlock` no longer report a change the node did not get ([#69](https://github.com/Piggidragon/Nerve-Protocol/issues/69), [#79](https://github.com/Piggidragon/Nerve-Protocol/pull/79)).
 - The keys lock is free again right after it is released, even when a command was forked in the meantime ([#73](https://github.com/Piggidragon/Nerve-Protocol/issues/73), [#79](https://github.com/Piggidragon/Nerve-Protocol/pull/79)).
 - `rule add` refuses the `fs:...` and `exec:...` forms, and `rule rm` removes entries that older runs made by mistake ([#78](https://github.com/Piggidragon/Nerve-Protocol/issues/78), [#79](https://github.com/Piggidragon/Nerve-Protocol/pull/79)).

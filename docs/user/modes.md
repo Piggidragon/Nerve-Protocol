@@ -255,9 +255,13 @@ folders.
   profile goes with the container's last folder entry, with `center rm`,
   and at `uninstall`, which say which profiles they removed. While the node
   runs they keep its profiles and say so, as it still serves the pairing
-  until it starts again, and the other changes from the CLI keep them too;
-  stop the node first. The running node itself removes a profile when the
-  pairing's last granted folder is deleted or moved away. The name comes from the
+  until it starts again, and the other changes the CLI writes to the file
+  itself keep them too; stop the node first. The running node itself removes
+  a profile when the pairing's last granted folder is deleted or moved away.
+  So does a `folder rm` or `folder set` that leaves a pairing with no
+  granted folder: the CLI hands it to the node over the
+  [control pipe](platforms.md#the-control-pipe), and the node syncs the
+  grants and removes the profile, without the CLI saying so. The name comes from the
   path of the state folder and the pairing in `node.toml`, so the node
   finds the profile as long as the config folder is there, also after the
   state folder was deleted, and whether you type the folder with `\` or
@@ -282,7 +286,9 @@ folders.
   `[Nerve.Profile]::DeleteAppContainerProfile('nerve.…')` after
   `Add-Type -Namespace Nerve -Name Profile -MemberDefinition '[DllImport("userenv.dll", CharSet = CharSet.Unicode)] public static extern int DeleteAppContainerProfile(string name);'`.
   It returns 0 also for a name that has no profile, so check that the
-  folder is gone. A node that still runs makes the profile of its
+  folder is gone. A folder that stays may be held by a registry hive that is
+  still loaded; it goes after a restart of Windows
+  ([#94](https://github.com/Piggidragon/Nerve-Protocol/issues/94)). A node that still runs makes the profile of its
   container again at its next command, without what its commands kept
   there.
 - A granted folder you move or rename on the same drive takes its entry
@@ -459,9 +465,10 @@ known.
   holds `Temp`), without any grant. It stays between the commands of the
   pairing, and Windows deletes it with the container's profile. The node
   removes that profile with the container's last grant, a running node
-  too when the pairing's folders are gone at its sync; `center rm`,
-  `uninstall` and other changes from the CLI remove it only while the node
-  does not run (see above) (checked, code).
+  too when the pairing's folders are gone at its sync, also after a
+  `folder rm` or `folder set` of the last one; `center rm`, `uninstall` and
+  the other changes the CLI writes to the file itself remove it only while
+  the node does not run (see above) (checked, code).
 - **The registry.** Checked: a command reads the machine part (`HKLM`, for
   example the Windows version), lists the keys of your `HKCU` and reads
   `HKCU\Environment`, which holds the environment variables you set for

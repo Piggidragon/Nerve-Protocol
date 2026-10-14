@@ -55,7 +55,7 @@ Running `install` again repairs what is missing and restarts the service.
 | What | Where |
 |---|---|
 | `node.toml`, one key per center | `/etc/nerve` |
-| Audit log, [log](logs.md), control socket, config key | `/var/lib/nerve/state` |
+| Audit log, [log](logs.md), control socket and its token, config key | `/var/lib/nerve/state` |
 | The keys, with `machine.secret_storage = "keyring"` | the keyring of `nerve`, `/var/lib/nerve/.local/share/keyrings` |
 | Home of `nerve` | `/var/lib/nerve` |
 | The program | `/usr/local/bin/nerve-node` |
@@ -247,8 +247,8 @@ Restart-Service nerve-node
 
 | What | Where |
 |---|---|
-| `node.toml`, one key per center, the stored password | `C:\ProgramData\Nerve\config` |
-| Audit log, [log](logs.md), config key | `C:\ProgramData\Nerve\state` |
+| `node.toml`, one key per center, the stored password of the account commands run as, the sudo password while sudo is on | `C:\ProgramData\Nerve\config` |
+| Audit log, [log](logs.md), config key, the record of the folder grants (`grants.json`) | `C:\ProgramData\Nerve\state` |
 | The program | `C:\Program Files\Nerve\nerve-node.exe` |
 | Start, stop, a start that fails, a crash | The Windows Event Log, Application, source `nerve-node` ([logs](logs.md#the-windows-event-log)) |
 
@@ -359,8 +359,8 @@ to remove it after a restart.
 
 - `install`, `setup`, `update` and `uninstall` are refused from a command the
   node runs for a center, as every other change of the node's settings is.
-  An agent cannot install, update or remove the node. On Windows, without a
-  control socket, the node cannot be asked; there these commands need an
+  An agent cannot install, update or remove the node. On Windows the control
+  pipe does not take this check yet; there these commands need an
   administrator, which a command gets only through an account in
   Administrators (the UAC warning above).
 - Each is written to the [audit log](audit.md) with the steps it did, and the

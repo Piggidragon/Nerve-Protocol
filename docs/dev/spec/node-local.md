@@ -8,8 +8,8 @@ same way and so the owner knows what each setting does.
 
 | What | Default | Override |
 |---|---|---|
-| `node.toml` and one key per center (`keys/<name>.key`) | `~/.config/nerve` | `--config-dir`, `NERVE_CONFIG_DIR` |
-| control socket `run/ctl.sock` and its token `run/ctl.token`, audit log `audit.jsonl`, log `log.jsonl`, the config's MAC key `config.key`, `keys.lock`, `keys.moving` | `~/.local/state/nerve` | `--state-dir`, `NERVE_STATE_DIR` |
+| `node.toml` and one key per center (`keys/<name>.key`); on Windows also `sudo.dpapi` and, on the installed node, `command-account.dpapi` | `~/.config/nerve` | `--config-dir`, `NERVE_CONFIG_DIR` |
+| control socket `run/ctl.sock` and its token `run/ctl.token`, audit log `audit.jsonl`, log `log.jsonl`, the config's MAC key `config.key`, `keys.lock`, `keys.moving`; on Windows the record of the folder grants `grants.json` and its lock `grants.json.lock` | `~/.local/state/nerve` | `--state-dir`, `NERVE_STATE_DIR` |
 
 With `machine.secret_storage = "keyring"` the keys are in the system keyring
 instead of `keys/` and `config.key` ([where the keys are](#where-the-keys-are)).
@@ -164,10 +164,10 @@ Two kinds of node keep their keys in files whatever is asked:
 On such a node:
 
 - A change to `keyring` is refused before anything moves, by whatever
-  writes the config (`config set`, setup, a center's `settings.set`, `config
-  accept`); `node.toml` and the keys stay as they were. This refusal comes
-  before the count of running commands below, as it holds whatever runs. A
-  running node does not reload a file another writer saved with `keyring`.
+  writes the config (`config set`, setup, `config accept`); `node.toml` and
+  the keys stay as they were. This refusal comes before the count of running
+  commands below, as it holds whatever runs. A running node does not reload a
+  file another writer saved with `keyring`.
 - `config accept` refuses a file that says `keyring`, even when the keys are
   in the keyring already, so nothing would move.
 - `setup` does not ask where the keys go. It prints a warning with the
@@ -694,8 +694,8 @@ holds the kept password again when `machine.sudo` says on and the file is
 the current account's. A sudo command runs what followed `sudo` in the
 shell, started with a fresh batch logon's full token (`CreateProcessAsUserW`)
 with the account's own environment, in a job like every command; the check
-that the account cannot open the node's folders does not apply to it. Without
-a control channel, `nerve-node sudo on` (elevated) checks the password,
+that the account cannot open the node's folders does not apply to it. The
+control pipe takes folder changes only, so `nerve-node sudo on` (elevated) checks the password,
 writes the file and sets `machine.sudo` in the signed file, which the service
 takes at its next start; `nerve-node sudo off` removes the file, and the
 running node drops a held password whose file is gone within a second and
@@ -705,7 +705,7 @@ switches off. `uninstall` removes the file.
 
 `<state>/run/ctl.sock` (Unix; Windows has the control pipe below). One
 JSON object per line: the client sends
-`{"method", "params"}`, the server answers `{"ok": value}` or
+`{"method", "params", "token"}` (the token is explained below), the server answers `{"ok": value}` or
 `{"error": "text"}`, or, for streaming methods, several `{"item": value}`
 lines until it closes. The socket is 0600 in a 0700 folder; only its own user
 or root may talk to it. That does not keep out a command the node runs as
@@ -713,8 +713,8 @@ that very user (a node a person runs, with no `machine.user`) or as root:
 Landlock stops a process connecting to a socket file only from ABI 9 on, and
 `setsid` takes a process out of the tree below its command. So the node makes
 a token at each start,
-`<state>/run/ctl.token` (0600), and answers a request only if it carries it
-(`{"method", "params", "token"}`). The CLI reads the file and sends it. The
+`<state>/run/ctl.token` (0600), and answers a request only if it carries it.
+The CLI reads the file and sends it. The
 file lies in the node's own folders, which a `folder` mode command's rules
 leave out, so such a command, and a process it left behind, are refused for
 every method.
@@ -722,7 +722,7 @@ every method.
 The one answer without the token is `status`: `{"ok": {"running": true}}`,
 nothing of the config. `update` of 0.0.2 asks it that way to wait for the
 node it restarted, and puts the old program back if it does not answer `ok`;
-since this version `install`, `update` and `setup` send the token.
+since 0.0.3 `install`, `update` and `setup` send the token.
 
 The token holds as far as the sandbox does. While the commands run as the
 node's own user, `folder` mode is no boundary against that user's other

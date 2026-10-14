@@ -111,9 +111,9 @@ administrator" gives, not the token UAC gives its other commands. So:
   Neither takes the account out of Administrators: do that yourself to close
   the other way to the administrator rights again. `sudo off` reminds you.
 
-Run the commands in a terminal opened with "Run as administrator". Windows
-has no control socket, so `sudo on` takes effect when the service starts
-again. `sudo off` takes effect at once: the running service drops the
+Run the commands in a terminal opened with "Run as administrator". The
+[control pipe](platforms.md#the-control-pipe) on Windows takes folder changes
+only, so `sudo on` takes effect when the service starts again. `sudo off` takes effect at once: the running service drops the
 password within a second.
 
 ```powershell

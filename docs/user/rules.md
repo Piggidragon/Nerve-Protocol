@@ -51,7 +51,9 @@ other.
 ## Rules for files and other actions
 
 `rule add` writes command rules, and refuses an entry in the pattern form
-(`fs.read:...`, `fs:...`), which would never match as a command. For files and
+(`fs.read:...`, `fs:...`, and also `exec.run:...` and `exec:...`, the form
+`rule ls` prints), which would never match as a command. Give `rule add` the
+bare command (`'git *'`), not that form. (`rule rm` does take it.) For files and
 other actions, add the rule to the policy by name. `lab` is the center's name on this machine (see
 `nerve-node center ls`).
 

@@ -211,13 +211,19 @@ message layer: the relay carries bytes, never messages.
   proxy) as much as the center, since what goes inside the tunnel (the TLS
   server name, the HTTP `Host`, the path) is the relayed node's. An owner
   judges a token by that.
-- A relay keeps at most a few undecided connections per peer (an IPv4
-  address, or an IPv6 /64), and a bounded number in all; one over either is
-  closed unread. The first byte, TLS and the `CONNECT` head share one
-  deadline of 15 seconds. Refusals without a valid token are not logged one
-  by one but counted, so a peer cannot flood the relay's log; nor are a
-  node's refusals for a limit. A node opens a bounded number of tunnels a
-  minute, so one with a token cannot rotate the audit log either.
+- A relay keeps at most a few undecided connections per peer address, a
+  larger share per IPv6 /64 (which the machines of one LAN share), and a
+  bounded number in all; one over any is closed unread. The first byte, TLS
+  and the `CONNECT` head share one deadline of 15 seconds. A granted
+  connection is a tunnel from then on, counted by the tunnel limits, and
+  gives its undecided slot back before the relay dials, which has a deadline
+  of its own. Refusals are not logged one by one but counted, with a token or
+  without, so no peer can flood the relay's log. A node opens a bounded
+  number of tunnels a minute (the owner can raise it for a relay behind this
+  one), so one with a token cannot rotate the audit log either.
+- Hosts are compared as a URL can tell them apart: without case or a
+  trailing dot, and an address in any of its spellings. A name and the
+  address it resolves to are not told apart.
 - A relay MUST end a tunnel when its owner turns the relay off, takes the
   node's token away or the center off the node's list, unpairs the center or
   locks the node, and when the tunnel carried nothing either way for 90

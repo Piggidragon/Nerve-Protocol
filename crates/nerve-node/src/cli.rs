@@ -347,6 +347,9 @@ pub enum RelayCmd {
         /// Tunnels at once of one relayed node (4 unless set).
         #[arg(long, value_name = "N")]
         max_links_per_node: Option<u32>,
+        /// Tunnels one relayed node may open a minute (30 unless set; more for a relay behind this one).
+        #[arg(long, value_name = "N")]
+        max_opens_per_minute: Option<u32>,
     },
     /// Turn the relay off: stop listening and end every tunnel. The nodes and their tokens stay.
     Off,
@@ -2816,6 +2819,7 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
             address,
             max_links,
             max_links_per_node,
+            max_opens_per_minute,
         } => {
             if address.parse::<std::net::SocketAddr>().is_err() {
                 return Err(format!(
@@ -2832,6 +2836,9 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
                 }
                 if let Some(n) = max_links_per_node {
                     c.relay.max_links_per_node = n;
+                }
+                if let Some(n) = max_opens_per_minute {
+                    c.relay.max_opens_per_minute = n;
                 }
                 Ok(())
             })
@@ -3055,10 +3062,14 @@ fn relay_centers(cfg: &NodeConfig, centers: &[String]) -> Result<(), String> {
         let at = |url: &str| {
             nerve_proto::link::CenterUrl::parse(url)
                 .ok()
-                .map(|u| (u.host.to_ascii_lowercase(), u.port))
+                .map(|u| (u.host, u.port))
+        };
+        let same = |a: Option<(String, u16)>, b: Option<(String, u16)>| match (a, b) {
+            (Some((ha, pa)), Some((hb, pb))) => pa == pb && crate::relay::same_host(&ha, &hb),
+            _ => false,
         };
         if let Some(other) = cfg.centers.iter().find(|o| {
-            o.name != entry.name && !centers.contains(&o.name) && at(&o.url) == at(&entry.url)
+            o.name != entry.name && !centers.contains(&o.name) && same(at(&o.url), at(&entry.url))
         }) {
             return Err(format!(
                 "the centers {c} and {} share one host and port, and a tunnel reaches the host and port, so the relay cannot keep them apart: name both or neither",

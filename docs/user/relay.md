@@ -128,9 +128,16 @@ nerve-node relay set 0.0.0.0:7490 --max-links 16 --max-links-per-node 4
 unless you set it. `--max-links-per-node` is the number per node, 4 unless
 you set it; a node needs one per center it is paired with. A tunnel that
 carries nothing for 90 seconds is closed (a live link sends something every
-20 seconds). At most 4 connections from one address (IPv6: one /64) may wait
-for the relay's answer at once, 15 seconds at most, so one machine cannot
-keep everyone else out. A node opens at most 30 tunnels a minute.
+20 seconds).
+
+`--max-opens-per-minute` is the number of tunnels a node may open a minute,
+30 unless you set it. That is far more than a node needs; raise it for a
+relay behind this one, whose nodes all count as one.
+
+At most 4 connections from one address may wait for the relay's answer at
+once, and 16 from one IPv6 /64, each 15 seconds at most; once the relay
+grants a tunnel, its connection counts as a tunnel instead. So a machine
+cannot keep the other machines of its network out.
 
 ## Who is connected
 
@@ -151,7 +158,9 @@ On Linux `nerve-node status` shows the relay in one line; on Windows
 in the [audit log](audit.md) when it ends: the node, its address, the
 center, when it started and ended, why it ended and how much it carried;
 never a token. The node's [log](logs.md) also has a line for every tunnel
-that opens or closes, and for each refusal of a node with its token.
+that opens or closes. Refusals are counted and told in one line a minute:
+one for nodes with their token, and one naming a node whose token came in
+plain HTTP, so you know to give it a new one.
 Connections without a valid token are counted and told in one line a
 minute.
 
@@ -189,7 +198,9 @@ Firewall must let other machines reach the relay's port.
   `relay rm` if you think it leaked.
 - Centers behind one address (`https://h.example/a`, `https://h.example/b`)
   are reached together: `relay add --center a` is refused there unless you
-  name `b` too.
+  name `b` too. The relay tells an address in any spelling apart from
+  others, but not a name from the address it resolves to: pair the relay's
+  centers at one name or address each.
 - The `proxy set` line holds the token, so your shell keeps it in its
   history (fish, bash, PowerShell's `ConsoleHost_history.txt`). Delete it
   from there after you ran it.

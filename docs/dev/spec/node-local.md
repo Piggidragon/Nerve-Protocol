@@ -356,6 +356,7 @@ listen = "0.0.0.0:7490"     # ip:port; the relay is off without it
 pin = "<pin>"               # the pin of the relay's TLS certificate; its key is a node key
 max_links = 16              # tunnels at once, over every relayed node
 max_links_per_node = 4      # tunnels at once of one relayed node
+max_opens_per_minute = 30   # tunnels one relayed node may open a minute
 
 [[relay.node]]
 name = "lab-pc"             # the user name of its Proxy-Authorization
@@ -487,7 +488,8 @@ password.
 The node can be the relay of other nodes (protocol §4.8). Only the owner
 turns it on, and a center reads and changes nothing of it, grant or not.
 
-- `nerve-node relay set <ip:port> [--max-links N] [--max-links-per-node N]`
+- `nerve-node relay set <ip:port> [--max-links N] [--max-links-per-node N]
+  [--max-opens-per-minute N]`
   turns it on; `relay off` stops listening and ends every tunnel, and keeps
   the nodes.
 - The relay speaks TLS only. The first `relay set` or `relay add` makes its
@@ -547,19 +549,28 @@ turns it on, and a center reads and changes nothing of it, grant or not.
   the peer's address, start, end, why it ended and the bytes each way. A
   refused `CONNECT` is no tunnel and only in the log.
 - At most 64 connections at once wait for their `CONNECT` to be decided (15
-  seconds in all for the first byte, TLS and the head), and at most 4 of them
-  from one peer (an IPv4 address, or an IPv6 /64); one over either is closed
-  unread. A connection refused without a valid token (plain HTTP, no or a
-  wrong token, over a limit) is logged at `debug`; at `warn` the log gets
-  one line a minute with how many there were and the last address, so a
-  flood of them cannot rotate the log. A valid token that came in plain
-  HTTP is told at `warn` with the node's name, to give it a new one.
-- A node opens at most 30 tunnels a minute; past that, and past the
-  tunnels at once, it gets `503`, logged at `debug` with one counted `warn`
-  line a minute. Each tunnel is an audit entry and two `info` lines, so a
-  node with its token cannot rotate the audit log or the log by opening and
-  closing tunnels. Other refusals of a node with its token are logged at
-  `info`.
+  seconds in all for the first byte, TLS and the head), at most 4 of them
+  from one address and 16 from one IPv6 /64 (link-local addresses count by
+  address only, their scope is not in it); one over any is closed unread.
+  Once granted, a connection is a tunnel, counted by `max_links` and
+  `max_links_per_node`, and gives its undecided slot back before the relay
+  resolves and dials the center (30 seconds at most).
+- Every refusal is logged at `debug`. At `warn` the log gets at most one line
+  a minute with the count: one for connections without a valid token
+  (plain HTTP, no or a wrong token, over a limit) with the last address, one
+  for refusals of nodes with their token (a target that is no center, a
+  limit) with the last node, and per node one when its valid token came in
+  plain HTTP, with its name, to give it a new one. So no peer, with a token
+  or without, can rotate the log.
+- A node opens at most `relay.max_opens_per_minute` tunnels a minute (30
+  unless set: a node needs one per center and redials after a second at the
+  soonest; a relay behind this one, which carries many nodes, needs more);
+  past that it gets `503`. Each tunnel is an audit entry and two `info`
+  lines, so a node with its token cannot rotate the audit log or the log by
+  opening and closing tunnels.
+- Hosts are compared without case or a trailing dot, and an address in any
+  of its spellings (`[2001:db8::1]` and `[2001:db8:0:0::1]`) is one address.
+  A name and the address it resolves to are not told apart.
 - A tunnel quiet for 90 seconds (by the monotonic clock, so a step of the
   wall clock changes nothing) is closed.
 - An `https` center paired at a loopback address or `localhost` is a

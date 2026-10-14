@@ -52,15 +52,17 @@ const UNDECIDED: usize = 64;
 /// Of those, from one address: a peer that holds its connections open
 /// without a word cannot take the slots of every other node.
 const UNDECIDED_PER_PEER: usize = 4;
+/// Of those, from one IPv6 /64 (link-local addresses aside): a machine that
+/// gives itself many addresses there cannot take them all, while the other
+/// machines of its LAN, which share the /64, keep room.
+const UNDECIDED_PER_PREFIX: usize = 16;
+/// How long the relay tries to reach a center for a granted tunnel, the name
+/// lookup included.
+const DIAL_DEADLINE: Duration = Duration::from_secs(30);
 /// Connections refused without a valid token are told in the log at most
 /// this often, counted: a peer that makes them as fast as it can must not
 /// push the rest of the log out.
 const TOKENLESS_EVERY: Duration = Duration::from_secs(60);
-/// Tunnels one relay node may open a minute. Each is two log lines and an
-/// audit entry; a node needs one per center and redials after a second at
-/// the soonest (spec §4.6), so this is far above its use and far below a
-/// loop that would rotate the audit log.
-const OPENS_PER_MINUTE: usize = 30;
 /// A tunnel that carries no byte either way this long is closed. A link pings
 /// every 20 seconds (spec §4.4), so only a dead one stays this quiet.
 const IDLE: Duration = Duration::from_secs(90);
@@ -77,8 +79,12 @@ pub(crate) struct Relays {
     tunnels: Mutex<HashMap<u64, Tunnel>>,
     next: AtomicU64,
     undecided: Arc<Semaphore>,
-    /// Undecided connections per peer address.
+    /// Undecided connections per peer address, and per IPv6 /64.
     peers: Mutex<HashMap<std::net::IpAddr, usize>>,
+    prefixes: Mutex<HashMap<std::net::IpAddr, usize>>,
+    /// Plain-HTTP connections that carried a valid token, per relay node,
+    /// told counted.
+    plain: Mutex<HashMap<String, Tally>>,
     /// Refusals without a valid token, told counted.
     tokenless: Tally,
     /// Refusals of a node with its token for a limit (tunnels at once, opens
@@ -102,6 +108,8 @@ impl Default for Relays {
             next: AtomicU64::new(1),
             undecided: Arc::new(Semaphore::new(UNDECIDED)),
             peers: Mutex::default(),
+            prefixes: Mutex::default(),
+            plain: Mutex::default(),
             tokenless: Tally::default(),
             held_back: Tally::default(),
             opens: Mutex::default(),
@@ -117,6 +125,12 @@ impl Default for Relays {
 struct Tally(Mutex<(u64, Option<std::time::Instant>)>);
 
 impl Tally {
+    /// Refusals counted since the last line.
+    #[cfg(test)]
+    fn pending(&self) -> u64 {
+        lock(&self.0).0
+    }
+
     fn note(&self, now: std::time::Instant) -> Option<u64> {
         let mut t = lock(&self.0);
         t.0 += 1;
@@ -173,9 +187,9 @@ impl Relays {
         self.tokenless.note(now)
     }
 
-    /// Whether `node` may open another tunnel now, and if so counts it
-    /// ([`OPENS_PER_MINUTE`]).
-    fn may_open(&self, node: &str, now: std::time::Instant) -> bool {
+    /// Whether `node` may open another tunnel now, `limit` a minute
+    /// (`relay.max_opens_per_minute`), and if so counts it.
+    fn may_open(&self, node: &str, limit: usize, now: std::time::Instant) -> bool {
         let mut opens = lock(&self.opens);
         let times = opens.entry(node.to_string()).or_default();
         while times
@@ -184,32 +198,44 @@ impl Relays {
         {
             times.pop_front();
         }
-        if times.len() >= OPENS_PER_MINUTE {
+        if times.len() >= limit {
             return false;
         }
         times.push_back(now);
         true
     }
 
-    /// Takes one of the undecided slots of `peer`, unless it holds its
-    /// share.
+    /// Takes one of the undecided slots of `peer`, unless its address, or
+    /// its IPv6 /64, holds its share.
     fn take_peer(&self, peer: std::net::IpAddr) -> bool {
         let mut peers = lock(&self.peers);
-        let n = peers.entry(peer).or_insert(0);
-        if *n >= UNDECIDED_PER_PEER {
+        let mut prefixes = lock(&self.prefixes);
+        let prefix = prefix_of(peer);
+        if peers.get(&peer).copied().unwrap_or(0) >= UNDECIDED_PER_PEER
+            || prefix
+                .is_some_and(|p| prefixes.get(&p).copied().unwrap_or(0) >= UNDECIDED_PER_PREFIX)
+        {
             return false;
         }
-        *n += 1;
+        *peers.entry(peer).or_insert(0) += 1;
+        if let Some(p) = prefix {
+            *prefixes.entry(p).or_insert(0) += 1;
+        }
         true
     }
 
     fn give_peer(&self, peer: std::net::IpAddr) {
-        let mut peers = lock(&self.peers);
-        if let Some(n) = peers.get_mut(&peer) {
-            *n -= 1;
-            if *n == 0 {
-                peers.remove(&peer);
+        let give = |map: &mut HashMap<std::net::IpAddr, usize>, key| {
+            if let Some(n) = map.get_mut(&key) {
+                *n -= 1;
+                if *n == 0 {
+                    map.remove(&key);
+                }
             }
+        };
+        give(&mut lock(&self.peers), peer);
+        if let Some(p) = prefix_of(peer) {
+            give(&mut lock(&self.prefixes), p);
         }
     }
 
@@ -511,10 +537,24 @@ fn targets(cfg: &NodeConfig, host: &str, port: u16) -> Vec<(String, CenterUrl)> 
         .filter(|c| !c.revoked && !c.unknown)
         .filter_map(|c| {
             let url = CenterUrl::parse(&c.url).ok()?;
-            (url.tls && url.port == port && url.host.eq_ignore_ascii_case(host))
+            (url.tls && url.port == port && same_host(&url.host, host))
                 .then(|| (c.name.clone(), url))
         })
         .collect()
+}
+
+/// Whether two host names or addresses are the same as a URL can tell: the
+/// case, a trailing dot and the spelling of an address do not count. A name
+/// and the address it resolves to are not told apart here.
+pub(crate) fn same_host(a: &str, b: &str) -> bool {
+    let norm = |h: &str| {
+        let h = h.trim_end_matches('.');
+        match h.parse::<std::net::IpAddr>() {
+            Ok(ip) => ip.to_canonical().to_string(),
+            Err(_) => h.to_ascii_lowercase(),
+        }
+    };
+    norm(a) == norm(b)
 }
 
 /// The centers a tunnel of `node` to `host:port` reaches, and where to dial:
@@ -595,17 +635,17 @@ async fn refuse<W: tokio::io::AsyncWrite + Unpin>(io: &mut W, r: &Refusal) {
     let _ = resp.write(io).await;
 }
 
-/// Who a peer is for the undecided limit: its IPv4 address, or the /64 of
-/// its IPv6 address, which one machine holds whole and can spread its
-/// connections over.
-fn peer_key(ip: std::net::IpAddr) -> std::net::IpAddr {
+/// The /64 an IPv6 peer address is counted in besides itself, for the
+/// undecided limit; none for IPv4, loopback and link-local addresses (their
+/// scope is not in the address, so one /64 there would be every link).
+fn prefix_of(ip: std::net::IpAddr) -> Option<std::net::IpAddr> {
     match ip.to_canonical() {
-        std::net::IpAddr::V6(v6) => {
+        std::net::IpAddr::V6(v6) if !v6.is_loopback() && (v6.segments()[0] & 0xffc0) != 0xfe80 => {
             let mut o = v6.octets();
             o[8..].fill(0);
-            std::net::IpAddr::V6(o.into())
+            Some(std::net::IpAddr::V6(o.into()))
         }
-        v4 => v4,
+        _ => None,
     }
 }
 
@@ -620,7 +660,7 @@ struct Undecided {
 impl Undecided {
     fn take(shared: &Arc<Shared>, peer: SocketAddr) -> Option<Undecided> {
         let permit = shared.relay.undecided.clone().try_acquire_owned().ok()?;
-        let ip = peer_key(peer.ip());
+        let ip = peer.ip().to_canonical();
         shared.relay.take_peer(ip).then(|| Undecided {
             _permit: permit,
             shared: shared.clone(),
@@ -635,13 +675,34 @@ impl Drop for Undecided {
     }
 }
 
-/// Tells a refusal of a node with its token for a limit, counted.
-fn held_back(shared: &Shared, node: &str, peer: SocketAddr, r: &Refusal) {
-    tracing::debug!("relay: refused a tunnel of {node} from {peer}: {}", r.why);
+/// Tells a refusal of a node with its token, counted: whatever it asks, a
+/// node gets no more than a line a minute in the log for its refusals.
+fn held_back(shared: &Shared, node: &str, peer: SocketAddr, target: &str, r: &Refusal) {
+    tracing::debug!(
+        "relay: refused a tunnel of {node} from {peer} to {}: {}",
+        clip(target),
+        r.why
+    );
     if let Some(n) = shared.relay.held_back.note(std::time::Instant::now()) {
         tracing::warn!(
-            "relay: refused {n} tunnel(s) of relay nodes for a limit, the last of {node} from {peer}: {}; such refusals are told at most once a minute",
+            "relay: refused {n} tunnel(s) of relay nodes, the last of {node} from {peer} to {}: {}; such refusals are told at most once a minute",
+            clip(target),
             r.why
+        );
+    }
+}
+
+/// Tells that relay node `node` sent its valid token in plain HTTP: once a
+/// minute per node at most, counted, so the owner learns whose token to
+/// replace without the log filling up.
+fn plain_token(shared: &Shared, node: &str, peer: SocketAddr) {
+    let due = lock(&shared.relay.plain)
+        .entry(node.to_string())
+        .or_default()
+        .note(std::time::Instant::now());
+    if let Some(n) = due {
+        tracing::warn!(
+            "relay: relay node {node} sent its token in plain HTTP {n} time(s), the last from {peer}, so it crossed the network in the clear; give it a new one (`nerve-node relay rm {node}`, then `relay add {node}`)"
         );
     }
 }
@@ -687,10 +748,7 @@ async fn connection(
             match sent {
                 // A valid token crossed the network in the clear: the owner
                 // is told whose, to give that node a new one.
-                Some(n) => tracing::warn!(
-                    "relay: relay node {} sent its token in plain HTTP from {peer}, so it crossed the network in the clear; give it a new one (`nerve-node relay rm {0}`, then `relay add {0}`)",
-                    n.name
-                ),
+                Some(n) => plain_token(&shared, &n.name, peer),
                 None => {
                     tracing::debug!("relay: refused a plain HTTP connection from {peer}");
                     tokenless(&shared, peer);
@@ -729,45 +787,52 @@ async fn connection(
     let grant = match decide(&cfg, &req) {
         Ok(g) => g,
         Err(r) => {
-            // Without a valid token a peer may only cost a counted line.
-            if node_of(&cfg, req.header("proxy-authorization")).is_none() {
-                tracing::debug!(
-                    "relay: refused a tunnel from {peer} to {}: {}",
-                    clip(&req.path),
-                    r.why
-                );
-                tokenless(&shared, peer);
-            } else {
-                tracing::info!(
-                    "relay: refused a tunnel from {peer} to {}: {}",
-                    clip(&req.path),
-                    r.why
-                );
+            // A refusal costs a counted line, with a token or without.
+            match node_of(&cfg, req.header("proxy-authorization")) {
+                None => {
+                    tracing::debug!(
+                        "relay: refused a tunnel from {peer} to {}: {}",
+                        clip(&req.path),
+                        r.why
+                    );
+                    tokenless(&shared, peer);
+                }
+                Some(n) => held_back(&shared, &n.name, peer, &req.path, &r),
             }
             refuse(&mut io, &r).await;
             return;
         }
     };
     let Some(_counted) = count(&shared.relay, &cfg, &grant, peer) else {
-        held_back(&shared, &grant.node, peer, &FULL);
+        held_back(&shared, &grant.node, peer, &req.path, &FULL);
         refuse(&mut io, &FULL).await;
         return;
     };
+    let limit = cfg.relay.max_opens_per_minute as usize;
     if !shared
         .relay
-        .may_open(&grant.node, std::time::Instant::now())
+        .may_open(&grant.node, limit, std::time::Instant::now())
     {
-        held_back(&shared, &grant.node, peer, &TOO_OFTEN);
+        held_back(&shared, &grant.node, peer, &req.path, &TOO_OFTEN);
         refuse(&mut io, &TOO_OFTEN).await;
         return;
     }
+    // Decided: from here the tunnel is counted as one of the node's, and
+    // the undecided slot goes back, so a slow dial does not keep the
+    // peer's other connections out.
+    drop(slot);
     // The relay dials as the node's own link does: through its proxy, or
     // another relay, when it has one.
-    let dialled = match crate::link::proxy_for(&shared.paths, &cfg, &grant.url).await {
-        Ok(Some(proxy)) => nerve_transport::net::reach(&grant.url, Some(&proxy)).await,
-        Ok(None) => dial_center(&grant.url).await,
-        Err(e) => Err(format!("bad proxy: {e}")),
+    let dial = async {
+        match crate::link::proxy_for(&shared.paths, &cfg, &grant.url).await {
+            Ok(Some(proxy)) => nerve_transport::net::reach(&grant.url, Some(&proxy)).await,
+            Ok(None) => dial_center(&grant.url).await,
+            Err(e) => Err(format!("bad proxy: {e}")),
+        }
     };
+    let dialled = tokio::time::timeout(DIAL_DEADLINE, dial)
+        .await
+        .unwrap_or_else(|_| Err(format!("no connection in {}", span(DIAL_DEADLINE))));
     let center = match dialled {
         Ok(c) => c,
         Err(e) => {
@@ -791,7 +856,6 @@ async fn connection(
     if io.write_all(ok).await.is_err() || io.flush().await.is_err() {
         return;
     }
-    drop(slot);
     tracing::info!(
         "relay: {} from {peer} to center {}: tunnel open",
         grant.node,
@@ -2318,15 +2382,19 @@ mod tests {
     fn a_node_opens_a_bounded_number_of_tunnels_a_minute() {
         let r = Relays::default();
         let t0 = std::time::Instant::now();
-        for i in 0..OPENS_PER_MINUTE {
+        let limit = nerve_policy::config::Relay::default().max_opens_per_minute as usize;
+        assert_eq!(limit, 30);
+        for i in 0..limit {
             assert!(
-                r.may_open("lab", t0 + Duration::from_millis(i as u64)),
+                r.may_open("lab", limit, t0 + Duration::from_millis(i as u64)),
                 "{i}"
             );
         }
-        assert!(!r.may_open("lab", t0 + Duration::from_secs(1)));
-        assert!(r.may_open("lab2", t0 + Duration::from_secs(1)));
-        assert!(r.may_open("lab", t0 + Duration::from_secs(61)));
+        assert!(!r.may_open("lab", limit, t0 + Duration::from_secs(1)));
+        assert!(r.may_open("lab2", limit, t0 + Duration::from_secs(1)));
+        assert!(r.may_open("lab", limit, t0 + Duration::from_secs(61)));
+        // A relay behind this one gets a larger share from its owner.
+        assert!(r.may_open("lab", 100, t0 + Duration::from_secs(1)));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2341,7 +2409,7 @@ mod tests {
         .await;
         let lab = basic("lab", &j.token);
         let mut held = Vec::new();
-        for i in 0..OPENS_PER_MINUTE {
+        for i in 0..30 {
             let (status, head, t) = connect(j.addr, &j.pin, &home_at, Some(&lab)).await;
             assert_eq!(status, 200, "{i}: {head}");
             held.push(t.unwrap());
@@ -2352,15 +2420,47 @@ mod tests {
         j.daemon.stop().await;
     }
 
-    /// One machine is one peer: its IPv6 addresses count by their /64.
+    /// A peer is counted by its address, and an IPv6 one also by its /64
+    /// with a larger share: the machines of one LAN share the /64, so it
+    /// cannot be the only count. Link-local addresses have no /64 that
+    /// means anything (their scope is not in the address).
     #[test]
-    fn a_peer_is_an_ipv4_address_or_an_ipv6_slash_64() {
-        let k = |s: &str| peer_key(s.parse().unwrap()).to_string();
-        assert_eq!(k("2001:db8:1:2:aaaa::1"), k("2001:db8:1:2:bbbb::9"));
-        assert_ne!(k("2001:db8:1:2::1"), k("2001:db8:1:3::1"));
-        assert_eq!(k("10.0.0.7"), "10.0.0.7");
-        assert_eq!(k("::ffff:10.0.0.7"), "10.0.0.7");
-        assert_ne!(k("10.0.0.7"), k("10.0.0.8"));
+    fn a_peer_counts_by_its_address_and_its_ipv6_slash_64() {
+        let r = Relays::default();
+        let ip = |s: &str| -> std::net::IpAddr { s.parse().unwrap() };
+        for _ in 0..UNDECIDED_PER_PEER {
+            assert!(r.take_peer(ip("2001:db8:1:2::10")));
+        }
+        assert!(!r.take_peer(ip("2001:db8:1:2::10")));
+        // A neighbour on the same LAN keeps its own share.
+        assert!(r.take_peer(ip("2001:db8:1:2::20")));
+        r.give_peer(ip("2001:db8:1:2::20"));
+        // One machine with many addresses in the /64 gets the /64's share.
+        let mut taken = UNDECIDED_PER_PEER;
+        for host in 0x100..0x200u16 {
+            if !r.take_peer(ip(&format!("2001:db8:1:2::{host:x}"))) {
+                break;
+            }
+            taken += 1;
+        }
+        assert_eq!(taken, UNDECIDED_PER_PREFIX);
+        assert!(r.take_peer(ip("2001:db8:1:3::1")), "another /64");
+        // Link-local and IPv4 peers count by their address alone.
+        for _ in 0..UNDECIDED_PER_PEER {
+            assert!(r.take_peer(ip("fe80::1")));
+        }
+        assert!(!r.take_peer(ip("fe80::1")));
+        assert!(r.take_peer(ip("fe80::2")));
+        assert_eq!(prefix_of(ip("fe80::a:b:c:d")), None);
+        assert_eq!(prefix_of(ip("10.0.0.7")), None);
+        assert_eq!(prefix_of(ip("::ffff:10.0.0.7")), None);
+        assert_eq!(
+            prefix_of(ip("2001:db8:1:2:aaaa::1")),
+            prefix_of(ip("2001:db8:1:2:bbbb::9"))
+        );
+        // Given back, a slot is free again.
+        r.give_peer(ip("2001:db8:1:2::100"));
+        assert!(r.take_peer(ip("2001:db8:1:2::999")));
     }
 
     /// The first byte, TLS and the head share one deadline: a peer that is
@@ -2391,5 +2491,131 @@ mod tests {
             "held for {took:?}, past the one deadline"
         );
         j.daemon.stop().await;
+    }
+
+    /// A node with its token gets a counted line a minute for its refusals,
+    /// whatever it asks (a target that is no center, a token sent in plain
+    /// HTTP), so it cannot rotate the log either: after the first of each,
+    /// the rest are counted for the next line, not told one by one. (The
+    /// counts are read rather than the log: `tracing` caches whether a line
+    /// is wanted once per process, and other tests run without this one's
+    /// subscriber.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_node_with_its_token_cannot_flood_the_log_with_refusals() {
+        let j = jump(vec![], |_| {}).await;
+        let lab = basic("lab", &j.token);
+        for _ in 0..40 {
+            let (status, _, _) = connect(j.addr, &j.pin, "127.0.0.1:9", Some(&lab)).await;
+            assert_eq!(status, 403);
+            let (status, _, _) = connect_plain(j.addr, "127.0.0.1:9", Some(&lab)).await;
+            assert_eq!(status, 400);
+        }
+        let relays = j.daemon.relay();
+        assert_eq!(relays.held_back.pending(), 39, "403s told one by one");
+        let plain = lock(&relays.plain).get("lab").map(Tally::pending);
+        assert_eq!(plain, Some(39), "plain tokens told one by one");
+        assert_eq!(
+            relays.tokenless.pending(),
+            0,
+            "a valid token was taken for none"
+        );
+        j.daemon.stop().await;
+    }
+
+    /// A tunnel that is granted gives its undecided slot back before the
+    /// relay dials: a slow center keeps no other connection of its peer out.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_slow_dial_keeps_no_other_connection_of_the_peer_out() {
+        let home = echo().await;
+        let home_at = format!("127.0.0.1:{}", port(&home));
+        serve_echo(home);
+        // The relay reaches its centers through a proxy that never answers
+        // for `dead`.
+        let dead = echo().await;
+        let dead_at = format!("127.0.0.1:{}", port(&dead));
+        let stall = stalling_proxy(port(&dead)).await;
+        let (token2, hash2) = new_token();
+        let j = jump(
+            vec![
+                center("home", format!("https://{home_at}")),
+                center("dead", format!("https://{dead_at}")),
+            ],
+            |c| {
+                c.relay.max_links = 64;
+                c.relay.max_links_per_node = 64;
+                c.relay.nodes.push(relay_node("lab2", hash2, &[]));
+                c.connection.proxy = Some(format!("http://{stall}"));
+            },
+        )
+        .await;
+        let lab = basic("lab", &j.token);
+        let mut stuck = Vec::new();
+        for _ in 0..UNDECIDED_PER_PEER {
+            let (addr, pin, target, auth) = (j.addr, j.pin.clone(), dead_at.clone(), lab.clone());
+            stuck.push(tokio::spawn(async move {
+                connect(addr, &pin, &target, Some(&auth)).await.0
+            }));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let started = std::time::Instant::now();
+        let (status, head, t) =
+            connect(j.addr, &j.pin, &home_at, Some(&basic("lab2", &token2))).await;
+        assert_eq!(status, 200, "{head}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        round_trip(&mut t.unwrap(), b"through").await;
+        for s in stuck {
+            s.abort();
+        }
+        j.daemon.stop().await;
+    }
+
+    /// An HTTP proxy that tunnels everywhere but to `stall`, where it never
+    /// answers the `CONNECT`.
+    async fn stalling_proxy(stall: u16) -> SocketAddr {
+        let l = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let at = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = l.accept().await {
+                tokio::spawn(async move {
+                    let Ok(req) = read_request_head(&mut s).await else {
+                        return;
+                    };
+                    if req.path.ends_with(&format!(":{stall}")) {
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                        return;
+                    }
+                    let Ok(mut c) = TcpStream::connect(req.path.as_str()).await else {
+                        return;
+                    };
+                    let _ = s
+                        .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                        .await;
+                    let _ = tokio::io::copy_bidirectional(&mut s, &mut c).await;
+                });
+            }
+        });
+        at
+    }
+
+    /// The same address in another spelling is the same address: centers
+    /// there are granted together, and a list that splits them is refused.
+    #[test]
+    fn one_address_in_two_spellings_is_one_address() {
+        assert!(same_host("2001:db8::1", "2001:db8:0:0::1"));
+        assert!(same_host("H.Example.", "h.example"));
+        assert!(same_host("::ffff:10.0.0.1", "10.0.0.1"));
+        assert!(!same_host("h.example", "g.example"));
+        let (token, hash) = new_token();
+        let mut cfg = NodeConfig::default();
+        cfg.relay.listen = Some("127.0.0.1:7490".into());
+        cfg.relay.nodes.push(relay_node("lab", hash, &["a"]));
+        cfg.centers
+            .push(center("a", "https://[2001:db8::1]/a".into()));
+        cfg.centers
+            .push(center("b", "https://[2001:db8:0:0::1]/b".into()));
+        let mut r = get("[2001:db8::1]:443");
+        r.headers
+            .insert("proxy-authorization".into(), basic("lab", &token));
+        assert_eq!(decide(&cfg, &r), Err(NOT_A_CENTER));
     }
 }

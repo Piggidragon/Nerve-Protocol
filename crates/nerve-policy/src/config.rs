@@ -207,6 +207,12 @@ pub struct Relay {
     /// Tunnels at once of one relayed node.
     #[serde(default = "d_relay_links_per_node")]
     pub max_links_per_node: u32,
+    /// Tunnels one relayed node may open a minute. Each is an audit entry and
+    /// two log lines, so this keeps a node with its token from rotating the
+    /// logs; a node needs one per center and redials after a second at the
+    /// soonest, and a relay behind this one (a chain) needs more.
+    #[serde(default = "d_relay_opens")]
+    pub max_opens_per_minute: u32,
     /// The pin of the relay's TLS certificate, whose key is kept with the
     /// node's own keys; set when `nerve-node relay` makes it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -222,6 +228,9 @@ fn d_relay_links() -> u32 {
 fn d_relay_links_per_node() -> u32 {
     4
 }
+fn d_relay_opens() -> u32 {
+    30
+}
 
 impl Default for Relay {
     fn default() -> Relay {
@@ -230,6 +239,7 @@ impl Default for Relay {
             pin: None,
             max_links: d_relay_links(),
             max_links_per_node: d_relay_links_per_node(),
+            max_opens_per_minute: d_relay_opens(),
             nodes: Vec::new(),
         }
     }
@@ -253,8 +263,8 @@ impl Relay {
                 format!("relay.listen {l:?}: an address and a port, like 0.0.0.0:7490 or [::]:7490")
             })?;
         }
-        if self.max_links == 0 || self.max_links_per_node == 0 {
-            return Err("relay.max_links and relay.max_links_per_node must be at least 1".into());
+        if self.max_links == 0 || self.max_links_per_node == 0 || self.max_opens_per_minute == 0 {
+            return Err("relay.max_links, relay.max_links_per_node and relay.max_opens_per_minute must be at least 1".into());
         }
         let mut names = std::collections::BTreeSet::new();
         for n in &self.nodes {

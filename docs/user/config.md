@@ -54,6 +54,7 @@ listen = "0.0.0.0:7490"
 pin = "…"                   # the pin of the relay's certificate, made by `relay set`
 max_links = 16              # tunnels at once, over all relayed nodes
 max_links_per_node = 4
+max_opens_per_minute = 30   # tunnels one relayed node may open a minute
 
 [[relay.node]]              # added by `nerve-node relay add`
 name = "lab-pc"

@@ -661,7 +661,20 @@ pub async fn edit(
         AuditLog::new(paths.audit_log()),
     )?;
     match store.update(f) {
-        Ok(_) => Ok(store.config().clone()),
+        Ok(_) => {
+            let cfg = store.config().clone();
+            // No daemon took the change, so the folder grants of Windows
+            // folder mode follow it here (crate::grants); a running node
+            // brings them in line with its own config again before a
+            // command.
+            let synced = crate::grants::apply(paths, &cfg, &crate::paths::home_dir());
+            if let Some(e) = synced.errors.first() {
+                return Err(format!(
+                    "the config is saved, but the folder grants do not follow it: {e}"
+                ));
+            }
+            Ok(cfg)
+        }
         Err(SetError::Conflict { .. }) => Err("the config changed meanwhile; try again".into()),
         Err(e) => Err(e.to_string()),
     }
@@ -1359,8 +1372,22 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
         Cmd::Uninstall { purge } => {
             let layout = Layout::system();
             owner_check(&[&layout.paths]).await?;
+            // The node run by hand: the one named, or the one in this
+            // user's default folders.
             #[cfg(windows)]
-            return crate::winsvc::uninstall(&layout, &crate::win_host::WinHost, purge, out);
+            let by_hand = if paths == layout.paths {
+                NodePaths::by_hand()
+            } else {
+                paths
+            };
+            #[cfg(windows)]
+            return crate::winsvc::uninstall(
+                &layout,
+                &by_hand,
+                &crate::win_host::WinHost,
+                purge,
+                out,
+            );
             #[cfg(not(windows))]
             crate::service::uninstall(&layout, &Host, purge, out)
         }
@@ -3029,7 +3056,10 @@ mod tests {
     #[test]
     fn the_keyring_turns_folder_commands_off_below_abi_9() {
         use nerve_sandbox::Confinement;
-        let abi = |v| Confinement { landlock_abi: v };
+        let abi = |v| Confinement {
+            landlock_abi: v,
+            appcontainer: false,
+        };
         let account = |uid| crate::service::Account {
             name: "alice".into(),
             uid,

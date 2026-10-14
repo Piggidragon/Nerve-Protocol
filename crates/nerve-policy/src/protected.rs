@@ -1207,11 +1207,13 @@ impl Protected {
     /// `folders` release the place it leads to for each flag it sets, by
     /// name, as [`Protected::check`] judges a call there. A folder that
     /// does not exist yet is judged by the part of it that does; a dangling
-    /// link, or a path that cannot be resolved, is refused. Only a Unix node
-    /// resolves: Landlock is Linux's.
+    /// link, or a path that cannot be resolved, is refused. A node resolves
+    /// the list of the platform it runs on: on Windows a folder's grant for
+    /// the command's AppContainer lands where a link or junction leads too.
+    /// A list of the other platform (a test's) takes the path as it is.
     pub fn real_folder(&self, folder: &Folder, folders: &[Folder]) -> Result<PathBuf, String> {
         let path = Path::new(&folder.path);
-        if self.windows || !cfg!(unix) {
+        if self.windows != cfg!(windows) {
             return Ok(path.to_path_buf());
         }
         let real =

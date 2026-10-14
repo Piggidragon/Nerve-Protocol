@@ -6,7 +6,7 @@ behaves the same except where this page says so.
 | | Linux | Windows |
 |---|---|---|
 | Shell for commands | `/bin/sh -c` | Windows PowerShell 5.1 (`powershell.exe -NoProfile -Command`) |
-| `folder` mode runs commands | Yes, confined by Landlock | No. It refuses every command |
+| `folder` mode runs commands | Yes, confined by Landlock | Yes, confined by an AppContainer; not yet on the [installed service](service.md#windows) |
 | `allowlist` and `user` mode run commands | Yes | Yes, in a Job Object, not confined to folders |
 | Sudo switch | Yes | On the [installed service](service.md#windows), with the administrator token of the account commands run as ([sudo on Windows](sudo.md#sudo-on-windows)) |
 | Control socket | Yes | No |
@@ -33,8 +33,9 @@ behaves the same except where this page says so.
   command running.
 - A process that another program starts for the command, such as WMI, a
   service or the task scheduler, belongs to that program and is not in the job.
-- A Job Object does not limit file access. It is not a sandbox. That is why
-  `folder` mode runs no command on Windows.
+- A Job Object does not limit file access. It is not a sandbox. In `folder`
+  mode the command also runs in an AppContainer, which is. See
+  [modes](modes.md#what-a-command-can-reach-in-folder-mode-windows).
 - Output that is not UTF-8 is read in the console code page.
 - A [sudo](sudo.md#sudo-on-windows) command runs with the elevated token of
   the account commands run as, which must be an administrator. Every other
@@ -74,7 +75,8 @@ warning at start: in the stderr output and in the node's log file. The
 center's Log page shows the center's own log and does not carry it. Commands
 from a center then run with full rights on the machine (on Linux unless
 `machine.user` names another account for them), and you are responsible for
-what they do.
+what they do. On Windows, in `folder` mode, their AppContainer still holds
+them to their folders.
 
 ### No control socket
 

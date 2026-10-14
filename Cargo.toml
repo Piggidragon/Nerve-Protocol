@@ -49,7 +49,8 @@ tempfile = "3"
 # Secret Service) for the proxy's header values and credentials.
 keyring = "4.2"
 # The Job Object a Windows command runs in (CreateJobObjectW and its limits),
-# the one binding the node does not declare itself.
+# and the AppContainer of folder mode with the grants on its folders: the
+# bindings the node does not declare itself.
 windows-sys = "0.61"
 
 [profile.release]

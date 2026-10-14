@@ -161,6 +161,18 @@ impl CenterState {
     }
 }
 
+/// How this node confines the commands of folder mode. The installed
+/// Windows service runs every command as another account (crate::win_user),
+/// and the AppContainer is not wired for that account yet (its profile and
+/// window station are made for the user the shim runs as), so there folder
+/// mode has no confinement and runs no command.
+fn confinement_for(detected: Confinement, service: bool) -> Confinement {
+    Confinement {
+        appcontainer: detected.appcontainer && !service,
+        ..detected
+    }
+}
+
 /// Everything the daemon's tasks share.
 /// How long a looked-up account is used before it is looked up again.
 const ACCOUNT_FRESH: std::time::Duration = std::time::Duration::from_secs(5);
@@ -288,8 +300,8 @@ impl Shared {
         own
     }
 
-    /// Whether commands of `folder` mode may run: confined (Landlock and the
-    /// shim's host), and kept from the node's keys. With the keys in the
+    /// Whether commands of `folder` mode may run: confined (Landlock or an
+    /// AppContainer, and the shim's host), and kept from the node's keys. With the keys in the
     /// keyring a command reaches them over the session bus, a socket file:
     /// Landlock keeps a command from connecting to one only from ABI 9 on
     /// (Linux 7.1), and before that only an account other than root and the
@@ -642,7 +654,10 @@ impl Daemon {
             exe: opts.exe,
             home: opts.home,
             platform: crate::paths::platform(),
-            confinement: opts.confinement.unwrap_or_else(Confinement::detect),
+            confinement: confinement_for(
+                opts.confinement.unwrap_or_else(Confinement::detect),
+                service,
+            ),
             store: Mutex::new(store),
             changed,
             centers: Mutex::default(),
@@ -768,9 +783,22 @@ async fn supervise(shared: Arc<Shared>) {
     let mut changed = shared.changed.subscribe();
     let mut stop = shared.stop.subscribe();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut granted: Option<u64> = None;
     loop {
         shared.settle_sudo();
         let cfg = shared.config();
+        // The folder grants follow the config as it changes (crate::grants);
+        // a command syncs them as well before it runs.
+        if shared.confinement.appcontainer && granted != Some(cfg.version) {
+            granted = Some(cfg.version);
+            let (s, c) = (shared.clone(), cfg.clone());
+            tokio::task::spawn_blocking(move || {
+                let synced = crate::grants::apply(&s.paths, &c, &s.rules_home(&c));
+                for e in synced.errors {
+                    tracing::warn!("folder grants: {e}");
+                }
+            });
+        }
         // The level follows the config, whoever changed it and however.
         if let Some(log) = &shared.log {
             log.set_level(cfg.log.level);
@@ -1390,6 +1418,7 @@ mod tests {
         o.exe = Some("/bin/true".into());
         o.confinement = Some(Confinement {
             landlock_abi: Some(6),
+            appcontainer: false,
         });
         let daemon = Daemon::start(o).await.unwrap();
         let s = daemon.shared.clone();
@@ -1561,5 +1590,31 @@ node_id = "n1"
         let text = describe_leaf("a.b", &Value::Null, &Value::String(long));
         assert_eq!(text.chars().count(), "a.b: unset -> ".len() + 81);
         assert!(text.ends_with('…'));
+    }
+}
+
+#[cfg(test)]
+mod confinement_tests {
+    use super::*;
+
+    /// The installed Windows service runs commands as another account, for
+    /// which the AppContainer is not wired: folder mode is not confined there
+    /// and runs no command. Landlock and a node run by hand keep theirs.
+    #[test]
+    fn the_installed_service_runs_no_command_in_an_appcontainer() {
+        let windows = Confinement {
+            landlock_abi: None,
+            appcontainer: true,
+        };
+        assert!(confinement_for(windows, false).appcontainer);
+        let installed = confinement_for(windows, true);
+        assert!(!installed.available(), "{installed:?}");
+        assert_eq!(installed.describe(), "none");
+        let linux = Confinement {
+            landlock_abi: Some(4),
+            appcontainer: false,
+        };
+        assert_eq!(confinement_for(linux, true), linux);
+        assert_eq!(confinement_for(linux, false), linux);
     }
 }

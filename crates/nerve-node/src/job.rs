@@ -9,7 +9,8 @@
 //! command's request, such as the WMI provider host (`Win32_Process.Create`),
 //! a service or the task scheduler. That process is that program's child and
 //! in that program's job. A job does not restrict file access either: it is
-//! no confinement, and folder mode still runs no command on Windows.
+//! no confinement. Folder mode adds that with an AppContainer, which the
+//! shim starts in the command's job (nerve_sandbox::appcontainer).
 //!
 //! When Windows makes no job, the command runs anyway and its processes are
 //! ended by the walk of crate::tree, best effort. When it makes one but

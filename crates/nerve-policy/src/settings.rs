@@ -609,7 +609,7 @@ impl SettingsStore {
         if new == self.config {
             return Ok(());
         }
-        new.version = self.config.version + 1;
+        new.version = self.next_version();
         self.write(&new, Some(self.config.version))
             .map_err(|e| e.to_string())?;
         self.config = new;
@@ -698,13 +698,27 @@ impl SettingsStore {
         if new == self.config {
             return Ok(self.config.version);
         }
-        new.version = self.config.version + 1;
+        new.version = self.next_version();
         self.write(&new, Some(self.config.version))?;
         let changes = diff(&to_json(&self.config), &to_json(&new));
         let version = new.version;
         self.config = new;
         self.changed(&by.label(), version, &changes);
         Ok(version)
+    }
+
+    /// The version of the file this store saves next: above the one in force
+    /// and above the record. Another writer may have saved the file
+    /// meanwhile and raised the record past the version in force (the CLI on
+    /// Windows, which has no socket to ask the node, or on Linux before the
+    /// node's socket is up). This store's save replaces that file, as it
+    /// always did; but numbered by its own version alone it would land below
+    /// the record, and the node would refuse its own file at its next start
+    /// as an earlier one put back. A record that cannot be read counts as
+    /// none; the save writes it again.
+    fn next_version(&self) -> u64 {
+        let last = self.secrets.accepted_version().ok().flatten().unwrap_or(0);
+        self.config.version.max(last) + 1
     }
 }
 
@@ -1838,6 +1852,57 @@ mod tests {
         assert_eq!(running.reload(), Ok(true));
         assert_eq!(running.version(), newest);
         assert_eq!(recorded(d.path()), Some(newest));
+    }
+
+    /// Another writer saved the file while a node holds its config in memory
+    /// (the CLI on Windows, which has no socket to ask the node), and raised
+    /// the record by more than one. The node's own next save must go above
+    /// the record, or its next start refuses the node's own file as an
+    /// earlier one put back, whatever kind of write it was.
+    #[test]
+    fn a_running_nodes_save_goes_above_the_record_another_writer_raised() {
+        type Save = fn(&mut SettingsStore) -> Result<(), String>;
+        let saves: [(&str, Save); 4] = [
+            ("mark", |s| s.mark(|c| c.centers[0].revoked = true)),
+            ("update", |s| {
+                s.update(|c| {
+                    c.limits.max_running = 9;
+                    Ok(())
+                })
+                .map(drop)
+                .map_err(|e| e.to_string())
+            }),
+            ("sudo of a center", |s| {
+                s.set_sudo(Writer::Center("home"), Sudo::On)
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            }),
+            ("settings.set of a center", |s| {
+                let v = s.version();
+                let mut new = doc(s);
+                new["policy"]["caps"] = json!({"exec": "off"});
+                s.set_center_document("home", new, v, |_| false, unix)
+                    .map(drop)
+                    .map_err(|e| e.to_string())
+            }),
+        ];
+        for (what, save) in saves {
+            let d = tempfile::tempdir().unwrap();
+            let mut running = store(d.path(), SettingsGrant::Write);
+            let mut cli = reopen(d.path()).unwrap();
+            bump(&mut cli);
+            let newest = bump(&mut cli);
+            assert!(newest > running.version() + 1, "{what}");
+            save(&mut running).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert!(running.version() > newest, "{what}");
+            assert_eq!(recorded(d.path()), Some(running.version()), "{what}");
+            let v = running.version();
+            drop(running);
+            // Its own file starts again, and nothing was refused.
+            let again = reopen(d.path()).unwrap_or_else(|e| panic!("{what}: {e}"));
+            assert_eq!(again.version(), v, "{what}");
+            assert_eq!(refusals(&again), 0, "{what}");
+        }
     }
 
     /// A record that is no number is not taken for none: it would let

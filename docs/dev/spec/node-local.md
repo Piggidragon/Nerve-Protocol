@@ -137,6 +137,13 @@ backup.
 - A record that holds no number is an error, not none: the node does not
   start, and the CLI's commands refuse, naming the file. `config accept`
   writes it again, or the owner deletes it.
+- A save by the running node is numbered above the record as well as above
+  the version in force. Another writer may have saved the file meanwhile and
+  raised the record (the CLI on Windows, where a running node takes the file
+  only at its next start; on Linux the CLI before the node's socket is up).
+  The node's save replaces that file, as it always did, but it never lands
+  below the record, so the node does not refuse its own file as an earlier
+  one put back at its next start.
 - A record that cannot be written after the file was saved changes nothing: it
   only lags, the audit log says `not_recorded`, and the next start records
   the version.
@@ -620,8 +627,12 @@ answer. For each call the node takes the center's policy and, in this order:
    dropped as Windows drops it (`node-state.\`), and a drive-relative
    `C:name` is taken from the working directory on that drive. A path a
    command builds at run time (`cd ~/.config; cat nerve/node.toml`) is not
-   seen there; in `folder` mode Landlock keeps the command out all the
-   same, while a `user` mode command runs as the user, unconfined.
+   seen there. In `folder` mode Landlock (the AppContainer on Windows) keeps a
+   command it confines out all the same. A `user` mode command runs as the
+   user, unconfined, so does a program an `allowlist` rule lets run, and a
+   sudo command (§4) runs as root without the sandbox in every mode; a
+   `folder` mode command can also ask a service of the user's session to run
+   a program outside it (`docs/user/modes.md`).
 1. A `locked` node (after `panic`) keeps no links and runs nothing; a paused,
    revoked or unknown center is not dialled.
 2. The capability setting: `off` refuses (`disabled`), `hidden` leaves it

@@ -432,14 +432,21 @@ pub fn container_grants(
 /// `p` resolved, as the policy compares paths (on Windows without the
 /// `\\?\` prefix); `p` itself when it cannot be resolved.
 fn real(p: &Path) -> PathBuf {
-    match std::fs::canonicalize(p) {
-        #[cfg(windows)]
-        Ok(c) => PathBuf::from(nerve_policy::paths::win::strip_verbatim(
+    real_checked(p).unwrap_or_else(|_| p.to_path_buf())
+}
+
+/// [`real`] with the reason it could not resolve.
+fn real_checked(p: &Path) -> std::io::Result<PathBuf> {
+    let c = std::fs::canonicalize(p)?;
+    #[cfg(windows)]
+    {
+        Ok(PathBuf::from(nerve_policy::paths::win::strip_verbatim(
             &c.to_string_lossy(),
-        )),
-        #[cfg(not(windows))]
-        Ok(c) => c,
-        Err(_) => p.to_path_buf(),
+        )))
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(c)
     }
 }
 
@@ -465,14 +472,71 @@ pub fn write_folders(cfg: &NodeConfig, home: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Why a folder about to be added at `path` (as given, not resolved) must not
-/// be stored at the place it leads to: its path crosses a link inside a `w`
-/// folder of any center in `cfg` ([`led_away`], with [`write_folders`]), and a
-/// command may have put that link there. `folder add` would otherwise follow
-/// it and store, and record, whatever it leads to.
-pub fn crosses_write_link(cfg: &NodeConfig, home: &Path, path: &Path) -> Option<String> {
-    let bounds: Vec<PathBuf> = write_folders(cfg, home).iter().map(|w| real(w)).collect();
-    led_away(path, &bounds)
+/// What [`settle`] made of the path of a folder about to be added.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Settled {
+    /// The folder's real place: the path followed a link at a time, none of
+    /// them inside a `w` folder, and it resolves to itself.
+    At(PathBuf),
+    /// The folder must not be added at the place the path leads to: it crosses
+    /// a link inside a `w` folder of any center, which a command may have put
+    /// there, or cannot be followed, or changed while it was looked at.
+    Refused(String),
+    /// This process cannot tell: it may not look into the folder, or into a
+    /// `w` folder it would have to judge the links by (the installed node's
+    /// CLI runs as the node's own user, not as the account).
+    Unknown,
+}
+
+/// Where a folder about to be added at `path` (absolute, as given) really is,
+/// judged for `folder add` in one pass: [`walk`] follows the path a link at a
+/// time against the `w` folders of every center in `cfg` and ends where it
+/// leads; that place must resolve to itself, so a link swapped in after the
+/// walk (a command can exchange a folder and a link at any moment) is caught
+/// rather than followed, and what is stored is what was looked at. A `w` folder
+/// that cannot be resolved here makes the answer [`Settled::Unknown`]: which
+/// links lie inside it cannot be told.
+pub fn settle(cfg: &NodeConfig, home: &Path, path: &Path) -> Settled {
+    settle_by(cfg, home, path, nerve_policy::paths::resolve)
+}
+
+fn settle_by(
+    cfg: &NodeConfig,
+    home: &Path,
+    path: &Path,
+    resolve: impl Fn(&Path) -> Result<PathBuf, nerve_policy::paths::PathError>,
+) -> Settled {
+    let mut bounds = Vec::new();
+    for w in write_folders(cfg, home) {
+        match real_checked(&w) {
+            Ok(r) => bounds.push(r),
+            // A `w` folder that is not there (yet) holds no link.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => bounds.push(w),
+            Err(_) => return Settled::Unknown,
+        }
+    }
+    // A link to nothing could point anywhere once something is made there.
+    if let Err(e @ nerve_policy::paths::PathError::DanglingSymlink(_)) = resolve(path) {
+        return Settled::Refused(e.to_string());
+    }
+    let walked = match walk(path, &bounds) {
+        Ok(p) => p,
+        Err(why) => return Settled::Refused(why),
+    };
+    match resolve(&walked) {
+        Ok(place) if within(&place, &walked) && within(&walked, &place) => Settled::At(place),
+        Ok(place) => Settled::Refused(format!(
+            "it leads to {} where it was looked at as {}: a link was put there meanwhile, or it is spelled with an 8.3 short name (use the full name)",
+            place.display(),
+            walked.display()
+        )),
+        Err(nerve_policy::paths::PathError::Io(e))
+            if e.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            Settled::Unknown
+        }
+        Err(e) => Settled::Refused(e.to_string()),
+    }
 }
 
 /// Why resolving `path` leads out of its own place: a link the resolution
@@ -489,6 +553,12 @@ pub fn crosses_write_link(cfg: &NodeConfig, home: &Path, path: &Path) -> Option<
 /// junction's target on Windows). On Windows a junction is a link here, as
 /// `symlink_metadata` reports it.
 fn led_away(path: &Path, writable: &[PathBuf]) -> Option<String> {
+    walk(path, writable).err()
+}
+
+/// [`led_away`], and where the path ends when nothing leads it away: the path
+/// followed a link at a time, which is also what `folder add` stores.
+fn walk(path: &Path, writable: &[PathBuf]) -> Result<PathBuf, String> {
     // The most links one resolution may cross, as the kernel's limit.
     const LINKS: usize = 40;
     let mut here = PathBuf::new();
@@ -512,7 +582,7 @@ fn led_away(path: &Path, writable: &[PathBuf]) -> Option<String> {
                 }
                 let holder = real(&here);
                 if writable.iter().any(|w| within(&holder, w)) {
-                    return Some(format!(
+                    return Err(format!(
                         "it passes through the link {} inside a folder where commands may write",
                         at.display()
                     ));
@@ -522,7 +592,7 @@ fn led_away(path: &Path, writable: &[PathBuf]) -> Option<String> {
                 match target {
                     Some(t) => todo.extend(steps(&t)),
                     None => {
-                        return Some(format!(
+                        return Err(format!(
                             "it cannot be resolved through the link {}",
                             at.display()
                         ));
@@ -531,7 +601,7 @@ fn led_away(path: &Path, writable: &[PathBuf]) -> Option<String> {
             }
         }
     }
-    None
+    Ok(here)
 }
 
 /// The first place the resolution of `path` lands at that `wanted` accepts,
@@ -2187,6 +2257,95 @@ mod tests {
         std::os::unix::fs::symlink(&docs, work.join("a")).unwrap();
         let spec = landlock_spec(&reader, &home, &[], &writable);
         assert!(!spec_reaches(&spec, &docs), "{spec:?}");
+    }
+
+    /// `settle` follows the path of a folder about to be added a link at a
+    /// time and answers with where it really is: a link of the owner's
+    /// outside the `w` folders is followed, one inside a `w` folder or one to
+    /// nowhere refuses, a link swapped in after the walk is caught instead of
+    /// followed, and a `w` folder this process cannot resolve makes it say it
+    /// cannot tell.
+    #[test]
+    fn a_folder_about_to_be_added_is_settled_where_it_really_is() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let (home, work, docs) = nested_home(&d);
+        let bin = work.join("bin");
+        let policy = |w: &Path| CenterPolicy {
+            folders: vec![folder(w, "rw")],
+            ..Default::default()
+        };
+        let mut cfg = NodeConfig::default();
+        let mut entry = nerve_policy::CenterEntry {
+            name: "lab".into(),
+            url: "https://center.example".into(),
+            pin: None,
+            center_id: "c".into(),
+            node_id: "n".into(),
+            settings: Default::default(),
+            paused: false,
+            revoked: false,
+            unknown: false,
+            policy: policy(&work),
+        };
+        cfg.centers.push(entry.clone());
+        // A plain folder, one that is not there yet, and the owner's link
+        // outside every `w` folder.
+        assert_eq!(settle(&cfg, &home, &bin), Settled::At(bin.clone()));
+        let later = work.join("later/deeper");
+        assert_eq!(settle(&cfg, &home, &later), Settled::At(later.clone()));
+        std::os::unix::fs::symlink(&docs, home.join("to-docs")).unwrap();
+        assert_eq!(
+            settle(&cfg, &home, &home.join("to-docs")),
+            Settled::At(docs.clone())
+        );
+        // Tidied: a doubled separator and a `.` part.
+        let odd = PathBuf::from(format!("{}//./bin", work.display()));
+        assert_eq!(settle(&cfg, &home, &odd), Settled::At(bin.clone()));
+
+        // A link inside the `w` folder is not followed, whoever made it.
+        std::fs::remove_dir(&bin).unwrap();
+        std::os::unix::fs::symlink(&docs, &bin).unwrap();
+        let Settled::Refused(why) = settle(&cfg, &home, &bin) else {
+            panic!("a link in a write folder was followed")
+        };
+        assert!(why.contains("may write"), "{why}");
+        assert!(matches!(
+            settle(&cfg, &home, &bin.join("sub")),
+            Settled::Refused(_)
+        ));
+        // A link to nothing is refused.
+        std::os::unix::fs::symlink(home.join("nowhere"), home.join("dangling")).unwrap();
+        assert!(matches!(
+            settle(&cfg, &home, &home.join("dangling")),
+            Settled::Refused(_)
+        ));
+
+        // A link swapped in after the walk: what resolves is not what was
+        // looked at.
+        std::fs::remove_file(&bin).unwrap();
+        std::fs::create_dir(&bin).unwrap();
+        let swapped = |_: &Path| Ok(docs.clone());
+        let Settled::Refused(why) = settle_by(&cfg, &home, &bin, swapped) else {
+            panic!("a swapped link was followed")
+        };
+        assert!(why.contains("meanwhile"), "{why}");
+
+        // A `w` folder that cannot be resolved here (a closed folder holds
+        // it) makes the links inside it impossible to judge.
+        if nerve_transport::net::euid() == 0 {
+            return; // root looks into every folder
+        }
+        let closed = home.join("closed");
+        std::fs::create_dir_all(closed.join("code")).unwrap();
+        entry.policy = policy(&closed.join("code"));
+        cfg.centers[0] = entry;
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let settled = settle(&cfg, &home, &bin);
+        let inside = settle(&cfg, &home, &closed.join("code/x"));
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(settled, Settled::Unknown);
+        assert_eq!(inside, Settled::Unknown);
     }
 
     /// `lands_at` follows a path a link at a time and answers with the first

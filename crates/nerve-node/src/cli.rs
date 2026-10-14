@@ -1786,9 +1786,8 @@ async fn add_folder(
                 .into(),
         );
     }
-    // A link a command may have put in the path is not followed: the folder
-    // would be stored, and recorded, at whatever it leads to.
     let (cfg, _) = read_config(paths).await?;
+    let name = pick_center(&cfg, center)?;
     let given = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -1796,108 +1795,88 @@ async fn add_folder(
             .map_err(|e| e.to_string())?
             .join(path)
     };
-    if let Some(why) = crate::exec::crosses_write_link(&cfg, &crate::paths::home_dir(), &given) {
-        return Err(format!(
-            "{}: {why}. Look at the link (`ls -l`, `dir /AL`): add the place you mean by its own path, or remove the link",
-            path.display()
-        ));
-    }
-    let real = resolve_folder(path)?;
-    // The place the owner adds is recorded, so that a link which replaces
-    // the folder later is refused (`exec::folder_sets`); adding it again
-    // takes the place it has then.
-    let placed = nerve_policy::paths::is_own_place(Path::new(&real));
-    let mode = std::cell::Cell::new(Mode::Folder);
-    let name = edit_center(paths, center, |e| {
-        e.policy.folders.retain(|f| f.path != real);
-        e.policy.folders.push(Folder {
-            path: real.clone(),
-            access,
-        });
-        e.policy.set_placed(&real, placed);
-        mode.set(e.policy.mode);
-        Ok(())
-    })
-    .await?;
-    // What this command could not judge, the running node does as the
-    // account the commands run as; it stores the real place the path leads
-    // to, as this command does where it can look.
-    let asked = if placed {
-        None
-    } else {
-        Some(record_by_node(paths, &name, &real).await)
+    let given = nerve_policy::paths::normal_folder(&given.display().to_string())?;
+    // A running node judges the path as the account the commands run as,
+    // which this command may not be (the installed node's CLI runs as the
+    // node's own user): it follows the links on the path a link at a time,
+    // refuses one a command may have put inside a `w` folder, and stores and
+    // records the real place, all in one step.
+    #[cfg(unix)]
+    let asked = {
+        let params = json!({"center": name, "path": given, "access": access.to_string()});
+        match nerve_transport::ctl::call(&paths.ctl_socket(), "folder.add", params).await {
+            Ok(v) => Some((
+                v["stored"].as_str().unwrap_or(&given).to_string(),
+                v["recorded"] == true,
+                v["mode"].as_str().map(str::to_string),
+            )),
+            Err(e) if e == nerve_transport::ctl::NOT_RUNNING => None,
+            Err(e) => return Err(e),
+        }
     };
-    let stored = match &asked {
-        Some(Ok(place)) => place.clone(),
-        _ => real.clone(),
+    #[cfg(not(unix))]
+    let asked: Option<(String, bool, Option<String>)> = None;
+    let (stored, recorded, mode) = match asked {
+        Some(a) => a,
+        None => {
+            // No node to ask: judge the path here, as this process sees it.
+            let settled = crate::exec::settle(&cfg, &crate::paths::home_dir(), Path::new(&given));
+            let (stored, recorded) = match settled {
+                crate::exec::Settled::Refused(why) => {
+                    return Err(crate::daemon::refusal(&given, &why));
+                }
+                crate::exec::Settled::At(place) => (place.display().to_string(), true),
+                crate::exec::Settled::Unknown => (given.clone(), false),
+            };
+            let mode = std::cell::Cell::new(Mode::Folder);
+            edit_center(paths, center, |e| {
+                e.policy.folders.retain(|f| !same_folder(&f.path, &stored));
+                e.policy.folders.push(Folder {
+                    path: stored.clone(),
+                    access,
+                });
+                if recorded {
+                    e.policy.set_placed(&stored, true);
+                }
+                mode.set(e.policy.mode);
+                Ok(())
+            })
+            .await?;
+            (stored, recorded, Some(mode.get().as_str().to_string()))
+        }
     };
     w(
         out,
         format!("{name}: folder {stored} {}", access.to_chmod()),
     );
-    match &asked {
-        Some(Err(Some(why))) => w(
-            out,
-            format!(
-                "note: {real} is stored as given and not recorded: {why}, and a command may have put that link there. It stays out of the commands' sandbox while a `w` folder shows the link, and is followed once none does: `folder rm` it, or add the place you mean by its own path"
-            ),
-        ),
-        Some(Err(None)) => w(
-            out,
-            format!(
-                "note: {real} is not recorded at its real place, since this command cannot tell that it is (the installed node's CLI may not look into the account's home) and no running node could: a link that replaces the folder later is followed once no `w` folder shows it, see modes.md \"A folder keeps the place you added\""
-            ),
-        ),
-        Some(Ok(place)) if *place != real => w(
-            out,
-            format!(
-                "note: {real} leads to {place} for the account the commands run as; the folder is stored there"
-            ),
-        ),
-        _ => {}
-    }
-    let mode = mode.get();
-    if mode != Mode::Folder {
+    if !recorded {
         w(
             out,
             format!(
-                "note: folders count in folder mode; {name} is in {} mode (`nerve-node mode set folder`)",
-                mode.as_str()
+                "note: {stored} is stored as given and not recorded at its real place, since this command cannot tell where its path leads (the installed node's CLI may not look into the account's home) and no running node could: a link that replaces the folder later is followed once no `w` folder shows it, see modes.md \"A folder keeps the place you added\"; start the node and add the folder again"
+            ),
+        );
+    } else if !same_folder(&stored, &given) {
+        w(
+            out,
+            format!("note: {given} leads to {stored}; the folder is stored there"),
+        );
+    }
+    if let Some(mode) = mode.filter(|m| m != Mode::Folder.as_str()) {
+        w(
+            out,
+            format!(
+                "note: folders count in folder mode; {name} is in {mode} mode (`nerve-node mode set folder`)"
             ),
         );
     }
     Ok(())
 }
 
-/// Asks the running node to record the folder at `path` of `center` at its
-/// real place, which it judges as the account the commands run as
-/// (`folder.place`): this command may not look into that account's home. The
-/// answer is the place the folder is stored at and recorded now (`path`, or
-/// the real place the path leads to for that account). Otherwise the reason
-/// when the node left the folder as it is, since its path crosses a link inside
-/// a `w` folder, and `None` when no node runs, this platform has no control
-/// socket, or the node cannot tell either.
-async fn record_by_node(
-    paths: &NodePaths,
-    center: &str,
-    path: &str,
-) -> Result<String, Option<String>> {
-    #[cfg(unix)]
-    {
-        let params = json!({"center": center, "path": path});
-        let v = nerve_transport::ctl::call(&paths.ctl_socket(), "folder.place", params)
-            .await
-            .map_err(|_| None)?;
-        match v["place"].as_str() {
-            Some(place) if v["placed"] == true => Ok(place.to_string()),
-            _ => Err(v["why"].as_str().map(str::to_string)),
-        }
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (paths, center, path);
-        Err(None)
-    }
+/// Whether two folder paths name one place.
+fn same_folder(a: &str, b: &str) -> bool {
+    use nerve_policy::paths::within;
+    within(Path::new(a), Path::new(b)) && within(Path::new(b), Path::new(a))
 }
 
 /// `nerve-node sudo on|off|status`. The password lives in the running
@@ -2962,6 +2941,17 @@ mod tests {
         let out = run(&paths, &["folder", "add", proj.to_str().unwrap(), "+rw"]).unwrap();
         assert!(!out.contains("not recorded"), "{out}");
         assert_eq!(load(&paths).centers[0].policy.places.len(), 1);
+        // Added again where it cannot look, the rights change and the record
+        // it has stays: a record only narrows, and the node checks it as the
+        // account before each command.
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let out = run(&paths, &["folder", "add", proj.to_str().unwrap(), "+r"]);
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(out.unwrap().contains("not recorded at its real place"));
+        let policy = load(&paths).centers[0].policy.clone();
+        assert_eq!(policy.folders.len(), 1);
+        assert_eq!(policy.folders[0].access.to_string(), "r");
+        assert_eq!(policy.places, [proj.display().to_string()]);
     }
 
     /// In the state the new warning reports, a link has replaced a recorded
@@ -3116,13 +3106,19 @@ mod tests {
         std::fs::create_dir(&docs).unwrap();
         run(&paths, &["folder", "add", work.to_str().unwrap(), "+rw"]).unwrap();
         // The folder is a plain one first, and then a command replaces it.
+        run(&paths, &["folder", "add", bin.to_str().unwrap(), "+r"]).unwrap();
         std::fs::remove_dir(&bin).unwrap();
         std::os::unix::fs::symlink(&docs, &bin).unwrap();
+        let before = load(&paths).centers[0].policy.clone();
         let e = run(&paths, &["folder", "add", bin.to_str().unwrap(), "+rx"]).unwrap_err();
         assert!(e.contains("link") && e.contains("may write"), "{e}");
         let policy = load(&paths).centers[0].policy.clone();
-        assert_eq!(policy.folders.len(), 1, "nothing was stored: {policy:?}");
-        assert_eq!(policy.places, [work.display().to_string()]);
+        assert_eq!(
+            policy, before,
+            "nothing changed, the record of `bin` included"
+        );
+        assert!(policy.is_placed(&bin.display().to_string()));
+        assert!(!policy.is_placed(&docs.display().to_string()));
         assert!(!policy.is_placed(&docs.display().to_string()));
         // A link of the owner's outside every write folder is followed.
         let to_docs = root.join("to-docs");

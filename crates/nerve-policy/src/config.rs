@@ -522,29 +522,6 @@ impl CenterPolicy {
         self.places.iter().any(|p| same_place(p, path))
     }
 
-    /// Stores the folder at `path` at `place`, the real place it leads to,
-    /// and records it there: the entry is replaced (any entry already at
-    /// `place` too) and keeps the access it has now. An error when the folder
-    /// is gone, which a change made meanwhile can cause.
-    pub fn store_at(&mut self, path: &str, place: &str) -> Result<(), String> {
-        let access = self
-            .folders
-            .iter()
-            .find(|f| same_place(&f.path, path))
-            .map(|f| f.access)
-            .ok_or_else(|| format!("{path} is no longer a folder of this center"))?;
-        if !same_place(place, path) {
-            self.folders
-                .retain(|f| !same_place(&f.path, path) && !same_place(&f.path, place));
-            self.folders.push(Folder {
-                path: place.to_string(),
-                access,
-            });
-        }
-        self.set_placed(place, true);
-        Ok(())
-    }
-
     /// Records the folder at `path` as being at its real place, or, with
     /// `placed` false, forgets that it was.
     pub fn set_placed(&mut self, path: &str, placed: bool) {
@@ -1200,47 +1177,6 @@ sudo_allow = ["sudo apt update"]
         p.folders.retain(|f| f.path != "/c");
         p.validate().unwrap();
         assert!(p.places.is_empty());
-    }
-
-    /// `store_at` moves a folder to the place it leads to with the access it
-    /// has now, replaces what is at that place, and refuses a folder that a
-    /// change made meanwhile took away.
-    #[cfg(not(windows))]
-    #[test]
-    fn a_folder_is_stored_at_its_place_with_the_access_it_has_now() {
-        let text = center(
-            "folders = [{ path = \"/a/link\", access = \"rw\" }, { path = \"/b\", access = \"r\" }, { path = \"/c\", access = \"x\" }]",
-        );
-        let mut p = NodeConfig::parse(&text).unwrap().centers[0].policy.clone();
-        p.store_at("/a/link", "/b").unwrap();
-        let access = |p: &CenterPolicy, at: &str| {
-            p.folders
-                .iter()
-                .find(|f| f.path == at)
-                .map(|f| f.access.to_string())
-        };
-        assert_eq!(access(&p, "/a/link"), None);
-        assert_eq!(
-            access(&p, "/b").as_deref(),
-            Some("rw"),
-            "the access of the link"
-        );
-        assert_eq!(p.folders.len(), 2);
-        assert!(p.is_placed("/b") && !p.is_placed("/c"));
-        // Its own place: only recorded; a rights change since is kept.
-        p.folders
-            .iter_mut()
-            .find(|f| f.path == "/c")
-            .unwrap()
-            .access = Access::parse("r").unwrap();
-        p.store_at("/c", "/c").unwrap();
-        assert_eq!(access(&p, "/c").as_deref(), Some("r"));
-        assert!(p.is_placed("/c"));
-        // The folder was removed meanwhile: nothing is put back.
-        p.folders.retain(|f| f.path != "/b");
-        let e = p.store_at("/b", "/d").unwrap_err();
-        assert!(e.contains("no longer a folder"), "{e}");
-        assert_eq!(access(&p, "/d"), None);
     }
 
     #[test]

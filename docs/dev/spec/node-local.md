@@ -137,7 +137,8 @@ the config's MAC and its key per center.
   `config-key:<state folder>` and `center-key:<name>:<config folder>`. Each
   holds the key's hex text. No copy stays in a file.
 
-The proxy's header values are in the keyring either way (§2).
+The proxy's header values are in the keyring either way (§2), except on the
+installed node on Windows, which takes none (§2, Proxy).
 
 Two kinds of node keep their keys in files whatever is asked:
 
@@ -411,6 +412,21 @@ When the daemon dials through the proxy it reads the entry; a missing or
 unreadable entry, or one without a value for a named header, stops the link
 with a status that names the entry, and the node does not dial directly
 instead (fail closed).
+
+The installed node on Windows (§1, where the keys are: the folders `install`
+uses, or the account `nerve`) takes no header value and no password either,
+though its keyring answers. The service runs as `nerve`, the Credential
+Manager is one per account, and `proxy set` runs as an administrator, so the
+values would be in the administrator's Credential Manager, out of the
+service's reach. The node keeps no proxy secret in a file, so there is nowhere
+else for them. `proxy set` with a header or a password refuses before it asks
+the keyring, and changes nothing (`node.toml`, the keyring); a proxy without
+either works, and its `proxy set` deletes the entry of an earlier call, as it
+does anywhere. Reading is as consistent: with headers named in `node.toml`
+(set before the install) the link stops with `bad proxy:` and the same reason,
+and `proxy ls` shows it, both without asking the keyring: an entry may be in
+the administrator's Credential Manager, but the service does not find it, so
+`proxy ls` must not call the values good.
 
 A `node.toml` that holds header values (`headers = { Name = "value" }`) or a
 user name and password in `connection.proxy` is refused on load, without the values in the message: take them out of the

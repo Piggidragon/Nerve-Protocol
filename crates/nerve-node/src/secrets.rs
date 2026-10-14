@@ -3,7 +3,9 @@
 //! The values of the proxy's header lines, a `Proxy-Authorization` made from a
 //! user name and password in the proxy URL among them, are always in the
 //! system keyring: `node.toml` names the headers, and their values are never
-//! in a file, a log, an error text or the audit log.
+//! in a file, a log, an error text or the audit log. The installed node on
+//! Windows has no keyring for them ([`PROXY_WINDOWS_SERVICE`]) and takes a
+//! proxy without header or password only.
 //!
 //! The node's own keys, the key of the config's MAC and the node key per
 //! center, are where `machine.secret_storage` says: 0600 files (`file`, the
@@ -85,9 +87,21 @@ fn absolute(p: &Path) -> std::path::PathBuf {
     std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf())
 }
 
+/// Why the installed node on Windows takes no header value and no password
+/// for its proxy. They are kept in the keyring, and the keyring the service
+/// reads is its own account's, not that of the administrator who runs
+/// `proxy set`. The node keeps them nowhere else.
+pub const PROXY_WINDOWS_SERVICE: &str = "the installed node on Windows is the service nerve-node, which runs as the account nerve, and the Credential Manager is one per account: the header values and the password that `proxy set` puts in the system keyring go to the Credential Manager of the account that runs it, not to that of nerve, and the service does not find them. The node keeps them nowhere else";
+
 /// Puts the proxy's header values into the node's keyring entry, replacing
-/// what it held.
+/// what it held. The installed node on Windows refuses, before it asks the
+/// keyring ([`PROXY_WINDOWS_SERVICE`]).
 pub fn store_proxy_headers(paths: &NodePaths, headers: &[(String, String)]) -> Result<(), String> {
+    if windows_service(paths) {
+        return Err(format!(
+            "this proxy needs a header value or a password, but {PROXY_WINDOWS_SERVICE}. So nothing was changed: the installed node on Windows can use only a proxy that needs neither, `nerve-node proxy set <url>` without `--header` and without a user name and password in the URL"
+        ));
+    }
     let entry = Entry::proxy(paths);
     let map: BTreeMap<&str, &str> = headers
         .iter()
@@ -103,10 +117,18 @@ pub fn store_proxy_headers(paths: &NodePaths, headers: &[(String, String)]) -> R
 
 /// The proxy's header lines: the names `node.toml` gives, with their values
 /// from the keyring. No names, no keyring call. A missing or unreadable entry,
-/// or one without a value for a name, is an error that names the entry.
+/// or one without a value for a name, is an error that names the entry. On
+/// the installed node on Windows named headers are an error without a keyring
+/// call: whatever an administrator's keyring holds, the service does not find
+/// it, and the same answer must come from the service and from `proxy ls`.
 pub fn proxy_headers(paths: &NodePaths, names: &[String]) -> Result<Vec<(String, String)>, String> {
     if names.is_empty() {
         return Ok(Vec::new());
+    }
+    if windows_service(paths) {
+        return Err(format!(
+            "node.toml names header values for the proxy, but {PROXY_WINDOWS_SERVICE}. Set a proxy that needs no header and no password with `nerve-node proxy set <url>`, or remove it with `nerve-node proxy rm`"
+        ));
     }
     let entry = Entry::proxy(paths);
     let again = "run `nerve-node proxy set` again";
@@ -1198,6 +1220,34 @@ mod tests {
             assert_eq!(files, storage == SecretStorage::File, "{storage:?}");
             assert_eq!(keyring, storage == SecretStorage::Keyring, "{storage:?}");
         }
+    }
+
+    /// The installed node on Windows keeps no proxy value in a keyring it
+    /// would not read: storing refuses, reading named headers fails, both
+    /// without asking the keyring, and a node on other folders is as it was.
+    #[test]
+    fn the_installed_node_on_windows_stores_and_reads_no_proxy_value() {
+        let (_d, paths) = node();
+        let headers = [("X-Key".to_string(), "s3cret-value".to_string())];
+        let names = ["X-Key".to_string()];
+        store_proxy_headers(&paths, &headers).unwrap();
+        assert_eq!(proxy_headers(&paths, &names).unwrap(), headers);
+        for_tests::pretend_windows_service(&paths);
+        let asked = store::calls();
+        let e = store_proxy_headers(&paths, &headers).unwrap_err();
+        assert!(e.contains(PROXY_WINDOWS_SERVICE), "{e}");
+        assert!(e.contains("nothing was changed"), "{e}");
+        // The entry from before is the administrator's, not the service's.
+        let e = proxy_headers(&paths, &names).unwrap_err();
+        assert!(e.contains(PROXY_WINDOWS_SERVICE), "{e}");
+        assert!(!e.contains("s3cret"), "{e}");
+        assert_eq!(store::calls(), asked, "the keyring was asked");
+        // No header, no value to read.
+        assert_eq!(proxy_headers(&paths, &[]).unwrap(), Vec::new());
+        // Another node of this process is not the installed one.
+        let (_d2, other) = node();
+        store_proxy_headers(&other, &headers).unwrap();
+        assert_eq!(proxy_headers(&other, &names).unwrap(), headers);
     }
 
     #[test]

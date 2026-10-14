@@ -41,9 +41,16 @@ behaves the same except where this page says so.
   against it, and neither is another account.
 - To keep the other commands from the node's files and socket, run them as
   another account: `machine.user`, or [the installed service](service.md). The
-  account must be neither root nor one that can become root (`docker`, `lxd`,
-  …); see [the account commands run as](service.md#the-account-commands-run-as).
-  Sudo commands stay out of this: they are root.
+  account must get root in no way without a password: it is not root, not in
+  `docker`, `lxd`, `incus-admin`, `libvirt` or `disk`, and may not use sudo
+  without a password (`NOPASSWD`); see [the account commands run
+  as](service.md#the-account-commands-run-as). A command can leave
+  `no_new_privs` and the sandbox through that account's own programs (its
+  systemd user session, a tmux or screen server), so for such an account every
+  command is root, not only the sudo commands. `install` takes the account
+  that ran `sudo`, which is a sudoer: where sudo needs no password, choose
+  another account with `sudo nerve-node setup`. Sudo commands stay out of this:
+  they are root.
 - A node that runs as root is refused unless `machine.allow_root` is set
   ([root and administrator](#root-and-administrator)).
 

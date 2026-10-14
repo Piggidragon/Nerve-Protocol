@@ -87,9 +87,12 @@ gets an answer only to `status`, and only `{"running": true}`. The token is as
 safe as the sandbox: while the commands run as the node's own user, any other
 program of that user that runs commands on request over a socket (the user's
 systemd session, a tmux or screen server) runs them outside it, and reads the
-token too. Only `machine.user` keeps that out, with an account that is
-neither root nor can become root ([the account commands run
-as](../user/service.md#the-account-commands-run-as)), and not for a
+token too. Only `machine.user` keeps that out, with an account that gets
+root in no way without a password: not root, not in `docker`, `lxd`,
+`incus-admin`, `libvirt` or `disk`, no `NOPASSWD` sudo, as a command can leave
+`no_new_privs` and the sandbox through the account's own user manager or a
+tmux server ([the account commands run
+as](../user/service.md#the-account-commands-run-as)). And not for a
 [sudo](../user/sudo.md) command, which runs as root whatever the account.
 A command without a sandbox (`allowlist`, `user`, sudo) reads the token as
 well. It is the node's

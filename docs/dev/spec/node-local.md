@@ -687,13 +687,19 @@ session (`systemd-run --user`) is one, a tmux or screen server another
 (`LANDLOCK_ACCESS_FS_RESOLVE_UNIX`, ABI 9) that leaves out only the session
 does not close them, and the node sets none while the keys are in files
 (`exec.rs`). The boundary is `machine.user`: the commands run as another
-account that is neither root nor can become root (`docker`, `lxd`,
-`incus-admin`, `libvirt`, `disk`; user docs, service.md "The account commands
-run as"). Root passes the socket's uid check, and an account that becomes
-root is root. It keeps out every command but a sudo command: that one runs
-as root whatever account `machine.user` names (no `no_new_privs`, and the
-unit keeps the capabilities it needs), so it reads the token, passes the uid
-check and can leave the tree.
+account that gets root in no way without a password: not root, not in
+`docker`, `lxd`, `incus-admin`, `libvirt` or `disk`, and no `NOPASSWD` sudo
+(user docs, service.md "The account commands run as"). Root passes the
+socket's uid check, and an account that becomes root is root. `no_new_privs`
+and Landlock hold the command's own process tree only: a program the
+account's user manager or a tmux or screen server starts for it has neither,
+so for a sudoer without a password every command is root, not only the sudo
+commands. `install` takes the account that ran `sudo`, a sudoer; `setup`
+chooses another. Where `machine.user` is none of these, the boundary keeps
+out every command but a sudo command: that one runs as root whatever
+account `machine.user` names (no `no_new_privs`, and the unit keeps the
+capabilities it needs), so it reads the token, passes the uid check and can
+leave the tree.
 
 A connection the node cannot take (for want of
 descriptors, memory or epoll watches, or for any other reason of that one

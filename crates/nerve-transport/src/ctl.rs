@@ -609,6 +609,18 @@ mod unix {
             .expect("the node closes the connection")
             .unwrap();
             assert_eq!(told, format!("{{\"error\":\"{BUSY}\"}}\n"));
+            // A request too big for the socket's buffer fails its write when
+            // the node closes the connection; the answer is read all the
+            // same and the failed write is not what the caller is told.
+            for _ in 0..5 {
+                let r = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    call(&p, "config.write", json!({"config": "x".repeat(4 << 20)})),
+                )
+                .await
+                .expect("the node answers a big call over its places");
+                assert_eq!(r, Err(BUSY.to_string()));
+            }
             drop(held);
             // A place is free again once its holder is gone.
             let mut v = Err(String::new());
@@ -635,6 +647,30 @@ mod unix {
             .expect("the node closes the connection")
             .unwrap();
             assert_eq!(got, "{\"ok\":\"up\"}\n");
+        }
+
+        /// A node that closes a connection on the caller without a word (the
+        /// request unread, so the close is a reset or the write breaks) is a
+        /// node that does not take the call now.
+        #[tokio::test]
+        async fn a_connection_closed_on_the_caller_reads_as_busy() {
+            let d = tempfile::tempdir().unwrap();
+            let p = d.path().join("ctl.sock");
+            let listener = bind(&p).await.unwrap();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    drop(stream);
+                }
+            });
+            for _ in 0..10 {
+                let r = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    call(&p, "config.write", json!({"config": "x".repeat(4 << 20)})),
+                )
+                .await
+                .expect("the call ends");
+                assert_eq!(r, Err(BUSY.to_string()));
+            }
         }
 
         /// Set in the process `serving_outlasts_running_out_of_descriptors`

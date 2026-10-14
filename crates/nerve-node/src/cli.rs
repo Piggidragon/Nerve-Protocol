@@ -860,6 +860,7 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
         } => {
             let removed = std::sync::Mutex::new(String::new());
             let name = edit_center(paths, &center, |e| {
+                let name = e.name.clone();
                 let l = list.of(&mut e.policy);
                 // An entry copied from `ls` goes as it is, so rules for
                 // files and other actions can be removed too. The arguments
@@ -868,10 +869,10 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
                 let rule = match made {
                     Ok(made) if made != command && l.contains(&command) && l.contains(&made) => {
                         return Err(format!(
-                            "both {command:?} and {made:?} are on the {}: remove {made:?} first with `nerve-node rule rm {} '{made}'`, and then {command:?} with `nerve-node rule rm {} '{command}'`",
+                            "both {command:?} and {made:?} are on the {}: remove {made:?} first with `nerve-node rule rm {word} '{made}' --center {center}`, and then {command:?} with `nerve-node rule rm {word} '{command}' --center {center}`",
                             list.label(),
-                            list.word(),
-                            list.word()
+                            word = list.word(),
+                            center = name
                         ));
                     }
                     _ if l.contains(&command) => command.clone(),
@@ -3622,6 +3623,32 @@ mod tests {
         assert!(!e.contains("already runs"), "{e}");
     }
 
+    /// With several centers the commands the ambiguous `rule rm` prints name
+    /// the center, so they work as printed.
+    #[test]
+    fn the_rm_refusal_names_the_center_it_means() {
+        let (_d, paths) = setup(&["home", "work"]);
+        let made = "exec.run:exec.run:git [*]";
+        for rule in ["exec.run:git *", made] {
+            let list = "center.work.policy.allow";
+            run(&paths, &["config", "add", list, rule]).unwrap();
+        }
+        let args = ["rule", "rm", "allow", "exec.run:git *", "--center", "work"];
+        let e = run(&paths, &args).unwrap_err();
+        assert!(
+            e.contains(&format!("rule rm allow '{made}' --center work")),
+            "{e}"
+        );
+        assert!(
+            e.contains("rule rm allow 'exec.run:git *' --center work"),
+            "{e}"
+        );
+        // Run as printed.
+        run(&paths, &["rule", "rm", "allow", made, "--center", "work"]).unwrap();
+        run(&paths, &args).unwrap();
+        assert!(load(&paths).center("work").unwrap().policy.allow.is_empty());
+    }
+
     #[test]
     fn the_three_lists_add_remove_and_show() {
         let (_d, paths) = setup(&["home"]);
@@ -3681,7 +3708,10 @@ mod tests {
         );
         // The refusal's own instructions work, also for an entry as `ls`
         // shows the working one.
-        assert!(e.contains(&format!("rule rm deny '{broken}'")), "{e}");
+        assert!(
+            e.contains(&format!("rule rm deny '{broken}' --center home")),
+            "{e}"
+        );
         let out = run(&paths, &["rule", "rm", "deny", broken]).unwrap();
         assert!(out.contains(broken), "{out}");
         assert_eq!(

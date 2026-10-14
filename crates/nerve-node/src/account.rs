@@ -60,8 +60,19 @@ pub fn invoker_warning(name: &str) -> String {
 /// boundary.
 pub const CREATE_USER_HINT: &str = "An account only the node uses is the boundary: `sudo nerve-node setup --create-user nerve-work` makes one and runs commands as it.";
 
+/// The same for root, who needs no `sudo` to run it.
+pub const CREATE_USER_HINT_ROOT: &str = "An account only the node uses is the boundary: `nerve-node setup --create-user nerve-work` makes one and runs commands as it.";
+
+/// Whether the rules `sudo -l -U <name>` lists let the account use sudo
+/// without a password: a `NOPASSWD` tag or `!authenticate`. Such a list
+/// costs sudo no failed login; the probe that follows is made only for an
+/// account whose list has one.
+pub fn lists_no_password(listing: &str) -> bool {
+    listing.contains("NOPASSWD:") || listing.contains("!authenticate")
+}
+
 /// The warnings for `account` as the account of the commands, none when
-/// it is a boundary. Root has its own. Otherwise: it ran `sudo`
+/// it is a boundary. Root has its own, with the suggestion. Otherwise: it ran `sudo`
 /// (`invoker`), it is in a group of [`ROOT_GROUPS`] (`groups`), or
 /// `sudo_without_password` says its sudo needs no password; the reasons
 /// share the suggestion at the end.
@@ -72,7 +83,7 @@ pub fn root_warnings(
     sudo_without_password: impl FnOnce() -> bool,
 ) -> Vec<String> {
     if account.uid == 0 {
-        return vec![root_warning()];
+        return vec![root_warning(), CREATE_USER_HINT_ROOT.into()];
     }
     let mut w = Vec::new();
     if account.name == invoker {
@@ -732,7 +743,31 @@ mod tests {
         let w = root_warnings(&account("root", 0), "alice", &[], || {
             panic!("root is not probed")
         });
-        assert_eq!(w, [root_warning()]);
+        assert_eq!(w, [root_warning(), CREATE_USER_HINT_ROOT.to_string()]);
+        // Root needs no sudo for the suggestion; the others do.
+        assert!(!CREATE_USER_HINT_ROOT.contains("sudo"));
+    }
+
+    /// The rules sudo lists for an account say whether a probe is worth
+    /// making: a password sudoer and an account without rules are not.
+    #[test]
+    fn a_sudo_listing_tells_whether_no_password_is_asked() {
+        assert!(lists_no_password(
+            "User alice may run the following commands on h:\n    (ALL) NOPASSWD: ALL\n"
+        ));
+        assert!(lists_no_password(
+            "Matching Defaults entries for alice on h:\n    !authenticate\n"
+        ));
+        assert!(lists_no_password(
+            "    (ALL : ALL) ALL\n    (root) NOPASSWD: /usr/bin/apt\n"
+        ));
+        assert!(!lists_no_password(
+            "User alice may run the following commands on h:\n    (ALL : ALL) ALL\n"
+        ));
+        assert!(!lists_no_password(
+            "User bob is not allowed to run sudo on h.\n"
+        ));
+        assert!(!lists_no_password(""));
     }
 
     #[test]

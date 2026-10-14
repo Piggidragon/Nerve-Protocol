@@ -231,13 +231,38 @@ impl System for Host {
 
     fn sudo_without_password(&self, account: &Account) -> bool {
         // Sudo run as root for the account, so no password is asked for
-        // the switch; the inner one is the account's own. `-n` never
-        // asks, so an account that needs a password fails at once.
-        let mut c = std::process::Command::new("sudo");
-        c.args(["-n", "-u", &account.name, "--", "sudo", "-n", "--", "true"])
+        // the switch. The rules come first: an account that needs a
+        // password is never run as, because its sudo would log a failed
+        // login and mail root about it.
+        let mut list = std::process::Command::new("sudo");
+        list.args(["-n", "-l", "-U", &account.name])
             .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
+        regain_root(&mut list);
+        let Ok(o) = list.output() else {
+            return false;
+        };
+        if !crate::account::lists_no_password(&String::from_utf8_lossy(&o.stdout)) {
+            return false;
+        }
+        // The account's own sudo, which `-n` never lets ask, and `-k`
+        // keeps from taking the ticket its owner has just made by typing
+        // the password for this command.
+        let mut c = std::process::Command::new("sudo");
+        c.args([
+            "-n",
+            "-u",
+            &account.name,
+            "--",
+            "sudo",
+            "-n",
+            "-k",
+            "--",
+            "true",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
         regain_root(&mut c);
         c.status().is_ok_and(|s| s.success())
     }

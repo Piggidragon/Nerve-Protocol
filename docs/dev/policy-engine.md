@@ -189,9 +189,13 @@ center's local name):
   next change at a marked place goes into every folder (`whole`), also one
   back to flags the folder still shows; a mark counts for the object it
   was made on, not for a folder made anew where a marked one was moved
-  away. Where the record cannot be marked, nothing changes, and a grant
-  is stale unless it is on the object at its path and every set of flags
-  it may give there is wanted. The mark keeps the flags each
+  away; a new grant is recorded with the file ID of the object at its
+  path before it goes on, so a first grant that stopped part way is found
+  where its folder went, as any other. Where the record cannot be marked,
+  nothing changes, and a grant is stale unless it is on the object at its
+  path and every set of flags it may give there is wanted; one whose
+  folder cannot be found is stale, and one on a volume that is away is
+  named, as in a sync that can write. The mark keeps the flags each
   stopped change was heading for (`Grant::toward`): until a change there
   finishes, the place counts as written by those flags too (the hard-link
   check, `w` without `r` for the pass), and a refused change whose place

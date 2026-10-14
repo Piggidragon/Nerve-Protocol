@@ -768,14 +768,20 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
             // set of flags it may give there is wanted: a folder moved
             // away keeps its grant where it is now, and a change that
             // stopped part way may give the flags it was heading for.
+            // As the main loop below: one whose object cannot be found may
+            // be on where its folder is now, and one on a volume that is
+            // away stays where it is.
             out.errors.push(e);
             for (old, s) in record.iter().zip(&seen) {
                 let wanted = at_path(old, &s.0)
                     && old
                         .states()
                         .all(|a| want.iter().any(|w| w.same_place(old) && w.access == a));
-                if changes(old, s) && !wanted {
-                    out.stale.push(old.clone());
+                match &s.1 {
+                    Some(Err(_)) => out.stale.push(old.clone()),
+                    Some(Ok(Found::Away)) => out.away.push(old.clone()),
+                    _ if changes(old, s) && !wanted => out.stale.push(old.clone()),
+                    _ => {}
                 }
             }
             return out;
@@ -918,6 +924,21 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
         .map(|(w, _)| w)
         .collect();
     if !todo.is_empty() {
+        // A new grant is recorded with the object at its path, as one that
+        // goes on is: should its change stop part way and the folder be
+        // moved, the next sync finds it where it is now.
+        let ids: Vec<Option<String>> = todo
+            .iter()
+            .map(|w| {
+                if replaced.iter().any(|o| o.same_place(w)) {
+                    return None;
+                }
+                match folders.look(&w.path, &w.container, w.access) {
+                    Ok(Some(l)) => l.id,
+                    _ => None,
+                }
+            })
+            .collect();
         // Recorded, and marked, before they go on.
         let mut ahead = kept.clone();
         ahead.extend(replaced.iter().map(|o| {
@@ -926,9 +947,11 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
         }));
         ahead.extend(
             todo.iter()
-                .filter(|w| !replaced.iter().any(|o| o.same_place(w)))
-                .map(|w| Grant {
+                .zip(&ids)
+                .filter(|(w, _)| !replaced.iter().any(|o| o.same_place(w)))
+                .map(|(w, id)| Grant {
                     unfinished: true,
+                    id: id.clone(),
                     ..(*w).clone()
                 }),
         );
@@ -942,7 +965,7 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
             }
             Ok(()) => {
                 changed = true;
-                for w in todo {
+                for (w, id) in todo.into_iter().zip(ids) {
                     // Refused before anything changed: what was there stays.
                     let links = links_at(&w.path);
                     let whole = unfinished_at(w);
@@ -971,6 +994,7 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
                             if !replaced.iter().any(|o| o.same_place(w)) {
                                 kept.push(Grant {
                                     unfinished: true,
+                                    id,
                                     ..w.clone()
                                 });
                             }
@@ -2577,6 +2601,69 @@ mod tests {
         assert!(!s.errors.is_empty(), "{s:?}");
         assert!(s.refusal("c1").is_some(), "{s:?}");
         assert_eq!(f.on("/x/private"), [("c1".to_string(), rw.access)]);
+
+        // Moved where it cannot be found, or to a volume that is away, while
+        // another pairing's folder is taken off: lost is stale, away is
+        // named, as without the record's trouble.
+        for away in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            let file = d.path().join("grants.json");
+            let mut f = Fake::default();
+            let id = f.make("/w/a");
+            f.make("/w/b");
+            let b = grant("c2", "/w/b", "r");
+            sync(&file, &[rw.clone(), b], &mut f);
+            f.mv("/w/a", "/x/a");
+            if away {
+                f.away = true;
+            } else {
+                f.lost.push(id);
+            }
+            read_only(d.path(), true);
+            let s = sync(&file, std::slice::from_ref(&rw), &mut f);
+            read_only(d.path(), false);
+            assert!(!s.errors.is_empty(), "{s:?}");
+            if away {
+                assert_eq!(s.away.len(), 1, "{s:?}");
+            } else {
+                assert!(s.refusal("c1").is_some(), "{s:?}");
+            }
+        }
+    }
+
+    /// A first grant that stopped part way, failing or with the node's end,
+    /// is recorded with its folder's object: moved before the next sync,
+    /// it is found where it is now and taken off there.
+    #[test]
+    fn a_first_grant_that_stopped_is_found_where_its_folder_went() {
+        for die in [false, true] {
+            let d = tempfile::tempdir().unwrap();
+            let file = d.path().join("grants.json");
+            let mut f = Fake::default();
+            f.make("/w/a");
+            let a = grant("c1", "/w/a", "rw");
+            if die {
+                f.die.push("/w/a".into());
+                let died = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    sync(&file, std::slice::from_ref(&a), &mut f)
+                }));
+                assert!(died.is_err());
+            } else {
+                f.cut.push("/w/a".into());
+                sync(&file, std::slice::from_ref(&a), &mut f);
+            }
+            let record = read_record(&file).unwrap();
+            assert!(record[0].id.is_some(), "{die}: {record:?}");
+            f.die.clear();
+            f.cut.clear();
+            f.mv("/w/a", "/x/a");
+            f.changes.clear();
+            let s = sync(&file, &[], &mut f);
+            assert!(s.errors.is_empty(), "{die}: {s:?}");
+            assert_eq!(s.removed, 1, "{die}: {s:?}");
+            assert_eq!(f.changes, [(PathBuf::from("/x/a"), true, false)], "{die}");
+            assert!(read_record(&file).unwrap().is_empty());
+        }
     }
 
     /// The mark of a folder moved away whose take-off stopped is about its

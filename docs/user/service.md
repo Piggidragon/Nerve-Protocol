@@ -109,8 +109,11 @@ rules do but a later rule asks for the password is, and sudo logs it. The
 account that ran `sudo`, the one its owner logs in as, is such an account
 too (see [platforms](platforms.md#linux)). `install` and `setup` warn
 about such an account, whether they take it or it is chosen already, and
-suggest an account made for the node, also for root. Choose one
-outside these groups, or a command can read the keys after all.
+suggest an account made for the node, also for root. `NOPASSWD` for a
+single command can be root as well (`apt`, `systemctl`, a shell, an editor),
+and they do not see that: check `sudo -l -U <account>` yourself. Choose one
+outside these groups and without such rules, or a command can read the keys
+after all.
 
 - No account chosen: the node runs no command, and says that
   `sudo nerve-node setup` chooses one.

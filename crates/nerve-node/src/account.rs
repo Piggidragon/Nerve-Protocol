@@ -81,10 +81,18 @@ pub fn lists_no_password(listing: &str, groups: &[String]) -> bool {
                 c.rsplit(' ').next() == Some("ALL")
             });
         }
-        // A default for one command (`Defaults!/usr/bin/apt …`) is not one
-        // for the account.
-        if line.starts_with("Defaults!") {
-            return false;
+        // A default bound to commands (`Defaults!/usr/bin/apt …`) or to a
+        // user to run as (`Defaults>postgres …`) holds for this probe,
+        // which runs `true` as root, only when the binding names all
+        // commands or root.
+        if let Some(bound) = line.strip_prefix("Defaults")
+            && let Some(kind @ ('!' | '>')) = bound.chars().next()
+        {
+            let list = bound[1..].split(' ').next().unwrap_or("");
+            let names = |n: &str| list.split(',').any(|i| i == n);
+            if !(names("ALL") || kind == '>' && names("root")) {
+                return false;
+            }
         }
         line.split(',').any(|entry| {
             // `Defaults>root !authenticate` names a user before the flag.
@@ -102,12 +110,14 @@ pub fn lists_no_password(listing: &str, groups: &[String]) -> bool {
 
 /// The names of the groups `account` is in, as `id -Gn` prints them.
 pub fn group_names(account: &Account) -> Vec<String> {
+    // `id` exits 1 when a group has no name and still prints the names it
+    // found, with the number of that one: the names are all there.
     match plain("id").args(["-Gn", "--", &account.name]).output() {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+        Ok(o) => String::from_utf8_lossy(&o.stdout)
             .split_whitespace()
             .map(String::from)
             .collect(),
-        _ => Vec::new(),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -828,9 +838,16 @@ mod tests {
         assert!(!yes(
             "    (ALL : ALL) ALL\n    (root) NOPASSWD: /usr/bin/apt, /usr/bin/systemctl\n"
         ));
+        assert!(yes(
+            "Runas and Command-specific defaults for alice:\n    Defaults!ALL !authenticate\n"
+        ));
         assert!(!yes(
             "Runas and Command-specific defaults for alice:\n    Defaults!/usr/bin/apt !authenticate\n"
         ));
+        // Bound to a user to run as: only root or everyone counts.
+        assert!(yes("    Defaults>root,postgres !authenticate\n"));
+        assert!(yes("    Defaults>ALL !authenticate\n"));
+        assert!(!yes("    Defaults>postgres !authenticate\n"));
         // Another group's exemption.
         assert!(!yes("    env_reset, exempt_group=admins\n"));
         assert!(!yes(

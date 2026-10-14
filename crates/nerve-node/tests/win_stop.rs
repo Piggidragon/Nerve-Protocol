@@ -17,7 +17,9 @@ use std::time::{Duration, Instant};
 use nerve_node::exec::{RunCall, RunOptions, Sig, run};
 use nerve_proto::ErrorCode;
 use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
-use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
+use windows_sys::Win32::System::Console::{
+    AllocConsole, GetConsoleProcessList, SetConsoleCtrlHandler,
+};
 use windows_sys::Win32::System::Threading::{
     GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
     TerminateProcess,
@@ -160,6 +162,69 @@ async fn term_lets_a_command_that_heeds_ctrl_c_clean_up() {
         "the command was ended without its cleanup"
     );
     assert!(t.elapsed() < GRACE, "term waited out the grace");
+}
+
+/// A command whose process has joined the node's own console is not sent
+/// Ctrl+C there, which would reach the node (and stop it, as it hears
+/// Ctrl+C): with nothing else to ask, `term` ends the job at once. The
+/// shell leaves its own console for this test process's one.
+#[tokio::test]
+async fn a_command_on_the_nodes_console_is_not_sent_ctrl_c() {
+    setup();
+    let mut one = [0u32; 1];
+    // SAFETY: the buffer holds one pid; AllocConsole takes nothing.
+    unsafe {
+        if GetConsoleProcessList(one.as_mut_ptr(), 1) == 0 {
+            AllocConsole();
+        }
+    }
+    let d = tempfile::tempdir().unwrap();
+    let command = format!(
+        "Add-Type -Namespace N -Name K -MemberDefinition \
+         '[DllImport(\"kernel32.dll\")] public static extern bool FreeConsole(); \
+         [DllImport(\"kernel32.dll\")] public static extern bool AttachConsole(uint p);'; \
+         [void][N.K]::FreeConsole(); \
+         if ([N.K]::AttachConsole({})) {{ Set-Content -Path attached -Value 1 }} \
+         else {{ Set-Content -Path refused -Value 1 }}; \
+         try {{ Start-Sleep 120 }} finally {{ Set-Content -Path cleaned -Value 1 }}",
+        std::process::id()
+    );
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let c = call(&command, d.path(), Duration::from_secs(120));
+    let task = tokio::spawn(async move {
+        run(&c, &opts(), |e| {
+            let _ = tx.send(e.clone());
+        })
+        .await
+    });
+    let ender = rx.await.unwrap();
+    let (attached, refused) = (d.path().join("attached"), d.path().join("refused"));
+    for _ in 0..600 {
+        if attached.exists() || refused.exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        attached.exists(),
+        "the shell did not join the test's console"
+    );
+    let t = Instant::now();
+    ender.signal(Sig::Term);
+    let r = tokio::time::timeout(Duration::from_secs(10), task)
+        .await
+        .expect("the command outlived term")
+        .unwrap();
+    assert!(r.is_ok(), "{r:?}");
+    assert!(
+        t.elapsed() < GRACE,
+        "term waited out the grace ({:?}): something was asked",
+        t.elapsed()
+    );
+    assert!(
+        !d.path().join("cleaned").exists(),
+        "the command heard Ctrl+C on the node's console"
+    );
 }
 
 /// A process that ignores Ctrl+C (cmd's `start /b` starts it so) is ended

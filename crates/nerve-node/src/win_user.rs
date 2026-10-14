@@ -1161,10 +1161,22 @@ pub fn restricted() -> io::Result<Token> {
 }
 
 /// Runs `line` with token `t` and waits up to `limit` for it; its exit
-/// code and stdout. One that runs longer is ended.
-pub fn run_capture(t: &Token, line: &str, limit: Duration) -> io::Result<(u32, Vec<u8>)> {
+/// code and stdout. One that runs longer is ended. With `job` it is put in
+/// that job before it runs anything.
+pub fn run_capture(
+    t: &Token,
+    line: &str,
+    limit: Duration,
+    job: Option<&crate::win::Job>,
+) -> io::Result<(u32, Vec<u8>)> {
     use std::io::Read;
     let child = spawn(t, line, None, None)?;
+    if let Some(job) = job
+        && let Err(e) = job.assign(child.process())
+    {
+        child.kill();
+        return Err(e);
+    }
     child.resume()?;
     let wait = child.waiter()?;
     let Spawned {

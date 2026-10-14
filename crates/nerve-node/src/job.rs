@@ -24,7 +24,7 @@
 
 use std::fmt::Display;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// How long the processes of a command that was asked to end have before
@@ -72,6 +72,8 @@ pub trait End {
     fn ask(&self) -> bool;
     /// Whether no process is left.
     fn empty(&self) -> bool;
+    /// Set while a stop of these processes runs ([`Ending::claim_stop`]).
+    fn stopping(&self) -> &AtomicBool;
 }
 
 /// How one command's processes are ended: through its job, or, when Windows
@@ -121,9 +123,20 @@ impl<J: End, W> Ending<J, W> {
         matches!(self, Ending::Job(j) if j.ask())
     }
 
+    /// Whether a stop of the command may start now: one at a time, so a
+    /// `term` sent again and again while a stop runs starts no more helpers
+    /// and threads. [`Ending::stop`] lets go of it at its end. A command
+    /// without a job is ended at once and claims nothing.
+    pub fn claim_stop(&self) -> bool {
+        match self {
+            Ending::Job(j) => !j.stopping().swap(true, Ordering::SeqCst),
+            Ending::Walk(_) => true,
+        }
+    }
+
     /// Asks the command's processes to end, gives them `grace` to do so,
     /// and then ends what is left (blocking). When none could be asked they
-    /// are ended at once.
+    /// are ended at once. Lets go of the claim of [`Ending::claim_stop`].
     pub fn stop(&self, grace: Duration, walk: impl FnOnce(&W)) {
         if let Ending::Job(j) = self
             && j.ask()
@@ -134,6 +147,9 @@ impl<J: End, W> Ending<J, W> {
             }
         }
         self.end(walk);
+        if let Ending::Job(j) = self {
+            j.stopping().store(false, Ordering::SeqCst);
+        }
     }
 }
 
@@ -240,6 +256,7 @@ pub use sys::{CONSOLE, Held, SUSPENDED, adopt, make};
 mod sys {
     use std::os::windows::io::{BorrowedHandle, OwnedHandle};
     use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
 
     use super::{End, assign_error, no_job_warning};
     use crate::win::{self, Job};
@@ -262,11 +279,17 @@ mod sys {
         job: Job,
         shell: Option<OwnedHandle>,
         asker: Asker,
+        stopping: AtomicBool,
     }
 
     impl Held {
         pub fn new(job: Job, shell: Option<OwnedHandle>, asker: Asker) -> Held {
-            Held { job, shell, asker }
+            Held {
+                job,
+                shell,
+                asker,
+                stopping: AtomicBool::new(false),
+            }
         }
     }
 
@@ -281,6 +304,10 @@ mod sys {
 
         fn empty(&self) -> bool {
             self.job.active() == Some(0)
+        }
+
+        fn stopping(&self) -> &AtomicBool {
+            &self.stopping
         }
     }
 
@@ -349,6 +376,7 @@ mod tests {
         heard: bool,
         heed: Option<usize>,
         looks: AtomicUsize,
+        stopping: AtomicBool,
     }
 
     impl End for Fake {
@@ -365,6 +393,10 @@ mod tests {
         fn empty(&self) -> bool {
             let looks = self.looks.fetch_add(1, Ordering::SeqCst) + 1;
             self.heed.is_some_and(|n| looks >= n)
+        }
+
+        fn stopping(&self) -> &AtomicBool {
+            &self.stopping
         }
     }
 
@@ -386,6 +418,7 @@ mod tests {
                 heard,
                 heed,
                 looks: AtomicUsize::new(0),
+                stopping: AtomicBool::new(false),
             },
             ends,
             asks,
@@ -427,6 +460,24 @@ mod tests {
         assert_eq!(asks.load(Ordering::SeqCst), 1);
         assert_eq!(ends.load(Ordering::SeqCst), 1);
         assert!(took < grace, "waited {took:?} though nothing was asked");
+    }
+
+    /// One stop at a time: a second claim while a stop runs is refused, and
+    /// the stop lets go of its claim when it has ended the job. A command
+    /// without a job claims nothing.
+    #[test]
+    fn a_command_has_one_stop_at_a_time() {
+        let (f, ends, asks) = asked(true, Some(1));
+        let e: Ending<Fake, u32> = Ending::Job(Arc::new(f));
+        assert!(e.claim_stop());
+        assert!(!e.claim_stop(), "a second stop was let in");
+        assert!(!e.clone().claim_stop(), "a copy started a stop of its own");
+        e.stop(Duration::from_secs(60), |_| panic!("walked"));
+        assert_eq!(asks.load(Ordering::SeqCst), 1);
+        assert_eq!(ends.load(Ordering::SeqCst), 1);
+        assert!(e.claim_stop(), "the claim outlived its stop");
+        let w: Ending<Fake, u32> = Ending::Walk(20);
+        assert!(w.claim_stop() && w.claim_stop());
     }
 
     /// A command without a job is asked nothing and walked at once: the

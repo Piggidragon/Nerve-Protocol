@@ -408,7 +408,10 @@ other process. The job is ended 3 seconds later, or at once when nothing was
 asked; a timeout's result waits for that. `kill`, `cancel`, `session.end`, a
 dropped link and the call's return end the job at once. A command of another
 account (installed node) is asked by a helper started with that account's
-token. A command without a job (the walk) is not asked. A process started
+token. The helper runs in the command's job, so it is ended with the
+command and the control pipe refuses it. A command has one stop at a time:
+`term` or `int` while one runs does nothing more. A command without a job
+(the walk) is not asked. A process started
 with Ctrl+C ignored (`start /b` in cmd, a new process group) does not hear
 it. Whether a process ignores Ctrl+C passes on to the processes it starts,
 so the node stops ignoring it before it starts its first command; a node

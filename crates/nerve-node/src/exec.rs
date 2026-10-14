@@ -1123,6 +1123,10 @@ impl Ender {
                 self.ending.end(walk);
                 return;
             }
+            // A stop runs already; it ends the job within its grace.
+            if !self.ending.claim_stop() {
+                return;
+            }
             // The copy holds the job open until it is ended.
             let ending = self.ending.clone();
             let stop = std::thread::Builder::new()

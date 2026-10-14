@@ -18,6 +18,9 @@
 //! command of another account (crate::win_user) is asked by a helper started
 //! with that account's token: the node may not open that account's
 //! processes, and the command's windows are on that account's desktop.
+//! The helper runs in the command's job, put there before it runs anything:
+//! like the command, it is ended with the job, and the control pipe refuses
+//! it (crate::pipe).
 
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
 use std::os::windows::process::CommandExt;
@@ -32,7 +35,7 @@ use windows_sys::Win32::System::Console::{
     SetConsoleCtrlHandler,
 };
 use windows_sys::Win32::System::Threading::{
-    DETACHED_PROCESS, GetExitCodeProcess, GetProcessId, OpenProcess,
+    CREATE_SUSPENDED, DETACHED_PROCESS, GetExitCodeProcess, GetProcessId, OpenProcess,
     PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -114,10 +117,10 @@ pub fn ask(job: &Job, shell: Option<&OwnedHandle>, asker: &Asker) -> bool {
     let mut args = vec![STOP_ARG.to_string(), std::process::id().to_string()];
     args.extend(pids.iter().map(u32::to_string));
     let asked = match asker {
-        Asker::Own(exe) => helper(exe, &args),
+        Asker::Own(exe) => helper(exe, &args, job),
         Asker::As(exe, token) => {
             let line = crate::exec::windows_command_line(&exe.to_string_lossy(), &args);
-            match crate::win_user::run_capture(token, &line, HELPER_WAIT) {
+            match crate::win_user::run_capture(token, &line, HELPER_WAIT, Some(job)) {
                 Ok((code, _)) => code != 0,
                 // It ran and may have asked.
                 Err(e) if e.kind() == std::io::ErrorKind::TimedOut => true,
@@ -132,16 +135,31 @@ pub fn ask(job: &Job, shell: Option<&OwnedHandle>, asker: &Asker) -> bool {
     asked
 }
 
-/// Runs the helper as the node itself, without a console, and waits for it.
-fn helper(exe: &Path, args: &[String]) -> bool {
+/// Runs the helper as the node itself, without a console, in `job`, and
+/// waits for it.
+fn helper(exe: &Path, args: &[String], job: &Job) -> bool {
     let child = Command::new(exe)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .creation_flags(DETACHED_PROCESS)
+        .creation_flags(DETACHED_PROCESS | CREATE_SUSPENDED)
         .spawn();
-    let mut child = match child {
+    let started = child.and_then(|mut c| {
+        // Suspended, so it runs nothing before it is in the job.
+        let joined = job
+            .assign(c.as_raw_handle() as HANDLE)
+            .and_then(|()| crate::win::resume(c.id()));
+        match joined {
+            Ok(()) => Ok(c),
+            Err(e) => {
+                let _ = c.kill();
+                let _ = c.wait();
+                Err(e)
+            }
+        }
+    });
+    let mut child = match started {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(

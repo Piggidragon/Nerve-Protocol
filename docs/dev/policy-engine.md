@@ -234,8 +234,10 @@ center's local name):
   root of the current drive. The cmdlet runs with `-ErrorAction Continue`, and
   its errors are written again as the function's under the caller's error
   action, so `$?` and the exit code stay as the cmdlet sets them
-  (`nerve_sandbox::POWERSHELL_START`). Other cmdlets still keep `..` on the
-  drive they stand on.
+  (`nerve_sandbox::POWERSHELL_START`). An object piped to them is bound as
+  the cmdlets bind it (its `Path`, or else its `PSPath` as `-LiteralPath`),
+  since their untyped `Path` would take it whole. Other cmdlets still keep
+  `..` on the drive they stand on.
 - The container has the network, as Landlock leaves it, but not the loopback
   address.
 

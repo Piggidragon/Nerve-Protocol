@@ -118,9 +118,16 @@ pub const POWERSHELL_START: &str = concat!(
     // it is `\` or `/`, the root of the drive it stands on. The cmdlet always
     // writes its errors, so that the function can write them again under
     // the caller's error action: one the cmdlet keeps quiet leaves `$?`
-    // true.
-    r"function global:NerveGo([string]$cmd, $bound) { ",
+    // true. An object other than a string `piped` to the untyped `Path` is
+    // bound as the cmdlet binds it: its `Path`, or else its `PSPath` as
+    // `-LiteralPath` (a folder from `Get-ChildItem` would otherwise be its
+    // bare name).
+    r"function global:NerveGo([string]$cmd, $bound, [bool]$piped) { ",
     r"$a = @{}; foreach ($k in $bound.Keys) { $a[$k] = $bound[$k] }; ",
+    r"$o = $a['Path']; if ($piped -and $null -ne $o -and $o -isnot [string]) { ",
+    r"$q = $o.PSObject.Properties; if ($q['Path']) { $a['Path'] = $q['Path'].Value } ",
+    r"else { foreach ($n in 'PSPath', 'LiteralPath', 'LP') { if ($q[$n]) { ",
+    r"$null = $a.Remove('Path'); $a['LiteralPath'] = [string]$q[$n].Value; break } } } }; ",
     r"foreach ($k in 'Path', 'LiteralPath') { if (-not $a[$k]) { continue }; ",
     r"$v = [string]$a[$k]; $tail = $null; ",
     r"if ($k -eq 'Path') { $s = $v -split '[\\/]'; $i = 0; ",
@@ -148,7 +155,8 @@ pub const POWERSHELL_START: &str = concat!(
     r"ValueFromPipelineByPropertyName = $true)] [Alias('PSPath', 'LP')] [string]$LiteralPath, ",
     r"[switch]$PassThru, ",
     r"[Parameter(ParameterSetName = 'Stack', ValueFromPipelineByPropertyName = $true)] [string]$StackName) ",
-    r"process { NerveGo 'Microsoft.PowerShell.Management\Set-Location' $PSBoundParameters 2>&1 | ",
+    r"process { NerveGo 'Microsoft.PowerShell.Management\Set-Location' $PSBoundParameters ",
+    r"$PSCmdlet.MyInvocation.ExpectingInput 2>&1 | ",
     r"ForEach-Object { if ($_ -is [Management.Automation.ErrorRecord]) { $PSCmdlet.WriteError($_) } ",
     r"else { $_ } } } }; ",
     r"function global:Push-Location { [CmdletBinding(DefaultParameterSetName = 'Path')] param(",
@@ -158,7 +166,8 @@ pub const POWERSHELL_START: &str = concat!(
     r"ValueFromPipelineByPropertyName = $true)] [Alias('PSPath', 'LP')] [string]$LiteralPath, ",
     r"[switch]$PassThru, ",
     r"[Parameter(ValueFromPipelineByPropertyName = $true)] [string]$StackName) ",
-    r"process { NerveGo 'Microsoft.PowerShell.Management\Push-Location' $PSBoundParameters 2>&1 | ",
+    r"process { NerveGo 'Microsoft.PowerShell.Management\Push-Location' $PSBoundParameters ",
+    r"$PSCmdlet.MyInvocation.ExpectingInput 2>&1 | ",
     r"ForEach-Object { if ($_ -is [Management.Automation.ErrorRecord]) { $PSCmdlet.WriteError($_) } ",
     r"else { $_ } } } }; ",
 );
@@ -2370,7 +2379,8 @@ mod tests {
     /// `..` names it or the error action keeps the error quiet. An escaped
     /// `-Path`, one with `..` before a wildcard and one with a wildcard
     /// right after `\` go where the cmdlet would take them, `cd $null`
-    /// fails as the cmdlet does, and a new drive leaves `$Error` empty.
+    /// fails as the cmdlet does, a new drive leaves `$Error` empty, and a
+    /// folder piped to `cd` or `pushd` is bound as the cmdlet binds it.
     #[cfg(windows)]
     #[test]
     fn powershell_changes_to_whole_paths_in_an_appcontainer() {
@@ -2407,7 +2417,10 @@ mod tests {
         let (code, log) = ps(
             &granted.join("app"),
             format!(
-                "{POWERSHELL_START}cd 'b`[1`]'; Set-Content -LiteralPath br.txt (cmd /c cd); \
+                "{POWERSHELL_START}Get-ChildItem '{g}' -Directory -Filter lib | cd; \
+                 Set-Content pipe.txt (cmd /c cd); cd '{g}\\app'; \
+                 Get-Item -LiteralPath 'b[1]' | pushd; Set-Content -LiteralPath pb.txt (cmd /c cd); popd; \
+                 cd 'b`[1`]'; Set-Content -LiteralPath br.txt (cmd /c cd); \
                  cd ..; $Error.Clear(); cd ..\\l*; $errors = $Error.Count; \
                  Set-Content lib.txt (cmd /c cd); Set-Content '{g}\\errors.txt' $errors; \
                  cd '{g}\\app'; cd sub; cd \\l*; Set-Content root.txt (cmd /c cd); cd '{g}\\app'; \
@@ -2437,8 +2450,14 @@ mod tests {
             read(bracket.join("br.txt"), &log),
             bracket.display().to_string()
         );
+        assert_eq!(
+            read(bracket.join("pb.txt"), &log),
+            bracket.display().to_string()
+        );
         let lib = granted.join("lib");
         assert_eq!(read(lib.join("lib.txt"), &log), lib.display().to_string());
+        // A folder piped from `Get-ChildItem` is its whole path, not its name.
+        assert_eq!(read(lib.join("pipe.txt"), &log), lib.display().to_string());
         // A `cd` that made a drive leaves nothing in `$Error`.
         assert_eq!(read(granted.join("errors.txt"), &log), "0");
         // `\l*` is `lib` at the root of `Work:`, not below `sub`.
@@ -2502,6 +2521,8 @@ mod tests {
             r"$s = $v -split '[\\/]'",
             r"$a['ErrorAction'] = 'Continue'; & $cmd @a",
             r"-ErrorAction Ignore) { $n++ }",
+            r"$PSCmdlet.MyInvocation.ExpectingInput 2>&1",
+            r"$a['LiteralPath'] = [string]$q[$n].Value",
             r"($i -eq 1 -and $s[0] -eq '')",
             r"ValueFromPipelineByPropertyName = $true)] $Path, ",
             r"'Microsoft.PowerShell.Management\Set-Location'",

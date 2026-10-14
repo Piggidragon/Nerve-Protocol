@@ -35,12 +35,53 @@ pub struct NodeConfig {
     pub connection: Connection,
     #[serde(default)]
     pub log: LogSection,
+    /// The local programs that may add capabilities to the node over its
+    /// control socket. Only the owner sets it.
+    #[serde(default, skip_serializing_if = "Providers::is_empty")]
+    pub providers: Providers,
     #[serde(default, rename = "center", skip_serializing_if = "Vec::is_empty")]
     pub centers: Vec<CenterEntry>,
 }
 
 fn is_false(b: &bool) -> bool {
     !*b
+}
+
+/// The programs that may attach to the node as capability providers
+/// (docs/dev/spec/node-local.md §7). None is allowed by default.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Providers {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed: Vec<AllowedProvider>,
+}
+
+impl Providers {
+    pub fn is_empty(&self) -> bool {
+        self.allowed.is_empty()
+    }
+
+    /// The entry named `name`.
+    pub fn get(&self, name: &str) -> Option<&AllowedProvider> {
+        self.allowed.iter().find(|p| p.name == name)
+    }
+}
+
+/// One program the owner lets attach: the name its capabilities carry as
+/// their `provider`, and the executable the attaching process must run.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AllowedProvider {
+    pub name: String,
+    /// The absolute path of the program, compared with the one the
+    /// attaching process runs once both are resolved.
+    pub exe: String,
+}
+
+/// Whether `name` can name a provider: a node name's shape (1 to 32 of
+/// a-z, 0-9 and `-`), and not `node`, which stands for the node itself.
+pub fn valid_provider_name(name: &str) -> bool {
+    nerve_proto::valid_node_name(name) && name != "node"
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -633,6 +674,24 @@ impl NodeConfig {
                 return Err(format!("connection.headers names {h} twice"));
             }
         }
+        let mut providers = std::collections::BTreeSet::new();
+        for p in &self.providers.allowed {
+            if !valid_provider_name(&p.name) {
+                return Err(format!(
+                    "providers.allowed name {:?}: 1 to 32 characters of a-z, 0-9 and -, not node",
+                    p.name
+                ));
+            }
+            if !providers.insert(p.name.clone()) {
+                return Err(format!("providers.allowed names {:?} twice", p.name));
+            }
+            if !Path::new(&p.exe).is_absolute() {
+                return Err(format!(
+                    "providers.allowed {}: exe {:?} is not an absolute path",
+                    p.name, p.exe
+                ));
+            }
+        }
         let mut names = std::collections::BTreeSet::new();
         for c in &mut self.centers {
             if !valid_center_name(&c.name) {
@@ -940,6 +999,46 @@ sudo_allow = ["sudo apt update"]
         ));
         let e = NodeConfig::parse(&text).unwrap_err();
         assert!(e.contains("use the full name"), "{e}");
+    }
+
+    /// The owner names the programs that may attach as providers; a name
+    /// that could not be a descriptor's `provider`, one given twice, and a
+    /// program that is not an absolute path are refused.
+    #[test]
+    fn allowed_providers_parse_and_bad_ones_are_refused() {
+        let exe = if cfg!(windows) {
+            "C:/bin/echo-provider"
+        } else {
+            "/usr/bin/echo-provider"
+        };
+        let text = format!("[providers]\nallowed = [{{ name = \"echo\", exe = \"{exe}\" }}]\n");
+        let c = NodeConfig::parse(&text).unwrap();
+        assert_eq!(c.providers.get("echo").unwrap().exe, exe);
+        assert!(c.providers.get("other").is_none());
+        assert_eq!(NodeConfig::parse(&c.to_toml()).unwrap(), c);
+        // None is allowed by default, and the file does not say so.
+        assert!(NodeConfig::default().providers.is_empty());
+        assert!(!NodeConfig::default().to_toml().contains("providers"));
+        for (bad, why) in [
+            ("{ name = \"node\", exe = \"EXE\" }", "not node"),
+            ("{ name = \"Echo\", exe = \"EXE\" }", "a-z, 0-9"),
+            ("{ name = \"echo\", exe = \"bin/echo\" }", "absolute"),
+            (
+                "{ name = \"echo\", exe = \"EXE\" }, { name = \"echo\", exe = \"EXE\" }",
+                "twice",
+            ),
+            (
+                "{ name = \"echo\", exe = \"EXE\", uid = 1 }",
+                "unknown field",
+            ),
+        ] {
+            let text = format!("[providers]\nallowed = [{}]\n", bad.replace("EXE", exe));
+            let e = NodeConfig::parse(&text).unwrap_err();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
+        // A center's document holds none of it.
+        let doc = serde_json::json!({"providers": {"allowed": []}});
+        assert!(serde_json::from_value::<CenterDocument>(doc).is_err());
     }
 
     #[test]

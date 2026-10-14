@@ -52,6 +52,9 @@ proxy = "http://proxy:3128" # set with `nerve-node proxy set`
 [log]
 level = "info"              # error | warn | info | debug: how much the node logs
 
+[providers]                 # programs that may add capabilities (providers.md)
+allowed = [{ name = "desk", exe = "/usr/lib/nerve-desktop/nerve-desktop" }]
+
 [[center]]
 name = "lab"
 url = "https://lab.example:7443"

@@ -531,3 +531,48 @@ fn node_part_passes_against_nerve_node() {
     assert_eq!(profiles.count(), 19, "{report}");
     drop(node);
 }
+
+/// The provider part against the real `nerve-node`: this test program
+/// attaches as the provider the owner allowed with `config add`.
+#[cfg(target_os = "linux")]
+#[test]
+fn provider_part_passes_against_nerve_node() {
+    use nerve_conformance::provider_part;
+    let root = tempfile::tempdir().unwrap();
+    let node = std::sync::Arc::new(std::sync::Mutex::new(Node::new(root.path())));
+    let n = node.clone();
+    let report = block_on(provider_part::run(move |link: PairLink| async move {
+        let link = link.render();
+        tokio::task::spawn_blocking(move || {
+            let mut node = n.lock().unwrap();
+            let (ok, out, err) = node.cli(&["center", "add", &link, "--yes"]);
+            if !ok {
+                return Err(format!("pair failed: {out}{err}"));
+            }
+            let (ok, out, err) = node.cli(&["center", "grant", "settings", "write"]);
+            if !ok {
+                return Err(format!("grant failed: {out}{err}"));
+            }
+            let exe = std::env::current_exe().unwrap();
+            let entry = format!("{{ name = \"conformance\", exe = \"{}\" }}", exe.display());
+            let (ok, out, err) = node.cli(&["config", "add", "providers.allowed", &entry]);
+            if !ok {
+                return Err(format!("allowing the provider failed: {out}{err}"));
+            }
+            node.start();
+            Ok(provider_part::Setup {
+                socket: node.state.join("run").join("ctl.sock"),
+                provider: "conformance".into(),
+            })
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }));
+    assert!(report.ok(), "{report}");
+    assert_eq!(
+        report.outcomes.len(),
+        provider_part::CHECKS.len(),
+        "{report}"
+    );
+    drop(node);
+}

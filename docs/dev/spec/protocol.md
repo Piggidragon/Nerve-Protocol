@@ -264,6 +264,9 @@ call over the call limit fails with `busy`.
   name (`docs/dev/spec/harness.md`), and a `_` inside a part would make that name
   ambiguous. A center ignores a descriptor with a name outside that set.
 - Effects: `read`, `sense`, `write`, `actuate`, `execute`.
+- `provider` names what serves a capability: `node`, or a local program
+  attached to the node (node-local.md §7). A center treats both alike; the
+  node decides every call either way.
 - Exposure: `on`, `off`. A capability that is `hidden` for a center is
   absent from that center's descriptor; `off` is listed with exposure `off`.
 - The descriptor is filtered per center. `rev` changes whenever that center's

@@ -28,7 +28,10 @@ nodes. Each node decides every call by the rules its owner set.
 | Harness | Any MCP client | Nothing of Nerve. It only speaks MCP |
 
 The node is the only part that talks to a center. The CLI talks to the node
-through its control socket.
+through its control socket, and so does a capability provider: a local program
+the owner allowed, such as a desktop app, that adds capabilities to the node
+([node-local §7](spec/node-local.md#7-capability-providers)). The node decides
+every call to them by the calling center's policy.
 
 ## Design rules
 

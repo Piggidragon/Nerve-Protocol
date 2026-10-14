@@ -391,6 +391,24 @@ fn by_mode(
     mode: Mode,
     reasons: &mut Vec<String>,
 ) -> bool {
+    // An action that names no path and no command (a provider's) lies in no
+    // folder, so the folders cannot allow it: folder mode lets it through only
+    // where it is set to on. Without this an empty list of paths would pass
+    // the folder check below for every read and write.
+    let pathless = call.targets.is_empty() && call.cwd.is_none() && call.command.is_none();
+    if mode == Mode::Folder
+        && pathless
+        && matches!(call.effect, Effect::Read | Effect::Write | Effect::Execute)
+    {
+        let on = policy.cap_setting(call.cap, Some(call.action)) == Some(CapSetting::On);
+        if !on {
+            reasons.push(format!(
+                "{}.{} touches no folder; folder mode allows it only where it is set to on",
+                call.cap, call.action
+            ));
+        }
+        return on;
+    }
     match call.effect {
         // No mode allows these; only the owner's `on` does.
         Effect::Sense | Effect::Actuate => {
@@ -498,6 +516,64 @@ mod tests {
         assert!(!folder_reach(&folders, Path::new("/w/a/b/x"), true));
         assert!(folder_reach(&folders, Path::new("/w/a/b/x"), false));
         assert!(folder_reach(&folders, Path::new("/w/a/c"), true));
+    }
+
+    /// An action that names no path (a provider's) lies in no folder:
+    /// folder mode allows it only where the owner set it on, whatever its
+    /// effect; user mode allows read, write and execute as for the built-in
+    /// capabilities; allowlist mode needs an allow rule on `cap.action`.
+    #[test]
+    fn a_pathless_action_needs_on_in_folder_mode() {
+        let t = T::new();
+        let env = t.env(true);
+        let decide_as = |policy: &CenterPolicy, effect| {
+            let call = Call {
+                cap: "echo",
+                action: "say",
+                effect,
+                targets: &[],
+                command: None,
+                cwd: None,
+                now_ms: NOW,
+            };
+            decide(policy, &env, &call)
+        };
+        let effects = [
+            Effect::Read,
+            Effect::Write,
+            Effect::Execute,
+            Effect::Sense,
+            Effect::Actuate,
+        ];
+        for effect in effects {
+            let mut p = policy(Mode::Folder);
+            let Decision::Forbidden(why) = decide_as(&p, effect) else {
+                panic!("{effect:?} passed folder mode without on");
+            };
+            assert!(why.contains("echo.say"), "{why}");
+            p.caps.insert("echo.say".into(), CapSetting::On);
+            assert_eq!(decide_as(&p, effect), Decision::Allow, "{effect:?}");
+            // A deny rule still wins.
+            p.deny.push("echo".into());
+            assert!(matches!(decide_as(&p, effect), Decision::Forbidden(_)));
+
+            let mut p = policy(Mode::User);
+            let quiet = matches!(effect, Effect::Sense | Effect::Actuate);
+            assert_eq!(
+                decide_as(&p, effect) == Decision::Allow,
+                !quiet,
+                "{effect:?}"
+            );
+            p.caps.insert("echo".into(), CapSetting::On);
+            assert_eq!(decide_as(&p, effect), Decision::Allow, "{effect:?}");
+
+            let mut p = policy(Mode::Allowlist);
+            assert!(matches!(decide_as(&p, effect), Decision::Forbidden(_)));
+            p.allow.push("echo.say".into());
+            assert_eq!(decide_as(&p, effect), Decision::Allow, "{effect:?}");
+            p.allow = vec!["echo.shout".into()];
+            assert!(matches!(decide_as(&p, effect), Decision::Forbidden(_)));
+        }
     }
 
     const MODES: [Mode; 3] = [Mode::Allowlist, Mode::Folder, Mode::User];

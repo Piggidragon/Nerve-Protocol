@@ -307,7 +307,14 @@ async fn session(
                 "the center's id is not the paired one".to_string(),
             ));
         }
-        let rev = descriptor::for_center(&cfg, entry, crate::now_ms(), shared.confined(&cfg)).rev;
+        let rev = descriptor::for_center(
+            &cfg,
+            entry,
+            crate::now_ms(),
+            shared.confined(&cfg),
+            &shared.providers.caps(),
+        )
+        .rev;
         let hello = Hello {
             node_id: key.node_id(),
             auth: msg::Auth {
@@ -460,8 +467,14 @@ impl Link {
             Some(x) => x,
             None => return self.end(ByeReason::Unpaired, Outcome::Stop).await,
         };
-        let mut rev =
-            descriptor::for_center(&cfg, &entry, crate::now_ms(), self.shared.confined(&cfg)).rev;
+        let mut rev = descriptor::for_center(
+            &cfg,
+            &entry,
+            crate::now_ms(),
+            self.shared.confined(&cfg),
+            &self.shared.providers.caps(),
+        )
+        .rev;
         let mut version = cfg.version;
         loop {
             tokio::select! {
@@ -543,9 +556,14 @@ impl Link {
     /// Tells the center when its view of the node changed.
     fn check_rev(&self, rev: &mut u64) {
         if let Some((cfg, entry)) = self.entry() {
-            let now =
-                descriptor::for_center(&cfg, &entry, crate::now_ms(), self.shared.confined(&cfg))
-                    .rev;
+            let now = descriptor::for_center(
+                &cfg,
+                &entry,
+                crate::now_ms(),
+                self.shared.confined(&cfg),
+                &self.shared.providers.caps(),
+            )
+            .rev;
             if now != *rev {
                 *rev = now;
                 self.handle
@@ -710,6 +728,7 @@ impl Link {
             &entry,
             crate::now_ms(),
             self.shared.confined(&cfg),
+            &self.shared.providers.caps(),
         ))
     }
 
@@ -883,7 +902,8 @@ impl Link {
         let (cfg, entry) = self
             .entry()
             .ok_or_else(|| RpcError::new(ErrorCode::Unavailable, "this center was removed"))?;
-        let view = descriptor::for_call(&cfg, &entry, crate::now_ms());
+        let view =
+            descriptor::for_call(&cfg, &entry, crate::now_ms(), &self.shared.providers.caps());
         let cap = view.capability(&inv.cap).ok_or_else(|| {
             RpcError::new(
                 ErrorCode::UnknownCapability,
@@ -905,6 +925,19 @@ impl Link {
                 ErrorCode::Disabled,
                 format!("{}.{} is off", inv.cap, inv.action),
             ));
+        }
+        // A provider's action (crate::provider) is decided and audited here
+        // like any other, with `cap.action` as its rule target; only an
+        // allowed call reaches the provider.
+        if cap.provider != "node" {
+            let provider = cap.provider.clone();
+            let target = format!("{}.{}", inv.cap, inv.action);
+            self.gate(&entry, &inv, effect, &[], None, None, target, None, None)?;
+            return self
+                .shared
+                .providers
+                .invoke(&provider, &inv.cap, &inv.action, inv.args.clone())
+                .await;
         }
         match (inv.cap.as_str(), inv.action.as_str()) {
             ("settings", "set") => self.settings_set(&inv.args),
@@ -1112,12 +1145,13 @@ impl Link {
         let s: Set = params(args)?;
         let account = self.account();
         let own = self.own();
+        // Only a provider's capability can sense (crate::provider).
+        let sensing = self.shared.providers.sensing();
         let r = lock(&self.shared.store).set_center_document(
             &self.name,
             s.document,
             s.if_version,
-            // This node offers no sense capabilities.
-            |_| false,
+            |cap| sensing.contains(cap),
             |opts| self.protected_with(opts, account.as_ref(), &own),
         );
         settings_result(r)
@@ -1134,6 +1168,7 @@ impl Link {
         let mut v = serde_json::to_value(doc).map_err(|e| RpcError::internal(e.to_string()))?;
         v["paused"] = Value::Bool(true);
         let version = store.version();
+        // Pausing changes nothing else of the document, so no sensing turns on.
         let r = store.set_center_document(
             &self.name,
             v,

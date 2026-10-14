@@ -621,7 +621,7 @@ async fn profile_steps(
     ))
 }
 
-fn expect_code(
+pub(crate) fn expect_code(
     got: Result<Result<Value, nerve_proto::RpcError>, String>,
     want: ErrorCode,
 ) -> Result<(), String> {

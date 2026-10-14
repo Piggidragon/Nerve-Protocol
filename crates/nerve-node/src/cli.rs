@@ -1291,6 +1291,22 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                             ),
                         );
                     }
+                    for p in v["providers"].as_array().into_iter().flatten() {
+                        let caps: Vec<&str> = p["capabilities"]
+                            .as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(Value::as_str)
+                            .collect();
+                        w(
+                            out,
+                            format!(
+                                "provider {} attached: {}",
+                                p["name"].as_str().unwrap_or_default(),
+                                caps.join(", ")
+                            ),
+                        );
+                    }
                     return Ok(());
                 }
                 Err(e) if e != nerve_transport::ctl::NOT_RUNNING => return Err(e),

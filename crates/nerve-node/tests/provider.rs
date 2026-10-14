@@ -1,0 +1,374 @@
+//! Capability providers on a real node daemon, in process
+//! (docs/dev/spec/node-local.md §7): the conformance provider checks, and
+//! what the node does beyond them: it refuses another program under an
+//! allowed name, lets a provider go when the owner no longer allows it,
+//! tells the provider of a cancelled call, and fails a call whose provider
+//! left. Linux only: the node tells the attaching program from
+//! `/proc/<pid>/exe`.
+#![cfg(target_os = "linux")]
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use nerve_conformance::fake_center::{self, FakeCenter};
+use nerve_conformance::wire::{Conn, Recv, code_of};
+use nerve_node::{Daemon, NodeOptions, NodePaths};
+use nerve_policy::NodeConfig;
+use nerve_policy::config::{AllowedProvider, SettingsGrant};
+use nerve_proto::rpc::Message;
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpStream, UnixStream};
+
+const WAIT: Duration = Duration::from_secs(15);
+
+fn options(root: &Path) -> NodeOptions {
+    let mut o = NodeOptions::new(NodePaths::new(root.join("config"), root.join("state")));
+    o.home = root.join("home");
+    std::fs::create_dir_all(&o.home).unwrap();
+    o.full_rights = Some(false);
+    o
+}
+
+/// This test program: what a provider started from here runs.
+fn me() -> String {
+    std::env::current_exe().unwrap().display().to_string()
+}
+
+async fn owner_edit(paths: &NodePaths, f: impl Fn(&mut NodeConfig)) {
+    nerve_node::cli::edit(paths, |c| {
+        f(c);
+        Ok(())
+    })
+    .await
+    .expect("the owner's edit");
+}
+
+/// Pairs with `center`, allows `exe` as the provider `desk`, lets `policy`
+/// change the center's policy, and starts the daemon.
+async fn node(
+    root: &Path,
+    center: &FakeCenter,
+    exe: &str,
+    policy: impl Fn(&mut nerve_policy::CenterPolicy),
+) -> Daemon {
+    let o = options(root);
+    nerve_node::pair::pair(&o.paths, &center.link(), Some("lab"))
+        .await
+        .expect("pair");
+    owner_edit(&o.paths, |c| {
+        c.providers.allowed = vec![AllowedProvider {
+            name: "desk".into(),
+            exe: exe.into(),
+        }];
+        policy(&mut c.centers[0].policy);
+    })
+    .await;
+    Daemon::start(o).await.expect("start")
+}
+
+async fn linked(center: &mut FakeCenter) -> Conn<TcpStream> {
+    let paired = center.paired().expect("paired");
+    let mut inc = center.next_link(WAIT).await.expect("the node dials");
+    fake_center::handshake(&mut inc.conn, &center.center_id, &paired)
+        .await
+        .expect("handshake");
+    inc.conn
+}
+
+/// A provider's connection.
+struct Provider {
+    lines: tokio::io::Lines<BufReader<tokio::net::unix::OwnedReadHalf>>,
+    w: tokio::net::unix::OwnedWriteHalf,
+}
+
+impl Provider {
+    async fn next(&mut self) -> Option<Value> {
+        let line = tokio::time::timeout(WAIT, self.lines.next_line())
+            .await
+            .expect("a line within 15 s")
+            .ok()??;
+        Some(serde_json::from_str(&line).unwrap())
+    }
+
+    async fn send(&mut self, v: Value) {
+        self.w.write_all(format!("{v}\n").as_bytes()).await.unwrap();
+    }
+}
+
+/// `hello` as the provider `desk` with one capability `lamp` whose
+/// action `on` writes: the connection and the node's first answer.
+async fn hello(socket: &Path) -> (Provider, Value) {
+    let token = std::fs::read_to_string(socket.with_file_name("ctl.token")).unwrap();
+    let (r, w) = UnixStream::connect(socket).await.unwrap().into_split();
+    let mut p = Provider {
+        lines: BufReader::new(r).lines(),
+        w,
+    };
+    let caps = json!([{"id": "lamp", "summary": "A lamp.",
+                       "actions": {"on": {"effect": "write"}}}]);
+    p.send(json!({"method": "hello", "token": token,
+                  "params": {"role": "provider", "name": "desk", "capabilities": caps}}))
+        .await;
+    let first = p.next().await.expect("an answer");
+    (p, first)
+}
+
+async fn descriptor_changed(conn: &mut Conn<TcpStream>) {
+    loop {
+        match conn.recv(WAIT).await {
+            Recv::Msg(Message::Notification { method: m, params })
+                if m == "event"
+                    && params["cap"] == "node"
+                    && params["name"] == "descriptor_changed" =>
+            {
+                return;
+            }
+            Recv::Msg(_) => {}
+            other => panic!("no descriptor_changed: {other:?}"),
+        }
+    }
+}
+
+async fn lamp_listed(conn: &mut Conn<TcpStream>) -> bool {
+    let d = conn
+        .call("describe", json!({"detail": "full"}), WAIT)
+        .await
+        .unwrap()
+        .expect("describe");
+    d["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|c| c["id"] == "lamp")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn passes_the_conformance_provider_checks() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().to_path_buf();
+    let running: Arc<Mutex<Option<Daemon>>> = Arc::default();
+    let keep = running.clone();
+    let report = nerve_conformance::provider_part::run(move |link| async move {
+        let o = options(&root);
+        nerve_node::pair::pair(&o.paths, &link, None).await?;
+        owner_edit(&o.paths, |c| {
+            c.centers[0].settings = SettingsGrant::Write;
+            c.providers.allowed = vec![AllowedProvider {
+                name: "conformance".into(),
+                exe: me(),
+            }];
+        })
+        .await;
+        let socket = o.paths.ctl_socket();
+        let d = Daemon::start(o).await?;
+        *keep.lock().unwrap() = Some(d);
+        Ok(nerve_conformance::provider_part::Setup {
+            socket,
+            provider: "conformance".into(),
+        })
+    })
+    .await;
+    let d = running.lock().unwrap().take();
+    if let Some(d) = d {
+        d.stop().await;
+    }
+    assert!(report.ok(), "{report}");
+    assert_eq!(
+        report.outcomes.len(),
+        nerve_conformance::provider_part::CHECKS.len()
+    );
+}
+
+/// The name alone does not attach: the program on the other end must be the
+/// one `providers.allowed` names.
+#[tokio::test(flavor = "multi_thread")]
+async fn another_program_under_an_allowed_name_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let other = dir.path().join("other-program");
+    std::fs::write(&other, "").unwrap();
+    let daemon = node(dir.path(), &center, &other.display().to_string(), |_| {}).await;
+    let _conn = linked(&mut center).await;
+    let (_p, first) = hello(&daemon.paths().ctl_socket()).await;
+    let e = first["error"].as_str().expect("refused");
+    assert!(e.contains("must be") && e.contains("other-program"), "{e}");
+    assert_eq!(daemon.status()["providers"], json!([]));
+    daemon.stop().await;
+}
+
+/// A provider the owner takes off `providers.allowed` is let go: its
+/// connection ends and its capability leaves the descriptor. `status`
+/// shows the attached ones.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_provider_the_owner_no_longer_allows_is_detached() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let daemon = node(dir.path(), &center, &me(), |p| {
+        p.mode = nerve_policy::Mode::User;
+    })
+    .await;
+    let mut conn = linked(&mut center).await;
+    let (mut p, first) = hello(&daemon.paths().ctl_socket()).await;
+    assert_eq!(first["ok"]["capabilities"], json!(["lamp"]), "{first}");
+    descriptor_changed(&mut conn).await;
+    assert!(lamp_listed(&mut conn).await);
+    assert_eq!(
+        daemon.status()["providers"],
+        json!([{"name": "desk", "capabilities": ["lamp"]}])
+    );
+    let paths = daemon.paths().clone();
+    assert!(
+        status(&paths)
+            .await
+            .contains("provider desk attached: lamp")
+    );
+    owner_edit(&paths, |c| c.providers.allowed.clear()).await;
+    assert_eq!(p.next().await, None, "the connection ends");
+    descriptor_changed(&mut conn).await;
+    assert!(!lamp_listed(&mut conn).await);
+    assert_eq!(daemon.status()["providers"], json!([]));
+    assert!(!status(&paths).await.contains("provider"));
+    daemon.stop().await;
+}
+
+/// What `nerve-node status` prints.
+async fn status(paths: &NodePaths) -> String {
+    use clap::Parser;
+    let cli = nerve_node::cli::Cli::parse_from([
+        "nerve-node".into(),
+        "--config-dir".into(),
+        paths.config_dir.clone(),
+        "--state-dir".into(),
+        paths.state_dir.clone(),
+        PathBuf::from("status"),
+    ]);
+    let mut out = Vec::new();
+    nerve_node::cli::execute(cli, &mut out).await.unwrap();
+    String::from_utf8(out).unwrap()
+}
+
+/// A call the center cancels is cancelled at the provider too, and a call
+/// whose provider leaves fails `unavailable` at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_reaches_the_provider_and_a_leaving_provider_fails_its_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let daemon = node(dir.path(), &center, &me(), |p| {
+        p.allow.push("lamp.on".into());
+    })
+    .await;
+    let mut conn = linked(&mut center).await;
+    let (mut p, _) = hello(&daemon.paths().ctl_socket()).await;
+    descriptor_changed(&mut conn).await;
+
+    let call = || json!({"cap": "lamp", "action": "on", "args": {"level": 3}, "ctx": {}});
+    let id = conn.request("invoke", call()).await.unwrap();
+    let got = p.next().await.expect("the call");
+    assert_eq!(got["method"], "invoke");
+    assert_eq!(
+        got["params"],
+        json!({"cap": "lamp", "action": "on", "args": {"level": 3}})
+    );
+    conn.notify("cancel", json!({"id": id})).await.unwrap();
+    let cancel = p.next().await.expect("the cancel");
+    assert_eq!(
+        cancel,
+        json!({"method": "cancel", "params": {"id": got["id"]}})
+    );
+    let e = conn
+        .answer(id, WAIT, &mut Vec::new())
+        .await
+        .unwrap()
+        .expect_err("cancelled");
+    assert_eq!(code_of(&e), "cancelled");
+    // A late answer to the cancelled call is dropped.
+    p.send(json!({"id": got["id"], "ok": {}})).await;
+
+    let id = conn.request("invoke", call()).await.unwrap();
+    let _ = p.next().await.expect("the call");
+    drop(p);
+    let e = conn
+        .answer(id, WAIT, &mut Vec::new())
+        .await
+        .unwrap()
+        .expect_err("the provider left");
+    assert_eq!(code_of(&e), "unavailable", "{}", e.message);
+    daemon.stop().await;
+}
+
+/// The capability a provider adds senses: a center with the settings grant
+/// may not allow it itself, the owner may.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_center_may_not_allow_a_sensing_provider_itself() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let o = options(dir.path());
+    nerve_node::pair::pair(&o.paths, &center.link(), Some("lab"))
+        .await
+        .unwrap();
+    owner_edit(&o.paths, |c| {
+        c.centers[0].settings = SettingsGrant::Write;
+        c.providers.allowed = vec![AllowedProvider {
+            name: "desk".into(),
+            exe: me(),
+        }];
+    })
+    .await;
+    let daemon = Daemon::start(o).await.unwrap();
+    let mut conn = linked(&mut center).await;
+    let token =
+        std::fs::read_to_string(daemon.paths().ctl_socket().with_file_name("ctl.token")).unwrap();
+    let (r, w) = UnixStream::connect(daemon.paths().ctl_socket())
+        .await
+        .unwrap()
+        .into_split();
+    let mut p = Provider {
+        lines: BufReader::new(r).lines(),
+        w,
+    };
+    let caps = json!([{"id": "camera", "actions": {"snap": {"effect": "sense"}}}]);
+    p.send(json!({"method": "hello", "token": token,
+                  "params": {"role": "provider", "name": "desk", "capabilities": caps}}))
+        .await;
+    // Attached once answered; default deny shows the center nothing of it.
+    assert!(p.next().await.unwrap().get("ok").is_some());
+
+    let got = conn
+        .call(
+            "get",
+            json!({"cap": "settings", "keys": ["document", "version"]}),
+            WAIT,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    for change in ["allow", "caps"] {
+        let mut doc = got["document"].clone();
+        if change == "allow" {
+            doc["policy"]["allow"] = json!(["camera.snap"]);
+        } else {
+            doc["policy"]["caps"] = json!({"camera": "on"});
+        }
+        let e = conn
+            .call(
+                "invoke",
+                json!({"cap": "settings", "action": "set", "ctx": {},
+                       "args": {"document": doc, "if_version": got["version"]}}),
+                WAIT,
+            )
+            .await
+            .unwrap()
+            .expect_err("refused");
+        assert_eq!(code_of(&e), "forbidden");
+        assert!(
+            e.message.contains("only the owner can turn sensing on"),
+            "{}",
+            e.message
+        );
+    }
+    let paths: PathBuf = daemon.paths().config_file();
+    assert!(!std::fs::read_to_string(paths).unwrap().contains("camera"));
+    daemon.stop().await;
+}

@@ -76,6 +76,17 @@ impl NodePaths {
         self.config_dir.join("keys").join(format!("{center}.key"))
     }
 
+    /// The relay's TLS certificate and key (crate::relay), beside the
+    /// center keys; not a `.key` name, so no center's.
+    pub fn relay_tls_file(&self) -> PathBuf {
+        self.config_dir.join("keys").join("relay-tls.pem")
+    }
+
+    /// The password of an `https://` proxy, a relay token above all.
+    pub fn proxy_login_file(&self) -> PathBuf {
+        self.config_dir.join("keys").join("proxy-login.secret")
+    }
+
     pub fn ctl_socket(&self) -> PathBuf {
         self.state_dir.join("run").join("ctl.sock")
     }
@@ -106,6 +117,13 @@ impl NodePaths {
     /// key must not depend on a setting in the file it checks.
     pub fn config_key(&self) -> PathBuf {
         self.state_dir.join("config.key")
+    }
+
+    /// The highest version of `node.toml` the node has saved or taken: an
+    /// older signed file put back in the config folder is refused against it
+    /// (`nerve_policy::settings::VERSION_FILE`). It holds no secret.
+    pub fn config_version(&self) -> PathBuf {
+        self.state_dir.join(nerve_policy::settings::VERSION_FILE)
     }
 
     /// Says that a move of the node's keys between their files and the

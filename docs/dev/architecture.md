@@ -40,7 +40,10 @@ every call to them by the calling center's policy.
    stricter. It cannot make the node more permissive, except by changing
    settings where the owner gave it the settings grant.
 2. **The node dials.** A node never listens for centers. Nodes behind NAT, on
-   laptops and in closed networks work without opening a port.
+   laptops and in closed networks work without opening a port. A node whose
+   owner turns on its relay listens for other nodes, and tunnels their TLS
+   bytes to its own centers only ([protocol §4.8](spec/protocol.md)); the
+   relayed node still dials, through it.
 3. **A center is a trust domain.** A node pairs with any number of centers and
    keeps their policy, sessions, audit entries and settings apart. A center
    cannot learn whether another center exists.
@@ -51,7 +54,8 @@ every call to them by the calling center's policy.
 6. **The center is a gate and a router.** It has no agent loop, no model, no
    memory and no chat history. It stores no file contents, command output or
    node secrets. It does not relay messages between nodes, call one node from
-   another or install software on a node.
+   another or install software on a node. A node's relay carries bytes, not
+   messages, and no node calls another either.
 7. **Data from a node is data.** File contents, command output and tool
    results are untrusted content at the center and in the harness. The center
    marks every tool result as device content.
@@ -62,9 +66,9 @@ every call to them by the calling center's policy.
 
 | Where | What |
 |---|---|
-| Config folder | `node.toml`, signed. `keys/<name>.key`, one Ed25519 key per center, mode 0600. On Windows, DPAPI files: `command-account.dpapi` (the password of the account commands run as, on the installed node) and `sudo.dpapi` (the sudo password while sudo is on) |
-| State folder | `audit.jsonl`, `log.jsonl`, `run/ctl.sock`, `run/ctl.token`, `config.key` (the key of the config's MAC), `keys.lock`, `keys.moving` (while the keys move between files and the keyring). On Windows, `grants.json` and `grants.json.lock`, the record of the folder grants |
-| System keyring | With `machine.secret_storage = "keyring"`: the center keys and the config's key instead of their files. The proxy's header values, always (the installed node on Windows takes none, see node-local §2) |
+| Config folder | `node.toml`, signed. `keys/<name>.key`, one Ed25519 key per center, mode 0600; `keys/relay-tls.pem` (the relay's TLS key) and `keys/proxy-login.secret` (an `https://` proxy's password, a relay token), when there are. On Windows, DPAPI files: `command-account.dpapi` (the password of the account commands run as, on the installed node) and `sudo.dpapi` (the sudo password while sudo is on) |
+| State folder | `audit.jsonl`, `log.jsonl`, `run/ctl.sock`, `run/ctl.token`, `config.key` (the key of the config's MAC), `config.version` (the last version of `node.toml` the node saved or took), `keys.lock`, `keys.moving` (while the keys move between files and the keyring). On Windows, `grants.json` and `grants.json.lock`, the record of the folder grants |
+| System keyring | With `machine.secret_storage = "keyring"`: the center keys, the config's key, the relay's TLS key and an `https://` proxy's password instead of their files. The proxy's header values, always (the installed node on Windows takes none, see node-local §2) |
 
 No call of any center reaches these two folders. See
 [settings and config](settings-and-config.md). The center keeps `tls.pem`,
@@ -82,7 +86,7 @@ No call of any center reaches these two folders. See
 | `crates/nerve-sandbox` | Confinement for commands: Landlock on Linux, an AppContainer on Windows |
 | `crates/nerve-node` | The `nerve-node` binary: daemon and CLI |
 | `crates/nerve-center` | The `nerve-center` binary: links, MCP server, web UI |
-| `crates/nerve-conformance` | The conformance suite, an echo node and a fake center |
+| `crates/nerve-conformance` | The conformance suite: center, node and harness parts, an echo node and a fake center |
 
 A wire change, its spec text and both ends change together.
 

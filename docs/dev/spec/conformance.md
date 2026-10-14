@@ -2,14 +2,15 @@
 
 The conformance suite lives in `crates/nerve-conformance`. It has four
 parts; every check names the section of [protocol.md](protocol.md) it tests
-(the provider part: of [node-local.md](node-local.md)), so a failure points
+(the harness part: of [harness.md](harness.md), the provider part: of
+[node-local.md](node-local.md)), so a failure points
 at the rule that was broken.
 
 | Part | Checks | Acts as | State |
 |---|---|---|---|
 | center | a center | the echo node | runs |
 | node | a node | a fake center | runs |
-| harness | the MCP server surface a harness sees | a center | skeleton: lists its checks, runs none |
+| harness | the MCP server surface a harness sees | an MCP client and two echo nodes | runs |
 | provider | a node's capability provider attach ([node-local.md §7](node-local.md#7-capability-providers)) | a center and a provider | runs (Unix) |
 
 Harnesses integrate through MCP only, so the harness part checks the
@@ -22,14 +23,23 @@ report, and `cargo test -p nerve-conformance` runs them:
 
 - `tests/self_test.rs`: the center part against the fake center and the node
   part against the echo node. These check the suite itself.
-- `tests/e2e.rs`: the center part against a real `nerve-center`, the node part
-  and the provider part against a real `nerve-node`, and `nerve-center` with
-  `nerve-node` against each other (pairing, link, tools over MCP, folders and
-  rules, settings, audit).
+- `tests/e2e.rs`: the center part and the harness part against a real
+  `nerve-center`, the node part and the provider part against a real
+  `nerve-node`, and `nerve-center` with `nerve-node` against each other
+  (pairing, link, tools over MCP, folders and rules, settings, audit).
+
+The end-to-end tests start `nerve-center` and `nerve-node` from the programs
+named by `NERVE_CENTER_BIN` and `NERVE_NODE_BIN`, and build them only when the
+variables are not set. The release workflow sets them to the Linux binaries it
+has just built, so the suite runs against what is released, on each
+architecture (docs/dev/releasing.md).
 
 To check another implementation, call `center_part::run(&pair_link)` with a
-fresh pairing link of that center, or `node_part::run(start)` with a closure
-that pairs the node under test with the link it is handed and starts it.
+fresh pairing link of that center, `node_part::run(start)` with a closure
+that pairs the node under test with the link it is handed and starts it, or
+`harness_part::run(&target)` with the center's HTTP MCP address, a harness
+token and two fresh pairing links (the part pairs two echo nodes, `conf-a` and
+`conf-b`, so the center must have no node of those names).
 
 The closure returns a `Setup`. With `folder` (an empty folder on the node, in
 wire form) and the settings grant `write` for the fake center, the node part
@@ -101,6 +111,39 @@ With a `Setup::sudo_password` as well:
 | 7.4.1 | a replayed sealed password is `invalid_args` and sudo stays off |
 | 7.4.1 | no frame the node sent carries the sudo password |
 
+## Harness part
+
+The section is that of [harness.md](harness.md). The part speaks MCP over HTTP,
+where a session is explicit; the rules are the same over stdio. It reads a
+reply with a `Content-Length` and a chunked one alike, and a reply that is not
+JSON is a failure of the check, not an empty result.
+
+| § | Check |
+|---|---|
+| 3 | a request without a token, and one with a wrong token, is answered with 401 |
+| 3 | a request whose `Origin` names another host is answered with 403 |
+| 3 | `initialize` answers with the version asked for (`2025-06-18`, `2025-03-26`, `2024-11-05`) and with `2025-06-18` for an unknown one; it names `nerve-center` and declares `tools.listChanged` |
+| 3 | `initialize` opens a session; a request without `Mcp-Session-Id` is 400 and one with an unknown id is 404; `ping` is answered with an empty result |
+| 4 | the tools of both nodes are listed, and `nodes` is a tool that lists them as online |
+| 4 | tool names keep `[A-Za-z0-9_-]` within 64 characters |
+| 4 | a capability with a profile is one tool, `<cap>_<action>`, with `node` as first required argument and an enum of exactly the nodes that offer it |
+| 4 | a capability without a profile is a tool per node, `<node>_<cap>_<action>`, with no `node` argument |
+| 4 | the actions of the capabilities `node`, `settings` and `audit` are never tools |
+| 4 | a read action has `readOnlyHint`, and a write action does not |
+| 4 | a result is device content (marked text, the object as `structuredContent`) |
+| 4 | a shared tool without `node` is `error invalid_args`; a failure on the node is `error <code>: <message>` |
+| 4 | a shared tool reaches the node `node` names |
+| 4 | a call to a node that is offline is `error unavailable`, and its tools stay listed |
+| 5 | two sessions have two ids; a node sees one `ctx.session` per session, so a node that two sessions use sees two |
+| 5 | `DELETE /mcp` ends the session (204), and the ended session is 404 |
+| 5 | `session.end` goes to every node the session used (checked for a session that used two) |
+| 5 | `session.end` names the session's `ctx.session` to a node it used, only for the ended session and not for another session on that node, and is not sent to a node it never used |
+| 5 | the other session goes on, and still reaches the node |
+
+Not covered: `notifications/cancelled`, the stdio transport and attach, a node
+the owner disabled, exposure `off`, names cut to 64 characters and clashes (these
+have unit tests in `nerve-center`).
+
 ## Provider part
 
 `provider_part::run(start)` checks a node's provider attach on Linux. The
@@ -131,5 +174,7 @@ is there) and attaches an `echo` provider with the actions `say`, `shout` and
 ## Not covered
 
 Binary frames and blobs (§5.4), limits (§5.5), the duplicate-link rule (§4.3),
-liveness timing (§4.4), back-off (§4.6) and proxies (§4.7) have unit tests in
-the implementations but no conformance checks.
+liveness timing (§4.4), back-off (§4.6), proxies (§4.7) and relays (§4.8)
+have unit tests in the implementations but no conformance checks of their
+own. `nerve-node`'s relay tests run the node part against a node that reaches
+the fake center only through a relay (`crates/nerve-node/src/relay.rs`).

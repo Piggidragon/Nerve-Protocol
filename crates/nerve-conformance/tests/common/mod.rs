@@ -56,6 +56,107 @@ pub fn free_port() -> u16 {
         .port()
 }
 
+/// The command of a `nerve-center` with its own state folder, a node
+/// listener on a free port (pinned TLS when `tls`, else plain loopback) and
+/// the web UI on a free port; the port of the node listener.
+fn center_command(state: &Path, tls: bool, extra: &[(&str, &str)]) -> (Command, u16) {
+    let node_port = free_port();
+    let mut cmd = Command::new(bin("nerve-center"));
+    cmd.env_clear()
+        .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+        .env("HOME", state)
+        .env("NERVE_STATE_DIR", state)
+        .env("NERVE_NAME", "e2e-center")
+        .env("NERVE_LISTEN", format!("127.0.0.1:{node_port}"))
+        .env("NERVE_UI", "127.0.0.1:0")
+        .env("NERVE_LOG", "info")
+        .env("NERVE_CALL_WAIT", "20");
+    if tls {
+        cmd.env("NERVE_PUBLIC_URL", format!("https://127.0.0.1:{node_port}"));
+    } else {
+        cmd.env("NERVE_PLAIN_LOOPBACK", "true")
+            .env("NERVE_PUBLIC_URL", format!("http://127.0.0.1:{node_port}"));
+    }
+    for (k, v) in extra {
+        cmd.env(k, v);
+    }
+    (cmd, node_port)
+}
+
+/// Passes the center's stderr on to ours and returns the address of its web
+/// UI, once it names it.
+fn ui_address(child: &mut Child) -> String {
+    let (ui_tx, ui_rx) = channel();
+    let stderr = child.stderr.take().unwrap();
+    std::thread::spawn(move || {
+        let mut sent = false;
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            eprintln!("[nerve-center] {line}");
+            if !sent && let Some(i) = line.find("web UI at http://") {
+                let addr = line[i + "web UI at http://".len()..]
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                let _ = ui_tx.send(addr);
+                sent = true;
+            }
+        }
+    });
+    ui_rx
+        .recv_timeout(Duration::from_secs(60))
+        .expect("nerve-center names its web UI address")
+}
+
+/// A `nerve-center` that serves MCP over HTTP with a harness token and has no
+/// harness on stdin.
+pub struct HttpCenter {
+    child: Child,
+    pub ui: Ui,
+    pub mcp_addr: String,
+    pub token: String,
+}
+
+impl HttpCenter {
+    pub fn start(state: &Path, token: &str) -> HttpCenter {
+        let mcp_addr = format!("127.0.0.1:{}", free_port());
+        let (mut cmd, _) = center_command(
+            state,
+            false,
+            &[
+                ("NERVE_MCP", "http"),
+                ("NERVE_MCP_LISTEN", &mcp_addr),
+                ("NERVE_HARNESS_TOKEN", token),
+                // The UI is open on loopback for the test to pair through.
+                ("NERVE_UI_NO_LOGIN", "true"),
+            ],
+        );
+        let mut child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("nerve-center starts");
+        let ui = ui_address(&mut child);
+        HttpCenter {
+            child,
+            ui: Ui {
+                addr: ui,
+                cookie: Arc::new(Mutex::new(None)),
+            },
+            mcp_addr,
+            token: token.to_string(),
+        }
+    }
+}
+
+impl Drop for HttpCenter {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 /// A `nerve-center` started the way a harness starts it: MCP over stdio.
 pub struct Mcp {
     child: Child,
@@ -72,26 +173,7 @@ impl Mcp {
     /// Starts a center in `state`. `tls` picks a TLS node listener (pinned
     /// through the link) over plain HTTP on loopback.
     pub fn start(state: &Path, tls: bool, extra: &[(&str, &str)]) -> Mcp {
-        let node_port = free_port();
-        let mut cmd = Command::new(bin("nerve-center"));
-        cmd.env_clear()
-            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
-            .env("HOME", state)
-            .env("NERVE_STATE_DIR", state)
-            .env("NERVE_NAME", "e2e-center")
-            .env("NERVE_LISTEN", format!("127.0.0.1:{node_port}"))
-            .env("NERVE_UI", "127.0.0.1:0")
-            .env("NERVE_LOG", "info")
-            .env("NERVE_CALL_WAIT", "20");
-        if tls {
-            cmd.env("NERVE_PUBLIC_URL", format!("https://127.0.0.1:{node_port}"));
-        } else {
-            cmd.env("NERVE_PLAIN_LOOPBACK", "true")
-                .env("NERVE_PUBLIC_URL", format!("http://127.0.0.1:{node_port}"));
-        }
-        for (k, v) in extra {
-            cmd.env(k, v);
-        }
+        let (mut cmd, node_port) = center_command(state, tls, extra);
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -113,26 +195,7 @@ impl Mcp {
                 }
             }
         });
-        let (ui_tx, ui_rx) = channel();
-        let stderr = child.stderr.take().unwrap();
-        std::thread::spawn(move || {
-            let mut sent = false;
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                eprintln!("[nerve-center] {line}");
-                if !sent && let Some(i) = line.find("web UI at http://") {
-                    let addr = line[i + "web UI at http://".len()..]
-                        .split_whitespace()
-                        .next()
-                        .unwrap_or("")
-                        .to_string();
-                    let _ = ui_tx.send(addr);
-                    sent = true;
-                }
-            }
-        });
-        let ui = ui_rx
-            .recv_timeout(Duration::from_secs(60))
-            .expect("nerve-center names its web UI address");
+        let ui = ui_address(&mut child);
         let mut m = Mcp {
             child,
             stdin,

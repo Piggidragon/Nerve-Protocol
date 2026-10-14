@@ -69,6 +69,9 @@ pub enum Cmd {
     /// Choose the proxy the node uses to reach centers.
     #[command(subcommand)]
     Proxy(ProxyCmd),
+    /// Let nodes that cannot reach a center themselves reach this node's centers through it.
+    #[command(subcommand)]
+    Relay(RelayCmd),
     /// Read or change any setting in node.toml by its name.
     #[command(subcommand)]
     Config(ConfigCmd),
@@ -317,8 +320,11 @@ pub enum ConfigCmd {
 pub enum ProxyCmd {
     /// Reach centers through an HTTP proxy. Header values and a password are kept in the system keyring, never in node.toml; the installed node on Windows takes neither.
     Set {
-        /// The proxy, http://host:port, or http://user:password@host:port when it wants a login.
+        /// The proxy, http://host:port, or http://user:password@host:port when it wants a login; https://... for a relay or another proxy reached over TLS.
         url: String,
+        /// The pin of an https:// proxy's certificate (a relay's: `nerve-node relay ls` there shows it); without it the system's roots check it.
+        #[arg(long)]
+        pin: Option<String>,
         /// A header for the proxy, `Name: value`; can be given more than once. The value goes into the system keyring.
         #[arg(long = "header", value_name = "NAME: VALUE")]
         headers: Vec<String>,
@@ -326,6 +332,65 @@ pub enum ProxyCmd {
     /// Reach centers directly again, and delete the proxy's values from the system keyring.
     Rm,
     /// Show the proxy that is set and the names of its headers, never their values.
+    Ls,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RelayCmd {
+    /// Turn the relay on: listen for other nodes at ADDRESS, like 0.0.0.0:7490. A node reaches only this node's own https centers through it.
+    Set {
+        /// The address and port to listen on, like 0.0.0.0:7490 or [::]:7490.
+        address: String,
+        /// Tunnels at once, over every relayed node (16 unless set).
+        #[arg(long, value_name = "N")]
+        max_links: Option<u32>,
+        /// Tunnels at once of one relayed node (4 unless set).
+        #[arg(long, value_name = "N")]
+        max_links_per_node: Option<u32>,
+        /// Tunnels one relayed node may open a minute, every node alike (30 unless set; for a relay behind this one, use `relay set-limits <name>`).
+        #[arg(long, value_name = "N")]
+        max_opens_per_minute: Option<u32>,
+    },
+    /// Turn the relay off: stop listening and end every tunnel. The nodes and their tokens stay.
+    Off,
+    /// Let a node use the relay: makes its token and shows it once. Without --center its tunnels may go to every https center of this node.
+    Add {
+        /// The relayed node's name here, 1 to 32 of a-z, 0-9 and -.
+        name: String,
+        /// A center of this node the relayed node may reach; can be given more than once. Without it, every one.
+        #[arg(long = "center", value_name = "CENTER")]
+        centers: Vec<String>,
+    },
+    /// Change which centers of this node a relayed node may reach; without --center, every one. Its tunnels to others end.
+    SetCenters {
+        /// The relayed node's name.
+        name: String,
+        /// A center of this node the relayed node may reach; can be given more than once.
+        #[arg(long = "center", value_name = "CENTER")]
+        centers: Vec<String>,
+    },
+    /// Give a relayed node limits of its own, in place of the relay's --max-links-per-node and --max-opens-per-minute: for a relay behind this one, which carries many nodes. A flag not given keeps that limit; without either flag, the relay's limits again.
+    SetLimits {
+        /// The relayed node's name.
+        name: String,
+        /// Its tunnels at once.
+        #[arg(long, value_name = "N")]
+        max_links: Option<u32>,
+        /// The tunnels it may open a minute.
+        #[arg(long, value_name = "N")]
+        max_opens_per_minute: Option<u32>,
+    },
+    /// Give a relayed node a new token and end the tunnels of the old one; its centers and limits stay. Shows the token once.
+    Token {
+        /// The relayed node's name.
+        name: String,
+    },
+    /// Take a node's token away and end its tunnels.
+    Rm {
+        /// The relayed node's name.
+        name: String,
+    },
+    /// Show the relay, the nodes that may use it and, on a running node, who is connected.
     Ls,
 }
 
@@ -360,7 +425,7 @@ const SECTIONS: &[(&str, &str, &[&[&str]])] = &[
     (
         "Pair and connect",
         "Link this machine to centers and choose how it reaches them.",
-        &[&["center"], &["proxy"]],
+        &[&["center"], &["proxy"], &["relay"]],
     ),
     (
         "What a center may do",
@@ -1307,6 +1372,17 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                             ),
                         );
                     }
+                    let relay = &v["relay"];
+                    if relay["listen"].is_string() {
+                        let tunnels = relay["tunnels"].as_array().map_or(0, Vec::len);
+                        w(
+                            out,
+                            format!(
+                                "relay: {}, {tunnels} tunnels open (`nerve-node relay ls` names them)",
+                                relay["status"].as_str().unwrap_or_default()
+                            ),
+                        );
+                    }
                     return Ok(());
                 }
                 Err(e) if e != nerve_transport::ctl::NOT_RUNNING => return Err(e),
@@ -1437,6 +1513,7 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
         }
         Cmd::Audit { follow, denied } => audit(&paths, follow, denied, out).await,
         Cmd::Proxy(c) => proxy_cmd(&paths, c, out).await,
+        Cmd::Relay(c) => relay_cmd(&paths, c, out).await,
         Cmd::Sudo(c) => sudo_cmd(&paths, c, out).await,
         Cmd::Install => {
             let layout = Layout::system();
@@ -2285,6 +2362,24 @@ fn audit_line(v: &Value) -> String {
         }
         return line;
     }
+    if v["kind"] == "relay" {
+        return format!(
+            "{}  relay  {} from {} to center {}: {} after {} ({} bytes up, {} down)",
+            s("ts"),
+            s("node"),
+            s("from"),
+            s("center"),
+            s("reason"),
+            nerve_transport::log::span(Duration::from_millis(
+                v["end"]
+                    .as_u64()
+                    .unwrap_or(0)
+                    .saturating_sub(v["start"].as_u64().unwrap_or(0))
+            )),
+            s("up"),
+            s("down"),
+        );
+    }
     if v["kind"] == "config" {
         return format!(
             "{}  config {}  {}: {}",
@@ -2563,13 +2658,16 @@ fn keyring_turns_commands_off(
 }
 
 /// `proxy set|rm|ls`. The header values, and a user name and password given
-/// in the URL, go into the system keyring ([`crate::secrets`]); `node.toml`
-/// keeps the URL without them and the header names. The installed node on
-/// Windows refuses them, as the service does not read the keyring of the
-/// account that runs this. Nothing here prints, logs or audits a value.
+/// in an `http://` URL, go into the system keyring ([`crate::secrets`]);
+/// `node.toml` keeps the URL without them and the header names. The
+/// installed node on Windows refuses them, as the service does not read the
+/// keyring of the account that runs this. The password of an `https://`
+/// proxy, a relay token, is kept with the node's own keys instead, where
+/// `machine.secret_storage` says, and its user name in `connection.login`.
+/// Nothing here prints, logs or audits a value.
 async fn proxy_cmd(paths: &NodePaths, c: ProxyCmd, out: &mut dyn Write) -> Result<(), String> {
     match c {
-        ProxyCmd::Set { url, headers } => {
+        ProxyCmd::Set { url, pin, headers } => {
             let mut hs: Vec<(String, String)> = Vec::new();
             for (i, h) in headers.iter().enumerate() {
                 // Not echoed: without its colon the whole line may be the secret.
@@ -2583,6 +2681,27 @@ async fn proxy_cmd(paths: &NodePaths, c: ProxyCmd, out: &mut dyn Write) -> Resul
                 hs.push((k, v.trim().to_string()));
             }
             let (url, login) = split_credentials(&url)?;
+            let https = url.to_ascii_lowercase().starts_with("https://");
+            let (now, _) = read_config(paths).await?;
+            let storage = now.machine.secret_storage;
+            // An https:// proxy's login is the node's own secret.
+            let (login, kept) = match login {
+                Some((user, password)) if https => {
+                    if !nerve_policy::config::valid_login(&user) {
+                        return Err("the proxy URL has an empty or bad user name".into());
+                    }
+                    if hs
+                        .iter()
+                        .any(|(n, _)| n.eq_ignore_ascii_case(PROXY_AUTHORIZATION))
+                    {
+                        return Err(format!(
+                            "give the proxy's user name and password either in the URL or as a {PROXY_AUTHORIZATION} header, not both"
+                        ));
+                    }
+                    (None, Some((user, password)))
+                }
+                other => (other, None),
+            };
             if let Some((user, password)) = login {
                 if hs
                     .iter()
@@ -2597,24 +2716,47 @@ async fn proxy_cmd(paths: &NodePaths, c: ProxyCmd, out: &mut dyn Write) -> Resul
                     base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
                 hs.push((PROXY_AUTHORIZATION.into(), format!("Basic {basic}")));
             }
-            nerve_transport::net::Proxy::parse(&url, hs.clone())?;
+            nerve_transport::net::Proxy::parse(&url, hs.clone())?.pinned(pin.clone())?;
             let names: Vec<String> = hs.iter().map(|(k, _)| k.clone()).collect();
+            // The relay token goes where the node's keys are; where that is
+            // a keyring that does not answer, this fails as for any key of
+            // the node, and nothing is changed.
+            match &kept {
+                Some((_, password)) => crate::secrets::store_proxy_login(paths, storage, password)?,
+                None if now.connection.login.is_some() => {
+                    let _ = crate::secrets::remove_proxy_login(paths, storage);
+                }
+                None => {}
+            }
             // The keyring first: when it cannot take the values, node.toml
             // stays as it was rather than name headers nobody can send. A
             // proxy without headers leaves the keyring alone, unless the one
             // before had some: their entry would only linger.
             if !hs.is_empty() {
                 crate::secrets::store_proxy_headers(paths, &hs)?;
-            } else if !read_config(paths).await?.0.connection.headers.is_empty() {
+            } else if !now.connection.headers.is_empty() {
                 let _ = crate::secrets::remove_proxy_headers(paths);
             }
+            let user = kept.as_ref().map(|(u, _)| u.clone());
             edit(paths, |c| {
                 c.connection.proxy = Some(url.clone());
+                c.connection.pin = pin.clone();
+                c.connection.login = user.clone();
                 c.connection.headers = names.clone();
                 Ok(())
             })
             .await?;
             let _ = writeln!(out, "proxy {url}");
+            if let Some(p) = &pin {
+                let _ = writeln!(out, "pin {p}");
+            }
+            if let Some(u) = &user {
+                let _ = writeln!(
+                    out,
+                    "login {u} (its password is kept with the node's keys: {})",
+                    keys_place(storage)
+                );
+            }
             for n in &names {
                 let _ = writeln!(out, "header {n} (its value is in the system keyring)");
             }
@@ -2624,11 +2766,19 @@ async fn proxy_cmd(paths: &NodePaths, c: ProxyCmd, out: &mut dyn Write) -> Resul
             let (cfg, _) = read_config(paths).await?;
             edit(paths, |c| {
                 c.connection.proxy = None;
+                c.connection.pin = None;
+                c.connection.login = None;
                 c.connection.headers.clear();
                 Ok(())
             })
             .await?;
             let _ = writeln!(out, "no proxy");
+            if cfg.connection.login.is_some()
+                && let Err(e) =
+                    crate::secrets::remove_proxy_login(paths, cfg.machine.secret_storage)
+            {
+                return Err(format!("the proxy is removed, but {e}"));
+            }
             // A proxy without headers has no entry; where there is no
             // keyring, asking for one would only fail.
             if cfg.connection.headers.is_empty() {
@@ -2650,6 +2800,25 @@ async fn proxy_cmd(paths: &NodePaths, c: ProxyCmd, out: &mut dyn Write) -> Resul
                 return Ok(());
             };
             let _ = writeln!(out, "proxy {url}");
+            if let Some(p) = &cfg.connection.pin {
+                let _ = writeln!(out, "pin {p}");
+            }
+            if let Some(u) = &cfg.connection.login {
+                let storage = cfg.machine.secret_storage;
+                match crate::secrets::proxy_login(paths, storage) {
+                    Ok(_) => {
+                        let _ = writeln!(
+                            out,
+                            "login {u} (its password is kept with the node's keys: {})",
+                            keys_place(storage)
+                        );
+                    }
+                    Err(e) => {
+                        let _ = writeln!(out, "login {u}");
+                        let _ = writeln!(out, "the link cannot use this proxy: {e}");
+                    }
+                }
+            }
             // The keyring is asked whether it holds every value; only the
             // names are shown.
             let names = &cfg.connection.headers;
@@ -2671,7 +2840,473 @@ async fn proxy_cmd(paths: &NodePaths, c: ProxyCmd, out: &mut dyn Write) -> Resul
     }
 }
 
+/// `relay set|off|add|token|set-centers|set-limits|rm|ls` (crate::relay).
+/// A token is shown once, by `add` or `token`; `node.toml` keeps only its
+/// hash. Each change says when it is in force ([`relay_in_force`]).
+async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Result<(), String> {
+    let w = |out: &mut dyn Write, s: String| {
+        let _ = writeln!(out, "{s}");
+    };
+    match c {
+        RelayCmd::Set {
+            address,
+            max_links,
+            max_links_per_node,
+            max_opens_per_minute,
+        } => {
+            if address.parse::<std::net::SocketAddr>().is_err() {
+                return Err(format!(
+                    "relay.listen {address:?}: an address and a port, like 0.0.0.0:7490 or [::]:7490"
+                ));
+            }
+            let (now, _) = read_config(paths).await?;
+            let (pin, made) = relay_pin(paths, &now, Some(&address))?;
+            let cfg = edit(paths, |c| {
+                c.relay.listen = Some(address.clone());
+                c.relay.pin = Some(pin.clone());
+                if let Some(n) = max_links {
+                    c.relay.max_links = n;
+                }
+                if let Some(n) = max_links_per_node {
+                    c.relay.max_links_per_node = n;
+                }
+                if let Some(n) = max_opens_per_minute {
+                    c.relay.max_opens_per_minute = n;
+                }
+                Ok(())
+            })
+            .await?;
+            w(
+                out,
+                format!(
+                    "relay on {address}: at most {} tunnels, {} per node, {} opened a minute per node",
+                    cfg.relay.max_links,
+                    cfg.relay.max_links_per_node,
+                    cfg.relay.max_opens_per_minute
+                ),
+            );
+            w(out, format!("its TLS certificate has the pin {pin}"));
+            if made && now.relay.pin.is_some() {
+                w(
+                    out,
+                    "that is a new certificate: the relayed nodes need the new pin in `proxy set --pin`".into(),
+                );
+            }
+            if cfg.relay.nodes.is_empty() {
+                w(
+                    out,
+                    "no node may use it yet: `nerve-node relay add <name>` makes a token".into(),
+                );
+            }
+            relay_in_force(paths, out, None).await;
+            Ok(())
+        }
+        RelayCmd::Off => {
+            edit(paths, |c| {
+                c.relay.listen = None;
+                Ok(())
+            })
+            .await?;
+            w(out, "relay off".into());
+            relay_in_force(
+                paths,
+                out,
+                Some("the relay stops listening, and every tunnel ends"),
+            )
+            .await;
+            Ok(())
+        }
+        RelayCmd::Add { name, centers } => {
+            if !nerve_proto::valid_node_name(&name) {
+                return Err(format!(
+                    "{name:?} is not a relay node name: 1 to 32 characters of a-z, 0-9 and -"
+                ));
+            }
+            let (now, _) = read_config(paths).await?;
+            relay_centers(&now, &centers)?;
+            let (pin, made) = relay_pin(paths, &now, now.relay.listen.as_deref())?;
+            let (token, hash) = crate::relay::new_token();
+            let cfg = edit(paths, |c| {
+                if c.relay.node(&name).is_some() {
+                    return Err(format!(
+                        "the relay knows a node {name} already; `nerve-node relay rm {name}` takes its token away first"
+                    ));
+                }
+                relay_centers(c, &centers)?;
+                c.relay.pin = Some(pin.clone());
+                c.relay.nodes.push(nerve_policy::config::RelayNode {
+                    name: name.clone(),
+                    token_sha256: hash.clone(),
+                    centers: centers.clone(),
+                    max_links: None,
+                    max_opens_per_minute: None,
+                });
+                Ok(())
+            })
+            .await?;
+            if made && now.relay.pin.is_some() {
+                w(
+                    out,
+                    format!(
+                        "the relay's TLS key was gone or did not match its pin, so it has a new certificate (pin {pin}): the relayed nodes need the new pin in `proxy set --pin`"
+                    ),
+                );
+            }
+            let at = relay_address(cfg.relay.listen.as_deref());
+            w(
+                out,
+                format!("relay node {name} added; its token, shown only now:"),
+            );
+            w(out, format!("  {token}"));
+            w(out, format!("it may reach {}", reach_of(&centers)));
+            w(out, format!("on {name}, run:"));
+            w(
+                out,
+                format!("  nerve-node proxy set 'https://{name}:{token}@{at}' --pin {pin}"),
+            );
+            if cfg.relay.listen.is_none() {
+                w(
+                    out,
+                    "the relay is off: `nerve-node relay set <address>` turns it on".into(),
+                );
+            }
+            relay_in_force(paths, out, None).await;
+            Ok(())
+        }
+        RelayCmd::SetLimits {
+            name,
+            max_links,
+            max_opens_per_minute,
+        } => {
+            let cfg = edit(paths, |c| {
+                let node = c
+                    .relay
+                    .nodes
+                    .iter_mut()
+                    .find(|n| n.name == name)
+                    .ok_or_else(|| format!("the relay knows no node {name}"))?;
+                // As `relay set`: a limit not given stays; no flag at all
+                // gives the node the relay's limits again.
+                if max_links.is_none() && max_opens_per_minute.is_none() {
+                    node.max_links = None;
+                    node.max_opens_per_minute = None;
+                }
+                if let Some(n) = max_links {
+                    node.max_links = Some(n);
+                }
+                if let Some(n) = max_opens_per_minute {
+                    node.max_opens_per_minute = Some(n);
+                }
+                Ok(())
+            })
+            .await?;
+            let node = cfg.relay.node(&name).expect("set above");
+            let links = node.links(&cfg.relay);
+            let mut line = format!(
+                "relay node {name}: at most {links} tunnels at once, {} opened a minute",
+                node.opens(&cfg.relay)
+            );
+            if cfg.relay.max_links < links {
+                line.push_str(&format!(
+                    " (the relay's {} tunnels in all bound it; `relay set <address> --max-links N` raises that)",
+                    cfg.relay.max_links
+                ));
+            }
+            w(out, line);
+            relay_in_force(paths, out, None).await;
+            Ok(())
+        }
+        RelayCmd::Token { name } => {
+            let (now, _) = read_config(paths).await?;
+            let (pin, made) = relay_pin(paths, &now, now.relay.listen.as_deref())?;
+            let (token, hash) = crate::relay::new_token();
+            let cfg = edit(paths, |c| {
+                c.relay.pin = Some(pin.clone());
+                let node = c
+                    .relay
+                    .nodes
+                    .iter_mut()
+                    .find(|n| n.name == name)
+                    .ok_or_else(|| {
+                        format!("the relay knows no node {name}; `relay add {name}` makes one")
+                    })?;
+                node.token_sha256 = hash.clone();
+                Ok(())
+            })
+            .await?;
+            if made && now.relay.pin.is_some() {
+                w(
+                    out,
+                    format!(
+                        "the relay's TLS key was gone or did not match its pin, so it has a new certificate (pin {pin}): the relayed nodes need the new pin in `proxy set --pin`"
+                    ),
+                );
+            }
+            let node = cfg.relay.node(&name).expect("set above");
+            let at = relay_address(cfg.relay.listen.as_deref());
+            // Whether the old token is dead is the running node's to say
+            // (`relay_in_force`): on Windows it takes the change at its next
+            // start.
+            w(
+                out,
+                format!("relay node {name} has a new token, shown only now:"),
+            );
+            w(out, format!("  {token}"));
+            w(out, format!("it may reach {}", reach_of(&node.centers)));
+            w(out, format!("on {name}, run:"));
+            w(
+                out,
+                format!("  nerve-node proxy set 'https://{name}:{token}@{at}' --pin {pin}"),
+            );
+            if cfg.relay.listen.is_none() {
+                w(
+                    out,
+                    "the relay is off: `nerve-node relay set <address>` turns it on".into(),
+                );
+            }
+            relay_in_force(
+                paths,
+                out,
+                Some("the old token no longer works, and its tunnels end"),
+            )
+            .await;
+            Ok(())
+        }
+        RelayCmd::SetCenters { name, centers } => {
+            edit(paths, |c| {
+                relay_centers(c, &centers)?;
+                let node = c
+                    .relay
+                    .nodes
+                    .iter_mut()
+                    .find(|n| n.name == name)
+                    .ok_or_else(|| format!("the relay knows no node {name}"))?;
+                node.centers = centers.clone();
+                Ok(())
+            })
+            .await?;
+            w(
+                out,
+                format!("relay node {name} may reach {}", reach_of(&centers)),
+            );
+            relay_in_force(paths, out, Some("its tunnels to other centers end")).await;
+            Ok(())
+        }
+        RelayCmd::Rm { name } => {
+            edit(paths, |c| {
+                let before = c.relay.nodes.len();
+                c.relay.nodes.retain(|n| n.name != name);
+                if c.relay.nodes.len() == before {
+                    return Err(format!("the relay knows no node {name}"));
+                }
+                Ok(())
+            })
+            .await?;
+            w(out, format!("relay node {name} removed"));
+            relay_in_force(
+                paths,
+                out,
+                Some("its token no longer works, and its tunnels end"),
+            )
+            .await;
+            Ok(())
+        }
+        RelayCmd::Ls => {
+            let (cfg, _) = read_config(paths).await?;
+            let r = &cfg.relay;
+            #[cfg(unix)]
+            let live =
+                match nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await {
+                    Ok(v) => Some(v["relay"].clone()),
+                    Err(e) if e == nerve_transport::ctl::NOT_RUNNING => None,
+                    Err(e) => return Err(e),
+                };
+            // Windows: the control pipe answers `status` too. Only a pipe
+            // that is not there means no node runs; any other error is
+            // said, not taken for "no tunnel".
+            #[cfg(windows)]
+            let live = match crate::pipe::call(paths, "status", json!({})).await {
+                Ok(v) => Some(v["relay"].clone()),
+                Err(e) if e == nerve_transport::ctl::NOT_RUNNING => None,
+                Err(e) => return Err(format!("cannot ask the running node: {e}")),
+            };
+            #[cfg(not(any(unix, windows)))]
+            let live: Option<Value> = None;
+            match (&r.listen, &live) {
+                (None, _) => w(out, "relay off".into()),
+                (Some(l), Some(v)) => w(
+                    out,
+                    format!(
+                        "relay on {l}: {}",
+                        v["status"].as_str().unwrap_or("not known")
+                    ),
+                ),
+                (Some(l), None) => w(out, format!("relay on {l}")),
+            }
+            w(
+                out,
+                format!(
+                    "at most {} tunnels, {} per node, {} opened a minute per node",
+                    r.max_links, r.max_links_per_node, r.max_opens_per_minute
+                ),
+            );
+            if let Some(pin) = &r.pin {
+                w(out, format!("pin {pin}"));
+            }
+            if r.nodes.is_empty() {
+                w(out, "no node may use it".into());
+            }
+            for n in &r.nodes {
+                let mut line = format!("node {}: {}", n.name, reach_of(&n.centers));
+                if n.max_links.is_some() || n.max_opens_per_minute.is_some() {
+                    line.push_str(&format!(
+                        "; its own limits: {} tunnels at once, {} opened a minute",
+                        n.links(r),
+                        n.opens(r)
+                    ));
+                }
+                w(out, line);
+            }
+            match live {
+                Some(v) => {
+                    let now = crate::now_ms();
+                    for t in v["tunnels"].as_array().into_iter().flatten() {
+                        let since = t["since_ms"].as_u64().unwrap_or(now);
+                        w(
+                            out,
+                            format!(
+                                "tunnel {} from {} to center {} for {}",
+                                t["node"].as_str().unwrap_or_default(),
+                                t["from"].as_str().unwrap_or_default(),
+                                t["center"].as_str().unwrap_or_default(),
+                                nerve_transport::log::span(std::time::Duration::from_millis(
+                                    now.saturating_sub(since)
+                                )),
+                            ),
+                        );
+                    }
+                }
+                None if r.listen.is_some() => {
+                    w(out, "no node runs here, so no tunnel is open".into())
+                }
+                None => {}
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Says when a relay change is in force. A running node that took it
+/// applies it at once: `now` says what that does ("its tunnels end"), for
+/// the changes that take something away. On Windows the CLI writes the file
+/// and the running node reads it at its next start, so until then that node
+/// goes on by its old relay settings, for new tunnels as well as open ones:
+/// a removed or replaced token still opens tunnels, and a new one is
+/// refused. With no node running there is nothing to say.
+async fn relay_in_force(paths: &NodePaths, out: &mut dyn Write, now: Option<&str>) {
+    if daemon_answers(paths, false).await {
+        if let Some(what) = now {
+            let _ = writeln!(out, "{what} now");
+        }
+    } else if cfg!(windows) {
+        let _ = writeln!(out, "{RELAY_AT_NEXT_START}");
+    }
+}
+
+/// [`relay_in_force`] on Windows, where a running node has not taken the
+/// change.
+const RELAY_AT_NEXT_START: &str = "a running node takes this change only at its next start, and until then works by its old relay settings: a removed or replaced token still opens new tunnels, the tunnels it carries stay, and a new token or node is refused. Restart it (`Restart-Service nerve-node` for the installed node) to apply the change now";
+
+/// Refuses a `--center` list that names a center this node is not paired
+/// with, or one twice.
+fn relay_centers(cfg: &NodeConfig, centers: &[String]) -> Result<(), String> {
+    for (i, c) in centers.iter().enumerate() {
+        let Some(entry) = cfg.center(c) else {
+            return Err(format!("no center named {c} is paired here"));
+        };
+        if centers[..i].contains(c) {
+            return Err(format!("--center {c} is given twice"));
+        }
+        // A tunnel reaches a host and port, not a center: a center there
+        // that is not on the list would be reached as well.
+        let at = |url: &str| {
+            nerve_proto::link::CenterUrl::parse(url)
+                .ok()
+                .map(|u| (u.host, u.port))
+        };
+        let same = |a: Option<(String, u16)>, b: Option<(String, u16)>| match (a, b) {
+            (Some((ha, pa)), Some((hb, pb))) => pa == pb && crate::relay::same_host(&ha, &hb),
+            _ => false,
+        };
+        if let Some(other) = cfg.centers.iter().find(|o| {
+            o.name != entry.name && !centers.contains(&o.name) && same(at(&o.url), at(&entry.url))
+        }) {
+            return Err(format!(
+                "the centers {c} and {} share one host and port, and a tunnel reaches the host and port, so the relay cannot keep them apart: name both or neither",
+                other.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// What a relay node's center list allows, in words.
+fn reach_of(centers: &[String]) -> String {
+    if centers.is_empty() {
+        "every https center of this node".into()
+    } else {
+        format!("the centers {}", centers.join(", "))
+    }
+}
+
+/// The pin of the relay's TLS certificate, and whether it was made now: one
+/// is made when the relay has none, or its key is gone or is not the one
+/// `relay.pin` names. The key goes where the node keeps its keys
+/// (`machine.secret_storage`), before the config names its pin; where that
+/// is a keyring that does not answer, this fails as for any of its keys.
+fn relay_pin(
+    paths: &NodePaths,
+    cfg: &NodeConfig,
+    address: Option<&str>,
+) -> Result<(String, bool), String> {
+    let storage = cfg.machine.secret_storage;
+    if let Some(pin) = &cfg.relay.pin
+        && let Ok(Some(id)) = crate::secrets::relay_tls(paths, storage)
+        && id.pin() == *pin
+    {
+        return Ok((pin.clone(), false));
+    }
+    let names: Vec<String> = address
+        .and_then(|a| a.parse::<std::net::SocketAddr>().ok())
+        .filter(|a| !a.ip().is_unspecified())
+        .map(|a| a.ip().to_string())
+        .into_iter()
+        .collect();
+    let id = nerve_transport::tls::ServerIdentity::generate(&names)?;
+    crate::secrets::store_relay_tls(paths, storage, &id)?;
+    Ok((id.pin(), true))
+}
+
+/// Where a relayed node finds the relay, for the line `relay add` shows:
+/// the listening address, or a placeholder where it listens on every
+/// address or is not set.
+fn relay_address(listen: Option<&str>) -> String {
+    match listen.and_then(|l| l.parse::<std::net::SocketAddr>().ok()) {
+        Some(a) if !a.ip().is_unspecified() => a.to_string(),
+        Some(a) => format!("<address of this machine>:{}", a.port()),
+        None => "<address of this machine>:<port>".into(),
+    }
+}
+
 const PROXY_AUTHORIZATION: &str = "Proxy-Authorization";
+
+/// Where the node's keys are, in words.
+fn keys_place(storage: SecretStorage) -> &'static str {
+    match storage {
+        SecretStorage::File => "a file in the config folder",
+        SecretStorage::Keyring => "the system keyring",
+    }
+}
 
 /// Splits a user name and password off a proxy URL
 /// (`http://user:pass@host:port`), percent-escapes decoded. Errors never quote
@@ -4689,7 +5324,7 @@ mod tests {
         for bad in [
             "alice:s3cret@127.0.0.1:3128",
             "http://alice:s3cret@127.0.0.1:3128/path",
-            "https://alice:s3cret@127.0.0.1:3128",
+            "https://alice:s3cret@127.0.0.1:3128/path",
             "http://alice:s3cr%zzet@127.0.0.1:3128",
         ] {
             let e = run(&paths, &["proxy", "set", bad]).unwrap_err();
@@ -4719,6 +5354,353 @@ mod tests {
             assert!(e.contains("run `nerve-node proxy set` again"), "{e}");
             assert!(!e.contains("s3cret"), "{e}");
         }
+    }
+
+    /// `relay add` shows a node's token once, with the line its node runs
+    /// (an https:// proxy with the relay's pin), and `node.toml` keeps only
+    /// the token's hash; the relay's TLS key is kept with the node's keys;
+    /// `set`, `set-centers`, `rm` and `off` change the relay and nothing
+    /// else.
+    #[test]
+    fn relay_add_shows_the_token_once_and_keeps_only_its_hash() {
+        let (_d, paths) = setup(&["home", "work"]);
+        // home and its neighbour share one address, behind one proxy.
+        let mut cfg = load(&paths);
+        cfg.centers[0].url = "https://h.example/a".into();
+        cfg.centers[1].url = "https://w.example".into();
+        let mut neighbour = entry("home-b");
+        neighbour.url = "https://H.example:443/b".into();
+        cfg.centers.push(neighbour);
+        cfg.save(&paths.config_file()).unwrap();
+        let paired = load(&paths).centers;
+        let out = run(
+            &paths,
+            &["relay", "set", "0.0.0.0:7490", "--max-links", "8"],
+        )
+        .unwrap();
+        let pin = load(&paths).relay.pin.expect("a pin");
+        assert!(
+            out.starts_with(&format!(
+                "relay on 0.0.0.0:7490: at most 8 tunnels, 4 per node, 30 opened a minute per node\nits TLS certificate has the pin {pin}\nno node may use it yet"
+            )),
+            "{out}"
+        );
+        let id = crate::secrets::relay_tls(&paths, SecretStorage::File)
+            .unwrap()
+            .expect("the relay's TLS key");
+        assert_eq!(id.pin(), pin);
+        assert!(paths.relay_tls_file().exists());
+        // Again: the same certificate.
+        run(
+            &paths,
+            &[
+                "relay",
+                "set",
+                "0.0.0.0:7491",
+                "--max-opens-per-minute",
+                "300",
+            ],
+        )
+        .unwrap();
+        assert_eq!(load(&paths).relay.max_opens_per_minute, 300);
+        assert!(
+            run(
+                &paths,
+                &[
+                    "relay",
+                    "set",
+                    "0.0.0.0:7491",
+                    "--max-opens-per-minute",
+                    "0"
+                ]
+            )
+            .is_err()
+        );
+        assert_eq!(load(&paths).relay.pin.as_deref(), Some(pin.as_str()));
+        let e = run(&paths, &["relay", "set", "relay.example:7490"]).unwrap_err();
+        assert!(e.contains("relay.listen"), "{e}");
+        assert_eq!(load(&paths).relay.listen.as_deref(), Some("0.0.0.0:7491"));
+
+        let out = run(&paths, &["relay", "add", "lab-pc"]).unwrap();
+        let token = out.lines().nth(1).unwrap().trim().to_string();
+        assert_eq!(token.len(), 43, "{out}");
+        assert!(
+            out.contains(&format!(
+                "it may reach every https center of this node\non lab-pc, run:\n  nerve-node proxy set 'https://lab-pc:{token}@<address of this machine>:7491' --pin {pin}\n"
+            )),
+            "{out}"
+        );
+        let file = std::fs::read_to_string(paths.config_file()).unwrap();
+        assert!(!file.contains(&token), "{file}");
+        let cfg = load(&paths);
+        let node = cfg.relay.node("lab-pc").unwrap();
+        assert_eq!(node.token_sha256, crate::relay::token_hash(&token));
+        assert!(node.centers.is_empty());
+        assert_eq!(cfg.centers, paired);
+        let e = run(&paths, &["relay", "add", "lab-pc"]).unwrap_err();
+        assert!(e.contains("relay rm lab-pc"), "{e}");
+        assert!(run(&paths, &["relay", "add", "Lab PC"]).is_err());
+
+        // A node limited to some centers; only paired ones can be named.
+        // A list that splits one address is refused: the relay cannot keep
+        // the two apart.
+        let e = run(&paths, &["relay", "add", "lab-2", "--center", "home"]).unwrap_err();
+        assert!(e.contains("home and home-b share one host and port"), "{e}");
+        assert!(load(&paths).relay.node("lab-2").is_none());
+        let out = run(&paths, &["relay", "add", "lab-2", "--center", "work"]).unwrap();
+        assert!(out.contains("it may reach the centers work\n"), "{out}");
+        assert_eq!(load(&paths).relay.node("lab-2").unwrap().centers, ["work"]);
+        let e = run(&paths, &["relay", "add", "lab-3", "--center", "elsewhere"]).unwrap_err();
+        assert!(e.contains("no center named elsewhere"), "{e}");
+        assert!(load(&paths).relay.node("lab-3").is_none());
+        let out = run(
+            &paths,
+            &[
+                "relay",
+                "set-centers",
+                "lab-2",
+                "--center",
+                "work",
+                "--center",
+                "home",
+                "--center",
+                "home-b",
+            ],
+        )
+        .unwrap();
+        assert!(
+            out.starts_with("relay node lab-2 may reach the centers work, home, home-b\n"),
+            "{out}"
+        );
+        assert!(
+            run(
+                &paths,
+                &["relay", "set-centers", "nobody", "--center", "home"]
+            )
+            .is_err()
+        );
+
+        // A node of its own limits, for a relay behind this one.
+        let out = run(
+            &paths,
+            &[
+                "relay",
+                "set-limits",
+                "lab-2",
+                "--max-links",
+                "12",
+                "--max-opens-per-minute",
+                "300",
+            ],
+        )
+        .unwrap();
+        assert!(
+            out.starts_with("relay node lab-2: at most 12 tunnels at once, 300 opened a minute (the relay's 8 tunnels in all bound it;"),
+            "{out}"
+        );
+        let node = load(&paths).relay.node("lab-2").unwrap().clone();
+        assert_eq!(
+            (node.max_links, node.max_opens_per_minute),
+            (Some(12), Some(300))
+        );
+        // One flag sets that limit and keeps the other, as `relay set` does.
+        run(
+            &paths,
+            &["relay", "set-limits", "lab-2", "--max-links", "20"],
+        )
+        .unwrap();
+        let node = load(&paths).relay.node("lab-2").unwrap().clone();
+        assert_eq!(
+            (node.max_links, node.max_opens_per_minute),
+            (Some(20), Some(300))
+        );
+        run(
+            &paths,
+            &["relay", "set-limits", "lab-2", "--max-links", "12"],
+        )
+        .unwrap();
+        // A new token keeps the node's centers and limits; the old one
+        // stops working.
+        let before = load(&paths).relay.node("lab-2").unwrap().clone();
+        let out = run(&paths, &["relay", "token", "lab-2"]).unwrap();
+        let token2 = out.lines().nth(1).unwrap().trim().to_string();
+        assert_eq!(token2.len(), 43, "{out}");
+        assert!(
+            out.contains("it may reach the centers work, home, home-b\n"),
+            "{out}"
+        );
+        let after = load(&paths).relay.node("lab-2").unwrap().clone();
+        assert_eq!(after.token_sha256, crate::relay::token_hash(&token2));
+        assert_ne!(after.token_sha256, before.token_sha256);
+        assert_eq!(
+            (&after.centers, after.max_links, after.max_opens_per_minute),
+            (
+                &before.centers,
+                before.max_links,
+                before.max_opens_per_minute
+            )
+        );
+        assert!(
+            !std::fs::read_to_string(paths.config_file())
+                .unwrap()
+                .contains(&token2)
+        );
+        assert!(run(&paths, &["relay", "token", "nobody"]).is_err());
+        // The flag's help sends a chain to `set-limits`, not to the
+        // relay-wide budget.
+        let help = Cli::command()
+            .find_subcommand_mut("relay")
+            .unwrap()
+            .find_subcommand_mut("set")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("relay set-limits <name>"), "{help}");
+        assert!(!help.contains("more for a relay behind this one"), "{help}");
+        assert_eq!(
+            load(&paths).relay.max_links_per_node,
+            4,
+            "the relay's stays"
+        );
+        assert!(
+            run(
+                &paths,
+                &["relay", "set-limits", "lab-2", "--max-links", "0"]
+            )
+            .is_err()
+        );
+        assert!(
+            run(
+                &paths,
+                &["relay", "set-limits", "nobody", "--max-links", "2"]
+            )
+            .is_err()
+        );
+        let ls = run(&paths, &["relay", "ls"]).unwrap();
+        assert!(
+            ls.contains("node lab-2: the centers work, home, home-b; its own limits: 12 tunnels at once, 300 opened a minute\n"),
+            "{ls}"
+        );
+        run(&paths, &["relay", "set-limits", "lab-2"]).unwrap();
+        let node = load(&paths).relay.node("lab-2").unwrap().clone();
+        assert_eq!((node.max_links, node.max_opens_per_minute), (None, None));
+
+        let ls = run(&paths, &["relay", "ls"]).unwrap();
+        assert!(
+            ls.starts_with(&format!(
+                "relay on 0.0.0.0:7491\nat most 8 tunnels, 4 per node, 300 opened a minute per node\npin {pin}\nnode lab-pc: every https center of this node\nnode lab-2: the centers work, home, home-b\n"
+            )),
+            "{ls}"
+        );
+        assert!(!ls.contains(&token), "{ls}");
+        run(&paths, &["relay", "set-centers", "lab-2"]).unwrap();
+        assert!(load(&paths).relay.node("lab-2").unwrap().centers.is_empty());
+
+        // A lost TLS key: relay add makes a new certificate and says so.
+        std::fs::remove_file(paths.relay_tls_file()).unwrap();
+        let out = run(&paths, &["relay", "add", "lab-4"]).unwrap();
+        let new_pin = load(&paths).relay.pin.unwrap();
+        assert_ne!(new_pin, pin);
+        assert!(
+            out.starts_with(&format!(
+                "the relay's TLS key was gone or did not match its pin, so it has a new certificate (pin {new_pin})"
+            )),
+            "{out}"
+        );
+        let out = run(&paths, &["relay", "add", "lab-5"]).unwrap();
+        assert!(!out.contains("new certificate"), "{out}");
+
+        let out = run(&paths, &["relay", "rm", "lab-pc"]).unwrap();
+        assert!(out.starts_with("relay node lab-pc removed"), "{out}");
+        assert!(load(&paths).relay.node("lab-pc").is_none());
+        assert!(run(&paths, &["relay", "rm", "lab-pc"]).is_err());
+        let out = run(&paths, &["relay", "off"]).unwrap();
+        assert!(out.starts_with("relay off\n"), "{out}");
+        let cfg = load(&paths);
+        assert_eq!(cfg.relay.listen, None);
+        assert_eq!(cfg.relay.max_links, 8);
+        assert!(
+            run(&paths, &["relay", "ls"])
+                .unwrap()
+                .starts_with("relay off\n")
+        );
+    }
+
+    /// The login of an https:// proxy, a relay token, is kept where the
+    /// node keeps its keys: its file by default, the keyring with
+    /// `keyring`, which refuses clearly when it does not answer; never in
+    /// node.toml, and `proxy rm` deletes it.
+    #[test]
+    fn an_https_proxy_login_is_kept_with_the_node_keys() {
+        let pin = "A".repeat(43);
+        let url = "https://lab:t0ken-value@127.0.0.1:7490";
+        for storage in [SecretStorage::File, SecretStorage::Keyring] {
+            let (_d, paths) = setup(&["home"]);
+            if storage == SecretStorage::Keyring {
+                let mut cfg = load(&paths);
+                cfg.machine.secret_storage = storage;
+                cfg.save(&paths.config_file()).unwrap();
+            }
+            let out = run(&paths, &["proxy", "set", url, "--pin", &pin]).unwrap();
+            assert!(
+                out.contains(&format!(
+                    "pin {pin}\nlogin lab (its password is kept with the node's keys"
+                )),
+                "{out}"
+            );
+            assert!(!out.contains("t0ken"), "{out}");
+            let cfg = load(&paths);
+            assert_eq!(
+                cfg.connection.proxy.as_deref(),
+                Some("https://127.0.0.1:7490")
+            );
+            assert_eq!(cfg.connection.login.as_deref(), Some("lab"));
+            assert!(cfg.connection.headers.is_empty());
+            let toml = std::fs::read_to_string(paths.config_file()).unwrap();
+            assert!(!toml.contains("t0ken"), "{toml}");
+            assert_eq!(keyring_entry(&paths), None, "the header entry stays empty");
+            let entry = crate::secrets::Entry::proxy_login(&paths);
+            let in_keyring = crate::secrets::store::get(entry.account()).unwrap();
+            let in_file = std::fs::read_to_string(paths.proxy_login_file()).ok();
+            match storage {
+                SecretStorage::File => {
+                    assert_eq!(in_file.as_deref().map(str::trim), Some("t0ken-value"));
+                    assert_eq!(in_keyring, None);
+                }
+                SecretStorage::Keyring => {
+                    assert_eq!(in_keyring.as_deref(), Some("t0ken-value"));
+                    assert_eq!(in_file, None);
+                }
+            }
+            let ls = run(&paths, &["proxy", "ls"]).unwrap();
+            assert!(ls.contains("login lab (its password is kept"), "{ls}");
+            run(&paths, &["proxy", "rm"]).unwrap();
+            assert_eq!(crate::secrets::store::get(entry.account()).unwrap(), None);
+            assert!(!paths.proxy_login_file().exists());
+            assert_eq!(load(&paths).connection, Default::default());
+        }
+        // With the keys in a keyring that does not answer, it refuses and
+        // changes nothing, as for any key of the node.
+        let (_d, paths) = setup(&["home"]);
+        let mut cfg = load(&paths);
+        cfg.machine.secret_storage = SecretStorage::Keyring;
+        cfg.save(&paths.config_file()).unwrap();
+        run(&paths, &["status"]).unwrap();
+        crate::secrets::store::set_unreachable(true);
+        let r = run(&paths, &["proxy", "set", url, "--pin", &pin]);
+        crate::secrets::store::set_unreachable(false);
+        let e = r.unwrap_err();
+        assert!(e.contains("system keyring"), "{e}");
+        assert!(!e.contains("t0ken"), "{e}");
+        assert_eq!(load(&paths).connection, Default::default());
+        assert!(!paths.proxy_login_file().exists());
+        // A pin is for an https:// proxy only.
+        let e = run(
+            &paths,
+            &["proxy", "set", "http://127.0.0.1:3128", "--pin", &pin],
+        )
+        .unwrap_err();
+        assert!(e.contains("https"), "{e}");
     }
 
     #[test]

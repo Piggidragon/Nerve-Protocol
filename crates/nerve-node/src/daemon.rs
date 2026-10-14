@@ -217,6 +217,8 @@ pub(crate) struct Shared {
     pub told_keyring: std::sync::atomic::AtomicBool,
     /// The capability providers attached now (crate::provider).
     pub providers: crate::provider::Providers,
+    /// The relay for other nodes (crate::relay), and who is connected.
+    pub relay: crate::relay::Relays,
 }
 
 impl Shared {
@@ -529,6 +531,7 @@ impl Shared {
             "folder_commands_off": self.unconfined(&cfg),
             "providers": self.providers.status(),
             "centers": centers,
+            "relay": self.relay.status(&cfg),
         })
     }
 }
@@ -592,6 +595,7 @@ pub fn reaches_bus(
 pub struct Daemon {
     shared: Arc<Shared>,
     supervisor: JoinHandle<()>,
+    relay: JoinHandle<()>,
     ctl: Option<JoinHandle<()>>,
     /// Held while the node runs: a CLI moves the keys only while no node
     /// reads them.
@@ -742,6 +746,7 @@ impl Daemon {
             account_cache: Mutex::default(),
             told_keyring: Default::default(),
             providers: Default::default(),
+            relay: Default::default(),
         });
         shared.tell_confinement(&cfg);
         // A file that says on starts off: on Linux the password lives in
@@ -753,6 +758,7 @@ impl Daemon {
             None
         };
         let supervisor = tokio::spawn(supervise(shared.clone()));
+        let relay = tokio::spawn(crate::relay::run(shared.clone()));
         tracing::info!(
             "node daemon running (nerve-node {}, {} centers, confinement {}, log level {})",
             crate::descriptor::VERSION,
@@ -763,6 +769,7 @@ impl Daemon {
         Ok(Daemon {
             shared,
             supervisor,
+            relay,
             ctl,
             _keys: keys,
         })
@@ -787,6 +794,25 @@ impl Daemon {
         self.shared.status()
     }
 
+    /// The relay's state, for a test.
+    #[cfg(test)]
+    pub(crate) fn relay(&self) -> &crate::relay::Relays {
+        &self.shared.relay
+    }
+
+    /// Changes the config in force as the owner's CLI does over the control
+    /// socket, for tests whose daemon has none (or runs on Windows).
+    #[cfg(test)]
+    pub(crate) fn owner_edit(&self, f: impl FnOnce(&mut NodeConfig)) {
+        lock(&self.shared.store)
+            .update(|c| {
+                f(c);
+                Ok(())
+            })
+            .expect("the owner's edit");
+        self.shared.bump();
+    }
+
     /// How many `folder` mode commands run now that the keys do not move
     /// into the keyring past ([`Shared::open_to_bus`]).
     pub fn open_to_bus(&self) -> usize {
@@ -806,6 +832,7 @@ impl Daemon {
         let _ = tokio::time::timeout(Duration::from_secs(5), self.supervisor).await;
         // Their connections outlive the socket's task otherwise.
         self.shared.providers.detach_all();
+        let _ = tokio::time::timeout(Duration::from_secs(2), self.relay).await;
         if let Some(c) = self.ctl {
             c.abort();
             let socket = self.shared.paths.ctl_socket();
@@ -1234,7 +1261,10 @@ pub(crate) fn control(
 
 /// Settings whose values are not told in the log, only that they changed.
 fn is_quiet_key(key: &str) -> bool {
-    key.starts_with("connection") || key.ends_with(".pin") || key.ends_with("_id")
+    key.starts_with("connection")
+        || key.starts_with("relay.node")
+        || key.ends_with(".pin")
+        || key.ends_with("_id")
 }
 
 /// A value as the log tells it: a word or a number plainly, anything longer
@@ -2277,6 +2307,22 @@ node_id = "n1"
             "settings changed by local (version 7): connection.headers changed; connection.proxy changed"
         );
         assert!(!text.contains("example") && !text.contains("X-"), "{text}");
+    }
+
+    /// The relay's address is told; its nodes and their token hashes only
+    /// as changed.
+    #[test]
+    fn a_relay_token_hash_is_never_shown() {
+        let hash = "a".repeat(64);
+        let a = "[relay]\nlisten = \"0.0.0.0:7490\"\n";
+        let b = format!(
+            "[relay]\nlisten = \"0.0.0.0:7491\"\n\n[[relay.node]]\nname = \"lab\"\ntoken_sha256 = \"{hash}\"\n"
+        );
+        let text = told(a, &b);
+        assert_eq!(
+            text,
+            "settings changed by local (version 7): relay.listen: 0.0.0.0:7490 -> 0.0.0.0:7491; relay.node changed"
+        );
     }
 
     #[test]

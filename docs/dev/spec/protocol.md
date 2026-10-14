@@ -153,7 +153,97 @@ a link has lasted 60 seconds.
 
 A node MAY reach a center over an HTTP `CONNECT` proxy (`connection.proxy` in
 its config, else `HTTPS_PROXY`/`NO_PROXY`). The inner TLS is still pinned. If
-the proxy fails the node does not fall back to a direct connection.
+the proxy fails the node does not fall back to a direct connection. The pair
+request (§3.2) to an `https` center goes through the same proxy.
+
+An `http://` proxy takes the `CONNECT` in plain HTTP. An `https://` proxy is
+reached over TLS of its own first, checked against `connection.pin` as a
+center's certificate is against its pin (§2.1), else against the system
+roots; the `CONNECT` and its `Proxy-Authorization` travel inside that TLS,
+and the link's own TLS to the center inside the tunnel.
+
+### 4.8 Relays
+
+A node in a network that reaches no center MAY reach one through another
+node, its **relay** (a jump node). This is a transport binding below the
+message layer: the relay carries bytes, never messages.
+
+- The relayed node names the relay as its `https://` proxy (§4.7) with the
+  pin of the relay's certificate, and authenticates with
+  `Proxy-Authorization: Basic base64(<name>:<token>)`, the relay node name and
+  token the relay's owner gave it. Everything above the tunnel is the relayed
+  node's link as without a relay: TLS to the center with its pin, the
+  `Nerve-Node` header and the signed `hello`, end to end.
+- A relay is off unless its owner turns it on. It speaks TLS only, with a
+  certificate of its own (its key kept as the node's other keys are). A
+  connection that does not start with a TLS handshake is answered `400` in
+  plain HTTP and closed; nothing it sent is used. Over TLS it answers
+  `CONNECT host:port` only:
+  - `407` with `Proxy-Authenticate: Basic` unless the name and token are
+    those of a node it knows. It MUST check this before it looks at the
+    target, so a peer without a token learns nothing of its centers;
+  - `403` unless `host:port` is the host (without case) and port of an
+    `https` center the relay itself is paired with, that has not revoked it
+    and still knows it (no `bye revoked`, no 401), and, when the owner gave
+    the node a list of centers, every such center at that host and port is
+    on the list (centers behind one reverse proxy share it; the relay cannot
+    tell them apart, so it grants them together or not at all). A center off
+    the list MUST get the same answer as one the relay does not have. The
+    relay MUST NOT
+    open a tunnel anywhere else: not to an `http` center (it is on the
+    relay's loopback), not to any other port of its machine or network. An
+    `https` center the relay is paired with at a loopback address (or
+    `localhost`) is a target; a center paired at a name is not reached on
+    this machine: when the relay dials it directly and the name resolves to
+    a loopback or unspecified address, the tunnel is refused with `502`.
+    Through the relay's own proxy the next hop resolves the name;
+  - `503` when it is off, when its node is locked, or when a limit is reached
+    (tunnels at once over all nodes and per node, tunnels a node opens a
+    minute);
+  - `502` when it cannot reach the center;
+  - `200` once it has a connection to the center. From then on it copies
+    bytes both ways and nothing else.
+- The relay dials the center as its own link would, through its own proxy if
+  it has one (§4.7). A chain of relays follows the same rules at each hop:
+  each one tunnels only to centers it is paired with itself.
+- What a tunnel reaches is the center's host and port, from the relay's
+  address: whatever is served there (other names and paths of a reverse
+  proxy) as much as the center, since what goes inside the tunnel (the TLS
+  server name, the HTTP `Host`, the path) is the relayed node's. An owner
+  judges a token by that.
+- A relay keeps at most a few undecided connections per peer address, a
+  larger share per IPv6 /64 (which the machines of one LAN share), and a
+  bounded number in all; one over any is closed unread. A machine with
+  enough addresses in a /64 can take that /64's share. The first byte, TLS
+  and the `CONNECT` head share one deadline of 15 seconds. A granted
+  connection is a tunnel from then on, counted by the tunnel limits, and
+  gives its undecided slot back before the relay dials, which has a deadline
+  of its own. Refusals are not logged one by one but counted, with a token or
+  without, so no peer can flood the relay's log; a count is told when its
+  minute is over even if no refusal follows, and when the relay stops
+  listening, and a node's refusals are counted apart from other nodes'. The
+  relay's dial fits every address of the center into its deadline. A node opens a bounded
+  number of tunnels a minute, so one with a token and the relay's limits
+  cannot rotate the audit log either. These limits hold for every node; a relay behind this one,
+  which carries many nodes, gets limits of its own as a node, so raising
+  them for it raises them for no other token.
+- Hosts are compared as a URL can tell them apart: without case or a
+  trailing dot, and an address in any of its spellings. A name and the
+  address it resolves to are not told apart.
+- A relay MUST end a tunnel when its owner turns the relay off, takes the
+  node's token away or the center off the node's list, unpairs the center or
+  locks the node, and when the tunnel carried nothing either way for 90
+  seconds by the monotonic clock (a link pings every 20 seconds, §4.4).
+- A relay keeps no token in clear at rest. `nerve-node` keeps the SHA-256 of
+  each token in `node.toml`. The relayed node keeps its token with its own
+  keys.
+- The relay writes one audit entry per tunnel when it ends: the node, the
+  center, the peer's address, start, end, why it ended and the bytes each
+  way; never a token.
+- The relay can cut a relayed node off but cannot read or alter its link:
+  an altered byte fails the TLS record, and the link ends before any message
+  of it counts. The relayed node's policy is its own; the relay's policy is
+  not asked, and no call runs on the relay for a tunnel.
 
 ## 5. Messages
 

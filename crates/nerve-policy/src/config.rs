@@ -5,7 +5,8 @@
 //!
 //! What one center may read and change (with the settings grant `write`) is its
 //! [`CenterDocument`]: its policy and its `paused` flag. Everything else, the
-//! center list, pairing, grants, machine options, proxy, is client-only.
+//! center list, pairing, grants, machine options, proxy, relay, is
+//! client-only.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -33,6 +34,10 @@ pub struct NodeConfig {
     pub limits: Limits,
     #[serde(default)]
     pub connection: Connection,
+    /// The relay for other nodes (docs/dev/spec/protocol.md §4.8); off by
+    /// default.
+    #[serde(default, skip_serializing_if = "Relay::is_default")]
+    pub relay: Relay,
     #[serde(default)]
     pub log: LogSection,
     /// The local programs that may add capabilities to the node over its
@@ -205,15 +210,186 @@ pub struct LogSection {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Connection {
-    /// `http://host:port`, never with a user name and password;
-    /// `HTTPS_PROXY`/`NO_PROXY` apply when unset.
+    /// `http://host:port` or `https://host:port` (a relay, protocol §4.8),
+    /// never with a user name and password; `HTTPS_PROXY`/`NO_PROXY` apply
+    /// when unset.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<String>,
+    /// The pin of an `https://` proxy's certificate; without it the system's
+    /// roots check it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<String>,
+    /// The user name of an `https://` proxy (a relay: the relay node name).
+    /// Its password, the relay token, is kept with the node's own keys,
+    /// where `machine.secret_storage` says, never in this file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub login: Option<String>,
     /// The names of the extra header lines for the proxy's `CONNECT`
     /// request. Their values are secrets and live in the system keyring
     /// (`nerve-node proxy set`), never in this file.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub headers: Vec<String>,
+}
+
+/// The relay: this node takes `CONNECT` requests of other nodes and tunnels
+/// them to its own centers (docs/dev/spec/protocol.md §4.8). Only the owner
+/// sets it: it is a machine setting, not part of what a center reads or
+/// changes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Relay {
+    /// The address the relay listens on, `ip:port`. The relay is off without
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<String>,
+    /// Tunnels at once, over every relayed node.
+    #[serde(default = "d_relay_links")]
+    pub max_links: u32,
+    /// Tunnels at once of one relayed node.
+    #[serde(default = "d_relay_links_per_node")]
+    pub max_links_per_node: u32,
+    /// Tunnels one relayed node may open a minute, every node alike. Each is
+    /// an audit entry and two log lines, so this keeps a node with its token
+    /// from rotating the logs; a node needs one per center and redials after
+    /// a second at the soonest. A relay behind this one (a chain) needs more,
+    /// and gets it as a limit of its own ([`RelayNode::max_opens_per_minute`]).
+    #[serde(default = "d_relay_opens")]
+    pub max_opens_per_minute: u32,
+    /// The pin of the relay's TLS certificate, whose key is kept with the
+    /// node's own keys; set when `nerve-node relay` makes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<String>,
+    /// The nodes that may use the relay, each with the hash of its token.
+    #[serde(default, rename = "node", skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<RelayNode>,
+}
+
+fn d_relay_links() -> u32 {
+    16
+}
+fn d_relay_links_per_node() -> u32 {
+    4
+}
+fn d_relay_opens() -> u32 {
+    30
+}
+
+impl Default for Relay {
+    fn default() -> Relay {
+        Relay {
+            listen: None,
+            pin: None,
+            max_links: d_relay_links(),
+            max_links_per_node: d_relay_links_per_node(),
+            max_opens_per_minute: d_relay_opens(),
+            nodes: Vec::new(),
+        }
+    }
+}
+
+impl Relay {
+    fn is_default(&self) -> bool {
+        *self == Relay::default()
+    }
+
+    pub fn node(&self, name: &str) -> Option<&RelayNode> {
+        self.nodes.iter().find(|n| n.name == name)
+    }
+
+    fn validate(&self) -> Result<(), String> {
+        if let Some(p) = &self.pin {
+            nerve_transport::tls::decode_pin(p).map_err(|e| format!("relay.pin: {e}"))?;
+        }
+        if let Some(l) = &self.listen {
+            l.parse::<std::net::SocketAddr>().map_err(|_| {
+                format!("relay.listen {l:?}: an address and a port, like 0.0.0.0:7490 or [::]:7490")
+            })?;
+        }
+        if self.max_links == 0 || self.max_links_per_node == 0 || self.max_opens_per_minute == 0 {
+            return Err("relay.max_links, relay.max_links_per_node and relay.max_opens_per_minute must be at least 1".into());
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for n in &self.nodes {
+            if n.max_links == Some(0) || n.max_opens_per_minute == Some(0) {
+                return Err(format!(
+                    "relay.node {}: max_links and max_opens_per_minute must be at least 1",
+                    n.name
+                ));
+            }
+            if !nerve_proto::valid_node_name(&n.name) {
+                return Err(format!(
+                    "relay.node name {:?}: 1 to 32 characters of a-z, 0-9 and -",
+                    n.name
+                ));
+            }
+            if !names.insert(n.name.as_str()) {
+                return Err(format!("relay.node names {:?} twice", n.name));
+            }
+            let hex = n
+                .token_sha256
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'));
+            if n.token_sha256.len() != 64 || !hex {
+                return Err(format!(
+                    "relay.node {}: token_sha256 is 64 characters of lowercase hex",
+                    n.name
+                ));
+            }
+            let mut seen = std::collections::BTreeSet::new();
+            for c in &n.centers {
+                // A center that is no longer paired may stay named: the
+                // node then reaches it no more, and the file still loads.
+                if !valid_center_name(c) {
+                    return Err(format!("relay.node {}: {c:?} is not a center name", n.name));
+                }
+                if !seen.insert(c.as_str()) {
+                    return Err(format!("relay.node {} names the center {c} twice", n.name));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A node that may use the relay. Its token is in no file: only its SHA-256
+/// is kept, so whoever reads `node.toml` cannot use the relay with it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayNode {
+    /// The name the node gives as the user name of its `Proxy-Authorization`.
+    pub name: String,
+    /// The lowercase hex SHA-256 of its token.
+    pub token_sha256: String,
+    /// The centers its tunnels may go to, by this node's names for them;
+    /// empty, every center a tunnel may go to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub centers: Vec<String>,
+    /// This node's tunnels at once, in place of `relay.max_links_per_node`:
+    /// a relay behind this one carries the tunnels of many nodes, and only
+    /// it should get more.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_links: Option<u32>,
+    /// This node's opens a minute, in place of `relay.max_opens_per_minute`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_opens_per_minute: Option<u32>,
+}
+
+impl RelayNode {
+    /// This node's tunnels at once: its own limit, else the relay's.
+    pub fn links(&self, relay: &Relay) -> u32 {
+        self.max_links.unwrap_or(relay.max_links_per_node)
+    }
+
+    /// This node's opens a minute: its own limit, else the relay's.
+    pub fn opens(&self, relay: &Relay) -> u32 {
+        self.max_opens_per_minute
+            .unwrap_or(relay.max_opens_per_minute)
+    }
+
+    /// Whether this node's tunnels may go to `center`.
+    pub fn may_reach(&self, center: &str) -> bool {
+        self.centers.is_empty() || self.centers.iter().any(|c| c == center)
+    }
 }
 
 /// Why a `node.toml` that keeps proxy secrets in the file is refused.
@@ -659,7 +835,35 @@ impl NodeConfig {
                 return Err(PROXY_SECRETS_IN_FILE.into());
             }
             nerve_transport::Proxy::parse(p, Vec::new())
+                .and_then(|p| p.pinned(self.connection.pin.clone()))
                 .map_err(|e| format!("connection.proxy: {e}"))?;
+        }
+        let https = self
+            .connection
+            .proxy
+            .as_deref()
+            .is_some_and(|p| p.to_ascii_lowercase().starts_with("https://"));
+        if !https && (self.connection.pin.is_some() || self.connection.login.is_some()) {
+            return Err("connection.pin and connection.login are for an https:// proxy".into());
+        }
+        if let Some(l) = &self.connection.login {
+            if !valid_login(l) {
+                return Err(
+                    "connection.login: 1 to 64 characters, no `:`, `@`, space or control character"
+                        .into(),
+                );
+            }
+            if self
+                .connection
+                .headers
+                .iter()
+                .any(|h| h.eq_ignore_ascii_case("proxy-authorization"))
+            {
+                return Err(
+                    "connection.login makes the Proxy-Authorization header; connection.headers names it too"
+                        .into(),
+                );
+            }
         }
         let mut seen = std::collections::BTreeSet::new();
         for (i, h) in self.connection.headers.iter().enumerate() {
@@ -692,6 +896,7 @@ impl NodeConfig {
                 ));
             }
         }
+        self.relay.validate()?;
         let mut names = std::collections::BTreeSet::new();
         for c in &mut self.centers {
             if !valid_center_name(&c.name) {
@@ -743,6 +948,15 @@ fn refuse_proxy_secrets(text: &str) -> Result<(), String> {
 /// Whether a URL carries a user name or password (`http://user:pass@host`).
 fn has_user_info(url: &str) -> bool {
     url.contains('@')
+}
+
+/// Whether `s` can be the user name of a proxy login: what Basic carries
+/// before its `:`.
+pub fn valid_login(s: &str) -> bool {
+    (1..=64).contains(&s.len())
+        && !s
+            .chars()
+            .any(|c| c == ':' || c == '@' || c.is_whitespace() || c.is_control())
 }
 
 /// A center's name as the CLI and the key file name use it.
@@ -909,7 +1123,19 @@ sudo_allow = ["sudo apt update"]
             ("[node]\nnmae = \"x\"\n", "unknown field"),
             ("[node]\nname = \"Bad Name\"\n", "node.name"),
             ("[limits]\nmax_running = 0\n", "max_running"),
-            ("[connection]\nproxy = \"https://p:1\"\n", "proxy"),
+            (
+                "[connection]\nproxy = \"http://p:1\"\npin = \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n",
+                "https",
+            ),
+            ("[connection]\nlogin = \"lab\"\n", "https"),
+            (
+                "[connection]\nproxy = \"https://p:1\"\nlogin = \"a:b\"\n",
+                "connection.login",
+            ),
+            (
+                "[connection]\nproxy = \"https://p:1\"\nlogin = \"lab\"\nheaders = [\"Proxy-Authorization\"]\n",
+                "names it too",
+            ),
             ("[machine]\nsudo = \"doas\"\n", "unknown variant"),
             ("[log]\nlevel = \"loud\"\n", "unknown variant"),
             ("[log]\nlvl = \"info\"\n", "unknown field"),
@@ -943,6 +1169,63 @@ sudo_allow = ["sudo apt update"]
             assert!(NodeConfig::parse(&center(bad)).is_err(), "{bad}");
         }
         assert!(NodeConfig::parse(&center("allow = [\"fs:/a/*\"]")).is_ok());
+    }
+
+    /// The relay is off and out of the file unless the owner sets it; its
+    /// nodes are kept by name and token hash, and anything else is refused.
+    #[test]
+    fn the_relay_is_off_until_set_and_keeps_only_token_hashes() {
+        let c = NodeConfig::parse("").unwrap();
+        assert_eq!(c.relay, Relay::default());
+        assert_eq!(c.relay.listen, None);
+        assert!(!c.to_toml().contains("relay"), "{}", c.to_toml());
+        let hash = "a".repeat(64);
+        let text = format!(
+            "[relay]\nlisten = \"0.0.0.0:7490\"\nmax_links = 3\n\n[[relay.node]]\nname = \"lab-pc\"\ntoken_sha256 = \"{hash}\"\n"
+        );
+        let c = NodeConfig::parse(&text).unwrap();
+        assert_eq!(c.relay.listen.as_deref(), Some("0.0.0.0:7490"));
+        assert_eq!((c.relay.max_links, c.relay.max_links_per_node), (3, 4));
+        assert_eq!(c.relay.node("lab-pc").unwrap().token_sha256, hash);
+        assert_eq!(NodeConfig::parse(&c.to_toml()).unwrap(), c);
+        let node = |name: &str, h: &str| {
+            format!("[[relay.node]]\nname = \"{name}\"\ntoken_sha256 = \"{h}\"\n")
+        };
+        for (bad, why) in [
+            (
+                "[relay]\nlisten = \"relay.example:7490\"\n".to_string(),
+                "relay.listen",
+            ),
+            (
+                "[relay]\nlisten = \"0.0.0.0\"\n".to_string(),
+                "relay.listen",
+            ),
+            ("[relay]\nmax_links = 0\n".to_string(), "at least 1"),
+            (
+                "[relay]\nmax_links_per_node = 0\n".to_string(),
+                "at least 1",
+            ),
+            ("[relay]\ntoken = \"x\"\n".to_string(), "unknown field"),
+            (node("Lab PC", &hash), "relay.node name"),
+            (node("lab", &"A".repeat(64)), "token_sha256"),
+            (node("lab", "abc"), "token_sha256"),
+            (
+                format!("{}{}", node("lab", &hash), node("lab", &hash)),
+                "twice",
+            ),
+            (
+                format!(
+                    "[[relay.node]]\nname = \"lab\"\ntoken_sha256 = \"{hash}\"\ntoken = \"t\"\n"
+                ),
+                "unknown field",
+            ),
+        ] {
+            let e = NodeConfig::parse(&bad).unwrap_err();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
+        // A center reads and changes its policy and `paused`, nothing of this.
+        let doc = serde_json::json!({"relay": {"listen": "0.0.0.0:1"}});
+        assert!(serde_json::from_value::<CenterDocument>(doc).is_err());
     }
 
     /// A config with one center whose policy is `policy`.

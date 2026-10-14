@@ -46,8 +46,10 @@ on lab-pc, run:
 ```
 
 The relay keeps only a hash of the token in `node.toml`. If you lose the
-token, take it away and make a new one: `nerve-node relay rm lab-pc`, then
-`relay add lab-pc` again.
+token, or think it leaked, give the node a new one:
+`nerve-node relay token lab-pc`. The old token stops working, its tunnels
+end, and the node keeps its centers and its limits. (`relay rm`, then
+`relay add`, makes the node anew, without them.)
 
 The certificate's key is kept with the node's own keys, where
 `machine.secret_storage` says: a file in the config folder by default, or
@@ -120,7 +122,12 @@ rules. To the outer relay, the inner one is a single relay node: its own
 links and every tunnel of the nodes behind it count against that one node's
 limits there. Give the inner relay limits of its own on the outer relay
 with `relay set-limits`, or its fifth link at once is refused
-([limits](#limits)).
+([limits](#limits)). All of the inner relay's connections come from one
+address, so at most 4 of them can wait for the outer relay's answer at
+once: when many of its nodes redial at the same moment (after a center
+restarts), a few are closed unread, counted in the outer relay's log as
+connections without a valid token, and retried at the next step of their
+back-off.
 
 ## Limits
 
@@ -146,12 +153,14 @@ limits of its own:
 
 ```sh
 nerve-node relay set-limits inner-relay --max-links 12 --max-opens-per-minute 300
-nerve-node relay set-limits inner-relay        # the relay's limits again
+nerve-node relay set-limits inner-relay --max-links 20   # the opens stay at 300
+nerve-node relay set-limits inner-relay                  # the relay's limits again
 ```
 
 `--max-links` there counts its own links to its centers plus one per center
 for each node behind it; raise the relay's `--max-links` too if the total
-needs it. `relay ls` shows a node's own limits. A relayed node that hits the
+needs it (`set-limits` says when the relay's total is lower). `relay ls`
+shows a node's own limits. A relayed node that hits the
 outer relay's limits sees `502` from its own relay.
 
 At most 4 connections from one address may wait for the relay's answer at

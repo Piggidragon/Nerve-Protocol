@@ -511,8 +511,10 @@ turns it on, and a center reads and changes nothing of it, grant or not.
   relayed node runs,
   `nerve-node proxy set 'https://<name>:<token>@<relay>:<port>' --pin <pin>`.
   `node.toml` keeps the token's SHA-256 only, and the log tells a change of
-  `relay.node` without its values. `relay rm <name>` takes the token away
-  and ends that node's tunnels.
+  `relay.node` without its values. `relay token <name>` gives a known node
+  a new token, shown once with the same line, and keeps its centers and
+  limits; the old token's tunnels end. `relay rm <name>` takes the token
+  away and ends that node's tunnels; its centers and limits go with it.
 - With `--center` (given more than once for more) the node's tunnels go
   only to the named centers of this node; without it, to every center a
   tunnel may go to (below). `relay set-centers <name> [--center
@@ -578,20 +580,22 @@ turns it on, and a center reads and changes nothing of it, grant or not.
   can rotate the log, and a line names the node whose refusals it counts.
 - A node opens at most `relay.max_opens_per_minute` tunnels a minute (30
   unless set: a node needs one per center and redials after a second at the
-  soonest; a relay behind this one, which carries many nodes, needs more;
-  `relay set`, `relay ls` and `status` show it); past that it gets `503`.
+  soonest; `relay set`, `relay ls` and `status` show it; a relay behind
+  this one, which carries many nodes, gets more as a limit of its own,
+  below); past that it gets `503`.
   `relay.max_links_per_node` and `relay.max_opens_per_minute` hold for
   every relay node; raising them raises them for every token. A node can
   have limits of its own instead (`[[relay.node]]` `max_links` and
   `max_opens_per_minute`, set with `relay set-limits <name> [--max-links N]
-  [--max-opens-per-minute N]`, both cleared without flags, shown by
-  `relay ls`). That is for a relay behind this one: in a chain the inner
+  [--max-opens-per-minute N]`: a limit not given stays, as with `relay
+  set`, and no flag at all clears both; shown by `relay ls`). That is for a relay behind this one: in a chain the inner
   relay is one relay node of the outer one, and its own links and every
   tunnel of the nodes behind it count against that node's limits (and the
   relay's `max_links`). A refusal at the outer relay reaches the relayed
   node as the inner relay's `502`. Each tunnel is an audit entry and two `info`
-  lines, so a node with its token cannot rotate the audit log or the log by
-  opening and closing tunnels.
+  lines, so a node with the relay's limits cannot rotate the audit log or
+  the log by opening and closing tunnels; a node with limits of its own,
+  only as far as they allow.
 - Hosts are compared without case or a trailing dot, and an address in any
   of its spellings (`[2001:db8::1]` and `[2001:db8:0:0::1]`) is one address.
   A name and the address it resolves to are not told apart.

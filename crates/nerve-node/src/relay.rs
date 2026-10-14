@@ -231,7 +231,7 @@ fn refused_line(kind: Refused, node: &str, t: &Told) -> String {
             "relay: refused {n} tunnel(s) of relay node {node}{over}, the last {last}; such refusals are told at most once a minute"
         ),
         Refused::Plain => format!(
-            "relay: relay node {node} sent its token in plain HTTP {n} time(s){over}, the last {last}, so it crossed the network in the clear; give it a new one (`nerve-node relay rm {node}`, then `relay add {node}`)"
+            "relay: relay node {node} sent its token in plain HTTP {n} time(s){over}, the last {last}, so it crossed the network in the clear; give it a new one with `nerve-node relay token {node}`"
         ),
     }
 }

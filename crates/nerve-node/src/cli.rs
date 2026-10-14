@@ -347,7 +347,7 @@ pub enum RelayCmd {
         /// Tunnels at once of one relayed node (4 unless set).
         #[arg(long, value_name = "N")]
         max_links_per_node: Option<u32>,
-        /// Tunnels one relayed node may open a minute (30 unless set; more for a relay behind this one).
+        /// Tunnels one relayed node may open a minute, every node alike (30 unless set; for a relay behind this one, use `relay set-limits <name>`).
         #[arg(long, value_name = "N")]
         max_opens_per_minute: Option<u32>,
     },
@@ -369,7 +369,7 @@ pub enum RelayCmd {
         #[arg(long = "center", value_name = "CENTER")]
         centers: Vec<String>,
     },
-    /// Give a relayed node limits of its own, in place of the relay's --max-links-per-node and --max-opens-per-minute: for a relay behind this one, which carries many nodes. Without either flag, the relay's limits again.
+    /// Give a relayed node limits of its own, in place of the relay's --max-links-per-node and --max-opens-per-minute: for a relay behind this one, which carries many nodes. A flag not given keeps that limit; without either flag, the relay's limits again.
     SetLimits {
         /// The relayed node's name.
         name: String,
@@ -379,6 +379,11 @@ pub enum RelayCmd {
         /// The tunnels it may open a minute.
         #[arg(long, value_name = "N")]
         max_opens_per_minute: Option<u32>,
+    },
+    /// Give a relayed node a new token and end the tunnels of the old one; its centers and limits stay. Shows the token once.
+    Token {
+        /// The relayed node's name.
+        name: String,
     },
     /// Take a node's token away and end its tunnels.
     Rm {
@@ -2956,20 +2961,78 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
                     .iter_mut()
                     .find(|n| n.name == name)
                     .ok_or_else(|| format!("the relay knows no node {name}"))?;
-                node.max_links = max_links;
-                node.max_opens_per_minute = max_opens_per_minute;
+                // As `relay set`: a limit not given stays; no flag at all
+                // gives the node the relay's limits again.
+                if max_links.is_none() && max_opens_per_minute.is_none() {
+                    node.max_links = None;
+                    node.max_opens_per_minute = None;
+                }
+                if let Some(n) = max_links {
+                    node.max_links = Some(n);
+                }
+                if let Some(n) = max_opens_per_minute {
+                    node.max_opens_per_minute = Some(n);
+                }
                 Ok(())
             })
             .await?;
             let node = cfg.relay.node(&name).expect("set above");
+            let links = node.links(&cfg.relay);
+            let mut line = format!(
+                "relay node {name}: at most {links} tunnels at once, {} opened a minute",
+                node.opens(&cfg.relay)
+            );
+            if cfg.relay.max_links < links {
+                line.push_str(&format!(
+                    " (the relay's {} tunnels in all bound it; `relay set <address> --max-links N` raises that)",
+                    cfg.relay.max_links
+                ));
+            }
+            w(out, line);
+            Ok(())
+        }
+        RelayCmd::Token { name } => {
+            let (now, _) = read_config(paths).await?;
+            let (pin, made) = relay_pin(paths, &now, now.relay.listen.as_deref())?;
+            let (token, hash) = crate::relay::new_token();
+            let cfg = edit(paths, |c| {
+                c.relay.pin = Some(pin.clone());
+                let node = c
+                    .relay
+                    .nodes
+                    .iter_mut()
+                    .find(|n| n.name == name)
+                    .ok_or_else(|| {
+                        format!("the relay knows no node {name}; `relay add {name}` makes one")
+                    })?;
+                node.token_sha256 = hash.clone();
+                Ok(())
+            })
+            .await?;
+            if made && now.relay.pin.is_some() {
+                w(
+                    out,
+                    format!(
+                        "the relay's TLS key was gone or did not match its pin, so it has a new certificate (pin {pin}): the relayed nodes need the new pin in `proxy set --pin`"
+                    ),
+                );
+            }
+            let node = cfg.relay.node(&name).expect("set above");
+            let at = relay_address(cfg.relay.listen.as_deref());
             w(
                 out,
                 format!(
-                    "relay node {name}: at most {} tunnels at once, {} opened a minute",
-                    node.links(&cfg.relay),
-                    node.opens(&cfg.relay)
+                    "relay node {name} has a new token, shown only now; the old one no longer works:"
                 ),
             );
+            w(out, format!("  {token}"));
+            w(out, format!("it may reach {}", reach_of(&node.centers)));
+            w(out, format!("on {name}, run:"));
+            w(
+                out,
+                format!("  nerve-node proxy set 'https://{name}:{token}@{at}' --pin {pin}"),
+            );
+            cut_note(paths, out, "the old token's tunnels end").await;
             Ok(())
         }
         RelayCmd::SetCenters { name, centers } => {
@@ -5384,7 +5447,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            out.starts_with("relay node lab-2: at most 12 tunnels at once, 300 opened a minute\n"),
+            out.starts_with("relay node lab-2: at most 12 tunnels at once, 300 opened a minute (the relay's 8 tunnels in all bound it;"),
             "{out}"
         );
         let node = load(&paths).relay.node("lab-2").unwrap().clone();
@@ -5392,6 +5455,60 @@ mod tests {
             (node.max_links, node.max_opens_per_minute),
             (Some(12), Some(300))
         );
+        // One flag sets that limit and keeps the other, as `relay set` does.
+        run(
+            &paths,
+            &["relay", "set-limits", "lab-2", "--max-links", "20"],
+        )
+        .unwrap();
+        let node = load(&paths).relay.node("lab-2").unwrap().clone();
+        assert_eq!(
+            (node.max_links, node.max_opens_per_minute),
+            (Some(20), Some(300))
+        );
+        run(
+            &paths,
+            &["relay", "set-limits", "lab-2", "--max-links", "12"],
+        )
+        .unwrap();
+        // A new token keeps the node's centers and limits; the old one
+        // stops working.
+        let before = load(&paths).relay.node("lab-2").unwrap().clone();
+        let out = run(&paths, &["relay", "token", "lab-2"]).unwrap();
+        let token2 = out.lines().nth(1).unwrap().trim().to_string();
+        assert_eq!(token2.len(), 43, "{out}");
+        assert!(
+            out.contains("it may reach the centers work, home, home-b\n"),
+            "{out}"
+        );
+        let after = load(&paths).relay.node("lab-2").unwrap().clone();
+        assert_eq!(after.token_sha256, crate::relay::token_hash(&token2));
+        assert_ne!(after.token_sha256, before.token_sha256);
+        assert_eq!(
+            (&after.centers, after.max_links, after.max_opens_per_minute),
+            (
+                &before.centers,
+                before.max_links,
+                before.max_opens_per_minute
+            )
+        );
+        assert!(
+            !std::fs::read_to_string(paths.config_file())
+                .unwrap()
+                .contains(&token2)
+        );
+        assert!(run(&paths, &["relay", "token", "nobody"]).is_err());
+        // The flag's help sends a chain to `set-limits`, not to the
+        // relay-wide budget.
+        let help = Cli::command()
+            .find_subcommand_mut("relay")
+            .unwrap()
+            .find_subcommand_mut("set")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("relay set-limits <name>"), "{help}");
+        assert!(!help.contains("more for a relay behind this one"), "{help}");
         assert_eq!(
             load(&paths).relay.max_links_per_node,
             4,

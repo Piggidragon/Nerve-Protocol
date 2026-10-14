@@ -207,10 +207,11 @@ pub struct Relay {
     /// Tunnels at once of one relayed node.
     #[serde(default = "d_relay_links_per_node")]
     pub max_links_per_node: u32,
-    /// Tunnels one relayed node may open a minute. Each is an audit entry and
-    /// two log lines, so this keeps a node with its token from rotating the
-    /// logs; a node needs one per center and redials after a second at the
-    /// soonest, and a relay behind this one (a chain) needs more.
+    /// Tunnels one relayed node may open a minute, every node alike. Each is
+    /// an audit entry and two log lines, so this keeps a node with its token
+    /// from rotating the logs; a node needs one per center and redials after
+    /// a second at the soonest. A relay behind this one (a chain) needs more,
+    /// and gets it as a limit of its own ([`RelayNode::max_opens_per_minute`]).
     #[serde(default = "d_relay_opens")]
     pub max_opens_per_minute: u32,
     /// The pin of the relay's TLS certificate, whose key is kept with the

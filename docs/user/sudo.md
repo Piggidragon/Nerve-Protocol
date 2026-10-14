@@ -31,6 +31,15 @@ for it.
    nerve-node sudo on
    ```
 
+   On a node installed as a service, `install` takes the account that ran
+   `sudo`. That account is no boundary: its owner logs in as it, and a
+   command can reach what the owner does with sudo. If it has `NOPASSWD`
+   sudo, every command is root. `install` and `setup` warn about this and
+   suggest `sudo nerve-node setup --create-user nerve-work`. An account made
+   that way has no password and no sudoers entry, so `sudo on` does not work
+   for it until you give it both. A node-only account that needs a password
+   for sudo and gets root no other way is fine.
+
 3. Look or turn it off:
 
    ```sh

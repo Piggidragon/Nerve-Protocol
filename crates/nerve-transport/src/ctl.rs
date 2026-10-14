@@ -7,17 +7,108 @@
 //!
 //! On Unix the socket is created 0600 in a 0700 folder, and every peer's
 //! credentials are read: only the socket's own user or root may talk to it.
-//! Windows has no control channel; there the CLI works on the config files
-//! directly (see `nerve-node`).
+//! Windows has a named pipe instead, with the same lines on it
+//! ([`serve_stream`], [`call_on`]); `nerve-node` makes it and checks who
+//! is on the other end.
+
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CtlRequest {
     pub method: String,
     #[serde(default)]
     pub params: Value,
+}
+
+/// The longest request line read.
+const LINE_BYTES: usize = 1024 * 1024;
+
+/// What a handler sends back: one answer, or items of a following call.
+pub enum Reply {
+    Ok(Value),
+    Err(String),
+    /// Items until the sender is dropped.
+    Follow(mpsc::Receiver<Value>),
+}
+
+/// Error when nothing listens.
+pub const NOT_RUNNING: &str = "not running";
+
+/// Serves one connection whose caller is `peer` (what the transport could
+/// tell of it): a request per line, each answered before the next is read.
+/// A line past [`LINE_BYTES`], or more than 64 of them in bytes, ends it.
+pub async fn serve_stream<S, P, F, Fut>(stream: S, peer: P, handler: Arc<F>) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite,
+    P: Copy,
+    F: Fn(CtlRequest, P) -> Fut,
+    Fut: std::future::Future<Output = Reply>,
+{
+    let (r, mut w) = tokio::io::split(stream);
+    let mut lines = BufReader::new(r.take(LINE_BYTES as u64 * 64));
+    loop {
+        let mut line = String::new();
+        if lines.read_line(&mut line).await? == 0 {
+            return Ok(());
+        }
+        if line.len() > LINE_BYTES {
+            return Ok(());
+        }
+        let reply = match serde_json::from_str::<CtlRequest>(&line) {
+            Ok(req) => handler(req, peer).await,
+            Err(e) => Reply::Err(format!("bad request: {e}")),
+        };
+        match reply {
+            Reply::Ok(v) => write_line(&mut w, &json!({"ok": v})).await?,
+            Reply::Err(e) => write_line(&mut w, &json!({"error": e})).await?,
+            Reply::Follow(mut rx) => {
+                while let Some(item) = rx.recv().await {
+                    write_line(&mut w, &json!({"item": item})).await?;
+                }
+                return Ok(());
+            }
+        }
+    }
+}
+
+async fn write_line<W: AsyncWrite + Unpin>(w: &mut W, v: &Value) -> std::io::Result<()> {
+    let mut s = v.to_string();
+    s.push('\n');
+    w.write_all(s.as_bytes()).await?;
+    w.flush().await
+}
+
+/// One call on a connection made already: sends the request and returns
+/// the answer.
+pub async fn call_on<S: AsyncRead + AsyncWrite>(
+    stream: S,
+    method: &str,
+    params: Value,
+) -> Result<Value, String> {
+    let (r, mut w) = tokio::io::split(stream);
+    write_line(&mut w, &json!({"method": method, "params": params}))
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut line = String::new();
+    BufReader::new(r.take(LINE_BYTES as u64))
+        .read_line(&mut line)
+        .await
+        .map_err(|e| e.to_string())?;
+    answer(&line)
+}
+
+fn answer(line: &str) -> Result<Value, String> {
+    let v: Value =
+        serde_json::from_str(line).map_err(|_| "the node closed without answering".to_string())?;
+    if let Some(e) = v.get("error").and_then(Value::as_str) {
+        return Err(e.to_string());
+    }
+    Ok(v.get("ok").cloned().unwrap_or(Value::Null))
 }
 
 /// Who is on the other end of a control connection.
@@ -67,22 +158,10 @@ mod unix {
     use std::sync::Arc;
 
     use serde_json::{Value, json};
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::net::{UnixListener, UnixStream};
-    use tokio::sync::mpsc;
 
-    use super::{CtlRequest, Peer};
-
-    /// The longest request line read.
-    const LINE_BYTES: usize = 1024 * 1024;
-
-    /// What a handler sends back: one answer, or items of a following call.
-    pub enum Reply {
-        Ok(Value),
-        Err(String),
-        /// Items until the sender is dropped.
-        Follow(mpsc::Receiver<Value>),
-    }
+    use super::{CtlRequest, NOT_RUNNING, Peer, Reply, answer, serve_stream, write_line};
 
     /// Binds `path` and serves every connection with `handler`. A stale socket
     /// file is replaced; a live one (another node running) is an error.
@@ -142,7 +221,7 @@ mod unix {
                 if peer.uid != me && peer.uid != 0 {
                     return;
                 }
-                let _ = connection(stream, peer, handler).await;
+                let _ = serve_stream(stream, peer, handler).await;
             });
         }
     }
@@ -183,76 +262,13 @@ mod unix {
         Ok(listener)
     }
 
-    async fn connection<F, Fut>(
-        stream: UnixStream,
-        peer: Peer,
-        handler: Arc<F>,
-    ) -> std::io::Result<()>
-    where
-        F: Fn(CtlRequest, Peer) -> Fut + Send + Sync + 'static,
-        Fut: std::future::Future<Output = Reply> + Send + 'static,
-    {
-        let (r, mut w) = stream.into_split();
-        let mut lines = BufReader::new(r.take(LINE_BYTES as u64 * 64));
-        loop {
-            let mut line = String::new();
-            if lines.read_line(&mut line).await? == 0 {
-                return Ok(());
-            }
-            if line.len() > LINE_BYTES {
-                return Ok(());
-            }
-            let reply = match serde_json::from_str::<CtlRequest>(&line) {
-                Ok(req) => handler(req, peer).await,
-                Err(e) => Reply::Err(format!("bad request: {e}")),
-            };
-            match reply {
-                Reply::Ok(v) => write_line(&mut w, &json!({"ok": v})).await?,
-                Reply::Err(e) => write_line(&mut w, &json!({"error": e})).await?,
-                Reply::Follow(mut rx) => {
-                    while let Some(item) = rx.recv().await {
-                        write_line(&mut w, &json!({"item": item})).await?;
-                    }
-                    return Ok(());
-                }
-            }
-        }
-    }
-
-    async fn write_line<W: AsyncWriteExt + Unpin>(w: &mut W, v: &Value) -> std::io::Result<()> {
-        let mut s = v.to_string();
-        s.push('\n');
-        w.write_all(s.as_bytes()).await?;
-        w.flush().await
-    }
-
-    /// Error when nothing listens on `path`.
-    pub const NOT_RUNNING: &str = "not running";
-
-    /// One call: sends the request and returns the answer.
+    /// One call: sends the request and returns the answer; [`NOT_RUNNING`]
+    /// when nothing listens on `path`.
     pub async fn call(path: &Path, method: &str, params: Value) -> Result<Value, String> {
         let stream = UnixStream::connect(path)
             .await
             .map_err(|_| NOT_RUNNING.to_string())?;
-        let (r, mut w) = stream.into_split();
-        write_line(&mut w, &json!({"method": method, "params": params}))
-            .await
-            .map_err(|e| e.to_string())?;
-        let mut line = String::new();
-        BufReader::new(r)
-            .read_line(&mut line)
-            .await
-            .map_err(|e| e.to_string())?;
-        answer(&line)
-    }
-
-    fn answer(line: &str) -> Result<Value, String> {
-        let v: Value = serde_json::from_str(line)
-            .map_err(|_| "the node closed without answering".to_string())?;
-        if let Some(e) = v.get("error").and_then(Value::as_str) {
-            return Err(e.to_string());
-        }
-        Ok(v.get("ok").cloned().unwrap_or(Value::Null))
+        super::call_on(stream, method, params).await
     }
 
     /// A following call: every item goes to `each` until the server closes.
@@ -285,6 +301,7 @@ mod unix {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use tokio::sync::mpsc;
 
         #[tokio::test]
         async fn calls_and_follows() {
@@ -465,4 +482,76 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub use unix::{NOT_RUNNING, Reply, bind, call, follow, serve, serve_on};
+pub use unix::{bind, call, follow, serve, serve_on};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The lines of the protocol on any stream, as Windows' pipe carries
+    /// them: a call gets its answer or its error, a bad line an error, and
+    /// the handler sees the peer the transport told.
+    #[tokio::test]
+    async fn the_lines_on_any_stream() {
+        let serve = |server| {
+            tokio::spawn(serve_stream(
+                server,
+                7u32,
+                Arc::new(|req: CtlRequest, peer: u32| async move {
+                    match req.method.as_str() {
+                        "echo" => Reply::Ok(json!({"params": req.params, "peer": peer})),
+                        _ => Reply::Err("unknown method".into()),
+                    }
+                }),
+            ))
+        };
+        let (client, server) = tokio::io::duplex(4096);
+        let task = serve(server);
+        let v = call_on(client, "echo", json!({"a": 1})).await.unwrap();
+        assert_eq!(v, json!({"params": {"a": 1}, "peer": 7}));
+        task.await.unwrap().unwrap();
+        let (client, server) = tokio::io::duplex(4096);
+        serve(server);
+        assert_eq!(
+            call_on(client, "nope", json!({})).await.unwrap_err(),
+            "unknown method"
+        );
+        // A line that is no request is answered, and the connection goes on.
+        let (mut client, server) = tokio::io::duplex(4096);
+        serve(server);
+        client.write_all(b"{\"params\": 1}\n").await.unwrap();
+        let mut lines = BufReader::new(&mut client);
+        let mut line = String::new();
+        lines.read_line(&mut line).await.unwrap();
+        assert!(
+            answer(&line).unwrap_err().starts_with("bad request"),
+            "{line}"
+        );
+        // A server that reads the call and closes without a word gives no
+        // answer.
+        let (client, server) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let mut line = String::new();
+            let _ = BufReader::new(server).read_line(&mut line).await;
+        });
+        assert_eq!(
+            call_on(client, "echo", json!({})).await.unwrap_err(),
+            "the node closed without answering"
+        );
+    }
+
+    /// A line longer than a request may be ends the connection unanswered.
+    #[tokio::test]
+    async fn an_overlong_line_ends_the_connection() {
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(serve_stream(
+            server,
+            (),
+            Arc::new(|_: CtlRequest, _: ()| async { Reply::Ok(json!("taken")) }),
+        ));
+        let long = "x".repeat(LINE_BYTES + 1);
+        let r = call_on(client, "echo", json!({"pad": long})).await;
+        assert_eq!(r.unwrap_err(), "the node closed without answering");
+        task.await.unwrap().unwrap();
+    }
+}

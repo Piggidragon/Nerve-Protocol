@@ -180,7 +180,7 @@ fn the_service() -> Result<Scm, String> {
 }
 
 /// The SID of the local account `name`.
-fn sid_of(name: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn sid_of(name: &str) -> Result<Vec<u8>, String> {
     let mut sid = vec![0u8; 68];
     let mut len = sid.len() as u32;
     let mut domain = vec![0u16; 256];
@@ -211,7 +211,7 @@ fn sid_of(name: &str) -> Result<Vec<u8>, String> {
 }
 
 /// A SID as text, `S-1-5-…`.
-fn sid_text(sid: &[u8]) -> Result<String, String> {
+pub(crate) fn sid_text(sid: &[u8]) -> Result<String, String> {
     let mut text: *mut u16 = std::ptr::null_mut();
     // SAFETY: a valid SID; the string is freed with LocalFree.
     if unsafe { ConvertSidToStringSidW(sid.as_ptr() as PSID, &mut text) } == 0 {

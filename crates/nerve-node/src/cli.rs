@@ -1,6 +1,7 @@
 //! The `nerve-node` command line (docs/dev/settings-and-config.md). Commands talk to the
-//! running daemon over the control socket; when none runs they edit the
-//! config file directly through the same [`SettingsStore`], which signs it.
+//! running daemon over the control socket (on Windows the folder changes
+//! over its control pipe, crate::pipe); when none runs they edit the config
+//! file directly through the same [`SettingsStore`], which signs it.
 
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
@@ -11,11 +12,12 @@ use serde::Serialize;
 use serde_json::{Value, json};
 
 use nerve_policy::audit::AuditLog;
-use nerve_policy::config::{Access, CapSetting, Folder, SecretStorage, SettingsGrant};
+use nerve_policy::config::{Access, CapSetting, SecretStorage, SettingsGrant};
 use nerve_policy::{Mode, NodeConfig, SetError, SettingsStore, rules, sudo_command};
 use nerve_proto::link::PairLink;
 
 use crate::daemon::{Daemon, NodeOptions};
+use crate::folder_change::{Applied, FolderChange};
 use crate::paths::NodePaths;
 use crate::service::{Host, Layout};
 
@@ -682,23 +684,7 @@ pub async fn edit(
 
 /// The center a per-center command means: the one named, or the only one.
 pub fn pick_center(cfg: &NodeConfig, given: &CenterArg) -> Result<String, String> {
-    if let Some(n) = &given.center {
-        return cfg
-            .center(n)
-            .map(|c| c.name.clone())
-            .ok_or_else(|| format!("no center named {n}"));
-    }
-    match cfg.centers.as_slice() {
-        [] => Err("no center is paired".into()),
-        [one] => Ok(one.name.clone()),
-        many => Err(format!(
-            "several centers are paired; pick one with --center ({})",
-            many.iter()
-                .map(|c| c.name.as_str())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )),
-    }
+    crate::folder_change::pick_center(cfg, given.center.as_deref())
 }
 
 /// Changes one center's entry.
@@ -892,8 +878,8 @@ const NEXT_START: &str = "takes effect at the next start of the node";
 
 /// Runs one command line, writing what it shows to `out`. A change made
 /// while no daemon answers on the control socket (none runs, or Windows,
-/// which has no socket) is only in the file, so the output says
-/// when it counts.
+/// whose pipe takes folder changes only) is only in the file, so the output
+/// says when it counts.
 pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
     let service = cli.cmd.is_service();
     if service && (cli.config_dir.is_some() || cli.state_dir.is_some()) {
@@ -914,11 +900,17 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
     let own_say = cfg!(windows) && matches!(cli.cmd, Cmd::Sudo(_));
     let before = (!matches!(cli.cmd, Cmd::Run) && !service && !own_say)
         .then(|| std::fs::read(paths.config_file()).ok());
+    // On Windows the running node takes folder changes over its pipe, and
+    // nothing else yet.
+    let folders = matches!(
+        cli.cmd,
+        Cmd::Folder(FolderCmd::Add { .. } | FolderCmd::Set { .. } | FolderCmd::Rm { .. })
+    );
     let r = command(paths.clone(), cli.cmd, out).await;
     if r.is_ok()
         && let Some(before) = before
         && std::fs::read(paths.config_file()).ok() != before
-        && !daemon_answers(&paths).await
+        && !daemon_answers(&paths, folders).await
     {
         let _ = writeln!(out, "the change is in node.toml; it {NEXT_START}");
     }
@@ -999,17 +991,23 @@ async fn owner_check(paths: &[&NodePaths]) -> Result<(), String> {
 }
 
 /// Whether a daemon answers on the control socket; it then took every
-/// change at once.
-async fn daemon_answers(paths: &NodePaths) -> bool {
+/// change at once. On Windows it takes only `folders` changes over its pipe,
+/// so only those count as taken when it answers.
+async fn daemon_answers(paths: &NodePaths, folders: bool) -> bool {
     #[cfg(unix)]
     {
+        let _ = folders;
         nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({}))
             .await
             .is_ok()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        let _ = paths;
+        folders && crate::pipe::call(paths, "status", json!({})).await.is_ok()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (paths, folders);
         false
     }
 }
@@ -1187,23 +1185,17 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             center,
         }) => {
             let (changes, center) = take_center_flag(changes, center)?;
-            let real = resolve_folder(&path)?;
-            let given = path.display().to_string();
-            let access = std::cell::Cell::new(Access::NONE);
-            let name = edit_center(&paths, &center, |e| {
-                let f = e
-                    .policy
-                    .folders
-                    .iter_mut()
-                    .find(|f| f.path == real || f.path == given)
-                    .ok_or_else(|| format!("{real} is not a folder of this center"))?;
-                f.access = changes.iter().try_fold(f.access, |a, c| a.change(c))?;
-                access.set(f.access);
-                Ok(())
-            })
-            .await?;
-            let access = access.get();
-            w(out, format!("{name}: folder {real} {}", access.to_chmod()));
+            let change = FolderChange::Set {
+                path: resolve_folder(&path)?,
+                given: path.display().to_string(),
+                changes,
+            };
+            let a = change_folder(&paths, &center, &change).await?;
+            let access = a.access.unwrap_or(Access::NONE);
+            w(
+                out,
+                format!("{}: folder {} {}", a.center, a.path, access.to_chmod()),
+            );
             if access.is_none() {
                 w(
                     out,
@@ -1214,20 +1206,12 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             Ok(())
         }
         Cmd::Folder(FolderCmd::Rm { path, center }) => {
-            let real = resolve_folder(&path)?;
-            let given = path.display().to_string();
-            let name = edit_center(&paths, &center, |e| {
-                let before = e.policy.folders.len();
-                e.policy
-                    .folders
-                    .retain(|f| f.path != real && f.path != given);
-                if e.policy.folders.len() == before {
-                    return Err(format!("{real} is not a folder of this center"));
-                }
-                Ok(())
-            })
-            .await?;
-            w(out, format!("{name}: removed {real}"));
+            let change = FolderChange::Rm {
+                path: resolve_folder(&path)?,
+                given: path.display().to_string(),
+            };
+            let a = change_folder(&paths, &center, &change).await?;
+            w(out, format!("{}: removed {}", a.center, a.path));
             Ok(())
         }
         Cmd::Folder(FolderCmd::Ls { center }) => {
@@ -1772,45 +1756,63 @@ async fn add_folder(
     let w = |out: &mut dyn Write, s: String| {
         let _ = writeln!(out, "{s}");
     };
-    // Nothing is the default, and a folder that grants nothing is
-    // never what was meant, so it is refused.
-    let access = rights.iter().try_fold(Access::NONE, |a, r| {
-        if r.starts_with('+') {
-            a.change(r)
-        } else {
-            Err(format!("{r:?}: a new folder takes +r, +w or +x"))
-        }
-    })?;
-    if access.is_none() {
-        return Err(
-            "name what the center may do in the folder: +r (read), +w (write), +x (run commands)"
-                .into(),
-        );
-    }
-    let real = resolve_folder(path)?;
-    let mode = std::cell::Cell::new(Mode::Folder);
-    let name = edit_center(paths, center, |e| {
-        e.policy.folders.retain(|f| f.path != real);
-        e.policy.folders.push(Folder {
-            path: real.clone(),
-            access,
-        });
-        mode.set(e.policy.mode);
-        Ok(())
-    })
-    .await?;
-    w(out, format!("{name}: folder {real} {}", access.to_chmod()));
-    let mode = mode.get();
-    if mode != Mode::Folder {
+    // The rights are checked before the folder is looked at.
+    let access = FolderChange::new_rights(rights)?;
+    let change = FolderChange::Add {
+        path: resolve_folder(path)?,
+        access,
+    };
+    let a = change_folder(paths, center, &change).await?;
+    w(
+        out,
+        format!("{}: folder {} {}", a.center, a.path, access.to_chmod()),
+    );
+    if a.mode != Mode::Folder {
         w(
             out,
             format!(
-                "note: folders count in folder mode; {name} is in {} mode (`nerve-node mode set folder`)",
-                mode.as_str()
+                "note: folders count in folder mode; {} is in {} mode (`nerve-node mode set folder`)",
+                a.center,
+                a.mode.as_str()
             ),
         );
     }
     Ok(())
+}
+
+/// Changes a center's folders. On Windows a running node takes the change
+/// over its control pipe and makes it itself, folder grants included
+/// (crate::pipe); a node that does not run, and the other platforms, take
+/// it as every other change ([`edit`]).
+async fn change_folder(
+    paths: &NodePaths,
+    center: &CenterArg,
+    change: &FolderChange,
+) -> Result<Applied, String> {
+    #[cfg(windows)]
+    match crate::pipe::call(
+        paths,
+        change.method(),
+        change.params(center.center.as_deref()),
+    )
+    .await
+    {
+        Ok(v) => {
+            return serde_json::from_value(v)
+                .map_err(|e| format!("the node's answer is not understood: {e}"));
+        }
+        Err(e) if e == nerve_transport::ctl::NOT_RUNNING => {}
+        Err(e) => return Err(e),
+    }
+    let (cfg, _) = read_config(paths).await?;
+    let name = pick_center(&cfg, center)?;
+    let applied = std::cell::RefCell::new(None);
+    edit(paths, |c| {
+        *applied.borrow_mut() = Some(crate::folder_change::apply_to(c, Some(&name), change)?);
+        Ok(())
+    })
+    .await?;
+    Ok(applied.into_inner().expect("applied when edit succeeds"))
 }
 
 /// `nerve-node sudo on|off|status`. The password lives in the running

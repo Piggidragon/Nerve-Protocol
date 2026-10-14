@@ -120,8 +120,9 @@ take another file at its next start: with the key gone, an unsigned file
 counts as a first file and is signed. The start-up audits that as
 `signed`. In `folder` mode Landlock keeps commands out of the state folder.
 
-On Windows there is no control socket: the CLI writes the signed
-file itself, and a running node takes the change at its next start. After
+On Windows there is no control socket. A running node takes the folder
+changes over its control pipe (§5); for every other change the CLI writes
+the signed file itself, and a running node takes it at its next start. After
 a change no daemon answered for, the CLI says so in one line ("takes effect
 at the next start of the node").
 
@@ -662,8 +663,8 @@ switches off. `uninstall` removes the file.
 
 ## 5. Control socket
 
-`<state>/run/ctl.sock` (Unix only; on Windows the CLI writes the
-signed `node.toml` itself, §1). One JSON object per line: the client sends
+`<state>/run/ctl.sock` (Unix; Windows has the control pipe below). One
+JSON object per line: the client sends
 `{"method", "params"}`, the server answers `{"ok": value}` or
 `{"error": "text"}`, or, for streaming methods, several `{"item": value}`
 lines until it closes. The socket is 0600 in a 0700 folder; only its own user
@@ -689,10 +690,54 @@ Methods:
 `owner.check` are refused from a process that runs below a command the node
 started for a center, so on Linux an agent cannot change its own policy
 through the socket, nor install, set up, update or remove the node.
-**Windows has no socket and no sandbox:** the CLI signs node.toml
-itself, so a command the node runs for a center can change the policy, and
-the change applies at the next start. On Windows, allow commands only to
-centers you would also give `settings = write`.
+### The control pipe (Windows)
+
+`\\.\pipe\nerve-node-<hash>`, where the hash is the first 16 bytes of the
+SHA-256 of the state folder's real path in lower case, in hex: one pipe per
+state folder. The lines are those of the socket. Methods:
+
+| Method | Params | |
+|---|---|---|
+| `status` | | as on the socket |
+| `folder.add` | `center`?, `path`, `access` (`r`, `w`, `x`, at least one) | adds the folder, or replaces its rights |
+| `folder.set` | `center`?, `path`, `given`, `changes` (1 to 64 of `=rwx`, `+x`, `-w`) | changes the rights of a folder the center has |
+| `folder.rm` | `center`?, `path`, `given` | takes a folder away |
+
+`path` is the folder resolved by the CLI, `given` as typed; `set` and `rm`
+find the folder by either. Without `center` the only paired center is meant.
+A field the method does not take refuses the request. The node checks a
+change as the CLI does when it writes the file, saves it, brings the folder
+grants in line, and answers `{center, path, access, mode, version}`
+(`access` is `null` after `rm`).
+
+Who may write:
+
+- The DACL (`D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;<node account>)`) lets
+  SYSTEM, the administrators (elevated) and the node's account open the
+  pipe. An AppContainer gets no access, nor does a command account whose
+  token has the administrators deny-only. Remote clients are refused
+  (`PIPE_REJECT_REMOTE_CLIENTS`).
+- Every request from a process in the job object of a command the node runs
+  is refused, `status` included: the node lists the processes of every job
+  it holds open (`JobObjectBasicProcessIdList`, nested jobs included) and
+  looks for the caller's process id (`GetNamedPipeClientProcessId`). While
+  a command runs without a job, and for a caller whose id Windows does not
+  tell, every request is refused.
+- The node makes the first instance with `FILE_FLAG_FIRST_PIPE_INSTANCE`
+  and makes the next one before it hands a connection on, so the pipe always
+  has one of its own. A node that cannot make the pipe (another process made
+  one of that name first) logs it and runs on without it.
+- The CLI opens the pipe for identification only and sends nothing unless
+  its owner is SYSTEM, the administrators or the node's account (`nerve` for
+  the installed node, else the CLI's own).
+
+Not covered: a process another program starts for a command (the task
+scheduler, WMI) is in no job of the node's; it opens the pipe only if its
+account may. A sudo command (an administrator token) and a command of a node
+run by hand (the node's own account) pass the DACL; the job check stops them
+on the pipe, but they can still change `node.toml` itself. On Windows, allow
+commands only to centers you would also give `settings = write`, or install
+the node as a service.
 
 ## 6. Audit log
 

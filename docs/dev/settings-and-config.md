@@ -100,9 +100,11 @@ client sends one JSON object per line, `{"method", "params"}`, and gets
 started for a center. On Linux an agent cannot change its own policy through
 the socket, nor install, set up, update or remove the node.
 
-Windows has no control socket and no sandbox. The CLI signs `node.toml` itself,
-so a command the node runs for a center can change the policy. The change
-applies at the next start.
+Windows has no control socket. It has a control pipe with the same lines,
+which serves `status`, `folder.add`, `folder.set` and `folder.rm` only
+([node-local.md §5](spec/node-local.md#5-control-socket)). For every other
+change the CLI signs `node.toml` itself, and the change applies at the next
+start.
 
 ## The log level
 

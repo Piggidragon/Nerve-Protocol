@@ -104,5 +104,5 @@ A command returns at most 1 MiB of stdout and 1 MiB of stderr. The result has
 ## A change did not apply
 
 If a command says `takes effect at the next start of the node`, no node was
-running to take it. Start `nerve-node run`. On Windows a running node always
-takes changes at its next start.
+running to take it. Start `nerve-node run`. On Windows a running node takes
+only folder changes at once; every other change it takes at its next start.

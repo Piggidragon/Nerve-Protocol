@@ -122,7 +122,14 @@ pub fn record_file(paths: &NodePaths) -> PathBuf {
 /// pairing, also of the same center or under the same name, must not find
 /// them. A name of 30 characters of `[a-z0-9.]`, within Windows' 64.
 pub fn container(paths: &NodePaths, node_id: &str) -> String {
-    let seed = format!("{}\n{node_id}", paths.state_dir.display());
+    container_at(&paths.state_dir.display().to_string(), node_id)
+}
+
+/// [`container`] for the state folder spelled `state`. The name hashes the
+/// spelling, not the folder: the default folder is `…\.local/state/nerve`
+/// to the node and `…\.local\state\nerve` to whoever types it.
+fn container_at(state: &str, node_id: &str) -> String {
+    let seed = format!("{state}\n{node_id}");
     let d = ring::digest::digest(&ring::digest::SHA256, seed.as_bytes());
     let hex: String = d.as_ref()[..12]
         .iter()
@@ -202,6 +209,8 @@ pub struct Synced {
     pub emptied: Vec<String>,
     /// How many grants were taken off.
     pub removed: usize,
+    /// The containers' profiles a cleanup removed or left ([`remove_all`]).
+    pub profiles: Profiles,
 }
 
 impl Synced {
@@ -1043,6 +1052,8 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
 /// Nothing to do where commands are not confined by grants (Linux).
 /// `report` is told how far a change is once it takes long (`Pace`): it
 /// passes down to every file and folder below the folder that it changes.
+/// For the node itself, which holds the lock that [`apply_outside`] looks
+/// at.
 pub fn apply(
     paths: &NodePaths,
     cfg: &NodeConfig,
@@ -1062,28 +1073,291 @@ pub fn apply(
     }
 }
 
+/// [`apply`] by the CLI (`report` as there): the profile of a container left without grants
+/// stays while the node runs, as its commands may still use it, and
+/// [`Synced::profiles`] says which went and which stayed.
+pub fn apply_outside(
+    paths: &NodePaths,
+    cfg: &NodeConfig,
+    home: &Path,
+    report: &mut dyn FnMut(&str),
+) -> Synced {
+    #[cfg(windows)]
+    {
+        let installed = crate::service::is_service_node(paths);
+        let want = wanted_on(installed, cfg, paths, home, &crate::paths::platform());
+        sync_outside_in(paths, &want, &mut Acls { report }, &mut WinProfiles)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (paths, cfg, home, report);
+        Synced::default()
+    }
+}
+
+/// [`apply_outside`] for `want`, on `folders` and the profiles in `store`.
+#[cfg(any(windows, test))]
+fn sync_outside_in(
+    paths: &NodePaths,
+    want: &[Grant],
+    folders: &mut impl Folders,
+    store: &mut impl ProfileStore,
+) -> Synced {
+    let mut s = sync(&record_file(paths), want, folders);
+    let p = drop_profiles(paths, &s.emptied, store);
+    s.errors.extend(p.errors.iter().cloned());
+    s.profiles = p;
+    s
+}
+
+/// The ids of the pairings in the config at `paths`, which name the
+/// profiles of their containers ([`container`]) also when the state folder,
+/// and the record of the grants in it, is gone. The file is read without
+/// its MAC: the key is in the state folder or the keyring, which may be
+/// gone too, and an id read here only leads to a container of this node.
+/// A missing file names none.
+pub fn node_ids(paths: &NodePaths) -> Result<Vec<String>, String> {
+    // Only the ids: a config that fails a check of its own still names its
+    // pairings.
+    #[derive(Deserialize)]
+    struct Config {
+        #[serde(default, rename = "center")]
+        centers: Vec<Pairing>,
+    }
+    #[derive(Deserialize)]
+    struct Pairing {
+        node_id: String,
+    }
+    let file = paths.config_file();
+    let text = match std::fs::read_to_string(&file) {
+        Ok(t) => t,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("{}: {e}", file.display())),
+    };
+    let c: Config = toml::from_str(&text).map_err(|e| format!("{}: {e}", file.display()))?;
+    Ok(c.centers.into_iter().map(|p| p.node_id).collect())
+}
+
+/// The ways a Windows path is spelled with `\` and `/` that `Path` takes for
+/// the same folder and that the node itself makes: as given, all `\`, and
+/// each `\` prefix with `/` after it, as a folder joined with `a/b/c` reads
+/// (the default state folder is one). Each is one path, so a container
+/// found by any of them is this node's.
+fn spellings(path: &str) -> Vec<String> {
+    let seps: Vec<usize> = path
+        .char_indices()
+        .filter(|&(_, c)| c == '\\' || c == '/')
+        .map(|(i, _)| i)
+        .collect();
+    let mut all = vec![path.to_string()];
+    for k in 0..=seps.len() {
+        let mut s = path.to_string();
+        // Both separators are one byte, so the offsets hold.
+        for (n, &i) in seps.iter().enumerate() {
+            let sep = if n < k { "\\" } else { "/" };
+            s.replace_range(i..i + 1, sep);
+        }
+        all.push(s);
+    }
+    let mut seen = Vec::new();
+    all.retain(|s| {
+        let new = !seen.contains(s);
+        seen.push(s.clone());
+        new
+    });
+    all
+}
+
+/// The names the container of the pairing `node_id` may have on the node at
+/// `paths`: [`container`], and on Windows those of the other spellings of
+/// its state folder ([`spellings`]), for a folder named otherwise than the
+/// node named it.
+pub fn containers(paths: &NodePaths, node_id: &str) -> Vec<String> {
+    let state = paths.state_dir.display().to_string();
+    let all = if cfg!(windows) {
+        spellings(&state)
+    } else {
+        vec![state]
+    };
+    all.iter().map(|s| container_at(s, node_id)).collect()
+}
+
+/// The name of the container of the pairing `node_id` whose profile this
+/// account has, of [`containers`]; [`container`] when it has none. So the
+/// owner tells the profiles of the nodes they keep from leftovers
+/// (`center ls`).
+pub fn profile_name(paths: &NodePaths, node_id: &str) -> String {
+    #[cfg(windows)]
+    {
+        profile_in(paths, node_id, &mut WinProfiles)
+    }
+    #[cfg(not(windows))]
+    {
+        container(paths, node_id)
+    }
+}
+
+/// [`profile_name`] with the profiles in `store`.
+#[cfg(any(windows, test))]
+fn profile_in(paths: &NodePaths, node_id: &str, store: &mut impl ProfileStore) -> String {
+    let all = containers(paths, node_id);
+    all.iter()
+        .find(|n| store.exists(n))
+        .unwrap_or(&all[0])
+        .clone()
+}
+
+/// The profiles of AppContainers this account has: on Windows a folder
+/// below `%LOCALAPPDATA%\Packages` and a registry key; in the tests a fake.
+pub trait ProfileStore {
+    fn exists(&mut self, name: &str) -> bool;
+    /// Removes the profile `name`; one that is not there is fine.
+    fn remove(&mut self, name: &str) -> io::Result<()>;
+}
+
+/// The profiles of this account on Windows.
+#[cfg(windows)]
+pub struct WinProfiles;
+
+#[cfg(windows)]
+impl ProfileStore for WinProfiles {
+    // Windows answers the removal of a missing profile as done, so whether
+    // one was there is its folder's.
+    fn exists(&mut self, name: &str) -> bool {
+        std::env::var_os("LOCALAPPDATA")
+            .is_some_and(|d| Path::new(&d).join("Packages").join(name).is_dir())
+    }
+    fn remove(&mut self, name: &str) -> io::Result<()> {
+        nerve_sandbox::appcontainer::remove_profile(name)
+    }
+}
+
+/// What became of the profiles of a node's containers.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Profiles {
+    /// Those removed.
+    pub removed: Vec<String>,
+    /// Those left because their node may run ([`Profiles::why`]): its
+    /// commands use them.
+    pub kept: Vec<String>,
+    pub why: Option<String>,
+    pub errors: Vec<String>,
+}
+
+impl Profiles {
+    /// Adds what `other` did, each profile once.
+    pub fn merge(&mut self, other: Profiles) {
+        for (to, from) in [
+            (&mut self.removed, other.removed),
+            (&mut self.kept, other.kept),
+            (&mut self.errors, other.errors),
+        ] {
+            for n in from {
+                if !to.contains(&n) {
+                    to.push(n);
+                }
+            }
+        }
+        self.why = self.why.take().or(other.why);
+    }
+}
+
+/// Keeps the node at `paths` from starting while its profiles go: the lock
+/// a running node holds for its life ([`crate::secrets::KeysLock`]). Why
+/// its profiles must stay instead: it runs, or that cannot be told. A node
+/// without a state folder does not run, and none is made to look.
+#[cfg(any(windows, test))]
+fn hold(paths: &NodePaths) -> Result<Option<crate::secrets::KeysLock>, String> {
+    if !paths.state_dir.is_dir() {
+        return Ok(None);
+    }
+    match crate::secrets::KeysLock::try_take(paths) {
+        Ok(Some(l)) => Ok(Some(l)),
+        Ok(None) => Err(format!("the node at {} runs", paths.state_dir.display())),
+        Err(e) => Err(format!("whether the node runs is not known: {e}")),
+    }
+}
+
+/// Removes the profiles `names` of the node at `paths` from `store`, unless
+/// that node runs.
+#[cfg(any(windows, test))]
+fn drop_profiles(paths: &NodePaths, names: &[String], store: &mut impl ProfileStore) -> Profiles {
+    let mut p = Profiles::default();
+    let there: Vec<String> = names.iter().filter(|n| store.exists(n)).cloned().collect();
+    let _held = match hold(paths) {
+        Ok(h) => h,
+        Err(why) => {
+            p.kept = there;
+            p.why = (!p.kept.is_empty()).then_some(why);
+            return p;
+        }
+    };
+    for n in names {
+        // Also where its folder is gone: the registry key may not be.
+        match store.remove(n) {
+            Ok(()) if there.contains(n) => p.removed.push(n.clone()),
+            Ok(()) => {}
+            Err(e) => p.errors.push(e.to_string()),
+        }
+    }
+    p
+}
+
+/// Removes the profile of the container of the pairing `node_id`, which
+/// goes with the pairing: the record of the grants names a container only
+/// while it has grants, and is lost with the state folder. Kept while the
+/// node runs, since it still serves the pairing until it starts again.
+pub fn forget(paths: &NodePaths, node_id: &str) -> Profiles {
+    #[cfg(windows)]
+    {
+        forget_in(paths, node_id, &mut WinProfiles)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (paths, node_id);
+        Profiles::default()
+    }
+}
+
+/// [`forget`] with the profiles in `store`.
+#[cfg(any(windows, test))]
+fn forget_in(paths: &NodePaths, node_id: &str, store: &mut impl ProfileStore) -> Profiles {
+    drop_profiles(paths, &containers(paths, node_id), store)
+}
+
 /// Takes off every grant the node put on, and the profiles of its
-/// containers: those in the record and those of the pairings `node_ids`.
-/// For uninstall; `report` as for [`apply`].
+/// containers: those in the record and those of the pairings `node_ids`
+/// ([`node_ids`]), which are found without the record. The profiles stay
+/// while the node runs. For uninstall; `report` as for [`apply`].
 pub fn remove_all(paths: &NodePaths, node_ids: &[String], report: &mut dyn FnMut(&str)) -> Synced {
     #[cfg(windows)]
     {
-        let mut s = windows_sync(paths, &[], report);
-        for n in node_ids {
-            let name = container(paths, n);
-            if !s.emptied.contains(&name)
-                && let Err(e) = nerve_sandbox::appcontainer::remove_profile(&name)
-            {
-                s.errors.push(e.to_string());
-            }
-        }
-        s
+        remove_all_in(paths, node_ids, &mut Acls { report }, &mut WinProfiles)
     }
     #[cfg(not(windows))]
     {
         let _ = (paths, node_ids, report);
         Synced::default()
     }
+}
+
+/// [`remove_all`] on `folders` and the profiles in `store`.
+#[cfg(any(windows, test))]
+fn remove_all_in(
+    paths: &NodePaths,
+    node_ids: &[String],
+    folders: &mut impl Folders,
+    store: &mut impl ProfileStore,
+) -> Synced {
+    let mut s = sync(&record_file(paths), &[], folders);
+    let mut names = s.emptied.clone();
+    names.extend(node_ids.iter().flat_map(|n| containers(paths, n)));
+    names.sort();
+    names.dedup();
+    let p = drop_profiles(paths, &names, store);
+    s.errors.extend(p.errors.iter().cloned());
+    s.profiles = p;
+    s
 }
 
 /// What a change of a grant is doing, as its progress names it.
@@ -2446,6 +2720,213 @@ mod tests {
         let a = grant("c1", "/w/a", "r");
         sync(&file, std::slice::from_ref(&a), &mut f);
         assert_eq!(recorded(&file), [a]);
+    }
+
+    /// The pairings' ids come from the config without its MAC key, which
+    /// went with the state folder, and so do the names of their containers;
+    /// a node without a config has none.
+    #[test]
+    fn the_pairings_are_found_without_the_state_folder() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("config"), d.path().join("state"));
+        assert_eq!(node_ids(&paths).unwrap(), Vec::<String>::new());
+        let mut store = nerve_policy::SettingsStore::open(
+            paths.config_file(),
+            paths.config_key(),
+            nerve_policy::audit::AuditLog::new(paths.audit_log()),
+        )
+        .unwrap();
+        store
+            .update(|c| {
+                for name in ["lab", "home"] {
+                    c.centers.push(nerve_policy::CenterEntry {
+                        url: "https://center.example".into(),
+                        ..center(name, &[])
+                    });
+                }
+                Ok(())
+            })
+            .unwrap();
+        drop(store);
+        let names: Vec<String> = [node("lab"), node("home")]
+            .iter()
+            .map(|n| container(&paths, n))
+            .collect();
+        std::fs::remove_dir_all(&paths.state_dir).unwrap();
+        let ids = node_ids(&paths).unwrap();
+        assert_eq!(ids, [node("lab"), node("home")]);
+        let found: Vec<String> = ids.iter().map(|n| container(&paths, n)).collect();
+        assert_eq!(found, names);
+        // Nothing to remove where no container has a profile.
+        assert_eq!(forget(&paths, &node("lab")), Profiles::default());
+        std::fs::write(paths.config_file(), "[[center]]\nnode_id = 1\n").unwrap();
+        assert!(node_ids(&paths).unwrap_err().contains("node.toml"));
+    }
+
+    /// Profiles by name, as an account has them.
+    #[derive(Default)]
+    struct FakeProfiles {
+        there: Vec<String>,
+        removed: Vec<String>,
+    }
+
+    impl ProfileStore for FakeProfiles {
+        fn exists(&mut self, name: &str) -> bool {
+            self.there.iter().any(|n| n == name)
+        }
+        fn remove(&mut self, name: &str) -> io::Result<()> {
+            self.there.retain(|n| n != name);
+            self.removed.push(name.into());
+            Ok(())
+        }
+    }
+
+    /// A Windows path, spelled with `\` and `/` in each way the node makes
+    /// it: the default state folder is the user's folder joined with
+    /// `.local/state/nerve`, which an owner types with `\`.
+    #[test]
+    fn a_state_folder_has_the_spellings_the_node_makes() {
+        let typed = r"C:\Users\u\.local\state\nerve";
+        let all = spellings(typed);
+        assert_eq!(all[0], typed);
+        assert!(all.contains(&r"C:\Users\u\.local/state/nerve".to_string()));
+        assert!(all.contains(&"C:/Users/u/.local/state/nerve".to_string()));
+        assert_eq!(all.len(), 6, "{all:?}");
+        let default = r"C:\Users\u\.local/state/nerve";
+        assert!(spellings(default).contains(&typed.to_string()));
+        assert_eq!(spellings("x"), ["x"]);
+        // The names follow the spelling, and the first is the node's own.
+        assert_ne!(container_at(typed, "n"), container_at(default, "n"));
+        let paths = NodePaths::new("/c", "/s/state");
+        assert_eq!(containers(&paths, "n")[0], container(&paths, "n"));
+        // `center ls` names the one with a profile, else the node's own.
+        let mut store = FakeProfiles::default();
+        assert_eq!(profile_in(&paths, "n", &mut store), container(&paths, "n"));
+        let last = containers(&paths, "n").pop().unwrap();
+        store.there.push(last.clone());
+        assert_eq!(profile_in(&paths, "n", &mut store), last);
+    }
+
+    /// `forget` removes the profile of the pairing's container and says it
+    /// did, but not while the node runs: it still serves the pairing, and
+    /// its commands use the profile.
+    #[test]
+    fn forget_keeps_the_profile_while_the_node_runs() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("config"), d.path().join("state"));
+        let name = container(&paths, &node("lab"));
+        let mut store = FakeProfiles {
+            there: vec![name.clone(), "nerve.other".into()],
+            ..Default::default()
+        };
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        let held = crate::secrets::KeysLock::try_take(&paths).unwrap().unwrap();
+        let p = forget_in(&paths, &node("lab"), &mut store);
+        assert_eq!(p.kept, std::slice::from_ref(&name));
+        assert!(p.why.unwrap().contains("runs"));
+        assert!(p.removed.is_empty() && store.removed.is_empty());
+        drop(held);
+        let p = forget_in(&paths, &node("lab"), &mut store);
+        assert_eq!(p.removed, std::slice::from_ref(&name));
+        assert!(p.kept.is_empty() && p.why.is_none() && p.errors.is_empty());
+        assert_eq!(store.there, ["nerve.other"]);
+        // Nothing there is nothing removed.
+        let p = forget_in(&paths, &node("lab"), &mut store);
+        assert_eq!(p, Profiles::default());
+        // No state folder: no node runs there, and none is made to look.
+        std::fs::remove_dir_all(&paths.state_dir).unwrap();
+        store.there.push(name.clone());
+        assert_eq!(forget_in(&paths, &node("lab"), &mut store).removed, [name]);
+        assert!(!paths.state_dir.exists());
+    }
+
+    /// The CLI's sync (`center rm`, `folder rm`) takes the grants of a
+    /// container off, and its profile only while the node does not run,
+    /// and says which went and which stayed.
+    #[test]
+    fn the_clis_sync_keeps_the_profile_of_an_emptied_container_while_the_node_runs() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("config"), d.path().join("state"));
+        let lab = container(&paths, &node("lab"));
+        let home = container(&paths, &node("home"));
+        let mut f = Fake::default();
+        f.make("/w/a");
+        f.make("/w/b");
+        let a = grant(&lab, "/w/a", "r");
+        let b = grant(&home, "/w/b", "r");
+        let mut store = FakeProfiles {
+            there: vec![lab.clone(), home.clone()],
+            ..Default::default()
+        };
+        let both = [a.clone(), b.clone()];
+        let s = sync_outside_in(&paths, &both, &mut f, &mut store);
+        assert_eq!(s.profiles, Profiles::default());
+        let held = crate::secrets::KeysLock::try_take(&paths).unwrap().unwrap();
+        let s = sync_outside_in(&paths, std::slice::from_ref(&b), &mut f, &mut store);
+        assert_eq!(s.removed, 1);
+        assert_eq!(s.profiles.kept, std::slice::from_ref(&lab));
+        assert!(s.profiles.why.unwrap().contains("runs"));
+        assert!(store.removed.is_empty());
+        drop(held);
+        // With the node stopped, the profile goes with the last grant.
+        sync_outside_in(&paths, &both, &mut f, &mut store);
+        let s = sync_outside_in(&paths, std::slice::from_ref(&b), &mut f, &mut store);
+        assert_eq!(s.profiles.removed, std::slice::from_ref(&lab));
+        assert_eq!(store.there, std::slice::from_ref(&home));
+        assert!(s.errors.is_empty(), "{s:?}");
+    }
+
+    /// What two cleanups did, each profile once.
+    #[test]
+    fn profiles_merge_each_once() {
+        let mut p = Profiles {
+            removed: vec!["a".into()],
+            ..Default::default()
+        };
+        p.merge(Profiles {
+            removed: vec!["a".into(), "b".into()],
+            kept: vec!["c".into()],
+            why: Some("runs".into()),
+            errors: vec!["e".into()],
+        });
+        assert_eq!(p.removed, ["a", "b"]);
+        assert_eq!(p.kept, ["c"]);
+        assert_eq!(p.why.as_deref(), Some("runs"));
+        assert_eq!(p.errors, ["e"]);
+    }
+
+    /// `remove_all` takes the grants off and removes the profiles of the
+    /// recorded containers and of the pairings; while the node runs the
+    /// profiles stay.
+    #[test]
+    fn remove_all_removes_the_profiles_unless_the_node_runs() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("config"), d.path().join("state"));
+        let lab = container(&paths, &node("lab"));
+        let home = container(&paths, &node("home"));
+        let mut f = Fake::default();
+        f.make("/w/a");
+        sync(&record_file(&paths), &[grant(&lab, "/w/a", "r")], &mut f);
+        let ids = [node("lab"), node("home")];
+        let held = crate::secrets::KeysLock::try_take(&paths).unwrap().unwrap();
+        let mut store = FakeProfiles {
+            there: vec![lab.clone(), home.clone()],
+            ..Default::default()
+        };
+        let s = remove_all_in(&paths, &ids, &mut f, &mut store);
+        assert_eq!(s.removed, 1);
+        let mut kept = s.profiles.kept.clone();
+        kept.sort();
+        let mut both = vec![lab.clone(), home.clone()];
+        both.sort();
+        assert_eq!(kept, both);
+        assert!(store.removed.is_empty());
+        drop(held);
+        let s = remove_all_in(&paths, &ids, &mut f, &mut store);
+        let mut removed = s.profiles.removed.clone();
+        removed.sort();
+        assert_eq!(removed, both);
+        assert!(store.there.is_empty() && s.errors.is_empty(), "{s:?}");
     }
 
     /// Each grant is in the record before it goes on, and stays in it when

@@ -429,7 +429,10 @@ mod tests {
     }
 
     /// With the keys in the keyring, the session bus and GNOME Keyring's folder
-    /// are the node's own too.
+    /// are the node's own too. Unix only: the places are Linux's (the daemon
+    /// asks for them on Linux alone), and the paths here are Unix paths, which
+    /// are not absolute on Windows.
+    #[cfg(unix)]
     #[test]
     fn the_keyring_places_are_the_session_bus_and_the_keyring_folder() {
         let env = |k: &str| {

@@ -18,7 +18,8 @@ landlock.workspace = true
 # The AppContainer a Windows command runs in, and the grants on its folders
 # (Storage_FileSystem finds a granted folder again by its file ID; the Wdk
 # parts and System_IO open what is in a folder through the folder's handle,
-# as a grant passes down).
+# as a grant passes down). Console lets the shim outlast the Ctrl+C that asks
+# its command to end.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     "Wdk_Foundation",
@@ -28,6 +29,7 @@ windows-sys = { workspace = true, features = [
     "Win32_Security_Authorization",
     "Win32_Security_Isolation",
     "Win32_Storage_FileSystem",
+    "Win32_System_Console",
     "Win32_System_IO",
     "Win32_System_Threading",
 ] }

@@ -378,7 +378,8 @@ wire they travel as `/c/Users/...` on Windows (protocol §7.2).
 `exec.run` runs its command line with `machine.shell`: `/bin/sh -c`, on
 Windows `powershell.exe -NoProfile -Command` (Windows PowerShell 5.1: `;`
 chains commands, `&` does not); the action's text in the descriptor names the
-shell. Output that is not UTF-8 is read in the console code page (Windows).
+shell. Output that is not UTF-8 is read in the OEM code page (Windows), which
+the command's own console starts with.
 A command is killed with its process group when its call ends: on
 `timeout_ms`, `cancel`, `session.end` of the session that started it, a
 dropped link, and when the call returns. Windows has no process groups:
@@ -395,6 +396,27 @@ child and not in the job. Only when Windows makes no job at all does the node
 fall back to recording the processes below the shell every 25 ms, best
 effort. A Job Object does not restrict file access: it is no confinement
 (see folder mode below).
+
+Windows has no signals either. Each command gets a console of its own,
+without a window (`CREATE_NO_WINDOW`), never the node's. On `timeout_ms`
+and on `exec.signal` with `term` or `int` the node first asks the command to
+end: a helper, `nerve-node __exec-stop`, sends Ctrl+C to the console of each
+process in the job that still runs (but never to a console the node is on)
+and posts `WM_CLOSE` to their visible top-level windows on its desktop. The
+node holds those processes open while the helper runs, so their pids name no
+other process. The job is ended 3 seconds later, or at once when nothing was
+asked; a timeout's result waits for that. `kill`, `cancel`, `session.end`, a
+dropped link and the call's return end the job at once. A command of another
+account (installed node) is asked by a helper started with that account's
+token. The helper runs in the command's job, so it is ended with the
+command and the control pipe refuses it. A command has one stop at a time:
+`term` or `int` while one runs does nothing more. A command without a job
+(the walk) is not asked. A process started
+with Ctrl+C ignored (`start /b` in cmd, a new process group) does not hear
+it. Whether a process ignores Ctrl+C passes on to the processes it starts,
+so the node stops ignoring it before it starts its first command; a node
+started with it ignored (over ssh, by `start /b`) hears Ctrl+C on its own
+console from then on.
 
 ### Proxy
 

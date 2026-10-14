@@ -37,9 +37,11 @@ libc.workspace = true
 # DACL (Authorization), the stored password (Cryptography), and starting a
 # command as another account (Pipes, Environment, Storage_FileSystem).
 # Registry reads an account's profile folder and hides `nerve` from the
-# sign-in screen; Console reads a password without echo; WindowsProgramming
-# names the account that runs a command. EventLog writes the installed
-# node's start, stop and failures to the Windows Event Log.
+# sign-in screen; Console reads a password without echo and sends a stopped
+# command Ctrl+C; WindowsProgramming names the account that runs a command.
+# EventLog writes the installed node's start, stop and failures to the
+# Windows Event Log. WindowsAndMessaging asks a stopped command's windows to
+# close.
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_NetworkManagement_NetManagement",
@@ -59,6 +61,7 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
     "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [dev-dependencies]

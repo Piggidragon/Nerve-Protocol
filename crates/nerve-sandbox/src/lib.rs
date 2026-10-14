@@ -363,9 +363,23 @@ mod imp {
     use super::{SHIM_FAILED, ShimSpec};
     use std::process::{Command, Stdio};
 
+    /// Takes Ctrl+C and Ctrl+Break as handled, so the shim lives on.
+    unsafe extern "system" fn outlast(event: u32) -> windows_sys::core::BOOL {
+        use windows_sys::Win32::System::Console::{CTRL_BREAK_EVENT, CTRL_C_EVENT};
+        (event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT).into()
+    }
+
     pub fn run(spec: ShimSpec) -> i32 {
         if spec.landlock.is_some() {
             return SHIM_FAILED;
+        }
+        // A stop sends Ctrl+C to the command's console, which the shim shares
+        // with the command (nerve-node's win_stop). The shim waits for the
+        // command and passes on its exit code rather than end first. A
+        // handler is not inherited, so the command still hears it.
+        // SAFETY: a handler that only compares its argument.
+        unsafe {
+            windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(outlast), 1);
         }
         // The node runs the shim in a job object of the command's own, which
         // holds this process and what it starts, the container's processes

@@ -10,6 +10,14 @@ fn main() {
     {
         std::process::exit(nerve_sandbox::shim_main());
     }
+    // So is the helper that asks a stopped command's processes to end on
+    // Windows (nerve_node::win_stop).
+    #[cfg(windows)]
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(nerve_node::win_stop::STOP_ARG))
+    {
+        std::process::exit(nerve_node::win_stop::helper_main());
+    }
     // So is the keyring probe that setup and install start
     // (docs/user/config.md): it answers whether the system keyring of the
     // user it runs as works.

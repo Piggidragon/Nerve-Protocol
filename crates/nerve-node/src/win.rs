@@ -16,7 +16,8 @@ use windows_sys::Win32::Security::{
 };
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-    JOBOBJECT_BASIC_PROCESS_ID_LIST, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+    JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_BASIC_PROCESS_ID_LIST,
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicAccountingInformation,
     JobObjectBasicProcessIdList, JobObjectExtendedLimitInformation, QueryInformationJobObject,
     SetInformationJobObject, TerminateJobObject,
 };
@@ -88,7 +89,6 @@ unsafe extern "system" {
     fn GetExitCodeProcess(process: Handle, code: *mut u32) -> i32;
     fn TerminateProcess(process: Handle, code: u32) -> i32;
     fn CloseHandle(handle: Handle) -> i32;
-    fn GetConsoleOutputCP() -> u32;
     fn GetOEMCP() -> u32;
     fn MultiByteToWideChar(
         code_page: u32,
@@ -313,7 +313,47 @@ impl Job {
         // SAFETY: the job is open.
         unsafe { TerminateJobObject(self.0, 1) != 0 }
     }
+
+    /// How many processes in the job still run; `None` when Windows cannot
+    /// say.
+    pub fn active(&self) -> Option<u32> {
+        let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+        // SAFETY: the job is open and the structure is the one this class
+        // fills, with its size.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self.0,
+                JobObjectBasicAccountingInformation,
+                (&raw mut info).cast(),
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        } != 0;
+        ok.then_some(info.ActiveProcesses)
+    }
+
+    /// The pids of the processes in the job now, nested jobs' included; at
+    /// most [`MAX_JOB_PIDS`], none when Windows cannot say. A pid may name
+    /// another process as soon as its process exits: the caller opens it
+    /// and checks [`Job::holds`] before it trusts it.
+    pub fn pids(&self) -> Vec<u32> {
+        let mut pids = process_ids(self.0).unwrap_or_default();
+        pids.truncate(MAX_JOB_PIDS);
+        pids
+    }
+
+    /// Whether `process` (a handle with PROCESS_QUERY_LIMITED_INFORMATION)
+    /// is in this job.
+    pub fn holds(&self, process: Handle) -> bool {
+        let mut r = 0;
+        // SAFETY: both handles are open.
+        let ok = unsafe { IsProcessInJob(process, self.0, &mut r) } != 0;
+        ok && r != 0
+    }
 }
+
+/// The most pids [`Job::pids`] reads of one job.
+pub const MAX_JOB_PIDS: usize = 1024;
 
 impl Drop for Job {
     fn drop(&mut self) {
@@ -409,15 +449,12 @@ pub fn is_elevated() -> bool {
     ok == 0 || info.TokenIsElevated != 0
 }
 
-/// The code page a console program started by the node writes in: the
-/// node's console's, or, when the node has none (a service), the OEM code
-/// page a new console gets.
+/// The code page a console program started by the node writes in: the OEM
+/// code page a new console gets. Every command has a console of its own
+/// (crate::job::CONSOLE), also when the node runs in one.
 pub fn console_code_page() -> u32 {
-    // SAFETY: both take no arguments.
-    match unsafe { GetConsoleOutputCP() } {
-        0 => unsafe { GetOEMCP() },
-        cp => cp,
-    }
+    // SAFETY: it takes no arguments.
+    unsafe { GetOEMCP() }
 }
 
 /// `bytes` decoded from code page `cp`; `None` when Windows cannot.

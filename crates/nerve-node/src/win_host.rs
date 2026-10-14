@@ -821,7 +821,8 @@ impl WinSystem for WinHost {
             &program.display().to_string(),
             &["--version".to_string()],
         );
-        let (code, out) = win_user::run_capture(&t, &line, Duration::from_secs(30)).map_err(at)?;
+        let (code, out) =
+            win_user::run_capture(&t, &line, Duration::from_secs(30), None).map_err(at)?;
         if code != 0 {
             return Err(format!("{} --version: exit code {code}", program.display()));
         }
@@ -964,9 +965,41 @@ mod tests {
             &exe.to_string_lossy(),
             &["/D".into(), "/C".into(), "whoami /groups".into()],
         );
-        let (code, out) = win_user::run_capture(&t, &line, Duration::from_secs(30)).unwrap();
+        let (code, out) = win_user::run_capture(&t, &line, Duration::from_secs(30), None).unwrap();
         assert_eq!(code, 0);
         assert!(!out.is_empty());
+    }
+
+    /// A program run in a job, as the helper that asks a command of another
+    /// account to end runs in the command's job (crate::win_stop), is ended
+    /// with that job.
+    #[test]
+    fn a_program_run_in_a_job_ends_with_it() {
+        let exe =
+            std::env::var_os("ComSpec").unwrap_or_else(|| "C:\\Windows\\System32\\cmd.exe".into());
+        let t = win_user::restricted().unwrap();
+        let line = crate::exec::windows_command_line(
+            &exe.to_string_lossy(),
+            &["/D".into(), "/C".into(), "ping -n 60 127.0.0.1".into()],
+        );
+        let job = std::sync::Arc::new(crate::win::Job::new().unwrap());
+        let ender = {
+            let job = job.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(1));
+                job.terminate()
+            })
+        };
+        let t0 = std::time::Instant::now();
+        let r = win_user::run_capture(&t, &line, Duration::from_secs(30), Some(&job));
+        assert!(ender.join().unwrap(), "the job was not ended");
+        let (code, _) = r.unwrap();
+        // TerminateJobObject's exit code.
+        assert_eq!(code, 1);
+        assert!(
+            t0.elapsed() < Duration::from_secs(20),
+            "the program outlived its job"
+        );
     }
 
     /// A batch logon of an administrator holds the Administrators group;

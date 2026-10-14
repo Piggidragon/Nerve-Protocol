@@ -169,19 +169,27 @@ folders.
   gets another program outside the container to do for it, such as a service
   or the task scheduler.
 - A command sets the permissions of a folder or file it makes, as every
-  Windows program may, so it can give them an entry of its own: for its
-  pairing's container, or for all AppContainers. The node neither sees nor
-  removes these. They stay when you remove the folder, change its flags,
-  remove the pairing or run `uninstall`, and they count again when that
-  center is paired again with the same state folder. In a folder with `w`
-  but not `r`, a command can make a folder that lets it read what you or
-  another pairing save into it later. So do not save files a pairing must
-  not read into a folder where it may write. After you take `w` off a
-  pairing's folder or remove the pairing, clean the folder:
-  `icacls <folder> /remove *S-1-15-2-… /T` with the SID that `icacls`
-  shows for the entry (all AppContainers are `S-1-15-2-1`), or
-  `icacls <folder> /reset /T`, which also resets permissions of your own
-  below the folder.
+  Windows program may, so it can give them an entry of its own, of three
+  kinds: for its pairing's container (`S-1-15-2-…`), for all AppContainers
+  (`ALL APPLICATION PACKAGES`, `S-1-15-2-1`), or for a capability that
+  every pairing's container has (`S-1-15-3-1`, `-2` and `-3`, which
+  `icacls` shows as `APPLICATION PACKAGE AUTHORITY\Your …`). The node
+  neither sees nor removes these. They stay when you remove the folder,
+  change its flags, remove the pairing or run `uninstall`. An entry for the
+  container counts again when that center is paired again with the same
+  state folder. The other two kinds count at once, for every pairing of the
+  node and for every app on the machine that runs in an AppContainer (for
+  a capability: every such app that has it). In a
+  folder with `w` but not `r`, a command can make a folder that lets it
+  read what you or another pairing save into it later. So do not save
+  files a pairing must not read into a folder where it may write. After you
+  take `w` off a pairing's folder or remove the pairing, clean the folder.
+  Only `icacls <folder> /reset /T` removes all of them with certainty; it
+  also resets permissions of your own below the folder. To keep those,
+  find the entries with
+  `icacls <folder> /T | findstr /C:"S-1-15-" /C:"APPLICATION PACKAGE"` and
+  remove each with `icacls <folder> /remove *<SID> /T`: every `S-1-15-2-…`
+  and `S-1-15-3-…` entry, and `ALL APPLICATION PACKAGES` as `*S-1-15-2-1`.
 - A hard link is one file under two names, and both share one access list.
   When the node grants, changes or moves a folder that commands may write
   in, or a folder that holds one, Windows passes the change to everything

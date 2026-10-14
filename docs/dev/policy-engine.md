@@ -173,8 +173,10 @@ command in an AppContainer, one per center (`nerve_sandbox::appcontainer`):
   its container) down to a file it linked into that folder. Where every container that may
   write there may read too, that entry gives nothing new while the grant
   is on. What stays, here and in general: entries a command put on what it
-  made (for its container's SID or for ALL APPLICATION PACKAGES) are not
-  the node's. `appcontainer::set` rewrites only the granted folder's own
+  made (for its container's SID, for ALL APPLICATION PACKAGES, or for one
+  of the capability SIDs every container is started with, S-1-15-3-1, -2
+  and -3) are not the node's. Those for ALL APPLICATION PACKAGES or a
+  capability count at once for every pairing and every AppContainer app. `appcontainer::set` rewrites only the granted folder's own
   list, so they outlive a take-off, a narrowing, removing the pairing and
   `uninstall` (the SID comes back with the same center and state folder),
   and with `rw` the propagation alone can pass one to a linked owner's file.

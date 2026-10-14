@@ -258,6 +258,50 @@ impl Shared {
         }
     }
 
+    /// Records the folder at `path` of `center` at its real place, judged as
+    /// the account the commands run as (`folder.place`, asked by the CLI
+    /// after `folder add`). The installed node's CLI runs as the node's own
+    /// user, which may not look into that account's home, so it cannot judge
+    /// a folder there; the node looks as the account does, as it does before a
+    /// command. `Ok(false)` when the folder is not its own place for the
+    /// account, or no account is chosen to tell.
+    #[cfg(unix)]
+    pub fn record_place(&self, center: &str, path: &str) -> Result<bool, String> {
+        let cfg = self.config();
+        let entry = cfg
+            .center(center)
+            .ok_or_else(|| format!("no center named {center}"))?;
+        let at = std::path::Path::new(path);
+        let listed = |f: &&nerve_policy::config::Folder| {
+            let f = std::path::Path::new(&f.path);
+            nerve_policy::paths::within(f, at) && nerve_policy::paths::within(at, f)
+        };
+        if entry.policy.folders.iter().find(listed).is_none() {
+            return Err(format!("{path} is not a folder of {center}"));
+        }
+        let Ok(account) = self.command_account(&cfg) else {
+            return Ok(false);
+        };
+        let own = {
+            let _as = crate::link::act_as(account.as_ref()).map_err(|e| e.message)?;
+            nerve_policy::paths::is_own_place(std::path::Path::new(path))
+        };
+        if !own {
+            return Ok(false);
+        }
+        lock(&self.store)
+            .update(|c| {
+                let e = c
+                    .center_mut(center)
+                    .ok_or_else(|| format!("no center named {center}"))?;
+                e.policy.set_placed(path, true);
+                Ok(())
+            })
+            .map_err(|e| e.to_string())?;
+        self.bump();
+        Ok(true)
+    }
+
     pub fn bump(&self) {
         self.changed.send_modify(|v| *v += 1);
         self.tell_confinement(&self.config());
@@ -873,6 +917,7 @@ async fn start_ctl(_shared: Arc<Shared>) -> Result<JoinHandle<()>, String> {
 #[cfg(unix)]
 const MUTATING: &[&str] = &[
     "config.write",
+    "folder.place",
     "config.accept",
     "reload",
     "sudo.on",
@@ -959,6 +1004,15 @@ pub(crate) fn control(
                     Reply::Err(format!("conflict: the config changed (version {current})"))
                 }
                 Err(e) => Reply::Err(e.to_string()),
+            }
+        }
+        "folder.place" => {
+            let (Some(center), Some(path)) = (str_of("center"), str_of("path")) else {
+                return Reply::Err("center and path are needed".into());
+            };
+            match shared.record_place(&center, &path) {
+                Ok(placed) => Reply::Ok(json!({"placed": placed})),
+                Err(e) => Reply::Err(e),
             }
         }
         "config.accept" => {
@@ -1450,6 +1504,71 @@ mod tests {
         assert_eq!(daemon.status()["folder_commands_off"], Value::Null);
         write(&storage(SecretStorage::Keyring));
         assert_eq!(told(), 2);
+        daemon.stop().await;
+    }
+
+    /// `folder.place` records a folder the CLI could not judge itself (the
+    /// installed node's CLI runs as the node's own user, which may not look
+    /// into the account's home): the node looks as the account does, and
+    /// records the folder only when it is its own place there.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_node_records_a_folder_at_its_real_place_when_asked() {
+        use nerve_policy::config::{Access, Folder};
+        use nerve_transport::ctl::Reply;
+        let (d, daemon) = daemon().await;
+        let s = daemon.shared.clone();
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let (work, link) = (root.join("work"), root.join("link"));
+        std::fs::create_dir(&work).unwrap();
+        std::os::unix::fs::symlink(&work, &link).unwrap();
+        let folder = |p: &std::path::Path| Folder {
+            path: p.display().to_string(),
+            access: Access::parse("r").unwrap(),
+        };
+        lock(&s.store)
+            .update(|c| {
+                c.centers.push(nerve_policy::CenterEntry {
+                    name: "home".into(),
+                    url: "https://center.example".into(),
+                    pin: None,
+                    center_id: "c".into(),
+                    node_id: "n".into(),
+                    settings: Default::default(),
+                    paused: false,
+                    revoked: false,
+                    unknown: false,
+                    policy: nerve_policy::CenterPolicy {
+                        folders: vec![folder(&work), folder(&link)],
+                        ..Default::default()
+                    },
+                });
+                Ok(())
+            })
+            .unwrap();
+        let ask = |center: &str, p: &std::path::Path, pid| {
+            let params = json!({"center": center, "path": p.display().to_string()});
+            control(&s, "folder.place", params, pid)
+        };
+        let places = || s.config().centers[0].policy.places.clone();
+        let Reply::Ok(v) = ask("home", &work, None) else {
+            panic!("folder.place failed")
+        };
+        assert_eq!(v["placed"], true);
+        assert_eq!(places(), [work.display().to_string()]);
+        // A folder spelled through a link is not its own place.
+        let Reply::Ok(v) = ask("home", &link, None) else {
+            panic!("folder.place failed")
+        };
+        assert_eq!(v["placed"], false);
+        assert_eq!(places(), [work.display().to_string()]);
+        // Only a folder of the center, and only the owner asks.
+        let other = root.join("other");
+        assert!(matches!(ask("home", &other, None), Reply::Err(e) if e.contains("not a folder")));
+        assert!(matches!(ask("lab", &work, None), Reply::Err(e) if e.contains("no center")));
+        let me = std::process::id();
+        lock(&s.commands).insert(me, "home".into());
+        assert!(matches!(ask("home", &work, Some(me)), Reply::Err(e) if e.starts_with("refused")));
         daemon.stop().await;
     }
 

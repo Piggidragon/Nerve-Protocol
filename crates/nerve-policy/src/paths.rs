@@ -383,6 +383,15 @@ pub fn resolve(path: &Path) -> Result<PathBuf, PathError> {
     Ok(out)
 }
 
+/// Whether the absolute `path` is its own real place: resolving it leads
+/// nowhere else, so no link is on the way. Not so for a path that cannot be
+/// resolved (a folder the caller may not look into, a dangling link). A
+/// folder is recorded as being at its real place only when this holds
+/// (`CenterPolicy::places`).
+pub fn is_own_place(path: &Path) -> bool {
+    resolve(path).is_ok_and(|r| within(&r, path) && within(path, &r))
+}
+
 /// `realpath`, on Windows without the `\\?\` prefix so resolved paths compare with
 /// configured ones.
 fn canonical(p: &Path) -> io::Result<PathBuf> {
@@ -600,5 +609,23 @@ mod unix_tests {
             resolve(&root.join("granted/dangling/y")),
             Err(PathError::DanglingSymlink(_))
         ));
+    }
+
+    /// A folder is recorded at its real place only when resolving it leads
+    /// nowhere else: not through a link, and not when it cannot be resolved.
+    #[test]
+    fn only_a_path_that_is_its_own_place_is_recorded() {
+        let d = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(d.path()).unwrap();
+        fs::create_dir(root.join("work")).unwrap();
+        symlink(root.join("work"), root.join("link")).unwrap();
+        symlink(root.join("nowhere"), root.join("dangling")).unwrap();
+        assert!(is_own_place(&root.join("work")));
+        // Not there yet: it will be where its path says.
+        assert!(is_own_place(&root.join("work/later")));
+        assert!(!is_own_place(&root.join("link")));
+        assert!(!is_own_place(&root.join("link/later")));
+        assert!(!is_own_place(&root.join("dangling")));
+        assert!(!is_own_place(Path::new("relative/path")));
     }
 }

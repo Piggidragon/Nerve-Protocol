@@ -684,14 +684,15 @@ Methods:
 | `config.read` | | `node.toml` and its `version` |
 | `config.write` | `config`, `if_version` | replaces it when the version matches |
 | `config.accept` | | takes `node.toml` as it is after it was refused, and signs it (§1) |
+| `folder.place` | `center`, `path` | records the listed folder at `path` in `policy.places` when it is its own place, judged as the account commands run as; `{placed}`. The CLI asks it after `folder add` for a folder it could not look into itself (the installed node's CLI runs as `nerve`) |
 | `reload` | | rereads `node.toml`; only a file the node signed is applied (§1) |
 | `sudo.status` | | `{sudo: "on"|"off"}` |
 | `sudo.on` | `password` | checks it with `sudo -v` and turns the switch on (§4) |
 | `sudo.off` | | turns the switch off and drops the password |
 | `owner.check` | | changes nothing; the CLI asks it before `install`, `setup`, `update` and `uninstall` |
 
-`config.write`, `config.accept`, `reload`, `sudo.on`, `sudo.off` and
-`owner.check` are refused from a process that runs below a command the node
+`config.write`, `config.accept`, `folder.place`, `reload`, `sudo.on`,
+`sudo.off` and `owner.check` are refused from a process that runs below a command the node
 started for a center, so on Linux an agent cannot change its own policy
 through the socket, nor install, set up, update or remove the node.
 **Windows has no socket and no sandbox:** the CLI signs node.toml

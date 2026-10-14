@@ -46,6 +46,12 @@ No grant lets a center change:
 A change that touches one of these is refused as a whole, and the refusal names
 the field.
 
+One more field is yours, and a change to it is not refused but dropped: the
+node's record of the folders it recorded at their real place (`places` in the
+policy, see [modes](modes.md#a-folder-keeps-the-place-you-added)). The
+settings document shows it, and a center that saves the document with another
+value there changes nothing; an entry goes only with its folder.
+
 ## Without the grant
 
 Everything is still possible on the machine, with [`nerve-node`](commands.md).

@@ -5,6 +5,8 @@
 //! [`apply_to`]. Both sides check a change the same way, and the config
 //! checks the result ([`NodeConfig::validate`]) wherever it is saved.
 
+use std::path::Path;
+
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -203,12 +205,15 @@ impl FolderChange {
                 given,
                 changes,
             } => {
-                let f = e
+                let Some(i) = e
                     .policy
                     .folders
-                    .iter_mut()
-                    .find(|f| f.path == *path || f.path == *given)
-                    .ok_or_else(|| format!("{path} is not a folder of this center"))?;
+                    .iter()
+                    .position(|f| f.path == *path || f.path == *given)
+                else {
+                    return Err(not_a_folder(path, &e.policy.folders));
+                };
+                let f = &mut e.policy.folders[i];
                 f.access = changes.iter().try_fold(f.access, |a, c| a.change(c))?;
                 Ok(Some(f.access))
             }
@@ -218,7 +223,7 @@ impl FolderChange {
                     .folders
                     .retain(|f| f.path != *path && f.path != *given);
                 if e.policy.folders.len() == before {
-                    return Err(format!("{path} is not a folder of this center"));
+                    return Err(not_a_folder(path, &e.policy.folders));
                 }
                 Ok(None)
             }
@@ -232,6 +237,44 @@ impl FolderChange {
             | FolderChange::Rm { path, .. } => path,
         }
     }
+}
+
+/// The most folders named in the hint when none of them lies beside the path.
+const HINT_MAX: usize = 3;
+
+/// The error for a path no folder of the center has. When the node may not
+/// even look at the path (the installed node's CLI runs as `nerve`, which
+/// cannot read the account's home, so a link there was kept as typed and
+/// not resolved), the folder may be listed under the path the link leads
+/// to: the message names the folders `folder ls` shows that could be it,
+/// the ones beside the path first. The lookup itself stays as it is.
+fn not_a_folder(path: &str, folders: &[Folder]) -> String {
+    let plain = format!("{path} is not a folder of this center");
+    let refused = matches!(
+        std::fs::symlink_metadata(path),
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied
+    );
+    if !refused {
+        return plain;
+    }
+    let parent = Path::new(path).parent();
+    let beside: Vec<&str> = folders
+        .iter()
+        .filter(|f| Path::new(&f.path).parent() == parent)
+        .map(|f| f.path.as_str())
+        .collect();
+    let named = if beside.is_empty() && folders.len() <= HINT_MAX {
+        folders.iter().map(|f| f.path.as_str()).collect()
+    } else {
+        beside
+    };
+    if named.is_empty() {
+        return plain;
+    }
+    format!(
+        "{plain}; this account cannot look into it, so if it is a link, use the path `nerve-node folder ls` shows for the folder: {}",
+        named.join(", ")
+    )
 }
 
 /// The center a per-center command means: the one named, or the only one.
@@ -446,6 +489,77 @@ mod tests {
     }
 
     /// `folder add` takes rights that each start with `+`, and some right.
+    /// A link in a folder the node's account may not look into stays as
+    /// typed, so the folder (kept under the path it leads to) is not found;
+    /// the error names the path `folder ls` shows.
+    #[cfg(unix)]
+    #[test]
+    fn a_path_the_node_cannot_look_into_names_the_listed_folder() {
+        use std::os::unix::fs::PermissionsExt;
+        if nerve_transport::net::euid() == 0 {
+            return; // root looks into every folder
+        }
+        let d = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(d.path()).unwrap().join("home");
+        let proj = home.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let (proj, link) = (
+            proj.display().to_string(),
+            home.join("linkproj").display().to_string(),
+        );
+        let mut cfg = config(&["home"]);
+        let add = FolderChange::Add {
+            path: proj.clone(),
+            access: Access::parse("r").unwrap(),
+        };
+        apply_to(&mut cfg, None, &add).unwrap();
+        let set = FolderChange::Set {
+            path: link.clone(),
+            given: link.clone(),
+            changes: vec!["+w".into()],
+        };
+        let rm = FolderChange::Rm {
+            path: link.clone(),
+            given: link.clone(),
+        };
+        // While the node can look at the path, it is a plain miss.
+        let plain = format!("{link} is not a folder of this center");
+        assert_eq!(apply_to(&mut cfg, None, &set).unwrap_err(), plain);
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let (s, r) = (
+            apply_to(&mut cfg, None, &set),
+            apply_to(&mut cfg, None, &rm),
+        );
+        // The folders beside the path are named; none beside, and no more
+        // than a few in all, every folder is.
+        let other = FolderChange::Add {
+            path: "/srv/a".into(),
+            access: Access::parse("r").unwrap(),
+        };
+        apply_to(&mut cfg, None, &other).unwrap();
+        let beside = apply_to(&mut cfg, None, &set).unwrap_err();
+        let far = format!("{}/elsewhere/link", home.display());
+        let far_set = FolderChange::Set {
+            path: far.clone(),
+            given: far,
+            changes: vec!["+w".into()],
+        };
+        let far_err = apply_to(&mut cfg, None, &far_set).unwrap_err();
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for e in [s.unwrap_err(), r.unwrap_err(), beside] {
+            assert!(e.starts_with(&plain), "{e}");
+            assert!(
+                e.ends_with(&format!(
+                    "`nerve-node folder ls` shows for the folder: {proj}"
+                )),
+                "{e}"
+            );
+        }
+        assert!(far_err.ends_with(&format!("{proj}, /srv/a")), "{far_err}");
+        // Nothing was changed by the refused calls.
+        assert_eq!(cfg.center("home").unwrap().policy.folders.len(), 2);
+    }
+
     #[test]
     fn a_new_folder_names_its_rights() {
         let rights = |r: &[&str]| {

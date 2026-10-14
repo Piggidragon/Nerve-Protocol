@@ -58,6 +58,12 @@ Quote `'=rx'` so zsh leaves it alone. `folder add` on a path that is listed
 already replaces its rights. `folder set` leaves a folder with no rights in
 the list. `folder rm` removes it.
 
+On the installed node the CLI runs as `nerve`, which cannot look into your
+home. A link there (`~/linkproj` to `~/proj`) cannot be followed, so `folder
+set` and `folder rm` find the folder only under the path `folder ls` shows.
+Given the link, they say `is not a folder of this center` and name the
+folders of the center that could be it: use that path.
+
 ## What a command can reach in `folder` mode (Linux)
 
 The node confines commands with Landlock:

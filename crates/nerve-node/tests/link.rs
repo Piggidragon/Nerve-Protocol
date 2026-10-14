@@ -521,6 +521,83 @@ async fn folder_mode_confines_commands_to_their_folders() {
     node.stop().await;
 }
 
+/// Runs `command` in `cwd` as an `exec.run` and answers its result.
+async fn run_in(conn: &mut Conn<TcpStream>, cwd: &Path, command: &str) -> Value {
+    conn.call(
+        "invoke",
+        json!({"cap": "exec", "action": "run",
+               "args": {"command": command, "cwd": cwd.display().to_string()}}),
+        WAIT,
+    )
+    .await
+    .unwrap()
+    .expect("the command runs")
+}
+
+/// A command with `w` on a folder replaces a folder inside it, one with
+/// rights of its own, by a link to a place no folder names (issue #74). The
+/// next command's rules must not grant the nested folder's rights there:
+/// Landlock follows a link in a rule's path, so the command would read and
+/// write the place the link leads to.
+#[tokio::test(flavor = "multi_thread")]
+async fn folder_mode_gives_no_rule_where_a_command_linked_a_nested_folder() {
+    if !nerve_sandbox::Confinement::detect().available() {
+        eprintln!("skipped: Landlock is not available here");
+        return;
+    }
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let home = dir.path().join("home");
+    let (work, docs) = (home.join("work"), home.join("docs"));
+    std::fs::create_dir_all(work.join("bin")).unwrap();
+    std::fs::create_dir_all(&docs).unwrap();
+    let (work, docs) = (
+        std::fs::canonicalize(&work).unwrap(),
+        std::fs::canonicalize(&docs).unwrap(),
+    );
+    let bin = work.join("bin");
+    std::fs::write(bin.join("in-bin.txt"), "bin\n").unwrap();
+    std::fs::write(docs.join("secret.txt"), "secret\n").unwrap();
+    let node = paired_node_with(dir.path(), &center, |p| {
+        p.mode = nerve_policy::Mode::Folder;
+        for (path, access) in [(&work, "rwx"), (&bin, "rwx")] {
+            p.folders.push(nerve_policy::config::Folder {
+                path: path.display().to_string(),
+                access: nerve_policy::config::Access::parse(access).unwrap(),
+            });
+        }
+    })
+    .await;
+    let mut conn = linked(&mut center).await;
+
+    // The folders as they were: `bin` is a folder like the rest.
+    let r = run_in(&mut conn, &work, "cat bin/in-bin.txt").await;
+    assert_eq!(r["exit_code"], 0, "{r}");
+    assert_eq!(r["stdout"], "bin\n", "{r}");
+
+    // The command swaps `bin` for a link to `docs`, which `work` allows.
+    let swap = format!("rm -rf bin && ln -s {} bin", docs.display());
+    let r = run_in(&mut conn, &work, &swap).await;
+    assert_eq!(r["exit_code"], 0, "{r}");
+    assert!(std::fs::symlink_metadata(&bin).unwrap().is_symlink());
+
+    // The next command gets nothing for `docs` from the rights of `bin`.
+    let r = run_in(&mut conn, &work, "cat bin/secret.txt").await;
+    assert_ne!(r["exit_code"], 0, "{r}");
+    assert!(!r["stdout"].as_str().unwrap().contains("secret"), "{r}");
+    let r = run_in(&mut conn, &work, "echo planted > bin/planted.txt").await;
+    assert_ne!(r["exit_code"], 0, "{r}");
+    assert!(!docs.join("planted.txt").exists());
+    // `work` keeps its own rights.
+    let r = run_in(&mut conn, &work, "echo fine > fresh.txt").await;
+    assert_eq!(r["exit_code"], 0, "{r}");
+    assert_eq!(
+        std::fs::read_to_string(work.join("fresh.txt")).unwrap(),
+        "fine\n"
+    );
+    node.stop().await;
+}
+
 /// A folder mode command that started with the keys in files is counted for as
 /// long as its `exec.run` runs: a move of the keys into the keyring is refused
 /// meanwhile and nothing moves, and the count is 0 again once the call

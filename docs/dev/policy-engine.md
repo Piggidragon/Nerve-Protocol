@@ -96,6 +96,16 @@ and, per platform, system files that open the machine.
   place gives nothing. A folder that is, or passes through, a link into a
   protected entry is refused unless the owner's folders release the place it
   leads to.
+- A command with `w` on a folder can replace a folder inside it by a link,
+  and Landlock follows a link in a rule's path. So a folder whose path, taken
+  a link at a time, crosses a link that lies inside a `w` folder of any center
+  is left out of the Landlock rules (`exec::led_away`). A link of the owner's
+  that leads into a `w` folder is followed to its end and judged on the way.
+  Links above the `w` folder, and the `w` folder itself, are the owner's and
+  are followed. Two gaps: only the `w` folders in the config count, so a link
+  made while a folder had `w` is followed again once `w` is taken off (#77),
+  and a command that runs without Landlock (`user` mode, `sudo`, an
+  `allowlist` command) can make a link where no `w` folder is.
 - A folder that holds a protected entry gives a command none of it. Landlock
   cannot deny inside a rule, so the sandbox takes the folder's other entries,
   level by level, down to the protected one.

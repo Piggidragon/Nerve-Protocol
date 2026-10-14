@@ -689,6 +689,20 @@ or root may talk to it. A connection the node cannot take (for want of
 descriptors, memory or epoll watches, or for any other reason of that one
 connection) does not end the socket: the node takes the next one once the
 cause is gone. Only an error that says the listener itself is broken ends it.
+A connection carries one request: the node closes it after the answer (for a
+streaming method, after the last item), closes one that sends no request line
+within 30 s, and serves at most 64 at once; one over that is answered with
+`{"error": "the node does not take connections now; try again"}` and closed.
+
+What a client makes of a connect that fails: only a missing socket (ENOENT)
+and a refused connect (ECONNREFUSED) mean that no node runs, and only then may
+the CLI write `node.toml` itself. A queue that is full (EAGAIN) means a node
+runs and takes no connection now (`the node does not take connections now; try
+again`): the command fails and writes nothing. Any other connect error names
+itself and decides nothing about a node. A call that gets no answer in 90 s
+gives up (`the node did not answer in time; try again`). A caller that maps
+every connect error to "not running" would write the file and report a change
+the running node never got.
 Methods:
 
 | Method | Params | |

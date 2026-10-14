@@ -44,12 +44,15 @@ nerve-node rule rm allow 'git status' --wildcard
 ```
 
 `rule rm` takes the same arguments as `rule add`. It also takes an entry as
-`rule ls` prints it, such as `'exec.run:git *'`.
+`rule ls` prints it, such as `'exec.run:git *'`. When the arguments could mean two entries on the list, `rule rm`
+removes none and tells you the two commands that remove them one after the
+other.
 
 ## Rules for files and other actions
 
-`rule add` writes command rules. For files and other actions, add the rule to
-the policy by name. `lab` is the center's name on this machine (see
+`rule add` writes command rules, and refuses an entry in the pattern form
+(`fs.read:...`, `fs:...`), which would never match as a command. For files and
+other actions, add the rule to the policy by name. `lab` is the center's name on this machine (see
 `nerve-node center ls`).
 
 ```sh

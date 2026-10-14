@@ -879,7 +879,7 @@ impl Secrets for NodeSecrets {
         if !self.locks {
             return Ok(false);
         }
-        self.held = KeysLock::try_take(&self.paths)?;
+        self.held = KeysLock::try_take_soon(&self.paths)?;
         self.defer = self.held.is_none();
         Ok(true)
     }
@@ -918,6 +918,10 @@ pub fn settle(paths: &NodePaths, cfg: &NodeConfig) {
     };
     s.finish(s.gather(cfg, storage));
 }
+
+/// How long [`KeysLock::try_take_soon`] tries: a forked command execs within
+/// milliseconds, even on a loaded machine.
+const FORKED_COPY_WAIT: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// `keys.lock` in the state folder, held by a running node for its life and
 /// by a CLI while it moves the keys: a move never runs while a node reads
@@ -962,6 +966,23 @@ impl KeysLock {
                 Err(e) if e.raw_os_error() == Some(SHARING_VIOLATION) => Ok(None),
                 Err(e) => Err(format!("{}: {e}", path.display())),
             }
+        }
+    }
+
+    /// The lock, trying again for a moment when someone holds it. A process
+    /// that released it a moment ago may have forked a command meanwhile: the
+    /// child holds a copy of the descriptor, and so the lock, until it execs.
+    /// A node or a CLI that holds it for real keeps it far longer.
+    pub fn try_take_soon(paths: &NodePaths) -> Result<Option<KeysLock>, String> {
+        let until = std::time::Instant::now() + FORKED_COPY_WAIT;
+        loop {
+            if let Some(l) = KeysLock::try_take(paths)? {
+                return Ok(Some(l));
+            }
+            if std::time::Instant::now() >= until {
+                return Ok(None);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
 
@@ -1348,7 +1369,7 @@ mod tests {
         paired(&paths, SecretStorage::File, &["home"]);
         // A running node holds the lock: a CLI that writes the file itself
         // (on Windows) leaves it the old copies.
-        let running = KeysLock::try_take(&paths).unwrap().unwrap();
+        let running = KeysLock::try_take_soon(&paths).unwrap().unwrap();
         assert!(KeysLock::try_take(&paths).unwrap().is_none());
         let mut s = windows_cli_store(&paths);
         set_storage(&mut s, SecretStorage::Keyring).unwrap();
@@ -1428,7 +1449,7 @@ mod tests {
     fn a_center_removed_while_a_move_waits_leaves_no_key_behind() {
         let (_d, paths) = node();
         drop(paired(&paths, SecretStorage::Keyring, &["lab"]));
-        let running = KeysLock::try_take(&paths).unwrap().unwrap();
+        let running = KeysLock::try_take_soon(&paths).unwrap().unwrap();
         let mut s = cli_store(&paths);
         set_storage(&mut s, SecretStorage::File).unwrap();
         assert!(paths.keys_moving().exists());
@@ -1490,7 +1511,7 @@ mod tests {
             .map(|f| std::fs::read(f).unwrap())
         };
         let before = files();
-        let running = KeysLock::try_take(&paths).unwrap().unwrap();
+        let running = KeysLock::try_take_soon(&paths).unwrap().unwrap();
         let mut s = cli_store(&paths);
         let asked = store::calls();
         let e = set_storage(&mut s, SecretStorage::Keyring).unwrap_err();
@@ -1507,6 +1528,38 @@ mod tests {
         set_storage(&mut s, SecretStorage::Keyring).unwrap();
         assert!(in_keyring(&paths, Key::Center("home")).is_some());
         assert!(!paths.key_file("home").exists());
+    }
+
+    /// A command that another thread of the process forks holds a copy of
+    /// keys.lock's descriptor until it execs, so a lock released a moment ago
+    /// can look held (#73). The CLI's take must not read that as a node that
+    /// holds it: its writes go on while commands are being started
+    /// (`is_service_node` runs `getent` the way a daemon's start does).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cli_takes_the_lock_while_commands_are_being_forked() {
+        let (_d, paths) = node();
+        drop(paired(&paths, SecretStorage::File, &["home"]));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let forking = {
+            let (paths, stop) = (paths.clone(), stop.clone());
+            std::thread::spawn(move || {
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    crate::service::is_service_node(&paths);
+                }
+            })
+        };
+        let mut s = NodeSecrets::for_cli(&paths);
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut takes = 0;
+        while std::time::Instant::now() < until {
+            assert!(s.begin().unwrap(), "no lock was asked for");
+            assert!(!s.defer, "the lock looked held after {takes} takes");
+            s.end();
+            takes += 1;
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        forking.join().unwrap();
     }
 
     /// A running node does not take in a file that another writer saved
@@ -1551,7 +1604,7 @@ mod tests {
         assert!(!paths.keys_moving().exists());
         assert!(paths.config_key().exists() && paths.key_file("home").exists());
         // The lock went with the move.
-        assert!(KeysLock::try_take(&paths).unwrap().is_some());
+        assert!(KeysLock::try_take_soon(&paths).unwrap().is_some());
         settle(&paths, &read_before);
         assert!(paths.config_key().exists() && paths.key_file("home").exists());
         assert_eq!(in_keyring(&paths, Key::Config), None);
@@ -1585,7 +1638,7 @@ mod tests {
         let (_d, paths) = node();
         paired(&paths, SecretStorage::File, &["home"]);
         // Saved with `keyring`, the old copies left, and no mark of it.
-        let running = KeysLock::try_take(&paths).unwrap().unwrap();
+        let running = KeysLock::try_take_soon(&paths).unwrap().unwrap();
         let mut s = windows_cli_store(&paths);
         set_storage(&mut s, SecretStorage::Keyring).unwrap();
         drop((s, running));

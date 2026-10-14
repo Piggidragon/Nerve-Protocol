@@ -294,7 +294,21 @@ center's local name):
   start without one.
 - PowerShell checks every folder above its working folder, which the
   container may not see, so a PowerShell command starts with a drive `Work:`
-  rooted at its working folder.
+  rooted at its working folder. Functions stand in for `Set-Location` and
+  `Push-Location`: a whole or relative path goes to the Work drive it lies
+  below, or to a new drive `Work2:`, `Work3:`, … rooted at that folder if the
+  command can see it, and otherwise to the cmdlet as a whole path, which
+  fails. Relative paths are resolved there too, since the cmdlet keeps `..`
+  on its drive (`..\app` on `Work:\` is `Work:\app`). A `-Path` loses its
+  escapes first; one with a wildcard has the part before its first wildcard
+  resolved so and keeps the rest, unless that part is `\` or `/` alone, the
+  root of the current drive. The cmdlet runs with `-ErrorAction Continue`, and
+  its errors are written again as the function's under the caller's error
+  action, so `$?` and the exit code stay as the cmdlet sets them
+  (`nerve_sandbox::POWERSHELL_START`). An object piped to them is bound as
+  the cmdlets bind it (its `Path`, or else its `PSPath` as `-LiteralPath`),
+  since their untyped `Path` would take it whole. Other cmdlets still keep
+  `..` on the drive they stand on.
 - The container has the network, as Landlock leaves it, but not the loopback
   address. Its token carries three capabilities, `internetClient`,
   `internetClientServer` and `privateNetworkClientServer`, and nothing else

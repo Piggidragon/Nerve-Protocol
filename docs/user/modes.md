@@ -211,8 +211,19 @@ folders.
   entry, also inside a folder you grant. That folder is granted as its other
   entries instead, as on Linux.
 - PowerShell starts on a drive `Work:` that is the working folder, because the
-  container may not look at the folders above it. Relative paths and native
-  programs work as usual. `cd` to a whole path above the folder does not.
+  container may not look at the folders above it. Whole paths, relative paths
+  below the working folder and native programs work as usual.
+- `cd` and `pushd` to the whole path of a folder the command may see, or with
+  `..` up out of the working folder into one, put PowerShell on a drive of
+  that folder (`Work2:`, `Work3:`, …), and native programs start in the folder
+  itself. These drives open nothing; the container decides what the command
+  reaches. `cd` to a folder the command may not see fails as any other access
+  does, also with `..`: PowerShell stays where it was, `$?` is false, and a
+  command that ends with that `cd` fails.
+- Other commands keep `..` on the drive they stand on: on `Work:\`,
+  `Get-Content ..\README.md` reads the working folder's own `README.md` or
+  fails, but does not read the one above it. Give them a whole path for a
+  folder above the one PowerShell stands in, or `cd` there first.
 - The command has the network, but not `localhost`. It has its own desktop,
   so it cannot reach your windows or clipboard, and Windows gives its
   container a folder of its own for temporary files.

@@ -855,6 +855,13 @@ async fn answer(
     peer: nerve_transport::ctl::Peer,
 ) -> nerve_transport::ctl::Reply {
     if !nerve_transport::ctl::token_ok(token, req.token.as_deref()) {
+        // `install`, `update` and `setup` of 0.0.2 ask `status` without a
+        // token to wait for the restarted node, and put the old program back
+        // when it does not answer `ok`. That a node runs tells nothing the
+        // socket does not.
+        if req.method == "status" {
+            return nerve_transport::ctl::Reply::Ok(json!({"running": true}));
+        }
         return nerve_transport::ctl::Reply::Err(NO_TOKEN.into());
     }
     match req.method.as_str() {
@@ -1477,6 +1484,37 @@ mod tests {
         daemon.stop().await;
     }
 
+    /// What `install`, `update` and `setup` run to wait for the node they
+    /// restarted: with the token, and as 0.0.2 sent it, without. A node that
+    /// does not answer them makes `update` put the old program back.
+    #[tokio::test]
+    async fn the_installers_find_the_node_they_restarted() {
+        use crate::service::System;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (_d, daemon) = daemon().await;
+        let paths = daemon.paths().clone();
+        let p = paths.clone();
+        tokio::task::spawn_blocking(move || crate::service::Host.wait_running(&p))
+            .await
+            .unwrap()
+            .unwrap();
+        // 0.0.2 counts the node as running when the reply holds `"ok"`.
+        let stream = tokio::net::UnixStream::connect(paths.ctl_socket())
+            .await
+            .unwrap();
+        let (r, mut w) = stream.into_split();
+        w.write_all(b"{\"method\":\"status\",\"params\":{}}\n")
+            .await
+            .unwrap();
+        let mut line = String::new();
+        tokio::io::BufReader::new(r)
+            .read_line(&mut line)
+            .await
+            .unwrap();
+        assert!(line.contains("\"ok\""), "{line}");
+        daemon.stop().await;
+    }
+
     /// A process that is no longer below a command (it left the command's
     /// tree, or the command ended) is told from the owner's by the token
     /// in the state folder, which the owner's CLI reads and a sandboxed
@@ -1501,9 +1539,10 @@ mod tests {
         assert_eq!(v["locked"], false);
         // ... a request without it, or with another, is refused for every
         // method, though it comes from the node's own user and below no
-        // command.
-        for given in [None, Some("wrong"), Some(&token[1..]), Some("")] {
-            for method in ["status", "config.read", "config.write", "sudo.status"] {
+        // command. Only `status` is answered, with nothing of the config.
+        let ask = |method: &'static str, given: Option<&'static str>| {
+            let socket = socket.clone();
+            async move {
                 let mut request = json!({"method": method, "params": {}});
                 if let Some(t) = given {
                     request["token"] = t.into();
@@ -1518,10 +1557,17 @@ mod tests {
                     .read_line(&mut line)
                     .await
                     .unwrap();
-                let reply: Value = serde_json::from_str(&line).unwrap();
-                let error = reply["error"].as_str().unwrap_or_default();
-                assert!(error.starts_with("refused"), "{method} {given:?}: {line}");
+                serde_json::from_str::<Value>(&line).unwrap()
             }
+        };
+        for given in [None, Some("wrong"), Some("short"), Some("")] {
+            for method in ["config.read", "config.write", "sudo.status", "owner.check"] {
+                let reply = ask(method, given).await;
+                let error = reply["error"].as_str().unwrap_or_default();
+                assert!(error.starts_with("refused"), "{method} {given:?}: {reply}");
+            }
+            let reply = ask("status", given).await;
+            assert_eq!(reply, json!({"ok": {"running": true}}), "{given:?}");
         }
         // A new start makes a new token, and a stop takes the file away.
         let mut opts = NodeOptions::new(daemon.paths().clone());

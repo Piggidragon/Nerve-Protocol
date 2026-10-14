@@ -82,8 +82,12 @@ command's Landlock rules leave them out, even when a granted folder holds them.
 `<state>/run/ctl.sock`, in a 0700 folder, mode 0600. Only its own user or root
 may talk to it, and only a request that carries the token the node wrote to
 `<state>/run/ctl.token` at its start: the CLI reads it, a `folder` mode command
-cannot, as the state folder is out of its rules. It is the node's only way in
-besides its center links. The client sends one JSON object per line,
+cannot, as the state folder is out of its rules. A request without the token
+gets an answer only to `status`, and only `{"running": true}`. The token is as
+safe as the sandbox: a program a command starts outside it over the user's
+session (`systemd-run --user`) is the user's own and reads the token too, which
+only `machine.user` (commands as another account) keeps out. It is the node's
+only way in besides its center links. The client sends one JSON object per line,
 `{"method", "params", "token"}`, and gets `{"ok": value}` or
 `{"error": "text"}`. A streaming method answers with several `{"item": value}`
 lines.

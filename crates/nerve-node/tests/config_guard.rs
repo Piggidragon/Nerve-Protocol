@@ -411,13 +411,16 @@ async fn a_command_cannot_read_the_config_over_the_control_socket() {
     // not stop a connection to the socket (with the keys in files they leave
     // connecting alone), and the command runs as the node's own user. It
     // must get nothing from it.
-    for args in ["center ls", "status"] {
-        let r = run_command(&mut conn, &work, &nerve(&o, args)).await;
-        let shown = format!("{}{}", r["stdout"], r["stderr"]);
-        assert!(!shown.contains(CENTER_SHOWN), "{args}: {r}");
-        assert!(shown.contains("refused"), "{args}: {r}");
-        assert_ne!(r["exit_code"], 0, "{args}: {r}");
-    }
+    let r = run_command(&mut conn, &work, &nerve(&o, "center ls")).await;
+    let shown = format!("{}{}", r["stdout"], r["stderr"]);
+    assert!(!shown.contains(CENTER_SHOWN), "{r}");
+    assert!(shown.contains("refused"), "{r}");
+    assert_ne!(r["exit_code"], 0, "{r}");
+    // `status` is answered without the token, but only that a node runs.
+    let r = run_command(&mut conn, &work, &nerve(&o, "status")).await;
+    let shown = format!("{}{}", r["stdout"], r["stderr"]);
+    assert!(!shown.contains(CENTER_SHOWN), "{r}");
+    assert!(shown.contains("running"), "{r}");
     node.stop().await;
 }
 

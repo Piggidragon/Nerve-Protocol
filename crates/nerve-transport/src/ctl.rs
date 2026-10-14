@@ -265,9 +265,10 @@ mod unix {
         })
     }
 
-    /// The request line a client sends. The token is read after the
-    /// connection is made: a server writes it right after it binds the socket.
-    fn request_line(path: &Path, method: &str, params: Value) -> Value {
+    /// The request a client sends on the socket `path`. The token is read
+    /// after the connection is made: a server writes it right after it binds
+    /// the socket.
+    pub fn request_line(path: &Path, method: &str, params: Value) -> Value {
         let token = std::fs::read_to_string(token_file(path)).ok();
         json!(CtlRequest {
             method: method.to_string(),
@@ -554,4 +555,6 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub use unix::{NOT_RUNNING, Reply, bind, call, follow, serve, serve_on, token_ok, write_token};
+pub use unix::{
+    NOT_RUNNING, Reply, bind, call, follow, request_line, serve, serve_on, token_ok, write_token,
+};

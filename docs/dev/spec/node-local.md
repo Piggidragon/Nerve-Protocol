@@ -669,7 +669,22 @@ out of the tree below its command. So the node makes a token at each start,
 (`{"method", "params", "token"}`). The CLI reads the file and sends it. The
 file lies in the node's own folders, which a `folder` mode command's rules
 leave out, so such a command, and a process it left behind, are refused for
-every method. A connection the node cannot take (for want of
+every method.
+
+The one answer without the token is `status`: `{"ok": {"running": true}}`,
+nothing of the config. `install`, `update` and `setup` of 0.0.2 ask it that
+way to wait for the node they restarted, and `update` puts the old program
+back if it does not answer `ok`; since this version they send the token.
+
+The token holds as far as the sandbox does. A program the command starts
+outside it, over the user's session (`systemd-run --user`, the D-Bus session
+bus), is the user's own process: it reads the token, `node.toml` and the keys
+as the CLI does. Landlock stops a command connecting to those sockets only
+from ABI 9 on, and the node sets no such rule while the keys are in files
+(`exec.rs`). Against a node that runs as the commands' own user, `folder` mode
+is no boundary on such a machine; `machine.user` is.
+
+A connection the node cannot take (for want of
 descriptors, memory or epoll watches, or for any other reason of that one
 connection) does not end the socket: the node takes the next one once the
 cause is gone. Only an error that says the listener itself is broken ends it.

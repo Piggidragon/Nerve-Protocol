@@ -139,7 +139,9 @@ folders.
   are, and a folder whose permissions do not inherit keeps the change out
   of itself and of what is below it. A change that stopped part way (you
   stopped the CLI or the node, or it failed) goes through the whole folder
-  again at the next sync. A change that takes more than a few seconds says
+  again at the next sync; until it is done, the node treats the folder as
+  having the flags it was heading for as well, and where the change is
+  refused, the pairing's commands do not run. A change that takes more than a few seconds says
   how far it is: the CLI prints it, a running node writes it to its log,
   and a command waits for it.
 - `folder rm` and `folder set` change the entry, and removing the pairing

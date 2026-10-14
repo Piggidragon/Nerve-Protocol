@@ -71,9 +71,36 @@ pub struct Grant {
     /// goes into every folder below ([`sync`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unfinished: bool,
+    /// The flags of each change that may have stopped part way since the
+    /// last one that finished: what it wrote below the folder may give
+    /// those, whatever the folder shows. Empty once a change finished.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub toward: Vec<Access>,
 }
 
 impl Grant {
+    /// Every set of flags the grant may give somewhere below its folder:
+    /// its own, and where a change stopped part way, those it was heading
+    /// for.
+    fn states(&self) -> impl Iterator<Item = Access> + '_ {
+        std::iter::once(self.access).chain(self.toward.iter().copied())
+    }
+
+    /// The grant marked as one whose change may stop part way, heading for
+    /// `to` (`None`: taken off, which gives nothing).
+    fn heading(&self, to: Option<Access>) -> Grant {
+        let mut g = Grant {
+            unfinished: true,
+            ..self.clone()
+        };
+        if let Some(a) = to
+            && !g.toward.contains(&a)
+        {
+            g.toward.push(a);
+        }
+        g
+    }
+
     fn same_place(&self, other: &Grant) -> bool {
         self.container == other.container
             && within(&self.path, &other.path)
@@ -131,6 +158,7 @@ pub fn wanted(cfg: &NodeConfig, paths: &NodePaths, home: &Path, platform: &Platf
                     access,
                     id: None,
                     unfinished: false,
+                    toward: Vec::new(),
                 })
         })
         .collect()
@@ -294,17 +322,19 @@ fn write_record(file: &Path, grants: &[Grant]) -> Result<(), String> {
 fn open_to_commands(path: &Path, want: &[Grant], record: &[Grant]) -> bool {
     want.iter()
         .chain(record)
-        .any(|g| g.access.write && within(path, &g.path) && !within(&g.path, path))
+        .any(|g| g.states().any(|a| a.write) && within(path, &g.path) && !within(&g.path, path))
 }
 
 /// Whether commands may write in `path` or below it: a folder a container
-/// may write, by a wanted or a recorded grant, is `path`, holds it, or lies
-/// inside it. A change of its list that Windows passes down then reaches
-/// what commands put there, also through a writable folder below it.
+/// may write, by a wanted or a recorded grant (also by the flags a change
+/// that stopped part way was heading for, [`Grant::states`]), is `path`,
+/// holds it, or lies inside it. A change of its list that Windows passes
+/// down then reaches what commands put there, also through a writable
+/// folder below it.
 fn written_in(path: &Path, want: &[Grant], record: &[Grant]) -> bool {
     want.iter()
         .chain(record)
-        .any(|g| g.access.write && (within(path, &g.path) || within(&g.path, path)))
+        .any(|g| g.states().any(|a| a.write) && (within(path, &g.path) || within(&g.path, path)))
 }
 
 /// Why the list of `path` must not be changed now for `container` and
@@ -529,7 +559,7 @@ fn pass<'a>(
     record: &[Grant],
 ) -> Option<&'a [PathBuf]> {
     let blind = want.iter().chain(record).any(|g| {
-        g.access.write && !g.access.read && (within(dir, &g.path) || within(&g.path, dir))
+        g.states().any(|a| a.write && !a.read) && (within(dir, &g.path) || within(&g.path, dir))
     });
     if blind { None } else { places }
 }
@@ -710,9 +740,13 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
         let marked: Vec<Grant> = record
             .iter()
             .zip(&seen)
-            .map(|(old, s)| Grant {
-                unfinished: old.unfinished || changes(old, s),
-                ..old.clone()
+            .map(|(old, s)| {
+                if changes(old, s) {
+                    let to = want.iter().find(|w| w.same_place(old)).map(|w| w.access);
+                    old.heading(to)
+                } else {
+                    old.clone()
+                }
             })
             .collect();
         if let Err(e) = write_record(file, &marked) {
@@ -800,7 +834,7 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
                 // still holds what was below it under its old path), or write
                 // where it is now, and taking the grant off passes the change
                 // down.
-                let links = if old.access.write
+                let links = if old.states().any(|a| a.write)
                     || written_in(&old.path, want, &record)
                     || written_in(&now, want, &record)
                 {
@@ -843,18 +877,21 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
             }
         }
     }
-    // What was on at a place stays on when its replacement fails: stale
-    // when its flags are not the wanted ones, and unfinished where the
-    // replacement may have stopped part way (`cut`).
+    // What was on at a place stays on when its replacement fails, and
+    // unfinished where the replacement may have stopped part way (`cut`):
+    // stale when any flags it may give below its folder are not the wanted
+    // ones, also those of an earlier change that stopped there.
     let keep_replaced = |w: &Grant, out: &mut Synced, kept: &mut Vec<Grant>, cut: bool| {
         for o in replaced.iter().filter(|o| o.same_place(w)) {
-            if o.access != w.access {
+            let o = if cut {
+                o.heading(Some(w.access))
+            } else {
+                o.clone()
+            };
+            if o.states().any(|a| a != w.access) {
                 out.stale.push(o.clone());
             }
-            kept.push(Grant {
-                unfinished: o.unfinished || cut,
-                ..o.clone()
-            });
+            kept.push(o);
         }
     };
     let todo: Vec<&Grant> = want
@@ -866,9 +903,9 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
     if !todo.is_empty() {
         // Recorded, and marked, before they go on.
         let mut ahead = kept.clone();
-        ahead.extend(replaced.iter().map(|o| Grant {
-            unfinished: true,
-            ..o.clone()
+        ahead.extend(replaced.iter().map(|o| {
+            let to = todo.iter().find(|w| w.same_place(o)).map(|w| w.access);
+            o.heading(to)
         }));
         ahead.extend(
             todo.iter()
@@ -1230,15 +1267,17 @@ mod tests {
             access: Access::parse(access).unwrap(),
             id: None,
             unfinished: false,
+            toward: Vec::new(),
         }
     }
 
     /// A grant as the record holds it, without the object's id and the
-    /// mark of a change that stopped (tested on its own).
+    /// marks of a change that stopped (tested on their own).
     fn plain(g: &Grant) -> Grant {
         Grant {
             id: None,
             unfinished: false,
+            toward: Vec::new(),
             ..g.clone()
         }
     }
@@ -1334,6 +1373,7 @@ mod tests {
                     access: *a,
                     id: None,
                     unfinished: false,
+                    toward: Vec::new(),
                 })
                 .collect();
             all.sort_by(|a, b| a.path.cmp(&b.path));
@@ -2347,13 +2387,19 @@ mod tests {
         assert_eq!(f.on("/w/a"), [("c1".to_string(), r.access)]);
         assert!(marks().iter().all(|m| *m), "{:?}", read_record(&file));
 
+        // The record keeps the flags it was heading for.
+        let record = read_record(&file).unwrap();
+        assert_eq!(record[0].toward, [rw.access], "{record:?}");
+
         // Back to `r`: the folder shows it, and yet the change goes through
-        // every folder below, to take the `rw` the stopped one left there.
+        // every folder below, to take the `rw` the stopped one left there;
+        // and as commands may have written there, it checks for hard links.
         f.cut.clear();
         f.changes.clear();
         let s = sync(&file, std::slice::from_ref(&r), &mut f);
         assert!(s.errors.is_empty() && s.stale.is_empty(), "{s:?}");
-        assert_eq!(f.changes, [(PathBuf::from("/w/a"), false, true)]);
+        assert_eq!(f.changes, [(PathBuf::from("/w/a"), true, true)]);
+        assert!(read_record(&file).unwrap()[0].toward.is_empty());
         assert_eq!(marks(), [false]);
         f.changes.clear();
         sync(&file, std::slice::from_ref(&r), &mut f);
@@ -2373,6 +2419,34 @@ mod tests {
         let s = sync(&file, &[], &mut f);
         assert_eq!(s.stale.len(), 1, "{s:?}");
         assert_eq!(marks(), [true]);
+    }
+
+    /// After a widening to `w` stopped part way, a change back that a hard
+    /// link below refuses leaves the grant stale, so its commands do not
+    /// run: what the stopped change wrote may give them `w`, which the user
+    /// took away. Once the link is gone, the change goes through.
+    #[test]
+    fn a_refused_change_after_a_stopped_widening_is_stale() {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("grants.json");
+        let mut f = Fake::default();
+        f.make("/w/a");
+        let (r, rw) = (grant("c1", "/w/a", "r"), grant("c1", "/w/a", "rw"));
+        sync(&file, std::slice::from_ref(&r), &mut f);
+        f.cut.push("/w/a".into());
+        sync(&file, std::slice::from_ref(&rw), &mut f);
+        f.cut.clear();
+        f.linked.push("/w/a/sub/l".into());
+        let s = sync(&file, std::slice::from_ref(&r), &mut f);
+        assert!(
+            s.errors.len() == 1 && s.errors[0].contains("hard links"),
+            "{s:?}"
+        );
+        assert!(s.refusal("c1").is_some(), "{s:?}");
+        f.linked.clear();
+        let s = sync(&file, std::slice::from_ref(&r), &mut f);
+        assert!(s.errors.is_empty() && s.stale.is_empty(), "{s:?}");
+        assert!(s.refusal("c1").is_none());
     }
 
     /// An error of the kind a refusal has, from a change that stopped part
@@ -2650,6 +2724,7 @@ mod tests {
                 access: Access::ALL,
                 id: None,
                 unfinished: false,
+                toward: Vec::new(),
             }),
             "{want:?}"
         );
@@ -2667,6 +2742,7 @@ mod tests {
                 access: Access::parse("r").unwrap(),
                 id: None,
                 unfinished: false,
+                toward: Vec::new(),
             }]
         );
         // The installed service runs no command in a container, so it
@@ -2741,6 +2817,7 @@ mod tests {
             access: Access::parse(a).unwrap(),
             id: None,
             unfinished: false,
+            toward: Vec::new(),
         };
         let sorted = |mut v: Vec<Grant>| {
             v.sort_by(|a, b| (&a.container, &a.path).cmp(&(&b.container, &b.path)));
@@ -2810,6 +2887,7 @@ mod tests {
             access: Access::parse(a).unwrap(),
             id: None,
             unfinished: false,
+            toward: Vec::new(),
         };
         let sorted = |mut v: Vec<Grant>| {
             v.sort_by(|a, b| a.path.cmp(&b.path));
@@ -2859,6 +2937,7 @@ mod tests {
             access: Access::ALL,
             id: None,
             unfinished: false,
+            toward: Vec::new(),
         }];
         let s = windows_sync(&paths, &want, &mut |_| {});
         assert!(s.errors.is_empty(), "{s:?}");
@@ -3136,6 +3215,7 @@ mod tests {
             access: Access::ALL,
             id: None,
             unfinished: false,
+            toward: Vec::new(),
         }];
         let s = windows_sync(&paths, &want, &mut |_| {});
         assert!(s.errors.is_empty(), "{s:?}");

@@ -187,7 +187,11 @@ center's local name):
   it, so `grants::sync` marks a grant `unfinished` in the record before it
   changes its folder and takes the mark off once the change is done; the
   next change at a marked place goes into every folder (`whole`), also one
-  back to flags the folder still shows. Taking a grant off goes into every
+  back to flags the folder still shows. The mark keeps the flags each
+  stopped change was heading for (`Grant::toward`): until a change there
+  finishes, the place counts as written by those flags too (the hard-link
+  check, `w` without `r` for the pass), and a refused change whose place
+  may give flags other than the wanted ones is stale. Taking a grant off goes into every
   folder all the same, since Windows' own walk, which earlier versions
   used, writes a folder before what is below it. A link or junction gets
   the change on its own list and is not followed. An error names the

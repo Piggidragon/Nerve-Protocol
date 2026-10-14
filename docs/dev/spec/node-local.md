@@ -382,7 +382,8 @@ shell. Output that is not UTF-8 is read in the OEM code page (Windows), which
 the command's own console starts with.
 A command is killed with its process group when its call ends: on
 `timeout_ms`, `cancel`, `session.end` of the session that started it, a
-dropped link, and when the call returns. Windows has no process groups:
+link that ended without being resumed (protocol §4.8), and when the call
+returns. While a dropped link waits for its resume, its commands run on. Windows has no process groups:
 there each command runs in a Job Object of its own. The shell starts
 suspended, is put in the job, and only then runs, so every process it starts
 is in the job, however deep and also when its parent has exited; ending the

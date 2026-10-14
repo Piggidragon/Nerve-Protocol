@@ -21,9 +21,10 @@ use nerve_proto::descriptor::{Detail, Effect, Exposure};
 use nerve_proto::frame::{Frame, FrameError};
 use nerve_proto::link::CenterUrl;
 use nerve_proto::msg::{
-    self, Bye, ByeReason, Cancel, Challenge, Describe, Get, Hello, Invoke, SessionEnd, Topic,
-    Topics, Welcome, method,
+    self, Ack, Bye, ByeReason, Cancel, Challenge, Describe, Get, Hello, Invoke, Resume, Resumed,
+    SessionEnd, Topic, Topics, Welcome, method,
 };
+use nerve_proto::resume;
 use nerve_proto::rpc::{Id, Message, params};
 use nerve_proto::{ErrorCode, PROTOCOL_VERSION, RpcError, limits};
 use nerve_transport::backoff::Backoff;
@@ -47,8 +48,63 @@ const DEAD: Duration = Duration::from_secs(45);
 enum Outcome {
     /// Dial again after the backoff.
     Retry,
+    /// The connection dropped without a bye: dial again, and resume the link
+    /// if the center can.
+    Lost,
     /// Do not dial again until the config says so.
     Stop,
+}
+
+/// A link that dropped without a bye, kept until `until` for the center to
+/// resume (spec §4.8): its calls run on, and what it sends is kept. Dropped,
+/// it ends like a link that cannot resume: its calls end and its commands
+/// are killed.
+struct Parked {
+    link: Option<Arc<Link>>,
+    until: Instant,
+}
+
+impl Parked {
+    fn link(&self) -> &Arc<Link> {
+        self.link.as_ref().expect("a parked link until it is taken")
+    }
+
+    /// The link, to carry on on a new connection.
+    fn resume(mut self) -> Arc<Link> {
+        self.link.take().expect("a parked link until it is taken")
+    }
+}
+
+impl Drop for Parked {
+    fn drop(&mut self) {
+        if let Some(l) = self.link.take() {
+            let n = lock(&l.calls).len();
+            if n > 0 {
+                tracing::warn!(
+                    "center {}: the link was not resumed; ending the {} in flight on it",
+                    l.name,
+                    plural(n, "call")
+                );
+            }
+            l.finish();
+        }
+    }
+}
+
+fn plural(n: usize, what: &str) -> String {
+    if n == 1 {
+        format!("1 {what}")
+    } else {
+        format!("{n} {what}s")
+    }
+}
+
+/// Waits until `t`, or for ever without one.
+async fn until(t: Option<Instant>) {
+    match t {
+        Some(t) => tokio::time::sleep_until(tokio::time::Instant::from_std(t)).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Dials `name` until it is removed, paused, revoked or unknown, or the
@@ -61,6 +117,9 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
     // Dials that failed since the link was last up: the first is a warning,
     // the rest are detail, or a center that is down fills the log.
     let mut failed_dials = 0u32;
+    // The link that dropped, while the center may resume it. Leaving this
+    // function drops it, which ends its calls.
+    let mut parked: Option<Parked> = None;
     loop {
         if *stop.borrow() {
             return;
@@ -105,14 +164,26 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
         cs.set_status("connecting");
         tracing::debug!("center {name}: dialling {url}");
         let started = Instant::now();
-        let dialled = ws::connect(
-            &url,
-            entry.pin.as_deref(),
-            proxy.as_ref(),
-            &key.node_id(),
-            limits::MESSAGE_BYTES as usize,
-        )
-        .await;
+        let dialled = {
+            let node_id = key.node_id();
+            let connect = ws::connect(
+                &url,
+                entry.pin.as_deref(),
+                proxy.as_ref(),
+                &node_id,
+                limits::MESSAGE_BYTES as usize,
+            );
+            tokio::pin!(connect);
+            // A dial that hangs past the grace still ends the parked link's
+            // calls on time.
+            tokio::select! {
+                r = &mut connect => r,
+                _ = until(parked.as_ref().map(|p| p.until)) => {
+                    parked = None;
+                    connect.await
+                }
+            }
+        };
         let outcome = match dialled {
             Err(ConnectError::Unknown) => {
                 tracing::warn!("center {name} does not know this node (401); dialling stopped");
@@ -131,7 +202,9 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
                 Outcome::Retry
             }
             Ok(ws) => {
-                let (outcome, was_up) = session(&shared, &cs, &entry, &key, ws).await;
+                let (outcome, was_up, kept) =
+                    session(&shared, &cs, &entry, &key, ws, parked.take()).await;
+                parked = kept;
                 if was_up {
                     failed_dials = 0;
                 }
@@ -155,6 +228,7 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
         loop {
             tokio::select! {
                 _ = tokio::time::sleep_until(until) => break,
+                _ = self::until(parked.as_ref().map(|p| p.until)) => parked = None,
                 _ = stop.changed() => return,
                 r = changed.changed() => {
                     if r.is_err() {
@@ -282,21 +356,54 @@ where
 
 type WsStream = tokio_tungstenite::WebSocketStream<nerve_transport::net::BoxIo>;
 
-/// One connected link: handshake, then serve until it ends. Also says whether
-/// the handshake came through, so the link was up.
+/// A fresh link id: 16 random bytes as hex (spec §4.8).
+fn new_link_id() -> String {
+    msg::hex(&nerve_transport::keys::random_bytes(16))
+}
+
+/// One connected link: handshake, then serve until it ends. `parked` is the
+/// link that dropped, which this connection offers the center to resume.
+/// Also says whether the handshake came through, so the link was up, and
+/// gives back the link to keep for a resume.
 async fn session(
     shared: &Arc<Shared>,
     cs: &Arc<CenterState>,
     entry: &CenterEntry,
     key: &NodeKey,
     ws: WsStream,
-) -> (Outcome, bool) {
+    parked: Option<Parked>,
+) -> (Outcome, bool, Option<Parked>) {
     let (mut sink, mut stream) = ws.split();
     let cfg = shared.config();
+    let mut parked = parked;
+    let mut offer = Resume {
+        link: new_link_id(),
+        got: 0,
+    };
 
     // Handshake (spec §4.2): challenge → hello → welcome.
     let hello = async {
-        let ch: Challenge = handshake_step(&mut stream, method::CHALLENGE).await?;
+        // The grace may end while the challenge is awaited; the parked
+        // link's calls end on time then.
+        let ch: Challenge = tokio::select! {
+            r = handshake_step(&mut stream, method::CHALLENGE) => r?,
+            _ = until(parked.as_ref().map(|p| p.until)) => {
+                parked = None;
+                handshake_step(&mut stream, method::CHALLENGE).await?
+            }
+        };
+        // A parked link is offered while its grace lasts and it still keeps
+        // every frame the center may not have read; otherwise it ends here.
+        // Once offered, it waits for the center's answer.
+        parked = parked
+            .take()
+            .filter(|p| Instant::now() < p.until && p.link().handle.resumable());
+        if let Some(p) = &parked {
+            offer = Resume {
+                link: p.link().id.clone(),
+                got: p.link().handle.got(),
+            };
+        }
         let nonce = msg::unhex(&ch.nonce).filter(|n| n.len() == 32).ok_or((
             Some(ByeReason::ProtocolError),
             "bad challenge nonce".to_string(),
@@ -320,6 +427,7 @@ async fn session(
             },
             limits: msg::Limits::default(),
             rev,
+            resume: Some(offer.clone()),
         };
         let m = Message::notification(
             method::HELLO,
@@ -335,27 +443,94 @@ async fn session(
                 format!("the center chose version {:?}", w.version),
             ));
         }
-        Ok(())
+        Ok(w.resume)
     }
     .await;
-    if let Err((reason, why)) = hello {
-        tracing::warn!("center {}: the handshake failed: {why}", entry.name);
-        cs.set_status(format!("handshake failed: {why}"));
-        if let Some(r) = reason {
-            let _ = sink.send(bye(r)).await;
+    let resumed = match hello {
+        Ok(r) => r,
+        Err((reason, why)) => {
+            tracing::warn!("center {}: the handshake failed: {why}", entry.name);
+            cs.set_status(format!("handshake failed: {why}"));
+            if let Some(r) = reason {
+                let _ = sink.send(bye(r)).await;
+            }
+            let _ = sink.close().await;
+            // The center did not take the link up: the next dial offers it
+            // again while its grace lasts.
+            return (Outcome::Retry, false, parked);
         }
-        let _ = sink.close().await;
-        return (Outcome::Retry, false);
-    }
-    tracing::info!("linked to center {}", entry.name);
-    cs.set_status("connected");
+    };
 
     // One writer owns the sink; everyone else queues (spec §5.5).
     let (tx, mut rx) = mpsc::channel::<WsMessage>(limits::SEND_QUEUE);
+    // The center carries on the parked link, or starts a new one; without
+    // `welcome.resume` it cannot resume links at all (spec §4.8).
+    let carried = match (resumed, parked) {
+        (Some(Resumed { resumed: true, got }), Some(p)) => {
+            match p.link().handle.attach(tx.clone(), got) {
+                Ok(again) => Ok((p.resume(), Some(again))),
+                Err(e) => Err(format!("the center resumed the link wrongly: {e}")),
+            }
+        }
+        (Some(Resumed { resumed: true, .. }), None) => {
+            Err("the center resumed a link the node did not offer".to_string())
+        }
+        (r, p) => {
+            if p.is_some() {
+                tracing::info!("center {}: the center did not resume the link", entry.name);
+            }
+            // Ends the parked link's calls before the new link is up.
+            drop(p);
+            let handle = Arc::new(LinkHandle::new(tx.clone(), r.is_some()));
+            let link = Arc::new(Link {
+                shared: shared.clone(),
+                cs: cs.clone(),
+                name: entry.name.clone(),
+                id: offer.link.clone(),
+                handle,
+                calls: Mutex::default(),
+                commands: Mutex::default(),
+                last_status: Mutex::new("online"),
+            });
+            Ok((link, None))
+        }
+    };
+    let (link, again) = match carried {
+        Ok(x) => x,
+        Err(why) => {
+            tracing::warn!("center {}: {why}", entry.name);
+            cs.set_status(format!("handshake failed: {why}"));
+            let _ = sink.send(bye(ByeReason::ProtocolError)).await;
+            let _ = sink.close().await;
+            return (Outcome::Retry, false, None);
+        }
+    };
+    match &again {
+        None => tracing::info!("linked to center {}", entry.name),
+        Some(a) => tracing::info!(
+            "link to center {} resumed with {} in flight; {} sent again",
+            entry.name,
+            plural(lock(&link.calls).len(), "call"),
+            plural(a.len(), "frame")
+        ),
+    }
+    let again = again.unwrap_or_default();
+    cs.set_status("connected");
+
     let (done_tx, mut done_rx) = oneshot::channel::<()>();
     // Every frame leaves through here, so the sudo password never does.
     let scrubber = shared.clone();
     let writer = tokio::spawn(async move {
+        // What the center did not read of the link goes first, in order.
+        for t in again {
+            if sink
+                .send(scrub(&scrubber, WsMessage::text(t)))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
         loop {
             tokio::select! {
                 m = rx.recv() => match m {
@@ -376,34 +551,40 @@ async fn session(
         let _ = sink.close().await;
     });
 
-    let handle = Arc::new(LinkHandle::new(tx.clone()));
-    *lock(&cs.link) = Some(handle.clone());
-    let link = Arc::new(Link {
-        shared: shared.clone(),
-        cs: cs.clone(),
-        name: entry.name.clone(),
-        handle,
-        tx,
-        calls: Mutex::default(),
-        commands: Mutex::default(),
-        last_status: Mutex::new("online"),
-    });
+    drop(tx);
+    *lock(&cs.link) = Some(link.handle.clone());
 
     let outcome = link.serve(&mut stream).await;
 
-    // The link is gone (spec §4.5): calls end, commands die with their
-    // process groups.
-    *lock(&cs.link) = None;
-    let calls: Vec<InFlight> = lock(&link.calls).drain().map(|(_, c)| c).collect();
-    for c in calls {
-        c.abort.abort();
-    }
+    // From here what the link sends is kept for a resume (or lost).
+    link.handle.detach();
     let _ = done_tx.send(());
     let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
-    if matches!(outcome, Outcome::Retry) {
-        cs.set_status("link lost; dialling again");
+    if matches!(outcome, Outcome::Lost) && link.handle.resumable() {
+        let n = lock(&link.calls).len();
+        tracing::info!(
+            "center {}: the link dropped; keeping it for {} for the center to resume, with {} in flight",
+            entry.name,
+            span(shared.grace),
+            plural(n, "call")
+        );
+        cs.set_status("link lost; resuming");
+        let parked = Parked {
+            link: Some(link),
+            until: Instant::now() + shared.grace,
+        };
+        return (Outcome::Retry, true, Some(parked));
     }
-    (outcome, true)
+    // The link is gone (spec §4.5): calls end, commands die with their
+    // process groups.
+    link.finish();
+    match outcome {
+        Outcome::Stop => (Outcome::Stop, true, None),
+        _ => {
+            cs.set_status("link lost; dialling again");
+            (Outcome::Retry, true, None)
+        }
+    }
 }
 
 /// A call in flight: its task, and the harness session it came from.
@@ -412,13 +593,15 @@ struct InFlight {
     session: Option<String>,
 }
 
-/// A live link's state shared with its calls.
+/// A link's state shared with its calls. A link the center resumes keeps it
+/// over several connections.
 struct Link {
     shared: Arc<Shared>,
     cs: Arc<CenterState>,
     name: String,
+    /// The id the center knows the link by (spec §4.8).
+    id: String,
     handle: Arc<LinkHandle>,
-    tx: mpsc::Sender<WsMessage>,
     /// Calls in flight; whoever removes an entry sends its reply.
     calls: Mutex<HashMap<Id, InFlight>>,
     /// Running `exec.run` calls → what ends them.
@@ -429,7 +612,23 @@ struct Link {
 
 impl Link {
     async fn send(&self, m: Message) {
-        let _ = self.tx.send(text(&m)).await;
+        self.handle.send(m.encode()).await;
+    }
+
+    /// Ends the link for good: its calls end, and a running command dies
+    /// with its process group.
+    fn finish(&self) {
+        {
+            let mut held = lock(&self.cs.link);
+            if held.as_ref().is_some_and(|h| Arc::ptr_eq(h, &self.handle)) {
+                *held = None;
+            }
+        }
+        self.handle.detach();
+        let calls: Vec<InFlight> = lock(&self.calls).drain().map(|(_, c)| c).collect();
+        for c in calls {
+            c.abort.abort();
+        }
     }
 
     async fn reply(&self, id: Id, r: Result<Value, RpcError>) {
@@ -469,11 +668,34 @@ impl Link {
                     heard = Instant::now();
                     match got {
                         Got::Msg(m) => {
+                            if resume::counted(&m) {
+                                self.handle.read_one();
+                            }
+                            if let Message::Notification { method: am, params: p } = &m
+                                && am == method::ACK
+                            {
+                                // An ack on a link that cannot resume is
+                                // ignored like any unknown notification.
+                                if !self.handle.resumes() {
+                                    continue;
+                                }
+                                let r = params::<Ack>(p)
+                                    .map_err(|e| e.message)
+                                    .and_then(|a| self.handle.acked(a.got));
+                                if let Err(e) = r {
+                                    tracing::warn!("center {}: a wrong ack: {e}", self.name);
+                                    return self.end(ByeReason::ProtocolError, Outcome::Retry).await;
+                                }
+                                continue;
+                            }
                             if let Some(o) = self.message(m).await {
                                 return o;
                             }
                         }
-                        Got::Bad(reply) => self.send(reply).await,
+                        Got::Bad(reply) => {
+                            self.handle.read_one();
+                            self.send(reply).await;
+                        }
                         Got::Binary(b) => {
                             // No blobs or streams flow center → node;
                             // only reserved media frames break the link.
@@ -489,7 +711,7 @@ impl Link {
                         }
                         Got::Closed => {
                             tracing::warn!("center {}: the link closed without a bye", self.name);
-                            return Outcome::Retry;
+                            return Outcome::Lost;
                         }
                     }
                 }
@@ -500,12 +722,14 @@ impl Link {
                             self.name,
                             span(DEAD)
                         );
-                        return Outcome::Retry;
+                        return Outcome::Lost;
                     }
                     if heard.elapsed() >= PING && pinged.elapsed() >= PING {
                         pinged = Instant::now();
-                        let _ = self.tx.try_send(WsMessage::Ping(Default::default()));
+                        self.handle.raw(WsMessage::Ping(Default::default()));
                     }
+                    // Every 5 s at most (resume::ACK_EVERY).
+                    self.handle.send_ack();
                     self.check_rev(&mut rev);
                     self.check_status();
                 }
@@ -580,7 +804,7 @@ impl Link {
             reason.as_str()
         );
         nerve_transport::log::emit(level, None, &why);
-        let _ = self.tx.send(bye(reason)).await;
+        self.handle.raw_send(bye(reason)).await;
         o
     }
 
@@ -675,7 +899,7 @@ impl Link {
         if let Some(c) = c {
             c.abort.abort();
             let e = Message::error(Some(id), RpcError::new(ErrorCode::Cancelled, why));
-            let _ = self.tx.try_send(text(&e));
+            self.handle.try_send(e.encode());
         }
     }
 

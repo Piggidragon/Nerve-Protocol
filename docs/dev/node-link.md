@@ -52,10 +52,31 @@ event `node/going_away {reason}`, so the center can tell "going away" from
 The wait starts at 1 second and doubles up to 60 seconds. Up to 10 % is taken
 off each wait at random. A link that lasted 60 seconds resets the wait.
 
-## No resume
+## Resume
 
-When a link ends, every call in flight on it ends. The center fails them with
-`connection_lost`. The node kills the commands started on that link.
+A link that drops without a bye is kept by both sides for 30 seconds, so an
+address change or a short outage loses no output. Exact rules:
+[spec/protocol.md](spec/protocol.md) §4.8.
+
+- The node names its link in every hello (`resume {link, got}`); a center that
+  can resume answers `welcome.resume {resumed, got}`. Each `got` counts the
+  text frames that side read of the link, `ack` and `bye` aside.
+- Both sides keep what they sent until the other side acknowledges it
+  (`ack {got}`, every 5 seconds at most), up to 16 MiB.
+- While the link is down, its commands run on and their results and events
+  are kept. The center shows the node offline; the calls wait.
+- On the resume each side sends again only what the other side's count shows
+  it never read. A call the node read is never sent again, so nothing runs
+  twice; one it did not read has not run and is sent again.
+- A link not resumed within 30 seconds, one that ended with a bye, and a link
+  with a center or node that cannot resume end at once: the center fails the
+  calls with `connection_lost`, and the node kills the commands started on
+  that link.
+
+The node keeps its side in `LinkHandle` (`crates/nerve-node/src/daemon.rs`)
+and the dropped link in `Parked` (`link.rs`); the center keeps it in its
+`Link` (`crates/nerve-center/src/link.rs`), parked in its links map. The counts
+and the kept frames are `nerve_proto::resume::Replay`, shared by both.
 
 ## HTTP proxy
 

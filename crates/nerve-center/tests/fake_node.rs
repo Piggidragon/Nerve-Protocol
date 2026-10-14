@@ -121,6 +121,15 @@ async fn send(ws: &mut WebSocketStream<BoxIo>, m: Message) {
 
 /// Connects and runs the handshake up to `welcome` (or what came instead).
 async fn handshake(r: &Running, key: &NodeKey) -> (WebSocketStream<BoxIo>, Message) {
+    handshake_with(r, key, json!({})).await
+}
+
+/// [`handshake`] with the fields of `more` added to the hello.
+async fn handshake_with(
+    r: &Running,
+    key: &NodeKey,
+    more: Value,
+) -> (WebSocketStream<BoxIo>, Message) {
     let mut ws = ws::connect(&url(r), None, None, &key.node_id(), MAX)
         .await
         .unwrap();
@@ -131,13 +140,16 @@ async fn handshake(r: &Running, key: &NodeKey) -> (WebSocketStream<BoxIo>, Messa
     let nonce = msg::unhex(params["nonce"].as_str().unwrap()).unwrap();
     let center_id = params["center_id"].as_str().unwrap().to_string();
     assert_eq!(center_id, r.center.id());
-    let hello = json!({
+    let mut hello = json!({
         "node_id": key.node_id(),
         "auth": {"sig": key.sign_connect(&center_id, &nonce)},
         "versions": ["0"],
         "software": {"name": "fake-node", "version": "x.y.z"},
         "rev": 1,
     });
+    for (k, v) in more.as_object().unwrap() {
+        hello[k] = v.clone();
+    }
     send(&mut ws, Message::notification(method::HELLO, hello)).await;
     let next = text(&mut ws).await.expect("a reply to hello");
     (ws, next)
@@ -253,6 +265,9 @@ async fn pair_connect_describe_and_call() {
     };
     assert_eq!(m, method::WELCOME);
     assert_eq!(params["version"], "0");
+    // A node that offers no resume hears nothing of one: an older node
+    // refuses a welcome with fields it does not know.
+    assert!(params.get("resume").is_none(), "{params:?}");
     let mut seen = serve(ws, descriptor(&key, "box-1"));
 
     // The descriptor arrives and becomes tools; settings stays out of them.
@@ -1135,6 +1150,303 @@ async fn an_old_link_that_fails_during_the_ping_is_one_drop() {
         waited(&again.msg) >= Duration::from_secs(2),
         "{}",
         again.msg
+    );
+    r.stop().await;
+}
+
+/// A link id for the resume tests.
+fn link_id(c: char) -> String {
+    c.to_string().repeat(32)
+}
+
+/// The welcome's `resume`.
+fn resume_of(welcome: &Message) -> Value {
+    let Message::Notification { method: m, params } = welcome else {
+        panic!("no welcome: {welcome:?}")
+    };
+    assert_eq!(m, method::WELCOME);
+    params.get("resume").cloned().unwrap_or(Value::Null)
+}
+
+/// The next request the center sends: its id, method and params.
+async fn request(ws: &mut WebSocketStream<BoxIo>) -> (nerve_proto::Id, String, Value) {
+    loop {
+        match text(ws).await.expect("a request") {
+            Message::Request { id, method, params } => {
+                return (id, method, Value::Object(params));
+            }
+            _ => continue,
+        }
+    }
+}
+
+/// A node that offers its link for a resume, has the center's describe
+/// answered and an `exec_run` call in flight, and then loses the connection.
+/// Gives the engine, the running tools/call and the invoke's id.
+async fn a_call_in_flight_on_a_dropped_link(
+    r: &Running,
+    key: &NodeKey,
+) -> (
+    std::sync::Arc<Engine>,
+    tokio::task::JoinHandle<Option<Value>>,
+    nerve_proto::Id,
+) {
+    assert_eq!(pair(r, key, "box-1").await.0, 200);
+    let (mut ws, welcome) =
+        handshake_with(r, key, json!({"resume": {"link": link_id('a'), "got": 0}})).await;
+    assert_eq!(resume_of(&welcome), json!({"resumed": false, "got": 0}));
+    // The center's frame 1, and the node's.
+    let (id, m, _) = request(&mut ws).await;
+    assert_eq!(m, method::DESCRIBE);
+    send(&mut ws, Message::result(id, descriptor(key, "box-1"))).await;
+    let c = r.center.clone();
+    wait_for(|| (!c.tools().is_empty()).then_some(())).await;
+    let e = std::sync::Arc::new(Engine::new(&r.center, "test"));
+    rpc(
+        &e,
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18"}),
+    )
+    .await;
+    let call = tokio::spawn({
+        let e = e.clone();
+        async move {
+            e.handle(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "exec_run", "arguments": {"node": "box-1", "command": "make"}}}))
+                .await
+        }
+    });
+    // The center's frame 2.
+    let (invoke, m, p) = request(&mut ws).await;
+    assert_eq!(m, method::INVOKE);
+    assert_eq!(p["args"]["command"], "make");
+    drop(ws);
+    let node = key.node_id();
+    wait_for(|| c.link(&node).is_none().then_some(())).await;
+    (e, call, invoke)
+}
+
+/// The reply text of a tools/call.
+async fn reply_text(call: tokio::task::JoinHandle<Option<Value>>) -> (String, bool) {
+    let r = tokio::time::timeout(Duration::from_secs(10), call)
+        .await
+        .expect("the call returns")
+        .unwrap()
+        .expect("a reply");
+    (
+        r["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        r["result"]["isError"] == true,
+    )
+}
+
+/// A node that resumes its dropped link (spec §4.8) answers the call that was
+/// in flight, and the harness gets that answer. The node had read the invoke,
+/// so it is not sent again: the first frame on the new connection is the
+/// center's new describe. The center acknowledges what it read.
+#[tokio::test]
+async fn a_node_that_resumes_its_link_answers_the_call_in_flight() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    let key = NodeKey::generate().unwrap();
+    let (_e, call, invoke) = a_call_in_flight_on_a_dropped_link(&r, &key).await;
+    assert!(!call.is_finished(), "the call waits for the resume");
+
+    let (mut ws, welcome) = handshake_with(
+        &r,
+        &key,
+        json!({"resume": {"link": link_id('a'), "got": 2}}),
+    )
+    .await;
+    assert_eq!(resume_of(&welcome), json!({"resumed": true, "got": 1}));
+    let (id, m, _) = request(&mut ws).await;
+    // The center's new describe (its third request), not its first again.
+    assert_eq!(m, method::DESCRIBE, "nothing the node read is sent again");
+    assert_eq!(id, nerve_proto::Id::Num(3), "the first describe came again");
+    send(&mut ws, Message::result(id, descriptor(&key, "box-1"))).await;
+    let out =
+        json!({"exit_code": 0, "stdout": "built after the drop", "stderr": "", "truncated": false});
+    send(&mut ws, Message::result(invoke, out)).await;
+    let (text_out, failed) = reply_text(call).await;
+    assert!(!failed, "{text_out}");
+    assert!(text_out.contains("built after the drop"), "{text_out}");
+
+    // The node's frames 2 and 3 are acknowledged, at most 5 s apart; a tick
+    // between the two acknowledges frame 2 first.
+    let mut last = 1;
+    while last < 3 {
+        match text(&mut ws).await.expect("an ack") {
+            Message::Notification { method: m, params } if m == method::ACK => {
+                let got = params["got"].as_u64().expect("a count");
+                assert!(got > last && got <= 3, "{params:?}");
+                last = got;
+            }
+            _ => continue,
+        }
+    }
+    let c = r.center.clone();
+    let node = key.node_id();
+    wait_for(|| c.link(&node).map(|_| ())).await;
+    r.stop().await;
+}
+
+/// An invoke the node did not read before the drop has not run: the resumed
+/// link sends it again, with the same id, and its answer reaches the harness.
+#[tokio::test]
+async fn a_call_the_node_did_not_read_is_sent_again_on_the_resumed_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    let key = NodeKey::generate().unwrap();
+    let (_e, call, invoke) = a_call_in_flight_on_a_dropped_link(&r, &key).await;
+
+    let (mut ws, welcome) = handshake_with(
+        &r,
+        &key,
+        json!({"resume": {"link": link_id('a'), "got": 1}}),
+    )
+    .await;
+    assert_eq!(resume_of(&welcome), json!({"resumed": true, "got": 1}));
+    let (id, m, p) = request(&mut ws).await;
+    assert_eq!(m, method::INVOKE, "the unread invoke comes first");
+    assert_eq!(id, invoke);
+    assert_eq!(p["args"]["command"], "make");
+    let out = json!({"exit_code": 0, "stdout": "built once", "stderr": "", "truncated": false});
+    send(&mut ws, Message::result(invoke, out)).await;
+    let (text_out, failed) = reply_text(call).await;
+    assert!(!failed, "{text_out}");
+    assert!(text_out.contains("built once"), "{text_out}");
+    r.stop().await;
+}
+
+/// A dropped link that is not resumed within the grace fails its calls with
+/// `connection_lost`, as without resume.
+#[tokio::test]
+async fn a_link_not_resumed_within_the_grace_fails_its_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    r.center.set_resume_grace(Duration::from_millis(300));
+    let key = NodeKey::generate().unwrap();
+    let (_e, call, _) = a_call_in_flight_on_a_dropped_link(&r, &key).await;
+    let (text_out, failed) = reply_text(call).await;
+    assert!(failed, "{text_out}");
+    assert!(text_out.starts_with("error connection_lost"), "{text_out}");
+    // The node coming back now finds nothing to resume.
+    let (_ws, welcome) = handshake_with(
+        &r,
+        &key,
+        json!({"resume": {"link": link_id('a'), "got": 2}}),
+    )
+    .await;
+    assert_eq!(resume_of(&welcome), json!({"resumed": false, "got": 0}));
+    r.stop().await;
+}
+
+/// A node that comes back with another link (it restarted) ends the old one
+/// at once: its calls fail with `connection_lost`.
+#[tokio::test]
+async fn a_node_that_comes_back_with_a_new_link_fails_the_old_calls() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    let key = NodeKey::generate().unwrap();
+    let (_e, call, _) = a_call_in_flight_on_a_dropped_link(&r, &key).await;
+    let (_ws, welcome) = handshake_with(
+        &r,
+        &key,
+        json!({"resume": {"link": link_id('b'), "got": 0}}),
+    )
+    .await;
+    assert_eq!(resume_of(&welcome), json!({"resumed": false, "got": 0}));
+    let (text_out, failed) = reply_text(call).await;
+    assert!(failed, "{text_out}");
+    assert!(text_out.starts_with("error connection_lost"), "{text_out}");
+    r.stop().await;
+}
+
+/// A resume offer whose link id is not 32 hex characters is refused.
+#[tokio::test]
+async fn a_malformed_link_id_is_a_protocol_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    let key = NodeKey::generate().unwrap();
+    assert_eq!(pair(&r, &key, "box-1").await.0, 200);
+    let (_ws, reply) =
+        handshake_with(&r, &key, json!({"resume": {"link": "short", "got": 0}})).await;
+    let Message::Notification { method: m, params } = reply else {
+        panic!("{reply:?}")
+    };
+    assert_eq!(m, method::BYE);
+    assert_eq!(params["reason"], "protocol_error");
+    r.stop().await;
+}
+
+/// A node whose old connection the center still holds (it went quiet without
+/// closing) resumes over it: the held connection does not answer the ping,
+/// so it is replaced, and the link goes on on the new one. A late frame on
+/// the old connection is not the link's any more.
+#[tokio::test]
+async fn a_node_resumes_its_link_over_a_held_connection() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    let key = NodeKey::generate().unwrap();
+    assert_eq!(pair(&r, &key, "box-1").await.0, 200);
+    let (mut old, _) = handshake_with(
+        &r,
+        &key,
+        json!({"resume": {"link": link_id('c'), "got": 0}}),
+    )
+    .await;
+    let (id, _, _) = request(&mut old).await;
+    send(&mut old, Message::result(id, descriptor(&key, "box-1"))).await;
+    let c = r.center.clone();
+    wait_for(|| (!c.tools().is_empty()).then_some(())).await;
+    let e = std::sync::Arc::new(Engine::new(&r.center, "test"));
+    rpc(
+        &e,
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18"}),
+    )
+    .await;
+    let call = tokio::spawn({
+        let e = e.clone();
+        async move {
+            e.handle(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "exec_run", "arguments": {"node": "box-1", "command": "make"}}}))
+                .await
+        }
+    });
+    let (invoke, _, _) = request(&mut old).await;
+
+    // The old connection stays open but is not read: its ping goes
+    // unanswered.
+    let (mut ws, welcome) = handshake_with(
+        &r,
+        &key,
+        json!({"resume": {"link": link_id('c'), "got": 2}}),
+    )
+    .await;
+    assert_eq!(resume_of(&welcome), json!({"resumed": true, "got": 1}));
+    let stale = json!({"exit_code": 0, "stdout": "stale", "stderr": "", "truncated": false});
+    let _ = old
+        .send(WsMessage::text(
+            Message::result(invoke.clone(), stale).encode(),
+        ))
+        .await;
+    let (id, m, _) = request(&mut ws).await;
+    assert_eq!(m, method::DESCRIBE);
+    send(&mut ws, Message::result(id, descriptor(&key, "box-1"))).await;
+    let out = json!({"exit_code": 0, "stdout": "fresh", "stderr": "", "truncated": false});
+    send(&mut ws, Message::result(invoke, out)).await;
+    let (text_out, failed) = reply_text(call).await;
+    assert!(!failed, "{text_out}");
+    assert!(text_out.contains("fresh"), "{text_out}");
+    let node = key.node_id();
+    assert!(
+        c.link(&node).is_some(),
+        "the node is up on the new connection"
     );
     r.stop().await;
 }

@@ -489,6 +489,120 @@ fn a_cancelled_call_and_an_ended_session_stop_their_command() {
     assert!(mcp.finish());
 }
 
+/// A TCP relay between the node and the center whose connections the test
+/// can cut, as an address change does.
+#[cfg(target_os = "linux")]
+struct Relay {
+    port: u16,
+    target: std::sync::Arc<std::sync::Mutex<u16>>,
+    open: std::sync::Arc<std::sync::Mutex<Vec<std::net::TcpStream>>>,
+}
+
+#[cfg(target_os = "linux")]
+impl Relay {
+    fn start() -> Relay {
+        use std::net::{TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let target = std::sync::Arc::new(std::sync::Mutex::new(0u16));
+        let open = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (t, o) = (target.clone(), open.clone());
+        std::thread::spawn(move || {
+            for near in listener.incoming().map_while(Result::ok) {
+                let Ok(far) = TcpStream::connect(("127.0.0.1", *t.lock().unwrap())) else {
+                    continue;
+                };
+                let mut open = o.lock().unwrap();
+                open.push(near.try_clone().unwrap());
+                open.push(far.try_clone().unwrap());
+                for (mut from, mut to) in [
+                    (near.try_clone().unwrap(), far.try_clone().unwrap()),
+                    (far, near),
+                ] {
+                    std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut from, &mut to);
+                        let _ = to.shutdown(std::net::Shutdown::Both);
+                    });
+                }
+            }
+        });
+        Relay { port, target, open }
+    }
+
+    /// Cuts every connection through the relay; new ones still pass.
+    fn cut(&self) {
+        for s in self.open.lock().unwrap().drain(..) {
+            let _ = s.shutdown(std::net::Shutdown::Both);
+        }
+    }
+}
+
+/// The link between the real binaries drops while a command runs (spec
+/// §4.8): both sides keep the link, the node dials again and resumes it,
+/// and the command's output, made while the link was down, reaches the
+/// harness.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_command_survives_a_dropped_link() {
+    let root = tempfile::tempdir().unwrap();
+    let relay = Relay::start();
+    let url = format!("http://127.0.0.1:{}", relay.port);
+    let mut mcp = Mcp::start(
+        &root.path().join("center"),
+        false,
+        &[("NERVE_PUBLIC_URL", &url)],
+    );
+    *relay.target.lock().unwrap() = mcp.node_port;
+    let mut node = Node::new(&root.path().join("node"));
+    node.ok(&["center", "add", &mcp.pair_link(), "--yes"]);
+    node.ok(&["mode", "set", "user"]);
+    node.start();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let tools = loop {
+        let tools = mcp.tools();
+        if tools
+            .iter()
+            .any(|t| t["name"].as_str().is_some_and(|n| n.ends_with("exec_run")))
+        {
+            break tools;
+        }
+        assert!(Instant::now() < deadline, "no exec_run tool: {tools:?}");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let ov = mcp.wait_overview("the node is online", |v| {
+        v["nodes"][0]["online"] == json!(true)
+    });
+    let name = ov["nodes"][0]["name"].as_str().unwrap().to_string();
+    let (run, args) = tool(&tools, "exec", "run", &name);
+    let (started, go) = (node.home.join("started"), node.home.join("go"));
+    let command = format!(
+        "touch {}; while [ ! -e {} ]; do sleep 0.05; done; echo resumed-output",
+        started.display(),
+        go.display()
+    );
+    mcp.send(
+        "run",
+        "tools/call",
+        json!({"name": run, "arguments": with(args, json!({"command": command}))}),
+    );
+    assert!(within(15, || started.exists()), "the command did not start");
+
+    relay.cut();
+    // The command ends while the link is down.
+    std::thread::sleep(Duration::from_millis(200));
+    std::fs::write(&go, "").unwrap();
+    let r = mcp.reply("run", Duration::from_secs(30));
+    let text = r["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_default();
+    assert_ne!(r["result"]["isError"], true, "{r}");
+    assert!(text.contains("resumed-output"), "{r}");
+    mcp.wait_overview("the node is online again", |v| {
+        v["nodes"][0]["online"] == json!(true)
+    });
+    assert!(mcp.finish());
+}
+
 /// The node part of the conformance runner against the real binary.
 #[test]
 fn node_part_passes_against_nerve_node() {

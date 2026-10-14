@@ -78,6 +78,8 @@ pub struct Inner {
     pair_log: Mutex<Quiet>,
     /// How long a link may be silent, in milliseconds.
     dead_after_ms: AtomicU64,
+    /// How long a dropped link waits for its resume, in milliseconds.
+    grace_ms: AtomicU64,
 }
 
 /// A line that may repeat: logged at most once in `QUIET_FOR`, with the count
@@ -256,6 +258,7 @@ impl Center {
             down: Mutex::new(HashMap::new()),
             pair_log: Mutex::new(Quiet::default()),
             dead_after_ms: AtomicU64::new(crate::link::DEAD_AFTER.as_millis() as u64),
+            grace_ms: AtomicU64::new(nerve_proto::resume::GRACE.as_millis() as u64),
         })))
     }
 
@@ -291,6 +294,18 @@ impl Center {
     pub fn set_dead_after(&self, d: Duration) {
         self.dead_after_ms
             .store(d.as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// How long a dropped link waits for the node to resume it (spec §4.8).
+    pub fn grace(&self) -> Duration {
+        Duration::from_millis(self.grace_ms.load(Ordering::Relaxed))
+    }
+
+    /// Shortens the grace, so that a test need not wait 30 s for the calls
+    /// of a link that was not resumed to end.
+    #[doc(hidden)]
+    pub fn set_resume_grace(&self, d: Duration) {
+        self.grace_ms.store(d.as_millis() as u64, Ordering::Relaxed);
     }
 
     /// Whether the `--log` flag was given, so that the level in the settings
@@ -441,7 +456,28 @@ impl Center {
         self.read(|s| s.nodes.contains_key(node_id))
     }
 
+    /// The node's link while it is up.
     pub fn link(&self, node_id: &str) -> Option<Arc<Link>> {
+        self.links
+            .lock()
+            .unwrap()
+            .get(node_id)
+            .filter(|l| l.is_live())
+            .cloned()
+    }
+
+    /// The node's link that dropped and waits for its resume.
+    pub(crate) fn parked(&self, node_id: &str) -> Option<Arc<Link>> {
+        self.links
+            .lock()
+            .unwrap()
+            .get(node_id)
+            .filter(|l| !l.is_closed() && !l.is_live())
+            .cloned()
+    }
+
+    /// The node's link, up or waiting for its resume.
+    fn held(&self, node_id: &str) -> Option<Arc<Link>> {
         self.links
             .lock()
             .unwrap()
@@ -667,6 +703,8 @@ impl Center {
         let link = self.links.lock().unwrap().remove(node_id);
         if let Some(l) = link {
             l.bye(ByeReason::Revoked).await;
+            // A parked link has no connection for the bye; its calls end.
+            l.fail_all();
         }
         self.forget(node_id, "removed by the owner; its link got bye revoked");
         Ok(())
@@ -707,7 +745,8 @@ impl Center {
         self.alerts.lock().unwrap().iter().cloned().collect()
     }
 
-    pub(crate) fn link_up(&self, link: Arc<Link>, hello: &Hello) {
+    /// A link is up; `resumed` when it carries on a link that dropped.
+    pub(crate) fn link_up(&self, link: Arc<Link>, hello: &Hello, resumed: bool) {
         let id = link.node_id.clone();
         self.links.lock().unwrap().insert(id.clone(), link.clone());
         let now = now_ms();
@@ -716,17 +755,30 @@ impl Center {
                 n.last_seen_ms = now;
                 n.going_away = None;
             }
-            s.day(&id, now).links += 1;
+            if !resumed {
+                s.day(&id, now).links += 1;
+            }
         });
-        let again = match self.down.lock().unwrap().remove(&id) {
-            Some(t) => format!(" again after {}", util::span(t.elapsed())),
-            None => String::new(),
+        let gap = self
+            .down
+            .lock()
+            .unwrap()
+            .remove(&id)
+            .map(|t| util::span(t.elapsed()));
+        let line = match (resumed, gap) {
+            (true, gap) => format!(
+                "link resumed{} with {} waiting on it (node software {})",
+                gap.map(|g| format!(" after {g}")).unwrap_or_default(),
+                plural(link.waiting() as u32, "call"),
+                hello.software.version
+            ),
+            (false, Some(g)) => format!(
+                "link up again after {g} (node software {})",
+                hello.software.version
+            ),
+            (false, None) => format!("link up (node software {})", hello.software.version),
         };
-        self.note(
-            Level::Info,
-            Some(&id),
-            format!("link up{again} (node software {})", hello.software.version),
-        );
+        self.note(Level::Info, Some(&id), line);
         self.changed(Change::Nodes);
         let c = self.clone();
         tokio::spawn(async move {
@@ -779,11 +831,120 @@ impl Center {
         );
     }
 
-    /// A link ended. `clean` is whether the node said bye; `why` is what ended
-    /// it, for the log. `silent` is how long nothing had come from the node,
-    /// which the wait before its next link counts from.
-    pub(crate) fn link_down(&self, link: &Arc<Link>, clean: bool, why: &str, silent: Duration) {
+    /// The connection of a link the node can resume dropped (spec §4.8): the
+    /// node is offline, and the calls on the link wait for the grace. After
+    /// it, a link still parked from connection `conn` ends like any other.
+    /// `up` is how long that connection was up.
+    pub(crate) fn link_parked(
+        &self,
+        link: &Arc<Link>,
+        clean: bool,
+        why: &str,
+        silent: Duration,
+        conn: u64,
+        up: Duration,
+    ) {
+        let id = link.node_id.clone();
+        {
+            // A link replaced by the connection that then failed to resume
+            // it is the node's again, so that the next one finds it.
+            let mut links = self.links.lock().unwrap();
+            let other = links
+                .get(&id)
+                .is_some_and(|l| !l.is_closed() && !Arc::ptr_eq(l, link));
+            if !other {
+                links.insert(id.clone(), link.clone());
+            }
+        }
+        let now = now_ms();
+        let online = up.as_millis() as u64;
+        self.update_soon(|s| {
+            if let Some(n) = s.nodes.get_mut(&id) {
+                n.last_seen_ms = now;
+            }
+            if s.nodes.contains_key(&id) {
+                let d = s.day(&id, now);
+                d.online_ms += online;
+                if !clean {
+                    d.drops += 1;
+                }
+            }
+        });
+        let gone = Instant::now()
+            .checked_sub(silent)
+            .unwrap_or_else(Instant::now);
+        self.down.lock().unwrap().entry(id.clone()).or_insert(gone);
+        let grace = self.grace();
+        self.note(
+            Level::Warn,
+            Some(&id),
+            format!(
+                "link dropped: {why} (it was up for {}); keeping it for {} for the node to resume, with {} waiting",
+                util::span(up),
+                util::span(grace),
+                plural(link.waiting() as u32, "call")
+            ),
+        );
+        self.changed(Change::Nodes);
+        let (c, link) = (self.clone(), link.clone());
+        tokio::spawn(async move {
+            tokio::time::sleep(grace).await;
+            let n = link.waiting();
+            if !link.expire(conn) {
+                return;
+            }
+            {
+                let mut links = c.links.lock().unwrap();
+                if links.get(&id).is_some_and(|l| Arc::ptr_eq(l, &link)) {
+                    links.remove(&id);
+                }
+            }
+            c.note(
+                Level::Warn,
+                Some(&id),
+                format!(
+                    "the node did not resume its link within {}; {} on it failed with connection_lost",
+                    util::span(grace),
+                    plural(n as u32, "call")
+                ),
+            );
+            c.changed(Change::Nodes);
+        });
+    }
+
+    /// A link's connection `conn` ended, after it was up for `up`. `clean`
+    /// is whether the node said bye; `why` is what ended it, for the log.
+    /// `silent` is how long nothing had come from the node, which the wait
+    /// before its next link counts from.
+    pub(crate) fn link_down(
+        &self,
+        link: &Arc<Link>,
+        clean: bool,
+        why: &str,
+        silent: Duration,
+        conn: u64,
+        up: Duration,
+    ) {
         let id = &link.node_id;
+        let now = now_ms();
+        let online = up.as_millis() as u64;
+        // A newer connection resumed the link: the node is up on it. This
+        // one's time and its drop still count.
+        if !link.current(conn) {
+            self.update_soon(|s| {
+                if s.nodes.contains_key(id) {
+                    let d = s.day(id, now);
+                    d.online_ms += online;
+                    d.drops += 1;
+                }
+            });
+            self.note(
+                Level::Debug,
+                Some(id),
+                format!("an earlier connection of a resumed link ended: {why}"),
+            );
+            return;
+        }
         // A link the node's newer one replaced is no longer the node's: its end
         // says nothing about the node, which is up.
         let current = {
@@ -794,8 +955,6 @@ impl Center {
             }
             current
         };
-        let now = now_ms();
-        let online = link.since.elapsed().as_millis() as u64;
         self.update_soon(|s| {
             if current && let Some(n) = s.nodes.get_mut(id) {
                 n.last_seen_ms = now;
@@ -814,7 +973,7 @@ impl Center {
                 Some(id),
                 format!(
                     "a link that was replaced ended: {why} (it was up for {})",
-                    util::span(link.since.elapsed())
+                    util::span(up)
                 ),
             );
             self.changed(Change::Nodes);
@@ -832,10 +991,7 @@ impl Center {
         self.note(
             level,
             Some(id),
-            format!(
-                "link {verb}: {why} (it was up for {})",
-                util::span(link.since.elapsed())
-            ),
+            format!("link {verb}: {why} (it was up for {})", util::span(up)),
         );
         self.changed(Change::Nodes);
     }
@@ -971,7 +1127,7 @@ impl Center {
             s.nodes
                 .values()
                 .map(|n| {
-                    let link = links.get(&n.id).filter(|l| !l.is_closed());
+                    let link = links.get(&n.id).filter(|l| l.is_live());
                     let d = n.descriptor.as_ref();
                     let caps: Vec<Value> = d
                         .map(|d| {
@@ -1077,7 +1233,8 @@ impl Center {
         );
         let nodes: Vec<String> = s.nodes.lock().unwrap().iter().cloned().collect();
         for n in nodes {
-            if let Some(l) = self.link(&n) {
+            // A parked link gets it when it resumes.
+            if let Some(l) = self.held(&n) {
                 l.notify(msg::method::SESSION_END, json!({"session": s.id}))
                     .await;
             }
@@ -1380,6 +1537,10 @@ impl Center {
         );
         for l in links {
             l.bye(ByeReason::Shutdown).await;
+            // A parked link has no connection for the bye; its calls end.
+            if !l.is_live() {
+                l.fail_all();
+            }
         }
         self.flush();
     }
@@ -1445,7 +1606,7 @@ impl Center {
     }
 }
 
-fn plural(n: u32, one: &str) -> String {
+pub(crate) fn plural(n: u32, one: &str) -> String {
     if n == 1 {
         format!("{n} {one}")
     } else {

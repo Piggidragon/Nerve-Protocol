@@ -104,11 +104,14 @@ Unknown fields are refused. Answers:
    {"node_id": "…", "auth": {"sig": "<128 hex>"}, "versions": ["0"],
     "software": {"name": "nerve-node", "version": "…"},
     "limits": {"message_bytes": 4194304, "blob_bytes": 67108864, "calls": 64, "streams": 16},
-    "rev": 7}
+    "rev": 7, "resume": {"link": "<32 hex>", "got": 0}}
    ```
    `sig` is the Ed25519 signature over the bytes
    `"nerve-connect/0" || center_id (UTF-8) || nonce (32 raw bytes)`.
-3. Center → node, notification `welcome {version, limits}`.
+   `resume` is optional; a node that can resume links sends it (§4.8).
+3. Center → node, notification `welcome {version, limits, resume?}`.
+   `resume {resumed, got}` answers the hello's `resume` and is sent only
+   when the hello had one (§4.8).
 
 Before `welcome`, any other message is a protocol error: the receiver sends
 `bye {reason: "protocol_error"}` and closes. A wrong signature or a `node_id`
@@ -140,8 +143,8 @@ frame as a dead link.
 suspend, an address change) sends the event `node/going_away {reason}` first,
 so the center can show why it dropped.
 
-There is no resume. When a link ends, calls in flight on it fail with
-`connection_lost`, and commands it started are killed.
+When a link ends with a `bye`, or drops and is not resumed (§4.8), calls in
+flight on it fail with `connection_lost`, and commands it started are killed.
 
 ### 4.6 Reconnect
 
@@ -154,6 +157,83 @@ a link has lasted 60 seconds.
 A node MAY reach a center over an HTTP `CONNECT` proxy (`connection.proxy` in
 its config, else `HTTPS_PROXY`/`NO_PROXY`). The inner TLS is still pinned. If
 the proxy fails the node does not fall back to a direct connection.
+
+### 4.8 Resume
+
+A link that drops without a `bye` MAY be resumed on a new connection within a
+grace of 30 seconds: calls in flight on it go on, and their results and the
+events sent meanwhile arrive. Both sides must be able to; otherwise the link
+ends as in §4.5. A resume sends a frame again only when the other side's count
+shows it never read it, so a call that may have run never runs twice.
+
+Link ids and counts:
+
+- A node that can resume links sends `hello.resume {link, got}` on every
+  connection. `link` names the link the connection carries: 16 random bytes
+  as 32 lowercase hex characters, new for a new link. `got` is how many
+  counted frames of that link the node read (0 for a new link).
+- A center that can resume links answers `welcome.resume {resumed, got}`,
+  and only to a hello with `resume` (a node is strict about `welcome`).
+  `resumed: true` carries the named link on, and `got` is how many counted
+  frames of it the center read. `resumed: false` starts a new link with that
+  id, with `got` 0. A welcome without `resume` means the center cannot resume
+  links; the node then treats the link as one that cannot resume.
+- A hello whose `resume.link` is not 32 lowercase hex characters is refused
+  with `bye {reason: "protocol_error"}`.
+- **Counted frames** are the text frames a side sends after `welcome`, except
+  `ack` and `bye`. Each side numbers the counted frames it sends from 1 over
+  the whole link, across resumes, and counts the counted frames it reads.
+  Binary frames are not counted; version "0" sends none a resume needs.
+
+Keeping and acknowledging, on a link that can resume:
+
+- Each side keeps the counted frames it sent until the other side
+  acknowledges them. The notification `ack {got}` (either direction) says the
+  sender read the first `got` counted frames of the link. A side sends one at
+  most every 5 seconds, when its count moved since its last `ack` or
+  handshake. An `ack` whose `got` is below an earlier one or above what was
+  sent ends the link with `bye {reason: "protocol_error"}`; on a link that
+  cannot resume an `ack` is ignored.
+- A side keeps at most 16 MiB of frames the other side has not acknowledged,
+  dropping the oldest past that. While it lacks a frame the other side has
+  not acknowledged, the link cannot resume.
+
+Drop and grace:
+
+- A link that ends without a `bye` (the connection closed or failed, or §4.4's
+  45 seconds passed) is kept by each side for 30 seconds from when that side
+  noticed: its calls stay in flight, its commands run on, and what the side
+  sends meanwhile is kept as above. The center shows the node offline and
+  answers new calls with `unavailable`. A link that ends with a `bye`, from
+  either side, ends at once (§4.5).
+- The node offers the link in the hello of its next connection while the
+  grace lasts and it still keeps every frame the center may lack. Once it
+  sent that hello it keeps the link until the `welcome` comes (at most the
+  15 seconds of §4.2), even past the grace. A welcome that does not carry the
+  link on ends it; a handshake that fails leaves it to the next connection
+  while the grace lasts.
+- The center carries the link on when it still holds the link the hello names
+  for that node, and `got` lies between what the node acknowledged and what
+  the center sent, and the center keeps every frame after `got`. Otherwise it
+  answers `resumed: false` and ends the link it held: its calls fail with
+  `connection_lost`. A held link that does not answer the ping of §4.3 is
+  replaced, and may be carried on the same way. A frame that arrives later on
+  the replaced connection is not the link's and is dropped.
+- After the grace, a link not resumed ends as in §4.5: the center fails its
+  calls with `connection_lost`, the node kills its commands.
+
+Replay:
+
+- After `welcome`, each side first sends again, in order and unchanged, the
+  counted frames after the other side's `got`, then new frames. The node
+  checks the center's `got` like an `ack`.
+- A request the node read is never sent again: an `invoke` the node read may
+  have run. Its result comes from the node's kept frames, or when the call
+  finishes. An `invoke` the node did not read has not run, and is sent again
+  with its id.
+- `seq` of events and state goes on counting on the resumed link.
+- After a resume the center fetches the descriptor again, as it may have
+  changed while the link was down.
 
 ## 5. Messages
 
@@ -179,6 +259,7 @@ Errors carry a string code in `error.data.code` (§5.3).
 | `stream.close` | request | either | `{sid, reason}` | `{}` |
 | `session.end` | notification | C→N | `{session}` | |
 | `bye` | notification | either | `{reason}` | |
+| `ack` | notification | either | `{got}` | (§4.8) |
 
 - `detail` is `summary`, `capability` (needs `cap`) or `full`.
 - `ctx` is `{session?}`: `session` is at most 256 bytes. Other fields are
@@ -189,8 +270,8 @@ Errors carry a string code in `error.data.code` (§5.3).
 - Topics are `<cap>/<event>`, `<cap>/state` or `<cap>/*`. Events of the `node`
   and `settings` capabilities are implicit: they are sent without
   `sub`. Everything else needs one.
-- `seq` counts per capability from 1 within a link; `ts` is milliseconds since
-  the Unix epoch.
+- `seq` counts per capability from 1 within a link, across its resumes
+  (§4.8); `ts` is milliseconds since the Unix epoch.
 
 ### 5.2 Strictness
 

@@ -36,7 +36,7 @@ names its reason.
 | `disabled: exec.run is off` | `cap set` switched it off or hid it | `nerve-node cap set exec.run on` |
 | `the command line is … bytes, longer than …` | A command over 64 KiB | Use a shorter command |
 | `unavailable` | The machine is offline | Check the link, below |
-| `connection_lost` | The link dropped during the call | Run it again |
+| `connection_lost` | The link dropped during the call and did not come back within 30 s, or the node or the center restarted | Run it again |
 | `busy` | Too many commands or calls at once (`limits.max_running`, 16 by default) | Wait, or raise the limit |
 
 The agent sees only the tools a machine could allow. If it sees only `nodes`,

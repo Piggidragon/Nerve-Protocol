@@ -1,6 +1,7 @@
 //! The center's side of one node link (spec §4): the handshake, the one-link
-//! rule, requests to the node with their pending replies, and the reader that
-//! routes the node's results, events and state.
+//! rule, the resume of a dropped link, requests to the node with their
+//! pending replies, and the reader that routes the node's results, events and
+//! state.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -13,7 +14,8 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use tokio_tungstenite::WebSocketStream;
 
 use nerve_proto::frame::{Frame, FrameError};
-use nerve_proto::msg::{self, ByeReason, Hello, Limits, method};
+use nerve_proto::msg::{self, ByeReason, Hello, Limits, Resumed, method};
+use nerve_proto::resume::{self, Replay};
 use nerve_proto::{ErrorCode, Id, Message, PROTOCOL_VERSION, RpcError};
 use nerve_transport::log::Level;
 use nerve_transport::net::BoxIo;
@@ -38,13 +40,17 @@ enum Out {
     Bye(ByeReason),
 }
 
-/// One authenticated, welcomed link.
+/// One authenticated, welcomed link. A link the node can resume outlives a
+/// dropped connection by the grace (§4.8): it is parked, its calls wait, and
+/// a connection that resumes it carries it on.
 pub struct Link {
     pub node_id: String,
     pub since: Instant,
     pub since_ms: u64,
     pub limits: Limits,
-    out: mpsc::Sender<Out>,
+    /// The id the node gave the link, when it can resume it.
+    pub resume_id: Option<String>,
+    wire: Mutex<Wire>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Reply>>>,
     next_id: AtomicU64,
     closed: AtomicBool,
@@ -57,14 +63,39 @@ pub struct Link {
     pub sessions: Mutex<std::collections::BTreeSet<String>>,
 }
 
+/// The connection a link is on, and what it counts for a resume.
+struct Wire {
+    /// The writer of the connection now; `None` while parked or ended.
+    out: Option<mpsc::Sender<Out>>,
+    /// Which connection carries the link: a resume moves it on, and a reader
+    /// of an older one stops.
+    conn: u64,
+    /// The counts and the kept frames, when the node can resume the link.
+    replay: Option<Replay>,
+    /// The connection dropped and the link waits for its resume.
+    parked: bool,
+}
+
 impl Link {
-    fn new(node_id: &str, limits: Limits, out: mpsc::Sender<Out>) -> Link {
+    fn new(
+        node_id: &str,
+        limits: Limits,
+        out: mpsc::Sender<Out>,
+        resume_id: Option<String>,
+    ) -> Link {
+        let replay = resume_id.is_some().then(|| Replay::new(resume::KEEP_BYTES));
         Link {
             node_id: node_id.to_string(),
             since: Instant::now(),
             since_ms: msg::now_ms(),
             limits,
-            out,
+            resume_id,
+            wire: Mutex::new(Wire {
+                out: Some(out),
+                conn: 0,
+                replay,
+                parked: false,
+            }),
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             closed: AtomicBool::new(false),
@@ -92,6 +123,163 @@ impl Link {
         self.closed.load(Ordering::SeqCst)
     }
 
+    /// Whether the link is on a connection now: neither ended nor parked.
+    pub fn is_live(&self) -> bool {
+        !self.is_closed() && !self.wire.lock().unwrap().parked
+    }
+
+    /// How many calls wait for their reply.
+    pub fn waiting(&self) -> usize {
+        self.pending.lock().unwrap().len()
+    }
+
+    /// Sends a counted text frame, waiting for room in the queue. While the
+    /// link is parked the frame is kept for the resume. `false` when it is
+    /// lost: the link ended, or its connection did and it cannot resume.
+    async fn send_text(&self, text: String) -> bool {
+        loop {
+            // Kept under the same lock that saw the link parked, so a resume
+            // that comes in between sends it.
+            let out = {
+                let mut w = self.wire.lock().unwrap();
+                match w.out.clone() {
+                    Some(o) => o,
+                    None => return w.keep(&text) && !self.is_closed(),
+                }
+            };
+            let permit = out.reserve().await;
+            let mut w = self.wire.lock().unwrap();
+            // A resume moved the link to another connection meanwhile.
+            if !w.out.as_ref().is_some_and(|o| o.same_channel(&out)) {
+                continue;
+            }
+            return match permit {
+                Ok(p) => {
+                    if let Some(r) = &mut w.replay {
+                        r.push(&text);
+                    }
+                    p.send(Out::Frame(WsMessage::text(text)));
+                    true
+                }
+                Err(_) => w.keep(&text),
+            };
+        }
+    }
+
+    /// Sends a frame of the connection now only (a ping, a `bye`).
+    async fn send_out(&self, o: Out) -> bool {
+        let out = self.wire.lock().unwrap().out.clone();
+        match out {
+            Some(out) => out.send(o).await.is_ok(),
+            None => false,
+        }
+    }
+
+    /// Takes a frame read on connection `conn`, counting it when it is
+    /// `counted`. `false` when a resume moved the link to a newer connection:
+    /// the frame is not the link's any more.
+    fn take_frame(&self, conn: u64, counted: bool) -> bool {
+        let mut w = self.wire.lock().unwrap();
+        if w.conn != conn {
+            return false;
+        }
+        if counted && let Some(r) = &mut w.replay {
+            r.read();
+        }
+        true
+    }
+
+    /// Whether connection `conn` still carries the link.
+    pub(crate) fn current(&self, conn: u64) -> bool {
+        self.wire.lock().unwrap().conn == conn
+    }
+
+    /// The node read the first `got` frames of the link.
+    fn acked(&self, got: u64) -> Result<(), String> {
+        match &mut self.wire.lock().unwrap().replay {
+            Some(r) => r.acked_to(got),
+            None => Ok(()),
+        }
+    }
+
+    /// Sends `ack {got}` when the count moved since the last one.
+    fn send_ack(&self) {
+        let mut w = self.wire.lock().unwrap();
+        let Wire {
+            out: Some(out),
+            replay: Some(r),
+            ..
+        } = &mut *w
+        else {
+            return;
+        };
+        if let Some(got) = r.ack_due() {
+            let m = Message::notification(method::ACK, json!({ "got": got }));
+            if out
+                .try_send(Out::Frame(WsMessage::text(m.encode())))
+                .is_ok()
+            {
+                r.told(got);
+            }
+        }
+    }
+
+    /// Parks the link after connection `conn` dropped, if the node can
+    /// resume it: it still keeps every frame the node may not have read.
+    fn park(&self, conn: u64) -> bool {
+        let mut w = self.wire.lock().unwrap();
+        let can =
+            w.conn == conn && !self.is_closed() && w.replay.as_ref().is_some_and(Replay::complete);
+        if can {
+            w.out = None;
+            w.parked = true;
+        }
+        can
+    }
+
+    /// Carries the link on on a new connection, the node having read `got`
+    /// frames of it. Gives the new connection's number and the frames to
+    /// send first; an error when the link cannot resume from there.
+    fn resume(&self, out: mpsc::Sender<Out>, got: u64) -> Result<(u64, Vec<String>), String> {
+        let mut w = self.wire.lock().unwrap();
+        if self.is_closed() {
+            return Err("the link ended".into());
+        }
+        let again = w
+            .replay
+            .as_mut()
+            .ok_or("the link cannot resume")?
+            .resume(got)?;
+        w.conn += 1;
+        w.out = Some(out);
+        w.parked = false;
+        Ok((w.conn, again))
+    }
+
+    /// Ends the link if it is still parked from connection `conn`: its
+    /// grace is over.
+    pub(crate) fn expire(&self, conn: u64) -> bool {
+        {
+            let mut w = self.wire.lock().unwrap();
+            if !(w.parked && w.conn == conn && !self.is_closed()) {
+                return false;
+            }
+            self.close(&mut w);
+        }
+        self.fail_pending();
+        true
+    }
+
+    /// The count of frames read from the node, for `welcome`.
+    fn got(&self) -> u64 {
+        self.wire
+            .lock()
+            .unwrap()
+            .replay
+            .as_ref()
+            .map_or(0, Replay::got)
+    }
+
     /// Sends a request; `wait` bounds the wait for its reply.
     pub async fn call(&self, method: &str, params: Value, wait: Option<Duration>) -> Reply {
         let (id, rx) = self.start(method, params).await?;
@@ -111,12 +299,7 @@ impl Link {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(id, tx);
         let text = Message::request(id, method, params).encode();
-        if self
-            .out
-            .send(Out::Frame(WsMessage::text(text)))
-            .await
-            .is_err()
-        {
+        if !self.send_text(text).await {
             self.pending.lock().unwrap().remove(&id);
             return Err(lost());
         }
@@ -154,12 +337,12 @@ impl Link {
 
     pub async fn notify(&self, method: &str, params: Value) {
         let text = Message::notification(method, params).encode();
-        let _ = self.out.send(Out::Frame(WsMessage::text(text))).await;
+        self.send_text(text).await;
     }
 
-    /// Ends the link with `bye {reason}`.
+    /// Ends the connection with `bye {reason}`.
     pub async fn bye(&self, reason: ByeReason) {
-        let _ = self.out.send(Out::Bye(reason)).await;
+        self.send_out(Out::Bye(reason)).await;
     }
 
     /// Whether the link answers a ping within `wait`.
@@ -167,19 +350,31 @@ impl Link {
         let notified = self.pong.notified();
         tokio::pin!(notified);
         notified.as_mut().enable();
-        if self
-            .out
-            .send(Out::Frame(WsMessage::Ping(b"nerve".to_vec().into())))
+        if !self
+            .send_out(Out::Frame(WsMessage::Ping(b"nerve".to_vec().into())))
             .await
-            .is_err()
         {
             return false;
         }
         tokio::time::timeout(wait, notified).await.is_ok()
     }
 
-    fn fail_all(&self) {
+    /// Ends the link: every call waiting on it fails with `connection_lost`.
+    pub(crate) fn fail_all(&self) {
+        self.close(&mut self.wire.lock().unwrap());
+        self.fail_pending();
+    }
+
+    /// Marks the link ended, under its wire's lock, so a resume cannot take
+    /// it up any more.
+    fn close(&self, w: &mut Wire) {
         self.closed.store(true, Ordering::SeqCst);
+        w.out = None;
+        w.parked = false;
+        w.replay = None;
+    }
+
+    fn fail_pending(&self) {
         let pending: Vec<_> = self.pending.lock().unwrap().drain().collect();
         for (_, tx) in pending {
             let _ = tx.send(Err(lost()));
@@ -191,6 +386,20 @@ impl Link {
             && let Some(tx) = self.pending.lock().unwrap().remove(n)
         {
             let _ = tx.send(r);
+        }
+    }
+}
+
+impl Wire {
+    /// Keeps a frame that cannot go out now for the resume; `false` on a
+    /// link that cannot resume, where it is lost.
+    fn keep(&mut self, text: &str) -> bool {
+        match &mut self.replay {
+            Some(r) => {
+                r.push(text);
+                true
+            }
+            None => false,
         }
     }
 }
@@ -298,33 +507,128 @@ pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String
         return refuse(ws, ByeReason::UnsupportedVersion).await;
     }
 
-    // One live link per node (§4.3): a held link that still answers means
-    // two machines hold this key.
-    if let Some(held) = center.link(&node_id) {
-        if held.answers(DUPLICATE_PING).await {
-            center.alert(
-                &node_id,
-                "a second link authenticated while the first was alive: the node's key may have been copied",
-            );
-            return refuse(ws, ByeReason::Duplicate).await;
-        }
-        held.bye(ByeReason::Replaced).await;
-        held.fail_all();
-        center.link_replaced(&held);
+    if hello
+        .resume
+        .as_ref()
+        .is_some_and(|r| !resume::valid_link_id(&r.link))
+    {
+        center.note(
+            Level::Debug,
+            Some(&node_id),
+            "the handshake failed: the hello names a link id that is not 32 hex characters",
+        );
+        return refuse(ws, ByeReason::ProtocolError).await;
     }
 
-    let welcome = Message::notification(
-        method::WELCOME,
-        json!({"version": PROTOCOL_VERSION, "limits": Limits::default()}),
-    );
-    if send_text(&mut ws, welcome).await.is_err() {
+    // One live link per node (§4.3): a held link that still answers means
+    // two machines hold this key.
+    let before = match center.link(&node_id) {
+        Some(held) => {
+            if held.answers(DUPLICATE_PING).await {
+                center.alert(
+                    &node_id,
+                    "a second link authenticated while the first was alive: the node's key may have been copied",
+                );
+                return refuse(ws, ByeReason::Duplicate).await;
+            }
+            held.bye(ByeReason::Replaced).await;
+            center.link_replaced(&held);
+            Some(held)
+        }
+        // A link that dropped and waits for its resume.
+        None => center.parked(&node_id),
+    };
+
+    // A link the node names, with a count that fits, is carried on (§4.8);
+    // any other link the node had ends here.
+    let (tx, mut rx) = mpsc::channel::<Out>(nerve_proto::limits::SEND_QUEUE);
+    let mut carried = None;
+    if let (Some(offer), Some(old)) = (&hello.resume, &before)
+        && old.resume_id.as_deref() == Some(offer.link.as_str())
+    {
+        match old.resume(tx.clone(), offer.got) {
+            Ok((conn, again)) => carried = Some((old.clone(), conn, again)),
+            Err(e) => center.note(
+                Level::Info,
+                Some(&node_id),
+                format!("the node asked to resume its link, which cannot be: {e}"),
+            ),
+        }
+    }
+    if carried.is_none()
+        && let Some(old) = &before
+        && !old.is_closed()
+    {
+        let n = old.waiting();
+        old.fail_all();
+        if n > 0 {
+            center.note(
+                Level::Info,
+                Some(&node_id),
+                format!(
+                    "the node's new link does not carry on its old one; {} on the old one failed with connection_lost",
+                    crate::center::plural(n as u32, "call")
+                ),
+            );
+        }
+    }
+
+    let mut welcome = json!({"version": PROTOCOL_VERSION, "limits": Limits::default()});
+    // Only a node that offered a resume hears of one: an older node refuses
+    // a welcome with fields it does not know.
+    if hello.resume.is_some() {
+        let r = match &carried {
+            Some((link, _, _)) => Resumed {
+                resumed: true,
+                got: link.got(),
+            },
+            None => Resumed {
+                resumed: false,
+                got: 0,
+            },
+        };
+        welcome["resume"] = serde_json::to_value(r).unwrap_or_default();
+    }
+    if send_text(&mut ws, Message::notification(method::WELCOME, welcome))
+        .await
+        .is_err()
+    {
+        // The node may still come back and resume from what it read.
+        if let Some((link, conn, _)) = &carried
+            && link.park(*conn)
+        {
+            center.link_parked(
+                link,
+                true,
+                "the welcome could not be sent",
+                Duration::ZERO,
+                *conn,
+                Duration::ZERO,
+            );
+        }
         return;
     }
 
-    let (tx, mut rx) = mpsc::channel::<Out>(nerve_proto::limits::SEND_QUEUE);
-    let link = Arc::new(Link::new(&node_id, hello.limits, tx));
+    let resumed = carried.is_some();
+    let (link, conn, again) = match carried {
+        Some(c) => c,
+        None => {
+            let id = hello.resume.as_ref().map(|r| r.link.clone());
+            (
+                Arc::new(Link::new(&node_id, hello.limits, tx, id)),
+                0,
+                Vec::new(),
+            )
+        }
+    };
     let (mut sink, mut stream) = ws.split();
     let writer = tokio::spawn(async move {
+        // What the node did not read of the link goes first, in order.
+        for t in again {
+            if sink.send(WsMessage::text(t)).await.is_err() {
+                return;
+            }
+        }
         while let Some(o) = rx.recv().await {
             match o {
                 Out::Frame(f) => {
@@ -341,16 +645,29 @@ pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String
             }
         }
     });
-    center.link_up(link.clone(), &hello);
+    center.link_up(link.clone(), &hello, resumed);
+    let up = Instant::now();
 
     let mut clean = false;
+    // Whether a bye ended the link, from either side: such a link does not
+    // wait for a resume.
+    let mut said_bye = false;
     let quiet = center.dead_after();
     // What ended the link, set on every way out of the loop, and for how long
     // nothing had come when it did.
     let why: String;
     let mut silent = Duration::ZERO;
+    let mut acks = tokio::time::interval(resume::ACK_EVERY);
+    let mut deadline = tokio::time::Instant::now() + quiet;
     loop {
-        let frame = match tokio::time::timeout(quiet, stream.next()).await {
+        let next = tokio::select! {
+            n = tokio::time::timeout_at(deadline, stream.next()) => n,
+            _ = acks.tick() => {
+                link.send_ack();
+                continue;
+            }
+        };
+        let frame = match next {
             Err(_) => {
                 why = format!(
                     "no frame from the node for {}, not even a ping",
@@ -369,12 +686,40 @@ pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String
             }
             Ok(Some(Ok(f))) => f,
         };
+        deadline = tokio::time::Instant::now() + quiet;
+        let decoded = match &frame {
+            WsMessage::Text(t) => Some(Message::decode(t)),
+            _ => None,
+        };
+        let counted = match &decoded {
+            Some(Ok(m)) => resume::counted(m),
+            Some(Err(_)) => true,
+            None => false,
+        };
+        if !link.take_frame(conn, counted) {
+            why = "a newer connection resumed the link".into();
+            break;
+        }
         link.touch();
         match frame {
-            WsMessage::Text(t) => match Message::decode(&t) {
+            WsMessage::Text(_) => match decoded.expect("a text frame") {
+                Ok(Message::Notification { method: m, params })
+                    if m == method::ACK && link.resume_id.is_some() =>
+                {
+                    let r = nerve_proto::rpc::params::<msg::Ack>(&params)
+                        .map_err(|e| e.message)
+                        .and_then(|a| link.acked(a.got));
+                    if let Err(e) = r {
+                        link.bye(ByeReason::ProtocolError).await;
+                        said_bye = true;
+                        why = format!("the node acknowledged frames wrongly: {e}");
+                        break;
+                    }
+                }
                 Ok(m) => {
                     if let Some(end) = handle(&center, &link, m).await {
                         clean = true;
+                        said_bye = true;
                         why = format!("the node said bye ({})", end.as_str());
                         if end == ByeReason::Unpaired {
                             center.forget(&node_id, "the node unpaired itself (bye unpaired)");
@@ -385,16 +730,14 @@ pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String
                 Err(reply) => {
                     // A malformed message from a node is answered, not fatal,
                     // so a newer node's mistake does not drop its link.
-                    let _ = link
-                        .out
-                        .send(Out::Frame(WsMessage::text(reply.encode())))
-                        .await;
+                    link.send_text(reply.encode()).await;
                 }
             },
             WsMessage::Binary(b) => {
                 // Nodes send no blobs to the center; media frames are refused.
                 if let Err(FrameError::MediaReserved) = Frame::decode(&b) {
                     link.bye(ByeReason::ProtocolError).await;
+                    said_bye = true;
                     why = "the node sent a media frame, which the center does not take".into();
                     break;
                 }
@@ -408,9 +751,18 @@ pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String
             _ => {}
         }
     }
-    link.fail_all();
     drop(writer);
-    center.link_down(&link, clean, &why, silent);
+    // A connection that dropped without a bye parks a link the node can
+    // resume; its calls wait for the grace.
+    if !said_bye && link.park(conn) {
+        center.link_parked(&link, clean, &why, silent, conn, up.elapsed());
+        return;
+    }
+    // A newer connection carries the link on: only this one ended.
+    if link.current(conn) {
+        link.fail_all();
+    }
+    center.link_down(&link, clean, &why, silent, conn, up.elapsed());
 }
 
 /// Handles one message from the node. Returns the bye reason when the node
@@ -436,8 +788,7 @@ async fn handle(center: &Center, link: &Arc<Link>, m: Message) -> Option<ByeReas
             );
             let mut e = e;
             e.code = -32601;
-            let text = Message::error(Some(id), e).encode();
-            let _ = link.out.send(Out::Frame(WsMessage::text(text))).await;
+            link.send_text(Message::error(Some(id), e).encode()).await;
         }
         Message::Notification { method: m, params } => match m.as_str() {
             method::EVENT => {

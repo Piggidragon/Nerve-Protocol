@@ -159,9 +159,9 @@ folders.
 - `folder rm` and `folder set` change the entry, and removing the pairing
   takes it off. That is the node's entry on the folder: permissions a
   command gave what it made there stay (see "What the AppContainer does not
-  stop" below). A running node takes changes from the CLI at its next start
-  ([platforms](platforms.md#no-control-socket)), and gives its folders their
-  entries again until then.
+  stop" below). A running node takes these changes from the CLI at once,
+  over its [control pipe](platforms.md#the-control-pipe), and has changed
+  the entries when the CLI answers.
 - `uninstall` takes off the entries of the node in your own folders (not
   those of a folder that holds hard links the check refuses, see below)
   (`%USERPROFILE%\.config\nerve` and `.local\state\nerve`, or those you name
@@ -283,8 +283,8 @@ folders.
   --no-hardlinks`. Or remove them (delete `node_modules` or `.venv`) before
   you add, change or remove the folder.
 
-`nerve-node status` cannot ask the running node on Windows
-([platforms](platforms.md#no-control-socket)). The node names its
+`nerve-node status` does not ask the running node on Windows yet
+([platforms](platforms.md#the-control-pipe)). The node names its
 confinement when it starts, in its output and its [log](logs.md):
 `node daemon running (…, confinement appcontainer, …)`. The center sees it in
 the node's `exec` state, `confinement appcontainer`, or `none` on the

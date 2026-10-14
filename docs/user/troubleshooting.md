@@ -104,5 +104,23 @@ A command returns at most 1 MiB of stdout and 1 MiB of stderr. The result has
 ## A change did not apply
 
 If a command says `takes effect at the next start of the node`, no node was
-running to take it. Start `nerve-node run`. On Windows a running node always
-takes changes at its next start.
+running to take it. Start `nerve-node run`. On Windows a running node takes
+only folder changes at once; every other change it takes at its next start.
+
+### Restart the node, then change the folder again (Windows)
+
+`folder add`, `set` or `rm` says `node.toml holds changes the running node
+takes at its next start`: an earlier command changed something else, which
+waits in the file for the next start. The node saves its whole config with a
+folder change and would undo that change, so it refuses. Restart the node
+(`Restart-Service nerve-node` for the installed node) and run the folder
+command again.
+
+### The control pipe is not the node's (Windows)
+
+`folder add`, `set` or `rm` says `the control pipe is not the node's`: another
+process made a pipe of the node's name before the node started, and the node
+runs without its pipe (its log says `the control pipe … is taken`). The CLI
+sends that pipe nothing. Find the process with Sysinternals
+`handle.exe -a nerve-node-`, end it, and restart the node. With the node
+stopped, folder changes go to `node.toml` as every other change does.

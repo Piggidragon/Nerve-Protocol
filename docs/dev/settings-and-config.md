@@ -122,9 +122,11 @@ is not caught, so for a command without a sandbox the socket is no boundary,
 as the node's files are none. For a `folder` mode command the token also
 holds, as far as the sandbox does.
 
-Windows has no control socket and no sandbox. The CLI signs `node.toml` itself,
-so a command the node runs for a center can change the policy. The change
-applies at the next start.
+Windows has no control socket. It has a control pipe with the same lines,
+which serves `status`, `folder.add`, `folder.set` and `folder.rm` only
+([node-local.md §5](spec/node-local.md#5-control-socket)). For every other
+change the CLI signs `node.toml` itself, and the change applies at the next
+start.
 
 ## The log level
 

@@ -76,6 +76,21 @@ mod unix {
     /// The longest request line read.
     const LINE_BYTES: usize = 1024 * 1024;
 
+    /// How long a connection may wait for its next request line. A caller
+    /// sends it at once; a process of the node's user that holds many
+    /// connections open without a word would else use up the node's
+    /// descriptors.
+    const IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// How long [`call`] waits for an answer. The slowest handler, the check
+    /// of a sudo password, ends after 30 s itself. A node that does not
+    /// accept (it is out of descriptors) never answers a call that sits in
+    /// its queue.
+    const ANSWER_WAIT: std::time::Duration = std::time::Duration::from_secs(90);
+
+    /// Error when [`call`] got no answer in time.
+    pub const NO_ANSWER: &str = "the node did not answer in time; try again";
+
     /// What a handler sends back: one answer, or items of a following call.
     pub enum Reply {
         Ok(Value),
@@ -112,6 +127,20 @@ mod unix {
         F: Fn(CtlRequest, Peer) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Reply> + Send + 'static,
     {
+        serve_idle(listener, handler, IDLE).await
+    }
+
+    /// [`serve_on`], with `idle` as the time a connection may wait for its
+    /// next request.
+    async fn serve_idle<F, Fut>(
+        listener: UnixListener,
+        handler: F,
+        idle: std::time::Duration,
+    ) -> std::io::Result<()>
+    where
+        F: Fn(CtlRequest, Peer) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Reply> + Send + 'static,
+    {
         let handler = Arc::new(handler);
         let me = crate::net::euid();
         let mut failing = false;
@@ -142,7 +171,7 @@ mod unix {
                 if peer.uid != me && peer.uid != 0 {
                     return;
                 }
-                let _ = connection(stream, peer, handler).await;
+                let _ = connection(stream, peer, handler, idle).await;
             });
         }
     }
@@ -187,6 +216,7 @@ mod unix {
         stream: UnixStream,
         peer: Peer,
         handler: Arc<F>,
+        idle: std::time::Duration,
     ) -> std::io::Result<()>
     where
         F: Fn(CtlRequest, Peer) -> Fut + Send + Sync + 'static,
@@ -196,8 +226,14 @@ mod unix {
         let mut lines = BufReader::new(r.take(LINE_BYTES as u64 * 64));
         loop {
             let mut line = String::new();
-            if lines.read_line(&mut line).await? == 0 {
-                return Ok(());
+            // No request in time, like none at all, ends the connection.
+            match tokio::time::timeout(idle, lines.read_line(&mut line)).await {
+                Ok(read) => {
+                    if read? == 0 {
+                        return Ok(());
+                    }
+                }
+                Err(_) => return Ok(()),
             }
             if line.len() > LINE_BYTES {
                 return Ok(());
@@ -249,6 +285,21 @@ mod unix {
 
     /// One call: sends the request and returns the answer.
     pub async fn call(path: &Path, method: &str, params: Value) -> Result<Value, String> {
+        call_within(path, method, params, ANSWER_WAIT).await
+    }
+
+    async fn call_within(
+        path: &Path,
+        method: &str,
+        params: Value,
+        limit: std::time::Duration,
+    ) -> Result<Value, String> {
+        tokio::time::timeout(limit, call_unlimited(path, method, params))
+            .await
+            .unwrap_or_else(|_| Err(NO_ANSWER.to_string()))
+    }
+
+    async fn call_unlimited(path: &Path, method: &str, params: Value) -> Result<Value, String> {
         let stream = UnixStream::connect(path)
             .await
             .map_err(|e| connect_error(&e))?;
@@ -397,16 +448,60 @@ mod unix {
             // A socket file nobody listens on is no node.
             drop(listener);
             drop(queued);
-            assert_eq!(
-                call(&p, "status", json!({})).await,
-                Err(NOT_RUNNING.to_string())
-            );
+            // A process forked meanwhile (the descriptor test below forks
+            // this binary) holds a copy of the listener until it execs, so
+            // the socket may take a moment to be gone.
+            let mut gone = call(&p, "status", json!({})).await;
+            for _ in 0..200 {
+                if gone == Err(NOT_RUNNING.to_string()) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                gone = call(&p, "status", json!({})).await;
+            }
+            assert_eq!(gone, Err(NOT_RUNNING.to_string()));
             // Any other error says what it is.
             let under_a_file = d.path().join("run/ctl.sock");
             std::fs::write(d.path().join("run"), b"").unwrap();
             let e = call(&under_a_file, "status", json!({})).await.unwrap_err();
             assert!(e.starts_with("cannot connect"), "{e}");
             assert_ne!(e, NOT_RUNNING);
+        }
+
+        /// A call that sits in the queue of a node that never accepts ends
+        /// with its own error, and a connection that sends nothing is closed
+        /// by the node.
+        #[tokio::test]
+        async fn waits_for_an_answer_and_for_a_request_end() {
+            let d = tempfile::tempdir().unwrap();
+            let p = d.path().join("ctl.sock");
+            let silent = bind(&p).await.unwrap();
+            let waited = std::time::Instant::now();
+            let r = call_within(
+                &p,
+                "status",
+                json!({}),
+                std::time::Duration::from_millis(200),
+            )
+            .await;
+            assert_eq!(r, Err(NO_ANSWER.to_string()));
+            assert!(waited.elapsed() < std::time::Duration::from_secs(5));
+            drop(silent);
+
+            let p = d.path().join("idle.sock");
+            let listener = bind(&p).await.unwrap();
+            tokio::spawn(serve_idle(
+                listener,
+                |_, _| async { Reply::Ok(json!("up")) },
+                std::time::Duration::from_millis(200),
+            ));
+            let mut idle = UnixStream::connect(&p).await.unwrap();
+            let mut byte = [0u8; 1];
+            let eof = tokio::time::timeout(std::time::Duration::from_secs(5), idle.read(&mut byte))
+                .await
+                .expect("the node closes a connection that sends nothing");
+            assert_eq!(eof.unwrap(), 0);
+            assert_eq!(call(&p, "status", json!({})).await, Ok(json!("up")));
         }
 
         /// Set in the process `serving_outlasts_running_out_of_descriptors`
@@ -533,4 +628,4 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub use unix::{BUSY, NOT_RUNNING, Reply, bind, call, follow, serve, serve_on};
+pub use unix::{BUSY, NO_ANSWER, NOT_RUNNING, Reply, bind, call, follow, serve, serve_on};

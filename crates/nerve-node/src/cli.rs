@@ -1006,14 +1006,15 @@ async fn owner_check(paths: &[&NodePaths]) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether a daemon answers on the control socket; it then took every
-/// change at once.
+/// Whether a daemon runs on the control socket; it then took every change
+/// at once. One that takes no connection now runs all the same.
 async fn daemon_answers(paths: &NodePaths) -> bool {
     #[cfg(unix)]
     {
-        nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({}))
-            .await
-            .is_ok()
+        !matches!(
+            nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await,
+            Err(e) if e == nerve_transport::ctl::NOT_RUNNING
+        )
     }
     #[cfg(not(unix))]
     {
@@ -1426,8 +1427,16 @@ async fn after_keyring_answers(
     out: &mut dyn Write,
 ) -> Result<(), String> {
     #[cfg(unix)]
-    if let Ok(status) = nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await {
-        return restart_for_keyring(&status, paths, machine, out);
+    match nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await {
+        Ok(status) => return restart_for_keyring(&status, paths, machine, out),
+        Err(e) if e == nerve_transport::ctl::NOT_RUNNING => {}
+        Err(e) => {
+            let _ = writeln!(
+                out,
+                "the running node was not asked whether it found a keyring ({e}); restart it if it did not"
+            );
+            return Ok(());
+        }
     }
     #[cfg(not(unix))]
     let _ = (paths, machine, out);
@@ -2192,11 +2201,22 @@ async fn config_cmd(paths: &NodePaths, c: ConfigCmd, out: &mut dyn Write) -> Res
 /// the kernel here and the account `cfg` runs commands as tell.
 async fn tell_folder_commands(paths: &NodePaths, cfg: &NodeConfig, out: &mut dyn Write) {
     #[cfg(unix)]
-    if let Ok(v) = nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await {
-        if v["folder_commands_off"] == crate::daemon::KEYRING_NOT_CONFINED {
-            let _ = writeln!(out, "{}", folder_commands_off());
+    match nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await {
+        Ok(v) => {
+            if v["folder_commands_off"] == crate::daemon::KEYRING_NOT_CONFINED {
+                let _ = writeln!(out, "{}", folder_commands_off());
+            }
+            return;
         }
-        return;
+        Err(e) if e == nerve_transport::ctl::NOT_RUNNING => {}
+        // The node that runs knows, and was not asked.
+        Err(e) => {
+            let _ = writeln!(
+                out,
+                "the running node was not asked whether folder mode still runs commands ({e}); `nerve-node status` shows it"
+            );
+            return;
+        }
     }
     if keyring_turns_commands_off(nerve_sandbox::Confinement::detect(), || {
         node_command_account(paths, cfg)
@@ -3424,31 +3444,54 @@ mod tests {
         assert!(r.unwrap_err().contains("nerve://pair"));
     }
 
+    /// A control socket whose queue is full and that nothing accepts from: a
+    /// node that runs but takes no connection now. Dropped, the socket is
+    /// gone with it.
+    #[cfg(unix)]
+    struct BusyNode {
+        _listener: std::os::unix::net::UnixListener,
+        _queued: Vec<tokio::net::UnixStream>,
+    }
+
+    #[cfg(unix)]
+    impl BusyNode {
+        async fn start(paths: &NodePaths) -> BusyNode {
+            use std::os::unix::io::AsRawFd;
+            let sock = paths.ctl_socket();
+            std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+            let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            // SAFETY: listen on a socket this test owns; a backlog of one is
+            // full after a few connections, and nothing accepts them.
+            assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+            let mut queued = vec![];
+            while let Ok(s) = tokio::net::UnixStream::connect(&sock).await {
+                queued.push(s);
+                assert!(queued.len() < 100, "the queue never filled");
+            }
+            BusyNode {
+                _listener: listener,
+                _queued: queued,
+            }
+        }
+
+        fn stop(self, paths: &NodePaths) {
+            drop(self);
+            std::fs::remove_file(paths.ctl_socket()).unwrap();
+        }
+    }
+
     /// A node that runs but takes no connection now (its queue is full) is
     /// not "not running": `panic` and `sudo off` must not write the file and
     /// report the change as done while the node never got it.
     #[cfg(unix)]
     #[test]
     fn a_busy_node_is_not_taken_for_none() {
-        use std::os::unix::io::AsRawFd;
         let (_d, paths) = setup(&["home"]);
-        let sock = paths.ctl_socket();
-        std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
-        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
-        // SAFETY: listen on a socket this test owns; a backlog of one is
-        // full after a few connections, and nothing accepts them.
-        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
-        let mut queued = vec![];
-        rt.block_on(async {
-            while let Ok(s) = tokio::net::UnixStream::connect(&sock).await {
-                queued.push(s);
-                assert!(queued.len() < 100, "the queue never filled");
-            }
-        });
+        let node = rt.block_on(BusyNode::start(&paths));
         let before = std::fs::read(paths.config_file()).unwrap();
         let busy = nerve_transport::ctl::BUSY;
         for args in [
@@ -3462,10 +3505,42 @@ mod tests {
         assert_eq!(std::fs::read(paths.config_file()).unwrap(), before);
         assert!(!load(&paths).locked);
         // Gone, the node is none, and the same commands go to the file.
-        drop((queued, listener));
-        std::fs::remove_file(&sock).unwrap();
+        node.stop(&paths);
         run(&paths, &["panic"]).unwrap();
         assert!(load(&paths).locked);
+    }
+
+    /// The callers that only ask whether a node runs take a busy one for a
+    /// node: it is not told that a change waits for the next start, and a
+    /// second node does not start beside it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_busy_node_still_counts_as_running() {
+        let (d, paths) = setup(&["home"]);
+        assert!(!daemon_answers(&paths).await);
+        let node = BusyNode::start(&paths).await;
+        assert!(daemon_answers(&paths).await);
+        let mut out = Vec::new();
+        after_keyring_answers(&paths, None, &mut out).await.unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("was not asked whether it found a keyring"),
+            "{out}"
+        );
+        let cfg = NodeConfig::load(&paths.config_file()).unwrap();
+        let mut out = Vec::new();
+        tell_folder_commands(&paths, &cfg, &mut out).await;
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("was not asked whether folder mode"), "{out}");
+        let mut opts = crate::NodeOptions::new(paths.clone());
+        opts.home = d.path().to_path_buf();
+        let e = crate::Daemon::start(opts)
+            .await
+            .err()
+            .expect("a second node");
+        assert!(e.contains("already runs"), "{e}");
+        node.stop(&paths);
+        assert!(!daemon_answers(&paths).await);
     }
 
     #[test]

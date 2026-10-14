@@ -152,6 +152,25 @@ fn remove_grants(
             at.join(", ")
         ));
     }
+    let p = &synced.profiles;
+    if !p.removed.is_empty() {
+        steps.did(format!(
+            "removed the AppContainer profiles of {whose} ({})",
+            p.removed.join(", ")
+        ));
+    }
+    if !p.kept.is_empty() {
+        let then = if kept {
+            "stop it and run `nerve-node uninstall` again to remove them"
+        } else {
+            "its config goes with --purge, so once it stopped, remove them by hand (docs/user/modes.md)"
+        };
+        steps.did(format!(
+            "left the AppContainer profiles of {whose} ({}), since {}: {then}",
+            p.kept.join(", "),
+            p.why.as_deref().unwrap_or("its node may run")
+        ));
+    }
 }
 
 /// The plain text [`SECRET_FILE`] holds: the account's name and password.
@@ -731,6 +750,9 @@ pub(crate) mod tests {
         event_source: RefCell<Option<PathBuf>>,
         /// The programs removed, in order.
         removed: RefCell<Vec<PathBuf>>,
+        /// The state folders of nodes that run: their containers' profiles
+        /// stay.
+        running: RefCell<Vec<PathBuf>>,
     }
 
     impl Fake {
@@ -755,6 +777,7 @@ pub(crate) mod tests {
                 away: RefCell::new(Vec::new()),
                 event_source: RefCell::new(None),
                 removed: RefCell::new(Vec::new()),
+                running: RefCell::new(Vec::new()),
             }
         }
 
@@ -957,9 +980,24 @@ pub(crate) mod tests {
                     id: None,
                 })
                 .collect();
+            // A profile per pairing, named after it.
+            let names: Vec<String> = node_ids.iter().map(|n| format!("nerve.{n}")).collect();
+            let profiles = if self.running.borrow().contains(&paths.state_dir) {
+                crate::grants::Profiles {
+                    why: (!names.is_empty()).then(|| "the node runs".into()),
+                    kept: names,
+                    ..Default::default()
+                }
+            } else {
+                crate::grants::Profiles {
+                    removed: names,
+                    ..Default::default()
+                }
+            };
             crate::grants::Synced {
                 removed: usize::from(recorded),
                 away,
+                profiles,
                 ..Default::default()
             }
         }
@@ -1475,10 +1513,52 @@ pub(crate) mod tests {
         let hand = by_hand(d.path());
         paired(&hand, &["lab"]);
         std::fs::remove_dir_all(&hand.state_dir).unwrap();
-        uninstall(&l, &hand, &sys, true, &mut Vec::new()).unwrap();
+        let mut out = Vec::new();
+        uninstall(&l, &hand, &sys, true, &mut out).unwrap();
         let call = format!("remove grants n-lab of {}", hand.state_dir.display());
         assert!(sys.calls().contains(&call), "{:?}", sys.calls());
         assert!(hand.config_file().exists() && !hand.state_dir.exists());
+        let out = String::from_utf8(out).unwrap();
+        let did = format!(
+            "removed the AppContainer profiles of the node run by hand ({}) (nerve.n-lab)",
+            hand.state_dir.display()
+        );
+        assert!(out.contains(&did), "{out}");
+    }
+
+    /// Uninstall on a machine where only a node run by hand is says which
+    /// of its profiles it removed, not that there was nothing to do.
+    #[test]
+    fn uninstall_of_only_a_node_run_by_hand_names_the_profiles_it_removed() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let hand = by_hand(d.path());
+        paired(&hand, &["lab"]);
+        let mut out = Vec::new();
+        uninstall(&layout(d.path()), &hand, &sys, false, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("(nerve.n-lab)"), "{out}");
+        assert!(!out.contains("nothing to uninstall"), "{out}");
+    }
+
+    /// The profiles of a node that runs stay, as its commands use them;
+    /// uninstall says which and how they go.
+    #[test]
+    fn uninstall_leaves_the_profiles_of_a_node_that_runs_and_says_so() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = installed(d.path(), &sys, "1.0.0");
+        let hand = by_hand(d.path());
+        paired(&hand, &["lab"]);
+        sys.running.borrow_mut().push(hand.state_dir.clone());
+        let mut out = Vec::new();
+        uninstall(&l, &hand, &sys, false, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        let left = format!(
+            "left the AppContainer profiles of the node run by hand ({}) (nerve.n-lab), since the node runs: stop it and run `nerve-node uninstall` again",
+            hand.state_dir.display()
+        );
+        assert!(out.contains(&left), "{out}");
     }
 
     /// A config that cannot be read names no pairing, and uninstall says

@@ -1070,12 +1070,29 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                 w(out, format!("the node key for {name} was not deleted: {e}"));
             }
             // So is the profile of its container on Windows (crate::grants),
-            // also when the record of the grants does not name it.
+            // also when the record of the grants does not name it; a node
+            // that runs still serves the center until it starts again.
             for id in gone.into_inner().unwrap_or_else(|p| p.into_inner()) {
                 if cfg.centers.iter().any(|c| c.node_id == id) {
                     continue;
                 }
-                if let Err(e) = crate::grants::forget(&paths, &id) {
+                let p = crate::grants::forget(&paths, &id);
+                for n in &p.removed {
+                    w(
+                        out,
+                        format!("removed the AppContainer profile {n} of {name}"),
+                    );
+                }
+                if let Some(why) = &p.why {
+                    w(
+                        out,
+                        format!(
+                            "the AppContainer profile {} of {name} stays, since {why}: once the node stopped, remove it by hand (docs/user/modes.md)",
+                            p.kept.join(", ")
+                        ),
+                    );
+                }
+                for e in &p.errors {
                     w(
                         out,
                         format!("the AppContainer profile of {name} was not removed: {e}"),
@@ -1117,6 +1134,17 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                         }
                     ),
                 );
+                // Which `nerve.*` profile is this pairing's: the others
+                // belong to other nodes or are left over (docs/user/modes.md).
+                if cfg!(windows) {
+                    w(
+                        out,
+                        format!(
+                            "  AppContainer {}",
+                            crate::grants::profile_name(&paths, &c.node_id)
+                        ),
+                    );
+                }
             }
             Ok(())
         }
@@ -2893,8 +2921,42 @@ mod tests {
         );
         assert!(profile.exists(), "{}", profile.display());
         assert!(!crate::grants::record_file(&paths).exists());
+        let ls = run(&paths, &["center", "ls"]).unwrap();
+        assert!(ls.contains(&format!("AppContainer {name}")), "{ls}");
         let out = run(&paths, &["center", "rm"]).unwrap();
-        assert!(!out.contains("profile"), "{out}");
+        assert!(
+            out.contains(&format!("removed the AppContainer profile {name} of home")),
+            "{out}"
+        );
+        assert!(!profile.exists(), "{}", profile.display());
+    }
+
+    /// On Windows: a node that spelled its state folder with `/`, as the
+    /// default one is, is found by the folder typed with `\`.
+    #[cfg(windows)]
+    #[test]
+    fn center_rm_finds_the_profile_of_the_state_folder_spelled_otherwise() {
+        let (d, paths) = setup(&["home"]);
+        let spelled = NodePaths::new(
+            &paths.config_dir,
+            PathBuf::from(format!("{}/s", d.path().display())),
+        );
+        assert_eq!(spelled.state_dir, paths.state_dir);
+        let name = crate::grants::container(&spelled, "n");
+        assert_ne!(name, crate::grants::container(&paths, "n"));
+        let profile = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap())
+            .join("Packages")
+            .join(&name);
+        let _ = nerve_sandbox::appcontainer::run(
+            Path::new("cmd.exe"),
+            &["/C".into(), "exit 0".into()],
+            &name,
+        );
+        assert!(profile.exists(), "{}", profile.display());
+        let ls = run(&paths, &["center", "ls"]).unwrap();
+        assert!(ls.contains(&format!("AppContainer {name}")), "{ls}");
+        let out = run(&paths, &["center", "rm"]).unwrap();
+        assert!(out.contains(&name), "{out}");
         assert!(!profile.exists(), "{}", profile.display());
     }
 

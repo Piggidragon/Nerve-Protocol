@@ -146,24 +146,33 @@ folders.
   yourself. Before you delete its folders, remove its pairings: the record of
   the entries is in its state folder.
 - Each pairing's container has a profile in the account that ran the node:
-  a folder `%LOCALAPPDATA%\Packages\nerve.…` and a registry key. It goes
-  with the container's last folder entry, with `center rm`, and at
-  `uninstall`. Its name comes from the path of the state folder and the
-  pairing in `node.toml`, so the node finds it as long as the config folder
-  is there, also after the state folder was deleted. If you deleted the
-  state folder before you removed the pairings, name both folders as they
-  were and remove the pairings:
+  a folder `%LOCALAPPDATA%\Packages\nerve.…` and a registry key.
+  `center ls` names each pairing's container (`AppContainer nerve.…`). The
+  profile goes with the container's last folder entry, with `center rm`,
+  and at `uninstall`, which say which profiles they removed. While the node
+  runs they keep its profiles, as it still serves the pairing until it
+  starts again, and say so; stop the node first. The name comes from the
+  path of the state folder and the pairing in `node.toml`, so the node
+  finds the profile as long as the config folder is there, also after the
+  state folder was deleted, and whether you type the folder with `\` or
+  `/`. If you deleted the state folder before you removed the pairings,
+  name both folders as they were and remove the pairings:
   `nerve-node --config-dir <config> --state-dir <state> config accept`,
-  then `center rm` with the same folders for each pairing. If the config
-  folder is gone too, the node cannot tell which profiles were its own.
-  `Get-ChildItem $env:LOCALAPPDATA\Packages -Filter nerve.*` lists the
-  profiles of all nodes this account ran. Remove those of nodes you no
-  longer run, as that account, each with
+  then `center rm` with the same folders for each pairing. Each says
+  `removed the AppContainer profile nerve.…`; where it does not, that
+  pairing never ran a command in its container, or the folders are not
+  the ones the node had.
+- If the config folder is gone too, the node cannot tell which profiles
+  were its own. `Get-ChildItem $env:LOCALAPPDATA\Packages -Filter nerve.*`
+  lists the profiles of all nodes this account ran; those that `center ls`
+  of the nodes you still run (with their folders) does not name are left
+  over. Remove each, as that account, with
   `[Nerve.Profile]::DeleteAppContainerProfile('nerve.…')` after
-  `Add-Type -Namespace Nerve -Name Profile -MemberDefinition '[DllImport("userenv.dll", CharSet = CharSet.Unicode)] public static extern int DeleteAppContainerProfile(string name);'`;
-  it returns 0 when the profile is gone. A node that still runs makes the
-  profile of its container again at its next command, without what its
-  commands kept there.
+  `Add-Type -Namespace Nerve -Name Profile -MemberDefinition '[DllImport("userenv.dll", CharSet = CharSet.Unicode)] public static extern int DeleteAppContainerProfile(string name);'`.
+  It returns 0 also for a name that has no profile, so check that the
+  folder is gone. A node that still runs makes the profile of its
+  container again at its next command, without what its commands kept
+  there.
 - A granted folder you move or rename on the same drive takes its entry
   along, as Windows keeps its permissions. At its next sync (at start, on a
   change, before a command, and when the CLI changes the config) the node

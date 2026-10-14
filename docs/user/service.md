@@ -314,9 +314,10 @@ register it yet gets it from the installed program:
 `uninstall` stops and removes the service, the source `nerve-node` of the
 Event Log (its entries stay), the user `nerve` and its profile, and the
 program. It also takes off the folder grants of `folder` mode that a node
-you ran yourself put on
+you ran yourself put on, and removes the profiles of its AppContainers
 ([modes](modes.md#what-a-command-can-reach-in-folder-mode-windows)); the
-service puts none on. Without `--purge` the folders and the stored password stay,
+service puts none on. It names the profiles it removed, and those it left
+because that node runs. Without `--purge` the folders and the stored password stay,
 open to the administrators only; the [sudo](sudo.md#sudo-on-windows)
 password goes, so sudo is off after a later `install`. A later `install`
 takes them up again.

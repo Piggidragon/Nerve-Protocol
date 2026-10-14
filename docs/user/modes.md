@@ -58,6 +58,35 @@ Quote `'=rx'` so zsh leaves it alone. `folder add` on a path that is listed
 already replaces its rights. `folder set` leaves a folder with no rights in
 the list. `folder rm` removes it.
 
+### A folder keeps the place you added
+
+`folder add` follows the links on the path and stores the real place. The
+node records that it did (`places` under the pairing's `policy` in
+`node.toml`). A command with `w` on a folder can put a link in place of a
+folder inside it, and a link would give that folder's rights in a place you
+never named. So the node looks at the path again before each command: a
+recorded folder whose path leads somewhere else now is left out of the
+command's confinement, and the node logs a warning (`folder <path> left out
+of the command's sandbox: it was added at its own place and its path leads to
+<place> now …`). That holds whoever made the link, also after you took `w`
+off the folder above or removed the pairing that had it. The folder is back
+once its path leads to the place you added again. To take the place the path
+leads to now, `folder rm` the folder and `folder add` it again.
+
+`folder rm` and `center rm` take the record away with the folder. A center
+with the [settings grant](settings-grant.md) cannot add or change entries of
+it, and one goes only with its folder.
+
+Not every folder is recorded. Folders added before the node kept this record
+have no entry, and neither have folders a center sets and folders you write
+into `node.toml` with `config set`. The node follows wherever their path
+leads, and the cautions about links below hold for them. To record such a
+folder, add it again with its rights. `nerve-node config get
+center.<name>.policy.places` lists the recorded ones. A node from before this
+record refuses a `node.toml` that has `places`: remove the key
+(`nerve-node config unset center.<name>.policy.places`) before you go back to
+it.
+
 ## What a command can reach in `folder` mode (Linux)
 
 The node confines commands with Landlock:
@@ -80,17 +109,16 @@ The node confines commands with Landlock:
   That holds for a link you made yourself too, and a link of yours that
   leads into the `w` folder is followed to its end and judged on the way.
   The folder is back once its path is a plain folder again. A link of your
-  own above the `w` folder is followed. Two gaps are left:
-  - Only the `w` folders in the config count. If a command made a link while
-    the outer folder had `w`, and you then take `w` off it (narrow it to `r`,
-    or remove the pairing), the node follows the link again. Before you do,
-    look for links (`find <folder> -type l`). A fix that remembers the place
-    you judged when you added the folder is tracked in #77.
-  - A command that runs without Landlock (`user` mode, `sudo`, and what an
-    `allowlist` rule allows) can make a link wherever you can write, also
-    where no `w` folder is, and the folder of another pairing there follows
-    it. Look for links in the folders you grant before you give a pairing one
-    of those.
+  own above the `w` folder is followed. A folder you added with `folder add`
+  is also left out when a link has replaced it since, and stays out after you
+  take `w` off the folder above or remove the pairing that had it
+  ([above](#a-folder-keeps-the-place-you-added)).
+  One gap is left: a command that runs without Landlock (`user` mode, `sudo`,
+  and what an `allowlist` rule allows) can make a link wherever you can
+  write, also where no `w` folder is. The folder of another pairing there
+  follows it unless it is recorded. Look for links in the folders you grant
+  that are not (`find <folder> -type l`) before you give a pairing one of
+  those.
 - With the keys in the system keyring, the node's D-Bus session and GNOME
   Keyring's folder count as its own, and a command cannot connect to a
   socket there ([keys](config.md#where-the-node-keeps-its-keys)). That needs
@@ -175,14 +203,13 @@ folders.
   names such a folder in its log (`left out of the command's sandbox: it
   passes through the link …`) and grants it once it is a plain folder again.
   A junction of yours that leads into the `w` folder is followed to its end
-  and judged on the way. One gap is
-  left here: if a command makes such a junction while the outer folder has
-  `w`, and you then take the `w` off that folder (narrow it to `r`, or
-  remove the pairing it belongs to), the node no longer knows commands could
-  write there and follows the junction again. Before you take `w` off a
-  folder or remove a pairing, check it for junctions and links
-  (`dir /AL /S <folder>`). A fix that remembers the place you judged when
-  you added the folder is tracked in #77.
+  and judged on the way. A folder you added with `folder add` stays out when
+  a junction has replaced it since, also after you took the `w` off the
+  folder above or removed the pairing that had it
+  ([above](#a-folder-keeps-the-place-you-added)). A folder without that
+  record (see there) is followed again once nothing shows commands could
+  write there: check it for junctions and links (`dir /AL /S <folder>`)
+  before you take `w` off the folder above or remove a pairing.
 - The node's own folders and the [protected paths](protected-paths.md) get no
   entry, also inside a folder you grant. That folder is granted as its other
   entries instead, as on Linux.

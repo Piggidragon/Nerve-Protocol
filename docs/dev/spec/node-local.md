@@ -354,6 +354,7 @@ unknown = false             # the center answered 401
 mode = "allowlist"          # allowlist | folder | user (the default is allowlist)
 until = 1790000000000  # optional, folder and user: ms since the epoch; then allowlist
 folders = [{ path = "/home/u/proj", access = "rwx" }]  # folder mode; r w x in any mix, "" for none
+places = ["/home/u/proj"]  # folders `folder add` recorded at their real place; the owner's, a center's write keeps it
 caps = { "fs.write" = "off" }   # on | off | hidden
 protected = { extra = [], allow = [] }  # a center may add to extra; only the owner removes or releases,
                                         # also by a folder at or inside an entry
@@ -575,8 +576,12 @@ answer. For each call the node takes the center's policy and, in this order:
    it leads to with its flags, and a folder that has become such a link
    since is left out of a command's Landlock rules, as is a folder whose path
    crosses a link that lies inside a `w` folder of any center (a command may
-   have put the link there). Only the `w` folders in the config count, and a
-   command that runs without Landlock can make a link elsewhere. A folder
+   have put the link there). A folder the owner added with `folder add` is
+   stored by its resolved path and listed in `policy.places`; such a folder
+   is also left out when its path resolves to another place now, whatever the
+   `w` folders say, and a center's settings document cannot change the list.
+   For a folder without an entry only the `w` folders in the config count,
+   and a command that runs without Landlock can make a link elsewhere. A folder
    that holds a protected entry gives a command in `folder` mode none of it:
    its Landlock rules take the folder's other entries, level by level down
    to the protected one, in the read, write and run sets alike, so the

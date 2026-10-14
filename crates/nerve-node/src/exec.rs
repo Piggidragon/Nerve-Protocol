@@ -314,6 +314,9 @@ pub struct FolderSets {
 /// A folder whose resolution crosses a link or junction at or inside a
 /// place where commands may write (`writable`, configured paths, `~`
 /// expanded) is left out ([`led_away`]): commands may have put that link.
+/// So is a folder recorded at its real place whose path leads elsewhere now,
+/// whatever `writable` says ([`replaced`]): the link may have come while a
+/// `w` folder let commands write there, and that `w` is gone.
 pub fn folder_sets(
     policy: &CenterPolicy,
     home: &Path,
@@ -339,6 +342,10 @@ pub fn folder_sets(
                 .and_then(|real| match led_away(&path, &bounds) {
                     Some(why) => Err(why),
                     None => Ok(real),
+                })
+                .and_then(|real| match replaced(policy, &x.path, &real) {
+                    Some(why) => Err(why),
+                    None => Ok(real),
                 });
             match real {
                 Ok(real) => Some((x.access, real)),
@@ -362,6 +369,24 @@ pub fn folder_sets(
         write: folders(&|a| a.write, true),
         exec: folders(&|a| a.execute, false),
     }
+}
+
+/// Why the folder at `path`, which resolves to `real`, is not the place the
+/// owner added, if it is not: the node recorded it at its real place
+/// (`CenterPolicy::places`, written by `folder add`, which stores the
+/// resolved path), so a path that leads elsewhere now has a link in its way
+/// that came later. A command may have put it there. [`led_away`] sees such a
+/// link only while a `w` folder in the config lets commands write where it
+/// lies; this holds after that `w` is taken off, or the pairing that had it
+/// is removed.
+fn replaced(policy: &CenterPolicy, path: &str, real: &Path) -> Option<String> {
+    let at = Path::new(path);
+    (policy.is_placed(path) && !(within(real, at) && within(at, real))).then(|| {
+        format!(
+            "it was added at its own place and its path leads to {} now, through a link put there since; `folder rm` it and `folder add` the place you mean",
+            real.display()
+        )
+    })
 }
 
 /// The grants a center's AppContainer gets on Windows: every path of
@@ -1980,6 +2005,97 @@ mod tests {
         std::os::unix::fs::symlink(&docs, &bin).unwrap();
         let spec = landlock_spec(&policy, &home, &[], &[home.join("w")]);
         assert!(!spec_reaches(&spec, &docs), "{spec:?}");
+    }
+
+    /// Issue #77: a link a command put in place of a nested folder while its
+    /// outer folder had `w` stays out of the rules after that `w` is gone
+    /// (narrowed to `r`, or the pairing removed), when the node recorded the
+    /// folder at its real place (`folder add`). A folder without the record
+    /// is followed again, and a plain folder at the recorded place is a rule.
+    #[test]
+    fn a_link_put_in_place_of_a_recorded_folder_stays_out_once_the_write_is_gone() {
+        let d = tempfile::tempdir().unwrap();
+        let (home, work, docs) = nested_home(&d);
+        let bin = work.join("bin");
+        std::fs::create_dir_all(docs.join("sub/deep")).unwrap();
+        std::fs::create_dir_all(work.join("a/sub/deep")).unwrap();
+        let deep = work.join("a/sub/deep");
+        let mut policy = CenterPolicy {
+            folders: vec![folder(&work, "r"), folder(&bin, "rx"), folder(&deep, "r")],
+            ..Default::default()
+        };
+        for f in [&bin, &deep] {
+            policy.set_placed(&f.display().to_string(), true);
+        }
+        let writable = [work.clone()];
+        let spec = landlock_spec(&policy, &home, &[], &[]);
+        assert!(
+            spec.read.contains(&bin) && spec.exec.contains(&bin),
+            "{spec:?}"
+        );
+        assert!(spec.read.contains(&deep), "{spec:?}");
+
+        // A command with `w` on `work` replaces `bin`, and `a` above `deep`.
+        std::fs::remove_dir(&bin).unwrap();
+        std::os::unix::fs::symlink(&docs, &bin).unwrap();
+        std::fs::remove_dir_all(work.join("a")).unwrap();
+        std::os::unix::fs::symlink(&docs, work.join("a")).unwrap();
+        let spec = landlock_spec(&policy, &home, &[], &writable);
+        assert!(!spec_reaches(&spec, &docs), "{spec:?}");
+
+        // `work` is `r` now, or its pairing is gone: no `w` folder is left
+        // to show the links, and the record keeps them out.
+        let spec = landlock_spec(&policy, &home, &[], &[]);
+        assert!(!spec_reaches(&spec, &docs), "{spec:?}");
+        assert!(spec.read.contains(&work), "{spec:?}");
+        // The same without the record: the links are followed.
+        let mut loose = policy.clone();
+        loose.places.clear();
+        let spec = landlock_spec(&loose, &home, &[], &[]);
+        assert!(spec.read.contains(&docs.join("sub/deep")), "{spec:?}");
+
+        // Plain folders at the recorded places are rules again.
+        std::fs::remove_file(&bin).unwrap();
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::remove_file(work.join("a")).unwrap();
+        std::fs::create_dir_all(&deep).unwrap();
+        let spec = landlock_spec(&policy, &home, &[], &[]);
+        assert!(
+            spec.read.contains(&bin) && spec.exec.contains(&bin),
+            "{spec:?}"
+        );
+        assert!(spec.read.contains(&deep), "{spec:?}");
+    }
+
+    /// A recorded folder that did not exist yet is judged the same: a link
+    /// at its place later keeps it out. An owner's link in the path of a
+    /// folder that was not recorded stays followed.
+    #[test]
+    fn a_folder_recorded_before_it_existed_is_not_followed_through_a_link() {
+        let d = tempfile::tempdir().unwrap();
+        let (home, work, docs) = nested_home(&d);
+        let later = home.join("later");
+        let mut policy = CenterPolicy {
+            folders: vec![folder(&later, "r")],
+            ..Default::default()
+        };
+        policy.set_placed(&later.display().to_string(), true);
+        std::os::unix::fs::symlink(&docs, &later).unwrap();
+        let spec = landlock_spec(&policy, &home, &[], &[]);
+        assert!(!spec_reaches(&spec, &docs), "{spec:?}");
+        std::fs::remove_file(&later).unwrap();
+        std::fs::create_dir(&later).unwrap();
+        let spec = landlock_spec(&policy, &home, &[], &[]);
+        assert!(spec.read.contains(&later), "{spec:?}");
+
+        let to_work = home.join("to-work");
+        std::os::unix::fs::symlink(&work, &to_work).unwrap();
+        let owner = CenterPolicy {
+            folders: vec![folder(&to_work, "r")],
+            ..Default::default()
+        };
+        let spec = landlock_spec(&owner, &home, &[], &[]);
+        assert!(spec.read.contains(&work), "{spec:?}");
     }
 
     /// A link of the owner's that leads into a write folder is followed down

@@ -549,6 +549,10 @@ impl SettingsStore {
         }
         let mut new: CenterDocument =
             serde_json::from_value(document).map_err(|e| SetError::Invalid(e.to_string()))?;
+        // The record of the folders' real places is the owner's: whatever the
+        // document says, it stays as it was, less the folders the center
+        // removed (validation drops those).
+        new.policy.places = entry.policy.places.clone();
         new.policy
             .validate()
             .map_err(|e| SetError::Invalid(e.to_string()))?;
@@ -846,6 +850,76 @@ mod tests {
 
     fn doc(s: &SettingsStore) -> Value {
         serde_json::to_value(s.center_document("home").unwrap()).unwrap()
+    }
+
+    /// The record of the folders' real places is the owner's: a center's
+    /// document cannot add an entry, take one away or rewrite it, and an
+    /// entry goes only with its folder.
+    #[test]
+    fn a_center_cannot_change_the_record_of_real_places() {
+        let d = tempfile::tempdir().unwrap();
+        let mut s = store(d.path(), SettingsGrant::Write);
+        let (work, bin) = (at_home("work"), at_home("work/bin"));
+        let path = |p: &Path| p.to_string_lossy().into_owned();
+        s.update(|c| {
+            let p = &mut c.center_mut("home").unwrap().policy;
+            for (at, access) in [(&work, "rw"), (&bin, "r")] {
+                p.folders.push(crate::config::Folder {
+                    path: path(at),
+                    access: crate::config::Access::parse(access).unwrap(),
+                });
+            }
+            p.set_placed(&path(&bin), true);
+            Ok(())
+        })
+        .unwrap();
+        let placed = |s: &SettingsStore| s.config().center("home").unwrap().policy.places.clone();
+        assert_eq!(placed(&s), [path(&bin)]);
+        // The document shows it; the same document back, one without it, and
+        // one that names others, change nothing about it.
+        assert_eq!(doc(&s)["policy"]["places"], json!([path(&bin)]));
+        for places in [
+            Some(json!([])),
+            None,
+            Some(json!([path(&work), "/nowhere"])),
+        ] {
+            let mut new = doc(&s);
+            new["policy"]["caps"] = json!({"exec": "off"});
+            match places {
+                Some(p) => new["policy"]["places"] = p,
+                None => {
+                    new["policy"].as_object_mut().unwrap().remove("places");
+                }
+            }
+            let v = s.version();
+            s.set_center_document("home", new, v, |_| false, host)
+                .unwrap();
+            assert_eq!(placed(&s), [path(&bin)]);
+            // Back to the way it was for the next round.
+            let mut new = doc(&s);
+            new["policy"]["caps"] = json!({});
+            let v = s.version();
+            s.set_center_document("home", new, v, |_| false, host)
+                .unwrap();
+        }
+        // A folder the center removes takes its entry along, and one it
+        // adds again is not recorded.
+        let mut new = doc(&s);
+        new["policy"]["folders"] = json!([{"path": path(&work), "access": "rw"}]);
+        let v = s.version();
+        s.set_center_document("home", new, v, |_| false, host)
+            .unwrap();
+        assert!(placed(&s).is_empty());
+        let mut new = doc(&s);
+        new["policy"]["folders"] = json!([
+            {"path": path(&work), "access": "rw"},
+            {"path": path(&bin), "access": "r"}
+        ]);
+        new["policy"]["places"] = json!([path(&bin)]);
+        let v = s.version();
+        s.set_center_document("home", new, v, |_| false, host)
+            .unwrap();
+        assert!(placed(&s).is_empty());
     }
 
     #[test]

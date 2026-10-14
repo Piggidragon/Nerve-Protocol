@@ -1788,6 +1788,10 @@ async fn add_folder(
         );
     }
     let real = resolve_folder(path)?;
+    // The place the owner adds is recorded, so that a link which replaces
+    // the folder later is refused (`exec::folder_sets`); adding it again
+    // takes the place it has then.
+    let placed = at_own_place(&real);
     let mode = std::cell::Cell::new(Mode::Folder);
     let name = edit_center(paths, center, |e| {
         e.policy.folders.retain(|f| f.path != real);
@@ -1795,6 +1799,7 @@ async fn add_folder(
             path: real.clone(),
             access,
         });
+        e.policy.set_placed(&real, placed);
         mode.set(e.policy.mode);
         Ok(())
     })
@@ -1948,6 +1953,16 @@ fn enum_str<T: serde::Serialize>(v: &T) -> String {
 
 fn parse_enum<T: serde::de::DeserializeOwned>(s: &str, choices: &str) -> Result<T, String> {
     serde_json::from_value(json!(s)).map_err(|_| format!("{s:?}: expected {choices}"))
+}
+
+/// Whether the folder at `real` (as `resolve_folder` gave it) is its own
+/// real place: resolving it leads nowhere else. Not so for one that cannot be
+/// resolved here (the installed node's CLI may not look into the account's
+/// home): the node cannot tell, and does not record it.
+fn at_own_place(real: &str) -> bool {
+    let at = Path::new(real);
+    nerve_policy::paths::resolve(at)
+        .is_ok_and(|r| nerve_policy::paths::within(&r, at) && nerve_policy::paths::within(at, &r))
 }
 
 /// Folders are stored resolved (symlinks followed), the way the policy
@@ -2775,6 +2790,60 @@ mod tests {
             assert_eq!(folders().len(), 1, "added again, not twice");
             assert_eq!(folders()[0].access.to_string(), want, "{rights:?}");
         }
+    }
+
+    /// `folder add` records the place it stores, so that a link which
+    /// replaces the folder later is refused (`exec::folder_sets`). Adding it
+    /// again, also through a link of the owner's, keeps one entry; `folder
+    /// set` keeps it, and `folder rm` takes it away with the folder.
+    #[cfg(unix)]
+    #[test]
+    fn folder_add_records_the_place_and_rm_forgets_it() {
+        let (d, paths) = setup(&["home"]);
+        let work = d.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        let link = d.path().join("link");
+        std::os::unix::fs::symlink(&work, &link).unwrap();
+        let real = nerve_policy::paths::resolve(&work)
+            .unwrap()
+            .display()
+            .to_string();
+        let (work, link) = (work.to_str().unwrap(), link.to_str().unwrap());
+        let places = || load(&paths).centers[0].policy.places.clone();
+        assert!(places().is_empty());
+        run(&paths, &["folder", "add", work, "+r"]).unwrap();
+        assert_eq!(places(), std::slice::from_ref(&real));
+        // The same place again, and by a link: one folder, one entry.
+        run(&paths, &["folder", "add", link, "+rw"]).unwrap();
+        run(&paths, &["folder", "set", work, "+x"]).unwrap();
+        assert_eq!(load(&paths).centers[0].policy.folders.len(), 1);
+        assert_eq!(places(), std::slice::from_ref(&real));
+        run(&paths, &["folder", "rm", link]).unwrap();
+        assert!(load(&paths).centers[0].policy.folders.is_empty());
+        assert!(places().is_empty());
+        // Added once more, it is recorded once more.
+        run(&paths, &["folder", "add", work, "+r"]).unwrap();
+        assert_eq!(places(), std::slice::from_ref(&real));
+    }
+
+    /// A folder is recorded at its real place only when resolving it leads
+    /// nowhere else: not through a link, and not when it cannot be resolved.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_folder_that_is_its_own_place_is_recorded() {
+        let d = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        std::fs::create_dir(root.join("work")).unwrap();
+        std::os::unix::fs::symlink(root.join("work"), root.join("link")).unwrap();
+        std::os::unix::fs::symlink(root.join("nowhere"), root.join("dangling")).unwrap();
+        let at = |p: &str| at_own_place(&root.join(p).display().to_string());
+        assert!(at("work"));
+        // Not there yet: it will be where its path says.
+        assert!(at("work/later"));
+        assert!(!at("link"));
+        assert!(!at("link/later"));
+        assert!(!at("dangling"));
+        assert!(!at_own_place("relative/path"));
     }
 
     #[test]

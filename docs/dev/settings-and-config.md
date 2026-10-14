@@ -68,6 +68,12 @@ center reads, or the node refuses the whole change and names the field.
    access at a protected place ([policy engine](policy-engine.md#protected-paths)).
 9. Turning a `sense` action on. A center can switch these off, never on.
 
+One item is in the document a center reads and is still the owner's: the
+record of the folders' real places, `policy.places`
+([policy engine](policy-engine.md#protected-paths)). The node does not refuse
+a write that differs there; it keeps the record as it was. The center adds no
+entry and changes none, and an entry goes only with its folder.
+
 Because the grant lets a center widen its rules up to `user` mode, a center
 with the grant is as strong as `user` mode on that machine.
 

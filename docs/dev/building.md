@@ -20,6 +20,21 @@ cargo test
 The release workflow runs the same three with `--locked --workspace` before it
 builds anything ([releasing](releasing.md)).
 
+The `CI` workflow (`.github/workflows/ci.yml`) runs on every pull request and on
+every push to `main`. Its Linux job and its Windows job each run fmt, clippy and
+`cargo test --workspace`, so the tests that are compiled only on Windows (grants,
+the integrity level, the service steps, the job object, the AppContainer,
+Windows paths) run on a Windows runner. Both use the toolchain of the release
+and a cargo cache keyed by `Cargo.lock`, so a change to the lock file builds
+once from scratch.
+
+A test that needs more than a hosted runner has (the node installed as a
+service, an administrator account, a virtual disk, the system keyring) is
+`#[ignore = "<reason>"]`: every run lists it as ignored with its reason, and it
+is run by hand on a Windows test machine with `cargo test -- --ignored`. The
+Windows job also skips by name the tests that fail on Windows today; the comment
+in the workflow says which and why, and the skip goes when the test is fixed.
+
 `cargo test` runs the unit tests, the integration tests and the
 [conformance suite](spec/conformance.md). The end-to-end tests, which
 start the real `nerve-center` and `nerve-node`, run on Unix. To run only the

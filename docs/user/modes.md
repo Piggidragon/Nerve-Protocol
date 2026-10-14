@@ -158,10 +158,16 @@ folders.
   `/`. If you deleted the state folder before you removed the pairings,
   name both folders as they were and remove the pairings:
   `nerve-node --config-dir <config> --state-dir <state> config accept`,
-  then `center rm` with the same folders for each pairing. Each says
-  `removed the AppContainer profile nerve.…`; where it does not, that
-  pairing never ran a command in its container, or the folders are not
-  the ones the node had.
+  then `center rm` with the same folders for each pairing. Spell the state
+  folder exactly as the node had it: the same upper and lower case, no
+  `\` at the end, and absolute or relative as it was given (only `\` and
+  `/` may differ). Each `center rm` says
+  `removed the AppContainer profile nerve.…`, also when the grants of the
+  other pairings do not follow. To check first, run `center ls` with the
+  same folders: when the `AppContainer nerve.…` name it shows for a
+  pairing is not in the `Get-ChildItem` list below, that pairing never ran
+  a command in its container, or the state folder is spelled otherwise
+  than the node had it.
 - If the config folder is gone too, the node cannot tell which profiles
   were its own. `Get-ChildItem $env:LOCALAPPDATA\Packages -Filter nerve.*`
   lists the profiles of all nodes this account ran; those that `center ls`

@@ -759,6 +759,8 @@ pub fn sync(file: &Path, want: &[Grant], folders: &mut impl Folders) -> Synced {
 /// Brings the grants on this machine in line with `cfg` ([`wanted`],
 /// [`sync`]), and removes the profile of a container left without grants.
 /// Nothing to do where commands are not confined by grants (Linux).
+/// For the node itself, which holds the lock that [`apply_outside`] looks
+/// at.
 pub fn apply(paths: &NodePaths, cfg: &NodeConfig, home: &Path) -> Synced {
     #[cfg(windows)]
     {
@@ -771,6 +773,38 @@ pub fn apply(paths: &NodePaths, cfg: &NodeConfig, home: &Path) -> Synced {
         let _ = (paths, cfg, home);
         Synced::default()
     }
+}
+
+/// [`apply`] by the CLI: the profile of a container left without grants
+/// stays while the node runs, as its commands may still use it, and
+/// [`Synced::profiles`] says which went and which stayed.
+pub fn apply_outside(paths: &NodePaths, cfg: &NodeConfig, home: &Path) -> Synced {
+    #[cfg(windows)]
+    {
+        let installed = crate::service::is_service_node(paths);
+        let want = wanted_on(installed, cfg, paths, home, &crate::paths::platform());
+        sync_outside_in(paths, &want, &mut Acls, &mut WinProfiles)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (paths, cfg, home);
+        Synced::default()
+    }
+}
+
+/// [`apply_outside`] for `want`, on `folders` and the profiles in `store`.
+#[cfg(any(windows, test))]
+fn sync_outside_in(
+    paths: &NodePaths,
+    want: &[Grant],
+    folders: &mut impl Folders,
+    store: &mut impl ProfileStore,
+) -> Synced {
+    let mut s = sync(&record_file(paths), want, folders);
+    let p = drop_profiles(paths, &s.emptied, store);
+    s.errors.extend(p.errors.iter().cloned());
+    s.profiles = p;
+    s
 }
 
 /// The ids of the pairings in the config at `paths`, which name the
@@ -907,18 +941,37 @@ pub struct Profiles {
     pub errors: Vec<String>,
 }
 
-/// Why the node at `paths` must keep its profiles: it runs (it holds
-/// [`crate::secrets::KeysLock`] for its life), or that cannot be told. A
-/// node without a state folder does not run, and none is made to look.
+impl Profiles {
+    /// Adds what `other` did, each profile once.
+    pub fn merge(&mut self, other: Profiles) {
+        for (to, from) in [
+            (&mut self.removed, other.removed),
+            (&mut self.kept, other.kept),
+            (&mut self.errors, other.errors),
+        ] {
+            for n in from {
+                if !to.contains(&n) {
+                    to.push(n);
+                }
+            }
+        }
+        self.why = self.why.take().or(other.why);
+    }
+}
+
+/// Keeps the node at `paths` from starting while its profiles go: the lock
+/// a running node holds for its life ([`crate::secrets::KeysLock`]). Why
+/// its profiles must stay instead: it runs, or that cannot be told. A node
+/// without a state folder does not run, and none is made to look.
 #[cfg(any(windows, test))]
-fn running(paths: &NodePaths) -> Option<String> {
+fn hold(paths: &NodePaths) -> Result<Option<crate::secrets::KeysLock>, String> {
     if !paths.state_dir.is_dir() {
-        return None;
+        return Ok(None);
     }
     match crate::secrets::KeysLock::try_take(paths) {
-        Ok(Some(_)) => None,
-        Ok(None) => Some(format!("the node at {} runs", paths.state_dir.display())),
-        Err(e) => Some(format!("whether the node runs is not known: {e}")),
+        Ok(Some(l)) => Ok(Some(l)),
+        Ok(None) => Err(format!("the node at {} runs", paths.state_dir.display())),
+        Err(e) => Err(format!("whether the node runs is not known: {e}")),
     }
 }
 
@@ -928,11 +981,14 @@ fn running(paths: &NodePaths) -> Option<String> {
 fn drop_profiles(paths: &NodePaths, names: &[String], store: &mut impl ProfileStore) -> Profiles {
     let mut p = Profiles::default();
     let there: Vec<String> = names.iter().filter(|n| store.exists(n)).cloned().collect();
-    if let Some(why) = running(paths) {
-        p.kept = there;
-        p.why = (!p.kept.is_empty()).then_some(why);
-        return p;
-    }
+    let _held = match hold(paths) {
+        Ok(h) => h,
+        Err(why) => {
+            p.kept = there;
+            p.why = (!p.kept.is_empty()).then_some(why);
+            return p;
+        }
+    };
     for n in names {
         // Also where its folder is gone: the registry key may not be.
         match store.remove(n) {
@@ -2156,6 +2212,61 @@ mod tests {
         store.there.push(name.clone());
         assert_eq!(forget_in(&paths, &node("lab"), &mut store).removed, [name]);
         assert!(!paths.state_dir.exists());
+    }
+
+    /// The CLI's sync (`center rm`, `folder rm`) takes the grants of a
+    /// container off, and its profile only while the node does not run,
+    /// and says which went and which stayed.
+    #[test]
+    fn the_clis_sync_keeps_the_profile_of_an_emptied_container_while_the_node_runs() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("config"), d.path().join("state"));
+        let lab = container(&paths, &node("lab"));
+        let home = container(&paths, &node("home"));
+        let mut f = Fake::default();
+        f.make("/w/a");
+        f.make("/w/b");
+        let a = grant(&lab, "/w/a", "r");
+        let b = grant(&home, "/w/b", "r");
+        let mut store = FakeProfiles {
+            there: vec![lab.clone(), home.clone()],
+            ..Default::default()
+        };
+        let both = [a.clone(), b.clone()];
+        let s = sync_outside_in(&paths, &both, &mut f, &mut store);
+        assert_eq!(s.profiles, Profiles::default());
+        let held = crate::secrets::KeysLock::try_take(&paths).unwrap().unwrap();
+        let s = sync_outside_in(&paths, std::slice::from_ref(&b), &mut f, &mut store);
+        assert_eq!(s.removed, 1);
+        assert_eq!(s.profiles.kept, std::slice::from_ref(&lab));
+        assert!(s.profiles.why.unwrap().contains("runs"));
+        assert!(store.removed.is_empty());
+        drop(held);
+        // With the node stopped, the profile goes with the last grant.
+        sync_outside_in(&paths, &both, &mut f, &mut store);
+        let s = sync_outside_in(&paths, std::slice::from_ref(&b), &mut f, &mut store);
+        assert_eq!(s.profiles.removed, std::slice::from_ref(&lab));
+        assert_eq!(store.there, std::slice::from_ref(&home));
+        assert!(s.errors.is_empty(), "{s:?}");
+    }
+
+    /// What two cleanups did, each profile once.
+    #[test]
+    fn profiles_merge_each_once() {
+        let mut p = Profiles {
+            removed: vec!["a".into()],
+            ..Default::default()
+        };
+        p.merge(Profiles {
+            removed: vec!["a".into(), "b".into()],
+            kept: vec!["c".into()],
+            why: Some("runs".into()),
+            errors: vec!["e".into()],
+        });
+        assert_eq!(p.removed, ["a", "b"]);
+        assert_eq!(p.kept, ["c"]);
+        assert_eq!(p.why.as_deref(), Some("runs"));
+        assert_eq!(p.errors, ["e"]);
     }
 
     /// `remove_all` takes the grants off and removes the profiles of the

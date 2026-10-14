@@ -633,11 +633,38 @@ pub async fn read_config(paths: &NodePaths) -> Result<(NodeConfig, Option<u64>),
 }
 
 /// Changes the config: through the daemon (retrying when someone else wrote
-/// meanwhile), or directly in the file when no daemon runs.
+/// meanwhile), or directly in the file when no daemon runs. An error also
+/// when the config is saved but the folder grants do not follow it.
 pub async fn edit(
     paths: &NodePaths,
     f: impl Fn(&mut NodeConfig) -> Result<(), String>,
 ) -> Result<NodeConfig, String> {
+    let saved = edit_saved(paths, f).await?;
+    match grants_failed(&saved.grants) {
+        Some(e) => Err(e),
+        None => Ok(saved.cfg),
+    }
+}
+
+/// The config [`edit_saved`] saved, and what the folder grants did when no
+/// daemon took the change (nothing when one did).
+pub struct Saved {
+    pub cfg: NodeConfig,
+    pub grants: crate::grants::Synced,
+}
+
+/// Why the folder grants do not follow a saved config, if they do not.
+fn grants_failed(s: &crate::grants::Synced) -> Option<String> {
+    s.errors
+        .first()
+        .map(|e| format!("the config is saved, but the folder grants do not follow it: {e}"))
+}
+
+/// [`edit`], which is also done when the folder grants do not follow.
+pub async fn edit_saved(
+    paths: &NodePaths,
+    f: impl Fn(&mut NodeConfig) -> Result<(), String>,
+) -> Result<Saved, String> {
     #[cfg(unix)]
     for _ in 0..5 {
         let sock = paths.ctl_socket();
@@ -650,7 +677,12 @@ pub async fn edit(
         f(&mut cfg)?;
         let params = json!({"config": cfg.to_toml(), "if_version": read["version"]});
         match nerve_transport::ctl::call(&sock, "config.write", params).await {
-            Ok(_) => return Ok(cfg),
+            Ok(_) => {
+                return Ok(Saved {
+                    cfg,
+                    grants: Default::default(),
+                });
+            }
             Err(e) if e.starts_with("conflict") => continue,
             Err(e) => return Err(e),
         }
@@ -667,13 +699,8 @@ pub async fn edit(
             // folder mode follow it here (crate::grants); a running node
             // brings them in line with its own config again before a
             // command.
-            let synced = crate::grants::apply(paths, &cfg, &crate::paths::home_dir());
-            if let Some(e) = synced.errors.first() {
-                return Err(format!(
-                    "the config is saved, but the folder grants do not follow it: {e}"
-                ));
-            }
-            Ok(cfg)
+            let grants = crate::grants::apply_outside(paths, &cfg, &crate::paths::home_dir());
+            Ok(Saved { cfg, grants })
         }
         Err(SetError::Conflict { .. }) => Err("the config changed meanwhile; try again".into()),
         Err(e) => Err(e.to_string()),
@@ -1049,7 +1076,10 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             let (cfg, _) = read_config(&paths).await?;
             let name = pick_center(&cfg, &center)?;
             let gone = std::sync::Mutex::new(Vec::new());
-            let cfg = edit(&paths, |c| {
+            // Saved also when the folder grants of the other pairings do not
+            // follow: the pairing is gone then, so its key and profile go
+            // now, or nothing names them later.
+            let saved = edit_saved(&paths, |c| {
                 let mut g = gone.lock().unwrap_or_else(|p| p.into_inner());
                 g.clear();
                 g.extend(
@@ -1062,6 +1092,7 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                 Ok(())
             })
             .await?;
+            let cfg = &saved.cfg;
             // The center is gone either way; a key that stays behind is
             // said, not hidden.
             if let Err(e) =
@@ -1069,38 +1100,51 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             {
                 w(out, format!("the node key for {name} was not deleted: {e}"));
             }
-            // So is the profile of its container on Windows (crate::grants),
-            // also when the record of the grants does not name it; a node
-            // that runs still serves the center until it starts again.
+            // So is the profile of its container on Windows (crate::grants):
+            // with its last grant when the record names it, else found by
+            // the pairing. A node that runs still serves the center until it
+            // starts again, so there it stays.
+            let mut p = saved.grants.profiles.clone();
+            let mut ours = Vec::new();
             for id in gone.into_inner().unwrap_or_else(|p| p.into_inner()) {
                 if cfg.centers.iter().any(|c| c.node_id == id) {
                     continue;
                 }
-                let p = crate::grants::forget(&paths, &id);
-                for n in &p.removed {
-                    w(
-                        out,
-                        format!("removed the AppContainer profile {n} of {name}"),
-                    );
+                ours.extend(crate::grants::containers(&paths, &id));
+                p.merge(crate::grants::forget(&paths, &id));
+            }
+            let of = |n: &String| {
+                if ours.contains(n) {
+                    format!("{n} of {name}")
+                } else {
+                    n.clone()
                 }
-                if let Some(why) = &p.why {
+            };
+            for n in &p.removed {
+                w(out, format!("removed the AppContainer profile {}", of(n)));
+            }
+            if let Some(why) = &p.why {
+                for n in &p.kept {
                     w(
                         out,
                         format!(
-                            "the AppContainer profile {} of {name} stays, since {why}: once the node stopped, remove it by hand (docs/user/modes.md)",
-                            p.kept.join(", ")
+                            "the AppContainer profile {} stays, since {why}: once the node stopped, remove it by hand (docs/user/modes.md)",
+                            of(n)
                         ),
                     );
                 }
-                for e in &p.errors {
-                    w(
-                        out,
-                        format!("the AppContainer profile of {name} was not removed: {e}"),
-                    );
-                }
+            }
+            for e in &p.errors {
+                w(
+                    out,
+                    format!("the AppContainer profile of {name} was not removed: {e}"),
+                );
             }
             w(out, format!("unpaired {name}"));
-            Ok(())
+            match grants_failed(&saved.grants) {
+                Some(e) => Err(e),
+                None => Ok(()),
+            }
         }
         Cmd::Center(CenterCmd::Ls) => {
             let (cfg, _) = read_config(&paths).await?;
@@ -2957,6 +3001,95 @@ mod tests {
         assert!(ls.contains(&format!("AppContainer {name}")), "{ls}");
         let out = run(&paths, &["center", "rm"]).unwrap();
         assert!(out.contains(&name), "{out}");
+        assert!(!profile.exists(), "{}", profile.display());
+    }
+
+    /// The profile folder of the container `name`, made by starting a
+    /// command in it; whether the command runs does not matter.
+    #[cfg(windows)]
+    fn profile_of(name: &str) -> PathBuf {
+        let _ = nerve_sandbox::appcontainer::run(
+            Path::new("cmd.exe"),
+            &["/C".into(), "exit 0".into()],
+            name,
+        );
+        let profile = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap())
+            .join("Packages")
+            .join(name);
+        assert!(profile.exists(), "{}", profile.display());
+        profile
+    }
+
+    /// On Windows: the profile of a pairing with folder entries goes with
+    /// their grants at `center rm`, which says so, and stays while the node
+    /// runs, which it says too.
+    #[cfg(windows)]
+    #[test]
+    fn center_rm_names_the_profile_that_goes_with_the_last_grant() {
+        let (d, paths) = setup(&["home"]);
+        let work = d.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        run(&paths, &["folder", "add", work.to_str().unwrap(), "+rw"]).unwrap();
+        assert!(crate::grants::record_file(&paths).exists());
+        let name = crate::grants::container(&paths, "n");
+        let profile = profile_of(&name);
+        // A node that runs holds the lock.
+        let held = crate::secrets::KeysLock::try_take(&paths).unwrap().unwrap();
+        let out = run(&paths, &["center", "rm"]).unwrap();
+        drop(held);
+        assert!(
+            out.contains(&format!(
+                "the AppContainer profile {name} of home stays, since the node at"
+            )),
+            "{out}"
+        );
+        assert!(profile.exists(), "{}", profile.display());
+        nerve_sandbox::appcontainer::remove_profile(&name).unwrap();
+
+        let (d, paths) = setup(&["home"]);
+        let work = d.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        run(&paths, &["folder", "add", work.to_str().unwrap(), "+rw"]).unwrap();
+        let name = crate::grants::container(&paths, "n");
+        let profile = profile_of(&name);
+        let out = run(&paths, &["center", "rm"]).unwrap();
+        assert!(
+            out.contains(&format!("removed the AppContainer profile {name} of home")),
+            "{out}"
+        );
+        assert!(!profile.exists(), "{}", profile.display());
+    }
+
+    /// On Windows: when the grants of the pairings that stay do not follow
+    /// (a hard link below a folder they write), `center rm` still removes
+    /// the pairing's profile, as nothing names it once the pairing is gone,
+    /// and then says what failed.
+    #[cfg(windows)]
+    #[test]
+    fn center_rm_removes_the_profile_when_the_other_grants_do_not_follow() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("c"), d.path().join("s"));
+        let work = d.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        std::fs::write(work.join("a.txt"), "x").unwrap();
+        std::fs::hard_link(work.join("a.txt"), work.join("b.txt")).unwrap();
+        let real = nerve_policy::paths::resolve(&work).unwrap();
+        let mut cfg = NodeConfig::default();
+        let mut home = entry("home");
+        home.node_id = "n-home".into();
+        home.policy.folders.push(Folder {
+            path: real.display().to_string(),
+            access: Access::parse("rw").unwrap(),
+        });
+        let mut lab = entry("lab");
+        lab.node_id = "n-lab".into();
+        cfg.centers = vec![home, lab];
+        cfg.save(&paths.config_file()).unwrap();
+        let name = crate::grants::container(&paths, "n-lab");
+        let profile = profile_of(&name);
+        let e = run(&paths, &["center", "rm", "--center", "lab"]).unwrap_err();
+        assert!(e.contains("the folder grants do not follow"), "{e}");
+        assert!(load(&paths).center("lab").is_none());
         assert!(!profile.exists(), "{}", profile.display());
     }
 

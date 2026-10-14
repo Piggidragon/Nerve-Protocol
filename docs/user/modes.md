@@ -557,6 +557,23 @@ of a group such as `docker`; see
 [the account commands run as](service.md#the-account-commands-run-as)). In `folder` mode they are the same account, held to their
 folders.
 
+### Paths a command builds at run time
+
+The node checks the paths a command line names plainly (an absolute path, or
+one that starts with `~/` or `$HOME/`) against the
+[protected paths](protected-paths.md) and its own folders. It does not see a
+path the command puts together while it runs: `cd ~/.config; cat
+nerve/node.toml`, where a shell joins the pieces, or a script or program that
+builds the name from parts, from its environment or from a file. In `folder`
+mode that does not matter, since Landlock keeps the command off the node's
+folders and the protected paths all the same. In `user` mode it is a limit:
+the command runs as your user without a sandbox, so it reaches whatever you
+reach, protected paths and the node's own folders included. No rule closes it.
+It is why `user` mode is for a center you would trust with a shell. A program
+that an `allowlist` rule lets run is not sandboxed either, so it holds for what
+such a program builds itself ([rules](rules.md#what-a-wildcard-covers) keeps
+shell syntax out of a wildcard rule, not what a program does).
+
 ## Which mode
 
 | You want | Use |

@@ -105,6 +105,39 @@ runs as you (in `user` mode) can reach it in either place. The check protects ag
 node installed as a service, commands run as another account
 ([service](service.md#the-account-commands-run-as)) and cannot reach it.
 
+### An older file put back
+
+A file the node signed earlier still has a right MAC, so the MAC alone does
+not show that someone put an earlier `node.toml` back in the config folder:
+a folder you removed, a rule you took away, a pairing you ended. The node
+therefore keeps the highest version of `node.toml` it has saved or taken in
+`config.version` in the state folder, and refuses a signed file below it the
+same way as a changed one:
+
+- At start the node does not start, and the commands that read the settings
+  refuse the file.
+- On a reload the old settings stay.
+
+The message is:
+
+```
+node.toml is refused: its version 3 is older than the last this node accepted (5), so an earlier file was put back; check it, then `nerve-node config accept` takes it as it is
+```
+
+You see it after you restore the config folder from a backup as well. Look at
+the file, then take it with `nerve-node config accept`: the node signs it
+under a version above every one before, so it is the newest file now, and the
+older copies are refused in turn.
+
+`config.version` is a number, in the state folder beside `config.key`, so it
+holds as far as the key does: a `user` mode command can delete it, a `folder`
+mode command cannot reach it. A node that has none (one from before the
+node kept it, or a state folder made new) takes `node.toml` as it is and
+records its version. If the file is damaged, the node does not start and says
+so: delete it, or take `node.toml` with `config accept`. Take care of the two
+folders together when you back them up and restore them: a config folder
+older than its state folder is refused.
+
 ## Where the node keeps its keys
 
 The node has a key per center and the key for the MAC above.
@@ -157,6 +190,15 @@ Secret Service needs no path to read the keys. With `keyring`, an allow
 rule for `secret-tool`, `busctl --user`, `gdbus`, `dbus-send` or the like
 hands a center every key of the node, which with `file` it could not read.
 Do not allow such a tool to a center, or keep the keys in files.
+
+This is a limit that stays, not one a later version closes. An allow rule
+names a program that runs as you, and that mode is not a sandbox
+([rules](rules.md#deny-a-command)): a rule for a keyring client is the same
+kind of rule as one for a shell script that reads your files. Confining
+`allowlist` commands for the keyring's sake would also stop programs a rule
+is there to run when they need your session (`ssh` with its agent, `git` with a
+credential helper), and it would still leave an allowed interpreter free to
+read what you read. Look at what you allow with `nerve-node rule ls allow`.
 
 With `keyring`, the node needs a keyring that answers. Without one it does
 not start, and `status` and the other commands that read the settings say:

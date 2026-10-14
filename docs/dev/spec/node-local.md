@@ -9,7 +9,7 @@ same way and so the owner knows what each setting does.
 | What | Default | Override |
 |---|---|---|
 | `node.toml` and one key per center (`keys/<name>.key`); on Windows also `sudo.dpapi` and, on the installed node, `command-account.dpapi` | `~/.config/nerve` | `--config-dir`, `NERVE_CONFIG_DIR` |
-| control socket `run/ctl.sock` and its token `run/ctl.token`, audit log `audit.jsonl`, log `log.jsonl`, the config's MAC key `config.key`, `keys.lock`, `keys.moving`; on Windows the record of the folder grants `grants.json` and its lock `grants.json.lock` | `~/.local/state/nerve` | `--state-dir`, `NERVE_STATE_DIR` |
+| control socket `run/ctl.sock` and its token `run/ctl.token`, audit log `audit.jsonl`, log `log.jsonl`, the config's MAC key `config.key`, the last version of the config `config.version`, `keys.lock`, `keys.moving`; on Windows the record of the folder grants `grants.json` and its lock `grants.json.lock` | `~/.local/state/nerve` | `--state-dir`, `NERVE_STATE_DIR` |
 
 With `machine.secret_storage = "keyring"` the keys are in the system keyring
 instead of `keys/` and `config.key` ([where the keys are](#where-the-keys-are)).
@@ -110,17 +110,46 @@ config folder would still not hold it.
 
 A file whose MAC is missing or does not match was changed outside the
 owner's path. It is refused and the refusal is audited (§6): at start-up the
-node does not start; on a reload the old config stays in force. A reload also
-refuses a signed file older than the one in force. After looking at a refused
-file, the owner takes it as it is with `nerve-node config accept`; the node
-then signs it. A `node.toml` without a MAC line (no key yet) is taken once
-as it is and signed.
+node does not start; on a reload the old config stays in force. After looking
+at a refused file, the owner takes it as it is with `nerve-node config
+accept`; the node then signs it. A `node.toml` without a MAC line (no key
+yet) is taken once as it is and signed.
 
-The check stands on `config.key`. A process that can delete or read it, and a
-`user` mode command is one (it runs unconfined as the user), can make the node
-take another file at its next start: with the key gone, an unsigned file
-counts as a first file and is signed. The start-up audits that as
-`signed`. In `folder` mode Landlock keeps commands out of the state folder.
+An earlier file that the node signed itself passes the MAC, so the MAC does
+not tell it from the last one. `<state>/config.version` does: the highest
+`version` of `node.toml` the node has saved or taken, as a decimal number
+(0600, no secret). It is written after every save of the file, never before,
+and only goes up. A signed file whose version is below it was put back and is
+refused like a changed one (audited, `refused`): at start-up the node does not
+start, and the CLI's read-only commands refuse it; a reload also refuses a
+signed file below the version in force, and the old config stays. The same
+refusal is what the owner sees after a restore of the config folder from a
+backup.
+
+- `config accept` takes the refused file under a version above every one
+  before it (the highest of the file, the config in force and the record, plus
+  one), so the file taken is the newest, the record goes on from it, and an
+  older copy is refused in turn.
+- A node with no record (an install from before there was one, or a state
+  folder made new) takes the file as it is and records its version. With no
+  `node.toml` and a record, the versions go on from the record, so the first
+  file the node saves is not an older one.
+- A record that holds no number is an error, not none: the node does not
+  start, and the CLI's commands refuse, naming the file. `config accept`
+  writes it again, or the owner deletes it.
+- A record that cannot be written after the file was saved changes nothing: it
+  only lags, the audit log says `not_recorded`, and the next start records
+  the version.
+
+The check stands on `config.key` and `config.version`. A process that can
+delete or read the key, and a `user` mode command is one (it runs unconfined
+as the user), can make the node take another file at its next start: with the
+key gone, an unsigned file counts as a first file and is signed (at a version
+not below the record). The start-up audits that as `signed`. A process that
+can write the state folder can delete or lower the record as well. In
+`folder` mode Landlock keeps commands out of the state folder. What the record
+adds is a defence against whoever can write the config folder alone: a
+backup, a sync tool, a process of another account.
 
 On Windows there is no control socket. A running node takes the folder
 changes over its control pipe (§5); for every other change the CLI writes
@@ -269,7 +298,26 @@ and is not counted.
 `allowlist` and `user` mode commands get no Landlock rules, so an allowed
 command that talks to the Secret Service (`secret-tool`, `busctl --user`,
 `gdbus`, `dbus-send`) reads the node's keys with `keyring`; it names no
-path the protected list could refuse.
+path the protected list could refuse. This is an accepted limit (decided in
+#57), not a gap waiting for a rule:
+
+- An allow rule names a program the owner lets run as themselves, and the
+  mode that runs it is not a sandbox (`rules.md`: a deny rule is not one
+  either). A connect rule for these commands would keep one kind of program
+  off one socket, while an allowed interpreter or build tool still reads the
+  rest of what the user's account reads, with paths it builds at run time (§3, step 0).
+  It would not make any rule safe that names a program that does more.
+- Landlock on an `allowlist` command would be a second sandbox next to
+  `folder` mode's, for the one mode that runs commands as the user on
+  purpose. It would also stop the programs a rule is there to run when they
+  need the session (`ssh` with the agent in `/run/user/<uid>`, `git` with a
+  credential helper), and every `allowlist` command would need the count of
+  running commands that `folder` mode has (a domain does not change while a
+  command runs), so that the keys do not move into the keyring under one that
+  started before.
+- So the owner's rule is: no allow rule for a program that asks the keyring
+  (`secret-tool`, `busctl`, `gdbus`, `dbus-send`, `kwallet-query` and the
+  like), or the keys stay in files. `nerve-node rule ls allow` shows them.
 
 #### A keyring on a Linux without a desktop
 
@@ -892,8 +940,8 @@ the node as a service.
 
 `<state>/audit.jsonl`, one JSON line per event: settings changes (with old
 and new value), calls allowed or forbidden (a refusal with its reason), and what happened to the config
-file itself (`"kind": "config"`, `event` `refused`, `signed` or `accepted`,
-with the file and the reason), and what the owner did to the node
+file itself (`"kind": "config"`, `event` `refused`, `signed`, `accepted` or
+`not_recorded`, with the file and the reason), and what the owner did to the node
 (`"kind": "node"`, `event` `install`, `setup`, `update` or `uninstall`, with
 its `steps` and the `error` that stopped it). It holds targets (paths, command lines), never
 file content or output; a target longer than 512 characters is cut there

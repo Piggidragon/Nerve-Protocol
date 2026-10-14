@@ -764,6 +764,14 @@ impl Secrets for NodeSecrets {
         }
     }
 
+    fn accepted_version(&self) -> Result<Option<u64>, String> {
+        nerve_policy::settings::read_version(&self.paths.config_version())
+    }
+
+    fn accept_version(&self, version: u64) -> Result<(), String> {
+        nerve_policy::settings::record_version(&self.paths.config_version(), version)
+    }
+
     fn copy(&mut self, cfg: &NodeConfig) -> Result<(), String> {
         let to = cfg.machine.secret_storage;
         // Before the count of running commands: this refusal holds whatever

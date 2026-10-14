@@ -57,8 +57,9 @@ const UNDECIDED_PER_PEER: usize = 4;
 /// machines of its LAN, which share the /64, keep room.
 const UNDECIDED_PER_PREFIX: usize = 16;
 /// How long the relay tries to reach a center for a granted tunnel, the name
-/// lookup included.
-const DIAL_DEADLINE: Duration = Duration::from_secs(30);
+/// lookup included: less than the 15 seconds a relayed node waits for the
+/// answer, so the relay does not dial on for a node that left.
+const DIAL_DEADLINE: Duration = Duration::from_secs(12);
 /// Connections refused without a valid token are told in the log at most
 /// this often, counted: a peer that makes them as fast as it can must not
 /// push the rest of the log out.
@@ -87,9 +88,8 @@ pub(crate) struct Relays {
     plain: Mutex<HashMap<String, Tally>>,
     /// Refusals without a valid token, told counted.
     tokenless: Tally,
-    /// Refusals of a node with its token for a limit (tunnels at once, opens
-    /// a minute), told counted.
-    held_back: Tally,
+    /// Refusals of a node with its token, per node, told counted.
+    held_back: Mutex<HashMap<String, Tally>>,
     /// When each relay node opened its tunnels in the last minute.
     opens: Mutex<HashMap<String, std::collections::VecDeque<std::time::Instant>>>,
     /// How long a tunnel may be quiet ([`IDLE`]; a test shortens it).
@@ -111,7 +111,7 @@ impl Default for Relays {
             prefixes: Mutex::default(),
             plain: Mutex::default(),
             tokenless: Tally::default(),
-            held_back: Tally::default(),
+            held_back: Mutex::default(),
             opens: Mutex::default(),
             idle_ms: AtomicU64::new(IDLE.as_millis() as u64),
             undecided_ms: AtomicU64::new(nerve_transport::http::HEAD_TIMEOUT.as_millis() as u64),
@@ -119,27 +119,125 @@ impl Default for Relays {
     }
 }
 
-/// Refusals of one kind, told in the log counted: the first, then at most
-/// one line per [`TOKENLESS_EVERY`] with the count since the last.
+/// Refusals of one kind, told in the log counted: the first at once, then
+/// at most one line per [`TOKENLESS_EVERY`] with the count since the last.
+/// A count left waiting is told when its minute is over
+/// ([`flush_tallies`]), also when no refusal follows.
 #[derive(Default)]
-struct Tally(Mutex<(u64, Option<std::time::Instant>)>);
+struct Tally(Mutex<TallyState>);
+
+#[derive(Default)]
+struct TallyState {
+    /// Refusals not told yet.
+    count: u64,
+    /// When the first of them came.
+    first: Option<std::time::Instant>,
+    /// When the last line was told.
+    told: Option<std::time::Instant>,
+    /// The last refusal, in words for the line.
+    last: String,
+}
+
+/// A line a tally has to tell: how many refusals, over how long, and the
+/// last of them.
+#[derive(Debug, PartialEq, Eq)]
+struct Told {
+    n: u64,
+    over: Duration,
+    last: String,
+}
 
 impl Tally {
     /// Refusals counted since the last line.
     #[cfg(test)]
     fn pending(&self) -> u64 {
-        lock(&self.0).0
+        lock(&self.0).count
     }
 
-    fn note(&self, now: std::time::Instant) -> Option<u64> {
+    /// Counts a refusal (`last` says what it was) and gives the line to tell
+    /// when one is due.
+    fn note(&self, now: std::time::Instant, last: String) -> Option<Told> {
         let mut t = lock(&self.0);
-        t.0 += 1;
-        match t.1 {
-            Some(at) if now.duration_since(at) < TOKENLESS_EVERY => None,
-            _ => {
-                let n = t.0;
-                *t = (0, Some(now));
-                Some(n)
+        t.count += 1;
+        t.first.get_or_insert(now);
+        t.last = last;
+        if t.told
+            .is_some_and(|at| now.duration_since(at) < TOKENLESS_EVERY)
+        {
+            return None;
+        }
+        Some(Tally::take(&mut t, now))
+    }
+
+    /// The line for refusals left waiting, once their minute is over.
+    fn flush(&self, now: std::time::Instant) -> Option<Told> {
+        let mut t = lock(&self.0);
+        if t.count == 0
+            || t.told
+                .is_some_and(|at| now.duration_since(at) < TOKENLESS_EVERY)
+        {
+            return None;
+        }
+        Some(Tally::take(&mut t, now))
+    }
+
+    fn take(t: &mut TallyState, now: std::time::Instant) -> Told {
+        let told = Told {
+            n: t.count,
+            over: t.first.map_or(Duration::ZERO, |f| now.duration_since(f)),
+            last: std::mem::take(&mut t.last),
+        };
+        t.count = 0;
+        t.first = None;
+        t.told = Some(now);
+        told
+    }
+}
+
+/// The kinds of counted refusals, for their log line.
+#[derive(Clone, Copy)]
+enum Refused {
+    /// Without a valid token.
+    Tokenless,
+    /// Of relay node `node`, with its token.
+    Node,
+    /// A valid token of relay node `node` that came in plain HTTP.
+    Plain,
+}
+
+/// The `warn` line for a count of refusals.
+fn refused_line(kind: Refused, node: &str, t: &Told) -> String {
+    let (n, last) = (t.n, &t.last);
+    let over = if n > 1 {
+        format!(" in {}", span(t.over))
+    } else {
+        String::new()
+    };
+    match kind {
+        Refused::Tokenless => format!(
+            "relay: refused {n} connection(s) without a valid relay token{over}, the last {last}; such refusals are told at most once a minute"
+        ),
+        Refused::Node => format!(
+            "relay: refused {n} tunnel(s) of relay node {node}{over}, the last {last}; such refusals are told at most once a minute"
+        ),
+        Refused::Plain => format!(
+            "relay: relay node {node} sent its token in plain HTTP {n} time(s){over}, the last {last}, so it crossed the network in the clear; give it a new one (`nerve-node relay rm {node}`, then `relay add {node}`)"
+        ),
+    }
+}
+
+/// Tells the counts that waited out their minute without a refusal after
+/// them: the relay's tick calls it.
+fn flush_tallies(shared: &Shared) {
+    let now = std::time::Instant::now();
+    let r = &shared.relay;
+    if let Some(t) = r.tokenless.flush(now) {
+        tracing::warn!("{}", refused_line(Refused::Tokenless, "", &t));
+    }
+    for (kind, map) in [(Refused::Node, &r.held_back), (Refused::Plain, &r.plain)] {
+        for (node, tally) in lock(map).iter() {
+            if let Some(t) = tally.flush(now) {
+                tracing::warn!("{}", refused_line(kind, node, &t));
             }
         }
     }
@@ -166,6 +264,7 @@ impl Relays {
             "status": lock(&self.status).clone(),
             "max_links": cfg.relay.max_links,
             "max_links_per_node": cfg.relay.max_links_per_node,
+            "max_opens_per_minute": cfg.relay.max_opens_per_minute,
             "pin": cfg.relay.pin,
             "nodes": cfg.relay.nodes.iter().map(|n| json!({
                 "name": n.name,
@@ -183,8 +282,8 @@ impl Relays {
     /// Counts a connection refused without a valid token, and says how many
     /// to tell in the log when a line is due: the first, then at most one
     /// per [`TOKENLESS_EVERY`] with the count since the last.
-    fn note_tokenless(&self, now: std::time::Instant) -> Option<u64> {
-        self.tokenless.note(now)
+    fn note_tokenless(&self, now: std::time::Instant, last: String) -> Option<Told> {
+        self.tokenless.note(now, last)
     }
 
     /// Whether `node` may open another tunnel now, `limit` a minute
@@ -384,8 +483,12 @@ async fn serve(
     changed: &mut tokio::sync::watch::Receiver<u64>,
     stop: &mut tokio::sync::watch::Receiver<bool>,
 ) {
+    // Counts of refusals are told when their minute is over, also when
+    // nothing comes after them.
+    let mut tick = tokio::time::interval(Duration::from_secs(5));
     loop {
         tokio::select! {
+            _ = tick.tick() => flush_tallies(shared),
             got = listener.accept() => match got {
                 Ok((io, peer)) => {
                     // A connection over the limits is closed unread.
@@ -675,20 +778,18 @@ impl Drop for Undecided {
     }
 }
 
-/// Tells a refusal of a node with its token, counted: whatever it asks, a
-/// node gets no more than a line a minute in the log for its refusals.
+/// Tells a refusal of a node with its token, counted per node: whatever it
+/// asks, a node gets no more than a line a minute in the log for its
+/// refusals, and the line names that node.
 fn held_back(shared: &Shared, node: &str, peer: SocketAddr, target: &str, r: &Refusal) {
-    tracing::debug!(
-        "relay: refused a tunnel of {node} from {peer} to {}: {}",
-        clip(target),
-        r.why
-    );
-    if let Some(n) = shared.relay.held_back.note(std::time::Instant::now()) {
-        tracing::warn!(
-            "relay: refused {n} tunnel(s) of relay nodes, the last of {node} from {peer} to {}: {}; such refusals are told at most once a minute",
-            clip(target),
-            r.why
-        );
+    let last = format!("from {peer} to {}: {}", clip(target), r.why);
+    tracing::debug!("relay: refused a tunnel of {node} {last}");
+    let due = lock(&shared.relay.held_back)
+        .entry(node.to_string())
+        .or_default()
+        .note(std::time::Instant::now(), last);
+    if let Some(t) = due {
+        tracing::warn!("{}", refused_line(Refused::Node, node, &t));
     }
 }
 
@@ -699,21 +800,20 @@ fn plain_token(shared: &Shared, node: &str, peer: SocketAddr) {
     let due = lock(&shared.relay.plain)
         .entry(node.to_string())
         .or_default()
-        .note(std::time::Instant::now());
-    if let Some(n) = due {
-        tracing::warn!(
-            "relay: relay node {node} sent its token in plain HTTP {n} time(s), the last from {peer}, so it crossed the network in the clear; give it a new one (`nerve-node relay rm {node}`, then `relay add {node}`)"
-        );
+        .note(std::time::Instant::now(), format!("from {peer}"));
+    if let Some(t) = due {
+        tracing::warn!("{}", refused_line(Refused::Plain, node, &t));
     }
 }
 
 /// Tells a connection refused without a valid token in the log, counted
 /// ([`Relays::note_tokenless`]).
 fn tokenless(shared: &Shared, peer: SocketAddr) {
-    if let Some(n) = shared.relay.note_tokenless(std::time::Instant::now()) {
-        tracing::warn!(
-            "relay: refused {n} connection(s) without a valid relay token, the last from {peer}; such refusals are told at most once a minute"
-        );
+    let due = shared
+        .relay
+        .note_tokenless(std::time::Instant::now(), format!("from {peer}"));
+    if let Some(t) = due {
+        tracing::warn!("{}", refused_line(Refused::Tokenless, "", &t));
     }
 }
 
@@ -2167,15 +2267,66 @@ mod tests {
     fn refusals_without_a_token_are_told_counted_once_a_minute() {
         let r = Relays::default();
         let t0 = std::time::Instant::now();
-        assert_eq!(r.note_tokenless(t0), Some(1));
+        let n = |t: Option<Told>| t.map(|t| t.n);
+        assert_eq!(n(r.note_tokenless(t0, "from a".into())), Some(1));
         for i in 1..10_000u64 {
-            assert_eq!(r.note_tokenless(t0 + Duration::from_millis(i)), None);
+            assert_eq!(
+                r.note_tokenless(t0 + Duration::from_millis(i), "from b".into()),
+                None
+            );
+        }
+        let t = r
+            .note_tokenless(
+                t0 + TOKENLESS_EVERY + Duration::from_secs(1),
+                "from c".into(),
+            )
+            .unwrap();
+        assert_eq!((t.n, t.last.as_str()), (10_000, "from c"));
+        assert_eq!(
+            r.note_tokenless(t0 + TOKENLESS_EVERY * 2, "from d".into()),
+            None
+        );
+    }
+
+    /// A count left waiting is told once its minute is over, also when no
+    /// refusal follows, with how long it took and the last refusal; a later
+    /// refusal starts a count of its own.
+    #[test]
+    fn a_waiting_count_is_told_when_its_minute_ends() {
+        let t = Tally::default();
+        let t0 = std::time::Instant::now();
+        let first = t.note(t0, "to x".into()).unwrap();
+        assert_eq!((first.n, first.last.as_str()), (1, "to x"));
+        for i in 1..=200u64 {
+            assert_eq!(
+                t.note(t0 + Duration::from_millis(100 * i), format!("to {i}")),
+                None
+            );
         }
         assert_eq!(
-            r.note_tokenless(t0 + TOKENLESS_EVERY + Duration::from_secs(1)),
-            Some(10_000)
+            t.flush(t0 + Duration::from_secs(30)),
+            None,
+            "the minute is not over"
         );
-        assert_eq!(r.note_tokenless(t0 + TOKENLESS_EVERY * 2), None);
+        let told = t
+            .flush(t0 + TOKENLESS_EVERY + Duration::from_secs(1))
+            .unwrap();
+        assert_eq!((told.n, told.last.as_str()), (200, "to 200"));
+        assert_eq!(
+            told.over,
+            TOKENLESS_EVERY + Duration::from_secs(1) - Duration::from_millis(100)
+        );
+        assert_eq!(t.flush(t0 + TOKENLESS_EVERY * 3), None, "nothing waits");
+        // An hour later, one refusal is one refusal.
+        let later = t
+            .note(t0 + Duration::from_secs(3600), "to y".into())
+            .unwrap();
+        assert_eq!((later.n, later.last.as_str()), (1, "to y"));
+        let line = refused_line(Refused::Node, "lab", &told);
+        assert!(
+            line.contains("refused 200 tunnel(s) of relay node lab in 1 min, the last to 200"),
+            "{line}"
+        );
     }
 
     /// A name that resolves to this machine is no way to it: only a center
@@ -2511,7 +2662,8 @@ mod tests {
             assert_eq!(status, 400);
         }
         let relays = j.daemon.relay();
-        assert_eq!(relays.held_back.pending(), 39, "403s told one by one");
+        let held = lock(&relays.held_back).get("lab").map(Tally::pending);
+        assert_eq!(held, Some(39), "403s told one by one");
         let plain = lock(&relays.plain).get("lab").map(Tally::pending);
         assert_eq!(plain, Some(39), "plain tokens told one by one");
         assert_eq!(
@@ -2617,5 +2769,30 @@ mod tests {
         r.headers
             .insert("proxy-authorization".into(), basic("lab", &token));
         assert_eq!(decide(&cfg, &r), Err(NOT_A_CENTER));
+    }
+
+    /// The owner's `relay.max_opens_per_minute` is the budget the relay
+    /// applies, not the default.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_relay_applies_the_owners_budget_of_opens() {
+        let home = echo().await;
+        let home_at = format!("127.0.0.1:{}", port(&home));
+        serve_echo(home);
+        let j = jump(vec![center("home", format!("https://{home_at}"))], |c| {
+            c.relay.max_opens_per_minute = 3;
+        })
+        .await;
+        let lab = basic("lab", &j.token);
+        let mut held = Vec::new();
+        for i in 0..3 {
+            let (status, head, t) = connect(j.addr, &j.pin, &home_at, Some(&lab)).await;
+            assert_eq!(status, 200, "{i}: {head}");
+            held.push(t.unwrap());
+        }
+        let (status, head, _) = connect(j.addr, &j.pin, &home_at, Some(&lab)).await;
+        assert_eq!(status, 503, "{head}");
+        assert_eq!(j.daemon.status()["relay"]["max_opens_per_minute"], 3);
+        drop(held);
+        j.daemon.stop().await;
     }
 }

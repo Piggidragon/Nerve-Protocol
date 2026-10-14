@@ -213,12 +213,15 @@ message layer: the relay carries bytes, never messages.
   judges a token by that.
 - A relay keeps at most a few undecided connections per peer address, a
   larger share per IPv6 /64 (which the machines of one LAN share), and a
-  bounded number in all; one over any is closed unread. The first byte, TLS
+  bounded number in all; one over any is closed unread. A machine with
+  enough addresses in a /64 can take that /64's share. The first byte, TLS
   and the `CONNECT` head share one deadline of 15 seconds. A granted
   connection is a tunnel from then on, counted by the tunnel limits, and
   gives its undecided slot back before the relay dials, which has a deadline
   of its own. Refusals are not logged one by one but counted, with a token or
-  without, so no peer can flood the relay's log. A node opens a bounded
+  without, so no peer can flood the relay's log; a count is told when its
+  minute is over even if no refusal follows, and a node's refusals are
+  counted apart from other nodes'. A node opens a bounded
   number of tunnels a minute (the owner can raise it for a relay behind this
   one), so one with a token cannot rotate the audit log either.
 - Hosts are compared as a URL can tell them apart: without case or a

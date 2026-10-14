@@ -2846,8 +2846,10 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
             w(
                 out,
                 format!(
-                    "relay on {address}: at most {} tunnels, {} per node",
-                    cfg.relay.max_links, cfg.relay.max_links_per_node
+                    "relay on {address}: at most {} tunnels, {} per node, {} opened a minute per node",
+                    cfg.relay.max_links,
+                    cfg.relay.max_links_per_node,
+                    cfg.relay.max_opens_per_minute
                 ),
             );
             w(out, format!("its TLS certificate has the pin {pin}"));
@@ -2990,8 +2992,8 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
             w(
                 out,
                 format!(
-                    "at most {} tunnels, {} per node",
-                    r.max_links, r.max_links_per_node
+                    "at most {} tunnels, {} per node, {} opened a minute per node",
+                    r.max_links, r.max_links_per_node, r.max_opens_per_minute
                 ),
             );
             if let Some(pin) = &r.pin {
@@ -5211,7 +5213,7 @@ mod tests {
         let pin = load(&paths).relay.pin.expect("a pin");
         assert!(
             out.starts_with(&format!(
-                "relay on 0.0.0.0:7490: at most 8 tunnels, 4 per node\nits TLS certificate has the pin {pin}\nno node may use it yet"
+                "relay on 0.0.0.0:7490: at most 8 tunnels, 4 per node, 30 opened a minute per node\nits TLS certificate has the pin {pin}\nno node may use it yet"
             )),
             "{out}"
         );
@@ -5221,7 +5223,31 @@ mod tests {
         assert_eq!(id.pin(), pin);
         assert!(paths.relay_tls_file().exists());
         // Again: the same certificate.
-        run(&paths, &["relay", "set", "0.0.0.0:7491"]).unwrap();
+        run(
+            &paths,
+            &[
+                "relay",
+                "set",
+                "0.0.0.0:7491",
+                "--max-opens-per-minute",
+                "300",
+            ],
+        )
+        .unwrap();
+        assert_eq!(load(&paths).relay.max_opens_per_minute, 300);
+        assert!(
+            run(
+                &paths,
+                &[
+                    "relay",
+                    "set",
+                    "0.0.0.0:7491",
+                    "--max-opens-per-minute",
+                    "0"
+                ]
+            )
+            .is_err()
+        );
         assert_eq!(load(&paths).relay.pin.as_deref(), Some(pin.as_str()));
         let e = run(&paths, &["relay", "set", "relay.example:7490"]).unwrap_err();
         assert!(e.contains("relay.listen"), "{e}");
@@ -5289,7 +5315,7 @@ mod tests {
         let ls = run(&paths, &["relay", "ls"]).unwrap();
         assert!(
             ls.starts_with(&format!(
-                "relay on 0.0.0.0:7491\nat most 8 tunnels, 4 per node\npin {pin}\nnode lab-pc: every https center of this node\nnode lab-2: the centers work, home, home-b\n"
+                "relay on 0.0.0.0:7491\nat most 8 tunnels, 4 per node, 300 opened a minute per node\npin {pin}\nnode lab-pc: every https center of this node\nnode lab-2: the centers work, home, home-b\n"
             )),
             "{ls}"
         );

@@ -137,7 +137,12 @@ relay behind this one, whose nodes all count as one.
 At most 4 connections from one address may wait for the relay's answer at
 once, and 16 from one IPv6 /64, each 15 seconds at most; once the relay
 grants a tunnel, its connection counts as a tunnel instead. So a machine
-cannot keep the other machines of its network out.
+with one address cannot keep the other machines of its network out. Over
+IPv6 the relay cannot tell one machine with several addresses from several
+machines: a machine with four or more addresses in your LAN's /64 (privacy
+addresses count, and many systems make one a day) can take the /64's 16 and
+keep the other machines of that /64 out over IPv6, though not those that
+reach the relay over IPv4 or from elsewhere.
 
 ## Who is connected
 
@@ -147,7 +152,7 @@ nerve-node relay ls
 
 ```
 relay on 0.0.0.0:7490: listening on 0.0.0.0:7490
-at most 16 tunnels, 4 per node
+at most 16 tunnels, 4 per node, 30 opened a minute per node
 pin q1Q3tvgEmVkvsjsZTEOBtG9Rb12pM9iyCOVCTVwjz4A
 node lab-pc: the centers home
 tunnel lab-pc from 10.0.0.7:51544 to center home for 2 h 5 min
@@ -158,11 +163,12 @@ On Linux `nerve-node status` shows the relay in one line; on Windows
 in the [audit log](audit.md) when it ends: the node, its address, the
 center, when it started and ended, why it ended and how much it carried;
 never a token. The node's [log](logs.md) also has a line for every tunnel
-that opens or closes. Refusals are counted and told in one line a minute:
-one for nodes with their token, and one naming a node whose token came in
-plain HTTP, so you know to give it a new one.
-Connections without a valid token are counted and told in one line a
-minute.
+that opens or closes. Refusals are counted: the first is told at once, and
+the rest in one line a minute with how many came, over how long, and the
+last of them, also when nothing comes after them. Each node has its own
+count, so the line names the node whose refusals it counts; one more count
+names a node whose token came in plain HTTP, so you know to give it a new
+one. Connections without a valid token share one count.
 
 ## Cut a node off
 

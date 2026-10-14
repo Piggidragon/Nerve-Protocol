@@ -552,20 +552,28 @@ turns it on, and a center reads and changes nothing of it, grant or not.
   seconds in all for the first byte, TLS and the head), at most 4 of them
   from one address and 16 from one IPv6 /64 (link-local addresses count by
   address only, their scope is not in it); one over any is closed unread.
+  A count by address cannot tell one machine with several addresses from
+  several machines: a machine with four or more addresses in the /64
+  (privacy addresses count) can take the /64's 16 and keep the other
+  machines of that /64 out over IPv6, though not the relay's other peers.
   Once granted, a connection is a tunnel, counted by `max_links` and
   `max_links_per_node`, and gives its undecided slot back before the relay
-  resolves and dials the center (30 seconds at most).
-- Every refusal is logged at `debug`. At `warn` the log gets at most one line
-  a minute with the count: one for connections without a valid token
-  (plain HTTP, no or a wrong token, over a limit) with the last address, one
-  for refusals of nodes with their token (a target that is no center, a
-  limit) with the last node, and per node one when its valid token came in
-  plain HTTP, with its name, to give it a new one. So no peer, with a token
-  or without, can rotate the log.
+  resolves and dials the center (12 seconds at most, less than the 15 a
+  relayed node waits for the answer).
+- Every refusal is logged at `debug`. At `warn` the log gets a counted line:
+  the first refusal at once, then at most one line a minute with how many
+  came since and over how long, and the last of them; a count that waits is
+  told when its minute is over, also when no refusal follows (the relay
+  looks every 5 seconds). There is one count for connections without a
+  valid token (plain HTTP, no or a wrong token, over a limit), one per node
+  for refusals of a node with its token (a target that is no center, a
+  limit), and one per node for a valid token that came in plain HTTP, which
+  names the node to give it a new one. So no peer, with a token or without,
+  can rotate the log, and a line names the node whose refusals it counts.
 - A node opens at most `relay.max_opens_per_minute` tunnels a minute (30
   unless set: a node needs one per center and redials after a second at the
-  soonest; a relay behind this one, which carries many nodes, needs more);
-  past that it gets `503`. Each tunnel is an audit entry and two `info`
+  soonest; a relay behind this one, which carries many nodes, needs more;
+  `relay set`, `relay ls` and `status` show it); past that it gets `503`. Each tunnel is an audit entry and two `info`
   lines, so a node with its token cannot rotate the audit log or the log by
   opening and closing tunnels.
 - Hosts are compared without case or a trailing dot, and an address in any

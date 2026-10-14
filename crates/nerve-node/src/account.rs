@@ -67,11 +67,12 @@ pub const CREATE_USER_HINT_ROOT: &str = "An account only the node uses is the bo
 /// Whether the rules `sudo -l -U <name>` lists may let the account use
 /// sudo without a password, so that a probe is worth making: a rule that
 /// grants every command (`ALL`) with `NOPASSWD`, `!authenticate` (not one
-/// for a single command), or `exempt_group=` naming one of `groups`. Such
-/// a list costs sudo no failed login. It is a gate only: a later rule can
-/// still ask for the password, and the probe decides. An account with
-/// `NOPASSWD` for single commands, such as `apt`, is not probed.
-pub fn lists_no_password(listing: &str, groups: &[String]) -> bool {
+/// for a single command), or `exempt_group=` naming a group of the account
+/// (`names` from `id -Gn`, `gids` from `id -G`). Such a list costs sudo no
+/// failed login. It is a gate only: a later rule can still ask for the
+/// password, and the probe decides. An account with `NOPASSWD` for single
+/// commands, such as `apt`, is not probed.
+pub fn lists_no_password(listing: &str, names: &[String], gids: &[u32]) -> bool {
     listing.lines().any(|line| {
         let line = line.trim();
         if let Some((_, cmds)) = line.split_once("NOPASSWD:") {
@@ -81,31 +82,57 @@ pub fn lists_no_password(listing: &str, groups: &[String]) -> bool {
                 c.rsplit(' ').next() == Some("ALL")
             });
         }
-        // A default bound to commands (`Defaults!/usr/bin/apt …`) or to a
-        // user to run as (`Defaults>postgres …`) holds for this probe,
-        // which runs `true` as root, only when the binding names all
-        // commands or root.
-        if let Some(bound) = line.strip_prefix("Defaults")
-            && let Some(kind @ ('!' | '>')) = bound.chars().next()
-        {
-            let list = bound[1..].split(' ').next().unwrap_or("");
-            let names = |n: &str| list.split(',').any(|i| i == n);
-            if !(names("ALL") || kind == '>' && names("root")) {
-                return false;
-            }
-        }
-        line.split(',').any(|entry| {
-            // `Defaults>root !authenticate` names a user before the flag.
-            let entry = entry.trim().rsplit(' ').next().unwrap_or("");
+        let Some(settings) = bound_settings(line) else {
+            return false;
+        };
+        settings.split(',').any(|entry| {
+            let entry = entry.trim();
             match entry.split_once('=') {
                 Some(("exempt_group", g)) => {
                     let g = g.trim_matches('"').trim_start_matches('%');
-                    groups.iter().any(|x| x == g)
+                    // A gid is printed as `\#27`.
+                    match g.trim_start_matches('\\').strip_prefix('#') {
+                        Some(n) => n.parse().is_ok_and(|n| gids.contains(&n)),
+                        None => names.iter().any(|x| x == g),
+                    }
                 }
                 _ => entry == "!authenticate",
             }
         })
     })
+}
+
+/// The settings of a line of the listing that holds for this probe, which
+/// runs `true` as root, or `None`. A default bound to commands
+/// (`Defaults!/usr/bin/apt …`) or to a user to run as (`Defaults>postgres
+/// …`) holds only when its binding names all commands or root. sudo
+/// prints the members of a binding with a comma and a space
+/// (`Defaults>nobody, root !authenticate`), and ends it at the first word
+/// that does not follow a comma.
+fn bound_settings(line: &str) -> Option<&str> {
+    let Some(bound) = line.strip_prefix("Defaults") else {
+        return Some(line);
+    };
+    let Some(kind @ ('!' | '>')) = bound.chars().next() else {
+        return Some(line);
+    };
+    let mut rest = &bound[1..];
+    let mut members = Vec::new();
+    loop {
+        let rest_trimmed = rest.trim_start();
+        let end = rest_trimmed.find(' ').unwrap_or(rest_trimmed.len());
+        let word = &rest_trimmed[..end];
+        rest = &rest_trimmed[end..];
+        members.extend(word.split(',').filter(|m| !m.is_empty()));
+        if !word.ends_with(',') {
+            break;
+        }
+    }
+    let has = |n: &str| members.contains(&n);
+    let all = has("ALL") || kind == '>' && (has("root") || has("#0"));
+    // `!root` takes root out again.
+    let out = kind == '>' && (has("!root") || has("!#0"));
+    (all && !out).then_some(rest)
 }
 
 /// The names of the groups `account` is in, as `id -Gn` prints them.
@@ -819,7 +846,7 @@ mod tests {
     #[test]
     fn a_sudo_listing_tells_whether_no_password_is_asked() {
         let wheel = ["alice".to_string(), "wheel".to_string()];
-        let yes = |l: &str| lists_no_password(l, &wheel);
+        let yes = |l: &str| lists_no_password(l, &wheel, &[27]);
         assert!(yes(
             "User alice may run the following commands on h:\n    (ALL) NOPASSWD: ALL\n"
         ));
@@ -844,10 +871,21 @@ mod tests {
         assert!(!yes(
             "Runas and Command-specific defaults for alice:\n    Defaults!/usr/bin/apt !authenticate\n"
         ));
-        // Bound to a user to run as: only root or everyone counts.
+        // Bound to a user to run as: only root or everyone counts, in
+        // whatever place sudo prints it, and not when `!root` follows.
         assert!(yes("    Defaults>root,postgres !authenticate\n"));
+        assert!(yes("    Defaults>root, nobody !authenticate\n"));
+        assert!(yes("    Defaults>nobody, root !authenticate\n"));
+        assert!(yes("    Defaults>#0 !authenticate\n"));
+        assert!(yes("    Defaults!/usr/bin/apt, ALL !authenticate\n"));
+        assert!(yes("    Defaults>ALL, !postgres !authenticate\n"));
+        assert!(!yes("    Defaults>ALL, !root !authenticate\n"));
+        assert!(!yes("    Defaults>nobody, postgres !authenticate\n"));
         assert!(yes("    Defaults>ALL !authenticate\n"));
         assert!(!yes("    Defaults>postgres !authenticate\n"));
+        // A group by its gid is printed with an escaped `#`.
+        assert!(yes("    env_reset, exempt_group=\\#27\n"));
+        assert!(!yes("    env_reset, exempt_group=\\#28\n"));
         // Another group's exemption.
         assert!(!yes("    env_reset, exempt_group=admins\n"));
         assert!(!yes(

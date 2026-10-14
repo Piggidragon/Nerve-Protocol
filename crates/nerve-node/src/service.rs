@@ -244,7 +244,8 @@ impl System for Host {
             return false;
         };
         let groups = crate::account::group_names(account);
-        if !crate::account::lists_no_password(&String::from_utf8_lossy(&o.stdout), &groups) {
+        let listing = String::from_utf8_lossy(&o.stdout);
+        if !crate::account::lists_no_password(&listing, &groups, &account.groups) {
             return false;
         }
         // The account's own sudo, which `-n` never lets ask, and `-k`

@@ -49,7 +49,9 @@ The relay keeps only a hash of the token in `node.toml`. If you lose the
 token, or think it leaked, give the node a new one:
 `nerve-node relay token lab-pc`. The old token stops working, its tunnels
 end, and the node keeps its centers and its limits. (`relay rm`, then
-`relay add`, makes the node anew, without them.)
+`relay add`, makes the node anew, without them.) On Windows the running
+relay takes the new token only when it starts again: restart it, or the old
+token goes on working ([On Windows](#on-windows)).
 
 The certificate's key is kept with the node's own keys, where
 `machine.secret_storage` says: a file in the config folder by default, or
@@ -216,9 +218,14 @@ Each of these ends the tunnels it concerns at once:
 
 Windows has no control socket, so a `relay` change is in `node.toml` and
 takes effect at the next start of the node (`Restart-Service nerve-node` for
-the installed node). Until then the running node keeps the tunnels it
-carries: `relay rm` and `relay off` say so, and you restart the node to cut
-them now. `relay ls` asks the running node who is connected. Windows
+the installed node). Until then the running node works by its old relay
+settings, for new tunnels as well as the ones it carries: a token taken
+away with `relay rm` or replaced with `relay token` still opens tunnels, a
+node off its center list still reaches the center, `relay off` does not stop
+the listener, and a new token or node gets `407`. Every `relay` change says
+so on Windows. After `relay token`, `relay rm`, `relay off` or `relay
+set-centers`, restart the node to apply it now, above all when a token may
+have leaked. `relay ls` asks the running node who is connected. Windows
 Firewall must let other machines reach the relay's port.
 
 ## What to know

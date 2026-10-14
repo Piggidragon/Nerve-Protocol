@@ -614,6 +614,12 @@ turns it on, and a center reads and changes nothing of it, grant or not.
 
 On Windows a change made with `relay` is in the file and takes effect at
 the next start of the node, as every change but the folder changes there.
+Until then the running node keeps its relay settings in memory, for new
+tunnels as well as open ones: a removed or replaced token still opens
+tunnels, a new token or node is refused (`407`), and `relay off` leaves the
+listener up. Every `relay` command that changes the file says so there
+(and says nothing is "now" in force); where a running node took the
+change, the commands that take something away say what ends now.
 
 ### Modes
 

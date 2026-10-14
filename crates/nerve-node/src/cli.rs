@@ -2824,8 +2824,9 @@ async fn proxy_cmd(paths: &NodePaths, c: ProxyCmd, out: &mut dyn Write) -> Resul
     }
 }
 
-/// `relay set|off|add|rm|ls` (crate::relay). A token is shown once, by
-/// `add`; `node.toml` keeps only its hash.
+/// `relay set|off|add|token|set-centers|set-limits|rm|ls` (crate::relay).
+/// A token is shown once, by `add` or `token`; `node.toml` keeps only its
+/// hash. Each change says when it is in force ([`relay_in_force`]).
 async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Result<(), String> {
     let w = |out: &mut dyn Write, s: String| {
         let _ = writeln!(out, "{s}");
@@ -2881,6 +2882,7 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
                     "no node may use it yet: `nerve-node relay add <name>` makes a token".into(),
                 );
             }
+            relay_in_force(paths, out, None).await;
             Ok(())
         }
         RelayCmd::Off => {
@@ -2890,7 +2892,12 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
             })
             .await?;
             w(out, "relay off".into());
-            cut_note(paths, out, "every tunnel ends").await;
+            relay_in_force(
+                paths,
+                out,
+                Some("the relay stops listening, and every tunnel ends"),
+            )
+            .await;
             Ok(())
         }
         RelayCmd::Add { name, centers } => {
@@ -2947,6 +2954,7 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
                     "the relay is off: `nerve-node relay set <address>` turns it on".into(),
                 );
             }
+            relay_in_force(paths, out, None).await;
             Ok(())
         }
         RelayCmd::SetLimits {
@@ -2989,6 +2997,7 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
                 ));
             }
             w(out, line);
+            relay_in_force(paths, out, None).await;
             Ok(())
         }
         RelayCmd::Token { name } => {
@@ -3019,11 +3028,12 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
             }
             let node = cfg.relay.node(&name).expect("set above");
             let at = relay_address(cfg.relay.listen.as_deref());
+            // Whether the old token is dead is the running node's to say
+            // (`relay_in_force`): on Windows it takes the change at its next
+            // start.
             w(
                 out,
-                format!(
-                    "relay node {name} has a new token, shown only now; the old one no longer works:"
-                ),
+                format!("relay node {name} has a new token, shown only now:"),
             );
             w(out, format!("  {token}"));
             w(out, format!("it may reach {}", reach_of(&node.centers)));
@@ -3032,7 +3042,18 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
                 out,
                 format!("  nerve-node proxy set 'https://{name}:{token}@{at}' --pin {pin}"),
             );
-            cut_note(paths, out, "the old token's tunnels end").await;
+            if cfg.relay.listen.is_none() {
+                w(
+                    out,
+                    "the relay is off: `nerve-node relay set <address>` turns it on".into(),
+                );
+            }
+            relay_in_force(
+                paths,
+                out,
+                Some("the old token no longer works, and its tunnels end"),
+            )
+            .await;
             Ok(())
         }
         RelayCmd::SetCenters { name, centers } => {
@@ -3052,7 +3073,7 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
                 out,
                 format!("relay node {name} may reach {}", reach_of(&centers)),
             );
-            cut_note(paths, out, "its tunnels to other centers end").await;
+            relay_in_force(paths, out, Some("its tunnels to other centers end")).await;
             Ok(())
         }
         RelayCmd::Rm { name } => {
@@ -3066,7 +3087,12 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
             })
             .await?;
             w(out, format!("relay node {name} removed"));
-            cut_note(paths, out, "its tunnels end").await;
+            relay_in_force(
+                paths,
+                out,
+                Some("its token no longer works, and its tunnels end"),
+            )
+            .await;
             Ok(())
         }
         RelayCmd::Ls => {
@@ -3154,20 +3180,26 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
     }
 }
 
-/// Says whether a relay change that cuts tunnels (`what`, cut now) is in force: a
-/// node that took it ends them now; on Windows, where the CLI writes the
-/// file and the running node reads it at its next start, they go on until
-/// then; with no node running there is none.
-async fn cut_note(paths: &NodePaths, out: &mut dyn Write, what: &str) {
+/// Says when a relay change is in force. A running node that took it
+/// applies it at once: `now` says what that does ("its tunnels end"), for
+/// the changes that take something away. On Windows the CLI writes the file
+/// and the running node reads it at its next start, so until then that node
+/// goes on by its old relay settings, for new tunnels as well as open ones:
+/// a removed or replaced token still opens tunnels, and a new one is
+/// refused. With no node running there is nothing to say.
+async fn relay_in_force(paths: &NodePaths, out: &mut dyn Write, now: Option<&str>) {
     if daemon_answers(paths, false).await {
-        let _ = writeln!(out, "{what} now");
+        if let Some(what) = now {
+            let _ = writeln!(out, "{what} now");
+        }
     } else if cfg!(windows) {
-        let _ = writeln!(
-            out,
-            "a running node takes this change at its next start and keeps the tunnels it carries until then: restart it (`Restart-Service nerve-node` for the installed node) to cut them now"
-        );
+        let _ = writeln!(out, "{RELAY_AT_NEXT_START}");
     }
 }
+
+/// [`relay_in_force`] on Windows, where a running node has not taken the
+/// change.
+const RELAY_AT_NEXT_START: &str = "a running node takes this change only at its next start, and until then works by its old relay settings: a removed or replaced token still opens new tunnels, the tunnels it carries stay, and a new token or node is refused. Restart it (`Restart-Service nerve-node` for the installed node) to apply the change now";
 
 /// Refuses a `--center` list that names a center this node is not paired
 /// with, or one twice.

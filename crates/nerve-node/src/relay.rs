@@ -2516,8 +2516,10 @@ mod tests {
     }
 
     /// `relay ls` asks the running node (its socket, on Windows its pipe)
-    /// and names the tunnels; `relay rm` says when they end: at once where
-    /// the node took the change, else at its next start (Windows).
+    /// and names the tunnels; `relay token` and `relay rm` say when the old
+    /// token stops working and the tunnels end: at once where the node took
+    /// the change, else at its next start (Windows), and the relay does as
+    /// they say.
     #[tokio::test(flavor = "multi_thread")]
     async fn relay_ls_names_the_tunnels_and_rm_says_when_they_end() {
         use clap::Parser;
@@ -2556,12 +2558,49 @@ mod tests {
             ls.contains("tunnel lab from 127.0.0.1:") && ls.contains(" to center home for "),
             "{ls}"
         );
+        // A new token. Where the running node took the change, the old one is
+        // dead at once and its tunnels end. On Windows the running node takes
+        // it at its next start, and the output says that the old token still
+        // opens tunnels until then, and the new one is refused.
+        let out = cli(&["relay", "token", "lab"]).await;
+        let token2 = out.lines().nth(1).unwrap().trim().to_string();
+        let lab2 = basic("lab", &token2);
+        if cfg!(windows) {
+            assert!(
+                out.contains("a removed or replaced token still opens new tunnels")
+                    && out.contains("Restart-Service nerve-node"),
+                "{out}"
+            );
+            assert!(!out.contains("no longer works"), "{out}");
+            assert!(!ends(&mut t, QUIET).await);
+            let (old, _, _) = connect(j.addr, &j.pin, &home_at, Some(&lab)).await;
+            let (new, _, _) = connect(j.addr, &j.pin, &home_at, Some(&lab2)).await;
+            assert_eq!((old, new), (200, 407), "as the output says");
+        } else {
+            assert!(
+                out.ends_with("the old token no longer works, and its tunnels end now\n"),
+                "{out}"
+            );
+            assert!(
+                ends(&mut t, WAIT).await,
+                "the tunnel outlived its old token"
+            );
+            let (old, _, _) = connect(j.addr, &j.pin, &home_at, Some(&lab)).await;
+            assert_eq!(old, 407);
+            let (new, head, t2) = connect(j.addr, &j.pin, &home_at, Some(&lab2)).await;
+            assert_eq!(new, 200, "{head}");
+            t = t2.unwrap();
+            round_trip(&mut t, b"again").await;
+        }
         let rm = cli(&["relay", "rm", "lab"]).await;
         if cfg!(windows) {
             assert!(rm.contains("Restart-Service nerve-node"), "{rm}");
             assert!(!rm.contains("end now"), "{rm}");
         } else {
-            assert_eq!(rm, "relay node lab removed\nits tunnels end now\n");
+            assert_eq!(
+                rm,
+                "relay node lab removed\nits token no longer works, and its tunnels end now\n"
+            );
             assert!(ends(&mut t, WAIT).await, "the tunnel outlived its token");
         }
         j.daemon.stop().await;

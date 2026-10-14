@@ -14,6 +14,7 @@ use serde_json::{Map, Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
 
+use nerve_policy::NodeConfig;
 use nerve_policy::config::{Access, CenterPolicy, Folder};
 use nerve_policy::paths::{to_wire, within};
 use nerve_policy::protected::{Platform, Protected};
@@ -256,10 +257,22 @@ fn decode(bytes: &[u8], cut: bool) -> String {
 /// the system and its `r` folders, writes its `w` folders, runs programs from
 /// the system and its `x` folders ([`folder_sets`]). The node's own folders
 /// (`own`: its config, keys and state) are in none of these sets, whatever
-/// the folders say ([`leave_out`]).
-pub fn landlock_spec(policy: &CenterPolicy, home: &Path, own: &[PathBuf]) -> LandlockSpec {
+/// the folders say ([`leave_out`]). The system folders are not cut: what a
+/// command reads there is the system's to guard.
+///
+/// `writable` are the configured folders where commands may write: the `w`
+/// folders of every center ([`write_folders`]), since another center's
+/// command may be the one that wrote. A folder whose resolution crosses a
+/// link inside one is left out ([`led_away`]): a command may have put that
+/// link, and the rule would grant the folder's flags wherever it leads.
+pub fn landlock_spec(
+    policy: &CenterPolicy,
+    home: &Path,
+    own: &[PathBuf],
+    writable: &[PathBuf],
+) -> LandlockSpec {
     // Landlock is Linux's, so the list is the Unix one.
-    let f = folder_sets(policy, home, own, &Platform::Unix, &[]);
+    let f = folder_sets(policy, home, own, &Platform::Unix, writable);
     LandlockSpec {
         read: leave_out(&[nerve_sandbox::system_dirs(), f.read].concat(), own),
         write: leave_out(&[nerve_sandbox::system_writable(), f.write].concat(), own),
@@ -391,50 +404,6 @@ pub fn container_grants(
     out
 }
 
-/// Why resolving `path` leads out of its own place: a link or junction on
-/// the way lies at or inside a place where commands may write (`writable`,
-/// resolved). `path` is walked component by component; once the resolved
-/// prefix is at or inside a `writable` place, a component that resolves
-/// elsewhere than its plain name is a link or junction a command may have
-/// put there, and the folder is left out. Above that boundary the links are
-/// the owner's and are followed, the boundary's own component (the write
-/// folder itself may be a junction of the owner's) among them. Places are
-/// judged resolved, so a writable folder reached by one spelling catches a
-/// folder configured by another (a link, a mount point, an 8.3 name).
-fn led_away(path: &Path, writable: &[PathBuf]) -> Option<String> {
-    use std::path::Component;
-    let comps: Vec<_> = path.components().collect();
-    // The drive and the root are one first step: `C:` alone names the
-    // current folder on drive C, not its root.
-    let roots = comps
-        .iter()
-        .take_while(|c| matches!(c, Component::Prefix(_) | Component::RootDir))
-        .count()
-        .max(1);
-    let mut inside = false;
-    for i in roots..=comps.len() {
-        let here = real(&comps[..i].iter().collect::<PathBuf>());
-        // The place this component names without following a link of its
-        // own: the resolved parent plus the component's name.
-        let plain = if i == roots {
-            here.clone()
-        } else {
-            real(&comps[..i - 1].iter().collect::<PathBuf>()).join(comps[i - 1].as_os_str())
-        };
-        // By the platform's path rules: NTFS names ignore case.
-        if inside && !(within(&here, &plain) && within(&plain, &here)) {
-            return Some(format!(
-                "it leads to {} through a link or junction inside a folder where commands may write",
-                here.display()
-            ));
-        }
-        if !inside && writable.iter().any(|w| within(&here, w)) {
-            inside = true;
-        }
-    }
-    None
-}
-
 /// `p` resolved, as the policy compares paths (on Windows without the
 /// `\\?\` prefix); `p` itself when it cannot be resolved.
 fn real(p: &Path) -> PathBuf {
@@ -456,6 +425,107 @@ fn real(p: &Path) -> PathBuf {
 /// commands connect where they did.
 pub fn connect_rule(own: &[PathBuf]) -> Vec<PathBuf> {
     leave_out(&[PathBuf::from("/")], own)
+}
+
+/// The configured folders where commands may write: the `w` folders of every
+/// center in `cfg` (`~` expanded with `home`), whatever the center's mode. A
+/// command of one center can replace a folder of another that lies inside
+/// one of them, so `landlock_spec` judges the folders against all of these.
+pub fn write_folders(cfg: &NodeConfig, home: &Path) -> Vec<PathBuf> {
+    cfg.centers
+        .iter()
+        .flat_map(|c| &c.policy.folders)
+        .filter(|f| f.access.write)
+        .filter_map(|f| expand(home, &f.path))
+        .collect()
+}
+
+/// Why resolving `path` leads out of its own place: a link the resolution
+/// crosses lies at or inside a place where commands may write (`writable`,
+/// resolved), and a command may have put it there. `path` is resolved the way
+/// the system does, a link at a time: its target is spliced into the rest of
+/// the path, so a link of the owner's that leads into a write folder is
+/// followed down to where it ends and every link on that way is judged too,
+/// not only the ones in the spelling `path` has. Above a write folder the
+/// links are the owner's and are followed, the write folder's own place (it
+/// may be a link of the owner's) among them. The folder that holds a link is
+/// compared resolved, so a write folder reached by one spelling catches a
+/// link reached by another (case, an 8.3 name, a `\\?\` prefix from a
+/// junction's target on Windows). On Windows a junction is a link here, as
+/// `symlink_metadata` reports it.
+fn led_away(path: &Path, writable: &[PathBuf]) -> Option<String> {
+    // The most links one resolution may cross, as the kernel's limit.
+    const LINKS: usize = 40;
+    let mut here = PathBuf::new();
+    let mut todo = steps(path);
+    let mut crossed = 0;
+    while let Some(step) = todo.pop() {
+        match step {
+            Step::Top(top) => here = top,
+            Step::Up => {
+                here.pop();
+            }
+            Step::Name(name) => {
+                let at = here.join(&name);
+                // A name that cannot be looked at (missing, or behind a
+                // folder that cannot be searched) is no link; `real_folder`
+                // has judged whether the path resolves at all.
+                let link = std::fs::symlink_metadata(&at).is_ok_and(|m| m.is_symlink());
+                if !link {
+                    here = at;
+                    continue;
+                }
+                let holder = real(&here);
+                if writable.iter().any(|w| within(&holder, w)) {
+                    return Some(format!(
+                        "it passes through the link {} inside a folder where commands may write",
+                        at.display()
+                    ));
+                }
+                crossed += 1;
+                let target = std::fs::read_link(&at).ok().filter(|_| crossed <= LINKS);
+                match target {
+                    Some(t) => todo.extend(steps(&t)),
+                    None => {
+                        return Some(format!(
+                            "it cannot be resolved through the link {}",
+                            at.display()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// One step of a path, as [`led_away`] takes it.
+enum Step {
+    /// Where an absolute path starts: the root, with the drive on Windows.
+    Top(PathBuf),
+    /// One level up.
+    Up,
+    Name(std::ffi::OsString),
+}
+
+/// The steps of `p`, the last first, so that `pop` gives the next one.
+fn steps(p: &Path) -> Vec<Step> {
+    use std::path::Component;
+    let mut top = PathBuf::new();
+    let mut out = Vec::new();
+    for c in p.components() {
+        match c {
+            Component::Prefix(_) | Component::RootDir => top.push(c.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => out.push(Step::Up),
+            Component::Normal(n) => out.push(Step::Name(n.to_os_string())),
+        }
+    }
+    if !top.as_os_str().is_empty() {
+        out.insert(0, Step::Top(top));
+    }
+    out.reverse();
+    out
 }
 
 /// `paths` without the folders in `own`. A Landlock rule grants a folder and
@@ -1634,7 +1704,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        let spec = landlock_spec(&policy, &w, &own);
+        let spec = landlock_spec(&policy, &w, &own, &[]);
         for set in [&spec.read, &spec.write, &spec.exec] {
             assert!(set.contains(&w.join("a")), "{set:?}");
             assert!(!set.iter().any(|p| own[0].starts_with(p)), "{set:?}");
@@ -1669,7 +1739,7 @@ mod tests {
                 .iter()
                 .any(|set| set.iter().any(|s| s.starts_with(p)))
         };
-        let spec = landlock_spec(&policy, &home, &[]);
+        let spec = landlock_spec(&policy, &home, &[], &[]);
         assert!(!reaches(&spec, &ssh), "{spec:?}");
         assert!(!reaches(&spec, &work.join("link")), "{spec:?}");
         for set in [&spec.read, &spec.write, &spec.exec] {
@@ -1678,12 +1748,12 @@ mod tests {
         // The plain folder becomes a link after it was added.
         std::fs::remove_dir(work.join("plain")).unwrap();
         std::os::unix::fs::symlink(&ssh, work.join("plain")).unwrap();
-        let spec = landlock_spec(&policy, &home, &[]);
+        let spec = landlock_spec(&policy, &home, &[], &[]);
         assert!(!reaches(&spec, &ssh), "{spec:?}");
         assert!(!reaches(&spec, &work.join("plain")), "{spec:?}");
         // The owner released `.ssh` for reading: a link there reads it.
         policy.folders = vec![folder(&ssh, "r"), folder(&work.join("link"), "r")];
-        let spec = landlock_spec(&policy, &home, &[]);
+        let spec = landlock_spec(&policy, &home, &[], &[]);
         assert!(spec.read.contains(&ssh), "{spec:?}");
         assert!(!spec.write.iter().any(|s| s.starts_with(&ssh)), "{spec:?}");
     }
@@ -1715,7 +1785,7 @@ mod tests {
             folders: vec![folder(&home, "rwx")],
             ..Default::default()
         };
-        let spec = landlock_spec(&policy, &home, &[]);
+        let spec = landlock_spec(&policy, &home, &[], &[]);
         for set in [&spec.read, &spec.write, &spec.exec] {
             assert!(!grants(set, &ssh), "{set:?}");
             assert!(set.contains(&home.join("other")), "{set:?}");
@@ -1726,7 +1796,7 @@ mod tests {
         assert!(spec.read.contains(&bin), "{:?}", spec.read);
         // The owner's own folder at the entry still gives it what it says.
         policy.folders.push(folder(&ssh, "r"));
-        let spec = landlock_spec(&policy, &home, &[]);
+        let spec = landlock_spec(&policy, &home, &[], &[]);
         assert!(spec.read.contains(&ssh), "{:?}", spec.read);
         assert!(!grants(&spec.write, &ssh), "{:?}", spec.write);
         assert!(!grants(&spec.exec, &ssh), "{:?}", spec.exec);
@@ -1753,7 +1823,7 @@ mod tests {
                 }],
                 ..Default::default()
             };
-            let spec = landlock_spec(&policy, h.path(), &[]);
+            let spec = landlock_spec(&policy, h.path(), &[], &[]);
             let label = access.to_chmod();
             assert_eq!(spec.read.contains(&w), access.read, "read set of {label}");
             assert_eq!(
@@ -1767,6 +1837,249 @@ mod tests {
                 "exec set of {label}"
             );
         }
+    }
+
+    /// Whether a rule of `spec` for a folder is `p`, holds it, lies inside it
+    /// or leads there. The system's own rules are left aside.
+    fn spec_reaches(spec: &LandlockSpec, p: &Path) -> bool {
+        let system = [
+            nerve_sandbox::system_dirs(),
+            nerve_sandbox::system_writable(),
+        ]
+        .concat();
+        [&spec.read, &spec.write, &spec.exec]
+            .into_iter()
+            .flatten()
+            .filter(|s| !system.contains(s))
+            .any(|s| {
+                let r = real(s);
+                p.starts_with(&r) || r.starts_with(p)
+            })
+    }
+
+    fn folder(p: &Path, access: &str) -> Folder {
+        Folder {
+            path: p.display().to_string(),
+            access: Access::parse(access).unwrap(),
+        }
+    }
+
+    /// A home in a temp dir with `work`, a `work/bin` and, beside them, the
+    /// `docs` that no folder names.
+    fn nested_home(d: &tempfile::TempDir) -> (PathBuf, PathBuf, PathBuf) {
+        let home = std::fs::canonicalize(d.path()).unwrap().join("home");
+        for dir in ["work/bin", "docs"] {
+            std::fs::create_dir_all(home.join(dir)).unwrap();
+        }
+        (home.clone(), home.join("work"), home.join("docs"))
+    }
+
+    /// A command with `w` on `work` replaces `work/bin`, a folder of its own,
+    /// by a link to a place no folder names (issue #74): the next command's
+    /// rules must not grant the flags of `bin` there, whether the folder is
+    /// one of the same center, the only one of another, or deeper down.
+    #[test]
+    fn a_link_put_in_place_of_a_nested_folder_gets_no_rule() {
+        let d = tempfile::tempdir().unwrap();
+        let (home, work, docs) = nested_home(&d);
+        let bin = work.join("bin");
+        let both = CenterPolicy {
+            folders: vec![folder(&work, "rw"), folder(&bin, "rx")],
+            ..Default::default()
+        };
+        // Another center holds only `bin`; `work` is writable by the first.
+        let only_bin = CenterPolicy {
+            folders: vec![folder(&bin, "rx")],
+            ..Default::default()
+        };
+        let writable = [work.clone()];
+
+        // Plain, `bin` is a rule of its own.
+        let spec = landlock_spec(&both, &home, &[], &writable);
+        assert!(spec.read.contains(&bin), "{spec:?}");
+        assert!(spec.exec.contains(&bin), "{spec:?}");
+        let spec = landlock_spec(&only_bin, &home, &[], &writable);
+        assert!(spec.read.contains(&bin), "{spec:?}");
+
+        std::fs::remove_dir(&bin).unwrap();
+        std::os::unix::fs::symlink(&docs, &bin).unwrap();
+        for policy in [&both, &only_bin] {
+            let spec = landlock_spec(policy, &home, &[], &writable);
+            assert!(!spec_reaches(&spec, &docs), "{spec:?}");
+            assert!(
+                !spec.read.contains(&bin) && !spec.exec.contains(&bin),
+                "{spec:?}"
+            );
+        }
+        // `work` itself stays, with its own flags.
+        let spec = landlock_spec(&both, &home, &[], &writable);
+        assert!(spec.write.contains(&work), "{spec:?}");
+        assert!(spec.read.contains(&work), "{spec:?}");
+
+        // A link further down the folder's path is the same.
+        std::fs::remove_file(&bin).unwrap();
+        std::fs::create_dir_all(docs.join("sub/deep")).unwrap();
+        std::fs::create_dir_all(work.join("a/sub/deep")).unwrap();
+        let deep = work.join("a/sub/deep");
+        let policy = CenterPolicy {
+            folders: vec![folder(&work, "rw"), folder(&deep, "r")],
+            ..Default::default()
+        };
+        let spec = landlock_spec(&policy, &home, &[], &writable);
+        assert!(spec.read.contains(&deep), "{spec:?}");
+        std::fs::remove_dir_all(work.join("a")).unwrap();
+        std::fs::create_dir_all(work.join("a")).unwrap();
+        std::os::unix::fs::symlink(docs.join("sub"), work.join("a/sub")).unwrap();
+        let spec = landlock_spec(&policy, &home, &[], &writable);
+        assert!(!spec_reaches(&spec, &docs), "{spec:?}");
+        assert!(spec.read.contains(&work), "{spec:?}");
+    }
+
+    /// The links of the owner stay what they were: a folder behind a link
+    /// outside every write folder is followed, and so is a write folder that
+    /// is a link itself, with a folder inside it.
+    #[test]
+    fn a_link_of_the_owner_is_followed_outside_the_write_folders() {
+        let d = tempfile::tempdir().unwrap();
+        let (home, work, docs) = nested_home(&d);
+        let bin = work.join("bin");
+        // No write folder: the folder is the only one, and its link is followed.
+        std::os::unix::fs::symlink(&docs, home.join("to-docs")).unwrap();
+        let policy = CenterPolicy {
+            folders: vec![folder(&home.join("to-docs"), "r")],
+            ..Default::default()
+        };
+        let spec = landlock_spec(&policy, &home, &[], &[]);
+        assert!(spec.read.contains(&docs), "{spec:?}");
+        // Beside the write folder, not inside it.
+        let spec = landlock_spec(&policy, &home, &[], std::slice::from_ref(&work));
+        assert!(spec.read.contains(&docs), "{spec:?}");
+
+        // The write folder is the owner's link to `work`, and a command
+        // writes through it: the folder inside it is where it really is.
+        std::os::unix::fs::symlink(&work, home.join("w")).unwrap();
+        let policy = CenterPolicy {
+            folders: vec![
+                folder(&home.join("w"), "rw"),
+                folder(&home.join("w/bin"), "r"),
+            ],
+            ..Default::default()
+        };
+        let spec = landlock_spec(&policy, &home, &[], &[home.join("w")]);
+        assert!(spec.read.contains(&work), "{spec:?}");
+        assert!(spec.read.contains(&bin), "{spec:?}");
+        // The write folder spelled by its real path catches the same folder.
+        let spec = landlock_spec(&policy, &home, &[], std::slice::from_ref(&work));
+        assert!(spec.read.contains(&bin), "{spec:?}");
+        // The write folder is named by the link, the folder by the real path.
+        let policy = CenterPolicy {
+            folders: vec![folder(&bin, "r")],
+            ..Default::default()
+        };
+        std::fs::remove_dir(&bin).unwrap();
+        std::os::unix::fs::symlink(&docs, &bin).unwrap();
+        let spec = landlock_spec(&policy, &home, &[], &[home.join("w")]);
+        assert!(!spec_reaches(&spec, &docs), "{spec:?}");
+    }
+
+    /// A link of the owner's that leads into a write folder is followed down
+    /// to where it ends, and the links on that way are judged too: a command
+    /// that replaces the folder the owner's link leads to, or one above it,
+    /// by a link of its own gets no rule for the place that leads to.
+    #[test]
+    fn a_link_put_below_an_owners_link_into_a_write_folder_gets_no_rule() {
+        let d = tempfile::tempdir().unwrap();
+        let (home, work, docs) = nested_home(&d);
+        let bin = work.join("bin");
+        let writable = [work.clone()];
+
+        // The owner's relative link to `work/bin`, beside the write folder.
+        std::os::unix::fs::symlink("work/bin", home.join("tools")).unwrap();
+        let policy = CenterPolicy {
+            folders: vec![folder(&work, "rw"), folder(&home.join("tools"), "rx")],
+            ..Default::default()
+        };
+        let spec = landlock_spec(&policy, &home, &[], &writable);
+        assert!(spec.read.contains(&bin), "{spec:?}");
+        std::fs::remove_dir(&bin).unwrap();
+        std::os::unix::fs::symlink(&docs, &bin).unwrap();
+        let spec = landlock_spec(&policy, &home, &[], &writable);
+        assert!(!spec_reaches(&spec, &docs), "{spec:?}");
+        assert!(spec.write.contains(&work), "{spec:?}");
+
+        // The only folder of another center leads through two levels, and the
+        // command replaces the upper one.
+        std::fs::remove_file(&bin).unwrap();
+        std::fs::create_dir_all(work.join("a/b")).unwrap();
+        std::fs::create_dir_all(docs.join("b")).unwrap();
+        std::os::unix::fs::symlink(work.join("a/b"), home.join("proj")).unwrap();
+        let reader = CenterPolicy {
+            folders: vec![folder(&home.join("proj"), "r")],
+            ..Default::default()
+        };
+        let spec = landlock_spec(&reader, &home, &[], &writable);
+        assert!(spec.read.contains(&work.join("a/b")), "{spec:?}");
+        std::fs::remove_dir_all(work.join("a")).unwrap();
+        std::os::unix::fs::symlink(&docs, work.join("a")).unwrap();
+        let spec = landlock_spec(&reader, &home, &[], &writable);
+        assert!(!spec_reaches(&spec, &docs), "{spec:?}");
+    }
+
+    /// Links that lead into one another are no way to a folder.
+    #[test]
+    fn a_loop_of_links_is_led_away() {
+        let d = tempfile::tempdir().unwrap();
+        let (home, work, _) = nested_home(&d);
+        std::os::unix::fs::symlink("two", home.join("one")).unwrap();
+        std::os::unix::fs::symlink("one", home.join("two")).unwrap();
+        assert!(led_away(&home.join("one"), &[]).is_some());
+        assert!(led_away(&work, &[]).is_none());
+    }
+
+    /// The write folders that bound the others are those of every center
+    /// in the config, `~` expanded, whatever the center's mode.
+    #[test]
+    fn the_write_folders_of_every_center_bound_the_others() {
+        let d = tempfile::tempdir().unwrap();
+        let (home, work, docs) = nested_home(&d);
+        let entry = |name: &str, mode, folders: Vec<Folder>| nerve_policy::CenterEntry {
+            name: name.into(),
+            url: "https://center.example".into(),
+            pin: None,
+            center_id: name.into(),
+            node_id: name.into(),
+            settings: Default::default(),
+            paused: false,
+            revoked: false,
+            unknown: false,
+            policy: CenterPolicy {
+                mode,
+                folders,
+                ..Default::default()
+            },
+        };
+        let mut cfg = NodeConfig::default();
+        cfg.centers.push(entry(
+            "writer",
+            nerve_policy::Mode::Allowlist,
+            vec![folder(&work, "rw"), folder(Path::new("~/docs"), "r")],
+        ));
+        cfg.centers.push(entry(
+            "reader",
+            nerve_policy::Mode::Folder,
+            vec![folder(&work.join("bin"), "rx")],
+        ));
+        assert_eq!(write_folders(&cfg, &home), std::slice::from_ref(&work));
+
+        // The writer's command swaps the reader's only folder.
+        std::fs::remove_dir(work.join("bin")).unwrap();
+        std::os::unix::fs::symlink(&docs, work.join("bin")).unwrap();
+        let reader = &cfg.centers[1].policy;
+        let spec = landlock_spec(reader, &home, &[], &write_folders(&cfg, &home));
+        assert!(!spec_reaches(&spec, &docs), "{spec:?}");
+        // Judged by its own folders alone, the link would be followed.
+        let spec = landlock_spec(reader, &home, &[], &[]);
+        assert!(spec.read.contains(&docs), "{spec:?}");
     }
 
     #[test]

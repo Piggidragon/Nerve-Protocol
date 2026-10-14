@@ -73,6 +73,24 @@ The node confines commands with Landlock:
 - Landlock cannot run a file it may not read. So an `x` folder also lets a
   command read files there by name. It still cannot list the folder.
 - The node's own folders are in none of these sets.
+- A command with `w` on a folder can put a link in place of a folder inside
+  it, and a link would give that folder's rights in a place you never named.
+  So a folder is left out of the sets, and the node logs a warning, when its
+  path passes through a link that lies inside a `w` folder (of any pairing).
+  That holds for a link you made yourself too, and a link of yours that
+  leads into the `w` folder is followed to its end and judged on the way.
+  The folder is back once its path is a plain folder again. A link of your
+  own above the `w` folder is followed. Two gaps are left:
+  - Only the `w` folders in the config count. If a command made a link while
+    the outer folder had `w`, and you then take `w` off it (narrow it to `r`,
+    or remove the pairing), the node follows the link again. Before you do,
+    look for links (`find <folder> -type l`). A fix that remembers the place
+    you judged when you added the folder is tracked in #77.
+  - A command that runs without Landlock (`user` mode, `sudo`, and what an
+    `allowlist` rule allows) can make a link wherever you can write, also
+    where no `w` folder is, and the folder of another pairing there follows
+    it. Look for links in the folders you grant before you give a pairing one
+    of those.
 - With the keys in the system keyring, the node's D-Bus session and GNOME
   Keyring's folder count as its own, and a command cannot connect to a
   socket there ([keys](config.md#where-the-node-keeps-its-keys)). That needs
@@ -155,14 +173,16 @@ folders.
   junction in its place, and the entry would land on the folder it leads
   to. This holds for a folder inside a `w` folder of any pairing. The node
   names such a folder in its log (`left out of the command's sandbox: it
-  leads to …`) and grants it once it is a plain folder again. One gap is
+  passes through the link …`) and grants it once it is a plain folder again.
+  A junction of yours that leads into the `w` folder is followed to its end
+  and judged on the way. One gap is
   left here: if a command makes such a junction while the outer folder has
   `w`, and you then take the `w` off that folder (narrow it to `r`, or
   remove the pairing it belongs to), the node no longer knows commands could
   write there and follows the junction again. Before you take `w` off a
   folder or remove a pairing, check it for junctions and links
   (`dir /AL /S <folder>`). A fix that remembers the place you judged when
-  you added the folder is tracked in its own issue.
+  you added the folder is tracked in #77.
 - The node's own folders and the [protected paths](protected-paths.md) get no
   entry, also inside a folder you grant. That folder is granted as its other
   entries instead, as on Linux.

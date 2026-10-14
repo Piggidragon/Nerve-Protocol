@@ -1281,7 +1281,11 @@ impl Link {
         let landlock = (folder && self.shared.confinement.landlock_abi.is_some()).then(|| {
             // The folders' entries are listed as the account.
             let _as = act_as(known.as_ref()).ok().flatten();
-            let mut spec = exec::landlock_spec(&entry.policy, &home, &own);
+            // The folders a command of any center may write: a link it puts
+            // in place of a folder inside one leads nowhere the next
+            // command gets rules for.
+            let writable = exec::write_folders(cfg, &home);
+            let mut spec = exec::landlock_spec(&entry.policy, &home, &own, &writable);
             // The keys in the keyring are behind the session bus, a socket
             // file in the own folders then.
             if cfg.machine.secret_storage == nerve_policy::config::SecretStorage::Keyring {

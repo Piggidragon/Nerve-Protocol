@@ -2,7 +2,7 @@
 //! center's requests (spec §4, §5, §7).
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -107,6 +107,24 @@ async fn until(t: Option<Instant>) {
     }
 }
 
+/// Awaits `work`, and drops what `slot` holds at `at` if `work` takes longer:
+/// a keyring that waits to be unlocked or a dial that hangs does not keep a
+/// parked link past its grace.
+async fn dropping_at<F: std::future::Future, T>(
+    work: F,
+    slot: &mut Option<T>,
+    at: Option<Instant>,
+) -> F::Output {
+    tokio::pin!(work);
+    tokio::select! {
+        r = &mut work => r,
+        _ = until(at) => {
+            *slot = None;
+            work.await
+        }
+    }
+}
+
 /// Dials `name` until it is removed, paused, revoked or unknown, or the
 /// daemon stops.
 pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
@@ -133,9 +151,11 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
         }
         // The keyring may block (the Secret Service asks to unlock), so off
         // the runtime's threads.
+        let grace = parked.as_ref().map(|p| p.until);
         let read = {
             let (shared, name) = (shared.clone(), name.clone());
-            tokio::task::spawn_blocking(move || load_key(&shared, &name)).await
+            let read = tokio::task::spawn_blocking(move || load_key(&shared, &name));
+            dropping_at(read, &mut parked, grace).await
         };
         let key = match read.unwrap_or_else(|e| Err(format!("the key read stopped: {e}"))) {
             Ok(k) => k,
@@ -153,7 +173,8 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
                 return;
             }
         };
-        let proxy = match proxy_for(&shared, &cfg, &url).await {
+        let grace = parked.as_ref().map(|p| p.until);
+        let proxy = match dropping_at(proxy_for(&shared, &cfg, &url), &mut parked, grace).await {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!("center {name}: bad proxy: {e}; dialling stopped");
@@ -173,16 +194,8 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
                 &node_id,
                 limits::MESSAGE_BYTES as usize,
             );
-            tokio::pin!(connect);
-            // A dial that hangs past the grace still ends the parked link's
-            // calls on time.
-            tokio::select! {
-                r = &mut connect => r,
-                _ = until(parked.as_ref().map(|p| p.until)) => {
-                    parked = None;
-                    connect.await
-                }
-            }
+            let grace = parked.as_ref().map(|p| p.until);
+            dropping_at(connect, &mut parked, grace).await
         };
         let outcome = match dialled {
             Err(ConnectError::Unknown) => {
@@ -279,6 +292,8 @@ enum Got {
     /// Anything else that shows the center is alive (ping, pong).
     Alive,
     TooLarge,
+    /// A frame the WebSocket could not take (over its limit, malformed).
+    Broken(String),
     Closed,
 }
 
@@ -288,6 +303,8 @@ where
         + Unpin,
 {
     match stream.next().await {
+        // What the center sent is broken, not the connection: the link ends.
+        Some(Err(e)) if ws::broken_frame(&e) => Got::Broken(e.to_string()),
         None | Some(Err(_)) => Got::Closed,
         Some(Ok(WsMessage::Text(t))) => {
             if t.len() as u64 > limits::MESSAGE_BYTES {
@@ -443,10 +460,10 @@ async fn session(
                 format!("the center chose version {:?}", w.version),
             ));
         }
-        Ok(w.resume)
+        Ok((w.resume, w.limits.message_bytes))
     }
     .await;
-    let resumed = match hello {
+    let (resumed, takes) = match hello {
         Ok(r) => r,
         Err((reason, why)) => {
             tracing::warn!("center {}: the handshake failed: {why}", entry.name);
@@ -481,12 +498,20 @@ async fn session(
             }
             // Ends the parked link's calls before the new link is up.
             drop(p);
-            let handle = Arc::new(LinkHandle::new(tx.clone(), r.is_some()));
+            // The password a frame carries is scrubbed when the frame is
+            // numbered; a weak reference, as the node's state holds the link.
+            let scrubber = Arc::downgrade(shared);
+            let scrub: crate::daemon::Scrub = Box::new(move |t| match scrubber.upgrade() {
+                Some(s) => s.scrub(t),
+                None => t,
+            });
+            let handle = Arc::new(LinkHandle::new(tx.clone(), r.is_some(), scrub));
             let link = Arc::new(Link {
                 shared: shared.clone(),
                 cs: cs.clone(),
                 name: entry.name.clone(),
                 id: offer.link.clone(),
+                takes: AtomicU64::new(takes),
                 handle,
                 calls: Mutex::default(),
                 commands: Mutex::default(),
@@ -505,6 +530,7 @@ async fn session(
             return (Outcome::Retry, false, None);
         }
     };
+    link.takes.store(takes, Ordering::Relaxed);
     match &again {
         None => tracing::info!("linked to center {}", entry.name),
         Some(a) => tracing::info!(
@@ -601,6 +627,8 @@ struct Link {
     name: String,
     /// The id the center knows the link by (spec §4.8).
     id: String,
+    /// The largest message the center takes (its `welcome.limits`).
+    takes: AtomicU64,
     handle: Arc<LinkHandle>,
     /// Calls in flight; whoever removes an entry sends its reply.
     calls: Mutex<HashMap<Id, InFlight>>,
@@ -631,12 +659,28 @@ impl Link {
         }
     }
 
+    /// Answers call `id`. An answer larger than the center takes would break
+    /// the connection, and a resume would send it again: the call fails with
+    /// `too_large` instead.
     async fn reply(&self, id: Id, r: Result<Value, RpcError>) {
-        self.send(match r {
-            Ok(v) => Message::result(id, v),
-            Err(e) => Message::error(Some(id), e),
-        })
-        .await;
+        let text = match r {
+            Ok(v) => Message::result(id.clone(), v),
+            Err(e) => Message::error(Some(id.clone()), e),
+        }
+        .encode();
+        let takes = self.takes.load(Ordering::Relaxed);
+        if text.len() as u64 > takes {
+            let e = RpcError::new(
+                ErrorCode::TooLarge,
+                format!(
+                    "the answer is {} bytes, more than the center takes ({takes})",
+                    text.len()
+                ),
+            );
+            tracing::warn!("center {}: {}", self.name, e.message);
+            return self.handle.send(Message::error(Some(id), e).encode()).await;
+        }
+        self.handle.send(text).await;
     }
 
     /// The center's entry, or `None` when it was removed meanwhile.
@@ -707,6 +751,10 @@ impl Link {
                         Got::Alive => {}
                         Got::TooLarge => {
                             tracing::warn!("center {}: it sent a message that is too large", self.name);
+                            return self.end(ByeReason::ProtocolError, Outcome::Retry).await;
+                        }
+                        Got::Broken(e) => {
+                            tracing::warn!("center {}: it sent a frame the node cannot read: {e}", self.name);
                             return self.end(ByeReason::ProtocolError, Outcome::Retry).await;
                         }
                         Got::Closed => {
@@ -842,6 +890,9 @@ impl Link {
             }
             // The calls of an ended session end like cancelled ones: a
             // command's process group is killed as on a timeout.
+            // A request the center gave up while the link was down, in its
+            // place in the replay (spec §4.8): nothing to do.
+            method::WITHDRAWN => None,
             method::SESSION_END => {
                 let Ok(end) = params::<SessionEnd>(&p) else {
                     return None;
@@ -1696,6 +1747,42 @@ impl Drop for Running<'_> {
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    /// Dropped when its flag says so.
+    struct Held(std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>);
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            *self.0.lock().unwrap() = Some(std::time::Instant::now());
+        }
+    }
+
+    /// A slow step of the dial loop (the keyring, a hanging dial) does not
+    /// keep the parked link past its grace: it goes when the grace ends, and
+    /// the step still finishes.
+    #[tokio::test]
+    async fn a_slow_step_drops_the_parked_link_when_the_grace_ends() {
+        let dropped = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut slot = Some(Held(dropped.clone()));
+        let started = std::time::Instant::now();
+        let grace = started + Duration::from_millis(50);
+        let step = async {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            7
+        };
+        assert_eq!(super::dropping_at(step, &mut slot, Some(grace)).await, 7);
+        assert!(slot.is_none());
+        let at = dropped.lock().unwrap().expect("dropped");
+        assert!(
+            at - started < Duration::from_millis(300),
+            "{:?}",
+            at - started
+        );
+        // Without a grace nothing goes.
+        let mut kept = Some(1);
+        assert_eq!(super::dropping_at(async { 2 }, &mut kept, None).await, 2);
+        assert_eq!(kept, Some(1));
+    }
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;

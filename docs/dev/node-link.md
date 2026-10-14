@@ -68,8 +68,14 @@ address change or a short outage loses no output. Exact rules:
 - On the resume each side sends again only what the other side's count shows
   it never read. A call the node read is never sent again, so nothing runs
   twice; one it did not read has not run and is sent again.
-- A link not resumed within 30 seconds, one that ended with a bye, and a link
-  with a center or node that cannot resume end at once: the center fails the
+- A request the center no longer waits for (timed out or cancelled while the
+  link was down) goes as `withdrawn {id}` instead, so it does not run late.
+- What a frame carries of the sudo password is taken out once, when the frame
+  is numbered; a kept frame does not wait for a later scrub.
+- A link not resumed within 30 seconds, one that ended with a bye, one whose
+  connection broke on a frame the receiver cannot take (it would come again on
+  every resume), and a link with a center or node that cannot resume end at
+  once: the center fails the
   calls with `connection_lost`, and the node kills the commands started on
   that link.
 
@@ -115,7 +121,9 @@ reliable streams, with a 10-byte header and at most 64 KiB of payload.
 
 Each side announces the limits for what it receives: the node in `hello`, the
 center in `welcome`. A message over the limit closes the link with
-`protocol_error`. A call over the call limit fails with `busy`.
+`protocol_error`. A call over the call limit fails with `busy`. An answer
+over the center's message limit is not sent: its call fails with
+`too_large`.
 
 A node parses what a center sends strictly: unknown fields and methods are
 errors. A center reads what a node sends with tolerance, so newer nodes keep

@@ -27,6 +27,20 @@ pub fn config(max_message: usize) -> WebSocketConfig {
         .max_frame_size(Some(max_message))
 }
 
+/// Whether a read error comes from what the peer sent (a frame over the
+/// limit, a broken frame) rather than from the connection. Such a frame would
+/// break the next connection the same way, so the link is not resumed over it
+/// (docs/dev/spec/protocol.md §4.8).
+pub fn broken_frame(e: &tokio_tungstenite::tungstenite::Error) -> bool {
+    use tokio_tungstenite::tungstenite::Error;
+    use tokio_tungstenite::tungstenite::error::ProtocolError;
+    match e {
+        Error::Capacity(_) | Error::Utf8(_) | Error::AttackAttempt => true,
+        Error::Protocol(p) => !matches!(p, ProtocolError::ResetWithoutClosingHandshake),
+        _ => false,
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum ConnectError {
     /// HTTP 401 on the upgrade: the center does not know this node (any more).

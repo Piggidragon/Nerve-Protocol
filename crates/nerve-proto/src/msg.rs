@@ -29,6 +29,7 @@ pub mod method {
     pub const SESSION_END: &str = "session.end";
     pub const BYE: &str = "bye";
     pub const ACK: &str = "ack";
+    pub const WITHDRAWN: &str = "withdrawn";
 }
 
 /// Limits a side announces for what it receives.

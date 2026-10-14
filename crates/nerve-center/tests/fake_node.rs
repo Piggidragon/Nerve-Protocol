@@ -1450,3 +1450,115 @@ async fn a_node_resumes_its_link_over_a_held_connection() {
     );
     r.stop().await;
 }
+
+/// A call its harness cancelled while the link was down is not delivered
+/// when the link resumes: the node never read the invoke, and it goes as
+/// `withdrawn` in its place, followed by the `cancel`.
+#[tokio::test]
+async fn a_call_cancelled_while_the_link_was_down_is_withdrawn_on_the_resume() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    let key = NodeKey::generate().unwrap();
+    let (e, call, invoke) = a_call_in_flight_on_a_dropped_link(&r, &key).await;
+    let note = e
+        .handle(
+            json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+            "params": {"requestId": 2}}),
+        )
+        .await;
+    assert!(note.is_none());
+    let reply = tokio::time::timeout(Duration::from_secs(5), call)
+        .await
+        .expect("the cancelled call returns")
+        .unwrap();
+    assert!(reply.is_none(), "{reply:?}");
+    // The cancel is queued by a task of its own.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let (mut ws, welcome) = handshake_with(
+        &r,
+        &key,
+        json!({"resume": {"link": link_id('a'), "got": 1}}),
+    )
+    .await;
+    assert_eq!(resume_of(&welcome), json!({"resumed": true, "got": 1}));
+    let first = text(&mut ws).await.expect("a frame");
+    let Message::Notification { method: m, params } = &first else {
+        panic!("the invoke came again: {first:?}")
+    };
+    assert_eq!(m, method::WITHDRAWN);
+    assert_eq!(serde_json::to_value(&invoke).unwrap(), params["id"]);
+    let second = text(&mut ws).await.expect("a frame");
+    assert!(
+        matches!(&second, Message::Notification { method: m, .. } if m == method::CANCEL),
+        "{second:?}"
+    );
+    let (_, m, _) = request(&mut ws).await;
+    assert_eq!(m, method::DESCRIBE);
+    r.stop().await;
+}
+
+/// A frame over the center's message limit ends the link with
+/// `bye protocol_error` instead of parking it: the node would send it again
+/// on every resume. The call in flight fails at once.
+#[tokio::test]
+async fn a_frame_over_the_limit_ends_a_resumable_link() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    let key = NodeKey::generate().unwrap();
+    assert_eq!(pair(&r, &key, "box-1").await.0, 200);
+    let (mut ws, _) = handshake_with(
+        &r,
+        &key,
+        json!({"resume": {"link": link_id('d'), "got": 0}}),
+    )
+    .await;
+    let (id, _, _) = request(&mut ws).await;
+    send(&mut ws, Message::result(id, descriptor(&key, "box-1"))).await;
+    let c = r.center.clone();
+    wait_for(|| (!c.tools().is_empty()).then_some(())).await;
+    let e = std::sync::Arc::new(Engine::new(&r.center, "test"));
+    rpc(
+        &e,
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18"}),
+    )
+    .await;
+    let call = tokio::spawn({
+        let e = e.clone();
+        async move {
+            e.handle(json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call",
+                "params": {"name": "exec_run", "arguments": {"node": "box-1", "command": "make"}}}))
+                .await
+        }
+    });
+    let (invoke, _, _) = request(&mut ws).await;
+    let big =
+        json!({"exit_code": 0, "stdout": "x".repeat(MAX + 1), "stderr": "", "truncated": false});
+    let _ = ws
+        .send(WsMessage::text(Message::result(invoke, big).encode()))
+        .await;
+    let bye = loop {
+        match text(&mut ws).await {
+            Some(Message::Notification { method: m, params }) if m == method::BYE => {
+                break params;
+            }
+            Some(_) => continue,
+            None => panic!("no bye"),
+        }
+    };
+    assert_eq!(bye["reason"], "protocol_error");
+    let (text_out, failed) = reply_text(call).await;
+    assert!(failed, "{text_out}");
+    assert!(text_out.starts_with("error connection_lost"), "{text_out}");
+    // Nothing is kept to resume.
+    let (_ws, welcome) = handshake_with(
+        &r,
+        &key,
+        json!({"resume": {"link": link_id('d'), "got": 2}}),
+    )
+    .await;
+    assert_eq!(resume_of(&welcome), json!({"resumed": false, "got": 0}));
+    r.stop().await;
+}

@@ -80,7 +80,14 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 pub(crate) struct LinkHandle {
     wire: Mutex<Wire>,
     subs: Mutex<Subs>,
+    /// Takes the sudo password out of a frame. A counted frame is scrubbed
+    /// once, before it is numbered and kept: the password it may carry is
+    /// the one held then, and a frame kept for a resume can outlive it.
+    scrub: Scrub,
 }
+
+/// What [`LinkHandle`] scrubs a frame with.
+pub(crate) type Scrub = Box<dyn Fn(String) -> String + Send + Sync>;
 
 struct Wire {
     /// The writer of the connection now; `None` while the link is down.
@@ -109,18 +116,20 @@ struct Subs {
 impl LinkHandle {
     /// A link on the connection `tx` writes to; `resumable` when the center
     /// can resume it.
-    pub fn new(tx: mpsc::Sender<WsMessage>, resumable: bool) -> LinkHandle {
+    pub fn new(tx: mpsc::Sender<WsMessage>, resumable: bool, scrub: Scrub) -> LinkHandle {
         LinkHandle {
             wire: Mutex::new(Wire {
                 tx: Some(tx),
                 replay: resumable.then(|| Replay::new(resume::KEEP_BYTES)),
             }),
             subs: Mutex::default(),
+            scrub,
         }
     }
 
     /// Sends a counted text frame, waiting for room in the queue.
     pub async fn send(&self, text: String) {
+        let text = (self.scrub)(text);
         loop {
             // Kept under the same lock that saw the link down, so a resume
             // that comes in between replays it.
@@ -158,6 +167,7 @@ impl LinkHandle {
     /// Sends a counted text frame if there is room; `false` when the queue
     /// is full and the frame was dropped.
     pub fn try_send(&self, text: String) -> bool {
+        let text = (self.scrub)(text);
         let mut w = lock(&self.wire);
         let Some(tx) = w.tx.clone() else {
             w.keep(&text);

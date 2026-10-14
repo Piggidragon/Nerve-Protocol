@@ -37,6 +37,7 @@ names its reason.
 | `the command line is … bytes, longer than …` | A command over 64 KiB | Use a shorter command |
 | `unavailable` | The machine is offline | Check the link, below |
 | `connection_lost` | The link dropped during the call and did not come back within 30 s, or the node or the center restarted | Run it again |
+| `the answer is … bytes, more than the center takes` (`too_large`) | The result is over the 4 MiB message limit, mostly from output full of control characters, which take six bytes each | Write the output to a file, or cut it down (`head -c`, `base64`) |
 | `busy` | Too many commands or calls at once (`limits.max_running`, 16 by default) | Wait, or raise the limit |
 
 The agent sees only the tools a machine could allow. If it sees only `nodes`,

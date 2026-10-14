@@ -250,6 +250,20 @@ impl Link {
             .as_mut()
             .ok_or("the link cannot resume")?
             .resume(got)?;
+        // A request nobody waits for any more (its caller timed out or
+        // cancelled) is not delivered late: it goes as `withdrawn`, which
+        // keeps the count and which the node ignores.
+        let pending = self.pending.lock().unwrap();
+        let again = again
+            .into_iter()
+            .map(|t| match Message::decode(&t) {
+                Ok(Message::Request { id: Id::Num(n), .. }) if !pending.contains_key(&n) => {
+                    Message::notification(method::WITHDRAWN, json!({ "id": n })).encode()
+                }
+                _ => t,
+            })
+            .collect();
+        drop(pending);
         w.conn += 1;
         w.out = Some(out);
         w.parked = false;
@@ -678,6 +692,14 @@ pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String
             }
             Ok(None) => {
                 why = "the connection closed without a bye".into();
+                break;
+            }
+            // A frame the WebSocket cannot take breaks the next connection
+            // too, if the node sends it again: the link ends, not parks.
+            Ok(Some(Err(e))) if nerve_transport::ws::broken_frame(&e) => {
+                link.bye(ByeReason::ProtocolError).await;
+                said_bye = true;
+                why = format!("the node sent a frame the center cannot take: {e}");
                 break;
             }
             Ok(Some(Err(e))) => {

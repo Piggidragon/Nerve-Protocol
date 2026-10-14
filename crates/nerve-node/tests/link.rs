@@ -1304,3 +1304,35 @@ async fn an_ack_past_what_the_node_sent_is_a_protocol_error() {
     );
     node.stop().await;
 }
+
+/// An answer larger than the center takes fails its call with `too_large`
+/// and leaves the link up: sent, it would break the connection, and a resume
+/// would send it again. Escaping makes `\0` six bytes, so 1 MiB of them is
+/// over the 4 MiB message limit.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_over_the_message_limit_fails_its_call_and_keeps_the_link() {
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let node = paired_node_with(dir.path(), &center, |p| {
+        p.mode = nerve_policy::Mode::User;
+    })
+    .await;
+    let (mut conn, _) = resumable_link(&mut center, fresh).await;
+    let e = conn
+        .call(
+            "invoke",
+            json!({"cap": "exec", "action": "run",
+                   "args": {"command": "head -c 1048576 /dev/zero"}}),
+            WAIT,
+        )
+        .await
+        .expect("the link stays up")
+        .expect_err("too large");
+    assert_eq!(nerve_conformance::wire::code_of(&e), "too_large", "{e:?}");
+    conn.call("describe", json!({"detail": "summary"}), WAIT)
+        .await
+        .expect("the link stays up")
+        .expect("describe");
+    node.stop().await;
+}

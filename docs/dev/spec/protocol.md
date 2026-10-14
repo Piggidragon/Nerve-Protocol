@@ -205,7 +205,10 @@ Drop and grace:
   noticed: its calls stay in flight, its commands run on, and what the side
   sends meanwhile is kept as above. The center shows the node offline and
   answers new calls with `unavailable`. A link that ends with a `bye`, from
-  either side, ends at once (§4.5).
+  either side, ends at once (§4.5). So does a connection that ends because
+  the receiver cannot take a frame (over its message limit, or not a valid
+  WebSocket frame): the frame would be sent again on every resume, so the
+  receiver ends the link with `bye {reason: "protocol_error"}`.
 - The node offers the link in the hello of its next connection while the
   grace lasts and it still keeps every frame the center may lack. Once it
   sent that hello it keeps the link until the `welcome` comes (at most the
@@ -230,7 +233,9 @@ Replay:
 - A request the node read is never sent again: an `invoke` the node read may
   have run. Its result comes from the node's kept frames, or when the call
   finishes. An `invoke` the node did not read has not run, and is sent again
-  with its id.
+  with its id, unless no one waits for it any more (its caller timed out or
+  cancelled): then the center sends the notification `withdrawn {id}` in its
+  place, which keeps the count, and the node ignores it.
 - `seq` of events and state goes on counting on the resumed link.
 - After a resume the center fetches the descriptor again, as it may have
   changed while the link was down.
@@ -260,6 +265,7 @@ Errors carry a string code in `error.data.code` (§5.3).
 | `session.end` | notification | C→N | `{session}` | |
 | `bye` | notification | either | `{reason}` | |
 | `ack` | notification | either | `{got}` | (§4.8) |
+| `withdrawn` | notification | C→N | `{id}` | (§4.8) |
 
 - `detail` is `summary`, `capability` (needs `cap`) or `full`.
 - `ctx` is `{session?}`: `session` is at most 256 bytes. Other fields are
@@ -322,7 +328,8 @@ on the producer.
 `limits` in `hello` and `welcome` announce what each side accepts: message
 bytes (default 4 MiB), blob bytes (64 MiB), concurrent calls (64), streams (16).
 A message over the receiver's limit closes the link with `protocol_error`; a
-call over the call limit fails with `busy`.
+call over the call limit fails with `busy`. A node does not send an answer
+over the center's message limit: the call fails with `too_large` instead.
 
 ## 6. Descriptor
 

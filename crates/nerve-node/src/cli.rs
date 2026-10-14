@@ -1017,14 +1017,13 @@ async fn owner_check(paths: &[&NodePaths]) -> Result<(), String> {
 }
 
 /// Whether a daemon runs on the control socket; it then took every change
-/// at once. One that takes no connection now runs all the same.
+/// at once. One that takes no connection now runs all the same; a socket
+/// that cannot be reached at all is none.
 async fn daemon_answers(paths: &NodePaths) -> bool {
     #[cfg(unix)]
     {
-        !matches!(
-            nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await,
-            Err(e) if e == nerve_transport::ctl::NOT_RUNNING
-        )
+        let outcome = nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await;
+        nerve_transport::ctl::node_is_there(&outcome).unwrap_or(false)
     }
     #[cfg(not(unix))]
     {
@@ -3551,6 +3550,16 @@ mod tests {
         assert!(e.contains("already runs"), "{e}");
         node.stop(&paths);
         assert!(!daemon_answers(&paths).await);
+        // A socket that cannot be reached at all is neither a node nor the
+        // lack of one: the start says what is wrong.
+        std::fs::remove_dir_all(paths.state_dir.join("run")).unwrap();
+        std::fs::write(paths.state_dir.join("run"), b"").unwrap();
+        assert!(!daemon_answers(&paths).await);
+        let mut opts = crate::NodeOptions::new(paths.clone());
+        opts.home = d.path().to_path_buf();
+        let e = crate::Daemon::start(opts).await.err().expect("no socket");
+        assert!(e.contains("cannot tell whether a node runs"), "{e}");
+        assert!(!e.contains("already runs"), "{e}");
     }
 
     #[test]

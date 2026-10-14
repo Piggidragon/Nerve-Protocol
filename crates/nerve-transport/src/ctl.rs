@@ -76,11 +76,17 @@ mod unix {
     /// The longest request line read.
     const LINE_BYTES: usize = 1024 * 1024;
 
-    /// How long a connection may wait for its next request line. A caller
-    /// sends it at once; a process of the node's user that holds many
-    /// connections open without a word would else use up the node's
-    /// descriptors.
+    /// How long a connection may wait for its request line. A caller sends
+    /// it at once.
     const IDLE: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// How many connections are served at once; one over it is closed at
+    /// once. With a request per connection and [`IDLE`] this keeps a process
+    /// of the node's user, which can connect, from using up the node's
+    /// descriptors with idle connections. It can still fill the places for a
+    /// while, and then the CLI is told the node closed without answering;
+    /// nothing is written then.
+    const MAX_CONNECTIONS: usize = 64;
 
     /// How long [`call`] waits for an answer. The slowest handler, the check
     /// of a sudo password, ends after 30 s itself. A node that does not
@@ -127,21 +133,23 @@ mod unix {
         F: Fn(CtlRequest, Peer) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Reply> + Send + 'static,
     {
-        serve_idle(listener, handler, IDLE).await
+        serve_limited(listener, handler, IDLE, MAX_CONNECTIONS).await
     }
 
     /// [`serve_on`], with `idle` as the time a connection may wait for its
-    /// next request.
-    async fn serve_idle<F, Fut>(
+    /// request and `max` connections served at once.
+    async fn serve_limited<F, Fut>(
         listener: UnixListener,
         handler: F,
         idle: std::time::Duration,
+        max: usize,
     ) -> std::io::Result<()>
     where
         F: Fn(CtlRequest, Peer) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Reply> + Send + 'static,
     {
         let handler = Arc::new(handler);
+        let places = Arc::new(tokio::sync::Semaphore::new(max));
         let me = crate::net::euid();
         let mut failing = false;
         loop {
@@ -159,8 +167,12 @@ mod unix {
                 Err(e) => return Err(e),
             };
             failing = false;
+            let Ok(place) = places.clone().try_acquire_owned() else {
+                continue;
+            };
             let handler = handler.clone();
             tokio::spawn(async move {
+                let _place = place;
                 let peer = match stream.peer_cred() {
                     Ok(c) => Peer {
                         uid: c.uid(),
@@ -224,7 +236,9 @@ mod unix {
     {
         let (r, mut w) = stream.into_split();
         let mut lines = BufReader::new(r.take(LINE_BYTES as u64 * 64));
-        loop {
+        // One request per connection: every client sends one, and a
+        // connection that stays for more would be a place held.
+        {
             let mut line = String::new();
             // No request in time, like none at all, ends the connection.
             match tokio::time::timeout(idle, lines.read_line(&mut line)).await {
@@ -249,9 +263,9 @@ mod unix {
                     while let Some(item) = rx.recv().await {
                         write_line(&mut w, &json!({"item": item})).await?;
                     }
-                    return Ok(());
                 }
             }
+            Ok(())
         }
     }
 
@@ -269,6 +283,9 @@ mod unix {
     /// full (EAGAIN).
     pub const BUSY: &str = "the node does not take connections now; try again";
 
+    /// The start of the error for a connect that failed for any other reason.
+    pub const CANNOT_CONNECT: &str = "cannot connect to the node's control socket";
+
     /// What a failed connect means. Only a missing socket (ENOENT) and one
     /// nobody listens on (ECONNREFUSED) say that no node runs: any other
     /// error leaves the node that may run unknown, and a caller that took it
@@ -279,7 +296,7 @@ mod unix {
                 NOT_RUNNING.to_string()
             }
             std::io::ErrorKind::WouldBlock => BUSY.to_string(),
-            _ => format!("cannot connect to the node's control socket: {e}"),
+            _ => format!("{CANNOT_CONNECT}: {e}"),
         }
     }
 
@@ -313,6 +330,19 @@ mod unix {
             .await
             .map_err(|e| e.to_string())?;
         answer(&line)
+    }
+
+    /// Whether the outcome of a call says that a node is there: an answer, a
+    /// refusal, a node that takes no connection now or answers too late. Only
+    /// a missing socket or a refused connect says none. A connect that failed
+    /// for any other reason says nothing either way, and comes back as the
+    /// error (a socket path too long, a folder in the way).
+    pub fn node_is_there(outcome: &Result<Value, String>) -> Result<bool, String> {
+        match outcome {
+            Err(e) if e == NOT_RUNNING => Ok(false),
+            Err(e) if e.starts_with(CANNOT_CONNECT) => Err(e.clone()),
+            _ => Ok(true),
+        }
     }
 
     fn answer(line: &str) -> Result<Value, String> {
@@ -464,7 +494,14 @@ mod unix {
             let under_a_file = d.path().join("run/ctl.sock");
             std::fs::write(d.path().join("run"), b"").unwrap();
             let e = call(&under_a_file, "status", json!({})).await.unwrap_err();
-            assert!(e.starts_with("cannot connect"), "{e}");
+            assert!(e.starts_with(CANNOT_CONNECT), "{e}");
+            // Only a connect that failed for another reason is no answer to
+            // whether a node is there.
+            assert_eq!(node_is_there(&Err(e.clone())), Err(e.clone()));
+            assert_eq!(node_is_there(&Err(NOT_RUNNING.into())), Ok(false));
+            assert_eq!(node_is_there(&Err(BUSY.into())), Ok(true));
+            assert_eq!(node_is_there(&Err(NO_ANSWER.into())), Ok(true));
+            assert_eq!(node_is_there(&Ok(json!(1))), Ok(true));
             assert_ne!(e, NOT_RUNNING);
         }
 
@@ -476,24 +513,29 @@ mod unix {
             let d = tempfile::tempdir().unwrap();
             let p = d.path().join("ctl.sock");
             let silent = bind(&p).await.unwrap();
-            let waited = std::time::Instant::now();
-            let r = call_within(
-                &p,
-                "status",
-                json!({}),
-                std::time::Duration::from_millis(200),
+            // Bounded here, so that a call without its limit fails this test
+            // and does not hang it.
+            let r = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                call_within(
+                    &p,
+                    "status",
+                    json!({}),
+                    std::time::Duration::from_millis(200),
+                ),
             )
-            .await;
+            .await
+            .expect("call_within ends by itself");
             assert_eq!(r, Err(NO_ANSWER.to_string()));
-            assert!(waited.elapsed() < std::time::Duration::from_secs(5));
             drop(silent);
 
             let p = d.path().join("idle.sock");
             let listener = bind(&p).await.unwrap();
-            tokio::spawn(serve_idle(
+            tokio::spawn(serve_limited(
                 listener,
                 |_, _| async { Reply::Ok(json!("up")) },
                 std::time::Duration::from_millis(200),
+                MAX_CONNECTIONS,
             ));
             let mut idle = UnixStream::connect(&p).await.unwrap();
             let mut byte = [0u8; 1];
@@ -502,6 +544,63 @@ mod unix {
                 .expect("the node closes a connection that sends nothing");
             assert_eq!(eof.unwrap(), 0);
             assert_eq!(call(&p, "status", json!({})).await, Ok(json!("up")));
+        }
+
+        /// A process that can connect holds no more than `max` places, and a
+        /// connection that sends a request every few moments is closed after
+        /// its answer, so it cannot stay and use up the node's descriptors.
+        #[tokio::test]
+        async fn connections_are_bounded_and_serve_one_request() {
+            let d = tempfile::tempdir().unwrap();
+            let p = d.path().join("ctl.sock");
+            let listener = bind(&p).await.unwrap();
+            tokio::spawn(serve_limited(
+                listener,
+                |_, _| async { Reply::Ok(json!("up")) },
+                std::time::Duration::from_secs(30),
+                2,
+            ));
+            let eof = |mut s: UnixStream| async move {
+                let mut byte = [0u8; 1];
+                tokio::time::timeout(std::time::Duration::from_secs(5), s.read(&mut byte))
+                    .await
+                    .expect("the node closes the connection")
+                    .unwrap()
+            };
+            // Two places held without a word; a third is closed at once.
+            let held = [
+                UnixStream::connect(&p).await.unwrap(),
+                UnixStream::connect(&p).await.unwrap(),
+            ];
+            // Let the node take both before the third comes.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            assert_eq!(eof(UnixStream::connect(&p).await.unwrap()).await, 0);
+            drop(held);
+            // A place is free again once its holder is gone.
+            let mut v = Err(String::new());
+            for _ in 0..100 {
+                v = call(&p, "status", json!({})).await;
+                if v.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert_eq!(v, Ok(json!("up")));
+            // The connection ends with its answer: a second request on it
+            // gets none.
+            let mut s = UnixStream::connect(&p).await.unwrap();
+            s.write_all(b"{\"method\":\"a\"}\n{\"method\":\"b\"}\n")
+                .await
+                .unwrap();
+            let mut got = String::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                s.read_to_string(&mut got),
+            )
+            .await
+            .expect("the node closes the connection")
+            .unwrap();
+            assert_eq!(got, "{\"ok\":\"up\"}\n");
         }
 
         /// Set in the process `serving_outlasts_running_out_of_descriptors`
@@ -628,4 +727,7 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub use unix::{BUSY, NO_ANSWER, NOT_RUNNING, Reply, bind, call, follow, serve, serve_on};
+pub use unix::{
+    BUSY, CANNOT_CONNECT, NO_ANSWER, NOT_RUNNING, Reply, bind, call, follow, node_is_there, serve,
+    serve_on,
+};

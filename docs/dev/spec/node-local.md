@@ -577,7 +577,12 @@ turns it on, and a center reads and changes nothing of it, grant or not.
 - A node opens at most `relay.max_opens_per_minute` tunnels a minute (30
   unless set: a node needs one per center and redials after a second at the
   soonest; a relay behind this one, which carries many nodes, needs more;
-  `relay set`, `relay ls` and `status` show it); past that it gets `503`. Each tunnel is an audit entry and two `info`
+  `relay set`, `relay ls` and `status` show it); past that it gets `503`.
+  In a chain the inner relay is one relay node of the outer one: its own
+  links and every tunnel of the nodes behind it count against that node's
+  `max_links_per_node` (and `max_links`) and its opens budget there, so the
+  outer relay's owner raises all of them for it. A refusal at the outer
+  relay reaches the relayed node as the inner relay's `502`. Each tunnel is an audit entry and two `info`
   lines, so a node with its token cannot rotate the audit log or the log by
   opening and closing tunnels.
 - Hosts are compared without case or a trailing dot, and an address in any

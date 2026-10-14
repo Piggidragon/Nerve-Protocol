@@ -466,6 +466,10 @@ pub(crate) async fn run(shared: Arc<Shared>) {
             } => {}
         }
     }
+    // Refusals of connections still in flight when the relay stopped
+    // listening are told before the node stops, not left for a relay that
+    // listens again.
+    tell_tallies(&shared, true);
     shared.relay.set_status("off", None);
 }
 
@@ -2869,6 +2873,93 @@ mod tests {
         assert_eq!(status, 503, "{head}");
         assert_eq!(j.daemon.status()["relay"]["max_opens_per_minute"], 3);
         drop(held);
+        j.daemon.stop().await;
+    }
+
+    /// When the relay stops listening, it tells the count that waited: an
+    /// owner who turns the relay off (or stops the node) right after the
+    /// first line still learns of the rest.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_relay_tells_what_waited_when_it_stops_listening() {
+        let j = jump(vec![], |_| {}).await;
+        for _ in 0..2 {
+            let (status, _, _) = connect(j.addr, &j.pin, "127.0.0.1:9", None).await;
+            assert_eq!(status, 407);
+        }
+        assert_eq!(j.daemon.relay().tokenless.pending(), 1, "the second waits");
+        j.daemon.owner_edit(|c| c.relay.listen = None);
+        for _ in 0..400 {
+            if j.daemon.status()["relay"]["status"] == "off" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(j.daemon.status()["relay"]["status"], "off");
+        assert_eq!(j.daemon.relay().tokenless.pending(), 0, "it was not told");
+        j.daemon.stop().await;
+    }
+
+    /// Through a proxy of its own whose first address drops packets, the
+    /// relay still reaches the center within its dial deadline: the next
+    /// address of the proxy gets its share of the time. Linux, where a full
+    /// accept queue drops new connections; skipped where `localhost` does
+    /// not name `[::1]` first or the queue does not fill that way.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_relays_own_proxy_gets_the_dial_deadline_too() {
+        let home = echo().await;
+        let home_at = format!("127.0.0.1:{}", port(&home));
+        serve_echo(home);
+        // The working proxy on IPv4, and a full queue on [::1] at its port.
+        let proxy = stalling_proxy(0).await;
+        let p = proxy.port();
+        let first = tokio::net::lookup_host(("localhost", p))
+            .await
+            .ok()
+            .and_then(|mut a| a.next());
+        if first.map(|a| a.ip()) != Some("::1".parse().unwrap()) {
+            eprintln!("  (localhost does not name [::1] first here; nothing to show)");
+            return;
+        }
+        let Ok(sock) = tokio::net::TcpSocket::new_v6() else {
+            return;
+        };
+        if sock
+            .bind(SocketAddr::new("::1".parse().unwrap(), p))
+            .is_err()
+        {
+            eprintln!("  (cannot bind [::1]:{p}; nothing to show)");
+            return;
+        }
+        let full = sock.listen(0).unwrap();
+        let mut queued = Vec::new();
+        for _ in 0..4 {
+            if let Ok(Ok(s)) =
+                tokio::time::timeout(Duration::from_millis(300), TcpStream::connect(("::1", p)))
+                    .await
+            {
+                queued.push(s);
+            }
+        }
+        let dropped =
+            tokio::time::timeout(Duration::from_millis(500), TcpStream::connect(("::1", p)))
+                .await
+                .is_err();
+        if !dropped {
+            eprintln!("  (the full queue does not drop connections here; nothing to show)");
+            return;
+        }
+        let j = jump(vec![center("home", format!("https://{home_at}"))], |c| {
+            c.connection.proxy = Some(format!("http://localhost:{p}"));
+        })
+        .await;
+        let started = std::time::Instant::now();
+        let (status, head, t) =
+            connect(j.addr, &j.pin, &home_at, Some(&basic("lab", &j.token))).await;
+        assert_eq!(status, 200, "{head}");
+        assert!(started.elapsed() < DIAL_DEADLINE, "{:?}", started.elapsed());
+        round_trip(&mut t.unwrap(), b"through").await;
+        drop((full, queued));
         j.daemon.stop().await;
     }
 }

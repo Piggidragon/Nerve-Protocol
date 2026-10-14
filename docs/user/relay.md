@@ -116,7 +116,11 @@ relay's own link, not the links it carries.
 
 If the relay itself reaches its centers through a proxy or another relay, it
 dials through that one too. Each relay in such a chain follows the same
-rules.
+rules. To the outer relay, the inner one is a single relay node: its own
+links and every tunnel of the nodes behind it count against that one node's
+limits there. On the outer relay, raise `--max-links-per-node` (and
+`--max-links`, if need be) and `--max-opens-per-minute` for the inner relay,
+or its fifth link at once is refused ([limits](#limits)).
 
 ## Limits
 
@@ -131,8 +135,13 @@ carries nothing for 90 seconds is closed (a live link sends something every
 20 seconds).
 
 `--max-opens-per-minute` is the number of tunnels a node may open a minute,
-30 unless you set it. That is far more than a node needs; raise it for a
-relay behind this one, whose nodes all count as one.
+30 unless you set it. That is far more than a node needs.
+
+A relay behind this one is one node here, whose links and whose nodes'
+tunnels all count as its own: give it a `--max-links-per-node` for all of
+them at once (its own links to its centers, plus one per center for each
+node behind it), and a larger `--max-opens-per-minute`. A relayed node that
+hits the outer relay's limits sees `502` from its own relay.
 
 At most 4 connections from one address may wait for the relay's answer at
 once, and 16 from one IPv6 /64, each 15 seconds at most; once the relay

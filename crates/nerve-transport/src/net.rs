@@ -355,6 +355,9 @@ where
             Some(u) => {
                 let left = u.saturating_duration_since(tokio::time::Instant::now());
                 if left.is_zero() {
+                    if i == 0 {
+                        last = "no time left to connect".into();
+                    }
                     break;
                 }
                 left / (n - i) as u32

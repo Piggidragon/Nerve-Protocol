@@ -170,22 +170,36 @@ where
             inbound,
         } => {
             write_line(&mut w, &json!({"ok": ok})).await?;
-            loop {
-                tokio::select! {
-                    // Cancelling this read keeps what it read in `buf`, and
-                    // the next one goes on from there.
-                    read = read_line_within(&mut lines, LINE_BYTES, &mut buf) => {
-                        let Line::Text(text) = read? else { break };
-                        let Ok(v) = serde_json::from_str::<Value>(&text) else { break };
-                        if inbound.send(v).await.is_err() {
-                            break;
-                        }
+            // Each direction runs on its own: a write that waits for the
+            // client to read must not stop the reading. A client that answers
+            // one line before it reads the next would else wait on the node
+            // writing while the node waits on it, for good, as soon as a
+            // line in each direction fills the socket's buffer.
+            let reading = async {
+                loop {
+                    let Line::Text(text) =
+                        read_line_within(&mut lines, LINE_BYTES, &mut buf).await?
+                    else {
+                        return Ok(());
+                    };
+                    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                        return Ok(());
+                    };
+                    if inbound.send(v).await.is_err() {
+                        return Ok::<(), std::io::Error>(());
                     }
-                    v = out.recv() => match v {
-                        Some(v) => write_line(&mut w, &v).await?,
-                        None => break,
-                    },
                 }
+            };
+            let writing = async {
+                while let Some(v) = out.recv().await {
+                    write_line(&mut w, &v).await?;
+                }
+                Ok::<(), std::io::Error>(())
+            };
+            // Whichever ends first ends the session.
+            tokio::select! {
+                r = reading => r?,
+                r = writing => r?,
             }
         }
     }
@@ -568,6 +582,57 @@ mod unix {
         use super::*;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::sync::mpsc;
+
+        /// A session on a real socket does not wedge when the node writes a
+        /// line larger than the socket's buffer while the client writes one
+        /// too: a client that answers each line before it reads the next
+        /// still gets every line, and the node every answer.
+        #[tokio::test]
+        async fn a_session_reads_while_it_writes_a_large_line() {
+            let (client, server) = UnixStream::pair().unwrap();
+            let (ends_tx, mut ends_rx) = mpsc::channel(1);
+            let handler = Arc::new(move |_: CtlRequest, _: ()| {
+                let ends_tx = ends_tx.clone();
+                async move {
+                    let (out_tx, out) = mpsc::channel(4);
+                    let (inbound, in_rx) = mpsc::channel(4);
+                    let _ = ends_tx.send((out_tx, in_rx)).await;
+                    Reply::Session {
+                        ok: json!({}),
+                        out,
+                        inbound,
+                    }
+                }
+            });
+            let task = tokio::spawn(crate::ctl::serve_stream(server, (), handler));
+            let (r, mut w) = client.into_split();
+            let mut lines = BufReader::new(r).lines();
+            w.write_all(b"{\"method\": \"hello\"}\n").await.unwrap();
+            let (out_tx, mut in_rx) = ends_rx.recv().await.unwrap();
+            assert!(lines.next_line().await.unwrap().is_some());
+            let big = "x".repeat(300 * 1024);
+            for i in 0..2 {
+                out_tx.send(json!({"call": i, "pad": big})).await.unwrap();
+            }
+            let wedge = std::time::Duration::from_secs(20);
+            tokio::time::timeout(wedge, async {
+                for i in 0..2 {
+                    let line = lines.next_line().await.unwrap().unwrap();
+                    let v: Value = serde_json::from_str(&line).unwrap();
+                    assert_eq!(v["call"], i);
+                    let answer = json!({"answer": i, "pad": big});
+                    w.write_all(format!("{answer}\n").as_bytes()).await.unwrap();
+                }
+                for i in 0..2 {
+                    assert_eq!(in_rx.recv().await.unwrap()["answer"], i);
+                }
+            })
+            .await
+            .expect("the session wedged");
+            drop(w);
+            drop(lines);
+            task.await.unwrap().unwrap();
+        }
 
         #[tokio::test]
         async fn calls_and_follows() {

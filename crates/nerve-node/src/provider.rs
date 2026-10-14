@@ -105,15 +105,21 @@ impl Providers {
             .collect()
     }
 
-    /// The ids of the attached capabilities that have an action that senses:
-    /// only the owner may turn those on or allow them.
-    pub fn sensing(&self) -> BTreeSet<String> {
-        lock(&self.attached)
-            .values()
-            .flat_map(|a| a.caps.iter())
-            .filter(|c| c.actions.values().any(|a| a.effect == Effect::Sense))
-            .map(|c| c.id.clone())
-            .collect()
+    /// The capabilities only the owner may turn on or allow, as a test of
+    /// a capability id: one an attached provider offers with an action that
+    /// senses, and one that is neither the node's own nor offered now. The
+    /// node cannot tell what such a capability will do once a provider
+    /// offers it, so a center's entry for it waits for the owner.
+    pub fn owner_only(&self) -> impl Fn(&str) -> bool + use<> {
+        let mut sensing = BTreeSet::new();
+        let mut offered = BTreeSet::new();
+        for c in lock(&self.attached).values().flat_map(|a| a.caps.iter()) {
+            offered.insert(c.id.clone());
+            if c.actions.values().any(|a| a.effect == Effect::Sense) {
+                sensing.insert(c.id.clone());
+            }
+        }
+        move |cap| sensing.contains(cap) || !(BUILT_IN.contains(&cap) || offered.contains(cap))
     }
 
     /// What `status` shows of them.

@@ -230,9 +230,17 @@ fn nerve_center_and_nerve_node_work_together() {
         click(&mcp, "deny", "fs", "write", "/nerve-e2e/a.txt", true),
         "fs.write:/nerve-e2e/*"
     );
-    assert_eq!(
-        click(&mcp, "allow", "camera", "snap", "camera.snap", false),
-        "camera.snap"
+    // No provider offers `camera` on this node, so it may sense for all the
+    // node knows: only the owner allows it. A deny rule is anyone's.
+    let (status, v) = button(
+        &mcp,
+        json!({"node_id": node_id, "list": "allow", "cap": "camera", "action": "snap",
+               "target": "camera.snap", "wildcard": false}),
+    );
+    assert_ne!(status, 200, "{v}");
+    assert!(
+        v.to_string().contains("only the owner can turn sensing on"),
+        "{v}"
     );
     assert_eq!(
         click(&mcp, "deny", "camera", "snap", "camera.snap", true),
@@ -253,10 +261,10 @@ fn nerve_center_and_nerve_node_work_together() {
         "exec.run:echo hi",
         "exec.run:echo *",
         "fs.read:/nerve-e2e/a.txt",
-        "camera.snap",
     ] {
         assert!(allow.contains(want), "{allow}");
     }
+    assert!(!allow.contains("camera"), "{allow}");
     assert_eq!(allow.matches("exec.run:echo hi").count(), 1, "{allow}");
     assert!(!allow.contains("rm"), "{allow}");
     let deny = list("deny");

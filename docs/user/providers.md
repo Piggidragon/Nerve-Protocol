@@ -49,8 +49,10 @@ A provider's capability is decided like any other ([modes](modes.md),
 | `user` | always, except one that senses or acts on the world, which needs `on` |
 
 Deny rules and `off` and `hidden` work as for `fs` and `exec`. A center with
-the [settings grant](settings-grant.md) can allow a provider's action itself,
-except one that senses (a camera, a microphone): only you turn those on.
+the [settings grant](settings-grant.md) can allow a provider's action itself
+while the provider is attached, except one that senses (a camera, a
+microphone): only you turn those on. While no provider offers a capability,
+only you can allow it or turn it on, as the node cannot tell yet what it does.
 
 When the program exits, its capabilities leave the centers' tool lists, and a
 call that was waiting for it fails with `unavailable`.

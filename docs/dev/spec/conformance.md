@@ -107,18 +107,21 @@ With a `Setup::sudo_password` as well:
 closure pairs the node with the link it is handed, gives that center the
 settings grant `write`, allows the program that runs the part
 (`std::env::current_exe()`) in `providers.allowed` under `Setup::provider`,
-and starts the node; `Setup::socket` is its control socket. The part writes an
-allow rule for `echo.say` and `echo.fail` with `settings.set`, then attaches an
-`echo` provider with the actions `say`, `shout` and `fail`. Every check names
-node-local §7.
+and starts the node; `Setup::socket` is its control socket. The part writes its
+own policy with `settings.set` (`user` mode and a deny rule for `echo.shout`
+before the provider comes, allow rules for `echo.say` and `echo.fail` once it
+is there) and attaches an `echo` provider with the actions `say`, `shout` and
+`fail`. Every check names node-local §7.
 
 | Check |
 |---|
+| a center may not allow a capability no provider offers |
 | a program `providers.allowed` does not name is refused |
 | an allowed provider attaches |
 | a second provider of the same name is refused |
 | the node tells the center that its descriptor changed |
-| the descriptor lists the capability with its provider, cut by the policy |
+| the descriptor lists the capability with its provider |
+| a center may allow an offered capability that does not sense, and the descriptor follows |
 | a call the policy allows reaches the provider and its answer comes back |
 | a provider's error comes back with its code |
 | a call the policy refuses never reaches the provider |

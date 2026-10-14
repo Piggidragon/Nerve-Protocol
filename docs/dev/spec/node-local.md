@@ -968,7 +968,9 @@ program of a desktop user cannot attach there yet.
 ### While it is attached
 
 The answer is `{"ok": {"name", "capabilities": [ids]}}`, and the connection
-stays. The node lists each capability in every center's descriptor with
+stays. The node reads the provider's lines while it writes its own, so a
+provider may answer one call before it reads the next. The node lists each
+capability in every center's descriptor with
 `provider: <name>` and cuts it by that center's policy as its own (§3): `caps`
 hides it or turns it off; in `allowlist` mode an action is shown only when an
 allow rule covers it; in `folder` mode only where it is set `on`; sense and
@@ -994,10 +996,13 @@ answer. The provider learns nothing of the center: not its name, its session
 or its policy.
 
 A center with the settings grant may add allow rules and `on` entries for a
-provider's capability like for any other, except for one that senses: only the
-owner turns sensing on. The node knows a capability's effects only while its
-provider is attached, so an entry a center wrote while none offered the
-capability is not checked for that.
+provider's capability like for any other, except for one that senses, and one
+that no attached provider offers now: the node knows a capability's effects
+only while its provider is attached, so one it does not know may sense once it
+comes. Only the owner adds those (`settings.set` refuses the document with
+`forbidden`). What stays open: an `on` entry or a capability-wide allow rule a
+center wrote for a capability that did not sense counts as well when its
+provider comes back with a sense action under the same id.
 
 ### Detach
 

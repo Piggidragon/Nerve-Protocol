@@ -6,8 +6,10 @@
 //! it, give the fake center the settings grant `write`, allow the program
 //! that runs this part (`std::env::current_exe()`) as a provider under
 //! [`Setup::provider`], and start the node. The part writes its own policy
-//! (an allow rule for `echo.say` and `echo.fail`, none for `echo.shout`),
-//! attaches an echo provider, and calls it through the center's link.
+//! with `settings.set` (`user` mode and a deny rule for `echo.shout` before
+//! the provider comes, allow rules for `echo.say` and `echo.fail` once it is
+//! there), attaches an echo provider, and calls it through the center's
+//! link.
 //!
 //! Unix only: the provider attaches on the control socket.
 
@@ -49,11 +51,13 @@ pub struct Setup {
 
 /// Every check, in order; each needs the ones before it.
 pub const CHECKS: &[&str] = &[
+    "a center may not allow a capability no provider offers",
     "a program providers.allowed does not name is refused",
     "an allowed provider attaches",
     "a second provider of the same name is refused",
     "the node tells the center that its descriptor changed",
-    "the descriptor lists the capability with its provider, cut by the policy",
+    "the descriptor lists the capability with its provider",
+    "a center may allow an offered capability that does not sense, and the descriptor follows",
     "a call the policy allows reaches the provider and its answer comes back",
     "a provider's error comes back with its code",
     "a call the policy refuses never reaches the provider",
@@ -254,6 +258,51 @@ async fn listed(conn: &mut Conn) -> Result<Option<Value>, String> {
         .cloned())
 }
 
+/// Changes this center's policy with `settings.set`: `f` edits it.
+async fn set_policy(
+    conn: &mut Conn,
+    f: impl FnOnce(&mut Value),
+) -> Result<Result<Value, nerve_proto::RpcError>, String> {
+    let got = ok(conn
+        .call(
+            method::GET,
+            json!({"cap": "settings", "keys": ["document", "version"]}),
+            WAIT,
+        )
+        .await)
+    .map_err(|e| format!("settings get (the fake center needs the settings grant write): {e}"))?;
+    let mut doc = got["document"].clone();
+    if let Some(p) = doc["policy"].as_object_mut() {
+        p.remove("until");
+    }
+    f(&mut doc["policy"]);
+    conn.call(
+        method::INVOKE,
+        json!({"cap": "settings", "action": "set", "ctx": {},
+               "args": {"document": doc, "if_version": got["version"]}}),
+        WAIT,
+    )
+    .await
+}
+
+/// The actions the descriptor lists for `CAP`, sorted, once it lists it
+/// with `provider` as its provider.
+async fn actions(conn: &mut Conn, provider: &str) -> Result<Vec<String>, String> {
+    let cap = listed(conn)
+        .await?
+        .ok_or("the descriptor does not list it")?;
+    ensure(
+        cap["provider"] == json!(provider),
+        format!("its provider is {}", cap["provider"]),
+    )?;
+    let mut actions: Vec<String> = cap["actions"]
+        .as_object()
+        .map(|a| a.keys().cloned().collect())
+        .unwrap_or_default();
+    actions.sort();
+    Ok(actions)
+}
+
 /// Runs the checks in [`CHECKS`] order, giving each result to `check`;
 /// stops at the first failure.
 async fn steps(
@@ -270,29 +319,23 @@ async fn steps(
         failed.map_or(Ok(()), Err)
     };
 
-    // Default deny: an allow rule for two of its actions, before it comes.
-    let got = ok(conn
-        .call(
-            method::GET,
-            json!({"cap": "settings", "keys": ["document", "version"]}),
-            WAIT,
-        )
-        .await)
-    .map_err(|e| format!("settings get (the fake center needs the settings grant write): {e}"))?;
-    let mut doc = got["document"].clone();
-    doc["policy"]["mode"] = json!("allowlist");
-    doc["policy"]["allow"] = json!([format!("{CAP}.say"), format!("{CAP}.fail")]);
-    if let Some(p) = doc["policy"].as_object_mut() {
-        p.remove("until");
-    }
-    ok(conn
-        .call(
-            method::INVOKE,
-            json!({"cap": "settings", "action": "set", "ctx": {},
-                   "args": {"document": doc, "if_version": got["version"]}}),
-            WAIT,
-        )
-        .await)
+    // Before it comes the node cannot tell whether `echo` senses, so only
+    // the owner may allow it.
+    step(expect_code(
+        set_policy(conn, |p| {
+            p["mode"] = json!("allowlist");
+            p["allow"] = json!([format!("{CAP}.say")]);
+        })
+        .await,
+        ErrorCode::Forbidden,
+    ))?;
+    // User mode shows every action of it once it comes; a deny rule (which
+    // anyone may add) keeps `shout` from running.
+    ok(set_policy(conn, |p| {
+        p["mode"] = json!("user");
+        p["deny"] = json!([format!("{CAP}.shout")]);
+    })
+    .await)
     .map_err(|e| format!("settings set: {e}"))?;
 
     let stranger = format!("{}-stranger", setup.provider);
@@ -318,23 +361,31 @@ async fn steps(
 
     step(descriptor_changed(conn).await)?;
 
-    step(listed(conn).await.and_then(|cap| {
-        let cap = cap.ok_or("the descriptor does not list it")?;
+    step(actions(conn, &setup.provider).await.and_then(|actions| {
         ensure(
-            cap["provider"] == json!(setup.provider),
-            format!("its provider is {}", cap["provider"]),
-        )?;
-        let mut actions: Vec<&String> = cap["actions"]
-            .as_object()
-            .map(|a| a.keys().collect())
-            .unwrap_or_default();
-        actions.sort();
-        // No rule allows shout, so the center is not shown it.
-        ensure(
-            actions == ["fail", "say"],
+            actions.contains(&"say".to_string()) && actions.contains(&"fail".to_string()),
             format!("its actions are {actions:?}"),
         )
     }))?;
+
+    // Default deny again, with rules for two of its actions: `echo` is
+    // offered now and does not sense, so the center may write them.
+    step(
+        async {
+            ok(set_policy(conn, |p| {
+                p["mode"] = json!("allowlist");
+                p["allow"] = json!([format!("{CAP}.say"), format!("{CAP}.fail")]);
+            })
+            .await)?;
+            let actions = actions(conn, &setup.provider).await?;
+            // No rule allows shout, so the center is not shown it.
+            ensure(
+                actions == ["fail", "say"],
+                format!("its actions are {actions:?}"),
+            )
+        }
+        .await,
+    )?;
 
     let seen = Arc::new(Mutex::new(Vec::new()));
     let (stop, stopped) = oneshot::channel();

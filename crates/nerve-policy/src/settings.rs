@@ -522,7 +522,8 @@ impl SettingsStore {
 
     /// `settings.set` from `center`: the whole document, checked against
     /// `if_version`. `is_sense(cap)` says whether a capability senses
-    /// (camera, microphone, screen): only the owner may turn those on.
+    /// (camera, microphone, screen), or may for all the node knows: only the
+    /// owner may turn those on.
     /// `protected(opts)` is this node's protected list with a center's
     /// options: only the owner may release an entry of it.
     pub fn set_center_document(
@@ -629,7 +630,7 @@ fn client_only(
         let cap = key.split('.').next().unwrap_or(key);
         if *setting == CapSetting::On && o.caps.get(key) != Some(&CapSetting::On) && is_sense(cap) {
             return Err(format!(
-                "policy.caps.{key}: only the owner can turn sensing on"
+                "policy.caps.{key}: only the owner can turn sensing on, and a capability the node does not offer now may sense"
             ));
         }
     }
@@ -639,7 +640,7 @@ fn client_only(
         let scope = rule.split(':').next().unwrap_or(rule);
         if is_sense(scope.split('.').next().unwrap_or(scope)) {
             return Err(format!(
-                "policy.allow {rule}: only the owner can turn sensing on"
+                "policy.allow {rule}: only the owner can turn sensing on, and a capability the node does not offer now may sense"
             ));
         }
     }

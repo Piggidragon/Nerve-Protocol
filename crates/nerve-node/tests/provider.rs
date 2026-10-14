@@ -179,6 +179,25 @@ async fn passes_the_conformance_provider_checks() {
         report.outcomes.len(),
         nerve_conformance::provider_part::CHECKS.len()
     );
+    // Every call to the provider is in the node's audit log: the ones it
+    // forwarded as allowed, the refused one with its reason.
+    let audit = NodePaths::new(dir.path().join("config"), dir.path().join("state")).audit_log();
+    let entries: Vec<Value> = std::fs::read_to_string(audit)
+        .unwrap()
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .filter(|e: &Value| e["cap"] == "echo")
+        .collect();
+    let decided = |action: &str, decision: &str| {
+        entries.iter().any(|e| {
+            e["action"] == action
+                && e["decision"] == decision
+                && e["target"] == format!("echo.{action}")
+        })
+    };
+    assert!(decided("say", "allowed"), "{entries:?}");
+    assert!(decided("fail", "allowed"), "{entries:?}");
+    assert!(decided("shout", "forbidden"), "{entries:?}");
 }
 
 /// The name alone does not attach: the program on the other end must be the
@@ -298,8 +317,9 @@ async fn a_cancel_reaches_the_provider_and_a_leaving_provider_fails_its_calls() 
     daemon.stop().await;
 }
 
-/// The capability a provider adds senses: a center with the settings grant
-/// may not allow it itself, the owner may.
+/// A center with the settings grant may not allow or turn on a capability
+/// that senses, nor one no provider offers now, which may sense once one
+/// does: only the owner may. One that is offered and does not sense, it may.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_center_may_not_allow_a_sensing_provider_itself() {
     let dir = tempfile::tempdir().unwrap();
@@ -318,6 +338,47 @@ async fn a_center_may_not_allow_a_sensing_provider_itself() {
     .await;
     let daemon = Daemon::start(o).await.unwrap();
     let mut conn = linked(&mut center).await;
+
+    // Each change in its own document; the answer of settings.set.
+    async fn set(conn: &mut Conn<TcpStream>, change: &str) -> Result<Value, nerve_proto::RpcError> {
+        let got = conn
+            .call(
+                "get",
+                json!({"cap": "settings", "keys": ["document", "version"]}),
+                WAIT,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        let mut doc = got["document"].clone();
+        let (key, value) = change.split_once('=').unwrap();
+        match key {
+            "allow" => doc["policy"]["allow"] = json!([value]),
+            _ => doc["policy"]["caps"] = json!({value: "on"}),
+        }
+        conn.call(
+            "invoke",
+            json!({"cap": "settings", "action": "set", "ctx": {},
+                   "args": {"document": doc, "if_version": got["version"]}}),
+            WAIT,
+        )
+        .await
+        .unwrap()
+    }
+    let refused = |r: Result<Value, nerve_proto::RpcError>| {
+        let e = r.expect_err("refused");
+        assert_eq!(code_of(&e), "forbidden");
+        assert!(
+            e.message.contains("only the owner can turn sensing on"),
+            "{}",
+            e.message
+        );
+    };
+    // Nothing offers `camera` yet: a center cannot arm it before it comes.
+    for change in ["allow=camera.snap", "caps=camera"] {
+        refused(set(&mut conn, change).await);
+    }
+
     let token =
         std::fs::read_to_string(daemon.paths().ctl_socket().with_file_name("ctl.token")).unwrap();
     let (r, w) = UnixStream::connect(daemon.paths().ctl_socket())
@@ -328,47 +389,91 @@ async fn a_center_may_not_allow_a_sensing_provider_itself() {
         lines: BufReader::new(r).lines(),
         w,
     };
-    let caps = json!([{"id": "camera", "actions": {"snap": {"effect": "sense"}}}]);
+    let caps = json!([{"id": "camera", "actions": {"snap": {"effect": "sense"}}},
+                      {"id": "lamp", "actions": {"on": {"effect": "write"}}}]);
     p.send(json!({"method": "hello", "token": token,
                   "params": {"role": "provider", "name": "desk", "capabilities": caps}}))
         .await;
     // Attached once answered; default deny shows the center nothing of it.
     assert!(p.next().await.unwrap().get("ok").is_some());
-
-    let got = conn
-        .call(
-            "get",
-            json!({"cap": "settings", "keys": ["document", "version"]}),
-            WAIT,
-        )
-        .await
-        .unwrap()
-        .unwrap();
-    for change in ["allow", "caps"] {
-        let mut doc = got["document"].clone();
-        if change == "allow" {
-            doc["policy"]["allow"] = json!(["camera.snap"]);
-        } else {
-            doc["policy"]["caps"] = json!({"camera": "on"});
-        }
-        let e = conn
-            .call(
-                "invoke",
-                json!({"cap": "settings", "action": "set", "ctx": {},
-                       "args": {"document": doc, "if_version": got["version"]}}),
-                WAIT,
-            )
-            .await
-            .unwrap()
-            .expect_err("refused");
-        assert_eq!(code_of(&e), "forbidden");
-        assert!(
-            e.message.contains("only the owner can turn sensing on"),
-            "{}",
-            e.message
-        );
+    for change in ["allow=camera.snap", "caps=camera"] {
+        refused(set(&mut conn, change).await);
     }
     let paths: PathBuf = daemon.paths().config_file();
-    assert!(!std::fs::read_to_string(paths).unwrap().contains("camera"));
+    assert!(!std::fs::read_to_string(&paths).unwrap().contains("camera"));
+    // The lamp is offered and does not sense.
+    set(&mut conn, "allow=lamp.on").await.expect("allowed");
+    assert!(std::fs::read_to_string(&paths).unwrap().contains("lamp.on"));
+    daemon.stop().await;
+}
+
+/// A provider whose program the owner changes in `providers.allowed` is let
+/// go too: it was checked against the old one.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_provider_is_detached_when_the_owner_names_another_program() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let daemon = node(dir.path(), &center, &me(), |p| {
+        p.mode = nerve_policy::Mode::User;
+    })
+    .await;
+    let mut conn = linked(&mut center).await;
+    let (mut p, first) = hello(&daemon.paths().ctl_socket()).await;
+    assert!(first.get("ok").is_some(), "{first}");
+    descriptor_changed(&mut conn).await;
+    assert!(lamp_listed(&mut conn).await);
+    let other = dir.path().join("other-program");
+    std::fs::write(&other, "").unwrap();
+    let paths = daemon.paths().clone();
+    owner_edit(&paths, |c| {
+        c.providers.allowed[0].exe = other.display().to_string();
+    })
+    .await;
+    assert_eq!(p.next().await, None, "the connection ends");
+    descriptor_changed(&mut conn).await;
+    assert!(!lamp_listed(&mut conn).await);
+    assert_eq!(daemon.status()["providers"], json!([]));
+    daemon.stop().await;
+}
+
+/// Two calls with large arguments at once, to a provider that answers one
+/// call before it reads the next, both come back: the node keeps reading
+/// answers while it writes the next call.
+#[tokio::test(flavor = "multi_thread")]
+async fn large_calls_at_once_do_not_wedge_a_provider() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let daemon = node(dir.path(), &center, &me(), |p| {
+        p.allow.push("lamp.on".into());
+    })
+    .await;
+    let mut conn = linked(&mut center).await;
+    let (mut p, _) = hello(&daemon.paths().ctl_socket()).await;
+    descriptor_changed(&mut conn).await;
+    let big = "x".repeat(300 * 1024);
+    let mut ids = Vec::new();
+    for i in 0..2 {
+        let args = json!({"n": i, "pad": big});
+        let call = json!({"cap": "lamp", "action": "on", "args": args, "ctx": {}});
+        ids.push(conn.request("invoke", call).await.unwrap());
+    }
+    let provider = tokio::spawn(async move {
+        for _ in 0..2 {
+            let call = p.next().await.expect("a call");
+            let answer = json!({"id": call["id"], "ok": call["params"]["args"]});
+            p.send(answer).await;
+        }
+        p
+    });
+    for (i, id) in ids.into_iter().enumerate() {
+        let v = conn
+            .answer(id, WAIT, &mut Vec::new())
+            .await
+            .unwrap()
+            .expect("answered");
+        assert_eq!(v["n"], i);
+        assert_eq!(v["pad"].as_str().map(str::len), Some(big.len()));
+    }
+    drop(provider.await.unwrap());
     daemon.stop().await;
 }

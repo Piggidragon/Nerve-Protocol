@@ -1146,12 +1146,12 @@ impl Link {
         let account = self.account();
         let own = self.own();
         // Only a provider's capability can sense (crate::provider).
-        let sensing = self.shared.providers.sensing();
+        let owner_only = self.shared.providers.owner_only();
         let r = lock(&self.shared.store).set_center_document(
             &self.name,
             s.document,
             s.if_version,
-            |cap| sensing.contains(cap),
+            owner_only,
             |opts| self.protected_with(opts, account.as_ref(), &own),
         );
         settings_result(r)

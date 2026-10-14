@@ -639,20 +639,32 @@ pub async fn edit(
     f: impl Fn(&mut NodeConfig) -> Result<(), String>,
 ) -> Result<NodeConfig, String> {
     #[cfg(unix)]
-    for _ in 0..5 {
+    {
         let sock = paths.ctl_socket();
-        let read = match nerve_transport::ctl::call(&sock, "config.read", json!({})).await {
-            Ok(v) => v,
-            Err(e) if e == nerve_transport::ctl::NOT_RUNNING => break,
-            Err(e) => return Err(e),
-        };
-        let mut cfg = NodeConfig::parse(read["config"].as_str().unwrap_or_default())?;
-        f(&mut cfg)?;
-        let params = json!({"config": cfg.to_toml(), "if_version": read["version"]});
-        match nerve_transport::ctl::call(&sock, "config.write", params).await {
-            Ok(_) => return Ok(cfg),
-            Err(e) if e.starts_with("conflict") => continue,
-            Err(e) => return Err(e),
+        let mut conflicts = 0;
+        loop {
+            let read = match nerve_transport::ctl::call(&sock, "config.read", json!({})).await {
+                Ok(v) => v,
+                // Only a node that is not there leaves the file to the CLI.
+                Err(e) if e == nerve_transport::ctl::NOT_RUNNING => break,
+                Err(e) => return Err(e),
+            };
+            let mut cfg = NodeConfig::parse(read["config"].as_str().unwrap_or_default())?;
+            f(&mut cfg)?;
+            let params = json!({"config": cfg.to_toml(), "if_version": read["version"]});
+            match nerve_transport::ctl::call(&sock, "config.write", params).await {
+                Ok(_) => return Ok(cfg),
+                Err(e) if e.starts_with("conflict") => {
+                    conflicts += 1;
+                    // A node that answered has the file: writing it here
+                    // would be undone by its next write, and the change
+                    // reported as made.
+                    if conflicts == 5 {
+                        return Err("the config keeps changing; try again".into());
+                    }
+                }
+                Err(e) => return Err(e),
+            }
         }
     }
     let mut store = SettingsStore::open_with(
@@ -856,8 +868,10 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
                 let rule = match made {
                     Ok(made) if made != command && l.contains(&command) && l.contains(&made) => {
                         return Err(format!(
-                            "both {command:?} and {made:?} are on the {}: remove one of them as `rule ls` shows it",
-                            list.label()
+                            "both {command:?} and {made:?} are on the {}: remove {made:?} first with `nerve-node rule rm {} '{made}'`, and then {command:?} with `nerve-node rule rm {} '{command}'`",
+                            list.label(),
+                            list.word(),
+                            list.word()
                         ));
                     }
                     _ if l.contains(&command) => command.clone(),
@@ -3519,6 +3533,52 @@ mod tests {
         assert!(load(&paths).locked);
     }
 
+    /// A node that answers but keeps refusing the write with a conflict (the
+    /// settings change under the CLI) is a node that did not get the change:
+    /// `panic` fails and the file stays as it is. Writing the file here
+    /// would be undone by the node's next write, with the change reported as
+    /// made.
+    #[cfg(unix)]
+    #[test]
+    fn a_node_that_always_answers_conflict_does_not_get_the_file_written() {
+        use nerve_transport::ctl::{Reply, serve};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_d, paths) = setup(&["home"]);
+        let text = std::fs::read_to_string(paths.config_file()).unwrap();
+        let writes = std::sync::Arc::new(AtomicUsize::new(0));
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (sock, counted) = (paths.ctl_socket(), writes.clone());
+        rt.spawn(async move {
+            let _ = serve(&sock, move |req, _| {
+                let (text, counted) = (text.clone(), counted.clone());
+                async move {
+                    match req.method.as_str() {
+                        "config.read" => Reply::Ok(json!({"config": text, "version": 7})),
+                        "config.write" => {
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            Reply::Err("conflict: the config changed (version 8)".into())
+                        }
+                        _ => Reply::Ok(json!({})),
+                    }
+                }
+            })
+            .await;
+        });
+        while !paths.ctl_socket().exists() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let before = std::fs::read(paths.config_file()).unwrap();
+        let e = run(&paths, &["panic"]).unwrap_err();
+        assert!(e.contains("keeps changing"), "{e}");
+        assert_eq!(writes.load(Ordering::SeqCst), 5);
+        assert_eq!(std::fs::read(paths.config_file()).unwrap(), before);
+        assert!(!load(&paths).locked);
+    }
+
     /// The callers that only ask whether a node runs take a busy one for a
     /// node: it is not told that a change waits for the next start, and a
     /// second node does not start beside it.
@@ -3619,6 +3679,9 @@ mod tests {
             e.contains(broken) && e.contains("\"fs:~/private/*\""),
             "{e}"
         );
+        // The refusal's own instructions work, also for an entry as `ls`
+        // shows the working one.
+        assert!(e.contains(&format!("rule rm deny '{broken}'")), "{e}");
         let out = run(&paths, &["rule", "rm", "deny", broken]).unwrap();
         assert!(out.contains(broken), "{out}");
         assert_eq!(
@@ -3626,6 +3689,21 @@ mod tests {
             ["exec.run:git status", "exec.run:rm *", "fs:~/private/*"]
         );
         run(&paths, &["rule", "rm", "deny", "fs:~/private/*"]).unwrap();
+        for rule in ["exec.run:git *", "exec.run:exec.run:git [*]"] {
+            let list = "center.home.policy.allow";
+            run(&paths, &["config", "add", list, rule]).unwrap();
+        }
+        let e = run(&paths, &["rule", "rm", "allow", "exec.run:git *"]).unwrap_err();
+        assert!(
+            e.contains("rule rm allow 'exec.run:exec.run:git [*]'"),
+            "{e}"
+        );
+        run(
+            &paths,
+            &["rule", "rm", "allow", "exec.run:exec.run:git [*]"],
+        )
+        .unwrap();
+        run(&paths, &["rule", "rm", "allow", "exec.run:git *"]).unwrap();
         // A colon in a command that is not a scope stays a command.
         run(&paths, &["rule", "add", "allow", "C:\\tools\\x.exe"]).unwrap();
         run(&paths, &["rule", "rm", "allow", "C:\\tools\\x.exe"]).unwrap();

@@ -664,7 +664,8 @@ connection) does not end the socket: the node takes the next one once the
 cause is gone. Only an error that says the listener itself is broken ends it.
 A connection carries one request: the node closes it after the answer (for a
 streaming method, after the last item), closes one that sends no request line
-within 30 s, and serves at most 64 at once, closing one over that at once.
+within 30 s, and serves at most 64 at once; one over that is answered with
+`{"error": "the node does not take connections now; try again"}` and closed.
 
 What a client makes of a connect that fails: only a missing socket (ENOENT)
 and a refused connect (ECONNREFUSED) mean that no node runs, and only then may

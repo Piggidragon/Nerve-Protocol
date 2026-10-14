@@ -80,12 +80,12 @@ mod unix {
     /// it at once.
     const IDLE: std::time::Duration = std::time::Duration::from_secs(30);
 
-    /// How many connections are served at once; one over it is closed at
-    /// once. With a request per connection and [`IDLE`] this keeps a process
-    /// of the node's user, which can connect, from using up the node's
-    /// descriptors with idle connections. It can still fill the places for a
-    /// while, and then the CLI is told the node closed without answering;
-    /// nothing is written then.
+    /// How many connections are served at once; one over it is answered with
+    /// [`BUSY`] and closed. With a request per connection and [`IDLE`] this
+    /// keeps a process of the node's user, which can connect, from using up
+    /// the node's descriptors with idle connections. It can still fill the
+    /// places for a while; the CLI is then told the node is busy and writes
+    /// nothing, and the way to stop the node anyway is to stop its process.
     const MAX_CONNECTIONS: usize = 64;
 
     /// How long [`call`] waits for an answer. The slowest handler, the check
@@ -168,6 +168,13 @@ mod unix {
             };
             failing = false;
             let Ok(place) = places.clone().try_acquire_owned() else {
+                // Said without waiting: the caller has written its request
+                // and may find the connection reset when it reads.
+                // A fresh connection has room for the line; `writable` only
+                // lets tokio learn that.
+                if stream.writable().await.is_ok() {
+                    let _ = stream.try_write(format!("{}\n", json!({"error": BUSY})).as_bytes());
+                }
                 continue;
             };
             let handler = handler.clone();
@@ -321,15 +328,31 @@ mod unix {
             .await
             .map_err(|e| connect_error(&e))?;
         let (r, mut w) = stream.into_split();
-        write_line(&mut w, &json!({"method": method, "params": params}))
-            .await
-            .map_err(|e| e.to_string())?;
+        // A node over its places answers BUSY and closes, possibly before
+        // the request is written: read the answer all the same.
+        let sent = write_line(&mut w, &json!({"method": method, "params": params})).await;
         let mut line = String::new();
         BufReader::new(r)
             .read_line(&mut line)
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| io_error(&e))?;
+        if line.is_empty()
+            && let Err(e) = sent
+        {
+            return Err(io_error(&e));
+        }
         answer(&line)
+    }
+
+    /// What an error after a connect says. A connection the node reset or
+    /// closed on the caller is the node over its places.
+    fn io_error(e: &std::io::Error) -> String {
+        match e.kind() {
+            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::BrokenPipe => {
+                BUSY.to_string()
+            }
+            _ => e.to_string(),
+        }
     }
 
     /// Whether the outcome of a call says that a node is there: an answer, a
@@ -365,11 +388,9 @@ mod unix {
             .await
             .map_err(|e| connect_error(&e))?;
         let (r, mut w) = stream.into_split();
-        write_line(&mut w, &json!({"method": method, "params": params}))
-            .await
-            .map_err(|e| e.to_string())?;
+        let sent = write_line(&mut w, &json!({"method": method, "params": params})).await;
         let mut lines = BufReader::new(r).lines();
-        while let Some(line) = lines.next_line().await.map_err(|e| e.to_string())? {
+        while let Some(line) = lines.next_line().await.map_err(|e| io_error(&e))? {
             let v: Value = serde_json::from_str(&line).map_err(|e| e.to_string())?;
             if let Some(item) = v.get("item") {
                 each(item.clone());
@@ -378,7 +399,7 @@ mod unix {
                 return Ok(());
             }
         }
-        Ok(())
+        sent.map_err(|e| io_error(&e))
     }
 
     #[cfg(test)]
@@ -560,21 +581,34 @@ mod unix {
                 std::time::Duration::from_secs(30),
                 2,
             ));
-            let eof = |mut s: UnixStream| async move {
-                let mut byte = [0u8; 1];
-                tokio::time::timeout(std::time::Duration::from_secs(5), s.read(&mut byte))
-                    .await
-                    .expect("the node closes the connection")
-                    .unwrap()
-            };
-            // Two places held without a word; a third is closed at once.
+            // Two places held without a word; a call over them is told the
+            // node is busy, with the request written or not.
             let held = [
                 UnixStream::connect(&p).await.unwrap(),
                 UnixStream::connect(&p).await.unwrap(),
             ];
             // Let the node take both before the third comes.
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            assert_eq!(eof(UnixStream::connect(&p).await.unwrap()).await, 0);
+            for _ in 0..20 {
+                let r = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    call(&p, "status", json!({})),
+                )
+                .await
+                .expect("the node answers a call over its places");
+                assert_eq!(r, Err(BUSY.to_string()));
+            }
+            // A connection that only listens is told the same and closed.
+            let mut told = String::new();
+            let mut over = UnixStream::connect(&p).await.unwrap();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                over.read_to_string(&mut told),
+            )
+            .await
+            .expect("the node closes the connection")
+            .unwrap();
+            assert_eq!(told, format!("{{\"error\":\"{BUSY}\"}}\n"));
             drop(held);
             // A place is free again once its holder is gone.
             let mut v = Err(String::new());

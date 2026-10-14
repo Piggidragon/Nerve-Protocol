@@ -107,7 +107,9 @@ folders.
   with the folder's rights. Everything below the folder inherits it. Adding a
   large folder takes as long as changing its permissions with `icacls`.
 - `folder rm` and `folder set` change the entry, and removing the pairing
-  takes it off. A running node takes changes from the CLI at its next start
+  takes it off. That is the node's entry on the folder: permissions a
+  command gave what it made there stay (see "What the AppContainer does not
+  stop" below). A running node takes changes from the CLI at its next start
   ([platforms](platforms.md#no-control-socket)), and gives its folders their
   entries again until then.
 - `uninstall` takes off the entries of the node in your own folders (not
@@ -129,7 +131,8 @@ folders.
   its new place.
 - The flags stay independent: `w` without `r` writes but neither reads nor
   lists, `x` runs programs and reads files by name but does not list. Hard
-  links are the exception, see "What the AppContainer does not stop" below.
+  links and the permissions a command gives what it makes are the
+  exceptions, see "What the AppContainer does not stop" below.
 - Deleting and renaming need `r` and `w`, since Windows allows a move with
   the same right as a delete: a command must not move what it cannot read
   to a folder where it can. So in a folder with `w` but not `r`, a command
@@ -165,6 +168,20 @@ folders.
   AppContainer (reading the system folders, the network), and work a command
   gets another program outside the container to do for it, such as a service
   or the task scheduler.
+- A command sets the permissions of a folder or file it makes, as every
+  Windows program may, so it can give them an entry of its own: for its
+  pairing's container, or for all AppContainers. The node neither sees nor
+  removes these. They stay when you remove the folder, change its flags,
+  remove the pairing or run `uninstall`, and they count again when that
+  center is paired again with the same state folder. In a folder with `w`
+  but not `r`, a command can make a folder that lets it read what you or
+  another pairing save into it later. So do not save files a pairing must
+  not read into a folder where it may write. After you take `w` off a
+  pairing's folder or remove the pairing, clean the folder:
+  `icacls <folder> /remove *S-1-15-2-… /T` with the SID that `icacls`
+  shows for the entry (all AppContainers are `S-1-15-2-1`), or
+  `icacls <folder> /reset /T`, which also resets permissions of your own
+  below the folder.
 - A hard link is one file under two names, and both share one access list.
   When the node grants, changes or moves a folder that commands may write
   in, or a folder that holds one, Windows passes the change to everything
@@ -183,8 +200,8 @@ folders.
   pairing has `w` without `r` on that folder, one above it or one inside
   it, and the node finds no granted folder moved or renamed in that sync.
   (A command may give a folder it makes permissions of its own, and the
-  change would pass them to a file it linked there: that gains it nothing
-  only where it may read already.) So a built
+  change would pass them to a file it linked there; the check keeps a file
+  it may only write from getting them this way.) So a built
   Rust project you rename or move needs `cargo clean` before its entry can
   come off at its new place; until then the record of the entry stays stale
   and that pairing's commands stop. Any other

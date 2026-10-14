@@ -171,9 +171,18 @@ command in an AppContainer, one per center (`nerve_sandbox::appcontainer`):
   make a folder there sets its security descriptor at creation, without
   `WRITE_DAC`, and the change passes an entry of its own there (read for
   its container) down to a file it linked into that folder. Where every container that may
-  write there may read too, that entry gives nothing new. What stays: a
-  command with `rw` can give itself `WRITE_DAC` on an owner's file there
-  and keep its access after the grant comes off. A link to anywhere else is refused, other build tools' too (pnpm's
+  write there may read too, that entry gives nothing new while the grant
+  is on. What stays, here and in general: entries a command put on what it
+  made (for its container's SID or for ALL APPLICATION PACKAGES) are not
+  the node's. `appcontainer::set` rewrites only the granted folder's own
+  list, so they outlive a take-off, a narrowing, removing the pairing and
+  `uninstall` (the SID comes back with the same center and state folder),
+  and with `rw` the propagation alone can pass one to a linked owner's file.
+  In a `w`-only folder they let a command read what is saved later into a
+  folder it made. The user docs name this limit and the `icacls` clean-up.
+  Taking a container's own explicit entries off below the folder in the
+  take-off's walk is a follow-up; entries for other principals cannot be
+  told apart from the owner's and stay a documented limit. A link to anywhere else is refused, other build tools' too (pnpm's
   store, uv's cache, a local `git clone`); the user docs give the ways
   around. A link a command of
   any pairing that may write there makes between the walk and the change

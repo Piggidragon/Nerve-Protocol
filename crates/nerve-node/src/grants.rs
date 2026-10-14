@@ -1678,9 +1678,9 @@ mod tests {
     fn a_folder_written_but_not_read_gives_no_pass() {
         type Grants<'a> = &'a [(&'a str, &'a str, &'a str)];
         // (grants as they are, grants after the change, the link)
-        let cases: [(Grants, Grants, (&str, &str)); 4] = [
+        let cases: [(Grants, Grants, (&str, &str)); 5] = [
             // At: the owner's file in a `w`-only project, changed or taken
-            // off.
+            // off, and in a project narrowed to `w`.
             (
                 &[("lab", "proj", "w")],
                 &[("lab", "proj", "wx")],
@@ -1689,6 +1689,11 @@ mod tests {
             (
                 &[("lab", "proj", "w")],
                 &[],
+                ("proj/target/secret.bin", "proj/target/zzz/x"),
+            ),
+            (
+                &[("lab", "proj", "rw")],
+                &[("lab", "proj", "w")],
                 ("proj/target/secret.bin", "proj/target/zzz/x"),
             ),
             // Above: another pairing writes in the folder around it.

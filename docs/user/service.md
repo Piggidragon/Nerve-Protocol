@@ -55,7 +55,7 @@ Running `install` again repairs what is missing and restarts the service.
 | What | Where |
 |---|---|
 | `node.toml`, one key per center | `/etc/nerve` |
-| Audit log, [log](logs.md), control socket and its token, config key | `/var/lib/nerve/state` |
+| Audit log, [log](logs.md), control socket and its token, config key, the last version of `node.toml` | `/var/lib/nerve/state` |
 | The keys, with `machine.secret_storage = "keyring"` | the keyring of `nerve`, `/var/lib/nerve/.local/share/keyrings` |
 | Home of `nerve` | `/var/lib/nerve` |
 | The program | `/usr/local/bin/nerve-node` |
@@ -248,7 +248,7 @@ Restart-Service nerve-node
 | What | Where |
 |---|---|
 | `node.toml`, one key per center, the stored password of the account commands run as, the sudo password while sudo is on | `C:\ProgramData\Nerve\config` |
-| Audit log, [log](logs.md), config key, the record of the folder grants (`grants.json`) | `C:\ProgramData\Nerve\state` |
+| Audit log, [log](logs.md), config key, the last version of `node.toml`, the record of the folder grants (`grants.json`) | `C:\ProgramData\Nerve\state` |
 | The program | `C:\Program Files\Nerve\nerve-node.exe` |
 | Start, stop, a start that fails, a crash | The Windows Event Log, Application, source `nerve-node` ([logs](logs.md#the-windows-event-log)) |
 

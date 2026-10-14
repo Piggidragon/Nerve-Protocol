@@ -56,7 +56,7 @@ enum Outcome {
 }
 
 /// A link that dropped without a bye, kept until `until` for the center to
-/// resume (spec §4.8): its calls run on, and what it sends is kept. Dropped,
+/// resume (spec §4.9): its calls run on, and what it sends is kept. Dropped,
 /// it ends like a link that cannot resume: its calls end and its commands
 /// are killed.
 struct Parked {
@@ -174,14 +174,15 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
             }
         };
         let grace = parked.as_ref().map(|p| p.until);
-        let proxy = match dropping_at(proxy_for(&shared, &cfg, &url), &mut parked, grace).await {
-            Ok(p) => p,
-            Err(e) => {
-                tracing::error!("center {name}: bad proxy: {e}; dialling stopped");
-                cs.set_status(format!("bad proxy: {e}"));
-                return;
-            }
-        };
+        let proxy =
+            match dropping_at(proxy_for(&shared.paths, &cfg, &url), &mut parked, grace).await {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!("center {name}: bad proxy: {e}; dialling stopped");
+                    cs.set_status(format!("bad proxy: {e}"));
+                    return;
+                }
+            };
         cs.set_status("connecting");
         tracing::debug!("center {name}: dialling {url}");
         let started = Instant::now();
@@ -265,8 +266,10 @@ fn load_key(shared: &Shared, name: &str) -> Result<NodeKey, String> {
 
 /// The proxy to dial `url` through, its header values read from the system
 /// keyring. An error stops the dial: a configured proxy is never bypassed.
-async fn proxy_for(
-    shared: &Shared,
+/// The link, the pairing and the relay's own dials (crate::relay) all take
+/// it from here.
+pub(crate) async fn proxy_for(
+    paths: &crate::paths::NodePaths,
     cfg: &NodeConfig,
     url: &CenterUrl,
 ) -> Result<Option<Proxy>, String> {
@@ -275,12 +278,26 @@ async fn proxy_for(
     };
     // The keyring may block (the Secret Service asks to unlock), so off the
     // runtime's threads.
-    let (paths, names) = (shared.paths.clone(), cfg.connection.headers.clone());
-    let headers =
-        tokio::task::spawn_blocking(move || crate::secrets::proxy_headers(&paths, &names))
-            .await
-            .map_err(|e| format!("the keyring read stopped: {e}"))??;
-    Proxy::parse(p, headers).map(Some)
+    let (paths, names) = (paths.clone(), cfg.connection.headers.clone());
+    let (login, storage) = (cfg.connection.login.clone(), cfg.machine.secret_storage);
+    let headers = tokio::task::spawn_blocking(move || {
+        let mut headers = crate::secrets::proxy_headers(&paths, &names)?;
+        // The login of an https:// proxy (a relay token) is kept with the
+        // node's own keys, not with the header values.
+        if let Some(user) = login {
+            use base64::Engine;
+            let password = crate::secrets::proxy_login(&paths, storage)?;
+            let basic =
+                base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
+            headers.push(("Proxy-Authorization".into(), format!("Basic {basic}")));
+        }
+        Ok::<_, String>(headers)
+    })
+    .await
+    .map_err(|e| format!("the keyring read stopped: {e}"))??;
+    Proxy::parse(p, headers)?
+        .pinned(cfg.connection.pin.clone())
+        .map(Some)
 }
 
 /// What one read from the link gave.
@@ -373,7 +390,7 @@ where
 
 type WsStream = tokio_tungstenite::WebSocketStream<nerve_transport::net::BoxIo>;
 
-/// A fresh link id: 16 random bytes as hex (spec §4.8).
+/// A fresh link id: 16 random bytes as hex (spec §4.9).
 fn new_link_id() -> String {
     msg::hex(&nerve_transport::keys::random_bytes(16))
 }
@@ -481,7 +498,7 @@ async fn session(
     // One writer owns the sink; everyone else queues (spec §5.5).
     let (tx, mut rx) = mpsc::channel::<WsMessage>(limits::SEND_QUEUE);
     // The center carries on the parked link, or starts a new one; without
-    // `welcome.resume` it cannot resume links at all (spec §4.8).
+    // `welcome.resume` it cannot resume links at all (spec §4.9).
     let carried = match (resumed, parked) {
         (Some(Resumed { resumed: true, got }), Some(p)) => {
             match p.link().handle.attach(tx.clone(), got) {
@@ -625,7 +642,7 @@ struct Link {
     shared: Arc<Shared>,
     cs: Arc<CenterState>,
     name: String,
-    /// The id the center knows the link by (spec §4.8).
+    /// The id the center knows the link by (spec §4.9).
     id: String,
     /// The largest message the center takes (its `welcome.limits`).
     takes: AtomicU64,
@@ -891,7 +908,7 @@ impl Link {
             // The calls of an ended session end like cancelled ones: a
             // command's process group is killed as on a timeout.
             // A request the center gave up while the link was down, in its
-            // place in the replay (spec §4.8): nothing to do.
+            // place in the replay (spec §4.9): nothing to do.
             method::WITHDRAWN => None,
             method::SESSION_END => {
                 let Ok(end) = params::<SessionEnd>(&p) else {

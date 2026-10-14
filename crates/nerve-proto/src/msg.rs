@@ -103,7 +103,7 @@ pub struct Hello {
     /// The descriptor revision the node will describe.
     pub rev: u64,
     /// The link this connection carries, for a node that can resume links
-    /// (§4.8).
+    /// (§4.9).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume: Option<Resume>,
 }

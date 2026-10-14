@@ -56,7 +56,14 @@ pub async fn pair(
         public_key: key.public_hex(),
     };
     let body = serde_json::to_value(&req).map_err(|e| e.to_string())?;
-    let mut io = nerve_transport::net::open(&link.center, link.pin.as_deref(), None).await?;
+    // The pair request goes the way the link will: a node that reaches its
+    // centers only through a proxy or a relay (protocol §4.7, §4.8) pairs
+    // through it too, and a proxy that fails is not bypassed.
+    let proxy = crate::link::proxy_for(paths, &cfg, &link.center)
+        .await
+        .map_err(|e| format!("bad proxy: {e}"))?;
+    let mut io =
+        nerve_transport::net::open(&link.center, link.pin.as_deref(), proxy.as_ref()).await?;
     let path = format!("{}{}", link.center.base, PAIR_PATH);
     let resp = nerve_transport::http::post_json(
         &mut io,

@@ -66,6 +66,17 @@ nothing is allowed yet.
 Without a flag, the node is dialling. The wait grows from 1 to 60 seconds. If
 `nerve-node status` says `LOCKED (panic)`, run `nerve-node unlock`.
 
+Through a [relay](relay.md), `status` names what the relay answered:
+
+| Message | Cause | Fix |
+|---|---|---|
+| `the proxy refused the tunnel to …: 400 …` | The node speaks plain HTTP to the relay, which speaks TLS only | `proxy set 'https://…' --pin <pin>`, the line `relay add` showed |
+| `TLS with the proxy …: its certificate does not carry the pinned key` | The pin in `proxy set` is not the relay's, or the relay made a new certificate | On the relay, `nerve-node relay ls` shows the pin |
+| `the proxy refused the tunnel to …: 407 …` | The relay does not know the name and token in `proxy set` | On the relay, `nerve-node relay ls`; give the node a new token with `relay token <name>`; on Windows the relay knows a new token only after `Restart-Service nerve-node` |
+| `the proxy refused the tunnel to …: 403 …` | The center's address is not one the relay is paired with over https, or not one the relay's owner picked for this node | Pair with the URL the relay uses for that center; on the relay, `relay ls` shows the node's centers |
+| `the proxy refused the tunnel to …: 503 …` | The relay is off, locked, carries as many tunnels as it may (all of them, or this node's), or this node opened as many as it may in a minute | On the relay, `nerve-node relay ls` and `status`, and its log: the node sees only `503`, the relay's log says which limit |
+| `the proxy refused the tunnel to …: 502 …` | The relay cannot reach the center, or the relay's own proxy or relay refused it (in a chain, the outer relay's limits for the inner one) | Check the relay's own link and its log; in a chain, give the inner relay limits of its own on the outer relay with `relay set-limits` ([relay](relay.md#limits)) |
+
 If `status` says `daemon: not running`, start `nerve-node run`. On Windows
 `status` does not ask the node yet: it says `daemon: not known (no control
 socket on Windows); a change takes effect at the next start of the node`
@@ -83,6 +94,8 @@ cannot switch to the account commands run as and runs no command at all.
 |---|---|
 | `refusing to run as root; set machine.allow_root = true to allow it` | Run as a normal user (on Windows: not elevated), or set `machine.allow_root` |
 | `node.toml is refused: its MAC does not match …` | Look at the file, then `nerve-node config accept`. See [config](config.md) |
+| `node.toml is refused: its version … is older than the last this node accepted …` | An earlier `node.toml` is back, from a backup or a sync tool. Look at it, then `nerve-node config accept`. See [config](config.md#an-older-file-put-back) |
+| `… config.version holds no version number` | The record of the last version in the state folder is damaged. Delete it, or take the file with `nerve-node config accept`. See [config](config.md#an-older-file-put-back) |
 | `machine.secret_storage is "keyring", but the system keyring cannot be reached …` | The keys are in a keyring that does not answer. Start it, or run `nerve-node setup`, which offers to install one on a Linux without a desktop. See [keys](config.md#where-the-node-keeps-its-keys) |
 | `… this running node found no keyring and does not look again until it is restarted …` | The node asked for a keyring before one answered. Restart the node, then change the setting again. `setup` restarts the installed node itself after it installed a keyring |
 | `… keeps the node's keys in the system keyring (machine.secret_storage = "keyring"), but … So the node does not start` (also from `install`) | The keys may not be in the keyring here: the installed node on Windows, or a Linux kernel with a Landlock ABI below 9. Run the `config set machine.secret_storage file` command the message names, as it says, then start the node. See [Windows](service.md#windows) and [keys](config.md#an-older-linux-kernel) |

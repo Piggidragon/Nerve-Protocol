@@ -1,4 +1,4 @@
-//! Resuming a dropped link (docs/dev/spec/protocol.md §4.8): what each side
+//! Resuming a dropped link (docs/dev/spec/protocol.md §4.9): what each side
 //! counts, and the frames it keeps until the other side has read them. No
 //! I/O here; the node and the center wrap it around their writers.
 //!

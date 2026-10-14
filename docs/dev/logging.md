@@ -170,7 +170,7 @@ sets no wait, since it is no longer the node's link. `link_replaced` takes
 the old link out of the node's links at once and says nothing if it is not
 there: a link that ended during the 3 s wait has told its drop already.
 
-A link the node can resume (protocol §4.8) that drops is parked: the drop line
+A link the node can resume (protocol §4.9) that drops is parked: the drop line
 (`link_parked`) says how many calls wait, and the link stays in the node's
 links, offline. A connection that resumes it logs `link resumed after …`
 through `link_up`, counted as no new link in the statistics; the end of an

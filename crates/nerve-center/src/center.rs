@@ -296,7 +296,7 @@ impl Center {
             .store(d.as_millis() as u64, Ordering::Relaxed);
     }
 
-    /// How long a dropped link waits for the node to resume it (spec §4.8).
+    /// How long a dropped link waits for the node to resume it (spec §4.9).
     pub fn grace(&self) -> Duration {
         Duration::from_millis(self.grace_ms.load(Ordering::Relaxed))
     }
@@ -831,7 +831,7 @@ impl Center {
         );
     }
 
-    /// The connection of a link the node can resume dropped (spec §4.8): the
+    /// The connection of a link the node can resume dropped (spec §4.9): the
     /// node is offline, and the calls on the link wait for the grace. After
     /// it, a link still parked from connection `conn` ends like any other.
     /// `up` is how long that connection was up.

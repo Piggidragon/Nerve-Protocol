@@ -41,7 +41,7 @@ enum Out {
 }
 
 /// One authenticated, welcomed link. A link the node can resume outlives a
-/// dropped connection by the grace (§4.8): it is parked, its calls wait, and
+/// dropped connection by the grace (§4.9): it is parked, its calls wait, and
 /// a connection that resumes it carries it on.
 pub struct Link {
     pub node_id: String,
@@ -557,7 +557,7 @@ pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String
         None => center.parked(&node_id),
     };
 
-    // A link the node names, with a count that fits, is carried on (§4.8);
+    // A link the node names, with a count that fits, is carried on (§4.9);
     // any other link the node had ends here.
     let (tx, mut rx) = mpsc::channel::<Out>(nerve_proto::limits::SEND_QUEUE);
     let mut carried = None;

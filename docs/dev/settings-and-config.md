@@ -36,17 +36,25 @@ A file with a missing or wrong MAC was changed outside the owner's path. The
 node refuses it and audits that:
 
 - At start-up the node does not start.
-- On a reload the old config stays. A reload also refuses a signed file that
-  is older than the one in force.
+- On a reload the old config stays.
 
 The owner looks at the file, then runs `nerve-node config accept`. The node
 signs it. A file without a MAC line (and no key) is taken
 once and signed.
 
-The check holds while `config.key` does. A process that can read or delete it
-can make the node take another file at its next start. A `user` mode command is
-such a process, because it runs as the user without a sandbox. In `folder`
-mode, Landlock keeps commands out of the state folder.
+A file the node signed earlier passes the MAC, so the MAC alone does not stop
+someone who can write the config folder from putting an older one back. The
+node keeps the highest version it has saved or taken in `config.version` in
+the state folder, and refuses a signed file below it the same way: at
+start-up it does not start, on a reload (which also refuses a file below the
+one in force) the old config stays. `config accept` takes such a file under a
+new version above every one before. Details:
+[spec §1](spec/node-local.md#who-writes-nodetoml).
+
+The check holds while `config.key` and `config.version` do. A process that can
+read or delete the key can make the node take another file at its next start.
+A `user` mode command is such a process, because it runs as the user without a
+sandbox. In `folder` mode, Landlock keeps commands out of the state folder.
 
 ## Client-only items
 
@@ -61,7 +69,8 @@ center reads, or the node refuses the whole change and names the field.
    `machine.sudo_path`, `machine.secret_storage`, `machine.user`.
 5. The sudo password. The node never returns it. A center only passes it on,
    sealed, when it switches sudo on.
-6. The proxy and its credentials.
+6. The proxy and its credentials, and the relay for other nodes with its
+   tokens.
 7. The local audit log.
 8. Releasing a protected path: a center may add to `protected.extra`, not
    remove from it or change `protected.allow`, and its folders may not widen

@@ -326,7 +326,7 @@ async fn the_sudo_switch() {
 
 /// A result kept while the link was down is scrubbed of the password held
 /// when it was made: turning sudo off before the link resumes does not let
-/// the password out in the replay (protocol §4.8).
+/// the password out in the replay (protocol §4.9).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_result_kept_for_a_resume_carries_no_password() {
     let dir = tempfile::tempdir().unwrap();

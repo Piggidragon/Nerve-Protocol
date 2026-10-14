@@ -183,7 +183,7 @@ fn pair(req: &Request, st: &Mutex<State>, center_id: &str) -> Response {
 }
 
 /// The center's handshake: challenge, hello check, welcome. Returns the hello,
-/// or the bye reason it sent. The welcome offers no resume (§4.8), as a
+/// or the bye reason it sent. The welcome offers no resume (§4.9), as a
 /// center that cannot resume links answers.
 pub async fn handshake(
     conn: &mut Conn<TcpStream>,
@@ -238,7 +238,7 @@ pub async fn hello(
 }
 
 /// The last handshake step: `welcome`, with `resume` when the center answers
-/// a node's resume offer (§4.8).
+/// a node's resume offer (§4.9).
 pub async fn welcome(
     conn: &mut Conn<TcpStream>,
     resume: Option<msg::Resumed>,

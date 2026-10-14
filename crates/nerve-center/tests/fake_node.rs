@@ -1243,7 +1243,7 @@ async fn reply_text(call: tokio::task::JoinHandle<Option<Value>>) -> (String, bo
     )
 }
 
-/// A node that resumes its dropped link (spec §4.8) answers the call that was
+/// A node that resumes its dropped link (spec §4.9) answers the call that was
 /// in flight, and the harness gets that answer. The node had read the invoke,
 /// so it is not sent again: the first frame on the new connection is the
 /// center's new describe. The center acknowledges what it read.
@@ -1539,16 +1539,28 @@ async fn a_frame_over_the_limit_ends_a_resumable_link() {
     let _ = ws
         .send(WsMessage::text(Message::result(invoke, big).encode()))
         .await;
-    let bye = loop {
-        match text(&mut ws).await {
-            Some(Message::Notification { method: m, params }) if m == method::BYE => {
-                break params;
-            }
-            Some(_) => continue,
-            None => panic!("no bye"),
+    // The center ends the connection. Its `bye` may not arrive: it closes
+    // with the rest of the frame unread, and the reset that sends can drop
+    // the bye before it is read (Windows does).
+    let ended = loop {
+        match tokio::time::timeout(Duration::from_secs(10), ws.next()).await {
+            Err(_) => panic!("the center keeps the connection"),
+            Ok(Some(Ok(WsMessage::Text(t)))) => match Message::decode(&t) {
+                Ok(Message::Notification { method: m, params }) if m == method::BYE => {
+                    break format!("bye {}", params["reason"].as_str().unwrap_or_default());
+                }
+                _ => continue,
+            },
+            Ok(Some(Ok(WsMessage::Close(_)))) | Ok(None) => break "closed".to_string(),
+            Ok(Some(Err(e))) => break format!("failed: {e}"),
+            Ok(Some(Ok(_))) => continue,
         }
     };
-    assert_eq!(bye["reason"], "protocol_error");
+    assert!(
+        !ended.starts_with("bye ") || ended == "bye protocol_error",
+        "{ended}"
+    );
+    // The link is not parked: the call fails at once.
     let (text_out, failed) = reply_text(call).await;
     assert!(failed, "{text_out}");
     assert!(text_out.starts_with("error connection_lost"), "{text_out}");

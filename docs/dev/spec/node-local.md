@@ -8,8 +8,8 @@ same way and so the owner knows what each setting does.
 
 | What | Default | Override |
 |---|---|---|
-| `node.toml` and one key per center (`keys/<name>.key`); on Windows also `sudo.dpapi` and, on the installed node, `command-account.dpapi` | `~/.config/nerve` | `--config-dir`, `NERVE_CONFIG_DIR` |
-| control socket `run/ctl.sock` and its token `run/ctl.token`, audit log `audit.jsonl`, log `log.jsonl`, the config's MAC key `config.key`, `keys.lock`, `keys.moving`; on Windows the record of the folder grants `grants.json` and its lock `grants.json.lock` | `~/.local/state/nerve` | `--state-dir`, `NERVE_STATE_DIR` |
+| `node.toml` and one key per center (`keys/<name>.key`), the relay's TLS key (`keys/relay-tls.pem`) and an `https://` proxy's password (`keys/proxy-login.secret`); on Windows also `sudo.dpapi` and, on the installed node, `command-account.dpapi` | `~/.config/nerve` | `--config-dir`, `NERVE_CONFIG_DIR` |
+| control socket `run/ctl.sock` and its token `run/ctl.token`, audit log `audit.jsonl`, log `log.jsonl`, the config's MAC key `config.key`, the last version of the config `config.version`, `keys.lock`, `keys.moving`; on Windows the record of the folder grants `grants.json` and its lock `grants.json.lock` | `~/.local/state/nerve` | `--state-dir`, `NERVE_STATE_DIR` |
 
 With `machine.secret_storage = "keyring"` the keys are in the system keyring
 instead of `keys/` and `config.key` ([where the keys are](#where-the-keys-are)).
@@ -110,17 +110,53 @@ config folder would still not hold it.
 
 A file whose MAC is missing or does not match was changed outside the
 owner's path. It is refused and the refusal is audited (§6): at start-up the
-node does not start; on a reload the old config stays in force. A reload also
-refuses a signed file older than the one in force. After looking at a refused
-file, the owner takes it as it is with `nerve-node config accept`; the node
-then signs it. A `node.toml` without a MAC line (no key yet) is taken once
-as it is and signed.
+node does not start; on a reload the old config stays in force. After looking
+at a refused file, the owner takes it as it is with `nerve-node config
+accept`; the node then signs it. A `node.toml` without a MAC line (no key
+yet) is taken once as it is and signed.
 
-The check stands on `config.key`. A process that can delete or read it, and a
-`user` mode command is one (it runs unconfined as the user), can make the node
-take another file at its next start: with the key gone, an unsigned file
-counts as a first file and is signed. The start-up audits that as
-`signed`. In `folder` mode Landlock keeps commands out of the state folder.
+An earlier file that the node signed itself passes the MAC, so the MAC does
+not tell it from the last one. `<state>/config.version` does: the highest
+`version` of `node.toml` the node has saved or taken, as a decimal number
+(0600, no secret). It is written after every save of the file, never before,
+and only goes up. A signed file whose version is below it was put back and is
+refused like a changed one (audited, `refused`): at start-up the node does not
+start, and the CLI's read-only commands refuse it; a reload also refuses a
+signed file below the version in force, and the old config stays. The same
+refusal is what the owner sees after a restore of the config folder from a
+backup.
+
+- `config accept` takes the refused file under a version above every one
+  before it (the highest of the file, the config in force and the record, plus
+  one), so the file taken is the newest, the record goes on from it, and an
+  older copy is refused in turn.
+- A node with no record (an install from before there was one, or a state
+  folder made new) takes the file as it is and records its version. With no
+  `node.toml` and a record, the versions go on from the record, so the first
+  file the node saves is not an older one.
+- A record that holds no number is an error, not none: the node does not
+  start, and the CLI's commands refuse, naming the file. `config accept`
+  writes it again, or the owner deletes it.
+- A save by the running node is numbered above the record as well as above
+  the version in force. Another writer may have saved the file meanwhile and
+  raised the record (the CLI on Windows, where a running node takes the file
+  only at its next start; on Linux the CLI before the node's socket is up).
+  The node's save replaces that file, as it always did, but it never lands
+  below the record, so the node does not refuse its own file as an earlier
+  one put back at its next start.
+- A record that cannot be written after the file was saved changes nothing: it
+  only lags, the audit log says `not_recorded`, and the next start records
+  the version.
+
+The check stands on `config.key` and `config.version`. A process that can
+delete or read the key, and a `user` mode command is one (it runs unconfined
+as the user), can make the node take another file at its next start: with the
+key gone, an unsigned file counts as a first file and is signed (at a version
+not below the record). The start-up audits that as `signed`. A process that
+can write the state folder can delete or lower the record as well. In
+`folder` mode Landlock keeps commands out of the state folder. What the record
+adds is a defence against whoever can write the config folder alone: a
+backup, a sync tool, a process of another account.
 
 On Windows there is no control socket. A running node takes the folder
 changes over its control pipe (§5); for every other change the CLI writes
@@ -131,17 +167,22 @@ at the next start of the node").
 ### Where the keys are
 
 `machine.secret_storage` says where the node keeps its own keys: the key of
-the config's MAC and its key per center.
+the config's MAC, its key per center, the relay's TLS key (§2, Relay) and
+the password of an `https://` proxy, the relay token of a relayed node (§2,
+Proxy).
 
-- `file`, the default: `<state>/config.key` and `<config>/keys/<name>.key`,
+- `file`, the default: `<state>/config.key`, `<config>/keys/<name>.key`,
+  `<config>/keys/relay-tls.pem` and `<config>/keys/proxy-login.secret`,
   each 0600.
 - `keyring`: the system keyring (Credential Manager on Windows, the Secret
   Service on Linux), under the service `nerve`, one entry per key, named
-  `config-key:<state folder>` and `center-key:<name>:<config folder>`. Each
-  holds the key's hex text. No copy stays in a file.
+  `config-key:<state folder>`, `center-key:<name>:<config folder>`,
+  `relay-tls:<config folder>` and `proxy-login:<config folder>`. Each holds
+  the key's text. No copy stays in a file.
 
-The proxy's header values are in the keyring either way (§2), except on the
-installed node on Windows, which takes none (§2, Proxy).
+The header values of a proxy, and the password of an `http://` one, are in
+the keyring either way (§2), except on the installed node on Windows, which
+takes none (§2, Proxy).
 
 Two kinds of node keep their keys in files whatever is asked:
 
@@ -269,7 +310,26 @@ and is not counted.
 `allowlist` and `user` mode commands get no Landlock rules, so an allowed
 command that talks to the Secret Service (`secret-tool`, `busctl --user`,
 `gdbus`, `dbus-send`) reads the node's keys with `keyring`; it names no
-path the protected list could refuse.
+path the protected list could refuse. This is an accepted limit (decided in
+#57), not a gap waiting for a rule:
+
+- An allow rule names a program the owner lets run as themselves, and the
+  mode that runs it is not a sandbox (`rules.md`: a deny rule is not one
+  either). A connect rule for these commands would keep one kind of program
+  off one socket, while an allowed interpreter or build tool still reads the
+  rest of what the user's account reads, with paths it builds at run time (§3, step 0).
+  It would not make any rule safe that names a program that does more.
+- Landlock on an `allowlist` command would be a second sandbox next to
+  `folder` mode's, for the one mode that runs commands as the user on
+  purpose. It would also stop the programs a rule is there to run when they
+  need the session (`ssh` with the agent in `/run/user/<uid>`, `git` with a
+  credential helper), and every `allowlist` command would need the count of
+  running commands that `folder` mode has (a domain does not change while a
+  command runs), so that the keys do not move into the keyring under one that
+  started before.
+- So the owner's rule is: no allow rule for a program that asks the keyring
+  (`secret-tool`, `busctl`, `gdbus`, `dbus-send`, `kwallet-query` and the
+  like), or the keys stay in files. `nerve-node rule ls allow` shows them.
 
 #### A keyring on a Linux without a desktop
 
@@ -339,9 +399,26 @@ max_running = 4             # commands at once, per node
 output_cap_bytes = 16777216
 
 [connection]
-proxy = "http://proxy:3128" # optional; HTTP CONNECT, never with user:password@
+proxy = "http://proxy:3128" # optional; HTTP CONNECT, never with user:password@;
+                            # https://host:port for a relay (§2, Relay)
+pin = "<pin>"               # optional, https:// only: the pin of its certificate
+login = "lab-pc"            # optional, https:// only: the user; its password is a node key
 headers = ["X-Proxy-Token"] # names of extra headers on the CONNECT request;
                             # their values are in the system keyring
+
+[relay]                     # optional; the relay for other nodes (protocol §4.8)
+listen = "0.0.0.0:7490"     # ip:port; the relay is off without it
+pin = "<pin>"               # the pin of the relay's TLS certificate; its key is a node key
+max_links = 16              # tunnels at once, over every relayed node
+max_links_per_node = 4      # tunnels at once of one relayed node
+max_opens_per_minute = 30   # tunnels one relayed node may open a minute
+
+[[relay.node]]
+name = "lab-pc"             # the user name of its Proxy-Authorization
+token_sha256 = "<hex>"      # SHA-256 of its token; the token is in no file
+centers = ["home"]          # optional: the centers it may reach; all when missing
+max_links = 12              # optional: its own tunnels at once (a relay behind this one)
+max_opens_per_minute = 300  # optional: its own opens a minute
 
 [[center]]
 name = "home"               # the owner's name; the CLI's --center
@@ -382,7 +459,7 @@ shell. Output that is not UTF-8 is read in the OEM code page (Windows), which
 the command's own console starts with.
 A command is killed with its process group when its call ends: on
 `timeout_ms`, `cancel`, `session.end` of the session that started it, a
-link that ended without being resumed (protocol §4.8), and when the call
+link that ended without being resumed (protocol §4.9), and when the call
 returns. While a dropped link waits for its resume, its commands run on. Windows has no process groups:
 there each command runs in a Job Object of its own. The shell starts
 suspended, is put in the job, and only then runs, so every process it starts
@@ -462,6 +539,165 @@ A `node.toml` that holds header values (`headers = { Name = "value" }`) or a
 user name and password in `connection.proxy` is refused on load, without the values in the message: take them out of the
 file, accept it (`nerve-node config accept`) and run `nerve-node proxy set`
 again.
+
+`center add` sends its pair request through the same proxy as the link
+(`connection.proxy`, else `HTTPS_PROXY`/`NO_PROXY` of the environment it
+runs in, which may differ from the daemon's), with the same values, when the
+center is `https`; a proxy that fails stops the
+pairing and nothing is stored.
+
+`nerve-node proxy set https://<user>:<password>@<host>:<port> [--pin <pin>]`
+sets an `https://` proxy, a relay (§2, Relay) above all: the node reaches
+it over TLS checked against `connection.pin` (else the system's roots) and
+sends the `CONNECT` inside that TLS (protocol §4.7). Its password, the relay
+token, is not a header value: it is one of the node's own keys, kept where
+`machine.secret_storage` says, as `keys/proxy-login.secret` (0600) or the
+keyring entry `proxy-login:<config folder>` (§1), and it moves with the
+other keys when that setting changes. `connection.login` keeps the user
+name. So the installed node on Windows, whose keys are in files, takes it,
+and so does a Linux node without a keyring whose keys are in files; with
+`keyring` and no keyring that answers, `proxy set` refuses with the
+keyring's error and changes nothing, and a node whose keys are there does
+not start, as for any key of the node. `--header` values of an `https://`
+proxy stay in the keyring as above. `proxy rm` deletes the password with the
+config entries; `proxy ls` shows the pin and the user name, never the
+password.
+
+### Relay
+
+The node can be the relay of other nodes (protocol §4.8). Only the owner
+turns it on, and a center reads and changes nothing of it, grant or not.
+
+- `nerve-node relay set <ip:port> [--max-links N] [--max-links-per-node N]
+  [--max-opens-per-minute N]`
+  turns it on; `relay off` stops listening and ends every tunnel, and keeps
+  the nodes.
+- The relay speaks TLS only. The first `relay set` or `relay add` makes its
+  certificate (self-signed, its names do not count): the key goes where
+  `machine.secret_storage` keeps the node's keys (`keys/relay-tls.pem`, or
+  the keyring entry `relay-tls:<config folder>`, §1) and moves with them;
+  `relay.pin` keeps its pin. A later `relay set` keeps it, and makes a new
+  one only when the key is gone or is not the one `relay.pin` names (it says
+  so: the relayed nodes need the new pin). With `keyring` and no keyring
+  that answers, `relay set` refuses as storing any key does, and the
+  running relay does not listen (`status` says why). A connection that
+  does not open with a TLS handshake gets `400` in plain HTTP, saying the
+  relay speaks TLS only, and is closed; the log notes that its token, if it
+  sent one, crossed the network in the clear.
+- `nerve-node relay add <name> [--center <center>]...` makes a token for a
+  relayed node: 43 characters of `a-z0-9`, shown once, with the line the
+  relayed node runs,
+  `nerve-node proxy set 'https://<name>:<token>@<relay>:<port>' --pin <pin>`.
+  `node.toml` keeps the token's SHA-256 only, and the log tells a change of
+  `relay.node` without its values. `relay token <name>` gives a known node
+  a new token, shown once with the same line, and keeps its centers and
+  limits; the old token's tunnels end. `relay rm <name>` takes the token
+  away and ends that node's tunnels; its centers and limits go with it.
+- With `--center` (given more than once for more) the node's tunnels go
+  only to the named centers of this node; without it, to every center a
+  tunnel may go to (below). `relay set-centers <name> [--center
+  <center>]...` changes the list later (without `--center`: every center
+  again) and ends the node's tunnels to a center it took away. Only paired
+  centers can be named; a center unpaired later stays on the list and is
+  reached no more. A tunnel to a center off the list is refused with the
+  same `403` as one to a center this node does not have.
+- `nerve-node relay ls` shows the relay, its pin, its nodes with their
+  centers and, from the running node, its tunnels: the node, its address,
+  the center and since when.
+  `status` carries the same under `relay` (§5); on Windows `relay ls` asks
+  the control pipe's `status` for them. `relay rm`, `relay off` and `relay
+  set-centers` say whether their cut is in force: "now" when a running node
+  took the change; on Windows, where the CLI writes the file for the next
+  start, that a running node keeps its tunnels until then and must be
+  restarted to cut them now.
+- A tunnel goes to one of this node's centers whose URL is `https` and
+  that has not revoked it or answered 401, and is on the node's list when
+  it has one, matched by host (without case)
+  and port; the relayed node must have paired with the same host name or
+  address. Centers that share a host and port (one reverse proxy, a path
+  each) are all reached by a tunnel there: the relay grants it only when the
+  node may reach every one of them, a list that splits them is refused by
+  `relay add` and `set-centers`, and the log and the audit name them all
+  (`a, b`). A tunnel reaches whatever is served at that host and port, seen
+  from this machine's address (other names of the proxy too), since the
+  relay does not read what goes inside it. A paused center is still a target: pausing stops this node's
+  own link, not the tunnels of others.
+- While the node is locked (`panic`) the relay does not listen. Any change
+  that takes a tunnel's grant away (the relay off, the token gone or
+  replaced, the center gone, revoked, unknown or off the node's list,
+  `panic`) ends it at once, and a new certificate makes the relay listen
+  anew.
+- Each tunnel is one audit entry when it ends (§6): the node, the center,
+  the peer's address, start, end, why it ended and the bytes each way. A
+  refused `CONNECT` is no tunnel and only in the log.
+- At most 64 connections at once wait for their `CONNECT` to be decided (15
+  seconds in all for the first byte, TLS and the head), at most 4 of them
+  from one address and 16 from one IPv6 /64 (link-local addresses count by
+  address only, their scope is not in it); one over any is closed unread.
+  A count by address cannot tell one machine with several addresses from
+  several machines: a machine with four or more addresses in the /64
+  (privacy addresses count) can take the /64's 16 and keep the other
+  machines of that /64 out over IPv6, though not the relay's other peers.
+  Once granted, a connection is a tunnel, counted by `max_links` and
+  `max_links_per_node`, and gives its undecided slot back before the relay
+  resolves and dials the center (12 seconds at most, less than the 15 a
+  relayed node waits for the answer; each address of the center gets its
+  share of the time left, so a first address that does not answer leaves
+  time for the next).
+- Every refusal is logged at `debug`. At `warn` the log gets a counted line:
+  the first refusal at once, then at most one line a minute with how many
+  came since, over how long (from the first of them to the last), and the
+  last of them; a count that waits is told when its minute is over, also
+  when no refusal follows (the relay looks every 5 seconds), and every count
+  still waiting is told when the relay stops listening (`relay off`,
+  `panic`, a new address or pin, the node stopping). There is one count for connections without a
+  valid token (plain HTTP, no or a wrong token, over a limit), one per node
+  for refusals of a node with its token (a target that is no center, a
+  limit), and one per node for a valid token that came in plain HTTP, which
+  names the node to give it a new one. So no peer, with a token or without,
+  can rotate the log, and a line names the node whose refusals it counts.
+- A node opens at most `relay.max_opens_per_minute` tunnels a minute (30
+  unless set: a node needs one per center and redials after a second at the
+  soonest; `relay set`, `relay ls` and `status` show it; a relay behind
+  this one, which carries many nodes, gets more as a limit of its own,
+  below); past that it gets `503`.
+  `relay.max_links_per_node` and `relay.max_opens_per_minute` hold for
+  every relay node; raising them raises them for every token. A node can
+  have limits of its own instead (`[[relay.node]]` `max_links` and
+  `max_opens_per_minute`, set with `relay set-limits <name> [--max-links N]
+  [--max-opens-per-minute N]`: a limit not given stays, as with `relay
+  set`, and no flag at all clears both; shown by `relay ls`). That is for a relay behind this one: in a chain the inner
+  relay is one relay node of the outer one, and its own links and every
+  tunnel of the nodes behind it count against that node's limits (and the
+  relay's `max_links`). A refusal at the outer relay reaches the relayed
+  node as the inner relay's `502`. Each tunnel is an audit entry and two `info`
+  lines, so a node with the relay's limits cannot rotate the audit log or
+  the log by opening and closing tunnels; a node with limits of its own,
+  only as far as they allow.
+- Hosts are compared without case or a trailing dot, and an address in any
+  of its spellings (`[2001:db8::1]` and `[2001:db8:0:0::1]`) is one address.
+  A name and the address it resolves to are not told apart.
+- A tunnel quiet for 90 seconds (by the monotonic clock, so a step of the
+  wall clock changes nothing) is closed.
+- An `https` center paired at a loopback address or `localhost` is a
+  target. A center paired at a name is dialled on the addresses the name
+  resolves to, and when one of them is loopback or unspecified the tunnel
+  is refused (`502`, the log says why): the relay does not reach this
+  machine's own ports by a name. When the relay dials through its own
+  proxy, the proxy resolves the name.
+- The relay dials a center through this node's own proxy when it has one,
+  so relays chain. It never reads what it carries, and no rule, folder or
+  mode of this node applies to a tunnel: the relayed node's calls are
+  decided by the relayed node, by its own policy.
+
+On Windows a change made with `relay` is in the file and takes effect at
+the next start of the node, as every change but the folder changes there.
+Until then the running node keeps its relay settings in memory, for new
+tunnels as well as open ones: a removed or replaced token still opens
+tunnels, a new token or node is refused (`407`), and `relay off` leaves the
+listener up. Every `relay` command that changes the file says so there
+(and says nothing is "now" in force); where a running node took the
+change, the commands that take something away say what ends now.
 
 ### Modes
 
@@ -573,8 +809,12 @@ answer. For each call the node takes the center's policy and, in this order:
    dropped as Windows drops it (`node-state.\`), and a drive-relative
    `C:name` is taken from the working directory on that drive. A path a
    command builds at run time (`cd ~/.config; cat nerve/node.toml`) is not
-   seen there; in `folder` mode Landlock keeps the command out all the
-   same, while a `user` mode command runs as the user, unconfined.
+   seen there. In `folder` mode Landlock (the AppContainer on Windows) keeps a
+   command it confines out all the same. A `user` mode command runs as the
+   user, unconfined, so does a program an `allowlist` rule lets run, and a
+   sudo command (§4) runs as root without the sandbox in every mode; a
+   `folder` mode command can also ask a service of the user's session to run
+   a program outside it (`docs/user/modes.md`).
 1. A `locked` node (after `panic`) keeps no links and runs nothing; a paused,
    revoked or unknown center is not dialled.
 2. The capability setting: `off` refuses (`disabled`), `hidden` leaves it
@@ -799,7 +1039,7 @@ Methods:
 
 | Method | Params | |
 |---|---|---|
-| `status` | | daemon and links |
+| `status` | | daemon and links; under `relay`, the relay's state, its pin, its nodes with their centers and its tunnels (§2, Relay) |
 | `config.read` | | `node.toml` and its `version` |
 | `config.write` | `config`, `if_version` | replaces it when the version matches |
 | `config.accept` | | takes `node.toml` as it is after it was refused, and signs it (§1) |
@@ -892,9 +1132,11 @@ the node as a service.
 ## 6. Audit log
 
 `<state>/audit.jsonl`, one JSON line per event: settings changes (with old
-and new value), calls allowed or forbidden (a refusal with its reason), and what happened to the config
-file itself (`"kind": "config"`, `event` `refused`, `signed` or `accepted`,
-with the file and the reason), and what the owner did to the node
+and new value), calls allowed or forbidden (a refusal with its reason), the
+relay's tunnels (`"kind": "relay"`, one per tunnel when it ends: `node`,
+`center`, `from`, `start`, `end`, `reason`, `up`, `down`; never a token), and what happened to the config
+file itself (`"kind": "config"`, `event` `refused`, `signed`, `accepted` or
+`not_recorded`, with the file and the reason), and what the owner did to the node
 (`"kind": "node"`, `event` `install`, `setup`, `update` or `uninstall`, with
 its `steps` and the `error` that stopped it). It holds targets (paths, command lines), never
 file content or output; a target longer than 512 characters is cut there

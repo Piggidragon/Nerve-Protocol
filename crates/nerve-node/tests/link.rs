@@ -1062,7 +1062,7 @@ async fn ends(pid: u32) -> bool {
     false
 }
 
-/// A link that drops while a command runs is resumed (spec §4.8): the
+/// A link that drops while a command runs is resumed (spec §4.9): the
 /// command runs on, and its result and its `exec/exit` event, sent while the
 /// link was down, arrive on the new connection. Only what the center did not
 /// read is sent again, and the resumed link takes new calls and acknowledges

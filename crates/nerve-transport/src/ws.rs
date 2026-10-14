@@ -30,7 +30,7 @@ pub fn config(max_message: usize) -> WebSocketConfig {
 /// Whether a read error comes from what the peer sent (a frame over the
 /// limit, a broken frame) rather than from the connection. Such a frame would
 /// break the next connection the same way, so the link is not resumed over it
-/// (docs/dev/spec/protocol.md §4.8).
+/// (docs/dev/spec/protocol.md §4.9).
 pub fn broken_frame(e: &tokio_tungstenite::tungstenite::Error) -> bool {
     use tokio_tungstenite::tungstenite::Error;
     use tokio_tungstenite::tungstenite::error::ProtocolError;

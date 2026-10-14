@@ -8,7 +8,8 @@ mod common;
 use std::future::Future;
 use std::time::{Duration, Instant};
 
-use common::{Mcp, Node, text_of};
+use common::{HttpCenter, Mcp, Node, text_of};
+use nerve_conformance::harness_part::{self, Target};
 use nerve_conformance::{center_part, node_part};
 use nerve_proto::link::PairLink;
 use nerve_transport::sudo::{Offer, seal};
@@ -44,6 +45,21 @@ fn center_part_passes_against_nerve_center_over_plain_loopback() {
 #[test]
 fn center_part_passes_against_nerve_center_over_pinned_tls() {
     center_part_against(true);
+}
+
+#[test]
+fn harness_part_passes_against_nerve_center() {
+    let state = tempfile::tempdir().unwrap();
+    let center = HttpCenter::start(state.path(), "e2e-harness-token");
+    let target = Target {
+        mcp_addr: center.mcp_addr.clone(),
+        token: center.token.clone(),
+        links: [(); 2].map(|_| PairLink::parse(&center.ui.pair_link()).unwrap()),
+    };
+    let report = block_on(harness_part::run(&target));
+    assert!(report.ok(), "{report}");
+    // Every check ran; a count that shrinks silently would hide a lost check.
+    assert_eq!(report.outcomes.len(), 36, "{report}");
 }
 
 /// The name of the tool for `cap.action` and the arguments that pick `node`
@@ -538,7 +554,7 @@ impl Relay {
 }
 
 /// The link between the real binaries drops while a command runs (spec
-/// §4.8): both sides keep the link, the node dials again and resumes it,
+/// §4.9): both sides keep the link, the node dials again and resumes it,
 /// and the command's output, made while the link was down, reaches the
 /// harness.
 #[cfg(target_os = "linux")]

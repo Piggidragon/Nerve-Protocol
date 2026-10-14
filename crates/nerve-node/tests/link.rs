@@ -1336,3 +1336,40 @@ async fn an_answer_over_the_message_limit_fails_its_call_and_keeps_the_link() {
         .expect("describe");
     node.stop().await;
 }
+
+/// A frame from the center that the node's WebSocket cannot take (here one
+/// over the 4 MiB message limit) ends the link with `bye protocol_error`
+/// instead of parking it: the center would send it again on every resume.
+/// The command on the link is killed, and the next link is a new one.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_frame_the_node_cannot_take_ends_a_resumable_link() {
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let node = paired_node_with(dir.path(), &center, |p| {
+        p.mode = nerve_policy::Mode::User;
+    })
+    .await;
+    let home = dir.path().join("home");
+    let (mut conn, first) = resumable_link(&mut center, fresh).await;
+    conn.request(
+        "invoke",
+        json!({"cap": "exec", "action": "run",
+               "args": {"command": "sleep 30 & echo $! > sleep.pid; wait"}}),
+    )
+    .await
+    .unwrap();
+    let pid = pid_in(&home.join("sleep.pid")).await;
+    let big = format!(
+        "{{\"jsonrpc\":\"2.0\",\"method\":\"x-pad\",\"params\":{{\"pad\":\"{}\"}}}}",
+        "x".repeat(4 * 1024 * 1024 + 1)
+    );
+    // The node may close before the whole frame is written.
+    let _ = conn.send_raw(&big).await;
+    assert!(conn.ends_within(WAIT).await.is_some(), "the link stays up");
+    assert!(ends(pid).await, "the command of the ended link runs on");
+    let (_conn, again) = resumable_link(&mut center, fresh).await;
+    assert_ne!(again.link, first.link, "the ended link was offered again");
+    assert_eq!(again.got, 0, "{again:?}");
+    node.stop().await;
+}

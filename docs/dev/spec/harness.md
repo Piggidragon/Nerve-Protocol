@@ -66,6 +66,24 @@ JSON; the server opens no SSE stream, so HTTP clients do not get
 `list_changed` and list tools again themselves. Requests with an `Origin`
 that does not match `Host` are refused (403).
 
+A session belongs to the token that opened it: a request with another token,
+also one that reaches more, gets 404 for it, and so does its `DELETE`.
+
+A token made in the web UI may have a **scope**: the capabilities and actions
+(`fs`, `fs.read`, `exec.run`, as in a rule) its sessions may use. Such a
+session lists only the tools whose action the scope names (`nodes` always,
+naming only what the scope reaches), answers a call of another tool with
+`isError` and `error forbidden: <cap>.<action> is outside the scope of this
+harness token (<scope>)` without sending it, and sends the scope with every
+call as `ctx.scope` ([protocol.md](protocol.md) §5.1), so the node refuses
+what it does not name too. A scope only narrows: what a scoped session may do
+is what the node allows this center, cut to the scope. A token without a
+scope, the one from `--harness-token` included, reaches everything the nodes
+allow the center, and so do stdio and attached sessions, which have no token.
+A scoped token is for a harness only: it does not sign in to the web UI (§7),
+which could make a token without a scope. Its calls need nodes that know
+scopes; an older node refuses them (`invalid_args`).
+
 ## 4. Tools
 
 - `nodes` lists the paired nodes, whether they are online and what
@@ -111,7 +129,8 @@ is `isError: true` with `error <code>: <message>`, the code from
 ## 5. Sessions
 
 Each MCP connection (stdio, attached, or HTTP session) is one session with an
-id the center sends as `ctx.session`. When a session ends, every node it used
+id the center sends as `ctx.session`, and the scope of its token, if it has
+one, as `ctx.scope` (§3). When a session ends, every node it used
 gets `session.end` and cancels that session's calls, which stops their
 commands. The web UI can end a session. A `notifications/cancelled` cancels
 its call on the node, and the cancelled request gets no response.
@@ -134,7 +153,9 @@ target, a command, a path or another action: Allow, Allow as wildcard, Deny
 and Deny as wildcard, only with the node's settings grant; each only adds a
 rule to the node's `policy.allow` or `policy.deny`, a sudo command's allow to
 `policy.sudo_allow`; `POST /api/audit/rule` takes `node_id`, `list` (`allow`,
-`deny` or `sudo`), the entry's `cap`, `action` and `target`, and `wildcard`),
+`deny` or `sudo`), the entry's `cap`, `action` and `target`, and `wildcard`;
+an entry shows the scope its call came with, and one refused by that scope
+offers no Allow, since no rule on the node lifts a scope),
 help (the node's commands, each with its
 usage and a short explanation; the center reads the list from the node's own
 CLI definition, `GET /api/help`, so it matches `nerve-node --help` of the
@@ -148,18 +169,24 @@ scripts and styles are built into the binary; nothing is loaded from another
 host.
 
 The UI logs in with a harness token, the same secret the HTTP endpoint
-takes (§3): the one from `--harness-token`, or one made in the settings tab.
-Nothing else is kept for the UI, so the token is set once, in the MCP entry.
-Whether there is a login is settled at start:
+takes (§3): the one from `--harness-token`, or one made in the settings tab
+without a scope. A token with a scope does not sign in: the login answers
+403 and says so, and that counts as no wrong try. Nothing else is kept for
+the UI, so the token is set once, in the MCP entry. The settings tab makes a
+token with an optional scope (`POST /api/tokens/create` with `label` and
+`scope`, a list of names; none or an empty list is no scope, a malformed one
+is refused with 400) and lists each token with its scope. Whether there is a
+login is settled at start, and only tokens that sign in count:
 
 - Beyond loopback (`--ui 0.0.0.0:7480` or any address that is not loopback)
-  a token must exist, from the flag or made earlier in the UI, and the login
-  cannot be switched off. The center refuses to start otherwise, and also with
-  `--ui-no-login`. The UI is then served over TLS.
-- On loopback the login is on as soon as a token exists, unless
-  `--ui-no-login` is given. A center without any token yet has no login, so
-  that the first token can be made in the UI; it then answers only for
-  loopback host names.
+  a token without a scope must exist, from the flag or made earlier in the
+  UI, and the login cannot be switched off. The center refuses to start
+  otherwise, and also with `--ui-no-login`. The UI is then served over TLS.
+- On loopback the login is on as soon as a token without a scope exists,
+  unless `--ui-no-login` is given. A center without such a token yet has no
+  login, so that the first token can be made in the UI; it then answers only
+  for loopback host names. Scoped tokens alone leave it so, rather than lock
+  the owner out.
 
 With a login, every page and API call but the login form and its assets needs
 a session: a browser without one is sent to `/login`, where the token is
@@ -178,5 +205,8 @@ not offered.
 
 `<state>/tls.pem` (identity), `<state>/state.json` (center id and name, nodes
 with their public keys and last descriptors, hashed harness tokens, daily
-statistics: counts and timings, kept `retention_days`). It never
+statistics: counts and timings, kept `retention_days`). Tokens with a scope
+are kept in a list of their own, `scoped_tokens`, with their scope: a center
+older than scopes does not know that list and lets none of them in, rather
+than with the full reach. It never
 stores file contents, command output, arguments or secrets.

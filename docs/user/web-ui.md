@@ -11,13 +11,15 @@ HTTP endpoint takes.
 
 | Where the UI listens | Login |
 |---|---|
-| Loopback, no token yet | None. This lets you make the first token |
-| Loopback, a token exists | On. `--ui-no-login` turns it off |
-| Any other address (`--ui 0.0.0.0:7480`) | Always on, and the UI uses TLS. The center refuses to start without a token or with `--ui-no-login` |
+| Loopback, no token without a scope yet | None. This lets you make the first token |
+| Loopback, a token without a scope exists | On. `--ui-no-login` turns it off |
+| Any other address (`--ui 0.0.0.0:7480`) | Always on, and the UI uses TLS. The center refuses to start without a token without a scope, or with `--ui-no-login` |
 
 - A browser without a session goes to `/login` and posts the token once.
 - The session lasts 12 hours. **Sign out** ends it.
 - Five wrong tokens in a minute lock the login for the rest of that minute.
+- A token with a [scope](harness.md#scopes) does not log in. It is for a
+  harness only.
 - Deleting a token ends the sessions that used it.
 - Lost the token? Start the center once with `--ui-no-login` on loopback and
   make a new one.
@@ -37,7 +39,8 @@ ssh -L 7480:127.0.0.1:7480 user@center-host
   Disable or Enable, Remove.
 - **Pair a machine.** Makes a [pairing](pairing.md) command, address, code and
   pin.
-- **Sessions.** The harnesses connected now. **End** stops one session.
+- **Sessions.** The harnesses connected now, each with the scope of its token
+  if it has one. **End** stops one session.
 - Alerts, for example a machine whose key is in use twice.
 
 A disabled machine stays paired and connected. The agent gets none of its tools
@@ -87,6 +90,11 @@ rule on the machine, so it works only if the machine gave the center the
 [settings grant](settings-grant.md). Otherwise the buttons are off and the
 entry says why. A target that was cut to its start gets no buttons.
 
+An entry of a call that came with a token's [scope](harness.md#scopes) shows
+that scope. A call the scope refused gets no Allow buttons: a rule on the
+machine does not lift a scope. Make a token whose scope names the action
+instead.
+
 ### Log
 
 What the center did and saw, newest first: links that dropped and came back,
@@ -127,8 +135,11 @@ of the same build.
   level**: error, warn, info (the default) or debug. The level applies at once
   and stays for the next start. If the center was started with `--log`, that
   level holds for this run and the one you pick is kept for the next start.
-- **Harness tokens.** Make a token with a label. It is shown once. Delete one
-  to stop it.
+- **Harness tokens.** Make a token with a label and, if you want, a
+  [scope](harness.md#scopes): names such as `fs.read fs.list` or `exec`,
+  separated by spaces. Leave the scope empty for a token that reaches
+  everything the machines allow this center and logs in here. The token is
+  shown once. The list shows each token's scope. Delete one to stop it.
 - **Machines.** For each online machine that gave the center the settings
   grant: its settings as JSON, with **Reload** and **Save**, and the sudo
   switch. A save sends the whole document with its version. If the version is

@@ -52,13 +52,25 @@ async fn get_root(r: &Running) -> (u16, Option<String>) {
 }
 
 fn store_with_a_token(dir: &std::path::Path) {
+    store_with(dir, false);
+}
+
+/// A state with one token made in the UI: one with the full reach, or one
+/// with a scope.
+fn store_with(dir: &std::path::Path, scoped: bool) {
     let mut s = Store::new("c".into(), "home".into());
-    s.harness_tokens.push(TokenRecord {
+    let rec = TokenRecord {
         id: "t1".into(),
         label: "harness".into(),
         hash: "0".repeat(64),
         created_ms: 1,
-    });
+        scope: scoped.then(|| nerve_proto::Scope::parse(["fs.read"]).unwrap()),
+    };
+    if scoped {
+        s.scoped_tokens.push(rec);
+    } else {
+        s.harness_tokens.push(rec);
+    }
     nerve_transport::files::create_private_dir(dir).unwrap();
     s.save(dir).unwrap();
 }
@@ -88,6 +100,22 @@ async fn a_token_made_in_an_earlier_run_turns_the_login_on() {
     store_with_a_token(d.path());
     let r = start(d.path(), &["--ui", "127.0.0.1:0"]).await.unwrap();
     assert_eq!(get_root(&r).await, (303, Some("/login".into())));
+}
+
+/// A scoped token does not sign in, so it does not turn the login on
+/// either: the owner would be locked out of the UI.
+#[tokio::test]
+async fn a_scoped_token_alone_neither_turns_the_login_on_nor_is_one_beyond_loopback() {
+    let d = tempfile::tempdir().unwrap();
+    store_with(d.path(), true);
+    let r = start(d.path(), &["--ui", "127.0.0.1:0"]).await.unwrap();
+    assert_eq!(get_root(&r).await, (200, None));
+    r.stop().await;
+    let e = start(d.path(), &["--ui", "0.0.0.0:0"])
+        .await
+        .err()
+        .expect("a refusal");
+    assert!(e.contains("harness token"), "{e}");
 }
 
 #[tokio::test]

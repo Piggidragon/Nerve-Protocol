@@ -59,13 +59,17 @@ pub async fn start(args: &Args, lock: Lock) -> Result<Running, String> {
     // then it also needs TLS, since the token and the session cookie cross the
     // network. On loopback it does once a token exists, unless the owner
     // switched the login off; a center without any token yet is open to this
-    // machine so that the first token can be made in the UI. All of this is
-    // settled before anything is bound or written.
+    // machine so that the first token can be made in the UI. Only a token
+    // with the full reach signs in, so a scoped one counts for the HTTP MCP
+    // endpoint and not for the login. All of this is settled before anything
+    // is bound or written.
     let state = args.state_dir();
+    let stored = Store::load(&state).map_err(|e| e.to_string())?;
     let has_token = token.is_some()
-        || Store::load(&state)
-            .map_err(|e| e.to_string())?
+        || stored
+            .as_ref()
             .is_some_and(|s| !s.harness_tokens.is_empty());
+    let any_token = has_token || stored.is_some_and(|s| s.tokens().next().is_some());
     if let Some(a) = ui_addr.as_deref().filter(|a| !is_loopback(a)) {
         if args.ui_no_login {
             return Err(format!(
@@ -115,7 +119,7 @@ pub async fn start(args: &Args, lock: Lock) -> Result<Running, String> {
         let tls = !is_loopback(&args.mcp_listen);
         let server = Server::bind(&args.mcp_listen, &center, !tls).await?;
         mcp = Some(server.local_addr());
-        if !has_token {
+        if !any_token {
             center.log().record(
                 Level::Warn,
                 None,

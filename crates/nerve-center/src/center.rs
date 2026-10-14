@@ -117,6 +117,10 @@ pub struct Session {
     pub id: String,
     pub transport: String,
     pub client: Mutex<String>,
+    /// The scope of the harness token that opened the session: its calls
+    /// carry it to the nodes as `ctx.scope`. None reaches what the nodes
+    /// allow this center.
+    pub scope: Option<nerve_proto::Scope>,
     pub started_ms: u64,
     ended: AtomicBool,
     pub calls: AtomicU64,
@@ -1034,10 +1038,16 @@ impl Center {
     // ---- Sessions ----
 
     pub fn new_session(&self, transport: &str) -> Arc<Session> {
+        self.open_session(transport, None)
+    }
+
+    /// A session whose calls keep to `scope`.
+    pub fn open_session(&self, transport: &str, scope: Option<nerve_proto::Scope>) -> Arc<Session> {
         let s = Arc::new(Session {
             id: format!("s-{}", nerve_transport::keys::random_token(20)),
             transport: transport.to_string(),
             client: Mutex::new(String::new()),
+            scope,
             started_ms: now_ms(),
             ended: AtomicBool::new(false),
             calls: AtomicU64::new(0),
@@ -1050,7 +1060,13 @@ impl Center {
         self.log.record(
             Level::Info,
             None,
-            &format!("a harness session started over {transport} ({})", s.id),
+            &match &s.scope {
+                None => format!("a harness session started over {transport} ({})", s.id),
+                Some(scope) => format!(
+                    "a harness session started over {transport} ({}), with the scope {scope}",
+                    s.id
+                ),
+            },
         );
         self.changed(Change::Sessions);
         s
@@ -1104,6 +1120,7 @@ impl Center {
                     "id": s.id,
                     "transport": s.transport,
                     "client": s.client.lock().unwrap().clone(),
+                    "scope": s.scope,
                     "started_ms": s.started_ms,
                     "calls": s.calls.load(Ordering::SeqCst),
                     "nodes": nodes,
@@ -1333,7 +1350,11 @@ impl Center {
                 format!("the node {} is offline", route.node_name),
             )
         })?;
-        let ctx = json!({"session": sess.id});
+        // A scope goes with every call, so the node keeps to it as well.
+        let ctx = match &sess.scope {
+            None => json!({"session": sess.id}),
+            Some(scope) => json!({"session": sess.id, "scope": scope}),
+        };
         sess.nodes.lock().unwrap().insert(route.node_id.clone());
         link.sessions.lock().unwrap().insert(sess.id.clone());
         let (id, rx) = link

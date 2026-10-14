@@ -119,13 +119,17 @@ pub struct Describe {
     pub cap: Option<String>,
 }
 
-/// Context a center attaches to a call: the session id and nothing else.
-/// Other fields are refused (D8).
+/// Context a center attaches to a call: the session id and the call's
+/// scope, and nothing else. Other fields are refused (D8), so nothing here
+/// can say a call is allowed: a scope only narrows.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Ctx {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// The actions this call may do (crate::scope); none narrows nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<crate::Scope>,
 }
 
 /// The longest session id a node accepts.
@@ -148,7 +152,8 @@ pub struct Invoke {
 }
 
 impl Invoke {
-    /// Checks what serde cannot: the session's length.
+    /// Checks what serde cannot: the session's length and the scope's
+    /// entries.
     pub fn check(&self) -> Result<(), crate::RpcError> {
         if let Some(s) = &self.ctx.session
             && (s.is_empty() || s.len() > SESSION_BYTES)
@@ -156,6 +161,10 @@ impl Invoke {
             return Err(crate::RpcError::invalid_args(
                 "ctx.session must be 1 to 256 bytes",
             ));
+        }
+        if let Some(s) = &self.ctx.scope {
+            s.check()
+                .map_err(|e| crate::RpcError::invalid_args(format!("ctx.scope: {e}")))?;
         }
         Ok(())
     }
@@ -359,10 +368,32 @@ mod tests {
         let long = Invoke {
             ctx: Ctx {
                 session: Some("s".repeat(257)),
+                scope: None,
             },
-            ..ok
+            ..ok.clone()
         };
         assert!(long.check().is_err());
+        // A scope is checked entry by entry; a well-formed one passes.
+        let scoped: Invoke = serde_json::from_value(json!({
+            "cap": "fs", "action": "read", "ctx": {"session": "s1", "scope": ["fs.read", "exec"]}
+        }))
+        .unwrap();
+        assert!(scoped.check().is_ok());
+        assert!(scoped.ctx.scope.unwrap().allows("exec", "run"));
+        for bad in [json!([]), json!(["fs_read"]), json!(["fs.read.x"])] {
+            let inv: Invoke = serde_json::from_value(json!({
+                "cap": "fs", "action": "read", "ctx": {"scope": bad}
+            }))
+            .unwrap();
+            let e = inv.check().unwrap_err();
+            assert!(e.message.starts_with("ctx.scope: "), "{}", e.message);
+        }
+        assert!(
+            serde_json::from_value::<Invoke>(json!({
+                "cap": "fs", "action": "read", "ctx": {"scope": "fs.read"}
+            }))
+            .is_err()
+        );
     }
 
     #[test]

@@ -72,14 +72,40 @@ plus `structuredContent` when the result is an object. A refusal or failure is
 
 ## Sessions
 
-Each MCP connection is one session. The center sends its id as `ctx.session`.
+Each MCP connection is one session. The center sends its id as `ctx.session`,
+and the scope of its token, if it has one, as `ctx.scope`.
 When the session ends, every node it used gets `session.end` and cancels the
 session's calls, which stops their commands. The web UI can end a session. A
 `notifications/cancelled` cancels its call on the node, and the cancelled
 request gets no response.
 
+## Token scopes
+
+The node's policy is per center, so every harness of one center can do the
+same. A harness token made in the web UI with a **scope** narrows what its
+HTTP sessions can do, for instance one harness that only reads files
+(`fs.read fs.list fs.stat fs.grep fs.find`) next to another that runs
+commands (`exec`), both on one center and one pairing.
+
+- The session lists only the tools whose action the scope names, and `nodes`
+  names only what the scope reaches. A call of another tool is refused by the
+  center with `error forbidden` and never sent.
+- Every call carries the scope as `ctx.scope`. The node refuses an action the
+  scope does not name, before its policy, and decides the others by its
+  policy as always. The center is not trusted to narrow: the node does it too.
+- A scope never widens. Naming `exec` gives nothing the node's policy does
+  not give this center.
+- A scoped token does not sign in to the web UI, which could make a token
+  without a scope. It does not turn the UI's login on either, so scoped
+  tokens alone do not lock the owner out.
+- A session belongs to its token. Another token, also a wider one, cannot use
+  or end it.
+- The flag token, stdio and attached sessions have no scope.
+- Scoped tokens are kept apart in `state.json` (`scoped_tokens`), so a center
+  older than scopes lets none of them in rather than with the full reach.
+
 ## The center has no policy of its own
 
 The center never holds a call back for a person. Every call goes to its node,
-whose policy decides. Every harness session sees every paired node that is not
-disabled.
+whose policy decides; a token's scope only takes away from that. Every harness
+session sees every paired node that is not disabled.

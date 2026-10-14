@@ -31,7 +31,7 @@ person.
 
 The refusal names what is missing, so the model can pass it on and the owner
 can add the rule. Every decision, allowed or refused, goes to the audit log
-with the center and the session. A center that subscribed gets it as an
+with the center, the session and the call's scope. A center that subscribed gets it as an
 `audit/decision` event.
 
 ## Order
@@ -42,6 +42,7 @@ steps in order.
 
 | # | Step | Result |
 |---|---|---|
+| 0 | The call carries a scope (`ctx.scope`) that does not name its capability or action | `forbidden`. No rule or mode widens a scope |
 | 1 | The command line is over 64 KiB | `forbidden` |
 | 2 | The call touches the node's own folders: any path of an `fs` call, a working directory, a path a command line names plainly | `forbidden`. No rule, mode, folder or release lifts this |
 | 3 | The capability or action is `off` or `hidden` | `disabled` |
@@ -50,8 +51,12 @@ steps in order.
 | 6 | The mode decides. A `sudo` command: the sudo list. `allowlist`: an allow rule for every target. `folder`: the folders' flags. `user`: allowed | Allowed or `forbidden` |
 | 7 | A protected path is touched | `forbidden`, whatever allowed the call |
 
-The order only narrows. Step 6 is the only one that allows, and steps 1 to 5 and
-7 can only refuse.
+The order only narrows. Step 6 is the only one that allows, and steps 0 to 5 and
+7 can only refuse. Step 0 is checked in the node's gate before the engine
+(`nerve_proto::Scope::refusal`), so an action that is `off` is still
+`disabled` first, and for the `settings` actions, which the
+engine does not decide, before they run. A scoped call's audit entry carries
+its scope.
 
 ## Rules
 

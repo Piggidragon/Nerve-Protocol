@@ -27,6 +27,10 @@ pub struct Entry {
     pub code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// The scope the call came with (`ctx.scope`), so the owner sees that
+    /// the center narrowed it, and that a refusal for it is no rule's doing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<nerve_proto::Scope>,
     /// Why a call was refused, as the error to the center says it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -378,6 +382,7 @@ mod tests {
             decision: "forbidden".into(),
             code: Some("forbidden".into()),
             session: None,
+            scope: None,
             reason: None,
         };
         log.decision(&e).unwrap();
@@ -408,6 +413,37 @@ mod tests {
         }
     }
 
+    /// The scope a call came with is in its line and in the event, and a
+    /// call without one has neither.
+    #[test]
+    fn the_scope_of_a_call_is_logged_and_sent() {
+        let d = tempfile::tempdir().unwrap();
+        let log = AuditLog::new(d.path().join("audit.jsonl"));
+        let scope = nerve_proto::Scope::parse(["fs.read", "exec"]).unwrap();
+        let e = Entry {
+            ts: 1,
+            center: "home".into(),
+            cap: "fs".into(),
+            action: "write".into(),
+            target: "/x".into(),
+            decision: "forbidden".into(),
+            code: Some("forbidden".into()),
+            session: Some("s1".into()),
+            scope: Some(scope),
+            reason: None,
+        };
+        log.decision(&e).unwrap();
+        log.decision(&Entry {
+            scope: None,
+            ..e.clone()
+        })
+        .unwrap();
+        let lines = log.read().unwrap();
+        assert_eq!(lines[0]["scope"], json!(["fs.read", "exec"]));
+        assert!(lines[1].get("scope").is_none(), "{}", lines[1]);
+        assert_eq!(e.event_data()["scope"], json!(["fs.read", "exec"]));
+    }
+
     /// A refused call with a huge command line logs only its start.
     #[test]
     fn a_long_target_is_cut() {
@@ -422,6 +458,7 @@ mod tests {
             decision: "forbidden".into(),
             code: Some("forbidden".into()),
             session: None,
+            scope: None,
             reason: Some(format!("the command {:?} is denied", "ü".repeat(3000))),
         };
         log.decision(&e).unwrap();
@@ -558,6 +595,7 @@ mod tests {
             decision: "forbidden".into(),
             code: Some("forbidden".into()),
             session: None,
+            scope: None,
             reason: None,
         }
     }

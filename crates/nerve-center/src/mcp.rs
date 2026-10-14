@@ -11,6 +11,7 @@ use serde_json::{Map, Value, json};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 
+use nerve_proto::Scope;
 use nerve_transport::http::{self, Request, Response};
 use nerve_transport::net::BoxIo;
 
@@ -36,6 +37,9 @@ Profiled tools take a `node` argument naming the machine; `nodes` lists the mach
 pub struct Engine {
     center: Center,
     transport: String,
+    /// What the harness token of this session lets it do; none over stdio,
+    /// an attached process and a token with the full reach.
+    scope: Option<Scope>,
     session: Mutex<Arc<Session>>,
     initialized: AtomicBool,
     /// Tool calls in flight by their request id (as JSON text), each with a
@@ -47,10 +51,17 @@ pub struct Engine {
 
 impl Engine {
     pub fn new(center: &Center, transport: &str) -> Engine {
+        Engine::with_scope(center, transport, None)
+    }
+
+    /// An engine whose tools and calls keep to `scope`, and whose calls carry
+    /// it to the nodes, which keep to it too (protocol §5.1).
+    pub fn with_scope(center: &Center, transport: &str, scope: Option<Scope>) -> Engine {
         Engine {
             center: center.clone(),
             transport: transport.to_string(),
-            session: Mutex::new(center.new_session(transport)),
+            session: Mutex::new(center.open_session(transport, scope.clone())),
+            scope,
             initialized: AtomicBool::new(false),
             calls: Mutex::new(HashMap::new()),
             next_call: AtomicU64::new(0),
@@ -67,7 +78,9 @@ impl Engine {
         let mut s = self.session.lock().unwrap();
         if s.ended() {
             let client = s.client.lock().unwrap().clone();
-            *s = self.center.new_session(&self.transport);
+            *s = self
+                .center
+                .open_session(&self.transport, self.scope.clone());
             *s.client.lock().unwrap() = client;
         }
         s.clone()
@@ -177,8 +190,22 @@ impl Engine {
 
     fn list(&self) -> Vec<Value> {
         let mut out = vec![nodes_tool()];
-        out.extend(self.center.tools().iter().map(Tool::to_mcp));
+        out.extend(
+            self.center
+                .tools()
+                .iter()
+                .filter(|t| self.in_scope(t))
+                .map(Tool::to_mcp),
+        );
         out
+    }
+
+    /// Whether this session's scope lets it use `tool`. The routes of a tool
+    /// share its capability and action, so one answer holds for them all.
+    fn in_scope(&self, tool: &Tool) -> bool {
+        self.scope
+            .as_ref()
+            .is_none_or(|s| tool.routes.values().all(|r| s.allows(&r.cap, &r.action)))
     }
 
     /// A tool call. Errors of the call itself are results with `isError`;
@@ -194,12 +221,28 @@ impl Engine {
             Some(_) => return Err((-32602, "arguments must be an object".into())),
         };
         if name == NODES_TOOL {
-            return Ok(text_result(&nodes_text(&self.center), false));
+            return Ok(text_result(
+                &nodes_text(&self.center, self.scope.as_ref()),
+                false,
+            ));
         }
         let tools = self.center.tools();
         let Some(tool) = tools.iter().find(|t| t.name == name) else {
             return Err((-32602, format!("unknown tool {name}")));
         };
+        // The list leaves such a tool out; a client may still name it. The
+        // node would refuse the call too, by the scope it carries.
+        if !self.in_scope(tool)
+            && let (Some(scope), Some(r)) = (&self.scope, tool.routes.values().next())
+        {
+            return Ok(text_result(
+                &format!(
+                    "error forbidden: {}.{} is outside the scope of this harness token ({scope}); the owner makes a token that reaches more in the center's web UI",
+                    r.cap, r.action
+                ),
+                true,
+            ));
+        }
         let route = if tool.selector {
             let node = match args.remove(NODE_ARG) {
                 Some(Value::String(s)) => s,
@@ -280,7 +323,7 @@ fn nodes_tool() -> Value {
     })
 }
 
-fn nodes_text(center: &Center) -> String {
+fn nodes_text(center: &Center, scope: Option<&Scope>) -> String {
     let nodes = center.nodes_json();
     let mut out = String::new();
     for n in nodes.as_array().into_iter().flatten() {
@@ -290,6 +333,7 @@ fn nodes_text(center: &Center) -> String {
             .flatten()
             .filter_map(|c| c["id"].as_str())
             .filter(|c| !tools::RESERVED_CAPS.contains(c))
+            .filter(|c| scope.is_none_or(|s| s.touches(c)))
             .collect();
         let disabled = n["disabled"].as_bool() == Some(true);
         out.push_str(&format!(
@@ -475,11 +519,36 @@ pub async fn serve_stdio(center: Center) {
     serve_lines(center, stdin, tokio::io::stdout(), "stdio").await;
 }
 
-/// Whether `given` is a harness token: the one from the environment or a flag,
-/// or one made in the web UI (stored hashed). The HTTP MCP endpoint and the
-/// web UI's login both ask this, so one secret opens both.
+/// Whether `given` is a harness token with the full reach: the one from the
+/// environment or a flag, or one made in the web UI without a scope (stored
+/// hashed). The web UI's login asks this, so the secret of the HTTP MCP
+/// endpoint opens the UI too; a scoped token opens neither the UI nor more
+/// than its scope.
 pub(crate) fn token_ok(center: &Center, env_token: Option<&str>, given: &str) -> bool {
     token_hash_ok(center, env_token, &util::sha256_hex(given.as_bytes()))
+}
+
+/// What the harness token `given` reaches, if it is one: `Some(None)` for a
+/// token with the full reach ([`token_ok`]), `Some(Some(scope))` for one
+/// made with a scope. The HTTP MCP endpoint asks this.
+pub(crate) fn token_access(
+    center: &Center,
+    env_token: Option<&str>,
+    given: &str,
+) -> Option<Option<Scope>> {
+    let hash = util::sha256_hex(given.as_bytes());
+    if token_hash_ok(center, env_token, &hash) {
+        return Some(None);
+    }
+    center.read(|s| {
+        s.scoped_tokens
+            .iter()
+            // A scoped record without its scope lets nothing in rather
+            // than everything.
+            .filter(|t| t.scope.is_some())
+            .find(|t| util::ct_eq(t.hash.as_bytes(), hash.as_bytes()))
+            .map(|t| t.scope.clone())
+    })
 }
 
 /// [`token_ok`] for a token that is only known by its SHA-256 (hex), which is
@@ -502,7 +571,8 @@ pub(crate) fn token_hash_ok(center: &Center, env_token: Option<&str>, hash: &str
 pub struct HttpMcp {
     center: Center,
     env_token: Option<String>,
-    sessions: Mutex<HashMap<String, Arc<Engine>>>,
+    /// Each session with the SHA-256 (hex) of the token that opened it.
+    sessions: Mutex<HashMap<String, (String, Arc<Engine>)>>,
 }
 
 impl HttpMcp {
@@ -541,17 +611,17 @@ impl HttpMcp {
         {
             return Response::text(403, "cross-origin requests are refused");
         }
-        let ok = req
-            .bearer()
-            .is_some_and(|t| token_ok(&self.center, self.env_token.as_deref(), t));
-        if !ok {
+        let Some((token, scope)) = req.bearer().and_then(|t| {
+            token_access(&self.center, self.env_token.as_deref(), t)
+                .map(|scope| (util::sha256_hex(t.as_bytes()), scope))
+        }) else {
             return Response::text(401, "a harness token is needed")
                 .with_header("WWW-Authenticate", "Bearer");
-        }
+        };
         let sid = req.header("mcp-session-id").map(str::to_string);
         match req.method.as_str() {
-            "POST" => self.post(req, sid).await,
-            "DELETE" => match sid.and_then(|s| self.sessions.lock().unwrap().remove(&s)) {
+            "POST" => self.post(req, sid, token, scope).await,
+            "DELETE" => match sid.and_then(|s| self.take(&s, &token)) {
                 Some(e) => {
                     e.close().await;
                     Response::new(204, "text/plain", Vec::new())
@@ -563,7 +633,28 @@ impl HttpMcp {
         }
     }
 
-    async fn post(&self, req: Request, sid: Option<String>) -> Response {
+    /// The session `sid` if `token` opened it. A session keeps to the scope
+    /// of its token, so another token, also one that reaches more, is told
+    /// there is no such session.
+    fn owned(&self, sid: &str, token: &str) -> Option<Arc<Engine>> {
+        let sessions = self.sessions.lock().unwrap();
+        let (owner, e) = sessions.get(sid)?;
+        util::ct_eq(owner.as_bytes(), token.as_bytes()).then(|| e.clone())
+    }
+
+    /// Removes the session `sid` if `token` opened it.
+    fn take(&self, sid: &str, token: &str) -> Option<Arc<Engine>> {
+        self.owned(sid, token)?;
+        self.sessions.lock().unwrap().remove(sid).map(|(_, e)| e)
+    }
+
+    async fn post(
+        &self,
+        req: Request,
+        sid: Option<String>,
+        token: String,
+        scope: Option<Scope>,
+    ) -> Response {
         let msg: Value = match serde_json::from_slice(&req.body) {
             Ok(v) => v,
             Err(e) => {
@@ -575,23 +666,26 @@ impl HttpMcp {
         };
         let is_init = msg.get("method").and_then(Value::as_str) == Some("initialize");
         let (engine, new_id) = if is_init && sid.is_none() {
-            let e = Arc::new(Engine::new(&self.center, "http"));
+            let e = Arc::new(Engine::with_scope(&self.center, "http", scope));
             let id = e.session().id.clone();
-            self.sessions.lock().unwrap().insert(id.clone(), e.clone());
+            self.sessions
+                .lock()
+                .unwrap()
+                .insert(id.clone(), (token, e.clone()));
             (e, Some(id))
         } else {
             let Some(sid) = sid else {
                 return Response::text(400, "Mcp-Session-Id is missing");
             };
-            let e = self.sessions.lock().unwrap().get(&sid).cloned();
-            match e {
+            match self.owned(&sid, &token) {
+                Some(e) if !e.session().ended() => (e, None),
                 // A session ended in the web UI is gone for HTTP clients; they
                 // start a new one.
-                Some(e) if !e.session().ended() => (e, None),
-                _ => {
+                Some(_) => {
                     self.sessions.lock().unwrap().remove(&sid);
                     return Response::text(404, "no such session");
                 }
+                None => return Response::text(404, "no such session"),
             }
         };
         let resp = match engine.handle(msg).await {

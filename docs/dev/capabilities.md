@@ -108,9 +108,14 @@ object.
 | `session.end {session}` | center to node | A harness session ended. The node cancels that session's calls |
 | `bye {reason}` | either | Clean close |
 
-`ctx` holds only `session`, an opaque id the center chose (at most 256 bytes).
+`ctx` holds only `session`, an opaque id the center chose (at most 256 bytes),
+and `scope`, the capabilities and actions the call may use (`fs`, `fs.read`).
 Any other field is refused. There is no field for "allowed", a mode or a
-folder, so a center cannot say a call is allowed.
+folder, so a center cannot say a call is allowed. A scope only narrows: the
+node refuses an action it does not name and decides the others by its policy,
+so a scoped call never does more than the center's entry allows. The center
+sends the scope of the harness token behind the call
+([MCP surface](mcp-surface.md#token-scopes)).
 
 Events of `node` and `settings` are implicit. Everything else needs `sub`.
 

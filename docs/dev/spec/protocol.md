@@ -181,8 +181,20 @@ Errors carry a string code in `error.data.code` (§5.3).
 | `bye` | notification | either | `{reason}` | |
 
 - `detail` is `summary`, `capability` (needs `cap`) or `full`.
-- `ctx` is `{session?}`: `session` is at most 256 bytes. Other fields are
-  refused. There is no field for "allowed", a mode or a folder.
+- `ctx` is `{session?, scope?}`: `session` is at most 256 bytes. Other
+  fields are refused. There is no field for "allowed", a mode or a folder.
+- `scope` is a list of 1 to 32 entries, each a capability (`fs`, every action
+  of it) or one action (`fs.read`), names of letters, digits and `-` of at
+  most 64 bytes, written as a rule's scope (node-local §2). It only narrows:
+  the node refuses a call whose action no entry names with `forbidden`
+  before its policy is asked, also a `settings` action, and decides a call
+  whose action an entry names by its policy as without a scope. So a scoped
+  call can do at most what the policy for its center allows. A malformed
+  scope, an empty one included, is `invalid_args`. Without `scope` the call
+  is not narrowed. A node older than scopes refuses the field as unknown
+  (§5.2), so a scoped call fails there rather than run unnarrowed. The
+  center sends the scope of the harness token behind the session
+  ([harness.md](harness.md) §3).
 - `deadline_ms` is a duration in milliseconds from receipt; past it the node
   fails the call with `timeout`.
 - `progress.id` and `cancel.id` are the `invoke` request id.
@@ -357,8 +369,9 @@ browser or tool) to the node; the center only relays it.
 
 ### 7.5 `audit`
 
-- event `decision {ts, cap, action, target, decision, code?, session?}`
-  (needs `sub`); `decision` is `allowed` or `forbidden`.
+- event `decision {ts, cap, action, target, decision, code?, session?,
+  scope?}` (needs `sub`); `decision` is `allowed` or `forbidden`, and `scope`
+  is the call's `ctx.scope`, when it had one (§5.1).
 
 ## 8. Center side
 

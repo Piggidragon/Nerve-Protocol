@@ -7,8 +7,8 @@
 //!
 //! With a [`Setup::folder`] and the settings grant `write` for the fake
 //! center, the part also checks the profiles (§7.2 to §7.5): it writes its own
-//! policy with `settings.set` and checks fs, exec, allow and deny rules, the
-//! audit event and the sudo switch. The sudo checks send one wrong password, so a node with
+//! policy with `settings.set` and checks fs, a call's scope, exec, allow and
+//! deny rules, the audit event and the sudo switch. The sudo checks send one wrong password, so a node with
 //! a real `sudo` logs one failed attempt.
 
 use std::future::Future;
@@ -178,6 +178,22 @@ where
         ),
     );
 
+    // §5.1: a scope is checked like the rest of ctx.
+    r.check(
+        "5.1",
+        "a malformed ctx scope is invalid_args",
+        expect_code(
+            conn.call(
+                method::INVOKE,
+                json!({"cap": "fs", "action": "read", "args": {},
+                       "ctx": {"session": "s1", "scope": ["fs_read"]}}),
+                WAIT,
+            )
+            .await,
+            ErrorCode::InvalidArgs,
+        ),
+    );
+
     if let Some(folder) = &setup.folder {
         let key = &paired.request.public_key;
         let pw = setup.sudo_password.as_deref();
@@ -208,6 +224,14 @@ const PROFILE_CHECKS: &[(&str, &str)] = &[
         "fs read returns what fs write wrote, with the same etag",
     ),
     ("7.2", "fs read outside the allowed folder is forbidden"),
+    (
+        "5.1",
+        "a call whose scope does not name its action is forbidden, though the policy allows it",
+    ),
+    (
+        "5.1",
+        "a scope that names an action leaves the decision to the policy",
+    ),
     ("7.3", "exec run of a command an allow rule names runs"),
     (
         "7.3",
@@ -287,6 +311,23 @@ async fn invoke(
     conn.call(
         method::INVOKE,
         json!({"cap": cap, "action": action, "args": args, "ctx": {}}),
+        WAIT,
+    )
+    .await
+}
+
+/// [`invoke`] with a scope in its ctx.
+async fn scoped(
+    conn: &mut Conn,
+    cap: &str,
+    action: &str,
+    args: Value,
+    scope: Value,
+) -> Result<Result<Value, nerve_proto::RpcError>, String> {
+    conn.call(
+        method::INVOKE,
+        json!({"cap": cap, "action": action, "args": args,
+               "ctx": {"session": "nerve-conformance", "scope": scope}}),
         WAIT,
     )
     .await
@@ -446,16 +487,44 @@ async fn profile_steps(
         .trim_end_matches('/')
         .rsplit_once('/')
         .map_or("", |(p, _)| p);
+    let outside = format!("{parent}/nerve-conformance-outside");
     step(expect_code(
-        invoke(
+        invoke(conn, "fs", "read", json!({"path": outside})).await,
+        ErrorCode::Forbidden,
+    ))?;
+
+    // A scope only narrows: the read the policy allows is refused when the
+    // scope does not name it, and goes through when it does, while the read
+    // the policy refuses stays refused under a scope that names all of fs.
+    step(expect_code(
+        scoped(
             conn,
             "fs",
             "read",
-            json!({"path": format!("{parent}/nerve-conformance-outside")}),
+            json!({"path": path}),
+            json!(["exec.run"]),
         )
         .await,
         ErrorCode::Forbidden,
     ))?;
+    step(
+        async {
+            let r = ok(scoped(
+                conn,
+                "fs",
+                "read",
+                json!({"path": path}),
+                json!(["fs.read"]),
+            )
+            .await)?;
+            ensure(r["content"] == content, format!("read {r}"))?;
+            expect_code(
+                scoped(conn, "fs", "read", json!({"path": outside}), json!(["fs"])).await,
+                ErrorCode::Forbidden,
+            )
+        }
+        .await,
+    )?;
 
     step(
         ok(invoke(conn, "exec", "run", json!({"command": ALLOWED})).await).and_then(|v| {

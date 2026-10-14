@@ -588,6 +588,150 @@ async fn http_mcp_needs_a_token_and_a_session() {
     r.stop().await;
 }
 
+/// A session's id from an `initialize` answer.
+fn session_id(resp: &nerve_transport::http::Response) -> String {
+    resp.headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("mcp-session-id"))
+        .map(|(_, v)| v.clone())
+        .expect("a session id")
+}
+
+/// A harness token with a scope is offered only the tools its scope names,
+/// is refused a call outside it by the center, and carries its scope to the
+/// node with every call. Its session is its own: another token, also one
+/// with the full reach, cannot use or end it.
+#[tokio::test]
+async fn a_scoped_token_reaches_only_its_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path()).await;
+    let key = NodeKey::generate().unwrap();
+    assert_eq!(pair(&r, &key, "box-1").await.0, 200);
+    let (ws, _) = handshake(&r, &key).await;
+    let mut seen = serve(ws, descriptor(&key, "box-1"));
+    let c = r.center.clone();
+    wait_for(|| (!c.tools().is_empty()).then_some(())).await;
+    c.update(|st| {
+        st.scoped_tokens.push(nerve_center::store::TokenRecord {
+            id: "t1".into(),
+            label: "reader".into(),
+            hash: nerve_center::util::sha256_hex(b"reader-token"),
+            created_ms: 1,
+            scope: Some(nerve_proto::Scope::parse(["fs.read"]).unwrap()),
+        })
+    });
+    let h = nerve_center::mcp::HttpMcp::new(&r.center, Some("full-token".into()));
+    let rpc_http = async |auth: &str, sid: Option<&str>, id: u64, method: &str, params: Value| {
+        let bearer = format!("Bearer {auth}");
+        let mut headers = vec![("authorization", bearer.as_str())];
+        if let Some(sid) = sid {
+            headers.push(("mcp-session-id", sid));
+        }
+        h.request(http(
+            "POST",
+            &headers,
+            json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}),
+        ))
+        .await
+    };
+    let init = json!({"protocolVersion": "2025-06-18", "capabilities": {},
+                      "clientInfo": {"name": "t", "version": "1"}});
+    let body = |resp: &nerve_transport::http::Response| -> Value {
+        serde_json::from_slice(&resp.body).unwrap()
+    };
+    let names = |v: &Value| -> Vec<String> {
+        v["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap().to_string())
+            .collect()
+    };
+
+    let resp = rpc_http("reader-token", None, 1, "initialize", init.clone()).await;
+    assert_eq!(resp.status, 200);
+    let sid = session_id(&resp);
+    let list = rpc_http("reader-token", Some(&sid), 2, "tools/list", json!({})).await;
+    assert_eq!(names(&body(&list)), ["nodes", "fs_read"]);
+
+    // Outside the scope: refused by the center, nothing reaches the node.
+    let run = json!({"name": "exec_run", "arguments": {"node": "box-1", "command": "uname"}});
+    let out = body(&rpc_http("reader-token", Some(&sid), 3, "tools/call", run).await);
+    assert_eq!(out["result"]["isError"], true, "{out}");
+    let text = out["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.starts_with(
+            "error forbidden: exec.run is outside the scope of this harness token (fs.read)"
+        ),
+        "{text}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), seen.recv())
+            .await
+            .is_err(),
+        "the node received something"
+    );
+    // `nodes` names only what the scope reaches.
+    let nodes = json!({"name": "nodes", "arguments": {}});
+    let out = body(&rpc_http("reader-token", Some(&sid), 4, "tools/call", nodes).await);
+    let text = out["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("offers fs") && !text.contains("exec"),
+        "{text}"
+    );
+
+    // Inside the scope: the call goes to the node with the scope in ctx.
+    let read = json!({"name": "fs_read", "arguments": {"node": "box-1", "path": "/x"}});
+    let out = body(&rpc_http("reader-token", Some(&sid), 5, "tools/call", read.clone()).await);
+    assert_ne!(out["result"]["isError"], true, "{out}");
+    let Some(Seen::Invoke(inv)) = seen.recv().await else {
+        panic!("no invoke")
+    };
+    assert_eq!(inv["ctx"]["scope"], json!(["fs.read"]), "{inv}");
+    assert_eq!(inv["ctx"]["session"], sid.as_str());
+
+    // The full token neither uses nor ends the scoped session.
+    let other = rpc_http("full-token", Some(&sid), 6, "tools/list", json!({})).await;
+    assert_eq!(other.status, 404);
+    let end = h
+        .request(http(
+            "DELETE",
+            &[
+                ("authorization", "Bearer full-token"),
+                ("mcp-session-id", &sid),
+            ],
+            Value::Null,
+        ))
+        .await;
+    assert_eq!(end.status, 404);
+    assert_eq!(
+        rpc_http("reader-token", Some(&sid), 7, "tools/list", json!({}))
+            .await
+            .status,
+        200
+    );
+
+    // A session of the full token gets every tool, and its calls no scope.
+    let resp = rpc_http("full-token", None, 8, "initialize", init).await;
+    let full = session_id(&resp);
+    let list = rpc_http("full-token", Some(&full), 9, "tools/list", json!({})).await;
+    assert_eq!(names(&body(&list)), ["nodes", "exec_run", "fs_read"]);
+    let out = body(&rpc_http("full-token", Some(&full), 10, "tools/call", read).await);
+    assert_ne!(out["result"]["isError"], true, "{out}");
+    let Some(Seen::Invoke(inv)) = seen.recv().await else {
+        panic!("no invoke")
+    };
+    assert!(inv["ctx"].get("scope").is_none(), "{inv}");
+    // Nor can the scoped token use the full token's session.
+    assert_eq!(
+        rpc_http("reader-token", Some(&full), 11, "tools/list", json!({}))
+            .await
+            .status,
+        404
+    );
+    r.stop().await;
+}
+
 #[tokio::test]
 async fn a_disabled_node_offers_no_tools_and_gets_no_calls() {
     let dir = tempfile::tempdir().unwrap();

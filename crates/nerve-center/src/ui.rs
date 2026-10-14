@@ -40,6 +40,7 @@ const ICON: &str = include_str!("ui/icon.svg");
 
 const WRONG_TOKEN: &str = "Wrong token.";
 const TOO_MANY: &str = "Too many wrong tokens. Wait a minute and try again.";
+const SCOPED: &str = "This token has a scope: it is for a harness only and does not sign in here. Sign in with a token that has the full reach.";
 
 pub const COOKIE: &str = "nerve_ui";
 pub const CSRF_HEADER: &str = "x-nerve-csrf";
@@ -278,6 +279,19 @@ impl Ui {
         // A pasted token often carries a trailing newline or space.
         let given = req.form_param("token").unwrap_or_default();
         let given = given.trim();
+        // A scoped token is a harness's, and the UI reaches everything: it
+        // could make a token without a scope. It is no wrong try, though.
+        if !given.is_empty()
+            && let Some(Some(_)) =
+                crate::mcp::token_access(&self.center, self.env_token.as_deref(), given)
+        {
+            log.record(
+                Level::Warn,
+                None,
+                "a web UI sign-in was refused: the token has a scope",
+            );
+            return login_form(403, Some(SCOPED));
+        }
         if given.is_empty() || !crate::mcp::token_ok(&self.center, self.env_token.as_deref(), given)
         {
             let tries = {
@@ -407,13 +421,23 @@ impl Ui {
             }
             ("GET", "/api/tokens") => Ok(c.read(|st| {
                 json!(
-                    st.harness_tokens
-                        .iter()
-                        .map(|t| json!({"id": t.id, "label": t.label, "created_ms": t.created_ms}))
+                    st.tokens()
+                        .map(|t| json!({"id": t.id, "label": t.label, "created_ms": t.created_ms, "scope": t.scope}))
                         .collect::<Vec<_>>()
                 )
             })),
             ("POST", "/api/tokens/create") => {
+                // No scope, or an empty one, is the full reach.
+                let scope = match b.get("scope") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::Array(a)) if a.is_empty() => None,
+                    Some(Value::Array(a)) => {
+                        let names: Option<Vec<&str>> = a.iter().map(Value::as_str).collect();
+                        let names = names.ok_or_else(|| bad("the scope is a list of names"))?;
+                        Some(nerve_proto::Scope::parse(names).map_err(bad)?)
+                    }
+                    Some(_) => return Err(bad("the scope is a list of names")),
+                };
                 let label = util::clip(s("label").trim(), 60);
                 let token = format!("nrv_{}", nerve_transport::keys::random_token(40));
                 let rec = TokenRecord {
@@ -425,26 +449,29 @@ impl Ui {
                     },
                     hash: util::sha256_hex(token.as_bytes()),
                     created_ms: now_ms(),
+                    scope,
                 };
                 let (id, label) = (rec.id.clone(), rec.label.clone());
-                c.update(|st| st.harness_tokens.push(rec));
-                c.log().record(
-                    Level::Info,
-                    None,
-                    &format!("a harness token was made, labelled {label:?}"),
-                );
+                let line = match &rec.scope {
+                    None => format!("a harness token was made, labelled {label:?}"),
+                    Some(scope) => format!(
+                        "a harness token was made, labelled {label:?}, with the scope {scope}"
+                    ),
+                };
+                c.update(|st| match rec.scope {
+                    None => st.harness_tokens.push(rec),
+                    Some(_) => st.scoped_tokens.push(rec),
+                });
+                c.log().record(Level::Info, None, &line);
                 // The token is shown once; only its hash is kept.
                 Ok(json!({"id": id, "token": token}))
             }
             ("POST", "/api/tokens/delete") => {
                 let id = s("id");
                 let gone = c.update(|st| {
-                    let label = st
-                        .harness_tokens
-                        .iter()
-                        .find(|t| t.id == id)
-                        .map(|t| t.label.clone());
+                    let label = st.tokens().find(|t| t.id == id).map(|t| t.label.clone());
                     st.harness_tokens.retain(|t| t.id != id);
+                    st.scoped_tokens.retain(|t| t.id != id);
                     label
                 });
                 if let Some(label) = gone {
@@ -1415,6 +1442,90 @@ mod tests {
             200
         );
         // The deleted token no longer logs in.
+        assert_eq!(sign_in(&ui, &token).await.status, 401);
+    }
+
+    /// A token made with a scope is kept apart from the others with its
+    /// scope, listed with it, does not sign in (without counting as a wrong
+    /// try), and is deleted like any other. A malformed scope makes none.
+    #[tokio::test]
+    async fn a_token_with_a_scope_is_kept_listed_and_kept_out_of_the_ui() {
+        let d = tempfile::tempdir().unwrap();
+        let c = center(d.path());
+        let open = Ui::new(&c, None, false, false);
+        let h = ("Host", "127.0.0.1:7480");
+        let r = open.request(req("GET", "/api/session", &[h], "")).await;
+        let (ck, csrf) = (
+            set_cookie(&r),
+            json(&r)["csrf"].as_str().unwrap().to_string(),
+        );
+        let post = |path: &str, body: &str| {
+            req(
+                "POST",
+                path,
+                &[h, ("Cookie", &ck), ("X-Nerve-CSRF", &csrf)],
+                body,
+            )
+        };
+        for bad in [r#"["fs_read"]"#, r#""fs.read""#, r#"[1]"#] {
+            let r = open
+                .request(post(
+                    "/api/tokens/create",
+                    &format!(r#"{{"label":"x","scope":{bad}}}"#),
+                ))
+                .await;
+            assert_eq!(r.status, 400, "{bad}: {}", body(&r));
+        }
+        let made = json(
+            &open
+                .request(post(
+                    "/api/tokens/create",
+                    r#"{"label":"reader","scope":["fs.read"," fs.list",""]}"#,
+                ))
+                .await,
+        );
+        let (token, id) = (
+            made["token"].as_str().unwrap().to_string(),
+            made["id"].as_str().unwrap().to_string(),
+        );
+        // An empty scope is the full reach.
+        open.request(post("/api/tokens/create", r#"{"label":"full","scope":[]}"#))
+            .await;
+        let (full, scoped) = c.read(|st| (st.harness_tokens.clone(), st.scoped_tokens.clone()));
+        assert_eq!(full.len(), 1);
+        assert!(full[0].scope.is_none());
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(
+            scoped[0].scope.as_ref().unwrap().entries(),
+            ["fs.read", "fs.list"]
+        );
+        let list = json(
+            &open
+                .request(req("GET", "/api/tokens", &[h, ("Cookie", &ck)], ""))
+                .await,
+        );
+        let reader = list
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["label"] == "reader")
+            .unwrap();
+        assert_eq!(reader["scope"], json!(["fs.read", "fs.list"]));
+
+        // With the login on it is refused, as often as it is tried, and the
+        // right token still signs in after that.
+        let ui = Ui::new(&c, Some(TOKEN.into()), true, true);
+        for _ in 0..LOGIN_TRIES + 1 {
+            let r = sign_in(&ui, &token).await;
+            assert_eq!(r.status, 403);
+            assert!(body(&r).contains("has a scope"), "{}", body(&r));
+            assert!(header(&r, "Set-Cookie").is_none());
+        }
+        assert_eq!(sign_in(&ui, TOKEN).await.status, 303);
+
+        open.request(post("/api/tokens/delete", &format!(r#"{{"id":"{id}"}}"#)))
+            .await;
+        assert!(c.read(|st| st.scoped_tokens.is_empty()));
         assert_eq!(sign_in(&ui, &token).await.status, 401);
     }
 

@@ -29,8 +29,15 @@ pub struct Store {
     pub center_name: String,
     #[serde(default)]
     pub nodes: BTreeMap<String, NodeRecord>,
+    /// The tokens with the full reach of the center: the HTTP MCP endpoint
+    /// and the web UI's login.
     #[serde(default)]
     pub harness_tokens: Vec<TokenRecord>,
+    /// The tokens narrowed to a scope (docs/dev/spec/harness.md §3): HTTP MCP
+    /// only. A list of their own, which a center older than scopes does not
+    /// know, so it lets none of them in rather than with the full reach.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scoped_tokens: Vec<TokenRecord>,
     #[serde(default = "d_retention")]
     pub retention_days: u32,
     /// How long a pairing code made from now on stays valid, in minutes.
@@ -59,6 +66,7 @@ impl Store {
             center_name,
             nodes: BTreeMap::new(),
             harness_tokens: Vec::new(),
+            scoped_tokens: Vec::new(),
             retention_days: RETENTION_DAYS,
             pair_code_minutes: PAIR_CODE_MINUTES,
             stats: BTreeMap::new(),
@@ -79,6 +87,11 @@ impl Store {
     pub fn save(&self, dir: &Path) -> std::io::Result<()> {
         let text = serde_json::to_vec_pretty(self).map_err(std::io::Error::other)?;
         nerve_transport::files::write_private(&dir.join(FILE), &text)
+    }
+
+    /// Every harness token, the full ones first.
+    pub fn tokens(&self) -> impl Iterator<Item = &TokenRecord> {
+        self.harness_tokens.iter().chain(&self.scoped_tokens)
     }
 
     pub fn node_by_name(&self, name: &str) -> Option<&NodeRecord> {
@@ -137,6 +150,10 @@ pub struct TokenRecord {
     /// Hex SHA-256 of the token; the token itself is shown once and not kept.
     pub hash: String,
     pub created_ms: u64,
+    /// What a token in `scoped_tokens` lets a harness do; none in
+    /// `harness_tokens`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<nerve_proto::Scope>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

@@ -22,6 +22,16 @@ action, the target and the decision. A refusal adds its reason.
 The reason says what is missing. Use it to write the rule you want
 ([rules](rules.md)).
 
+A call that came with a harness token's [scope](harness.md#scopes) shows it
+after the decision:
+
+```
+1791834106607  lab  fs.write  /home/u/proj/a.txt  forbidden (scope fs.read, fs.list): fs.write is outside the scope of this call (fs.read, fs.list); …
+```
+
+A refusal for the scope is not about your rules: no rule lifts it. The
+token's scope is set in the center.
+
 Settings changes are lines like `1791834068828  settings v1 by local`. They
 show the new version and who changed it: `local` for `nerve-node`, or the name
 of a center. The log holds the old and the new value of each setting.

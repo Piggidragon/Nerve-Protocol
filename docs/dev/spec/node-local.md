@@ -647,6 +647,14 @@ answer. For each call the node takes the center's policy and, in this order:
 
 Every refusal names its reasons in the error and in the audit log.
 
+A call's scope (protocol §5.1) narrows this further. An action the scope
+does not name is `forbidden` before step 0, whatever the policy says, and the
+refusal says that no rule or mode widens a scope; an action it names is
+decided by the steps above as without a scope. The `settings` actions, which
+these steps do not decide, keep to the scope too. The descriptor is the
+center's, not a scope's: the center leaves out of a session's tools what its
+scope does not name.
+
 What the center is shown follows the same policy, so that its harness builds
 no tool the node would refuse. In `allowlist` mode an `fs` or `exec` action
 is in the descriptor only when an `allow` rule covers it by scope: `<cap>`
@@ -891,7 +899,8 @@ the node as a service.
 ## 6. Audit log
 
 `<state>/audit.jsonl`, one JSON line per event: settings changes (with old
-and new value), calls allowed or forbidden (a refusal with its reason), and what happened to the config
+and new value), calls allowed or forbidden (a refusal with its reason, and
+the call's `scope` when it came with one), and what happened to the config
 file itself (`"kind": "config"`, `event` `refused`, `signed` or `accepted`,
 with the file and the reason), and what the owner did to the node
 (`"kind": "node"`, `event` `install`, `setup`, `update` or `uninstall`, with

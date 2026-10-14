@@ -247,6 +247,113 @@ async fn a_call_no_rule_allows_is_refused_immediately() {
     node.stop().await;
 }
 
+/// A call's scope only narrows: an action it does not name is refused
+/// although a rule allows it, one it names is still decided by the policy,
+/// and the audit log keeps the scope with each decision. The settings
+/// actions, which the policy does not decide, keep to the scope too.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_scope_narrows_a_call_and_never_widens_it() {
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let o = options(dir.path());
+    let home = std::fs::canonicalize(&o.home).unwrap();
+    nerve_node::pair::pair(&o.paths, &center.link(), Some("lab"))
+        .await
+        .expect("pair");
+    let rule = format!("fs.read:{}/*", nerve_policy::paths::to_wire(&home));
+    owner_edit(&o.paths, |c| {
+        c.centers[0].policy.allow.push(rule.clone());
+        c.centers[0].settings = nerve_policy::config::SettingsGrant::Write;
+    })
+    .await;
+    let node = Daemon::start(o).await.expect("start");
+    let mut conn = linked(&mut center).await;
+    let file = home.join("note.txt");
+    std::fs::write(&file, "hello").unwrap();
+    let path = nerve_policy::paths::to_wire(&file);
+    let mut call = async |cap: &str, action: &str, args: Value, scope: Value| {
+        conn.call(
+            "invoke",
+            json!({"cap": cap, "action": action, "args": args,
+                   "ctx": {"session": "s1", "scope": scope}}),
+            WAIT,
+        )
+        .await
+        .unwrap()
+        .map_err(|e| (nerve_conformance::wire::code_of(&e), e.message))
+    };
+
+    // Named, and allowed by the rule.
+    let read = call("fs", "read", json!({"path": path}), json!(["fs.read"])).await;
+    assert_eq!(read.expect("the scope names the read")["content"], "hello");
+    // Allowed by the rule, but not named.
+    let (code, why) = call("fs", "read", json!({"path": path}), json!(["exec"]))
+        .await
+        .expect_err("the scope does not name the read");
+    assert_eq!(code, "forbidden");
+    assert!(why.contains("outside the scope"), "{why}");
+    // Named, but no rule allows it: the scope gives nothing of its own.
+    let (code, why) = call(
+        "fs",
+        "write",
+        json!({"path": path, "content": "x"}),
+        json!(["fs"]),
+    )
+    .await
+    .expect_err("no rule allows the write");
+    assert_eq!(code, "forbidden");
+    assert!(why.contains("no allow rule"), "{why}");
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello");
+    // A settings action outside the scope does nothing.
+    let (code, _) = call("settings", "pause", json!({}), json!(["fs.read"]))
+        .await
+        .expect_err("the scope does not name settings.pause");
+    assert_eq!(code, "forbidden");
+    // A malformed scope is no scope at all.
+    let (code, _) = call("fs", "read", json!({"path": path}), json!(["fs_read"]))
+        .await
+        .expect_err("a malformed scope");
+    assert_eq!(code, "invalid_args");
+    // Still linked and not paused: the read works without a scope.
+    let read = conn
+        .call(
+            "invoke",
+            json!({"cap": "fs", "action": "read", "args": {"path": path}}),
+            WAIT,
+        )
+        .await
+        .unwrap();
+    assert!(read.is_ok(), "{read:?}");
+
+    let lines: Vec<Value> = std::fs::read_to_string(node.paths().audit_log())
+        .unwrap()
+        .lines()
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .filter(|v: &Value| v["cap"] == "fs")
+        .collect();
+    let seen: Vec<(&str, &str, Value)> = lines
+        .iter()
+        .map(|v| {
+            (
+                v["action"].as_str().unwrap_or_default(),
+                v["decision"].as_str().unwrap_or_default(),
+                v["scope"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        seen,
+        [
+            ("read", "allowed", json!(["fs.read"])),
+            ("read", "forbidden", json!(["exec"])),
+            ("write", "forbidden", json!(["fs"])),
+            ("read", "allowed", Value::Null),
+        ],
+        "{lines:?}"
+    );
+    node.stop().await;
+}
+
 /// A command line longer than the node checks is refused, also with no
 /// grant at all, and the audit log says why.
 #[tokio::test(flavor = "multi_thread")]

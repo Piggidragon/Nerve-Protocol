@@ -340,6 +340,7 @@ function sessionCard(s) {
       pill("", s.transport),
       el("span", { class: "push" }, btn("End", "danger", act(() => api("POST", "/api/sessions/end", { id: s.id }))))),
     el("p", { class: "meta" }, `Since ${ago(s.started_ms)}, ${plural(s.calls, "call")}`),
+    s.scope ? el("p", { class: "meta" }, `Scope: ${s.scope.join(", ")}`) : null,
     s.nodes.length ? el("div", { class: "chips" }, s.nodes.map((n) => el("span", { class: "chip" }, n))) : null,
     el("p", { class: "meta faint mono" }, s.id));
 }
@@ -553,6 +554,9 @@ function auditRow(d, n) {
   // action is its own target. A target cut to its start names no call.
   const cut = /… \[cut at \d+ of \d+ characters\]$/.test(d.target || "");
   const known = d.cap && d.action && !cut && (d.target || !["exec", "fs"].includes(d.cap));
+  // A call outside the scope of its harness token was refused by that
+  // scope: an allow rule on the machine would not let it through.
+  const byScope = d.decision === "forbidden" && Array.isArray(d.scope) && !scopeAllows(d.scope, d.cap, d.action);
   // A sudo command has its own allow list; deny rules take it as any other.
   const sudo = d.cap === "exec" && d.action === "run" && /^\s*(\S*\/)?sudo(\s|$)/.test(d.target || "");
   const allow = sudo ? "sudo" : "allow";
@@ -563,11 +567,19 @@ function auditRow(d, n) {
       pill(k.pill, d.decision + (d.by ? ` by ${d.by}` : "") + (d.code ? ` [${d.code}]` : "")),
       el("span", { class: "when", title: when(d.ts) }, ago(d.ts))),
     d.target ? el("code", { class: "target mono" }, d.target) : null,
+    Array.isArray(d.scope) ? el("p", { class: "meta" }, `Scope of the call: ${d.scope.join(", ")}`) : null,
+    byScope ? el("p", { class: "meta" }, "Refused by the scope of the harness token that made the call; a rule on the machine does not lift that.") : null,
     known ? el("div", { class: "actions" },
-      ruleBtn("Allow", "", allow, false), ruleBtn("Allow as wildcard", "", allow, true),
+      byScope ? null : ruleBtn("Allow", "", allow, false), byScope ? null : ruleBtn("Allow as wildcard", "", allow, true),
       ruleBtn("Deny", "danger", "deny", false), ruleBtn("Deny as wildcard", "danger", "deny", true)) : null,
     known && !write ? el("p", { class: "meta" }, why) : null,
     cut ? el("p", { class: "meta" }, "The target was cut to its start, so no rule can name it.") : null);
+}
+
+// Whether a scope names `cap.action`: an entry is a capability or one
+// action of it (docs/dev/spec/protocol.md §5.1).
+function scopeAllows(scope, cap, action) {
+  return scope.some((e) => e === cap || e === `${cap}.${action}`);
 }
 
 // ---- Log ----
@@ -739,10 +751,15 @@ function pageSettings() {
 
 function tokenForm() {
   const label = el("input", { class: "input", type: "text", placeholder: "Label, for example the harness name", "aria-label": "Token label", maxlength: "64" });
+  const scope = el("input", { class: "input mono", type: "text", placeholder: "fs.read fs.list", "aria-label": "Token scope", "aria-describedby": "token-scope-hint" });
   return el("div", { class: "form-row" }, el("label", { class: "field" }, el("span", { class: "label" }, "New token"), label),
+    el("label", { class: "field" }, el("span", { class: "label" }, "Scope (optional)"), scope,
+      el("span", { class: "hint", id: "token-scope-hint" }, "Empty: everything the machines allow this center, and the token signs in here. Otherwise only the capabilities and actions named, such as fs, fs.read, exec or exec.run, and the token is for a harness only.")),
     el("button", { type: "button", class: "btn primary", onclick: act(async () => {
-      const r = await api("POST", "/api/tokens/create", { label: label.value });
+      const names = scope.value.split(/[\s,]+/).filter(Boolean);
+      const r = await api("POST", "/api/tokens/create", { label: label.value, scope: names });
       label.value = "";
+      scope.value = "";
       state.newToken = r.token;
       await loadTokens();
     }) }, icon("key", "sm"), "Create"));
@@ -761,7 +778,9 @@ function drawTokens() {
       el("button", { type: "button", class: "btn ghost sm", onclick: () => copy(state.newToken) }, icon("copy", "sm"), "Copy"),
       el("button", { type: "button", class: "btn ghost sm", "aria-label": "Hide", onclick: () => { state.newToken = null; drawTokens(); } }, icon("x", "sm"))) : null,
     s.tokens.length ? s.tokens.map((t) => el("div", { class: "card" }, el("div", { class: "card-top" },
-      icon("key"), el("span", { class: "name" }, t.label || "(no label)"), el("span", { class: "meta push" }, `Created ${ago(t.created_ms)}`),
+      icon("key"), el("span", { class: "name" }, t.label || "(no label)"),
+      el("span", { class: "meta" }, t.scope ? `Scope: ${t.scope.join(", ")}` : "Full reach"),
+      el("span", { class: "meta push" }, `Created ${ago(t.created_ms)}`),
       btn("Delete", "danger", act(async () => { await api("POST", "/api/tokens/delete", { id: t.id }); await loadTokens(); }), "trash"))))
       : el("p", { class: "meta" }, "No tokens yet.")].flat().filter(Boolean));
 }

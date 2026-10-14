@@ -39,6 +39,36 @@ in to the [web UI](web-ui.md).
 - Or make more in the web UI: Settings, Harness tokens. The token is shown
   once. Delete it there to stop it.
 
+### Scopes
+
+What a machine allows is set per center, so every harness of a center can do
+the same. A token made in the web UI can have a **scope**: the capabilities
+and actions its harness may use, written as a rule's scope
+([rules](rules.md)). For example, one harness that only looks at files and
+another that runs commands, on the same center:
+
+| Scope | The harness may |
+|---|---|
+| `fs.read fs.list fs.stat fs.grep fs.find` | Look at files |
+| `fs` | Look at and write files |
+| `exec` | Run commands and stop them |
+| `exec.run` | Run commands |
+| empty | Everything the machines allow this center |
+
+- A scope only takes away. The machine still decides every call by its own
+  rules and mode: a token with the scope `exec` runs no command the machine
+  does not allow the center.
+- The harness sees only the tools its scope names. A call outside the scope
+  fails with `error forbidden: … is outside the scope of this harness token`.
+- The machine checks the scope too, and its [audit log](audit.md) shows it.
+  A rule on the machine does not lift a scope; make a token with another
+  scope instead.
+- A token with a scope does not log in to the [web UI](web-ui.md#log-in).
+- The scope cannot be changed. Make a new token and delete the old one.
+- `--harness-token` and the stdio connection have no scope.
+- A scoped token's calls need machines that run this version or a newer
+  one. An older `nerve-node` refuses them.
+
 ## The tools the model gets
 
 Tools follow what the nodes allow. A new machine allows nothing, so the model

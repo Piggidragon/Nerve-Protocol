@@ -2287,6 +2287,14 @@ fn audit_line(v: &Value) -> String {
         s("target"),
         s("decision")
     );
+    // A scope the center narrowed the call to (spec §5.1).
+    let line = match v["scope"].as_array() {
+        Some(scope) => {
+            let names: Vec<&str> = scope.iter().filter_map(Value::as_str).collect();
+            format!("{line} (scope {})", names.join(", "))
+        }
+        None => line,
+    };
     match v["reason"].as_str() {
         Some(reason) => format!("{line}: {reason}"),
         None => line,
@@ -5268,6 +5276,23 @@ mod tests {
         let out = run(&paths, &["audit", "--denied"]).unwrap();
         assert_eq!(out.lines().count(), 1, "{out}");
         assert!(out.contains("ls  forbidden"), "{out}");
+    }
+
+    /// A call the center narrowed shows its scope, before the reason.
+    #[test]
+    fn audit_shows_the_scope_of_a_call() {
+        let line = audit_line(&serde_json::json!({"ts": 1, "center": "lab", "cap": "fs",
+            "action": "write", "target": "/x", "decision": "forbidden",
+            "scope": ["fs.read", "exec"], "reason": "fs.write is outside the scope"}));
+        assert!(
+            line.ends_with(
+                "fs.write  /x  forbidden (scope fs.read, exec): fs.write is outside the scope"
+            ),
+            "{line}"
+        );
+        let plain = audit_line(&serde_json::json!({"ts": 1, "center": "lab", "cap": "fs",
+            "action": "read", "target": "/x", "decision": "allowed"}));
+        assert!(plain.ends_with("fs.read  /x  allowed"), "{plain}");
     }
 
     /// Output that a test reads while `audit --follow` writes it.

@@ -21,8 +21,9 @@ const FIELD_MAX: usize = 200;
 /// The fields an entry keeps: the event's (docs/dev/spec/protocol.md §7.5), `by`,
 /// which the web UI shows, and the node the center adds. Anything else a
 /// node sends is dropped, so no other field can make an entry large.
-const FIELDS: [&str; 10] = [
-    "ts", "cap", "action", "target", "decision", "code", "session", "by", "node_id", "node",
+const FIELDS: [&str; 11] = [
+    "ts", "cap", "action", "target", "decision", "code", "session", "scope", "by", "node_id",
+    "node",
 ];
 
 #[derive(Debug, Default)]
@@ -68,7 +69,8 @@ impl AuditFeed {
 
 /// The entry with only the known fields: the target cut to
 /// [`nerve_policy::audit::TARGET_MAX_CHARS`] characters and marked as the
-/// node marks it, every other text clipped, `ts` kept as a number.
+/// node marks it, every other text clipped, `ts` kept as a number, `scope`
+/// kept as at most as many names as a scope holds.
 fn trim(e: Value) -> Value {
     let Value::Object(o) = e else {
         return Value::Object(Map::new());
@@ -81,7 +83,13 @@ fn trim(e: Value) -> Value {
         let v = match v {
             Value::Number(n) if k == "ts" => Value::Number(n),
             Value::String(s) if k == "target" => nerve_policy::audit::cut_target(&s).into(),
-            Value::String(s) if k != "ts" => util::clip(&s, FIELD_MAX).into(),
+            Value::String(s) if k != "ts" && k != "scope" => util::clip(&s, FIELD_MAX).into(),
+            Value::Array(a) if k == "scope" => a
+                .iter()
+                .filter_map(Value::as_str)
+                .take(nerve_proto::scope::ENTRIES_MAX)
+                .map(|s| Value::from(util::clip(s, 2 * nerve_proto::scope::NAME_MAX_BYTES + 1)))
+                .collect(),
             _ => continue,
         };
         out.insert(k, v);
@@ -141,6 +149,31 @@ mod tests {
             "{}",
             answer.len()
         );
+    }
+
+    /// The scope of a call is kept, as a list of names of a scope's sizes.
+    #[test]
+    fn a_scope_is_kept_within_a_scopes_size() {
+        let mut f = AuditFeed::default();
+        let mut e = refused("ls".into());
+        e["scope"] = json!(["fs.read", "exec"]);
+        f.push(e.clone());
+        let many: Vec<Value> = (0..1000)
+            .map(|i| json!(format!("c{i}.{}", "a".repeat(500))))
+            .collect();
+        e["scope"] = Value::Array(many);
+        f.push(e.clone());
+        e["scope"] = json!("fs.read");
+        f.push(e);
+        let l = f.list();
+        assert_eq!(l[0]["scope"], json!(["fs.read", "exec"]));
+        let kept = l[1]["scope"].as_array().unwrap();
+        assert_eq!(kept.len(), nerve_proto::scope::ENTRIES_MAX);
+        assert!(
+            kept.iter()
+                .all(|s| s.as_str().unwrap().len() <= 2 * 64 + 1 + 4)
+        );
+        assert!(l[2].get("scope").is_none(), "{}", l[2]);
     }
 
     /// No other field makes an entry large: unknown ones are dropped and

@@ -17,10 +17,12 @@ pub mod frame;
 pub mod link;
 pub mod msg;
 pub mod rpc;
+pub mod scope;
 
 pub use descriptor::{Capability, Descriptor, Detail, Effect, Exposure};
 pub use error::{ErrorCode, RpcError};
 pub use rpc::{Id, Message};
+pub use scope::Scope;
 
 /// The protocol version of all of 0.0.x and 0.x (docs/dev/spec/protocol.md §1).
 pub const PROTOCOL_VERSION: &str = "0";

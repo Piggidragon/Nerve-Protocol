@@ -906,6 +906,17 @@ impl Link {
                 format!("{}.{} is off", inv.cap, inv.action),
             ));
         }
+        // The settings actions are not decided by the policy (`gate`), so
+        // their scope is looked at here; the center sends them without one.
+        if inv.cap == "settings"
+            && let Some(why) = inv
+                .ctx
+                .scope
+                .as_ref()
+                .and_then(|s| s.refusal(&inv.cap, &inv.action))
+        {
+            return Err(RpcError::forbidden(why));
+        }
         match (inv.cap.as_str(), inv.action.as_str()) {
             ("settings", "set") => self.settings_set(&inv.args),
             ("settings", "pause") => self.settings_pause(),
@@ -1059,9 +1070,19 @@ impl Link {
             cwd,
             now_ms: crate::now_ms(),
         };
+        // The call's scope only narrows: an action it does not name is
+        // refused before the policy is asked, and one it names is decided
+        // by the policy as any other call (spec §5.1).
+        let out_of_scope = inv
+            .ctx
+            .scope
+            .as_ref()
+            .and_then(|s| s.refusal(&inv.cap, &inv.action));
         // The policy looks at the paths as the account (crate::account::FsAs);
         // the audit entry below is the node's own again.
-        let decision = {
+        let decision = if let Some(why) = out_of_scope {
+            Decision::Forbidden(why)
+        } else {
             let protected = self.protected(entry);
             let home = account.map_or(&self.shared.home, |a| &a.home);
             let _as = act_as(account)?;
@@ -1083,6 +1104,7 @@ impl Link {
                 decision: decision.into(),
                 code: code.map(Into::into),
                 session: inv.ctx.session.clone(),
+                scope: inv.ctx.scope.clone(),
                 reason: reason.map(Into::into),
             })
         };

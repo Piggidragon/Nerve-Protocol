@@ -362,6 +362,8 @@ max_opens_per_minute = 30   # tunnels one relayed node may open a minute
 name = "lab-pc"             # the user name of its Proxy-Authorization
 token_sha256 = "<hex>"      # SHA-256 of its token; the token is in no file
 centers = ["home"]          # optional: the centers it may reach; all when missing
+max_links = 12              # optional: its own tunnels at once (a relay behind this one)
+max_opens_per_minute = 300  # optional: its own opens a minute
 
 [[center]]
 name = "home"               # the owner's name; the CLI's --center
@@ -578,11 +580,16 @@ turns it on, and a center reads and changes nothing of it, grant or not.
   unless set: a node needs one per center and redials after a second at the
   soonest; a relay behind this one, which carries many nodes, needs more;
   `relay set`, `relay ls` and `status` show it); past that it gets `503`.
-  In a chain the inner relay is one relay node of the outer one: its own
-  links and every tunnel of the nodes behind it count against that node's
-  `max_links_per_node` (and `max_links`) and its opens budget there, so the
-  outer relay's owner raises all of them for it. A refusal at the outer
-  relay reaches the relayed node as the inner relay's `502`. Each tunnel is an audit entry and two `info`
+  `relay.max_links_per_node` and `relay.max_opens_per_minute` hold for
+  every relay node; raising them raises them for every token. A node can
+  have limits of its own instead (`[[relay.node]]` `max_links` and
+  `max_opens_per_minute`, set with `relay set-limits <name> [--max-links N]
+  [--max-opens-per-minute N]`, both cleared without flags, shown by
+  `relay ls`). That is for a relay behind this one: in a chain the inner
+  relay is one relay node of the outer one, and its own links and every
+  tunnel of the nodes behind it count against that node's limits (and the
+  relay's `max_links`). A refusal at the outer relay reaches the relayed
+  node as the inner relay's `502`. Each tunnel is an audit entry and two `info`
   lines, so a node with its token cannot rotate the audit log or the log by
   opening and closing tunnels.
 - Hosts are compared without case or a trailing dot, and an address in any

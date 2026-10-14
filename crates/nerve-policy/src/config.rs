@@ -268,6 +268,12 @@ impl Relay {
         }
         let mut names = std::collections::BTreeSet::new();
         for n in &self.nodes {
+            if n.max_links == Some(0) || n.max_opens_per_minute == Some(0) {
+                return Err(format!(
+                    "relay.node {}: max_links and max_opens_per_minute must be at least 1",
+                    n.name
+                ));
+            }
             if !nerve_proto::valid_node_name(&n.name) {
                 return Err(format!(
                     "relay.node name {:?}: 1 to 32 characters of a-z, 0-9 and -",
@@ -316,9 +322,28 @@ pub struct RelayNode {
     /// empty, every center a tunnel may go to.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub centers: Vec<String>,
+    /// This node's tunnels at once, in place of `relay.max_links_per_node`:
+    /// a relay behind this one carries the tunnels of many nodes, and only
+    /// it should get more.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_links: Option<u32>,
+    /// This node's opens a minute, in place of `relay.max_opens_per_minute`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_opens_per_minute: Option<u32>,
 }
 
 impl RelayNode {
+    /// This node's tunnels at once: its own limit, else the relay's.
+    pub fn links(&self, relay: &Relay) -> u32 {
+        self.max_links.unwrap_or(relay.max_links_per_node)
+    }
+
+    /// This node's opens a minute: its own limit, else the relay's.
+    pub fn opens(&self, relay: &Relay) -> u32 {
+        self.max_opens_per_minute
+            .unwrap_or(relay.max_opens_per_minute)
+    }
+
     /// Whether this node's tunnels may go to `center`.
     pub fn may_reach(&self, center: &str) -> bool {
         self.centers.is_empty() || self.centers.iter().any(|c| c == center)

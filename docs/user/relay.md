@@ -110,7 +110,7 @@ center on its own loopback; what a center's host and port serve besides the
 center is reached too ([below](#what-to-know)). An `https` center the relay is
 paired with at `127.0.0.1`, `[::1]` or `localhost` (a center on the relay's
 own machine) is reached. A center paired at a name is not reached on the
-relay's own machine: if the name resolves to a loopback address there, the
+relay's own loopback: if the name resolves to a loopback address there, the
 tunnel is refused. A paused center is still reached: pausing stops the
 relay's own link, not the links it carries.
 
@@ -118,9 +118,9 @@ If the relay itself reaches its centers through a proxy or another relay, it
 dials through that one too. Each relay in such a chain follows the same
 rules. To the outer relay, the inner one is a single relay node: its own
 links and every tunnel of the nodes behind it count against that one node's
-limits there. On the outer relay, raise `--max-links-per-node` (and
-`--max-links`, if need be) and `--max-opens-per-minute` for the inner relay,
-or its fifth link at once is refused ([limits](#limits)).
+limits there. Give the inner relay limits of its own on the outer relay
+with `relay set-limits`, or its fifth link at once is refused
+([limits](#limits)).
 
 ## Limits
 
@@ -137,11 +137,22 @@ carries nothing for 90 seconds is closed (a live link sends something every
 `--max-opens-per-minute` is the number of tunnels a node may open a minute,
 30 unless you set it. That is far more than a node needs.
 
-A relay behind this one is one node here, whose links and whose nodes'
-tunnels all count as its own: give it a `--max-links-per-node` for all of
-them at once (its own links to its centers, plus one per center for each
-node behind it), and a larger `--max-opens-per-minute`. A relayed node that
-hits the outer relay's limits sees `502` from its own relay.
+These three hold for every relayed node and every token. Do not raise
+`--max-links-per-node` or `--max-opens-per-minute` for one node: every token
+would get the same, and could hold that many of the relay's tunnels or fill
+its logs that much faster. A relay behind this one is one node here, whose
+links and whose nodes' tunnels all count as its own. Give that one node
+limits of its own:
+
+```sh
+nerve-node relay set-limits inner-relay --max-links 12 --max-opens-per-minute 300
+nerve-node relay set-limits inner-relay        # the relay's limits again
+```
+
+`--max-links` there counts its own links to its centers plus one per center
+for each node behind it; raise the relay's `--max-links` too if the total
+needs it. `relay ls` shows a node's own limits. A relayed node that hits the
+outer relay's limits sees `502` from its own relay.
 
 At most 4 connections from one address may wait for the relay's answer at
 once, and 16 from one IPv6 /64, each 15 seconds at most; once the relay

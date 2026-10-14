@@ -369,6 +369,17 @@ pub enum RelayCmd {
         #[arg(long = "center", value_name = "CENTER")]
         centers: Vec<String>,
     },
+    /// Give a relayed node limits of its own, in place of the relay's --max-links-per-node and --max-opens-per-minute: for a relay behind this one, which carries many nodes. Without either flag, the relay's limits again.
+    SetLimits {
+        /// The relayed node's name.
+        name: String,
+        /// Its tunnels at once.
+        #[arg(long, value_name = "N")]
+        max_links: Option<u32>,
+        /// The tunnels it may open a minute.
+        #[arg(long, value_name = "N")]
+        max_opens_per_minute: Option<u32>,
+    },
     /// Take a node's token away and end its tunnels.
     Rm {
         /// The relayed node's name.
@@ -2885,7 +2896,7 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
             }
             let (now, _) = read_config(paths).await?;
             relay_centers(&now, &centers)?;
-            let (pin, _) = relay_pin(paths, &now, now.relay.listen.as_deref())?;
+            let (pin, made) = relay_pin(paths, &now, now.relay.listen.as_deref())?;
             let (token, hash) = crate::relay::new_token();
             let cfg = edit(paths, |c| {
                 if c.relay.node(&name).is_some() {
@@ -2899,10 +2910,20 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
                     name: name.clone(),
                     token_sha256: hash.clone(),
                     centers: centers.clone(),
+                    max_links: None,
+                    max_opens_per_minute: None,
                 });
                 Ok(())
             })
             .await?;
+            if made && now.relay.pin.is_some() {
+                w(
+                    out,
+                    format!(
+                        "the relay's TLS key was gone or did not match its pin, so it has a new certificate (pin {pin}): the relayed nodes need the new pin in `proxy set --pin`"
+                    ),
+                );
+            }
             let at = relay_address(cfg.relay.listen.as_deref());
             w(
                 out,
@@ -2921,6 +2942,34 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
                     "the relay is off: `nerve-node relay set <address>` turns it on".into(),
                 );
             }
+            Ok(())
+        }
+        RelayCmd::SetLimits {
+            name,
+            max_links,
+            max_opens_per_minute,
+        } => {
+            let cfg = edit(paths, |c| {
+                let node = c
+                    .relay
+                    .nodes
+                    .iter_mut()
+                    .find(|n| n.name == name)
+                    .ok_or_else(|| format!("the relay knows no node {name}"))?;
+                node.max_links = max_links;
+                node.max_opens_per_minute = max_opens_per_minute;
+                Ok(())
+            })
+            .await?;
+            let node = cfg.relay.node(&name).expect("set above");
+            w(
+                out,
+                format!(
+                    "relay node {name}: at most {} tunnels at once, {} opened a minute",
+                    node.links(&cfg.relay),
+                    node.opens(&cfg.relay)
+                ),
+            );
             Ok(())
         }
         RelayCmd::SetCenters { name, centers } => {
@@ -3003,7 +3052,15 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
                 w(out, "no node may use it".into());
             }
             for n in &r.nodes {
-                w(out, format!("node {}: {}", n.name, reach_of(&n.centers)));
+                let mut line = format!("node {}: {}", n.name, reach_of(&n.centers));
+                if n.max_links.is_some() || n.max_opens_per_minute.is_some() {
+                    line.push_str(&format!(
+                        "; its own limits: {} tunnels at once, {} opened a minute",
+                        n.links(r),
+                        n.opens(r)
+                    ));
+                }
+                w(out, line);
             }
             match live {
                 Some(v) => {
@@ -5312,6 +5369,57 @@ mod tests {
             .is_err()
         );
 
+        // A node of its own limits, for a relay behind this one.
+        let out = run(
+            &paths,
+            &[
+                "relay",
+                "set-limits",
+                "lab-2",
+                "--max-links",
+                "12",
+                "--max-opens-per-minute",
+                "300",
+            ],
+        )
+        .unwrap();
+        assert!(
+            out.starts_with("relay node lab-2: at most 12 tunnels at once, 300 opened a minute\n"),
+            "{out}"
+        );
+        let node = load(&paths).relay.node("lab-2").unwrap().clone();
+        assert_eq!(
+            (node.max_links, node.max_opens_per_minute),
+            (Some(12), Some(300))
+        );
+        assert_eq!(
+            load(&paths).relay.max_links_per_node,
+            4,
+            "the relay's stays"
+        );
+        assert!(
+            run(
+                &paths,
+                &["relay", "set-limits", "lab-2", "--max-links", "0"]
+            )
+            .is_err()
+        );
+        assert!(
+            run(
+                &paths,
+                &["relay", "set-limits", "nobody", "--max-links", "2"]
+            )
+            .is_err()
+        );
+        let ls = run(&paths, &["relay", "ls"]).unwrap();
+        assert!(
+            ls.contains("node lab-2: the centers work, home, home-b; its own limits: 12 tunnels at once, 300 opened a minute\n"),
+            "{ls}"
+        );
+        run(&paths, &["relay", "set-limits", "lab-2"]).unwrap();
+        let node = load(&paths).relay.node("lab-2").unwrap().clone();
+        assert_eq!((node.max_links, node.max_opens_per_minute), (None, None));
+
         let ls = run(&paths, &["relay", "ls"]).unwrap();
         assert!(
             ls.starts_with(&format!(
@@ -5322,6 +5430,20 @@ mod tests {
         assert!(!ls.contains(&token), "{ls}");
         run(&paths, &["relay", "set-centers", "lab-2"]).unwrap();
         assert!(load(&paths).relay.node("lab-2").unwrap().centers.is_empty());
+
+        // A lost TLS key: relay add makes a new certificate and says so.
+        std::fs::remove_file(paths.relay_tls_file()).unwrap();
+        let out = run(&paths, &["relay", "add", "lab-4"]).unwrap();
+        let new_pin = load(&paths).relay.pin.unwrap();
+        assert_ne!(new_pin, pin);
+        assert!(
+            out.starts_with(&format!(
+                "the relay's TLS key was gone or did not match its pin, so it has a new certificate (pin {new_pin})"
+            )),
+            "{out}"
+        );
+        let out = run(&paths, &["relay", "add", "lab-5"]).unwrap();
+        assert!(!out.contains("new certificate"), "{out}");
 
         let out = run(&paths, &["relay", "rm", "lab-pc"]).unwrap();
         assert!(out.starts_with("relay node lab-pc removed"), "{out}");

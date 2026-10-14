@@ -74,7 +74,7 @@ Through a [relay](relay.md), `status` names what the relay answered:
 | `the proxy refused the tunnel to …: 407 …` | The relay does not know the name and token in `proxy set` | On the relay, `nerve-node relay ls`; make a new token with `relay rm` and `relay add` |
 | `the proxy refused the tunnel to …: 403 …` | The center's address is not one the relay is paired with over https, or not one the relay's owner picked for this node | Pair with the URL the relay uses for that center; on the relay, `relay ls` shows the node's centers |
 | `the proxy refused the tunnel to …: 503 …` | The relay is off, locked, carries as many tunnels as it may (all of them, or this node's), or this node opened as many as it may in a minute | On the relay, `nerve-node relay ls` and `status`, and its log: the node sees only `503`, the relay's log says which limit |
-| `the proxy refused the tunnel to …: 502 …` | The relay cannot reach the center, or the relay's own proxy or relay refused it (in a chain, the outer relay's limits for the inner one) | Check the relay's own link and its log; in a chain, raise the outer relay's limits for the inner relay ([relay](relay.md#limits)) |
+| `the proxy refused the tunnel to …: 502 …` | The relay cannot reach the center, or the relay's own proxy or relay refused it (in a chain, the outer relay's limits for the inner one) | Check the relay's own link and its log; in a chain, give the inner relay limits of its own on the outer relay with `relay set-limits` ([relay](relay.md#limits)) |
 
 If `status` says `daemon: not running`, start `nerve-node run`. On Windows
 `status` does not ask the node yet: it says `daemon: not known (no control

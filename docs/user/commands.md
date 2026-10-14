@@ -24,6 +24,7 @@ center is paired.
 | `relay set <ip:port>`, `relay off` | Let other nodes reach this node's centers through it | [relay](relay.md) |
 | `relay add <name> [--center C]`, `relay rm <name>`, `relay ls` | Give a node a relay token, take it away, see who is connected | [relay](relay.md) |
 | `relay set-centers <name> [--center C]` | Change which centers a relayed node may reach | [relay](relay.md#limit-a-node-to-some-centers) |
+| `relay set-limits <name> [--max-links N] [--max-opens-per-minute N]` | Give one relayed node (a relay behind this one) limits of its own | [relay](relay.md#limits) |
 
 ## What a center may do
 

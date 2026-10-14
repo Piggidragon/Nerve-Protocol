@@ -739,9 +739,11 @@ fn count<'a>(
 ) -> Option<Counted<'a>> {
     let mut tunnels = lock(&relays.tunnels);
     let of_node = tunnels.values().filter(|t| t.node == g.node).count();
-    if tunnels.len() >= cfg.relay.max_links as usize
-        || of_node >= cfg.relay.max_links_per_node as usize
-    {
+    let per_node = cfg
+        .relay
+        .node(&g.node)
+        .map_or(cfg.relay.max_links_per_node, |n| n.links(&cfg.relay));
+    if tunnels.len() >= cfg.relay.max_links as usize || of_node >= per_node as usize {
         return None;
     }
     let id = relays.next.fetch_add(1, Ordering::Relaxed);
@@ -935,7 +937,10 @@ async fn connection(
         refuse(&mut io, &FULL).await;
         return;
     };
-    let limit = cfg.relay.max_opens_per_minute as usize;
+    let limit = cfg
+        .relay
+        .node(&grant.node)
+        .map_or(cfg.relay.max_opens_per_minute, |n| n.opens(&cfg.relay)) as usize;
     if !shared
         .relay
         .may_open(&grant.node, limit, std::time::Instant::now())
@@ -1223,6 +1228,8 @@ mod tests {
             name: name.into(),
             token_sha256: hash,
             centers: centers.iter().map(|c| c.to_string()).collect(),
+            max_links: None,
+            max_opens_per_minute: None,
         }
     }
 
@@ -2960,6 +2967,45 @@ mod tests {
         assert!(started.elapsed() < DIAL_DEADLINE, "{:?}", started.elapsed());
         round_trip(&mut t.unwrap(), b"through").await;
         drop((full, queued));
+        j.daemon.stop().await;
+    }
+
+    /// A relay node with limits of its own (a relay behind this one) gets
+    /// them, while every other node keeps the relay's: raising the limits
+    /// for one does not raise them for every token.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_node_with_limits_of_its_own_gets_them_and_no_other_node_does() {
+        let home = echo().await;
+        let home_at = format!("127.0.0.1:{}", port(&home));
+        serve_echo(home);
+        let (token2, hash2) = new_token();
+        let j = jump(vec![center("home", format!("https://{home_at}"))], |c| {
+            c.relay.max_links = 16;
+            c.relay.max_links_per_node = 2;
+            c.relay.max_opens_per_minute = 3;
+            let mut inner = relay_node("inner", hash2, &[]);
+            inner.max_links = Some(6);
+            inner.max_opens_per_minute = Some(10);
+            c.relay.nodes.push(inner);
+        })
+        .await;
+        let (lab, inner) = (basic("lab", &j.token), basic("inner", &token2));
+        let mut held = Vec::new();
+        for i in 0..6 {
+            let (status, head, t) = connect(j.addr, &j.pin, &home_at, Some(&inner)).await;
+            assert_eq!(status, 200, "inner {i}: {head}");
+            held.push(t.unwrap());
+        }
+        let (status, _, _) = connect(j.addr, &j.pin, &home_at, Some(&inner)).await;
+        assert_eq!(status, 503, "inner past its own limit");
+        for i in 0..2 {
+            let (status, head, t) = connect(j.addr, &j.pin, &home_at, Some(&lab)).await;
+            assert_eq!(status, 200, "lab {i}: {head}");
+            held.push(t.unwrap());
+        }
+        let (status, _, _) = connect(j.addr, &j.pin, &home_at, Some(&lab)).await;
+        assert_eq!(status, 503, "lab keeps the relay's limit");
+        drop(held);
         j.daemon.stop().await;
     }
 }

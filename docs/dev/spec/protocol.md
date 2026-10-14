@@ -223,8 +223,10 @@ message layer: the relay carries bytes, never messages.
   minute is over even if no refusal follows, and when the relay stops
   listening, and a node's refusals are counted apart from other nodes'. The
   relay's dial fits every address of the center into its deadline. A node opens a bounded
-  number of tunnels a minute (the owner can raise it for a relay behind this
-  one), so one with a token cannot rotate the audit log either.
+  number of tunnels a minute, so one with a token cannot rotate the audit
+  log either. These limits hold for every node; a relay behind this one,
+  which carries many nodes, gets limits of its own as a node, so raising
+  them for it raises them for no other token.
 - Hosts are compared as a URL can tell them apart: without case or a
   trailing dot, and an address in any of its spellings. A name and the
   address it resolves to are not told apart.

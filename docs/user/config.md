@@ -60,6 +60,8 @@ max_opens_per_minute = 30   # tunnels one relayed node may open a minute
 name = "lab-pc"
 token_sha256 = "…"          # the hash of its token; the token is in no file
 centers = ["home"]          # optional: the centers it may reach; every one without it
+max_links = 12              # optional, `relay set-limits`: its own tunnels at once
+max_opens_per_minute = 300  # optional, `relay set-limits`: its own opens a minute
 
 [log]
 level = "info"              # error | warn | info | debug: how much the node logs

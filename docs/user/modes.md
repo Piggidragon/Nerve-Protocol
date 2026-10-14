@@ -72,9 +72,11 @@ place the pass ends at must resolve to itself, so a link swapped in meanwhile
 is refused too. On Windows a `subst` drive is followed through the folder it maps, name by
 name, so a junction on that folder is judged like any other; a path with a
 drive but no root (`C:sub`) and a path that is not on a drive letter (a share,
-`\\?\GLOBALROOT\…`) are refused; and short (8.3) names, in the path, in a
-junction's target or in the folder a `subst` drive maps, are written out in
-full. The node records that it
+`\\?\GLOBALROOT\…`) are refused, and so is a link whose target is not on a drive (a share, a
+device path); a link to a volume root (`\\?\Volume{…}\`), which is how Windows
+spells a volume mounted at a folder, is followed as the place the volume is
+mounted at; and short (8.3) names, in the path, in a junction's target or in
+the folder a `subst` drive maps, are written out in full. The node records that it
 stored the real place (`places` under the pairing's `policy` in `node.toml`).
 A command with `w` on a folder can put a link in place of a folder inside it,
 and a link would give that folder's rights in a place you never named. So the

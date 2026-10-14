@@ -617,21 +617,38 @@ fn walk_by(
     while let Some(step) = todo.pop() {
         match step {
             Step::Top(top) => {
-                // A `subst` drive is a name for a folder, and the folder may
-                // hold a junction: the walk goes through its names one by one
-                // like through a link, not through the resolved drive.
                 #[cfg(windows)]
-                if let Some(mapped) = subst_target(&top) {
-                    crossed += 1;
-                    if crossed > LINKS {
+                match root_kind(&top) {
+                    // A `subst` drive is a name for a folder, and the folder
+                    // may hold a junction: the walk goes through its names one
+                    // by one like through a link, not through the resolved
+                    // drive.
+                    Root::Subst(mapped) => {
+                        crossed += 1;
+                        if crossed > LINKS {
+                            return Err(format!(
+                                "it cannot be resolved through the drive {}",
+                                top.display()
+                            ));
+                        }
+                        // `subst` keeps the folder as it was typed, short
+                        // names too.
+                        todo.extend(steps(&long_names(&mapped)));
+                        continue;
+                    }
+                    // A volume root is the place its mount point names, and
+                    // nothing on its own volume lies above it.
+                    Root::Volume(mount) => {
+                        here = mount;
+                        continue;
+                    }
+                    Root::Drive => {}
+                    Root::Other => {
                         return Err(format!(
-                            "it cannot be resolved through the drive {}",
+                            "it passes through a link to {}, which is not a path on a drive",
                             top.display()
                         ));
                     }
-                    // `subst` keeps the folder as it was typed, short names too.
-                    todo.extend(steps(&long_names(&mapped)));
-                    continue;
                 }
                 here = top;
             }
@@ -639,6 +656,15 @@ fn walk_by(
                 here.pop();
             }
             Step::Name(name) => {
+                // A name with a colon is a drive or a stream: joining it would
+                // leave the path being walked.
+                #[cfg(windows)]
+                if name.to_string_lossy().contains(':') {
+                    return Err(format!(
+                        "it passes through the name {}, which is not a folder name",
+                        name.to_string_lossy()
+                    ));
+                }
                 let at = here.join(&name);
                 // A name that cannot be looked at (missing, or behind a
                 // folder that cannot be searched) is no link; `real_folder`
@@ -678,6 +704,47 @@ fn walk_by(
         }
     }
     Ok(here)
+}
+
+/// What the root `top` of a path is, for the walk (Windows).
+#[cfg(windows)]
+enum Root {
+    /// A drive of a volume: taken as it is.
+    Drive,
+    /// A drive made by `subst`, and the folder it names.
+    Subst(PathBuf),
+    /// A volume root (`\\?\Volume{guid}\`), as the drive or folder path it
+    /// is mounted at.
+    Volume(PathBuf),
+    /// Anything else (a share, a device path): nothing can judge the links
+    /// below it, since no drive path names where it is.
+    Other,
+}
+
+#[cfg(windows)]
+fn root_kind(top: &Path) -> Root {
+    use std::path::{Component, Prefix};
+    let on_drive = |p: &Path| {
+        matches!(
+            p.components().next(),
+            Some(Component::Prefix(p)) if matches!(p.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+        )
+    };
+    match top.components().next() {
+        Some(Component::Prefix(p)) => match p.kind() {
+            Prefix::Disk(_) | Prefix::VerbatimDisk(_) => {
+                subst_target(top).map_or(Root::Drive, Root::Subst)
+            }
+            Prefix::Verbatim(name) if name.to_string_lossy().starts_with("Volume{") => {
+                match real_checked(top) {
+                    Ok(mount) if on_drive(&mount) => Root::Volume(mount),
+                    _ => Root::Other,
+                }
+            }
+            _ => Root::Other,
+        },
+        _ => Root::Other,
+    }
 }
 
 /// The folder the drive `top` (`Z:\`) is made to name by `subst`, as a path;
@@ -2787,6 +2854,62 @@ mod windows_tests {
         assert_eq!(at(&short.join("proj")), Settled::At(place));
     }
 
+    /// A config with one center whose only folder is `work`, rw.
+    fn lab_config(work: &Path) -> NodeConfig {
+        let mut cfg = NodeConfig::default();
+        cfg.centers.push(nerve_policy::CenterEntry {
+            name: "lab".into(),
+            url: "https://center.example".into(),
+            pin: None,
+            center_id: "c".into(),
+            node_id: "n".into(),
+            settings: Default::default(),
+            paused: false,
+            revoked: false,
+            unknown: false,
+            policy: CenterPolicy {
+                folders: vec![Folder {
+                    path: work.display().to_string(),
+                    access: Access::parse("rw").unwrap(),
+                }],
+                ..Default::default()
+            },
+        });
+        cfg
+    }
+
+    /// An owner's symlink at `link` to the directory `target`; `None` where
+    /// the process may not make one.
+    fn symlink_to(link: &Path, target: &str) -> Option<()> {
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::windows::fs::symlink_dir(target, link).ok()
+    }
+
+    /// The canonical form of a temporary folder.
+    fn canonical_tmp(d: &tempfile::TempDir) -> PathBuf {
+        PathBuf::from(nerve_policy::paths::win::strip_verbatim(
+            &std::fs::canonicalize(d.path()).unwrap().to_string_lossy(),
+        ))
+    }
+
+    /// The volume GUID path of the volume that holds `p` (`\\?\Volume{…}\`).
+    fn volume_root(p: &Path) -> String {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetVolumeNameForVolumeMountPointW;
+        let drive: Vec<u16> = std::ffi::OsStr::new(&p.display().to_string()[..3])
+            .encode_wide()
+            .chain([0])
+            .collect();
+        let mut buf = vec![0u16; 64];
+        // SAFETY: a NUL-terminated drive root and a buffer of the length given.
+        let ok = unsafe {
+            GetVolumeNameForVolumeMountPointW(drive.as_ptr(), buf.as_mut_ptr(), buf.len() as u32)
+        };
+        assert!(ok != 0, "no volume name for {p:?}");
+        let end = buf.iter().position(|&c| c == 0).unwrap();
+        String::from_utf16_lossy(&buf[..end])
+    }
+
     /// A `subst` drive on a free letter, unmapped when dropped.
     struct Subst(String);
 
@@ -2819,6 +2942,44 @@ mod windows_tests {
         }
     }
 
+    /// A symlink to a volume root (`\\?\Volume{guid}\…`) is walked as the
+    /// place the volume is mounted at, which canonicalize never spells as the
+    /// GUID: a folder behind it is settled at its real place (a mounted
+    /// volume gave the "meanwhile" refusal before), and a junction in a `w`
+    /// folder on the way is still refused.
+    #[test]
+    fn a_volume_root_is_walked_as_the_place_it_is_mounted_at() {
+        let d = tempfile::tempdir().unwrap();
+        let root = canonical_tmp(&d);
+        let (work, secret) = (root.join("work"), root.join("secret"));
+        let project = work.join("project");
+        std::fs::create_dir_all(project.join("inner")).unwrap();
+        std::fs::create_dir_all(secret.join("inner")).unwrap();
+        let cfg = lab_config(&work);
+        let at = |p: &Path| settle(&cfg, &root, p);
+        let volume = volume_root(&root);
+        let on_volume = |p: &Path| format!("{volume}{}", &p.display().to_string()[3..]);
+        let Some(()) = symlink_to(&root.join("links").join("vol"), &on_volume(&project)) else {
+            return;
+        };
+        let via = root.join("links").join("vol").join("inner");
+        let inner = nerve_policy::paths::resolve(&project.join("inner")).unwrap();
+        assert_eq!(at(&via), Settled::At(inner));
+        // A command replaces the folder by a junction to `secret`.
+        std::fs::rename(&project, work.join("old")).unwrap();
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&project)
+            .arg(&secret)
+            .output()
+            .unwrap();
+        assert!(made.status.success(), "{made:?}");
+        let Settled::Refused(why) = at(&via) else {
+            panic!("{} was followed through the junction", via.display())
+        };
+        assert!(why.contains("may write"), "{why}");
+    }
+
     /// A `subst` drive is walked through the folder it maps, name by name: a
     /// junction a command put in place of that folder, inside a `w` folder,
     /// is refused like any other, where resolving the drive would have
@@ -2835,25 +2996,7 @@ mod windows_tests {
         for dir in [project.join("inner"), secret.join("inner")] {
             std::fs::create_dir_all(dir).unwrap();
         }
-        let mut cfg = NodeConfig::default();
-        cfg.centers.push(nerve_policy::CenterEntry {
-            name: "lab".into(),
-            url: "https://center.example".into(),
-            pin: None,
-            center_id: "c".into(),
-            node_id: "n".into(),
-            settings: Default::default(),
-            paused: false,
-            revoked: false,
-            unknown: false,
-            policy: CenterPolicy {
-                folders: vec![Folder {
-                    path: work.display().to_string(),
-                    access: Access::parse("rw").unwrap(),
-                }],
-                ..Default::default()
-            },
-        });
+        let cfg = lab_config(&work);
         let at = |p: &Path| settle(&cfg, &root, p);
         assert!(matches!(at(Path::new("C:sub")), Settled::Refused(_)));
         let Some(drive) = Subst::new(&project) else {
@@ -2875,6 +3018,18 @@ mod windows_tests {
                 panic!("{} was followed through the junction", path.display())
             };
             assert!(why.contains("may write"), "{why}");
+        }
+        // An owner's symlink outside `work` to the drive through the object
+        // manager reaches the junction too, and is refused the same way.
+        let link = root.join("links").join("groot");
+        if symlink_to(&link, &format!("\\\\?\\GLOBALROOT\\??\\{}\\", drive.0)).is_some() {
+            let given =
+                nerve_policy::paths::normal_folder(&link.join("inner").display().to_string())
+                    .unwrap();
+            assert!(
+                matches!(at(Path::new(&given)), Settled::Refused(_)),
+                "{given} was followed"
+            );
         }
         // The same folder by its own path is refused alike, and so is every
         // other spelling of it that does not name a drive: a device path and a

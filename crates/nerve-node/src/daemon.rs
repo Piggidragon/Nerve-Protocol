@@ -720,7 +720,9 @@ impl Daemon {
         let _ = tokio::time::timeout(Duration::from_secs(5), self.supervisor).await;
         if let Some(c) = self.ctl {
             c.abort();
-            let _ = std::fs::remove_file(self.shared.paths.ctl_socket());
+            let socket = self.shared.paths.ctl_socket();
+            let _ = std::fs::remove_file(nerve_transport::ctl::token_file(&socket));
+            let _ = std::fs::remove_file(socket);
         }
         tracing::info!("node daemon stopped");
     }
@@ -809,18 +811,18 @@ async fn start_ctl(shared: Arc<Shared>) -> Result<JoinHandle<()>, String> {
     let listener = nerve_transport::ctl::bind(&path)
         .await
         .map_err(|e| format!("{}: {e}", path.display()))?;
+    // A command of the node's own user in `folder` mode can connect to the
+    // socket where Landlock does not reach it, and a process it left behind
+    // (`setsid`) is below no command the node knows. The token is in the
+    // own folders, which its rules leave out.
+    let token = nerve_transport::ctl::write_token(&path)
+        .map_err(|e| format!("{}: {e}", nerve_transport::ctl::token_file(&path).display()))?;
     let s = shared.clone();
     let task = tokio::spawn(async move {
         let r = nerve_transport::ctl::serve_on(listener, move |req, peer| {
             let s = s.clone();
-            async move {
-                match req.method.as_str() {
-                    // Checking the password runs `sudo -v`, so it cannot
-                    // block inside `control`.
-                    "sudo.on" => sudo_on(&s, req.params, peer.pid).await,
-                    m => control(&s, m, req.params, peer.pid),
-                }
-            }
+            let token = token.clone();
+            async move { answer(&s, &token, req, peer).await }
         })
         .await;
         if let Err(e) = r {
@@ -839,18 +841,29 @@ async fn start_ctl(_shared: Arc<Shared>) -> Result<JoinHandle<()>, String> {
     Ok(tokio::spawn(async {}))
 }
 
-/// Methods that change something: refused from below a center's command.
-/// `owner.check` changes nothing itself: the CLI asks it before `install`,
-/// `setup`, `update` and `uninstall`, which change the node.
+/// Why a request without the control socket's token is refused.
 #[cfg(unix)]
-const MUTATING: &[&str] = &[
-    "config.write",
-    "config.accept",
-    "reload",
-    "sudo.on",
-    "sudo.off",
-    "owner.check",
-];
+const NO_TOKEN: &str = "refused: this request does not carry the control socket's token, which only the owner's own programs can read";
+
+/// One request that came in on the control socket, from `peer`: only one
+/// that carries the socket's `token` is answered.
+#[cfg(unix)]
+async fn answer(
+    shared: &Arc<Shared>,
+    token: &str,
+    req: nerve_transport::ctl::CtlRequest,
+    peer: nerve_transport::ctl::Peer,
+) -> nerve_transport::ctl::Reply {
+    if !nerve_transport::ctl::token_ok(token, req.token.as_deref()) {
+        return nerve_transport::ctl::Reply::Err(NO_TOKEN.into());
+    }
+    match req.method.as_str() {
+        // Checking the password runs `sudo -v`, so it cannot block inside
+        // `control`.
+        "sudo.on" => sudo_on(shared, req.params, peer.pid).await,
+        m => control(shared, m, req.params, peer.pid),
+    }
+}
 
 /// `sudo.on {password}`: the CLI on this machine turns the switch on. The
 /// socket is the owner's only, so the password travels in the clear here.
@@ -878,7 +891,11 @@ async fn sudo_on(
     }
 }
 
-/// One control-socket request.
+/// One control-socket request. Every method is refused from below a center's
+/// command: the reading ones too, as `status` and `config.read` hand over the
+/// whole config, which the command's sandbox keeps from it as a file.
+/// `owner.check` changes nothing itself: the CLI asks it before `install`,
+/// `setup`, `update` and `uninstall`, which change the node.
 #[cfg(unix)]
 pub(crate) fn control(
     shared: &Arc<Shared>,
@@ -887,7 +904,7 @@ pub(crate) fn control(
     pid: Option<u32>,
 ) -> nerve_transport::ctl::Reply {
     use nerve_transport::ctl::Reply;
-    if MUTATING.contains(&method) && shared.below_command(pid) {
+    if shared.below_command(pid) {
         return Reply::Err(
             "refused: this request comes from a command the node runs for a center".into(),
         );
@@ -1438,17 +1455,82 @@ mod tests {
         lock(&s.commands).insert(me, "home".into());
         let r = control(&s, "config.write", write.clone(), Some(me));
         assert!(matches!(r, nerve_transport::ctl::Reply::Err(e) if e.starts_with("refused")));
-        let r = control(&s, "status", json!({}), Some(me));
-        assert!(matches!(r, nerve_transport::ctl::Reply::Ok(_)));
+        // What reads the config is refused as well: `status` and
+        // `config.read` hand it over whole.
+        for method in ["status", "config.read", "sudo.status"] {
+            let r = control(&s, method, json!({}), Some(me));
+            assert!(
+                matches!(&r, nerve_transport::ctl::Reply::Err(e) if e.starts_with("refused")),
+                "{method} answered a command"
+            );
+        }
         // What install, setup, update and uninstall ask first.
         let r = control(&s, "owner.check", json!({}), Some(me));
         assert!(matches!(r, nerve_transport::ctl::Reply::Err(e) if e.starts_with("refused")));
         lock(&s.commands).clear();
+        let r = control(&s, "status", json!({}), Some(me));
+        assert!(matches!(r, nerve_transport::ctl::Reply::Ok(_)));
         let r = control(&s, "config.write", write, Some(me));
         assert!(matches!(r, nerve_transport::ctl::Reply::Ok(_)));
         let r = control(&s, "owner.check", json!({}), Some(me));
         assert!(matches!(r, nerve_transport::ctl::Reply::Ok(_)));
         daemon.stop().await;
+    }
+
+    /// A process that is no longer below a command (it left the command's
+    /// tree, or the command ended) is told from the owner's by the token
+    /// in the state folder, which the owner's CLI reads and a sandboxed
+    /// command cannot.
+    #[tokio::test]
+    async fn answers_only_requests_that_carry_the_token() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+        let (_d, daemon) = daemon().await;
+        let socket = daemon.paths().ctl_socket();
+        let token_file = nerve_transport::ctl::token_file(&socket);
+        let token = std::fs::read_to_string(&token_file).unwrap();
+        assert!(token.len() >= 32, "{token}");
+        // The same user's own file, as the socket is.
+        use std::os::unix::fs::PermissionsExt;
+        let mode = std::fs::metadata(&token_file).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+
+        // The CLI's call reads the token and is answered ...
+        let v = nerve_transport::ctl::call(&socket, "status", json!({}))
+            .await
+            .unwrap();
+        assert_eq!(v["locked"], false);
+        // ... a request without it, or with another, is refused for every
+        // method, though it comes from the node's own user and below no
+        // command.
+        for given in [None, Some("wrong"), Some(&token[1..]), Some("")] {
+            for method in ["status", "config.read", "config.write", "sudo.status"] {
+                let mut request = json!({"method": method, "params": {}});
+                if let Some(t) = given {
+                    request["token"] = t.into();
+                }
+                let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+                let (r, mut w) = stream.into_split();
+                w.write_all(format!("{request}\n").as_bytes())
+                    .await
+                    .unwrap();
+                let mut line = String::new();
+                tokio::io::BufReader::new(r)
+                    .read_line(&mut line)
+                    .await
+                    .unwrap();
+                let reply: Value = serde_json::from_str(&line).unwrap();
+                let error = reply["error"].as_str().unwrap_or_default();
+                assert!(error.starts_with("refused"), "{method} {given:?}: {line}");
+            }
+        }
+        // A new start makes a new token, and a stop takes the file away.
+        let mut opts = NodeOptions::new(daemon.paths().clone());
+        opts.home = daemon.shared.home.clone();
+        daemon.stop().await;
+        assert!(!token_file.exists());
+        let again = Daemon::start(opts).await.unwrap();
+        assert_ne!(std::fs::read_to_string(&token_file).unwrap(), token);
+        again.stop().await;
     }
 
     #[tokio::test]

@@ -80,10 +80,13 @@ command's Landlock rules leave them out, even when a granted folder holds them.
 ## Control socket
 
 `<state>/run/ctl.sock`, in a 0700 folder, mode 0600. Only its own user or root
-may talk to it. It is the node's only way in besides its center links. The
-client sends one JSON object per line, `{"method", "params"}`, and gets
-`{"ok": value}` or `{"error": "text"}`. A streaming method answers with several
-`{"item": value}` lines.
+may talk to it, and only a request that carries the token the node wrote to
+`<state>/run/ctl.token` at its start: the CLI reads it, a `folder` mode command
+cannot, as the state folder is out of its rules. It is the node's only way in
+besides its center links. The client sends one JSON object per line,
+`{"method", "params", "token"}`, and gets `{"ok": value}` or
+`{"error": "text"}`. A streaming method answers with several `{"item": value}`
+lines.
 
 | Method | Does |
 |---|---|
@@ -95,10 +98,10 @@ client sends one JSON object per line, `{"method", "params"}`, and gets
 | `sudo.status`, `sudo.on`, `sudo.off` | The sudo switch |
 | `owner.check` | Nothing; the CLI asks it before `install`, `setup`, `update` and `uninstall` |
 
-`config.write`, `config.accept`, `reload`, `sudo.on`, `sudo.off` and
-`owner.check` are refused from a process that runs below a command the node
-started for a center. On Linux an agent cannot change its own policy through
-the socket, nor install, set up, update or remove the node.
+Every method is refused from a process that runs below a command the node
+started for a center, the reading ones too. On Linux an agent cannot read or
+change its own policy through the socket, nor install, set up, update or
+remove the node.
 
 Windows has no control socket and no sandbox. The CLI signs `node.toml` itself,
 so a command the node runs for a center can change the policy. The change

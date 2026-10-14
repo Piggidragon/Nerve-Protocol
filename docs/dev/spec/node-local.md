@@ -9,7 +9,7 @@ same way and so the owner knows what each setting does.
 | What | Default | Override |
 |---|---|---|
 | `node.toml` and one key per center (`keys/<name>.key`) | `~/.config/nerve` | `--config-dir`, `NERVE_CONFIG_DIR` |
-| control socket `run/ctl.sock`, audit log `audit.jsonl`, log `log.jsonl`, the config's MAC key `config.key`, `keys.lock`, `keys.moving` | `~/.local/state/nerve` | `--state-dir`, `NERVE_STATE_DIR` |
+| control socket `run/ctl.sock` and its token `run/ctl.token`, audit log `audit.jsonl`, log `log.jsonl`, the config's MAC key `config.key`, `keys.lock`, `keys.moving` | `~/.local/state/nerve` | `--state-dir`, `NERVE_STATE_DIR` |
 
 With `machine.secret_storage = "keyring"` the keys are in the system keyring
 instead of `keys/` and `config.key` ([where the keys are](#where-the-keys-are)).
@@ -661,7 +661,15 @@ signed `node.toml` itself, §1). One JSON object per line: the client sends
 `{"method", "params"}`, the server answers `{"ok": value}` or
 `{"error": "text"}`, or, for streaming methods, several `{"item": value}`
 lines until it closes. The socket is 0600 in a 0700 folder; only its own user
-or root may talk to it. A connection the node cannot take (for want of
+or root may talk to it. That leaves out a command the node runs as that very
+user (a node a person runs, with no `machine.user`): Landlock stops a process
+connecting to a socket file only from ABI 9 on, and `setsid` takes a process
+out of the tree below its command. So the node makes a token at each start,
+`<state>/run/ctl.token` (0600), and answers a request only if it carries it
+(`{"method", "params", "token"}`). The CLI reads the file and sends it. The
+file lies in the node's own folders, which a `folder` mode command's rules
+leave out, so such a command, and a process it left behind, are refused for
+every method. A connection the node cannot take (for want of
 descriptors, memory or epoll watches, or for any other reason of that one
 connection) does not end the socket: the node takes the next one once the
 cause is gone. Only an error that says the listener itself is broken ends it.
@@ -679,10 +687,14 @@ Methods:
 | `sudo.off` | | turns the switch off and drops the password |
 | `owner.check` | | changes nothing; the CLI asks it before `install`, `setup`, `update` and `uninstall` |
 
-`config.write`, `config.accept`, `reload`, `sudo.on`, `sudo.off` and
-`owner.check` are refused from a process that runs below a command the node
-started for a center, so on Linux an agent cannot change its own policy
-through the socket, nor install, set up, update or remove the node.
+Every method is refused from a process that runs below a command the node
+started for a center, the reading ones (`status`, `config.read`,
+`sudo.status`) too, as they hand over the whole config. So on Linux an agent
+cannot read its own policy, change it through the socket, nor install, set
+up, update or remove the node. The token also keeps out a process that left
+the command's tree. A command without a sandbox (`allowlist` and `user`
+mode) can read the token file as it can read `node.toml`, so for it only the
+tree decides, and only while the command runs.
 **Windows has no socket and no sandbox:** the CLI signs node.toml
 itself, so a command the node runs for a center can change the policy, and
 the change applies at the next start. On Windows, allow commands only to

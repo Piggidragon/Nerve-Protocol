@@ -7,6 +7,12 @@
 //!
 //! On Unix the socket is created 0600 in a 0700 folder, and every peer's
 //! credentials are read: only the socket's own user or root may talk to it.
+//! That does not tell the owner's programs from a sandboxed process of the
+//! same user: Landlock keeps a process from connecting to a socket file only
+//! from ABI 9 on, and a process that left the tree below its command (with
+//! `setsid`) is no longer known as one. So a server may also hand out a token
+//! ([`write_token`]): a file beside the socket that the client reads and sends
+//! with each request, which a process kept from the folder cannot read.
 //! Windows has no control channel; there the CLI works on the config files
 //! directly (see `nerve-node`).
 
@@ -18,6 +24,9 @@ pub struct CtlRequest {
     pub method: String,
     #[serde(default)]
     pub params: Value,
+    /// What the client read from [`token_file`], when it could.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 /// Who is on the other end of a control connection.
@@ -25,6 +34,11 @@ pub struct CtlRequest {
 pub struct Peer {
     pub uid: u32,
     pub pid: Option<u32>,
+}
+
+/// The file that holds the token of the server on the socket `socket`.
+pub fn token_file(socket: &std::path::Path) -> std::path::PathBuf {
+    socket.with_file_name("ctl.token")
 }
 
 /// The parent process of `pid`, from `/proc/<pid>/stat` (Linux only).
@@ -71,7 +85,7 @@ mod unix {
     use tokio::net::{UnixListener, UnixStream};
     use tokio::sync::mpsc;
 
-    use super::{CtlRequest, Peer};
+    use super::{CtlRequest, Peer, token_file};
 
     /// The longest request line read.
     const LINE_BYTES: usize = 1024 * 1024;
@@ -229,13 +243,46 @@ mod unix {
     /// Error when nothing listens on `path`.
     pub const NOT_RUNNING: &str = "not running";
 
+    /// Makes a token for the server on `socket` that [`bind`] just made: a
+    /// new one per start, in [`token_file`], readable by its user only. The
+    /// server compares what requests carry with it ([`token_ok`]).
+    pub fn write_token(socket: &Path) -> std::io::Result<String> {
+        let token = crate::keys::random_token(32);
+        crate::files::write_private(&token_file(socket), token.as_bytes())?;
+        Ok(token)
+    }
+
+    /// Whether a request carries `token`, compared in time that depends only
+    /// on the lengths.
+    pub fn token_ok(token: &str, given: Option<&str>) -> bool {
+        given.is_some_and(|g| {
+            token.len() == g.len()
+                && token
+                    .bytes()
+                    .zip(g.bytes())
+                    .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+                    == 0
+        })
+    }
+
+    /// The request line a client sends. The token is read after the
+    /// connection is made: a server writes it right after it binds the socket.
+    fn request_line(path: &Path, method: &str, params: Value) -> Value {
+        let token = std::fs::read_to_string(token_file(path)).ok();
+        json!(CtlRequest {
+            method: method.to_string(),
+            params,
+            token,
+        })
+    }
+
     /// One call: sends the request and returns the answer.
     pub async fn call(path: &Path, method: &str, params: Value) -> Result<Value, String> {
         let stream = UnixStream::connect(path)
             .await
             .map_err(|_| NOT_RUNNING.to_string())?;
         let (r, mut w) = stream.into_split();
-        write_line(&mut w, &json!({"method": method, "params": params}))
+        write_line(&mut w, &request_line(path, method, params))
             .await
             .map_err(|e| e.to_string())?;
         let mut line = String::new();
@@ -266,7 +313,7 @@ mod unix {
             .await
             .map_err(|_| NOT_RUNNING.to_string())?;
         let (r, mut w) = stream.into_split();
-        write_line(&mut w, &json!({"method": method, "params": params}))
+        write_line(&mut w, &request_line(path, method, params))
             .await
             .map_err(|e| e.to_string())?;
         let mut lines = BufReader::new(r).lines();
@@ -339,6 +386,48 @@ mod unix {
                     .unwrap_err(),
                 NOT_RUNNING
             );
+        }
+
+        #[test]
+        fn a_token_is_compared_whole() {
+            assert!(token_ok("abc", Some("abc")));
+            for given in [None, Some(""), Some("ab"), Some("abd"), Some("abcd")] {
+                assert!(!token_ok("abc", given), "{given:?}");
+            }
+        }
+
+        /// A client sends the token it finds beside the socket, and none where
+        /// there is no file; a token is new per start and the file is private.
+        #[tokio::test]
+        async fn a_call_carries_the_token_beside_the_socket() {
+            let d = tempfile::tempdir().unwrap();
+            let p = d.path().join("run/ctl.sock");
+            let listener = bind(&p).await.unwrap();
+            tokio::spawn(serve_on(listener, |req, _| async move {
+                if req.method == "follow" {
+                    let (tx, rx) = mpsc::channel(1);
+                    tx.try_send(json!(req.token)).unwrap();
+                    return Reply::Follow(rx);
+                }
+                Reply::Ok(json!(req.token))
+            }));
+            let items = |p: std::path::PathBuf| async move {
+                let mut got = vec![];
+                follow(&p, "follow", json!({}), |v| got.push(v))
+                    .await
+                    .unwrap();
+                got
+            };
+            assert_eq!(call(&p, "echo", json!({})).await.unwrap(), Value::Null);
+            assert_eq!(items(p.clone()).await, vec![Value::Null]);
+            let token = write_token(&p).unwrap();
+            assert_eq!(token_file(&p), d.path().join("run/ctl.token"));
+            assert_eq!(call(&p, "echo", json!({})).await.unwrap(), json!(token));
+            assert_eq!(items(p.clone()).await, vec![json!(token)]);
+            assert_ne!(write_token(&p).unwrap(), token);
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(token_file(&p)).unwrap().permissions();
+            assert_eq!(mode.mode() & 0o777, 0o600);
         }
 
         /// Set in the process `serving_outlasts_running_out_of_descriptors`
@@ -465,4 +554,4 @@ mod unix {
 }
 
 #[cfg(unix)]
-pub use unix::{NOT_RUNNING, Reply, bind, call, follow, serve, serve_on};
+pub use unix::{NOT_RUNNING, Reply, bind, call, follow, serve, serve_on, token_ok, write_token};

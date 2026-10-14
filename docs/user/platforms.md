@@ -21,6 +21,10 @@ behaves the same except where this page says so.
 - Commands run with `no_new_privs`, so setuid programs cannot gain privileges.
   Only a command on the [sudo list](sudo.md) runs without it.
 - When a call ends, the node kills the command's whole process group.
+- A command cannot talk to the node's control socket: the node answers only
+  programs that can read its token in the state folder, which `folder` mode
+  keeps from a command, and refuses a command that runs without that sandbox
+  while it runs.
 - A node that runs as root is refused unless `machine.allow_root` is set
   ([root and administrator](#root-and-administrator)).
 

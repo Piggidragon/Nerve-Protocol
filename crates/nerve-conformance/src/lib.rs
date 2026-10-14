@@ -5,8 +5,8 @@
 //! - [`center_part`] checks a center over the wire, acting as a node (the
 //!   [`echo`] node).
 //! - [`node_part`] checks a node, acting as a center ([`fake_center`]).
-//! - [`harness_part`] will check the MCP server surface a harness sees; it
-//!   is a skeleton.
+//! - [`harness_part`] checks the MCP server surface a harness sees, acting as
+//!   an MCP client and two echo nodes.
 //!
 //! There is no runner binary (the workspace ships exactly
 //! `nerve-center` and `nerve-node`); the parts run from `cargo test` in this

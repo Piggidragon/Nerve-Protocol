@@ -51,6 +51,14 @@ suite:
 cargo test -p nerve-conformance
 ```
 
+To run the end-to-end tests against programs you built elsewhere (the release
+workflow does this with the binaries it releases), name them:
+
+```sh
+NERVE_CENTER_BIN=/path/to/nerve-center NERVE_NODE_BIN=/path/to/nerve-node \
+  cargo test -p nerve-conformance
+```
+
 ## Static Linux binaries
 
 Needs the musl target and clang:

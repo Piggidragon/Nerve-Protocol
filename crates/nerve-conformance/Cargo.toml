@@ -1,6 +1,6 @@
 [package]
 name = "nerve-conformance"
-description = "Conformance runner of the Nerve Protocol: center part, node part, echo node; harness part is a skeleton."
+description = "Conformance runner of the Nerve Protocol: center part, node part, harness part, echo node."
 version.workspace = true
 edition.workspace = true
 repository.workspace = true

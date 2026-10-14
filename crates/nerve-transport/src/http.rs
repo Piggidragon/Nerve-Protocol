@@ -134,28 +134,7 @@ pub async fn read_request<R: AsyncRead + Unpin>(
     let (head, mut rest) = tokio::time::timeout(HEAD_TIMEOUT, read_head(io))
         .await
         .map_err(|_| "timed out waiting for the HTTP request".to_string())??;
-    let mut headers = [httparse::EMPTY_HEADER; 64];
-    let mut req = httparse::Request::new(&mut headers);
-    match req.parse(&head) {
-        Ok(httparse::Status::Complete(_)) => {}
-        _ => return Err("malformed HTTP request".into()),
-    }
-    let target = req.path.unwrap_or("/");
-    let (path, query) = target.split_once('?').unwrap_or((target, ""));
-    let mut map = BTreeMap::new();
-    for h in req.headers.iter() {
-        map.insert(
-            h.name.to_ascii_lowercase(),
-            String::from_utf8_lossy(h.value).trim().to_string(),
-        );
-    }
-    let mut out = Request {
-        method: req.method.unwrap_or("").to_string(),
-        path: path.to_string(),
-        query: query.to_string(),
-        headers: map,
-        body: Vec::new(),
-    };
+    let mut out = parse_head(&head)?;
     if out.header("transfer-encoding").is_some() {
         return Err("chunked request bodies are not supported".into());
     }
@@ -183,6 +162,57 @@ pub async fn read_request<R: AsyncRead + Unpin>(
     }
     out.body = body;
     Ok(out)
+}
+
+/// Reads one request head a byte at a time, so that nothing past its blank
+/// line is taken: what follows a `CONNECT` belongs to the tunnel. Reads no
+/// body.
+pub async fn read_request_head<R: AsyncRead + Unpin>(io: &mut R) -> Result<Request, String> {
+    let read = async {
+        let mut head = Vec::with_capacity(512);
+        let mut b = [0u8; 1];
+        while !head.ends_with(b"\r\n\r\n") {
+            if head.len() > HEAD_BYTES {
+                return Err("HTTP head over 16 KiB".to_string());
+            }
+            let n = io.read(&mut b).await.map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Err("connection closed before the HTTP head ended".to_string());
+            }
+            head.push(b[0]);
+        }
+        Ok(head)
+    };
+    let head = tokio::time::timeout(HEAD_TIMEOUT, read)
+        .await
+        .map_err(|_| "timed out waiting for the HTTP request".to_string())??;
+    parse_head(&head)
+}
+
+/// A request head as [`Request`], with no body yet.
+fn parse_head(head: &[u8]) -> Result<Request, String> {
+    let mut headers = [httparse::EMPTY_HEADER; 64];
+    let mut req = httparse::Request::new(&mut headers);
+    match req.parse(head) {
+        Ok(httparse::Status::Complete(_)) => {}
+        _ => return Err("malformed HTTP request".into()),
+    }
+    let target = req.path.unwrap_or("/");
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    let mut map = BTreeMap::new();
+    for h in req.headers.iter() {
+        map.insert(
+            h.name.to_ascii_lowercase(),
+            String::from_utf8_lossy(h.value).trim().to_string(),
+        );
+    }
+    Ok(Request {
+        method: req.method.unwrap_or("").to_string(),
+        path: path.to_string(),
+        query: query.to_string(),
+        headers: map,
+        body: Vec::new(),
+    })
 }
 
 /// A response to write.
@@ -242,10 +272,12 @@ pub fn reason(status: u16) -> &'static str {
         403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        407 => "Proxy Authentication Required",
         409 => "Conflict",
         413 => "Payload Too Large",
         429 => "Too Many Requests",
         500 => "Internal Server Error",
+        502 => "Bad Gateway",
         503 => "Service Unavailable",
         _ => "Status",
     }
@@ -413,6 +445,28 @@ mod tests {
         let resp = client.await.unwrap();
         assert_eq!(resp.status, 201);
         assert_eq!(resp.body, br#"{"ok":true}"#);
+    }
+
+    /// A head read alone leaves what follows it in the stream: the bytes
+    /// after a `CONNECT` are the tunnel's.
+    #[tokio::test]
+    async fn a_head_read_alone_takes_nothing_past_it() {
+        let (mut a, mut b) = tokio::io::duplex(4096);
+        a.write_all(
+            b"CONNECT c.example:443 HTTP/1.1\r\nHost: c.example:443\r\nProxy-Authorization: Basic eA==\r\n\r\ntunnel",
+        )
+        .await
+        .unwrap();
+        let req = read_request_head(&mut b).await.unwrap();
+        assert_eq!(req.method, "CONNECT");
+        assert_eq!(req.path, "c.example:443");
+        assert_eq!(req.header("proxy-authorization"), Some("Basic eA=="));
+        let mut rest = [0u8; 6];
+        b.read_exact(&mut rest).await.unwrap();
+        assert_eq!(&rest, b"tunnel");
+        a.write_all(b"GET / HTTP/1.1\r\n").await.unwrap();
+        drop(a);
+        assert!(read_request_head(&mut b).await.is_err());
     }
 
     #[tokio::test]

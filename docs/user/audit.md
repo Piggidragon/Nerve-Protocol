@@ -31,6 +31,14 @@ of a center. The log holds the old and the new value of each setting.
 with the steps that were done and the error that stopped the rest, if any
 ([service](service.md)).
 
+A tunnel of the [relay](relay.md) is one line when it ends: who, from where,
+to which center, why it ended, how long it lasted and how much it carried.
+It never holds a token.
+
+```
+1791834106607  relay  lab-pc from 10.0.0.7:51544 to center home: cut off by the owner after 2 h 5 min (81234 bytes up, 90211 down)
+```
+
 ## What the log holds
 
 - Targets: paths and command lines, cut at 512 characters.

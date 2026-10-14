@@ -220,28 +220,31 @@ fn owner_verdict(owner: Option<u32>, me: u32, peer: SocketAddr) -> Result<(), St
 
 /// An HTTP proxy the node reaches centers through with `CONNECT`
 /// (docs/dev/spec/protocol.md §4.7). The tunnel only carries bytes: TLS to the center
-/// runs inside it, pinned as without a proxy.
+/// runs inside it, pinned as without a proxy. An `https://` proxy, a relay
+/// (§4.8) above all, is reached over TLS of its own, checked against `pin`
+/// (else the system's roots), and the `CONNECT` runs inside that.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Proxy {
     pub host: String,
     pub port: u16,
+    /// `https://`: the `CONNECT` goes over TLS to the proxy.
+    pub tls: bool,
+    /// The pin of the proxy's certificate, as a center's pin (§2.1).
+    pub pin: Option<String>,
     /// Extra header lines for the `CONNECT` request (`Proxy-Authorization`, ...).
     pub headers: Vec<(String, String)>,
 }
 
 impl Proxy {
-    /// `http://host:port` (an `https://` proxy is not supported).
-    /// A URL with a user name and password is refused without echoing it,
-    /// since the error ends up in status lines and logs; `nerve-node proxy
-    /// set` takes them out and keeps them in the system keyring.
+    /// `http://host:port` or `https://host:port`. A URL with a user name and
+    /// password is refused without echoing it, since the error ends up in
+    /// status lines and logs; `nerve-node proxy set` takes them out and
+    /// keeps them as secrets.
     pub fn parse(s: &str, headers: Vec<(String, String)>) -> Result<Proxy, String> {
         if s.contains('@') {
             return Err("a proxy URL here holds no user name or password".into());
         }
         let u = CenterUrl::parse(s).map_err(|e| e.replace("center URL", "proxy URL"))?;
-        if u.tls {
-            return Err("an https:// proxy is not supported; use http://host:port".into());
-        }
         if !u.base.is_empty() {
             return Err("a proxy URL has no path".into());
         }
@@ -256,8 +259,23 @@ impl Proxy {
         Ok(Proxy {
             host: u.host,
             port: u.port,
+            tls: u.tls,
+            pin: None,
             headers,
         })
+    }
+
+    /// The proxy with the pin of its certificate; only an `https://` proxy
+    /// has one.
+    pub fn pinned(mut self, pin: Option<String>) -> Result<Proxy, String> {
+        if let Some(p) = &pin {
+            if !self.tls {
+                return Err("a proxy pin is for an https:// proxy".into());
+            }
+            crate::tls::decode_pin(p).map_err(|e| format!("bad proxy pin: {e}"))?;
+        }
+        self.pin = pin;
+        Ok(self)
     }
 
     /// The proxy from `HTTPS_PROXY` (or `https_proxy`) for `host`, unless
@@ -302,30 +320,99 @@ pub fn no_proxy(list: &str, host: &str) -> bool {
         })
 }
 
-async fn dial(host: &str, port: u16, addrs: Vec<SocketAddr>) -> Result<TcpStream, String> {
+async fn dial(
+    host: &str,
+    port: u16,
+    addrs: Vec<SocketAddr>,
+    until: Option<tokio::time::Instant>,
+) -> Result<TcpStream, String> {
+    let s = connect_first(addrs, until, TcpStream::connect)
+        .await
+        .map_err(|last| format!("cannot connect to {host}:{port}: {last}"))?;
+    let _ = s.set_nodelay(true);
+    Ok(s)
+}
+
+/// Tries `addrs` in turn until `connect` reaches one. Without `until` each
+/// try has [`CONNECT_TIMEOUT`]. With it, each try has the time left divided
+/// by the addresses left, so a first address that does not answer leaves
+/// time for the next: a name with an AAAA record whose path drops packets
+/// still reaches its A record before `until`. The error is the last try's.
+pub async fn connect_first<T, F, Fut>(
+    addrs: Vec<SocketAddr>,
+    until: Option<tokio::time::Instant>,
+    connect: F,
+) -> Result<T, String>
+where
+    F: Fn(SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
     let mut last = String::from("no address");
-    for a in addrs {
-        match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(a)).await {
-            Ok(Ok(s)) => {
-                let _ = s.set_nodelay(true);
-                return Ok(s);
+    let n = addrs.len();
+    for (i, a) in addrs.into_iter().enumerate() {
+        let each = match until {
+            None => CONNECT_TIMEOUT,
+            Some(u) => {
+                let left = u.saturating_duration_since(tokio::time::Instant::now());
+                if left.is_zero() {
+                    if i == 0 {
+                        last = "no time left to connect".into();
+                    }
+                    break;
+                }
+                left / (n - i) as u32
             }
+        };
+        match tokio::time::timeout(each, connect(a)).await {
+            Ok(Ok(s)) => return Ok(s),
             Ok(Err(e)) => last = format!("{a}: {e}"),
             Err(_) => last = format!("{a}: timed out"),
         }
     }
-    Err(format!("cannot connect to {host}:{port}: {last}"))
+    Err(last)
 }
 
-/// Opens a `CONNECT` tunnel to `host:port` through `proxy`. Fails closed: a
-/// proxy that refuses or answers oddly is an error, never a direct connection.
-async fn tunnel(proxy: &Proxy, host: &str, port: u16) -> Result<TcpStream, String> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+/// Opens a `CONNECT` tunnel to `host:port` through `proxy`, over TLS to an
+/// `https://` proxy. Fails closed: a proxy that refuses or answers oddly is
+/// an error, never a direct connection.
+async fn tunnel(
+    proxy: &Proxy,
+    host: &str,
+    port: u16,
+    until: Option<tokio::time::Instant>,
+) -> Result<BoxIo, String> {
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((proxy.host.as_str(), proxy.port))
         .await
         .map_err(|e| format!("cannot resolve the proxy {}: {e}", proxy.host))?
         .collect();
-    let mut tcp = dial(&proxy.host, proxy.port, addrs).await?;
+    let tcp = dial(&proxy.host, proxy.port, addrs, until).await?;
+    let mut io: BoxIo = if proxy.tls {
+        let config = crate::tls::client_config(proxy.pin.as_deref())?;
+        let name = ServerName::try_from(proxy.host.clone())
+            .map_err(|_| format!("bad TLS server name {}", proxy.host))?;
+        let tls = tokio::time::timeout(
+            CONNECT_TIMEOUT,
+            TlsConnector::from(config).connect(name, tcp),
+        )
+        .await
+        .map_err(|_| {
+            format!(
+                "TLS handshake with the proxy {}:{} timed out",
+                proxy.host, proxy.port
+            )
+        })?
+        .map_err(|e| proxy_tls_error(proxy, &e))?;
+        Box::new(tls)
+    } else {
+        Box::new(tcp)
+    };
+    ask_connect(&mut io, proxy, host, port).await?;
+    Ok(io)
+}
+
+/// The `CONNECT` request and its answer on `io`.
+async fn ask_connect(io: &mut BoxIo, proxy: &Proxy, host: &str, port: u16) -> Result<(), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let target = if host.contains(':') {
         format!("[{host}]:{port}")
     } else {
@@ -336,9 +423,10 @@ async fn tunnel(proxy: &Proxy, host: &str, port: u16) -> Result<TcpStream, Strin
         req.push_str(&format!("{k}: {v}\r\n"));
     }
     req.push_str("\r\n");
-    tcp.write_all(req.as_bytes())
+    io.write_all(req.as_bytes())
         .await
         .map_err(|e| format!("proxy: {e}"))?;
+    io.flush().await.map_err(|e| format!("proxy: {e}"))?;
     // Read the answer byte by byte up to its blank line, so nothing of the
     // tunnelled stream is consumed.
     let mut head = Vec::new();
@@ -348,7 +436,7 @@ async fn tunnel(proxy: &Proxy, host: &str, port: u16) -> Result<TcpStream, Strin
             if head.len() > 8192 {
                 return Err("proxy answer header over 8 KiB".to_string());
             }
-            let n = tcp.read(&mut b).await.map_err(|e| format!("proxy: {e}"))?;
+            let n = io.read(&mut b).await.map_err(|e| format!("proxy: {e}"))?;
             if n == 0 {
                 return Err("the proxy closed the connection".to_string());
             }
@@ -363,7 +451,7 @@ async fn tunnel(proxy: &Proxy, host: &str, port: u16) -> Result<TcpStream, Strin
     let mut resp = httparse::Response::new(&mut headers);
     match resp.parse(&head) {
         Ok(httparse::Status::Complete(_)) if resp.code.is_some_and(|c| (200..300).contains(&c)) => {
-            Ok(tcp)
+            Ok(())
         }
         Ok(httparse::Status::Complete(_)) => Err(format!(
             "the proxy refused the tunnel to {target}: {} {}",
@@ -374,6 +462,58 @@ async fn tunnel(proxy: &Proxy, host: &str, port: u16) -> Result<TcpStream, Strin
     }
 }
 
+/// A refused certificate of an `https://` proxy, in words.
+fn proxy_tls_error(proxy: &Proxy, e: &std::io::Error) -> String {
+    let refused = e
+        .get_ref()
+        .and_then(|i| i.downcast_ref::<rustls::Error>())
+        .is_some_and(|r| matches!(r, rustls::Error::InvalidCertificate(_)));
+    let at = format!("{}:{}", proxy.host, proxy.port);
+    match (refused, proxy.pin.is_some()) {
+        (true, true) => format!(
+            "TLS with the proxy {at}: its certificate does not carry the pinned key; if it is a relay, `nerve-node relay ls` there shows its pin"
+        ),
+        (true, false) => format!(
+            "TLS with the proxy {at}: its certificate is not one this machine trusts; give its pin with `nerve-node proxy set <url> --pin <pin>`"
+        ),
+        _ => format!("TLS with the proxy {at}: {e}"),
+    }
+}
+
+/// The connection under a link to `url`: through `proxy` for a TLS center,
+/// else straight to the addresses [`usable_addrs`] lets it use. A relay
+/// (docs/dev/spec/protocol.md §4.8) dials its centers this way too, so a relay
+/// behind a proxy or another relay goes on through it.
+pub async fn reach(url: &CenterUrl, proxy: Option<&Proxy>) -> Result<BoxIo, String> {
+    reach_until(url, proxy, None).await
+}
+
+/// [`reach`] with every address it tries fitted into `until`
+/// ([`connect_first`]): the relay, which must answer its node in time.
+pub async fn reach_until(
+    url: &CenterUrl,
+    proxy: Option<&Proxy>,
+    until: Option<tokio::time::Instant>,
+) -> Result<BoxIo, String> {
+    match proxy.filter(|_| url.tls) {
+        Some(p) => tunnel(p, &url.host, url.port, until).await,
+        None => Ok(Box::new(direct(url, until).await?)),
+    }
+}
+
+/// A TCP connection straight to `url`.
+async fn direct(url: &CenterUrl, until: Option<tokio::time::Instant>) -> Result<TcpStream, String> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((url.host.as_str(), url.port))
+        .await
+        .map_err(|e| format!("cannot resolve {}: {e}", url.host))?
+        .collect();
+    let named = url.host.parse::<std::net::IpAddr>().is_err();
+    let addrs = usable_addrs(url.tls, named, addrs)?;
+    dial(&url.host, url.port, addrs, until)
+        .await
+        .map_err(|e| format!("{url}: {e}"))
+}
+
 /// Opens a connection to the center: TLS (pinned when `pin` is set), or plain
 /// TCP to a center on this machine. `proxy` is used for TLS centers only; a
 /// loopback center is never reached through one.
@@ -382,25 +522,13 @@ pub async fn open(
     pin: Option<&str>,
     proxy: Option<&Proxy>,
 ) -> Result<BoxIo, String> {
-    let tcp = match proxy.filter(|_| url.tls) {
-        Some(p) => tunnel(p, &url.host, url.port).await?,
-        None => {
-            let addrs: Vec<SocketAddr> = tokio::net::lookup_host((url.host.as_str(), url.port))
-                .await
-                .map_err(|e| format!("cannot resolve {}: {e}", url.host))?
-                .collect();
-            let named = url.host.parse::<std::net::IpAddr>().is_err();
-            let addrs = usable_addrs(url.tls, named, addrs)?;
-            dial(&url.host, url.port, addrs)
-                .await
-                .map_err(|e| format!("{url}: {e}"))?
-        }
-    };
     if !url.tls {
+        let tcp = direct(url, None).await?;
         #[cfg(target_os = "linux")]
         check_local_peer(&tcp)?;
         return Ok(Box::new(tcp));
     }
+    let tcp = reach(url, proxy).await?;
     let config = crate::tls::client_config(pin)?;
     let name = ServerName::try_from(url.host.clone())
         .map_err(|_| format!("bad TLS server name {}", url.host))?;
@@ -748,6 +876,34 @@ mod tests {
         }
     }
 
+    /// Within a deadline every address gets its share: a first one that
+    /// never answers leaves time for the next, which is reached before the
+    /// deadline.
+    #[tokio::test]
+    async fn every_address_gets_a_share_of_the_deadline() {
+        let (dead, live) = (a("[2001:db8::1]:443"), a("192.0.2.1:443"));
+        let connect = |addr: SocketAddr| async move {
+            if addr == dead {
+                std::future::pending::<()>().await;
+            }
+            Ok::<SocketAddr, std::io::Error>(addr)
+        };
+        let started = tokio::time::Instant::now();
+        let until = started + Duration::from_millis(1200);
+        let got = connect_first(vec![dead, live], Some(until), connect).await;
+        assert_eq!(got, Ok(live));
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(500) && took < Duration::from_millis(1200),
+            "{took:?}"
+        );
+        // All of them dead: an error by the deadline, naming the last.
+        let until = tokio::time::Instant::now() + Duration::from_millis(600);
+        let both = connect_first(vec![dead, dead], Some(until), connect).await;
+        assert!(both.unwrap_err().contains("timed out"));
+        assert!(tokio::time::Instant::now() < until + Duration::from_millis(300));
+    }
+
     #[test]
     fn no_proxy_lists() {
         assert!(no_proxy("*", "a"));
@@ -763,13 +919,71 @@ mod tests {
             Proxy::parse("http://p.example:3128", vec![]).unwrap().port,
             3128
         );
-        assert!(Proxy::parse("https://p.example", vec![]).is_err());
+        let tls = Proxy::parse("https://p.example:7490", vec![]).unwrap();
+        assert!(tls.tls);
+        assert!(tls.clone().pinned(Some("A".repeat(43))).is_ok());
+        assert!(tls.pinned(Some("short".into())).is_err());
+        let plain = Proxy::parse("http://p.example:3128", vec![]).unwrap();
+        assert!(plain.pinned(Some("A".repeat(43))).is_err());
         assert!(Proxy::parse("http://p.example/x", vec![]).is_err());
         assert!(Proxy::parse("http://p", vec![("A".into(), "b\r\nX: y".into())]).is_err());
         assert!(Proxy::parse("http://p", vec![("A B".into(), "b".into())]).is_err());
         // A user name and password are refused without being echoed.
         let e = Proxy::parse("http://u:hunter2@p.example:3128", vec![]).unwrap_err();
         assert!(!e.contains("hunter2"), "{e}");
+    }
+
+    /// An https:// proxy is reached over TLS checked against its pin, and the
+    /// CONNECT with its headers travels inside that TLS; a wrong pin sends
+    /// nothing.
+    #[tokio::test]
+    async fn an_https_proxy_takes_the_connect_inside_pinned_tls() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        crate::init_crypto();
+        let id = crate::tls::ServerIdentity::generate(&["127.0.0.1".into()]).unwrap();
+        let acceptor = crate::tls::Acceptor::new(&id).unwrap();
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = l.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (tcp, _) = l.accept().await.unwrap();
+            let mut s = acceptor.accept(tcp).await.unwrap();
+            let req = crate::http::read_request_head(&mut s).await.unwrap();
+            assert_eq!(
+                (req.method.as_str(), req.path.as_str()),
+                ("CONNECT", "c.example:443")
+            );
+            assert_eq!(req.header("proxy-authorization"), Some("Basic x"));
+            s.write_all(b"HTTP/1.1 200 Connection established\r\n\r\ntunnelled")
+                .await
+                .unwrap();
+            s.flush().await.unwrap();
+            // A client with the wrong pin ends the handshake.
+            let (tcp, _) = l.accept().await.unwrap();
+            assert!(acceptor.accept(tcp).await.is_err());
+        });
+        let p = Proxy::parse(
+            &format!("https://127.0.0.1:{port}"),
+            vec![("Proxy-Authorization".into(), "Basic x".into())],
+        )
+        .unwrap();
+        let mut t = tunnel(
+            &p.clone().pinned(Some(id.pin())).unwrap(),
+            "c.example",
+            443,
+            None,
+        )
+        .await
+        .unwrap();
+        let mut got = [0u8; 9];
+        t.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got, b"tunnelled");
+        let other = crate::tls::ServerIdentity::generate(&[]).unwrap().pin();
+        let e = tunnel(&p.pinned(Some(other)).unwrap(), "c.example", 443, None)
+            .await
+            .err()
+            .unwrap();
+        assert!(e.contains("does not carry the pinned key"), "{e}");
+        server.await.unwrap();
     }
 
     /// A proxy that grants the tunnel carries bytes; one that refuses fails
@@ -799,11 +1013,11 @@ mod tests {
             vec![("Proxy-Authorization".into(), "Basic x".into())],
         )
         .unwrap();
-        let mut t = tunnel(&p, "c.example", 443).await.unwrap();
+        let mut t = tunnel(&p, "c.example", 443, None).await.unwrap();
         let mut got = [0u8; 9];
         t.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, b"tunnelled");
-        let e = tunnel(&p, "c.example", 443).await.unwrap_err();
+        let e = tunnel(&p, "c.example", 443, None).await.err().unwrap();
         assert!(e.contains("407"), "{e}");
         server.await.unwrap();
     }

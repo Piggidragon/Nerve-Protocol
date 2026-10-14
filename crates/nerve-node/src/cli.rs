@@ -313,7 +313,7 @@ pub enum ConfigCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum ProxyCmd {
-    /// Reach centers through an HTTP proxy. Header values and a password are kept in the system keyring, never in node.toml.
+    /// Reach centers through an HTTP proxy. Header values and a password are kept in the system keyring, never in node.toml; the installed node on Windows takes neither.
     Set {
         /// The proxy, http://host:port, or http://user:password@host:port when it wants a login.
         url: String,
@@ -2262,8 +2262,9 @@ fn keyring_turns_commands_off(
 
 /// `proxy set|rm|ls`. The header values, and a user name and password given
 /// in the URL, go into the system keyring ([`crate::secrets`]); `node.toml`
-/// keeps the URL without them and the header names. Nothing here prints,
-/// logs or audits a value.
+/// keeps the URL without them and the header names. The installed node on
+/// Windows refuses them, as the service does not read the keyring of the
+/// account that runs this. Nothing here prints, logs or audits a value.
 async fn proxy_cmd(paths: &NodePaths, c: ProxyCmd, out: &mut dyn Write) -> Result<(), String> {
     match c {
         ProxyCmd::Set { url, headers } => {
@@ -3745,6 +3746,91 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The installed node on Windows runs as `nerve`, whose Credential
+    /// Manager is not the administrator's that `proxy set` writes to. So
+    /// a header or a password is refused, with the keyring left alone and
+    /// nothing changed; a proxy that needs neither works, and its call
+    /// takes an entry left by an earlier `proxy set` away.
+    #[test]
+    fn on_the_installed_node_on_windows_proxy_set_refuses_header_values_and_a_password() {
+        let (_d, paths) = setup(&["home"]);
+        // Set as an administrator before the node was installed.
+        run(
+            &paths,
+            &[
+                "proxy",
+                "set",
+                "http://127.0.0.1:3128",
+                "--header",
+                "X-Old: o1d-value",
+            ],
+        )
+        .unwrap();
+        crate::secrets::for_tests::pretend_windows_service(&paths);
+        let before = std::fs::read_to_string(paths.config_file()).unwrap();
+        let held = keyring_entry(&paths);
+        assert!(held.is_some());
+        let asked = crate::secrets::store::calls();
+        for args in [
+            &[
+                "proxy",
+                "set",
+                "http://127.0.0.1:3129",
+                "--header",
+                "X-Key: s3cret-value",
+            ][..],
+            &["proxy", "set", "http://alice:pa55w0rd@127.0.0.1:3129"],
+        ] {
+            let e = run(&paths, args).unwrap_err();
+            assert!(
+                e.contains(
+                    "go to the Credential Manager of the account that runs it, not to that of nerve"
+                ),
+                "{e}"
+            );
+            assert!(e.contains("nothing was changed"), "{e}");
+            assert!(e.contains("`nerve-node proxy set <url>`"), "{e}");
+            assert!(!e.contains("s3cret") && !e.contains("pa55w0rd"), "{e}");
+            assert!(!e.contains("alice"), "{e}");
+        }
+        // The keyring was not asked, and node.toml and the old entry stayed.
+        assert_eq!(crate::secrets::store::calls(), asked);
+        assert_eq!(
+            std::fs::read_to_string(paths.config_file()).unwrap(),
+            before
+        );
+        assert_eq!(keyring_entry(&paths), held);
+
+        // The entry an administrator's keyring holds is not what the service
+        // reads, so `proxy ls` does not call it good.
+        let ls = run(&paths, &["proxy", "ls"]).unwrap();
+        assert!(ls.contains("header X-Old\n"), "{ls}");
+        assert!(!ls.contains("its value is in the system keyring"), "{ls}");
+        assert!(ls.contains("the link cannot use this proxy"), "{ls}");
+        assert!(ls.contains("the service does not find them"), "{ls}");
+        assert!(!ls.contains("o1d-value"), "{ls}");
+
+        // A proxy that needs neither works, and takes the old entry away.
+        let next = format!("the change is in node.toml; it {NEXT_START}\n");
+        let out = run(&paths, &["proxy", "set", "http://127.0.0.1:3129"]).unwrap();
+        assert_eq!(out, format!("proxy http://127.0.0.1:3129\n{next}"));
+        let cfg = load(&paths);
+        assert_eq!(
+            cfg.connection.proxy.as_deref(),
+            Some("http://127.0.0.1:3129")
+        );
+        assert!(cfg.connection.headers.is_empty());
+        assert_eq!(keyring_entry(&paths), None);
+        assert_eq!(
+            run(&paths, &["proxy", "ls"]).unwrap(),
+            "proxy http://127.0.0.1:3129\n"
+        );
+        assert_eq!(
+            run(&paths, &["proxy", "rm"]).unwrap(),
+            format!("no proxy\n{next}")
+        );
     }
 
     fn files_below(dir: &Path) -> Vec<PathBuf> {

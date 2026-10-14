@@ -530,6 +530,16 @@ pub struct Daemon {
     _keys: crate::secrets::KeysLock,
 }
 
+/// Whether a node runs on the control socket. One that takes no connection
+/// now (its queue is full) runs all the same. A socket that cannot be
+/// reached at all says neither way: its error comes back as the start's.
+#[cfg(unix)]
+async fn node_runs(paths: &NodePaths) -> Result<bool, String> {
+    let outcome = nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await;
+    nerve_transport::ctl::node_is_there(&outcome)
+        .map_err(|e| format!("cannot tell whether a node runs for this state directory: {e}"))
+}
+
 impl Daemon {
     /// Starts the daemon: loads the config, serves the control socket, dials
     /// every center that is not paused, revoked or unknown.
@@ -575,11 +585,7 @@ impl Daemon {
             Some(l) => l,
             None => {
                 #[cfg(unix)]
-                if opts.ctl
-                    && nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({}))
-                        .await
-                        .is_ok()
-                {
+                if opts.ctl && node_runs(&paths).await? {
                     return Err("a node daemon already runs for this state directory".into());
                 }
                 // A command that moves the keys holds it for a moment.
@@ -621,11 +627,7 @@ impl Daemon {
             tracing::warn!("{warning}");
         }
         #[cfg(unix)]
-        if opts.ctl
-            && nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({}))
-                .await
-                .is_ok()
-        {
+        if opts.ctl && node_runs(&paths).await? {
             return Err("a node daemon already runs for this state directory".into());
         }
         let (changed, _) = watch::channel(0);
@@ -793,7 +795,9 @@ async fn supervise(shared: Arc<Shared>) {
             granted = Some(cfg.version);
             let (s, c) = (shared.clone(), cfg.clone());
             tokio::task::spawn_blocking(move || {
-                let synced = crate::grants::apply(&s.paths, &c, &s.rules_home(&c));
+                let synced = crate::grants::apply(&s.paths, &c, &s.rules_home(&c), &mut |m| {
+                    tracing::info!("folder grants: {m}")
+                });
                 for e in synced.errors {
                     tracing::warn!("folder grants: {e}");
                 }

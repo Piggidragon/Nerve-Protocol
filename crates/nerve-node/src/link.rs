@@ -1336,9 +1336,15 @@ impl Link {
         home: &std::path::Path,
     ) -> Result<nerve_sandbox::ContainerSpec, RpcError> {
         let (paths, cfg, home) = (self.shared.paths.clone(), cfg.clone(), home.to_path_buf());
-        let synced = tokio::task::spawn_blocking(move || crate::grants::apply(&paths, &cfg, &home))
-            .await
-            .map_err(|e| RpcError::internal(e.to_string()))?;
+        // A change that takes long holds the command; the log says how far
+        // it is.
+        let synced = tokio::task::spawn_blocking(move || {
+            crate::grants::apply(&paths, &cfg, &home, &mut |m| {
+                tracing::info!("folder grants: {m}")
+            })
+        })
+        .await
+        .map_err(|e| RpcError::internal(e.to_string()))?;
         for e in &synced.errors {
             tracing::warn!("folder grants: {e}");
         }
@@ -1539,6 +1545,31 @@ mod tests {
         assert!(status.contains(&entry), "{status}");
         assert!(status.contains("proxy set"), "{status}");
         // Fail closed: neither the proxy nor the center was dialled.
+        let quiet = Duration::from_millis(300);
+        assert!(tokio::time::timeout(quiet, proxy.accept()).await.is_err());
+        assert!(tokio::time::timeout(quiet, center.accept()).await.is_err());
+        daemon.stop().await;
+    }
+
+    /// The installed node on Windows runs as `nerve`: a value an
+    /// administrator's `proxy set` left in the Credential Manager is not
+    /// found by the service, so the status says why, and neither the proxy
+    /// nor the center is dialled.
+    #[tokio::test]
+    async fn on_the_installed_node_on_windows_header_values_stop_the_link_and_say_why() {
+        let (d, paths, center, proxy) = behind_a_proxy().await;
+        let headers = [("X-Key".to_string(), "s3cret-value".to_string())];
+        crate::secrets::store_proxy_headers(&paths, &headers).unwrap();
+        crate::secrets::for_tests::pretend_windows_service(&paths);
+        let daemon = start(&d, &paths).await;
+        let status = settled_status(&daemon).await;
+        assert!(status.starts_with("bad proxy: "), "{status}");
+        assert!(
+            status.contains("not to that of nerve")
+                && status.contains("`nerve-node proxy set <url>`"),
+            "{status}"
+        );
+        assert!(!status.contains("s3cret"), "{status}");
         let quiet = Duration::from_millis(300);
         assert!(tokio::time::timeout(quiet, proxy.accept()).await.is_err());
         assert!(tokio::time::timeout(quiet, center.accept()).await.is_err());

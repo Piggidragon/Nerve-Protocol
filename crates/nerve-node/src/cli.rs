@@ -313,7 +313,7 @@ pub enum ConfigCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum ProxyCmd {
-    /// Reach centers through an HTTP proxy. Header values and a password are kept in the system keyring, never in node.toml.
+    /// Reach centers through an HTTP proxy. Header values and a password are kept in the system keyring, never in node.toml; the installed node on Windows takes neither.
     Set {
         /// The proxy, http://host:port, or http://user:password@host:port when it wants a login.
         url: String,
@@ -666,25 +666,37 @@ pub async fn edit_saved(
     f: impl Fn(&mut NodeConfig) -> Result<(), String>,
 ) -> Result<Saved, String> {
     #[cfg(unix)]
-    for _ in 0..5 {
+    {
         let sock = paths.ctl_socket();
-        let read = match nerve_transport::ctl::call(&sock, "config.read", json!({})).await {
-            Ok(v) => v,
-            Err(e) if e == nerve_transport::ctl::NOT_RUNNING => break,
-            Err(e) => return Err(e),
-        };
-        let mut cfg = NodeConfig::parse(read["config"].as_str().unwrap_or_default())?;
-        f(&mut cfg)?;
-        let params = json!({"config": cfg.to_toml(), "if_version": read["version"]});
-        match nerve_transport::ctl::call(&sock, "config.write", params).await {
-            Ok(_) => {
-                return Ok(Saved {
-                    cfg,
-                    grants: Default::default(),
-                });
+        let mut conflicts = 0;
+        loop {
+            let read = match nerve_transport::ctl::call(&sock, "config.read", json!({})).await {
+                Ok(v) => v,
+                // Only a node that is not there leaves the file to the CLI.
+                Err(e) if e == nerve_transport::ctl::NOT_RUNNING => break,
+                Err(e) => return Err(e),
+            };
+            let mut cfg = NodeConfig::parse(read["config"].as_str().unwrap_or_default())?;
+            f(&mut cfg)?;
+            let params = json!({"config": cfg.to_toml(), "if_version": read["version"]});
+            match nerve_transport::ctl::call(&sock, "config.write", params).await {
+                Ok(_) => {
+                    return Ok(Saved {
+                        cfg,
+                        grants: Default::default(),
+                    });
+                }
+                Err(e) if e.starts_with("conflict") => {
+                    conflicts += 1;
+                    // A node that answered has the file: writing it here
+                    // would be undone by its next write, and the change
+                    // reported as made.
+                    if conflicts == 5 {
+                        return Err("the config keeps changing; try again".into());
+                    }
+                }
+                Err(e) => return Err(e),
             }
-            Err(e) if e.starts_with("conflict") => continue,
-            Err(e) => return Err(e),
         }
     }
     let mut store = SettingsStore::open_with(
@@ -698,8 +710,11 @@ pub async fn edit_saved(
             // No daemon took the change, so the folder grants of Windows
             // folder mode follow it here (crate::grants); a running node
             // brings them in line with its own config again before a
-            // command.
-            let grants = crate::grants::apply_outside(paths, &cfg, &crate::paths::home_dir());
+            // command. A change that takes long says how far it is here.
+            let grants =
+                crate::grants::apply_outside(paths, &cfg, &crate::paths::home_dir(), &mut |m| {
+                    eprintln!("{m}")
+                });
             Ok(Saved { cfg, grants })
         }
         Err(SetError::Conflict { .. }) => Err("the config changed meanwhile; try again".into()),
@@ -821,10 +836,31 @@ impl List {
         }
     }
 
-    /// The entry a command line stands for. The allow and deny lists hold
-    /// `exec.run` rules; the sudo list holds the sudo command lines, and takes
-    /// the command with or without the `sudo` in front.
+    /// The entry a command line stands for, for `rule add`: the same as
+    /// [`List::command_rule`], but a line in the pattern form of `config add`
+    /// (`fs.read:~/notes/*`, `fs:~/private/*`) is refused. As a command it
+    /// would become a rule that never matches. A single letter before the `:`
+    /// is a drive (`C:\tools\x.exe`), not a capability.
     fn entry(self, command: &str, wildcard: bool) -> Result<String, String> {
+        if matches!(self, List::Allow | List::Deny)
+            && let Some((scope, _)) = command.trim().split_once(':')
+            && (scope.contains('.') || scope.len() > 1)
+            && rules::valid_scope(scope)
+        {
+            return Err(format!(
+                "`{scope}:` is the pattern form for files and other actions, not a command: add it with `nerve-node config add center.<name>.policy.{}`",
+                self.word()
+            ));
+        }
+        self.command_rule(command, wildcard)
+    }
+
+    /// The rule a command line stands for. The allow and deny lists hold
+    /// `exec.run` rules; the sudo list holds the sudo command lines, and takes
+    /// the command with or without the `sudo` in front. `rule rm` uses it
+    /// as it is, so the rules an older `rule add` made from the pattern form
+    /// can be removed with the arguments that made them.
+    fn command_rule(self, command: &str, wildcard: bool) -> Result<String, String> {
         match self {
             List::Allow if sudo_command(command).is_some() => {
                 Err("a sudo command goes on the sudo list: `nerve-node rule add sudo`".into())
@@ -865,24 +901,37 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
             wildcard,
             center,
         } => {
+            let removed = std::sync::Mutex::new(String::new());
             let name = edit_center(paths, &center, |e| {
+                let name = e.name.clone();
                 let l = list.of(&mut e.policy);
                 // An entry copied from `ls` goes as it is, so rules for
-                // files and other actions can be removed too.
-                let rule = if l.contains(&command) {
-                    command.clone()
-                } else {
-                    list.entry(&command, wildcard)?
+                // files and other actions can be removed too. The arguments
+                // of `add` stand for the command rule they made.
+                let made = list.command_rule(&command, wildcard);
+                let rule = match made {
+                    Ok(made) if made != command && l.contains(&command) && l.contains(&made) => {
+                        return Err(format!(
+                            "both {command:?} and {made:?} are on the {}: remove {made:?} first with `nerve-node rule rm {word} '{made}' --center {center}`, and then {command:?} with `nerve-node rule rm {word} '{command}' --center {center}`",
+                            list.label(),
+                            word = list.word(),
+                            center = name
+                        ));
+                    }
+                    _ if l.contains(&command) => command.clone(),
+                    made => made?,
                 };
                 let before = l.len();
                 l.retain(|r| *r != rule);
                 if l.len() == before {
                     return Err(format!("{rule:?} is not on the {}", list.label()));
                 }
+                *removed.lock().unwrap() = rule;
                 Ok(())
             })
             .await?;
-            let _ = writeln!(out, "{name}: removed from the {}", list.label());
+            let removed = removed.into_inner().unwrap();
+            let _ = writeln!(out, "{name}: removed {removed:?} from the {}", list.label());
         }
         RuleCmd::Ls { list, center } => {
             let (cfg, _) = read_config(paths).await?;
@@ -1025,14 +1074,14 @@ async fn owner_check(paths: &[&NodePaths]) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether a daemon answers on the control socket; it then took every
-/// change at once.
+/// Whether a daemon runs on the control socket; it then took every change
+/// at once. One that takes no connection now runs all the same; a socket
+/// that cannot be reached at all is none.
 async fn daemon_answers(paths: &NodePaths) -> bool {
     #[cfg(unix)]
     {
-        nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({}))
-            .await
-            .is_ok()
+        let outcome = nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await;
+        nerve_transport::ctl::node_is_there(&outcome).unwrap_or(false)
     }
     #[cfg(not(unix))]
     {
@@ -1526,8 +1575,16 @@ async fn after_keyring_answers(
     out: &mut dyn Write,
 ) -> Result<(), String> {
     #[cfg(unix)]
-    if let Ok(status) = nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await {
-        return restart_for_keyring(&status, paths, machine, out);
+    match nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await {
+        Ok(status) => return restart_for_keyring(&status, paths, machine, out),
+        Err(e) if e == nerve_transport::ctl::NOT_RUNNING => {}
+        Err(e) => {
+            let _ = writeln!(
+                out,
+                "the running node was not asked whether it found a keyring ({e}); restart it if it did not"
+            );
+            return Ok(());
+        }
     }
     #[cfg(not(unix))]
     let _ = (paths, machine, out);
@@ -2292,11 +2349,22 @@ async fn config_cmd(paths: &NodePaths, c: ConfigCmd, out: &mut dyn Write) -> Res
 /// the kernel here and the account `cfg` runs commands as tell.
 async fn tell_folder_commands(paths: &NodePaths, cfg: &NodeConfig, out: &mut dyn Write) {
     #[cfg(unix)]
-    if let Ok(v) = nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await {
-        if v["folder_commands_off"] == crate::daemon::KEYRING_NOT_CONFINED {
-            let _ = writeln!(out, "{}", folder_commands_off());
+    match nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await {
+        Ok(v) => {
+            if v["folder_commands_off"] == crate::daemon::KEYRING_NOT_CONFINED {
+                let _ = writeln!(out, "{}", folder_commands_off());
+            }
+            return;
         }
-        return;
+        Err(e) if e == nerve_transport::ctl::NOT_RUNNING => {}
+        // The node that runs knows, and was not asked.
+        Err(e) => {
+            let _ = writeln!(
+                out,
+                "the running node was not asked whether folder mode still runs commands ({e}); `nerve-node status` shows it"
+            );
+            return;
+        }
     }
     if keyring_turns_commands_off(nerve_sandbox::Confinement::detect(), || {
         node_command_account(paths, cfg)
@@ -2356,8 +2424,9 @@ fn keyring_turns_commands_off(
 
 /// `proxy set|rm|ls`. The header values, and a user name and password given
 /// in the URL, go into the system keyring ([`crate::secrets`]); `node.toml`
-/// keeps the URL without them and the header names. Nothing here prints,
-/// logs or audits a value.
+/// keeps the URL without them and the header names. The installed node on
+/// Windows refuses them, as the service does not read the keyring of the
+/// account that runs this. Nothing here prints, logs or audits a value.
 async fn proxy_cmd(paths: &NodePaths, c: ProxyCmd, out: &mut dyn Write) -> Result<(), String> {
     match c {
         ProxyCmd::Set { url, headers } => {
@@ -3675,6 +3744,187 @@ mod tests {
         assert!(r.unwrap_err().contains("nerve://pair"));
     }
 
+    /// A control socket whose queue is full and that nothing accepts from: a
+    /// node that runs but takes no connection now. Dropped, the socket is
+    /// gone with it.
+    #[cfg(unix)]
+    struct BusyNode {
+        _listener: std::os::unix::net::UnixListener,
+        _queued: Vec<tokio::net::UnixStream>,
+    }
+
+    #[cfg(unix)]
+    impl BusyNode {
+        async fn start(paths: &NodePaths) -> BusyNode {
+            use std::os::unix::io::AsRawFd;
+            let sock = paths.ctl_socket();
+            std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+            let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            // SAFETY: listen on a socket this test owns; a backlog of one is
+            // full after a few connections, and nothing accepts them.
+            assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
+            let mut queued = vec![];
+            while let Ok(s) = tokio::net::UnixStream::connect(&sock).await {
+                queued.push(s);
+                assert!(queued.len() < 100, "the queue never filled");
+            }
+            BusyNode {
+                _listener: listener,
+                _queued: queued,
+            }
+        }
+
+        fn stop(self, paths: &NodePaths) {
+            drop(self);
+            std::fs::remove_file(paths.ctl_socket()).unwrap();
+        }
+    }
+
+    /// A node that runs but takes no connection now (its queue is full) is
+    /// not "not running": `panic` and `sudo off` must not write the file and
+    /// report the change as done while the node never got it.
+    #[cfg(unix)]
+    #[test]
+    fn a_busy_node_is_not_taken_for_none() {
+        let (_d, paths) = setup(&["home"]);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let node = rt.block_on(BusyNode::start(&paths));
+        let before = std::fs::read(paths.config_file()).unwrap();
+        let busy = nerve_transport::ctl::BUSY;
+        for args in [
+            &["panic"][..],
+            &["sudo", "off"],
+            &["rule", "add", "allow", "ls"],
+        ] {
+            let e = run(&paths, args).unwrap_err();
+            assert_eq!(e, busy, "{args:?}");
+        }
+        assert_eq!(std::fs::read(paths.config_file()).unwrap(), before);
+        assert!(!load(&paths).locked);
+        // Gone, the node is none, and the same commands go to the file.
+        node.stop(&paths);
+        run(&paths, &["panic"]).unwrap();
+        assert!(load(&paths).locked);
+    }
+
+    /// A node that answers but keeps refusing the write with a conflict (the
+    /// settings change under the CLI) is a node that did not get the change:
+    /// `panic` fails and the file stays as it is. Writing the file here
+    /// would be undone by the node's next write, with the change reported as
+    /// made.
+    #[cfg(unix)]
+    #[test]
+    fn a_node_that_always_answers_conflict_does_not_get_the_file_written() {
+        use nerve_transport::ctl::{Reply, serve};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (_d, paths) = setup(&["home"]);
+        let text = std::fs::read_to_string(paths.config_file()).unwrap();
+        let writes = std::sync::Arc::new(AtomicUsize::new(0));
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (sock, counted) = (paths.ctl_socket(), writes.clone());
+        rt.spawn(async move {
+            let _ = serve(&sock, move |req, _| {
+                let (text, counted) = (text.clone(), counted.clone());
+                async move {
+                    match req.method.as_str() {
+                        "config.read" => Reply::Ok(json!({"config": text, "version": 7})),
+                        "config.write" => {
+                            counted.fetch_add(1, Ordering::SeqCst);
+                            Reply::Err("conflict: the config changed (version 8)".into())
+                        }
+                        _ => Reply::Ok(json!({})),
+                    }
+                }
+            })
+            .await;
+        });
+        while !paths.ctl_socket().exists() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let before = std::fs::read(paths.config_file()).unwrap();
+        let e = run(&paths, &["panic"]).unwrap_err();
+        assert!(e.contains("keeps changing"), "{e}");
+        assert_eq!(writes.load(Ordering::SeqCst), 5);
+        assert_eq!(std::fs::read(paths.config_file()).unwrap(), before);
+        assert!(!load(&paths).locked);
+    }
+
+    /// The callers that only ask whether a node runs take a busy one for a
+    /// node: it is not told that a change waits for the next start, and a
+    /// second node does not start beside it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_busy_node_still_counts_as_running() {
+        let (d, paths) = setup(&["home"]);
+        assert!(!daemon_answers(&paths).await);
+        let node = BusyNode::start(&paths).await;
+        assert!(daemon_answers(&paths).await);
+        let mut out = Vec::new();
+        after_keyring_answers(&paths, None, &mut out).await.unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("was not asked whether it found a keyring"),
+            "{out}"
+        );
+        let cfg = NodeConfig::load(&paths.config_file()).unwrap();
+        let mut out = Vec::new();
+        tell_folder_commands(&paths, &cfg, &mut out).await;
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("was not asked whether folder mode"), "{out}");
+        let mut opts = crate::NodeOptions::new(paths.clone());
+        opts.home = d.path().to_path_buf();
+        let e = crate::Daemon::start(opts)
+            .await
+            .err()
+            .expect("a second node");
+        assert!(e.contains("already runs"), "{e}");
+        node.stop(&paths);
+        assert!(!daemon_answers(&paths).await);
+        // A socket that cannot be reached at all is neither a node nor the
+        // lack of one: the start says what is wrong.
+        std::fs::remove_dir_all(paths.state_dir.join("run")).unwrap();
+        std::fs::write(paths.state_dir.join("run"), b"").unwrap();
+        assert!(!daemon_answers(&paths).await);
+        let mut opts = crate::NodeOptions::new(paths.clone());
+        opts.home = d.path().to_path_buf();
+        let e = crate::Daemon::start(opts).await.err().expect("no socket");
+        assert!(e.contains("cannot tell whether a node runs"), "{e}");
+        assert!(!e.contains("already runs"), "{e}");
+    }
+
+    /// With several centers the commands the ambiguous `rule rm` prints name
+    /// the center, so they work as printed.
+    #[test]
+    fn the_rm_refusal_names_the_center_it_means() {
+        let (_d, paths) = setup(&["home", "work"]);
+        let made = "exec.run:exec.run:git [*]";
+        for rule in ["exec.run:git *", made] {
+            let list = "center.work.policy.allow";
+            run(&paths, &["config", "add", list, rule]).unwrap();
+        }
+        let args = ["rule", "rm", "allow", "exec.run:git *", "--center", "work"];
+        let e = run(&paths, &args).unwrap_err();
+        assert!(
+            e.contains(&format!("rule rm allow '{made}' --center work")),
+            "{e}"
+        );
+        assert!(
+            e.contains("rule rm allow 'exec.run:git *' --center work"),
+            "{e}"
+        );
+        // Run as printed.
+        run(&paths, &["rule", "rm", "allow", made, "--center", "work"]).unwrap();
+        run(&paths, &args).unwrap();
+        assert!(load(&paths).center("work").unwrap().policy.allow.is_empty());
+    }
+
     #[test]
     fn the_three_lists_add_remove_and_show() {
         let (_d, paths) = setup(&["home"]);
@@ -3697,6 +3947,85 @@ mod tests {
         // A sudo command is not an allow rule.
         let e = run(&paths, &["rule", "add", "allow", "sudo apt update"]).unwrap_err();
         assert!(e.contains("rule add sudo"), "{e}");
+        // The `cap.action:pattern` form is for `config add`; as a command it
+        // would become a rule that never matches.
+        for list in ["allow", "deny"] {
+            let e = run(&paths, &["rule", "add", list, "exec.run:echo *"]).unwrap_err();
+            assert!(e.contains("config add"), "{e}");
+        }
+        let e = run(&paths, &["rule", "add", "allow", "fs.read:~/notes/*"]).unwrap_err();
+        assert!(e.contains("policy.allow"), "{e}");
+        // So is the form with a capability alone, which the docs show.
+        for (list, rule) in [("deny", "fs:~/private/*"), ("allow", "exec:git *")] {
+            let e = run(&paths, &["rule", "add", list, rule]).unwrap_err();
+            assert!(e.contains("config add"), "{e}");
+        }
+        assert_eq!(
+            load(&paths).centers[0].policy.allow,
+            ["exec.run:git status"]
+        );
+        // With the working rule on the list as well (added as the refusal
+        // says), the arguments name neither of the two: the user picks one.
+        let broken = "exec.run:fs:~/private/[*]";
+        run(
+            &paths,
+            &["config", "add", "center.home.policy.deny", broken],
+        )
+        .unwrap();
+        run(
+            &paths,
+            &["config", "add", "center.home.policy.deny", "fs:~/private/*"],
+        )
+        .unwrap();
+        let e = run(&paths, &["rule", "rm", "deny", "fs:~/private/*"]).unwrap_err();
+        assert!(
+            e.contains(broken) && e.contains("\"fs:~/private/*\""),
+            "{e}"
+        );
+        // The refusal's own instructions work, also for an entry as `ls`
+        // shows the working one.
+        assert!(
+            e.contains(&format!("rule rm deny '{broken}' --center home")),
+            "{e}"
+        );
+        let out = run(&paths, &["rule", "rm", "deny", broken]).unwrap();
+        assert!(out.contains(broken), "{out}");
+        assert_eq!(
+            load(&paths).centers[0].policy.deny,
+            ["exec.run:git status", "exec.run:rm *", "fs:~/private/*"]
+        );
+        run(&paths, &["rule", "rm", "deny", "fs:~/private/*"]).unwrap();
+        for rule in ["exec.run:git *", "exec.run:exec.run:git [*]"] {
+            let list = "center.home.policy.allow";
+            run(&paths, &["config", "add", list, rule]).unwrap();
+        }
+        let e = run(&paths, &["rule", "rm", "allow", "exec.run:git *"]).unwrap_err();
+        assert!(
+            e.contains("rule rm allow 'exec.run:exec.run:git [*]'"),
+            "{e}"
+        );
+        run(
+            &paths,
+            &["rule", "rm", "allow", "exec.run:exec.run:git [*]"],
+        )
+        .unwrap();
+        run(&paths, &["rule", "rm", "allow", "exec.run:git *"]).unwrap();
+        // A colon in a command that is not a scope stays a command.
+        run(&paths, &["rule", "add", "allow", "C:\\tools\\x.exe"]).unwrap();
+        run(&paths, &["rule", "rm", "allow", "C:\\tools\\x.exe"]).unwrap();
+        // The rule an older `rule add` made of the pattern form goes with the
+        // arguments that made it.
+        let broken = "exec.run:exec.run:echo [*]";
+        run(
+            &paths,
+            &["config", "add", "center.home.policy.allow", broken],
+        )
+        .unwrap();
+        run(&paths, &["rule", "rm", "allow", "exec.run:echo *"]).unwrap();
+        assert_eq!(
+            load(&paths).centers[0].policy.allow,
+            ["exec.run:git status"]
+        );
         // A command with a glob character in it is allowed as itself.
         run(&paths, &["rule", "add", "allow", "rm *"]).unwrap();
         assert!(load(&paths).centers[0].policy.allow[1].contains("[*]"));
@@ -3987,6 +4316,91 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The installed node on Windows runs as `nerve`, whose Credential
+    /// Manager is not the administrator's that `proxy set` writes to. So
+    /// a header or a password is refused, with the keyring left alone and
+    /// nothing changed; a proxy that needs neither works, and its call
+    /// takes an entry left by an earlier `proxy set` away.
+    #[test]
+    fn on_the_installed_node_on_windows_proxy_set_refuses_header_values_and_a_password() {
+        let (_d, paths) = setup(&["home"]);
+        // Set as an administrator before the node was installed.
+        run(
+            &paths,
+            &[
+                "proxy",
+                "set",
+                "http://127.0.0.1:3128",
+                "--header",
+                "X-Old: o1d-value",
+            ],
+        )
+        .unwrap();
+        crate::secrets::for_tests::pretend_windows_service(&paths);
+        let before = std::fs::read_to_string(paths.config_file()).unwrap();
+        let held = keyring_entry(&paths);
+        assert!(held.is_some());
+        let asked = crate::secrets::store::calls();
+        for args in [
+            &[
+                "proxy",
+                "set",
+                "http://127.0.0.1:3129",
+                "--header",
+                "X-Key: s3cret-value",
+            ][..],
+            &["proxy", "set", "http://alice:pa55w0rd@127.0.0.1:3129"],
+        ] {
+            let e = run(&paths, args).unwrap_err();
+            assert!(
+                e.contains(
+                    "go to the Credential Manager of the account that runs it, not to that of nerve"
+                ),
+                "{e}"
+            );
+            assert!(e.contains("nothing was changed"), "{e}");
+            assert!(e.contains("`nerve-node proxy set <url>`"), "{e}");
+            assert!(!e.contains("s3cret") && !e.contains("pa55w0rd"), "{e}");
+            assert!(!e.contains("alice"), "{e}");
+        }
+        // The keyring was not asked, and node.toml and the old entry stayed.
+        assert_eq!(crate::secrets::store::calls(), asked);
+        assert_eq!(
+            std::fs::read_to_string(paths.config_file()).unwrap(),
+            before
+        );
+        assert_eq!(keyring_entry(&paths), held);
+
+        // The entry an administrator's keyring holds is not what the service
+        // reads, so `proxy ls` does not call it good.
+        let ls = run(&paths, &["proxy", "ls"]).unwrap();
+        assert!(ls.contains("header X-Old\n"), "{ls}");
+        assert!(!ls.contains("its value is in the system keyring"), "{ls}");
+        assert!(ls.contains("the link cannot use this proxy"), "{ls}");
+        assert!(ls.contains("the service does not find them"), "{ls}");
+        assert!(!ls.contains("o1d-value"), "{ls}");
+
+        // A proxy that needs neither works, and takes the old entry away.
+        let next = format!("the change is in node.toml; it {NEXT_START}\n");
+        let out = run(&paths, &["proxy", "set", "http://127.0.0.1:3129"]).unwrap();
+        assert_eq!(out, format!("proxy http://127.0.0.1:3129\n{next}"));
+        let cfg = load(&paths);
+        assert_eq!(
+            cfg.connection.proxy.as_deref(),
+            Some("http://127.0.0.1:3129")
+        );
+        assert!(cfg.connection.headers.is_empty());
+        assert_eq!(keyring_entry(&paths), None);
+        assert_eq!(
+            run(&paths, &["proxy", "ls"]).unwrap(),
+            "proxy http://127.0.0.1:3129\n"
+        );
+        assert_eq!(
+            run(&paths, &["proxy", "rm"]).unwrap(),
+            format!("no proxy\n{next}")
+        );
     }
 
     fn files_below(dir: &Path) -> Vec<PathBuf> {

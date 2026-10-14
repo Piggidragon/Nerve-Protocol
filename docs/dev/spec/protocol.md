@@ -220,8 +220,9 @@ message layer: the relay carries bytes, never messages.
   gives its undecided slot back before the relay dials, which has a deadline
   of its own. Refusals are not logged one by one but counted, with a token or
   without, so no peer can flood the relay's log; a count is told when its
-  minute is over even if no refusal follows, and a node's refusals are
-  counted apart from other nodes'. A node opens a bounded
+  minute is over even if no refusal follows, and when the relay stops
+  listening, and a node's refusals are counted apart from other nodes'. The
+  relay's dial fits every address of the center into its deadline. A node opens a bounded
   number of tunnels a minute (the owner can raise it for a relay behind this
   one), so one with a token cannot rotate the audit log either.
 - Hosts are compared as a URL can tell them apart: without case or a

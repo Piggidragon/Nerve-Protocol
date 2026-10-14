@@ -165,7 +165,8 @@ center, when it started and ended, why it ended and how much it carried;
 never a token. The node's [log](logs.md) also has a line for every tunnel
 that opens or closes. Refusals are counted: the first is told at once, and
 the rest in one line a minute with how many came, over how long, and the
-last of them, also when nothing comes after them. Each node has its own
+last of them, also when nothing comes after them, and at once when the relay
+stops listening or the node stops. Each node has its own
 count, so the line names the node whose refusals it counts; one more count
 names a node whose token came in plain HTTP, so you know to give it a new
 one. Connections without a valid token share one count.

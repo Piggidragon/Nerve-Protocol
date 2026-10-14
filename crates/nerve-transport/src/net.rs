@@ -320,30 +320,69 @@ pub fn no_proxy(list: &str, host: &str) -> bool {
         })
 }
 
-async fn dial(host: &str, port: u16, addrs: Vec<SocketAddr>) -> Result<TcpStream, String> {
+async fn dial(
+    host: &str,
+    port: u16,
+    addrs: Vec<SocketAddr>,
+    until: Option<tokio::time::Instant>,
+) -> Result<TcpStream, String> {
+    let s = connect_first(addrs, until, TcpStream::connect)
+        .await
+        .map_err(|last| format!("cannot connect to {host}:{port}: {last}"))?;
+    let _ = s.set_nodelay(true);
+    Ok(s)
+}
+
+/// Tries `addrs` in turn until `connect` reaches one. Without `until` each
+/// try has [`CONNECT_TIMEOUT`]. With it, each try has the time left divided
+/// by the addresses left, so a first address that does not answer leaves
+/// time for the next: a name with an AAAA record whose path drops packets
+/// still reaches its A record before `until`. The error is the last try's.
+pub async fn connect_first<T, F, Fut>(
+    addrs: Vec<SocketAddr>,
+    until: Option<tokio::time::Instant>,
+    connect: F,
+) -> Result<T, String>
+where
+    F: Fn(SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
     let mut last = String::from("no address");
-    for a in addrs {
-        match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(a)).await {
-            Ok(Ok(s)) => {
-                let _ = s.set_nodelay(true);
-                return Ok(s);
+    let n = addrs.len();
+    for (i, a) in addrs.into_iter().enumerate() {
+        let each = match until {
+            None => CONNECT_TIMEOUT,
+            Some(u) => {
+                let left = u.saturating_duration_since(tokio::time::Instant::now());
+                if left.is_zero() {
+                    break;
+                }
+                left / (n - i) as u32
             }
+        };
+        match tokio::time::timeout(each, connect(a)).await {
+            Ok(Ok(s)) => return Ok(s),
             Ok(Err(e)) => last = format!("{a}: {e}"),
             Err(_) => last = format!("{a}: timed out"),
         }
     }
-    Err(format!("cannot connect to {host}:{port}: {last}"))
+    Err(last)
 }
 
 /// Opens a `CONNECT` tunnel to `host:port` through `proxy`, over TLS to an
 /// `https://` proxy. Fails closed: a proxy that refuses or answers oddly is
 /// an error, never a direct connection.
-async fn tunnel(proxy: &Proxy, host: &str, port: u16) -> Result<BoxIo, String> {
+async fn tunnel(
+    proxy: &Proxy,
+    host: &str,
+    port: u16,
+    until: Option<tokio::time::Instant>,
+) -> Result<BoxIo, String> {
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((proxy.host.as_str(), proxy.port))
         .await
         .map_err(|e| format!("cannot resolve the proxy {}: {e}", proxy.host))?
         .collect();
-    let tcp = dial(&proxy.host, proxy.port, addrs).await?;
+    let tcp = dial(&proxy.host, proxy.port, addrs, until).await?;
     let mut io: BoxIo = if proxy.tls {
         let config = crate::tls::client_config(proxy.pin.as_deref())?;
         let name = ServerName::try_from(proxy.host.clone())
@@ -443,21 +482,31 @@ fn proxy_tls_error(proxy: &Proxy, e: &std::io::Error) -> String {
 /// (docs/dev/spec/protocol.md §4.8) dials its centers this way too, so a relay
 /// behind a proxy or another relay goes on through it.
 pub async fn reach(url: &CenterUrl, proxy: Option<&Proxy>) -> Result<BoxIo, String> {
+    reach_until(url, proxy, None).await
+}
+
+/// [`reach`] with every address it tries fitted into `until`
+/// ([`connect_first`]): the relay, which must answer its node in time.
+pub async fn reach_until(
+    url: &CenterUrl,
+    proxy: Option<&Proxy>,
+    until: Option<tokio::time::Instant>,
+) -> Result<BoxIo, String> {
     match proxy.filter(|_| url.tls) {
-        Some(p) => tunnel(p, &url.host, url.port).await,
-        None => Ok(Box::new(direct(url).await?)),
+        Some(p) => tunnel(p, &url.host, url.port, until).await,
+        None => Ok(Box::new(direct(url, until).await?)),
     }
 }
 
 /// A TCP connection straight to `url`.
-async fn direct(url: &CenterUrl) -> Result<TcpStream, String> {
+async fn direct(url: &CenterUrl, until: Option<tokio::time::Instant>) -> Result<TcpStream, String> {
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((url.host.as_str(), url.port))
         .await
         .map_err(|e| format!("cannot resolve {}: {e}", url.host))?
         .collect();
     let named = url.host.parse::<std::net::IpAddr>().is_err();
     let addrs = usable_addrs(url.tls, named, addrs)?;
-    dial(&url.host, url.port, addrs)
+    dial(&url.host, url.port, addrs, until)
         .await
         .map_err(|e| format!("{url}: {e}"))
 }
@@ -471,7 +520,7 @@ pub async fn open(
     proxy: Option<&Proxy>,
 ) -> Result<BoxIo, String> {
     if !url.tls {
-        let tcp = direct(url).await?;
+        let tcp = direct(url, None).await?;
         #[cfg(target_os = "linux")]
         check_local_peer(&tcp)?;
         return Ok(Box::new(tcp));
@@ -824,6 +873,34 @@ mod tests {
         }
     }
 
+    /// Within a deadline every address gets its share: a first one that
+    /// never answers leaves time for the next, which is reached before the
+    /// deadline.
+    #[tokio::test]
+    async fn every_address_gets_a_share_of_the_deadline() {
+        let (dead, live) = (a("[2001:db8::1]:443"), a("192.0.2.1:443"));
+        let connect = |addr: SocketAddr| async move {
+            if addr == dead {
+                std::future::pending::<()>().await;
+            }
+            Ok::<SocketAddr, std::io::Error>(addr)
+        };
+        let started = tokio::time::Instant::now();
+        let until = started + Duration::from_millis(1200);
+        let got = connect_first(vec![dead, live], Some(until), connect).await;
+        assert_eq!(got, Ok(live));
+        let took = started.elapsed();
+        assert!(
+            took >= Duration::from_millis(500) && took < Duration::from_millis(1200),
+            "{took:?}"
+        );
+        // All of them dead: an error by the deadline, naming the last.
+        let until = tokio::time::Instant::now() + Duration::from_millis(600);
+        let both = connect_first(vec![dead, dead], Some(until), connect).await;
+        assert!(both.unwrap_err().contains("timed out"));
+        assert!(tokio::time::Instant::now() < until + Duration::from_millis(300));
+    }
+
     #[test]
     fn no_proxy_lists() {
         assert!(no_proxy("*", "a"));
@@ -886,14 +963,19 @@ mod tests {
             vec![("Proxy-Authorization".into(), "Basic x".into())],
         )
         .unwrap();
-        let mut t = tunnel(&p.clone().pinned(Some(id.pin())).unwrap(), "c.example", 443)
-            .await
-            .unwrap();
+        let mut t = tunnel(
+            &p.clone().pinned(Some(id.pin())).unwrap(),
+            "c.example",
+            443,
+            None,
+        )
+        .await
+        .unwrap();
         let mut got = [0u8; 9];
         t.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, b"tunnelled");
         let other = crate::tls::ServerIdentity::generate(&[]).unwrap().pin();
-        let e = tunnel(&p.pinned(Some(other)).unwrap(), "c.example", 443)
+        let e = tunnel(&p.pinned(Some(other)).unwrap(), "c.example", 443, None)
             .await
             .err()
             .unwrap();
@@ -928,11 +1010,11 @@ mod tests {
             vec![("Proxy-Authorization".into(), "Basic x".into())],
         )
         .unwrap();
-        let mut t = tunnel(&p, "c.example", 443).await.unwrap();
+        let mut t = tunnel(&p, "c.example", 443, None).await.unwrap();
         let mut got = [0u8; 9];
         t.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, b"tunnelled");
-        let e = tunnel(&p, "c.example", 443).await.err().unwrap();
+        let e = tunnel(&p, "c.example", 443, None).await.err().unwrap();
         assert!(e.contains("407"), "{e}");
         server.await.unwrap();
     }

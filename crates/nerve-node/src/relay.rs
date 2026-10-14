@@ -130,8 +130,9 @@ struct Tally(Mutex<TallyState>);
 struct TallyState {
     /// Refusals not told yet.
     count: u64,
-    /// When the first of them came.
+    /// When the first of them came, and the last.
     first: Option<std::time::Instant>,
+    latest: Option<std::time::Instant>,
     /// When the last line was told.
     told: Option<std::time::Instant>,
     /// The last refusal, in words for the line.
@@ -160,6 +161,7 @@ impl Tally {
         let mut t = lock(&self.0);
         t.count += 1;
         t.first.get_or_insert(now);
+        t.latest = Some(now);
         t.last = last;
         if t.told
             .is_some_and(|at| now.duration_since(at) < TOKENLESS_EVERY)
@@ -169,12 +171,14 @@ impl Tally {
         Some(Tally::take(&mut t, now))
     }
 
-    /// The line for refusals left waiting, once their minute is over.
-    fn flush(&self, now: std::time::Instant) -> Option<Told> {
+    /// The line for refusals left waiting, once their minute is over, or
+    /// at once with `force` (the relay stops listening).
+    fn flush(&self, now: std::time::Instant, force: bool) -> Option<Told> {
         let mut t = lock(&self.0);
         if t.count == 0
-            || t.told
-                .is_some_and(|at| now.duration_since(at) < TOKENLESS_EVERY)
+            || (!force
+                && t.told
+                    .is_some_and(|at| now.duration_since(at) < TOKENLESS_EVERY))
         {
             return None;
         }
@@ -184,11 +188,17 @@ impl Tally {
     fn take(t: &mut TallyState, now: std::time::Instant) -> Told {
         let told = Told {
             n: t.count,
-            over: t.first.map_or(Duration::ZERO, |f| now.duration_since(f)),
+            // From the first refusal of the batch to its last, not to the
+            // line: how long the refusals came for.
+            over: match (t.first, t.latest) {
+                (Some(f), Some(l)) => l.duration_since(f),
+                _ => Duration::ZERO,
+            },
             last: std::mem::take(&mut t.last),
         };
         t.count = 0;
         t.first = None;
+        t.latest = None;
         t.told = Some(now);
         told
     }
@@ -226,20 +236,30 @@ fn refused_line(kind: Refused, node: &str, t: &Told) -> String {
     }
 }
 
-/// Tells the counts that waited out their minute without a refusal after
-/// them: the relay's tick calls it.
-fn flush_tallies(shared: &Shared) {
-    let now = std::time::Instant::now();
-    let r = &shared.relay;
-    if let Some(t) = r.tokenless.flush(now) {
-        tracing::warn!("{}", refused_line(Refused::Tokenless, "", &t));
+/// The lines for the counts that waited out their minute without a refusal
+/// after them, or, with `force`, for every count still waiting: the relay's
+/// tick asks for the first, the end of listening (`relay off`, `panic`, a
+/// new address or pin, the node stopping) for the second, so no count is
+/// left untold.
+fn flush_tallies(r: &Relays, now: std::time::Instant, force: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    if let Some(t) = r.tokenless.flush(now, force) {
+        lines.push(refused_line(Refused::Tokenless, "", &t));
     }
     for (kind, map) in [(Refused::Node, &r.held_back), (Refused::Plain, &r.plain)] {
         for (node, tally) in lock(map).iter() {
-            if let Some(t) = tally.flush(now) {
-                tracing::warn!("{}", refused_line(kind, node, &t));
+            if let Some(t) = tally.flush(now, force) {
+                lines.push(refused_line(kind, node, &t));
             }
         }
+    }
+    lines
+}
+
+/// Logs [`flush_tallies`].
+fn tell_tallies(shared: &Shared, force: bool) {
+    for line in flush_tallies(&shared.relay, std::time::Instant::now(), force) {
+        tracing::warn!("{line}");
     }
 }
 
@@ -410,6 +430,9 @@ pub(crate) async fn run(shared: Arc<Shared>) {
                         &mut stop,
                     )
                     .await;
+                    // What waited is told now, not when the relay listens
+                    // again, or never when the node stops.
+                    tell_tallies(&shared, true);
                     tracing::info!("relay: stopped listening on {shown}");
                     shared.relay.set_status("off", None);
                     continue;
@@ -488,7 +511,7 @@ async fn serve(
     let mut tick = tokio::time::interval(Duration::from_secs(5));
     loop {
         tokio::select! {
-            _ = tick.tick() => flush_tallies(shared),
+            _ = tick.tick() => tell_tallies(shared, false),
             got = listener.accept() => match got {
                 Ok((io, peer)) => {
                     // A connection over the limits is closed unread.
@@ -923,10 +946,13 @@ async fn connection(
     drop(slot);
     // The relay dials as the node's own link does: through its proxy, or
     // another relay, when it has one.
+    let until = tokio::time::Instant::now() + DIAL_DEADLINE;
     let dial = async {
         match crate::link::proxy_for(&shared.paths, &cfg, &grant.url).await {
-            Ok(Some(proxy)) => nerve_transport::net::reach(&grant.url, Some(&proxy)).await,
-            Ok(None) => dial_center(&grant.url).await,
+            Ok(Some(proxy)) => {
+                nerve_transport::net::reach_until(&grant.url, Some(&proxy), Some(until)).await
+            }
+            Ok(None) => dial_center(&grant.url, until).await,
             Err(e) => Err(format!("bad proxy: {e}")),
         }
     };
@@ -1014,24 +1040,20 @@ fn tunnel_addrs(host: &str, addrs: Vec<SocketAddr>) -> Result<Vec<SocketAddr>, S
 }
 
 /// Dials a center of this node straight, on the addresses [`tunnel_addrs`]
-/// lets a tunnel use.
-async fn dial_center(url: &CenterUrl) -> Result<BoxIo, String> {
+/// lets a tunnel use, each with its share of the time left until `until`
+/// (`net::connect_first`): a first address that does not answer leaves time
+/// for the next.
+async fn dial_center(url: &CenterUrl, until: tokio::time::Instant) -> Result<BoxIo, String> {
     let addrs: Vec<SocketAddr> = tokio::net::lookup_host((url.host.as_str(), url.port))
         .await
         .map_err(|e| format!("cannot resolve {}: {e}", url.host))?
         .collect();
-    let mut last = String::new();
-    for a in tunnel_addrs(&url.host, addrs)? {
-        match tokio::time::timeout(Duration::from_secs(15), TcpStream::connect(a)).await {
-            Ok(Ok(s)) => {
-                let _ = s.set_nodelay(true);
-                return Ok(Box::new(s));
-            }
-            Ok(Err(e)) => last = format!("{a}: {e}"),
-            Err(_) => last = format!("{a}: timed out"),
-        }
-    }
-    Err(format!("cannot connect to {url}: {last}"))
+    let addrs = tunnel_addrs(&url.host, addrs)?;
+    let s = nerve_transport::net::connect_first(addrs, Some(until), TcpStream::connect)
+        .await
+        .map_err(|last| format!("cannot connect to {url}: {last}"))?;
+    let _ = s.set_nodelay(true);
+    Ok(Box::new(s))
 }
 
 /// A target as the log shows it: cut, since a peer chooses it.
@@ -2304,19 +2326,22 @@ mod tests {
             );
         }
         assert_eq!(
-            t.flush(t0 + Duration::from_secs(30)),
+            t.flush(t0 + Duration::from_secs(30), false),
             None,
             "the minute is not over"
         );
         let told = t
-            .flush(t0 + TOKENLESS_EVERY + Duration::from_secs(1))
+            .flush(t0 + TOKENLESS_EVERY + Duration::from_secs(1), false)
             .unwrap();
         assert_eq!((told.n, told.last.as_str()), (200, "to 200"));
+        // Over how long they came: from the first of the batch to its last,
+        // not to the line.
+        assert_eq!(told.over, Duration::from_millis(19_900));
         assert_eq!(
-            told.over,
-            TOKENLESS_EVERY + Duration::from_secs(1) - Duration::from_millis(100)
+            t.flush(t0 + TOKENLESS_EVERY * 3, false),
+            None,
+            "nothing waits"
         );
-        assert_eq!(t.flush(t0 + TOKENLESS_EVERY * 3), None, "nothing waits");
         // An hour later, one refusal is one refusal.
         let later = t
             .note(t0 + Duration::from_secs(3600), "to y".into())
@@ -2324,9 +2349,60 @@ mod tests {
         assert_eq!((later.n, later.last.as_str()), (1, "to y"));
         let line = refused_line(Refused::Node, "lab", &told);
         assert!(
-            line.contains("refused 200 tunnel(s) of relay node lab in 1 min, the last to 200"),
+            line.contains("refused 200 tunnel(s) of relay node lab in 19 s, the last to 200"),
             "{line}"
         );
+    }
+
+    /// The relay's flush tells every kind of count that waited out its
+    /// minute (without a token, each node's refusals, each node's plain
+    /// token), and with `force` (the relay stops listening) every count
+    /// still waiting, whatever its minute.
+    #[test]
+    fn the_relay_tells_every_kind_of_waiting_count() {
+        let r = Relays::default();
+        let t0 = std::time::Instant::now();
+        let later = t0 + Duration::from_secs(1);
+        let note_twice = |t: &Tally| {
+            assert!(t.note(t0, "first".into()).is_some());
+            assert!(t.note(later, "second".into()).is_none());
+        };
+        note_twice(&r.tokenless);
+        note_twice(lock(&r.held_back).entry("lab".into()).or_default());
+        note_twice(lock(&r.plain).entry("lab".into()).or_default());
+        assert!(flush_tallies(&r, t0 + Duration::from_secs(30), false).is_empty());
+        let mut lines = flush_tallies(&r, t0 + TOKENLESS_EVERY + Duration::from_secs(1), false);
+        lines.sort();
+        assert_eq!(lines.len(), 3, "{lines:#?}");
+        assert!(
+            lines[0].starts_with(
+                "relay: refused 1 connection(s) without a valid relay token, the last second"
+            ),
+            "{lines:#?}"
+        );
+        assert!(
+            lines[1].starts_with("relay: refused 1 tunnel(s) of relay node lab, the last second"),
+            "{lines:#?}"
+        );
+        assert!(
+            lines[2].starts_with(
+                "relay: relay node lab sent its token in plain HTTP 1 time(s), the last second"
+            ),
+            "{lines:#?}"
+        );
+        assert_eq!(r.tokenless.pending(), 0);
+        // Forced: told within the minute too, when the relay stops listening.
+        let t1 = t0 + Duration::from_secs(200);
+        assert!(lock(&r.held_back)["lab"].note(t1, "a".into()).is_some());
+        assert!(lock(&r.held_back)["lab"].note(t1, "b".into()).is_none());
+        assert!(flush_tallies(&r, t1, false).is_empty());
+        let forced = flush_tallies(&r, t1, true);
+        assert_eq!(forced.len(), 1, "{forced:#?}");
+        assert!(
+            forced[0].contains("relay node lab, the last b"),
+            "{forced:#?}"
+        );
+        assert!(flush_tallies(&r, t1, true).is_empty(), "told twice");
     }
 
     /// A name that resolves to this machine is no way to it: only a center
@@ -2358,18 +2434,18 @@ mod tests {
         let home_at = format!("127.0.0.1:{}", port(&home));
         serve_echo(home);
         let j = jump(vec![center("home", format!("https://{home_at}"))], |_| {}).await;
-        j.daemon.relay().set_idle(Duration::from_millis(600));
+        j.daemon.relay().set_idle(Duration::from_millis(2000));
         let lab = basic("lab", &j.token);
         let (_, _, quiet) = connect(j.addr, &j.pin, &home_at, Some(&lab)).await;
         let (_, _, busy) = connect(j.addr, &j.pin, &home_at, Some(&lab)).await;
         let (mut quiet, mut busy) = (quiet.unwrap(), busy.unwrap());
         round_trip(&mut quiet, b"once").await;
         let started = std::time::Instant::now();
-        while started.elapsed() < Duration::from_millis(2000) {
+        while started.elapsed() < Duration::from_millis(4500) {
             round_trip(&mut busy, b"ping").await;
             tokio::time::sleep(Duration::from_millis(150)).await;
         }
-        assert!(ends(&mut quiet, QUIET).await, "a quiet tunnel stayed open");
+        assert!(ends(&mut quiet, WAIT).await, "a quiet tunnel stayed open");
         assert!(!ends(&mut busy, QUIET).await, "a busy tunnel was closed");
         round_trip(&mut busy, b"still").await;
         let audited = nerve_policy::audit::AuditLog::new(j.daemon.paths().audit_log())

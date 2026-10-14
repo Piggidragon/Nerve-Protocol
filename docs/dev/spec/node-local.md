@@ -559,12 +559,16 @@ turns it on, and a center reads and changes nothing of it, grant or not.
   Once granted, a connection is a tunnel, counted by `max_links` and
   `max_links_per_node`, and gives its undecided slot back before the relay
   resolves and dials the center (12 seconds at most, less than the 15 a
-  relayed node waits for the answer).
+  relayed node waits for the answer; each address of the center gets its
+  share of the time left, so a first address that does not answer leaves
+  time for the next).
 - Every refusal is logged at `debug`. At `warn` the log gets a counted line:
   the first refusal at once, then at most one line a minute with how many
-  came since and over how long, and the last of them; a count that waits is
-  told when its minute is over, also when no refusal follows (the relay
-  looks every 5 seconds). There is one count for connections without a
+  came since, over how long (from the first of them to the last), and the
+  last of them; a count that waits is told when its minute is over, also
+  when no refusal follows (the relay looks every 5 seconds), and every count
+  still waiting is told when the relay stops listening (`relay off`,
+  `panic`, a new address or pin, the node stopping). There is one count for connections without a
   valid token (plain HTTP, no or a wrong token, over a limit), one per node
   for refusals of a node with its token (a target that is no center, a
   limit), and one per node for a valid token that came in plain HTTP, which

@@ -228,9 +228,10 @@ center's local name):
   below, or to a new drive `Work2:`, `Work3:`, … rooted at that folder if the
   command can see it, and otherwise to the cmdlet as a whole path, which
   fails. Relative paths are resolved there too, since the cmdlet keeps `..`
-  on its drive (`Work:\..\app` is `Work:\app`). A `-Path` loses its escapes
-  first; one with a wildcard has the part before its first wildcard resolved
-  so and keeps the rest. The cmdlet runs with `-ErrorAction Continue`, and
+  on its drive (`..\app` on `Work:\` is `Work:\app`). A `-Path` loses its
+  escapes first; one with a wildcard has the part before its first wildcard
+  resolved so and keeps the rest, unless that part is `\` or `/` alone, the
+  root of the current drive. The cmdlet runs with `-ErrorAction Continue`, and
   its errors are written again as the function's under the caller's error
   action, so `$?` and the exit code stay as the cmdlet sets them
   (`nerve_sandbox::POWERSHELL_START`). Other cmdlets still keep `..` on the

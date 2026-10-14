@@ -79,11 +79,12 @@ The node confines commands with Landlock:
   can ask one that runs commands on request, such as the user's systemd session
   or a tmux server, to run a program outside the sandbox, and that program
   reads the node's files and changes its settings through the control socket.
-  Run the commands as another account, one that gets root in no way without a
-  password (not root, not in `docker` or a like group, no `NOPASSWD` sudo), to
-  keep them from the node's files and settings: see
-  [Linux](platforms.md#linux). A [sudo](sudo.md) command is root and is not
-  kept out.
+  Run the commands as another account, one that only the node uses and that
+  gets root in no way without a password (not root, not in `docker` or a like
+  group, no `NOPASSWD` sudo, nobody works as it and uses sudo from it), to keep
+  them from the node's files and settings: see [Linux](platforms.md#linux).
+  The account that ran `install` is not such an account. A [sudo](sudo.md)
+  command is root and is not kept out.
 - A command with `w` on a folder can put a link in place of a folder inside
   it, and a link would give that folder's rights in a place you never named.
   So a folder is left out of the sets, and the node logs a warning, when its

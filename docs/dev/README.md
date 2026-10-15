@@ -16,6 +16,7 @@ pages explain the design and link to the spec for detail.
 | [policy-engine.md](policy-engine.md) | How the node decides a call, and the sandbox |
 | [settings-and-config.md](settings-and-config.md) | `node.toml`, the settings API, the control socket |
 | [logging.md](logging.md) | The log of the center and the node: levels, redaction, the file, the web UI's data |
+| [backup.md](backup.md) | The backup file: format, encryption, what a restore does |
 
 ## Build and release
 

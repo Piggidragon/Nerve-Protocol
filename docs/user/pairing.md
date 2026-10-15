@@ -95,6 +95,12 @@ A machine whose key was copied to another machine is caught: a center keeps
 one live link per machine. If a second link arrives while the first still
 answers, the center refuses it and shows an alert.
 
+## Back up or move
+
+`nerve-node backup <file>` keeps the config and the keys, and
+`nerve-node restore <file>` puts them back on this machine or another one, so
+a moved node needs no new pairing ([backup](backup.md)).
+
 ## Keep it running
 
 `nerve-node run` runs in the foreground. On Linux with systemd,

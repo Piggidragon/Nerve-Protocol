@@ -11,8 +11,9 @@ is what a harness, and whoever writes its MCP entry, can rely on.
 
 ## 1. Starting it
 
-There are no subcommands. Every setting is a flag or a variable in the MCP
-entry:
+A harness starts it with no subcommand: every setting is a flag or a variable
+in the MCP entry. The only subcommands are the owner's `backup` and `restore`
+([backup](../backup.md)), which a harness never runs:
 
 | Flag | Variable | Default | Meaning |
 |---|---|---|---|

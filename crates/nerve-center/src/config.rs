@@ -1,10 +1,11 @@
 //! Flags and `NERVE_*` variables. A harness starts `nerve-center` from its MCP
-//! entry, so every setting is a flag or a variable there; there are no
-//! subcommands.
+//! entry, so every setting is a flag or a variable there. The only
+//! subcommands are `backup` and `restore`, which the owner runs by hand on a
+//! center that is not running (`restore`) or may be (`backup`).
 
 use std::path::PathBuf;
 
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use nerve_transport::log::Level;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -25,7 +26,7 @@ pub enum McpMode {
 )]
 pub struct Args {
     /// The state folder (identity, paired nodes, statistics).
-    #[arg(long, env = "NERVE_STATE_DIR")]
+    #[arg(long, env = "NERVE_STATE_DIR", global = true)]
     pub state_dir: Option<PathBuf>,
     /// The center name shown to nodes and in the web UI.
     #[arg(long, env = "NERVE_NAME")]
@@ -61,6 +62,35 @@ pub struct Args {
     /// the web UI holds, info at first; with it this level holds for this run.
     #[arg(long, env = "NERVE_LOG")]
     pub log: Option<Level>,
+    #[command(subcommand)]
+    pub cmd: Option<Cmd>,
+}
+
+/// What the owner runs by hand; a harness never does.
+#[derive(Debug, Clone, Subcommand)]
+pub enum Cmd {
+    /// Write the center's identity and state (its certificate and key, the paired nodes, the harness tokens' hashes and the statistics) to a file that a passphrase protects, to keep or to move the center to another machine.
+    Backup {
+        /// The file to write. It is private to you (mode 0600).
+        file: PathBuf,
+        /// Replace the file when it exists.
+        #[arg(long)]
+        overwrite: bool,
+        /// Read the passphrase from the first line of this file instead of asking.
+        #[arg(long, value_name = "FILE")]
+        passphrase_file: Option<PathBuf>,
+    },
+    /// Put the identity and state of a backup in place of this center's. No center may run on the state folder.
+    Restore {
+        /// The backup file.
+        file: PathBuf,
+        /// Replace a center here that is not the one the backup is of.
+        #[arg(long)]
+        replace: bool,
+        /// Read the passphrase from the first line of this file instead of asking.
+        #[arg(long, value_name = "FILE")]
+        passphrase_file: Option<PathBuf>,
+    },
 }
 
 impl Args {
@@ -141,8 +171,10 @@ mod tests {
         let a = Args::try_parse_from(["nerve-center", "--log", "Debug"]).unwrap();
         assert_eq!(a.log, Some(Level::Debug));
         assert!(Args::try_parse_from(["nerve-center", "--log", "loud"]).is_err());
-        // No subcommands: anything positional is refused.
+        // The only subcommands are backup and restore: anything else
+        // positional is refused.
         assert!(Args::try_parse_from(["nerve-center", "pair"]).is_err());
+        assert!(a.cmd.is_none());
         assert!(
             is_loopback("127.0.0.1:7480") && is_loopback("[::1]:1") && !is_loopback("0.0.0.0:7480")
         );

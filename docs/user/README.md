@@ -43,6 +43,7 @@ open port.
 | [audit.md](audit.md) | See what was allowed and refused |
 | [logs.md](logs.md) | The log of the center and the node: levels, what is in it, where it is |
 | [stop.md](stop.md) | Panic, pause, disable, remove |
+| [backup.md](backup.md) | Back up and restore a node or a center, move one to another machine |
 | [proxy.md](proxy.md) | Reach the center through an HTTP proxy |
 | [relay.md](relay.md) | Reach the center through another node (a jump node) |
 | [providers.md](providers.md) | Let a program on the machine add capabilities |

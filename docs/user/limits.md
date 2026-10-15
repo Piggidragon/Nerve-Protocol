@@ -86,9 +86,11 @@ systemd hands to it:
   (`systemctl --user`), its unit needs `Delegate=yes`. Without it systemd
   keeps the cgroup as its own and turns the limits off again at its next
   reload, so the node takes no cgroup there. A unit with
-  `ProtectControlGroups=private` sees only its own cgroup, which tells the
-  node nothing of its unit; the node takes it only where systemd marks it
-  as delegated (systemd 257 and later, with `Delegate=yes`).
+  `ProtectControlGroups=private` sees only its own cgroup, whose path names
+  no unit: the node asks your systemd which unit it runs in
+  (`systemctl --user whoami`, systemd 256 and later), and takes the cgroup
+  when that unit has `Delegate=yes`. On an older systemd such a unit gets
+  no limits; leave `ProtectControlGroups=private` out there.
 
 Without such a cgroup (no systemd, cgroup v1, a node started in a terminal),
 commands run without these limits. `nerve-node status` says so, and why:

@@ -152,10 +152,18 @@ mod linux {
             let alone = procs.iter().all(|&p| p == me);
             // The root of what this process sees is the root of a cgroup
             // namespace, a unit's own with `ProtectControlGroups=private`:
-            // its path says nothing of the unit, and so of its delegation.
-            let handed =
-                owned && alone && name != "/" && (!below_user_manager(&name) || delegates(&name));
+            // its path names no unit, so the user's systemd is asked which
+            // is the node's and whether it is delegated. The system's marks
+            // its delegated cgroups there (257 and later).
+            let root = name == "/";
+            let ask = root || below_user_manager(&name);
+            let handed = owned && alone && (!ask || delegates(&name));
             if !(delegated(&dir) || handed) {
+                if root {
+                    return Err(
+                        "the node's cgroup is the root of a cgroup namespace (`ProtectControlGroups=private`) and is not delegated to it: a unit of your own systemd needs `Delegate=yes`, and systemd 256 or later, which names the node's unit (`systemctl --user whoami`); or leave `ProtectControlGroups=private` out".into(),
+                    );
+                }
                 return Err(format!(
                     "the node's cgroup {name} is not delegated to it: the installed service has one (`sudo nerve-node install` writes its unit again); a node of your own gets one with `systemd-run --user --scope -p Delegate=yes nerve-node run`, or `Delegate=yes` in a unit of yours"
                 ));
@@ -447,32 +455,50 @@ mod linux {
 
     /// Whether the user's systemd delegates the unit of the cgroup `path`
     /// (`systemctl --user show -p Delegate`).
+    /// At the root of a cgroup namespace (`/`) the path names no unit:
+    /// the user's systemd names the node's own (`systemctl --user whoami`,
+    /// systemd 256).
     fn unit_delegates(path: &str) -> bool {
-        let Some(args) = ask_delegate(path) else {
-            return false;
+        let run = |args: &[&str]| {
+            std::process::Command::new("systemctl")
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(o.stdout.trim_ascii()).into_owned())
         };
-        std::process::Command::new("systemctl")
-            .args(args)
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .is_ok_and(|o| o.status.success() && o.stdout.trim_ascii() == b"yes")
+        let own;
+        let args = if path == "/" {
+            let Some(unit) = run(&["--user", "whoami"]) else {
+                return false;
+            };
+            own = unit;
+            ask_unit(&own)
+        } else {
+            ask_delegate(path)
+        };
+        args.and_then(|a| run(&a)).is_some_and(|v| v == "yes")
     }
 
     /// The `systemctl` arguments that ask the user's systemd whether the
     /// unit of the cgroup `path`, its last part, is delegated.
     fn ask_delegate(path: &str) -> Option<Vec<&str>> {
-        let unit = path.rsplit('/').next().unwrap_or_default();
-        if !below_user_manager(path)
-            || unit.is_empty()
-            || unit.starts_with('-')
-            || unit.starts_with('.')
-        {
+        if !below_user_manager(path) {
             return None;
         }
-        Some(vec![
-            "--user", "show", "-p", "Delegate", "--value", "--", unit,
-        ])
+        ask_unit(path.rsplit('/').next().unwrap_or_default())
+    }
+
+    /// The `systemctl` arguments that ask the user's systemd whether the
+    /// unit `unit` is delegated; none for what names no unit.
+    fn ask_unit(unit: &str) -> Option<Vec<&str>> {
+        let bad = unit.is_empty()
+            || unit.starts_with('-')
+            || unit.starts_with('.')
+            || unit.contains(char::is_whitespace);
+        (!bad).then(|| vec!["--user", "show", "-p", "Delegate", "--value", "--", unit])
     }
 
     /// Removes `dir`; whether it is gone.
@@ -652,10 +678,11 @@ mod linux {
         }
 
         /// The root of a cgroup namespace (a unit with
-        /// `ProtectControlGroups=private`): its path names no unit, so
-        /// without systemd's mark it is not taken, also not by its owner.
+        /// `ProtectControlGroups=private`): its path names no unit, so the
+        /// user's systemd is asked about the node's own; one it does not
+        /// delegate is not taken, also not by its owner.
         #[test]
-        fn the_root_of_a_cgroup_namespace_needs_the_mark() {
+        fn the_root_of_a_cgroup_namespace_is_taken_only_when_delegated() {
             if euid() == 0 {
                 eprintln!("skipped: root");
                 return;
@@ -668,16 +695,38 @@ mod linux {
                     false
                 })
                 .unwrap_err();
-                assert!(
-                    e.contains("the node's cgroup / is not delegated"),
-                    "{own}: {e}"
-                );
+                assert!(e.contains("the root of a cgroup namespace"), "{own}: {e}");
+                assert!(e.contains("`Delegate=yes`, and systemd 256"), "{own}: {e}");
                 assert!(
                     !dir.join("node/cgroup.procs").exists(),
                     "{own}: it touched it"
                 );
-                assert!(asked.borrow().is_empty(), "{own}: {:?}", asked.borrow());
+                assert_eq!(*asked.borrow(), ["/"], "{own}");
+
+                let (t, dir) = fake("/", "cpu memory pids", "7\n");
+                let c = Cgroups::at(t.path(), own, 7, euid(), &yes).unwrap();
+                assert_eq!(c.name(), "/");
+                assert!(dir.join("node/cgroup.procs").exists(), "{own}");
+                // Not another user's, nor a shared one, whatever is said.
+                let (t, _) = fake("/", "cpu memory pids", "7\n");
+                assert!(Cgroups::at(t.path(), own, 7, euid() + 1, &yes).is_err());
+                let (t, _) = fake("/", "cpu memory pids", "7\n8\n");
+                assert!(Cgroups::at(t.path(), own, 7, euid(), &yes).is_err());
             }
+            assert_eq!(
+                ask_unit("nerve.service").unwrap(),
+                [
+                    "--user",
+                    "show",
+                    "-p",
+                    "Delegate",
+                    "--value",
+                    "--",
+                    "nerve.service"
+                ]
+            );
+            assert_eq!(ask_unit(""), None);
+            assert_eq!(ask_unit("a b"), None);
         }
 
         #[test]

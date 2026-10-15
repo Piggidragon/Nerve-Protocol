@@ -503,8 +503,10 @@ system's systemd gives a unit's cgroup to its `User=` only with
 systemd, which marks none, is asked as well (`systemctl --user show -p
 Delegate`, for the unit that is the last part of the path). Without the
 mark the root of the visible hierarchy (`/`, the root of a cgroup namespace
-such as `ProtectControlGroups=private` makes) is never taken: its path names
-no unit. A cgroup systemd did not delegate is not taken: systemd turns its controllers off at
+such as `ProtectControlGroups=private` makes) names no unit: it is taken only
+when the user's systemd names the node's unit (`systemctl --user whoami`,
+systemd 256) and says it is delegated, so a system unit there needs the mark
+(systemd 257 sets it), and a user unit on an older systemd gets no cgroup. A cgroup systemd did not delegate is not taken: systemd turns its controllers off at
 its next reload. It moves itself into the leaf `node`, turns on
 `+memory +cpu +pids` in the root's `cgroup.subtree_control` (each where the
 root has it), and makes `cmd-<n>` beside the leaf per command. The forked

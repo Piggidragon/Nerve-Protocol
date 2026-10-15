@@ -56,6 +56,15 @@ fn fake_sudo(dir: &Path) -> PathBuf {
 /// rule for `echo *` (and one line that chains) and a sudo allow entry for
 /// `sudo echo *`.
 async fn node(root: &Path, center: &FakeCenter) -> Daemon {
+    node_with(root, center, |_| Ok(())).await
+}
+
+/// [`node`], with `more` changing the config as well.
+async fn node_with(
+    root: &Path,
+    center: &FakeCenter,
+    more: impl Fn(&mut nerve_policy::NodeConfig) -> Result<(), String>,
+) -> Daemon {
     let mut o = NodeOptions::new(NodePaths::new(root.join("config"), root.join("state")));
     o.home = root.join("home");
     std::fs::create_dir_all(&o.home).unwrap();
@@ -80,7 +89,7 @@ async fn node(root: &Path, center: &FakeCenter) -> Daemon {
         policy
             .allow
             .push(rules::rule_for("exec", "run", CHAINED, false)?);
-        Ok(())
+        more(cfg)
     })
     .await
     .expect("the owner's edit");
@@ -312,6 +321,101 @@ async fn the_sudo_switch() {
     assert!(written.contains("oops [redacted] on stderr"), "{written}");
     assert_eq!(written.matches(RIGHT).count(), 1, "{written}");
 
+    node.stop().await;
+}
+
+/// A result kept while the link was down is scrubbed of the password held
+/// when it was made: turning sudo off before the link resumes does not let
+/// the password out in the replay (protocol §4.9).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_result_kept_for_a_resume_carries_no_password() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let home = dir.path().join("home");
+    let waits =
+        format!("touch started; while [ ! -e go ]; do sleep 0.05; done; echo {RIGHT}; touch done");
+    let node = node_with(dir.path(), &center, |cfg| {
+        let rule = rules::rule_for("exec", "run", &waits, false)?;
+        cfg.centers[0].policy.allow.push(rule);
+        Ok(())
+    })
+    .await;
+    let paired = center.paired().expect("paired");
+    let mut inc = center.next_link(WAIT).await.expect("the node dials");
+    let hello = fake_center::hello(&mut inc.conn, &center.center_id, &paired)
+        .await
+        .expect("hello");
+    let offer = hello.resume.expect("a resume offer");
+    let fresh = nerve_proto::msg::Resumed {
+        resumed: false,
+        got: 0,
+    };
+    fake_center::welcome(&mut inc.conn, Some(fresh))
+        .await
+        .expect("welcome");
+    let mut conn = inc.conn;
+    let mut seen = Seen { frames: Vec::new() };
+    let offer_box = seen.offer(&mut conn, &center).await;
+    let sealed = seal(&offer_box, RIGHT, now()).unwrap();
+    seen.on(&mut conn, &sealed).await.expect("on");
+
+    let run = conn
+        .request(
+            "invoke",
+            json!({"cap": "exec", "action": "run", "args": {"command": waits}}),
+        )
+        .await
+        .unwrap();
+    let exists = |f: &str| {
+        let p = home.join(f);
+        async move {
+            for _ in 0..200 {
+                if p.exists() {
+                    return true;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            false
+        }
+    };
+    assert!(exists("started").await, "the command did not start");
+    // The frames the center read, `ack` aside.
+    let read = seen
+        .frames
+        .iter()
+        .filter(|f| !f.contains("\"method\":\"ack\""))
+        .count() as u64;
+    drop(conn);
+    std::fs::write(home.join("go"), "").unwrap();
+    assert!(exists("done").await, "the command did not finish");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Sudo goes off while the result waits for the resume.
+    nerve_transport::ctl::call(&node.paths().ctl_socket(), "sudo.off", json!({}))
+        .await
+        .expect("sudo off");
+
+    let mut inc = center.next_link(WAIT).await.expect("the node dials again");
+    let hello = fake_center::hello(&mut inc.conn, &center.center_id, &paired)
+        .await
+        .expect("hello");
+    assert_eq!(hello.resume.as_ref().map(|r| &r.link), Some(&offer.link));
+    let again = nerve_proto::msg::Resumed {
+        resumed: true,
+        got: read,
+    };
+    fake_center::welcome(&mut inc.conn, Some(again))
+        .await
+        .expect("welcome");
+    let mut conn = inc.conn;
+    let mut others = Vec::new();
+    let r = conn
+        .answer(run, WAIT, &mut others)
+        .await
+        .unwrap()
+        .expect("the command's result");
+    assert_eq!(r["stdout"], "[redacted]\n", "{r}");
+    let replayed: Vec<String> = others.iter().map(Message::encode).collect();
+    assert!(!replayed.join("\n").contains(RIGHT), "{replayed:?}");
     node.stop().await;
 }
 

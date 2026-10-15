@@ -1,6 +1,8 @@
 //! Flags and `NERVE_*` variables. A harness starts `nerve-center` from its MCP
 //! entry, so every setting is a flag or a variable there. The only
-//! subcommands are the service's, which the owner runs as root on Linux
+//! subcommands are the owner's: `backup` and `restore`, which run by hand on a
+//! center that is not running (`restore`) or may be (`backup`), and the
+//! service's `install`, `update` and `uninstall`, run as root on Linux
 //! ([`crate::service`]).
 
 use std::path::PathBuf;
@@ -26,7 +28,7 @@ pub enum McpMode {
 )]
 pub struct Args {
     /// The state folder (identity, paired nodes, statistics).
-    #[arg(long, env = "NERVE_STATE_DIR")]
+    #[arg(long, env = "NERVE_STATE_DIR", global = true)]
     pub state_dir: Option<PathBuf>,
     /// The center name shown to nodes and in the web UI.
     #[arg(long, env = "NERVE_NAME")]
@@ -66,10 +68,32 @@ pub struct Args {
     pub cmd: Option<Cmd>,
 }
 
-/// The service commands (Linux with systemd, as root). Without one,
+/// What the owner runs by hand; a harness never does. Without one,
 /// `nerve-center` runs the center.
 #[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
 pub enum Cmd {
+    /// Write the center's identity and state (its certificate and key, the paired nodes, the harness tokens' hashes and the statistics) to a file that a passphrase protects, to keep or to move the center to another machine.
+    Backup {
+        /// The file to write. It is private to you (mode 0600).
+        file: PathBuf,
+        /// Replace the file when it exists.
+        #[arg(long)]
+        overwrite: bool,
+        /// Read the passphrase from the first line of this file instead of asking.
+        #[arg(long, value_name = "FILE")]
+        passphrase_file: Option<PathBuf>,
+    },
+    /// Put the identity and state of a backup in place of this center's. No center may run on the state folder.
+    Restore {
+        /// The backup file.
+        file: PathBuf,
+        /// Replace a center here that is not the one the backup is of.
+        #[arg(long)]
+        replace: bool,
+        /// Read the passphrase from the first line of this file instead of asking.
+        #[arg(long, value_name = "FILE")]
+        passphrase_file: Option<PathBuf>,
+    },
     /// Install the center as a service that starts with the machine and runs under a user of its own, with MCP over HTTP (Linux with systemd, as root).
     Install,
     /// Replace the installed program with the latest release and restart the service; the state and the settings stay.
@@ -84,6 +108,17 @@ pub enum Cmd {
         #[arg(long)]
         purge: bool,
     },
+}
+
+impl Cmd {
+    /// install, update and uninstall: they work on the installed service,
+    /// as root, not on `--state-dir`.
+    pub fn is_service(&self) -> bool {
+        matches!(
+            self,
+            Cmd::Install | Cmd::Update { .. } | Cmd::Uninstall { .. }
+        )
+    }
 }
 
 impl Args {
@@ -164,8 +199,8 @@ mod tests {
         let a = Args::try_parse_from(["nerve-center", "--log", "Debug"]).unwrap();
         assert_eq!(a.log, Some(Level::Debug));
         assert!(Args::try_parse_from(["nerve-center", "--log", "loud"]).is_err());
-        // The service commands only: anything else positional is refused.
-        assert_eq!(a.cmd, None);
+        // The owner's subcommands only: anything else positional is refused.
+        assert!(a.cmd.is_none());
         assert!(Args::try_parse_from(["nerve-center", "pair"]).is_err());
         let cmd = |args: &[&str]| {
             Args::try_parse_from(std::iter::once("nerve-center").chain(args.iter().copied()))
@@ -185,6 +220,11 @@ mod tests {
             Some(Cmd::Uninstall { purge: true })
         );
         assert!(Args::try_parse_from(["nerve-center", "install", "x"]).is_err());
+        // The service's go to the service, backup and restore to the state
+        // folder.
+        assert!(cmd(&["install"]).unwrap().is_service());
+        assert!(!cmd(&["backup", "f"]).unwrap().is_service());
+        assert!(!cmd(&["restore", "f"]).unwrap().is_service());
         assert!(
             is_loopback("127.0.0.1:7480") && is_loopback("[::1]:1") && !is_loopback("0.0.0.0:7480")
         );

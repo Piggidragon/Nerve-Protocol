@@ -112,6 +112,37 @@ pub enum Cmd {
         #[arg(long)]
         purge: bool,
     },
+    /// Write the config and the keys to a file that a passphrase protects, to keep or to move the node to another machine.
+    Backup {
+        /// The file to write. It is private to you (mode 0600).
+        file: PathBuf,
+        /// Also take the keys that are in the system keyring into the file; without it they stay there and are left out.
+        #[arg(long)]
+        include_keyring: bool,
+        /// Replace the file when it exists.
+        #[arg(long)]
+        overwrite: bool,
+        /// Read the passphrase from the first line of this file instead of asking.
+        #[arg(long, value_name = "FILE")]
+        passphrase_file: Option<PathBuf>,
+    },
+    /// Put the config and keys of a backup in place of this node's. The node must not run.
+    Restore {
+        /// The backup file.
+        file: PathBuf,
+        /// Replace a node here that is not the one the backup is of.
+        #[arg(long)]
+        replace: bool,
+        /// Keep the keys in `file` or in the system `keyring` here, whatever the backup's config says.
+        #[arg(long, value_name = "file|keyring")]
+        secret_storage: Option<String>,
+        /// Leave the proxy out of the restored config, with its password and header values; set it again on this machine.
+        #[arg(long)]
+        without_proxy: bool,
+        /// Read the passphrase from the first line of this file instead of asking.
+        #[arg(long, value_name = "FILE")]
+        passphrase_file: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -419,8 +450,13 @@ pub struct Help {
 const SECTIONS: &[(&str, &str, &[&[&str]])] = &[
     (
         "Install and set up",
-        "Run the node as a service under a user of its own (Linux with sudo, Windows as administrator), set it up and keep it current.",
-        &[&["install", "uninstall"], &["setup"], &["update"]],
+        "Run the node as a service under a user of its own (Linux with sudo, Windows as administrator), set it up, keep it current, and back it up or move it.",
+        &[
+            &["install", "uninstall"],
+            &["setup"],
+            &["update"],
+            &["backup", "restore"],
+        ],
     ),
     (
         "Pair and connect",
@@ -1038,7 +1074,9 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
     // The daemon writes the file itself while it runs; the service commands
     // leave it alone (or delete it with the rest). Sudo on Windows says
     // itself when its change counts (crate::winsudo).
-    let own_say = cfg!(windows) && matches!(cli.cmd, Cmd::Sudo(_));
+    // A restore says itself what comes next.
+    let own_say = (cfg!(windows) && matches!(cli.cmd, Cmd::Sudo(_)))
+        || matches!(cli.cmd, Cmd::Restore { .. });
     let before = (!matches!(cli.cmd, Cmd::Run) && !service && !own_say)
         .then(|| std::fs::read(paths.config_file()).ok());
     // On Windows the running node takes folder changes over its pipe, and
@@ -1111,8 +1149,9 @@ pub fn service_log(cli: &Cli) -> Option<PathBuf> {
 
 /// The rule of the other owner commands (docs/dev/spec/node-local.md §5):
 /// nothing a command of a center starts may install, set up, update or
-/// remove the node. The node that runs knows its commands, so it is asked
-/// over its control socket, and refuses a caller below one of them.
+/// remove the node, nor back it up or restore it. The node that runs knows
+/// its commands, so it is asked over its control socket, and refuses a
+/// caller below one of them.
 pub async fn owner_check(paths: &[&NodePaths]) -> Result<(), String> {
     #[cfg(unix)]
     for p in paths {
@@ -1151,6 +1190,59 @@ async fn daemon_answers(paths: &NodePaths, folders: bool) -> bool {
         let _ = (paths, folders);
         false
     }
+}
+
+/// What `status` says of the limits per command (crate::cgroup::status):
+/// what a command gets and may ask for, then where they hold or why not.
+fn limits_lines(v: &Value) -> Vec<String> {
+    let n = |k: &str| v[k].as_u64().unwrap_or_default();
+    let mut lines = vec![format!(
+        "limits per command: memory {} MiB, CPU {} %, {} processes; a call may ask for up to {} MiB, {} %, {} processes",
+        n("memory_mb"),
+        n("cpu_percent"),
+        n("processes"),
+        n("memory_max_mb"),
+        n("cpu_max_percent"),
+        n("processes_max"),
+    )];
+    let list = |k: &str| -> Vec<&str> {
+        v[k].as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect()
+    };
+    let (enforced, lost) = (list("enforced"), list("lost"));
+    if let Some(cgroup) = v["cgroup"].as_str() {
+        let not: Vec<&str> = ["memory", "cpu", "processes"]
+            .into_iter()
+            .filter(|l| !enforced.contains(l) && !lost.contains(l))
+            .collect();
+        let mut line = match enforced.is_empty() {
+            true => format!("limits held by the cgroup {cgroup}: none"),
+            false => format!(
+                "limits held by the cgroup {cgroup}: {}",
+                enforced.join(", ")
+            ),
+        };
+        if !not.is_empty() {
+            line.push_str(&format!(
+                "; not {} (the cgroup has no controller for it)",
+                not.join(", ")
+            ));
+        }
+        lines.push(line);
+        // Turned off while the node ran: no command runs (crate::cgroup).
+        if !lost.is_empty() {
+            lines.push(format!(
+                "NO COMMAND RUNS: {} turned off in the cgroup since the node started; start the node again",
+                lost.join(", ")
+            ));
+        }
+    } else if let Some(why) = v["off"].as_str() {
+        lines.push(format!("commands run WITHOUT these limits: {why}"));
+    }
+    lines
 }
 
 /// What `status` says when no daemon answered. With a control socket
@@ -1339,6 +1431,9 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                     if let Some(why) = v["folder_commands_off"].as_str() {
                         w(out, format!("folder mode runs no command: {why}"));
                     }
+                    for line in limits_lines(&v["command_limits"]) {
+                        w(out, line);
+                    }
                     if v["locked"] == true {
                         w(
                             out,
@@ -1393,6 +1488,11 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                 &crate::secrets::NodeSecrets::for_cli(&paths),
             )?;
             w(out, no_daemon_status(cfg!(unix)));
+            let limits =
+                crate::cgroup::status(&cfg.limits.command, &Err("the node does not run".into()));
+            if let Some(line) = limits_lines(&limits).first() {
+                w(out, line.clone());
+            }
             if cfg.locked {
                 w(
                     out,
@@ -1515,6 +1615,56 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
         Cmd::Proxy(c) => proxy_cmd(&paths, c, out).await,
         Cmd::Relay(c) => relay_cmd(&paths, c, out).await,
         Cmd::Sudo(c) => sudo_cmd(&paths, c, out).await,
+        Cmd::Backup {
+            file,
+            include_keyring,
+            overwrite,
+            passphrase_file,
+        } => {
+            // A command of a center must not take the node's keys out under a
+            // passphrase of its own.
+            owner_check(&[&paths]).await?;
+            let (cfg, _) = read_config(&paths).await?;
+            let pass = crate::prompt::passphrase(passphrase_file.as_deref(), out, true)?;
+            let opts = crate::backup::BackupOpts {
+                include_keyring,
+                overwrite,
+                rounds: nerve_transport::backup::ITERATIONS,
+            };
+            let r = crate::backup::backup(&paths, &cfg, &file, &pass, &opts)?;
+            crate::backup::print_backup(&r, &file, out);
+            Ok(())
+        }
+        Cmd::Restore {
+            file,
+            replace,
+            secret_storage,
+            without_proxy,
+            passphrase_file,
+        } => {
+            owner_check(&[&paths]).await?;
+            let bytes = nerve_transport::backup::read_file(&file)?;
+            let kind = nerve_transport::backup::kind_of(&bytes)?;
+            if kind != nerve_transport::backup::Kind::Node {
+                return Err(format!(
+                    "this is the backup of a {}, not of a node: restore it with `nerve-center restore`",
+                    kind.word()
+                ));
+            }
+            let storage = secret_storage
+                .map(|s| parse_enum::<SecretStorage>(&s, "file or keyring"))
+                .transpose()?;
+            let pass = crate::prompt::passphrase(passphrase_file.as_deref(), out, false)?;
+            let parsed = crate::backup::open(&bytes, &pass)?;
+            let opts = crate::backup::RestoreOpts {
+                replace,
+                secret_storage: storage,
+                without_proxy,
+            };
+            let r = crate::backup::restore(&paths, &parsed, &opts)?;
+            crate::backup::print_restore(&r, &parsed, out);
+            Ok(())
+        }
         Cmd::Install => {
             let layout = Layout::system();
             owner_check(&[&paths, &layout.paths]).await?;
@@ -4328,6 +4478,34 @@ mod tests {
         assert_eq!(load(&paths).limits.max_running, 16);
     }
 
+    /// The owner sets the run-time limits by name; a limit of 0 is refused
+    /// and changes nothing, and unsetting one gives the default back.
+    #[test]
+    fn config_sets_the_run_time_limits() {
+        let (_d, paths) = setup(&["home"]);
+        assert_eq!(load(&paths).limits.default_timeout_secs, 600);
+        assert_eq!(load(&paths).limits.max_timeout_secs, 3600);
+        run(
+            &paths,
+            &["config", "set", "limits.default_timeout_secs", "30"],
+        )
+        .unwrap();
+        run(&paths, &["config", "set", "limits.max_timeout_secs", "90"]).unwrap();
+        assert_eq!(load(&paths).limits.default_timeout_secs, 30);
+        assert_eq!(load(&paths).limits.max_timeout_secs, 90);
+        assert_eq!(
+            run(&paths, &["config", "get", "limits.max_timeout_secs"]).unwrap(),
+            "90\n"
+        );
+        for key in ["default_timeout_secs", "max_timeout_secs"] {
+            let e = run(&paths, &["config", "set", &format!("limits.{key}"), "0"]).unwrap_err();
+            assert!(e.contains("must be at least 1"), "{e}");
+        }
+        assert_eq!(load(&paths).limits.max_timeout_secs, 90);
+        run(&paths, &["config", "unset", "limits.max_timeout_secs"]).unwrap();
+        assert_eq!(load(&paths).limits.max_timeout_secs, 3600);
+    }
+
     /// install, update and uninstall work on the installed node only, so
     /// they take no folders; none says it is not done.
     #[test]
@@ -4759,6 +4937,85 @@ mod tests {
         restart_for_keyring(&fine, &paths, Some(&sys), &mut out).unwrap();
         restart_for_keyring(&fine, &paths, None, &mut out).unwrap();
         assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+    }
+
+    /// `status` shows the limits per command the owner set, and whether
+    /// the running node holds commands to them, or why not.
+    #[cfg(unix)]
+    #[test]
+    fn the_status_shows_the_limits_per_command() {
+        let (d, paths) = setup(&[]);
+        run(
+            &paths,
+            &["config", "set", "limits.command.memory_mb", "512"],
+        )
+        .unwrap();
+        let out = run(&paths, &["status"]).unwrap();
+        assert!(
+            out.contains("limits per command: memory 512 MiB, CPU 200 %, 1024 processes; a call may ask for up to 16384 MiB, 800 %, 8192 processes"),
+            "{out}"
+        );
+        let (ready_tx, ready) = std::sync::mpsc::channel();
+        let (stop, stop_rx) = std::sync::mpsc::channel::<()>();
+        let node = {
+            let (home, paths) = (d.path().to_path_buf(), paths.clone());
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let mut opts = NodeOptions::new(paths);
+                opts.home = home;
+                opts.full_rights = Some(false);
+                opts.cgroups = Some(Err("no cgroup for this test".into()));
+                let daemon = rt.block_on(Daemon::start(opts)).unwrap();
+                ready_tx.send(()).unwrap();
+                rt.block_on(async {
+                    while stop_rx.try_recv().is_err() {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    daemon.stop().await;
+                });
+            })
+        };
+        ready.recv().unwrap();
+        let out = run(&paths, &["status"]);
+        stop.send(()).unwrap();
+        node.join().unwrap();
+        let out = out.unwrap();
+        assert!(out.contains("limits per command: memory 512 MiB"), "{out}");
+        assert!(
+            out.contains("commands run WITHOUT these limits: no cgroup for this test"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn the_status_names_the_cgroup_and_what_it_holds() {
+        let v = json!({"memory_mb": 1, "memory_max_mb": 2, "cpu_percent": 3,
+                       "cpu_max_percent": 4, "processes": 5, "processes_max": 6,
+                       "cgroup": "/system.slice/nerve-node.service",
+                       "enforced": ["memory", "processes"], "off": null});
+        assert_eq!(
+            limits_lines(&v),
+            [
+                "limits per command: memory 1 MiB, CPU 3 %, 5 processes; a call may ask for up to 2 MiB, 4 %, 6 processes",
+                "limits held by the cgroup /system.slice/nerve-node.service: memory, processes; not cpu (the cgroup has no controller for it)",
+            ]
+        );
+        // Turned off since the start: said apart from what the cgroup never
+        // had, with what follows from it.
+        let v = json!({"memory_mb": 1, "memory_max_mb": 2, "cpu_percent": 3,
+                       "cpu_max_percent": 4, "processes": 5, "processes_max": 6,
+                       "cgroup": "/", "enforced": [], "lost": ["memory", "processes"],
+                       "off": null});
+        assert_eq!(
+            limits_lines(&v)[1..],
+            [
+                "limits held by the cgroup /: none; not cpu (the cgroup has no controller for it)",
+                "NO COMMAND RUNS: memory, processes turned off in the cgroup since the node started; start the node again",
+            ]
+        );
     }
 
     /// Setup restarts a node that found no keyring also when the keyring

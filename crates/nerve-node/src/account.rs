@@ -792,13 +792,28 @@ impl Drop for FsAs {
 /// node waits for it a short while at most.
 #[cfg(target_os = "linux")]
 pub fn kill_as(uid: u32, pgid: u32, sig: libc::c_int) {
+    signal_as(uid, -(pgid as libc::pid_t), sig);
+}
+
+/// [`kill_as`] for the one process `pid`: a command's process that left
+/// its process group but not its cgroup (crate::cgroup).
+#[cfg(target_os = "linux")]
+pub fn kill_pid_as(uid: u32, pid: u32, sig: libc::c_int) {
+    if pid != 0 {
+        signal_as(uid, pid as libc::pid_t, sig);
+    }
+}
+
+/// `kill(target, sig)` from a child that has `uid` as its effective id.
+#[cfg(target_os = "linux")]
+fn signal_as(uid: u32, target: libc::pid_t, sig: libc::c_int) {
     // SAFETY: the child of a process with many threads makes plain system
     // calls only and leaves with _exit.
     unsafe {
         let pid = libc::fork();
         if pid == 0 {
             if libc::syscall(libc::SYS_setresuid, u32::MAX, uid, u32::MAX) == 0 {
-                libc::kill(-(pgid as libc::pid_t), sig);
+                libc::kill(target, sig);
             }
             libc::_exit(0);
         }

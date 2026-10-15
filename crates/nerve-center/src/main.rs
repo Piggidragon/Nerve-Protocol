@@ -7,6 +7,16 @@ use clap::Parser;
 
 fn main() -> std::process::ExitCode {
     let args = nerve_center::config::Args::parse();
+    // `backup` and `restore` are the owner's, run by hand: no log, no server.
+    if let Some(cmd) = args.cmd.as_ref().filter(|c| !c.is_service()) {
+        return match nerve_center::backup::run(&args.state_dir(), cmd, &mut std::io::stdout()) {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("nerve-center: {e}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
     // The level of the settings replaces this one once the state is opened.
     nerve_transport::log::install(args.log.unwrap_or_default(), true);
     let rt = match tokio::runtime::Runtime::new() {

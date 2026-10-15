@@ -8,6 +8,8 @@
 //! process with [`daemon::Daemon::start`] and pair with [`pair::pair`].
 
 pub mod account;
+pub mod backup;
+pub mod cgroup;
 pub mod cli;
 pub mod daemon;
 pub mod descriptor;
@@ -26,6 +28,7 @@ pub mod keyring_setup;
 mod link;
 pub mod pair;
 pub mod paths;
+pub mod prompt;
 // Providers attach over the control socket, which is Unix's; the pipe on
 // Windows takes none yet.
 #[cfg_attr(not(unix), allow(dead_code))]

@@ -1,6 +1,6 @@
 //! The `exec` capability (spec §7.3): shell commands, each in its own
 //! process group so the whole tree can be signalled and is killed when the
-//! call ends or the link drops. Windows has no process groups; there each
+//! call ends or its link ends (a dropped link that is resumed goes on). Windows has no process groups; there each
 //! command runs in a job object of its own (crate::job), and only when
 //! Windows makes none does the node record the processes below the shell
 //! while it runs (crate::tree), best effort.
@@ -37,6 +37,21 @@ struct RunArgs {
     cwd: Option<String>,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    memory_mb: Option<u64>,
+    #[serde(default)]
+    cpu_percent: Option<u32>,
+    #[serde(default)]
+    processes: Option<u32>,
+}
+
+/// The limits a call asks for its command; each up to the node's most
+/// (`limits.command`, [`nerve_policy::config::CommandLimits::grant`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Asked {
+    pub memory_mb: Option<u64>,
+    pub cpu_percent: Option<u32>,
+    pub processes: Option<u32>,
 }
 
 /// A parsed `exec.run`.
@@ -44,7 +59,10 @@ struct RunArgs {
 pub struct RunCall {
     pub command: String,
     pub cwd: PathBuf,
+    /// What the call asked for; `None` when it gave no `timeout_ms` (0 counts
+    /// as none). [`Timeouts`] turns it into the limit the command runs under.
     pub timeout: Option<Duration>,
+    pub limits: Asked,
 }
 
 impl RunCall {
@@ -70,6 +88,11 @@ impl RunCall {
             command: a.command,
             cwd,
             timeout: a.timeout_ms.filter(|t| *t > 0).map(Duration::from_millis),
+            limits: Asked {
+                memory_mb: a.memory_mb,
+                cpu_percent: a.cpu_percent,
+                processes: a.processes,
+            },
         })
     }
 
@@ -80,6 +103,81 @@ impl RunCall {
             path: self.cwd.clone(),
             write: false,
         }]
+    }
+}
+
+/// How long a command may run, from the owner's `limits`: a call that gives
+/// no `timeout_ms` gets `default`, and no call gets more than `max`. So no
+/// command runs without an end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timeouts {
+    pub default: Duration,
+    pub max: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Timeouts {
+        Timeouts::from_limits(&nerve_policy::config::Limits::default())
+    }
+}
+
+impl Timeouts {
+    pub fn from_limits(l: &nerve_policy::config::Limits) -> Timeouts {
+        Timeouts {
+            default: Duration::from_secs(l.default_timeout_secs),
+            max: Duration::from_secs(l.max_timeout_secs),
+        }
+    }
+
+    /// The limit of a call that asked for `asked`. The default is cut to the
+    /// maximum like a `timeout_ms` is, so an owner who lowers the maximum
+    /// below the default needs no second change.
+    pub fn limit(&self, asked: Option<Duration>) -> RunLimit {
+        let wanted = asked.unwrap_or(self.default);
+        RunLimit {
+            after: wanted.min(self.max),
+            asked,
+            capped: wanted > self.max,
+            max: self.max,
+        }
+    }
+}
+
+/// The time one command has, and what it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunLimit {
+    pub after: Duration,
+    asked: Option<Duration>,
+    /// What was wanted was more than the maximum.
+    capped: bool,
+    max: Duration,
+}
+
+impl RunLimit {
+    /// The error of a command that ran past it. It says which limit that was,
+    /// so the model knows whether a larger `timeout_ms` helps.
+    pub fn timed_out(&self) -> RpcError {
+        let after = nerve_transport::log::span(self.after);
+        let text = match (self.asked, self.capped) {
+            (Some(_), false) => {
+                format!("the command ran past timeout_ms ({after}) and was killed")
+            }
+            (Some(asked), true) => format!(
+                "the command ran past the node's maximum of {after} and was killed: timeout_ms asked for {}, which the owner's limits.max_timeout_secs cuts",
+                nerve_transport::log::span(asked)
+            ),
+            (None, false) if self.max > self.after => format!(
+                "the command ran past the default limit of {after} and was killed: no timeout_ms was given (up to {} is allowed)",
+                nerve_transport::log::span(self.max)
+            ),
+            (None, false) => format!(
+                "the command ran past the node's limit of {after} and was killed: no timeout_ms was given"
+            ),
+            (None, true) => format!(
+                "the command ran past the node's maximum of {after} and was killed: no timeout_ms was given, and the owner's limits.max_timeout_secs is below the default"
+            ),
+        };
+        RpcError::new(ErrorCode::Timeout, text)
     }
 }
 
@@ -229,6 +327,17 @@ pub fn shell_summary(shell: Option<&str>) -> String {
     } else {
         format!("Runs a command with {line}.")
     }
+}
+
+/// What the `exec.run` action says about the time a command has, so a model
+/// knows what it gets without `timeout_ms` and what it cannot get.
+pub fn timeout_summary(t: &Timeouts) -> String {
+    use nerve_transport::log::span;
+    format!(
+        "A command is killed after timeout_ms, after {} when you give none, and never runs longer than {}.",
+        span(t.limit(None).after),
+        span(t.max)
+    )
 }
 
 /// Command output as text. UTF-8 is taken as it is, also when the cap cut
@@ -963,6 +1072,8 @@ pub struct RunOptions {
     /// The `nerve-node` binary that hosts the shim.
     pub exe: PathBuf,
     pub output_cap: usize,
+    /// The time a command has when its call gives none, and the most it gets.
+    pub timeouts: Timeouts,
     /// Set only for a `sudo` command the sudo allow list names (already rewritten with
     /// [`sudo_line`]): the password goes to sudo's stdin once sudo shows the
     /// prompt. Every other command runs with no_new_privs (Linux), so a
@@ -973,6 +1084,12 @@ pub struct RunOptions {
     pub account: Option<crate::service::Account>,
     /// The node's own folders, which the account must not reach.
     pub own: Vec<PathBuf>,
+    /// Linux: the command runs in a cgroup of its own below these, held to
+    /// these limits (crate::cgroup); `None` runs it without.
+    pub limits: Option<(
+        std::sync::Arc<crate::cgroup::Cgroups>,
+        nerve_policy::config::Granted,
+    )>,
 }
 
 /// What a sudo command needs: the password and the prompt sudo was told to
@@ -1422,11 +1539,25 @@ pub async fn run(
             c
         }
     };
+    // The command's cgroup, which it joins in the child before anything
+    // else, so all it starts is held to its limits. One that cannot be made
+    // keeps the command from running: the owner set the limits.
+    #[cfg(target_os = "linux")]
+    let cgroup = match &opts.limits {
+        Some((cgroups, granted)) => Some(cgroups.command(granted).map_err(|e| {
+            RpcError::new(
+                ErrorCode::Unavailable,
+                format!("the command was not run: {e}"),
+            )
+        })?),
+        None => None,
+    };
     // A command of another account takes its ids, drops the service's
     // capabilities and enters its folder in the child (crate::account);
     // any other drops the capabilities.
     #[cfg(target_os = "linux")]
     {
+        let join = cgroup.as_ref().map(crate::cgroup::CommandCgroup::procs_fd);
         let switch = match &opts.account {
             Some(a) => Some(
                 crate::account::Switch::new(a, Some(&call.cwd), &opts.own)
@@ -1440,6 +1571,9 @@ pub async fn run(
         // SAFETY: plain system calls on memory moved into the closure.
         unsafe {
             cmd.pre_exec(move || {
+                if let Some(fd) = join {
+                    crate::cgroup::join(fd)?;
+                }
                 match &switch {
                     Some(s) => s.apply()?,
                     None if nerve_transport::net::euid() != 0 => crate::account::drop_caps()?,
@@ -1546,6 +1680,7 @@ pub async fn run(
     let stdout = child.stdout.take().expect("piped");
     let stderr = child.stderr.take().expect("piped");
     let cap = opts.output_cap.min(OUTPUT_HARD_CAP);
+    let limit = opts.timeouts.limit(call.timeout);
     let err = async {
         match sudo_stdin {
             Some((stdin, sudo)) => sudo_stderr(stderr, stdin, sudo, pid, cap).await,
@@ -1557,28 +1692,27 @@ pub async fn run(
         (o, e, st)
     };
     tokio::pin!(work);
-    let (out, err, status, timed_out) = match call.timeout {
-        Some(t) => match tokio::time::timeout(t, &mut work).await {
-            Ok((o, e, s)) => (o, e, Some(s), false),
-            Err(_) => {
-                #[cfg(windows)]
-                if let Some(e) = &group.0 {
-                    e.grace(&mut work).await;
-                }
-                ((Vec::new(), false), (Vec::new(), false), None, true)
+    let (out, err, status, timed_out) = match tokio::time::timeout(limit.after, &mut work).await {
+        Ok((o, e, s)) => (o, e, Some(s), false),
+        Err(_) => {
+            #[cfg(windows)]
+            if let Some(e) = &group.0 {
+                e.grace(&mut work).await;
             }
-        },
-        None => {
-            let (o, e, s) = work.await;
-            (o, e, Some(s), false)
+            ((Vec::new(), false), (Vec::new(), false), None, true)
         }
     };
     drop(group);
+    // Read before the cgroup goes with what is left in it.
+    #[cfg(target_os = "linux")]
+    let out_of_memory = cgroup
+        .as_ref()
+        .filter(|c| c.out_of_memory())
+        .map(crate::cgroup::CommandCgroup::memory_mb);
+    #[cfg(target_os = "linux")]
+    drop(cgroup);
     if timed_out {
-        return Err(RpcError::new(
-            ErrorCode::Timeout,
-            "the command ran past timeout_ms and was killed",
-        ));
+        return Err(limit.timed_out());
     }
     let status = status
         .expect("set unless timed out")
@@ -1602,6 +1736,11 @@ pub async fn run(
             };
             result["signal"] = name.into();
         }
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(mb) = out_of_memory {
+        result["killed"] = "memory".into();
+        result["reason"] = crate::cgroup::memory_reason(mb).into();
     }
     Ok(result)
 }
@@ -1697,6 +1836,7 @@ async fn run_as(
         .map_err(|e| RpcError::internal(format!("waiting for the command: {e}")))?;
     let crate::win_user::Spawned { stdout, stderr, .. } = child;
     let cap = opts.output_cap.min(OUTPUT_HARD_CAP);
+    let limit = opts.timeouts.limit(call.timeout);
     let work = async {
         tokio::join!(
             capped(tokio::fs::File::from_std(stdout), cap),
@@ -1710,21 +1850,15 @@ async fn run_as(
         )
     };
     tokio::pin!(work);
-    let (out, err, code) = match call.timeout {
-        Some(t) => match tokio::time::timeout(t, &mut work).await {
-            Ok(r) => r,
-            Err(_) => {
-                if let Some(e) = &group.0 {
-                    e.grace(&mut work).await;
-                }
-                drop(group);
-                return Err(RpcError::new(
-                    ErrorCode::Timeout,
-                    "the command ran past timeout_ms and was killed",
-                ));
+    let (out, err, code) = match tokio::time::timeout(limit.after, &mut work).await {
+        Ok(r) => r,
+        Err(_) => {
+            if let Some(e) = &group.0 {
+                e.grace(&mut work).await;
             }
-        },
-        None => work.await,
+            drop(group);
+            return Err(limit.timed_out());
+        }
     };
     drop(group);
     let code = code.map_err(|e| RpcError::internal(format!("waiting for the command: {e}")))?;
@@ -1811,9 +1945,11 @@ mod tests {
             container: None,
             exe: PathBuf::from("/nonexistent"),
             output_cap: cap,
+            timeouts: Timeouts::default(),
             sudo: None,
             account: None,
             own: Vec::new(),
+            limits: None,
         }
     }
 
@@ -1822,7 +1958,191 @@ mod tests {
             command: cmd.into(),
             cwd: std::env::temp_dir(),
             timeout: Some(Duration::from_secs(10)),
+            limits: Default::default(),
         }
+    }
+
+    /// A command runs in a cgroup of its own, held to its limits: past its
+    /// memory it is killed and its result says so, past its processes it
+    /// cannot start more, and what it left behind ends with it, also
+    /// outside its process group. This needs a cgroup delegated to the
+    /// process, so the test runs [`limits_in_a_real_cgroup`] in a scope
+    /// systemd's user manager makes for it; without one it is skipped.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_command_is_held_to_its_limits_in_a_cgroup_of_its_own() {
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new("systemd-run")
+            .args(["--user", "--scope", "--quiet", "-p", "Delegate=yes"])
+            // The helper's own bound, whatever its commands do.
+            .args(["-p", "MemoryMax=1G", "-p", "MemorySwapMax=0", "--"])
+            .arg(&exe)
+            .args([
+                "--ignored",
+                "--exact",
+                "exec::tests::limits_in_a_real_cgroup",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .output();
+        let Ok(out) = out else {
+            eprintln!("skipped: no systemd-run here");
+            return;
+        };
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if !text.contains("limits helper started") {
+            eprintln!("skipped: systemd-run --user made no scope: {text}");
+            return;
+        }
+        assert!(text.contains("limits helper passed"), "{text}");
+    }
+
+    /// A command whose cgroup cannot be made does not run: the owner set
+    /// limits, and it would run without them. The cgroups are plain folders
+    /// here, the node's made read-only.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_command_without_its_cgroup_does_not_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let me = nerve_transport::net::euid();
+        if me == 0 {
+            eprintln!("skipped: root writes a read-only folder");
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        let own = t.path().join("node.scope");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(t.path().join("cgroup.controllers"), "cpu memory pids").unwrap();
+        std::fs::write(own.join("cgroup.controllers"), "cpu memory pids").unwrap();
+        std::fs::write(own.join("cgroup.procs"), "").unwrap();
+        let cgroups =
+            crate::cgroup::Cgroups::at(t.path(), "/node.scope", std::process::id(), me, &|_| true)
+                .unwrap();
+        std::fs::write(own.join("cgroup.subtree_control"), "cpu memory pids").unwrap();
+        let mut o = opts(1024);
+        o.limits = Some((
+            std::sync::Arc::new(cgroups),
+            nerve_policy::config::Granted {
+                memory_mb: 64,
+                cpu_percent: 100,
+                processes: 16,
+            },
+        ));
+        let ran = t.path().join("ran");
+        let line = format!("touch {}", ran.display());
+        std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let r = run(&call(&line), &o, |_| {}).await;
+        std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let e = r.unwrap_err();
+        assert_eq!(e.kind(), ErrorCode::Unavailable, "{e:?}");
+        assert!(
+            e.message
+                .starts_with("the command was not run: cannot make a cgroup for the command"),
+            "{e:?}"
+        );
+        assert!(!ran.exists(), "the command ran without its cgroup");
+        // With its cgroup, the same command runs.
+        let r = run(&call(&line), &o, |_| {}).await.unwrap();
+        assert_eq!(r["exit_code"], 0, "{r}");
+        assert!(ran.exists());
+    }
+
+    /// A child that cannot join its cgroup is not started.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_join_is_an_error() {
+        use std::os::fd::AsRawFd;
+        let full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        assert!(crate::cgroup::join(full.as_raw_fd()).is_err());
+        assert!(crate::cgroup::join(-1).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "a helper of a_command_is_held_to_its_limits_in_a_cgroup_of_its_own"]
+    async fn limits_in_a_real_cgroup() {
+        use nerve_policy::config::Granted;
+        println!("limits helper started");
+        let cgroups = std::sync::Arc::new(crate::cgroup::Cgroups::find().unwrap());
+        assert!(
+            cgroups.enforced().contains(&"memory") && cgroups.enforced().contains(&"processes"),
+            "{:?}",
+            cgroups.enforced()
+        );
+        let held = |memory_mb, processes| {
+            let mut o = opts(1024);
+            o.limits = Some((
+                cgroups.clone(),
+                Granted {
+                    memory_mb,
+                    cpu_percent: 100,
+                    processes,
+                },
+            ));
+            o
+        };
+        // About 64 MB in the shell's own memory.
+        let big = "x=$(head -c 64000000 /dev/zero | tr '\\0' a); echo ${#x}";
+        let r = run(&call(big), &held(16, 64), |_| {}).await.unwrap();
+        assert_eq!(r["killed"], "memory", "{r}");
+        assert_eq!(r["signal"], "kill", "{r}");
+        assert_eq!(
+            r["reason"],
+            "the command went past its memory limit of 16 MiB and was killed"
+        );
+        let r = run(&call(big), &held(512, 64), |_| {}).await.unwrap();
+        assert_eq!(r["stdout"], "64000000\n", "{r}");
+        assert!(r.get("killed").is_none(), "{r}");
+
+        // A shell with 4 processes at most starts no 10 more.
+        let many = "for i in 1 2 3 4 5 6 7 8 9 10; do sleep 1 & done; wait";
+        let r = run(&call(many), &held(64, 4), |_| {}).await.unwrap();
+        assert!(!r["stderr"].as_str().unwrap().is_empty(), "{r}");
+        assert!(r.get("killed").is_none(), "{r}");
+
+        // What left the process group is in the cgroup still, and ends.
+        let left = "setsid sleep 60 >/dev/null 2>&1 < /dev/null & echo $!";
+        let r = run(&call(left), &held(64, 64), |_| {}).await.unwrap();
+        let pid: i32 = r["stdout"].as_str().unwrap().trim().parse().unwrap();
+        let mut ended = false;
+        for _ in 0..100 {
+            // SAFETY: signal 0 only asks whether the process is there.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                ended = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(ended, "the process {pid} outlived its command");
+        // And the commands' cgroups are gone.
+        let own = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+        let dir = Path::new("/sys/fs/cgroup").join(
+            own.trim()
+                .trim_start_matches("0::/")
+                .trim_end_matches("/node"),
+        );
+        let mut left = Vec::new();
+        for _ in 0..100 {
+            left = std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("cmd-"))
+                .collect();
+            if left.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(left.is_empty(), "{left:?}");
+        println!("limits helper passed");
     }
 
     #[tokio::test]
@@ -2049,6 +2369,62 @@ mod tests {
         // SAFETY: signal 0 only checks whether the group exists.
         let alive = unsafe { libc::kill(-(pid as libc::pid_t), 0) } == 0;
         assert!(!alive, "the process group outlived the call");
+    }
+
+    /// A guard so a command that is not ended fails the test and does not
+    /// hang it.
+    async fn within_a_few_seconds(
+        call: &RunCall,
+        opts: &RunOptions,
+    ) -> (Result<Value, RpcError>, Duration) {
+        let started = std::time::Instant::now();
+        let r = tokio::time::timeout(Duration::from_secs(20), run(call, opts, |_| {}))
+            .await
+            .expect("the command was not ended");
+        (r, started.elapsed())
+    }
+
+    /// A call without `timeout_ms` is ended at the default.
+    #[tokio::test]
+    async fn a_call_without_timeout_ms_ends_at_the_default() {
+        let mut o = opts(1024);
+        o.timeouts = Timeouts {
+            default: Duration::from_millis(300),
+            max: Duration::from_secs(10),
+        };
+        let mut c = call("sleep 30");
+        c.timeout = None;
+        let (r, took) = within_a_few_seconds(&c, &o).await;
+        let e = r.unwrap_err();
+        assert_eq!(e.kind(), ErrorCode::Timeout);
+        assert!(e.message.contains("default limit"), "{}", e.message);
+        assert!(took >= Duration::from_millis(300), "{took:?}");
+        // One that ends before the default is left alone.
+        c.command = "echo done".into();
+        let (r, _) = within_a_few_seconds(&c, &o).await;
+        assert_eq!(r.unwrap()["stdout"], "done\n");
+    }
+
+    /// A `timeout_ms` above the maximum is cut to it, and one below it is kept.
+    #[tokio::test]
+    async fn a_larger_timeout_ms_is_cut_to_the_maximum() {
+        let mut o = opts(1024);
+        o.timeouts = Timeouts {
+            default: Duration::from_secs(10),
+            max: Duration::from_millis(400),
+        };
+        let mut c = call("sleep 30");
+        c.timeout = Some(Duration::from_secs(600));
+        let (r, took) = within_a_few_seconds(&c, &o).await;
+        let e = r.unwrap_err();
+        assert_eq!(e.kind(), ErrorCode::Timeout);
+        assert!(e.message.contains("maximum"), "{}", e.message);
+        assert!(took >= Duration::from_millis(400), "{took:?}");
+        // Below the maximum the call's own value counts.
+        c.timeout = Some(Duration::from_millis(100));
+        let (r, _) = within_a_few_seconds(&c, &o).await;
+        let e = r.unwrap_err();
+        assert!(e.message.contains("past timeout_ms"), "{}", e.message);
     }
 
     /// With the keys in the keyring a command connects to socket files anywhere
@@ -2762,10 +3138,111 @@ mod tests {
     }
 }
 
-/// The shell's text and the output decoding: plain logic, on every platform.
+/// The shell's text, the output decoding and the run-time limits: plain
+/// logic, on every platform.
 #[cfg(test)]
 mod text_tests {
     use super::*;
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    fn timeouts(default: u64, max: u64) -> Timeouts {
+        Timeouts {
+            default: secs(default),
+            max: secs(max),
+        }
+    }
+
+    /// A call without `timeout_ms` gets the default, one within the maximum
+    /// gets what it asked for, and a larger one is cut to the maximum. The
+    /// default is cut as well.
+    #[test]
+    fn a_call_gets_the_default_and_no_more_than_the_maximum() {
+        let t = timeouts(60, 300);
+        assert_eq!(t.limit(None).after, secs(60));
+        assert_eq!(t.limit(Some(secs(5))).after, secs(5));
+        assert_eq!(t.limit(Some(secs(300))).after, secs(300));
+        assert_eq!(t.limit(Some(secs(301))).after, secs(300));
+        assert_eq!(t.limit(Some(secs(86_400))).after, secs(300));
+        assert_eq!(
+            t.limit(Some(Duration::from_millis(u64::MAX))).after,
+            secs(300)
+        );
+        // An owner who lowers the maximum below the default.
+        assert_eq!(timeouts(600, 30).limit(None).after, secs(30));
+        // What `limits` holds when the owner set nothing.
+        assert_eq!(Timeouts::default(), timeouts(600, 3600));
+    }
+
+    /// `timeout_ms` of 0 is no value: it gets the default, never no limit.
+    #[test]
+    fn a_zero_timeout_is_no_timeout_and_not_no_limit() {
+        let home = std::env::temp_dir();
+        let zero = json!({"command": "ls", "timeout_ms": 0})
+            .as_object()
+            .unwrap()
+            .clone();
+        let c = RunCall::parse(&zero, &home).unwrap();
+        assert_eq!(c.timeout, None);
+        assert_eq!(timeouts(60, 300).limit(c.timeout).after, secs(60));
+        let some = json!({"command": "ls", "timeout_ms": 1500})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            RunCall::parse(&some, &home).unwrap().timeout,
+            Some(Duration::from_millis(1500))
+        );
+    }
+
+    /// The error says which limit ended the command, so a model knows whether
+    /// a larger `timeout_ms` would help.
+    #[test]
+    fn the_timeout_says_which_limit_it_was() {
+        let t = timeouts(600, 3600);
+        let say = |l: RunLimit| {
+            let e = l.timed_out();
+            assert_eq!(e.kind(), ErrorCode::Timeout);
+            e.message
+        };
+        assert_eq!(
+            say(t.limit(Some(secs(30)))),
+            "the command ran past timeout_ms (30 s) and was killed"
+        );
+        assert_eq!(
+            say(t.limit(None)),
+            "the command ran past the default limit of 10 min and was killed: no timeout_ms was given (up to 1 h is allowed)"
+        );
+        assert_eq!(
+            say(t.limit(Some(secs(7200)))),
+            "the command ran past the node's maximum of 1 h and was killed: timeout_ms asked for 2 h, which the owner's limits.max_timeout_secs cuts"
+        );
+        // The default is the maximum: a larger timeout_ms would not help.
+        assert_eq!(
+            say(timeouts(60, 60).limit(None)),
+            "the command ran past the node's limit of 1 min and was killed: no timeout_ms was given"
+        );
+        assert_eq!(
+            say(timeouts(600, 30).limit(None)),
+            "the command ran past the node's maximum of 30 s and was killed: no timeout_ms was given, and the owner's limits.max_timeout_secs is below the default"
+        );
+    }
+
+    /// The `exec.run` text tells a model what a command gets.
+    #[test]
+    fn the_run_action_names_its_time_limits() {
+        assert_eq!(
+            timeout_summary(&timeouts(600, 3600)),
+            "A command is killed after timeout_ms, after 10 min when you give none, and never runs longer than 1 h."
+        );
+        // The default shown is the one that applies.
+        assert_eq!(
+            timeout_summary(&timeouts(600, 90)),
+            "A command is killed after timeout_ms, after 1 min 30 s when you give none, and never runs longer than 1 min 30 s."
+        );
+    }
 
     /// A stand-in for code page 850 with the two letters the tests use.
     fn cp850(b: &[u8]) -> Option<String> {
@@ -2842,9 +3319,11 @@ mod windows_tests {
             container: None,
             exe: PathBuf::from("nerve-node.exe"),
             output_cap: 64 * 1024,
+            timeouts: Timeouts::default(),
             sudo: None,
             account: None,
             own: Vec::new(),
+            limits: None,
         }
     }
 
@@ -2853,6 +3332,7 @@ mod windows_tests {
             command: cmd.into(),
             cwd: cwd.to_path_buf(),
             timeout: Some(timeout),
+            limits: Default::default(),
         }
     }
 

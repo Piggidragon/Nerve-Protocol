@@ -1,9 +1,10 @@
 # Run the center
 
-The harness starts `nerve-center` itself, like any MCP server. Every setting
-is a flag or an environment variable. On Linux the center can also
-[run as a service](#run-it-as-a-service) that starts with the machine; its
-only subcommands, `install`, `update` and `uninstall`, are for that.
+The harness starts `nerve-center` itself, like any MCP server. Every setting is
+a flag or an environment variable. The only subcommands are `backup` and
+`restore`, which you run by hand ([backup](backup.md)), and `install`,
+`update` and `uninstall`: on Linux the center can also
+[run as a service](#run-it-as-a-service) that starts with the machine.
 
 ## Add it to the harness
 
@@ -82,6 +83,13 @@ attached harnesses have ended too.
 A second one with `--mcp http` or `--mcp none` refuses to start. On Windows a
 second instance cannot attach and fails.
 
+## Back it up
+
+`nerve-center backup <file>` writes `tls.pem` and `state.json` to one file
+that a passphrase protects; `nerve-center restore <file>` puts them back, on
+this machine or another. The nodes then find the same center by the same pin
+and need not pair again ([backup](backup.md)).
+
 ## What the center keeps
 
 In the state folder:
@@ -155,8 +163,19 @@ this machine while the service runs: the node port is taken.
 Nothing else is written. `journalctl -u nerve-center` shows the center's
 output.
 
-The service starts with a new center. Machines paired with a center you ran
-yourself are not taken over; pair them again with the service.
+The service starts with a new center. To move a center you ran yourself
+into it, with its pairings, [back it up](backup.md#the-center) and restore
+it into the service's state folder, then run `install` again, which gives
+the restored files to `nerve-center` and starts it:
+
+```sh
+nerve-center backup ~/nerve-center.bak     # as you, on the center you ran
+sudo systemctl stop nerve-center
+sudo nerve-center --state-dir /var/lib/nerve-center restore ~/nerve-center.bak --replace
+sudo nerve-center install
+```
+
+Stop the center you ran yourself for good: the service has its key now.
 
 ### Settings of the service
 

@@ -282,6 +282,10 @@ pub async fn execute(cmd: Cmd, out: &mut dyn Write) -> Result<(), String> {
         }
         Cmd::Update { from } => update(&layout, &Host, from.as_deref(), out).await,
         Cmd::Uninstall { purge } => uninstall(&layout, &Host, purge, out),
+        // `main` gives these to crate::backup.
+        Cmd::Backup { .. } | Cmd::Restore { .. } => {
+            Err("backup and restore are not service commands".into())
+        }
     }
 }
 

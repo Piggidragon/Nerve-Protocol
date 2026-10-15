@@ -21,6 +21,10 @@ behaves the same except where this page says so.
 - Commands run with `no_new_privs`, so setuid programs cannot gain privileges.
   Only a command on the [sudo list](sudo.md) runs without it.
 - When a call ends, the node kills the command's whole process group.
+- Each command runs in a cgroup of its own, held to its memory, CPU and
+  processes ([limits](limits.md)), where systemd hands the node a cgroup: the
+  installed service, or a node started with `systemd-run --user --scope -p
+  Delegate=yes`. Windows does not hold commands to these limits yet.
 - A `folder` mode command cannot read or change the node's settings through
   its control socket: the node answers only programs that can read its token
   in the state folder, which the mode's sandbox keeps from a command. This

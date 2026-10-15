@@ -11,10 +11,11 @@ is what a harness, and whoever writes its MCP entry, can rely on.
 
 ## 1. Starting it
 
-Every setting is a flag or a variable in the MCP entry. The only
-subcommands, `install`, `update` and `uninstall`, run the center as a
-systemd service on Linux (docs/user/center.md, "Run it as a service"); a
-harness never uses them:
+A harness starts it with no subcommand: every setting is a flag or a variable
+in the MCP entry. The only subcommands are the owner's, which a harness never
+runs: `backup` and `restore` ([backup](../backup.md)), and `install`, `update`
+and `uninstall`, which run the center as a systemd service on Linux
+(docs/user/center.md, "Run it as a service"):
 
 | Flag | Variable | Default | Meaning |
 |---|---|---|---|

@@ -84,12 +84,22 @@ To pair again, remove the old pairing on both sides, then make a new link.
 
 ## Drops
 
-The node dials the center. When a link drops, running commands on it end. The
-node dials again: it waits 1 second, then doubles the wait up to 60 seconds.
+The node dials the center. When a link drops without a goodbye (an address
+change, a short outage), both sides keep it for 30 seconds: running commands
+go on, and their output reaches the agent once the node is back. The node
+dials again: it waits 1 second, then doubles the wait up to 60 seconds. If
+the link is not back within 30 seconds, or the node or the center restarted,
+the commands on it end and their calls fail with `connection_lost`.
 
 A machine whose key was copied to another machine is caught: a center keeps
 one live link per machine. If a second link arrives while the first still
 answers, the center refuses it and shows an alert.
+
+## Back up or move
+
+`nerve-node backup <file>` keeps the config and the keys, and
+`nerve-node restore <file>` puts them back on this machine or another one, so
+a moved node needs no new pairing ([backup](backup.md)).
 
 ## Keep it running
 

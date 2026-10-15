@@ -179,6 +179,22 @@ pub struct Limits {
     /// stdout and stderr of one command are each cut at this size.
     #[serde(default = "d_output_cap")]
     pub output_cap_bytes: u64,
+    /// How long a command may run when its call gives no `timeout_ms`. A
+    /// command past its limit is killed. Left out of the file while it is
+    /// the default, so an older node still reads a file nobody set it in.
+    #[serde(
+        default = "d_default_timeout",
+        skip_serializing_if = "is_default_timeout"
+    )]
+    pub default_timeout_secs: u64,
+    /// The longest a command may run, whatever its call asks for: a larger
+    /// `timeout_ms` is cut to this. It also cuts the default above.
+    #[serde(default = "d_max_timeout", skip_serializing_if = "is_max_timeout")]
+    pub max_timeout_secs: u64,
+    /// What one command may use (a cgroup on Linux). Written only where
+    /// the owner changed it, so a node of before can read the file.
+    #[serde(default, skip_serializing_if = "CommandLimits::is_default")]
+    pub command: CommandLimits,
 }
 
 fn d_max_running() -> u32 {
@@ -187,13 +203,194 @@ fn d_max_running() -> u32 {
 fn d_output_cap() -> u64 {
     16 * 1024 * 1024
 }
+fn d_default_timeout() -> u64 {
+    10 * 60
+}
+fn d_max_timeout() -> u64 {
+    60 * 60
+}
+fn is_default_timeout(n: &u64) -> bool {
+    *n == d_default_timeout()
+}
+fn is_max_timeout(n: &u64) -> bool {
+    *n == d_max_timeout()
+}
 
 impl Default for Limits {
     fn default() -> Limits {
         Limits {
             max_running: d_max_running(),
             output_cap_bytes: d_output_cap(),
+            default_timeout_secs: d_default_timeout(),
+            max_timeout_secs: d_max_timeout(),
+            command: CommandLimits::default(),
         }
+    }
+}
+
+/// The memory, CPU and processes of one command: what it gets when its call
+/// names none, and the most a call may ask for. Only the owner sets them; a
+/// call may ask for less than the most, never for more. On Linux the node
+/// holds a command to them with a cgroup of its own (docs/user/limits.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandLimits {
+    /// Memory in MiB; a command past it is killed.
+    #[serde(default = "d_memory_mb")]
+    pub memory_mb: u64,
+    #[serde(default = "d_memory_max_mb")]
+    pub memory_max_mb: u64,
+    /// CPU time in percent of one CPU (200 is two CPUs); a command past it
+    /// is slowed down, not killed.
+    #[serde(default = "d_cpu_percent")]
+    pub cpu_percent: u32,
+    #[serde(default = "d_cpu_max_percent")]
+    pub cpu_max_percent: u32,
+    /// Processes and threads at once; past it a command cannot start more.
+    #[serde(default = "d_processes")]
+    pub processes: u32,
+    #[serde(default = "d_processes_max")]
+    pub processes_max: u32,
+}
+
+fn d_memory_mb() -> u64 {
+    4096
+}
+fn d_memory_max_mb() -> u64 {
+    16384
+}
+fn d_cpu_percent() -> u32 {
+    200
+}
+fn d_cpu_max_percent() -> u32 {
+    800
+}
+fn d_processes() -> u32 {
+    1024
+}
+fn d_processes_max() -> u32 {
+    8192
+}
+
+/// The most memory a limit may name, in MiB (1 PiB): its bytes still fit a
+/// u64 many times over.
+pub const MEMORY_MB_MOST: u64 = 1 << 30;
+/// The most CPU a limit may name: 4096 CPUs.
+pub const CPU_PERCENT_MOST: u32 = 409_600;
+/// The most processes a limit may name: Linux's own most of pids.
+pub const PROCESSES_MOST: u32 = 4_194_304;
+
+impl Default for CommandLimits {
+    fn default() -> CommandLimits {
+        CommandLimits {
+            memory_mb: d_memory_mb(),
+            memory_max_mb: d_memory_max_mb(),
+            cpu_percent: d_cpu_percent(),
+            cpu_max_percent: d_cpu_max_percent(),
+            processes: d_processes(),
+            processes_max: d_processes_max(),
+        }
+    }
+}
+
+impl CommandLimits {
+    pub fn is_default(&self) -> bool {
+        *self == CommandLimits::default()
+    }
+
+    /// Each value at least 1 and at most its `*_MOST`, and no default above
+    /// its most.
+    pub fn validate(&self) -> Result<(), String> {
+        let each: [(&str, u64, u64, u64); 3] = [
+            (
+                "memory_mb",
+                self.memory_mb,
+                self.memory_max_mb,
+                MEMORY_MB_MOST,
+            ),
+            (
+                "cpu_percent",
+                self.cpu_percent.into(),
+                self.cpu_max_percent.into(),
+                CPU_PERCENT_MOST.into(),
+            ),
+            (
+                "processes",
+                self.processes.into(),
+                self.processes_max.into(),
+                PROCESSES_MOST.into(),
+            ),
+        ];
+        for (name, default, max, most) in each {
+            let max_name = max_key(name);
+            for (key, v) in [(name.to_string(), default), (max_name.clone(), max)] {
+                if v == 0 || v > most {
+                    return Err(format!(
+                        "limits.command.{key} must be from 1 to {most}, not {v}"
+                    ));
+                }
+            }
+            if default > max {
+                return Err(format!(
+                    "limits.command.{name} ({default}) is above limits.command.{max_name} ({max})"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The limits of one command whose call asked for these (each `None`
+    /// where it named none): the default where it did not ask, what it
+    /// asked where that is no more than the most. Asking for more, or for
+    /// nothing at all (0), refuses the call with the reason.
+    pub fn grant(
+        &self,
+        memory_mb: Option<u64>,
+        cpu_percent: Option<u32>,
+        processes: Option<u32>,
+    ) -> Result<Granted, String> {
+        fn pick(name: &str, asked: Option<u64>, default: u64, max: u64) -> Result<u64, String> {
+            match asked {
+                None => Ok(default),
+                Some(0) => Err(format!("{name} must be at least 1")),
+                Some(a) if a > max => Err(format!(
+                    "{name} {a} is more than this node lets a command have: at most {max}"
+                )),
+                Some(a) => Ok(a),
+            }
+        }
+        // The maxima are u32 for these two, so the picks fit back.
+        Ok(Granted {
+            memory_mb: pick("memory_mb", memory_mb, self.memory_mb, self.memory_max_mb)?,
+            cpu_percent: pick(
+                "cpu_percent",
+                cpu_percent.map(Into::into),
+                self.cpu_percent.into(),
+                self.cpu_max_percent.into(),
+            )? as u32,
+            processes: pick(
+                "processes",
+                processes.map(Into::into),
+                self.processes.into(),
+                self.processes_max.into(),
+            )? as u32,
+        })
+    }
+}
+
+/// The limits one command runs with ([`CommandLimits::grant`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Granted {
+    pub memory_mb: u64,
+    pub cpu_percent: u32,
+    pub processes: u32,
+}
+
+/// The name of the most that goes with the default `name`.
+fn max_key(name: &str) -> String {
+    match name.split_once('_') {
+        Some((what, unit)) => format!("{what}_max_{unit}"),
+        None => format!("{name}_max"),
     }
 }
 
@@ -830,6 +1027,17 @@ impl NodeConfig {
         if self.limits.max_running == 0 {
             return Err("limits.max_running must be at least 1".into());
         }
+        // 0 would kill every command at once, and read as "none" it would be
+        // the way round the maximum.
+        for (key, n) in [
+            ("default_timeout_secs", self.limits.default_timeout_secs),
+            ("max_timeout_secs", self.limits.max_timeout_secs),
+        ] {
+            if n == 0 {
+                return Err(format!("limits.{key} must be at least 1"));
+            }
+        }
+        self.limits.command.validate()?;
         if let Some(p) = &self.connection.proxy {
             if has_user_info(p) {
                 return Err(PROXY_SECRETS_IN_FILE.into());
@@ -1079,6 +1287,8 @@ sudo_allow = ["sudo apt update"]
         let c = NodeConfig::parse(&sample()).unwrap();
         assert_eq!(c.limits.max_running, 4);
         assert_eq!(c.limits.output_cap_bytes, 16 * 1024 * 1024);
+        assert_eq!(c.limits.default_timeout_secs, 10 * 60);
+        assert_eq!(c.limits.max_timeout_secs, 60 * 60);
         let home = c.center("home").unwrap();
         assert_eq!(home.settings, SettingsGrant::Write);
         assert_eq!(home.policy.mode, Mode::Folder);
@@ -1103,6 +1313,124 @@ sudo_allow = ["sudo apt update"]
     }
 
     #[test]
+    fn the_run_time_limits_are_the_owners_and_kept_out_of_the_file_while_default() {
+        let c = NodeConfig::parse("[limits]\ndefault_timeout_secs = 30\nmax_timeout_secs = 90\n")
+            .unwrap();
+        assert_eq!(c.limits.default_timeout_secs, 30);
+        assert_eq!(c.limits.max_timeout_secs, 90);
+        assert_eq!(NodeConfig::parse(&c.to_toml()).unwrap(), c);
+        // One set, the other the default.
+        let c = NodeConfig::parse("[limits]\nmax_timeout_secs = 90\n").unwrap();
+        assert_eq!(c.limits.default_timeout_secs, 600);
+        // A file that never set them reads on an older node, which refuses
+        // keys it does not know: the defaults are not written.
+        let plain = NodeConfig::parse(&sample()).unwrap().to_toml();
+        assert!(!plain.contains("timeout"), "{plain}");
+        let mut set = NodeConfig::default();
+        set.limits.max_timeout_secs = 90;
+        assert!(set.to_toml().contains("max_timeout_secs = 90"));
+        assert!(!set.to_toml().contains("default_timeout_secs"));
+        // A center reads and changes its policy, nothing of this.
+        let doc = serde_json::json!({"limits": {"max_timeout_secs": 1}});
+        assert!(serde_json::from_value::<CenterDocument>(doc).is_err());
+    }
+
+    #[test]
+    fn command_limits_have_defaults_and_a_call_gets_at_most_the_most() {
+        let c = NodeConfig::parse(&sample()).unwrap();
+        let l = c.limits.command;
+        assert_eq!(l, CommandLimits::default());
+        assert_eq!((l.memory_mb, l.memory_max_mb), (4096, 16384));
+        assert_eq!((l.cpu_percent, l.cpu_max_percent), (200, 800));
+        assert_eq!((l.processes, l.processes_max), (1024, 8192));
+        let set = NodeConfig::parse(
+            "[limits.command]\nmemory_mb = 512\nmemory_max_mb = 1024\ncpu_percent = 50\nprocesses_max = 2000\n",
+        )
+        .unwrap();
+        let l = set.limits.command;
+        assert_eq!(
+            (l.memory_mb, l.memory_max_mb, l.cpu_percent),
+            (512, 1024, 50)
+        );
+        assert_eq!(NodeConfig::parse(&set.to_toml()).unwrap(), set);
+        // Only a changed one is written, so a node of before reads the file.
+        assert!(set.to_toml().contains("[limits.command]"));
+        assert!(!c.to_toml().contains("[limits.command]"), "{}", c.to_toml());
+
+        // No call names a limit: the defaults.
+        assert_eq!(
+            l.grant(None, None, None).unwrap(),
+            Granted {
+                memory_mb: 512,
+                cpu_percent: 50,
+                processes: 1024
+            }
+        );
+        // Less than the default, and more up to the most.
+        assert_eq!(
+            l.grant(Some(100), Some(800), Some(2000)).unwrap(),
+            Granted {
+                memory_mb: 100,
+                cpu_percent: 800,
+                processes: 2000
+            }
+        );
+        for (asked, why) in [
+            ((Some(1025), None, None), "memory_mb 1025 is more than"),
+            ((None, Some(801), None), "cpu_percent 801 is more than"),
+            ((None, None, Some(2001)), "processes 2001 is more than"),
+            ((Some(0), None, None), "memory_mb must be at least 1"),
+            ((None, Some(0), None), "cpu_percent must be at least 1"),
+        ] {
+            let e = l.grant(asked.0, asked.1, asked.2).unwrap_err();
+            assert!(e.contains(why), "{asked:?}: {e}");
+        }
+        // The most is said, so the caller can ask again within it.
+        assert!(
+            l.grant(Some(1 << 40), None, None)
+                .unwrap_err()
+                .contains("at most 1024")
+        );
+    }
+
+    #[test]
+    fn refuses_command_limits_that_cannot_hold() {
+        for (bad, why) in [
+            (
+                "[limits.command]\nmemory_mb = 9000\nmemory_max_mb = 8192\n",
+                "limits.command.memory_mb (9000) is above limits.command.memory_max_mb (8192)",
+            ),
+            (
+                "[limits.command]\ncpu_percent = 900\n",
+                "limits.command.cpu_percent (900) is above limits.command.cpu_max_percent (800)",
+            ),
+            (
+                "[limits.command]\nprocesses = 9000\n",
+                "limits.command.processes (9000) is above limits.command.processes_max (8192)",
+            ),
+            (
+                "[limits.command]\nmemory_mb = 0\n",
+                "memory_mb must be from 1",
+            ),
+            (
+                "[limits.command]\nprocesses_max = 0\n",
+                "processes_max must be from 1",
+            ),
+            (
+                "[limits.command]\nmemory_max_mb = 9999999999999\n",
+                "memory_max_mb must be from 1 to 1073741824",
+            ),
+            ("[limits.command]\nmemroy_mb = 1\n", "unknown field"),
+        ] {
+            let e = NodeConfig::parse(bad).unwrap_err();
+            assert!(e.contains(why), "{bad}: {e}");
+        }
+        // A center's document does not hold them.
+        let doc = serde_json::json!({"limits": {"command": {"memory_mb": 1}}});
+        assert!(serde_json::from_value::<CenterDocument>(doc).is_err());
+    }
+
+    #[test]
     fn the_log_level_is_info_unless_the_owner_sets_it() {
         use nerve_transport::log::Level;
         assert_eq!(NodeConfig::default().log.level, Level::Info);
@@ -1123,6 +1451,11 @@ sudo_allow = ["sudo apt update"]
             ("[node]\nnmae = \"x\"\n", "unknown field"),
             ("[node]\nname = \"Bad Name\"\n", "node.name"),
             ("[limits]\nmax_running = 0\n", "max_running"),
+            (
+                "[limits]\ndefault_timeout_secs = 0\n",
+                "default_timeout_secs",
+            ),
+            ("[limits]\nmax_timeout_secs = 0\n", "max_timeout_secs"),
             (
                 "[connection]\nproxy = \"http://p:1\"\npin = \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n",
                 "https",

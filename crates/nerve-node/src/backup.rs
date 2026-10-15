@@ -216,6 +216,22 @@ pub struct Parsed {
 }
 
 impl Parsed {
+    /// The same backup without its proxy: the config names none, and the
+    /// password and header values in it are dropped.
+    fn without_proxy(&self) -> Parsed {
+        let mut cfg = self.cfg.clone();
+        cfg.connection = Default::default();
+        Parsed {
+            cfg,
+            keys: self.keys.clone(),
+            relay_tls: self.relay_tls.clone(),
+            proxy_login: None,
+            proxy_headers: None,
+            created_ms: self.created_ms,
+            program: self.program.clone(),
+        }
+    }
+
     /// The centers the backup's config names.
     pub fn centers(&self) -> Vec<&str> {
         self.cfg.centers.iter().map(|c| c.name.as_str()).collect()
@@ -330,6 +346,10 @@ pub struct RestoreOpts {
     pub replace: bool,
     /// Keep the keys here instead of where the backup's config says.
     pub secret_storage: Option<SecretStorage>,
+    /// Leave the proxy out of the restored config, with its password and
+    /// header values: nothing of it is kept or needed, so nothing can be sent
+    /// to the wrong proxy, and the owner sets it again on this machine.
+    pub without_proxy: bool,
 }
 
 /// What a restore did, for the owner.
@@ -412,6 +432,15 @@ pub fn restore(paths: &NodePaths, b: &Parsed, opts: &RestoreOpts) -> Result<Rest
         )
     })?;
 
+    let stripped;
+    let had_proxy = b.cfg.connection.proxy.is_some();
+    let b = if opts.without_proxy {
+        stripped = b.without_proxy();
+        &stripped
+    } else {
+        b
+    };
+
     let target = inspect(paths);
     match &target {
         Target::Node(here) if !opts.replace && !same_node(here, &b.cfg) => {
@@ -442,7 +471,7 @@ pub fn restore(paths: &NodePaths, b: &Parsed, opts: &RestoreOpts) -> Result<Rest
     }
     if secrets::windows_service(paths) && !cfg.connection.headers.is_empty() {
         return Err(format!(
-            "the backup's config names header values for the proxy, but {}. Remove the proxy from the backup's node first, or restore on a node that is not the installed one on Windows",
+            "the backup's config names header values for the proxy, but {}. Restore with --without-proxy, or remove the proxy from the backup's node first, or restore on a node that is not the installed one on Windows",
             secrets::PROXY_WINDOWS_SERVICE
         ));
     }
@@ -450,6 +479,11 @@ pub fn restore(paths: &NodePaths, b: &Parsed, opts: &RestoreOpts) -> Result<Rest
         centers: cfg.centers.iter().map(|c| c.name.clone()).collect(),
         ..RestoreReport::default()
     };
+    if opts.without_proxy && had_proxy {
+        report.notes.push(
+            "the proxy is left out of the restored config, with its password and header values: set it again on this machine with `nerve-node proxy set`".into(),
+        );
+    }
     // The password of the sudo switch is in no backup and never at rest on
     // Linux: a node restored with the switch on would claim it.
     if cfg.machine.sudo == Sudo::On {
@@ -700,8 +734,15 @@ fn write_keys<'a>(
             secrets::store::get(account.account()).ok().flatten()
         } else {
             secrets::store::get(account.account()).map_err(|e| {
+                // Where the kernel is below Landlock ABI 9 `setup` does not
+                // offer to install a keyring, so it is not named there.
+                let how = if secrets::no_keyring(paths).is_some() {
+                    "start or unlock the keyring by hand (`nerve-node setup` installs none on this kernel)"
+                } else {
+                    "start or unlock the keyring (on a Linux without a desktop, `nerve-node setup` can install one if you answer `keyring` where it asks where the keys go)"
+                };
                 format!(
-                    "cannot read the proxy's header values in the system keyring (entry {account}) to check whose they are: {e}. Start or unlock the keyring (on a Linux without a desktop, `nerve-node setup` can install one), or take the proxy's header values off the node you back up (`nerve-node proxy rm` there, then back it up again)"
+                    "cannot read the proxy's header values in the system keyring (entry {account}) to check whose they are: {e}. Restore with --without-proxy and set the proxy again on this machine; or {how}; or take the proxy's header values off the node you back up (`nerve-node proxy rm` there, then back it up again)"
                 )
             })?
         };
@@ -728,7 +769,11 @@ fn write_keys<'a>(
     if let Some(map) = &b.proxy_headers {
         let account = Entry::proxy(paths);
         let prev = secrets::store::get(account.account())
-            .map_err(|e| format!("cannot read the keyring entry {account}: {e}"))?;
+            .map_err(|e| {
+                format!(
+                    "cannot read the keyring entry {account}: {e}. The backup holds the header values, and they go into that keyring: give the machine a keyring that answers, or restore with --without-proxy and set the proxy again"
+                )
+            })?;
         let headers: Vec<(String, String)> =
             map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
         undo.push(Undo::Headers(prev));
@@ -1874,12 +1919,27 @@ mod tests {
         secrets::store::set_unreachable(false);
         let err = err.err().unwrap();
         assert!(
-            err.contains("to check whose they are") && err.contains("nerve-node setup"),
+            err.contains("to check whose they are")
+                && err.contains("nerve-node setup")
+                && err.contains("--without-proxy"),
             "{err}"
         );
         assert!(err.contains("nothing was restored"), "{err}");
         assert!(!err.contains("Basic"), "{err}");
         assert_eq!(std::fs::read(n.config_file()).unwrap(), before);
+        // Below Landlock ABI 9 setup installs no keyring, and the message does
+        // not send the owner to it.
+        secrets::for_tests::pretend_landlock(&n, secrets::Landlock::Abi(5));
+        secrets::store::set_unreachable(true);
+        let err = restore(&n, &parsed, &RestoreOpts::default());
+        secrets::store::set_unreachable(false);
+        let err = err.err().unwrap();
+        assert!(
+            err.contains("installs none on this kernel")
+                && !err.contains("can install one")
+                && err.contains("--without-proxy"),
+            "{err}"
+        );
         // A backup made with --include-keyring is no way round it: its values
         // are written into the same keyring, which does not answer either.
         let (_g, with, report) = roundtrip(&n, true);
@@ -1899,7 +1959,10 @@ mod tests {
             );
             secrets::store::set_unreachable(false);
             let err = err.err().unwrap();
-            assert!(err.contains("cannot read the keyring entry"), "{err}");
+            assert!(
+                err.contains("cannot read the keyring entry") && err.contains("--without-proxy"),
+                "{err}"
+            );
             assert!(!err.contains("Basic"), "{err}");
         }
         assert_eq!(std::fs::read(n.config_file()).unwrap(), before);
@@ -1924,6 +1987,135 @@ mod tests {
         assert!(!to.config_file().exists(), "nothing was written");
         assert!(
             secrets::store::get(Entry::proxy(&to).account())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn a_restore_without_the_proxy_keeps_nothing_of_it_and_needs_no_keyring() {
+        let (_a, n) = node();
+        paired(&n, SecretStorage::File, &["home"]);
+        secrets::store_proxy_headers(&n, &[("Proxy-Authorization".into(), "Basic A".into())])
+            .unwrap();
+        let mut s = open_store(&n);
+        s.update(|c| {
+            c.connection.proxy = Some("http://proxy-a.example:3128".into());
+            c.connection.headers = vec!["Proxy-Authorization".into()];
+            Ok(())
+        })
+        .unwrap();
+        drop(s);
+        let (_f, plain, _) = roundtrip(&n, false);
+        let (_g, with, _) = roundtrip(&n, true);
+        assert!(with.proxy_headers.is_some() && plain.proxy_headers.is_none());
+
+        // The node moved to proxy B, and the keyring does not answer: the
+        // restore that cannot say whose the values are is refused, and the
+        // one that leaves the proxy out is not.
+        secrets::store_proxy_headers(&n, &[("Proxy-Authorization".into(), "Basic B".into())])
+            .unwrap();
+        let mut s = open_store(&n);
+        s.update(|c| {
+            c.connection.proxy = Some("http://proxy-b.example:3128".into());
+            Ok(())
+        })
+        .unwrap();
+        drop(s);
+        let without = RestoreOpts {
+            without_proxy: true,
+            ..RestoreOpts::default()
+        };
+        secrets::store::set_unreachable(true);
+        let refused = restore(&n, &plain, &RestoreOpts::default());
+        let r = restore(&n, &plain, &without);
+        secrets::store::set_unreachable(false);
+        assert!(refused.is_err());
+        let r = r.unwrap();
+        let cfg = config(&n);
+        assert_eq!(
+            cfg.connection,
+            Default::default(),
+            "no proxy, pin, user or header names"
+        );
+        assert_eq!(cfg.centers.len(), 1);
+        let notes = r.notes.join("\n");
+        assert!(
+            notes.contains("proxy is left out") && notes.contains("proxy set"),
+            "{notes}"
+        );
+        // The keyring could not be asked to delete B's values; they are
+        // said to be left, and no config names them.
+        assert!(
+            notes.contains("header values of the replaced node were left"),
+            "{notes}"
+        );
+
+        // A backup that holds the values: they are not written either, and
+        // the ones of the replaced node go.
+        let mut s = open_store(&n);
+        s.update(|c| {
+            c.connection.proxy = Some("http://proxy-b.example:3128".into());
+            c.connection.headers = vec!["Proxy-Authorization".into()];
+            Ok(())
+        })
+        .unwrap();
+        drop(s);
+        secrets::store_proxy_headers(&n, &[("Proxy-Authorization".into(), "Basic B".into())])
+            .unwrap();
+        let r = restore(&n, &with, &without).unwrap();
+        assert!(
+            r.notes.iter().any(|n| n.contains("proxy is left out")),
+            "{r:?}"
+        );
+        assert!(
+            secrets::store::get(Entry::proxy(&n).account())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(config(&n).connection, Default::default());
+
+        // Without a proxy in the backup the flag says nothing.
+        let (_b, plain_node) = node();
+        paired(&plain_node, SecretStorage::File, &["home"]);
+        let (_h, nothing, _) = roundtrip(&plain_node, false);
+        let r = restore(&plain_node, &nothing, &without).unwrap();
+        assert!(r.notes.is_empty(), "{r:?}");
+    }
+
+    #[test]
+    fn a_restore_without_the_proxy_drops_its_password() {
+        let pin = nerve_transport::tls::ServerIdentity::generate(&["relay.example".into()])
+            .unwrap()
+            .pin();
+        let (_a, n) = node();
+        paired(&n, SecretStorage::Keyring, &["home"]);
+        drop(with_proxy(&n, "relay-a.example", "node-a", "a-token", &pin));
+        let (_f, with, _) = roundtrip(&n, true);
+        assert!(with.proxy_login.is_some());
+        let r = restore(
+            &n,
+            &with,
+            &RestoreOpts {
+                without_proxy: true,
+                ..RestoreOpts::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            r.notes.iter().any(|n| n.contains("proxy is left out")),
+            "{r:?}"
+        );
+        assert_eq!(config(&n).connection, Default::default());
+        assert!(
+            secrets::get(&n, SecretStorage::Keyring, Key::ProxyLogin)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!n.proxy_login_file().exists());
+        // The node key is restored as usual.
+        assert!(
+            secrets::get(&n, SecretStorage::Keyring, Key::Center("home"))
                 .unwrap()
                 .is_some()
         );

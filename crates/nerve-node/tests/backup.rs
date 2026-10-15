@@ -241,3 +241,63 @@ async fn a_file_that_is_not_a_node_backup_is_said_so() {
     .unwrap_err();
     assert!(err.contains("cannot open"), "{err}");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_restore_can_leave_the_proxy_out() {
+    let d = tempfile::tempdir().unwrap();
+    let root = d.path();
+    let center = FakeCenter::start(false).await.unwrap();
+    let (old, _) = machine(root, "old");
+    nerve_node::pair::pair(&old, &center.link(), Some("lab"))
+        .await
+        .unwrap();
+    nerve_node::cli::edit(&old, |c| {
+        c.connection.proxy = Some("http://proxy.example:3128".into());
+        Ok(())
+    })
+    .await
+    .unwrap();
+    let pass = root.join("pass");
+    nerve_transport::files::write_private(&pass, PASS.as_bytes()).unwrap();
+    let pass = pass.to_str().unwrap();
+    let file = root.join("node.bak");
+    let file_arg = file.to_str().unwrap();
+    cli(&old, &["backup", file_arg, "--passphrase-file", pass])
+        .await
+        .unwrap();
+
+    // As it is, the proxy comes back with the node.
+    let (kept, _) = machine(root, "kept");
+    cli(&kept, &["restore", file_arg, "--passphrase-file", pass])
+        .await
+        .unwrap();
+    let got = cli(&kept, &["config", "get", "connection.proxy"])
+        .await
+        .unwrap();
+    assert!(got.contains("proxy.example"), "{got}");
+
+    // With the flag it does not, and the restore says to set it again.
+    let (bare, _) = machine(root, "bare");
+    let out = cli(
+        &bare,
+        &[
+            "restore",
+            file_arg,
+            "--without-proxy",
+            "--passphrase-file",
+            pass,
+        ],
+    )
+    .await
+    .unwrap();
+    assert!(
+        out.contains("proxy is left out") && out.contains("proxy set"),
+        "{out}"
+    );
+    let err = cli(&bare, &["config", "get", "connection.proxy"])
+        .await
+        .unwrap_err();
+    assert!(err.contains("not set"), "{err}");
+    // The pairing is there all the same.
+    assert!(cli(&bare, &["center", "ls"]).await.unwrap().contains("lab"));
+}

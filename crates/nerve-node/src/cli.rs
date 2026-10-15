@@ -136,6 +136,9 @@ pub enum Cmd {
         /// Keep the keys in `file` or in the system `keyring` here, whatever the backup's config says.
         #[arg(long, value_name = "file|keyring")]
         secret_storage: Option<String>,
+        /// Leave the proxy out of the restored config, with its password and header values; set it again on this machine.
+        #[arg(long)]
+        without_proxy: bool,
         /// Read the passphrase from the first line of this file instead of asking.
         #[arg(long, value_name = "FILE")]
         passphrase_file: Option<PathBuf>,
@@ -1636,6 +1639,7 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             file,
             replace,
             secret_storage,
+            without_proxy,
             passphrase_file,
         } => {
             owner_check(&[&paths]).await?;
@@ -1655,6 +1659,7 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             let opts = crate::backup::RestoreOpts {
                 replace,
                 secret_storage: storage,
+                without_proxy,
             };
             let r = crate::backup::restore(&paths, &parsed, &opts)?;
             crate::backup::print_restore(&r, &parsed, out);

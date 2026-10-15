@@ -76,6 +76,7 @@ On a node that has config here already:
 |---|---|
 | `--replace` | Restore over a node that is not the one the backup is of |
 | `--secret-storage file\|keyring` | Keep the keys here in files or in the keyring, whatever the backup's config says. Needed when the backup was made on a machine with a keyring and this one has none |
+| `--without-proxy` | Leave the proxy out of the restored config, with its password and header values, and set it again on this machine with `proxy set`. Nothing of it is kept or needed, so no keyring is asked and nothing can go to the wrong proxy |
 | `--passphrase-file <file>` | Read the passphrase from the first line of a file instead of asking. On Linux the file must not be readable by others; Windows does not check |
 
 If the backup has no key for a pairing, `restore` says so and names the
@@ -102,11 +103,14 @@ unless you give `--include-keyring`) does not keep whatever is on this machine:
 - When this machine's keyring does not answer (locked, or no desktop session
   to ask), `restore` cannot tell whose the header values are and stops with
   nothing written, unless the config being replaced names the same proxy, pin
-  and header names. Start or unlock the keyring (on a Linux without a desktop,
-  `nerve-node setup` installs one), or take the header values off the node you
-  back up (`nerve-node proxy rm` there) and make a new backup. A backup made
-  with `--include-keyring` does not get round this: it writes the values into
-  the same keyring, and fails the same way.
+  and header names. Restore with `--without-proxy` and set the proxy again
+  here; or start or unlock the keyring (on a Linux without a desktop,
+  `nerve-node setup` can install one if you answer `keyring` where it asks
+  where the keys go; on a kernel below Linux 7.1 it installs none, so start
+  one by hand); or take the header values off the node you back up
+  (`nerve-node proxy rm` there) and make a new backup. A backup made with
+  `--include-keyring` does not get round this: it writes the values into the
+  same keyring, and fails the same way.
 - Header values for the same proxy and names that lack one of the names are
   kept, and `restore` says so. They are for the right proxy, and the link
   fails with a message naming the missing header until `proxy set` gives all
@@ -183,10 +187,12 @@ center, a relayed node holds the pin of its relay, and a node behind an
 
 A node whose proxy has header values (an `http://` proxy with a login is one)
 needs a keyring that answers on the new machine, since the node reads those
-values from it: [keys](config.md#where-the-node-keeps-its-keys) says how a Linux
-without a desktop gets one (`nerve-node setup`). Without a keyring the restore
-stops, and the node could not use that proxy anyway; take the header values off
-the old node with `nerve-node proxy rm` and back it up again, then.
+values from it ([keys](config.md#where-the-node-keeps-its-keys) says how a
+Linux without a desktop gets one; on a kernel below Linux 7.1 `nerve-node setup`
+installs none). Without a keyring the restore stops, and the node could not use
+that proxy anyway. Restore with `--without-proxy` and set the proxy again on the
+new machine, or take the header values off the old node with `nerve-node proxy
+rm` and back it up again.
 
 The centers see the same node id from a new address. Their link rule keeps one
 live link per node, so stop the old node before the new one connects.
@@ -219,3 +225,5 @@ passphrase needs no file.
 | `… are not the same node` or `… not the same center` | The backup is of another one. `--replace` if you mean it |
 | `… is the backup of a center, not of a node` | Use the other program's `restore` |
 | `… made by a newer program` | Update this program first |
+| `cannot read the proxy's header values in the system keyring … to check whose they are` | The keyring does not answer and the backup cannot say whose the values are. `--without-proxy`, or a keyring that answers, or `proxy rm` on the old node and a new backup |
+| `cannot read the keyring entry …` (in a restore) | The backup holds the proxy's header values and they go into a keyring that does not answer. `--without-proxy`, or a keyring that answers |

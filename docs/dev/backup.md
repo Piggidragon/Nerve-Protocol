@@ -147,12 +147,24 @@ A keyring that does not answer is not an empty one: its entry would be sent to
 the restored proxy as soon as it answers again. So when the replaced config
 does not vouch for the header values, a keyring that cannot be asked stops the
 restore ("cannot read the proxy's header values ... to check whose they are"),
-with nothing written. The remedies are a keyring that answers (`nerve-node
-setup` installs one on a Linux without a desktop) or a backup of a node whose
+with nothing written. The remedies are `--without-proxy`, a keyring that
+answers (`nerve-node setup` installs one only if the owner answers `keyring`
+where it asks where the keys go, and none below Landlock ABI 9; the message
+says which case it is, by `secrets::no_keyring`) or a backup of a node whose
 proxy has no header values. A backup made with `--include-keyring` is no
-remedy: writing the values into the keyring asks the same keyring. When the
-replaced config does vouch for them (the same proxy, pin and names), they are
-that proxy's whatever the keyring says, and the restore goes on with the note.
+remedy: writing the values into the keyring asks the same keyring.
+
+`--without-proxy` (`Parsed::without_proxy`) makes the backup a backup without
+a proxy before anything else looks at it: `connection` is the default, and the
+password and header values are dropped. So no credential is kept, written or
+needed, no keyring is asked for them, and the old node's header entry is
+deleted like any entry the restored config does not name. It is also the way
+to restore a config with header values on the installed node on Windows, which
+takes none.
+
+When the replaced config does vouch for the header values (the same proxy, pin
+and names), they are that proxy's whatever the keyring says, and the restore
+goes on with the note.
 
 ## Center
 

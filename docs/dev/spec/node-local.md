@@ -501,8 +501,10 @@ system's systemd gives a unit's cgroup to its `User=` only with
 `trusted.delegate`, which the node's user cannot read). Below
 `user@<uid>.service` every cgroup is the user's, so there the user's
 systemd, which marks none, is asked as well (`systemctl --user show -p
-Delegate`, for the unit that is the last part of the path). A cgroup
-systemd did not delegate is not taken: systemd turns its controllers off at
+Delegate`, for the unit that is the last part of the path). Without the
+mark the root of the visible hierarchy (`/`, the root of a cgroup namespace
+such as `ProtectControlGroups=private` makes) is never taken: its path names
+no unit. A cgroup systemd did not delegate is not taken: systemd turns its controllers off at
 its next reload. It moves itself into the leaf `node`, turns on
 `+memory +cpu +pids` in the root's `cgroup.subtree_control` (each where the
 root has it), and makes `cmd-<n>` beside the leaf per command. The forked
@@ -513,7 +515,8 @@ above. `cmd-*` cgroups left from before are killed and removed at start.
 Before it makes a command's cgroup the node checks that the controllers it
 turned on are still on in `cgroup.subtree_control`; if one went off it
 refuses the command (`unavailable`), and `status` reads them there each
-time. When the command ends the node reads `memory.events`: `oom` above 0
+time: `enforced` lists those on, `lost` those turned off since the start
+(the CLI prints `NO COMMAND RUNS` for them). When the command ends the node reads `memory.events`: `oom` above 0
 (its own limit was reached) with `oom_kill` or `oom_group_kill` above 0
 gives the result `killed: "memory"` and a `reason`, and the audit log an
 entry `killed`, code `memory`, after the call's `allowed`; a kill by an OOM
@@ -530,7 +533,7 @@ cgroup (no systemd, cgroup v1, a terminal's session scope) runs commands
 without these limits; the log says so at start (a warning on the installed
 node), and `status` has `command_limits: {memory_mb, memory_max_mb,
 cpu_percent, cpu_max_percent, processes, processes_max, cgroup, enforced,
-off}`, where `enforced` lists `memory`, `cpu` and `processes` as far as the
+lost, off}`, where `enforced` lists `memory`, `cpu` and `processes` as far as the
 root passes their controllers on, and `off` says why there is no cgroup. A
 cgroup that cannot be made for a command keeps it from running
 (`unavailable`). A command of the node's own user can write its cgroup's

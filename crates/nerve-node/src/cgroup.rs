@@ -45,6 +45,7 @@ pub fn status(limits: &CommandLimits, found: &Found) -> Value {
         "processes_max": limits.processes_max,
         "cgroup": found.as_ref().ok().map(|c| c.name().to_string()),
         "enforced": found.as_ref().map_or_else(|_| Vec::new(), |c| c.enforced()),
+        "lost": found.as_ref().map_or_else(|_| Vec::new(), |c| c.lost()),
         "off": found.as_ref().err(),
     })
 }
@@ -130,7 +131,8 @@ mod linux {
             }
             // A node that runs in its leaf already, started again in it.
             let name = match own.rsplit_once('/') {
-                Some((parent, LEAF)) if !parent.is_empty() => parent,
+                Some(("", LEAF)) => "/",
+                Some((parent, LEAF)) => parent,
                 _ => own,
             }
             .to_string();
@@ -148,7 +150,11 @@ mod linux {
             // systemd's: it turns the controllers off again when it reloads.
             let owned = euid != 0 && std::fs::metadata(&dir).is_ok_and(|m| m.uid() == euid);
             let alone = procs.iter().all(|&p| p == me);
-            let handed = owned && alone && (!below_user_manager(&name) || delegates(&name));
+            // The root of what this process sees is the root of a cgroup
+            // namespace, a unit's own with `ProtectControlGroups=private`:
+            // its path says nothing of the unit, and so of its delegation.
+            let handed =
+                owned && alone && name != "/" && (!below_user_manager(&name) || delegates(&name));
             if !(delegated(&dir) || handed) {
                 return Err(format!(
                     "the node's cgroup {name} is not delegated to it: the installed service has one (`sudo nerve-node install` writes its unit again); a node of your own gets one with `systemd-run --user --scope -p Delegate=yes nerve-node run`, or `Delegate=yes` in a unit of yours"
@@ -223,6 +229,20 @@ mod linux {
                 .into_iter()
                 .filter_map(|(on, n)| on.then_some(n))
                 .collect()
+        }
+
+        /// The limits it held a command to at start that something turned
+        /// off since: while there are any, no command runs.
+        pub fn lost(&self) -> Vec<&'static str> {
+            let (memory, cpu, pids) = self.live();
+            [
+                (self.memory && !memory, "memory"),
+                (self.cpu && !cpu, "cpu"),
+                (self.pids && !pids, "processes"),
+            ]
+            .into_iter()
+            .filter_map(|(lost, n)| lost.then_some(n))
+            .collect()
         }
 
         /// Which of its controllers are on below it now. Something else
@@ -631,6 +651,35 @@ mod linux {
             );
         }
 
+        /// The root of a cgroup namespace (a unit with
+        /// `ProtectControlGroups=private`): its path names no unit, so
+        /// without systemd's mark it is not taken, also not by its owner.
+        #[test]
+        fn the_root_of_a_cgroup_namespace_needs_the_mark() {
+            if euid() == 0 {
+                eprintln!("skipped: root");
+                return;
+            }
+            for own in ["/", "/node"] {
+                let (t, dir) = fake("/", "cpu memory pids", "7\n");
+                let asked = std::cell::RefCell::new(Vec::new());
+                let e = Cgroups::at(t.path(), own, 7, euid(), &|p| {
+                    asked.borrow_mut().push(p.to_string());
+                    false
+                })
+                .unwrap_err();
+                assert!(
+                    e.contains("the node's cgroup / is not delegated"),
+                    "{own}: {e}"
+                );
+                assert!(
+                    !dir.join("node/cgroup.procs").exists(),
+                    "{own}: it touched it"
+                );
+                assert!(asked.borrow().is_empty(), "{own}: {:?}", asked.borrow());
+            }
+        }
+
         #[test]
         fn a_node_in_its_leaf_already_takes_the_cgroup_above() {
             if euid() == 0 {
@@ -662,8 +711,11 @@ mod linux {
             }
             let (t, dir) = fake("/svc.service", "cpu memory pids", "");
             let c = Cgroups::at(t.path(), "/svc.service", 7, euid(), &yes).unwrap();
+            turned_on(&dir, "cpu memory pids");
+            assert!(c.lost().is_empty());
             turned_on(&dir, "pids");
             assert_eq!(c.enforced(), ["processes"]);
+            assert_eq!(c.lost(), ["memory", "cpu"]);
             let granted = Granted {
                 memory_mb: 16,
                 cpu_percent: 100,
@@ -759,6 +811,10 @@ impl Cgroups {
     }
 
     pub fn enforced(&self) -> Vec<&'static str> {
+        match *self {}
+    }
+
+    pub fn lost(&self) -> Vec<&'static str> {
         match *self {}
     }
 }

@@ -85,7 +85,10 @@ systemd hands to it:
   not its own to divide. Run as a service of your own systemd
   (`systemctl --user`), its unit needs `Delegate=yes`. Without it systemd
   keeps the cgroup as its own and turns the limits off again at its next
-  reload, so the node takes no cgroup there.
+  reload, so the node takes no cgroup there. A unit with
+  `ProtectControlGroups=private` sees only its own cgroup, which tells the
+  node nothing of its unit; the node takes it only where systemd marks it
+  as delegated (systemd 257 and later, with `Delegate=yes`).
 
 Without such a cgroup (no systemd, cgroup v1, a node started in a terminal),
 commands run without these limits. `nerve-node status` says so, and why:
@@ -103,8 +106,11 @@ commands run WITHOUT these limits: the node's cgroup /user.slice/… is not dele
 
 When a cgroup offers only some controllers, the line names the limits that
 are not held. When something else turns a controller off while the node
-runs, `status` shows that too, and no command runs until you start the node
-again.
+runs, no command runs until you start the node again, and `status` says so:
+
+```
+NO COMMAND RUNS: memory turned off in the cgroup since the node started; start the node again
+```
 
 When a command ends, everything still in its cgroup is killed: also a
 process it moved out of its process group (`setsid`, `nohup … &`), which

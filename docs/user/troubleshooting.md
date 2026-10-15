@@ -42,6 +42,7 @@ names its reason.
 | `memory_mb … is more than this node lets a command have: at most …` (also `cpu_percent`, `processes`) | The call asked for more than the most you set | Ask for less, or raise `limits.command.*_max*` ([limits](limits.md)) |
 | `killed: "memory"` in a result | The command went past its own memory limit (a command the machine's OOM killed has only `signal: "kill"`) | Ask for more `memory_mb`, up to the most, or raise `limits.command.memory_mb` |
 | `commands run WITHOUT these limits: …` in `status` | The node has no cgroup of its own: started in a terminal, or installed before limits came | [Where the limits hold](limits.md#where-the-limits-hold) |
+| `the cgroup … no longer passes on the controllers the node turned on`, or `NO COMMAND RUNS` in `status` | Something turned a limit off in the node's cgroup while it ran, such as a reload of a service manager that did not delegate it | Start the node again; give its unit `Delegate=yes` ([limits](limits.md#where-the-limits-hold)) |
 
 The agent sees only the tools a machine could allow. If it sees only `nodes`,
 nothing is allowed yet.

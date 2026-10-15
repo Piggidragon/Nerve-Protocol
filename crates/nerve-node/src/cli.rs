@@ -1166,21 +1166,26 @@ fn limits_lines(v: &Value) -> Vec<String> {
         n("cpu_max_percent"),
         n("processes_max"),
     )];
-    let enforced: Vec<&str> = v["enforced"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect();
+    let list = |k: &str| -> Vec<&str> {
+        v[k].as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect()
+    };
+    let (enforced, lost) = (list("enforced"), list("lost"));
     if let Some(cgroup) = v["cgroup"].as_str() {
         let not: Vec<&str> = ["memory", "cpu", "processes"]
             .into_iter()
-            .filter(|l| !enforced.contains(l))
+            .filter(|l| !enforced.contains(l) && !lost.contains(l))
             .collect();
-        let mut line = format!(
-            "limits held by the cgroup {cgroup}: {}",
-            enforced.join(", ")
-        );
+        let mut line = match enforced.is_empty() {
+            true => format!("limits held by the cgroup {cgroup}: none"),
+            false => format!(
+                "limits held by the cgroup {cgroup}: {}",
+                enforced.join(", ")
+            ),
+        };
         if !not.is_empty() {
             line.push_str(&format!(
                 "; not {} (the cgroup has no controller for it)",
@@ -1188,6 +1193,13 @@ fn limits_lines(v: &Value) -> Vec<String> {
             ));
         }
         lines.push(line);
+        // Turned off while the node ran: no command runs (crate::cgroup).
+        if !lost.is_empty() {
+            lines.push(format!(
+                "NO COMMAND RUNS: {} turned off in the cgroup since the node started; start the node again",
+                lost.join(", ")
+            ));
+        }
     } else if let Some(why) = v["off"].as_str() {
         lines.push(format!("commands run WITHOUT these limits: {why}"));
     }
@@ -4872,6 +4884,19 @@ mod tests {
             [
                 "limits per command: memory 1 MiB, CPU 3 %, 5 processes; a call may ask for up to 2 MiB, 4 %, 6 processes",
                 "limits held by the cgroup /system.slice/nerve-node.service: memory, processes; not cpu (the cgroup has no controller for it)",
+            ]
+        );
+        // Turned off since the start: said apart from what the cgroup never
+        // had, with what follows from it.
+        let v = json!({"memory_mb": 1, "memory_max_mb": 2, "cpu_percent": 3,
+                       "cpu_max_percent": 4, "processes": 5, "processes_max": 6,
+                       "cgroup": "/", "enforced": [], "lost": ["memory", "processes"],
+                       "off": null});
+        assert_eq!(
+            limits_lines(&v)[1..],
+            [
+                "limits held by the cgroup /: none; not cpu (the cgroup has no controller for it)",
+                "NO COMMAND RUNS: memory, processes turned off in the cgroup since the node started; start the node again",
             ]
         );
     }

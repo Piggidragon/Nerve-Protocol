@@ -140,13 +140,16 @@ mod linux {
             // systemd marks a cgroup it delegates, but the user's own
             // systemd marks none, and a system one before 251 only with
             // `trusted.delegate`, which a process without CAP_SYS_ADMIN
-            // does not see. Such a cgroup is the user's either way, so for
-            // one that is this user's and holds only this process, its unit
-            // says. One systemd did not delegate is systemd's: it turns the
-            // controllers off again when it reloads.
+            // does not see. The system's systemd gives a unit's cgroup to
+            // its `User=` only with `Delegate=`, so there one that is this
+            // user's (not root's) and holds only this process is delegated.
+            // Below the user's own systemd every cgroup is the user's, so
+            // there its unit says. One systemd did not delegate is
+            // systemd's: it turns the controllers off again when it reloads.
             let owned = euid != 0 && std::fs::metadata(&dir).is_ok_and(|m| m.uid() == euid);
             let alone = procs.iter().all(|&p| p == me);
-            if !(delegated(&dir) || owned && alone && delegates(&name)) {
+            let handed = owned && alone && (!below_user_manager(&name) || delegates(&name));
+            if !(delegated(&dir) || handed) {
                 return Err(format!(
                     "the node's cgroup {name} is not delegated to it: the installed service has one (`sudo nerve-node install` writes its unit again); a node of your own gets one with `systemd-run --user --scope -p Delegate=yes nerve-node run`, or `Delegate=yes` in a unit of yours"
                 ));
@@ -415,8 +418,15 @@ mod linux {
         }
     }
 
-    /// Whether the service manager that owns the cgroup `path` delegates
-    /// its unit (`systemctl show -p Delegate`).
+    /// Whether the cgroup `path` is below a user's own systemd
+    /// (`user@<uid>.service`).
+    fn below_user_manager(path: &str) -> bool {
+        path.split('/')
+            .any(|p| p.starts_with("user@") && p.ends_with(".service"))
+    }
+
+    /// Whether the user's systemd delegates the unit of the cgroup `path`
+    /// (`systemctl --user show -p Delegate`).
     fn unit_delegates(path: &str) -> bool {
         let Some(args) = ask_delegate(path) else {
             return false;
@@ -429,24 +439,20 @@ mod linux {
             .is_ok_and(|o| o.status.success() && o.stdout.trim_ascii() == b"yes")
     }
 
-    /// The `systemctl` arguments that ask whether the unit of the cgroup
-    /// `path` is delegated: the unit is its last part, and its manager the
-    /// user's below `user@<uid>.service`, else the system's, which any
-    /// user may ask.
+    /// The `systemctl` arguments that ask the user's systemd whether the
+    /// unit of the cgroup `path`, its last part, is delegated.
     fn ask_delegate(path: &str) -> Option<Vec<&str>> {
         let unit = path.rsplit('/').next().unwrap_or_default();
-        if unit.is_empty() || unit.starts_with('-') || unit.starts_with('.') {
+        if !below_user_manager(path)
+            || unit.is_empty()
+            || unit.starts_with('-')
+            || unit.starts_with('.')
+        {
             return None;
         }
-        let user = path
-            .split('/')
-            .any(|p| p.starts_with("user@") && p.ends_with(".service"));
-        let mut args = Vec::new();
-        if user {
-            args.push("--user");
-        }
-        args.extend(["show", "-p", "Delegate", "--value", "--", unit]);
-        Some(args)
+        Some(vec![
+            "--user", "show", "-p", "Delegate", "--value", "--", unit,
+        ])
     }
 
     /// Removes `dir`; whether it is gone.
@@ -530,7 +536,7 @@ mod linux {
                 eprintln!("skipped: root");
                 return;
             }
-            let own = "/user.slice/app.slice/run-1.scope";
+            let own = "/user.slice/user-1000.slice/user@1000.service/app.slice/run-1.scope";
             let (t, dir) = fake(own, "cpu memory pids io", "42\n");
             let asked = std::cell::RefCell::new(Vec::new());
             let c = Cgroups::at(t.path(), own, 42, euid(), &|u| {
@@ -580,9 +586,11 @@ mod linux {
         }
 
         /// The installed service on a systemd before 251, whose mark the
-        /// node's user cannot see: the system's manager is asked.
+        /// node's user cannot see: the system's systemd gave it the cgroup,
+        /// which it does only with `Delegate=`, and nothing is asked, so a
+        /// machine without a system bus takes it too.
         #[test]
-        fn a_service_without_a_visible_mark_asks_the_system_manager() {
+        fn a_service_without_a_visible_mark_is_taken_by_its_owner() {
             if euid() == 0 {
                 eprintln!("skipped: root");
                 return;
@@ -592,22 +600,18 @@ mod linux {
             let asked = std::cell::RefCell::new(Vec::new());
             let c = Cgroups::at(t.path(), own, 7, euid(), &|p| {
                 asked.borrow_mut().push(p.to_string());
-                true
+                false
             })
             .unwrap();
             assert_eq!(c.name(), own);
-            assert_eq!(*asked.borrow(), [own]);
-            assert_eq!(
-                ask_delegate(own).unwrap(),
-                [
-                    "show",
-                    "-p",
-                    "Delegate",
-                    "--value",
-                    "--",
-                    "nerve-node.service"
-                ]
-            );
+            assert!(asked.borrow().is_empty(), "{:?}", asked.borrow());
+            // Still not one of another user, nor one shared.
+            let (t, _) = fake(own, "cpu memory pids", "7\n");
+            assert!(Cgroups::at(t.path(), own, 7, euid() + 1, &yes).is_err());
+            let (t, _) = fake(own, "cpu memory pids", "7\n8\n");
+            assert!(Cgroups::at(t.path(), own, 7, euid(), &yes).is_err());
+            // Only the user's systemd is asked.
+            assert_eq!(ask_delegate(own), None);
             assert_eq!(
                 ask_delegate("/user.slice/user-1000.slice/user@1000.service/app.slice/run-1.scope")
                     .unwrap(),
@@ -621,8 +625,10 @@ mod linux {
                     "run-1.scope"
                 ]
             );
-            assert_eq!(ask_delegate("/"), None);
-            assert_eq!(ask_delegate("/x/-unit"), None);
+            assert_eq!(
+                ask_delegate("/user.slice/user-1000.slice/user@1000.service/x/-u"),
+                None
+            );
         }
 
         #[test]

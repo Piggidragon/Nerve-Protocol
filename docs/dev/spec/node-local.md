@@ -495,13 +495,15 @@ is killed whole), `cpu.max` (`cpu_percent` × 1000 µs per 100 ms) and
 of its own up to the most. The node takes its own cgroup as the root
 (`/proc/self/cgroup`) when systemd delegated it (`user.delegate` or
 `trusted.delegate` set to `1`), or when it belongs to the node's user, who
-is not root, holds no other process, and the manager that owns it says its
-unit (the last part of the path) is delegated: `systemctl --user show -p
-Delegate` below `user@<uid>.service`, else `systemctl show -p Delegate` of
-the system's, which any user may ask. The user's systemd marks none, and a
-system one before 251 sets only `trusted.delegate`, which the node's user
-cannot read. A cgroup systemd did not delegate is not taken: systemd turns
-its controllers off at its next reload. It moves itself into the leaf `node`, turns on
+is not root, and holds no other process: outside `user@<uid>.service` the
+system's systemd gives a unit's cgroup to its `User=` only with
+`Delegate=`, so that is proof enough (a system systemd before 251 sets only
+`trusted.delegate`, which the node's user cannot read). Below
+`user@<uid>.service` every cgroup is the user's, so there the user's
+systemd, which marks none, is asked as well (`systemctl --user show -p
+Delegate`, for the unit that is the last part of the path). A cgroup
+systemd did not delegate is not taken: systemd turns its controllers off at
+its next reload. It moves itself into the leaf `node`, turns on
 `+memory +cpu +pids` in the root's `cgroup.subtree_control` (each where the
 root has it), and makes `cmd-<n>` beside the leaf per command. The forked
 child writes `0` to that cgroup's `cgroup.procs` through a descriptor the

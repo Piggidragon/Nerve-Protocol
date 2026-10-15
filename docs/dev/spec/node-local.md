@@ -462,7 +462,8 @@ shell. Output that is not UTF-8 is read in the OEM code page (Windows), which
 the command's own console starts with.
 A command is killed with its process group when its call ends: on
 `timeout_ms`, `cancel`, `session.end` of the session that started it, a
-dropped link, and when the call returns. Windows has no process groups:
+link that ended without being resumed (protocol §4.9), and when the call
+returns. While a dropped link waits for its resume, its commands run on. Windows has no process groups:
 there each command runs in a Job Object of its own. The shell starts
 suspended, is put in the job, and only then runs, so every process it starts
 is in the job, however deep and also when its parent has exited; ending the
@@ -486,7 +487,8 @@ and posts `WM_CLOSE` to their visible top-level windows on its desktop. The
 node holds those processes open while the helper runs, so their pids name no
 other process. The job is ended 3 seconds later, or at once when nothing was
 asked; a timeout's result waits for that. `kill`, `cancel`, `session.end`, a
-dropped link and the call's return end the job at once. A command of another
+link that ended without being resumed (protocol §4.9) and the call's return
+end the job at once. A command of another
 account (installed node) is asked by a helper started with that account's
 token. The helper runs in the command's job, so it is ended with the
 command and the control pipe refuses it. A command has one stop at a time:

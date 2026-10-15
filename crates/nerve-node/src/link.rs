@@ -2,14 +2,14 @@
 //! center's requests (spec §4, §5, §7).
 
 use std::collections::HashMap;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::AbortHandle;
 
 use nerve_policy::audit::Entry;
@@ -21,9 +21,10 @@ use nerve_proto::descriptor::{Detail, Effect, Exposure};
 use nerve_proto::frame::{Frame, FrameError};
 use nerve_proto::link::CenterUrl;
 use nerve_proto::msg::{
-    self, Bye, ByeReason, Cancel, Challenge, Describe, Get, Hello, Invoke, SessionEnd, Topic,
-    Topics, Welcome, method,
+    self, Ack, Bye, ByeReason, Cancel, Challenge, Describe, Get, Hello, Invoke, Resume, Resumed,
+    SessionEnd, Topic, Topics, Welcome, method,
 };
+use nerve_proto::resume;
 use nerve_proto::rpc::{Id, Message, params};
 use nerve_proto::{ErrorCode, PROTOCOL_VERSION, RpcError, limits};
 use nerve_transport::backoff::Backoff;
@@ -47,8 +48,113 @@ const DEAD: Duration = Duration::from_secs(45);
 enum Outcome {
     /// Dial again after the backoff.
     Retry,
+    /// The connection dropped without a bye: dial again, and resume the link
+    /// if the center can.
+    Lost,
     /// Do not dial again until the config says so.
     Stop,
+}
+
+/// A link that dropped without a bye, kept until `until` for the center to
+/// resume (spec §4.9): its calls run on, and what it sends is kept. Dropped,
+/// it ends like a link that cannot resume: its calls end and its commands
+/// are killed.
+struct Parked {
+    link: Option<Arc<Link>>,
+    until: Instant,
+}
+
+impl Parked {
+    fn link(&self) -> &Arc<Link> {
+        self.link.as_ref().expect("a parked link until it is taken")
+    }
+
+    /// The link, to carry on on a new connection.
+    fn resume(mut self) -> Arc<Link> {
+        self.link.take().expect("a parked link until it is taken")
+    }
+}
+
+impl Drop for Parked {
+    fn drop(&mut self) {
+        if let Some(l) = self.link.take() {
+            let n = lock(&l.calls).len();
+            if n > 0 {
+                tracing::warn!(
+                    "center {}: the link was not resumed; ending the {} in flight on it",
+                    l.name,
+                    plural(n, "call")
+                );
+            }
+            l.finish();
+        }
+    }
+}
+
+fn plural(n: usize, what: &str) -> String {
+    if n == 1 {
+        format!("1 {what}")
+    } else {
+        format!("{n} {what}s")
+    }
+}
+
+/// Waits until `t`, or for ever without one.
+async fn until(t: Option<Instant>) {
+    match t {
+        Some(t) => tokio::time::sleep_until(tokio::time::Instant::from_std(t)).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Awaits `work`, and drops what `slot` holds at `at`, or when `halt`
+/// resolves, if `work` takes longer: a keyring that waits to be unlocked, a
+/// dial or a handshake that hangs does not keep a parked link past its grace,
+/// nor past a lock or pause.
+async fn dropping_at<F: std::future::Future, T>(
+    work: F,
+    slot: &mut Option<T>,
+    at: Option<Instant>,
+    halt: impl std::future::Future<Output = ()>,
+) -> F::Output {
+    tokio::pin!(work);
+    if slot.is_none() {
+        return work.await;
+    }
+    tokio::select! {
+        r = &mut work => r,
+        _ = until(at) => {
+            *slot = None;
+            work.await
+        }
+        _ = halt => {
+            *slot = None;
+            work.await
+        }
+    }
+}
+
+/// Why the config ends center `name`'s link, if it does: the node is locked
+/// or the center paused (`paused`), or the center is revoked, unknown or
+/// removed (`unpaired`).
+fn stop_reason(cfg: &NodeConfig, name: &str) -> Option<ByeReason> {
+    match cfg.center(name) {
+        None => Some(ByeReason::Unpaired),
+        Some(_) if cfg.locked => Some(ByeReason::Paused),
+        Some(e) if e.paused => Some(ByeReason::Paused),
+        Some(e) if e.revoked || e.unknown => Some(ByeReason::Unpaired),
+        Some(_) => None,
+    }
+}
+
+/// Resolves once the config ends center `name`'s link ([`stop_reason`]),
+/// or the daemon is going away.
+async fn halted(shared: &Shared, name: &str, changed: &mut watch::Receiver<u64>) {
+    while stop_reason(&shared.config(), name).is_none() {
+        if changed.changed().await.is_err() {
+            return;
+        }
+    }
 }
 
 /// Dials `name` until it is removed, paused, revoked or unknown, or the
@@ -61,6 +167,9 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
     // Dials that failed since the link was last up: the first is a warning,
     // the rest are detail, or a center that is down fills the log.
     let mut failed_dials = 0u32;
+    // The link that dropped, while the center may resume it. Leaving this
+    // function drops it, which ends its calls.
+    let mut parked: Option<Parked> = None;
     loop {
         if *stop.borrow() {
             return;
@@ -74,9 +183,12 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
         }
         // The keyring may block (the Secret Service asks to unlock), so off
         // the runtime's threads.
+        let grace = parked.as_ref().map(|p| p.until);
         let read = {
-            let (shared, name) = (shared.clone(), name.clone());
-            tokio::task::spawn_blocking(move || load_key(&shared, &name)).await
+            let (s, n) = (shared.clone(), name.clone());
+            let read = tokio::task::spawn_blocking(move || load_key(&s, &n));
+            let halt = halted(&shared, &name, &mut changed);
+            dropping_at(read, &mut parked, grace, halt).await
         };
         let key = match read.unwrap_or_else(|e| Err(format!("the key read stopped: {e}"))) {
             Ok(k) => k,
@@ -94,7 +206,16 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
                 return;
             }
         };
-        let proxy = match proxy_for(&shared.paths, &cfg, &url).await {
+        let grace = parked.as_ref().map(|p| p.until);
+        let halt = halted(&shared, &name, &mut changed);
+        let proxy = match dropping_at(
+            proxy_for(&shared.paths, &cfg, &url),
+            &mut parked,
+            grace,
+            halt,
+        )
+        .await
+        {
             Ok(p) => p,
             Err(e) => {
                 tracing::error!("center {name}: bad proxy: {e}; dialling stopped");
@@ -105,14 +226,24 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
         cs.set_status("connecting");
         tracing::debug!("center {name}: dialling {url}");
         let started = Instant::now();
-        let dialled = ws::connect(
-            &url,
-            entry.pin.as_deref(),
-            proxy.as_ref(),
-            &key.node_id(),
-            limits::MESSAGE_BYTES as usize,
-        )
-        .await;
+        let dialled = {
+            let node_id = key.node_id();
+            let connect = ws::connect(
+                &url,
+                entry.pin.as_deref(),
+                proxy.as_ref(),
+                &node_id,
+                limits::MESSAGE_BYTES as usize,
+            );
+            let grace = parked.as_ref().map(|p| p.until);
+            dropping_at(
+                connect,
+                &mut parked,
+                grace,
+                halted(&shared, &name, &mut changed),
+            )
+            .await
+        };
         let outcome = match dialled {
             Err(ConnectError::Unknown) => {
                 tracing::warn!("center {name} does not know this node (401); dialling stopped");
@@ -131,7 +262,9 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
                 Outcome::Retry
             }
             Ok(ws) => {
-                let (outcome, was_up) = session(&shared, &cs, &entry, &key, ws).await;
+                let (outcome, was_up, kept) =
+                    session(&shared, &cs, &entry, &key, ws, parked.take(), &mut changed).await;
+                parked = kept;
                 if was_up {
                     failed_dials = 0;
                 }
@@ -155,6 +288,7 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
         loop {
             tokio::select! {
                 _ = tokio::time::sleep_until(until) => break,
+                _ = self::until(parked.as_ref().map(|p| p.until)) => parked = None,
                 _ = stop.changed() => return,
                 r = changed.changed() => {
                     if r.is_err() {
@@ -221,6 +355,8 @@ enum Got {
     /// Anything else that shows the center is alive (ping, pong).
     Alive,
     TooLarge,
+    /// A frame the WebSocket could not take (over its limit, malformed).
+    Broken(String),
     Closed,
 }
 
@@ -230,6 +366,8 @@ where
         + Unpin,
 {
     match stream.next().await {
+        // What the center sent is broken, not the connection: the link ends.
+        Some(Err(e)) if ws::broken_frame(&e) => Got::Broken(e.to_string()),
         None | Some(Err(_)) => Got::Closed,
         Some(Ok(WsMessage::Text(t))) => {
             if t.len() as u64 > limits::MESSAGE_BYTES {
@@ -298,21 +436,52 @@ where
 
 type WsStream = tokio_tungstenite::WebSocketStream<nerve_transport::net::BoxIo>;
 
-/// One connected link: handshake, then serve until it ends. Also says whether
-/// the handshake came through, so the link was up.
+/// A fresh link id: 16 random bytes as hex (spec §4.9).
+fn new_link_id() -> String {
+    msg::hex(&nerve_transport::keys::random_bytes(16))
+}
+
+/// One connected link: handshake, then serve until it ends. `parked` is the
+/// link that dropped, which this connection offers the center to resume.
+/// Also says whether the handshake came through, so the link was up, and
+/// gives back the link to keep for a resume.
 async fn session(
     shared: &Arc<Shared>,
     cs: &Arc<CenterState>,
     entry: &CenterEntry,
     key: &NodeKey,
     ws: WsStream,
-) -> (Outcome, bool) {
+    parked: Option<Parked>,
+    changed: &mut watch::Receiver<u64>,
+) -> (Outcome, bool, Option<Parked>) {
     let (mut sink, mut stream) = ws.split();
     let cfg = shared.config();
+    let mut parked = parked;
+    let mut offer = Resume {
+        link: new_link_id(),
+        got: 0,
+    };
 
     // Handshake (spec §4.2): challenge → hello → welcome.
     let hello = async {
-        let ch: Challenge = handshake_step(&mut stream, method::CHALLENGE).await?;
+        // The grace, a lock or a pause may come while the challenge is
+        // awaited; the parked link's calls end on time then.
+        let grace = parked.as_ref().map(|p| p.until);
+        let halt = halted(shared, &entry.name, &mut *changed);
+        let step = handshake_step(&mut stream, method::CHALLENGE);
+        let ch: Challenge = dropping_at(step, &mut parked, grace, halt).await?;
+        // A parked link is offered while its grace lasts and it still keeps
+        // every frame the center may not have read; otherwise it ends here.
+        // Once offered, it waits for the center's answer.
+        parked = parked
+            .take()
+            .filter(|p| Instant::now() < p.until && p.link().handle.resumable());
+        if let Some(p) = &parked {
+            offer = Resume {
+                link: p.link().id.clone(),
+                got: p.link().handle.got(),
+            };
+        }
         let nonce = msg::unhex(&ch.nonce).filter(|n| n.len() == 32).ok_or((
             Some(ByeReason::ProtocolError),
             "bad challenge nonce".to_string(),
@@ -343,6 +512,7 @@ async fn session(
             },
             limits: msg::Limits::default(),
             rev,
+            resume: Some(offer.clone()),
         };
         let m = Message::notification(
             method::HELLO,
@@ -351,34 +521,129 @@ async fn session(
         sink.send(text(&m))
             .await
             .map_err(|e| (None, format!("send: {e}")))?;
-        let w: Welcome = handshake_step(&mut stream, method::WELCOME).await?;
+        // An offered link waits for the answer, but not past a lock or pause.
+        let halt = halted(shared, &entry.name, &mut *changed);
+        let step = handshake_step(&mut stream, method::WELCOME);
+        let w: Welcome = dropping_at(step, &mut parked, None, halt).await?;
         if w.version != PROTOCOL_VERSION {
             return Err((
                 Some(ByeReason::UnsupportedVersion),
                 format!("the center chose version {:?}", w.version),
             ));
         }
-        Ok(())
+        Ok((w.resume, w.limits.message_bytes))
     }
     .await;
-    if let Err((reason, why)) = hello {
-        tracing::warn!("center {}: the handshake failed: {why}", entry.name);
-        cs.set_status(format!("handshake failed: {why}"));
-        if let Some(r) = reason {
-            let _ = sink.send(bye(r)).await;
+    let (resumed, takes) = match hello {
+        Ok(r) => r,
+        Err((reason, why)) => {
+            tracing::warn!("center {}: the handshake failed: {why}", entry.name);
+            cs.set_status(format!("handshake failed: {why}"));
+            if let Some(r) = reason {
+                let _ = sink.send(bye(r)).await;
+            }
+            let _ = sink.close().await;
+            // The center did not take the link up: the next dial offers it
+            // again while its grace lasts.
+            return (Outcome::Retry, false, parked);
         }
+    };
+    // A lock or pause that came during the handshake ends the link before it
+    // serves, a parked one with its calls.
+    if let Some(reason) = stop_reason(&shared.config(), &entry.name) {
+        drop(parked);
+        tracing::info!(
+            "center {}: closing the link with bye {}",
+            entry.name,
+            reason.as_str()
+        );
+        if reason == ByeReason::Paused {
+            cs.set_status("paused");
+        }
+        let _ = sink.send(bye(reason)).await;
         let _ = sink.close().await;
-        return (Outcome::Retry, false);
+        return (Outcome::Stop, true, None);
     }
-    tracing::info!("linked to center {}", entry.name);
-    cs.set_status("connected");
 
     // One writer owns the sink; everyone else queues (spec §5.5).
     let (tx, mut rx) = mpsc::channel::<WsMessage>(limits::SEND_QUEUE);
+    // The center carries on the parked link, or starts a new one; without
+    // `welcome.resume` it cannot resume links at all (spec §4.9).
+    let carried = match (resumed, parked) {
+        (Some(Resumed { resumed: true, got }), Some(p)) => {
+            match p.link().handle.attach(tx.clone(), got) {
+                Ok(again) => Ok((p.resume(), Some(again))),
+                Err(e) => Err(format!("the center resumed the link wrongly: {e}")),
+            }
+        }
+        (Some(Resumed { resumed: true, .. }), None) => {
+            Err("the center resumed a link the node did not offer".to_string())
+        }
+        (r, p) => {
+            if p.is_some() {
+                tracing::info!("center {}: the center did not resume the link", entry.name);
+            }
+            // Ends the parked link's calls before the new link is up.
+            drop(p);
+            // The password a frame carries is scrubbed when the frame is
+            // numbered; a weak reference, as the node's state holds the link.
+            let scrubber = Arc::downgrade(shared);
+            let scrub: crate::daemon::Scrub = Box::new(move |t| match scrubber.upgrade() {
+                Some(s) => s.scrub(t),
+                None => t,
+            });
+            let handle = Arc::new(LinkHandle::new(tx.clone(), r.is_some(), scrub));
+            let link = Arc::new(Link {
+                shared: shared.clone(),
+                cs: cs.clone(),
+                name: entry.name.clone(),
+                id: offer.link.clone(),
+                takes: AtomicU64::new(takes),
+                handle,
+                calls: Mutex::default(),
+                commands: Mutex::default(),
+                last_status: Mutex::new("online"),
+            });
+            Ok((link, None))
+        }
+    };
+    let (link, again) = match carried {
+        Ok(x) => x,
+        Err(why) => {
+            tracing::warn!("center {}: {why}", entry.name);
+            cs.set_status(format!("handshake failed: {why}"));
+            let _ = sink.send(bye(ByeReason::ProtocolError)).await;
+            let _ = sink.close().await;
+            return (Outcome::Retry, false, None);
+        }
+    };
+    link.takes.store(takes, Ordering::Relaxed);
+    match &again {
+        None => tracing::info!("linked to center {}", entry.name),
+        Some(a) => tracing::info!(
+            "link to center {} resumed with {} in flight; {} sent again",
+            entry.name,
+            plural(lock(&link.calls).len(), "call"),
+            plural(a.len(), "frame")
+        ),
+    }
+    let again = again.unwrap_or_default();
+    cs.set_status("connected");
+
     let (done_tx, mut done_rx) = oneshot::channel::<()>();
     // Every frame leaves through here, so the sudo password never does.
     let scrubber = shared.clone();
     let writer = tokio::spawn(async move {
+        // What the center did not read of the link goes first, in order.
+        for t in again {
+            if sink
+                .send(scrub(&scrubber, WsMessage::text(t)))
+                .await
+                .is_err()
+            {
+                return;
+            }
+        }
         loop {
             tokio::select! {
                 m = rx.recv() => match m {
@@ -399,34 +664,40 @@ async fn session(
         let _ = sink.close().await;
     });
 
-    let handle = Arc::new(LinkHandle::new(tx.clone()));
-    *lock(&cs.link) = Some(handle.clone());
-    let link = Arc::new(Link {
-        shared: shared.clone(),
-        cs: cs.clone(),
-        name: entry.name.clone(),
-        handle,
-        tx,
-        calls: Mutex::default(),
-        commands: Mutex::default(),
-        last_status: Mutex::new("online"),
-    });
+    drop(tx);
+    *lock(&cs.link) = Some(link.handle.clone());
 
     let outcome = link.serve(&mut stream).await;
 
-    // The link is gone (spec §4.5): calls end, commands die with their
-    // process groups.
-    *lock(&cs.link) = None;
-    let calls: Vec<InFlight> = lock(&link.calls).drain().map(|(_, c)| c).collect();
-    for c in calls {
-        c.abort.abort();
-    }
+    // From here what the link sends is kept for a resume (or lost).
+    link.handle.detach();
     let _ = done_tx.send(());
     let _ = tokio::time::timeout(Duration::from_secs(2), writer).await;
-    if matches!(outcome, Outcome::Retry) {
-        cs.set_status("link lost; dialling again");
+    if matches!(outcome, Outcome::Lost) && link.handle.resumable() {
+        let n = lock(&link.calls).len();
+        tracing::info!(
+            "center {}: the link dropped; keeping it for {} for the center to resume, with {} in flight",
+            entry.name,
+            span(shared.grace),
+            plural(n, "call")
+        );
+        cs.set_status("link lost; resuming");
+        let parked = Parked {
+            link: Some(link),
+            until: Instant::now() + shared.grace,
+        };
+        return (Outcome::Retry, true, Some(parked));
     }
-    (outcome, true)
+    // The link is gone (spec §4.5): calls end, commands die with their
+    // process groups.
+    link.finish();
+    match outcome {
+        Outcome::Stop => (Outcome::Stop, true, None),
+        _ => {
+            cs.set_status("link lost; dialling again");
+            (Outcome::Retry, true, None)
+        }
+    }
 }
 
 /// A call in flight: its task, and the harness session it came from.
@@ -435,13 +706,17 @@ struct InFlight {
     session: Option<String>,
 }
 
-/// A live link's state shared with its calls.
+/// A link's state shared with its calls. A link the center resumes keeps it
+/// over several connections.
 struct Link {
     shared: Arc<Shared>,
     cs: Arc<CenterState>,
     name: String,
+    /// The id the center knows the link by (spec §4.9).
+    id: String,
+    /// The largest message the center takes (its `welcome.limits`).
+    takes: AtomicU64,
     handle: Arc<LinkHandle>,
-    tx: mpsc::Sender<WsMessage>,
     /// Calls in flight; whoever removes an entry sends its reply.
     calls: Mutex<HashMap<Id, InFlight>>,
     /// Running `exec.run` calls → what ends them.
@@ -452,15 +727,47 @@ struct Link {
 
 impl Link {
     async fn send(&self, m: Message) {
-        let _ = self.tx.send(text(&m)).await;
+        self.handle.send(m.encode()).await;
     }
 
+    /// Ends the link for good: its calls end, and a running command dies
+    /// with its process group.
+    fn finish(&self) {
+        {
+            let mut held = lock(&self.cs.link);
+            if held.as_ref().is_some_and(|h| Arc::ptr_eq(h, &self.handle)) {
+                *held = None;
+            }
+        }
+        self.handle.detach();
+        let calls: Vec<InFlight> = lock(&self.calls).drain().map(|(_, c)| c).collect();
+        for c in calls {
+            c.abort.abort();
+        }
+    }
+
+    /// Answers call `id`. An answer larger than the center takes would break
+    /// the connection, and a resume would send it again: the call fails with
+    /// `too_large` instead.
     async fn reply(&self, id: Id, r: Result<Value, RpcError>) {
-        self.send(match r {
-            Ok(v) => Message::result(id, v),
-            Err(e) => Message::error(Some(id), e),
-        })
-        .await;
+        let text = match r {
+            Ok(v) => Message::result(id.clone(), v),
+            Err(e) => Message::error(Some(id.clone()), e),
+        }
+        .encode();
+        let takes = self.takes.load(Ordering::Relaxed);
+        if text.len() as u64 > takes {
+            let e = RpcError::new(
+                ErrorCode::TooLarge,
+                format!(
+                    "the answer is {} bytes, more than the center takes ({takes})",
+                    text.len()
+                ),
+            );
+            tracing::warn!("center {}: {}", self.name, e.message);
+            return self.handle.send(Message::error(Some(id), e).encode()).await;
+        }
+        self.handle.send(text).await;
     }
 
     /// The center's entry, or `None` when it was removed meanwhile.
@@ -483,6 +790,15 @@ impl Link {
             Some(x) => x,
             None => return self.end(ByeReason::Unpaired, Outcome::Stop).await,
         };
+        // A lock or pause that came since the handshake is not seen by
+        // `changed`, which starts now; a resumed link would carry the
+        // commands it had past it.
+        if let Some(reason) = stop_reason(&cfg, &self.name) {
+            if reason == ByeReason::Paused {
+                self.cs.set_status("paused");
+            }
+            return self.end(reason, Outcome::Stop).await;
+        }
         let mut rev = descriptor::for_center(
             &cfg,
             &entry,
@@ -498,11 +814,34 @@ impl Link {
                     heard = Instant::now();
                     match got {
                         Got::Msg(m) => {
+                            if resume::counted(&m) {
+                                self.handle.read_one();
+                            }
+                            if let Message::Notification { method: am, params: p } = &m
+                                && am == method::ACK
+                            {
+                                // An ack on a link that cannot resume is
+                                // ignored like any unknown notification.
+                                if !self.handle.resumes() {
+                                    continue;
+                                }
+                                let r = params::<Ack>(p)
+                                    .map_err(|e| e.message)
+                                    .and_then(|a| self.handle.acked(a.got));
+                                if let Err(e) = r {
+                                    tracing::warn!("center {}: a wrong ack: {e}", self.name);
+                                    return self.end(ByeReason::ProtocolError, Outcome::Retry).await;
+                                }
+                                continue;
+                            }
                             if let Some(o) = self.message(m).await {
                                 return o;
                             }
                         }
-                        Got::Bad(reply) => self.send(reply).await,
+                        Got::Bad(reply) => {
+                            self.handle.read_one();
+                            self.send(reply).await;
+                        }
                         Got::Binary(b) => {
                             // No blobs or streams flow center → node;
                             // only reserved media frames break the link.
@@ -516,9 +855,13 @@ impl Link {
                             tracing::warn!("center {}: it sent a message that is too large", self.name);
                             return self.end(ByeReason::ProtocolError, Outcome::Retry).await;
                         }
+                        Got::Broken(e) => {
+                            tracing::warn!("center {}: it sent a frame the node cannot read: {e}", self.name);
+                            return self.end(ByeReason::ProtocolError, Outcome::Retry).await;
+                        }
                         Got::Closed => {
                             tracing::warn!("center {}: the link closed without a bye", self.name);
-                            return Outcome::Retry;
+                            return Outcome::Lost;
                         }
                     }
                 }
@@ -529,12 +872,14 @@ impl Link {
                             self.name,
                             span(DEAD)
                         );
-                        return Outcome::Retry;
+                        return Outcome::Lost;
                     }
                     if heard.elapsed() >= PING && pinged.elapsed() >= PING {
                         pinged = Instant::now();
-                        let _ = self.tx.try_send(WsMessage::Ping(Default::default()));
+                        self.handle.raw(WsMessage::Ping(Default::default()));
                     }
+                    // Every 5 s at most (resume::ACK_EVERY).
+                    self.handle.send_ack();
                     self.check_rev(&mut rev);
                     self.check_status();
                 }
@@ -614,7 +959,7 @@ impl Link {
             reason.as_str()
         );
         nerve_transport::log::emit(level, None, &why);
-        let _ = self.tx.send(bye(reason)).await;
+        self.handle.raw_send(bye(reason)).await;
         o
     }
 
@@ -652,6 +997,9 @@ impl Link {
             }
             // The calls of an ended session end like cancelled ones: a
             // command's process group is killed as on a timeout.
+            // A request the center gave up while the link was down, in its
+            // place in the replay (spec §4.9): nothing to do.
+            method::WITHDRAWN => None,
             method::SESSION_END => {
                 let Ok(end) = params::<SessionEnd>(&p) else {
                     return None;
@@ -709,7 +1057,7 @@ impl Link {
         if let Some(c) = c {
             c.abort.abort();
             let e = Message::error(Some(id), RpcError::new(ErrorCode::Cancelled, why));
-            let _ = self.tx.try_send(text(&e));
+            self.handle.try_send(e.encode());
         }
     }
 
@@ -1523,6 +1871,67 @@ impl Drop for Running<'_> {
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
+
+    /// Dropped when its flag says so.
+    struct Held(std::sync::Arc<std::sync::Mutex<Option<std::time::Instant>>>);
+
+    impl Drop for Held {
+        fn drop(&mut self) {
+            *self.0.lock().unwrap() = Some(std::time::Instant::now());
+        }
+    }
+
+    /// A slow step of the dial loop (the keyring, a hanging dial) does not
+    /// keep the parked link past its grace: it goes when the grace ends, and
+    /// the step still finishes.
+    #[tokio::test]
+    async fn a_slow_step_drops_the_parked_link_when_the_grace_ends() {
+        let dropped = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut slot = Some(Held(dropped.clone()));
+        let started = std::time::Instant::now();
+        let grace = started + Duration::from_millis(50);
+        let step = async {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            7
+        };
+        let halt = std::future::pending();
+        assert_eq!(
+            super::dropping_at(step, &mut slot, Some(grace), halt).await,
+            7
+        );
+        assert!(slot.is_none());
+        let at = dropped.lock().unwrap().expect("dropped");
+        assert!(
+            at - started < Duration::from_millis(300),
+            "{:?}",
+            at - started
+        );
+        // Without a grace nothing goes.
+        let mut kept = Some(1);
+        let halt = std::future::pending();
+        assert_eq!(
+            super::dropping_at(async { 2 }, &mut kept, None, halt).await,
+            2
+        );
+        assert_eq!(kept, Some(1));
+        // A halt (a lock, a pause) drops it at once, and the step finishes.
+        let dropped = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut slot = Some(Held(dropped.clone()));
+        let started = std::time::Instant::now();
+        let halt = tokio::time::sleep(Duration::from_millis(50));
+        let step = async {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            8
+        };
+        assert_eq!(super::dropping_at(step, &mut slot, None, halt).await, 8);
+        assert!(slot.is_none());
+        let at = dropped.lock().unwrap().expect("dropped");
+        assert!(
+            at - started < Duration::from_millis(300),
+            "{:?}",
+            at - started
+        );
+    }
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;

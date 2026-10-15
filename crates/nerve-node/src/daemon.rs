@@ -18,6 +18,7 @@ use nerve_policy::config::SecretStorage;
 use nerve_policy::{NodeConfig, SettingsStore};
 use nerve_proto::Message;
 use nerve_proto::msg::{Topic, method};
+use nerve_proto::resume::{self, Replay};
 use nerve_sandbox::Confinement;
 use nerve_transport::log::{Level, Log};
 use nerve_transport::ws::WsMessage;
@@ -47,6 +48,9 @@ pub struct NodeOptions {
     /// How commands can be confined, instead of asking the kernel. A test
     /// sets it, to stand for a kernel it does not run on.
     pub confinement: Option<Confinement>,
+    /// How long a dropped link is kept for the center to resume it
+    /// (nerve_proto::resume::GRACE). A test shortens it.
+    pub resume_grace: Duration,
 }
 
 impl NodeOptions {
@@ -59,6 +63,7 @@ impl NodeOptions {
             log: nerve_transport::log::global(),
             full_rights: None,
             confinement: None,
+            resume_grace: resume::GRACE,
         }
     }
 }
@@ -69,10 +74,36 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The sending side of one live link, shared with the calls running on it.
+/// The sending side of a link, shared with the calls running on it. A link
+/// the center can resume outlives a drop (nerve_proto::resume): what the
+/// node sends meanwhile is kept, and goes out when the link resumes.
 pub(crate) struct LinkHandle {
-    pub tx: mpsc::Sender<WsMessage>,
+    wire: Mutex<Wire>,
     subs: Mutex<Subs>,
+    /// Takes the sudo password out of a frame. A counted frame is scrubbed
+    /// once, before it is numbered and kept: the password it may carry is
+    /// the one held then, and a frame kept for a resume can outlive it.
+    scrub: Scrub,
+}
+
+/// What [`LinkHandle`] scrubs a frame with.
+pub(crate) type Scrub = Box<dyn Fn(String) -> String + Send + Sync>;
+
+struct Wire {
+    /// The writer of the connection now; `None` while the link is down.
+    tx: Option<mpsc::Sender<WsMessage>>,
+    /// The counts and the kept frames, when the center can resume the link.
+    replay: Option<Replay>,
+}
+
+impl Wire {
+    /// Keeps a frame that cannot go out now for the resume. On a link that
+    /// cannot resume it is lost with the link.
+    fn keep(&mut self, text: &str) {
+        if let Some(r) = &mut self.replay {
+            r.push(text);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -83,11 +114,166 @@ struct Subs {
 }
 
 impl LinkHandle {
-    pub fn new(tx: mpsc::Sender<WsMessage>) -> LinkHandle {
+    /// A link on the connection `tx` writes to; `resumable` when the center
+    /// can resume it.
+    pub fn new(tx: mpsc::Sender<WsMessage>, resumable: bool, scrub: Scrub) -> LinkHandle {
         LinkHandle {
-            tx,
+            wire: Mutex::new(Wire {
+                tx: Some(tx),
+                replay: resumable.then(|| Replay::new(resume::KEEP_BYTES)),
+            }),
             subs: Mutex::default(),
+            scrub,
         }
+    }
+
+    /// Sends a counted text frame, waiting for room in the queue.
+    pub async fn send(&self, text: String) {
+        let text = (self.scrub)(text);
+        loop {
+            // Kept under the same lock that saw the link down, so a resume
+            // that comes in between replays it.
+            let tx = {
+                let mut w = lock(&self.wire);
+                match w.tx.clone() {
+                    Some(tx) => tx,
+                    None => {
+                        w.keep(&text);
+                        return;
+                    }
+                }
+            };
+            let permit = tx.reserve().await;
+            let mut w = lock(&self.wire);
+            // The connection changed while this waited for room: the frame
+            // goes to the one there is now.
+            if !w.tx.as_ref().is_some_and(|t| t.same_channel(&tx)) {
+                continue;
+            }
+            match permit {
+                Ok(p) => {
+                    if let Some(r) = &mut w.replay {
+                        r.push(&text);
+                    }
+                    p.send(WsMessage::text(text));
+                }
+                // The writer is gone: the link is going down.
+                Err(_) => w.keep(&text),
+            }
+            return;
+        }
+    }
+
+    /// Sends a counted text frame if there is room; `false` when the queue
+    /// is full and the frame was dropped.
+    pub fn try_send(&self, text: String) -> bool {
+        let text = (self.scrub)(text);
+        let mut w = lock(&self.wire);
+        let Some(tx) = w.tx.clone() else {
+            w.keep(&text);
+            return true;
+        };
+        match tx.try_reserve() {
+            Ok(p) => {
+                if let Some(r) = &mut w.replay {
+                    r.push(&text);
+                }
+                p.send(WsMessage::text(text));
+                true
+            }
+            Err(mpsc::error::TrySendError::Full(())) => false,
+            Err(mpsc::error::TrySendError::Closed(())) => {
+                w.keep(&text);
+                true
+            }
+        }
+    }
+
+    /// Sends a frame of this connection only (a ping, an `ack`), if there
+    /// is room.
+    pub fn raw(&self, m: WsMessage) {
+        if let Some(tx) = &lock(&self.wire).tx {
+            let _ = tx.try_send(m);
+        }
+    }
+
+    /// Sends a frame of this connection only (a `bye`), waiting for room.
+    pub async fn raw_send(&self, m: WsMessage) {
+        let tx = lock(&self.wire).tx.clone();
+        if let Some(tx) = tx {
+            let _ = tx.send(m).await;
+        }
+    }
+
+    /// Counts a counted frame read from the center.
+    pub fn read_one(&self) {
+        if let Some(r) = &mut lock(&self.wire).replay {
+            r.read();
+        }
+    }
+
+    /// Sends `ack {got}` when the count moved since the last one.
+    pub fn send_ack(&self) {
+        let mut w = lock(&self.wire);
+        let Wire {
+            tx: Some(tx),
+            replay: Some(r),
+        } = &mut *w
+        else {
+            return;
+        };
+        if let Some(got) = r.ack_due() {
+            let m = Message::notification(method::ACK, json!({ "got": got }));
+            if tx.try_send(WsMessage::text(m.encode())).is_ok() {
+                r.told(got);
+            }
+        }
+    }
+
+    /// Whether the center can resume this link (it agreed to in `welcome`).
+    pub fn resumes(&self) -> bool {
+        lock(&self.wire).replay.is_some()
+    }
+
+    /// The center read the first `got` frames.
+    pub fn acked(&self, got: u64) -> Result<(), String> {
+        match &mut lock(&self.wire).replay {
+            Some(r) => r.acked_to(got),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether the center can resume this link now: it agreed to, and every
+    /// frame it may lack is still kept.
+    pub fn resumable(&self) -> bool {
+        lock(&self.wire)
+            .replay
+            .as_ref()
+            .is_some_and(Replay::complete)
+    }
+
+    /// The counted frames read from the center so far.
+    pub fn got(&self) -> u64 {
+        lock(&self.wire).replay.as_ref().map_or(0, Replay::got)
+    }
+
+    /// Takes the link off its connection: until it resumes, what is sent is
+    /// kept, or lost on a link that cannot resume.
+    pub fn detach(&self) {
+        lock(&self.wire).tx = None;
+    }
+
+    /// Puts the resumed link on the connection `tx` writes to, the center
+    /// having read `got` frames of it. Gives the frames to send first.
+    pub fn attach(&self, tx: mpsc::Sender<WsMessage>, got: u64) -> Result<Vec<String>, String> {
+        let mut w = lock(&self.wire);
+        let again = w
+            .replay
+            .as_mut()
+            .ok_or("this link cannot resume")?
+            .resume(got)?;
+        w.tx = Some(tx);
+        Ok(again)
     }
 
     pub fn sub(&self, topics: Vec<Topic>, on: bool) {
@@ -122,7 +308,7 @@ impl LinkHandle {
             method::EVENT,
             json!({"cap": cap, "name": name, "seq": seq, "ts": crate::now_ms(), "data": data}),
         );
-        if self.tx.try_send(WsMessage::text(m.encode())).is_err() {
+        if !self.try_send(m.encode()) {
             tracing::warn!("event {cap}/{name} dropped: the link's send queue is full");
         }
     }
@@ -141,7 +327,7 @@ impl LinkHandle {
             method::STATE,
             json!({"cap": cap, "seq": seq, "ts": crate::now_ms(), "changed": changed}),
         );
-        let _ = self.tx.try_send(WsMessage::text(m.encode()));
+        self.try_send(m.encode());
     }
 }
 
@@ -215,6 +401,8 @@ pub(crate) struct Shared {
     /// Whether the log said that the keyring turned folder mode's commands
     /// off ([`Shared::tell_confinement`]).
     pub told_keyring: std::sync::atomic::AtomicBool,
+    /// How long a dropped link is kept for its resume.
+    pub grace: Duration,
     /// The capability providers attached now (crate::provider).
     pub providers: crate::provider::Providers,
     /// The relay for other nodes (crate::relay), and who is connected.
@@ -745,6 +933,7 @@ impl Daemon {
             sudo_for: Mutex::default(),
             account_cache: Mutex::default(),
             told_keyring: Default::default(),
+            grace: opts.resume_grace,
             providers: Default::default(),
             relay: Default::default(),
         });

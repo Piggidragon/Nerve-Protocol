@@ -16,6 +16,7 @@ pub mod error;
 pub mod frame;
 pub mod link;
 pub mod msg;
+pub mod resume;
 pub mod rpc;
 
 pub use descriptor::{Capability, Descriptor, Detail, Effect, Exposure};

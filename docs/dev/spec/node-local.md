@@ -484,7 +484,8 @@ and posts `WM_CLOSE` to their visible top-level windows on its desktop. The
 node holds those processes open while the helper runs, so their pids name no
 other process. The job is ended 3 seconds later, or at once when nothing was
 asked; a timeout's result waits for that. `kill`, `cancel`, `session.end`, a
-dropped link and the call's return end the job at once. A command of another
+link that ended without being resumed (protocol §4.9) and the call's return
+end the job at once. A command of another
 account (installed node) is asked by a helper started with that account's
 token. The helper runs in the command's job, so it is ended with the
 command and the control pipe refuses it. A command has one stop at a time:

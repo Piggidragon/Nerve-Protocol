@@ -1373,3 +1373,56 @@ async fn a_frame_the_node_cannot_take_ends_a_resumable_link() {
     assert_eq!(again.got, 0, "{again:?}");
     node.stop().await;
 }
+
+/// A lock (`panic`) that lands while the node dials and shakes hands again
+/// with a dropped link still ends that link once the center carries it on:
+/// `bye paused`, and the command that was running is killed.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_during_the_resume_handshake_ends_the_link() {
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let node = paired_node_with(dir.path(), &center, |p| {
+        p.mode = nerve_policy::Mode::User;
+    })
+    .await;
+    let home = dir.path().join("home");
+    let (mut conn, first) = resumable_link(&mut center, fresh).await;
+    conn.call("describe", json!({"detail": "summary"}), WAIT)
+        .await
+        .unwrap()
+        .expect("describe");
+    conn.request(
+        "invoke",
+        json!({"cap": "exec", "action": "run",
+               "args": {"command": "sleep 30 & echo $! > sleep.pid; wait"}}),
+    )
+    .await
+    .unwrap();
+    let pid = pid_in(&home.join("sleep.pid")).await;
+    drop(conn);
+
+    // The node dials again; the center holds back its challenge (as its
+    // duplicate ping does) while the owner locks the node.
+    let paired = center.paired().unwrap();
+    let mut inc = center.next_link(WAIT).await.expect("the node dials");
+    owner_edit(node.paths(), |c| c.locked = true).await;
+    assert!(running(pid), "the parked command runs until the link ends");
+    let hello = fake_center::hello(&mut inc.conn, &center.center_id, &paired)
+        .await
+        .expect("hello");
+    let offer = hello.resume.expect("an offer");
+    assert_eq!(offer.link, first.link);
+    fake_center::welcome(
+        &mut inc.conn,
+        Some(nerve_proto::msg::Resumed {
+            resumed: true,
+            got: 1,
+        }),
+    )
+    .await
+    .expect("welcome");
+    assert_eq!(inc.conn.ends_within(WAIT).await.as_deref(), Some("paused"));
+    assert!(ends(pid).await, "the command outlived the lock");
+    node.stop().await;
+}

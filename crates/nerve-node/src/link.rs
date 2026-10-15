@@ -720,6 +720,16 @@ impl Link {
             Some(x) => x,
             None => return self.end(ByeReason::Unpaired, Outcome::Stop).await,
         };
+        // A lock or pause that came while the node dialled and shook hands
+        // is not seen by `changed`, which starts now; a resumed link would
+        // carry the commands it had past it.
+        if cfg.locked || entry.paused {
+            self.cs.set_status("paused");
+            return self.end(ByeReason::Paused, Outcome::Stop).await;
+        }
+        if entry.revoked || entry.unknown {
+            return self.end(ByeReason::Unpaired, Outcome::Stop).await;
+        }
         let mut rev =
             descriptor::for_center(&cfg, &entry, crate::now_ms(), self.shared.confined(&cfg)).rev;
         let mut version = cfg.version;

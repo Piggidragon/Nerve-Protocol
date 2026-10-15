@@ -1022,6 +1022,446 @@ async fn a_session_end_stops_the_commands_of_that_session() {
     node.stop().await;
 }
 
+/// Accepts the node's link with the handshake of a center that can resume
+/// links: `answer` gives the welcome's reply to the node's resume offer.
+/// Returns the connection and the offer.
+async fn resumable_link(
+    center: &mut FakeCenter,
+    answer: impl FnOnce(&nerve_proto::msg::Resume) -> nerve_proto::msg::Resumed,
+) -> (Conn<TcpStream>, nerve_proto::msg::Resume) {
+    let paired = center.paired().expect("paired");
+    let mut inc = center.next_link(WAIT).await.expect("the node dials");
+    let hello = fake_center::hello(&mut inc.conn, &center.center_id, &paired)
+        .await
+        .expect("hello");
+    let offer = hello.resume.expect("the node offers its link for a resume");
+    assert!(nerve_proto::resume::valid_link_id(&offer.link), "{offer:?}");
+    fake_center::welcome(&mut inc.conn, Some(answer(&offer)))
+        .await
+        .expect("welcome");
+    (inc.conn, offer)
+}
+
+/// A fresh link, with nothing to carry on.
+fn fresh(_: &nerve_proto::msg::Resume) -> nerve_proto::msg::Resumed {
+    nerve_proto::msg::Resumed {
+        resumed: false,
+        got: 0,
+    }
+}
+
+/// Waits up to 5 s for process `pid` to end.
+#[cfg(target_os = "linux")]
+async fn ends(pid: u32) -> bool {
+    for _ in 0..100 {
+        if !running(pid) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    false
+}
+
+/// A link that drops while a command runs is resumed (spec §4.9): the
+/// command runs on, and its result and its `exec/exit` event, sent while the
+/// link was down, arrive on the new connection. Only what the center did not
+/// read is sent again, and the resumed link takes new calls and acknowledges
+/// what it reads.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_link_resumes_with_the_output_and_the_exit_event() {
+    use nerve_conformance::wire::Recv;
+    use nerve_proto::rpc::Message;
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let node = paired_node_with(dir.path(), &center, |p| {
+        p.mode = nerve_policy::Mode::User;
+    })
+    .await;
+    let home = dir.path().join("home");
+    let (mut conn, first) = resumable_link(&mut center, fresh).await;
+    assert_eq!(first.got, 0, "{first:?}");
+
+    // The center's counted frames: 1 the sub, 2 the run. The node's: 1 the
+    // sub's result, then what the run sends.
+    conn.call("sub", json!({"topics": ["exec/exit"]}), WAIT)
+        .await
+        .unwrap()
+        .expect("sub");
+    let command = "touch started; while [ ! -e go ]; do sleep 0.05; done; echo resumed-output";
+    let run = conn
+        .request(
+            "invoke",
+            json!({"cap": "exec", "action": "run", "args": {"command": command}}),
+        )
+        .await
+        .unwrap();
+    for _ in 0..200 {
+        if home.join("started").exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(home.join("started").exists(), "the command did not start");
+
+    drop(conn);
+    // The command finishes while the link is down.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    std::fs::write(home.join("go"), "").unwrap();
+
+    // The center read the sub's result only.
+    let (mut conn, again) = resumable_link(&mut center, |_| nerve_proto::msg::Resumed {
+        resumed: true,
+        got: 1,
+    })
+    .await;
+    assert_eq!(again.link, first.link, "the same link is offered");
+    assert_eq!(again.got, 2, "the node read the sub and the run");
+
+    let mut others = Vec::new();
+    let ran = conn
+        .answer(run, WAIT, &mut others)
+        .await
+        .unwrap()
+        .expect("the command's result");
+    assert_eq!(ran["exit_code"], 0, "{ran}");
+    assert_eq!(ran["stdout"], "resumed-output\n", "{ran}");
+    let exit = |m: &Message| {
+        matches!(m, Message::Notification { method, params }
+            if method == "event" && params["cap"] == "exec" && params["name"] == "exit")
+    };
+    let mut seen = others.clone();
+    if !seen.iter().any(exit) {
+        loop {
+            match conn.recv(WAIT).await {
+                Recv::Msg(m) if exit(&m) => {
+                    seen.push(m);
+                    break;
+                }
+                Recv::Msg(m) => seen.push(m),
+                other => panic!("no exec/exit event: {other:?}"),
+            }
+        }
+    }
+    let Some(Message::Notification { params: ev, .. }) = seen.iter().find(|m| exit(m)) else {
+        unreachable!()
+    };
+    assert_eq!(ev["data"]["call"], json!(run), "{ev:?}");
+    assert_eq!(ev["data"]["exit_code"], 0, "{ev:?}");
+    assert_eq!(ev["seq"], 1, "{ev:?}");
+    // The sub's result, which the center had read, does not come again.
+    assert!(
+        !seen.iter().any(|m| matches!(m, Message::Result { .. })),
+        "{seen:?}"
+    );
+
+    // The resumed link takes new calls, and the node acknowledges the three
+    // frames it read of the link within 5 s.
+    let d = conn
+        .call("describe", json!({"detail": "summary"}), WAIT)
+        .await
+        .unwrap()
+        .expect("describe");
+    assert!(d["capabilities"].is_array(), "{d}");
+    let ack = loop {
+        match conn.recv(Duration::from_secs(10)).await {
+            Recv::Msg(Message::Notification { method, params }) if method == "ack" => {
+                break params;
+            }
+            Recv::Msg(_) => continue,
+            other => panic!("no ack: {other:?}"),
+        }
+    };
+    assert_eq!(ack["got"], 3, "{ack:?}");
+    node.stop().await;
+}
+
+/// A dropped link the center does not resume within the grace ends as
+/// without resume: its command is killed, and the next link is a new one.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_link_not_resumed_within_the_grace_ends_its_calls() {
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let mut o = options(dir.path());
+    o.resume_grace = Duration::from_secs(1);
+    nerve_node::pair::pair(&o.paths, &center.link(), Some("lab"))
+        .await
+        .expect("pair");
+    owner_edit(&o.paths, |c| {
+        c.centers[0].policy.mode = nerve_policy::Mode::User
+    })
+    .await;
+    let node = Daemon::start(o).await.expect("start");
+    let home = dir.path().join("home");
+    let (mut conn, first) = resumable_link(&mut center, fresh).await;
+    conn.request(
+        "invoke",
+        json!({"cap": "exec", "action": "run",
+               "args": {"command": "sleep 30 & echo $! > sleep.pid; wait"}}),
+    )
+    .await
+    .unwrap();
+    let pid = pid_in(&home.join("sleep.pid")).await;
+    drop(conn);
+
+    // The node dials again at once; this center answers only after the
+    // grace, and the command is gone by then.
+    let paired = center.paired().unwrap();
+    let mut inc = center.next_link(WAIT).await.expect("the node dials");
+    assert!(ends(pid).await, "the command outlived the grace");
+    let hello = fake_center::hello(&mut inc.conn, &center.center_id, &paired)
+        .await
+        .expect("hello");
+    let offer = hello.resume.expect("an offer");
+    assert_ne!(offer.link, first.link, "the old link is gone");
+    assert_eq!(offer.got, 0, "{offer:?}");
+    node.stop().await;
+}
+
+/// A center that does not carry the link on (`resumed: false`) ends it: the
+/// command started on it is killed at once.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_link_the_center_does_not_resume_ends_its_calls() {
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let node = paired_node_with(dir.path(), &center, |p| {
+        p.mode = nerve_policy::Mode::User;
+    })
+    .await;
+    let home = dir.path().join("home");
+    let (mut conn, first) = resumable_link(&mut center, fresh).await;
+    let run = conn
+        .request(
+            "invoke",
+            json!({"cap": "exec", "action": "run",
+                   "args": {"command": "sleep 30 & echo $! > sleep.pid; wait"}}),
+        )
+        .await
+        .unwrap();
+    let pid = pid_in(&home.join("sleep.pid")).await;
+    drop(conn);
+    assert!(running(pid), "the command runs on while the link is down");
+
+    let (mut conn, again) = resumable_link(&mut center, fresh).await;
+    assert_eq!(again.link, first.link);
+    assert_eq!(again.got, 1);
+    assert!(ends(pid).await, "the command of a link not resumed runs on");
+    // Its call is not answered on the new link.
+    let mut others = Vec::new();
+    conn.call("describe", json!({"detail": "summary"}), WAIT)
+        .await
+        .unwrap()
+        .expect("describe");
+    assert!(
+        conn.answer(run, Duration::from_millis(500), &mut others)
+            .await
+            .is_err(),
+        "the old call was answered: {others:?}"
+    );
+    node.stop().await;
+}
+
+/// On a link whose center cannot resume (its welcome says nothing of it),
+/// a drop ends the calls at once, as in 0.0.1.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn without_resume_a_drop_ends_the_calls_at_once() {
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let node = paired_node_with(dir.path(), &center, |p| {
+        p.mode = nerve_policy::Mode::User;
+    })
+    .await;
+    let home = dir.path().join("home");
+    let mut conn = linked(&mut center).await;
+    conn.request(
+        "invoke",
+        json!({"cap": "exec", "action": "run",
+               "args": {"command": "sleep 30 & echo $! > sleep.pid; wait"}}),
+    )
+    .await
+    .unwrap();
+    let pid = pid_in(&home.join("sleep.pid")).await;
+    drop(conn);
+    assert!(ends(pid).await, "the command outlived its link");
+    node.stop().await;
+}
+
+/// An `ack` for frames the node never sent ends the link with
+/// `bye protocol_error`.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_ack_past_what_the_node_sent_is_a_protocol_error() {
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let node = paired_node(dir.path(), &center).await;
+    let (mut conn, _) = resumable_link(&mut center, fresh).await;
+    conn.notify("ack", json!({"got": 5})).await.unwrap();
+    assert_eq!(
+        conn.ends_within(WAIT).await.as_deref(),
+        Some("protocol_error")
+    );
+    node.stop().await;
+}
+
+/// An answer larger than the center takes fails its call with `too_large`
+/// and leaves the link up: sent, it would break the connection, and a resume
+/// would send it again. Escaping makes `\0` six bytes, so 1 MiB of them is
+/// over the 4 MiB message limit.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_over_the_message_limit_fails_its_call_and_keeps_the_link() {
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let node = paired_node_with(dir.path(), &center, |p| {
+        p.mode = nerve_policy::Mode::User;
+    })
+    .await;
+    let (mut conn, _) = resumable_link(&mut center, fresh).await;
+    let e = conn
+        .call(
+            "invoke",
+            json!({"cap": "exec", "action": "run",
+                   "args": {"command": "head -c 1048576 /dev/zero"}}),
+            WAIT,
+        )
+        .await
+        .expect("the link stays up")
+        .expect_err("too large");
+    assert_eq!(nerve_conformance::wire::code_of(&e), "too_large", "{e:?}");
+    conn.call("describe", json!({"detail": "summary"}), WAIT)
+        .await
+        .expect("the link stays up")
+        .expect("describe");
+    node.stop().await;
+}
+
+/// A frame from the center that the node's WebSocket cannot take (here one
+/// over the 4 MiB message limit) ends the link with `bye protocol_error`
+/// instead of parking it: the center would send it again on every resume.
+/// The command on the link is killed, and the next link is a new one.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_frame_the_node_cannot_take_ends_a_resumable_link() {
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let node = paired_node_with(dir.path(), &center, |p| {
+        p.mode = nerve_policy::Mode::User;
+    })
+    .await;
+    let home = dir.path().join("home");
+    let (mut conn, first) = resumable_link(&mut center, fresh).await;
+    conn.request(
+        "invoke",
+        json!({"cap": "exec", "action": "run",
+               "args": {"command": "sleep 30 & echo $! > sleep.pid; wait"}}),
+    )
+    .await
+    .unwrap();
+    let pid = pid_in(&home.join("sleep.pid")).await;
+    let big = format!(
+        "{{\"jsonrpc\":\"2.0\",\"method\":\"x-pad\",\"params\":{{\"pad\":\"{}\"}}}}",
+        "x".repeat(4 * 1024 * 1024 + 1)
+    );
+    // The node may close before the whole frame is written.
+    let _ = conn.send_raw(&big).await;
+    assert!(conn.ends_within(WAIT).await.is_some(), "the link stays up");
+    assert!(ends(pid).await, "the command of the ended link runs on");
+    let (_conn, again) = resumable_link(&mut center, fresh).await;
+    assert_ne!(again.link, first.link, "the ended link was offered again");
+    assert_eq!(again.got, 0, "{again:?}");
+    node.stop().await;
+}
+
+/// A node in Mode::User whose resumable link dropped while a command ran:
+/// the daemon, the dropped link's offer, the command's pid and the next
+/// connection the node dialled, with no challenge sent yet.
+#[cfg(target_os = "linux")]
+async fn a_dropped_link_with_a_command(
+    root: &Path,
+    center: &mut FakeCenter,
+) -> (Daemon, nerve_proto::msg::Resume, u32, fake_center::Incoming) {
+    let node = paired_node_with(root, center, |p| {
+        p.mode = nerve_policy::Mode::User;
+    })
+    .await;
+    let (mut conn, first) = resumable_link(center, fresh).await;
+    conn.call("describe", json!({"detail": "summary"}), WAIT)
+        .await
+        .unwrap()
+        .expect("describe");
+    conn.request(
+        "invoke",
+        json!({"cap": "exec", "action": "run",
+               "args": {"command": "sleep 30 & echo $! > sleep.pid; wait"}}),
+    )
+    .await
+    .unwrap();
+    let pid = pid_in(&root.join("home").join("sleep.pid")).await;
+    drop(conn);
+    // The node dials again; the center holds back its challenge, as its
+    // duplicate ping does.
+    let inc = center.next_link(WAIT).await.expect("the node dials");
+    (node, first, pid, inc)
+}
+
+/// A lock (`panic`) while the node waits for the challenge of a connection
+/// that would resume a dropped link ends that link at once: its command is
+/// killed, the hello offers a new link, and the link ends with `bye paused`.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_while_the_node_dials_again_ends_the_dropped_link_at_once() {
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let (node, first, pid, mut inc) = a_dropped_link_with_a_command(dir.path(), &mut center).await;
+    assert!(running(pid), "the parked command runs");
+    owner_edit(node.paths(), |c| c.locked = true).await;
+    assert!(ends(pid).await, "the command outlived the lock");
+    let paired = center.paired().unwrap();
+    let hello = fake_center::hello(&mut inc.conn, &center.center_id, &paired)
+        .await
+        .expect("hello");
+    let offer = hello.resume.expect("an offer");
+    assert_ne!(offer.link, first.link, "the ended link was offered");
+    fake_center::welcome(&mut inc.conn, Some(fresh(&offer)))
+        .await
+        .expect("welcome");
+    assert_eq!(inc.conn.ends_within(WAIT).await.as_deref(), Some("paused"));
+    node.stop().await;
+}
+
+/// A lock while the node waits for the welcome that answers its resume
+/// offer ends the dropped link at once, and a welcome that then carries it
+/// on gets `bye paused`.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_while_the_node_waits_for_the_welcome_ends_the_dropped_link_at_once() {
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let (node, first, pid, mut inc) = a_dropped_link_with_a_command(dir.path(), &mut center).await;
+    let paired = center.paired().unwrap();
+    let hello = fake_center::hello(&mut inc.conn, &center.center_id, &paired)
+        .await
+        .expect("hello");
+    let offer = hello.resume.expect("an offer");
+    assert_eq!(offer.link, first.link);
+    assert!(running(pid), "the offered link's command runs");
+    owner_edit(node.paths(), |c| c.locked = true).await;
+    assert!(ends(pid).await, "the command outlived the lock");
+    fake_center::welcome(
+        &mut inc.conn,
+        Some(nerve_proto::msg::Resumed {
+            resumed: true,
+            got: 1,
+        }),
+    )
+    .await
+    .expect("welcome");
+    assert_eq!(inc.conn.ends_within(WAIT).await.as_deref(), Some("paused"));
+    node.stop().await;
+}
+
 /// A call may ask its command for less than the owner's most, never for
 /// more; `status` shows the limits and why this node does not hold them.
 #[tokio::test(flavor = "multi_thread")]

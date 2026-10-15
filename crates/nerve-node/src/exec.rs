@@ -1,6 +1,6 @@
 //! The `exec` capability (spec §7.3): shell commands, each in its own
 //! process group so the whole tree can be signalled and is killed when the
-//! call ends or the link drops. Windows has no process groups; there each
+//! call ends or its link ends (a dropped link that is resumed goes on). Windows has no process groups; there each
 //! command runs in a job object of its own (crate::job), and only when
 //! Windows makes none does the node record the processes below the shell
 //! while it runs (crate::tree), best effort.

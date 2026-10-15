@@ -36,7 +36,8 @@ names its reason.
 | `disabled: exec.run is off` | `cap set` switched it off or hid it | `nerve-node cap set exec.run on` |
 | `the command line is … bytes, longer than …` | A command over 64 KiB | Use a shorter command |
 | `unavailable` | The machine is offline | Check the link, below |
-| `connection_lost` | The link dropped during the call | Run it again |
+| `connection_lost` | The link dropped during the call and did not come back within 30 s, or the node or the center restarted | Run it again |
+| `the answer is … bytes, more than the center takes` (`too_large`) | The result is over the 4 MiB message limit, mostly from output full of control characters, which take six bytes each | Write the output to a file, or cut it down (`head -c`, `base64`) |
 | `busy` | Too many commands or calls at once (`limits.max_running`, 16 by default) | Wait, or raise the limit |
 | `memory_mb … is more than this node lets a command have: at most …` (also `cpu_percent`, `processes`) | The call asked for more than the most you set | Ask for less, or raise `limits.command.*_max*` ([limits](limits.md)) |
 | `killed: "memory"` in a result | The command went past its memory limit | Ask for more `memory_mb`, up to the most, or raise `limits.command.memory_mb` |

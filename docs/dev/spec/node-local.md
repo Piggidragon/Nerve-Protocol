@@ -397,6 +397,8 @@ secret_storage = "file"     # file | keyring: where the node keeps its keys (§1
 [limits]
 max_running = 4             # commands at once, per node
 output_cap_bytes = 16777216
+default_timeout_secs = 600  # optional: a command's limit when its call gives no timeout_ms
+max_timeout_secs = 3600     # optional: no command runs longer, whatever timeout_ms says
 
 [limits.command]            # one command (Commands below); these are the defaults
 memory_mb = 4096            # MiB; a call may ask for less or more up to memory_max_mb
@@ -468,6 +470,18 @@ Windows `powershell.exe -NoProfile -Command` (Windows PowerShell 5.1: `;`
 chains commands, `&` does not); the action's text in the descriptor names the
 shell. Output that is not UTF-8 is read in the OEM code page (Windows), which
 the command's own console starts with.
+Every command has a run-time limit: its `timeout_ms`, or
+`limits.default_timeout_secs` (600) when the call gives none (0 counts as none),
+and never more than `limits.max_timeout_secs` (3600): a larger `timeout_ms` is
+cut to it, and so is the default when the maximum is lower. Both are at least
+1, are the owner's alone (a center's settings document does not reach them),
+and are left out of the file while they are the defaults, so an older node
+reads a file nobody set them in. They are read when a call starts: a running
+command keeps its limit. The `timeout` error names the limit that ended the
+command, and the descriptor states both numbers in `exec.run`'s text and as
+`maximum` and `default` (milliseconds) of its `timeout_ms` parameter, so a
+change of either changes the descriptor's rev, and nodes with other limits
+have other params (a center merges the tools of nodes with equal params).
 A command is killed with its process group when its call ends: on
 `timeout_ms`, `cancel`, `session.end` of the session that started it, a
 link that ended without being resumed (protocol §4.9), and when the call

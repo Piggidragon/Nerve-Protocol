@@ -46,6 +46,9 @@ than 30 seconds does not stop a command; use `nerve-node panic`. On Linux the
 node kills the command's whole process group, and everything in the command's
 cgroup where it has one ([limits](limits.md)). On Windows it ends the
 command's Job Object. A command that goes past its memory limit is killed too.
+Every command also has a timeout: its `timeout_ms`, or the node's default, and
+never more than the node's maximum
+([how long a command may run](config.md#how-long-a-command-may-run)).
 
 On Windows a timeout, and `exec_signal` with `term` or `int`, first ask the
 command to end: its console programs get Ctrl+C and its windows a close

@@ -3,6 +3,8 @@
 Each command a center runs gets a limit on its memory, its CPU and its
 number of processes. You set what a command gets and the most a call may ask
 for. A call may ask for less, or for more up to that most, never beyond it.
+How long a command may run has its own default and most, in
+[how long a command may run](config.md#how-long-a-command-may-run).
 
 Linux only for now. On Windows the settings are there, but commands are not
 held to them yet.

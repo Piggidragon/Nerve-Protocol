@@ -45,6 +45,8 @@ secret_storage = "file"     # file | keyring: where the node keeps its keys
 [limits]
 max_running = 16            # commands at once, over all centers
 output_cap_bytes = 16777216 # for stdout and for stderr each; a result carries 1 MiB at most
+default_timeout_secs = 600  # how long a command runs when its call gives no timeout_ms
+max_timeout_secs = 3600     # the longest any command runs; a larger timeout_ms is cut to it
 
 [limits.command]            # what one command may use, Linux (limits.md)
 memory_mb = 4096            # MiB; past it the command is killed
@@ -99,6 +101,31 @@ The file also holds a `version` that grows with every write, `locked`
 (set by `panic`), and per center the `url`, `pin`, `center_id` and `node_id`
 the pairing filled in. Unknown keys are refused. `places` is the node's
 record of the folders `folder add` stored ([modes](modes.md#a-folder-keeps-the-place-you-added)).
+
+## How long a command may run
+
+Every command ends. The agent can give a call a `timeout_ms`; without one the
+command gets `limits.default_timeout_secs`, 10 minutes. A `timeout_ms` above
+`limits.max_timeout_secs`, 1 hour, is cut to it, and so is the default when you
+set the maximum below it. A command past its limit is killed with everything it
+started ([what ends a command](stop.md#what-ends-a-command)), and the call
+fails with `timeout`; the message says which limit it was, and whether a
+larger `timeout_ms` would help.
+
+```sh
+nerve-node config set limits.max_timeout_secs 86400    # a command may run a day
+nerve-node config set limits.default_timeout_secs 1800 # and gets half an hour unless it asks
+```
+
+Both are yours alone: a center, also with the [settings grant](settings-grant.md),
+cannot change them. The agent sees the two numbers in the description of
+`exec_run` and in the `maximum` and `default` of its `timeout_ms` (in
+milliseconds), and both follow a change. Machines with other limits are
+separate tools for the agent (`build_exec_run`, `lab_exec_run`), so it never
+reads one machine's numbers for another. A limit is at least 1 second;
+for a long job, set a large maximum and not none. The settings are left out of
+`node.toml` while they are the defaults, so `config get` shows them only once
+you set them. A command already running keeps the limit it started with.
 
 ## Do not edit the file by hand
 

@@ -39,6 +39,7 @@ names its reason.
 | `connection_lost` | The link dropped during the call and did not come back within 30 s, or the node or the center restarted | Run it again |
 | `the answer is … bytes, more than the center takes` (`too_large`) | The result is over the 4 MiB message limit, mostly from output full of control characters, which take six bytes each | Write the output to a file, or cut it down (`head -c`, `base64`) |
 | `busy` | Too many commands or calls at once (`limits.max_running`, 16 by default) | Wait, or raise the limit |
+| `timeout`: `the command ran past …` | The command ran longer than its `timeout_ms`, than the node's default (10 minutes, when the call gave none), or than the node's maximum (1 hour). It was killed. The message says which | Give a larger `timeout_ms`. Above the maximum, you raise `limits.max_timeout_secs` ([how long a command may run](config.md#how-long-a-command-may-run)) |
 | `memory_mb … is more than this node lets a command have: at most …` (also `cpu_percent`, `processes`) | The call asked for more than the most you set | Ask for less, or raise `limits.command.*_max*` ([limits](limits.md)) |
 | `killed: "memory"` in a result | The command went past its own memory limit (a command the machine's OOM killed has only `signal: "kill"`) | Ask for more `memory_mb`, up to the most, or raise `limits.command.memory_mb` |
 | `commands run WITHOUT these limits: …` in `status` | The node has no cgroup of its own: started in a terminal, or installed before limits came | [Where the limits hold](limits.md#where-the-limits-hold) |

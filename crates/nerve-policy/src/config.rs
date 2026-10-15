@@ -179,6 +179,18 @@ pub struct Limits {
     /// stdout and stderr of one command are each cut at this size.
     #[serde(default = "d_output_cap")]
     pub output_cap_bytes: u64,
+    /// How long a command may run when its call gives no `timeout_ms`. A
+    /// command past its limit is killed. Left out of the file while it is
+    /// the default, so an older node still reads a file nobody set it in.
+    #[serde(
+        default = "d_default_timeout",
+        skip_serializing_if = "is_default_timeout"
+    )]
+    pub default_timeout_secs: u64,
+    /// The longest a command may run, whatever its call asks for: a larger
+    /// `timeout_ms` is cut to this. It also cuts the default above.
+    #[serde(default = "d_max_timeout", skip_serializing_if = "is_max_timeout")]
+    pub max_timeout_secs: u64,
     /// What one command may use (a cgroup on Linux). Written only where
     /// the owner changed it, so a node of before can read the file.
     #[serde(default, skip_serializing_if = "CommandLimits::is_default")]
@@ -191,12 +203,26 @@ fn d_max_running() -> u32 {
 fn d_output_cap() -> u64 {
     16 * 1024 * 1024
 }
+fn d_default_timeout() -> u64 {
+    10 * 60
+}
+fn d_max_timeout() -> u64 {
+    60 * 60
+}
+fn is_default_timeout(n: &u64) -> bool {
+    *n == d_default_timeout()
+}
+fn is_max_timeout(n: &u64) -> bool {
+    *n == d_max_timeout()
+}
 
 impl Default for Limits {
     fn default() -> Limits {
         Limits {
             max_running: d_max_running(),
             output_cap_bytes: d_output_cap(),
+            default_timeout_secs: d_default_timeout(),
+            max_timeout_secs: d_max_timeout(),
             command: CommandLimits::default(),
         }
     }
@@ -1001,6 +1027,16 @@ impl NodeConfig {
         if self.limits.max_running == 0 {
             return Err("limits.max_running must be at least 1".into());
         }
+        // 0 would kill every command at once, and read as "none" it would be
+        // the way round the maximum.
+        for (key, n) in [
+            ("default_timeout_secs", self.limits.default_timeout_secs),
+            ("max_timeout_secs", self.limits.max_timeout_secs),
+        ] {
+            if n == 0 {
+                return Err(format!("limits.{key} must be at least 1"));
+            }
+        }
         self.limits.command.validate()?;
         if let Some(p) = &self.connection.proxy {
             if has_user_info(p) {
@@ -1251,6 +1287,8 @@ sudo_allow = ["sudo apt update"]
         let c = NodeConfig::parse(&sample()).unwrap();
         assert_eq!(c.limits.max_running, 4);
         assert_eq!(c.limits.output_cap_bytes, 16 * 1024 * 1024);
+        assert_eq!(c.limits.default_timeout_secs, 10 * 60);
+        assert_eq!(c.limits.max_timeout_secs, 60 * 60);
         let home = c.center("home").unwrap();
         assert_eq!(home.settings, SettingsGrant::Write);
         assert_eq!(home.policy.mode, Mode::Folder);
@@ -1272,6 +1310,29 @@ sudo_allow = ["sudo apt update"]
         let again = NodeConfig::parse(&c.to_toml()).unwrap();
         assert_eq!(again, c);
         assert_eq!(NodeConfig::parse("").unwrap(), NodeConfig::default());
+    }
+
+    #[test]
+    fn the_run_time_limits_are_the_owners_and_kept_out_of_the_file_while_default() {
+        let c = NodeConfig::parse("[limits]\ndefault_timeout_secs = 30\nmax_timeout_secs = 90\n")
+            .unwrap();
+        assert_eq!(c.limits.default_timeout_secs, 30);
+        assert_eq!(c.limits.max_timeout_secs, 90);
+        assert_eq!(NodeConfig::parse(&c.to_toml()).unwrap(), c);
+        // One set, the other the default.
+        let c = NodeConfig::parse("[limits]\nmax_timeout_secs = 90\n").unwrap();
+        assert_eq!(c.limits.default_timeout_secs, 600);
+        // A file that never set them reads on an older node, which refuses
+        // keys it does not know: the defaults are not written.
+        let plain = NodeConfig::parse(&sample()).unwrap().to_toml();
+        assert!(!plain.contains("timeout"), "{plain}");
+        let mut set = NodeConfig::default();
+        set.limits.max_timeout_secs = 90;
+        assert!(set.to_toml().contains("max_timeout_secs = 90"));
+        assert!(!set.to_toml().contains("default_timeout_secs"));
+        // A center reads and changes its policy, nothing of this.
+        let doc = serde_json::json!({"limits": {"max_timeout_secs": 1}});
+        assert!(serde_json::from_value::<CenterDocument>(doc).is_err());
     }
 
     #[test]
@@ -1390,6 +1451,11 @@ sudo_allow = ["sudo apt update"]
             ("[node]\nnmae = \"x\"\n", "unknown field"),
             ("[node]\nname = \"Bad Name\"\n", "node.name"),
             ("[limits]\nmax_running = 0\n", "max_running"),
+            (
+                "[limits]\ndefault_timeout_secs = 0\n",
+                "default_timeout_secs",
+            ),
+            ("[limits]\nmax_timeout_secs = 0\n", "max_timeout_secs"),
             (
                 "[connection]\nproxy = \"http://p:1\"\npin = \"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n",
                 "https",

@@ -89,6 +89,8 @@ runs it only when it is set to `on`, whatever its effect.
   for stderr.
 - `exec.signal` is offered only where the policy allows it: by an allow rule in
   `allowlist` mode, with `caps.exec.signal = on` in `folder` and `user` mode.
+- Every command has a time limit: `timeout_ms`, else the node's default, and
+  never more than the node's maximum (the owner's `limits` in `node.toml`).
 - `exec.run` takes `memory_mb`, `cpu_percent` and `processes`, each up to
   the most the owner set (`limits.command`); the descriptor shows the
   defaults and the most. A command killed for its memory has `killed:

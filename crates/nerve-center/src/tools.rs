@@ -500,6 +500,57 @@ mod tests {
         assert_eq!(names(&t), ["a_x-y_go", "a_x-y_go_2"]);
     }
 
+    /// Two nodes that differ only in how long a command may run are two
+    /// tools, each with its own numbers in its text: one shared `exec_run`
+    /// would state the first node's limits for both.
+    #[test]
+    fn nodes_with_other_run_time_limits_are_not_one_tool() {
+        use nerve_policy::{CenterEntry, NodeConfig};
+        let view = |cfg: &NodeConfig| {
+            let mut e: CenterEntry = serde_json::from_value(json!({
+                "name": "home", "url": "https://center.example", "center_id": "c1",
+                "node_id": "n1"
+            }))
+            .unwrap();
+            e.policy.mode = nerve_policy::Mode::User;
+            nerve_node::descriptor::for_center(cfg, &e, 0, true, &[])
+        };
+        let mut long = NodeConfig::default();
+        long.limits.max_timeout_secs = 86_400;
+        let (build_node, lab, same) = (
+            view(&NodeConfig::default()),
+            view(&long),
+            view(&NodeConfig::default()),
+        );
+        // The exec tools of two nodes; the fs tools are one either way.
+        let exec = |a: &Descriptor, b: &Descriptor| {
+            let mut t = build(&[
+                NodeView {
+                    id: "1",
+                    name: "build",
+                    descriptor: a,
+                },
+                NodeView {
+                    id: "2",
+                    name: "lab",
+                    descriptor: b,
+                },
+            ]);
+            t.retain(|t| t.name.ends_with("exec_run"));
+            t
+        };
+        let t = exec(&build_node, &lab);
+        assert_eq!(names(&t), ["build_exec_run", "lab_exec_run"]);
+        assert!(t[0].description.contains("never runs longer than 1 h"));
+        assert!(t[1].description.contains("never runs longer than 24 h"));
+        assert_eq!(
+            t[1].input_schema["properties"]["timeout_ms"]["maximum"],
+            86_400_000
+        );
+        // Equal limits stay one tool.
+        assert_eq!(names(&exec(&build_node, &same)), ["exec_run"]);
+    }
+
     #[test]
     fn a_schema_with_its_own_node_argument_is_not_merged() {
         let p = json!({"type": "object", "properties": {"node": {"type": "string"}}});

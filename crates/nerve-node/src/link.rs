@@ -1715,6 +1715,7 @@ impl Link {
             container,
             exe: self.shared.exe.clone().unwrap_or_default(),
             output_cap: (cfg.limits.output_cap_bytes as usize).min(exec::OUTPUT_HARD_CAP),
+            timeouts: exec::Timeouts::from_limits(&cfg.limits),
             sudo,
             account,
             own,

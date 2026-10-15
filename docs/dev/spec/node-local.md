@@ -305,7 +305,7 @@ taken before a move that finished first does not start either. A reload
 (SIGHUP, `reload`) of a file that another writer saved with `keyring` is
 refused the same way while one runs, and the config in force stays. A process
 that a command takes out of its process group (`setsid`) outlives its call
-and is not counted.
+where the node has no cgroup for commands (Commands), and is not counted.
 
 `allowlist` and `user` mode commands get no Landlock rules, so an allowed
 command that talks to the Secret Service (`secret-tool`, `busctl --user`,
@@ -398,6 +398,14 @@ secret_storage = "file"     # file | keyring: where the node keeps its keys (§1
 max_running = 4             # commands at once, per node
 output_cap_bytes = 16777216
 
+[limits.command]            # one command (Commands below); these are the defaults
+memory_mb = 4096            # MiB; a call may ask for less or more up to memory_max_mb
+memory_max_mb = 16384
+cpu_percent = 200           # of one CPU
+cpu_max_percent = 800
+processes = 1024            # processes and threads (pids.max)
+processes_max = 8192
+
 [connection]
 proxy = "http://proxy:3128" # optional; HTTP CONNECT, never with user:password@;
                             # https://host:port for a relay (§2, Relay)
@@ -477,6 +485,65 @@ child and not in the job. Only when Windows makes no job at all does the node
 fall back to recording the processes below the shell every 25 ms, best
 effort. A Job Object does not restrict file access: it is no confinement
 (see folder mode below).
+
+On Linux each command runs in a cgroup v2 of its own, held to the limits
+its call was granted from `limits.command`: `memory.max` (with
+`memory.swap.max` 0 and `memory.oom.group` 1, so a command past its memory
+is killed whole), `cpu.max` (`cpu_percent` × 1000 µs per 100 ms) and
+`pids.max`. Each default and most is from 1 up to 1 PiB, 4096 CPUs and
+4194304 processes, and no default is above its most; a call names a value
+of its own up to the most. The node takes its own cgroup as the root
+(`/proc/self/cgroup`) when systemd delegated it (`user.delegate` or
+`trusted.delegate` set to `1`), or when it belongs to the node's user, who
+is not root, and holds no other process: outside `user@<uid>.service` the
+system's systemd gives a unit's cgroup to its `User=` only with
+`Delegate=`, so that is proof enough (a system systemd before 251 sets only
+`trusted.delegate`, which the node's user cannot read). Below
+`user@<uid>.service` every cgroup is the user's, so there the user's
+systemd, which marks none, is asked as well (`systemctl --user show -p
+Delegate`, for the unit that is the last part of the path). Without the
+mark the root of the visible hierarchy (`/`, the root of a cgroup namespace
+such as `ProtectControlGroups=private` makes) names no unit: it is taken only
+when the user's systemd names the node's unit (`systemctl --user whoami`,
+systemd 256) and says it is delegated, so a system unit there needs the mark
+(systemd 257 sets it), and a user unit on an older systemd gets no cgroup. A cgroup systemd did not delegate is not taken: systemd turns its controllers off at
+its next reload. It moves itself into the leaf `node`, turns on
+`+memory +cpu +pids` in the root's `cgroup.subtree_control` (each where the
+root has it), and makes `cmd-<n>` beside the leaf per command. The forked
+child writes `0` to that cgroup's `cgroup.procs` through a descriptor the
+node opened, before it switches accounts and execs, so the command and all
+it starts are in it. A node started in its leaf already takes the cgroup
+above. `cmd-*` cgroups left from before are killed and removed at start.
+Before it makes a command's cgroup the node checks that the controllers it
+turned on are still on in `cgroup.subtree_control`; if one went off it
+refuses the command (`unavailable`), and `status` reads them there each
+time: `enforced` lists those on, `lost` those turned off since the start
+(the CLI prints `NO COMMAND RUNS` for them). When the command ends the node reads `memory.events`: `oom` above 0
+(its own limit was reached) with `oom_kill` or `oom_group_kill` above 0
+gives the result `killed: "memory"` and a `reason`, and the audit log an
+entry `killed`, code `memory`, after the call's `allowed`; a kill by an OOM
+from outside (the machine's, a cgroup above) leaves `oom` at 0 and gives
+only `signal: "kill"`, with no audit entry of its own. Then it writes `1` to `cgroup.kill` (Linux 5.14; before
+it, SIGKILL to each pid, as the uid that owns it where that is not the
+node's, `account::kill_pid_as`), which also ends what left the
+process group, and removes the cgroup, from a thread when processes are
+still going.
+
+The installed unit has `Delegate=cpu memory pids` and `OOMPolicy=continue`,
+so a command killed for its memory does not stop the service. A node without such a
+cgroup (no systemd, cgroup v1, a terminal's session scope) runs commands
+without these limits; the log says so at start (a warning on the installed
+node), and `status` has `command_limits: {memory_mb, memory_max_mb,
+cpu_percent, cpu_max_percent, processes, processes_max, cgroup, enforced,
+lost, off}`, where `enforced` lists `memory`, `cpu` and `processes` as far as the
+root passes their controllers on, and `off` says why there is no cgroup. A
+cgroup that cannot be made for a command keeps it from running
+(`unavailable`). A command of the node's own user can write its cgroup's
+files, outside folder mode's Landlock, and so can a root one (root as the
+account, a sudo command); one of another account cannot. Any command can
+have work started outside its cgroup by its account's service manager
+(`systemd-run --user`, `at`, cron), which the limits do not hold.
+Windows does not hold commands to these limits yet.
 
 Windows has no signals either. Each command gets a console of its own,
 without a window (`CREATE_NO_WINDOW`), never the node's. On `timeout_ms`
@@ -1142,8 +1209,9 @@ the node as a service.
 ## 6. Audit log
 
 `<state>/audit.jsonl`, one JSON line per event: settings changes (with old
-and new value), calls allowed or forbidden (a refusal with its reason), the
-relay's tunnels (`"kind": "relay"`, one per tunnel when it ends: `node`,
+and new value), calls allowed or forbidden (a refusal with its reason), commands killed
+for their memory limit (`decision` `killed`, `code` `memory`, with the
+reason), the relay's tunnels (`"kind": "relay"`, one per tunnel when it ends: `node`,
 `center`, `from`, `start`, `end`, `reason`, `up`, `down`; never a token), and what happened to the config
 file itself (`"kind": "config"`, `event` `refused`, `signed`, `accepted` or
 `not_recorded`, with the file and the reason), and what the owner did to the node

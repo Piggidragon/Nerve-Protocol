@@ -48,6 +48,10 @@ pub struct NodeOptions {
     /// How commands can be confined, instead of asking the kernel. A test
     /// sets it, to stand for a kernel it does not run on.
     pub confinement: Option<Confinement>,
+    /// Where commands are held to their limits, or why they are not,
+    /// instead of looking for the process's cgroup (crate::cgroup), which
+    /// moves the process. A test sets it.
+    pub cgroups: Option<crate::cgroup::Found>,
     /// How long a dropped link is kept for the center to resume it
     /// (nerve_proto::resume::GRACE). A test shortens it.
     pub resume_grace: Duration,
@@ -63,6 +67,7 @@ impl NodeOptions {
             log: nerve_transport::log::global(),
             full_rights: None,
             confinement: None,
+            cgroups: None,
             resume_grace: resume::GRACE,
         }
     }
@@ -372,6 +377,9 @@ pub(crate) struct Shared {
     /// Which protected list applies, and where its system folders are.
     pub platform: nerve_policy::protected::Platform,
     pub confinement: Confinement,
+    /// The cgroup that holds each command to its limits (crate::cgroup), or
+    /// why there is none.
+    pub cgroups: crate::cgroup::Found,
     pub store: Mutex<SettingsStore>,
     /// Ticks whenever the config may have changed; links re-check their
     /// center, the supervisor its link tasks.
@@ -717,6 +725,7 @@ impl Shared {
             // Why folder mode runs no command, which `confinement` alone
             // does not say once the keyring is the reason.
             "folder_commands_off": self.unconfined(&cfg),
+            "command_limits": crate::cgroup::status(&cfg.limits.command, &self.cgroups),
             "providers": self.providers.status(),
             "centers": centers,
             "relay": self.relay.status(&cfg),
@@ -910,6 +919,9 @@ impl Daemon {
                 );
             }
         }
+        let cgroups = opts
+            .cgroups
+            .unwrap_or_else(|| crate::cgroup::Cgroups::find().map(Arc::new));
         let shared = Arc::new(Shared {
             paths: paths.clone(),
             service,
@@ -920,6 +932,7 @@ impl Daemon {
                 opts.confinement.unwrap_or_else(Confinement::detect),
                 service,
             ),
+            cgroups,
             store: Mutex::new(store),
             changed,
             centers: Mutex::default(),
@@ -955,6 +968,20 @@ impl Daemon {
             shared.confinement.describe(),
             cfg.log.level
         );
+        // After the start line, which opens the node's part of the log.
+        match &shared.cgroups {
+            Ok(c) => tracing::info!(
+                "commands are held to their limits ({}) in the cgroup {}",
+                c.enforced().join(", "),
+                c.name()
+            ),
+            // The installed Linux node is meant to have them; a node of the
+            // owner's own often is not.
+            Err(why) if service && cfg!(target_os = "linux") => {
+                tracing::warn!("commands run without their limits: {why}")
+            }
+            Err(why) => tracing::info!("commands run without their limits: {why}"),
+        }
         Ok(Daemon {
             shared,
             supervisor,

@@ -89,6 +89,10 @@ runs it only when it is set to `on`, whatever its effect.
   for stderr.
 - `exec.signal` is offered only where the policy allows it: by an allow rule in
   `allowlist` mode, with `caps.exec.signal = on` in `folder` and `user` mode.
+- `exec.run` takes `memory_mb`, `cpu_percent` and `processes`, each up to
+  the most the owner set (`limits.command`); the descriptor shows the
+  defaults and the most. A command killed for its memory has `killed:
+  "memory"` and a `reason` in its result.
 - A timeout, `cancel` or `session.end` kills the command's process group. On
   Windows they end the command's Job Object; a timeout, and `exec.signal`
   with `term` or `int`, first ask the command to end (Ctrl+C, `WM_CLOSE`) and

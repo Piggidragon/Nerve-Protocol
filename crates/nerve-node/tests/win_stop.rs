@@ -61,6 +61,7 @@ fn opts() -> RunOptions {
         sudo: None,
         account: None,
         own: Vec::new(),
+        limits: None,
     }
 }
 
@@ -69,6 +70,7 @@ fn call(cmd: &str, cwd: &Path, timeout: Duration) -> RunCall {
         command: cmd.into(),
         cwd: cwd.to_path_buf(),
         timeout: Some(timeout),
+        limits: Default::default(),
     }
 }
 

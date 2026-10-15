@@ -43,8 +43,9 @@ goodbye is kept 30 seconds and its commands run on; they end when the link is
 not back by then, or at once when the link ends with a goodbye (`panic`,
 `center pause`, a stopped node). Taking the machine off the network for less
 than 30 seconds does not stop a command; use `nerve-node panic`. On Linux the
-node kills the command's whole process group. On Windows it ends the
-command's Job Object.
+node kills the command's whole process group, and everything in the command's
+cgroup where it has one ([limits](limits.md)). On Windows it ends the
+command's Job Object. A command that goes past its memory limit is killed too.
 
 On Windows a timeout, and `exec_signal` with `term` or `int`, first ask the
 command to end: its console programs get Ctrl+C and its windows a close

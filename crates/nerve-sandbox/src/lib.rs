@@ -17,7 +17,9 @@
 //! off when a folder goes. The shim starts the command in the container and
 //! waits for it.
 //!
-//! Neither limits a command's memory or process count by cgroup.
+//! Neither limits a command's memory, CPU or processes: on Linux the node
+//! runs each command in a cgroup of its own for that (`nerve-node`'s
+//! `cgroup` module).
 
 use std::path::PathBuf;
 

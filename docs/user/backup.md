@@ -76,7 +76,7 @@ On a node that has config here already:
 |---|---|
 | `--replace` | Restore over a node that is not the one the backup is of |
 | `--secret-storage file\|keyring` | Keep the keys here in files or in the keyring, whatever the backup's config says. Needed when the backup was made on a machine with a keyring and this one has none |
-| `--without-proxy` | Leave the proxy out of the restored config, with its password and header values, and set it again on this machine with `proxy set`. Nothing of it is kept or needed, so no keyring is asked and nothing can go to the wrong proxy |
+| `--without-proxy` | Leave the proxy out of the restored config, with its pin, password and header values, and set it again on this machine with `proxy set`: the address, the `--pin` of an `https://` proxy and its login (for a relay, `relay token <name>` on the relay prints the whole command, with a new token and the pin). Nothing of it is kept or needed, so no keyring is asked and nothing can go to the wrong proxy |
 | `--passphrase-file <file>` | Read the passphrase from the first line of a file instead of asking. On Linux the file must not be readable by others; Windows does not check |
 
 If the backup has no key for a pairing, `restore` says so and names the
@@ -151,7 +151,9 @@ center, a relayed node holds the pin of its relay, and a node behind an
 `https://` proxy holds the proxy's.
 
 - **A restored node keeps every pin in its `node.toml`** exactly as saved. It
-  does not learn them again. It also keeps the node key of each center, so the
+  does not learn them again. The one exception is `--without-proxy`, which
+  drops the `https://` proxy's pin along with the proxy; the centers' pins and
+  the relay's stay. The node also keeps the node key of each center, so the
   center knows it by the same node id and needs no pairing: the pairing is
   what the node had at the time of the backup.
 - **A restored center brings back its certificate**, so the pin that its nodes

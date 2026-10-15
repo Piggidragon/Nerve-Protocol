@@ -185,9 +185,10 @@ restore does to it:
 |---|---|---|
 | A center's, held by its nodes | `center.<name>.pin` in `node.toml` | Kept as saved. The center keeps it by restoring `tls.pem` |
 | The relay's | `relay.pin` in `node.toml`; its key in `relay-tls` | Kept; the key is checked against it. A relay whose key is missing does not listen until `relay set` makes a new key and pin |
-| An `https://` proxy's | `connection.pin` in `node.toml` | Kept |
+| An `https://` proxy's | `connection.pin` in `node.toml` | Kept, unless `--without-proxy` leaves the whole `connection` section out: the pin goes with the proxy, and `proxy set --pin` gives it again |
 
-A restore never changes a pin and never learns one. A pairing that was ended
+A restore never changes a pin and never learns one; `--without-proxy` is the
+one case where a pin is dropped, and only the proxy's. A pairing that was ended
 on one side after the backup is not revived: the other side no longer knows
 the node's key.
 

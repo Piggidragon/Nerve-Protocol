@@ -481,7 +481,7 @@ pub fn restore(paths: &NodePaths, b: &Parsed, opts: &RestoreOpts) -> Result<Rest
     };
     if opts.without_proxy && had_proxy {
         report.notes.push(
-            "the proxy is left out of the restored config, with its password and header values: set it again on this machine with `nerve-node proxy set`".into(),
+            "the proxy is left out of the restored config, with its pin, password and header values: set it again on this machine with `nerve-node proxy set`, which needs the address, the `--pin` of an https:// proxy and its login. For a relay, `nerve-node relay token <name>` on the relay prints the command with a new token and the pin".into(),
         );
     }
     // The password of the sudo switch is in no backup and never at rest on
@@ -2044,6 +2044,12 @@ mod tests {
             notes.contains("proxy is left out") && notes.contains("proxy set"),
             "{notes}"
         );
+        // The pin goes with the proxy, and the note says what `proxy set`
+        // needs then.
+        assert!(
+            notes.contains("its pin") && notes.contains("--pin") && notes.contains("relay token"),
+            "{notes}"
+        );
         // The keyring could not be asked to delete B's values; they are
         // said to be left, and no config names them.
         assert!(
@@ -2081,6 +2087,84 @@ mod tests {
         let (_h, nothing, _) = roundtrip(&plain_node, false);
         let r = restore(&plain_node, &nothing, &without).unwrap();
         assert!(r.notes.is_empty(), "{r:?}");
+    }
+
+    #[test]
+    fn a_restore_without_the_proxy_writes_none_of_its_credentials_on_an_empty_machine() {
+        let without = RestoreOpts {
+            without_proxy: true,
+            ..RestoreOpts::default()
+        };
+        let account = |p: &NodePaths| Entry::proxy(p).account().to_string();
+
+        // The header values of an http:// proxy, in a backup that holds them.
+        let (_a, n) = node();
+        paired(&n, SecretStorage::File, &["home"]);
+        secrets::store_proxy_headers(&n, &[("Proxy-Authorization".into(), "Basic A".into())])
+            .unwrap();
+        let mut s = open_store(&n);
+        s.update(|c| {
+            c.connection.proxy = Some("http://proxy-a.example:3128".into());
+            c.connection.headers = vec!["Proxy-Authorization".into()];
+            Ok(())
+        })
+        .unwrap();
+        drop(s);
+        let (_f, with, _) = roundtrip(&n, true);
+        assert!(with.proxy_headers.is_some());
+
+        // A keyring that does not answer is no obstacle: nothing is written
+        // to it, so the remedy the refusals name works.
+        let (_b, to) = node();
+        secrets::store::set_unreachable(true);
+        let r = restore(&to, &with, &without);
+        secrets::store::set_unreachable(false);
+        r.unwrap();
+        assert_eq!(config(&to).connection, Default::default());
+        // And one that answers is not given the credential of a proxy the
+        // restored config does not name.
+        let (_c, to) = node();
+        restore(&to, &with, &without).unwrap();
+        assert!(secrets::store::get(&account(&to)).unwrap().is_none());
+        // Without the flag the values go in.
+        let (_d, to) = node();
+        restore(&to, &with, &RestoreOpts::default()).unwrap();
+        assert!(secrets::store::get(&account(&to)).unwrap().is_some());
+
+        // The password of an https:// proxy, in files, in a default backup.
+        let pin = nerve_transport::tls::ServerIdentity::generate(&["relay.example".into()])
+            .unwrap()
+            .pin();
+        let (_e, n) = node();
+        paired(&n, SecretStorage::File, &["home"]);
+        secrets::store_proxy_login(&n, SecretStorage::File, "a-token").unwrap();
+        let mut s = open_store(&n);
+        s.update(|c| {
+            c.connection.proxy = Some("https://relay-a.example:7490".into());
+            c.connection.pin = Some(pin.clone());
+            c.connection.login = Some("node-a".into());
+            Ok(())
+        })
+        .unwrap();
+        drop(s);
+        let (_g, plain, _) = roundtrip(&n, false);
+        assert!(plain.proxy_login.is_some());
+        let (_h, to) = node();
+        restore(&to, &plain, &without).unwrap();
+        assert!(!to.proxy_login_file().exists());
+        assert!(
+            secrets::get(&to, SecretStorage::Keyring, Key::ProxyLogin)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(config(&to).connection, Default::default());
+        // Without the flag it is written.
+        let (_i, to) = node();
+        restore(&to, &plain, &RestoreOpts::default()).unwrap();
+        assert_eq!(
+            secrets::proxy_login(&to, SecretStorage::File).unwrap(),
+            "a-token"
+        );
     }
 
     #[test]

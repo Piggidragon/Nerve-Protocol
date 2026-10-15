@@ -64,6 +64,11 @@ async fn a_node_moves_to_another_machine_and_the_center_knows_it() {
         .unwrap_err();
     assert!(err.contains("runs on these folders"), "{err}");
     node.stop().await;
+    // The old node dialled the center while it was backed up, and the center
+    // queued that link. Take it away, or `next_link` below would hand it
+    // out as the restored node's and the test would not look at the restored
+    // node at all.
+    while center.next_link(Duration::from_millis(300)).await.is_some() {}
 
     // The file holds no key in the clear, and only its owner reads it.
     let key = std::fs::read_to_string(old.key_file("lab")).unwrap();

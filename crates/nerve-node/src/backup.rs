@@ -23,7 +23,7 @@ use nerve_policy::config::{SecretStorage, Sudo, valid_center_name};
 use nerve_policy::settings::{Secrets, sealed};
 use nerve_policy::{NodeConfig, SettingsStore};
 use nerve_transport::backup::{self, Contents, Kind, Passphrase};
-use nerve_transport::keys::NodeKey;
+use nerve_transport::keys::{MacKey, NodeKey};
 
 use crate::paths::NodePaths;
 use crate::secrets::{self, Entry, Key, KeysLock, NodeSecrets};
@@ -473,12 +473,7 @@ pub fn restore(paths: &NodePaths, b: &Parsed, opts: &RestoreOpts) -> Result<Rest
     secrets::get(paths, to, Key::Config)?;
 
     let mut undo: Vec<Undo> = Vec::new();
-    if let Err(e) = write_keys(paths, to, &cfg, b, &mut undo, &mut report) {
-        roll_back(paths, to, undo);
-        return Err(format!("{e}; nothing was restored"));
-    }
-
-    let key = match own.mac_key_or_new() {
+    let key = match write_keys(paths, to, &cfg, b, &mut undo, &mut report) {
         Ok(k) => k,
         Err(e) => {
             roll_back(paths, to, undo);
@@ -500,6 +495,21 @@ pub fn restore(paths: &NodePaths, b: &Parsed, opts: &RestoreOpts) -> Result<Rest
             cfg.version
         ));
     }
+    // The sudo switch is off now, and on the installed node on Windows the
+    // administrator's password it kept is at rest in the config folder, with
+    // DPAPI, only while the switch is on (`sudo off` removes it).
+    if cfg!(windows) && crate::winsudo::kept(paths) {
+        match crate::winsudo::forget(paths) {
+            Ok(()) => report.notes.push(format!(
+                "{} is deleted: the sudo switch is off, so the administrator's password it held is not kept",
+                crate::winsudo::SUDO_FILE
+            )),
+            Err(e) => report.notes.push(format!(
+                "the sudo switch is off, but the administrator's password it held could not be deleted ({e}): delete {}, or run `nerve-node sudo on` and `sudo off`",
+                crate::winsudo::SUDO_FILE
+            )),
+        }
+    }
     let _ = AuditLog::new(paths.audit_log()).config(
         "restored",
         &paths.config_file(),
@@ -518,8 +528,10 @@ pub fn restore(paths: &NodePaths, b: &Parsed, opts: &RestoreOpts) -> Result<Rest
     Ok(report)
 }
 
-/// Writes every key of the backup where `to` keeps them. A key the backup
-/// lacks stays if the one here fits the pairing.
+/// Writes every key of the backup where `to` keeps them, and gives back the
+/// key that signs the restored config. A key the backup lacks stays if the
+/// one here fits the config, in the place `to` or in the other one, which
+/// the restore is about to empty: it is taken over, not left to be deleted.
 fn write_keys<'a>(
     paths: &NodePaths,
     to: SecretStorage,
@@ -527,7 +539,21 @@ fn write_keys<'a>(
     b: &Parsed,
     undo: &mut Vec<Undo<'a>>,
     report: &mut RestoreReport,
-) -> Result<(), String> {
+) -> Result<MacKey, String> {
+    // The key must be in `to` itself. Reading it the way the node does would
+    // fall back to the file where a move of the keys never finished, and sign
+    // the config with a key that the clean-up of the old place then deletes.
+    let mac = match secrets::get(paths, to, Key::Config)? {
+        Some(t) => {
+            MacKey::from_text(&t).map_err(|e| format!("{} here: {e}", Key::Config.what()))?
+        }
+        None => {
+            let (mac, text) = MacKey::generate();
+            undo.push(Undo::Key(Key::Config, None));
+            secrets::put(paths, to, Key::Config, &text)?;
+            mac
+        }
+    };
     let mut put = |key: Key<'a>, text: &str| -> Result<(), String> {
         let prev = secrets::get(paths, to, key)?;
         // Already as it should be: nothing to write, nothing to put back.
@@ -537,20 +563,66 @@ fn write_keys<'a>(
         undo.push(Undo::Key(key, prev));
         secrets::put(paths, to, key, text)
     };
+    // What is here already for `key`: in `to`, else in the other place. A
+    // keyring that does not answer is no key.
+    let here = |key: Key, fits: &dyn Fn(&str) -> bool| -> Option<(SecretStorage, String)> {
+        [to, secrets::other(to)].into_iter().find_map(|place| {
+            secrets::get(paths, place, key)
+                .ok()
+                .flatten()
+                .filter(|t| fits(t))
+                .map(|t| (place, t))
+        })
+    };
     for e in &cfg.centers {
+        let key = Key::Center(&e.name);
         match b.keys.get(&e.name) {
-            Some(t) => put(Key::Center(&e.name), t)?,
-            None => match secrets::center_key(paths, to, &e.name) {
-                Ok(k) if k.node_id() == e.node_id => report.kept.push(e.name.clone()),
-                _ => report.no_key.push(e.name.clone()),
-            },
+            Some(t) => put(key, t)?,
+            None => {
+                let fits = |t: &str| NodeKey::from_text(t).is_ok_and(|k| k.node_id() == e.node_id);
+                match here(key, &fits) {
+                    Some((place, text)) => {
+                        if place != to {
+                            put(key, &text)?;
+                        }
+                        report.kept.push(e.name.clone());
+                    }
+                    None => report.no_key.push(e.name.clone()),
+                }
+            }
         }
     }
-    if let Some(t) = &b.relay_tls {
-        put(Key::RelayTls, t)?;
+    match (&b.relay_tls, &cfg.relay.pin) {
+        (Some(t), _) => put(Key::RelayTls, t)?,
+        (None, Some(pin)) => {
+            let fits = |t: &str| {
+                nerve_transport::tls::ServerIdentity::from_pem(t).is_ok_and(|i| i.pin() == *pin)
+            };
+            match here(Key::RelayTls, &fits) {
+                Some((place, text)) if place != to => put(Key::RelayTls, &text)?,
+                Some(_) => {}
+                None => report.notes.push(
+                    "the relay's TLS key is not in the backup and not here: the relay does not listen until `nerve-node relay set <address>` makes a new key and pin, which the nodes behind it must take".into(),
+                ),
+            }
+        }
+        (None, None) => {}
     }
-    if let Some(t) = &b.proxy_login {
-        put(Key::ProxyLogin, t)?;
+    match (&b.proxy_login, &cfg.connection.login) {
+        (Some(t), _) => put(Key::ProxyLogin, t)?,
+        (None, Some(_)) => match here(Key::ProxyLogin, &|t: &str| !t.is_empty()) {
+            Some((place, text)) if place != to => put(Key::ProxyLogin, &text)?,
+            Some(_) => {}
+            None => report.notes.push(
+                "the proxy's password is not in the backup and not here: run `nerve-node proxy set` again".into(),
+            ),
+        },
+        (None, None) => {}
+    }
+    if b.proxy_headers.is_none() && !cfg.connection.headers.is_empty() {
+        report.notes.push(
+            "the proxy's header values were left out of the backup (they are in the keyring); if this machine's keyring lacks them too, run `nerve-node proxy set` again".into(),
+        );
     }
     if let Some(map) = &b.proxy_headers {
         let account = Entry::proxy(paths);
@@ -561,7 +633,7 @@ fn write_keys<'a>(
         undo.push(Undo::Headers(prev));
         secrets::store_proxy_headers(paths, &headers)?;
     }
-    Ok(())
+    Ok(mac)
 }
 
 /// Puts back what the keys held before, last first. A key that cannot be put
@@ -1180,6 +1252,225 @@ mod tests {
         let r = restore(&to, &parsed, &RestoreOpts::default()).unwrap();
         assert_eq!(r.no_key, ["home"]);
         assert!(r.kept.is_empty());
+    }
+
+    /// Restores `parsed` over `to` with the keys going to `storage`, and gives
+    /// back what the node reads afterwards.
+    fn restore_into(
+        to: &NodePaths,
+        parsed: &Parsed,
+        storage: Option<SecretStorage>,
+    ) -> RestoreReport {
+        let r = restore(
+            to,
+            parsed,
+            &RestoreOpts {
+                secret_storage: storage,
+                ..RestoreOpts::default()
+            },
+        )
+        .unwrap();
+        // Whatever the place of its keys, the node reads and verifies the
+        // config it was given, as it does at its start.
+        let again = open_store(to);
+        assert!(
+            again.config().machine.secret_storage
+                == storage.unwrap_or(parsed.cfg.machine.secret_storage)
+        );
+        r
+    }
+
+    #[test]
+    fn a_config_is_signed_with_a_key_that_is_in_the_place_of_the_keys() {
+        // A node whose keys are in files, restored from a backup that keeps
+        // them in the keyring: the MAC key goes into the keyring, and the
+        // key file of the old place goes without taking the signature's key.
+        let (_a, from) = node();
+        let keys = paired(&from, SecretStorage::Keyring, &["home"]);
+        let (_f, parsed, _) = roundtrip(&from, true);
+        let (_b, to) = node();
+        let mut s = open_store(&to);
+        s.update(|c| {
+            c.limits.max_running = 3;
+            Ok(())
+        })
+        .unwrap();
+        drop(s);
+        assert!(to.config_key().exists());
+        restore_into(&to, &parsed, None);
+        assert!(!to.config_key().exists(), "the old key file is gone");
+        assert!(
+            secrets::get(&to, SecretStorage::Keyring, Key::Config)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            &key_text(&to, SecretStorage::Keyring, "home"),
+            &keys["home"]
+        );
+        assert_eq!(config(&to).limits.max_running, 16);
+
+        // And the other way: a node whose keys are in the keyring, restored
+        // from a backup that keeps them in files.
+        let (_c, from) = node();
+        let keys = paired(&from, SecretStorage::File, &["home"]);
+        let (_g, parsed, _) = roundtrip(&from, false);
+        let (_d, to) = node();
+        let mut s = open_store(&to);
+        s.update(|c| {
+            c.machine.secret_storage = SecretStorage::Keyring;
+            Ok(())
+        })
+        .unwrap();
+        drop(s);
+        assert!(
+            secrets::get(&to, SecretStorage::Keyring, Key::Config)
+                .unwrap()
+                .is_some()
+        );
+        restore_into(&to, &parsed, None);
+        assert!(
+            secrets::get(&to, SecretStorage::Keyring, Key::Config)
+                .unwrap()
+                .is_none()
+        );
+        assert!(to.config_key().exists());
+        assert_eq!(&key_text(&to, SecretStorage::File, "home"), &keys["home"]);
+    }
+
+    #[test]
+    fn a_key_the_backup_lacks_is_taken_over_when_the_keys_change_place() {
+        // The keys are in the keyring and the backup, made without consent,
+        // has none; the restore on the same machine keeps them in files.
+        let (_a, n) = node();
+        let keys = paired(&n, SecretStorage::Keyring, &["home"]);
+        let (_f, parsed, _) = roundtrip(&n, false);
+        assert!(parsed.keys.is_empty());
+        let r = restore_into(&n, &parsed, Some(SecretStorage::File));
+        assert_eq!(r.kept, ["home"], "{r:?}");
+        assert!(r.no_key.is_empty());
+        assert_eq!(&key_text(&n, SecretStorage::File, "home"), &keys["home"]);
+        assert!(
+            secrets::get(&n, SecretStorage::Keyring, Key::Center("home"))
+                .unwrap()
+                .is_none(),
+            "the old copy goes once the new one is there"
+        );
+
+        // The other way: the node moved its keys into files since.
+        let (_b, n) = node();
+        let keys = paired(&n, SecretStorage::Keyring, &["home"]);
+        let (_g, parsed, _) = roundtrip(&n, false);
+        let mut s = open_store(&n);
+        s.update(|c| {
+            c.machine.secret_storage = SecretStorage::File;
+            Ok(())
+        })
+        .unwrap();
+        drop(s);
+        assert!(n.key_file("home").exists());
+        let r = restore_into(&n, &parsed, None);
+        assert_eq!(r.kept, ["home"], "{r:?}");
+        assert_eq!(&key_text(&n, SecretStorage::Keyring, "home"), &keys["home"]);
+        assert!(!n.key_file("home").exists());
+    }
+
+    #[test]
+    fn the_relay_key_and_the_proxy_password_the_backup_lacks_are_taken_over_too() {
+        let (_a, n) = node();
+        let keys = paired(&n, SecretStorage::Keyring, &["home"]);
+        let relay =
+            nerve_transport::tls::ServerIdentity::generate(&["relay.example".into()]).unwrap();
+        secrets::store_relay_tls(&n, SecretStorage::Keyring, &relay).unwrap();
+        secrets::store_proxy_login(&n, SecretStorage::Keyring, "s3cret-token").unwrap();
+        let mut s = open_store(&n);
+        s.update(|c| {
+            c.relay.pin = Some(relay.pin());
+            c.relay.listen = Some("127.0.0.1:7490".into());
+            c.connection.proxy = Some("https://relay.example:7490".into());
+            c.connection.pin = Some(relay.pin());
+            c.connection.login = Some("node-a".into());
+            Ok(())
+        })
+        .unwrap();
+        drop(s);
+        let (_f, parsed, report) = roundtrip(&n, false);
+        assert_eq!(report.left_out.len(), 3, "{report:?}");
+        let r = restore_into(&n, &parsed, Some(SecretStorage::File));
+        assert!(r.notes.is_empty(), "{r:?}");
+        assert_eq!(&key_text(&n, SecretStorage::File, "home"), &keys["home"]);
+        assert_eq!(
+            secrets::proxy_login(&n, SecretStorage::File).unwrap(),
+            "s3cret-token"
+        );
+        assert_eq!(
+            secrets::relay_tls(&n, SecretStorage::File)
+                .unwrap()
+                .unwrap()
+                .pin(),
+            relay.pin()
+        );
+        assert!(
+            secrets::get(&n, SecretStorage::Keyring, Key::RelayTls)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            secrets::get(&n, SecretStorage::Keyring, Key::ProxyLogin)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn what_is_not_in_the_backup_and_not_here_is_said() {
+        let (_a, from) = node();
+        paired(&from, SecretStorage::Keyring, &["home"]);
+        let relay =
+            nerve_transport::tls::ServerIdentity::generate(&["relay.example".into()]).unwrap();
+        secrets::store_relay_tls(&from, SecretStorage::Keyring, &relay).unwrap();
+        secrets::store_proxy_login(&from, SecretStorage::Keyring, "s3cret-token").unwrap();
+        secrets::store_proxy_headers(&from, &[("X-Token".into(), "tok-value".into())]).unwrap();
+        let mut s = open_store(&from);
+        s.update(|c| {
+            c.relay.pin = Some(relay.pin());
+            c.relay.listen = Some("127.0.0.1:7490".into());
+            c.connection.proxy = Some("https://relay.example:7490".into());
+            c.connection.pin = Some(relay.pin());
+            c.connection.login = Some("node-a".into());
+            c.connection.headers = vec!["X-Token".into()];
+            Ok(())
+        })
+        .unwrap();
+        drop(s);
+        let (_f, parsed, _) = roundtrip(&from, false);
+        let (_b, to) = node();
+        let r = restore(&to, &parsed, &RestoreOpts::default()).unwrap();
+        let notes = r.notes.join("\n");
+        assert!(
+            notes.contains("relay's TLS key") && notes.contains("relay set"),
+            "{notes}"
+        );
+        assert!(notes.contains("proxy's password"), "{notes}");
+        assert!(notes.contains("header values"), "{notes}");
+        assert_eq!(r.no_key, ["home"]);
+    }
+
+    /// The sudo password the installed node on Windows keeps with DPAPI is at
+    /// rest only while the switch is on.
+    #[cfg(windows)]
+    #[test]
+    fn a_restore_deletes_the_dpapi_password_of_the_sudo_switch() {
+        let (_a, from) = node();
+        paired(&from, SecretStorage::File, &["home"]);
+        let (_f, parsed, _) = roundtrip(&from, false);
+        let (_b, to) = node();
+        let file = to.config_dir.join(crate::winsudo::SUDO_FILE);
+        std::fs::create_dir_all(&to.config_dir).unwrap();
+        std::fs::write(&file, b"sealed password").unwrap();
+        let r = restore(&to, &parsed, &RestoreOpts::default()).unwrap();
+        assert!(!file.exists());
+        assert!(r.notes.iter().any(|n| n.contains("sudo.dpapi")), "{r:?}");
     }
 
     #[test]

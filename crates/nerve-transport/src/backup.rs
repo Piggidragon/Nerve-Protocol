@@ -174,7 +174,9 @@ pub fn seal_with(
     iterations: u32,
 ) -> Result<Vec<u8>, String> {
     let mut plain = serde_json::to_vec(contents).map_err(|e| e.to_string())?;
-    if plain.len() as u64 > MAX_FILE {
+    // The file, not only its text: a file above the cap is one `read_file`
+    // refuses, so a backup that size must not be written.
+    if (plain.len() + HEADER_LEN + TAG_LEN) as u64 > MAX_FILE {
         plain.fill(0);
         return Err(format!(
             "what the backup would hold is larger than {} MiB, which is more than a node or a center has; refusing",
@@ -455,6 +457,40 @@ mod tests {
         let mut mixed = center.clone();
         mixed[9] = Kind::Node.byte();
         assert!(open(&mixed, &pass("correct horse battery")).is_err());
+    }
+
+    #[test]
+    fn a_backup_is_written_only_when_it_can_be_read_again() {
+        // The most a file holds is MAX_FILE with its header and tag; a text
+        // that fits the cap by itself but not the file is refused when the
+        // backup is made, not when it is needed.
+        let base = Contents {
+            kind: Kind::Node,
+            created_ms: 0,
+            program: String::new(),
+            files: BTreeMap::from([("a".to_string(), String::new())]),
+        };
+        let empty = serde_json::to_vec(&base).unwrap().len();
+        let room = MAX_FILE as usize - HEADER_LEN - TAG_LEN;
+        let with = |plain: usize| {
+            let mut c = base.clone();
+            c.files.insert("a".into(), "x".repeat(plain - empty));
+            c
+        };
+        let p = pass("correct horse battery");
+        let exact = seal_with(&with(room), &p, 4).unwrap();
+        assert_eq!(exact.len() as u64, MAX_FILE);
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("big.bak");
+        write_file(&path, &exact, false).unwrap();
+        let back = read_file(&path).unwrap();
+        assert_eq!(open(&back, &p).unwrap().files["a"].len(), room - empty);
+        // One byte more would be a file that `read_file` refuses.
+        let err = seal_with(&with(room + 1), &p, 4).unwrap_err();
+        assert!(err.contains("larger than"), "{err}");
+        // Also the old bound, the text alone at the cap.
+        let err = seal_with(&with(MAX_FILE as usize), &p, 4).unwrap_err();
+        assert!(err.contains("larger than"), "{err}");
     }
 
     #[test]

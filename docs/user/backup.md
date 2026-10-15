@@ -22,7 +22,7 @@ that exists; `--overwrite` does.
 | In the backup | Not in it |
 |---|---|
 | `node.toml` as the node reads it: pairings with their `url`, `pin`, `center_id` and `node_id`, modes, folders, rules, relay and proxy settings | The key of the config's MAC: a node that restores makes its own |
-| The node key of every center, the relay's TLS key, the password of an `https://` proxy (the keys in `keys/`) | The sudo password. It is not stored anywhere, so a node restores with `sudo` off |
+| The node key of every center, the relay's TLS key, the password of an `https://` proxy (the keys in `keys/`) | The sudo password. It is not stored anywhere, so a node restores with `sudo` off. On Windows the restore also deletes `sudo.dpapi`, which holds that password only while the switch is on |
 | The proxy's header values | The audit log, the [log](logs.md), the control socket |
 | | On Windows, `sudo.dpapi` and `command-account.dpapi`: DPAPI ties them to the machine |
 
@@ -32,7 +32,7 @@ The node can run while you back it up.
 |---|---|
 | `--include-keyring` | Also take the keys that are in the system keyring ([below](#keys-in-the-keyring)) |
 | `--overwrite` | Replace the file when it exists |
-| `--passphrase-file <file>` | Read the passphrase from the first line of a file (it must not be readable by others) instead of asking. Without a terminal, one line of stdin is the passphrase |
+| `--passphrase-file <file>` | Read the passphrase from the first line of a file instead of asking. On Linux the file must not be readable by others; Windows does not check, so keep the file in a folder only you can read. Without a terminal, one line of stdin is the passphrase |
 
 ### Keys in the keyring
 
@@ -76,13 +76,17 @@ On a node that has config here already:
 |---|---|
 | `--replace` | Restore over a node that is not the one the backup is of |
 | `--secret-storage file\|keyring` | Keep the keys here in files or in the keyring, whatever the backup's config says. Needed when the backup was made on a machine with a keyring and this one has none |
-| `--passphrase-file <file>` | Read the passphrase from the first line of a file (it must not be readable by others) instead of asking |
+| `--passphrase-file <file>` | Read the passphrase from the first line of a file instead of asking. On Linux the file must not be readable by others; Windows does not check |
 
 If the backup has no key for a pairing, `restore` says so and names the
-pairing. When the keyring of this machine still holds a key that fits the
-pairing (a restore on the same machine), it stays. Otherwise that center
-cannot connect: run `nerve-node center rm --center <name>`, then
-`nerve-node center add` with a new link.
+pairing. When this machine still holds a key that fits the pairing, in the
+files or in the keyring (a restore on the same machine), it stays, and it
+goes where the restored node keeps its keys: a restore with `--secret-storage`
+takes it over from the other place before that place is emptied. Otherwise
+that center cannot connect: run `nerve-node center rm --center <name>`, then
+`nerve-node center add` with a new link. The relay's TLS key and the proxy's
+password are treated the same way, and `restore` says when one is missing
+(the proxy's header values, which are in the keyring, are never moved).
 
 A restore that fails half way puts the keys back as they were and writes
 nothing. If the machine dies in the middle of it, run it again.

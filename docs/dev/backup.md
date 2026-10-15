@@ -102,18 +102,24 @@ In this order:
 5. The config's version is set above the version of the backup, the record
    (`config.version`) and the file it replaces. The record only goes up, so an
    older config is not accepted by lowering it.
-6. Every key is written with a read-back. Before a key is overwritten its old
+6. The MAC key is taken from `to` itself, or made there. It is not read the
+   way the node reads it, which falls back to `config.key` while a move of the
+   keys is unfinished: that file is about to be deleted with the old place,
+   and the restored config would be signed with a key that is gone.
+7. Every key is written with a read-back. Before a key is overwritten its old
    text is noted; when one write fails, the earlier ones are put back, and
    nothing else has been written.
-7. The config is written signed, the record is raised, an audit entry
-   (`config`, `restored`) is made.
-8. Keys the replaced config kept and the new one does not name are deleted,
+8. The config is written signed, the record is raised, an audit entry
+   (`config`, `restored`) is made. On Windows `sudo.dpapi`, which holds the
+   administrator's password only while the switch is on, is deleted.
+9. Keys the replaced config kept and the new one does not name are deleted,
    and every key left in the place the keys moved away from.
 
-A pairing without a key in the backup keeps the key already here if it fits
-the pairing's `node_id` (a restore on the same machine from a backup made
-without `--include-keyring`); otherwise it is listed, and the owner pairs it
-again.
+A key the backup lacks (a node key, the relay's TLS key, the proxy's password)
+is looked for in `to` and in the other place. One that fits the config (the
+pairing's `node_id`, `relay.pin`) stays, and is copied into `to` when it is
+in the other place, before step 9 empties that place. Otherwise it is listed
+or noted, and the owner pairs again or runs `relay set` or `proxy set`.
 
 ## Center
 

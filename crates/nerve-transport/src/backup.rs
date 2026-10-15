@@ -273,19 +273,27 @@ pub fn open(bytes: &[u8], pass: &Passphrase) -> Result<Contents, String> {
 /// [`MAX_FILE`] before it is read into memory.
 pub fn read_file(path: &Path) -> Result<Vec<u8>, String> {
     let name = path.display();
+    let check = |meta: &std::fs::Metadata| -> Result<(), String> {
+        if !meta.is_file() {
+            return Err(format!("{name} is not a file"));
+        }
+        if meta.len() > MAX_FILE {
+            return Err(format!(
+                "{name} is larger than {} MiB, so it is not a Nerve backup",
+                MAX_FILE / (1024 * 1024)
+            ));
+        }
+        Ok(())
+    };
+    // Before it is opened: Windows refuses to open a folder, and the message
+    // would be "Access is denied" instead of what is wrong.
+    check(&std::fs::metadata(path).map_err(|e| format!("cannot open {name}: {e}"))?)?;
     let file = std::fs::File::open(path).map_err(|e| format!("cannot open {name}: {e}"))?;
+    // And again on the open file, which may be another one by now.
     let meta = file
         .metadata()
         .map_err(|e| format!("cannot read {name}: {e}"))?;
-    if !meta.is_file() {
-        return Err(format!("{name} is not a file"));
-    }
-    if meta.len() > MAX_FILE {
-        return Err(format!(
-            "{name} is larger than {} MiB, so it is not a Nerve backup",
-            MAX_FILE / (1024 * 1024)
-        ));
-    }
+    check(&meta)?;
     let mut bytes = Vec::with_capacity(meta.len() as usize);
     file.take(MAX_FILE + 1)
         .read_to_end(&mut bytes)

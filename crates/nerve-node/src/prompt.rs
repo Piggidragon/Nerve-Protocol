@@ -39,18 +39,26 @@ pub fn passphrase(
 /// Unix, as `ssh` does for a key: the passphrase would be theirs too.
 fn from_file(path: &Path) -> Result<Passphrase, String> {
     let name = path.display();
+    let check = |meta: &std::fs::Metadata| -> Result<(), String> {
+        if !meta.is_file() {
+            return Err(format!("{name} is not a file"));
+        }
+        if meta.len() > MAX_FILE {
+            return Err(format!(
+                "{name} is larger than {MAX_FILE} bytes, which is no passphrase"
+            ));
+        }
+        Ok(())
+    };
+    // Before it is opened: Windows refuses to open a folder, and the message
+    // would be "Access is denied" instead of what is wrong.
+    check(&std::fs::metadata(path).map_err(|e| format!("cannot open {name}: {e}"))?)?;
     let file = std::fs::File::open(path).map_err(|e| format!("cannot open {name}: {e}"))?;
+    // And again on the open file, which may be another one by now.
     let meta = file
         .metadata()
         .map_err(|e| format!("cannot read {name}: {e}"))?;
-    if !meta.is_file() {
-        return Err(format!("{name} is not a file"));
-    }
-    if meta.len() > MAX_FILE {
-        return Err(format!(
-            "{name} is larger than {MAX_FILE} bytes, which is no passphrase"
-        ));
-    }
+    check(&meta)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

@@ -183,8 +183,21 @@ fn pair(req: &Request, st: &Mutex<State>, center_id: &str) -> Response {
 }
 
 /// The center's handshake: challenge, hello check, welcome. Returns the hello,
-/// or the bye reason it sent.
+/// or the bye reason it sent. The welcome offers no resume (§4.9), as a
+/// center that cannot resume links answers.
 pub async fn handshake(
+    conn: &mut Conn<TcpStream>,
+    center_id: &str,
+    paired: &Paired,
+) -> Result<Hello, String> {
+    let hello = hello(conn, center_id, paired).await?;
+    welcome(conn, None).await?;
+    Ok(hello)
+}
+
+/// The center's handshake up to the checked hello: challenge, hello check.
+/// Returns the hello, or the bye reason it sent.
+pub async fn hello(
     conn: &mut Conn<TcpStream>,
     center_id: &str,
     paired: &Paired,
@@ -221,12 +234,20 @@ pub async fn handshake(
         conn.bye("unsupported_version").await;
         return Err("no common version".into());
     }
-    conn.notify(
-        method::WELCOME,
-        json!({"version": PROTOCOL_VERSION, "limits": msg::Limits::default()}),
-    )
-    .await?;
     Ok(hello)
+}
+
+/// The last handshake step: `welcome`, with `resume` when the center answers
+/// a node's resume offer (§4.9).
+pub async fn welcome(
+    conn: &mut Conn<TcpStream>,
+    resume: Option<msg::Resumed>,
+) -> Result<(), String> {
+    let mut w = json!({"version": PROTOCOL_VERSION, "limits": msg::Limits::default()});
+    if let Some(r) = resume {
+        w["resume"] = serde_json::to_value(r).map_err(|e| e.to_string())?;
+    }
+    conn.notify(method::WELCOME, w).await
 }
 
 async fn auto_link(mut conn: Conn<TcpStream>, center_id: &str, p: &Paired) -> Result<(), String> {

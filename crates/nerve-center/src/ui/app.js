@@ -520,6 +520,8 @@ const DECISIONS = {
   allowed: { ic: "ok", tone: "ok", pill: "up" },
   denied: { ic: "ban", tone: "danger", pill: "down" },
   forbidden: { ic: "lock", tone: "danger", pill: "down" },
+  // A command the node killed for its memory limit, after it was allowed.
+  killed: { ic: "ban", tone: "danger", pill: "down" },
 };
 
 function pageAudit() {

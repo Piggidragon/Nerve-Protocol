@@ -9,6 +9,7 @@
 
 pub mod account;
 pub mod backup;
+pub mod cgroup;
 pub mod cli;
 pub mod daemon;
 pub mod descriptor;

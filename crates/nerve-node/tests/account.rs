@@ -38,9 +38,11 @@ fn opts(policy: &CenterPolicy, account: &Account, own: &[PathBuf]) -> RunOptions
         container: None,
         exe: env!("CARGO_BIN_EXE_nerve-node").into(),
         output_cap: 64 * 1024,
+        timeouts: Default::default(),
         sudo: None,
         account: Some(account.clone()),
         own: own.to_vec(),
+        limits: None,
     }
 }
 
@@ -80,6 +82,7 @@ async fn a_folder_mode_command_of_the_account_stays_in_its_folders_and_off_the_k
         command: cmd.into(),
         cwd: work.clone(),
         timeout: Some(Duration::from_secs(20)),
+        limits: Default::default(),
     };
     let probe = format!(
         "id -u; echo HOME=$HOME; pwd; cat in.txt; cat {out}; cat {key}; echo end",

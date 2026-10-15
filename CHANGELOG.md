@@ -18,7 +18,7 @@
 
 ### Run-time limit for commands
 
-- Every command has a time limit now. A call without `timeout_ms` gets `limits.default_timeout_secs` (10 minutes), and a `timeout_ms` above `limits.max_timeout_secs` (1 hour) is cut to it. A command past its limit is killed and the call fails with `timeout`, as before; the message says which limit it was. Before, a command without `timeout_ms` ran until it ended or its session did. The agent sees both numbers in the description of `exec_run`. Only the owner sets them, for example `nerve-node config set limits.max_timeout_secs 86400` for jobs that run a day; a center cannot, also with the settings grant ([#120](https://github.com/Piggidragon/Nerve-Protocol/issues/120)).
+- Every command has a time limit now. A call without `timeout_ms` gets `limits.default_timeout_secs` (10 minutes), and a `timeout_ms` above `limits.max_timeout_secs` (1 hour) is cut to it. A command past its limit is killed and the call fails with `timeout`, as before; the message says which limit it was. Before, a command without `timeout_ms` ran until it ended or its session did. The agent sees both numbers in the description of `exec_run` and in its `timeout_ms` parameter, and machines with other limits are separate tools. Only the owner sets them, for example `nerve-node config set limits.max_timeout_secs 86400` for jobs that run a day; a center cannot, also with the settings grant ([#120](https://github.com/Piggidragon/Nerve-Protocol/issues/120)).
 - A 0.0.3 node refuses a `node.toml` that holds either key. Before you go back to 0.0.3, remove them with `nerve-node config unset limits.default_timeout_secs` and `limits.max_timeout_secs`. A file in which you set neither reads on 0.0.3, as the defaults are not written.
 
 ## 0.0.3

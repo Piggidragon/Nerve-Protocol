@@ -243,6 +243,17 @@ fn fs_cap(exposure: Exposure) -> Capability {
     c
 }
 
+/// `timeout_ms` with the run-time limits in it, as `memory_mb` has its own.
+/// The center makes one tool of the `exec.run` of nodes whose params are
+/// equal and takes its text from the first of them, so nodes that differ in
+/// their limits must differ here, or the model reads one node's numbers for
+/// all.
+fn timeout_param(t: &crate::exec::Timeouts) -> Value {
+    let ms = |d: std::time::Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    json!({"type": "integer", "minimum": 1,
+           "maximum": ms(t.max), "default": ms(t.limit(None).after)})
+}
+
 /// `limits` give the defaults and the most of what a call may ask its
 /// command to be held to, `timeouts` the time it gets.
 fn exec_cap(
@@ -269,7 +280,7 @@ fn exec_cap(
             ),
             obj(
                 json!({"command": {"type": "string"}, "cwd": cwd_param(windows),
-                       "timeout_ms": {"type": "integer", "minimum": 1},
+                       "timeout_ms": timeout_param(timeouts),
                        "memory_mb": {"type": "integer", "minimum": 1,
                                      "maximum": limits.memory_max_mb,
                                      "default": limits.memory_mb},
@@ -1041,6 +1052,10 @@ mod tests {
             before.contains("after 10 min when you give none, and never runs longer than 1 h"),
             "{before}"
         );
+        assert_eq!(
+            timeout_ms(&cfg),
+            json!({"type": "integer", "minimum": 1, "maximum": 3_600_000, "default": 600_000})
+        );
         cfg.limits.default_timeout_secs = 90;
         cfg.limits.max_timeout_secs = 120;
         let (after, changed) = text(&cfg);
@@ -1049,6 +1064,42 @@ mod tests {
             "{after}"
         );
         assert_ne!(changed, rev);
+        assert_eq!(
+            timeout_ms(&cfg),
+            json!({"type": "integer", "minimum": 1, "maximum": 120_000, "default": 90_000})
+        );
+        // The default shown is the one that applies: cut to the maximum.
+        cfg.limits.max_timeout_secs = 30;
+        assert_eq!(timeout_ms(&cfg)["default"], 30_000);
+    }
+
+    /// The `timeout_ms` parameter of `exec.run` as a center reads it.
+    fn timeout_ms(cfg: &NodeConfig) -> Value {
+        let mut e = entry();
+        e.policy.mode = Mode::User;
+        let d = for_center(cfg, &e, 0, true, &[]);
+        d.capability("exec").unwrap().actions["run"].params["properties"]["timeout_ms"].clone()
+    }
+
+    /// Nodes that differ only in their run-time limits have different params
+    /// for `exec.run`, so the center keeps their tools apart (nerve-center
+    /// `tools`); nodes with equal limits have equal ones.
+    #[test]
+    fn nodes_with_other_run_time_limits_have_other_params() {
+        let params = |cfg: &NodeConfig| {
+            let mut e = entry();
+            e.policy.mode = Mode::User;
+            let d = for_center(cfg, &e, 0, true, &[]);
+            d.capability("exec").unwrap().actions["run"].params.clone()
+        };
+        let plain = NodeConfig::default();
+        let mut long = NodeConfig::default();
+        long.limits.max_timeout_secs = 86_400;
+        let mut short_default = NodeConfig::default();
+        short_default.limits.default_timeout_secs = 60;
+        assert_eq!(params(&plain), params(&NodeConfig::default()));
+        assert_ne!(params(&plain), params(&long));
+        assert_ne!(params(&plain), params(&short_default));
     }
 
     /// A call sees the limits its command gets and the most it may ask

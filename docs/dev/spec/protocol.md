@@ -502,8 +502,10 @@ concurrently.
   A node ends every command: one without `timeout_ms` gets the node's
   default, one with a larger value gets the node's maximum, and past its limit
   the command is killed and the call fails with `timeout`. Both numbers are
-  the owner's (`limits` of `node.toml`, node-local §2). The action's text
-  in the descriptor states them.
+  the owner's (`limits` of `node.toml`, node-local §2). The descriptor states
+  them in the action's text and as `maximum` and `default`, in milliseconds,
+  of the `timeout_ms` parameter; as that parameter differs between nodes
+  with other limits, a center does not merge their `exec.run` into one tool.
 - state: `{shell, confinement}`; event `exit {call, exit_code}` (needs `sub`).
 - Output is capped at `limits.output_cap_bytes` of the node's config;
   `truncated` says it was cut.

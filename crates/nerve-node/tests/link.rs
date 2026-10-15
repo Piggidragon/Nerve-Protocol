@@ -1494,7 +1494,8 @@ async fn a_call_asks_for_limits_up_to_the_owners_most() {
         run(json!({"command": "echo ok", "memory_mb": 1024, "cpu_percent": 10, "processes": 8}))
             .await
             .expect("within the most");
-    assert_eq!(r["stdout"], "ok\n", "{r}");
+    // PowerShell ends the line with \r\n, sh with \n.
+    assert_eq!(r["stdout"].as_str().map(str::trim_end), Some("ok"), "{r}");
     assert!(r.get("killed").is_none(), "{r}");
     let e = run(json!({"command": "echo no", "memory_mb": 1025}))
         .await

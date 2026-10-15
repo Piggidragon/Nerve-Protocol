@@ -495,10 +495,13 @@ is killed whole), `cpu.max` (`cpu_percent` × 1000 µs per 100 ms) and
 of its own up to the most. The node takes its own cgroup as the root
 (`/proc/self/cgroup`) when systemd delegated it (`user.delegate` or
 `trusted.delegate` set to `1`), or when it belongs to the node's user, who
-is not root, holds no other process, and the user's systemd says its unit
-(the last part of the path) is delegated (`systemctl --user show -p
-Delegate`): that systemd marks none. A cgroup systemd did not delegate is
-not taken: systemd turns its controllers off at its next reload. It moves itself into the leaf `node`, turns on
+is not root, holds no other process, and the manager that owns it says its
+unit (the last part of the path) is delegated: `systemctl --user show -p
+Delegate` below `user@<uid>.service`, else `systemctl show -p Delegate` of
+the system's, which any user may ask. The user's systemd marks none, and a
+system one before 251 sets only `trusted.delegate`, which the node's user
+cannot read. A cgroup systemd did not delegate is not taken: systemd turns
+its controllers off at its next reload. It moves itself into the leaf `node`, turns on
 `+memory +cpu +pids` in the root's `cgroup.subtree_control` (each where the
 root has it), and makes `cmd-<n>` beside the leaf per command. The forked
 child writes `0` to that cgroup's `cgroup.procs` through a descriptor the
@@ -510,10 +513,10 @@ turned on are still on in `cgroup.subtree_control`; if one went off it
 refuses the command (`unavailable`), and `status` reads them there each
 time. When the command ends the node reads `memory.events`: `oom` above 0
 (its own limit was reached) with `oom_kill` or `oom_group_kill` above 0
-gives the result `killed: "memory"` and a `reason`; a kill by an OOM from
-outside (the machine's, a cgroup above) leaves `oom` at 0 and gives only
-`signal: "kill"`, and the audit log an entry `killed`, code `memory`, after the
-call's `allowed`. Then it writes `1` to `cgroup.kill` (Linux 5.14; before
+gives the result `killed: "memory"` and a `reason`, and the audit log an
+entry `killed`, code `memory`, after the call's `allowed`; a kill by an OOM
+from outside (the machine's, a cgroup above) leaves `oom` at 0 and gives
+only `signal: "kill"`, with no audit entry of its own. Then it writes `1` to `cgroup.kill` (Linux 5.14; before
 it, SIGKILL to each pid, as the uid that owns it where that is not the
 node's, `account::kill_pid_as`), which also ends what left the
 process group, and removes the cgroup, from a thread when processes are

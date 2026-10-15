@@ -1533,8 +1533,11 @@ async fn a_command_killed_for_its_memory_is_said_in_its_result_and_the_audit() {
     std::fs::write(fake.join("cgroup.controllers"), "cpu memory pids").unwrap();
     std::fs::write(own.join("cgroup.controllers"), "cpu memory pids").unwrap();
     std::fs::write(own.join("cgroup.procs"), "").unwrap();
-    let cgroups = nerve_node::cgroup::Cgroups::at(&fake, "/node.scope", std::process::id(), me)
-        .expect("plain folders of this user");
+    let cgroups =
+        nerve_node::cgroup::Cgroups::at(&fake, "/node.scope", std::process::id(), me, &|_| true)
+            .expect("plain folders of this user");
+    // What the kernel answers once the node turned the controllers on.
+    std::fs::write(own.join("cgroup.subtree_control"), "cpu memory pids").unwrap();
     let mut center = FakeCenter::start(false).await.unwrap();
     let mut o = options(dir.path());
     o.cgroups = Some(Ok(Arc::new(cgroups)));

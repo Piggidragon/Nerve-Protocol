@@ -13,9 +13,13 @@
 //! cgroup is killed (`cgroup.kill`), also what left its process group, and
 //! the cgroup is removed.
 //!
-//! A command run as another account cannot leave its cgroup or raise its
-//! limits: the cgroups and their files are the node's user's. A command of
-//! the node's own user could, outside folder mode's Landlock.
+//! A command run as another account than the node's and root cannot write
+//! its cgroup's files, which are the node's user's, so it cannot leave its
+//! cgroup or raise its limits that way. A command of the node's own user
+//! could, outside folder mode's Landlock, and so could a root one (the
+//! account root, a sudo command). Every command can still have work started
+//! outside its cgroup by a service manager of its account (`systemd-run
+//! --user`, `at`, cron); that work is not held to its limits.
 //!
 //! Without such a cgroup (no systemd, a cgroup v1 machine, a node started
 //! in a terminal) commands run without these limits; `status` and the log
@@ -102,13 +106,22 @@ mod linux {
                 name,
                 std::process::id(),
                 nerve_transport::net::euid(),
+                &user_unit_delegates,
             )
         }
 
         /// [`Cgroups::find`] for process `me`, run by `euid`, in the cgroup
-        /// `own` of the hierarchy mounted at `mount`. A test hands it
-        /// plain folders.
-        pub fn at(mount: &Path, own: &str, me: u32, euid: u32) -> Result<Cgroups, String> {
+        /// `own` of the hierarchy mounted at `mount`. `delegates` answers
+        /// whether the user's service manager delegates the unit of that
+        /// name, for a cgroup without systemd's mark. A test hands it plain
+        /// folders.
+        pub fn at(
+            mount: &Path,
+            own: &str,
+            me: u32,
+            euid: u32,
+            delegates: &dyn Fn(&str) -> bool,
+        ) -> Result<Cgroups, String> {
             if !mount.join("cgroup.controllers").is_file() {
                 return Err(format!(
                     "{} is no cgroup v2 (unified hierarchy)",
@@ -124,14 +137,17 @@ mod linux {
             let dir = mount.join(name.trim_start_matches('/'));
             let procs = read_pids(&dir.join("cgroup.procs"))
                 .map_err(|e| format!("cannot read the processes of the cgroup {name}: {e}"))?;
-            // systemd marks a cgroup it delegates. Without the mark, one
-            // that is this user's and holds only this process is as good:
-            // the user's own systemd marks none.
+            // systemd marks a cgroup it delegates, but the user's own
+            // systemd marks none. Its cgroup is the user's either way, so
+            // for one that is this user's and holds only this process, the
+            // unit itself says. One systemd did not delegate is systemd's:
+            // it turns the controllers off again when it reloads.
             let owned = euid != 0 && std::fs::metadata(&dir).is_ok_and(|m| m.uid() == euid);
             let alone = procs.iter().all(|&p| p == me);
-            if !(delegated(&dir) || owned && alone) {
+            let unit = name.rsplit('/').next().unwrap_or_default();
+            if !(delegated(&dir) || owned && alone && delegates(unit)) {
                 return Err(format!(
-                    "the node's cgroup {name} is not delegated to it: the installed service has one (`sudo nerve-node install` writes its unit again); a node of your own gets one with `systemd-run --user --scope -p Delegate=yes nerve-node run`"
+                    "the node's cgroup {name} is not delegated to it: the installed service has one (`sudo nerve-node install` writes its unit again); a node of your own gets one with `systemd-run --user --scope -p Delegate=yes nerve-node run`, or `Delegate=yes` in a unit of yours"
                 ));
             }
             let leaf = dir.join(LEAF);
@@ -195,22 +211,44 @@ mod linux {
             &self.name
         }
 
-        /// The limits it holds a command to.
+        /// The limits it holds a command to now: the controllers it turned
+        /// on at start that are still on.
         pub fn enforced(&self) -> Vec<&'static str> {
-            [
-                (self.memory, "memory"),
-                (self.cpu, "cpu"),
-                (self.pids, "processes"),
-            ]
-            .into_iter()
-            .filter_map(|(on, n)| on.then_some(n))
-            .collect()
+            let (memory, cpu, pids) = self.live();
+            [(memory, "memory"), (cpu, "cpu"), (pids, "processes")]
+                .into_iter()
+                .filter_map(|(on, n)| on.then_some(n))
+                .collect()
+        }
+
+        /// Which of its controllers are on below it now. Something else
+        /// that writes the cgroup, systemd for one that it did not
+        /// delegate, can turn them off.
+        fn live(&self) -> (bool, bool, bool) {
+            let on = std::fs::read_to_string(self.dir.join("cgroup.subtree_control"))
+                .unwrap_or_default();
+            let has = |c: &str| {
+                on.split_whitespace()
+                    .any(|o| o.trim_start_matches('+') == c)
+            };
+            (
+                self.memory && has("memory"),
+                self.cpu && has("cpu"),
+                self.pids && has("pids"),
+            )
         }
 
         /// A fresh cgroup for one command, with `limits`. Swap does not
         /// count as room: a command past its memory is killed, not swapped
         /// out, and with it everything else of the command.
         pub fn command(&self, limits: &Granted) -> Result<CommandCgroup, String> {
+            // A cgroup whose controllers went off would take no limit.
+            if self.live() != (self.memory, self.cpu, self.pids) {
+                return Err(format!(
+                    "the cgroup {} no longer passes on the controllers the node turned on: something else turned them off; start the node again (`nerve-node status` shows what is left)",
+                    self.name
+                ));
+            }
             let mut tries = 0;
             let dir = loop {
                 let n = self.next.fetch_add(1, Ordering::Relaxed);
@@ -284,14 +322,25 @@ mod linux {
             self.memory_mb
         }
 
-        /// Whether the kernel killed a process of it for its memory limit.
+        /// Whether the kernel killed a process of it for its own memory
+        /// limit. `oom_kill` also counts kills of an OOM that came from
+        /// outside (the machine's, a cgroup above); then `oom`, the times
+        /// it reached its own limit, stays 0.
         pub fn out_of_memory(&self) -> bool {
-            self.memory
-                && std::fs::read_to_string(self.dir.join("memory.events")).is_ok_and(|t| {
-                    t.lines().any(|l| {
-                        matches!(l.split_once(' '), Some(("oom_kill" | "oom_group_kill", n)) if n.trim() != "0")
-                    })
-                })
+            if !self.memory {
+                return false;
+            }
+            let Ok(t) = std::fs::read_to_string(self.dir.join("memory.events")) else {
+                return false;
+            };
+            let count = |key: &str| {
+                t.lines()
+                    .filter_map(|l| l.split_once(' '))
+                    .find(|(k, _)| *k == key)
+                    .and_then(|(_, n)| n.trim().parse::<u64>().ok())
+                    .unwrap_or(0)
+            };
+            count("oom") > 0 && (count("oom_kill") > 0 || count("oom_group_kill") > 0)
         }
     }
 
@@ -343,18 +392,40 @@ mod linux {
         }
     }
 
-    /// `cgroup.kill` (Linux 5.14); before it, a SIGKILL to each process the
-    /// node may signal.
+    /// `cgroup.kill` (Linux 5.14); before it, a SIGKILL to each process,
+    /// as the account it runs as where that is not the node's: the
+    /// installed node may not signal the command account's processes
+    /// itself (crate::account::kill_pid_as).
     fn kill(dir: &Path) {
         if put(&dir.join("cgroup.kill"), "1").is_ok() {
             return;
         }
+        let me = nerve_transport::net::euid();
         for p in read_pids(&dir.join("cgroup.procs")).unwrap_or_default() {
-            // SAFETY: kill on a pid of the command's cgroup.
-            unsafe {
-                libc::kill(p as libc::pid_t, libc::SIGKILL);
+            match std::fs::metadata(format!("/proc/{p}")).map(|m| m.uid()) {
+                Ok(uid) if uid != me && me != 0 => {
+                    crate::account::kill_pid_as(uid, p, libc::SIGKILL)
+                }
+                // SAFETY: kill on a pid of the command's cgroup.
+                _ => unsafe {
+                    libc::kill(p as libc::pid_t, libc::SIGKILL);
+                },
             }
         }
+    }
+
+    /// Whether the user's service manager delegates its unit `unit`
+    /// (`systemctl --user show -p Delegate`).
+    fn user_unit_delegates(unit: &str) -> bool {
+        if unit.is_empty() || unit.starts_with('-') {
+            return false;
+        }
+        std::process::Command::new("systemctl")
+            .args(["--user", "show", "-p", "Delegate", "--value", "--", unit])
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|o| o.status.success() && o.stdout.trim_ascii() == b"yes")
     }
 
     /// Removes `dir`; whether it is gone.
@@ -417,6 +488,20 @@ mod linux {
             nerve_transport::net::euid()
         }
 
+        /// The user's systemd delegates every unit, or none.
+        fn yes(_: &str) -> bool {
+            true
+        }
+        fn no(_: &str) -> bool {
+            false
+        }
+
+        /// What the kernel answers for `cgroup.subtree_control` once these
+        /// are on; the plain file keeps only the last write.
+        fn turned_on(dir: &Path, on: &str) {
+            std::fs::write(dir.join("cgroup.subtree_control"), on).unwrap();
+        }
+
         #[test]
         fn a_cgroup_of_the_node_alone_is_taken_and_a_shared_one_is_not() {
             if euid() == 0 {
@@ -426,9 +511,15 @@ mod linux {
             }
             let own = "/user.slice/app.slice/run-1.scope";
             let (t, dir) = fake(own, "cpu memory pids io", "42\n");
-            let c = Cgroups::at(t.path(), own, 42, euid()).unwrap();
+            let asked = std::cell::RefCell::new(Vec::new());
+            let c = Cgroups::at(t.path(), own, 42, euid(), &|u| {
+                asked.borrow_mut().push(u.to_string());
+                true
+            })
+            .unwrap();
             assert_eq!(c.name(), own);
-            assert_eq!(c.enforced(), ["memory", "cpu", "processes"]);
+            // The unit of the cgroup was asked whether it is delegated.
+            assert_eq!(*asked.borrow(), ["run-1.scope"]);
             // The node moved into its leaf; the controllers go below.
             assert_eq!(
                 std::fs::read_to_string(dir.join("node/cgroup.procs")).unwrap(),
@@ -439,10 +530,19 @@ mod linux {
                 "+pids",
                 "the last of +memory, +cpu, +pids"
             );
+            turned_on(&dir, "cpu memory pids");
+            assert_eq!(c.enforced(), ["memory", "cpu", "processes"]);
 
+            // A unit the user's systemd does not delegate is systemd's:
+            // it would turn the controllers off again.
+            let (t, dir) = fake(own, "cpu memory pids", "42\n");
+            let e = Cgroups::at(t.path(), own, 42, euid(), &no).unwrap_err();
+            assert!(e.contains("is not delegated to it"), "{e}");
+            assert!(e.contains("`Delegate=yes` in a unit of yours"), "{e}");
+            assert!(!dir.join("node").exists(), "it touched the cgroup");
             // Another process in it: that cgroup is not the node's to take.
             let (t, _) = fake(own, "cpu memory pids", "42\n43\n");
-            let e = Cgroups::at(t.path(), own, 42, euid()).unwrap_err();
+            let e = Cgroups::at(t.path(), own, 42, euid(), &yes).unwrap_err();
             assert!(e.contains("is not delegated to it"), "{e}");
             assert!(
                 e.contains("systemd-run --user --scope -p Delegate=yes"),
@@ -450,11 +550,11 @@ mod linux {
             );
             // Nor one of another user.
             let (t, _) = fake(own, "cpu memory pids", "42\n");
-            let e = Cgroups::at(t.path(), own, 42, euid() + 1).unwrap_err();
+            let e = Cgroups::at(t.path(), own, 42, euid() + 1, &yes).unwrap_err();
             assert!(e.contains("is not delegated to it"), "{e}");
             // Nor a machine without cgroup v2.
             let t = tempfile::tempdir().unwrap();
-            let e = Cgroups::at(t.path(), own, 42, euid()).unwrap_err();
+            let e = Cgroups::at(t.path(), own, 42, euid(), &yes).unwrap_err();
             assert!(e.contains("no cgroup v2"), "{e}");
         }
 
@@ -466,16 +566,43 @@ mod linux {
             }
             let (t, dir) = fake("/svc.service", "memory pids", "");
             std::fs::create_dir(dir.join("node")).unwrap();
-            let c = Cgroups::at(t.path(), "/svc.service/node", 7, euid()).unwrap();
+            let c = Cgroups::at(t.path(), "/svc.service/node", 7, euid(), &yes).unwrap();
             assert_eq!(c.name(), "/svc.service");
             // Only the controllers the cgroup has.
+            turned_on(&dir, "cpu memory pids");
             assert_eq!(c.enforced(), ["memory", "processes"]);
             let (t, _) = fake("/svc.service", "io", "");
-            let e = Cgroups::at(t.path(), "/svc.service", 7, euid()).unwrap_err();
+            let e = Cgroups::at(t.path(), "/svc.service", 7, euid(), &yes).unwrap_err();
             assert!(
                 e.contains("passes on no memory, cpu or pids controller"),
                 "{e}"
             );
+        }
+
+        /// Controllers that something else turned off show in the status,
+        /// and no command runs in a cgroup that would not hold it.
+        #[test]
+        fn a_cgroup_whose_controllers_went_off_takes_no_command() {
+            if euid() == 0 {
+                eprintln!("skipped: root");
+                return;
+            }
+            let (t, dir) = fake("/svc.service", "cpu memory pids", "");
+            let c = Cgroups::at(t.path(), "/svc.service", 7, euid(), &yes).unwrap();
+            turned_on(&dir, "pids");
+            assert_eq!(c.enforced(), ["processes"]);
+            let granted = Granted {
+                memory_mb: 16,
+                cpu_percent: 100,
+                processes: 8,
+            };
+            let e = c.command(&granted).unwrap_err();
+            assert!(
+                e.contains("no longer passes on the controllers the node turned on"),
+                "{e}"
+            );
+            turned_on(&dir, "memory cpu pids");
+            assert!(c.command(&granted).is_ok());
         }
 
         #[test]
@@ -487,7 +614,8 @@ mod linux {
             let (t, dir) = fake("/svc.service", "cpu memory pids", "");
             // Left behind by a node before: numbered past.
             std::fs::create_dir(dir.join("cmd-4")).unwrap();
-            let c = Cgroups::at(t.path(), "/svc.service", 7, euid()).unwrap();
+            let c = Cgroups::at(t.path(), "/svc.service", 7, euid(), &yes).unwrap();
+            turned_on(&dir, "cpu memory pids");
             let granted = Granted {
                 memory_mb: 16,
                 cpu_percent: 150,
@@ -505,18 +633,39 @@ mod linux {
             assert_eq!(read("pids.max"), "32");
             assert!(cg.procs_fd() >= 0);
             assert!(!cg.out_of_memory());
-            std::fs::write(
-                d.join("memory.events"),
-                "low 0\nhigh 0\nmax 9\noom 1\noom_kill 0\n",
-            )
-            .unwrap();
+            let events = |t: &str| std::fs::write(d.join("memory.events"), t).unwrap();
+            events("low 0\nhigh 0\nmax 9\noom 1\noom_kill 0\n");
             assert!(
                 !cg.out_of_memory(),
                 "it was at its limit, nothing was killed"
             );
-            std::fs::write(d.join("memory.events"), "max 9\noom 1\noom_kill 1\n").unwrap();
+            // Killed by an OOM from outside: the machine's, or a cgroup
+            // above. It never reached its own limit.
+            events("max 0\noom 0\noom_kill 5\noom_group_kill 1\n");
+            assert!(!cg.out_of_memory(), "not its own limit");
+            events("max 9\noom 1\noom_kill 1\n");
+            assert!(cg.out_of_memory());
+            events("max 9\noom 2\noom_kill 0\noom_group_kill 1\n");
             assert!(cg.out_of_memory());
             assert_eq!(cg.memory_mb(), 16);
+        }
+
+        /// Without `cgroup.kill` (Linux before 5.14) each process left is
+        /// killed by itself.
+        #[test]
+        fn without_cgroup_kill_each_process_is_killed() {
+            let t = tempfile::tempdir().unwrap();
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            // A folder where the kernel's file would be: no write lands.
+            std::fs::create_dir(t.path().join("cgroup.kill")).unwrap();
+            std::fs::write(t.path().join("cgroup.procs"), format!("{}\n", child.id())).unwrap();
+            kill(t.path());
+            let status = child.wait().unwrap();
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(status.signal(), Some(libc::SIGKILL), "{status:?}");
         }
     }
 }

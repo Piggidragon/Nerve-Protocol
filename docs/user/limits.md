@@ -51,6 +51,11 @@ in the tool's parameters.
 | CPU | The command is slowed down. It is not killed. |
 | Processes | The command cannot start more. A shell says `Cannot fork` or `Resource temporarily unavailable`. |
 
+Only a command that reached its own limit gets `killed`. When the machine
+runs out of memory as a whole, the kernel may kill a command below its
+limit: its result then has only `"signal": "kill"`, and raising `memory_mb`
+does not help.
+
 Swap does not count as room: a command past its memory is killed, not
 swapped out. Files the command reads into the page cache count towards its
 memory, but the kernel frees those first.
@@ -77,7 +82,10 @@ systemd hands to it:
   ```
 
   Started plainly in a terminal, it shares the terminal's cgroup, which is
-  not its own to divide.
+  not its own to divide. Run as a service of your own systemd
+  (`systemctl --user`), its unit needs `Delegate=yes`. Without it systemd
+  keeps the cgroup as its own and turns the limits off again at its next
+  reload, so the node takes no cgroup there.
 
 Without such a cgroup (no systemd, cgroup v1, a node started in a terminal),
 commands run without these limits. `nerve-node status` says so, and why:
@@ -94,7 +102,9 @@ commands run WITHOUT these limits: the node's cgroup /user.slice/… is not dele
 ```
 
 When a cgroup offers only some controllers, the line names the limits that
-are not held.
+are not held. When something else turns a controller off while the node
+runs, `status` shows that too, and no command runs until you start the node
+again.
 
 When a command ends, everything still in its cgroup is killed: also a
 process it moved out of its process group (`setsid`, `nohup … &`), which
@@ -104,10 +114,18 @@ would otherwise outlive it.
 
 - A command that runs as the node's own user (a node you start yourself, in
   `allowlist` or `user` mode) can move itself out of its cgroup or raise its
-  limits, as the cgroup's files are that user's. Commands of the installed
-  service run as another account ([the account commands run
-  as](service.md#the-account-commands-run-as)) and cannot. In `folder` mode
-  Landlock keeps a command from writing the cgroup files.
+  limits, as the cgroup's files are that user's. In `folder` mode Landlock
+  keeps a command from writing the cgroup files.
+- A command that runs as root can too: when root is the account commands
+  run as, and every command on the [sudo list](sudo.md).
+- Commands of the installed service run as another account ([the account
+  commands run as](service.md#the-account-commands-run-as)) and cannot write
+  their cgroup. But any command, in every mode, can have work started
+  outside its cgroup by a service manager of its account: `systemd-run
+  --user`, `at`, cron. That work is not held to the limits and outlives the
+  command. The limits bound what a command uses by itself, not what it can
+  ask others to run; they are no boundary against a center you do not
+  trust.
 - Disk space and disk speed are not limited.
 - The limits are per command. `limits.max_running` (16 by default) bounds how
   many commands run at once, so many commands together can use more.

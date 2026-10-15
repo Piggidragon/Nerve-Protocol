@@ -495,19 +495,27 @@ is killed whole), `cpu.max` (`cpu_percent` × 1000 µs per 100 ms) and
 of its own up to the most. The node takes its own cgroup as the root
 (`/proc/self/cgroup`) when systemd delegated it (`user.delegate` or
 `trusted.delegate` set to `1`), or when it belongs to the node's user, who
-is not root, and holds no other process (a scope of the user's systemd,
-which marks none). It moves itself into the leaf `node`, turns on
+is not root, holds no other process, and the user's systemd says its unit
+(the last part of the path) is delegated (`systemctl --user show -p
+Delegate`): that systemd marks none. A cgroup systemd did not delegate is
+not taken: systemd turns its controllers off at its next reload. It moves itself into the leaf `node`, turns on
 `+memory +cpu +pids` in the root's `cgroup.subtree_control` (each where the
 root has it), and makes `cmd-<n>` beside the leaf per command. The forked
 child writes `0` to that cgroup's `cgroup.procs` through a descriptor the
 node opened, before it switches accounts and execs, so the command and all
 it starts are in it. A node started in its leaf already takes the cgroup
 above. `cmd-*` cgroups left from before are killed and removed at start.
-When the command ends the node reads `memory.events`: an `oom_kill` or
-`oom_group_kill` above 0 gives the result `killed: "memory"` and a
-`reason`, and the audit log an entry `killed`, code `memory`, after the
+Before it makes a command's cgroup the node checks that the controllers it
+turned on are still on in `cgroup.subtree_control`; if one went off it
+refuses the command (`unavailable`), and `status` reads them there each
+time. When the command ends the node reads `memory.events`: `oom` above 0
+(its own limit was reached) with `oom_kill` or `oom_group_kill` above 0
+gives the result `killed: "memory"` and a `reason`; a kill by an OOM from
+outside (the machine's, a cgroup above) leaves `oom` at 0 and gives only
+`signal: "kill"`, and the audit log an entry `killed`, code `memory`, after the
 call's `allowed`. Then it writes `1` to `cgroup.kill` (Linux 5.14; before
-it, SIGKILL to each pid it may signal), which also ends what left the
+it, SIGKILL to each pid, as the uid that owns it where that is not the
+node's, `account::kill_pid_as`), which also ends what left the
 process group, and removes the cgroup, from a thread when processes are
 still going.
 
@@ -521,7 +529,10 @@ off}`, where `enforced` lists `memory`, `cpu` and `processes` as far as the
 root passes their controllers on, and `off` says why there is no cgroup. A
 cgroup that cannot be made for a command keeps it from running
 (`unavailable`). A command of the node's own user can write its cgroup's
-files, outside folder mode's Landlock; one of another account cannot.
+files, outside folder mode's Landlock, and so can a root one (root as the
+account, a sudo command); one of another account cannot. Any command can
+have work started outside its cgroup by its account's service manager
+(`systemd-run --user`, `at`, cron), which the limits do not hold.
 Windows does not hold commands to these limits yet.
 
 Windows has no signals either. Each command gets a console of its own,

@@ -1923,6 +1923,69 @@ mod tests {
         assert!(text.contains("limits helper passed"), "{text}");
     }
 
+    /// A command whose cgroup cannot be made does not run: the owner set
+    /// limits, and it would run without them. The cgroups are plain folders
+    /// here, the node's made read-only.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_command_without_its_cgroup_does_not_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let me = nerve_transport::net::euid();
+        if me == 0 {
+            eprintln!("skipped: root writes a read-only folder");
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        let own = t.path().join("node.scope");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(t.path().join("cgroup.controllers"), "cpu memory pids").unwrap();
+        std::fs::write(own.join("cgroup.controllers"), "cpu memory pids").unwrap();
+        std::fs::write(own.join("cgroup.procs"), "").unwrap();
+        let cgroups =
+            crate::cgroup::Cgroups::at(t.path(), "/node.scope", std::process::id(), me, &|_| true)
+                .unwrap();
+        std::fs::write(own.join("cgroup.subtree_control"), "cpu memory pids").unwrap();
+        let mut o = opts(1024);
+        o.limits = Some((
+            std::sync::Arc::new(cgroups),
+            nerve_policy::config::Granted {
+                memory_mb: 64,
+                cpu_percent: 100,
+                processes: 16,
+            },
+        ));
+        let ran = t.path().join("ran");
+        let line = format!("touch {}", ran.display());
+        std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let r = run(&call(&line), &o, |_| {}).await;
+        std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let e = r.unwrap_err();
+        assert_eq!(e.kind(), ErrorCode::Unavailable, "{e:?}");
+        assert!(
+            e.message
+                .starts_with("the command was not run: cannot make a cgroup for the command"),
+            "{e:?}"
+        );
+        assert!(!ran.exists(), "the command ran without its cgroup");
+        // With its cgroup, the same command runs.
+        let r = run(&call(&line), &o, |_| {}).await.unwrap();
+        assert_eq!(r["exit_code"], 0, "{r}");
+        assert!(ran.exists());
+    }
+
+    /// A child that cannot join its cgroup is not started.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_join_is_an_error() {
+        use std::os::fd::AsRawFd;
+        let full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        assert!(crate::cgroup::join(full.as_raw_fd()).is_err());
+        assert!(crate::cgroup::join(-1).is_err());
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     #[ignore = "a helper of a_command_is_held_to_its_limits_in_a_cgroup_of_its_own"]

@@ -506,8 +506,9 @@ concurrently.
   node's default; one above the node's most, or 0, fails with
   `invalid_args`, whose message names the most. The descriptor gives each
   default and most as the parameter's `default` and `maximum`. A command
-  the node killed because it went past its memory has `killed: "memory"`
-  and a `reason` in its result (and `signal: "kill"`). Output comes in the result; the
+  the node killed because it went past its own memory limit has `killed:
+  "memory"` and a `reason` in its result (and `signal: "kill"`); one an OOM
+  of the machine killed has only `signal: "kill"`. Output comes in the result; the
   `output` reliable stream is declared for later.
 
 ### 7.4 `settings` (only with the settings grant `write`)

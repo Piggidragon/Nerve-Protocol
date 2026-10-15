@@ -412,7 +412,7 @@ fn audit_cap() -> Capability {
             obj(
                 json!({"ts": {"type": "integer"}, "cap": {"type": "string"},
                        "action": {"type": "string"}, "target": {"type": "string"},
-                       "decision": {"enum": ["allowed", "forbidden"]},
+                       "decision": {"enum": ["allowed", "forbidden", "killed"]},
                        "code": {"type": "string"},
                        "session": {"type": "string"}}),
                 &["ts", "cap", "action", "target", "decision"],
@@ -1032,6 +1032,13 @@ mod tests {
         assert_eq!(p["cpu_percent"]["default"], 200);
         assert_eq!(p["processes"]["maximum"], 8192);
         assert_eq!(p["processes"]["default"], 1024);
+        // A command killed for its memory is a decision of its own.
+        let d = for_call(&cfg, &e, 0, &[]);
+        let audit = d.capabilities.iter().find(|c| c.id == "audit").unwrap();
+        assert_eq!(
+            audit.events["decision"].data["properties"]["decision"]["enum"],
+            json!(["allowed", "forbidden", "killed"])
+        );
         cfg.limits.command.memory_max_mb = 8192;
         let (p, other) = run(&cfg);
         assert_eq!(p["memory_mb"]["maximum"], 8192);

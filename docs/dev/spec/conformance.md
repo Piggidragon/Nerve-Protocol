@@ -1,14 +1,17 @@
 # Conformance
 
-The conformance suite lives in `crates/nerve-conformance`. It has three
-parts; every check names the section of [protocol.md](protocol.md) it tests,
-so a failure points at the rule that was broken.
+The conformance suite lives in `crates/nerve-conformance`. It has four
+parts; every check names the section of [protocol.md](protocol.md) it tests
+(the harness part: of [harness.md](harness.md), the provider part: of
+[node-local.md](node-local.md)), so a failure points
+at the rule that was broken.
 
 | Part | Checks | Acts as | State |
 |---|---|---|---|
 | center | a center | the echo node | runs |
 | node | a node | a fake center | runs |
 | harness | the MCP server surface a harness sees | an MCP client and two echo nodes | runs |
+| provider | a node's capability provider attach ([node-local.md §7](node-local.md#7-capability-providers)) | a center and a provider | runs (Unix) |
 
 Harnesses integrate through MCP only, so the harness part checks the
 MCP server surface. Native plugins are a backlog item.
@@ -21,9 +24,9 @@ report, and `cargo test -p nerve-conformance` runs them:
 - `tests/self_test.rs`: the center part against the fake center and the node
   part against the echo node. These check the suite itself.
 - `tests/e2e.rs`: the center part and the harness part against a real
-  `nerve-center`, the node part against a real `nerve-node`, and `nerve-center`
-  with `nerve-node` against each other (pairing, link, tools over MCP, folders
-  and rules, settings, audit).
+  `nerve-center`, the node part and the provider part against a real
+  `nerve-node`, and `nerve-center` with `nerve-node` against each other
+  (pairing, link, tools over MCP, folders and rules, settings, audit).
 
 The end-to-end tests start `nerve-center` and `nerve-node` from the programs
 named by `NERVE_CENTER_BIN` and `NERVE_NODE_BIN`, and build them only when the
@@ -140,6 +143,33 @@ JSON is a failure of the check, not an empty result.
 Not covered: `notifications/cancelled`, the stdio transport and attach, a node
 the owner disabled, exposure `off`, names cut to 64 characters and clashes (these
 have unit tests in `nerve-center`).
+
+## Provider part
+
+`provider_part::run(start)` checks a node's provider attach on Linux. The
+closure pairs the node with the link it is handed, gives that center the
+settings grant `write`, allows the program that runs the part
+(`std::env::current_exe()`) in `providers.allowed` under `Setup::provider`,
+and starts the node; `Setup::socket` is its control socket. The part writes its
+own policy with `settings.set` (`user` mode and a deny rule for `echo.shout`
+before the provider comes, allow rules for `echo.say` and `echo.fail` once it
+is there) and attaches an `echo` provider with the actions `say`, `shout` and
+`fail`. Every check names node-local §7.
+
+| Check |
+|---|
+| a center may not allow a capability no provider offers |
+| a program `providers.allowed` does not name is refused |
+| an allowed provider attaches |
+| a second provider of the same name is refused |
+| the node tells the center that its descriptor changed |
+| the descriptor lists the capability with its provider |
+| a center may allow an offered capability that does not sense, and the descriptor follows |
+| a call the policy allows reaches the provider and its answer comes back |
+| a provider's error comes back with its code |
+| a call the policy refuses never reaches the provider |
+| when the provider exits its capability leaves the descriptor |
+| a call to a provider that left is `unknown_capability` |
 
 ## Not covered
 

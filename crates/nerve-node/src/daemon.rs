@@ -403,6 +403,8 @@ pub(crate) struct Shared {
     pub told_keyring: std::sync::atomic::AtomicBool,
     /// How long a dropped link is kept for its resume.
     pub grace: Duration,
+    /// The capability providers attached now (crate::provider).
+    pub providers: crate::provider::Providers,
     /// The relay for other nodes (crate::relay), and who is connected.
     pub relay: crate::relay::Relays,
 }
@@ -715,6 +717,7 @@ impl Shared {
             // Why folder mode runs no command, which `confinement` alone
             // does not say once the keyring is the reason.
             "folder_commands_off": self.unconfined(&cfg),
+            "providers": self.providers.status(),
             "centers": centers,
             "relay": self.relay.status(&cfg),
         })
@@ -931,6 +934,7 @@ impl Daemon {
             account_cache: Mutex::default(),
             told_keyring: Default::default(),
             grace: opts.resume_grace,
+            providers: Default::default(),
             relay: Default::default(),
         });
         shared.tell_confinement(&cfg);
@@ -1015,6 +1019,8 @@ impl Daemon {
         tracing::info!("node daemon stopping");
         self.shared.stop.send_replace(true);
         let _ = tokio::time::timeout(Duration::from_secs(5), self.supervisor).await;
+        // Their connections outlive the socket's task otherwise.
+        self.shared.providers.detach_all();
         let _ = tokio::time::timeout(Duration::from_secs(2), self.relay).await;
         if let Some(c) = self.ctl {
             c.abort();
@@ -1089,6 +1095,11 @@ async fn supervise(shared: Arc<Shared>) {
         // The level follows the config, whoever changed it and however.
         if let Some(log) = &shared.log {
             log.set_level(cfg.log.level);
+        }
+        // A provider the owner no longer allows goes, and its capabilities
+        // with it.
+        if shared.providers.follow_config(&cfg) {
+            shared.bump();
         }
         tasks.retain(|_, t| !t.is_finished());
         if !cfg.locked {
@@ -1306,6 +1317,14 @@ async fn answer(
         // Checking the password runs `sudo -v`, so it cannot block inside
         // `control`.
         "sudo.on" => sudo_on(shared, req.params, peer.pid).await,
+        // A capability provider attaches; its connection stays
+        // (crate::provider).
+        "hello" => {
+            if shared.below_command(peer.pid) {
+                return nerve_transport::ctl::Reply::Err(FROM_A_COMMAND.into());
+            }
+            crate::provider::attach(shared, req.params, peer.pid)
+        }
         m => control(shared, m, req.params, peer.pid),
     }
 }

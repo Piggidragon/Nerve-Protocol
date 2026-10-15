@@ -26,6 +26,10 @@ pub mod keyring_setup;
 mod link;
 pub mod pair;
 pub mod paths;
+// Providers attach over the control socket, which is Unix's; the pipe on
+// Windows takes none yet.
+#[cfg_attr(not(unix), allow(dead_code))]
+mod provider;
 // The control pipe is Windows-only in use; its rules are tested everywhere.
 #[cfg_attr(not(windows), allow(dead_code))]
 mod pipe;

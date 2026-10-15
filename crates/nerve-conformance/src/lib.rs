@@ -1,12 +1,14 @@
 //! Conformance runner of the Nerve Protocol (docs/dev/spec/conformance.md).
 //!
-//! Three parts, each a library call that returns a [`Report`]:
+//! Four parts, each a library call that returns a [`Report`]:
 //!
 //! - [`center_part`] checks a center over the wire, acting as a node (the
 //!   [`echo`] node).
 //! - [`node_part`] checks a node, acting as a center ([`fake_center`]).
 //! - [`harness_part`] checks the MCP server surface a harness sees, acting as
 //!   an MCP client and two echo nodes.
+//! - [`provider_part`] checks a node's capability provider attach, acting
+//!   as a center and as a provider on the node's control socket (Unix).
 //!
 //! There is no runner binary (the workspace ships exactly
 //! `nerve-center` and `nerve-node`); the parts run from `cargo test` in this
@@ -17,6 +19,8 @@ pub mod echo;
 pub mod fake_center;
 pub mod harness_part;
 pub mod node_part;
+#[cfg(unix)]
+pub mod provider_part;
 pub mod wire;
 
 use std::fmt;

@@ -44,6 +44,7 @@ open port.
 | [stop.md](stop.md) | Panic, pause, disable, remove |
 | [proxy.md](proxy.md) | Reach the center through an HTTP proxy |
 | [relay.md](relay.md) | Reach the center through another node (a jump node) |
+| [providers.md](providers.md) | Let a program on the machine add capabilities |
 | [web-ui.md](web-ui.md) | The center's web UI |
 | [platforms.md](platforms.md) | What differs on Linux and Windows |
 | [troubleshooting.md](troubleshooting.md) | Messages and what to do |

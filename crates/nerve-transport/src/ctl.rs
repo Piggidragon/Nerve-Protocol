@@ -56,6 +56,52 @@ pub enum Reply {
     Err(String),
     /// Items until the sender is dropped.
     Follow(mpsc::Receiver<Value>),
+    /// A connection the handler keeps (a capability provider's): `{"ok":
+    /// value}` first, then each value of `out` as a line to the client, and
+    /// each line the client sends, a JSON value of at most [`LINE_BYTES`],
+    /// to `inbound`. It ends when the client closes or sends a line that is
+    /// too long or no JSON, or when the handler drops the sender of `out` or
+    /// the receiver of `inbound`; `inbound` is dropped then, which tells
+    /// the handler.
+    Session {
+        ok: Value,
+        out: mpsc::Receiver<Value>,
+        inbound: mpsc::Sender<Value>,
+    },
+}
+
+/// What [`read_line_within`] read.
+enum Line {
+    /// A line, without its line break.
+    Text(String),
+    /// The stream ended before another byte came.
+    End,
+    /// The line passed the limit, or was not UTF-8.
+    Bad,
+}
+
+/// Reads one line of at most `max` bytes, its line break included, into
+/// `buf`, which holds what an earlier call cancelled in a `select!` read of
+/// it already. A last line without a line break counts as a line.
+async fn read_line_within<R: tokio::io::AsyncBufRead + Unpin>(
+    r: &mut R,
+    max: usize,
+    buf: &mut Vec<u8>,
+) -> std::io::Result<Line> {
+    let room = (max + 1).saturating_sub(buf.len()) as u64;
+    (&mut *r).take(room).read_until(b'\n', buf).await?;
+    if buf.len() > max {
+        return Ok(Line::Bad);
+    }
+    // Without a line break and within the limit, the stream ended.
+    if buf.is_empty() {
+        return Ok(Line::End);
+    }
+    let mut text = std::mem::take(buf);
+    if text.last() == Some(&b'\n') {
+        text.pop();
+    }
+    Ok(String::from_utf8(text).map_or(Line::Bad, Line::Text))
 }
 
 /// Error when nothing listens.
@@ -90,22 +136,22 @@ where
     Fut: std::future::Future<Output = Reply>,
 {
     let (r, mut w) = tokio::io::split(stream);
-    let mut lines = BufReader::new(r.take(LINE_BYTES as u64 * 64));
+    let mut lines = BufReader::new(r);
+    let mut buf = Vec::new();
     // One request per connection: every client sends one, and a connection
-    // that stays for more would be a place held.
-    let mut line = String::new();
-    // No request in time, like none at all, ends the connection.
-    match tokio::time::timeout(idle, lines.read_line(&mut line)).await {
-        Ok(read) => {
-            if read? == 0 {
-                return Ok(());
-            }
-        }
+    // that stays for more would be a place held. Only a session (a
+    // provider's) stays, and only after the handler took it.
+    // No request in time, like none at all, ends the connection; so does
+    // one that is too long.
+    let line = match tokio::time::timeout(idle, read_line_within(&mut lines, LINE_BYTES, &mut buf))
+        .await
+    {
+        Ok(read) => match read? {
+            Line::Text(t) => t,
+            Line::End | Line::Bad => return Ok(()),
+        },
         Err(_) => return Ok(()),
-    }
-    if line.len() > LINE_BYTES {
-        return Ok(());
-    }
+    };
     let reply = match serde_json::from_str::<CtlRequest>(&line) {
         Ok(req) => handler(req, peer).await,
         Err(e) => Reply::Err(format!("bad request: {e}")),
@@ -116,6 +162,44 @@ where
         Reply::Follow(mut rx) => {
             while let Some(item) = rx.recv().await {
                 write_line(&mut w, &json!({"item": item})).await?;
+            }
+        }
+        Reply::Session {
+            ok,
+            mut out,
+            inbound,
+        } => {
+            write_line(&mut w, &json!({"ok": ok})).await?;
+            // Each direction runs on its own: a write that waits for the
+            // client to read must not stop the reading. A client that answers
+            // one line before it reads the next would else wait on the node
+            // writing while the node waits on it, for good, as soon as a
+            // line in each direction fills the socket's buffer.
+            let reading = async {
+                loop {
+                    let Line::Text(text) =
+                        read_line_within(&mut lines, LINE_BYTES, &mut buf).await?
+                    else {
+                        return Ok(());
+                    };
+                    let Ok(v) = serde_json::from_str::<Value>(&text) else {
+                        return Ok(());
+                    };
+                    if inbound.send(v).await.is_err() {
+                        return Ok::<(), std::io::Error>(());
+                    }
+                }
+            };
+            let writing = async {
+                while let Some(v) = out.recv().await {
+                    write_line(&mut w, &v).await?;
+                }
+                Ok::<(), std::io::Error>(())
+            };
+            // Whichever ends first ends the session.
+            tokio::select! {
+                r = reading => r?,
+                r = writing => r?,
             }
         }
     }
@@ -498,6 +582,57 @@ mod unix {
         use super::*;
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::sync::mpsc;
+
+        /// A session on a real socket does not wedge when the node writes a
+        /// line larger than the socket's buffer while the client writes one
+        /// too: a client that answers each line before it reads the next
+        /// still gets every line, and the node every answer.
+        #[tokio::test]
+        async fn a_session_reads_while_it_writes_a_large_line() {
+            let (client, server) = UnixStream::pair().unwrap();
+            let (ends_tx, mut ends_rx) = mpsc::channel(1);
+            let handler = Arc::new(move |_: CtlRequest, _: ()| {
+                let ends_tx = ends_tx.clone();
+                async move {
+                    let (out_tx, out) = mpsc::channel(4);
+                    let (inbound, in_rx) = mpsc::channel(4);
+                    let _ = ends_tx.send((out_tx, in_rx)).await;
+                    Reply::Session {
+                        ok: json!({}),
+                        out,
+                        inbound,
+                    }
+                }
+            });
+            let task = tokio::spawn(crate::ctl::serve_stream(server, (), handler));
+            let (r, mut w) = client.into_split();
+            let mut lines = BufReader::new(r).lines();
+            w.write_all(b"{\"method\": \"hello\"}\n").await.unwrap();
+            let (out_tx, mut in_rx) = ends_rx.recv().await.unwrap();
+            assert!(lines.next_line().await.unwrap().is_some());
+            let big = "x".repeat(300 * 1024);
+            for i in 0..2 {
+                out_tx.send(json!({"call": i, "pad": big})).await.unwrap();
+            }
+            let wedge = std::time::Duration::from_secs(20);
+            tokio::time::timeout(wedge, async {
+                for i in 0..2 {
+                    let line = lines.next_line().await.unwrap().unwrap();
+                    let v: Value = serde_json::from_str(&line).unwrap();
+                    assert_eq!(v["call"], i);
+                    let answer = json!({"answer": i, "pad": big});
+                    w.write_all(format!("{answer}\n").as_bytes()).await.unwrap();
+                }
+                for i in 0..2 {
+                    assert_eq!(in_rx.recv().await.unwrap()["answer"], i);
+                }
+            })
+            .await
+            .expect("the session wedged");
+            drop(w);
+            drop(lines);
+            task.await.unwrap().unwrap();
+        }
 
         #[tokio::test]
         async fn calls_and_follows() {
@@ -1025,6 +1160,85 @@ mod tests {
         .expect("the connection ends")
         .unwrap();
         assert_eq!(got, "");
+        task.await.unwrap().unwrap();
+    }
+
+    /// A session stays after its answer: lines go both ways until the
+    /// client closes, which the handler learns from `inbound`; a line that
+    /// is too long or no JSON ends it, and so does the handler dropping its
+    /// sender.
+    #[tokio::test]
+    async fn a_session_carries_lines_both_ways_until_one_side_ends_it() {
+        use tokio::io::AsyncBufReadExt;
+        type Ends = (mpsc::Sender<Value>, mpsc::Receiver<Value>);
+        let (ends_tx, mut ends_rx) = mpsc::channel::<Ends>(4);
+        let handler = Arc::new(move |req: CtlRequest, _: ()| {
+            let ends_tx = ends_tx.clone();
+            async move {
+                let (out_tx, out) = mpsc::channel(4);
+                let (inbound, in_rx) = mpsc::channel(4);
+                let _ = ends_tx.send((out_tx, in_rx)).await;
+                Reply::Session {
+                    ok: json!({"took": req.method}),
+                    out,
+                    inbound,
+                }
+            }
+        });
+        let start = |handler| {
+            let (client, server) = tokio::io::duplex(4 * 1024 * 1024);
+            let task = tokio::spawn(serve_stream(server, (), handler));
+            (client, task)
+        };
+        let (client, task) = start(handler.clone());
+        let (r, mut w) = tokio::io::split(client);
+        let mut lines = BufReader::new(r).lines();
+        w.write_all(b"{\"method\": \"hello\"}\n").await.unwrap();
+        let (out_tx, mut in_rx) = ends_rx.recv().await.unwrap();
+        let first = lines.next_line().await.unwrap().unwrap();
+        assert_eq!(answer(&first).unwrap(), json!({"took": "hello"}));
+        for i in 0..100 {
+            w.write_all(format!("{{\"n\": {i}}}\n").as_bytes())
+                .await
+                .unwrap();
+            assert_eq!(in_rx.recv().await.unwrap(), json!({"n": i}));
+            out_tx.send(json!({"back": i})).await.unwrap();
+            let line = lines.next_line().await.unwrap().unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(&line).unwrap(),
+                json!({"back": i})
+            );
+        }
+        // The client goes: the handler hears it.
+        drop(w);
+        drop(lines);
+        assert_eq!(in_rx.recv().await, None);
+        task.await.unwrap().unwrap();
+        drop(out_tx);
+
+        // A line too long, or one that is no JSON, ends it.
+        for bad in ["x".repeat(LINE_BYTES + 1), "not json".to_string()] {
+            let (mut client, task) = start(handler.clone());
+            client
+                .write_all(b"{\"method\": \"hello\"}\n")
+                .await
+                .unwrap();
+            let (_out_tx, mut in_rx) = ends_rx.recv().await.unwrap();
+            client.write_all(bad.as_bytes()).await.unwrap();
+            client.write_all(b"\n{\"n\": 1}\n").await.unwrap();
+            assert_eq!(in_rx.recv().await, None);
+            task.await.unwrap().unwrap();
+        }
+
+        // The handler drops its sender: the client sees the end.
+        let (client, task) = start(handler);
+        let (r, mut w) = tokio::io::split(client);
+        let mut lines = BufReader::new(r).lines();
+        w.write_all(b"{\"method\": \"hello\"}\n").await.unwrap();
+        let (out_tx, _in_rx) = ends_rx.recv().await.unwrap();
+        assert!(lines.next_line().await.unwrap().is_some());
+        drop(out_tx);
+        assert_eq!(lines.next_line().await.unwrap(), None);
         task.await.unwrap().unwrap();
     }
 }

@@ -81,6 +81,12 @@ call's target: the whole command line, the resolved path, or `<cap>.<action>`.
 `folder` and `user` mode give full access in their area, and deny rules narrow
 it. Allow rules are not looked at there.
 
+An action that names no path and no command, which is what a [capability
+provider](spec/node-local.md#7-capability-providers) adds, lies in no folder:
+`folder` mode allows it only where the owner set it `on`. `user` mode allows
+it as it allows the node's own actions, and `allowlist` mode by an allow rule
+on `<cap>.<action>`.
+
 ## Protected paths
 
 Protected paths apply to the file actions and to a command's working directory,

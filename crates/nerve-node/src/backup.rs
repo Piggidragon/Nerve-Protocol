@@ -391,9 +391,10 @@ fn names(cfg: &NodeConfig) -> String {
         .join(", ")
 }
 
-/// How one key written by a restore is put back when a later one fails.
+/// How one key written or deleted by a restore is put back when a later one
+/// fails: the key, the place it was in, and what it held there.
 enum Undo<'a> {
-    Key(Key<'a>, Option<String>),
+    Key(Key<'a>, SecretStorage, Option<String>),
     Headers(Option<String>),
 }
 
@@ -480,14 +481,14 @@ pub fn restore(paths: &NodePaths, b: &Parsed, opts: &RestoreOpts) -> Result<Rest
     let key = match write_keys(paths, to, &cfg, old, b, &mut undo, &mut report) {
         Ok(k) => k,
         Err(e) => {
-            roll_back(paths, to, undo);
+            roll_back(paths, undo);
             return Err(format!("{e}; nothing was restored"));
         }
     };
     let written =
         nerve_transport::files::write_private(&paths.config_file(), sealed(&key, &cfg).as_bytes());
     if let Err(e) = written {
-        roll_back(paths, to, undo);
+        roll_back(paths, undo);
         return Err(format!(
             "cannot write {}: {e}; nothing was restored",
             paths.config_file().display()
@@ -554,7 +555,7 @@ fn write_keys<'a>(
         }
         None => {
             let (mac, text) = MacKey::generate();
-            undo.push(Undo::Key(Key::Config, None));
+            undo.push(Undo::Key(Key::Config, to, None));
             secrets::put(paths, to, Key::Config, &text)?;
             mac
         }
@@ -565,7 +566,7 @@ fn write_keys<'a>(
         if prev.as_deref() == Some(text) {
             return Ok(());
         }
-        undo.push(Undo::Key(key, prev));
+        undo.push(Undo::Key(key, to, prev));
         secrets::put(paths, to, key, text)
     };
     // What is here already for `key`: in `to`, else in the other place. A
@@ -636,31 +637,81 @@ fn write_keys<'a>(
                     .filter(|t| !t.is_empty())
                     .map(|t| (place, t))
             });
-            match carried {
-                Some((place, text)) if place != to => put(Key::ProxyLogin, &text)?,
-                Some(_) => {}
-                None => match secrets::get(paths, to, Key::ProxyLogin)? {
-                    // One that is here is for another proxy, or for none
-                    // this restore knows: it goes, so that it is never sent.
-                    Some(prev) => {
-                        undo.push(Undo::Key(Key::ProxyLogin, Some(prev)));
-                        secrets::delete(paths, to, Key::ProxyLogin)?;
-                        report.notes.push(
-                            "the proxy's password here is not for the proxy and user that the restored config names, so it was deleted: run `nerve-node proxy set` again".into(),
-                        );
+            let key = Key::ProxyLogin;
+            let other = secrets::other(to);
+            // Whatever is not carried into `to` is deleted, in both places:
+            // the node reads the file when the keyring holds none, and a
+            // move of the keys copies what it finds in the other place. One
+            // that is left would be sent to a proxy it was not made for.
+            let mut gone = false;
+            match &carried {
+                Some((place, text)) => {
+                    if *place != to {
+                        put(key, text)?;
                     }
-                    None => report.notes.push(
-                        "the proxy's password is not in the backup and not here: run `nerve-node proxy set` again".into(),
-                    ),
-                },
+                }
+                None => {
+                    if let Some(prev) = secrets::get(paths, to, key)? {
+                        undo.push(Undo::Key(key, to, Some(prev)));
+                        secrets::delete(paths, to, key)?;
+                        gone = true;
+                    }
+                }
+            }
+            // A keyring that does not answer holds no copy to read.
+            if let Some(prev) = secrets::get(paths, other, key).ok().flatten() {
+                undo.push(Undo::Key(key, other, Some(prev)));
+                secrets::delete(paths, other, key)?;
+                gone = true;
+            }
+            if carried.is_none() {
+                report.notes.push(if gone {
+                    "the proxy's password here is not for the proxy and user that the restored config names, so it was deleted: run `nerve-node proxy set` again".into()
+                } else {
+                    "the proxy's password is not in the backup and not here: run `nerve-node proxy set` again".into()
+                });
             }
         }
         (None, None) => {}
     }
     if b.proxy_headers.is_none() && !cfg.connection.headers.is_empty() {
-        report.notes.push(
-            "the proxy's header values were left out of the backup (they are in the keyring); if this machine's keyring lacks them too, run `nerve-node proxy set` again".into(),
-        );
+        // The values are credentials that nothing in them ties to a proxy,
+        // and the node sends them by header name to whichever proxy the
+        // config names. They stay only where the replaced config named the
+        // same proxy, pin and header names; others are deleted.
+        let names = |c: &NodeConfig| {
+            let mut v = c.connection.headers.clone();
+            v.sort();
+            v
+        };
+        let same = old.is_some_and(|o| {
+            o.connection.proxy == cfg.connection.proxy
+                && o.connection.pin == cfg.connection.pin
+                && names(o) == names(cfg)
+        });
+        // A keyring that does not answer holds no values.
+        let here = secrets::store::get(Entry::proxy(paths).account())
+            .ok()
+            .flatten();
+        let complete = |t: &str| {
+            header_map(t).is_some_and(|m| cfg.connection.headers.iter().all(|n| m.contains_key(n)))
+        };
+        match here {
+            Some(t) if same && complete(&t) => {}
+            Some(t) if !same => {
+                undo.push(Undo::Headers(Some(t)));
+                secrets::remove_proxy_headers(paths)?;
+                report.notes.push(
+                    "the proxy's header values here are not for the proxy and header names that the restored config names, so they were deleted: run `nerve-node proxy set` again".into(),
+                );
+            }
+            Some(_) => report.notes.push(
+                "the proxy's header values were left out of the backup (they are in the keyring), and the ones here lack a value the restored config names: run `nerve-node proxy set` again".into(),
+            ),
+            None => report.notes.push(
+                "the proxy's header values were left out of the backup (they are in the keyring); if this machine's keyring lacks them too, run `nerve-node proxy set` again".into(),
+            ),
+        }
     }
     if let Some(map) = &b.proxy_headers {
         let account = Entry::proxy(paths);
@@ -676,14 +727,14 @@ fn write_keys<'a>(
 
 /// Puts back what the keys held before, last first. A key that cannot be put
 /// back is left; the message of the restore already says it failed.
-fn roll_back(paths: &NodePaths, to: SecretStorage, undo: Vec<Undo>) {
+fn roll_back(paths: &NodePaths, undo: Vec<Undo>) {
     for u in undo.into_iter().rev() {
         match u {
-            Undo::Key(key, Some(text)) => {
-                let _ = secrets::put(paths, to, key, &text);
+            Undo::Key(key, place, Some(text)) => {
+                let _ = secrets::put(paths, place, key, &text);
             }
-            Undo::Key(key, None) => {
-                let _ = secrets::delete(paths, to, key);
+            Undo::Key(key, place, None) => {
+                let _ = secrets::delete(paths, place, key);
             }
             Undo::Headers(Some(text)) => {
                 let _ = secrets::store::set(Entry::proxy(paths).account(), &text);
@@ -1538,6 +1589,224 @@ mod tests {
         );
         assert!(
             secrets::get(&to, SecretStorage::Keyring, Key::ProxyLogin)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_proxy_password_in_the_other_place_is_deleted_too() {
+        let pin = nerve_transport::tls::ServerIdentity::generate(&["relay.example".into()])
+            .unwrap()
+            .pin();
+        let (_a, n) = node();
+        paired(&n, SecretStorage::Keyring, &["home"]);
+        drop(with_proxy(&n, "relay-a.example", "node-a", "a-token", &pin));
+        let (_f, parsed, _) = roundtrip(&n, false);
+
+        // The node moved its keys into files and to relay B, and its
+        // node.toml was edited by hand since: the restore wants --replace.
+        let mut s = open_store(&n);
+        s.update(|c| {
+            c.machine.secret_storage = SecretStorage::File;
+            Ok(())
+        })
+        .unwrap();
+        secrets::store_proxy_login(&n, SecretStorage::File, "b-token").unwrap();
+        s.update(|c| {
+            c.connection.proxy = Some("https://relay-b.example:7490".into());
+            c.connection.login = Some("node-b".into());
+            Ok(())
+        })
+        .unwrap();
+        drop(s);
+        let mut text = std::fs::read_to_string(n.config_file()).unwrap();
+        text.push_str("# edited\n");
+        std::fs::write(n.config_file(), text).unwrap();
+        let err = restore(&n, &parsed, &RestoreOpts::default()).err().unwrap();
+        assert!(err.contains("--replace"), "{err}");
+        let r = restore(
+            &n,
+            &parsed,
+            &RestoreOpts {
+                replace: true,
+                ..RestoreOpts::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("proxy's password") && n.contains("deleted")),
+            "{r:?}"
+        );
+        // Relay B's token is nowhere the node reads it: not in the file it
+        // falls back to, and not in what a start copies into the keyring.
+        assert!(!n.proxy_login_file().exists());
+        assert!(secrets::proxy_login(&n, SecretStorage::Keyring).is_err());
+        secrets::settle(&n, &config(&n));
+        assert!(
+            secrets::get(&n, SecretStorage::Keyring, Key::ProxyLogin)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(config(&n).connection.login.as_deref(), Some("node-a"));
+
+        // The same on a machine with no config and a password left in a
+        // file, where the keys go into the keyring.
+        let (_b, to) = node();
+        secrets::store_proxy_login(&to, SecretStorage::File, "stray").unwrap();
+        let r = restore_into(&to, &parsed, None);
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("proxy's password") && n.contains("deleted")),
+            "{r:?}"
+        );
+        assert!(!to.proxy_login_file().exists());
+        assert!(secrets::proxy_login(&to, SecretStorage::Keyring).is_err());
+
+        // And the other way: the keys go into files, and the keyring holds
+        // a password that a move of the keys could take over.
+        let (_c, to) = node();
+        secrets::store_proxy_login(&to, SecretStorage::Keyring, "stray").unwrap();
+        let r = restore_into(&to, &parsed, Some(SecretStorage::File));
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("proxy's password") && n.contains("deleted")),
+            "{r:?}"
+        );
+        assert!(
+            secrets::get(&to, SecretStorage::Keyring, Key::ProxyLogin)
+                .unwrap()
+                .is_none()
+        );
+        assert!(secrets::proxy_login(&to, SecretStorage::File).is_err());
+    }
+
+    #[test]
+    fn the_password_that_stays_leaves_no_copy_in_the_other_place() {
+        let pin = nerve_transport::tls::ServerIdentity::generate(&["relay.example".into()])
+            .unwrap()
+            .pin();
+        let (_a, n) = node();
+        paired(&n, SecretStorage::Keyring, &["home"]);
+        drop(with_proxy(&n, "relay-a.example", "node-a", "a-token", &pin));
+        let (_f, parsed, _) = roundtrip(&n, false);
+        // A copy in a file, left from a move that did not finish.
+        secrets::store_proxy_login(&n, SecretStorage::File, "old-copy").unwrap();
+        let r = restore_into(&n, &parsed, None);
+        assert!(r.notes.is_empty(), "{r:?}");
+        assert_eq!(
+            secrets::proxy_login(&n, SecretStorage::Keyring).unwrap(),
+            "a-token"
+        );
+        assert!(!n.proxy_login_file().exists());
+    }
+
+    #[test]
+    fn proxy_header_values_stay_only_for_the_proxy_and_header_names_they_belonged_to() {
+        let (_a, n) = node();
+        paired(&n, SecretStorage::File, &["home"]);
+        let set = |proxy: &str, names: &[&str]| {
+            let mut s = open_store(&n);
+            let (proxy, names) = (
+                proxy.to_string(),
+                names.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+            );
+            s.update(|c| {
+                c.connection.proxy = Some(proxy.clone());
+                c.connection.headers = names.clone();
+                Ok(())
+            })
+            .unwrap();
+        };
+        let values = |pairs: &[(&str, &str)]| {
+            let pairs: Vec<(String, String)> = pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            secrets::store_proxy_headers(&n, &pairs).unwrap();
+        };
+        values(&[("Proxy-Authorization", "Basic A")]);
+        set("http://proxy-a.example:3128", &["Proxy-Authorization"]);
+        let (_f, parsed, report) = roundtrip(&n, false);
+        assert!(
+            report.left_out.iter().any(|l| l.contains("header values")),
+            "{report:?}"
+        );
+
+        // The same proxy and header names: the values stay, and nothing is said.
+        let r = restore_into(&n, &parsed, None);
+        assert!(r.notes.is_empty(), "{r:?}");
+        let got = secrets::proxy_headers(&n, &["Proxy-Authorization".into()]).unwrap();
+        assert_eq!(
+            got,
+            [("Proxy-Authorization".to_string(), "Basic A".to_string())]
+        );
+
+        // The node moved to proxy B since; B's credential must not go to A.
+        values(&[("Proxy-Authorization", "Basic B")]);
+        set("http://proxy-b.example:3128", &["Proxy-Authorization"]);
+        let r = restore_into(&n, &parsed, None);
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("header values") && n.contains("deleted")),
+            "{r:?}"
+        );
+        assert_eq!(
+            config(&n).connection.proxy.as_deref(),
+            Some("http://proxy-a.example:3128")
+        );
+        assert!(secrets::proxy_headers(&n, &["Proxy-Authorization".into()]).is_err());
+        assert!(
+            secrets::store::get(Entry::proxy(&n).account())
+                .unwrap()
+                .is_none()
+        );
+
+        // The same proxy with other header names is other values.
+        values(&[("X-Token", "t")]);
+        set("http://proxy-a.example:3128", &["X-Token"]);
+        let r = restore_into(&n, &parsed, None);
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("header values") && n.contains("deleted")),
+            "{r:?}"
+        );
+        assert!(
+            secrets::store::get(Entry::proxy(&n).account())
+                .unwrap()
+                .is_none()
+        );
+
+        // Values that lack one of the names: kept as they are, and said.
+        values(&[("X-Other", "t")]);
+        set("http://proxy-a.example:3128", &["Proxy-Authorization"]);
+        let r = restore_into(&n, &parsed, None);
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("header values") && n.contains("lack a value")),
+            "{r:?}"
+        );
+
+        // A machine with no config of its own and a stray entry.
+        let (_b, to) = node();
+        secrets::store_proxy_headers(&to, &[("Proxy-Authorization".into(), "Basic X".into())])
+            .unwrap();
+        let r = restore_into(&to, &parsed, None);
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("header values") && n.contains("deleted")),
+            "{r:?}"
+        );
+        assert!(
+            secrets::store::get(Entry::proxy(&to).account())
                 .unwrap()
                 .is_none()
         );

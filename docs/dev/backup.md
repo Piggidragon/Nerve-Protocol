@@ -121,11 +121,27 @@ A key the backup lacks (a node key, the relay's TLS key) is looked for in
 place, before step 9 empties that place. Otherwise it is listed or noted, and
 the owner pairs again or runs `relay set`.
 
-The proxy's password has nothing to check it against, so it is taken only
-from the replaced config's own place, and only when that config names the same
-`connection.proxy`, `connection.pin` and `connection.login` as the restored
-one. Any other password in `to` is deleted (with an undo entry) and noted: it
-would be sent as `Proxy-Authorization` to a proxy it was not made for.
+The proxy's password and the proxy's header values are credentials that
+nothing in them ties to a proxy, and the node sends them to whichever proxy the
+config names. A backup that lacks them (no `--include-keyring`) therefore does
+not keep what is here unless the replaced config (`Target::Node`) vouches for
+it:
+
+- The password is taken from the replaced config's own place, and only when
+  that config names the same `connection.proxy`, `connection.pin` and
+  `connection.login` as the restored one. Every other copy, in `to` and in the
+  other place, is deleted, with an undo entry that remembers the place: the
+  node reads the file when the keyring holds none, and a move of the keys
+  copies what it finds in the other place, so a copy left there would still be
+  sent.
+- The header values (the keyring entry `Entry::proxy`, whatever
+  `machine.secret_storage` says) stay when the replaced config names the same
+  proxy, pin and header names (as a set) and the entry holds a value for each
+  name. Another entry is deleted (`Undo::Headers`). One that lacks a value is
+  left and noted.
+
+A replaced config that could not be read, or none, vouches for nothing. Each
+case adds a note that says to run `proxy set` again.
 
 ## Center
 

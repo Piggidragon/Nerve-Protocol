@@ -38,6 +38,7 @@ names its reason.
 | `unavailable` | The machine is offline | Check the link, below |
 | `connection_lost` | The link dropped during the call | Run it again |
 | `busy` | Too many commands or calls at once (`limits.max_running`, 16 by default) | Wait, or raise the limit |
+| `timeout`: `the command ran past …` | The command ran longer than its `timeout_ms`, than the node's default (10 minutes, when the call gave none), or than the node's maximum (1 hour). It was killed. The message says which | Give a larger `timeout_ms`. Above the maximum, you raise `limits.max_timeout_secs` ([how long a command may run](config.md#how-long-a-command-may-run)) |
 
 The agent sees only the tools a machine could allow. If it sees only `nodes`,
 nothing is allowed yet.

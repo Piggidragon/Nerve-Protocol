@@ -400,6 +400,12 @@ concurrently.
 
 - `command` is a string run by the node's shell. `call` is the `invoke` id of a
   running `run`.
+- `timeout_ms` is the longest the command may run; 0 is the same as none.
+  A node ends every command: one without `timeout_ms` gets the node's
+  default, one with a larger value gets the node's maximum, and past its limit
+  the command is killed and the call fails with `timeout`. Both numbers are
+  the owner's (`limits` of `node.toml`, node-local §2). The action's text
+  in the descriptor states them.
 - state: `{shell, confinement}`; event `exit {call, exit_code}` (needs `sub`).
 - Output is capped at `limits.output_cap_bytes` of the node's config;
   `truncated` says it was cut. Output comes in the result; the

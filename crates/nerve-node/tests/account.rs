@@ -38,6 +38,7 @@ fn opts(policy: &CenterPolicy, account: &Account, own: &[PathBuf]) -> RunOptions
         container: None,
         exe: env!("CARGO_BIN_EXE_nerve-node").into(),
         output_cap: 64 * 1024,
+        timeouts: Default::default(),
         sudo: None,
         account: Some(account.clone()),
         own: own.to_vec(),

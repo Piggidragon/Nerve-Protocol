@@ -4328,6 +4328,34 @@ mod tests {
         assert_eq!(load(&paths).limits.max_running, 16);
     }
 
+    /// The owner sets the run-time limits by name; a limit of 0 is refused
+    /// and changes nothing, and unsetting one gives the default back.
+    #[test]
+    fn config_sets_the_run_time_limits() {
+        let (_d, paths) = setup(&["home"]);
+        assert_eq!(load(&paths).limits.default_timeout_secs, 600);
+        assert_eq!(load(&paths).limits.max_timeout_secs, 3600);
+        run(
+            &paths,
+            &["config", "set", "limits.default_timeout_secs", "30"],
+        )
+        .unwrap();
+        run(&paths, &["config", "set", "limits.max_timeout_secs", "90"]).unwrap();
+        assert_eq!(load(&paths).limits.default_timeout_secs, 30);
+        assert_eq!(load(&paths).limits.max_timeout_secs, 90);
+        assert_eq!(
+            run(&paths, &["config", "get", "limits.max_timeout_secs"]).unwrap(),
+            "90\n"
+        );
+        for key in ["default_timeout_secs", "max_timeout_secs"] {
+            let e = run(&paths, &["config", "set", &format!("limits.{key}"), "0"]).unwrap_err();
+            assert!(e.contains("must be at least 1"), "{e}");
+        }
+        assert_eq!(load(&paths).limits.max_timeout_secs, 90);
+        run(&paths, &["config", "unset", "limits.max_timeout_secs"]).unwrap();
+        assert_eq!(load(&paths).limits.max_timeout_secs, 3600);
+    }
+
     /// install, update and uninstall work on the installed node only, so
     /// they take no folders; none says it is not done.
     #[test]

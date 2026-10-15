@@ -38,7 +38,9 @@ Only you can resume it.
 ## What ends a command
 
 A command stops when its call ends: on its timeout, when the caller cancels,
-when its session ends, or when the link drops. On Linux the node kills the
+when its session ends, or when the link drops. Every command has a timeout:
+its `timeout_ms`, or the node's default, and never more than the node's maximum
+([how long a command may run](config.md#how-long-a-command-may-run)). On Linux the node kills the
 command's whole process group. On Windows it ends the command's Job Object.
 
 On Windows a timeout, and `exec_signal` with `term` or `int`, first ask the

@@ -58,6 +58,7 @@ fn opts() -> RunOptions {
         container: None,
         exe: env!("CARGO_BIN_EXE_nerve-node").into(),
         output_cap: 64 * 1024,
+        timeouts: Default::default(),
         sudo: None,
         account: None,
         own: Vec::new(),

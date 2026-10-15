@@ -44,6 +44,8 @@ struct RunArgs {
 pub struct RunCall {
     pub command: String,
     pub cwd: PathBuf,
+    /// What the call asked for; `None` when it gave no `timeout_ms` (0 counts
+    /// as none). [`Timeouts`] turns it into the limit the command runs under.
     pub timeout: Option<Duration>,
 }
 
@@ -80,6 +82,81 @@ impl RunCall {
             path: self.cwd.clone(),
             write: false,
         }]
+    }
+}
+
+/// How long a command may run, from the owner's `limits`: a call that gives
+/// no `timeout_ms` gets `default`, and no call gets more than `max`. So no
+/// command runs without an end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timeouts {
+    pub default: Duration,
+    pub max: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Timeouts {
+        Timeouts::from_limits(&nerve_policy::config::Limits::default())
+    }
+}
+
+impl Timeouts {
+    pub fn from_limits(l: &nerve_policy::config::Limits) -> Timeouts {
+        Timeouts {
+            default: Duration::from_secs(l.default_timeout_secs),
+            max: Duration::from_secs(l.max_timeout_secs),
+        }
+    }
+
+    /// The limit of a call that asked for `asked`. The default is cut to the
+    /// maximum like a `timeout_ms` is, so an owner who lowers the maximum
+    /// below the default needs no second change.
+    pub fn limit(&self, asked: Option<Duration>) -> RunLimit {
+        let wanted = asked.unwrap_or(self.default);
+        RunLimit {
+            after: wanted.min(self.max),
+            asked,
+            capped: wanted > self.max,
+            max: self.max,
+        }
+    }
+}
+
+/// The time one command has, and what it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunLimit {
+    pub after: Duration,
+    asked: Option<Duration>,
+    /// What was wanted was more than the maximum.
+    capped: bool,
+    max: Duration,
+}
+
+impl RunLimit {
+    /// The error of a command that ran past it. It says which limit that was,
+    /// so the model knows whether a larger `timeout_ms` helps.
+    pub fn timed_out(&self) -> RpcError {
+        let after = nerve_transport::log::span(self.after);
+        let text = match (self.asked, self.capped) {
+            (Some(_), false) => {
+                format!("the command ran past timeout_ms ({after}) and was killed")
+            }
+            (Some(asked), true) => format!(
+                "the command ran past the node's maximum of {after} and was killed: timeout_ms asked for {}, which the owner's limits.max_timeout_secs cuts",
+                nerve_transport::log::span(asked)
+            ),
+            (None, false) if self.max > self.after => format!(
+                "the command ran past the default limit of {after} and was killed: no timeout_ms was given (up to {} is allowed)",
+                nerve_transport::log::span(self.max)
+            ),
+            (None, false) => format!(
+                "the command ran past the node's limit of {after} and was killed: no timeout_ms was given"
+            ),
+            (None, true) => format!(
+                "the command ran past the node's maximum of {after} and was killed: no timeout_ms was given, and the owner's limits.max_timeout_secs is below the default"
+            ),
+        };
+        RpcError::new(ErrorCode::Timeout, text)
     }
 }
 
@@ -229,6 +306,17 @@ pub fn shell_summary(shell: Option<&str>) -> String {
     } else {
         format!("Runs a command with {line}.")
     }
+}
+
+/// What the `exec.run` action says about the time a command has, so a model
+/// knows what it gets without `timeout_ms` and what it cannot get.
+pub fn timeout_summary(t: &Timeouts) -> String {
+    use nerve_transport::log::span;
+    format!(
+        "A command is killed after timeout_ms, after {} when you give none, and never runs longer than {}.",
+        span(t.limit(None).after),
+        span(t.max)
+    )
 }
 
 /// Command output as text. UTF-8 is taken as it is, also when the cap cut
@@ -963,6 +1051,8 @@ pub struct RunOptions {
     /// The `nerve-node` binary that hosts the shim.
     pub exe: PathBuf,
     pub output_cap: usize,
+    /// The time a command has when its call gives none, and the most it gets.
+    pub timeouts: Timeouts,
     /// Set only for a `sudo` command the sudo allow list names (already rewritten with
     /// [`sudo_line`]): the password goes to sudo's stdin once sudo shows the
     /// prompt. Every other command runs with no_new_privs (Linux), so a
@@ -1546,6 +1636,7 @@ pub async fn run(
     let stdout = child.stdout.take().expect("piped");
     let stderr = child.stderr.take().expect("piped");
     let cap = opts.output_cap.min(OUTPUT_HARD_CAP);
+    let limit = opts.timeouts.limit(call.timeout);
     let err = async {
         match sudo_stdin {
             Some((stdin, sudo)) => sudo_stderr(stderr, stdin, sudo, pid, cap).await,
@@ -1557,28 +1648,19 @@ pub async fn run(
         (o, e, st)
     };
     tokio::pin!(work);
-    let (out, err, status, timed_out) = match call.timeout {
-        Some(t) => match tokio::time::timeout(t, &mut work).await {
-            Ok((o, e, s)) => (o, e, Some(s), false),
-            Err(_) => {
-                #[cfg(windows)]
-                if let Some(e) = &group.0 {
-                    e.grace(&mut work).await;
-                }
-                ((Vec::new(), false), (Vec::new(), false), None, true)
+    let (out, err, status, timed_out) = match tokio::time::timeout(limit.after, &mut work).await {
+        Ok((o, e, s)) => (o, e, Some(s), false),
+        Err(_) => {
+            #[cfg(windows)]
+            if let Some(e) = &group.0 {
+                e.grace(&mut work).await;
             }
-        },
-        None => {
-            let (o, e, s) = work.await;
-            (o, e, Some(s), false)
+            ((Vec::new(), false), (Vec::new(), false), None, true)
         }
     };
     drop(group);
     if timed_out {
-        return Err(RpcError::new(
-            ErrorCode::Timeout,
-            "the command ran past timeout_ms and was killed",
-        ));
+        return Err(limit.timed_out());
     }
     let status = status
         .expect("set unless timed out")
@@ -1697,6 +1779,7 @@ async fn run_as(
         .map_err(|e| RpcError::internal(format!("waiting for the command: {e}")))?;
     let crate::win_user::Spawned { stdout, stderr, .. } = child;
     let cap = opts.output_cap.min(OUTPUT_HARD_CAP);
+    let limit = opts.timeouts.limit(call.timeout);
     let work = async {
         tokio::join!(
             capped(tokio::fs::File::from_std(stdout), cap),
@@ -1710,21 +1793,15 @@ async fn run_as(
         )
     };
     tokio::pin!(work);
-    let (out, err, code) = match call.timeout {
-        Some(t) => match tokio::time::timeout(t, &mut work).await {
-            Ok(r) => r,
-            Err(_) => {
-                if let Some(e) = &group.0 {
-                    e.grace(&mut work).await;
-                }
-                drop(group);
-                return Err(RpcError::new(
-                    ErrorCode::Timeout,
-                    "the command ran past timeout_ms and was killed",
-                ));
+    let (out, err, code) = match tokio::time::timeout(limit.after, &mut work).await {
+        Ok(r) => r,
+        Err(_) => {
+            if let Some(e) = &group.0 {
+                e.grace(&mut work).await;
             }
-        },
-        None => work.await,
+            drop(group);
+            return Err(limit.timed_out());
+        }
     };
     drop(group);
     let code = code.map_err(|e| RpcError::internal(format!("waiting for the command: {e}")))?;
@@ -1811,6 +1888,7 @@ mod tests {
             container: None,
             exe: PathBuf::from("/nonexistent"),
             output_cap: cap,
+            timeouts: Timeouts::default(),
             sudo: None,
             account: None,
             own: Vec::new(),
@@ -2049,6 +2127,62 @@ mod tests {
         // SAFETY: signal 0 only checks whether the group exists.
         let alive = unsafe { libc::kill(-(pid as libc::pid_t), 0) } == 0;
         assert!(!alive, "the process group outlived the call");
+    }
+
+    /// A guard so a command that is not ended fails the test and does not
+    /// hang it.
+    async fn within_a_few_seconds(
+        call: &RunCall,
+        opts: &RunOptions,
+    ) -> (Result<Value, RpcError>, Duration) {
+        let started = std::time::Instant::now();
+        let r = tokio::time::timeout(Duration::from_secs(20), run(call, opts, |_| {}))
+            .await
+            .expect("the command was not ended");
+        (r, started.elapsed())
+    }
+
+    /// A call without `timeout_ms` is ended at the default.
+    #[tokio::test]
+    async fn a_call_without_timeout_ms_ends_at_the_default() {
+        let mut o = opts(1024);
+        o.timeouts = Timeouts {
+            default: Duration::from_millis(300),
+            max: Duration::from_secs(10),
+        };
+        let mut c = call("sleep 30");
+        c.timeout = None;
+        let (r, took) = within_a_few_seconds(&c, &o).await;
+        let e = r.unwrap_err();
+        assert_eq!(e.kind(), ErrorCode::Timeout);
+        assert!(e.message.contains("default limit"), "{}", e.message);
+        assert!(took >= Duration::from_millis(300), "{took:?}");
+        // One that ends before the default is left alone.
+        c.command = "echo done".into();
+        let (r, _) = within_a_few_seconds(&c, &o).await;
+        assert_eq!(r.unwrap()["stdout"], "done\n");
+    }
+
+    /// A `timeout_ms` above the maximum is cut to it, and one below it is kept.
+    #[tokio::test]
+    async fn a_larger_timeout_ms_is_cut_to_the_maximum() {
+        let mut o = opts(1024);
+        o.timeouts = Timeouts {
+            default: Duration::from_secs(10),
+            max: Duration::from_millis(400),
+        };
+        let mut c = call("sleep 30");
+        c.timeout = Some(Duration::from_secs(600));
+        let (r, took) = within_a_few_seconds(&c, &o).await;
+        let e = r.unwrap_err();
+        assert_eq!(e.kind(), ErrorCode::Timeout);
+        assert!(e.message.contains("maximum"), "{}", e.message);
+        assert!(took >= Duration::from_millis(400), "{took:?}");
+        // Below the maximum the call's own value counts.
+        c.timeout = Some(Duration::from_millis(100));
+        let (r, _) = within_a_few_seconds(&c, &o).await;
+        let e = r.unwrap_err();
+        assert!(e.message.contains("past timeout_ms"), "{}", e.message);
     }
 
     /// With the keys in the keyring a command connects to socket files anywhere
@@ -2762,10 +2896,111 @@ mod tests {
     }
 }
 
-/// The shell's text and the output decoding: plain logic, on every platform.
+/// The shell's text, the output decoding and the run-time limits: plain
+/// logic, on every platform.
 #[cfg(test)]
 mod text_tests {
     use super::*;
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    fn timeouts(default: u64, max: u64) -> Timeouts {
+        Timeouts {
+            default: secs(default),
+            max: secs(max),
+        }
+    }
+
+    /// A call without `timeout_ms` gets the default, one within the maximum
+    /// gets what it asked for, and a larger one is cut to the maximum. The
+    /// default is cut as well.
+    #[test]
+    fn a_call_gets_the_default_and_no_more_than_the_maximum() {
+        let t = timeouts(60, 300);
+        assert_eq!(t.limit(None).after, secs(60));
+        assert_eq!(t.limit(Some(secs(5))).after, secs(5));
+        assert_eq!(t.limit(Some(secs(300))).after, secs(300));
+        assert_eq!(t.limit(Some(secs(301))).after, secs(300));
+        assert_eq!(t.limit(Some(secs(86_400))).after, secs(300));
+        assert_eq!(
+            t.limit(Some(Duration::from_millis(u64::MAX))).after,
+            secs(300)
+        );
+        // An owner who lowers the maximum below the default.
+        assert_eq!(timeouts(600, 30).limit(None).after, secs(30));
+        // What `limits` holds when the owner set nothing.
+        assert_eq!(Timeouts::default(), timeouts(600, 3600));
+    }
+
+    /// `timeout_ms` of 0 is no value: it gets the default, never no limit.
+    #[test]
+    fn a_zero_timeout_is_no_timeout_and_not_no_limit() {
+        let home = std::env::temp_dir();
+        let zero = json!({"command": "ls", "timeout_ms": 0})
+            .as_object()
+            .unwrap()
+            .clone();
+        let c = RunCall::parse(&zero, &home).unwrap();
+        assert_eq!(c.timeout, None);
+        assert_eq!(timeouts(60, 300).limit(c.timeout).after, secs(60));
+        let some = json!({"command": "ls", "timeout_ms": 1500})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert_eq!(
+            RunCall::parse(&some, &home).unwrap().timeout,
+            Some(Duration::from_millis(1500))
+        );
+    }
+
+    /// The error says which limit ended the command, so a model knows whether
+    /// a larger `timeout_ms` would help.
+    #[test]
+    fn the_timeout_says_which_limit_it_was() {
+        let t = timeouts(600, 3600);
+        let say = |l: RunLimit| {
+            let e = l.timed_out();
+            assert_eq!(e.kind(), ErrorCode::Timeout);
+            e.message
+        };
+        assert_eq!(
+            say(t.limit(Some(secs(30)))),
+            "the command ran past timeout_ms (30 s) and was killed"
+        );
+        assert_eq!(
+            say(t.limit(None)),
+            "the command ran past the default limit of 10 min and was killed: no timeout_ms was given (up to 1 h is allowed)"
+        );
+        assert_eq!(
+            say(t.limit(Some(secs(7200)))),
+            "the command ran past the node's maximum of 1 h and was killed: timeout_ms asked for 2 h, which the owner's limits.max_timeout_secs cuts"
+        );
+        // The default is the maximum: a larger timeout_ms would not help.
+        assert_eq!(
+            say(timeouts(60, 60).limit(None)),
+            "the command ran past the node's limit of 1 min and was killed: no timeout_ms was given"
+        );
+        assert_eq!(
+            say(timeouts(600, 30).limit(None)),
+            "the command ran past the node's maximum of 30 s and was killed: no timeout_ms was given, and the owner's limits.max_timeout_secs is below the default"
+        );
+    }
+
+    /// The `exec.run` text tells a model what a command gets.
+    #[test]
+    fn the_run_action_names_its_time_limits() {
+        assert_eq!(
+            timeout_summary(&timeouts(600, 3600)),
+            "A command is killed after timeout_ms, after 10 min when you give none, and never runs longer than 1 h."
+        );
+        // The default shown is the one that applies.
+        assert_eq!(
+            timeout_summary(&timeouts(600, 90)),
+            "A command is killed after timeout_ms, after 1 min 30 s when you give none, and never runs longer than 1 min 30 s."
+        );
+    }
 
     /// A stand-in for code page 850 with the two letters the tests use.
     fn cp850(b: &[u8]) -> Option<String> {
@@ -2842,6 +3077,7 @@ mod windows_tests {
             container: None,
             exe: PathBuf::from("nerve-node.exe"),
             output_cap: 64 * 1024,
+            timeouts: Timeouts::default(),
             sudo: None,
             account: None,
             own: Vec::new(),

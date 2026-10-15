@@ -243,7 +243,12 @@ fn fs_cap(exposure: Exposure) -> Capability {
     c
 }
 
-fn exec_cap(exposure: Exposure, shell: Option<&str>, windows: bool) -> Capability {
+fn exec_cap(
+    exposure: Exposure,
+    shell: Option<&str>,
+    timeouts: &crate::exec::Timeouts,
+    windows: bool,
+) -> Capability {
     let mut c = cap(
         "exec",
         "exec",
@@ -254,7 +259,11 @@ fn exec_cap(exposure: Exposure, shell: Option<&str>, windows: bool) -> Capabilit
         "run".into(),
         action(
             Effect::Execute,
-            &crate::exec::shell_summary(shell),
+            &format!(
+                "{} {}",
+                crate::exec::shell_summary(shell),
+                crate::exec::timeout_summary(timeouts)
+            ),
             obj(
                 json!({"command": {"type": "string"}, "cwd": cwd_param(windows),
                        "timeout_ms": {"type": "integer", "minimum": 1}}),
@@ -530,7 +539,12 @@ fn build(
         caps.push(fs_cap(e));
     }
     if let Some(e) = exposure(entry, "exec") {
-        caps.push(exec_cap(e, cfg.machine.shell.as_deref(), cfg!(windows)));
+        caps.push(exec_cap(
+            e,
+            cfg.machine.shell.as_deref(),
+            &crate::exec::Timeouts::from_limits(&cfg.limits),
+            cfg!(windows),
+        ));
     }
     if entry.settings == SettingsGrant::Write {
         caps.push(settings_cap());
@@ -982,12 +996,39 @@ mod tests {
         );
         assert_eq!(cwd_param(false), json!({"type": "string"}));
         for windows in [true, false] {
-            let exec = exec_cap(Exposure::On, None, windows);
+            let exec = exec_cap(Exposure::On, None, &Default::default(), windows);
             assert_eq!(
                 exec.actions["run"].params["properties"]["cwd"],
                 cwd_param(windows)
             );
         }
+    }
+
+    /// The model reads the time a command gets from the `exec.run` text; a
+    /// change of the owner's limits changes it, and with it the rev.
+    #[test]
+    fn exec_run_names_the_owners_run_time_limits() {
+        let mut cfg = NodeConfig::default();
+        let mut e = entry();
+        e.policy.mode = Mode::User;
+        let text = |cfg: &NodeConfig| {
+            let d = for_center(cfg, &e, 0, true, &[]);
+            let run = &d.capability("exec").unwrap().actions["run"];
+            (run.summary.clone(), d.rev)
+        };
+        let (before, rev) = text(&cfg);
+        assert!(
+            before.contains("after 10 min when you give none, and never runs longer than 1 h"),
+            "{before}"
+        );
+        cfg.limits.default_timeout_secs = 90;
+        cfg.limits.max_timeout_secs = 120;
+        let (after, changed) = text(&cfg);
+        assert!(
+            after.contains("after 1 min 30 s when you give none, and never runs longer than 2 min"),
+            "{after}"
+        );
+        assert_ne!(changed, rev);
     }
 
     #[test]

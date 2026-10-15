@@ -368,6 +368,87 @@ async fn signal_a_sleep(
     (signal, ran, log)
 }
 
+/// Runs `args` as an `exec.run` that is not allowed to finish, and returns
+/// the error it ends with and how long it took.
+#[cfg(unix)]
+async fn run_to_the_limit(conn: &mut Conn<TcpStream>, args: Value) -> (Value, Duration) {
+    let started = std::time::Instant::now();
+    let e = conn
+        .call(
+            "invoke",
+            json!({"cap": "exec", "action": "run", "args": args}),
+            Duration::from_secs(20),
+        )
+        .await
+        .unwrap()
+        .expect_err("the command runs past its limit");
+    assert_eq!(nerve_conformance::wire::code_of(&e), "timeout", "{e:?}");
+    (json!(e.message), started.elapsed())
+}
+
+/// A call without `timeout_ms` is ended at the default of the owner's
+/// `limits`, one that asks for more at their maximum, and the command's
+/// group with it. The `exec.run` text in the descriptor says both numbers.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_ends_at_the_default_and_at_the_owners_maximum() {
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let o = options(dir.path());
+    nerve_node::pair::pair(&o.paths, &center.link(), Some("lab"))
+        .await
+        .unwrap();
+    owner_edit(&o.paths, |c| {
+        c.limits.default_timeout_secs = 1;
+        c.limits.max_timeout_secs = 3;
+        c.centers[0].policy.allow.push("exec.run:sleep *".into());
+    })
+    .await;
+    let node = Daemon::start(o).await.unwrap();
+    let mut conn = linked(&mut center).await;
+
+    let d = conn
+        .call("describe", json!({"detail": "full"}), WAIT)
+        .await
+        .unwrap()
+        .expect("describe");
+    let text = d["capabilities"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|c| c["id"] == "exec")
+        .map(|c| c["actions"]["run"]["summary"].to_string())
+        .expect("exec is offered");
+    assert!(
+        text.contains("after 1 s when you give none, and never runs longer than 3 s"),
+        "{text}"
+    );
+
+    // Not asked: the default, 1 s.
+    let (said, took) = run_to_the_limit(&mut conn, json!({"command": "sleep 30"})).await;
+    assert!(
+        said.as_str().unwrap().contains("default limit of 1 s"),
+        "{said}"
+    );
+    assert!(took >= Duration::from_secs(1), "{took:?}");
+    // Asked for a minute: the maximum, 3 s, so after the default's second.
+    let (said, took) = run_to_the_limit(
+        &mut conn,
+        json!({"command": "sleep 30", "timeout_ms": 60_000}),
+    )
+    .await;
+    assert!(said.as_str().unwrap().contains("maximum of 3 s"), "{said}");
+    assert!(took >= Duration::from_secs(3), "{took:?}");
+    // Asked for less than the maximum: what it asked for.
+    let (said, _) =
+        run_to_the_limit(&mut conn, json!({"command": "sleep 30", "timeout_ms": 500})).await;
+    assert!(
+        said.as_str().unwrap().contains("timeout_ms (500 ms)"),
+        "{said}"
+    );
+    node.stop().await;
+}
+
 /// `exec.signal` goes through the policy like every other action: a deny
 /// rule refuses it and the refusal is audited.
 #[cfg(unix)]

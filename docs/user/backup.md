@@ -99,6 +99,11 @@ unless you give `--include-keyring`) does not keep whatever is on this machine:
   so that it is never sent to a proxy it does not belong to, and `restore`
   says so: run `nerve-node proxy set` again. It says the same when a password
   or values are missing.
+- When this machine's keyring does not answer (locked, or no desktop session
+  to ask), `restore` cannot tell whose the header values are and stops with
+  nothing written, unless the config being replaced names the same proxy and
+  header names. Unlock the keyring, or restore a backup made with
+  `--include-keyring`.
 - Header values for the same proxy and names that lack one of the names are
   kept, and `restore` says so. They are for the right proxy, and the link
   fails with a message naming the missing header until `proxy set` gives all

@@ -143,6 +143,15 @@ it:
 A replaced config that could not be read, or none, vouches for nothing. Each
 case adds a note that says to run `proxy set` again.
 
+A keyring that does not answer is not an empty one: its entry would be sent to
+the restored proxy as soon as it answers again. So when the replaced config
+does not vouch for the header values, a keyring that cannot be asked stops the
+restore ("cannot read the proxy's header values ... to check whose they are"),
+with nothing written; the restore needs a keyring that answers, or a backup
+made with `--include-keyring`. When the replaced config does vouch for them
+(the same proxy, pin and names), they are that proxy's whatever the keyring
+says, and the restore goes on with the note.
+
 ## Center
 
 `tls.pem` and `state.json` are read as they are on disk. Both are written

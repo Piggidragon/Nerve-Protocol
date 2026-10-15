@@ -689,10 +689,22 @@ fn write_keys<'a>(
                 && o.connection.pin == cfg.connection.pin
                 && names(o) == names(cfg)
         });
-        // A keyring that does not answer holds no values.
-        let here = secrets::store::get(Entry::proxy(paths).account())
-            .ok()
-            .flatten();
+        // Whose the values are cannot be told without asking the keyring,
+        // and a keyring that does not answer is not an empty one: its entry
+        // would be sent to the restored proxy once it answers again. So when
+        // the replaced config does not vouch for them, a keyring that cannot
+        // be asked stops the restore. Where it does, they are the same
+        // proxy's whatever the keyring says, and the note is all there is.
+        let account = Entry::proxy(paths);
+        let here = if same {
+            secrets::store::get(account.account()).ok().flatten()
+        } else {
+            secrets::store::get(account.account()).map_err(|e| {
+                format!(
+                    "cannot read the proxy's header values in the system keyring (entry {account}) to check whose they are: {e}. Unlock the keyring, or restore a backup made with --include-keyring"
+                )
+            })?
+        };
         let complete = |t: &str| {
             header_map(t).is_some_and(|m| cfg.connection.headers.iter().all(|n| m.contains_key(n)))
         };
@@ -1813,6 +1825,84 @@ mod tests {
             secrets::store::get(Entry::proxy(&to).account())
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn a_keyring_that_does_not_answer_stops_a_restore_that_cannot_say_whose_header_values_are() {
+        let (_a, n) = node();
+        paired(&n, SecretStorage::File, &["home"]);
+        secrets::store_proxy_headers(&n, &[("Proxy-Authorization".into(), "Basic A".into())])
+            .unwrap();
+        let mut s = open_store(&n);
+        s.update(|c| {
+            c.connection.proxy = Some("http://proxy-a.example:3128".into());
+            c.connection.headers = vec!["Proxy-Authorization".into()];
+            Ok(())
+        })
+        .unwrap();
+        let (_f, parsed, _) = roundtrip(&n, false);
+
+        // The same proxy: the values are its own, so the restore goes on and
+        // says what it knows.
+        secrets::store::set_unreachable(true);
+        let r = restore(&n, &parsed, &RestoreOpts::default());
+        secrets::store::set_unreachable(false);
+        let r = r.unwrap();
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("header values were left out")),
+            "{r:?}"
+        );
+
+        // The node moved to proxy B since. With the keyring out of reach the
+        // restore cannot tell whose the values are, and stops: nothing is
+        // written, and B's credential is not left to be sent to A.
+        secrets::store_proxy_headers(&n, &[("Proxy-Authorization".into(), "Basic B".into())])
+            .unwrap();
+        let mut s = open_store(&n);
+        s.update(|c| {
+            c.connection.proxy = Some("http://proxy-b.example:3128".into());
+            Ok(())
+        })
+        .unwrap();
+        drop(s);
+        let before = std::fs::read(n.config_file()).unwrap();
+        secrets::store::set_unreachable(true);
+        let err = restore(&n, &parsed, &RestoreOpts::default());
+        secrets::store::set_unreachable(false);
+        let err = err.err().unwrap();
+        assert!(
+            err.contains("to check whose they are") && err.contains("--include-keyring"),
+            "{err}"
+        );
+        assert!(err.contains("nothing was restored"), "{err}");
+        assert!(!err.contains("Basic"), "{err}");
+        assert_eq!(std::fs::read(n.config_file()).unwrap(), before);
+        // Once the keyring answers, the restore deletes them.
+        let r = restore_into(&n, &parsed, None);
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("header values") && n.contains("deleted")),
+            "{r:?}"
+        );
+        assert!(secrets::proxy_headers(&n, &["Proxy-Authorization".into()]).is_err());
+
+        // A machine with no config of its own and an entry in the keyring.
+        let (_b, to) = node();
+        secrets::store_proxy_headers(&to, &[("Proxy-Authorization".into(), "Basic X".into())])
+            .unwrap();
+        secrets::store::set_unreachable(true);
+        let err = restore(&to, &parsed, &RestoreOpts::default());
+        secrets::store::set_unreachable(false);
+        assert!(err.err().unwrap().contains("to check whose they are"));
+        assert!(!to.config_file().exists(), "nothing was written");
+        assert!(
+            secrets::store::get(Entry::proxy(&to).account())
+                .unwrap()
+                .is_some()
         );
     }
 

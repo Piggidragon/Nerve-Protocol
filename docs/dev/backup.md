@@ -147,10 +147,12 @@ A keyring that does not answer is not an empty one: its entry would be sent to
 the restored proxy as soon as it answers again. So when the replaced config
 does not vouch for the header values, a keyring that cannot be asked stops the
 restore ("cannot read the proxy's header values ... to check whose they are"),
-with nothing written; the restore needs a keyring that answers, or a backup
-made with `--include-keyring`. When the replaced config does vouch for them
-(the same proxy, pin and names), they are that proxy's whatever the keyring
-says, and the restore goes on with the note.
+with nothing written. The remedies are a keyring that answers (`nerve-node
+setup` installs one on a Linux without a desktop) or a backup of a node whose
+proxy has no header values. A backup made with `--include-keyring` is no
+remedy: writing the values into the keyring asks the same keyring. When the
+replaced config does vouch for them (the same proxy, pin and names), they are
+that proxy's whatever the keyring says, and the restore goes on with the note.
 
 ## Center
 

@@ -701,7 +701,7 @@ fn write_keys<'a>(
         } else {
             secrets::store::get(account.account()).map_err(|e| {
                 format!(
-                    "cannot read the proxy's header values in the system keyring (entry {account}) to check whose they are: {e}. Unlock the keyring, or restore a backup made with --include-keyring"
+                    "cannot read the proxy's header values in the system keyring (entry {account}) to check whose they are: {e}. Start or unlock the keyring (on a Linux without a desktop, `nerve-node setup` can install one), or take the proxy's header values off the node you back up (`nerve-node proxy rm` there, then back it up again)"
                 )
             })?
         };
@@ -1874,11 +1874,34 @@ mod tests {
         secrets::store::set_unreachable(false);
         let err = err.err().unwrap();
         assert!(
-            err.contains("to check whose they are") && err.contains("--include-keyring"),
+            err.contains("to check whose they are") && err.contains("nerve-node setup"),
             "{err}"
         );
         assert!(err.contains("nothing was restored"), "{err}");
         assert!(!err.contains("Basic"), "{err}");
+        assert_eq!(std::fs::read(n.config_file()).unwrap(), before);
+        // A backup made with --include-keyring is no way round it: its values
+        // are written into the same keyring, which does not answer either.
+        let (_g, with, report) = roundtrip(&n, true);
+        assert!(
+            report.saved.iter().any(|l| l.contains("header values")),
+            "{report:?}"
+        );
+        for storage in [None, Some(SecretStorage::File)] {
+            secrets::store::set_unreachable(true);
+            let err = restore(
+                &n,
+                &with,
+                &RestoreOpts {
+                    secret_storage: storage,
+                    ..RestoreOpts::default()
+                },
+            );
+            secrets::store::set_unreachable(false);
+            let err = err.err().unwrap();
+            assert!(err.contains("cannot read the keyring entry"), "{err}");
+            assert!(!err.contains("Basic"), "{err}");
+        }
         assert_eq!(std::fs::read(n.config_file()).unwrap(), before);
         // Once the keyring answers, the restore deletes them.
         let r = restore_into(&n, &parsed, None);

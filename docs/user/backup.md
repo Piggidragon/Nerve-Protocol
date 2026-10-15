@@ -101,9 +101,12 @@ unless you give `--include-keyring`) does not keep whatever is on this machine:
   or values are missing.
 - When this machine's keyring does not answer (locked, or no desktop session
   to ask), `restore` cannot tell whose the header values are and stops with
-  nothing written, unless the config being replaced names the same proxy and
-  header names. Unlock the keyring, or restore a backup made with
-  `--include-keyring`.
+  nothing written, unless the config being replaced names the same proxy, pin
+  and header names. Start or unlock the keyring (on a Linux without a desktop,
+  `nerve-node setup` installs one), or take the header values off the node you
+  back up (`nerve-node proxy rm` there) and make a new backup. A backup made
+  with `--include-keyring` does not get round this: it writes the values into
+  the same keyring, and fails the same way.
 - Header values for the same proxy and names that lack one of the names are
   kept, and `restore` says so. They are for the right proxy, and the link
   fails with a message naming the missing header until `proxy set` gives all
@@ -177,6 +180,13 @@ center, a relayed node holds the pin of its relay, and a node behind an
    (`machine.user`), the paths of providers, and the address of the relay.
    `nerve-node config get` shows each.
 4. `nerve-node sudo on` if you used the sudo switch, then `nerve-node run`.
+
+A node whose proxy has header values (an `http://` proxy with a login is one)
+needs a keyring that answers on the new machine, since the node reads those
+values from it: [keys](config.md#where-the-node-keeps-its-keys) says how a Linux
+without a desktop gets one (`nerve-node setup`). Without a keyring the restore
+stops, and the node could not use that proxy anyway; take the header values off
+the old node with `nerve-node proxy rm` and back it up again, then.
 
 The centers see the same node id from a new address. Their link rule keeps one
 live link per node, so stop the old node before the new one connects.

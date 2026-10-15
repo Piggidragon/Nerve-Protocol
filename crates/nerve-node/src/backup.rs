@@ -473,7 +473,11 @@ pub fn restore(paths: &NodePaths, b: &Parsed, opts: &RestoreOpts) -> Result<Rest
     secrets::get(paths, to, Key::Config)?;
 
     let mut undo: Vec<Undo> = Vec::new();
-    let key = match write_keys(paths, to, &cfg, b, &mut undo, &mut report) {
+    let old = match &target {
+        Target::Node(c) => Some(&**c),
+        _ => None,
+    };
+    let key = match write_keys(paths, to, &cfg, old, b, &mut undo, &mut report) {
         Ok(k) => k,
         Err(e) => {
             roll_back(paths, to, undo);
@@ -536,6 +540,7 @@ fn write_keys<'a>(
     paths: &NodePaths,
     to: SecretStorage,
     cfg: &'a NodeConfig,
+    old: Option<&NodeConfig>,
     b: &Parsed,
     undo: &mut Vec<Undo<'a>>,
     report: &mut RestoreReport,
@@ -610,13 +615,46 @@ fn write_keys<'a>(
     }
     match (&b.proxy_login, &cfg.connection.login) {
         (Some(t), _) => put(Key::ProxyLogin, t)?,
-        (None, Some(_)) => match here(Key::ProxyLogin, &|t: &str| !t.is_empty()) {
-            Some((place, text)) if place != to => put(Key::ProxyLogin, &text)?,
-            Some(_) => {}
-            None => report.notes.push(
-                "the proxy's password is not in the backup and not here: run `nerve-node proxy set` again".into(),
-            ),
-        },
+        (None, Some(_)) => {
+            // Nothing in the password says which proxy and user it is for,
+            // so it stays only where the config it belonged to, the one
+            // being replaced, names the same proxy, pin and user. Another
+            // one would send the credential of one proxy to another.
+            let same = |o: &NodeConfig| {
+                (&o.connection.proxy, &o.connection.pin, &o.connection.login)
+                    == (
+                        &cfg.connection.proxy,
+                        &cfg.connection.pin,
+                        &cfg.connection.login,
+                    )
+            };
+            let carried = old.filter(|o| same(o)).and_then(|o| {
+                let place = o.machine.secret_storage;
+                secrets::get(paths, place, Key::ProxyLogin)
+                    .ok()
+                    .flatten()
+                    .filter(|t| !t.is_empty())
+                    .map(|t| (place, t))
+            });
+            match carried {
+                Some((place, text)) if place != to => put(Key::ProxyLogin, &text)?,
+                Some(_) => {}
+                None => match secrets::get(paths, to, Key::ProxyLogin)? {
+                    // One that is here is for another proxy, or for none
+                    // this restore knows: it goes, so that it is never sent.
+                    Some(prev) => {
+                        undo.push(Undo::Key(Key::ProxyLogin, Some(prev)));
+                        secrets::delete(paths, to, Key::ProxyLogin)?;
+                        report.notes.push(
+                            "the proxy's password here is not for the proxy and user that the restored config names, so it was deleted: run `nerve-node proxy set` again".into(),
+                        );
+                    }
+                    None => report.notes.push(
+                        "the proxy's password is not in the backup and not here: run `nerve-node proxy set` again".into(),
+                    ),
+                },
+            }
+        }
         (None, None) => {}
     }
     if b.proxy_headers.is_none() && !cfg.connection.headers.is_empty() {
@@ -1417,6 +1455,89 @@ mod tests {
         );
         assert!(
             secrets::get(&n, SecretStorage::Keyring, Key::ProxyLogin)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A node that uses relay A as its proxy, with a password for it.
+    fn with_proxy(n: &NodePaths, host: &str, user: &str, token: &str, pin: &str) -> SettingsStore {
+        secrets::store_proxy_login(n, SecretStorage::Keyring, token).unwrap();
+        let mut s = open_store(n);
+        let (host, user, pin) = (host.to_string(), user.to_string(), pin.to_string());
+        s.update(|c| {
+            c.connection.proxy = Some(format!("https://{host}:7490"));
+            c.connection.pin = Some(pin.clone());
+            c.connection.login = Some(user.clone());
+            Ok(())
+        })
+        .unwrap();
+        s
+    }
+
+    #[test]
+    fn a_proxy_password_stays_only_for_the_proxy_and_user_it_belonged_to() {
+        let pin = nerve_transport::tls::ServerIdentity::generate(&["relay.example".into()])
+            .unwrap()
+            .pin();
+        let (_a, n) = node();
+        paired(&n, SecretStorage::Keyring, &["home"]);
+        drop(with_proxy(&n, "relay-a.example", "node-a", "a-token", &pin));
+        let (_f, parsed, _) = roundtrip(&n, false);
+
+        // The same proxy and user: the password stays, and nothing is said.
+        let r = restore_into(&n, &parsed, None);
+        assert!(r.notes.is_empty(), "{r:?}");
+        assert_eq!(
+            secrets::proxy_login(&n, SecretStorage::Keyring).unwrap(),
+            "a-token"
+        );
+
+        // Since then the node moved to relay B, with B's user and token. The
+        // restore names relay A again; B's token is not A's and goes.
+        drop(with_proxy(&n, "relay-b.example", "node-b", "b-token", &pin));
+        let r = restore_into(&n, &parsed, None);
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("proxy's password") && n.contains("proxy set")),
+            "{r:?}"
+        );
+        let cfg = config(&n);
+        assert_eq!(cfg.connection.login.as_deref(), Some("node-a"));
+        assert!(secrets::proxy_login(&n, SecretStorage::Keyring).is_err());
+        assert!(
+            secrets::get(&n, SecretStorage::Keyring, Key::ProxyLogin)
+                .unwrap()
+                .is_none()
+        );
+
+        // Another user of the same proxy is another credential too.
+        drop(with_proxy(
+            &n,
+            "relay-a.example",
+            "node-other",
+            "other-token",
+            &pin,
+        ));
+        let r = restore_into(&n, &parsed, None);
+        assert!(
+            r.notes.iter().any(|n| n.contains("proxy's password")),
+            "{r:?}"
+        );
+        assert!(secrets::proxy_login(&n, SecretStorage::Keyring).is_err());
+
+        // A password on a machine with no config of its own, for no known
+        // proxy, is not taken either.
+        let (_b, to) = node();
+        secrets::store_proxy_login(&to, SecretStorage::Keyring, "stray").unwrap();
+        let r = restore_into(&to, &parsed, None);
+        assert!(
+            r.notes.iter().any(|n| n.contains("proxy's password")),
+            "{r:?}"
+        );
+        assert!(
+            secrets::get(&to, SecretStorage::Keyring, Key::ProxyLogin)
                 .unwrap()
                 .is_none()
         );

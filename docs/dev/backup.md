@@ -115,11 +115,17 @@ In this order:
 9. Keys the replaced config kept and the new one does not name are deleted,
    and every key left in the place the keys moved away from.
 
-A key the backup lacks (a node key, the relay's TLS key, the proxy's password)
-is looked for in `to` and in the other place. One that fits the config (the
-pairing's `node_id`, `relay.pin`) stays, and is copied into `to` when it is
-in the other place, before step 9 empties that place. Otherwise it is listed
-or noted, and the owner pairs again or runs `relay set` or `proxy set`.
+A key the backup lacks (a node key, the relay's TLS key) is looked for in
+`to` and in the other place. One that fits the config (the pairing's
+`node_id`, `relay.pin`) stays, and is copied into `to` when it is in the other
+place, before step 9 empties that place. Otherwise it is listed or noted, and
+the owner pairs again or runs `relay set`.
+
+The proxy's password has nothing to check it against, so it is taken only
+from the replaced config's own place, and only when that config names the same
+`connection.proxy`, `connection.pin` and `connection.login` as the restored
+one. Any other password in `to` is deleted (with an undo entry) and noted: it
+would be sent as `Proxy-Authorization` to a proxy it was not made for.
 
 ## Center
 

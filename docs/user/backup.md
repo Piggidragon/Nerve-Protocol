@@ -84,9 +84,13 @@ files or in the keyring (a restore on the same machine), it stays, and it
 goes where the restored node keeps its keys: a restore with `--secret-storage`
 takes it over from the other place before that place is emptied. Otherwise
 that center cannot connect: run `nerve-node center rm --center <name>`, then
-`nerve-node center add` with a new link. The relay's TLS key and the proxy's
-password are treated the same way, and `restore` says when one is missing
-(the proxy's header values, which are in the keyring, are never moved).
+`nerve-node center add` with a new link. The relay's TLS key, which must fit
+`relay.pin`, is treated the same way. The proxy's password stays only when the
+config it belonged to names the same proxy, pin and user as the restored one,
+since nothing in it says which proxy it is for: another one is deleted, so that
+it is never sent to a proxy it does not belong to. `restore` says when one is
+missing or deleted (the proxy's header values, which are in the keyring, are
+never moved).
 
 A restore that fails half way puts the keys back as they were and writes
 nothing. If the machine dies in the middle of it, run it again.

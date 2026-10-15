@@ -94,11 +94,15 @@ unless you give `--include-keyring`) does not keep whatever is on this machine:
 - The password stays only when the config it belonged to, the one being
   replaced, names the same proxy, pin and user as the restored one.
 - The header values (an `http://` proxy's login is one) stay only when that
-  config names the same proxy, pin and header names, and all of them are here.
+  config names the same proxy, pin and header names.
 - Anything else is deleted, wherever it is (in the files and in the keyring),
   so that it is never sent to a proxy it does not belong to, and `restore`
   says so: run `nerve-node proxy set` again. It says the same when a password
   or values are missing.
+- Header values for the same proxy and names that lack one of the names are
+  kept, and `restore` says so. They are for the right proxy, and the link
+  fails with a message naming the missing header until `proxy set` gives all
+  of them.
 
 A restore that fails half way puts the keys back as they were and writes
 nothing. If the machine dies in the middle of it, run it again.

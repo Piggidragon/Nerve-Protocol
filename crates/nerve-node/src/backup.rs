@@ -1793,6 +1793,10 @@ mod tests {
                 .any(|n| n.contains("header values") && n.contains("lack a value")),
             "{r:?}"
         );
+        // They are for the right proxy: kept, not deleted, so what they do
+        // hold is still there.
+        let kept = secrets::store::get(Entry::proxy(&n).account()).unwrap();
+        assert_eq!(header_map(&kept.unwrap()).unwrap()["X-Other"], "t");
 
         // A machine with no config of its own and a stray entry.
         let (_b, to) = node();

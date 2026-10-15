@@ -146,6 +146,9 @@ rules and runs the command.
 - A `sudo` command runs without Landlock, which would stop sudo from gaining
   privileges. Every other command runs with `no_new_privs`.
 - Without Landlock (`confinement none`), `folder` mode refuses every command.
+- In every mode a command runs in a cgroup of its own, with the memory, CPU
+  and processes of `limits.command` (`crate::cgroup`, node-local §2,
+  Commands). That is a bound on what it uses, not on what it reaches.
 
 On Windows, each command runs in a Job Object that ends all its processes with
 it. A Job Object limits no file access. So in `folder` mode the shim starts the

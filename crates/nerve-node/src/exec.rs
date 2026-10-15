@@ -1,6 +1,6 @@
 //! The `exec` capability (spec §7.3): shell commands, each in its own
 //! process group so the whole tree can be signalled and is killed when the
-//! call ends or the link drops. Windows has no process groups; there each
+//! call ends or its link ends (a dropped link that is resumed goes on). Windows has no process groups; there each
 //! command runs in a job object of its own (crate::job), and only when
 //! Windows makes none does the node record the processes below the shell
 //! while it runs (crate::tree), best effort.
@@ -37,6 +37,21 @@ struct RunArgs {
     cwd: Option<String>,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    memory_mb: Option<u64>,
+    #[serde(default)]
+    cpu_percent: Option<u32>,
+    #[serde(default)]
+    processes: Option<u32>,
+}
+
+/// The limits a call asks for its command; each up to the node's most
+/// (`limits.command`, [`nerve_policy::config::CommandLimits::grant`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Asked {
+    pub memory_mb: Option<u64>,
+    pub cpu_percent: Option<u32>,
+    pub processes: Option<u32>,
 }
 
 /// A parsed `exec.run`.
@@ -47,6 +62,7 @@ pub struct RunCall {
     /// What the call asked for; `None` when it gave no `timeout_ms` (0 counts
     /// as none). [`Timeouts`] turns it into the limit the command runs under.
     pub timeout: Option<Duration>,
+    pub limits: Asked,
 }
 
 impl RunCall {
@@ -72,6 +88,11 @@ impl RunCall {
             command: a.command,
             cwd,
             timeout: a.timeout_ms.filter(|t| *t > 0).map(Duration::from_millis),
+            limits: Asked {
+                memory_mb: a.memory_mb,
+                cpu_percent: a.cpu_percent,
+                processes: a.processes,
+            },
         })
     }
 
@@ -1063,6 +1084,12 @@ pub struct RunOptions {
     pub account: Option<crate::service::Account>,
     /// The node's own folders, which the account must not reach.
     pub own: Vec<PathBuf>,
+    /// Linux: the command runs in a cgroup of its own below these, held to
+    /// these limits (crate::cgroup); `None` runs it without.
+    pub limits: Option<(
+        std::sync::Arc<crate::cgroup::Cgroups>,
+        nerve_policy::config::Granted,
+    )>,
 }
 
 /// What a sudo command needs: the password and the prompt sudo was told to
@@ -1512,11 +1539,25 @@ pub async fn run(
             c
         }
     };
+    // The command's cgroup, which it joins in the child before anything
+    // else, so all it starts is held to its limits. One that cannot be made
+    // keeps the command from running: the owner set the limits.
+    #[cfg(target_os = "linux")]
+    let cgroup = match &opts.limits {
+        Some((cgroups, granted)) => Some(cgroups.command(granted).map_err(|e| {
+            RpcError::new(
+                ErrorCode::Unavailable,
+                format!("the command was not run: {e}"),
+            )
+        })?),
+        None => None,
+    };
     // A command of another account takes its ids, drops the service's
     // capabilities and enters its folder in the child (crate::account);
     // any other drops the capabilities.
     #[cfg(target_os = "linux")]
     {
+        let join = cgroup.as_ref().map(crate::cgroup::CommandCgroup::procs_fd);
         let switch = match &opts.account {
             Some(a) => Some(
                 crate::account::Switch::new(a, Some(&call.cwd), &opts.own)
@@ -1530,6 +1571,9 @@ pub async fn run(
         // SAFETY: plain system calls on memory moved into the closure.
         unsafe {
             cmd.pre_exec(move || {
+                if let Some(fd) = join {
+                    crate::cgroup::join(fd)?;
+                }
                 match &switch {
                     Some(s) => s.apply()?,
                     None if nerve_transport::net::euid() != 0 => crate::account::drop_caps()?,
@@ -1659,6 +1703,14 @@ pub async fn run(
         }
     };
     drop(group);
+    // Read before the cgroup goes with what is left in it.
+    #[cfg(target_os = "linux")]
+    let out_of_memory = cgroup
+        .as_ref()
+        .filter(|c| c.out_of_memory())
+        .map(crate::cgroup::CommandCgroup::memory_mb);
+    #[cfg(target_os = "linux")]
+    drop(cgroup);
     if timed_out {
         return Err(limit.timed_out());
     }
@@ -1684,6 +1736,11 @@ pub async fn run(
             };
             result["signal"] = name.into();
         }
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(mb) = out_of_memory {
+        result["killed"] = "memory".into();
+        result["reason"] = crate::cgroup::memory_reason(mb).into();
     }
     Ok(result)
 }
@@ -1892,6 +1949,7 @@ mod tests {
             sudo: None,
             account: None,
             own: Vec::new(),
+            limits: None,
         }
     }
 
@@ -1900,7 +1958,191 @@ mod tests {
             command: cmd.into(),
             cwd: std::env::temp_dir(),
             timeout: Some(Duration::from_secs(10)),
+            limits: Default::default(),
         }
+    }
+
+    /// A command runs in a cgroup of its own, held to its limits: past its
+    /// memory it is killed and its result says so, past its processes it
+    /// cannot start more, and what it left behind ends with it, also
+    /// outside its process group. This needs a cgroup delegated to the
+    /// process, so the test runs [`limits_in_a_real_cgroup`] in a scope
+    /// systemd's user manager makes for it; without one it is skipped.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_command_is_held_to_its_limits_in_a_cgroup_of_its_own() {
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new("systemd-run")
+            .args(["--user", "--scope", "--quiet", "-p", "Delegate=yes"])
+            // The helper's own bound, whatever its commands do.
+            .args(["-p", "MemoryMax=1G", "-p", "MemorySwapMax=0", "--"])
+            .arg(&exe)
+            .args([
+                "--ignored",
+                "--exact",
+                "exec::tests::limits_in_a_real_cgroup",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .output();
+        let Ok(out) = out else {
+            eprintln!("skipped: no systemd-run here");
+            return;
+        };
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if !text.contains("limits helper started") {
+            eprintln!("skipped: systemd-run --user made no scope: {text}");
+            return;
+        }
+        assert!(text.contains("limits helper passed"), "{text}");
+    }
+
+    /// A command whose cgroup cannot be made does not run: the owner set
+    /// limits, and it would run without them. The cgroups are plain folders
+    /// here, the node's made read-only.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_command_without_its_cgroup_does_not_run() {
+        use std::os::unix::fs::PermissionsExt;
+        let me = nerve_transport::net::euid();
+        if me == 0 {
+            eprintln!("skipped: root writes a read-only folder");
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        let own = t.path().join("node.scope");
+        std::fs::create_dir_all(&own).unwrap();
+        std::fs::write(t.path().join("cgroup.controllers"), "cpu memory pids").unwrap();
+        std::fs::write(own.join("cgroup.controllers"), "cpu memory pids").unwrap();
+        std::fs::write(own.join("cgroup.procs"), "").unwrap();
+        let cgroups =
+            crate::cgroup::Cgroups::at(t.path(), "/node.scope", std::process::id(), me, &|_| true)
+                .unwrap();
+        std::fs::write(own.join("cgroup.subtree_control"), "cpu memory pids").unwrap();
+        let mut o = opts(1024);
+        o.limits = Some((
+            std::sync::Arc::new(cgroups),
+            nerve_policy::config::Granted {
+                memory_mb: 64,
+                cpu_percent: 100,
+                processes: 16,
+            },
+        ));
+        let ran = t.path().join("ran");
+        let line = format!("touch {}", ran.display());
+        std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let r = run(&call(&line), &o, |_| {}).await;
+        std::fs::set_permissions(&own, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let e = r.unwrap_err();
+        assert_eq!(e.kind(), ErrorCode::Unavailable, "{e:?}");
+        assert!(
+            e.message
+                .starts_with("the command was not run: cannot make a cgroup for the command"),
+            "{e:?}"
+        );
+        assert!(!ran.exists(), "the command ran without its cgroup");
+        // With its cgroup, the same command runs.
+        let r = run(&call(&line), &o, |_| {}).await.unwrap();
+        assert_eq!(r["exit_code"], 0, "{r}");
+        assert!(ran.exists());
+    }
+
+    /// A child that cannot join its cgroup is not started.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_join_is_an_error() {
+        use std::os::fd::AsRawFd;
+        let full = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        assert!(crate::cgroup::join(full.as_raw_fd()).is_err());
+        assert!(crate::cgroup::join(-1).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[ignore = "a helper of a_command_is_held_to_its_limits_in_a_cgroup_of_its_own"]
+    async fn limits_in_a_real_cgroup() {
+        use nerve_policy::config::Granted;
+        println!("limits helper started");
+        let cgroups = std::sync::Arc::new(crate::cgroup::Cgroups::find().unwrap());
+        assert!(
+            cgroups.enforced().contains(&"memory") && cgroups.enforced().contains(&"processes"),
+            "{:?}",
+            cgroups.enforced()
+        );
+        let held = |memory_mb, processes| {
+            let mut o = opts(1024);
+            o.limits = Some((
+                cgroups.clone(),
+                Granted {
+                    memory_mb,
+                    cpu_percent: 100,
+                    processes,
+                },
+            ));
+            o
+        };
+        // About 64 MB in the shell's own memory.
+        let big = "x=$(head -c 64000000 /dev/zero | tr '\\0' a); echo ${#x}";
+        let r = run(&call(big), &held(16, 64), |_| {}).await.unwrap();
+        assert_eq!(r["killed"], "memory", "{r}");
+        assert_eq!(r["signal"], "kill", "{r}");
+        assert_eq!(
+            r["reason"],
+            "the command went past its memory limit of 16 MiB and was killed"
+        );
+        let r = run(&call(big), &held(512, 64), |_| {}).await.unwrap();
+        assert_eq!(r["stdout"], "64000000\n", "{r}");
+        assert!(r.get("killed").is_none(), "{r}");
+
+        // A shell with 4 processes at most starts no 10 more.
+        let many = "for i in 1 2 3 4 5 6 7 8 9 10; do sleep 1 & done; wait";
+        let r = run(&call(many), &held(64, 4), |_| {}).await.unwrap();
+        assert!(!r["stderr"].as_str().unwrap().is_empty(), "{r}");
+        assert!(r.get("killed").is_none(), "{r}");
+
+        // What left the process group is in the cgroup still, and ends.
+        let left = "setsid sleep 60 >/dev/null 2>&1 < /dev/null & echo $!";
+        let r = run(&call(left), &held(64, 64), |_| {}).await.unwrap();
+        let pid: i32 = r["stdout"].as_str().unwrap().trim().parse().unwrap();
+        let mut ended = false;
+        for _ in 0..100 {
+            // SAFETY: signal 0 only asks whether the process is there.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                ended = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(ended, "the process {pid} outlived its command");
+        // And the commands' cgroups are gone.
+        let own = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+        let dir = Path::new("/sys/fs/cgroup").join(
+            own.trim()
+                .trim_start_matches("0::/")
+                .trim_end_matches("/node"),
+        );
+        let mut left = Vec::new();
+        for _ in 0..100 {
+            left = std::fs::read_dir(&dir)
+                .unwrap()
+                .flatten()
+                .map(|e| e.file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("cmd-"))
+                .collect();
+            if left.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(left.is_empty(), "{left:?}");
+        println!("limits helper passed");
     }
 
     #[tokio::test]
@@ -3081,6 +3323,7 @@ mod windows_tests {
             sudo: None,
             account: None,
             own: Vec::new(),
+            limits: None,
         }
     }
 
@@ -3089,6 +3332,7 @@ mod windows_tests {
             command: cmd.into(),
             cwd: cwd.to_path_buf(),
             timeout: Some(timeout),
+            limits: Default::default(),
         }
     }
 

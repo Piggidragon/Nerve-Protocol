@@ -1153,6 +1153,59 @@ async fn daemon_answers(paths: &NodePaths, folders: bool) -> bool {
     }
 }
 
+/// What `status` says of the limits per command (crate::cgroup::status):
+/// what a command gets and may ask for, then where they hold or why not.
+fn limits_lines(v: &Value) -> Vec<String> {
+    let n = |k: &str| v[k].as_u64().unwrap_or_default();
+    let mut lines = vec![format!(
+        "limits per command: memory {} MiB, CPU {} %, {} processes; a call may ask for up to {} MiB, {} %, {} processes",
+        n("memory_mb"),
+        n("cpu_percent"),
+        n("processes"),
+        n("memory_max_mb"),
+        n("cpu_max_percent"),
+        n("processes_max"),
+    )];
+    let list = |k: &str| -> Vec<&str> {
+        v[k].as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect()
+    };
+    let (enforced, lost) = (list("enforced"), list("lost"));
+    if let Some(cgroup) = v["cgroup"].as_str() {
+        let not: Vec<&str> = ["memory", "cpu", "processes"]
+            .into_iter()
+            .filter(|l| !enforced.contains(l) && !lost.contains(l))
+            .collect();
+        let mut line = match enforced.is_empty() {
+            true => format!("limits held by the cgroup {cgroup}: none"),
+            false => format!(
+                "limits held by the cgroup {cgroup}: {}",
+                enforced.join(", ")
+            ),
+        };
+        if !not.is_empty() {
+            line.push_str(&format!(
+                "; not {} (the cgroup has no controller for it)",
+                not.join(", ")
+            ));
+        }
+        lines.push(line);
+        // Turned off while the node ran: no command runs (crate::cgroup).
+        if !lost.is_empty() {
+            lines.push(format!(
+                "NO COMMAND RUNS: {} turned off in the cgroup since the node started; start the node again",
+                lost.join(", ")
+            ));
+        }
+    } else if let Some(why) = v["off"].as_str() {
+        lines.push(format!("commands run WITHOUT these limits: {why}"));
+    }
+    lines
+}
+
 /// What `status` says when no daemon answered. With a control socket
 /// (Unix) that means none runs; without one a running node cannot be told
 /// apart from a stopped one.
@@ -1339,6 +1392,9 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                     if let Some(why) = v["folder_commands_off"].as_str() {
                         w(out, format!("folder mode runs no command: {why}"));
                     }
+                    for line in limits_lines(&v["command_limits"]) {
+                        w(out, line);
+                    }
                     if v["locked"] == true {
                         w(
                             out,
@@ -1393,6 +1449,11 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                 &crate::secrets::NodeSecrets::for_cli(&paths),
             )?;
             w(out, no_daemon_status(cfg!(unix)));
+            let limits =
+                crate::cgroup::status(&cfg.limits.command, &Err("the node does not run".into()));
+            if let Some(line) = limits_lines(&limits).first() {
+                w(out, line.clone());
+            }
             if cfg.locked {
                 w(
                     out,
@@ -4787,6 +4848,85 @@ mod tests {
         restart_for_keyring(&fine, &paths, Some(&sys), &mut out).unwrap();
         restart_for_keyring(&fine, &paths, None, &mut out).unwrap();
         assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+    }
+
+    /// `status` shows the limits per command the owner set, and whether
+    /// the running node holds commands to them, or why not.
+    #[cfg(unix)]
+    #[test]
+    fn the_status_shows_the_limits_per_command() {
+        let (d, paths) = setup(&[]);
+        run(
+            &paths,
+            &["config", "set", "limits.command.memory_mb", "512"],
+        )
+        .unwrap();
+        let out = run(&paths, &["status"]).unwrap();
+        assert!(
+            out.contains("limits per command: memory 512 MiB, CPU 200 %, 1024 processes; a call may ask for up to 16384 MiB, 800 %, 8192 processes"),
+            "{out}"
+        );
+        let (ready_tx, ready) = std::sync::mpsc::channel();
+        let (stop, stop_rx) = std::sync::mpsc::channel::<()>();
+        let node = {
+            let (home, paths) = (d.path().to_path_buf(), paths.clone());
+            std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                let mut opts = NodeOptions::new(paths);
+                opts.home = home;
+                opts.full_rights = Some(false);
+                opts.cgroups = Some(Err("no cgroup for this test".into()));
+                let daemon = rt.block_on(Daemon::start(opts)).unwrap();
+                ready_tx.send(()).unwrap();
+                rt.block_on(async {
+                    while stop_rx.try_recv().is_err() {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    daemon.stop().await;
+                });
+            })
+        };
+        ready.recv().unwrap();
+        let out = run(&paths, &["status"]);
+        stop.send(()).unwrap();
+        node.join().unwrap();
+        let out = out.unwrap();
+        assert!(out.contains("limits per command: memory 512 MiB"), "{out}");
+        assert!(
+            out.contains("commands run WITHOUT these limits: no cgroup for this test"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn the_status_names_the_cgroup_and_what_it_holds() {
+        let v = json!({"memory_mb": 1, "memory_max_mb": 2, "cpu_percent": 3,
+                       "cpu_max_percent": 4, "processes": 5, "processes_max": 6,
+                       "cgroup": "/system.slice/nerve-node.service",
+                       "enforced": ["memory", "processes"], "off": null});
+        assert_eq!(
+            limits_lines(&v),
+            [
+                "limits per command: memory 1 MiB, CPU 3 %, 5 processes; a call may ask for up to 2 MiB, 4 %, 6 processes",
+                "limits held by the cgroup /system.slice/nerve-node.service: memory, processes; not cpu (the cgroup has no controller for it)",
+            ]
+        );
+        // Turned off since the start: said apart from what the cgroup never
+        // had, with what follows from it.
+        let v = json!({"memory_mb": 1, "memory_max_mb": 2, "cpu_percent": 3,
+                       "cpu_max_percent": 4, "processes": 5, "processes_max": 6,
+                       "cgroup": "/", "enforced": [], "lost": ["memory", "processes"],
+                       "off": null});
+        assert_eq!(
+            limits_lines(&v)[1..],
+            [
+                "limits held by the cgroup /: none; not cpu (the cgroup has no controller for it)",
+                "NO COMMAND RUNS: memory, processes turned off in the cgroup since the node started; start the node again",
+            ]
+        );
     }
 
     /// Setup restarts a node that found no keyring also when the keyring

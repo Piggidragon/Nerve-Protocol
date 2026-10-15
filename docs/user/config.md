@@ -48,6 +48,14 @@ output_cap_bytes = 16777216 # for stdout and for stderr each; a result carries 1
 default_timeout_secs = 600  # how long a command runs when its call gives no timeout_ms
 max_timeout_secs = 3600     # the longest any command runs; a larger timeout_ms is cut to it
 
+[limits.command]            # what one command may use, Linux (limits.md)
+memory_mb = 4096            # MiB; past it the command is killed
+memory_max_mb = 16384       # the most a call may ask for
+cpu_percent = 200           # of one CPU: 200 is two CPUs
+cpu_max_percent = 800
+processes = 1024            # processes and threads at once
+processes_max = 8192
+
 [connection]
 proxy = "http://proxy:3128" # set with `nerve-node proxy set`; https://… for a relay
 
@@ -221,7 +229,8 @@ and nothing changes. Wait until they end, or end every command with `nerve-node 
 set `keyring`, then `nerve-node unlock`. Commands that run as another
 account than root do not count, as they cannot reach the session.
 A process that a command takes out of its process group (`setsid`) outlives
-the command and is not counted. If a center you do not trust had `folder`
+the command where the node runs it without a cgroup ([limits](limits.md)),
+and is not counted. If a center you do not trust had `folder`
 mode while the keys were in files, restart the machine before you set
 `keyring`.
 

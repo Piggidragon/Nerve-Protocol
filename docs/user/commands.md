@@ -48,7 +48,7 @@ center is paired.
 | Command | Does | Page |
 |---|---|---|
 | `run` | Run the node in the foreground | [pairing](pairing.md) |
-| `status` | Show whether it runs, the links and the confinement | [troubleshooting](troubleshooting.md) |
+| `status` | Show whether it runs, the links, the confinement and the [limits per command](limits.md) | [troubleshooting](troubleshooting.md) |
 | `audit [--denied] [--follow]` | Show what was allowed and refused | [audit](audit.md) |
 | `panic`, `unlock` | Stop everything, then allow it again | [stop](stop.md#panic) |
 

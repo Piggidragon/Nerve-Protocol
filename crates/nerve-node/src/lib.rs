@@ -8,6 +8,7 @@
 //! process with [`daemon::Daemon::start`] and pair with [`pair::pair`].
 
 pub mod account;
+pub mod cgroup;
 pub mod cli;
 pub mod daemon;
 pub mod descriptor;

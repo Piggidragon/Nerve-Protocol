@@ -38,12 +38,19 @@ Only you can resume it.
 ## What ends a command
 
 A command stops when its call ends: on its timeout, when the caller cancels,
-when its session ends, or when the link drops. Every command has a timeout:
-its `timeout_ms`, or the node's default, and never more than the node's maximum
-([how long a command may run](config.md#how-long-a-command-may-run)). On Linux the node kills the
-command's whole process group. On Windows it ends the command's Job Object.
+when its session ends, or when its link ends. A link that drops without a
+goodbye is kept 30 seconds and its commands run on; they end when the link is
+not back by then, or at once when the link ends with a goodbye (`panic`,
+`center pause`, a stopped node). Taking the machine off the network for less
+than 30 seconds does not stop a command; use `nerve-node panic`. On Linux the
+node kills the command's whole process group, and everything in the command's
+cgroup where it has one ([limits](limits.md)). On Windows it ends the
+command's Job Object. A command that goes past its memory limit is killed too.
+Every command also has a timeout: its `timeout_ms`, or the node's default, and
+never more than the node's maximum
+([how long a command may run](config.md#how-long-a-command-may-run)).
 
 On Windows a timeout, and `exec_signal` with `term` or `int`, first ask the
 command to end: its console programs get Ctrl+C and its windows a close
 request. What has not ended 3 seconds later is ended with the Job Object.
-`kill`, a cancel, the end of a session and a dropped link end it at once.
+`kill`, a cancel, the end of a session and the end of its link end it at once.

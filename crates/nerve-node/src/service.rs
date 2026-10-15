@@ -104,7 +104,11 @@ impl Layout {
     /// privilege it keeps: they let it start a command as the
     /// account `machine.user` names. Every command drops them before it
     /// runs; the bounding set stays as it is, since an allowed sudo command
-    /// needs root's.
+    /// needs root's. The service's cgroup is the node's to divide
+    /// (`Delegate=`): each command runs in one of its own below it, held to
+    /// its limits (crate::cgroup). A command the kernel kills for its memory
+    /// leaves the node running (`OOMPolicy=`, which `Delegate=` defaults to
+    /// already).
     pub fn unit_text(&self) -> String {
         format!(
             "# Written by `nerve-node install`; `nerve-node uninstall` removes it.
@@ -120,6 +124,8 @@ User={USER}
 Group={USER}
 Environment=HOME={home}
 AmbientCapabilities=CAP_SETUID CAP_SETGID
+Delegate=cpu memory pids
+OOMPolicy=continue
 ExecStart={bin} --config-dir {config} --state-dir {state} run
 ExecReload=kill -HUP $MAINPID
 Restart=on-failure
@@ -1790,6 +1796,9 @@ pub(crate) mod tests {
             .filter(|l| l.contains("Capabilit") || l.contains("NoNewPrivileges"))
             .collect();
         assert_eq!(caps, ["AmbientCapabilities=CAP_SETUID CAP_SETGID"]);
+        // The cgroup of the service is the node's, for one per command.
+        assert!(unit.contains("\nDelegate=cpu memory pids\n"), "{unit}");
+        assert!(unit.contains("\nOOMPolicy=continue\n"), "{unit}");
         assert!(
             unit.contains(&format!(
                 "\nExecStart={} --config-dir {} --state-dir {} run\n",

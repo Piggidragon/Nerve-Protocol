@@ -170,6 +170,15 @@ sets no wait, since it is no longer the node's link. `link_replaced` takes
 the old link out of the node's links at once and says nothing if it is not
 there: a link that ended during the 3 s wait has told its drop already.
 
+A link the node can resume (protocol §4.9) that drops is parked: the drop line
+(`link_parked`) says how many calls wait, and the link stays in the node's
+links, offline. A connection that resumes it logs `link resumed after …`
+through `link_up`, counted as no new link in the statistics; the end of an
+older connection of that link is a debug line. A link not resumed within the
+grace logs a warning with the calls that failed. The grace is 30 s
+(`Center::grace`); a test shortens it with `set_resume_grace`, and a node's
+with `NodeOptions::resume_grace`.
+
 A pairing code that runs out unused is noticed by `Center::sweep_codes`, which
 the center calls every five seconds, so its line is at most that late. The
 pairing endpoint is open to anyone who reaches the port, so a refusal for a

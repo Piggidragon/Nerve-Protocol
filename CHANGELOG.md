@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Limits per command
+
+- On Linux every command runs in a cgroup of its own, held to its memory, CPU and processes. The owner sets the defaults and the most a call may ask for in `[limits.command]` of `node.toml`; `exec.run` takes `memory_mb`, `cpu_percent` and `processes` up to that most. A command past its memory is killed, and its result (`killed: "memory"`) and the audit log say why. `nerve-node status` shows the limits and whether the node holds them ([#119](https://github.com/Piggidragon/Nerve-Protocol/issues/119)).
+- When a command ends, everything in its cgroup ends too, also a process it moved out of its process group.
+- The installed unit gets `Delegate=cpu memory pids`. After `update`, run `sudo nerve-node install` once more to write it; until then commands run without these limits. A node you start yourself has them under `systemd-run --user --scope -p Delegate=yes nerve-node run`.
+- A 0.0.3 node refuses a `node.toml` that sets `[limits.command]`. Before you go back to 0.0.3, remove it with `nerve-node config unset limits.command`.
+
 ### Capability providers
 
 - A program on the machine that the owner names in `providers.allowed`, such as a desktop app, can attach to the node's control socket and add capabilities of its own. The node lists them to every center with `provider: <name>`, decides and audits every call to them by that center's policy, forwards only the allowed ones, and drops them when the program exits. Linux only for now; the conformance suite has a provider part ([#16](https://github.com/Piggidragon/Nerve-Protocol/issues/16)).

@@ -274,6 +274,21 @@ impl AuditLog {
         self.append(&v)
     }
 
+    /// A rotation of a key between the node and `center`
+    /// (docs/dev/spec/protocol.md §4.9): `event` says which and how it ended
+    /// (`node-key`, `node-key-refused`, `node-key-unanswered`,
+    /// `node-key-grace-ended`, `center-key`), `detail` the public keys or
+    /// pins and why. Never a private key.
+    pub fn key(&self, center: &str, event: &str, detail: &str) -> std::io::Result<()> {
+        self.append(&json!({
+            "ts": nerve_proto::msg::now_ms(),
+            "kind": "key",
+            "center": center,
+            "event": event,
+            "detail": detail,
+        }))
+    }
+
     /// One tunnel the relay carried (docs/dev/spec/protocol.md §4.8): the
     /// relayed node, the center, the peer's address, when it opened and
     /// ended (ms since the epoch), why it ended and the bytes each way. No

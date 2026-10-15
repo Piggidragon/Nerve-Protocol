@@ -57,6 +57,31 @@ The center computes the `node_id` from the public key itself.
 | 403 | Code unknown, used, expired or out of tries |
 | 409 | Another node has this name, or this key is paired |
 
+## Key rotation
+
+Both keys of a pairing can be replaced without pairing again
+([spec/protocol.md](spec/protocol.md) §4.9, feature `rotate`). The side whose
+key changes starts it on its owner's command; the new key goes over the
+live link, signed by the old one, and the old key stays valid for a grace of
+7 days.
+
+| Key | Started by | Code |
+|---|---|---|
+| The node's key for a center | `nerve-node center rotate-key` | `crates/nerve-node/src/rotate.rs`, `Center::rotate_node_key` |
+| The center's TLS key | the web UI (Settings, Center key) | `Center::rotate_key`, `crate::rotate::center_rotated` on the node |
+
+- The node id stays the one of the first key. The center keeps the node's
+  old key beside the new one (`old_key` in `state.json`) until the grace
+  ends or the node ends it (`key.retire`).
+- The node keeps its new key aside (`keys/<name>.next.key`, or its keyring
+  entry) until the center answered; no answer sends it again on the next
+  link, so a rotation the center took is never lost.
+- The center keeps its new key in `tls.next.pem`, serves the old one during
+  the grace so that nodes away for a while can still be told, then moves the
+  new one to `tls.pem`. A start that finds a half-made rotation keeps the
+  old key. The node keeps the old pin as `old_pin` until the grace ends.
+- Each rotation is in the node's audit log and the center's log.
+
 ## Unpairing
 
 Both sides can end a pairing.

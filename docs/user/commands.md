@@ -17,6 +17,7 @@ center is paired.
 |---|---|---|
 | `center add '<link>' [--name N] [--yes]` | Pair with a center | [pairing](pairing.md) |
 | `center rm` | Unpair and delete the key | [pairing](pairing.md#unpair) |
+| `center rotate-key [--end-grace]` | Give this machine a new key for a center, or end the old key's 7 days | [pairing](pairing.md#rotate-the-machines-key) |
 | `center ls` | List centers, their mode and grant | [pairing](pairing.md) |
 | `center pause`, `center resume` | Stop or restart the link to a center | [stop](stop.md#pause) |
 | `center grant settings write\|off` | Let a center change settings | [settings grant](settings-grant.md) |

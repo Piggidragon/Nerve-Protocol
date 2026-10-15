@@ -82,6 +82,35 @@ nerve-node center ls
 
 To pair again, remove the old pairing on both sides, then make a new link.
 
+## Rotate the machine's key
+
+Each pairing has its own key. To replace the key for a center without pairing
+again, run on the machine, while the node runs and is linked to that center:
+
+```sh
+nerve-node center rotate-key --center lab
+```
+
+The node makes a new key and sends it to the center over the link, signed with
+the old one. It prints the new public key once. The center takes the old key
+for 7 more days, so nothing breaks while the switch is under way. To end that
+now:
+
+```sh
+nerve-node center rotate-key --end-grace --center lab
+```
+
+- The machine keeps its id at the center; its tools and statistics stay.
+- If the center refuses the new key, the old one stays. If no answer comes,
+  the old key stays in use and the node sends the new key again on its next
+  link.
+- A center older than 0.0.4 cannot rotate keys; the command says so and
+  changes nothing.
+- Each rotation is in the [audit log](audit.md).
+
+The center's own key is rotated in its web UI ([center](center.md#rotate-the-key)).
+A running node follows it by itself.
+
 ## Drops
 
 The node dials the center. When a link drops, running commands on it end. The

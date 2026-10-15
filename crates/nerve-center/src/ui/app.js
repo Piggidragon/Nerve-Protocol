@@ -52,7 +52,7 @@ let lastSig = null;
 let busy = false;
 let down = false;
 let settingsRun = 0;
-const state = { overview: null, stats: null, statsNode: null, audit: null, log: null, help: null, pairing: null, settings: null, newToken: null };
+const state = { overview: null, stats: null, statsNode: null, audit: null, log: null, help: null, pairing: null, settings: null, newToken: null, newPin: null };
 
 const $ = (id) => document.getElementById(id);
 
@@ -730,11 +730,43 @@ function pageSettings() {
         await api("POST", "/api/center", { name: name.value, retention_days: Number(days.value), pair_code_minutes: Number(pairMinutes.value), log_level: logLevel });
         notify("Saved.");
       }) }, "Save")))),
+    section("Center key", "Machines check the center by this key's pin. Rotating it makes a new key; the old one is served for 7 more days, so the machines learn the new one when they link.", null,
+      centerKey(s.center.key)),
     section("Harness tokens", "A token lets an AI harness call this center over HTTP.", null,
       el("div", { class: "list" }, el("div", { class: "card" }, tokenForm()), s.tokensBox)),
     section("Machines", "Settings kept on each machine itself.", null,
       s.nodes.length ? el("div", { class: "list" }, s.nodes.map(nodeSettings)) : empty("No machines yet.")),
   ];
+}
+
+// The center's TLS key (docs/user/center.md#rotate-the-key). The new pin is
+// shown once, when the rotation is made, as a pairing shows its code.
+function centerKey(k) {
+  const rotate = act(async () => {
+    const yes = await modal({ title: "Rotate the center's key?", message: "Machines that link in the next 7 days follow it. A machine away longer, or one older than this center, has to be paired again.", confirm: "Rotate" });
+    if (!yes) return;
+    const r = await api("POST", "/api/center/key/rotate");
+    state.newPin = r.pin;
+    notify(`The key was rotated; ${plural(r.told, "machine")} linked now ${r.told === 1 ? "was" : "were"} told.`);
+    await loadSettings();
+  });
+  const finish = act(async () => {
+    const yes = await modal({ title: "Serve the new key now?", message: "Machines that were not told of the rotation cannot link any more and have to be paired again.", confirm: "Serve it now", danger: true });
+    if (!yes) return;
+    await api("POST", "/api/center/key/finish");
+    notify("The center serves its new key now.");
+    await loadSettings();
+  });
+  return el("div", { class: "card" },
+    state.newPin ? el("div", { class: "banner ok" }, icon("key"),
+      el("span", {}, "New pin, shown once: ", el("code", { class: "mono" }, state.newPin)),
+      el("button", { type: "button", class: "btn ghost sm", onclick: () => copy(state.newPin) }, icon("copy", "sm"), "Copy"),
+      el("button", { type: "button", class: "btn ghost sm", "aria-label": "Hide", onclick: () => { state.newPin = null; draw(true); } }, icon("x", "sm"))) : null,
+    el("p", { class: "meta" }, "Pin served now: ", el("code", { class: "mono" }, k.pin)),
+    k.grace_until_ms ? el("p", { class: "meta" }, `A rotation is in its grace: the old key is served until ${when(k.grace_until_ms)}.`) : null,
+    el("div", { class: "actions" }, k.grace_until_ms
+      ? btn("Serve the new key now", "danger", finish, "key")
+      : btn("Rotate key", "", rotate, "key")));
 }
 
 function tokenForm() {

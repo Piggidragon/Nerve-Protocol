@@ -41,6 +41,11 @@ enum Out {
 /// One authenticated, welcomed link.
 pub struct Link {
     pub node_id: String,
+    /// The node key the hello was signed with: its key, or its old one in
+    /// the grace of a rotation (§4.9).
+    pub auth_key: String,
+    /// Whether both sides speak key rotation.
+    pub rotate: bool,
     pub since: Instant,
     pub since_ms: u64,
     pub limits: Limits,
@@ -58,9 +63,17 @@ pub struct Link {
 }
 
 impl Link {
-    fn new(node_id: &str, limits: Limits, out: mpsc::Sender<Out>) -> Link {
+    fn new(
+        node_id: &str,
+        auth_key: String,
+        rotate: bool,
+        limits: Limits,
+        out: mpsc::Sender<Out>,
+    ) -> Link {
         Link {
             node_id: node_id.to_string(),
+            auth_key,
+            rotate,
             since: Instant::now(),
             since_ms: msg::now_ms(),
             limits,
@@ -226,7 +239,7 @@ async fn next_text(ws: &mut WebSocketStream<BoxIo>, wait: Duration) -> Option<St
 /// Runs a link from the upgraded WebSocket until it ends. `node_id` is the
 /// `Nerve-Node` header, already known to belong to a paired node.
 pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String) {
-    let Some(public_key) = center.public_key(&node_id) else {
+    let Some((public_key, old_key)) = center.node_keys(&node_id) else {
         return refuse(ws, ByeReason::Revoked).await;
     };
     let nonce = nerve_transport::keys::random_bytes(32);
@@ -271,21 +284,32 @@ pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String
             return refuse(ws, ByeReason::ProtocolError).await;
         }
     };
-    if hello.node_id != node_id
-        || !nerve_transport::keys::verify_connect(
-            &public_key,
-            &center.id(),
-            &nonce,
-            &hello.auth.sig,
-        )
-    {
+    // The node's key, or its old one while the grace of a rotation runs.
+    let signed = |k: &str| {
+        hello.node_id == node_id
+            && nerve_transport::keys::verify_connect(k, &center.id(), &nonce, &hello.auth.sig)
+    };
+    let now = msg::now_ms();
+    let auth_key = if signed(&public_key) {
+        public_key
+    } else if let Some(old) = old_key.as_ref().filter(|o| signed(&o.public_key)) {
+        if now >= old.until_ms {
+            center.note(
+                Level::Warn,
+                Some(&node_id),
+                "a link was refused: the hello is signed with the node's old key, whose grace after its rotation has ended",
+            );
+            return refuse(ws, ByeReason::ProtocolError).await;
+        }
+        old.public_key.clone()
+    } else {
         center.note(
             Level::Warn,
             Some(&node_id),
             "a link failed authentication: the hello is not signed with the key paired for this node",
         );
         return refuse(ws, ByeReason::ProtocolError).await;
-    }
+    };
     if !hello.versions.iter().any(|v| v == PROTOCOL_VERSION) {
         center.note(
             Level::Warn,
@@ -313,16 +337,33 @@ pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String
         center.link_replaced(&held);
     }
 
+    // Features go only to a node that named its own (§1.1): an older node
+    // refuses a field it does not know in the welcome.
+    let features = (!hello.features.is_empty()).then(|| {
+        nerve_proto::FEATURES
+            .iter()
+            .filter(|f| hello.features.iter().any(|h| h == *f))
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()
+    });
+    let rotate = features
+        .as_ref()
+        .is_some_and(|f| f.iter().any(|f| f == nerve_proto::FEATURE_ROTATE));
     let welcome = Message::notification(
         method::WELCOME,
-        json!({"version": PROTOCOL_VERSION, "limits": Limits::default()}),
+        serde_json::to_value(msg::Welcome {
+            version: PROTOCOL_VERSION.into(),
+            limits: Limits::default(),
+            features,
+        })
+        .unwrap_or_default(),
     );
     if send_text(&mut ws, welcome).await.is_err() {
         return;
     }
 
     let (tx, mut rx) = mpsc::channel::<Out>(nerve_proto::limits::SEND_QUEUE);
-    let link = Arc::new(Link::new(&node_id, hello.limits, tx));
+    let link = Arc::new(Link::new(&node_id, auth_key, rotate, hello.limits, tx));
     let (mut sink, mut stream) = ws.split();
     let writer = tokio::spawn(async move {
         while let Some(o) = rx.recv().await {
@@ -342,6 +383,11 @@ pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String
         }
     });
     center.link_up(link.clone(), &hello);
+    // A node that links while the center's key rotation is told learns of
+    // it now.
+    if rotate && let Some(notice) = center.rotation_notice() {
+        link.notify(method::CENTER_ROTATE, notice).await;
+    }
 
     let mut clean = false;
     let quiet = center.dead_after();
@@ -452,6 +498,19 @@ async fn handle(center: &Center, link: &Arc<Link>, m: Message) -> Option<ByeReas
                 {
                     *link.status.lock().unwrap() = s.to_string();
                     center.changed(crate::center::Change::Nodes);
+                }
+            }
+            method::KEY_ROTATE if link.rotate => {
+                let r = center.rotate_node_key(link, &params);
+                link.notify(method::KEY_ROTATED, json!(r)).await;
+            }
+            method::KEY_RETIRE if link.rotate => {
+                let (r, opened_with_it) = center.retire_node_key(link, &params);
+                link.notify(method::KEY_RETIRED, json!(r)).await;
+                // The key this link was opened with is refused from now on,
+                // so the link ends; the node dials again with its key.
+                if opened_with_it {
+                    link.bye(ByeReason::Replaced).await;
                 }
             }
             method::BYE => {

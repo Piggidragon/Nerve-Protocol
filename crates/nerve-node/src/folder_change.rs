@@ -366,6 +366,7 @@ mod tests {
             paused: false,
             revoked: false,
             unknown: false,
+            old_pin: None,
             policy: Default::default(),
         }
     }

@@ -17,7 +17,9 @@ gets HTTP 401. The node then stops dialling that center.
    `rev`. It signs `"nerve-connect/0" || center_id || nonce` with its Ed25519
    key for this center.
 3. The center checks the signature and sends `welcome` with the version it
-   picked and its limits.
+   picked and its limits, and the features of the hello it speaks too
+   (`rotate`, [key rotation](identity-and-pairing.md#key-rotation)), when
+   the hello named any.
 
 No other message is valid before `welcome`. Each side has 15 seconds per step.
 After `welcome` the center asks for the descriptor with `describe`.

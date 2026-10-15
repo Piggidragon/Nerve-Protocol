@@ -517,6 +517,14 @@ impl Node {
         self.ok(&["config", "set", "machine.sudo_path", &path]);
     }
 
+    /// Stops the daemon, as a stop of the machine would.
+    pub fn stop(&mut self) {
+        if let Some(mut c) = self.daemon.take() {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+
     /// Whether the daemon has exited by itself.
     pub fn daemon_exited(&mut self) -> bool {
         self.daemon

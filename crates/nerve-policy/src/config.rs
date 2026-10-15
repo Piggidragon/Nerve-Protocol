@@ -427,14 +427,41 @@ pub struct CenterEntry {
     /// The center answered 401: it no longer knows this node.
     #[serde(default, skip_serializing_if = "is_false")]
     pub unknown: bool,
+    /// The pin the center had before it rotated its key, still taken until
+    /// its grace ends (docs/dev/spec/protocol.md §4.9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_pin: Option<OldPin>,
     #[serde(default)]
     pub policy: CenterPolicy,
+}
+
+/// A center's replaced pin and the end of its grace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OldPin {
+    pub pin: String,
+    /// Milliseconds since the Unix epoch; from then on the pin is refused.
+    pub until_ms: u64,
 }
 
 impl CenterEntry {
     /// Whether the node should keep a link to this center.
     pub fn dials(&self) -> bool {
         !self.paused && !self.revoked && !self.unknown
+    }
+
+    /// The pins the center's certificate may carry at `now_ms`: the pin, and
+    /// the old one while its grace runs. Empty without a pin (the system's
+    /// roots, or plain HTTP on loopback).
+    pub fn pins_at(&self, now_ms: u64) -> Vec<&str> {
+        let Some(pin) = self.pin.as_deref() else {
+            return Vec::new();
+        };
+        let mut pins = vec![pin];
+        if let Some(old) = self.old_pin.as_ref().filter(|o| now_ms < o.until_ms) {
+            pins.push(&old.pin);
+        }
+        pins
     }
 }
 
@@ -910,6 +937,16 @@ impl NodeConfig {
             }
             nerve_proto::link::CenterUrl::parse(&c.url)
                 .map_err(|e| format!("center {}: {e}", c.name))?;
+            if let Some(old) = &c.old_pin {
+                nerve_transport::tls::decode_pin(&old.pin)
+                    .map_err(|e| format!("center {}: old_pin: {e}", c.name))?;
+                if c.pin.is_none() {
+                    return Err(format!(
+                        "center {}: old_pin needs the pin that replaced it",
+                        c.name
+                    ));
+                }
+            }
             c.policy
                 .validate()
                 .map_err(|e| format!("center {}: {e}", c.name))?;
@@ -1233,6 +1270,31 @@ sudo_allow = ["sudo apt update"]
         format!(
             "[[center]]\nname = \"home\"\nurl = \"https://c.example:8443\"\ncenter_id = \"c\"\nnode_id = \"n\"\n[center.policy]\n{policy}\n"
         )
+    }
+
+    /// A rotated center's old pin round-trips through the file and is taken
+    /// beside the new one until its grace ends.
+    #[test]
+    fn an_old_pin_is_taken_until_its_grace_ends() {
+        let (new, old) = ("B".repeat(43), "A".repeat(43));
+        let text = format!(
+            "[[center]]\nname = \"home\"\nurl = \"https://c.example:8443\"\npin = \"{new}\"\ncenter_id = \"c\"\nnode_id = \"n\"\n[center.old_pin]\npin = \"{old}\"\nuntil_ms = 1000\n"
+        );
+        let cfg = NodeConfig::parse(&text).unwrap();
+        let c = &cfg.centers[0];
+        assert_eq!(c.pins_at(999), [new.as_str(), old.as_str()]);
+        assert_eq!(c.pins_at(1000), [new.as_str()]);
+        assert_eq!(NodeConfig::parse(&cfg.to_toml()).unwrap(), cfg);
+        // A center without a pin has none to take.
+        let mut plain = c.clone();
+        plain.pin = None;
+        plain.old_pin = None;
+        assert!(plain.pins_at(0).is_empty());
+        // A bad old pin, or one without the pin that replaced it, is refused.
+        let bad = text.replace(&format!("pin = \"{old}\""), "pin = \"short\"");
+        assert!(NodeConfig::parse(&bad).unwrap_err().contains("old_pin"));
+        let alone = text.replace(&format!("pin = \"{new}\"\n"), "");
+        assert!(NodeConfig::parse(&alone).unwrap_err().contains("old_pin"));
     }
 
     /// A folder spelled so that it matches nothing at call time (an 8.3

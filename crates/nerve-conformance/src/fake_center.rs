@@ -189,6 +189,27 @@ pub async fn handshake(
     center_id: &str,
     paired: &Paired,
 ) -> Result<Hello, String> {
+    handshake_with(
+        conn,
+        center_id,
+        &paired.node_id,
+        &paired.request.public_key,
+        None,
+    )
+    .await
+}
+
+/// [`handshake`] against the node key `public_key` (hex), which a rotation
+/// may have replaced since the pairing, answering with `features` in the
+/// welcome when given (docs/dev/spec/protocol.md §1.1); without, as a center
+/// older than features.
+pub async fn handshake_with(
+    conn: &mut Conn<TcpStream>,
+    center_id: &str,
+    node_id: &str,
+    public_key: &str,
+    features: Option<&[&str]>,
+) -> Result<Hello, String> {
     let nonce = nerve_transport::keys::random_bytes(32);
     conn.notify(
         method::CHALLENGE,
@@ -207,13 +228,9 @@ pub async fn handshake(
             return Err(format!("expected hello, got {other:?}"));
         }
     };
-    let signed = nerve_transport::keys::verify_connect(
-        &paired.request.public_key,
-        center_id,
-        &nonce,
-        &hello.auth.sig,
-    );
-    if !signed || hello.node_id != paired.node_id {
+    let signed =
+        nerve_transport::keys::verify_connect(public_key, center_id, &nonce, &hello.auth.sig);
+    if !signed || hello.node_id != node_id {
         conn.bye("protocol_error").await;
         return Err("the hello signature does not verify".into());
     }
@@ -221,11 +238,11 @@ pub async fn handshake(
         conn.bye("unsupported_version").await;
         return Err("no common version".into());
     }
-    conn.notify(
-        method::WELCOME,
-        json!({"version": PROTOCOL_VERSION, "limits": msg::Limits::default()}),
-    )
-    .await?;
+    let mut welcome = json!({"version": PROTOCOL_VERSION, "limits": msg::Limits::default()});
+    if let Some(f) = features {
+        welcome["features"] = json!(f);
+    }
+    conn.notify(method::WELCOME, welcome).await?;
     Ok(hello)
 }
 

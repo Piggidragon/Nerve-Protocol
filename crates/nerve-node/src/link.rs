@@ -76,16 +76,17 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
         // the runtime's threads.
         let read = {
             let (shared, name) = (shared.clone(), name.clone());
-            tokio::task::spawn_blocking(move || load_key(&shared, &name)).await
+            tokio::task::spawn_blocking(move || load_keys(&shared, &name)).await
         };
-        let key = match read.unwrap_or_else(|e| Err(format!("the key read stopped: {e}"))) {
-            Ok(k) => k,
-            Err(e) => {
-                tracing::error!("center {name}: {e}; dialling stopped");
-                cs.set_status(e);
-                return;
-            }
-        };
+        let (key, rotating) =
+            match read.unwrap_or_else(|e| Err(format!("the key read stopped: {e}"))) {
+                Ok(k) => k,
+                Err(e) => {
+                    tracing::error!("center {name}: {e}; dialling stopped");
+                    cs.set_status(e);
+                    return;
+                }
+            };
         let url = match CenterUrl::parse(&entry.url) {
             Ok(u) => u,
             Err(e) => {
@@ -105,11 +106,12 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
         cs.set_status("connecting");
         tracing::debug!("center {name}: dialling {url}");
         let started = Instant::now();
-        let dialled = ws::connect(
+        // The node id stays the one of the pairing when the key is rotated.
+        let dialled = ws::connect_pins(
             &url,
-            entry.pin.as_deref(),
+            &entry.pins_at(crate::now_ms()),
             proxy.as_ref(),
-            &key.node_id(),
+            &entry.node_id,
             limits::MESSAGE_BYTES as usize,
         )
         .await;
@@ -131,7 +133,7 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
                 Outcome::Retry
             }
             Ok(ws) => {
-                let (outcome, was_up) = session(&shared, &cs, &entry, &key, ws).await;
+                let (outcome, was_up) = session(&shared, &cs, &entry, &key, rotating, ws).await;
                 if was_up {
                     failed_dials = 0;
                 }
@@ -174,6 +176,15 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
 fn load_key(shared: &Shared, name: &str) -> Result<NodeKey, String> {
     let storage = shared.config().machine.secret_storage;
     crate::secrets::center_key(&shared.paths, storage, name)
+}
+
+/// [`load_key`], and whether a rotation of the key waits for the center's
+/// answer (crate::rotate).
+fn load_keys(shared: &Shared, name: &str) -> Result<(NodeKey, bool), String> {
+    let storage = shared.config().machine.secret_storage;
+    let key = crate::secrets::center_key(&shared.paths, storage, name)?;
+    let rotating = crate::secrets::center_next_key(&shared.paths, storage, name)?.is_some();
+    Ok((key, rotating))
 }
 
 /// The proxy to dial `url` through, its header values read from the system
@@ -305,6 +316,7 @@ async fn session(
     cs: &Arc<CenterState>,
     entry: &CenterEntry,
     key: &NodeKey,
+    rotating: bool,
     ws: WsStream,
 ) -> (Outcome, bool) {
     let (mut sink, mut stream) = ws.split();
@@ -332,7 +344,7 @@ async fn session(
         )
         .rev;
         let hello = Hello {
-            node_id: key.node_id(),
+            node_id: entry.node_id.clone(),
             auth: msg::Auth {
                 sig: key.sign_connect(&ch.center_id, &nonce),
             },
@@ -343,6 +355,10 @@ async fn session(
             },
             limits: msg::Limits::default(),
             rev,
+            features: nerve_proto::FEATURES
+                .iter()
+                .map(|f| f.to_string())
+                .collect(),
         };
         let m = Message::notification(
             method::HELLO,
@@ -358,18 +374,27 @@ async fn session(
                 format!("the center chose version {:?}", w.version),
             ));
         }
-        Ok(())
+        // A center older than features names none.
+        let rotate = w
+            .features
+            .unwrap_or_default()
+            .iter()
+            .any(|f| f == nerve_proto::FEATURE_ROTATE);
+        Ok(rotate)
     }
     .await;
-    if let Err((reason, why)) = hello {
-        tracing::warn!("center {}: the handshake failed: {why}", entry.name);
-        cs.set_status(format!("handshake failed: {why}"));
-        if let Some(r) = reason {
-            let _ = sink.send(bye(r)).await;
+    let rotate = match hello {
+        Ok(rotate) => rotate,
+        Err((reason, why)) => {
+            tracing::warn!("center {}: the handshake failed: {why}", entry.name);
+            cs.set_status(format!("handshake failed: {why}"));
+            if let Some(r) = reason {
+                let _ = sink.send(bye(r)).await;
+            }
+            let _ = sink.close().await;
+            return (Outcome::Retry, false);
         }
-        let _ = sink.close().await;
-        return (Outcome::Retry, false);
-    }
+    };
     tracing::info!("linked to center {}", entry.name);
     cs.set_status("connected");
 
@@ -400,7 +425,13 @@ async fn session(
     });
 
     let handle = Arc::new(LinkHandle::new(tx.clone()));
+    handle.set_rotate(rotate);
     *lock(&cs.link) = Some(handle.clone());
+    // A rotation of the node's key that got no answer on an earlier link is
+    // sent again on this one.
+    if rotate && rotating {
+        tokio::spawn(crate::rotate::resume(shared.clone(), entry.name.clone()));
+    }
     let link = Arc::new(Link {
         shared: shared.clone(),
         cs: cs.clone(),
@@ -415,8 +446,9 @@ async fn session(
     let outcome = link.serve(&mut stream).await;
 
     // The link is gone (spec §4.5): calls end, commands die with their
-    // process groups.
+    // process groups, and a key rotation stops waiting for its answer.
     *lock(&cs.link) = None;
+    link.handle.ended();
     let calls: Vec<InFlight> = lock(&link.calls).drain().map(|(_, c)| c).collect();
     for c in calls {
         c.abort.abort();
@@ -696,6 +728,17 @@ impl Link {
                         Some(Outcome::Retry)
                     }
                 }
+            }
+            // Answers to a rotation of the node's key (crate::rotate).
+            method::KEY_ROTATED | method::KEY_RETIRED => {
+                if !self.handle.answer(m, p) {
+                    tracing::debug!("center {}: {m} that nothing waits for; ignored", self.name);
+                }
+                None
+            }
+            method::CENTER_ROTATE => {
+                crate::rotate::center_rotated(&self.shared, &self.name, &self.handle, &p);
+                None
             }
             // Unknown notifications are ignored (spec §3).
             _ => None,
@@ -1549,6 +1592,7 @@ mod tests {
             paused: false,
             revoked: false,
             unknown: false,
+            old_pin: None,
             policy: Default::default(),
         });
         cfg.connection.proxy = Some(format!(

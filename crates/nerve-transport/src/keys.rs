@@ -68,6 +68,38 @@ impl NodeKey {
     pub fn sign_sudo_offer(&self, center_id: &str, offer: &crate::sudo::Offer) -> String {
         hex(self.pair.sign(&offer.message(center_id)).as_ref())
     }
+
+    /// A signature of `key.rotate` (spec §4.9): hex Ed25519 over the rotate
+    /// message for `new_key`. The key it replaces makes `sig`, the new key
+    /// itself `proof`.
+    pub fn sign_rotate(&self, center_id: &str, new_key: &[u8]) -> String {
+        hex(self
+            .pair
+            .sign(&nerve_proto::rotate_node_message(center_id, new_key))
+            .as_ref())
+    }
+
+    /// The `sig` of `key.retire`: hex Ed25519 over the retire message for
+    /// this key.
+    pub fn sign_retire(&self, center_id: &str) -> String {
+        hex(self
+            .pair
+            .sign(&nerve_proto::retire_node_message(
+                center_id,
+                &self.public_key(),
+            ))
+            .as_ref())
+    }
+}
+
+/// Checks a signature (hex) by the node key `public_hex` over `message`.
+pub fn verify_node_signature(public_hex: &str, message: &[u8], sig_hex: &str) -> bool {
+    let (Some(pk), Some(sig)) = (unhex(public_hex), unhex(sig_hex)) else {
+        return false;
+    };
+    UnparsedPublicKey::new(&ED25519, pk)
+        .verify(message, &sig)
+        .is_ok()
 }
 
 /// A node id: base32 of the first 16 bytes of sha256 of the public key.
@@ -214,6 +246,48 @@ mod tests {
         let mut other = p.offer().clone();
         other.ts += 1;
         assert!(!verify_sudo_offer(&k.public_hex(), "c1", &other, &sig));
+    }
+
+    #[test]
+    fn rotations_are_signed_for_one_center_and_one_key() {
+        let (old, new) = (NodeKey::generate().unwrap(), NodeKey::generate().unwrap());
+        let msg = |c: &str, k: &NodeKey| nerve_proto::rotate_node_message(c, &k.public_key());
+        let sig = old.sign_rotate("c1", &new.public_key());
+        assert!(verify_node_signature(
+            &old.public_hex(),
+            &msg("c1", &new),
+            &sig
+        ));
+        // Not for another center, another new key, or under another key.
+        assert!(!verify_node_signature(
+            &old.public_hex(),
+            &msg("c2", &new),
+            &sig
+        ));
+        assert!(!verify_node_signature(
+            &old.public_hex(),
+            &msg("c1", &old),
+            &sig
+        ));
+        assert!(!verify_node_signature(
+            &new.public_hex(),
+            &msg("c1", &new),
+            &sig
+        ));
+        // A retire signature is no rotate signature.
+        let retire = new.sign_retire("c1");
+        let retire_msg = nerve_proto::retire_node_message("c1", &new.public_key());
+        assert!(verify_node_signature(
+            &new.public_hex(),
+            &retire_msg,
+            &retire
+        ));
+        assert!(!verify_node_signature(
+            &new.public_hex(),
+            &nerve_proto::rotate_node_message("c1", &new.public_key()),
+            &retire
+        ));
+        assert!(!verify_node_signature("zz", &retire_msg, &retire));
     }
 
     #[test]

@@ -600,3 +600,75 @@ fn provider_part_passes_against_nerve_node() {
     );
     drop(node);
 }
+
+/// Key rotation through both binaries over pinned TLS
+/// (docs/dev/spec/protocol.md §4.9): the node rotates its key and ends the
+/// grace of the old one, the center rotates its own and serves it after its
+/// grace, and the node links on through both without pairing again.
+#[test]
+fn both_keys_rotate_without_pairing_again() {
+    let root = tempfile::tempdir().unwrap();
+    let mcp = Mcp::start(&root.path().join("center"), true, &[]);
+    let mut node = Node::new(&root.path().join("node"));
+    node.ok(&["center", "add", &mcp.pair_link(), "--yes"]);
+    node.start();
+    let online = |v: &Value| v["nodes"][0]["online"] == json!(true);
+    let ov = mcp.wait_overview("the node comes online", online);
+    let node_id = ov["nodes"][0]["id"].clone();
+    let old_pin = ov["center"]["pin"].as_str().unwrap().to_string();
+
+    // The node's key: the center takes the new one and the old one for the
+    // grace, which the owner then ends.
+    let out = node.ok(&["center", "rotate-key"]);
+    assert!(out.contains("took this machine's new key"), "{out}");
+    let new_key = out.lines().nth(1).unwrap().trim().to_string();
+    assert_eq!(new_key.len(), 64, "{out}");
+    let ov = mcp.wait_overview("the old key has a grace", |v| {
+        v["nodes"][0]["key_grace_until_ms"].is_u64()
+    });
+    let since = ov["nodes"][0]["since_ms"].clone();
+    let out = node.ok(&["center", "rotate-key", "--end-grace"]);
+    assert!(out.contains(&new_key), "{out}");
+    // The link the old key opened ends; the node links again with its new
+    // key, under the same id.
+    let ov = mcp.wait_overview("the node links with its new key", |v| {
+        online(v)
+            && v["nodes"][0]["since_ms"] != since
+            && v["nodes"][0]["key_grace_until_ms"].is_null()
+    });
+    assert_eq!(ov["nodes"][0]["id"], node_id);
+
+    // The center's key: the node is told and pins the new key beside the
+    // old one; at the end of the grace only the new one.
+    let (status, r) = mcp.api("POST", "/api/center/key/rotate", Value::Null);
+    assert_eq!(status, 200, "{r}");
+    let new_pin = r["pin"].as_str().unwrap().to_string();
+    assert_ne!(new_pin, old_pin);
+    let toml = node.config.join("node.toml");
+    let read = || std::fs::read_to_string(&toml).unwrap();
+    assert!(
+        within(30, || read().contains(&new_pin)
+            && read().contains(&old_pin)),
+        "{}",
+        read()
+    );
+    let (status, r) = mcp.api("POST", "/api/center/key/finish", Value::Null);
+    assert_eq!(status, 200, "{r}");
+    assert_eq!(r["pin"], new_pin.as_str());
+    assert!(within(30, || !read().contains(&old_pin)), "{}", read());
+    // A new start of the node links over the new key.
+    node.stop();
+    mcp.wait_overview("the node is gone", |v| {
+        v["nodes"][0]["online"] == json!(false)
+    });
+    node.start();
+    mcp.wait_overview("the node links over the new key", online);
+    let audit = node.ok(&["audit"]);
+    for event in [
+        "key node-key:",
+        "key node-key-grace-ended:",
+        "key center-key:",
+    ] {
+        assert!(audit.contains(event), "{event}: {audit}");
+    }
+}

@@ -51,7 +51,19 @@ pub async fn connect(
     node_id: &str,
     max_message: usize,
 ) -> Result<WebSocketStream<BoxIo>, ConnectError> {
-    let io = crate::net::open(url, pin, proxy)
+    connect_pins(url, pin.as_slice(), proxy, node_id, max_message).await
+}
+
+/// [`connect`] to a center that may present any of `pins`
+/// ([`crate::net::open_pins`]).
+pub async fn connect_pins(
+    url: &CenterUrl,
+    pins: &[&str],
+    proxy: Option<&Proxy>,
+    node_id: &str,
+    max_message: usize,
+) -> Result<WebSocketStream<BoxIo>, ConnectError> {
+    let io = crate::net::open_pins(url, pins, proxy)
         .await
         .map_err(ConnectError::Other)?;
     let mut req = url

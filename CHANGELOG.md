@@ -9,6 +9,12 @@
 - A center with the settings grant can no longer allow, or turn on, a capability or an action the node does not offer now: it may sense once a provider offers it, so only the owner does that.
 - A 0.0.3 node refuses a `node.toml` that holds `providers`. Before you go back to 0.0.3, remove it with `nerve-node config unset providers`.
 
+### Key rotation
+
+- A machine's key for a center, and the center's own TLS key, can be replaced without pairing again ([#121](https://github.com/Piggidragon/Nerve-Protocol/issues/121)). `nerve-node center rotate-key` sends the machine's new key to the center over the link, signed with the old one; in the center's web UI, Settings, **Rotate key** makes a new center key that the linked machines learn, signed with the old one. The old key stays valid for 7 days, or until its owner ends that (`--end-grace`, **Serve the new key now**). The machine keeps its id. Each rotation is in the node's audit log and the center's log.
+- The protocol gets additive features (`hello.features`, `welcome.features`, spec §1.1) and the feature `rotate` (spec §4.9). A node or center older than 0.0.4 keeps working with a newer one, but cannot rotate; a node older than 0.0.4 has to pair again after its center's key was rotated.
+- A 0.0.3 node refuses a `node.toml` that holds `old_pin`, which a rotation of the center's key writes for 7 days. Before you go back to 0.0.3, remove it with `nerve-node config unset center.<name>.old_pin`.
+
 ## 0.0.3
 
 ### Upgrading from 0.0.2

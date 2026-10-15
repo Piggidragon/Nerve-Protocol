@@ -69,10 +69,19 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Where the params of an awaited notification go.
+type Answer = tokio::sync::oneshot::Sender<serde_json::Map<String, Value>>;
+
 /// The sending side of one live link, shared with the calls running on it.
 pub(crate) struct LinkHandle {
     pub tx: mpsc::Sender<WsMessage>,
     subs: Mutex<Subs>,
+    /// Whether the center named the feature `rotate` in its welcome
+    /// (docs/dev/spec/protocol.md §4.9).
+    rotate: std::sync::atomic::AtomicBool,
+    /// The answer a key rotation waits for: the method, and where its
+    /// params go (crate::rotate).
+    waiting: Mutex<Option<(&'static str, Answer)>>,
 }
 
 #[derive(Default)]
@@ -87,6 +96,47 @@ impl LinkHandle {
         LinkHandle {
             tx,
             subs: Mutex::default(),
+            rotate: Default::default(),
+            waiting: Mutex::default(),
+        }
+    }
+
+    /// Notes that the center speaks key rotation.
+    pub fn set_rotate(&self, on: bool) {
+        self.rotate.store(on, Ordering::SeqCst);
+    }
+
+    pub fn rotate(&self) -> bool {
+        self.rotate.load(Ordering::SeqCst)
+    }
+
+    /// Waits for the next notification `method` from the center: its params,
+    /// or an error when the link ended first. One waits at a time; a newer
+    /// wait replaces an older one, which then ends.
+    pub fn expect(
+        &self,
+        method: &'static str,
+    ) -> tokio::sync::oneshot::Receiver<serde_json::Map<String, Value>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *lock(&self.waiting) = Some((method, tx));
+        rx
+    }
+
+    /// The link ended: a wait for an answer ends with it.
+    pub fn ended(&self) {
+        lock(&self.waiting).take();
+    }
+
+    /// Hands a notification to whoever waits for it; `false` when nobody
+    /// does, and it is ignored.
+    pub fn answer(&self, method: &str, params: serde_json::Map<String, Value>) -> bool {
+        let mut w = lock(&self.waiting);
+        match w.take() {
+            Some((m, tx)) if m == method => tx.send(params).is_ok(),
+            other => {
+                *w = other;
+                false
+            }
         }
     }
 
@@ -149,6 +199,9 @@ impl LinkHandle {
 pub(crate) struct CenterState {
     pub link: Mutex<Option<Arc<LinkHandle>>>,
     pub status: Mutex<String>,
+    /// Held while a rotation of the node's key for this center runs, so the
+    /// owner's command and the one a new link resumes do not cross.
+    pub rotating: tokio::sync::Mutex<()>,
 }
 
 impl CenterState {
@@ -433,6 +486,7 @@ impl Shared {
                 Arc::new(CenterState {
                     link: Mutex::new(None),
                     status: Mutex::new("not connected".into()),
+                    rotating: tokio::sync::Mutex::new(()),
                 })
             })
             .clone()
@@ -442,6 +496,13 @@ impl Shared {
     pub fn emit(&self, center: &str, cap: &str, name: &str, data: Value) {
         if let Some(l) = lock(&self.centers).get(center).and_then(|c| c.link()) {
             l.event(cap, name, data);
+        }
+    }
+
+    /// Records a rotation of a key in the audit log (crate::rotate).
+    pub fn audit_key(&self, center: &str, event: &str, detail: &str) {
+        if let Err(err) = lock(&self.store).audit().key(center, event, detail) {
+            tracing::error!("the audit log cannot be written: {err}");
         }
     }
 
@@ -1043,6 +1104,7 @@ pub(crate) async fn pipe_control(
     }
     match method {
         "status" => Reply::Ok(shared.status()),
+        "center.rotate-key" => rotate_key(shared, &params).await,
         "folder.add" | "folder.set" | "folder.rm" => {
             let (center, change) =
                 match crate::folder_change::FolderChange::from_request(method, params) {
@@ -1102,6 +1164,24 @@ pub(crate) async fn pipe_control(
     }
 }
 
+/// `center.rotate-key {center, end_grace}`: the owner rotates the node's key
+/// for a center, or ends the grace of its old key (crate::rotate).
+async fn rotate_key(shared: &Arc<Shared>, params: &Value) -> nerve_transport::ctl::Reply {
+    use nerve_transport::ctl::Reply;
+    let Some(center) = params.get("center").and_then(Value::as_str) else {
+        return Reply::Err("center is missing".into());
+    };
+    let r = if params.get("end_grace").and_then(Value::as_bool) == Some(true) {
+        crate::rotate::end_grace(shared, center).await
+    } else {
+        crate::rotate::rotate(shared, center).await
+    };
+    match r {
+        Ok(v) => Reply::Ok(v),
+        Err(e) => Reply::Err(e),
+    }
+}
+
 /// Why a request without the control socket's token is refused.
 #[cfg(unix)]
 const NO_TOKEN: &str = "refused: this request does not carry the control socket's token, which only the owner's own programs can read";
@@ -1128,6 +1208,13 @@ async fn answer(
         // Checking the password runs `sudo -v`, so it cannot block inside
         // `control`.
         "sudo.on" => sudo_on(shared, req.params, peer.pid).await,
+        // A rotation waits for the center's answer.
+        "center.rotate-key" => {
+            if shared.below_command(peer.pid) {
+                return nerve_transport::ctl::Reply::Err(FROM_A_COMMAND.into());
+            }
+            rotate_key(shared, &req.params).await
+        }
         // A capability provider attaches; its connection stays
         // (crate::provider).
         "hello" => {
@@ -1767,6 +1854,7 @@ mod tests {
                     paused: true,
                     revoked: false,
                     unknown: false,
+                    old_pin: None,
                     policy: Default::default(),
                 });
                 Ok(())
@@ -1909,6 +1997,7 @@ mod tests {
                     paused: true,
                     revoked: false,
                     unknown: false,
+                    old_pin: None,
                     policy: Default::default(),
                 });
                 Ok(())
@@ -1996,6 +2085,7 @@ mod tests {
                     paused: false,
                     revoked: false,
                     unknown: false,
+                    old_pin: None,
                     policy: nerve_policy::CenterPolicy {
                         folders: vec![Folder {
                             path: wdir.display().to_string(),

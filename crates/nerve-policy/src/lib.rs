@@ -9,7 +9,7 @@ pub mod protected;
 pub mod rules;
 pub mod settings;
 
-pub use config::{CenterDocument, CenterEntry, CenterPolicy, Mode, NodeConfig};
+pub use config::{CenterDocument, CenterEntry, CenterPolicy, Mode, NodeConfig, OldPin};
 pub use decide::{
     COMMAND_MAX_BYTES, Call, Decision, Env, Target, decide, folder_reach, readable_below,
     sudo_command,

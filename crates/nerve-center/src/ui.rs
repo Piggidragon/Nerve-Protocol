@@ -456,6 +456,13 @@ impl Ui {
                 }
                 Ok(json!({}))
             }
+            // The center's key (docs/dev/spec/protocol.md §4.9): the answer
+            // to a rotation is the only place the new pin is shown.
+            ("POST", "/api/center/key/rotate") => c.rotate_key().await.map_err(bad),
+            ("POST", "/api/center/key/finish") => c
+                .finish_key_rotation("the owner ended its grace")
+                .await
+                .map_err(bad),
             ("GET", "/api/center") => Ok(c.read(|st| {
                 json!({
                     "name": st.center_name,
@@ -467,7 +474,11 @@ impl Ui {
                     "log_level_now": c.log().level(),
                     "log_level_pinned": c.log_level_pinned(),
                 })
-            })),
+            }))
+            .map(|mut v| {
+                v["key"] = c.key_json();
+                v
+            }),
             ("POST", "/api/center") => {
                 let name = b
                     .get("name")
@@ -888,6 +899,7 @@ mod tests {
                     id: id.into(),
                     name: name.into(),
                     public_key: "00".repeat(32),
+                    old_key: None,
                     platform: "linux".into(),
                     arch: "x86_64".into(),
                     paired_ms: 1,
@@ -1937,6 +1949,7 @@ mod tests {
                     id: "n1".into(),
                     name: "box".into(),
                     public_key: "00".into(),
+                    old_key: None,
                     platform: "linux".into(),
                     arch: "x86_64".into(),
                     paired_ms: 0,

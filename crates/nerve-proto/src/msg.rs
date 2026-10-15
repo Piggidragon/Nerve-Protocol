@@ -28,6 +28,13 @@ pub mod method {
     pub const STREAM_CLOSE: &str = "stream.close";
     pub const SESSION_END: &str = "session.end";
     pub const BYE: &str = "bye";
+    // Key rotation (§4.9), only between sides that both name the feature
+    // `rotate`.
+    pub const KEY_ROTATE: &str = "key.rotate";
+    pub const KEY_ROTATED: &str = "key.rotated";
+    pub const KEY_RETIRE: &str = "key.retire";
+    pub const KEY_RETIRED: &str = "key.retired";
+    pub const CENTER_ROTATE: &str = "center.rotate";
 }
 
 /// Limits a side announces for what it receives.
@@ -100,6 +107,10 @@ pub struct Hello {
     pub limits: Limits,
     /// The descriptor revision the node will describe.
     pub rev: u64,
+    /// Additive features the node speaks (§1.1). Left out by nodes older
+    /// than features.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -108,6 +119,63 @@ pub struct Welcome {
     pub version: String,
     #[serde(default)]
     pub limits: Limits,
+    /// The features of the hello the center speaks too. Sent only to a node
+    /// whose hello named features: an older node refuses the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub features: Option<Vec<String>>,
+}
+
+/// `key.rotate` (node → center): the node's new key for this center, signed
+/// by the key it replaces (`sig`) and by itself (`proof`), both over
+/// [`crate::rotate_node_message`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeyRotate {
+    /// The new Ed25519 public key, 64 lowercase hex characters.
+    pub public_key: String,
+    pub sig: String,
+    pub proof: String,
+}
+
+/// `key.rotated` (center → node): the answer to `key.rotate`. Without
+/// `error` the center takes `public_key` as the node's key from now on.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyRotated {
+    pub public_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// `key.retire` (node → center): ends the grace of the node's old key now,
+/// signed by its current key over [`crate::retire_node_message`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeyRetire {
+    /// The node's current public key, which signs, hex.
+    pub public_key: String,
+    pub sig: String,
+}
+
+/// `key.retired` (center → node): the answer to `key.retire`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KeyRetired {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// `center.rotate` (center → node): the center's new TLS key, signed by the
+/// old one. The keys are their SubjectPublicKeyInfo in DER, base64url
+/// without padding; `sig` is the old key's signature over
+/// [`crate::rotate_center_message`], base64url too.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CenterRotate {
+    pub old_spki: String,
+    pub new_spki: String,
+    pub sig: String,
+    /// How long the center still serves the old key, in milliseconds; 0
+    /// once it serves the new one.
+    pub grace_ms: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -373,6 +441,38 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(h.limits, Limits::default());
+    }
+
+    #[test]
+    fn features_are_additive() {
+        // A hello without features (an older node) reads as none.
+        let h: Hello = serde_json::from_value(json!({
+            "node_id": "n", "auth": {"sig": "00"}, "versions": ["0"],
+            "software": {"name": "x", "version": "1"}, "rev": 1
+        }))
+        .unwrap();
+        assert!(h.features.is_empty());
+        assert!(serde_json::to_value(&h).unwrap().get("features").is_none());
+        // A welcome names them only for a node that asked; the node stays
+        // strict about anything else.
+        let w = Welcome {
+            version: "0".into(),
+            limits: Limits::default(),
+            features: None,
+        };
+        assert!(serde_json::to_value(&w).unwrap().get("features").is_none());
+        let w: Welcome =
+            serde_json::from_value(json!({"version": "0", "features": ["rotate"]})).unwrap();
+        assert_eq!(w.features, Some(vec!["rotate".to_string()]));
+        assert!(serde_json::from_value::<Welcome>(json!({"version": "0", "x": 1})).is_err());
+        // What a center sends about keys is strict too.
+        assert!(
+            serde_json::from_value::<CenterRotate>(json!({
+                "old_spki": "a", "new_spki": "b", "sig": "c", "grace_ms": 1, "pin": "d"
+            }))
+            .is_err()
+        );
+        assert!(serde_json::from_value::<KeyRotated>(json!({"public_key": "a", "x": 1})).is_err());
     }
 
     #[test]

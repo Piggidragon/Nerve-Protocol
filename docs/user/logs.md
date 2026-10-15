@@ -20,6 +20,8 @@ The state folders are listed under [where files live](install.md#where-files-liv
 A node [installed as a service](service.md) writes it to
 `/var/lib/nerve/state/log.jsonl`, on Windows to
 `C:\ProgramData\Nerve\state\log.jsonl`, beside its config and audit log.
+A center [installed as a service](center.md#run-it-as-a-service) writes it to
+`/var/lib/nerve-center/log.jsonl`.
 The file is readable by its owner only. At 5 MiB the program moves it to
 `log.jsonl.1`, which replaces the older copy, so a log takes at most about
 10 MiB. The node writes it while `nerve-node run` is running.
@@ -72,7 +74,7 @@ with `ForEach-Object { "$($_.TimeCreated) $($_.Id) $($_.Properties.Value)" }`.
 Every user of the machine can read the Application log, so these entries are
 redacted like the log ([below](#what-is-never-in-it)). A node you start
 yourself with `nerve-node run` writes no events. On Linux the journal has the
-service's output (`journalctl -u nerve-node`).
+service's output (`journalctl -u nerve-node`, `journalctl -u nerve-center`).
 
 ## Levels
 

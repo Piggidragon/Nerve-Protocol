@@ -434,7 +434,7 @@ impl System for Host {
 }
 
 /// The shell of an account that does not log in.
-fn no_login() -> &'static str {
+pub fn no_login() -> &'static str {
     ["/usr/sbin/nologin", "/sbin/nologin"]
         .into_iter()
         .find(|s| Path::new(s).exists())
@@ -474,7 +474,8 @@ fn regain_root(c: &mut std::process::Command) {
     let _ = c;
 }
 
-fn run(program: &str, args: &[&str]) -> Result<(), String> {
+/// Runs a system tool; its error output is the error.
+pub fn run(program: &str, args: &[&str]) -> Result<(), String> {
     let o = std::process::Command::new(program)
         .args(args)
         .output()
@@ -1024,11 +1025,17 @@ fn uninstall_steps(
 
 /// A version as `nerve-node --version` prints it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) struct Version(u64, u64, u64);
+pub struct Version(u64, u64, u64);
 
 impl Version {
     pub(crate) fn parse(said: &str) -> Option<Version> {
-        let v = said.trim().strip_prefix("nerve-node ")?;
+        Version::parse_of("nerve-node", said)
+    }
+
+    /// A version as `<program> --version` prints it, for another program of
+    /// the release (the center's service).
+    pub fn parse_of(program: &str, said: &str) -> Option<Version> {
+        let v = said.trim().strip_prefix(program)?.strip_prefix(' ')?;
         let mut parts = v.split('.').map(|p| p.parse::<u64>().ok());
         let v = Version(parts.next()??, parts.next()??, parts.next()??);
         parts.next().is_none().then_some(v)
@@ -1166,7 +1173,7 @@ pub(crate) fn asset_name() -> Result<String, String> {
 
 /// Downloads `asset` from the release at `base` and checks it against the
 /// release's `SHA256SUMS`.
-pub(crate) async fn fetch_release(base: &str, asset: &str) -> Result<Vec<u8>, String> {
+pub async fn fetch_release(base: &str, asset: &str) -> Result<Vec<u8>, String> {
     nerve_transport::init_crypto();
     let sums = download(&format!("{base}/SHA256SUMS"), SUMS_MAX).await?;
     let want = String::from_utf8_lossy(&sums)
@@ -1254,7 +1261,7 @@ fn split_url(url: &str) -> Result<(nerve_proto::link::CenterUrl, String), String
 
 /// Writes `data` to `path` through a temporary file beside it and a rename,
 /// with `mode`.
-pub(crate) fn write_file(path: &Path, data: &[u8], mode: u32) -> Result<(), String> {
+pub fn write_file(path: &Path, data: &[u8], mode: u32) -> Result<(), String> {
     let at = |e: std::io::Error| format!("{}: {e}", path.display());
     let dir = path.parent().unwrap_or(Path::new("."));
     std::fs::create_dir_all(dir).map_err(at)?;
@@ -1280,7 +1287,7 @@ pub(crate) fn write_file(path: &Path, data: &[u8], mode: u32) -> Result<(), Stri
     r.map_err(at)
 }
 
-fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
+pub fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -1299,7 +1306,7 @@ fn set_mode(path: &Path, mode: u32) -> Result<(), String> {
 /// of the node's user then cannot reach through a link that user made more
 /// than that user may. A link in place of `dir` is refused. Nothing changes
 /// for another caller than root, or a folder of root's.
-fn as_owner_of(dir: &Path) -> Result<Option<impl Drop>, String> {
+pub fn as_owner_of(dir: &Path) -> Result<Option<impl Drop>, String> {
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::fs::MetadataExt;
@@ -1403,12 +1410,26 @@ fn chown_below(at: &Path, shown: &Path, uid: u32, gid: u32) -> Result<(), String
 /// root's.
 #[cfg(target_os = "linux")]
 fn chown_entry(at: &Path, uid: u32, gid: u32) -> Result<(), String> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(at)
-        .map_err(|e| e.to_string())?;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
+    let path = std::ffi::CString::new(at.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+    // Through libc, not `OpenOptions::custom_flags`: on musl, the C library
+    // of the released programs, the standard library takes O_PATH out of
+    // the flags (musl's O_ACCMODE holds it), and the entry would be opened
+    // for reading, which a socket refuses, a link fails and a FIFO waits on.
+    // SAFETY: a valid C string; the new descriptor is owned below.
+    let fd = unsafe {
+        libc::open(
+            path.as_ptr(),
+            libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().to_string());
+    }
+    // SAFETY: open returned a fresh descriptor nothing else owns.
+    let f = std::fs::File::from(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) });
     let m = f.metadata().map_err(|e| e.to_string())?;
     if m.nlink() > 1 {
         return Err(
@@ -2310,6 +2331,30 @@ pub(crate) mod tests {
         r.unwrap();
         // The tree given as a link is changed as a link only.
         chown_tree(&tree.join("link"), me.uid, me.gid).unwrap();
+    }
+
+    /// A socket in the tree, as the control socket of a node that ran is in
+    /// its state folder, and a FIFO are given away as a file is: neither is
+    /// opened, which a socket refuses and a FIFO would wait on. The walk
+    /// runs aside, so a FIFO that holds it fails the test instead of
+    /// hanging it.
+    #[test]
+    fn chown_tree_gives_a_socket_and_a_fifo_away() {
+        let d = tempfile::tempdir().unwrap();
+        let tree = d.path().join("tree");
+        std::fs::create_dir_all(tree.join("run")).unwrap();
+        let _l = std::os::unix::net::UnixListener::bind(tree.join("run/ctl.sock")).unwrap();
+        let fifo =
+            std::ffi::CString::new(tree.join("run/fifo").into_os_string().into_encoded_bytes())
+                .unwrap();
+        // SAFETY: a valid C string.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let me = me();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || tx.send(chown_tree(&tree, me.uid, me.gid)));
+        rx.recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the walk waits on the FIFO")
+            .unwrap();
     }
 
     /// A file with a second name, which the node's user could have made to

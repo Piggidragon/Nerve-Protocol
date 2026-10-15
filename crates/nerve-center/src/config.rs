@@ -1,10 +1,11 @@
 //! Flags and `NERVE_*` variables. A harness starts `nerve-center` from its MCP
-//! entry, so every setting is a flag or a variable there; there are no
-//! subcommands.
+//! entry, so every setting is a flag or a variable there. The only
+//! subcommands are the service's, which the owner runs as root on Linux
+//! ([`crate::service`]).
 
 use std::path::PathBuf;
 
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 use nerve_transport::log::Level;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -61,6 +62,28 @@ pub struct Args {
     /// the web UI holds, info at first; with it this level holds for this run.
     #[arg(long, env = "NERVE_LOG")]
     pub log: Option<Level>,
+    #[command(subcommand)]
+    pub cmd: Option<Cmd>,
+}
+
+/// The service commands (Linux with systemd, as root). Without one,
+/// `nerve-center` runs the center.
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum Cmd {
+    /// Install the center as a service that starts with the machine and runs under a user of its own, with MCP over HTTP (Linux with systemd, as root).
+    Install,
+    /// Replace the installed program with the latest release and restart the service; the state and the settings stay.
+    Update {
+        /// Take the new program from this file instead of downloading the latest release.
+        #[arg(long, value_name = "FILE")]
+        from: Option<PathBuf>,
+    },
+    /// Stop and remove the service, its user and the program; the state and settings folders stay.
+    Uninstall {
+        /// Delete the state and settings folders too: the center's key, its pairings and its log.
+        #[arg(long)]
+        purge: bool,
+    },
 }
 
 impl Args {
@@ -141,8 +164,27 @@ mod tests {
         let a = Args::try_parse_from(["nerve-center", "--log", "Debug"]).unwrap();
         assert_eq!(a.log, Some(Level::Debug));
         assert!(Args::try_parse_from(["nerve-center", "--log", "loud"]).is_err());
-        // No subcommands: anything positional is refused.
+        // The service commands only: anything else positional is refused.
+        assert_eq!(a.cmd, None);
         assert!(Args::try_parse_from(["nerve-center", "pair"]).is_err());
+        let cmd = |args: &[&str]| {
+            Args::try_parse_from(std::iter::once("nerve-center").chain(args.iter().copied()))
+                .unwrap()
+                .cmd
+        };
+        assert_eq!(cmd(&["install"]), Some(Cmd::Install));
+        assert_eq!(
+            cmd(&["update", "--from", "x"]),
+            Some(Cmd::Update {
+                from: Some("x".into())
+            })
+        );
+        assert_eq!(cmd(&["update"]), Some(Cmd::Update { from: None }));
+        assert_eq!(
+            cmd(&["uninstall", "--purge"]),
+            Some(Cmd::Uninstall { purge: true })
+        );
+        assert!(Args::try_parse_from(["nerve-center", "install", "x"]).is_err());
         assert!(
             is_loopback("127.0.0.1:7480") && is_loopback("[::1]:1") && !is_loopback("0.0.0.0:7480")
         );

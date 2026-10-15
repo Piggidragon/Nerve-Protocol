@@ -1,6 +1,7 @@
 //! `nerve-center`: started by a harness from its MCP configuration. Logs go to
 //! stderr and to the log file in the state folder, never to stdout, which
-//! carries MCP.
+//! carries MCP. `install`, `update` and `uninstall` (as root on Linux) say
+//! their steps on stdout instead.
 
 use clap::Parser;
 
@@ -15,6 +16,16 @@ fn main() -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+    if let Some(cmd) = args.cmd.clone() {
+        let mut out = std::io::stdout();
+        return match rt.block_on(nerve_center::service::execute(cmd, &mut out)) {
+            Ok(()) => std::process::ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("nerve-center: {e}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
     match rt.block_on(nerve_center::server::run(args)) {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(e) => {

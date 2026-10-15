@@ -2,8 +2,9 @@
 //!
 //! `nerve-center` is started by a harness like any MCP server. It pairs nodes,
 //! holds their links, maps their capabilities to MCP tools and serves the
-//! center web UI. It has no subcommands: everything is set by flags or
-//! `NERVE_*` variables in the harness's MCP entry, or in the web UI.
+//! center web UI. Everything is set by flags or `NERVE_*` variables in the
+//! harness's MCP entry, or in the web UI. Its only subcommands install,
+//! update and remove it as a service on Linux ([`service`]).
 //
 // Harnesses get Nerve through MCP only: this MCP server is the whole
 // integration surface. Native plugins are a backlog item.
@@ -17,6 +18,7 @@ pub mod listen;
 pub mod mcp;
 pub mod pairing;
 pub mod server;
+pub mod service;
 pub mod store;
 pub mod tools;
 pub mod ui;

@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::AbortHandle;
 
 use nerve_policy::audit::Entry;
@@ -107,20 +107,52 @@ async fn until(t: Option<Instant>) {
     }
 }
 
-/// Awaits `work`, and drops what `slot` holds at `at` if `work` takes longer:
-/// a keyring that waits to be unlocked or a dial that hangs does not keep a
-/// parked link past its grace.
+/// Awaits `work`, and drops what `slot` holds at `at`, or when `halt`
+/// resolves, if `work` takes longer: a keyring that waits to be unlocked, a
+/// dial or a handshake that hangs does not keep a parked link past its grace,
+/// nor past a lock or pause.
 async fn dropping_at<F: std::future::Future, T>(
     work: F,
     slot: &mut Option<T>,
     at: Option<Instant>,
+    halt: impl std::future::Future<Output = ()>,
 ) -> F::Output {
     tokio::pin!(work);
+    if slot.is_none() {
+        return work.await;
+    }
     tokio::select! {
         r = &mut work => r,
         _ = until(at) => {
             *slot = None;
             work.await
+        }
+        _ = halt => {
+            *slot = None;
+            work.await
+        }
+    }
+}
+
+/// Why the config ends center `name`'s link, if it does: the node is locked
+/// or the center paused (`paused`), or the center is revoked, unknown or
+/// removed (`unpaired`).
+fn stop_reason(cfg: &NodeConfig, name: &str) -> Option<ByeReason> {
+    match cfg.center(name) {
+        None => Some(ByeReason::Unpaired),
+        Some(_) if cfg.locked => Some(ByeReason::Paused),
+        Some(e) if e.paused => Some(ByeReason::Paused),
+        Some(e) if e.revoked || e.unknown => Some(ByeReason::Unpaired),
+        Some(_) => None,
+    }
+}
+
+/// Resolves once the config ends center `name`'s link ([`stop_reason`]),
+/// or the daemon is going away.
+async fn halted(shared: &Shared, name: &str, changed: &mut watch::Receiver<u64>) {
+    while stop_reason(&shared.config(), name).is_none() {
+        if changed.changed().await.is_err() {
+            return;
         }
     }
 }
@@ -153,9 +185,10 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
         // the runtime's threads.
         let grace = parked.as_ref().map(|p| p.until);
         let read = {
-            let (shared, name) = (shared.clone(), name.clone());
-            let read = tokio::task::spawn_blocking(move || load_key(&shared, &name));
-            dropping_at(read, &mut parked, grace).await
+            let (s, n) = (shared.clone(), name.clone());
+            let read = tokio::task::spawn_blocking(move || load_key(&s, &n));
+            let halt = halted(&shared, &name, &mut changed);
+            dropping_at(read, &mut parked, grace, halt).await
         };
         let key = match read.unwrap_or_else(|e| Err(format!("the key read stopped: {e}"))) {
             Ok(k) => k,
@@ -174,15 +207,22 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
             }
         };
         let grace = parked.as_ref().map(|p| p.until);
-        let proxy =
-            match dropping_at(proxy_for(&shared.paths, &cfg, &url), &mut parked, grace).await {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::error!("center {name}: bad proxy: {e}; dialling stopped");
-                    cs.set_status(format!("bad proxy: {e}"));
-                    return;
-                }
-            };
+        let halt = halted(&shared, &name, &mut changed);
+        let proxy = match dropping_at(
+            proxy_for(&shared.paths, &cfg, &url),
+            &mut parked,
+            grace,
+            halt,
+        )
+        .await
+        {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!("center {name}: bad proxy: {e}; dialling stopped");
+                cs.set_status(format!("bad proxy: {e}"));
+                return;
+            }
+        };
         cs.set_status("connecting");
         tracing::debug!("center {name}: dialling {url}");
         let started = Instant::now();
@@ -196,7 +236,13 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
                 limits::MESSAGE_BYTES as usize,
             );
             let grace = parked.as_ref().map(|p| p.until);
-            dropping_at(connect, &mut parked, grace).await
+            dropping_at(
+                connect,
+                &mut parked,
+                grace,
+                halted(&shared, &name, &mut changed),
+            )
+            .await
         };
         let outcome = match dialled {
             Err(ConnectError::Unknown) => {
@@ -217,7 +263,7 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
             }
             Ok(ws) => {
                 let (outcome, was_up, kept) =
-                    session(&shared, &cs, &entry, &key, ws, parked.take()).await;
+                    session(&shared, &cs, &entry, &key, ws, parked.take(), &mut changed).await;
                 parked = kept;
                 if was_up {
                     failed_dials = 0;
@@ -406,6 +452,7 @@ async fn session(
     key: &NodeKey,
     ws: WsStream,
     parked: Option<Parked>,
+    changed: &mut watch::Receiver<u64>,
 ) -> (Outcome, bool, Option<Parked>) {
     let (mut sink, mut stream) = ws.split();
     let cfg = shared.config();
@@ -417,15 +464,12 @@ async fn session(
 
     // Handshake (spec §4.2): challenge → hello → welcome.
     let hello = async {
-        // The grace may end while the challenge is awaited; the parked
-        // link's calls end on time then.
-        let ch: Challenge = tokio::select! {
-            r = handshake_step(&mut stream, method::CHALLENGE) => r?,
-            _ = until(parked.as_ref().map(|p| p.until)) => {
-                parked = None;
-                handshake_step(&mut stream, method::CHALLENGE).await?
-            }
-        };
+        // The grace, a lock or a pause may come while the challenge is
+        // awaited; the parked link's calls end on time then.
+        let grace = parked.as_ref().map(|p| p.until);
+        let halt = halted(shared, &entry.name, &mut *changed);
+        let step = handshake_step(&mut stream, method::CHALLENGE);
+        let ch: Challenge = dropping_at(step, &mut parked, grace, halt).await?;
         // A parked link is offered while its grace lasts and it still keeps
         // every frame the center may not have read; otherwise it ends here.
         // Once offered, it waits for the center's answer.
@@ -477,7 +521,10 @@ async fn session(
         sink.send(text(&m))
             .await
             .map_err(|e| (None, format!("send: {e}")))?;
-        let w: Welcome = handshake_step(&mut stream, method::WELCOME).await?;
+        // An offered link waits for the answer, but not past a lock or pause.
+        let halt = halted(shared, &entry.name, &mut *changed);
+        let step = handshake_step(&mut stream, method::WELCOME);
+        let w: Welcome = dropping_at(step, &mut parked, None, halt).await?;
         if w.version != PROTOCOL_VERSION {
             return Err((
                 Some(ByeReason::UnsupportedVersion),
@@ -501,6 +548,22 @@ async fn session(
             return (Outcome::Retry, false, parked);
         }
     };
+    // A lock or pause that came during the handshake ends the link before it
+    // serves, a parked one with its calls.
+    if let Some(reason) = stop_reason(&shared.config(), &entry.name) {
+        drop(parked);
+        tracing::info!(
+            "center {}: closing the link with bye {}",
+            entry.name,
+            reason.as_str()
+        );
+        if reason == ByeReason::Paused {
+            cs.set_status("paused");
+        }
+        let _ = sink.send(bye(reason)).await;
+        let _ = sink.close().await;
+        return (Outcome::Stop, true, None);
+    }
 
     // One writer owns the sink; everyone else queues (spec §5.5).
     let (tx, mut rx) = mpsc::channel::<WsMessage>(limits::SEND_QUEUE);
@@ -727,15 +790,14 @@ impl Link {
             Some(x) => x,
             None => return self.end(ByeReason::Unpaired, Outcome::Stop).await,
         };
-        // A lock or pause that came while the node dialled and shook hands
-        // is not seen by `changed`, which starts now; a resumed link would
-        // carry the commands it had past it.
-        if cfg.locked || entry.paused {
-            self.cs.set_status("paused");
-            return self.end(ByeReason::Paused, Outcome::Stop).await;
-        }
-        if entry.revoked || entry.unknown {
-            return self.end(ByeReason::Unpaired, Outcome::Stop).await;
+        // A lock or pause that came since the handshake is not seen by
+        // `changed`, which starts now; a resumed link would carry the
+        // commands it had past it.
+        if let Some(reason) = stop_reason(&cfg, &self.name) {
+            if reason == ByeReason::Paused {
+                self.cs.set_status("paused");
+            }
+            return self.end(reason, Outcome::Stop).await;
         }
         let mut rev = descriptor::for_center(
             &cfg,
@@ -1832,7 +1894,11 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(400)).await;
             7
         };
-        assert_eq!(super::dropping_at(step, &mut slot, Some(grace)).await, 7);
+        let halt = std::future::pending();
+        assert_eq!(
+            super::dropping_at(step, &mut slot, Some(grace), halt).await,
+            7
+        );
         assert!(slot.is_none());
         let at = dropped.lock().unwrap().expect("dropped");
         assert!(
@@ -1842,8 +1908,29 @@ mod tests {
         );
         // Without a grace nothing goes.
         let mut kept = Some(1);
-        assert_eq!(super::dropping_at(async { 2 }, &mut kept, None).await, 2);
+        let halt = std::future::pending();
+        assert_eq!(
+            super::dropping_at(async { 2 }, &mut kept, None, halt).await,
+            2
+        );
         assert_eq!(kept, Some(1));
+        // A halt (a lock, a pause) drops it at once, and the step finishes.
+        let dropped = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let mut slot = Some(Held(dropped.clone()));
+        let started = std::time::Instant::now();
+        let halt = tokio::time::sleep(Duration::from_millis(50));
+        let step = async {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            8
+        };
+        assert_eq!(super::dropping_at(step, &mut slot, None, halt).await, 8);
+        assert!(slot.is_none());
+        let at = dropped.lock().unwrap().expect("dropped");
+        assert!(
+            at - started < Duration::from_millis(300),
+            "{:?}",
+            at - started
+        );
     }
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};

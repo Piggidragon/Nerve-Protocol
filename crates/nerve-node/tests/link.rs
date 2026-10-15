@@ -1374,20 +1374,19 @@ async fn a_frame_the_node_cannot_take_ends_a_resumable_link() {
     node.stop().await;
 }
 
-/// A lock (`panic`) that lands while the node dials and shakes hands again
-/// with a dropped link still ends that link once the center carries it on:
-/// `bye paused`, and the command that was running is killed.
+/// A node in Mode::User whose resumable link dropped while a command ran:
+/// the daemon, the dropped link's offer, the command's pid and the next
+/// connection the node dialled, with no challenge sent yet.
 #[cfg(target_os = "linux")]
-#[tokio::test(flavor = "multi_thread")]
-async fn a_lock_during_the_resume_handshake_ends_the_link() {
-    let dir = tempdir();
-    let mut center = FakeCenter::start(false).await.unwrap();
-    let node = paired_node_with(dir.path(), &center, |p| {
+async fn a_dropped_link_with_a_command(
+    root: &Path,
+    center: &mut FakeCenter,
+) -> (Daemon, nerve_proto::msg::Resume, u32, fake_center::Incoming) {
+    let node = paired_node_with(root, center, |p| {
         p.mode = nerve_policy::Mode::User;
     })
     .await;
-    let home = dir.path().join("home");
-    let (mut conn, first) = resumable_link(&mut center, fresh).await;
+    let (mut conn, first) = resumable_link(center, fresh).await;
     conn.call("describe", json!({"detail": "summary"}), WAIT)
         .await
         .unwrap()
@@ -1399,20 +1398,57 @@ async fn a_lock_during_the_resume_handshake_ends_the_link() {
     )
     .await
     .unwrap();
-    let pid = pid_in(&home.join("sleep.pid")).await;
+    let pid = pid_in(&root.join("home").join("sleep.pid")).await;
     drop(conn);
+    // The node dials again; the center holds back its challenge, as its
+    // duplicate ping does.
+    let inc = center.next_link(WAIT).await.expect("the node dials");
+    (node, first, pid, inc)
+}
 
-    // The node dials again; the center holds back its challenge (as its
-    // duplicate ping does) while the owner locks the node.
-    let paired = center.paired().unwrap();
-    let mut inc = center.next_link(WAIT).await.expect("the node dials");
+/// A lock (`panic`) while the node waits for the challenge of a connection
+/// that would resume a dropped link ends that link at once: its command is
+/// killed, the hello offers a new link, and the link ends with `bye paused`.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_while_the_node_dials_again_ends_the_dropped_link_at_once() {
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let (node, first, pid, mut inc) = a_dropped_link_with_a_command(dir.path(), &mut center).await;
+    assert!(running(pid), "the parked command runs");
     owner_edit(node.paths(), |c| c.locked = true).await;
-    assert!(running(pid), "the parked command runs until the link ends");
+    assert!(ends(pid).await, "the command outlived the lock");
+    let paired = center.paired().unwrap();
+    let hello = fake_center::hello(&mut inc.conn, &center.center_id, &paired)
+        .await
+        .expect("hello");
+    let offer = hello.resume.expect("an offer");
+    assert_ne!(offer.link, first.link, "the ended link was offered");
+    fake_center::welcome(&mut inc.conn, Some(fresh(&offer)))
+        .await
+        .expect("welcome");
+    assert_eq!(inc.conn.ends_within(WAIT).await.as_deref(), Some("paused"));
+    node.stop().await;
+}
+
+/// A lock while the node waits for the welcome that answers its resume
+/// offer ends the dropped link at once, and a welcome that then carries it
+/// on gets `bye paused`.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lock_while_the_node_waits_for_the_welcome_ends_the_dropped_link_at_once() {
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let (node, first, pid, mut inc) = a_dropped_link_with_a_command(dir.path(), &mut center).await;
+    let paired = center.paired().unwrap();
     let hello = fake_center::hello(&mut inc.conn, &center.center_id, &paired)
         .await
         .expect("hello");
     let offer = hello.resume.expect("an offer");
     assert_eq!(offer.link, first.link);
+    assert!(running(pid), "the offered link's command runs");
+    owner_edit(node.paths(), |c| c.locked = true).await;
+    assert!(ends(pid).await, "the command outlived the lock");
     fake_center::welcome(
         &mut inc.conn,
         Some(nerve_proto::msg::Resumed {
@@ -1423,6 +1459,5 @@ async fn a_lock_during_the_resume_handshake_ends_the_link() {
     .await
     .expect("welcome");
     assert_eq!(inc.conn.ends_within(WAIT).await.as_deref(), Some("paused"));
-    assert!(ends(pid).await, "the command outlived the lock");
     node.stop().await;
 }

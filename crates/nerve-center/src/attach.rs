@@ -62,6 +62,36 @@ pub fn try_lock(state: &Path) -> Result<Option<Lock>, String> {
     Ok(Some(Lock { _file: file }))
 }
 
+/// Takes the center lock for work on the state folder that a running center
+/// must not meet (a restore): `None` when a center runs. Where `try_lock`
+/// has a real lock this is it. On Windows `try_lock` takes none, so a center
+/// there holds its lock file open and this opens it without sharing, which a
+/// running center's handle refuses.
+#[cfg(unix)]
+pub fn claim(state: &Path) -> Result<Option<Lock>, String> {
+    try_lock(state)
+}
+
+#[cfg(not(unix))]
+pub fn claim(state: &Path) -> Result<Option<Lock>, String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const SHARING_VIOLATION: i32 = 32;
+    std::fs::create_dir_all(state)
+        .map_err(|e| format!("cannot create {}: {e}", state.display()))?;
+    let path = state.join(LOCK_FILE);
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .share_mode(0)
+        .open(&path)
+    {
+        Ok(file) => Ok(Some(Lock { _file: file })),
+        Err(e) if e.raw_os_error() == Some(SHARING_VIOLATION) => Ok(None),
+        Err(e) => Err(format!("cannot open {}: {e}", path.display())),
+    }
+}
+
 #[cfg(unix)]
 mod unix {
     use std::path::Path;

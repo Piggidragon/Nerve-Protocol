@@ -1,0 +1,148 @@
+# Backup and restore
+
+How `nerve-node backup|restore` and `nerve-center backup|restore` work, and
+why. The owner's view is in [docs/user/backup.md](../user/backup.md). The
+container is `crates/nerve-transport/src/backup.rs`; what goes in and what a
+restore does is `crates/nerve-node/src/backup.rs` and
+`crates/nerve-center/src/backup.rs`.
+
+## Decisions
+
+- **One encrypted file, passphrase only.** The file holds private keys, and a
+  backup is meant to lie in places a key file should not (a stick, a cloud
+  folder, a mail). There is no plain mode. The passphrase comes from the
+  terminal, a file (`--passphrase-file`, which must not be readable by others
+  on Unix) or one line of stdin; never from an argument or a variable, which
+  other processes of the user can see. A new backup takes at least 12
+  characters.
+- **Only `ring`.** `ring` has PBKDF2 and the AEADs but no memory-hard KDF
+  (Argon2, scrypt). The file uses PBKDF2-HMAC-SHA256 with 600 000 rounds (the
+  OWASP 2023 figure) and ChaCha20-Poly1305. A memory-hard KDF would resist a
+  graphics card better and needs a new crate, so it is a later change:
+  `kdf` in the header says which one a file used.
+- **The keyring is the owner's call.** A key in the system keyring is read
+  out only with `--include-keyring`. The backup says what it left out.
+- **A restore asks before it replaces.** A backup that is of another node or
+  center than the one here is refused without `--replace`.
+- **A restore never goes under a running node or center.** It holds the
+  node's `keys.lock` (a node holds it for its life) or the center's lock
+  (`center.lock`; on Windows, where the center takes none, a share-less open
+  of the same file).
+
+## The file
+
+All numbers are big-endian. The header is the associated data of the
+encryption, so a changed header opens nothing.
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 8 | `NERVEBAK` |
+| 8 | 1 | format, `1` |
+| 9 | 1 | kind: `1` node, `2` center |
+| 10 | 1 | kdf: `1` PBKDF2-HMAC-SHA256 |
+| 11 | 1 | cipher: `1` ChaCha20-Poly1305 |
+| 12 | 4 | PBKDF2 rounds (1 to 10 000 000; a file asking for more is refused before any work) |
+| 16 | 16 | salt, random per file |
+| 32 | 12 | nonce, random per file |
+| 44 | n + 16 | ciphertext and tag |
+
+The key is `PBKDF2(passphrase, salt, rounds)`, 32 bytes. Salt and nonce are new
+for every file, so one passphrase never gives two files the same key. A file
+larger than 32 MiB is refused before it is read.
+
+The plaintext is JSON: `kind`, `created_ms`, `program`, and `files`, texts by
+a **logical name**, never by a path, so a file cannot name where a restore
+writes.
+
+| Kind | Names |
+|---|---|
+| node | `node.toml`, `key/<center>` (one per pairing), `relay-tls`, `proxy-login`, `proxy-headers` |
+| center | `tls.pem`, `state.json` |
+
+`node.toml` is the config as the node reads it, verified (a refused config is
+not backed up) and without its MAC line. The MAC key
+(`config.key`) is not in the file: it only says that this node wrote the file,
+so the node that restores makes its own and signs the restored config with it.
+
+A backup is trusted as far as its passphrase: it carries every setting of
+`node.toml`, `providers.allowed`, `machine.sudo_path` and `machine.user`
+among them. The user page tells the owner to restore only a file they made;
+the program cannot tell it from one that someone else made with a passphrase
+they know.
+
+## Backup of a node
+
+1. The config comes from the running node over the control socket, else from
+   the file with its MAC checked ([`read_config`](../../crates/nerve-node/src/cli.rs)).
+   `owner.check` comes first, so a command of a center cannot take the keys
+   out under a passphrase of its own.
+2. Each key is read from where `machine.secret_storage` says. With `keyring`
+   and no `--include-keyring` the keyring is not asked for it. A node key is
+   checked against the `node_id` of its pairing, the relay key against
+   `relay.pin`; one that does not fit is left out and said.
+3. The proxy's header values are read from their keyring entry, again only
+   with consent.
+
+## Restore of a node
+
+In this order:
+
+1. The file is read (size and kind are checked before the passphrase is
+   asked), opened, and every key in it is checked against the config: a key of
+   a pairing the config lacks, a text that is no key, a node key whose id is
+   not the pairing's, or a name this program does not know refuses the whole
+   file.
+2. `keys.lock` is taken, or the restore refuses.
+3. The folders here are inspected. A node here is **the same** when it has no
+   pairing, or shares a `(center_id, node_id)` pair with the backup. Any other
+   node, or a `node.toml` that cannot be read, needs `--replace`.
+4. The keys' place is `--secret-storage`, else what the backup's config says.
+   A place the node cannot use (`no_keyring`) is refused here, before any
+   write. The sudo switch is set off: its password is in no backup.
+5. The config's version is set above the version of the backup, the record
+   (`config.version`) and the file it replaces. The record only goes up, so an
+   older config is not accepted by lowering it.
+6. Every key is written with a read-back. Before a key is overwritten its old
+   text is noted; when one write fails, the earlier ones are put back, and
+   nothing else has been written.
+7. The config is written signed, the record is raised, an audit entry
+   (`config`, `restored`) is made.
+8. Keys the replaced config kept and the new one does not name are deleted,
+   and every key left in the place the keys moved away from.
+
+A pairing without a key in the backup keeps the key already here if it fits
+the pairing's `node_id` (a restore on the same machine from a backup made
+without `--include-keyring`); otherwise it is listed, and the owner pairs it
+again.
+
+## Center
+
+`tls.pem` and `state.json` are read as they are on disk. Both are written
+whole by the center (a temporary file and a rename), so a backup of a running
+center is a state it had; only the statistics may lag by up to 5 seconds.
+
+A restore takes the center lock, checks `center_id` (the same center is
+restored, another needs `--replace`), writes `tls.pem` and then `state.json`,
+and puts the old `tls.pem` back if the second write fails.
+
+## Pins
+
+A pin is the hash of a public key. Where each one is kept decides what a
+restore does to it:
+
+| Pin | Kept in | Restore |
+|---|---|---|
+| A center's, held by its nodes | `center.<name>.pin` in `node.toml` | Kept as saved. The center keeps it by restoring `tls.pem` |
+| The relay's | `relay.pin` in `node.toml`; its key in `relay-tls` | Kept; the key is checked against it. A relay whose key is missing does not listen until `relay set` makes a new key and pin |
+| An `https://` proxy's | `connection.pin` in `node.toml` | Kept |
+
+A restore never changes a pin and never learns one. A pairing that was ended
+on one side after the backup is not revived: the other side no longer knows
+the node's key.
+
+## What is not in a backup
+
+The MAC key (made again), the sudo password (never at rest on Linux; DPAPI on
+Windows is tied to the machine), the audit log, the log, the control socket
+and token, the Windows record of folder grants (`grants.json`, rebuilt by the
+running node before a command), and the center's log.

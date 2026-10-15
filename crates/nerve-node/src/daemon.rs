@@ -1168,7 +1168,8 @@ async fn sudo_on(
 /// command: the reading ones too, as `status` and `config.read` hand over the
 /// whole config, which the command's sandbox keeps from it as a file.
 /// `owner.check` changes nothing itself: the CLI asks it before `install`,
-/// `setup`, `update` and `uninstall`, which change the node.
+/// `setup`, `update`, `uninstall`, `backup` and `restore`, which change the
+/// node or take its keys.
 #[cfg(unix)]
 pub(crate) fn control(
     shared: &Arc<Shared>,
@@ -2106,6 +2107,68 @@ mod tests {
         assert!(matches!(r, nerve_transport::ctl::Reply::Ok(_)));
         let r = control(&s, "owner.check", json!({}), Some(me));
         assert!(matches!(r, nerve_transport::ctl::Reply::Ok(_)));
+        daemon.stop().await;
+    }
+
+    /// A command of a center must not take the node's keys out under a
+    /// passphrase of its own, nor put keys of its choosing in: `backup` and
+    /// `restore` ask `owner.check` first.
+    #[tokio::test]
+    async fn backup_and_restore_are_refused_from_below_a_command() {
+        use clap::Parser;
+        let (d, daemon) = daemon().await;
+        let s = daemon.shared.clone();
+        let paths = daemon.paths().clone();
+        let pass = d.path().join("pass");
+        nerve_transport::files::write_private(&pass, b"correct horse battery\n").unwrap();
+        let file = d.path().join("n.bak");
+        let run = |args: Vec<String>| {
+            let mut argv: Vec<String> = vec![
+                "nerve-node".into(),
+                "--config-dir".into(),
+                paths.config_dir.display().to_string(),
+                "--state-dir".into(),
+                paths.state_dir.display().to_string(),
+            ];
+            argv.extend(args);
+            async move {
+                let cli = crate::cli::Cli::try_parse_from(argv).map_err(|e| e.to_string())?;
+                crate::cli::execute(cli, &mut Vec::new()).await
+            }
+        };
+        let (f, p) = (file.display().to_string(), pass.display().to_string());
+        let backup = || {
+            vec![
+                "backup".into(),
+                f.clone(),
+                "--passphrase-file".into(),
+                p.clone(),
+            ]
+        };
+        let restore = || {
+            vec![
+                "restore".into(),
+                f.clone(),
+                "--passphrase-file".into(),
+                p.clone(),
+            ]
+        };
+
+        // This process stands in for a command the node started.
+        lock(&s.commands).insert(std::process::id(), "home".into());
+        for args in [backup(), restore()] {
+            let e = run(args).await.unwrap_err();
+            assert!(e.starts_with("refused"), "{e}");
+        }
+        assert!(!file.exists(), "a command got a backup out");
+
+        // The owner's backup works while the node runs; its restore does not,
+        // as a running node holds the keys.
+        lock(&s.commands).clear();
+        run(backup()).await.unwrap();
+        assert!(file.exists());
+        let e = run(restore()).await.unwrap_err();
+        assert!(e.contains("runs on these folders"), "{e}");
         daemon.stop().await;
     }
 

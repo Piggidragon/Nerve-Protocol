@@ -137,7 +137,7 @@ after `hello` and carries its calls.
 | `reload` | Reread `node.toml` (only a file the node signed) |
 | `sudo.status`, `sudo.on`, `sudo.off` | The sudo switch |
 | `folder.add` | `folder add`, judged by the node as the account commands run as; it stores and records the real place |
-| `owner.check` | Nothing; the CLI asks it before `install`, `setup`, `update` and `uninstall` |
+| `owner.check` | Nothing; the CLI asks it before `install`, `setup`, `update`, `uninstall`, `backup` and `restore` |
 | `hello` | A capability provider attaches; its connection stays ([node-local §7](spec/node-local.md#7-capability-providers)) |
 
 Every method is refused from a process that runs below a command the node

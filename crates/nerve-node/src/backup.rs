@@ -1,0 +1,1435 @@
+//! Backup and restore of a node (docs/dev/backup.md, docs/user/backup.md).
+//!
+//! A backup holds `node.toml` as the node reads it, the node's keys (one per
+//! center, the relay's TLS key, the password of an `https://` proxy) and the
+//! proxy's header values. It holds no more: the key of the config's MAC is
+//! made again by the node that restores (a MAC key is not worth carrying
+//! around: it only checks that the file was written by this node), the sudo
+//! password is never at rest, and the audit log, the log and the control
+//! socket belong to the machine.
+//!
+//! What sits in the system keyring leaves it only with the owner's consent
+//! (`--include-keyring`). A restore never touches a node that runs, and
+//! refuses a backup of another node unless the owner says so.
+//!
+//! No message here carries the text of a key, a password or a passphrase;
+//! they name the center, the file or the keyring entry.
+
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
+
+use nerve_policy::audit::AuditLog;
+use nerve_policy::config::{SecretStorage, Sudo, valid_center_name};
+use nerve_policy::settings::{Secrets, sealed};
+use nerve_policy::{NodeConfig, SettingsStore};
+use nerve_transport::backup::{self, Contents, Kind, Passphrase};
+use nerve_transport::keys::NodeKey;
+
+use crate::paths::NodePaths;
+use crate::secrets::{self, Entry, Key, KeysLock, NodeSecrets};
+
+/// The logical names of the texts in a node backup. A file carries no path:
+/// where each goes is decided here.
+const CONFIG: &str = "node.toml";
+const KEY_PREFIX: &str = "key/";
+const RELAY_TLS: &str = "relay-tls";
+const PROXY_LOGIN: &str = "proxy-login";
+const PROXY_HEADERS: &str = "proxy-headers";
+
+/// What the owner chose for a backup.
+#[derive(Debug, Clone, Copy)]
+pub struct BackupOpts {
+    /// Take the keys that sit in the system keyring into the file.
+    pub include_keyring: bool,
+    /// Replace the file when it exists.
+    pub overwrite: bool,
+    /// PBKDF2 rounds ([`backup::ITERATIONS`]; a test uses fewer).
+    pub rounds: u32,
+}
+
+/// What a backup took and what it left out.
+#[derive(Debug, Default)]
+pub struct BackupReport {
+    /// The centers the config names.
+    pub centers: Vec<String>,
+    /// The keys in the file, as a message names them.
+    pub saved: Vec<String>,
+    /// What was not taken, and why.
+    pub left_out: Vec<String>,
+}
+
+/// Writes the backup of the node `cfg` describes at `paths` to `file`.
+pub fn backup(
+    paths: &NodePaths,
+    cfg: &NodeConfig,
+    file: &Path,
+    pass: &Passphrase,
+    opts: &BackupOpts,
+) -> Result<BackupReport, String> {
+    pass.check_new()?;
+    let (contents, report) = collect(paths, cfg, opts.include_keyring)?;
+    let bytes = backup::seal_with(&contents, pass, opts.rounds)?;
+    backup::write_file(file, &bytes, opts.overwrite)?;
+    Ok(report)
+}
+
+/// What a key is read as: its text, still in the keyring, or not there.
+enum Fetch {
+    Text(String),
+    /// It sits in the keyring and the owner did not consent to take it out.
+    Keyring,
+    Missing,
+}
+
+fn fetch(
+    paths: &NodePaths,
+    storage: SecretStorage,
+    consent: bool,
+    key: Key,
+) -> Result<Fetch, String> {
+    if storage == SecretStorage::Keyring && !consent {
+        return Ok(Fetch::Keyring);
+    }
+    Ok(match secrets::read_secret(paths, storage, key)? {
+        Some(t) => Fetch::Text(t),
+        None => Fetch::Missing,
+    })
+}
+
+fn collect(
+    paths: &NodePaths,
+    cfg: &NodeConfig,
+    consent: bool,
+) -> Result<(Contents, BackupReport), String> {
+    let storage = cfg.machine.secret_storage;
+    let mut files = BTreeMap::new();
+    let mut report = BackupReport::default();
+    files.insert(CONFIG.to_string(), cfg.to_toml());
+
+    // One key: into the file when it is there and fits the config, else a
+    // line in the report that says why it is not.
+    let mut take = |name: String,
+                    what: String,
+                    got: Fetch,
+                    fits: &dyn Fn(&str) -> bool,
+                    report: &mut BackupReport| {
+        match got {
+            Fetch::Text(t) if fits(&t) => {
+                files.insert(name, t);
+                report.saved.push(what);
+            }
+            Fetch::Text(_) => report.left_out.push(format!(
+                "{what} (it does not fit the config, so it was left out)"
+            )),
+            Fetch::Keyring => report.left_out.push(format!(
+                "{what} (it is in the system keyring; --include-keyring takes it out)"
+            )),
+            Fetch::Missing => report.left_out.push(format!("{what} (this node has none)")),
+        }
+    };
+
+    for e in &cfg.centers {
+        report.centers.push(e.name.clone());
+        let node_id = e.node_id.clone();
+        take(
+            format!("{KEY_PREFIX}{}", e.name),
+            format!("the node key for {}", e.name),
+            fetch(paths, storage, consent, Key::Center(&e.name))?,
+            &move |t: &str| NodeKey::from_text(t).is_ok_and(|k| k.node_id() == node_id),
+            &mut report,
+        );
+    }
+    if let Some(pin) = &cfg.relay.pin {
+        let pin = pin.clone();
+        take(
+            RELAY_TLS.into(),
+            "the relay's TLS key".into(),
+            fetch(paths, storage, consent, Key::RelayTls)?,
+            &move |t: &str| {
+                nerve_transport::tls::ServerIdentity::from_pem(t).is_ok_and(|i| i.pin() == pin)
+            },
+            &mut report,
+        );
+    }
+    if cfg.connection.login.is_some() {
+        take(
+            PROXY_LOGIN.into(),
+            "the proxy's password".into(),
+            fetch(paths, storage, consent, Key::ProxyLogin)?,
+            &|t: &str| !t.is_empty(),
+            &mut report,
+        );
+    }
+    // The header values are in the keyring whatever `secret_storage` says,
+    // except on the installed node on Windows, which takes none.
+    if !cfg.connection.headers.is_empty() && !secrets::windows_service(paths) {
+        let entry = Entry::proxy(paths);
+        let got = if consent {
+            match secrets::store::get(entry.account()) {
+                Ok(Some(t)) => Fetch::Text(t),
+                Ok(None) => Fetch::Missing,
+                Err(e) => {
+                    return Err(format!(
+                        "cannot read the proxy's header values from the system keyring (entry {entry}): {e}"
+                    ));
+                }
+            }
+        } else {
+            Fetch::Keyring
+        };
+        let names = cfg.connection.headers.clone();
+        take(
+            PROXY_HEADERS.into(),
+            "the proxy's header values".into(),
+            got,
+            &move |t: &str| header_map(t).is_some_and(|m| names.iter().all(|n| m.contains_key(n))),
+            &mut report,
+        );
+    }
+
+    Ok((
+        Contents {
+            kind: Kind::Node,
+            created_ms: crate::now_ms(),
+            program: format!("nerve-node {}", env!("CARGO_PKG_VERSION")),
+            files,
+        },
+        report,
+    ))
+}
+
+/// The proxy's header values as the keyring entry holds them.
+fn header_map(text: &str) -> Option<BTreeMap<String, String>> {
+    serde_json::from_str(text).ok()
+}
+
+/// A node backup that was opened and checked, ready to be restored.
+pub struct Parsed {
+    cfg: NodeConfig,
+    /// The node key per center, by the center's name.
+    keys: BTreeMap<String, String>,
+    relay_tls: Option<String>,
+    proxy_login: Option<String>,
+    proxy_headers: Option<BTreeMap<String, String>>,
+    pub created_ms: u64,
+    pub program: String,
+}
+
+impl Parsed {
+    /// The centers the backup's config names.
+    pub fn centers(&self) -> Vec<&str> {
+        self.cfg.centers.iter().map(|c| c.name.as_str()).collect()
+    }
+}
+
+/// Checks what [`backup::open`] returned: that it is a node backup, that its
+/// config is one this node would take, and that every key in it belongs to
+/// the config (a key of another pairing, or a text that is no key, would be
+/// a backup mixed up or damaged).
+pub fn parse(contents: Contents) -> Result<Parsed, String> {
+    if contents.kind != Kind::Node {
+        return Err(format!(
+            "this is the backup of a {}, not of a node",
+            contents.kind.word()
+        ));
+    }
+    let mut files = contents.files;
+    let text = files
+        .remove(CONFIG)
+        .ok_or("the backup holds no node.toml")?;
+    let cfg = NodeConfig::parse(&text).map_err(|e| format!("the backup's node.toml: {e}"))?;
+    let mut keys = BTreeMap::new();
+    let mut relay_tls = None;
+    let mut proxy_login = None;
+    let mut proxy_headers = None;
+    for (name, text) in files {
+        if let Some(center) = name.strip_prefix(KEY_PREFIX) {
+            let entry = cfg
+                .center(center)
+                .filter(|_| valid_center_name(center))
+                .ok_or_else(|| {
+                    format!("the backup holds a key for {center:?}, which its config does not pair")
+                })?;
+            let key = NodeKey::from_text(&text)
+                .map_err(|_| format!("the node key for {center} in the backup is not a key"))?;
+            if key.node_id() != entry.node_id {
+                return Err(format!(
+                    "the node key for {center} in the backup is not the one its config pairs with (another node id)"
+                ));
+            }
+            keys.insert(center.to_string(), text);
+            continue;
+        }
+        match name.as_str() {
+            RELAY_TLS => {
+                let pin = cfg
+                    .relay
+                    .pin
+                    .as_deref()
+                    .ok_or("the backup holds a relay TLS key, but its config has no relay")?;
+                let id = nerve_transport::tls::ServerIdentity::from_pem(&text)
+                    .map_err(|_| "the relay's TLS key in the backup is not a key".to_string())?;
+                if id.pin() != pin {
+                    return Err(
+                        "the relay's TLS key in the backup is not the one its config pins".into(),
+                    );
+                }
+                relay_tls = Some(text);
+            }
+            PROXY_LOGIN => {
+                if cfg.connection.login.is_none() {
+                    return Err(
+                        "the backup holds a proxy password, but its config has no proxy user"
+                            .into(),
+                    );
+                }
+                proxy_login = Some(text);
+            }
+            PROXY_HEADERS => {
+                let map = header_map(&text)
+                    .ok_or("the proxy's header values in the backup are not what a node writes")?;
+                if let Some(n) = cfg
+                    .connection
+                    .headers
+                    .iter()
+                    .find(|n| !map.contains_key(*n))
+                {
+                    return Err(format!(
+                        "the backup holds no value for the proxy header {n}"
+                    ));
+                }
+                proxy_headers = Some(map);
+            }
+            other => {
+                return Err(format!(
+                    "the backup holds {other:?}, which this program does not know; it was made by a newer one?"
+                ));
+            }
+        }
+    }
+    Ok(Parsed {
+        cfg,
+        keys,
+        relay_tls,
+        proxy_login,
+        proxy_headers,
+        created_ms: contents.created_ms,
+        program: contents.program,
+    })
+}
+
+/// Opens a backup file's bytes with the passphrase and checks them.
+pub fn open(bytes: &[u8], pass: &Passphrase) -> Result<Parsed, String> {
+    parse(backup::open(bytes, pass)?)
+}
+
+/// What the owner chose for a restore.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RestoreOpts {
+    /// Replace a node here that is not the one the backup is of.
+    pub replace: bool,
+    /// Keep the keys here instead of where the backup's config says.
+    pub secret_storage: Option<SecretStorage>,
+}
+
+/// What a restore did, for the owner.
+#[derive(Debug, Default)]
+pub struct RestoreReport {
+    pub centers: Vec<String>,
+    /// Centers whose key is not in the backup and not here: they cannot dial
+    /// until the owner pairs them again.
+    pub no_key: Vec<String>,
+    /// Centers whose key was not in the backup, and the one already here fits.
+    pub kept: Vec<String>,
+    /// Things the owner should know, one line each.
+    pub notes: Vec<String>,
+}
+
+/// What the folders hold before a restore.
+enum Target {
+    /// No `node.toml`: a machine the node is moved to.
+    Empty,
+    Node(Box<NodeConfig>),
+    /// A `node.toml` this node cannot read (changed outside the owner's path,
+    /// or its keys are out of reach).
+    Unreadable(String),
+}
+
+fn inspect(paths: &NodePaths) -> Target {
+    if !paths.config_file().exists() {
+        return Target::Empty;
+    }
+    match SettingsStore::peek_with(&paths.config_file(), &NodeSecrets::new(paths)) {
+        Ok(c) => Target::Node(Box::new(c)),
+        Err(e) => Target::Unreadable(e),
+    }
+}
+
+/// The pairings of a config: which node it is, to the centers.
+fn pairings(cfg: &NodeConfig) -> BTreeSet<(&str, &str)> {
+    cfg.centers
+        .iter()
+        .map(|e| (e.center_id.as_str(), e.node_id.as_str()))
+        .collect()
+}
+
+/// A node here with pairings must share one with the backup to be the node
+/// it is of. A node without any is nothing a restore could mix up.
+fn same_node(here: &NodeConfig, backup: &NodeConfig) -> bool {
+    let here = pairings(here);
+    here.is_empty() || !here.is_disjoint(&pairings(backup))
+}
+
+fn names(cfg: &NodeConfig) -> String {
+    if cfg.centers.is_empty() {
+        return "no center".into();
+    }
+    cfg.centers
+        .iter()
+        .map(|c| c.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// How one key written by a restore is put back when a later one fails.
+enum Undo<'a> {
+    Key(Key<'a>, Option<String>),
+    Headers(Option<String>),
+}
+
+/// Puts the backup's config and keys in place of the node at `paths`.
+///
+/// Takes [`KeysLock`] for its whole run: a node that runs holds it, and a
+/// restore never goes under a running node. Everything that can be checked
+/// is checked before the first byte is written; the keys go first, then the
+/// config, and a key that cannot be written puts the ones before it back.
+pub fn restore(paths: &NodePaths, b: &Parsed, opts: &RestoreOpts) -> Result<RestoreReport, String> {
+    let _lock = KeysLock::try_take_soon(paths)?.ok_or_else(|| {
+        format!(
+            "a nerve-node runs on these folders (it holds {}), or a command of nerve-node is moving its keys. A restore never goes under a running node: stop it (`nerve-node` is a service: stop the service; otherwise end `nerve-node run`), then restore",
+            paths.keys_lock().display()
+        )
+    })?;
+
+    let target = inspect(paths);
+    match &target {
+        Target::Node(here) if !opts.replace && !same_node(here, &b.cfg) => {
+            return Err(format!(
+                "the node here is paired with {} and the backup is of a node paired with {}: they are not the same node, and a restore would replace the one here. If you mean that, add --replace",
+                names(here),
+                names(&b.cfg)
+            ));
+        }
+        Target::Unreadable(why) if !opts.replace => {
+            return Err(format!(
+                "the config here cannot be read ({why}). A restore replaces it; add --replace to do that"
+            ));
+        }
+        _ => {}
+    }
+
+    let mut cfg = b.cfg.clone();
+    let to = opts.secret_storage.unwrap_or(cfg.machine.secret_storage);
+    cfg.machine.secret_storage = to;
+    if to == SecretStorage::Keyring
+        && let Some(n) = secrets::no_keyring(paths)
+    {
+        return Err(format!(
+            "this node cannot keep its keys in the system keyring: {}. Restore with --secret-storage file",
+            n.why()
+        ));
+    }
+    if secrets::windows_service(paths) && !cfg.connection.headers.is_empty() {
+        return Err(format!(
+            "the backup's config names header values for the proxy, but {}. Remove the proxy from the backup's node first, or restore on a node that is not the installed one on Windows",
+            secrets::PROXY_WINDOWS_SERVICE
+        ));
+    }
+    let mut report = RestoreReport {
+        centers: cfg.centers.iter().map(|c| c.name.clone()).collect(),
+        ..RestoreReport::default()
+    };
+    // The password of the sudo switch is in no backup and never at rest on
+    // Linux: a node restored with the switch on would claim it.
+    if cfg.machine.sudo == Sudo::On {
+        cfg.machine.sudo = Sudo::Off;
+        report.notes.push(
+            "the sudo switch is off: its password is not in a backup. `nerve-node sudo on` turns it on".into(),
+        );
+    }
+    cfg.validate()?;
+
+    let own = NodeSecrets::for_restore(paths, to);
+    // Above every version this node had, so the file is the newest and the
+    // record, which only goes up, does not refuse it.
+    let last = own.accepted_version().ok().flatten().unwrap_or(0);
+    let here = match &target {
+        Target::Node(c) => c.version,
+        _ => 0,
+    };
+    cfg.version = cfg.version.max(last).max(here) + 1;
+
+    // Out of the keyring a restore writes to, before anything is written.
+    secrets::get(paths, to, Key::Config)?;
+
+    let mut undo: Vec<Undo> = Vec::new();
+    if let Err(e) = write_keys(paths, to, &cfg, b, &mut undo, &mut report) {
+        roll_back(paths, to, undo);
+        return Err(format!("{e}; nothing was restored"));
+    }
+
+    let key = match own.mac_key_or_new() {
+        Ok(k) => k,
+        Err(e) => {
+            roll_back(paths, to, undo);
+            return Err(format!("{e}; nothing was restored"));
+        }
+    };
+    let written =
+        nerve_transport::files::write_private(&paths.config_file(), sealed(&key, &cfg).as_bytes());
+    if let Err(e) = written {
+        roll_back(paths, to, undo);
+        return Err(format!(
+            "cannot write {}: {e}; nothing was restored",
+            paths.config_file().display()
+        ));
+    }
+    if let Err(e) = own.accept_version(cfg.version) {
+        report.notes.push(format!(
+            "the version {} of node.toml is not recorded: {e}. The node records it at its next start",
+            cfg.version
+        ));
+    }
+    let _ = AuditLog::new(paths.audit_log()).config(
+        "restored",
+        &paths.config_file(),
+        &format!(
+            "the owner restored the config and keys of {} from a backup made by {}",
+            names(&cfg),
+            b.program
+        ),
+    );
+
+    if let Target::Node(old) = &target {
+        for e in forget_old(paths, old, &cfg, to) {
+            report.notes.push(e);
+        }
+    }
+    Ok(report)
+}
+
+/// Writes every key of the backup where `to` keeps them. A key the backup
+/// lacks stays if the one here fits the pairing.
+fn write_keys<'a>(
+    paths: &NodePaths,
+    to: SecretStorage,
+    cfg: &'a NodeConfig,
+    b: &Parsed,
+    undo: &mut Vec<Undo<'a>>,
+    report: &mut RestoreReport,
+) -> Result<(), String> {
+    let mut put = |key: Key<'a>, text: &str| -> Result<(), String> {
+        let prev = secrets::get(paths, to, key)?;
+        // Already as it should be: nothing to write, nothing to put back.
+        if prev.as_deref() == Some(text) {
+            return Ok(());
+        }
+        undo.push(Undo::Key(key, prev));
+        secrets::put(paths, to, key, text)
+    };
+    for e in &cfg.centers {
+        match b.keys.get(&e.name) {
+            Some(t) => put(Key::Center(&e.name), t)?,
+            None => match secrets::center_key(paths, to, &e.name) {
+                Ok(k) if k.node_id() == e.node_id => report.kept.push(e.name.clone()),
+                _ => report.no_key.push(e.name.clone()),
+            },
+        }
+    }
+    if let Some(t) = &b.relay_tls {
+        put(Key::RelayTls, t)?;
+    }
+    if let Some(t) = &b.proxy_login {
+        put(Key::ProxyLogin, t)?;
+    }
+    if let Some(map) = &b.proxy_headers {
+        let account = Entry::proxy(paths);
+        let prev = secrets::store::get(account.account())
+            .map_err(|e| format!("cannot read the keyring entry {account}: {e}"))?;
+        let headers: Vec<(String, String)> =
+            map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        undo.push(Undo::Headers(prev));
+        secrets::store_proxy_headers(paths, &headers)?;
+    }
+    Ok(())
+}
+
+/// Puts back what the keys held before, last first. A key that cannot be put
+/// back is left; the message of the restore already says it failed.
+fn roll_back(paths: &NodePaths, to: SecretStorage, undo: Vec<Undo>) {
+    for u in undo.into_iter().rev() {
+        match u {
+            Undo::Key(key, Some(text)) => {
+                let _ = secrets::put(paths, to, key, &text);
+            }
+            Undo::Key(key, None) => {
+                let _ = secrets::delete(paths, to, key);
+            }
+            Undo::Headers(Some(text)) => {
+                let _ = secrets::store::set(Entry::proxy(paths).account(), &text);
+            }
+            Undo::Headers(None) => {
+                let _ = secrets::remove_proxy_headers(paths);
+            }
+        }
+    }
+}
+
+/// Deletes what the replaced config kept and the restored one does not name:
+/// the keys of pairings that are gone, and every key in the place the keys
+/// left. Says what it could not delete.
+fn forget_old(
+    paths: &NodePaths,
+    old: &NodeConfig,
+    new: &NodeConfig,
+    to: SecretStorage,
+) -> Vec<String> {
+    let from = old.machine.secret_storage;
+    let keep = secrets::keys(new);
+    let mut notes = Vec::new();
+    for key in secrets::keys(old) {
+        if from == to && keep.contains(&key) {
+            continue;
+        }
+        if let Err(e) = secrets::delete(paths, from, key) {
+            notes.push(format!("{} of the replaced node was left: {e}", key.what()));
+        }
+    }
+    if !old.connection.headers.is_empty()
+        && new.connection.headers.is_empty()
+        && !secrets::windows_service(paths)
+        && let Err(e) = secrets::remove_proxy_headers(paths)
+    {
+        notes.push(format!(
+            "the proxy's header values of the replaced node were left: {e}"
+        ));
+    }
+    notes
+}
+
+/// Says what a backup did.
+pub fn print_backup(r: &BackupReport, file: &Path, out: &mut dyn std::io::Write) {
+    let _ = writeln!(out, "backed up to {}", file.display());
+    let _ = writeln!(
+        out,
+        "  node.toml, with {}",
+        match r.centers.len() {
+            0 => "no center".to_string(),
+            1 => format!("the center {}", r.centers[0]),
+            _ => format!("the centers {}", r.centers.join(", ")),
+        }
+    );
+    for s in &r.saved {
+        let _ = writeln!(out, "  {s}");
+    }
+    for s in &r.left_out {
+        let _ = writeln!(out, "  left out: {s}");
+    }
+    let _ = writeln!(
+        out,
+        "The file is encrypted with your passphrase. Keep both; nobody can recover the file without it."
+    );
+}
+
+/// Says what a restore did and what comes next.
+pub fn print_restore(r: &RestoreReport, b: &Parsed, out: &mut dyn std::io::Write) {
+    let _ = writeln!(
+        out,
+        "restored the config and keys of {} (backup made by {})",
+        if r.centers.is_empty() {
+            "a node with no center".to_string()
+        } else {
+            format!("the centers {}", r.centers.join(", "))
+        },
+        b.program
+    );
+    for c in &r.kept {
+        let _ = writeln!(
+            out,
+            "  the node key for {c} was not in the backup; the one already here fits and stays"
+        );
+    }
+    for c in &r.no_key {
+        let _ = writeln!(
+            out,
+            "  no node key for {c}: it was not in the backup. Pair it again: `nerve-node center rm --center {c}`, then `nerve-node center add`"
+        );
+    }
+    for n in &r.notes {
+        let _ = writeln!(out, "  {n}");
+    }
+    let _ = writeln!(
+        out,
+        "Start the node. It keeps the pins and the keys it had, so a center that still knows it takes it back; check the folders and the account that commands run as (docs/user/backup.md)."
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nerve_policy::CenterEntry;
+
+    const PASS: &str = "correct horse battery";
+
+    fn pass() -> Passphrase {
+        Passphrase::new(PASS.into())
+    }
+
+    fn node() -> (tempfile::TempDir, NodePaths) {
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("config"), d.path().join("state"));
+        (d, paths)
+    }
+
+    fn open_store(paths: &NodePaths) -> SettingsStore {
+        SettingsStore::open_with(
+            paths.config_file(),
+            Box::new(NodeSecrets::new(paths)),
+            AuditLog::new(paths.audit_log()),
+        )
+        .unwrap()
+    }
+
+    fn entry(name: &str, key: &NodeKey) -> CenterEntry {
+        CenterEntry {
+            name: name.into(),
+            url: "https://center.example:7443".into(),
+            pin: Some("A".repeat(43)),
+            center_id: format!("id-{name}"),
+            node_id: key.node_id(),
+            settings: Default::default(),
+            paused: false,
+            revoked: false,
+            unknown: false,
+            policy: Default::default(),
+        }
+    }
+
+    /// A node paired with `centers`, keys kept where `storage` says. Returns
+    /// the keys' texts by center.
+    fn paired(
+        paths: &NodePaths,
+        storage: SecretStorage,
+        centers: &[&str],
+    ) -> BTreeMap<String, String> {
+        let mut s = open_store(paths);
+        if storage == SecretStorage::Keyring {
+            s.update(|c| {
+                c.machine.secret_storage = storage;
+                Ok(())
+            })
+            .unwrap();
+        }
+        let mut texts = BTreeMap::new();
+        for name in centers {
+            let key = NodeKey::generate().unwrap();
+            secrets::store_center_key(paths, storage, name, &key).unwrap();
+            s.update(|c| {
+                c.centers.push(entry(name, &key));
+                Ok(())
+            })
+            .unwrap();
+            texts.insert(name.to_string(), key.to_text().trim().to_string());
+        }
+        texts
+    }
+
+    fn config(paths: &NodePaths) -> NodeConfig {
+        SettingsStore::peek_with(&paths.config_file(), &NodeSecrets::new(paths)).unwrap()
+    }
+
+    fn opts(include_keyring: bool) -> BackupOpts {
+        BackupOpts {
+            include_keyring,
+            overwrite: false,
+            rounds: 4,
+        }
+    }
+
+    /// Backs `paths` up and opens the file again, as a restore would.
+    fn roundtrip(
+        paths: &NodePaths,
+        include_keyring: bool,
+    ) -> (tempfile::TempDir, Parsed, BackupReport) {
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("n.bak");
+        let r = backup(
+            paths,
+            &config(paths),
+            &file,
+            &pass(),
+            &opts(include_keyring),
+        )
+        .unwrap();
+        let bytes = backup::read_file(&file).unwrap();
+        (d, open(&bytes, &pass()).unwrap(), r)
+    }
+
+    fn key_text(paths: &NodePaths, storage: SecretStorage, center: &str) -> String {
+        secrets::center_key(paths, storage, center)
+            .unwrap()
+            .to_text()
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn a_node_moves_to_an_empty_machine_with_its_keys_and_pins() {
+        let (_a, from) = node();
+        let keys = paired(&from, SecretStorage::File, &["home", "work"]);
+        let (_f, parsed, report) = roundtrip(&from, false);
+        assert_eq!(report.centers, ["home", "work"]);
+        assert_eq!(report.saved.len(), 2);
+        assert!(report.left_out.is_empty());
+
+        let (_b, to) = node();
+        let r = restore(&to, &parsed, &RestoreOpts::default()).unwrap();
+        assert_eq!(r.centers, ["home", "work"]);
+        assert!(r.no_key.is_empty() && r.kept.is_empty());
+        // The same keys, so the centers know the node by the same ids, and
+        // the pins in the config are the ones the node had.
+        for (name, text) in &keys {
+            assert_eq!(&key_text(&to, SecretStorage::File, name), text);
+        }
+        let (was, now) = (config(&from), config(&to));
+        for name in ["home", "work"] {
+            let (w, n) = (was.center(name).unwrap(), now.center(name).unwrap());
+            assert_eq!(
+                (&w.pin, &w.url, &w.node_id, &w.center_id),
+                (&n.pin, &n.url, &n.node_id, &n.center_id)
+            );
+        }
+        // The node reads its own config: signed with a key of its own.
+        assert!(to.config_key().exists());
+        assert!(now.version > 0);
+    }
+
+    #[test]
+    fn every_file_a_restore_writes_is_private() {
+        let (_a, from) = node();
+        paired(&from, SecretStorage::File, &["home"]);
+        let (_f, parsed, _) = roundtrip(&from, false);
+        let (_b, to) = node();
+        restore(&to, &parsed, &RestoreOpts::default()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for p in [
+                to.config_file(),
+                to.key_file("home"),
+                to.config_key(),
+                to.config_version(),
+            ] {
+                let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o600, "{}", p.display());
+            }
+        }
+    }
+
+    #[test]
+    fn the_backup_file_holds_no_key_in_the_clear() {
+        let (_a, from) = node();
+        let keys = paired(&from, SecretStorage::File, &["home"]);
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("n.bak");
+        backup(&from, &config(&from), &file, &pass(), &opts(false)).unwrap();
+        let bytes = std::fs::read(&file).unwrap();
+        let text = String::from_utf8_lossy(&bytes);
+        assert!(!text.contains(&keys["home"]) && !text.contains("center.example"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn keys_in_the_keyring_stay_there_without_consent() {
+        let (_a, from) = node();
+        paired(&from, SecretStorage::Keyring, &["home"]);
+        let (_f, parsed, report) = roundtrip(&from, false);
+        assert!(report.saved.is_empty(), "{report:?}");
+        assert_eq!(report.left_out.len(), 1);
+        assert!(
+            report.left_out[0].contains("--include-keyring"),
+            "{report:?}"
+        );
+        assert!(parsed.keys.is_empty());
+        // The config alone goes: the restore says the key is missing.
+        let (_b, to) = node();
+        let r = restore(&to, &parsed, &RestoreOpts::default()).unwrap();
+        assert_eq!(r.no_key, ["home"]);
+        assert!(!to.key_file("home").exists());
+    }
+
+    #[test]
+    fn the_keyring_is_not_asked_without_consent() {
+        // Only the MAC key that checks node.toml is read: a key per center
+        // is not.
+        let (_a, from) = node();
+        paired(&from, SecretStorage::Keyring, &["home", "work"]);
+        let cfg = config(&from);
+        let before = secrets::store::calls();
+        let d = tempfile::tempdir().unwrap();
+        backup(&from, &cfg, &d.path().join("n.bak"), &pass(), &opts(false)).unwrap();
+        assert_eq!(
+            secrets::store::calls(),
+            before,
+            "the backup asked the keyring"
+        );
+    }
+
+    #[test]
+    fn with_consent_the_keyring_keys_go_into_the_file_and_come_back() {
+        let (_a, from) = node();
+        let keys = paired(&from, SecretStorage::Keyring, &["home"]);
+        let (_f, parsed, report) = roundtrip(&from, true);
+        assert_eq!(report.saved, ["the node key for home"]);
+        assert!(report.left_out.is_empty());
+
+        // Back into a keyring on another machine, as the config says.
+        let (_b, to) = node();
+        let r = restore(&to, &parsed, &RestoreOpts::default()).unwrap();
+        assert!(r.no_key.is_empty());
+        assert_eq!(
+            &key_text(&to, SecretStorage::Keyring, "home"),
+            &keys["home"]
+        );
+        assert!(!to.key_file("home").exists(), "no copy in a file");
+        assert!(
+            !to.config_key().exists(),
+            "the MAC key is in the keyring too"
+        );
+        assert_eq!(config(&to).machine.secret_storage, SecretStorage::Keyring);
+
+        // Or into files, where a machine has no keyring.
+        let (_c, files) = node();
+        restore(
+            &files,
+            &parsed,
+            &RestoreOpts {
+                secret_storage: Some(SecretStorage::File),
+                ..RestoreOpts::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            &key_text(&files, SecretStorage::File, "home"),
+            &keys["home"]
+        );
+        assert_eq!(config(&files).machine.secret_storage, SecretStorage::File);
+    }
+
+    #[test]
+    fn a_keyring_that_cannot_be_reached_fails_before_anything_is_written() {
+        let (_a, from) = node();
+        paired(&from, SecretStorage::Keyring, &["home"]);
+        let (_f, parsed, _) = roundtrip(&from, true);
+        let (_b, to) = node();
+        secrets::store::set_unreachable(true);
+        let err = restore(&to, &parsed, &RestoreOpts::default())
+            .err()
+            .unwrap();
+        secrets::store::set_unreachable(false);
+        assert!(!err.contains(&key_text(&from, SecretStorage::Keyring, "home")));
+        assert!(!to.config_file().exists() && !to.key_file("home").exists());
+    }
+
+    #[test]
+    fn a_node_that_cannot_use_the_keyring_is_not_restored_into_it() {
+        let (_a, from) = node();
+        paired(&from, SecretStorage::Keyring, &["home"]);
+        let (_f, parsed, _) = roundtrip(&from, true);
+        let (_b, to) = node();
+        secrets::for_tests::pretend_landlock(&to, secrets::Landlock::Abi(7));
+        let err = restore(&to, &parsed, &RestoreOpts::default())
+            .err()
+            .unwrap();
+        assert!(err.contains("--secret-storage file"), "{err}");
+        assert!(!to.config_file().exists());
+        // With files it works.
+        restore(
+            &to,
+            &parsed,
+            &RestoreOpts {
+                secret_storage: Some(SecretStorage::File),
+                ..RestoreOpts::default()
+            },
+        )
+        .unwrap();
+        assert!(to.key_file("home").exists());
+    }
+
+    #[test]
+    fn a_restore_never_goes_under_a_running_node() {
+        let (_a, from) = node();
+        paired(&from, SecretStorage::File, &["home"]);
+        let (_f, parsed, _) = roundtrip(&from, false);
+        let (_b, to) = node();
+        paired(&to, SecretStorage::File, &["other"]);
+        let before = std::fs::read(to.config_file()).unwrap();
+        // A running node holds the keys lock for its life.
+        let lock = KeysLock::try_take(&to).unwrap().unwrap();
+        let err = restore(
+            &to,
+            &parsed,
+            &RestoreOpts {
+                replace: true,
+                ..RestoreOpts::default()
+            },
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("runs on these folders"), "{err}");
+        assert_eq!(std::fs::read(to.config_file()).unwrap(), before);
+        assert!(to.key_file("other").exists() && !to.key_file("home").exists());
+        drop(lock);
+        restore(
+            &to,
+            &parsed,
+            &RestoreOpts {
+                replace: true,
+                ..RestoreOpts::default()
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn another_node_is_refused_unless_the_owner_says_so() {
+        let (_a, from) = node();
+        paired(&from, SecretStorage::File, &["home"]);
+        let (_f, parsed, _) = roundtrip(&from, false);
+
+        // A node paired with other centers.
+        let (_b, other) = node();
+        let theirs = paired(&other, SecretStorage::File, &["lab"]);
+        let before = std::fs::read(other.config_file()).unwrap();
+        let err = restore(&other, &parsed, &RestoreOpts::default())
+            .err()
+            .unwrap();
+        assert!(
+            err.contains("not the same node") && err.contains("lab") && err.contains("home"),
+            "{err}"
+        );
+        assert!(err.contains("--replace"), "{err}");
+        assert_eq!(std::fs::read(other.config_file()).unwrap(), before);
+        assert!(!other.key_file("home").exists());
+
+        // With --replace the node here is the backup's, and the keys of the
+        // pairing that is gone are deleted with it.
+        let r = restore(
+            &other,
+            &parsed,
+            &RestoreOpts {
+                replace: true,
+                ..RestoreOpts::default()
+            },
+        )
+        .unwrap();
+        assert!(r.notes.is_empty(), "{r:?}");
+        assert!(other.key_file("home").exists());
+        assert!(
+            !other.key_file("lab").exists(),
+            "the key of lab is gone: {theirs:?}"
+        );
+        assert!(config(&other).center("lab").is_none());
+    }
+
+    #[test]
+    fn the_same_node_is_restored_without_a_flag_and_goes_back_in_time() {
+        let (_a, n) = node();
+        paired(&n, SecretStorage::File, &["home", "work"]);
+        let (_f, parsed, _) = roundtrip(&n, false);
+        // Since the backup: a third pairing, and changes.
+        paired(&n, SecretStorage::File, &["later"]);
+        let mut s = open_store(&n);
+        s.update(|c| {
+            c.centers[0].paused = true;
+            Ok(())
+        })
+        .unwrap();
+        let newest = s.version();
+        drop(s);
+
+        restore(&n, &parsed, &RestoreOpts::default()).unwrap();
+        let cfg = config(&n);
+        assert!(cfg.center("later").is_none() && !cfg.center("home").unwrap().paused);
+        assert!(
+            !n.key_file("later").exists(),
+            "the key of a pairing the backup lacks goes"
+        );
+        assert!(n.key_file("home").exists() && n.key_file("work").exists());
+        // An older config would be refused as one put back; this one is
+        // above everything the node had, so it is the newest.
+        assert!(cfg.version > newest, "{} {}", cfg.version, newest);
+    }
+
+    #[test]
+    fn a_config_here_that_cannot_be_read_needs_the_flag() {
+        let (_a, from) = node();
+        paired(&from, SecretStorage::File, &["home"]);
+        let (_f, parsed, _) = roundtrip(&from, false);
+        let (_b, to) = node();
+        paired(&to, SecretStorage::File, &["home"]);
+        // Changed outside the owner's path.
+        let mut text = std::fs::read_to_string(to.config_file()).unwrap();
+        text.push_str("# edited\n");
+        std::fs::write(to.config_file(), text).unwrap();
+        let err = restore(&to, &parsed, &RestoreOpts::default())
+            .err()
+            .unwrap();
+        assert!(
+            err.contains("cannot be read") && err.contains("--replace"),
+            "{err}"
+        );
+        restore(
+            &to,
+            &parsed,
+            &RestoreOpts {
+                replace: true,
+                ..RestoreOpts::default()
+            },
+        )
+        .unwrap();
+        // It reads again.
+        config(&to);
+    }
+
+    #[test]
+    fn a_node_without_pairings_is_nothing_to_mix_up() {
+        let (_a, from) = node();
+        paired(&from, SecretStorage::File, &["home"]);
+        let (_f, parsed, _) = roundtrip(&from, false);
+        let (_b, to) = node();
+        let mut s = open_store(&to);
+        s.update(|c| {
+            c.limits.max_running = 3;
+            Ok(())
+        })
+        .unwrap();
+        restore(&to, &parsed, &RestoreOpts::default()).unwrap();
+        assert_eq!(config(&to).limits.max_running, 16);
+    }
+
+    #[test]
+    fn a_restore_goes_above_the_version_the_node_had_recorded() {
+        let (_a, from) = node();
+        paired(&from, SecretStorage::File, &["home"]);
+        let (_f, parsed, _) = roundtrip(&from, false);
+        let (_b, to) = node();
+        // A machine whose node saved its config many times.
+        nerve_policy::settings::record_version(&to.config_version(), 500).unwrap();
+        restore(&to, &parsed, &RestoreOpts::default()).unwrap();
+        let cfg = config(&to);
+        assert_eq!(cfg.version, 501);
+        assert_eq!(
+            nerve_policy::settings::read_version(&to.config_version()).unwrap(),
+            Some(501)
+        );
+    }
+
+    #[test]
+    fn the_sudo_switch_comes_back_off() {
+        let (_a, from) = node();
+        paired(&from, SecretStorage::File, &["home"]);
+        let mut s = open_store(&from);
+        s.set_sudo(nerve_policy::Writer::Local, Sudo::On).unwrap();
+        let (_f, parsed, _) = roundtrip(&from, false);
+        let (_b, to) = node();
+        let r = restore(&to, &parsed, &RestoreOpts::default()).unwrap();
+        assert_eq!(config(&to).machine.sudo, Sudo::Off);
+        assert!(r.notes.iter().any(|n| n.contains("sudo")), "{r:?}");
+    }
+
+    #[test]
+    fn the_key_that_is_already_here_stays_when_the_backup_lacks_it() {
+        // The keys were in the keyring when the backup was made, without
+        // consent; the restore is on the same machine, which still has them.
+        let (_a, n) = node();
+        let keys = paired(&n, SecretStorage::Keyring, &["home"]);
+        let (_f, parsed, _) = roundtrip(&n, false);
+        let r = restore(&n, &parsed, &RestoreOpts::default()).unwrap();
+        assert_eq!(r.kept, ["home"]);
+        assert!(r.no_key.is_empty());
+        assert_eq!(&key_text(&n, SecretStorage::Keyring, "home"), &keys["home"]);
+    }
+
+    #[test]
+    fn a_key_here_that_fits_no_pairing_does_not_count_as_kept() {
+        let (_a, from) = node();
+        paired(&from, SecretStorage::Keyring, &["home"]);
+        let (_f, parsed, _) = roundtrip(&from, false);
+        let (_b, to) = node();
+        // A key of the same name, but another node's.
+        let wrong = NodeKey::generate().unwrap();
+        secrets::store_center_key(&to, SecretStorage::Keyring, "home", &wrong).unwrap();
+        let r = restore(&to, &parsed, &RestoreOpts::default()).unwrap();
+        assert_eq!(r.no_key, ["home"]);
+        assert!(r.kept.is_empty());
+    }
+
+    #[test]
+    fn a_failing_key_puts_back_the_ones_before_it() {
+        let (_a, from) = node();
+        let keys = paired(&from, SecretStorage::File, &["alpha", "beta"]);
+        let (_f, parsed, _) = roundtrip(&from, false);
+        // Another node here, with keys of its own for the same names.
+        let (_b, to) = node();
+        paired(&to, SecretStorage::File, &["alpha", "beta"]);
+        let old_alpha = std::fs::read(to.key_file("alpha")).unwrap();
+        // beta's key file is a directory: it cannot be written.
+        std::fs::remove_file(to.key_file("beta")).unwrap();
+        std::fs::create_dir(to.key_file("beta")).unwrap();
+        let replace = RestoreOpts {
+            replace: true,
+            ..RestoreOpts::default()
+        };
+        let err = restore(&to, &parsed, &replace).err().unwrap();
+        assert!(err.contains("nothing was restored"), "{err}");
+        assert!(!err.contains(&keys["alpha"]) && !err.contains(&keys["beta"]));
+        assert_eq!(
+            std::fs::read(to.key_file("alpha")).unwrap(),
+            old_alpha,
+            "alpha is back as it was"
+        );
+        assert!(
+            std::fs::read_to_string(to.config_file())
+                .unwrap()
+                .contains("beta")
+        );
+    }
+
+    #[test]
+    fn a_backup_that_does_not_fit_itself_is_refused() {
+        let (_a, from) = node();
+        paired(&from, SecretStorage::File, &["home"]);
+        let cfg = config(&from);
+        let key = key_text(&from, SecretStorage::File, "home");
+        let seal = |files: Vec<(&str, String)>| {
+            parse(Contents {
+                kind: Kind::Node,
+                created_ms: 1,
+                program: "t".into(),
+                files: files.into_iter().map(|(k, v)| (k.to_string(), v)).collect(),
+            })
+        };
+        let toml = cfg.to_toml();
+        // The good one parses.
+        assert!(seal(vec![("node.toml", toml.clone()), ("key/home", key.clone())]).is_ok());
+        let other = NodeKey::generate().unwrap().to_text();
+        for (what, files, want) in [
+            ("no config", vec![("key/home", key.clone())], "no node.toml"),
+            (
+                "a bad config",
+                vec![("node.toml", "version = [".into())],
+                "node.toml",
+            ),
+            (
+                "a key of no pairing",
+                vec![("node.toml", toml.clone()), ("key/lab", key.clone())],
+                "does not pair",
+            ),
+            (
+                "a path as a name",
+                vec![("node.toml", toml.clone()), ("key/../x", key.clone())],
+                "does not pair",
+            ),
+            (
+                "a text that is no key",
+                vec![("node.toml", toml.clone()), ("key/home", "nope".into())],
+                "not a key",
+            ),
+            (
+                "another node's key",
+                vec![("node.toml", toml.clone()), ("key/home", other)],
+                "another node id",
+            ),
+            (
+                "a relay key without a relay",
+                vec![("node.toml", toml.clone()), ("relay-tls", "x".into())],
+                "no relay",
+            ),
+            (
+                "a proxy password without a user",
+                vec![("node.toml", toml.clone()), ("proxy-login", "x".into())],
+                "no proxy user",
+            ),
+            (
+                "a name nobody knows",
+                vec![("node.toml", toml.clone()), ("../etc/passwd", "x".into())],
+                "does not know",
+            ),
+        ] {
+            let err = seal(files)
+                .err()
+                .unwrap_or_else(|| panic!("{what} was taken"));
+            assert!(err.contains(want), "{what}: {err}");
+            assert!(!err.contains(&key), "{what}: {err}");
+        }
+        // A center's backup is not a node's.
+        let err = parse(Contents {
+            kind: Kind::Center,
+            created_ms: 1,
+            program: "t".into(),
+            files: BTreeMap::new(),
+        })
+        .err()
+        .unwrap();
+        assert!(err.contains("of a center, not of a node"), "{err}");
+    }
+
+    #[test]
+    fn a_wrong_passphrase_and_a_short_one_say_so_without_the_secret() {
+        let (_a, from) = node();
+        paired(&from, SecretStorage::File, &["home"]);
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("n.bak");
+        let err = backup(
+            &from,
+            &config(&from),
+            &file,
+            &Passphrase::new("hunter2".into()),
+            &opts(false),
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("12 characters") && !err.contains("hunter2"),
+            "{err}"
+        );
+        assert!(!file.exists());
+        backup(&from, &config(&from), &file, &pass(), &opts(false)).unwrap();
+        let bytes = backup::read_file(&file).unwrap();
+        let err = open(&bytes, &Passphrase::new("wrong horse battery".into()))
+            .err()
+            .unwrap();
+        assert!(
+            err.contains("passphrase is wrong") && !err.contains("wrong horse"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_existing_file_is_kept_unless_the_owner_overwrites() {
+        let (_a, from) = node();
+        paired(&from, SecretStorage::File, &["home"]);
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("n.bak");
+        std::fs::write(&file, b"precious").unwrap();
+        let err = backup(&from, &config(&from), &file, &pass(), &opts(false)).unwrap_err();
+        assert!(err.contains("exists already"), "{err}");
+        assert_eq!(std::fs::read(&file).unwrap(), b"precious");
+        let o = BackupOpts {
+            overwrite: true,
+            ..opts(false)
+        };
+        backup(&from, &config(&from), &file, &pass(), &o).unwrap();
+        assert!(backup::kind_of(&std::fs::read(&file).unwrap()).is_ok());
+    }
+
+    #[test]
+    fn the_relay_and_the_proxy_keys_travel_too() {
+        let (_a, from) = node();
+        let keys = paired(&from, SecretStorage::File, &["home"]);
+        let relay =
+            nerve_transport::tls::ServerIdentity::generate(&["relay.example".into()]).unwrap();
+        secrets::store_relay_tls(&from, SecretStorage::File, &relay).unwrap();
+        secrets::store_proxy_login(&from, SecretStorage::File, "s3cret-token").unwrap();
+        let mut s = open_store(&from);
+        s.update(|c| {
+            c.relay.pin = Some(relay.pin());
+            c.relay.listen = Some("127.0.0.1:7490".into());
+            c.connection.proxy = Some("https://relay.example:7490".into());
+            c.connection.pin = Some(relay.pin());
+            c.connection.login = Some("node-a".into());
+            Ok(())
+        })
+        .unwrap();
+        let (_f, parsed, report) = roundtrip(&from, false);
+        assert_eq!(report.saved.len(), 3, "{report:?}");
+        let (_b, to) = node();
+        restore(&to, &parsed, &RestoreOpts::default()).unwrap();
+        assert_eq!(&key_text(&to, SecretStorage::File, "home"), &keys["home"]);
+        assert_eq!(
+            secrets::proxy_login(&to, SecretStorage::File).unwrap(),
+            "s3cret-token"
+        );
+        assert_eq!(
+            secrets::relay_tls(&to, SecretStorage::File)
+                .unwrap()
+                .unwrap()
+                .pin(),
+            relay.pin(),
+            "the relay keeps the certificate its nodes pin"
+        );
+    }
+
+    #[test]
+    fn proxy_header_values_leave_the_keyring_only_with_consent() {
+        let (_a, from) = node();
+        paired(&from, SecretStorage::File, &["home"]);
+        secrets::store_proxy_headers(&from, &[("X-Token".into(), "tok-value".into())]).unwrap();
+        let mut s = open_store(&from);
+        s.update(|c| {
+            c.connection.proxy = Some("http://proxy.example:3128".into());
+            c.connection.headers = vec!["X-Token".into()];
+            Ok(())
+        })
+        .unwrap();
+        let (_f, without, report) = roundtrip(&from, false);
+        assert!(
+            report
+                .left_out
+                .iter()
+                .any(|l| l.contains("header values") && l.contains("--include-keyring")),
+            "{report:?}"
+        );
+        assert!(without.proxy_headers.is_none());
+
+        let (_g, with, report) = roundtrip(&from, true);
+        assert!(
+            report.saved.iter().any(|l| l.contains("header values")),
+            "{report:?}"
+        );
+        let (_b, to) = node();
+        restore(&to, &with, &RestoreOpts::default()).unwrap();
+        let got = secrets::proxy_headers(&to, &["X-Token".into()]).unwrap();
+        assert_eq!(got, [("X-Token".to_string(), "tok-value".to_string())]);
+    }
+
+    #[test]
+    fn nothing_prints_a_secret() {
+        let (_a, from) = node();
+        let keys = paired(&from, SecretStorage::File, &["home", "work"]);
+        let (_f, parsed, report) = roundtrip(&from, false);
+        let mut out = Vec::new();
+        print_backup(&report, Path::new("/x/n.bak"), &mut out);
+        let (_b, to) = node();
+        let r = restore(&to, &parsed, &RestoreOpts::default()).unwrap();
+        print_restore(&r, &parsed, &mut out);
+        let text = String::from_utf8(out).unwrap();
+        for k in keys.values() {
+            assert!(!text.contains(k));
+        }
+        assert!(text.contains("home") && text.contains("work"));
+        // The audit log says that it happened, and names no key.
+        let audit = std::fs::read_to_string(to.audit_log()).unwrap();
+        assert!(audit.contains("\"restored\""), "{audit}");
+        for k in keys.values() {
+            assert!(!audit.contains(k));
+        }
+    }
+}

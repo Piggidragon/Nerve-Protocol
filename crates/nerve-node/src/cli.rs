@@ -112,6 +112,34 @@ pub enum Cmd {
         #[arg(long)]
         purge: bool,
     },
+    /// Write the config and the keys to a file that a passphrase protects, to keep or to move the node to another machine.
+    Backup {
+        /// The file to write. It is private to you (mode 0600).
+        file: PathBuf,
+        /// Also take the keys that are in the system keyring into the file; without it they stay there and are left out.
+        #[arg(long)]
+        include_keyring: bool,
+        /// Replace the file when it exists.
+        #[arg(long)]
+        overwrite: bool,
+        /// Read the passphrase from the first line of this file instead of asking.
+        #[arg(long, value_name = "FILE")]
+        passphrase_file: Option<PathBuf>,
+    },
+    /// Put the config and keys of a backup in place of this node's. The node must not run.
+    Restore {
+        /// The backup file.
+        file: PathBuf,
+        /// Replace a node here that is not the one the backup is of.
+        #[arg(long)]
+        replace: bool,
+        /// Keep the keys in `file` or in the system `keyring` here, whatever the backup's config says.
+        #[arg(long, value_name = "file|keyring")]
+        secret_storage: Option<String>,
+        /// Read the passphrase from the first line of this file instead of asking.
+        #[arg(long, value_name = "FILE")]
+        passphrase_file: Option<PathBuf>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -419,8 +447,13 @@ pub struct Help {
 const SECTIONS: &[(&str, &str, &[&[&str]])] = &[
     (
         "Install and set up",
-        "Run the node as a service under a user of its own (Linux with sudo, Windows as administrator), set it up and keep it current.",
-        &[&["install", "uninstall"], &["setup"], &["update"]],
+        "Run the node as a service under a user of its own (Linux with sudo, Windows as administrator), set it up, keep it current, and back it up or move it.",
+        &[
+            &["install", "uninstall"],
+            &["setup"],
+            &["update"],
+            &["backup", "restore"],
+        ],
     ),
     (
         "Pair and connect",
@@ -1038,7 +1071,9 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
     // The daemon writes the file itself while it runs; the service commands
     // leave it alone (or delete it with the rest). Sudo on Windows says
     // itself when its change counts (crate::winsudo).
-    let own_say = cfg!(windows) && matches!(cli.cmd, Cmd::Sudo(_));
+    // A restore says itself what comes next.
+    let own_say = (cfg!(windows) && matches!(cli.cmd, Cmd::Sudo(_)))
+        || matches!(cli.cmd, Cmd::Restore { .. });
     let before = (!matches!(cli.cmd, Cmd::Run) && !service && !own_say)
         .then(|| std::fs::read(paths.config_file()).ok());
     // On Windows the running node takes folder changes over its pipe, and
@@ -1111,8 +1146,9 @@ pub fn service_log(cli: &Cli) -> Option<PathBuf> {
 
 /// The rule of the other owner commands (docs/dev/spec/node-local.md §5):
 /// nothing a command of a center starts may install, set up, update or
-/// remove the node. The node that runs knows its commands, so it is asked
-/// over its control socket, and refuses a caller below one of them.
+/// remove the node, nor back it up or restore it. The node that runs knows
+/// its commands, so it is asked over its control socket, and refuses a
+/// caller below one of them.
 async fn owner_check(paths: &[&NodePaths]) -> Result<(), String> {
     #[cfg(unix)]
     for p in paths {
@@ -1515,6 +1551,54 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
         Cmd::Proxy(c) => proxy_cmd(&paths, c, out).await,
         Cmd::Relay(c) => relay_cmd(&paths, c, out).await,
         Cmd::Sudo(c) => sudo_cmd(&paths, c, out).await,
+        Cmd::Backup {
+            file,
+            include_keyring,
+            overwrite,
+            passphrase_file,
+        } => {
+            // A command of a center must not take the node's keys out under a
+            // passphrase of its own.
+            owner_check(&[&paths]).await?;
+            let (cfg, _) = read_config(&paths).await?;
+            let pass = crate::prompt::passphrase(passphrase_file.as_deref(), out, true)?;
+            let opts = crate::backup::BackupOpts {
+                include_keyring,
+                overwrite,
+                rounds: nerve_transport::backup::ITERATIONS,
+            };
+            let r = crate::backup::backup(&paths, &cfg, &file, &pass, &opts)?;
+            crate::backup::print_backup(&r, &file, out);
+            Ok(())
+        }
+        Cmd::Restore {
+            file,
+            replace,
+            secret_storage,
+            passphrase_file,
+        } => {
+            owner_check(&[&paths]).await?;
+            let bytes = nerve_transport::backup::read_file(&file)?;
+            let kind = nerve_transport::backup::kind_of(&bytes)?;
+            if kind != nerve_transport::backup::Kind::Node {
+                return Err(format!(
+                    "this is the backup of a {}, not of a node: restore it with `nerve-center restore`",
+                    kind.word()
+                ));
+            }
+            let storage = secret_storage
+                .map(|s| parse_enum::<SecretStorage>(&s, "file or keyring"))
+                .transpose()?;
+            let pass = crate::prompt::passphrase(passphrase_file.as_deref(), out, false)?;
+            let parsed = crate::backup::open(&bytes, &pass)?;
+            let opts = crate::backup::RestoreOpts {
+                replace,
+                secret_storage: storage,
+            };
+            let r = crate::backup::restore(&paths, &parsed, &opts)?;
+            crate::backup::print_restore(&r, &parsed, out);
+            Ok(())
+        }
         Cmd::Install => {
             let layout = Layout::system();
             owner_check(&[&paths, &layout.paths]).await?;

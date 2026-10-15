@@ -124,7 +124,9 @@ refused like a changed one (audited, `refused`): at start-up the node does not
 start, and the CLI's read-only commands refuse it; a reload also refuses a
 signed file below the version in force, and the old config stays. The same
 refusal is what the owner sees after a restore of the config folder from a
-backup.
+backup by hand. `nerve-node restore` ([backup](../backup.md)) is the owner's
+way: it saves the restored config under a version above the record and the
+file it replaces, so the record never goes down.
 
 - `config accept` takes the refused file under a version above every one
   before it (the highest of the file, the config in force and the record, plus
@@ -1055,7 +1057,7 @@ Methods:
 | `sudo.status` | | `{sudo: "on"|"off"}` |
 | `sudo.on` | `password` | checks it with `sudo -v` and turns the switch on (§4) |
 | `sudo.off` | | turns the switch off and drops the password |
-| `owner.check` | | changes nothing; the CLI asks it before `install`, `setup`, `update` and `uninstall` |
+| `owner.check` | | changes nothing; the CLI asks it before `install`, `setup`, `update`, `uninstall`, `backup` and `restore` |
 | `hello` | `role` (`provider`), `name`, `capabilities` | a capability provider attaches; the connection stays (§7) |
 
 Every method is refused from a process that runs below a command the node
@@ -1143,7 +1145,7 @@ the node as a service.
 and new value), calls allowed or forbidden (a refusal with its reason), the
 relay's tunnels (`"kind": "relay"`, one per tunnel when it ends: `node`,
 `center`, `from`, `start`, `end`, `reason`, `up`, `down`; never a token), and what happened to the config
-file itself (`"kind": "config"`, `event` `refused`, `signed`, `accepted` or
+file itself (`"kind": "config"`, `event` `refused`, `signed`, `accepted`, `restored` or
 `not_recorded`, with the file and the reason), and what the owner did to the node
 (`"kind": "node"`, `event` `install`, `setup`, `update` or `uninstall`, with
 its `steps` and the `error` that stopped it). It holds targets (paths, command lines), never

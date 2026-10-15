@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+### Backup, restore and moving
+
+- `nerve-node backup <file>` and `nerve-node restore <file>`, and the same for `nerve-center`, write the config and keys (the center's certificate, key and state) to one file that a passphrase protects (PBKDF2-HMAC-SHA256 and ChaCha20-Poly1305, at least 12 characters), and put them back on the same machine or another, so a node or a center can be moved without pairing again ([#122](https://github.com/Piggidragon/Nerve-Protocol/issues/122)).
+- Keys in the system keyring, and a proxy's header values, go into a backup only with `--include-keyring`. A restore never goes under a running node or center, refuses a backup of another node or center unless you add `--replace`, keeps every pin as saved and sets the sudo switch off. `nerve-center` has these two subcommands now; a harness still starts it without one.
+
 ### Capability providers
 
 - A program on the machine that the owner names in `providers.allowed`, such as a desktop app, can attach to the node's control socket and add capabilities of its own. The node lists them to every center with `provider: <name>`, decides and audits every call to them by that center's policy, forwards only the allowed ones, and drops them when the program exits. Linux only for now; the conformance suite has a provider part ([#16](https://github.com/Piggidragon/Nerve-Protocol/issues/16)).

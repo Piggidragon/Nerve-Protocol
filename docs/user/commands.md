@@ -61,3 +61,8 @@ center is paired.
 | `setup --create-user <name>` | Make an account only the node uses, and run commands as it (Linux, installed node) | [service](service.md#setup) |
 | `update [--from FILE]` | Put the latest release in place and restart the service | [service](service.md#update) |
 | `uninstall [--purge]` | Remove the service, its user and the program | [service](service.md#uninstall) |
+| `backup <file> [--include-keyring] [--overwrite] [--passphrase-file F]` | Write the config and keys to a file that a passphrase protects | [backup](backup.md) |
+| `restore <file> [--replace] [--secret-storage file\|keyring] [--passphrase-file F]` | Put a backup in place of this node's, or on another machine | [backup](backup.md#restore) |
+
+The center has two commands of its own: `nerve-center backup <file>` and
+`nerve-center restore <file>` ([backup](backup.md#the-center)).

@@ -1,7 +1,8 @@
 # Run the center
 
-The harness starts `nerve-center` itself, like any MCP server. The center has
-no subcommands. Every setting is a flag or an environment variable.
+The harness starts `nerve-center` itself, like any MCP server. Every setting is
+a flag or an environment variable. The only subcommands are `backup` and
+`restore`, which you run by hand ([backup](backup.md)).
 
 ## Add it to the harness
 
@@ -77,6 +78,13 @@ attached harnesses have ended too.
 
 A second one with `--mcp http` or `--mcp none` refuses to start. On Windows a
 second instance cannot attach and fails.
+
+## Back it up
+
+`nerve-center backup <file>` writes `tls.pem` and `state.json` to one file
+that a passphrase protects; `nerve-center restore <file>` puts them back, on
+this machine or another. The nodes then find the same center by the same pin
+and need not pair again ([backup](backup.md)).
 
 ## What the center keeps
 

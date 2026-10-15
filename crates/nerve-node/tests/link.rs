@@ -1021,3 +1021,127 @@ async fn a_session_end_stops_the_commands_of_that_session() {
     );
     node.stop().await;
 }
+
+/// A call may ask its command for less than the owner's most, never for
+/// more; `status` shows the limits and why this node does not hold them.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_call_asks_for_limits_up_to_the_owners_most() {
+    let dir = tempdir();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let mut o = options(dir.path());
+    o.cgroups = Some(Err("no cgroup for this test".into()));
+    nerve_node::pair::pair(&o.paths, &center.link(), Some("lab"))
+        .await
+        .expect("pair");
+    owner_edit(&o.paths, |c| {
+        c.centers[0].policy.allow.push("exec.run:echo *".into());
+        c.limits.command.memory_mb = 512;
+        c.limits.command.memory_max_mb = 1024;
+    })
+    .await;
+    let node = Daemon::start(o).await.expect("start");
+    let mut conn = linked(&mut center).await;
+    let mut run = async |args: Value| {
+        conn.call(
+            "invoke",
+            json!({"cap": "exec", "action": "run", "args": args}),
+            WAIT,
+        )
+        .await
+        .unwrap()
+    };
+    let r =
+        run(json!({"command": "echo ok", "memory_mb": 1024, "cpu_percent": 10, "processes": 8}))
+            .await
+            .expect("within the most");
+    assert_eq!(r["stdout"], "ok\n", "{r}");
+    assert!(r.get("killed").is_none(), "{r}");
+    let e = run(json!({"command": "echo no", "memory_mb": 1025}))
+        .await
+        .expect_err("more than the most");
+    assert_eq!(nerve_conformance::wire::code_of(&e), "invalid_args");
+    assert!(e.to_string().contains("at most 1024"), "{e}");
+    let e = run(json!({"command": "echo no", "processes": 0}))
+        .await
+        .expect_err("no process at all");
+    assert_eq!(nerve_conformance::wire::code_of(&e), "invalid_args");
+
+    let limits = &node.status()["command_limits"];
+    assert_eq!(limits["memory_mb"], 512, "{limits}");
+    assert_eq!(limits["memory_max_mb"], 1024, "{limits}");
+    assert_eq!(limits["cgroup"], Value::Null, "{limits}");
+    assert_eq!(limits["off"], "no cgroup for this test", "{limits}");
+    node.stop().await;
+}
+
+/// A command the kernel killed for its memory limit: its result says so,
+/// and so does the audit log. The cgroups
+/// are plain folders here, and the command writes what the kernel would
+/// into its `memory.events`; a real one is in the exec tests.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_killed_for_its_memory_is_said_in_its_result_and_the_audit() {
+    let me = nerve_transport::net::euid();
+    if me == 0 {
+        eprintln!("skipped: root's own folders are no cgroup without systemd's mark");
+        return;
+    }
+    let dir = tempdir();
+    let fake = dir.path().join("cgroup");
+    let own = fake.join("node.scope");
+    std::fs::create_dir_all(&own).unwrap();
+    std::fs::write(fake.join("cgroup.controllers"), "cpu memory pids").unwrap();
+    std::fs::write(own.join("cgroup.controllers"), "cpu memory pids").unwrap();
+    std::fs::write(own.join("cgroup.procs"), "").unwrap();
+    let cgroups = nerve_node::cgroup::Cgroups::at(&fake, "/node.scope", std::process::id(), me)
+        .expect("plain folders of this user");
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let mut o = options(dir.path());
+    o.cgroups = Some(Ok(Arc::new(cgroups)));
+    nerve_node::pair::pair(&o.paths, &center.link(), Some("lab"))
+        .await
+        .expect("pair");
+    // User mode runs any command line, unconfined.
+    owner_edit(&o.paths, |c| {
+        c.centers[0].policy.mode = nerve_policy::Mode::User
+    })
+    .await;
+    let node = Daemon::start(o).await.expect("start");
+    let mut conn = linked(&mut center).await;
+    let command = format!(
+        "for d in {}/cmd-*; do printf 'oom 1\\noom_kill 1\\n' > \"$d/memory.events\"; done; cat \"$d/memory.max\"",
+        own.display()
+    );
+    let r = conn
+        .call(
+            "invoke",
+            json!({"cap": "exec", "action": "run",
+                   "args": {"command": command, "memory_mb": 64}}),
+            WAIT,
+        )
+        .await
+        .unwrap()
+        .expect("it ran");
+    // The node set the limit the call asked for.
+    assert_eq!(r["stdout"], (64u64 << 20).to_string(), "{r}");
+    assert_eq!(r["killed"], "memory", "{r}");
+    let why = "the command went past its memory limit of 64 MiB and was killed";
+    assert_eq!(r["reason"], why, "{r}");
+    let status = node.status();
+    assert_eq!(
+        status["command_limits"]["cgroup"], "/node.scope",
+        "{status}"
+    );
+    let audit = node.paths().audit_log();
+    node.stop().await;
+    let log = std::fs::read_to_string(audit).unwrap();
+    let killed: Vec<Value> = log
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["decision"] == "killed")
+        .collect();
+    assert_eq!(killed.len(), 1, "{log}");
+    assert_eq!(killed[0]["code"], "memory", "{log}");
+    assert_eq!(killed[0]["reason"], why, "{log}");
+    assert_eq!(killed[0]["target"], command, "{log}");
+}

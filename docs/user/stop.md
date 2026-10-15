@@ -39,7 +39,9 @@ Only you can resume it.
 
 A command stops when its call ends: on its timeout, when the caller cancels,
 when its session ends, or when the link drops. On Linux the node kills the
-command's whole process group. On Windows it ends the command's Job Object.
+command's whole process group, and everything in the command's cgroup where
+it has one ([limits](limits.md)). On Windows it ends the command's Job Object.
+A command that goes past its memory limit is killed too.
 
 On Windows a timeout, and `exec_signal` with `term` or `int`, first ask the
 command to end: its console programs get Ctrl+C and its windows a close

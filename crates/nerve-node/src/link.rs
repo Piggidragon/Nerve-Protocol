@@ -1281,7 +1281,18 @@ impl Link {
             let _as = act_as(known.as_ref())?;
             RunCall::parse(&inv.args, &home)?
         };
+        // A call may ask for less than the owner's most, never for more.
+        let granted = cfg
+            .limits
+            .command
+            .grant(
+                rc.limits.memory_mb,
+                rc.limits.cpu_percent,
+                rc.limits.processes,
+            )
+            .map_err(RpcError::invalid_args)?;
         let target = rc.command.clone();
+        let command = rc.command.clone();
         // The gate and the sandbox below go by one answer, from `cfg` and its
         // account, taken before the gate: a config written meanwhile or a limit
         // that passes cannot let a command the gate judged by the folders run
@@ -1359,10 +1370,35 @@ impl Link {
             sudo,
             account,
             own,
+            limits: self
+                .shared
+                .cgroups
+                .as_ref()
+                .ok()
+                .map(|c| (c.clone(), granted)),
         };
         let r = exec::run(&rc, &opts, |e| guard.started(e)).await;
         drop(open);
         drop(guard);
+        // A command killed for its memory limit is a decision of the node's
+        // too: the audit log and the node's log say so, as the result does.
+        if let Ok(v) = &r
+            && v["killed"] == "memory"
+        {
+            let reason = v["reason"].as_str().unwrap_or_default();
+            tracing::warn!("a command of {} was killed: {reason}", self.name);
+            self.shared.audit(&Entry {
+                ts: crate::now_ms(),
+                center: self.name.clone(),
+                cap: inv.cap.clone(),
+                action: inv.action.clone(),
+                target: command,
+                decision: "killed".into(),
+                code: Some("memory".into()),
+                session: inv.ctx.session.clone(),
+                reason: Some(reason.into()),
+            });
+        }
         if let Ok(v) = &r {
             self.handle.event(
                 "exec",

@@ -22,6 +22,13 @@ action, the target and the decision. A refusal adds its reason.
 The reason says what is missing. Use it to write the rule you want
 ([rules](rules.md)).
 
+A command killed for its memory limit gets a second line, `killed`, with the
+reason ([limits](limits.md)):
+
+```
+1791834531877  lab  exec.run  make -j8  killed: the command went past its memory limit of 4096 MiB and was killed
+```
+
 Settings changes are lines like `1791834068828  settings v1 by local`. They
 show the new version and who changed it: `local` for `nerve-node`, or the name
 of a center. The log holds the old and the new value of each setting.

@@ -39,6 +39,7 @@ open port.
 | [sudo.md](sudo.md) | The sudo switch |
 | [settings-grant.md](settings-grant.md) | Let a center change a machine's settings |
 | [config.md](config.md) | Read and change `node.toml` by name |
+| [limits.md](limits.md) | Memory, CPU and processes of one command |
 | [audit.md](audit.md) | See what was allowed and refused |
 | [logs.md](logs.md) | The log of the center and the node: levels, what is in it, where it is |
 | [stop.md](stop.md) | Panic, pause, disable, remove |

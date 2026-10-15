@@ -395,14 +395,21 @@ concurrently.
 
 | Action | Effect | Params → result |
 |---|---|---|
-| `run` | execute | `{command, cwd?, timeout_ms?}` → `{exit_code, signal?, stdout, stderr, truncated}` |
+| `run` | execute | `{command, cwd?, timeout_ms?, memory_mb?, cpu_percent?, processes?}` → `{exit_code, signal?, stdout, stderr, truncated, killed?, reason?}` |
 | `signal` | actuate | `{call, signal: "term"|"kill"|"int"}` → `{}` |
 
 - `command` is a string run by the node's shell. `call` is the `invoke` id of a
   running `run`.
 - state: `{shell, confinement}`; event `exit {call, exit_code}` (needs `sub`).
 - Output is capped at `limits.output_cap_bytes` of the node's config;
-  `truncated` says it was cut. Output comes in the result; the
+  `truncated` says it was cut.
+- `memory_mb`, `cpu_percent` (100 is one CPU) and `processes` are the
+  limits of the command (node-local §2, Commands). Each one left out is the
+  node's default; one above the node's most, or 0, fails with
+  `invalid_args`, whose message names the most. The descriptor gives each
+  default and most as the parameter's `default` and `maximum`. A command
+  the node killed because it went past its memory has `killed: "memory"`
+  and a `reason` in its result (and `signal: "kill"`). Output comes in the result; the
   `output` reliable stream is declared for later.
 
 ### 7.4 `settings` (only with the settings grant `write`)
@@ -451,7 +458,9 @@ browser or tool) to the node; the center only relays it.
 ### 7.5 `audit`
 
 - event `decision {ts, cap, action, target, decision, code?, session?}`
-  (needs `sub`); `decision` is `allowed` or `forbidden`.
+  (needs `sub`); `decision` is `allowed` or `forbidden`, or `killed` with
+  `code: "memory"` for a command the node killed for its memory limit,
+  after that call's `allowed`.
 
 ## 8. Center side
 

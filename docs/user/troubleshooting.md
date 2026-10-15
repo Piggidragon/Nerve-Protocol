@@ -38,6 +38,9 @@ names its reason.
 | `unavailable` | The machine is offline | Check the link, below |
 | `connection_lost` | The link dropped during the call | Run it again |
 | `busy` | Too many commands or calls at once (`limits.max_running`, 16 by default) | Wait, or raise the limit |
+| `memory_mb … is more than this node lets a command have: at most …` (also `cpu_percent`, `processes`) | The call asked for more than the most you set | Ask for less, or raise `limits.command.*_max*` ([limits](limits.md)) |
+| `killed: "memory"` in a result | The command went past its memory limit | Ask for more `memory_mb`, up to the most, or raise `limits.command.memory_mb` |
+| `commands run WITHOUT these limits: …` in `status` | The node has no cgroup of its own: started in a terminal, or installed before limits came | [Where the limits hold](limits.md#where-the-limits-hold) |
 
 The agent sees only the tools a machine could allow. If it sees only `nodes`,
 nothing is allowed yet.

@@ -242,7 +242,7 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
             // rotated; while a rotation of the center's key is in its grace,
             // either of its pins is taken.
             let pins = entry.pins_at(crate::now_ms());
-            let connect = ws::connect_pins(
+            let connect = ws::connect_pins_seen(
                 &url,
                 &pins,
                 proxy.as_ref(),
@@ -275,7 +275,7 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
                 failed_dials += 1;
                 Outcome::Retry
             }
-            Ok(ws) => {
+            Ok((ws, seen_pin)) => {
                 let (signer, pending) = match &next {
                     None => (&key, Pending::None),
                     Some(n) if sign_next => (n, Pending::Adopt(n.public_hex())),
@@ -284,6 +284,7 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
                 let keys = Signing {
                     key: signer,
                     pending,
+                    seen_pin,
                 };
                 let (outcome, was_up, kept) =
                     session(&shared, &cs, &entry, keys, ws, parked.take(), &mut changed).await;
@@ -350,6 +351,8 @@ fn load_keys(shared: &Shared, name: &str) -> Result<(NodeKey, Option<NodeKey>), 
 struct Signing<'a> {
     key: &'a NodeKey,
     pending: Pending,
+    /// The pin of the certificate the center showed for this connection.
+    seen_pin: Option<String>,
 }
 
 /// A rotation of the node's key that waits for the center's answer, as a
@@ -507,7 +510,11 @@ async fn session(
     parked: Option<Parked>,
     changed: &mut watch::Receiver<u64>,
 ) -> (Outcome, bool, Option<Parked>) {
-    let Signing { key, pending } = keys;
+    let Signing {
+        key,
+        pending,
+        seen_pin,
+    } = keys;
     let (mut sink, mut stream) = ws.split();
     let cfg = shared.config();
     let mut parked = parked;
@@ -666,6 +673,7 @@ async fn session(
                 calls: Mutex::default(),
                 commands: Mutex::default(),
                 last_status: Mutex::new("online"),
+                seen_pin: Mutex::new(None),
             });
             Ok((link, None))
         }
@@ -681,6 +689,7 @@ async fn session(
         }
     };
     link.takes.store(takes, Ordering::Relaxed);
+    *lock(&link.seen_pin) = seen_pin;
     match &again {
         None => tracing::info!("linked to center {}", entry.name),
         Some(a) => tracing::info!(
@@ -803,6 +812,11 @@ struct Link {
     commands: Mutex<HashMap<Id, exec::Ender>>,
     /// The `node` status the center last heard (online, busy or paused).
     last_status: Mutex<&'static str>,
+    /// The pin of the certificate the center showed for the connection now.
+    /// A connection under a pin that stops counting (the old pin of a
+    /// rotation of the center's key, its time over) ends, and the node dials
+    /// again with the pins that are left (spec §4.10).
+    seen_pin: Mutex<Option<String>>,
 }
 
 impl Link {
@@ -965,6 +979,13 @@ impl Link {
                     self.check_rev(&mut rev);
                     self.check_status();
                     crate::rotate::drop_old_pin(&self.shared, &self.name);
+                    if self.under_a_pin_that_stopped() {
+                        tracing::warn!(
+                            "center {}: this connection was opened under the center's old pin, which no longer counts; dialling again with the new one",
+                            self.name
+                        );
+                        return Outcome::Lost;
+                    }
                 }
                 r = changed.changed() => {
                     if r.is_err() {
@@ -979,6 +1000,15 @@ impl Link {
                     }
                     if entry.revoked || entry.unknown {
                         return self.end(ByeReason::Unpaired, Outcome::Stop).await;
+                    }
+                    // Told that the old pin no longer counts (the center
+                    // serves its new key): a connection under it ends now.
+                    if self.under_a_pin_that_stopped() {
+                        tracing::warn!(
+                            "center {}: this connection was opened under the center's old pin, which no longer counts; dialling again with the new one",
+                            self.name
+                        );
+                        return Outcome::Lost;
                     }
                     self.check_rev(&mut rev);
                     if cfg.version != version {
@@ -995,6 +1025,21 @@ impl Link {
                 }
             }
         }
+    }
+
+    /// Whether the connection now was opened under a pin the center's entry
+    /// no longer takes: the old pin of a rotation whose time is over, or
+    /// that the center ended early.
+    fn under_a_pin_that_stopped(&self) -> bool {
+        let Some(seen) = lock(&self.seen_pin).clone() else {
+            return false;
+        };
+        let Some((_, entry)) = self.entry() else {
+            return false;
+        };
+        let pins = entry.pins_at(crate::now_ms());
+        // A pairing without a pin checks the system's roots instead.
+        !pins.is_empty() && !pins.contains(&seen.as_str())
     }
 
     /// Tells the center when its view of the node changed.

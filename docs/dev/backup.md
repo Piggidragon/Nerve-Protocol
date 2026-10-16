@@ -207,9 +207,12 @@ the backup, and its `pin` and `old_pin` stay. Where it counts fewer (an older
 copy of the node), the backup's stay. The same count with another key or pin
 keeps the backup's, with a note. A pin the owner sets by hand counts as a
 rotation the node took (the settings store raises `pin_rotations`). With the same count and the same
-pin, an `old_pin` here that is gone or ends sooner than the backup's stays:
-the center ended its grace after the backup, maybe because the old key
-leaked, so the old pin does not come back.
+pin, an `old_pin` here that is gone, or whose time is over, means the center
+ended its grace after the backup, maybe because the old key leaked: the
+backup's old pin does not come back, with a note. One here that still runs
+and ends a little sooner (each later notice of the same grace is taken from
+the center's time left, so it can end some milliseconds sooner) stays, without
+a note.
 
 ## Pins
 
@@ -218,13 +221,14 @@ restore does to it:
 
 | Pin | Kept in | Restore |
 |---|---|---|
-| A center's, held by its nodes | `center.<name>.pin` in `node.toml` | Kept as saved, unless the config being replaced counts more `pin_rotations` (it was told a newer pin, or one was set by hand): then its `pin` and `old_pin` stay. The center keeps it by restoring `tls.pem` |
+| A center's, held by its nodes | `center.<name>.pin` in `node.toml` | Kept as saved, unless the config being replaced counts more `pin_rotations` (it was told a newer pin, or one was set by hand): then its `pin` and `old_pin` stay. With the same count and pin, a backup's `old_pin` whose time ended here does not come back. The center keeps it by restoring `tls.pem` |
 | The relay's | `relay.pin` in `node.toml`; its key in `relay-tls` | Kept; the key is checked against it. A relay whose key is missing does not listen until `relay set` makes a new key and pin |
 | An `https://` proxy's | `connection.pin` in `node.toml` | Kept, unless `--without-proxy` leaves the whole `connection` section out: the pin goes with the proxy, and `proxy set --pin` gives it again |
 
-A restore never learns a pin. It keeps the backup's, with two exceptions: a
-center's pin here that is further along (above) stays, and `--without-proxy`
-drops the proxy's pin. A pairing that was ended
+A restore never learns a pin. It keeps the backup's, with three exceptions: a
+center's pin here that is further along (above) stays, a center's old pin
+whose time ended here does not come back, and `--without-proxy` drops the
+proxy's pin. A pairing that was ended
 on one side after the backup is not revived: the other side no longer knows
 the node's key.
 

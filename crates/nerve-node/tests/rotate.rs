@@ -591,3 +591,61 @@ async fn a_new_key_node_toml_cannot_record_is_settled_on_the_next_link() {
     assert_eq!(cfg.centers[0].public_key.as_deref(), Some(new.as_str()));
     drop(daemon);
 }
+
+/// A TLS front with `id`'s key in front of the fake center at `to`.
+async fn tls_front(id: &ServerIdentity, to: u16) -> u16 {
+    let acceptor = nerve_transport::tls::Acceptor::new(id).unwrap();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        while let Ok((tcp, _)) = l.accept().await {
+            let acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                let Ok(mut tls) = acceptor.accept(tcp).await else {
+                    return;
+                };
+                let Ok(mut up) = TcpStream::connect(("127.0.0.1", to)).await else {
+                    return;
+                };
+                let _ = tokio::io::copy_bidirectional(&mut tls, &mut up).await;
+            });
+        }
+    });
+    port
+}
+
+/// A connection the node opened under the center's old pin ends once that
+/// pin's time is over: whoever holds the old key keeps no link.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_link_under_an_old_pin_ends_when_its_time_is_over() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let (a, b) = (
+        ServerIdentity::generate(&[]).unwrap(),
+        ServerIdentity::generate(&[]).unwrap(),
+    );
+    // The old key A answers; the node pins B and takes A for a few seconds.
+    let front = tls_front(&a, center.url.port).await;
+    let until = nerve_proto::msg::now_ms() + 4000;
+    let daemon = node_with(dir.path(), &center, |e| {
+        e.url = format!("https://127.0.0.1:{front}");
+        e.pin = Some(b.pin());
+        e.old_pin = Some(nerve_policy::OldPin {
+            pin: a.pin(),
+            until_ms: until,
+        });
+    })
+    .await;
+    let old = paired(&center).request.public_key;
+    let mut conn = link(&mut center, &old, Some(ROTATE)).await;
+    assert!(
+        nerve_proto::msg::now_ms() < until,
+        "the link came up within the old pin's time"
+    );
+    assert!(
+        conn.ends_within(Duration::from_secs(15)).await.is_some(),
+        "the link under the old pin ends with its time"
+    );
+    assert!(nerve_proto::msg::now_ms() >= until);
+    drop(daemon);
+}

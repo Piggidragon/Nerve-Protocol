@@ -556,21 +556,29 @@ pub fn restore(paths: &NodePaths, b: &Parsed, opts: &RestoreOpts) -> Result<Rest
                     "the pin of center {} here is another one than the backup's: the restore takes the backup's. If the node cannot link, set the center's pin with `nerve-node config set center.{}.pin <pin>`",
                     e.name, e.name
                 ));
-            } else if h.pin_rotations == e.pin_rotations && h.pin == e.pin {
-                // The same pin, but the old one's time ended here sooner
-                // (the center ended its grace, maybe because that key
-                // leaked): the old pin does not come back.
-                let sooner = match (&h.old_pin, &e.old_pin) {
-                    (_, None) => false,
-                    (None, Some(_)) => true,
-                    (Some(h), Some(b)) => h.until_ms < b.until_ms,
-                };
-                if sooner {
-                    e.old_pin = h.old_pin.clone();
-                    report.notes.push(format!(
-                        "the grace of center {}'s old key ended after the backup was made: the restore does not bring its old pin back",
-                        e.name
-                    ));
+            } else if h.pin_rotations == e.pin_rotations
+                && h.pin == e.pin
+                && let Some(backed_up) = &e.old_pin
+            {
+                // The same pin. An old pin here that is gone, or whose time
+                // is over, ended after the backup was made (the center ended
+                // its grace, maybe because that key leaked): it does not come
+                // back. One here that still runs and ends a little sooner
+                // (a later notice of the same grace) is taken as it is.
+                let now = crate::now_ms();
+                match &h.old_pin {
+                    Some(o) if now < o.until_ms => {
+                        if o.until_ms < backed_up.until_ms {
+                            e.old_pin = Some(o.clone());
+                        }
+                    }
+                    _ => {
+                        e.old_pin = None;
+                        report.notes.push(format!(
+                            "the grace of center {}'s old key ended after the backup was made: the restore does not bring its old pin back",
+                            e.name
+                        ));
+                    }
                 }
             }
         }
@@ -1713,6 +1721,38 @@ mod tests {
         let cfg = open_store(&n).config().clone();
         assert_eq!(cfg.centers[0].pin.as_deref(), Some(p1.as_str()));
         assert_eq!(cfg.centers[0].old_pin, None);
+
+        // An old pin here that still runs and ends a little sooner (a later
+        // notice of the same grace) is no end of the grace: it stays, without
+        // that note.
+        let (_b, n) = node();
+        paired(&n, SecretStorage::File, &["home"]);
+        let mut s = open_store(&n);
+        s.mark(in_grace).unwrap();
+        drop(s);
+        let (_g, parsed, _) = roundtrip(&n, false);
+        let mut s = open_store(&n);
+        s.mark(|c| {
+            let o = c.center_mut("home").unwrap().old_pin.as_mut().unwrap();
+            o.until_ms -= 5;
+        })
+        .unwrap();
+        let here = s.config().centers[0].old_pin.clone();
+        drop(s);
+        let r = restore_into(&n, &parsed, None);
+        assert!(
+            !r.notes
+                .iter()
+                .any(|t| t.contains("does not bring its old pin back")),
+            "{r:?}"
+        );
+        let cfg = open_store(&n).config().clone();
+        assert_eq!(cfg.centers[0].old_pin, here);
+        assert!(
+            cfg.centers[0]
+                .pins_at(crate::now_ms())
+                .contains(&p0.as_str())
+        );
     }
 
     /// A center's pin set by hand counts as a rotation the node took: a

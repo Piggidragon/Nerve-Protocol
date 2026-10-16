@@ -533,11 +533,22 @@ pub async fn open_pins(
     pins: &[&str],
     proxy: Option<&Proxy>,
 ) -> Result<BoxIo, String> {
+    open_pins_seen(url, pins, proxy).await.map(|(io, _)| io)
+}
+
+/// [`open_pins`], also giving the pin of the certificate the center showed
+/// (`None` over plain HTTP): a link opened under an old pin ends when that
+/// pin stops counting (docs/dev/spec/protocol.md §4.10).
+pub async fn open_pins_seen(
+    url: &CenterUrl,
+    pins: &[&str],
+    proxy: Option<&Proxy>,
+) -> Result<(BoxIo, Option<String>), String> {
     if !url.tls {
         let tcp = direct(url, None).await?;
         #[cfg(target_os = "linux")]
         check_local_peer(&tcp)?;
-        return Ok(Box::new(tcp));
+        return Ok((Box::new(tcp), None));
     }
     let tcp = reach(url, proxy).await?;
     let config = crate::tls::client_config_pins(pins)?;
@@ -550,7 +561,13 @@ pub async fn open_pins(
     .await
     .map_err(|_| format!("TLS handshake with {url} timed out"))?
     .map_err(|e| tls_error(url, !pins.is_empty(), &e))?;
-    Ok(Box::new(tls))
+    let seen = tls
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|c| c.first())
+        .and_then(|c| crate::tls::pin_of_cert(c.as_ref()));
+    Ok((Box::new(tls), seen))
 }
 
 /// This process's effective user id (0 off Unix).

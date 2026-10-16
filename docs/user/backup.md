@@ -153,11 +153,13 @@ center, a relayed node holds the pin of its relay, and a node behind an
 `https://` proxy holds the proxy's.
 
 - **A restored node keeps every pin in its `node.toml`** exactly as saved. It
-  does not learn them again. There are two exceptions: `--without-proxy`
-  drops the `https://` proxy's pin along with the proxy, and a center's pin
-  that the node here was told after the backup was made (a rotation of the
+  does not learn them again. There are three exceptions: `--without-proxy`
+  drops the `https://` proxy's pin along with the proxy; a center's pin that
+  the node here was told after the backup was made (a rotation of the
   center's key), or that was set here by hand since, stays over the backup's
-  older one (below). The relay's pin always stays. The node also keeps the node key of each center, so the
+  older one (below); and a center's old pin whose time ended here after the
+  backup was made (the center ended its grace) does not come back. The
+  relay's pin always stays. The node also keeps the node key of each center, so the
   center knows it by the same node id and needs no pairing: the pairing is
   what the node had at the time of the backup.
 - **A restored center brings back its certificate**, so the pin that its nodes

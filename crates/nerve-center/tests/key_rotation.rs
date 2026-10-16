@@ -626,3 +626,104 @@ async fn a_start_drops_a_new_key_the_state_does_not_know() {
     assert!(r.center.read(|s| s.key_rotation.is_none()));
     r.stop().await;
 }
+
+/// When the grace of a node's old key ends, by the sweep or by a newer
+/// rotation, a link opened with that key ends too.
+#[tokio::test]
+async fn a_link_of_the_old_node_key_ends_with_its_grace() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path(), false).await;
+    let cid = r.center.id();
+    let k = [(); 3].map(|_| NodeKey::generate().unwrap());
+    let id = pair(&r, &k[0], "box-1").await;
+    let c = r.center.clone();
+
+    // Rotated to k1 on a link that k0 opened; the sweep ends k0's grace.
+    let mut ws = welcomed(&r, &id, &k[0]).await;
+    send(
+        &mut ws,
+        Message::notification(method::KEY_ROTATE, rotate_params(&cid, &k[0], &k[1])),
+    )
+    .await;
+    next(&mut ws, method::KEY_ROTATED)
+        .await
+        .expect("key.rotated");
+    r.center.sweep().await;
+    assert!(c.link(&id).is_some(), "the grace still runs");
+    r.center.update(|s| {
+        s.nodes
+            .get_mut(&id)
+            .unwrap()
+            .old_key
+            .as_mut()
+            .unwrap()
+            .until_ms = 1;
+    });
+    r.center.sweep().await;
+    assert!(c.link(&id).is_none(), "the k0 link ends with its grace");
+    let bye = next(&mut ws, method::BYE).await.expect("bye");
+    assert_eq!(bye["reason"], "replaced");
+    drop(ws);
+
+    // A link k1 opens; k1 → k2 on it, then on a link k1 opened during
+    // that grace, k2 → k0 ends k1's grace and that link.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut ws = welcomed(&r, &id, &k[1]).await;
+    send(
+        &mut ws,
+        Message::notification(method::KEY_ROTATE, rotate_params(&cid, &k[1], &k[2])),
+    )
+    .await;
+    next(&mut ws, method::KEY_ROTATED)
+        .await
+        .expect("key.rotated");
+    assert!(c.link(&id).is_some(), "k1 is in its grace");
+    send(
+        &mut ws,
+        Message::notification(method::KEY_ROTATE, rotate_params(&cid, &k[2], &k[0])),
+    )
+    .await;
+    let a = next(&mut ws, method::KEY_ROTATED)
+        .await
+        .expect("key.rotated");
+    assert!(a.get("error").is_none(), "{a}");
+    let bye = next(&mut ws, method::BYE).await.expect("bye");
+    assert_eq!(bye["reason"], "replaced");
+    assert!(c.link(&id).is_none());
+    r.stop().await;
+}
+
+/// A center that cannot save the node's new key says so, and keeps the key
+/// it had: the node would delete its old key on a "taken".
+#[cfg(unix)]
+#[tokio::test]
+async fn a_node_key_the_center_cannot_save_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path(), false).await;
+    let cid = r.center.id();
+    let (old, new) = (NodeKey::generate().unwrap(), NodeKey::generate().unwrap());
+    let id = pair(&r, &old, "box-1").await;
+    let mut ws = welcomed(&r, &id, &old).await;
+    let mode = |m| std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(m));
+    mode(0o500).unwrap();
+    // Root writes anyway; then this test says nothing.
+    let writable = std::fs::write(dir.path().join("probe"), b"x").is_ok();
+    send(
+        &mut ws,
+        Message::notification(method::KEY_ROTATE, rotate_params(&cid, &old, &new)),
+    )
+    .await;
+    let a = next(&mut ws, method::KEY_ROTATED)
+        .await
+        .expect("key.rotated");
+    mode(0o700).unwrap();
+    if writable {
+        return;
+    }
+    let e = a["error"].as_str().unwrap_or_default();
+    assert!(e.contains("state file"), "{a}");
+    assert_eq!(r.center.public_key(&id), Some(old.public_hex()));
+    assert!(r.center.read(|s| s.nodes[&id].old_key.is_none()));
+    r.stop().await;
+}

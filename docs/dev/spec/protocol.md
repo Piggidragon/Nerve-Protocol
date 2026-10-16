@@ -275,8 +275,11 @@ nothing rotates on its own. The new key travels over the paired,
 authenticated link, signed by the key it replaces. The replaced key stays
 valid for a **grace** of 7 days (604800000 ms) after the rotation, then it is
 refused; the owner of the side whose key changed can end the grace earlier.
-A rotation in the grace of another one ends that other grace at once: there
-is at most one old key per side.
+There is at most one old key per side. A node key rotation in the grace of
+another one ends that other grace at once; the center refuses a rotation of
+its own key while one is in its grace, until the owner ends that grace. When
+the grace of a node's old key ends, in whatever way, a link that was opened
+with that key ends with `bye {reason: "replaced"}`.
 
 A peer that does not speak `rotate` cannot rotate. A node that does not
 speak it is not told of a center's new key, and after the center's grace it
@@ -298,11 +301,19 @@ has to pair again.
    `error` the center took `public_key`; with it, it refused and keeps the
    key it had.
 
+A center saves the new key before it answers that it took it: the node
+deletes its old key on that answer. A center that cannot save it answers
+with an `error` and keeps the key it had.
+
 The node keeps the new key aside before it sends it, and makes it its key
-only when `key.rotated` says it was taken. On a refusal it drops it. Without
-an answer it keeps both, signs with the old one, and sends the same
-`key.rotate` again on its next link. A `hello` may be signed with the old key
-until the grace ends (§4.2).
+only when `key.rotated` says it was taken, also when that answer comes after
+the node stopped waiting for it. On a refusal it drops it. Without an answer
+it keeps both, signs with the old one, and sends the same `key.rotate` again
+on its next link. A `hello` may be signed with the old key until the grace
+ends (§4.2). While the new key waits for an answer, a node whose handshake
+fails tries the next one with the new key: a center that took the new key
+and whose grace for the old one has ended still links it; a link that comes
+up so settles the rotation as taken.
 
 To end the grace early, node → center `key.retire {public_key, sig}`:
 `public_key` is the node's current key, `sig` its signature (hex) over
@@ -327,7 +338,8 @@ dials again with its key.
    it holds and that `sig` verifies under `old_spki`. Then it pins the new
    key and takes the old pin as well until `min(grace_ms, 7 days)` from now.
    A rotation that does not verify changes nothing. A node that checks the
-   center against system roots (no pin) ignores it.
+   center against system roots (no pin) ignores it. Once the old pin's time
+   is over, the node drops it from its config.
 4. At the end of the grace, or when the owner ends it earlier, the center
    serves the new key for every new connection; links up then go on. It
    goes on telling the rotation with `grace_ms: 0` until 7 days after it

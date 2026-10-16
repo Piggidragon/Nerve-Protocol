@@ -61,16 +61,27 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
     // Dials that failed since the link was last up: the first is a warning,
     // the rest are detail, or a center that is down fills the log.
     let mut failed_dials = 0u32;
+    // While a rotation of the node's key waits for the center's answer, a
+    // handshake that fails is tried next with the new key: the center may
+    // have taken it, and the grace of the old one may have ended since.
+    let mut sign_next = false;
     loop {
         if *stop.borrow() {
             return;
         }
-        let cfg = shared.config();
-        let Some(entry) = cfg.center(&name).cloned() else {
+        let mut cfg = shared.config();
+        let Some(mut entry) = cfg.center(&name).cloned() else {
             return;
         };
         if !entry.dials() || cfg.locked {
             return;
+        }
+        if crate::rotate::drop_old_pin(&shared, &name) {
+            cfg = shared.config();
+            let Some(e) = cfg.center(&name).cloned() else {
+                return;
+            };
+            entry = e;
         }
         // The keyring may block (the Secret Service asks to unlock), so off
         // the runtime's threads.
@@ -78,15 +89,14 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
             let (shared, name) = (shared.clone(), name.clone());
             tokio::task::spawn_blocking(move || load_keys(&shared, &name)).await
         };
-        let (key, rotating) =
-            match read.unwrap_or_else(|e| Err(format!("the key read stopped: {e}"))) {
-                Ok(k) => k,
-                Err(e) => {
-                    tracing::error!("center {name}: {e}; dialling stopped");
-                    cs.set_status(e);
-                    return;
-                }
-            };
+        let (key, next) = match read.unwrap_or_else(|e| Err(format!("the key read stopped: {e}"))) {
+            Ok(k) => k,
+            Err(e) => {
+                tracing::error!("center {name}: {e}; dialling stopped");
+                cs.set_status(e);
+                return;
+            }
+        };
         let url = match CenterUrl::parse(&entry.url) {
             Ok(u) => u,
             Err(e) => {
@@ -133,9 +143,17 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
                 Outcome::Retry
             }
             Ok(ws) => {
-                let (outcome, was_up) = session(&shared, &cs, &entry, &key, rotating, ws).await;
+                let (signer, pending) = match &next {
+                    None => (&key, Pending::None),
+                    Some(n) if sign_next => (n, Pending::Adopt(n.public_hex())),
+                    Some(_) => (&key, Pending::Resend),
+                };
+                let (outcome, was_up) = session(&shared, &cs, &entry, signer, pending, ws).await;
                 if was_up {
                     failed_dials = 0;
+                    sign_next = false;
+                } else if next.is_some() {
+                    sign_next = !sign_next;
                 }
                 outcome
             }
@@ -178,13 +196,24 @@ fn load_key(shared: &Shared, name: &str) -> Result<NodeKey, String> {
     crate::secrets::center_key(&shared.paths, storage, name)
 }
 
-/// [`load_key`], and whether a rotation of the key waits for the center's
+/// [`load_key`], and the new key of a rotation that waits for the center's
 /// answer (crate::rotate).
-fn load_keys(shared: &Shared, name: &str) -> Result<(NodeKey, bool), String> {
+fn load_keys(shared: &Shared, name: &str) -> Result<(NodeKey, Option<NodeKey>), String> {
     let storage = shared.config().machine.secret_storage;
     let key = crate::secrets::center_key(&shared.paths, storage, name)?;
-    let rotating = crate::secrets::center_next_key(&shared.paths, storage, name)?.is_some();
-    Ok((key, rotating))
+    let next = crate::secrets::center_next_key(&shared.paths, storage, name)?;
+    Ok((key, next))
+}
+
+/// A rotation of the node's key that waits for the center's answer, as a
+/// link meets it.
+enum Pending {
+    None,
+    /// The hello is signed with the old key: the rotation is sent again.
+    Resend,
+    /// The hello is signed with the new key (this public key): if the link
+    /// comes up, the center holds it, and the rotation is settled.
+    Adopt(String),
 }
 
 /// The proxy to dial `url` through, its header values read from the system
@@ -316,7 +345,7 @@ async fn session(
     cs: &Arc<CenterState>,
     entry: &CenterEntry,
     key: &NodeKey,
-    rotating: bool,
+    pending: Pending,
     ws: WsStream,
 ) -> (Outcome, bool) {
     let (mut sink, mut stream) = ws.split();
@@ -428,9 +457,20 @@ async fn session(
     handle.set_rotate(rotate);
     *lock(&cs.link) = Some(handle.clone());
     // A rotation of the node's key that got no answer on an earlier link is
-    // sent again on this one.
-    if rotate && rotating {
-        tokio::spawn(crate::rotate::resume(shared.clone(), entry.name.clone()));
+    // sent again on this one, or settled when this hello was signed with the
+    // new key and the center took it.
+    match pending {
+        Pending::Resend if rotate => {
+            tokio::spawn(crate::rotate::resume(shared.clone(), entry.name.clone()));
+        }
+        Pending::Adopt(public_key) => {
+            tokio::spawn(crate::rotate::adopt(
+                shared.clone(),
+                entry.name.clone(),
+                public_key,
+            ));
+        }
+        _ => {}
     }
     let link = Arc::new(Link {
         shared: shared.clone(),
@@ -569,6 +609,7 @@ impl Link {
                     }
                     self.check_rev(&mut rev);
                     self.check_status();
+                    crate::rotate::drop_old_pin(&self.shared, &self.name);
                 }
                 r = changed.changed() => {
                     if r.is_err() {
@@ -731,7 +772,18 @@ impl Link {
             }
             // Answers to a rotation of the node's key (crate::rotate).
             method::KEY_ROTATED | method::KEY_RETIRED => {
-                if !self.handle.answer(m, p) {
+                if self.handle.answer(m, p.clone()) {
+                    return None;
+                }
+                // An answer that came after the owner's command gave up
+                // still settles the rotation.
+                if m == method::KEY_ROTATED && self.handle.rotate() {
+                    tokio::spawn(crate::rotate::late_answer(
+                        self.shared.clone(),
+                        self.name.clone(),
+                        p,
+                    ));
+                } else {
                     tracing::debug!("center {}: {m} that nothing waits for; ignored", self.name);
                 }
                 None

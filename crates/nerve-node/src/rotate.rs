@@ -228,9 +228,33 @@ async fn send(
             ));
         }
     };
+    settle(
+        shared,
+        center,
+        storage,
+        &current.public_hex(),
+        next,
+        reply.error,
+    )
+    .await
+}
+
+/// Acts on the center's answer about `next`: `error` drops it, else it
+/// becomes the node's key and the copy aside goes. Should that fail, the
+/// copy aside is sent again on the next link, and the center answers it the
+/// same.
+async fn settle(
+    shared: &Shared,
+    center: &str,
+    storage: SecretStorage,
+    current_hex: &str,
+    next: NodeKey,
+    error: Option<String>,
+) -> Result<Value, String> {
+    let new_hex = next.public_hex();
     let paths = shared.paths.clone();
     let name = center.to_string();
-    if let Some(e) = reply.error {
+    if let Some(e) = error {
         let e = clip(&e);
         let dropped = tokio::task::spawn_blocking(move || {
             crate::secrets::remove_center_next_key(&paths, storage, &name)
@@ -245,17 +269,13 @@ async fn send(
             center,
             "node-key-refused",
             &format!(
-                "the center refused the new key {new_hex}: {e}; the old key {} stays",
-                current.public_hex()
+                "the center refused the new key {new_hex}: {e}; the old key {current_hex} stays"
             ),
         );
         return Err(format!(
             "center {center} refused the new key: {e}; the old key stays in use"
         ));
     }
-    // The center takes the new key: it becomes the node's, then the copy
-    // aside goes. Should the first step fail, the copy aside is sent again
-    // on the next link, and the center answers it the same.
     tokio::task::spawn_blocking(move || {
         crate::secrets::store_center_key(&paths, storage, &name, &next)?;
         crate::secrets::remove_center_next_key(&paths, storage, &name)
@@ -276,8 +296,7 @@ async fn send(
         center,
         "node-key",
         &format!(
-            "the center took the new key {new_hex} in place of {}, which it takes for {} more",
-            current.public_hex(),
+            "the center took the new key {new_hex} in place of {current_hex}, which it takes for {} more",
             grace()
         ),
     );
@@ -286,6 +305,56 @@ async fn send(
         "public_key": new_hex,
         "grace_until_ms": crate::now_ms() + ROTATE_GRACE_MS,
     }))
+}
+
+/// A `key.rotated` that came when nothing waited for it any more (the
+/// owner's command gave up after [`ANSWER`]): about the new key kept aside,
+/// it settles the rotation all the same, so a key the center took is never
+/// left unused on a link that stays up.
+pub(crate) async fn late_answer(shared: Arc<Shared>, center: String, p: Map<String, Value>) {
+    let Ok(reply) = params::<KeyRotated>(&p) else {
+        return;
+    };
+    let cs = shared.center(&center);
+    let _one = cs.rotating.lock().await;
+    let Ok((storage, _)) = entry(&shared, &center) else {
+        return;
+    };
+    match keys(&shared, storage, &center).await {
+        Ok((current, Some(next))) if next.public_hex() == reply.public_key => {
+            let current = current.public_hex();
+            if let Err(e) = settle(&shared, &center, storage, &current, next, reply.error).await {
+                tracing::warn!("center {center}: {e}");
+            }
+        }
+        Ok(_) => tracing::debug!(
+            "center {center}: key.rotated about a key this node does not hold aside; ignored"
+        ),
+        Err(e) => tracing::warn!("center {center}: the key rotation cannot go on: {e}"),
+    }
+}
+
+/// The center took a hello signed with the new key kept aside: it holds
+/// that key for the node, so the rotation is settled without asking again.
+pub(crate) async fn adopt(shared: Arc<Shared>, center: String, public_key: String) {
+    let cs = shared.center(&center);
+    let _one = cs.rotating.lock().await;
+    let Ok((storage, _)) = entry(&shared, &center) else {
+        return;
+    };
+    match keys(&shared, storage, &center).await {
+        Ok((current, Some(next))) if next.public_hex() == public_key => {
+            tracing::info!(
+                "center {center} took a hello signed with this node's new key, so it took the rotation that got no answer"
+            );
+            let current = current.public_hex();
+            if let Err(e) = settle(&shared, &center, storage, &current, next, None).await {
+                tracing::warn!("center {center}: {e}");
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("center {center}: the key rotation cannot go on: {e}"),
+    }
 }
 
 /// `center.rotate` from `center`: the center has a new key, signed by the old
@@ -408,6 +477,27 @@ pub(crate) fn center_rotated(
             "center {center} sent a rotation from a key this node does not pin ({old_pin}); ignored"
         );
     }
+}
+
+/// Drops the old pin of `center` from node.toml once its grace is over
+/// (it is no longer taken by then); whether it did. Asked at each dial and
+/// on a live link's tick.
+pub(crate) fn drop_old_pin(shared: &Shared, center: &str) -> bool {
+    let expired = |e: &CenterEntry| {
+        e.old_pin
+            .as_ref()
+            .is_some_and(|o| crate::now_ms() >= o.until_ms)
+    };
+    if !shared.config().center(center).is_some_and(expired) {
+        return false;
+    }
+    shared.mark_center(center, |e| {
+        if expired(e) {
+            e.old_pin = None;
+        }
+    });
+    tracing::info!("center {center}: the grace of its old key has ended; its old pin is dropped");
+    true
 }
 
 /// A center's text as the node repeats it: one line, cut.

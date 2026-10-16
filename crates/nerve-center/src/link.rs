@@ -191,7 +191,7 @@ impl Link {
         tokio::time::timeout(wait, notified).await.is_ok()
     }
 
-    fn fail_all(&self) {
+    pub(crate) fn fail_all(&self) {
         self.closed.store(true, Ordering::SeqCst);
         let pending: Vec<_> = self.pending.lock().unwrap().drain().collect();
         for (_, tx) in pending {
@@ -501,8 +501,13 @@ async fn handle(center: &Center, link: &Arc<Link>, m: Message) -> Option<ByeReas
                 }
             }
             method::KEY_ROTATE if link.rotate => {
-                let r = center.rotate_node_key(link, &params);
+                let (r, dropped) = center.rotate_node_key(link, &params);
                 link.notify(method::KEY_ROTATED, json!(r)).await;
+                // A rotation in the grace of another ends the older key's
+                // grace, and a link opened with it ends too.
+                if let Some(key) = dropped {
+                    center.end_link_of_key(&link.node_id, &key).await;
+                }
             }
             method::KEY_RETIRE if link.rotate => {
                 let (r, opened_with_it) = center.retire_node_key(link, &params);
@@ -511,6 +516,7 @@ async fn handle(center: &Center, link: &Arc<Link>, m: Message) -> Option<ByeReas
                 // so the link ends; the node dials again with its key.
                 if opened_with_it {
                     link.bye(ByeReason::Replaced).await;
+                    link.fail_all();
                 }
             }
             method::BYE => {

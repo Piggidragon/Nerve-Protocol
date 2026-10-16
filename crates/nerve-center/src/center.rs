@@ -475,6 +475,45 @@ impl Center {
         out
     }
 
+    /// Runs `f` on the stored state and saves it, all or nothing: when `f`
+    /// fails or the save does, the state stays as it was and the error is
+    /// returned. For a change the center may not tell before it is kept.
+    fn update_saved<T>(
+        &self,
+        f: impl FnOnce(&mut Store) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut s = self.store.lock().unwrap();
+        let before = s.clone();
+        let out = match f(&mut s) {
+            Ok(v) => v,
+            Err(e) => {
+                *s = before;
+                return Err(e);
+            }
+        };
+        if let Err(e) = s.save(&self.dir) {
+            *s = before;
+            return Err(format!("the center cannot write its state file: {e}"));
+        }
+        self.dirty.store(false, Ordering::SeqCst);
+        Ok(out)
+    }
+
+    /// Ends the node's link when it was opened with `key`, a key of the node
+    /// whose grace ended: `bye replaced`, and no call goes to it any more.
+    /// The node dials again with its key.
+    pub(crate) async fn end_link_of_key(&self, node_id: &str, key: &str) {
+        if let Some(l) = self.link(node_id).filter(|l| l.auth_key == key) {
+            self.note(
+                Level::Info,
+                Some(node_id),
+                "the link opened with the node's old key ends: that key's grace is over",
+            );
+            l.bye(ByeReason::Replaced).await;
+            l.fail_all();
+        }
+    }
+
     /// Runs `f` on the stored state and saves it later (statistics).
     fn update_soon(&self, f: impl FnOnce(&mut Store)) {
         f(&mut self.store.lock().unwrap());
@@ -879,33 +918,48 @@ impl Center {
 
     /// Takes a node's new key (`key.rotate` on `link`): signed by the key
     /// it replaces and by itself. The old key is taken until the grace
-    /// ends; a rotation in the grace of another drops that older key.
-    pub(crate) fn rotate_node_key(&self, link: &Link, p: &Map<String, Value>) -> msg::KeyRotated {
+    /// ends; a rotation in the grace of another drops that older key, which
+    /// it also gives back so that a link opened with it ends. The new key is
+    /// saved before it is told as taken: the node deletes its old key then.
+    pub(crate) fn rotate_node_key(
+        &self,
+        link: &Link,
+        p: &Map<String, Value>,
+    ) -> (msg::KeyRotated, Option<String>) {
         let r: msg::KeyRotate = match nerve_proto::rpc::params(p) {
             Ok(r) => r,
             Err(e) => {
-                return self.key_refused(
-                    link,
-                    String::new(),
-                    format!("bad key.rotate: {}", e.message),
+                return (
+                    self.key_refused(
+                        link,
+                        String::new(),
+                        format!("bad key.rotate: {}", e.message),
+                    ),
+                    None,
                 );
             }
         };
         let new = r.public_key.clone();
         let Some(raw) = msg::unhex(&new).filter(|b| b.len() == 32) else {
-            return self.key_refused(
-                link,
-                new,
-                "public_key must be 32 bytes as 64 lowercase hex characters".into(),
+            return (
+                self.key_refused(
+                    link,
+                    new,
+                    "public_key must be 32 bytes as 64 lowercase hex characters".into(),
+                ),
+                None,
             );
         };
         let message = nerve_proto::rotate_node_message(&self.id(), &raw);
         let verify = nerve_transport::keys::verify_node_signature;
         if !verify(&new, &message, &r.proof) {
-            return self.key_refused(link, new, "the new key did not sign the rotation".into());
+            return (
+                self.key_refused(link, new, "the new key did not sign the rotation".into()),
+                None,
+            );
         }
         let now = now_ms();
-        let out = self.update(|s| {
+        let out = self.update_saved(|s| {
             if s.node_by_key(&new).is_some_and(|n| n.id != link.node_id) {
                 return Err("another node holds this key".to_string());
             }
@@ -920,26 +974,29 @@ impl Center {
                 return Err("the rotation is not signed by the node's current key".to_string());
             }
             let old = std::mem::replace(&mut n.public_key, new.clone());
-            n.old_key = Some(OldKey {
+            let dropped = n.old_key.replace(OldKey {
                 public_key: old.clone(),
                 until_ms: now + nerve_proto::ROTATE_GRACE_MS,
             });
-            Ok(Some(old))
+            Ok(Some((old, dropped.map(|d| d.public_key))))
         });
         match out {
-            Err(why) => self.key_refused(link, new, why),
+            Err(why) => (self.key_refused(link, new, why), None),
             Ok(None) => {
                 self.note(
                     Level::Debug,
                     Some(&link.node_id),
                     "the node sent its key rotation again; the center has its new key already",
                 );
-                msg::KeyRotated {
-                    public_key: new,
-                    error: None,
-                }
+                (
+                    msg::KeyRotated {
+                        public_key: new,
+                        error: None,
+                    },
+                    None,
+                )
             }
-            Ok(Some(old)) => {
+            Ok(Some((old, dropped))) => {
                 self.note(
                     Level::Info,
                     Some(&link.node_id),
@@ -949,10 +1006,13 @@ impl Center {
                     ),
                 );
                 self.changed(Change::Nodes);
-                msg::KeyRotated {
-                    public_key: new,
-                    error: None,
-                }
+                (
+                    msg::KeyRotated {
+                        public_key: new,
+                        error: None,
+                    },
+                    dropped,
+                )
             }
         }
     }
@@ -993,7 +1053,7 @@ impl Center {
             return refused("public_key must be 32 bytes as 64 lowercase hex characters".into());
         };
         let message = nerve_proto::retire_node_message(&self.id(), &raw);
-        let out = self.update(|s| {
+        let out = self.update_saved(|s| {
             let n = s
                 .nodes
                 .get_mut(&link.node_id)
@@ -1058,6 +1118,17 @@ impl Center {
                 }
             }
         }
+        let expired: Vec<(String, String)> = self.read(|s| {
+            s.nodes
+                .values()
+                .filter_map(|n| {
+                    n.old_key
+                        .as_ref()
+                        .filter(|o| now >= o.until_ms)
+                        .map(|o| (n.id.clone(), o.public_key.clone()))
+                })
+                .collect()
+        });
         let stale = self.read(|s| {
             s.key_rotation.as_ref().is_some_and(|r| {
                 r.finished_ms.is_some() && now >= r.started_ms + nerve_proto::ROTATE_GRACE_MS
@@ -1079,6 +1150,10 @@ impl Center {
                     }
                 }
             });
+        }
+        // A link the old key opened during its grace ends with the grace.
+        for (node_id, key) in expired {
+            self.end_link_of_key(&node_id, &key).await;
         }
     }
 

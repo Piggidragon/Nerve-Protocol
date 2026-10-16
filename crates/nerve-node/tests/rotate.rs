@@ -35,12 +35,21 @@ fn options(root: &Path) -> NodeOptions {
 /// (the fake center speaks plain HTTP, so the link does not check it), and
 /// starts the daemon.
 async fn node(root: &Path, center: &FakeCenter, pin: Option<String>) -> Daemon {
+    node_with(root, center, |e| e.pin = pin.clone()).await
+}
+
+/// [`node`], with the pairing's entry changed by `f` before the start.
+async fn node_with(
+    root: &Path,
+    center: &FakeCenter,
+    f: impl Fn(&mut nerve_policy::CenterEntry),
+) -> Daemon {
     let o = options(root);
     nerve_node::pair::pair(&o.paths, &center.link(), Some("lab"))
         .await
         .expect("pair");
     nerve_node::cli::edit(&o.paths, |c| {
-        c.centers[0].pin = pin.clone();
+        f(&mut c.centers[0]);
         Ok(())
     })
     .await
@@ -297,6 +306,112 @@ async fn an_unanswered_rotation_is_sent_again_on_the_next_link() {
     }
     assert_eq!(key(&paths).public_hex(), new);
     assert!(!paths.next_key_file("lab").exists());
+    drop(daemon);
+}
+
+/// A `key.rotated` that comes after the owner's command stopped waiting
+/// still settles the rotation, on the link it came over.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_late_answer_settles_the_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let daemon = node(dir.path(), &center, None).await;
+    let paths = daemon.paths().clone();
+    let old = paired(&center).request.public_key;
+    let mut conn = link(&mut center, &old, Some(ROTATE)).await;
+
+    let run = rotate(&paths, &[]);
+    let p = next(&mut conn, method::KEY_ROTATE)
+        .await
+        .expect("key.rotate");
+    let new = check_rotate(&p, &center.center_id, &old);
+    let e = run.await.unwrap().expect_err("no answer in time");
+    assert!(e.contains("did not answer"), "{e}");
+    assert_eq!(key(&paths).public_hex(), old);
+    conn.notify(method::KEY_ROTATED, json!({"public_key": new}))
+        .await
+        .unwrap();
+    for _ in 0..200 {
+        if key(&paths).public_hex() == new {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(key(&paths).public_hex(), new);
+    assert!(!paths.next_key_file("lab").exists());
+    assert!(audit(&paths).contains("\"event\":\"node-key\""));
+    drop(daemon);
+}
+
+/// A center that took the new key but whose answer never came, and whose
+/// grace for the old key has ended, refuses the old key's hello: the node
+/// tries the new key next, and once that links the rotation is settled.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_hello_is_tried_with_the_new_key_kept_aside() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let daemon = node(dir.path(), &center, None).await;
+    let paths = daemon.paths().clone();
+    let old = paired(&center).request.public_key;
+    let mut conn = link(&mut center, &old, Some(ROTATE)).await;
+
+    let run = rotate(&paths, &[]);
+    let p = next(&mut conn, method::KEY_ROTATE)
+        .await
+        .expect("key.rotate");
+    let new = check_rotate(&p, &center.center_id, &old);
+    drop(conn);
+    run.await.unwrap().expect_err("no answer");
+
+    // The center holds only the new key now: the old key's hello is refused.
+    let paired = paired(&center);
+    let mut inc = center.next_link(WAIT).await.expect("the node dials");
+    let refused = fake_center::handshake_with(
+        &mut inc.conn,
+        &center.center_id,
+        &paired.node_id,
+        &new,
+        Some(ROTATE),
+    )
+    .await;
+    assert!(refused.is_err(), "signed with the old key");
+    drop(inc);
+    // The next hello is signed with the new key, under the same node id.
+    let _conn = link(&mut center, &new, Some(ROTATE)).await;
+    for _ in 0..200 {
+        if key(&paths).public_hex() == new {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(key(&paths).public_hex(), new);
+    assert!(!paths.next_key_file("lab").exists());
+    drop(daemon);
+}
+
+/// An old pin whose time is over goes from node.toml.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_old_pin_whose_time_is_over_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let (a, b) = (
+        ServerIdentity::generate(&[]).unwrap(),
+        ServerIdentity::generate(&[]).unwrap(),
+    );
+    let daemon = node_with(dir.path(), &center, |e| {
+        e.pin = Some(b.pin());
+        e.old_pin = Some(nerve_policy::OldPin {
+            pin: a.pin(),
+            until_ms: 1,
+        });
+    })
+    .await;
+    let paths = daemon.paths().clone();
+    let old = paired(&center).request.public_key;
+    let _conn = link(&mut center, &old, Some(ROTATE)).await;
+    let (cfg, _) = nerve_node::cli::read_config(&paths).await.unwrap();
+    assert_eq!(cfg.centers[0].old_pin, None);
+    assert_eq!(cfg.centers[0].pin, Some(b.pin()));
     drop(daemon);
 }
 

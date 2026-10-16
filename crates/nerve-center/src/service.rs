@@ -74,7 +74,10 @@ impl Layout {
     /// after that default, so it may set another mode. Unlike the node it
     /// starts no command and needs no privilege at all: it keeps no
     /// capability, gets no new privileges, and may write its state folder
-    /// only.
+    /// only. The rest keeps a center an attacker took over from the kernel
+    /// paths it never needs: no namespaces (a user namespace would give it
+    /// capabilities of its own there), sockets of the internet and Unix
+    /// only, the system calls of an ordinary service, no shared memory.
     pub fn unit_text(&self) -> String {
         format!(
             "# Written by `nerve-center install`; `nerve-center uninstall` removes it.
@@ -102,6 +105,25 @@ ReadWritePaths={state}
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
+InaccessiblePaths=-/dev/shm
+RemoveIPC=yes
+RestrictNamespaces=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
 
 [Install]
 WantedBy=multi-user.target
@@ -263,6 +285,16 @@ fn supported(sys: &dyn System, what: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Run first in `main` for `backup` and `restore`, while the process has one
+/// thread: root's command on a state folder that belongs to another user,
+/// as the installed center's belongs to `nerve-center`, runs as that user
+/// ([`nerve_node::service::become_owner`], as the node's commands do). Root
+/// then follows no link that user put there, and what it writes stays the
+/// center's, so the service starts on it.
+pub fn settle_user(state: &Path) -> Result<(), String> {
+    nerve_node::service::become_owner(&nerve_node::NodePaths::new(state, state), false)
+}
+
 /// Says a step as it is done.
 fn did(out: &mut dyn Write, step: impl std::fmt::Display) {
     let _ = writeln!(out, "{step}");
@@ -272,20 +304,53 @@ fn did(out: &mut dyn Write, step: impl std::fmt::Display) {
 /// own, none of them may be run by a command the installed node runs for a
 /// center ([`nerve_node::cli::owner_check`]): an agent cannot replace or
 /// remove its center either.
-pub async fn execute(cmd: Cmd, out: &mut dyn Write) -> Result<(), String> {
-    nerve_node::cli::owner_check(&[&nerve_node::service::Layout::system().paths]).await?;
-    let layout = Layout::system();
+/// `given` are the center's settings the owner gave with the command
+/// ([`crate::config::settings_given`]): none of them reaches the service,
+/// whose settings are in its settings file, so they are refused.
+pub async fn execute(cmd: Cmd, given: &[String], out: &mut dyn Write) -> Result<(), String> {
+    let node = nerve_node::service::Layout::system().paths;
+    execute_on(cmd, given, &Layout::system(), &Host, &node, out).await
+}
+
+/// [`execute`] on `layout`, with `node` the installed node's folders.
+async fn execute_on(
+    cmd: Cmd,
+    given: &[String],
+    layout: &Layout,
+    sys: &dyn System,
+    node: &nerve_node::NodePaths,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    let what = match &cmd {
+        Cmd::Install => "install",
+        Cmd::Update { .. } => "update",
+        Cmd::Uninstall { .. } => "uninstall",
+        // `main` gives these to crate::backup.
+        Cmd::Backup { .. } | Cmd::Restore { .. } => {
+            return Err("backup and restore are not service commands".into());
+        }
+    };
+    if !given.is_empty() {
+        return Err(format!(
+            "{what} takes none of the center's settings ({}): the installed center reads them from {} and keeps its state in {}. Run `sudo nerve-center {what}` without them, and set them in that file",
+            given.join(", "),
+            layout.settings().display(),
+            layout.state.display()
+        ));
+    }
+    // Root first: a caller without it cannot reach the node's control
+    // socket either, and would be told about that instead of about sudo.
+    // Nothing changes before either check.
+    supported(sys, what)?;
+    nerve_node::cli::owner_check(&[node]).await?;
     match cmd {
         Cmd::Install => {
             let exe = std::env::current_exe().map_err(|e| format!("this program: {e}"))?;
-            install(&layout, &Host, &exe, out)
+            install(layout, sys, &exe, out)
         }
-        Cmd::Update { from } => update(&layout, &Host, from.as_deref(), out).await,
-        Cmd::Uninstall { purge } => uninstall(&layout, &Host, purge, out),
-        // `main` gives these to crate::backup.
-        Cmd::Backup { .. } | Cmd::Restore { .. } => {
-            Err("backup and restore are not service commands".into())
-        }
+        Cmd::Update { from } => update(layout, sys, from.as_deref(), out).await,
+        Cmd::Uninstall { purge } => uninstall(layout, sys, purge, out),
+        Cmd::Backup { .. } | Cmd::Restore { .. } => unreachable!("refused above"),
     }
 }
 
@@ -693,6 +758,38 @@ mod tests {
         }
     }
 
+    /// A machine where the caller is not root.
+    struct NotRoot;
+    impl System for NotRoot {
+        fn is_root(&self) -> bool {
+            false
+        }
+        fn has_systemd(&self) -> bool {
+            true
+        }
+        fn account(&self, _: &str) -> Result<Option<Account>, String> {
+            unreachable!()
+        }
+        fn add_account(&self, _: &str, _: &Path) -> Result<(), String> {
+            unreachable!()
+        }
+        fn remove_account(&self, _: &str) -> Result<(), String> {
+            unreachable!()
+        }
+        fn systemctl(&self, _: &[&str]) -> Result<(), String> {
+            unreachable!()
+        }
+        fn give(&self, _: &Path, _: u32, _: u32) -> Result<(), String> {
+            unreachable!()
+        }
+        fn wait_running(&self, _: &Path) -> Result<(), String> {
+            unreachable!()
+        }
+        fn version_of(&self, _: &Path, _: &Account) -> Result<String, String> {
+            unreachable!()
+        }
+    }
+
     fn layout(root: &Path) -> Layout {
         Layout {
             unit: root.join("etc/systemd/system").join(UNIT_NAME),
@@ -780,6 +877,11 @@ mod tests {
             "CapabilityBoundingSet=",
             "ProtectSystem=strict",
             &format!("ReadWritePaths={}", l.state.display()),
+            "InaccessiblePaths=-/dev/shm",
+            "RestrictNamespaces=yes",
+            "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
+            "SystemCallFilter=@system-service",
+            "MemoryDenyWriteExecute=yes",
         ] {
             assert!(unit.contains(&format!("\n{line}\n")), "{line}: {unit}");
         }
@@ -862,36 +964,6 @@ mod tests {
         assert!(!l.bin.exists() && !l.unit.exists() && !l.state.exists());
         assert!(sys.calls().is_empty());
 
-        struct NotRoot;
-        impl System for NotRoot {
-            fn is_root(&self) -> bool {
-                false
-            }
-            fn has_systemd(&self) -> bool {
-                true
-            }
-            fn account(&self, _: &str) -> Result<Option<Account>, String> {
-                unreachable!()
-            }
-            fn add_account(&self, _: &str, _: &Path) -> Result<(), String> {
-                unreachable!()
-            }
-            fn remove_account(&self, _: &str) -> Result<(), String> {
-                unreachable!()
-            }
-            fn systemctl(&self, _: &[&str]) -> Result<(), String> {
-                unreachable!()
-            }
-            fn give(&self, _: &Path, _: u32, _: u32) -> Result<(), String> {
-                unreachable!()
-            }
-            fn wait_running(&self, _: &Path) -> Result<(), String> {
-                unreachable!()
-            }
-            fn version_of(&self, _: &Path, _: &Account) -> Result<String, String> {
-                unreachable!()
-            }
-        }
         let rt = tokio::runtime::Builder::new_current_thread()
             .build()
             .unwrap();
@@ -911,6 +983,71 @@ mod tests {
                 format!("{what} needs root: run `sudo nerve-center {what}`")
             );
         }
+    }
+
+    /// A caller without root is told so first, also where an installed
+    /// node's control socket, which it may not open, is there to ask.
+    #[tokio::test]
+    async fn without_root_the_commands_say_so_before_they_ask_the_node() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let node = nerve_node::NodePaths::new(d.path().join("etc/nerve"), d.path().join("state"));
+        let run = node.ctl_socket().parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let l = layout(d.path());
+        let mut results = Vec::new();
+        for (what, cmd) in [
+            ("install", Cmd::Install),
+            ("update", Cmd::Update { from: None }),
+            ("uninstall", Cmd::Uninstall { purge: false }),
+        ] {
+            let r = execute_on(cmd, &[], &l, &NotRoot, &node, &mut Vec::new()).await;
+            results.push((what, r));
+        }
+        std::fs::set_permissions(&run, std::fs::Permissions::from_mode(0o700)).unwrap();
+        for (what, r) in results {
+            assert_eq!(
+                r.unwrap_err(),
+                format!("{what} needs root: run `sudo nerve-center {what}`")
+            );
+        }
+    }
+
+    /// A setting given with a service command would reach nothing: it is
+    /// refused before anything is checked or changed, with the file it
+    /// belongs in.
+    #[tokio::test]
+    async fn the_center_s_settings_given_to_a_service_command_are_refused() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = layout(d.path());
+        let node = nerve_node::NodePaths::new(d.path().join("etc/nerve"), d.path().join("node"));
+        let given = ["--public-url".to_string(), "--state-dir".to_string()];
+        let e = execute_on(Cmd::Install, &given, &l, &sys, &node, &mut Vec::new())
+            .await
+            .unwrap_err();
+        assert!(
+            e.starts_with(
+                "install takes none of the center's settings (--public-url, --state-dir)"
+            ),
+            "{e}"
+        );
+        assert!(e.contains(&l.settings().display().to_string()), "{e}");
+        assert!(sys.calls().is_empty() && !l.state.exists() && !l.unit.exists());
+        // NotRoot answers nothing but that it is not root: the refusal
+        // comes first.
+        let e = execute_on(
+            Cmd::Uninstall { purge: true },
+            &["NERVE_LISTEN".to_string()],
+            &l,
+            &NotRoot,
+            &node,
+            &mut Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(e.starts_with("uninstall takes none"), "{e}");
     }
 
     /// A link in place of the state or the settings folder is refused:

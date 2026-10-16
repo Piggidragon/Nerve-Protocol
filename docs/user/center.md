@@ -108,8 +108,9 @@ On Linux with systemd, `nerve-center` installs itself as a service, as the
 node does ([service](service.md)). The service starts with the machine and
 runs under a user of its own, `nerve-center`, with MCP over HTTP: harnesses
 connect to it with a [harness token](harness.md#tokens) instead of starting
-it. `install`, `update` and `uninstall` need root. Windows is not supported
-yet.
+it. `install`, `update` and `uninstall` need root and take none of the
+center's flags: the service's settings are in its
+[settings file](#settings-of-the-service). Windows is not supported yet.
 
 ### Install
 
@@ -165,14 +166,13 @@ output.
 
 The service starts with a new center. To move a center you ran yourself
 into it, with its pairings, [back it up](backup.md#the-center) and restore
-it into the service's state folder, then run `install` again, which gives
-the restored files to `nerve-center` and starts it:
+it into the service's state folder while the service is stopped:
 
 ```sh
 nerve-center backup ~/nerve-center.bak     # as you, on the center you ran
 sudo systemctl stop nerve-center
 sudo nerve-center --state-dir /var/lib/nerve-center restore ~/nerve-center.bak --replace
-sudo nerve-center install
+sudo systemctl start nerve-center
 ```
 
 Stop the center you ran yourself for good: the service has its key now.
@@ -194,8 +194,13 @@ change how it is started.
 
 The service has no privilege: no capability, and no new privileges through
 a setuid program. It may write its state folder and nothing else on the
-machine, and sees no home folders. A `NERVE_LISTEN` on a port below 1024
-therefore fails; use a higher port, or forward one to it.
+machine, and sees no home folders and no shared memory (`/dev/shm`). The
+unit also keeps it from the kernel interfaces a center never needs: it may
+not make namespaces, open other sockets than IPv4, IPv6 and Unix ones, or
+make system calls outside systemd's `@system-service` set, and it cannot
+see other processes or change kernel settings, the clock or the host name.
+A `NERVE_LISTEN` on a port below 1024 fails; use a higher port, or forward
+one to it.
 
 ### Update
 

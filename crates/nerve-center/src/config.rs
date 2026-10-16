@@ -121,6 +121,40 @@ impl Cmd {
     }
 }
 
+/// The center's settings given with a command, as the owner wrote them: a
+/// flag (`--public-url`) or a variable (`NERVE_PUBLIC_URL`). Defaults are
+/// not given.
+pub fn settings_given(m: &clap::ArgMatches) -> Vec<String> {
+    use clap::CommandFactory;
+    use clap::parser::ValueSource;
+    let cmd = Args::command();
+    let mut given = Vec::new();
+    for a in cmd.get_arguments() {
+        let id = a.get_id().as_str();
+        // A global flag may come after the subcommand, where its value is.
+        let below = || {
+            m.subcommand()
+                .filter(|_| a.is_global_set())
+                .and_then(|(_, s)| s.value_source(id))
+        };
+        let source = match m.value_source(id) {
+            Some(clap::parser::ValueSource::DefaultValue) | None => below().or(m.value_source(id)),
+            s => s,
+        };
+        match source {
+            Some(ValueSource::CommandLine) => {
+                given.push(format!("--{}", a.get_long().unwrap_or(id)));
+            }
+            Some(ValueSource::EnvVariable) => given.push(
+                a.get_env()
+                    .map_or_else(|| id.to_string(), |e| e.to_string_lossy().into_owned()),
+            ),
+            _ => {}
+        }
+    }
+    given
+}
+
 impl Args {
     pub fn state_dir(&self) -> PathBuf {
         self.state_dir.clone().unwrap_or_else(default_state_dir)
@@ -170,6 +204,37 @@ pub fn is_loopback(addr: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The settings an owner gives with a command, wherever the flag stands;
+    /// none when only defaults hold.
+    #[test]
+    fn the_settings_given_are_named() {
+        use clap::CommandFactory;
+        let given = |args: &[&str]| {
+            let m = Args::command()
+                .try_get_matches_from(std::iter::once("nerve-center").chain(args.iter().copied()))
+                .unwrap();
+            settings_given(&m)
+        };
+        assert!(given(&["install"]).is_empty());
+        assert!(given(&["uninstall", "--purge"]).is_empty());
+        assert_eq!(
+            given(&["--public-url", "https://center.example:7443", "install"]),
+            ["--public-url"]
+        );
+        assert_eq!(
+            given(&["install", "--state-dir", "/srv/c"]),
+            ["--state-dir"]
+        );
+        assert_eq!(
+            given(&["--state-dir", "/srv/c", "install"]),
+            ["--state-dir"]
+        );
+        assert_eq!(
+            given(&["--listen", "0.0.0.0:9443", "--ui", "off", "update"]),
+            ["--listen", "--ui"]
+        );
+    }
 
     #[test]
     fn flags_and_defaults() {

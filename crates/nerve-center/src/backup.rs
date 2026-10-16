@@ -247,7 +247,16 @@ pub fn restore(state: &Path, b: &Parsed, replace: bool) -> Result<RestoreReport,
 }
 
 /// Runs `nerve-center backup` or `nerve-center restore` on `state`.
-pub fn run(state: &Path, cmd: &crate::config::Cmd, out: &mut dyn Write) -> Result<(), String> {
+/// `settle` is called before anything in the state folder is touched
+/// ([`crate::service::settle_user`]: root works there as the folder's
+/// owner). A restore reads the backup and the passphrase before it, as the
+/// caller, so that they may be where only root can read.
+pub fn run(
+    state: &Path,
+    cmd: &crate::config::Cmd,
+    settle: &dyn Fn(&Path) -> Result<(), String>,
+    out: &mut dyn Write,
+) -> Result<(), String> {
     use crate::config::Cmd;
     match cmd {
         Cmd::Backup {
@@ -255,6 +264,7 @@ pub fn run(state: &Path, cmd: &crate::config::Cmd, out: &mut dyn Write) -> Resul
             overwrite,
             passphrase_file,
         } => {
+            settle(state)?;
             let pass = nerve_node::prompt::passphrase(passphrase_file.as_deref(), out, true)?;
             let r = backup(state, file, &pass, *overwrite, backup::ITERATIONS)?;
             print_backup(&r, file, out);
@@ -274,6 +284,7 @@ pub fn run(state: &Path, cmd: &crate::config::Cmd, out: &mut dyn Write) -> Resul
             }
             let pass = nerve_node::prompt::passphrase(passphrase_file.as_deref(), out, false)?;
             let parsed = open(&bytes, &pass)?;
+            settle(state)?;
             let r = restore(state, &parsed, *replace)?;
             print_restore(&r, &parsed, out);
         }
@@ -347,6 +358,56 @@ mod tests {
             going_away: None,
             descriptor: None,
         }
+    }
+
+    /// `run` switches to the state folder's owner before a backup touches
+    /// it, and in a restore only after it has read the backup and the
+    /// passphrase as the caller, who may be root reading a file in its own
+    /// home.
+    #[test]
+    fn run_settles_the_user_before_the_state_folder_and_after_reading_a_backup() {
+        use crate::config::Cmd;
+        use std::cell::RefCell;
+        let d = tempfile::tempdir().unwrap();
+        let state = d.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        center(&state, "c1");
+        let pass_file = |name: &str, text: &str| {
+            let p = d.path().join(name);
+            nerve_transport::files::write_private(&p, text.as_bytes()).unwrap();
+            p
+        };
+        let right = pass_file("pass", PASS);
+        let wrong = pass_file("wrong", "not the passphrase at all");
+        let settled = RefCell::new(Vec::new());
+        let refuse = |s: &Path| {
+            settled.borrow_mut().push(s.to_path_buf());
+            Err::<(), _>("settled".to_string())
+        };
+        let file = d.path().join("c.bak");
+        let backup = |pass: &Path| Cmd::Backup {
+            file: file.clone(),
+            overwrite: false,
+            passphrase_file: Some(pass.into()),
+        };
+        // A backup settles first: refused there, nothing is read or written.
+        let e = run(&state, &backup(&right), &refuse, &mut Vec::new()).unwrap_err();
+        assert_eq!(e, "settled");
+        assert_eq!(*settled.borrow(), std::slice::from_ref(&state));
+        assert!(!file.exists());
+        run(&state, &backup(&right), &|_| Ok(()), &mut Vec::new()).unwrap();
+        let restore = |pass: &Path| Cmd::Restore {
+            file: file.clone(),
+            replace: false,
+            passphrase_file: Some(pass.into()),
+        };
+        // A restore opens the backup before it settles.
+        let e = run(&state, &restore(&wrong), &refuse, &mut Vec::new()).unwrap_err();
+        assert!(e.contains("passphrase"), "{e}");
+        assert_eq!(settled.borrow().len(), 1);
+        let e = run(&state, &restore(&right), &refuse, &mut Vec::new()).unwrap_err();
+        assert_eq!(e, "settled");
+        assert_eq!(settled.borrow().len(), 2);
     }
 
     /// A state folder of a center that has run: its identity, a paired node

@@ -82,8 +82,10 @@ fn mac_input(body: &str) -> Vec<u8> {
     [MAC_CONTEXT, body.as_bytes()].concat()
 }
 
-/// The file the node writes for `c`: the MAC line, then the TOML.
-fn sealed(key: &MacKey, c: &NodeConfig) -> String {
+/// The file the node writes for `c`: the MAC line, then the TOML. A restore
+/// from a backup writes the config through it, with the key of the node it
+/// restores into.
+pub fn sealed(key: &MacKey, c: &NodeConfig) -> String {
     let body = c.to_toml();
     let mac = key.sign(&mac_input(&body));
     format!("{MAC_LINE}{mac}{MAC_NOTE}\n{body}")
@@ -888,6 +890,7 @@ mod tests {
                 paused: false,
                 revoked: false,
                 unknown: false,
+                public_key: None,
                 old_pin: None,
                 policy: CenterPolicy::default(),
             });

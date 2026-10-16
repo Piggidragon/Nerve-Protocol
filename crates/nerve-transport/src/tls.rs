@@ -176,7 +176,7 @@ pub fn client_config(pin: Option<&str>) -> Result<Arc<ClientConfig>, String> {
 
 /// The client configuration for a center that may present any of `pins`:
 /// the one it paired with and, while a rotation of the center's key is in
-/// its grace (docs/dev/spec/protocol.md §4.9), the other one. No pin: the
+/// its grace (docs/dev/spec/protocol.md §4.10), the other one. No pin: the
 /// system's roots.
 pub fn client_config_pins(pins: &[&str]) -> Result<Arc<ClientConfig>, String> {
     let provider = provider();
@@ -297,7 +297,7 @@ impl ServerIdentity {
     /// Signs `message` with the identity's key, as [`verify_spki_signature`]
     /// checks it against [`ServerIdentity::spki`]: ECDSA (ASN.1) for a P-256
     /// or P-384 key, Ed25519 for an Ed25519 key. Other keys cannot sign a
-    /// rotation (docs/dev/spec/protocol.md §4.9).
+    /// rotation (docs/dev/spec/protocol.md §4.10).
     pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>, String> {
         use ring::signature::{
             ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P384_SHA384_ASN1_SIGNING, EcdsaKeyPair,

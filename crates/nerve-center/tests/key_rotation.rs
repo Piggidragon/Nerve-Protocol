@@ -1,4 +1,4 @@
-//! Key rotation (docs/dev/spec/protocol.md §4.9) at the center, against a
+//! Key rotation (docs/dev/spec/protocol.md §4.10) at the center, against a
 //! fake node in the same process: a node's key, taken only when the key it
 //! replaces signed it, the old key's grace and its end; and the center's own
 //! key, told to the nodes signed by the old one and served at the end of the

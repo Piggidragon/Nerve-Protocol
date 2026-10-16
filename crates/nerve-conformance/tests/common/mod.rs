@@ -257,6 +257,21 @@ impl Mcp {
         }
     }
 
+    /// Waits for the reply to the request sent as `id` with [`Mcp::send`],
+    /// keeping notifications.
+    pub fn reply(&mut self, id: &str, wait: Duration) -> Value {
+        let until = Instant::now() + wait;
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            match self.out.recv_timeout(left) {
+                Ok(v) if v.get("id") == Some(&json!(id)) => return v,
+                Ok(v) => self.notes.push(v),
+                Err(RecvTimeoutError::Timeout) => panic!("no reply to {id} within {wait:?}"),
+                Err(RecvTimeoutError::Disconnected) => panic!("nerve-center closed stdout"),
+            }
+        }
+    }
+
     pub fn tools(&mut self) -> Vec<Value> {
         let r = self.request("tools/list", json!({}));
         r["result"]["tools"].as_array().cloned().unwrap_or_default()

@@ -32,7 +32,7 @@ working without it.
 
 | Feature | Since | Section |
 |---|---|---|
-| `rotate` | nerve 0.0.4 | key rotation, §4.9 |
+| `rotate` | nerve 0.0.4 | key rotation, §4.10 |
 
 ## 2. Identity
 
@@ -48,7 +48,7 @@ working without it.
 - A node holds one Ed25519 key per center it is paired with.
 - The **node id** is the lowercase base32 (RFC 4648 alphabet, no padding) of the
   first 16 bytes of SHA-256 of the 32-byte raw public key it paired with: 26
-  characters. It stays when the key is rotated (§4.9).
+  characters. It stays when the key is rotated (§4.10).
 - A **node name** is 1 to 32 characters of `a-z`, `0-9` and `-`. The default is
   derived from the host name.
 
@@ -122,14 +122,17 @@ Unknown fields are refused. Answers:
    {"node_id": "…", "auth": {"sig": "<128 hex>"}, "versions": ["0"],
     "software": {"name": "nerve-node", "version": "…"},
     "limits": {"message_bytes": 4194304, "blob_bytes": 67108864, "calls": 64, "streams": 16},
-    "rev": 7, "features": ["rotate"]}
+    "rev": 7, "features": ["rotate"], "resume": {"link": "<32 hex>", "got": 0}}
    ```
    `sig` is the Ed25519 signature over the bytes
    `"nerve-connect/0" || center_id (UTF-8) || nonce (32 raw bytes)`, with
    the node's key for this center, or with its old key while the grace of a
-   rotation runs (§4.9). `features` is optional (§1.1).
-3. Center → node, notification `welcome {version, limits, features?}`;
-   `features` only when the hello had it (§1.1).
+   rotation runs (§4.10). `features` is optional (§1.1). `resume` is
+   optional; a node that can resume links sends it (§4.9).
+3. Center → node, notification `welcome {version, limits, features?, resume?}`.
+   `features` is sent only when the hello had it (§1.1). `resume {resumed,
+   got}` answers the hello's `resume` and is sent only when the hello had one
+   (§4.9).
 
 Before `welcome`, any other message is a protocol error: the receiver sends
 `bye {reason: "protocol_error"}` and closes. A wrong signature or a `node_id`
@@ -161,8 +164,8 @@ frame as a dead link.
 suspend, an address change) sends the event `node/going_away {reason}` first,
 so the center can show why it dropped.
 
-There is no resume. When a link ends, calls in flight on it fail with
-`connection_lost`, and commands it started are killed.
+When a link ends with a `bye`, or drops and is not resumed (§4.9), calls in
+flight on it fail with `connection_lost`, and commands it started are killed.
 
 ### 4.6 Reconnect
 
@@ -266,7 +269,99 @@ message layer: the relay carries bytes, never messages.
   of it counts. The relayed node's policy is its own; the relay's policy is
   not asked, and no call runs on the relay for a tunnel.
 
-### 4.9 Key rotation
+### 4.9 Resume
+
+A link that drops without a `bye` MAY be resumed on a new connection within a
+grace of 30 seconds: calls in flight on it go on, and their results and the
+events sent meanwhile arrive. Both sides must be able to; otherwise the link
+ends as in §4.5. A resume sends a frame again only when the other side's count
+shows it never read it, so a call that may have run never runs twice.
+
+Link ids and counts:
+
+- A node that can resume links sends `hello.resume {link, got}` on every
+  connection. `link` names the link the connection carries: 16 random bytes
+  as 32 lowercase hex characters, new for a new link. `got` is how many
+  counted frames of that link the node read (0 for a new link).
+- A center that can resume links answers `welcome.resume {resumed, got}`,
+  and only to a hello with `resume` (a node is strict about `welcome`).
+  `resumed: true` carries the named link on, and `got` is how many counted
+  frames of it the center read. `resumed: false` starts a new link with that
+  id, with `got` 0. A welcome without `resume` means the center cannot resume
+  links; the node then treats the link as one that cannot resume.
+- A hello whose `resume.link` is not 32 lowercase hex characters is refused
+  with `bye {reason: "protocol_error"}`.
+- **Counted frames** are the text frames a side sends after `welcome`, except
+  `ack` and `bye`. Each side numbers the counted frames it sends from 1 over
+  the whole link, across resumes, and counts the counted frames it reads.
+  Binary frames are not counted; version "0" sends none a resume needs.
+
+Keeping and acknowledging, on a link that can resume:
+
+- Each side keeps the counted frames it sent until the other side
+  acknowledges them. The notification `ack {got}` (either direction) says the
+  sender read the first `got` counted frames of the link. A side sends one at
+  most every 5 seconds, when its count moved since its last `ack` or
+  handshake. An `ack` whose `got` is below an earlier one or above what was
+  sent ends the link with `bye {reason: "protocol_error"}`; on a link that
+  cannot resume an `ack` is ignored.
+- A side keeps at most 16 MiB of frames the other side has not acknowledged,
+  dropping the oldest past that. While it lacks a frame the other side has
+  not acknowledged, the link cannot resume.
+
+Drop and grace:
+
+- A link that ends without a `bye` (the connection closed or failed, or §4.4's
+  45 seconds passed) is kept by each side for 30 seconds from when that side
+  noticed: its calls stay in flight, its commands run on, and what the side
+  sends meanwhile is kept as above. The center shows the node offline and
+  answers new calls with `unavailable`. A link that ends with a `bye`, from
+  either side, ends at once (§4.5). So does a connection that ends because
+  the receiver cannot take a frame (over its message limit, or not a valid
+  WebSocket frame): the frame would be sent again on every resume, so the
+  receiver ends the link with `bye {reason: "protocol_error"}`. That `bye`
+  may not arrive: the receiver closes with the rest of the frame unread, and
+  the reset this makes can drop it (Windows does). The sender, center or
+  node, then sees a dropped connection and keeps the link like any dropped
+  one. The node's next hello ends it on both sides: the node names a new link
+  (it ended the link itself) or is answered `resumed: false` (the center
+  did). Without a next hello, the grace ends it.
+- The node offers the link in the hello of its next connection while the
+  grace lasts and it still keeps every frame the center may lack. Once it
+  sent that hello it keeps the link until the `welcome` comes (at most the
+  15 seconds of §4.2), even past the grace. A welcome that does not carry the
+  link on ends it; a handshake that fails leaves it to the next connection
+  while the grace lasts.
+- The center carries the link on when it still holds the link the hello names
+  for that node, it has read at least one counted frame of it, `got` lies
+  between what the node acknowledged and what the center sent, and the center
+  keeps every frame after `got`. The node sends nothing counted before it
+  reads the `welcome`, so a link of which the center read nothing may be one
+  whose `resumed: false` the node never got; the node then still holds the
+  older link of that id, which must not be taken for the new one. Otherwise it
+  answers `resumed: false` and ends the link it held: its calls fail with
+  `connection_lost`. A held link that does not answer the ping of §4.3 is
+  replaced, and may be carried on the same way. A frame that arrives later on
+  the replaced connection is not the link's and is dropped.
+- After the grace, a link not resumed ends as in §4.5: the center fails its
+  calls with `connection_lost`, the node kills its commands.
+
+Replay:
+
+- After `welcome`, each side first sends again, in order and unchanged, the
+  counted frames after the other side's `got`, then new frames. The node
+  checks the center's `got` like an `ack`.
+- A request the node read is never sent again: an `invoke` the node read may
+  have run. Its result comes from the node's kept frames, or when the call
+  finishes. An `invoke` the node did not read has not run, and is sent again
+  with its id, unless no one waits for it any more (its caller timed out or
+  cancelled): then the center sends the notification `withdrawn {id}` in its
+  place, which keeps the count, and the node ignores it.
+- `seq` of events and state goes on counting on the resumed link.
+- After a resume the center fetches the descriptor again, as it may have
+  changed while the link was down.
+
+### 4.10 Key rotation
 
 Feature `rotate` (§1.1). Either key of a pairing can be replaced without
 pairing again: the node's key for the center, and the center's TLS key that
@@ -348,6 +443,11 @@ dials again with its key.
 Pairing links carry the pin of the key the center serves. A node that
 paired during the grace is told on its first link.
 
+With resume (§4.9): the key messages are counted frames, so one that a drop
+cut off goes out again when the link resumes. A resumed link goes on under
+the key its resuming hello was signed with. A link the center ends because
+its key's grace ended ends with a `bye` and is not resumed.
+
 ## 5. Messages
 
 Text frames carry JSON-RPC 2.0. No batches; `params` is always an object.
@@ -372,7 +472,9 @@ Errors carry a string code in `error.data.code` (§5.3).
 | `stream.close` | request | either | `{sid, reason}` | `{}` |
 | `session.end` | notification | C→N | `{session}` | |
 | `bye` | notification | either | `{reason}` | |
-| `key.rotate` | notification | N→C | `{public_key, sig, proof}` (§4.9) | |
+| `ack` | notification | either | `{got}` | (§4.9) |
+| `withdrawn` | notification | C→N | `{id}` | (§4.9) |
+| `key.rotate` | notification | N→C | `{public_key, sig, proof}` (§4.10) | |
 | `key.rotated` | notification | C→N | `{public_key, error?}` | |
 | `key.retire` | notification | N→C | `{public_key, sig}` | |
 | `key.retired` | notification | C→N | `{error?}` | |
@@ -387,8 +489,8 @@ Errors carry a string code in `error.data.code` (§5.3).
 - Topics are `<cap>/<event>`, `<cap>/state` or `<cap>/*`. Events of the `node`
   and `settings` capabilities are implicit: they are sent without
   `sub`. Everything else needs one.
-- `seq` counts per capability from 1 within a link; `ts` is milliseconds since
-  the Unix epoch.
+- `seq` counts per capability from 1 within a link, across its resumes
+  (§4.9); `ts` is milliseconds since the Unix epoch.
 
 ### 5.2 Strictness
 
@@ -440,7 +542,8 @@ on the producer.
 `limits` in `hello` and `welcome` announce what each side accepts: message
 bytes (default 4 MiB), blob bytes (64 MiB), concurrent calls (64), streams (16).
 A message over the receiver's limit closes the link with `protocol_error`; a
-call over the call limit fails with `busy`.
+call over the call limit fails with `busy`. A node does not send an answer
+over the center's message limit: the call fails with `too_large` instead.
 
 ## 6. Descriptor
 
@@ -504,14 +607,30 @@ concurrently.
 
 | Action | Effect | Params → result |
 |---|---|---|
-| `run` | execute | `{command, cwd?, timeout_ms?}` → `{exit_code, signal?, stdout, stderr, truncated}` |
+| `run` | execute | `{command, cwd?, timeout_ms?, memory_mb?, cpu_percent?, processes?}` → `{exit_code, signal?, stdout, stderr, truncated, killed?, reason?}` |
 | `signal` | actuate | `{call, signal: "term"|"kill"|"int"}` → `{}` |
 
 - `command` is a string run by the node's shell. `call` is the `invoke` id of a
   running `run`.
+- `timeout_ms` is the longest the command may run; 0 is the same as none.
+  A node ends every command: one without `timeout_ms` gets the node's
+  default, one with a larger value gets the node's maximum, and past its limit
+  the command is killed and the call fails with `timeout`. Both numbers are
+  the owner's (`limits` of `node.toml`, node-local §2). The descriptor states
+  them in the action's text and as `maximum` and `default`, in milliseconds,
+  of the `timeout_ms` parameter; as that parameter differs between nodes
+  with other limits, a center does not merge their `exec.run` into one tool.
 - state: `{shell, confinement}`; event `exit {call, exit_code}` (needs `sub`).
 - Output is capped at `limits.output_cap_bytes` of the node's config;
-  `truncated` says it was cut. Output comes in the result; the
+  `truncated` says it was cut.
+- `memory_mb`, `cpu_percent` (100 is one CPU) and `processes` are the
+  limits of the command (node-local §2, Commands). Each one left out is the
+  node's default; one above the node's most, or 0, fails with
+  `invalid_args`, whose message names the most. The descriptor gives each
+  default and most as the parameter's `default` and `maximum`. A command
+  the node killed because it went past its own memory limit has `killed:
+  "memory"` and a `reason` in its result (and `signal: "kill"`); one an OOM
+  of the machine killed has only `signal: "kill"`. Output comes in the result; the
   `output` reliable stream is declared for later.
 
 ### 7.4 `settings` (only with the settings grant `write`)
@@ -560,7 +679,9 @@ browser or tool) to the node; the center only relays it.
 ### 7.5 `audit`
 
 - event `decision {ts, cap, action, target, decision, code?, session?}`
-  (needs `sub`); `decision` is `allowed` or `forbidden`.
+  (needs `sub`); `decision` is `allowed` or `forbidden`, or `killed` with
+  `code: "memory"` for a command the node killed for its memory limit,
+  after that call's `allowed`.
 
 ## 8. Center side
 

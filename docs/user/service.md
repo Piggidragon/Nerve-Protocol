@@ -9,7 +9,8 @@ systemd, run `nerve-node run` under your own service manager
 elevated on Windows, is refused unless `machine.allow_root` is set, and warns
 at start when it runs
 ([root and administrator](platforms.md#root-and-administrator)). Windows
-differs in a few places; see [Windows](#windows).
+differs in a few places; see [Windows](#windows). The center installs
+itself the same way on Linux ([center](center.md#run-it-as-a-service)).
 
 ## Install
 
@@ -42,7 +43,10 @@ Whatever the downloaded file is called, `install` puts it in place as
    stop the install.
 4. Copies the program to `/usr/local/bin/nerve-node`.
 5. Writes the unit `/etc/systemd/system/nerve-node.service`, enables it and
-   starts it. It waits until the node answers.
+   starts it. It waits until the node answers. The unit hands the node its
+   cgroup (`Delegate=cpu memory pids`), so each command runs held to its
+   [limits](limits.md), and keeps the node running when one of them is
+   killed for its memory (`OOMPolicy=continue`).
 
 When the settings of an earlier install keep the keys in the system keyring
 ([keys](config.md#where-the-node-keeps-its-keys)), `install` first checks
@@ -199,6 +203,11 @@ in place as `/usr/local/bin/nerve-node` and restarts the service. `HTTPS_PROXY` 
 The config, the keys and the audit log are not touched. `update` refuses a
 file that is not `nerve-node` and a program older than the installed one. If
 the new program does not start, the old one is put back and started again.
+
+`update` does not write the unit. After an update from a version without
+[limits per command](limits.md), run `sudo nerve-node install` once more: it
+writes the unit with `Delegate=` and restarts the node. Until then
+`nerve-node status` says that commands run without their limits.
 
 ## Uninstall
 

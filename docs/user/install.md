@@ -44,6 +44,15 @@ sudo nerve-node setup
 `install` puts the program at `/usr/local/bin/nerve-node`, whatever the
 downloaded file is called.
 
+The center installs itself as a service the same way, with MCP over HTTP
+([center](center.md#run-it-as-a-service)):
+
+```sh
+curl -LO https://github.com/Piggidragon/Nerve-Protocol/releases/latest/download/nerve-center-x86_64-linux
+chmod +x nerve-center-x86_64-linux
+sudo ./nerve-center-x86_64-linux install
+```
+
 ## Install on Windows
 
 In PowerShell, compare each hash with its line in `SHA256SUMS`:
@@ -80,7 +89,9 @@ See [building](../dev/building.md).
 A node [installed as a service](service.md) keeps its files in `/etc/nerve`
 and `/var/lib/nerve/state`, on Windows in `C:\ProgramData\Nerve\config` and
 `C:\ProgramData\Nerve\state`. Without `--config-dir` and `--state-dir` the
-commands use those folders.
+commands use those folders. A center installed as a service keeps its state
+in `/var/lib/nerve-center` and its settings in `/etc/nerve-center`
+([center](center.md#run-it-as-a-service)).
 
 Both programs read `NERVE_STATE_DIR`. On a machine that runs both, set it per
 program or use the flags. Do not set it for the whole machine.

@@ -1377,6 +1377,7 @@ pub(crate) mod tests {
                         paused: false,
                         revoked: false,
                         unknown: false,
+                        public_key: None,
                         old_pin: None,
                         policy: Default::default(),
                     });
@@ -1434,6 +1435,7 @@ pub(crate) mod tests {
                     paused: false,
                     revoked: false,
                     unknown: false,
+                    public_key: None,
                     old_pin: None,
                     policy: Default::default(),
                 });
@@ -1477,6 +1479,7 @@ pub(crate) mod tests {
                         paused: false,
                         revoked: false,
                         unknown: false,
+                        public_key: None,
                         old_pin: None,
                         policy: Default::default(),
                     });

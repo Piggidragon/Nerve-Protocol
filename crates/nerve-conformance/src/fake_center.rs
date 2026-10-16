@@ -183,20 +183,16 @@ fn pair(req: &Request, st: &Mutex<State>, center_id: &str) -> Response {
 }
 
 /// The center's handshake: challenge, hello check, welcome. Returns the hello,
-/// or the bye reason it sent.
+/// or the bye reason it sent. The welcome offers no resume (§4.9), as a
+/// center that cannot resume links answers.
 pub async fn handshake(
     conn: &mut Conn<TcpStream>,
     center_id: &str,
     paired: &Paired,
 ) -> Result<Hello, String> {
-    handshake_with(
-        conn,
-        center_id,
-        &paired.node_id,
-        &paired.request.public_key,
-        None,
-    )
-    .await
+    let hello = hello(conn, center_id, paired).await?;
+    welcome(conn, None).await?;
+    Ok(hello)
 }
 
 /// [`handshake`] against the node key `public_key` (hex), which a rotation
@@ -209,6 +205,28 @@ pub async fn handshake_with(
     node_id: &str,
     public_key: &str,
     features: Option<&[&str]>,
+) -> Result<Hello, String> {
+    let hello = hello_with(conn, center_id, node_id, public_key).await?;
+    welcome_with(conn, None, features).await?;
+    Ok(hello)
+}
+
+/// The center's handshake up to the checked hello: challenge, hello check.
+/// Returns the hello, or the bye reason it sent.
+pub async fn hello(
+    conn: &mut Conn<TcpStream>,
+    center_id: &str,
+    paired: &Paired,
+) -> Result<Hello, String> {
+    hello_with(conn, center_id, &paired.node_id, &paired.request.public_key).await
+}
+
+/// [`hello`] against the node key `public_key` (hex).
+pub async fn hello_with(
+    conn: &mut Conn<TcpStream>,
+    center_id: &str,
+    node_id: &str,
+    public_key: &str,
 ) -> Result<Hello, String> {
     let nonce = nerve_transport::keys::random_bytes(32);
     conn.notify(
@@ -238,12 +256,32 @@ pub async fn handshake_with(
         conn.bye("unsupported_version").await;
         return Err("no common version".into());
     }
-    let mut welcome = json!({"version": PROTOCOL_VERSION, "limits": msg::Limits::default()});
-    if let Some(f) = features {
-        welcome["features"] = json!(f);
-    }
-    conn.notify(method::WELCOME, welcome).await?;
     Ok(hello)
+}
+
+/// The last handshake step: `welcome`, with `resume` when the center answers
+/// a node's resume offer (§4.9).
+pub async fn welcome(
+    conn: &mut Conn<TcpStream>,
+    resume: Option<msg::Resumed>,
+) -> Result<(), String> {
+    welcome_with(conn, resume, None).await
+}
+
+/// [`welcome`], with `features` when given (§1.1).
+pub async fn welcome_with(
+    conn: &mut Conn<TcpStream>,
+    resume: Option<msg::Resumed>,
+    features: Option<&[&str]>,
+) -> Result<(), String> {
+    let mut w = json!({"version": PROTOCOL_VERSION, "limits": msg::Limits::default()});
+    if let Some(r) = resume {
+        w["resume"] = serde_json::to_value(r).map_err(|e| e.to_string())?;
+    }
+    if let Some(f) = features {
+        w["features"] = json!(f);
+    }
+    conn.notify(method::WELCOME, w).await
 }
 
 async fn auto_link(mut conn: Conn<TcpStream>, center_id: &str, p: &Paired) -> Result<(), String> {

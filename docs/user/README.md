@@ -29,7 +29,7 @@ open port.
 | Page | Covers |
 |---|---|
 | [install.md](install.md) | Download, check, install, where files live |
-| [center.md](center.md) | Start the center, its flags and ports |
+| [center.md](center.md) | Start the center, its flags and ports, install it as a service on Linux |
 | [harness.md](harness.md) | Connect an MCP harness, the tools it gets |
 | [pairing.md](pairing.md) | Pair a machine, start the node, unpair |
 | [service.md](service.md) | Install the node as a service, set it up, update and uninstall it |
@@ -39,9 +39,11 @@ open port.
 | [sudo.md](sudo.md) | The sudo switch |
 | [settings-grant.md](settings-grant.md) | Let a center change a machine's settings |
 | [config.md](config.md) | Read and change `node.toml` by name |
+| [limits.md](limits.md) | Memory, CPU and processes of one command |
 | [audit.md](audit.md) | See what was allowed and refused |
 | [logs.md](logs.md) | The log of the center and the node: levels, what is in it, where it is |
 | [stop.md](stop.md) | Panic, pause, disable, remove |
+| [backup.md](backup.md) | Back up and restore a node or a center, move one to another machine |
 | [proxy.md](proxy.md) | Reach the center through an HTTP proxy |
 | [relay.md](relay.md) | Reach the center through another node (a jump node) |
 | [providers.md](providers.md) | Let a program on the machine add capabilities |

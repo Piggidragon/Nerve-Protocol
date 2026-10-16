@@ -16,6 +16,7 @@ pub mod error;
 pub mod frame;
 pub mod link;
 pub mod msg;
+pub mod resume;
 pub mod rpc;
 
 pub use descriptor::{Capability, Descriptor, Detail, Effect, Exposure};
@@ -44,13 +45,13 @@ pub fn connect_message(center_id: &str, nonce: &[u8]) -> Vec<u8> {
     m
 }
 
-/// The feature of key rotation (docs/dev/spec/protocol.md §1.1, §4.9), named
+/// The feature of key rotation (docs/dev/spec/protocol.md §1.1, §4.10), named
 /// in `hello.features` and `welcome.features`.
 pub const FEATURE_ROTATE: &str = "rotate";
 /// The features this implementation speaks.
 pub const FEATURES: &[&str] = &[FEATURE_ROTATE];
 
-/// How long a replaced key stays valid after a rotation (§4.9): seven days.
+/// How long a replaced key stays valid after a rotation (§4.10): seven days.
 pub const ROTATE_GRACE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 /// What the replaced node key signs before the center id and the new key.

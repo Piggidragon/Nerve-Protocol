@@ -69,7 +69,7 @@ impl NodeKey {
         hex(self.pair.sign(&offer.message(center_id)).as_ref())
     }
 
-    /// A signature of `key.rotate` (spec §4.9): hex Ed25519 over the rotate
+    /// A signature of `key.rotate` (spec §4.10): hex Ed25519 over the rotate
     /// message for `new_key`. The key it replaces makes `sig`, the new key
     /// itself `proof`.
     pub fn sign_rotate(&self, center_id: &str, new_key: &[u8]) -> String {

@@ -194,7 +194,7 @@ pub fn remove_proxy_headers(paths: &NodePaths) -> Result<bool, String> {
 
 /// One of the node's own keys, in its file or its keyring entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Key<'a> {
+pub(crate) enum Key<'a> {
     /// The key of the config's MAC.
     Config,
     /// The node key for a center.
@@ -208,7 +208,7 @@ enum Key<'a> {
 }
 
 impl Key<'_> {
-    fn file(self, paths: &NodePaths) -> std::path::PathBuf {
+    pub(crate) fn file(self, paths: &NodePaths) -> std::path::PathBuf {
         match self {
             Key::Config => paths.config_key(),
             Key::Center(c) => paths.key_file(c),
@@ -218,7 +218,7 @@ impl Key<'_> {
         }
     }
 
-    fn entry(self, paths: &NodePaths) -> Entry {
+    pub(crate) fn entry(self, paths: &NodePaths) -> Entry {
         match self {
             Key::Config => Entry::config_key(paths),
             Key::Center(c) => Entry::center_key(paths, c),
@@ -229,7 +229,7 @@ impl Key<'_> {
     }
 
     /// How a message names it.
-    fn what(self) -> String {
+    pub(crate) fn what(self) -> String {
         match self {
             Key::Config => "the key of the config's MAC".into(),
             Key::Center(c) => format!("the node key for center {c}"),
@@ -244,7 +244,7 @@ impl Key<'_> {
 /// the new one of a rotation under way, the relay's TLS key once the relay
 /// has a pin, and the proxy's password while the config names its user.
 /// A key that is not there is passed over.
-fn keys(cfg: &NodeConfig) -> Vec<Key<'_>> {
+pub(crate) fn keys(cfg: &NodeConfig) -> Vec<Key<'_>> {
     std::iter::once(Key::Config)
         .chain(
             cfg.centers
@@ -257,7 +257,7 @@ fn keys(cfg: &NodeConfig) -> Vec<Key<'_>> {
 }
 
 /// The other place.
-fn other(storage: SecretStorage) -> SecretStorage {
+pub(crate) fn other(storage: SecretStorage) -> SecretStorage {
     match storage {
         SecretStorage::File => SecretStorage::Keyring,
         SecretStorage::Keyring => SecretStorage::File,
@@ -274,7 +274,11 @@ fn place(storage: SecretStorage) -> &'static str {
 
 /// The text of `key` in `storage`, trimmed; `None` when it is not there.
 /// Errors name the file or the entry, never the text.
-fn get(paths: &NodePaths, storage: SecretStorage, key: Key) -> Result<Option<String>, String> {
+pub(crate) fn get(
+    paths: &NodePaths,
+    storage: SecretStorage,
+    key: Key,
+) -> Result<Option<String>, String> {
     match storage {
         SecretStorage::File => {
             let file = key.file(paths);
@@ -304,7 +308,12 @@ fn get(paths: &NodePaths, storage: SecretStorage, key: Key) -> Result<Option<Str
 
 /// Keeps `text` as `key` in `storage`, replacing what was there, and reads
 /// it back: a copy that does not read back as written is an error.
-fn put(paths: &NodePaths, storage: SecretStorage, key: Key, text: &str) -> Result<(), String> {
+pub(crate) fn put(
+    paths: &NodePaths,
+    storage: SecretStorage,
+    key: Key,
+    text: &str,
+) -> Result<(), String> {
     match storage {
         SecretStorage::File => {
             let file = key.file(paths);
@@ -336,7 +345,7 @@ fn put(paths: &NodePaths, storage: SecretStorage, key: Key, text: &str) -> Resul
 }
 
 /// Deletes `key` from `storage`; `Ok(false)` when it was not there.
-fn delete(paths: &NodePaths, storage: SecretStorage, key: Key) -> Result<bool, String> {
+pub(crate) fn delete(paths: &NodePaths, storage: SecretStorage, key: Key) -> Result<bool, String> {
     match storage {
         SecretStorage::File => {
             let file = key.file(paths);
@@ -652,7 +661,7 @@ pub fn remove_center_next_key(
 /// the keyring answers it does not hold is looked for in its file, where a
 /// move that has not finished left it. An unreachable keyring is an error,
 /// never a reason to read the file.
-fn read_secret(
+pub(crate) fn read_secret(
     paths: &NodePaths,
     storage: SecretStorage,
     key: Key,
@@ -822,6 +831,16 @@ impl NodeSecrets {
             s.storage = other(s.storage);
         }
         s
+    }
+
+    /// For a restore from a backup ([`crate::backup`]): the MAC key where the
+    /// restored config keeps the keys, `storage`. No store moves anything
+    /// here: the restore writes every key itself.
+    pub(crate) fn for_restore(paths: &NodePaths, storage: SecretStorage) -> NodeSecrets {
+        NodeSecrets {
+            storage,
+            ..NodeSecrets::new(paths)
+        }
     }
 
     /// Moves every key of `cfg` into `into` from the other place: a key
@@ -1359,6 +1378,7 @@ mod tests {
                     paused: false,
                     revoked: false,
                     unknown: false,
+                    public_key: None,
                     old_pin: None,
                     policy: Default::default(),
                 });

@@ -43,7 +43,7 @@ pub struct Store {
     #[serde(default)]
     pub log_level: Level,
     /// The last rotation of the center's key (docs/dev/spec/protocol.md
-    /// §4.9), while nodes are told of it. Public values only: the keys are
+    /// §4.10), while nodes are told of it. Public values only: the keys are
     /// in their PEM files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_rotation: Option<KeyRotation>,
@@ -149,7 +149,7 @@ pub struct NodeRecord {
     /// the one of the key it paired with when the key is rotated.
     pub public_key: String,
     /// The key the node rotated away from, taken until its grace ends
-    /// (docs/dev/spec/protocol.md §4.9).
+    /// (docs/dev/spec/protocol.md §4.10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub old_key: Option<OldKey>,
     pub platform: String,

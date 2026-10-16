@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+### Limits per command
+
+- On Linux every command runs in a cgroup of its own, held to its memory, CPU and processes. The owner sets the defaults and the most a call may ask for in `[limits.command]` of `node.toml`; `exec.run` takes `memory_mb`, `cpu_percent` and `processes` up to that most. A command past its memory is killed, and its result (`killed: "memory"`) and the audit log say why. `nerve-node status` shows the limits and whether the node holds them ([#119](https://github.com/Piggidragon/Nerve-Protocol/issues/119)).
+- When a command ends, everything in its cgroup ends too, also a process it moved out of its process group.
+- The installed unit gets `Delegate=cpu memory pids`. After `update`, run `sudo nerve-node install` once more to write it; until then commands run without these limits. A node you start yourself has them under `systemd-run --user --scope -p Delegate=yes nerve-node run`.
+- A 0.0.3 node refuses a `node.toml` that sets `[limits.command]`. Before you go back to 0.0.3, remove it with `nerve-node config unset limits.command`.
+
+### Backup, restore and moving
+
+- `nerve-node backup <file>` and `nerve-node restore <file>`, and the same for `nerve-center`, write the config and keys (the center's certificate, key and state) to one file that a passphrase protects (PBKDF2-HMAC-SHA256 and ChaCha20-Poly1305, at least 12 characters), and put them back on the same machine or another, so a node or a center can be moved without pairing again ([#122](https://github.com/Piggidragon/Nerve-Protocol/issues/122)).
+- Keys in the system keyring, and a proxy's header values, go into a backup only with `--include-keyring`. A restore never goes under a running node or center, refuses a backup of another node or center unless you add `--replace`, keeps every pin as saved and sets the sudo switch off. These are two of `nerve-center`'s subcommands now; a harness still starts it without one.
+
+### The center as a service
+
+- On Linux with systemd, `sudo nerve-center install` installs the center as a service that starts with the machine, under a user of its own (`nerve-center`) with its own state folder (`/var/lib/nerve-center`), with MCP over HTTP and no privilege. Its settings are in `/etc/nerve-center/center.env`, which `install` writes once with a new harness token, so the web UI asks for a login from the start. `update` replaces the program with the latest release, checked against `SHA256SUMS`, or with `--from <file>`, and puts the old one back when the new one does not start. `uninstall` removes the service, the user and the program; `--purge` also the folders ([#123](https://github.com/Piggidragon/Nerve-Protocol/issues/123)).
+- The released node's `install` and `uninstall` no longer fail on the control socket, or on a link, in its state folder: the static Linux programs opened such an entry instead of only giving it to the node's user.
+
 ### Capability providers
 
 - A program on the machine that the owner names in `providers.allowed`, such as a desktop app, can attach to the node's control socket and add capabilities of its own. The node lists them to every center with `provider: <name>`, decides and audits every call to them by that center's policy, forwards only the allowed ones, and drops them when the program exits. Linux only for now; the conformance suite has a provider part ([#16](https://github.com/Piggidragon/Nerve-Protocol/issues/16)).
@@ -9,10 +26,16 @@
 - A center with the settings grant can no longer allow, or turn on, a capability or an action the node does not offer now: it may sense once a provider offers it, so only the owner does that.
 - A 0.0.3 node refuses a `node.toml` that holds `providers`. Before you go back to 0.0.3, remove it with `nerve-node config unset providers`.
 
+### Run-time limit for commands
+
+- Every command has a time limit now. A call without `timeout_ms` gets `limits.default_timeout_secs` (10 minutes), and a `timeout_ms` above `limits.max_timeout_secs` (1 hour) is cut to it. A command past its limit is killed and the call fails with `timeout`, as before; the message says which limit it was. Before, a command without `timeout_ms` ran until it ended or its session did. The agent sees both numbers in the description of `exec_run` and in its `timeout_ms` parameter, and machines with other limits are separate tools. Only the owner sets them, for example `nerve-node config set limits.max_timeout_secs 86400` for jobs that run a day; a center cannot, also with the settings grant ([#120](https://github.com/Piggidragon/Nerve-Protocol/issues/120)).
+- A 0.0.3 node refuses a `node.toml` that holds either key. Before you go back to 0.0.3, remove them with `nerve-node config unset limits.default_timeout_secs` and `limits.max_timeout_secs`. A file in which you set neither reads on 0.0.3, as the defaults are not written.
+
 ### Key rotation
 
 - A machine's key for a center, and the center's own TLS key, can be replaced without pairing again ([#121](https://github.com/Piggidragon/Nerve-Protocol/issues/121)). `nerve-node center rotate-key` sends the machine's new key to the center over the link, signed with the old one; in the center's web UI, Settings, **Rotate key** makes a new center key that the linked machines learn, signed with the old one. The old key stays valid for 7 days, or until its owner ends that (`--end-grace`, **Serve the new key now**). The machine keeps its id. Each rotation is in the node's audit log and the center's log.
-- The protocol gets additive features (`hello.features`, `welcome.features`, spec §1.1) and the feature `rotate` (spec §4.9). A node or center older than 0.0.4 keeps working with a newer one, but cannot rotate; a node older than 0.0.4 has to pair again after its center's key was rotated.
+- The protocol gets additive features (`hello.features`, `welcome.features`, spec §1.1) and the feature `rotate` (spec §4.10). A node or center older than 0.0.4 keeps working with a newer one, but cannot rotate; a node older than 0.0.4 has to pair again after its center's key was rotated.
+- A 0.0.3 node refuses a `node.toml` that holds `public_key` under a pairing, which a rotation of the machine's key writes, and cannot use the rotated key anyway: such a pairing has to be paired again on 0.0.3.
 - A 0.0.3 node refuses a `node.toml` that holds `old_pin`, which a rotation of the center's key writes for up to 7 days; the running node drops it once that time is over. To go back to 0.0.3 within that time, remove it with `nerve-node config unset center.<name>.old_pin`.
 
 ## 0.0.3

@@ -1,4 +1,4 @@
-//! Key rotation (docs/dev/spec/protocol.md §4.9): the node's key for a
+//! Key rotation (docs/dev/spec/protocol.md §4.10): the node's key for a
 //! center, which the owner rotates here (`nerve-node center rotate-key`),
 //! and the center's key, which the center rotates and tells the node of
 //! over the link (`center.rotate`).
@@ -21,7 +21,6 @@ use nerve_proto::msg::{CenterRotate, KeyRetire, KeyRetired, KeyRotate, KeyRotate
 use nerve_proto::rpc::{Message, params};
 use nerve_transport::keys::NodeKey;
 use nerve_transport::log::span;
-use nerve_transport::ws::WsMessage;
 
 use crate::daemon::{LinkHandle, Shared};
 
@@ -185,8 +184,8 @@ async fn ask<T: serde::de::DeserializeOwned>(
     answer: &'static str,
 ) -> Option<T> {
     let rx = link.expect(answer);
-    let m = Message::notification(method, p);
-    link.tx.send(WsMessage::text(m.encode())).await.ok()?;
+    // A counted frame: on a link that drops and resumes it goes out again.
+    link.send(Message::notification(method, p).encode()).await;
     let got: Map<String, Value> = tokio::time::timeout(ANSWER, rx).await.ok()?.ok()?;
     params::<T>(&got).ok()
 }
@@ -288,6 +287,14 @@ async fn settle(
             grace()
         )
     })?;
+    // The config names the key now, which its node id no longer does, so
+    // that a backup can tell it belongs to this pairing.
+    let named = new_hex.clone();
+    if !shared.mark_center(center, |e| e.public_key = Some(named)) {
+        tracing::warn!(
+            "center {center}: node.toml could not record the new key; a backup leaves the key out until it does"
+        );
+    }
     tracing::info!(
         "center {center} took this node's new key {new_hex}; the old key works there for {} more, or until `nerve-node center rotate-key --end-grace`",
         grace()

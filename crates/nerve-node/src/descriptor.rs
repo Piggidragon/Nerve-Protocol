@@ -243,7 +243,26 @@ fn fs_cap(exposure: Exposure) -> Capability {
     c
 }
 
-fn exec_cap(exposure: Exposure, shell: Option<&str>, windows: bool) -> Capability {
+/// `timeout_ms` with the run-time limits in it, as `memory_mb` has its own.
+/// The center makes one tool of the `exec.run` of nodes whose params are
+/// equal and takes its text from the first of them, so nodes that differ in
+/// their limits must differ here, or the model reads one node's numbers for
+/// all.
+fn timeout_param(t: &crate::exec::Timeouts) -> Value {
+    let ms = |d: std::time::Duration| u64::try_from(d.as_millis()).unwrap_or(u64::MAX);
+    json!({"type": "integer", "minimum": 1,
+           "maximum": ms(t.max), "default": ms(t.limit(None).after)})
+}
+
+/// `limits` give the defaults and the most of what a call may ask its
+/// command to be held to, `timeouts` the time it gets.
+fn exec_cap(
+    exposure: Exposure,
+    shell: Option<&str>,
+    windows: bool,
+    limits: &nerve_policy::config::CommandLimits,
+    timeouts: &crate::exec::Timeouts,
+) -> Capability {
     let mut c = cap(
         "exec",
         "exec",
@@ -254,16 +273,30 @@ fn exec_cap(exposure: Exposure, shell: Option<&str>, windows: bool) -> Capabilit
         "run".into(),
         action(
             Effect::Execute,
-            &crate::exec::shell_summary(shell),
+            &format!(
+                "{} {}",
+                crate::exec::shell_summary(shell),
+                crate::exec::timeout_summary(timeouts)
+            ),
             obj(
                 json!({"command": {"type": "string"}, "cwd": cwd_param(windows),
-                       "timeout_ms": {"type": "integer", "minimum": 1}}),
+                       "timeout_ms": timeout_param(timeouts),
+                       "memory_mb": {"type": "integer", "minimum": 1,
+                                     "maximum": limits.memory_max_mb,
+                                     "default": limits.memory_mb},
+                       "cpu_percent": {"type": "integer", "minimum": 1,
+                                       "maximum": limits.cpu_max_percent,
+                                       "default": limits.cpu_percent},
+                       "processes": {"type": "integer", "minimum": 1,
+                                     "maximum": limits.processes_max,
+                                     "default": limits.processes}}),
                 &["command"],
             ),
             obj(
                 json!({"exit_code": {"type": ["integer", "null"]}, "signal": {"type": "string"},
                        "stdout": {"type": "string"}, "stderr": {"type": "string"},
-                       "truncated": {"type": "boolean"}}),
+                       "truncated": {"type": "boolean"},
+                       "killed": {"enum": ["memory"]}, "reason": {"type": "string"}}),
                 &["exit_code", "stdout", "stderr", "truncated"],
             ),
         ),
@@ -395,7 +428,7 @@ fn audit_cap() -> Capability {
             obj(
                 json!({"ts": {"type": "integer"}, "cap": {"type": "string"},
                        "action": {"type": "string"}, "target": {"type": "string"},
-                       "decision": {"enum": ["allowed", "forbidden"]},
+                       "decision": {"enum": ["allowed", "forbidden", "killed"]},
                        "code": {"type": "string"},
                        "session": {"type": "string"}}),
                 &["ts", "cap", "action", "target", "decision"],
@@ -530,7 +563,13 @@ fn build(
         caps.push(fs_cap(e));
     }
     if let Some(e) = exposure(entry, "exec") {
-        caps.push(exec_cap(e, cfg.machine.shell.as_deref(), cfg!(windows)));
+        caps.push(exec_cap(
+            e,
+            cfg.machine.shell.as_deref(),
+            cfg!(windows),
+            &cfg.limits.command,
+            &crate::exec::Timeouts::from_limits(&cfg.limits),
+        ));
     }
     if entry.settings == SettingsGrant::Write {
         caps.push(settings_cap());
@@ -615,6 +654,7 @@ mod tests {
             paused: false,
             revoked: false,
             unknown: false,
+            public_key: None,
             old_pin: None,
             policy: CenterPolicy::default(),
         }
@@ -983,12 +1023,118 @@ mod tests {
         );
         assert_eq!(cwd_param(false), json!({"type": "string"}));
         for windows in [true, false] {
-            let exec = exec_cap(Exposure::On, None, windows);
+            let exec = exec_cap(
+                Exposure::On,
+                None,
+                windows,
+                &Default::default(),
+                &Default::default(),
+            );
             assert_eq!(
                 exec.actions["run"].params["properties"]["cwd"],
                 cwd_param(windows)
             );
         }
+    }
+
+    /// The model reads the time a command gets from the `exec.run` text; a
+    /// change of the owner's limits changes it, and with it the rev.
+    #[test]
+    fn exec_run_names_the_owners_run_time_limits() {
+        let mut cfg = NodeConfig::default();
+        let mut e = entry();
+        e.policy.mode = Mode::User;
+        let text = |cfg: &NodeConfig| {
+            let d = for_center(cfg, &e, 0, true, &[]);
+            let run = &d.capability("exec").unwrap().actions["run"];
+            (run.summary.clone(), d.rev)
+        };
+        let (before, rev) = text(&cfg);
+        assert!(
+            before.contains("after 10 min when you give none, and never runs longer than 1 h"),
+            "{before}"
+        );
+        assert_eq!(
+            timeout_ms(&cfg),
+            json!({"type": "integer", "minimum": 1, "maximum": 3_600_000, "default": 600_000})
+        );
+        cfg.limits.default_timeout_secs = 90;
+        cfg.limits.max_timeout_secs = 120;
+        let (after, changed) = text(&cfg);
+        assert!(
+            after.contains("after 1 min 30 s when you give none, and never runs longer than 2 min"),
+            "{after}"
+        );
+        assert_ne!(changed, rev);
+        assert_eq!(
+            timeout_ms(&cfg),
+            json!({"type": "integer", "minimum": 1, "maximum": 120_000, "default": 90_000})
+        );
+        // The default shown is the one that applies: cut to the maximum.
+        cfg.limits.max_timeout_secs = 30;
+        assert_eq!(timeout_ms(&cfg)["default"], 30_000);
+    }
+
+    /// The `timeout_ms` parameter of `exec.run` as a center reads it.
+    fn timeout_ms(cfg: &NodeConfig) -> Value {
+        let mut e = entry();
+        e.policy.mode = Mode::User;
+        let d = for_center(cfg, &e, 0, true, &[]);
+        d.capability("exec").unwrap().actions["run"].params["properties"]["timeout_ms"].clone()
+    }
+
+    /// Nodes that differ only in their run-time limits have different params
+    /// for `exec.run`, so the center keeps their tools apart (nerve-center
+    /// `tools`); nodes with equal limits have equal ones.
+    #[test]
+    fn nodes_with_other_run_time_limits_have_other_params() {
+        let params = |cfg: &NodeConfig| {
+            let mut e = entry();
+            e.policy.mode = Mode::User;
+            let d = for_center(cfg, &e, 0, true, &[]);
+            d.capability("exec").unwrap().actions["run"].params.clone()
+        };
+        let plain = NodeConfig::default();
+        let mut long = NodeConfig::default();
+        long.limits.max_timeout_secs = 86_400;
+        let mut short_default = NodeConfig::default();
+        short_default.limits.default_timeout_secs = 60;
+        assert_eq!(params(&plain), params(&NodeConfig::default()));
+        assert_ne!(params(&plain), params(&long));
+        assert_ne!(params(&plain), params(&short_default));
+    }
+
+    /// A call sees the limits its command gets and the most it may ask
+    /// for; the owner changing them changes the descriptor.
+    #[test]
+    fn exec_run_shows_the_limits_of_a_command() {
+        let mut cfg = NodeConfig::default();
+        let e = entry();
+        let run = |cfg: &NodeConfig| {
+            let d = for_call(cfg, &e, 0, &[]);
+            let exec = d.capabilities.iter().find(|c| c.id == "exec").unwrap();
+            (exec.actions["run"].params["properties"].clone(), d.rev)
+        };
+        let (p, rev) = run(&cfg);
+        assert_eq!(
+            p["memory_mb"],
+            json!({"type": "integer", "minimum": 1, "maximum": 16384, "default": 4096})
+        );
+        assert_eq!(p["cpu_percent"]["maximum"], 800);
+        assert_eq!(p["cpu_percent"]["default"], 200);
+        assert_eq!(p["processes"]["maximum"], 8192);
+        assert_eq!(p["processes"]["default"], 1024);
+        // A command killed for its memory is a decision of its own.
+        let d = for_call(&cfg, &e, 0, &[]);
+        let audit = d.capabilities.iter().find(|c| c.id == "audit").unwrap();
+        assert_eq!(
+            audit.events["decision"].data["properties"]["decision"]["enum"],
+            json!(["allowed", "forbidden", "killed"])
+        );
+        cfg.limits.command.memory_max_mb = 8192;
+        let (p, other) = run(&cfg);
+        assert_eq!(p["memory_mb"]["maximum"], 8192);
+        assert_ne!(rev, other);
     }
 
     #[test]

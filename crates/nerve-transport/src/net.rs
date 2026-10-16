@@ -526,7 +526,7 @@ pub async fn open(
 }
 
 /// [`open`] for a center that may present any of `pins`: while a rotation
-/// of its key is in its grace (docs/dev/spec/protocol.md §4.9) the node
+/// of its key is in its grace (docs/dev/spec/protocol.md §4.10) the node
 /// takes the old pin and the new one. No pin: the system's roots.
 pub async fn open_pins(
     url: &CenterUrl,

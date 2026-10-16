@@ -1,5 +1,6 @@
 # The checks on every pull request, and on main after a merge: fmt, clippy and
-# the whole test suite, on Linux and on Windows. The release workflow runs the
+# the whole test suite, on Linux and on Windows, and the tests that differ on
+# musl, the C library of the released Linux programs. The release workflow runs the
 # same fmt, clippy and tests on Linux before it builds anything
 # (docs/dev/releasing.md), but nothing there runs the Windows tests: its
 # Windows job only builds.
@@ -87,6 +88,40 @@ jobs:
       # The whole workspace, with the end-to-end tests that start the real
       # programs (Unix only). `--no-fail-fast` shows every failing test at once.
       - run: cargo test --locked --workspace --no-fail-fast
+
+  # The released Linux programs are static, built against musl
+  # (release.yml), and the standard library differs there: it drops O_PATH
+  # from `OpenOptions::custom_flags`, as musl's O_ACCMODE holds it. The walk
+  # that gives the node's and the center's folders away (install,
+  # uninstall) opened sockets, links and FIFOs on musl only, so its tests
+  # run on that target as well.
+  musl:
+    name: Linux musl (folder walk of install and uninstall)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --target x86_64-unknown-linux-musl
+          rustup default "$RUST_TOOLCHAIN"
+      - name: A C compiler for musl (ring's C parts)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends musl-tools
+      - name: Cargo cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ runner.os }}-musl-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+      - name: Tests
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo test --locked --target x86_64-unknown-linux-musl -p nerve-node --lib -- service::tests::chown
 
   # Linux never compiles the Windows branches, so clippy and the tests must run
   # here too: nerve-node, nerve-sandbox and nerve-policy have Windows-only code

@@ -31,7 +31,7 @@ pub async fn tcp(addr: &str) -> Result<TcpListener, String> {
 pub struct Server {
     pub listener: TcpListener,
     /// The center whose key TLS uses, taken anew for each connection: a
-    /// rotation of the key (docs/dev/spec/protocol.md §4.9) changes it
+    /// rotation of the key (docs/dev/spec/protocol.md §4.10) changes it
     /// while the listener runs.
     tls: Option<Center>,
 }

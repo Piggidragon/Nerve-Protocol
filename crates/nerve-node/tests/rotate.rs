@@ -1,4 +1,4 @@
-//! Key rotation (docs/dev/spec/protocol.md §4.9) on a real node daemon
+//! Key rotation (docs/dev/spec/protocol.md §4.10) on a real node daemon
 //! against the conformance fake center, in process: the owner rotates the
 //! node's key with `center rotate-key`, the center takes it, refuses it or
 //! does not answer; the owner ends the grace of the old key; and the center
@@ -187,6 +187,11 @@ async fn the_node_takes_its_new_key_once_the_center_took_it() {
     assert!(out.contains("7 more days"), "{out}");
     assert_eq!(key(&paths).public_hex(), new);
     assert!(!paths.next_key_file("lab").exists());
+    // The config names the new key, which a backup checks the key by; the
+    // node id stays.
+    let (cfg, _) = nerve_node::cli::read_config(&paths).await.unwrap();
+    assert_eq!(cfg.centers[0].public_key.as_deref(), Some(new.as_str()));
+    assert_eq!(cfg.centers[0].node_id, paired(&center).node_id);
     let log = audit(&paths);
     assert!(log.contains("\"event\":\"node-key\""), "{log}");
     // No private key in the audit log, nor in the answer.

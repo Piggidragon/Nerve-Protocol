@@ -246,8 +246,9 @@ impl AuditLog {
 
     /// Something that happened to the config file itself: `refused` (it was
     /// changed outside the owner's path and is not applied), `signed` (the
-    /// node signed a file without a MAC line) or `accepted` (the owner
-    /// took a refused file as it is).
+    /// node signed a file without a MAC line), `accepted` (the owner
+    /// took a refused file as it is) or `restored` (the owner put the config
+    /// of a backup in place).
     pub fn config(&self, event: &str, file: &Path, reason: &str) -> std::io::Result<()> {
         self.append(&json!({
             "ts": nerve_proto::msg::now_ms(),
@@ -275,7 +276,7 @@ impl AuditLog {
     }
 
     /// A rotation of a key between the node and `center`
-    /// (docs/dev/spec/protocol.md §4.9): `event` says which and how it ended
+    /// (docs/dev/spec/protocol.md §4.10): `event` says which and how it ended
     /// (`node-key`, `node-key-refused`, `node-key-unanswered`,
     /// `node-key-grace-ended`, `center-key`), `detail` the public keys or
     /// pins and why. Never a private key.

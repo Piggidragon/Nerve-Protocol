@@ -456,7 +456,7 @@ impl Ui {
                 }
                 Ok(json!({}))
             }
-            // The center's key (docs/dev/spec/protocol.md §4.9): the answer
+            // The center's key (docs/dev/spec/protocol.md §4.10): the answer
             // to a rotation is the only place the new pin is shown.
             ("POST", "/api/center/key/rotate") => c.rotate_key().await.map_err(bad),
             ("POST", "/api/center/key/finish") => c

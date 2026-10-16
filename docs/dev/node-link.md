@@ -54,10 +54,44 @@ event `node/going_away {reason}`, so the center can tell "going away" from
 The wait starts at 1 second and doubles up to 60 seconds. Up to 10 % is taken
 off each wait at random. A link that lasted 60 seconds resets the wait.
 
-## No resume
+## Resume
 
-When a link ends, every call in flight on it ends. The center fails them with
-`connection_lost`. The node kills the commands started on that link.
+A link that drops without a bye is kept by both sides for 30 seconds, so an
+address change or a short outage loses no output. Exact rules:
+[spec/protocol.md](spec/protocol.md) §4.9.
+
+- The node names its link in every hello (`resume {link, got}`); a center that
+  can resume answers `welcome.resume {resumed, got}`. Each `got` counts the
+  text frames that side read of the link, `ack` and `bye` aside.
+- Both sides keep what they sent until the other side acknowledges it
+  (`ack {got}`, every 5 seconds at most), up to 16 MiB.
+- While the link is down, its commands run on and their results and events
+  are kept. The center shows the node offline; the calls wait.
+- On the resume each side sends again only what the other side's count shows
+  it never read. A call the node read is never sent again, so nothing runs
+  twice; one it did not read has not run and is sent again.
+- The center carries on only a link of which it read something: the node
+  sends nothing before it reads the welcome, so a link whose welcome may have
+  been lost is never taken for an older link of the same id.
+- A request the center no longer waits for (timed out or cancelled while the
+  link was down) goes as `withdrawn {id}` instead, so it does not run late.
+- What a frame carries of the sudo password is taken out once, when the frame
+  is numbered; a kept frame does not wait for a later scrub.
+- A link not resumed within 30 seconds, one that ended with a bye, and a link
+  with a center or node that cannot resume end at once: the center fails the
+  calls with `connection_lost`, and the node kills the commands started on
+  that link.
+- A frame the receiver cannot take (over its limit, or broken) would come
+  again on every resume, so the receiver ends the link at once with
+  `bye protocol_error`. That bye can be lost, as the receiver closes with the
+  frame unread (Windows drops it on the reset). The sender then keeps the link
+  as dropped, until the node's next hello ends it (a new link id, or
+  `resumed: false`) or the grace does.
+
+The node keeps its side in `LinkHandle` (`crates/nerve-node/src/daemon.rs`)
+and the dropped link in `Parked` (`link.rs`); the center keeps it in its
+`Link` (`crates/nerve-center/src/link.rs`), parked in its links map. The counts
+and the kept frames are `nerve_proto::resume::Replay`, shared by both.
 
 ## HTTP proxy
 
@@ -110,7 +144,9 @@ reliable streams, with a 10-byte header and at most 64 KiB of payload.
 
 Each side announces the limits for what it receives: the node in `hello`, the
 center in `welcome`. A message over the limit closes the link with
-`protocol_error`. A call over the call limit fails with `busy`.
+`protocol_error`. A call over the call limit fails with `busy`. An answer
+over the center's message limit is not sent: its call fails with
+`too_large`.
 
 A node parses what a center sends strictly: unknown fields and methods are
 errors. A center reads what a node sends with tolerance, so newer nodes keep

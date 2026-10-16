@@ -49,7 +49,7 @@ center is paired.
 | Command | Does | Page |
 |---|---|---|
 | `run` | Run the node in the foreground | [pairing](pairing.md) |
-| `status` | Show whether it runs, the links and the confinement | [troubleshooting](troubleshooting.md) |
+| `status` | Show whether it runs, the links, the confinement and the [limits per command](limits.md) | [troubleshooting](troubleshooting.md) |
 | `audit [--denied] [--follow]` | Show what was allowed and refused | [audit](audit.md) |
 | `panic`, `unlock` | Stop everything, then allow it again | [stop](stop.md#panic) |
 
@@ -62,3 +62,15 @@ center is paired.
 | `setup --create-user <name>` | Make an account only the node uses, and run commands as it (Linux, installed node) | [service](service.md#setup) |
 | `update [--from FILE]` | Put the latest release in place and restart the service | [service](service.md#update) |
 | `uninstall [--purge]` | Remove the service, its user and the program | [service](service.md#uninstall) |
+| `backup <file> [--include-keyring] [--overwrite] [--passphrase-file F]` | Write the config and keys to a file that a passphrase protects | [backup](backup.md) |
+| `restore <file> [--replace] [--secret-storage file\|keyring] [--without-proxy] [--passphrase-file F]` | Put a backup in place of this node's, or on another machine | [backup](backup.md#restore) |
+
+The center has five commands of its own, which a harness never runs:
+
+| Command | Does | See |
+|---|---|---|
+| `backup <file>` | Write the center's identity and state to a file that a passphrase protects | [backup](backup.md#the-center) |
+| `restore <file>` | Put a backup in place of this center's, or on another machine | [backup](backup.md#the-center) |
+| `install` | Install the center as a service under a user of its own (Linux with systemd, as root) | [center](center.md#run-it-as-a-service) |
+| `update [--from FILE]` | Put the latest release in place and restart the service | [center](center.md#update) |
+| `uninstall [--purge]` | Remove the service, its user and the program | [center](center.md#uninstall) |

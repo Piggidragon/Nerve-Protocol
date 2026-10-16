@@ -28,13 +28,15 @@ pub mod method {
     pub const STREAM_CLOSE: &str = "stream.close";
     pub const SESSION_END: &str = "session.end";
     pub const BYE: &str = "bye";
-    // Key rotation (§4.9), only between sides that both name the feature
+    // Key rotation (§4.10), only between sides that both name the feature
     // `rotate`.
     pub const KEY_ROTATE: &str = "key.rotate";
     pub const KEY_ROTATED: &str = "key.rotated";
     pub const KEY_RETIRE: &str = "key.retire";
     pub const KEY_RETIRED: &str = "key.retired";
     pub const CENTER_ROTATE: &str = "center.rotate";
+    pub const ACK: &str = "ack";
+    pub const WITHDRAWN: &str = "withdrawn";
 }
 
 /// Limits a side announces for what it receives.
@@ -111,6 +113,35 @@ pub struct Hello {
     /// than features.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub features: Vec<String>,
+    /// The link this connection carries, for a node that can resume links
+    /// (§4.9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<Resume>,
+}
+
+/// `hello.resume`: the id of the link the node wants to carry on (or a new
+/// one), and how many counted frames it read of it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Resume {
+    pub link: String,
+    pub got: u64,
+}
+
+/// `welcome.resume`: whether the center carries on the link the node named,
+/// and how many counted frames of it the center read. Sent only to a node
+/// whose hello had `resume`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Resumed {
+    pub resumed: bool,
+    pub got: u64,
+}
+
+/// `ack {got}`: the sender read the first `got` counted frames of the link.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Ack {
+    pub got: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -123,6 +154,8 @@ pub struct Welcome {
     /// whose hello named features: an older node refuses the field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub features: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume: Option<Resumed>,
 }
 
 /// `key.rotate` (node → center): the node's new key for this center, signed
@@ -459,6 +492,7 @@ mod tests {
             version: "0".into(),
             limits: Limits::default(),
             features: None,
+            resume: None,
         };
         assert!(serde_json::to_value(&w).unwrap().get("features").is_none());
         let w: Welcome =

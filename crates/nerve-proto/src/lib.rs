@@ -45,6 +45,49 @@ pub fn connect_message(center_id: &str, nonce: &[u8]) -> Vec<u8> {
     m
 }
 
+/// The feature of key rotation (docs/dev/spec/protocol.md §1.1, §4.10), named
+/// in `hello.features` and `welcome.features`.
+pub const FEATURE_ROTATE: &str = "rotate";
+/// The features this implementation speaks.
+pub const FEATURES: &[&str] = &[FEATURE_ROTATE];
+
+/// How long a replaced key stays valid after a rotation (§4.10): seven days.
+pub const ROTATE_GRACE_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// What the replaced node key signs before the center id and the new key.
+pub const ROTATE_NODE_CONTEXT: &[u8] = b"nerve-rotate-node/0";
+/// What the node's current key signs to end the grace of its old key.
+pub const RETIRE_NODE_CONTEXT: &[u8] = b"nerve-retire-node/0";
+/// What the center's old key signs before the center id and the new pin.
+pub const ROTATE_CENTER_CONTEXT: &[u8] = b"nerve-rotate-center/0";
+
+fn signed(context: &[u8], center_id: &str, tail: &[u8]) -> Vec<u8> {
+    let mut m = Vec::with_capacity(context.len() + center_id.len() + tail.len());
+    m.extend_from_slice(context);
+    m.extend_from_slice(center_id.as_bytes());
+    m.extend_from_slice(tail);
+    m
+}
+
+/// The bytes both node keys sign in `key.rotate`:
+/// `"nerve-rotate-node/0" || center_id || new public key (32 raw bytes)`.
+pub fn rotate_node_message(center_id: &str, new_key: &[u8]) -> Vec<u8> {
+    signed(ROTATE_NODE_CONTEXT, center_id, new_key)
+}
+
+/// The bytes the node's current key signs in `key.retire`:
+/// `"nerve-retire-node/0" || center_id || that current public key (32 raw
+/// bytes)`.
+pub fn retire_node_message(center_id: &str, current_key: &[u8]) -> Vec<u8> {
+    signed(RETIRE_NODE_CONTEXT, center_id, current_key)
+}
+
+/// The bytes the center's old key signs in `center.rotate`:
+/// `"nerve-rotate-center/0" || center_id || the new pin (its 32 raw bytes)`.
+pub fn rotate_center_message(center_id: &str, new_pin: &[u8]) -> Vec<u8> {
+    signed(ROTATE_CENTER_CONTEXT, center_id, new_pin)
+}
+
 /// Default limits (docs/dev/spec/protocol.md §5.5): what a side receives unless it
 /// announces otherwise.
 pub mod limits {
@@ -101,5 +144,22 @@ mod tests {
     fn connect_message_layout() {
         let m = connect_message("c1", &[1, 2]);
         assert_eq!(m, b"nerve-connect/0c1\x01\x02");
+    }
+
+    #[test]
+    fn rotation_message_layouts() {
+        assert_eq!(
+            rotate_node_message("c1", &[7]),
+            b"nerve-rotate-node/0c1\x07"
+        );
+        assert_eq!(
+            retire_node_message("c1", &[7]),
+            b"nerve-retire-node/0c1\x07"
+        );
+        assert_eq!(
+            rotate_center_message("c1", &[7]),
+            b"nerve-rotate-center/0c1\x07"
+        );
+        assert_eq!(ROTATE_GRACE_MS, 604_800_000);
     }
 }

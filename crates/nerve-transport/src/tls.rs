@@ -25,6 +25,16 @@ pub fn pin_of_spki(spki_der: &[u8]) -> String {
     URL_SAFE_NO_PAD.encode(ring::digest::digest(&ring::digest::SHA256, spki_der))
 }
 
+/// base64url without padding, as pins and `center.rotate` carry bytes.
+pub fn b64url(bytes: &[u8]) -> String {
+    URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// The bytes of [`b64url`] text; `None` when it is not that.
+pub fn unb64url(text: &str) -> Option<Vec<u8>> {
+    URL_SAFE_NO_PAD.decode(text).ok()
+}
+
 /// Checks a pin's form and returns its 32 bytes.
 pub fn decode_pin(pin: &str) -> Result<[u8; 32], String> {
     let raw = URL_SAFE_NO_PAD
@@ -63,6 +73,66 @@ pub fn spki_of(cert: &[u8]) -> Option<&[u8]> {
     Some(&rest[..rest.len() - after.len()])
 }
 
+/// The key algorithms a center's key may have for a rotation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpkiAlg {
+    P256,
+    P384,
+    Ed25519,
+}
+
+/// The AlgorithmIdentifier of each, as DER: id-ecPublicKey with its curve,
+/// and id-Ed25519.
+const ALG_P256: &[u8] = &[
+    0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48,
+    0xce, 0x3d, 0x03, 0x01, 0x07,
+];
+const ALG_P384: &[u8] = &[
+    0x30, 0x10, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x05, 0x2b, 0x81, 0x04,
+    0x00, 0x22,
+];
+const ALG_ED25519: &[u8] = &[0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70];
+
+/// The algorithm and the raw public key of a SubjectPublicKeyInfo; `None`
+/// for any other algorithm or a malformed one.
+fn spki_key(spki: &[u8]) -> Option<(SpkiAlg, &[u8])> {
+    let (tag, body, rest) = der_element(spki)?;
+    if tag != 0x30 || !rest.is_empty() {
+        return None;
+    }
+    let (_, _, after_alg) = der_element(body)?;
+    let alg_id = &body[..body.len() - after_alg.len()];
+    let alg = match alg_id {
+        a if a == ALG_P256 => SpkiAlg::P256,
+        a if a == ALG_P384 => SpkiAlg::P384,
+        a if a == ALG_ED25519 => SpkiAlg::Ed25519,
+        _ => return None,
+    };
+    let (tag, bits, rest) = der_element(after_alg)?;
+    // A BIT STRING without unused bits, and nothing after it.
+    if tag != 0x03 || !rest.is_empty() || bits.first() != Some(&0) {
+        return None;
+    }
+    Some((alg, &bits[1..]))
+}
+
+/// Whether `sig` is a signature over `message` by the key of the
+/// SubjectPublicKeyInfo `spki` (DER), as [`ServerIdentity::sign`] makes it.
+pub fn verify_spki_signature(spki: &[u8], message: &[u8], sig: &[u8]) -> bool {
+    use ring::signature::{ECDSA_P256_SHA256_ASN1, ECDSA_P384_SHA384_ASN1, ED25519};
+    let Some((alg, key)) = spki_key(spki) else {
+        return false;
+    };
+    let alg: &dyn ring::signature::VerificationAlgorithm = match alg {
+        SpkiAlg::P256 => &ECDSA_P256_SHA256_ASN1,
+        SpkiAlg::P384 => &ECDSA_P384_SHA384_ASN1,
+        SpkiAlg::Ed25519 => &ED25519,
+    };
+    ring::signature::UnparsedPublicKey::new(alg, key)
+        .verify(message, sig)
+        .is_ok()
+}
+
 /// The tag, contents and remainder of the DER element at the start of `d`.
 fn der_element(d: &[u8]) -> Option<(u8, &[u8], &[u8])> {
     let tag = *d.first()?;
@@ -98,40 +168,53 @@ fn provider() -> Arc<CryptoProvider> {
 /// The client configuration for a center: pinned when `pin` is set, else the
 /// system's roots.
 pub fn client_config(pin: Option<&str>) -> Result<Arc<ClientConfig>, String> {
+    match pin {
+        Some(p) => client_config_pins(&[p]),
+        None => client_config_pins(&[]),
+    }
+}
+
+/// The client configuration for a center that may present any of `pins`:
+/// the one it paired with and, while a rotation of the center's key is in
+/// its grace (docs/dev/spec/protocol.md §4.10), the other one. No pin: the
+/// system's roots.
+pub fn client_config_pins(pins: &[&str]) -> Result<Arc<ClientConfig>, String> {
     let provider = provider();
     let builder = ClientConfig::builder_with_provider(provider.clone())
         .with_safe_default_protocol_versions()
         .map_err(|e| e.to_string())?;
-    let config = match pin {
-        Some(pin) => builder
+    let config = if pins.is_empty() {
+        let loaded = rustls_native_certs::load_native_certs();
+        let mut roots = rustls::RootCertStore::empty();
+        let (added, _) = roots.add_parsable_certificates(loaded.certs);
+        if added == 0 {
+            return Err(
+                "no system root certificates found; pair with a link that carries the certificate pin"
+                    .into(),
+            );
+        }
+        builder.with_root_certificates(roots).with_no_client_auth()
+    } else {
+        builder
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(PinVerifier {
-                pin: decode_pin(pin)?,
+                pins: pins
+                    .iter()
+                    .map(|p| decode_pin(p))
+                    .collect::<Result<_, _>>()?,
                 algs: provider.signature_verification_algorithms,
             }))
-            .with_no_client_auth(),
-        None => {
-            let loaded = rustls_native_certs::load_native_certs();
-            let mut roots = rustls::RootCertStore::empty();
-            let (added, _) = roots.add_parsable_certificates(loaded.certs);
-            if added == 0 {
-                return Err(
-                    "no system root certificates found; pair with a link that carries the certificate pin"
-                        .into(),
-                );
-            }
-            builder.with_root_certificates(roots).with_no_client_auth()
-        }
+            .with_no_client_auth()
     };
     Ok(Arc::new(config))
 }
 
-/// Accepts exactly the pinned key. The handshake signature is still verified, so
+/// Accepts exactly the pinned keys. The handshake signature is still verified, so
 /// the server has to hold the private key; name and expiry do not matter, as with
 /// an ssh host key.
 #[derive(Debug)]
 struct PinVerifier {
-    pin: [u8; 32],
+    pins: Vec<[u8; 32]>,
     algs: WebPkiSupportedAlgorithms,
 }
 
@@ -147,8 +230,8 @@ impl ServerCertVerifier for PinVerifier {
         let spki = spki_of(end_entity.as_ref())
             .ok_or(Error::InvalidCertificate(CertificateError::BadEncoding))?;
         let got = ring::digest::digest(&ring::digest::SHA256, spki);
-        // The pin is public (it is in the pairing link), so a plain comparison is fine.
-        if got.as_ref() == self.pin {
+        // The pins are public (they are in the pairing link), so a plain comparison is fine.
+        if self.pins.iter().any(|p| got.as_ref() == p) {
             Ok(ServerCertVerified::assertion())
         } else {
             Err(Error::InvalidCertificate(
@@ -204,6 +287,44 @@ impl ServerIdentity {
 
     pub fn pin(&self) -> String {
         pin_of_cert(&self.cert_der).unwrap_or_default()
+    }
+
+    /// The certificate's SubjectPublicKeyInfo in DER.
+    pub fn spki(&self) -> Vec<u8> {
+        spki_of(&self.cert_der).unwrap_or_default().to_vec()
+    }
+
+    /// Signs `message` with the identity's key, as [`verify_spki_signature`]
+    /// checks it against [`ServerIdentity::spki`]: ECDSA (ASN.1) for a P-256
+    /// or P-384 key, Ed25519 for an Ed25519 key. Other keys cannot sign a
+    /// rotation (docs/dev/spec/protocol.md §4.10).
+    pub fn sign(&self, message: &[u8]) -> Result<Vec<u8>, String> {
+        use ring::signature::{
+            ECDSA_P256_SHA256_ASN1_SIGNING, ECDSA_P384_SHA384_ASN1_SIGNING, EcdsaKeyPair,
+            EcdsaSigningAlgorithm, Ed25519KeyPair,
+        };
+        let spki = self.spki();
+        let (alg, _) = spki_key(&spki).ok_or(
+            "the center's key is not an ECDSA P-256, P-384 or Ed25519 key, so it cannot sign a rotation",
+        )?;
+        let rng = ring::rand::SystemRandom::new();
+        let bad = "the center's private key does not read as its certificate says";
+        let ecdsa = |a: &'static EcdsaSigningAlgorithm| {
+            EcdsaKeyPair::from_pkcs8(a, &self.key_der, &rng)
+                .map_err(|_| bad.to_string())?
+                .sign(&rng, message)
+                .map(|s| s.as_ref().to_vec())
+                .map_err(|_| "signing with the center's key failed".to_string())
+        };
+        match alg {
+            SpkiAlg::P256 => ecdsa(&ECDSA_P256_SHA256_ASN1_SIGNING),
+            SpkiAlg::P384 => ecdsa(&ECDSA_P384_SHA384_ASN1_SIGNING),
+            SpkiAlg::Ed25519 => Ok(Ed25519KeyPair::from_pkcs8_maybe_unchecked(&self.key_der)
+                .map_err(|_| bad.to_string())?
+                .sign(message)
+                .as_ref()
+                .to_vec()),
+        }
     }
 
     /// The certificate and key as one PEM text.
@@ -303,5 +424,75 @@ mod tests {
         assert!(decode_pin(&id.pin()).is_ok());
         assert!(back.server_config().is_ok());
         assert!(ServerIdentity::from_pem("junk").is_err());
+    }
+
+    /// A self-signed identity with an Ed25519 key, as an owner might put in
+    /// place of the generated P-256 one.
+    fn ed25519_identity() -> ServerIdentity {
+        let kp = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&kp)
+            .unwrap();
+        ServerIdentity {
+            cert_der: cert.der().to_vec(),
+            key_der: kp.serialize_der(),
+        }
+    }
+
+    #[test]
+    fn a_center_key_signs_what_its_spki_verifies() {
+        for (old, new) in [
+            (
+                ServerIdentity::generate(&[]).unwrap(),
+                ServerIdentity::generate(&[]).unwrap(),
+            ),
+            (ed25519_identity(), ed25519_identity()),
+        ] {
+            let msg = b"nerve-rotate-center/0c1 new pin";
+            let sig = old.sign(msg).unwrap();
+            assert!(verify_spki_signature(&old.spki(), msg, &sig));
+            // Not another message, not under another key, not cut short.
+            assert!(!verify_spki_signature(&old.spki(), b"other", &sig));
+            assert!(!verify_spki_signature(&new.spki(), msg, &sig));
+            assert!(!verify_spki_signature(&old.spki(), msg, &sig[1..]));
+            let mut spki = old.spki();
+            spki.push(0);
+            assert!(!verify_spki_signature(&spki, msg, &sig));
+            assert_eq!(pin_of_spki(&old.spki()), old.pin());
+        }
+        assert!(!verify_spki_signature(&[], b"m", b"s"));
+    }
+
+    #[test]
+    fn several_pins_accept_each_of_their_keys_and_no_other() {
+        let (a, b, c) = (
+            ServerIdentity::generate(&[]).unwrap(),
+            ServerIdentity::generate(&[]).unwrap(),
+            ServerIdentity::generate(&[]).unwrap(),
+        );
+        let (pa, pb) = (a.pin(), b.pin());
+        let v = PinVerifier {
+            pins: [pa.as_str(), pb.as_str()]
+                .iter()
+                .map(|p| decode_pin(p).unwrap())
+                .collect(),
+            algs: provider().signature_verification_algorithms,
+        };
+        let name = ServerName::try_from("localhost").unwrap();
+        let check = |id: &ServerIdentity| {
+            v.verify_server_cert(
+                &CertificateDer::from(id.cert_der.clone()),
+                &[],
+                &name,
+                &[],
+                UnixTime::now(),
+            )
+            .is_ok()
+        };
+        assert!(check(&a) && check(&b));
+        assert!(!check(&c));
+        assert!(client_config_pins(&[&pa, &pb]).is_ok());
+        assert!(client_config_pins(&[&pa, "short"]).is_err());
     }
 }

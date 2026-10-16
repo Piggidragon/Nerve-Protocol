@@ -12,7 +12,7 @@
 ### Backup, restore and moving
 
 - `nerve-node backup <file>` and `nerve-node restore <file>`, and the same for `nerve-center`, write the config and keys (the center's certificate, key and state) to one file that a passphrase protects (PBKDF2-HMAC-SHA256 and ChaCha20-Poly1305, at least 12 characters), and put them back on the same machine or another, so a node or a center can be moved without pairing again ([#122](https://github.com/Piggidragon/Nerve-Protocol/issues/122)).
-- Keys in the system keyring, and a proxy's header values, go into a backup only with `--include-keyring`. A restore never goes under a running node or center, refuses a backup of another node or center unless you add `--replace`, keeps every pin as saved and sets the sudo switch off. These are two of `nerve-center`'s subcommands now; a harness still starts it without one.
+- Keys in the system keyring, and a proxy's header values, go into a backup only with `--include-keyring`. A restore never goes under a running node or center, refuses a backup of another node or center unless you add `--replace`, keeps every pin as saved, except a newer one here from a key rotation (or set by hand since), which stays, and a center's old pin whose time ended here, which does not come back, and sets the sudo switch off. These are two of `nerve-center`'s subcommands now; a harness still starts it without one.
 
 ### The center as a service
 
@@ -30,6 +30,13 @@
 
 - Every command has a time limit now. A call without `timeout_ms` gets `limits.default_timeout_secs` (10 minutes), and a `timeout_ms` above `limits.max_timeout_secs` (1 hour) is cut to it. A command past its limit is killed and the call fails with `timeout`, as before; the message says which limit it was. Before, a command without `timeout_ms` ran until it ended or its session did. The agent sees both numbers in the description of `exec_run` and in its `timeout_ms` parameter, and machines with other limits are separate tools. Only the owner sets them, for example `nerve-node config set limits.max_timeout_secs 86400` for jobs that run a day; a center cannot, also with the settings grant ([#120](https://github.com/Piggidragon/Nerve-Protocol/issues/120)).
 - A 0.0.3 node refuses a `node.toml` that holds either key. Before you go back to 0.0.3, remove them with `nerve-node config unset limits.default_timeout_secs` and `limits.max_timeout_secs`. A file in which you set neither reads on 0.0.3, as the defaults are not written.
+
+### Key rotation
+
+- A machine's key for a center, and the center's own TLS key, can be replaced without pairing again ([#121](https://github.com/Piggidragon/Nerve-Protocol/issues/121)). `nerve-node center rotate-key` sends the machine's new key to the center over the link, signed with the old one; in the center's web UI, Settings, **Rotate key** makes a new center key that the linked machines learn, signed with the old one. The old key stays valid for 7 days, or until its owner ends that (`--end-grace`, **Serve the new key now**). The machine keeps its id. Each rotation is in the node's audit log and the center's log.
+- The protocol gets additive features (`hello.features`, `welcome.features`, spec §1.1) and the feature `rotate` (spec §4.10). A node or center older than 0.0.4 keeps working with a newer one, but cannot rotate; a node older than 0.0.4 has to pair again after its center's key was rotated.
+- A 0.0.3 node refuses a `node.toml` that holds `public_key` or `key_rotations` under a pairing, which a rotation of the machine's key writes, and cannot use the rotated key anyway: such a pairing has to be paired again on 0.0.3.
+- A 0.0.3 node refuses a `node.toml` that holds `pin_rotations` or `old_pin` under a pairing. A rotation of the center's key writes both (`old_pin` for up to 7 days; the running node drops it once that time is over), and so does setting a center's pin by hand with `config set center.<name>.pin`, which writes `pin_rotations`. Such a pairing works on 0.0.3 with the new pin once the center serves its new key (after its 7 days, or **Serve the new key now**); until then 0.0.3 cannot link with it. So go back only after that, and before you do, remove them with `nerve-node config unset center.<name>.pin_rotations` and `nerve-node config unset center.<name>.old_pin`.
 
 ## 0.0.3
 

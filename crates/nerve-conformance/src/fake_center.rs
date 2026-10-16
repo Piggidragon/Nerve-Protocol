@@ -195,12 +195,38 @@ pub async fn handshake(
     Ok(hello)
 }
 
+/// [`handshake`] against the node key `public_key` (hex), which a rotation
+/// may have replaced since the pairing, answering with `features` in the
+/// welcome when given (docs/dev/spec/protocol.md §1.1); without, as a center
+/// older than features.
+pub async fn handshake_with(
+    conn: &mut Conn<TcpStream>,
+    center_id: &str,
+    node_id: &str,
+    public_key: &str,
+    features: Option<&[&str]>,
+) -> Result<Hello, String> {
+    let hello = hello_with(conn, center_id, node_id, public_key).await?;
+    welcome_with(conn, None, features).await?;
+    Ok(hello)
+}
+
 /// The center's handshake up to the checked hello: challenge, hello check.
 /// Returns the hello, or the bye reason it sent.
 pub async fn hello(
     conn: &mut Conn<TcpStream>,
     center_id: &str,
     paired: &Paired,
+) -> Result<Hello, String> {
+    hello_with(conn, center_id, &paired.node_id, &paired.request.public_key).await
+}
+
+/// [`hello`] against the node key `public_key` (hex).
+pub async fn hello_with(
+    conn: &mut Conn<TcpStream>,
+    center_id: &str,
+    node_id: &str,
+    public_key: &str,
 ) -> Result<Hello, String> {
     let nonce = nerve_transport::keys::random_bytes(32);
     conn.notify(
@@ -220,13 +246,9 @@ pub async fn hello(
             return Err(format!("expected hello, got {other:?}"));
         }
     };
-    let signed = nerve_transport::keys::verify_connect(
-        &paired.request.public_key,
-        center_id,
-        &nonce,
-        &hello.auth.sig,
-    );
-    if !signed || hello.node_id != paired.node_id {
+    let signed =
+        nerve_transport::keys::verify_connect(public_key, center_id, &nonce, &hello.auth.sig);
+    if !signed || hello.node_id != node_id {
         conn.bye("protocol_error").await;
         return Err("the hello signature does not verify".into());
     }
@@ -243,9 +265,21 @@ pub async fn welcome(
     conn: &mut Conn<TcpStream>,
     resume: Option<msg::Resumed>,
 ) -> Result<(), String> {
+    welcome_with(conn, resume, None).await
+}
+
+/// [`welcome`], with `features` when given (§1.1).
+pub async fn welcome_with(
+    conn: &mut Conn<TcpStream>,
+    resume: Option<msg::Resumed>,
+    features: Option<&[&str]>,
+) -> Result<(), String> {
     let mut w = json!({"version": PROTOCOL_VERSION, "limits": msg::Limits::default()});
     if let Some(r) = resume {
         w["resume"] = serde_json::to_value(r).map_err(|e| e.to_string())?;
+    }
+    if let Some(f) = features {
+        w["features"] = json!(f);
     }
     conn.notify(method::WELCOME, w).await
 }

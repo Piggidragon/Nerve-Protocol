@@ -76,6 +76,14 @@ impl NodePaths {
         self.config_dir.join("keys").join(format!("{center}.key"))
     }
 
+    /// The node's new key for `center` while a rotation of it is under way
+    /// (crate::rotate); a center name holds no `.`, so no center's key.
+    pub fn next_key_file(&self, center: &str) -> PathBuf {
+        self.config_dir
+            .join("keys")
+            .join(format!("{center}.next.key"))
+    }
+
     /// The relay's TLS certificate and key (crate::relay), beside the
     /// center keys; not a `.key` name, so no center's.
     pub fn relay_tls_file(&self) -> PathBuf {

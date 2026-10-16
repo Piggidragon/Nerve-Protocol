@@ -522,14 +522,36 @@ pub async fn open(
     pin: Option<&str>,
     proxy: Option<&Proxy>,
 ) -> Result<BoxIo, String> {
+    open_pins(url, pin.as_slice(), proxy).await
+}
+
+/// [`open`] for a center that may present any of `pins`: while a rotation
+/// of its key is in its grace (docs/dev/spec/protocol.md §4.10) the node
+/// takes the old pin and the new one. No pin: the system's roots.
+pub async fn open_pins(
+    url: &CenterUrl,
+    pins: &[&str],
+    proxy: Option<&Proxy>,
+) -> Result<BoxIo, String> {
+    open_pins_seen(url, pins, proxy).await.map(|(io, _)| io)
+}
+
+/// [`open_pins`], also giving the pin of the certificate the center showed
+/// (`None` over plain HTTP): a link opened under an old pin ends when that
+/// pin stops counting (docs/dev/spec/protocol.md §4.10).
+pub async fn open_pins_seen(
+    url: &CenterUrl,
+    pins: &[&str],
+    proxy: Option<&Proxy>,
+) -> Result<(BoxIo, Option<String>), String> {
     if !url.tls {
         let tcp = direct(url, None).await?;
         #[cfg(target_os = "linux")]
         check_local_peer(&tcp)?;
-        return Ok(Box::new(tcp));
+        return Ok((Box::new(tcp), None));
     }
     let tcp = reach(url, proxy).await?;
-    let config = crate::tls::client_config(pin)?;
+    let config = crate::tls::client_config_pins(pins)?;
     let name = ServerName::try_from(url.host.clone())
         .map_err(|_| format!("bad TLS server name {}", url.host))?;
     let tls = tokio::time::timeout(
@@ -538,8 +560,14 @@ pub async fn open(
     )
     .await
     .map_err(|_| format!("TLS handshake with {url} timed out"))?
-    .map_err(|e| tls_error(url, pin.is_some(), &e))?;
-    Ok(Box::new(tls))
+    .map_err(|e| tls_error(url, !pins.is_empty(), &e))?;
+    let seen = tls
+        .get_ref()
+        .1
+        .peer_certificates()
+        .and_then(|c| c.first())
+        .and_then(|c| crate::tls::pin_of_cert(c.as_ref()));
+    Ok((Box::new(tls), seen))
 }
 
 /// This process's effective user id (0 off Unix).
@@ -553,6 +581,15 @@ pub fn euid() -> u32 {
     0
 }
 
+/// What a refused pinned certificate's message says, so a caller can tell
+/// that refusal apart (and add what to do, which depends on how often it
+/// happened: right after a rotation of the center's key the center may not
+/// serve the new key yet).
+pub const PIN_REFUSED: &str = "does not carry the key pinned at pairing";
+
+/// What to do about a pinned certificate refused again and again.
+pub const PIN_ADVICE: &str = "If the center got a new key and this node missed its rotation (it was away longer than the grace), pair again with a new pairing link.";
+
 /// A refused certificate in words that say what happened and what to do; rustls
 /// alone says `ApplicationVerificationFailure` or `CaUsedAsEndEntity`.
 fn tls_error(url: &CenterUrl, pinned: bool, e: &std::io::Error) -> String {
@@ -565,7 +602,7 @@ fn tls_error(url: &CenterUrl, pinned: bool, e: &std::io::Error) -> String {
         });
     match refused {
         Some(_) if pinned => format!(
-            "TLS with {url}: the center's certificate does not carry the key pinned at pairing. Its key changed (a new certificate), or another server answers there. If the center got a new certificate, pair again with a new pairing link."
+            "TLS with {url}: the center's certificate {PIN_REFUSED}. Its key changed (a new certificate), or another server answers there."
         ),
         Some(c) => {
             use rustls::CertificateError as C;

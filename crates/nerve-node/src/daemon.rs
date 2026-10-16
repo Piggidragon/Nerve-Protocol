@@ -79,6 +79,9 @@ pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// Where the params of an awaited notification go.
+type Answer = tokio::sync::oneshot::Sender<serde_json::Map<String, Value>>;
+
 /// The sending side of a link, shared with the calls running on it. A link
 /// the center can resume outlives a drop (nerve_proto::resume): what the
 /// node sends meanwhile is kept, and goes out when the link resumes.
@@ -89,6 +92,12 @@ pub(crate) struct LinkHandle {
     /// once, before it is numbered and kept: the password it may carry is
     /// the one held then, and a frame kept for a resume can outlive it.
     scrub: Scrub,
+    /// Whether the center named the feature `rotate` in its welcome
+    /// (docs/dev/spec/protocol.md §4.10).
+    rotate: std::sync::atomic::AtomicBool,
+    /// The answer a key rotation waits for: the method, and where its
+    /// params go (crate::rotate).
+    waiting: Mutex<Option<(&'static str, Answer)>>,
 }
 
 /// What [`LinkHandle`] scrubs a frame with.
@@ -129,6 +138,47 @@ impl LinkHandle {
             }),
             subs: Mutex::default(),
             scrub,
+            rotate: Default::default(),
+            waiting: Mutex::default(),
+        }
+    }
+
+    /// Notes that the center speaks key rotation.
+    pub fn set_rotate(&self, on: bool) {
+        self.rotate.store(on, Ordering::SeqCst);
+    }
+
+    pub fn rotate(&self) -> bool {
+        self.rotate.load(Ordering::SeqCst)
+    }
+
+    /// Waits for the next notification `method` from the center: its params,
+    /// or an error when the link ended first. One waits at a time; a newer
+    /// wait replaces an older one, which then ends.
+    pub fn expect(
+        &self,
+        method: &'static str,
+    ) -> tokio::sync::oneshot::Receiver<serde_json::Map<String, Value>> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        *lock(&self.waiting) = Some((method, tx));
+        rx
+    }
+
+    /// The link ended: a wait for an answer ends with it.
+    pub fn ended(&self) {
+        lock(&self.waiting).take();
+    }
+
+    /// Hands a notification to whoever waits for it; `false` when nobody
+    /// does, and it is ignored.
+    pub fn answer(&self, method: &str, params: serde_json::Map<String, Value>) -> bool {
+        let mut w = lock(&self.waiting);
+        match w.take() {
+            Some((m, tx)) if m == method => tx.send(params).is_ok(),
+            other => {
+                *w = other;
+                false
+            }
         }
     }
 
@@ -340,6 +390,12 @@ impl LinkHandle {
 pub(crate) struct CenterState {
     pub link: Mutex<Option<Arc<LinkHandle>>>,
     pub status: Mutex<String>,
+    /// Held while a rotation of the node's key for this center runs, so the
+    /// owner's command and the one a new link resumes do not cross.
+    pub rotating: tokio::sync::Mutex<()>,
+    /// When dropping an expired old pin last failed to save; it is tried
+    /// again only a while later (crate::rotate::drop_old_pin).
+    pub old_pin_failed: Mutex<Option<std::time::Instant>>,
 }
 
 impl CenterState {
@@ -629,6 +685,8 @@ impl Shared {
                 Arc::new(CenterState {
                     link: Mutex::new(None),
                     status: Mutex::new("not connected".into()),
+                    rotating: tokio::sync::Mutex::new(()),
+                    old_pin_failed: Mutex::new(None),
                 })
             })
             .clone()
@@ -638,6 +696,13 @@ impl Shared {
     pub fn emit(&self, center: &str, cap: &str, name: &str, data: Value) {
         if let Some(l) = lock(&self.centers).get(center).and_then(|c| c.link()) {
             l.event(cap, name, data);
+        }
+    }
+
+    /// Records a rotation of a key in the audit log (crate::rotate).
+    pub fn audit_key(&self, center: &str, event: &str, detail: &str) {
+        if let Err(err) = lock(&self.store).audit().key(center, event, detail) {
+            tracing::error!("the audit log cannot be written: {err}");
         }
     }
 
@@ -655,16 +720,23 @@ impl Shared {
     }
 
     /// Marks bookkeeping on a center (revoked, unknown) and tells everyone.
-    pub fn mark_center(&self, name: &str, f: impl FnOnce(&mut nerve_policy::CenterEntry)) {
+    /// Says whether it was saved: when not, the config in force is as it
+    /// was.
+    pub fn mark_center(&self, name: &str, f: impl FnOnce(&mut nerve_policy::CenterEntry)) -> bool {
         let r = lock(&self.store).mark(|c| {
             if let Some(e) = c.center_mut(name) {
                 f(e);
             }
         });
-        if let Err(e) = r {
-            tracing::error!("cannot save the config: {e}");
-        }
+        let saved = match r {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!("cannot save the config: {e}");
+                false
+            }
+        };
         self.bump();
+        saved
     }
 
     // Only the Unix control socket asks this; Windows' pipe asks the jobs of
@@ -1259,6 +1331,7 @@ pub(crate) async fn pipe_control(
     }
     match method {
         "status" => Reply::Ok(shared.status()),
+        "center.rotate-key" => rotate_key(shared, &params).await,
         "folder.add" | "folder.set" | "folder.rm" => {
             let (center, change) =
                 match crate::folder_change::FolderChange::from_request(method, params) {
@@ -1318,6 +1391,24 @@ pub(crate) async fn pipe_control(
     }
 }
 
+/// `center.rotate-key {center, end_grace}`: the owner rotates the node's key
+/// for a center, or ends the grace of its old key (crate::rotate).
+async fn rotate_key(shared: &Arc<Shared>, params: &Value) -> nerve_transport::ctl::Reply {
+    use nerve_transport::ctl::Reply;
+    let Some(center) = params.get("center").and_then(Value::as_str) else {
+        return Reply::Err("center is missing".into());
+    };
+    let r = if params.get("end_grace").and_then(Value::as_bool) == Some(true) {
+        crate::rotate::end_grace(shared, center).await
+    } else {
+        crate::rotate::rotate(shared, center).await
+    };
+    match r {
+        Ok(v) => Reply::Ok(v),
+        Err(e) => Reply::Err(e),
+    }
+}
+
 /// Why a request without the control socket's token is refused.
 #[cfg(unix)]
 const NO_TOKEN: &str = "refused: this request does not carry the control socket's token, which only the owner's own programs can read";
@@ -1344,6 +1435,13 @@ async fn answer(
         // Checking the password runs `sudo -v`, so it cannot block inside
         // `control`.
         "sudo.on" => sudo_on(shared, req.params, peer.pid).await,
+        // A rotation waits for the center's answer.
+        "center.rotate-key" => {
+            if shared.below_command(peer.pid) {
+                return nerve_transport::ctl::Reply::Err(FROM_A_COMMAND.into());
+            }
+            rotate_key(shared, &req.params).await
+        }
         // A capability provider attaches; its connection stays
         // (crate::provider).
         "hello" => {
@@ -1984,6 +2082,10 @@ mod tests {
                     paused: true,
                     revoked: false,
                     unknown: false,
+                    public_key: None,
+                    key_rotations: 0,
+                    pin_rotations: 0,
+                    old_pin: None,
                     policy: Default::default(),
                 });
                 Ok(())
@@ -2126,6 +2228,10 @@ mod tests {
                     paused: true,
                     revoked: false,
                     unknown: false,
+                    public_key: None,
+                    key_rotations: 0,
+                    pin_rotations: 0,
+                    old_pin: None,
                     policy: Default::default(),
                 });
                 Ok(())
@@ -2213,6 +2319,10 @@ mod tests {
                     paused: false,
                     revoked: false,
                     unknown: false,
+                    public_key: None,
+                    key_rotations: 0,
+                    pin_rotations: 0,
+                    old_pin: None,
                     policy: nerve_policy::CenterPolicy {
                         folders: vec![Folder {
                             path: wdir.display().to_string(),
@@ -2652,5 +2762,74 @@ mod confinement_tests {
         };
         assert_eq!(confinement_for(linux, true), linux);
         assert_eq!(confinement_for(linux, false), linux);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod old_pin_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// An expired old pin that cannot be dropped from node.toml (a full
+    /// disk) is not told as dropped, and is tried again only a while later.
+    #[tokio::test]
+    async fn an_old_pin_that_cannot_be_dropped_is_tried_again_later() {
+        let log = Log::new(Level::Info);
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("config"), d.path().join("state"));
+        let mut opts = NodeOptions::new(paths.clone());
+        opts.home = d.path().to_path_buf();
+        opts.ctl = false;
+        opts.log = Some(log.clone());
+        let daemon = Daemon::start(opts).await.unwrap();
+        let s = daemon.shared.clone();
+        lock(&s.store)
+            .update(|c| {
+                c.centers.push(nerve_policy::CenterEntry {
+                    name: "lab".into(),
+                    url: "http://127.0.0.1:1".into(),
+                    pin: Some("B".repeat(43)),
+                    center_id: "id-lab".into(),
+                    node_id: "n".into(),
+                    settings: Default::default(),
+                    paused: true,
+                    revoked: false,
+                    unknown: false,
+                    public_key: None,
+                    key_rotations: 0,
+                    pin_rotations: 0,
+                    old_pin: Some(nerve_policy::OldPin {
+                        pin: "A".repeat(43),
+                        until_ms: 1,
+                    }),
+                    policy: Default::default(),
+                });
+                Ok(())
+            })
+            .unwrap();
+        let old_pin = || s.config().centers[0].old_pin.clone();
+        let mode = |m| {
+            std::fs::set_permissions(&paths.config_dir, std::fs::Permissions::from_mode(m)).unwrap()
+        };
+        mode(0o500);
+        // Root writes anyway; then this test says nothing.
+        let writable = std::fs::write(paths.config_dir.join("probe"), b"x").is_ok();
+        let dropped = crate::rotate::drop_old_pin(&s, "lab");
+        mode(0o700);
+        if writable {
+            return;
+        }
+        assert!(!dropped);
+        assert!(old_pin().is_some());
+        assert!(lock(&s.center("lab").old_pin_failed).is_some());
+        // Writable again, but within the wait: not tried yet.
+        assert!(!crate::rotate::drop_old_pin(&s, "lab"));
+        assert!(old_pin().is_some());
+        // After the wait it is.
+        *lock(&s.center("lab").old_pin_failed) =
+            std::time::Instant::now().checked_sub(Duration::from_secs(601));
+        assert!(crate::rotate::drop_old_pin(&s, "lab"));
+        assert!(old_pin().is_none());
+        drop(daemon);
     }
 }

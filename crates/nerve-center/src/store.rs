@@ -42,6 +42,37 @@ pub struct Store {
     /// it for one run.
     #[serde(default)]
     pub log_level: Level,
+    /// The last rotation of the center's key (docs/dev/spec/protocol.md
+    /// §4.10), while nodes are told of it. Public values only: the keys are
+    /// in their PEM files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_rotation: Option<KeyRotation>,
+    /// How many rotations of its key the center started: a restore keeps
+    /// the keys of the state that is further along, here or in the backup.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub key_rotations: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
+/// A rotation of the center's TLS key: what `center.rotate` tells the
+/// nodes, and how far it got.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct KeyRotation {
+    pub started_ms: u64,
+    /// When the center serves the new key at the latest.
+    pub until_ms: u64,
+    /// The SubjectPublicKeyInfo of the old and the new key, base64url.
+    pub old_spki: String,
+    pub new_spki: String,
+    /// The old key's signature over the rotate message, base64url.
+    pub sig: String,
+    /// When the center started to serve the new key. It goes on telling the
+    /// nodes, with no grace left, so they drop the old pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_ms: Option<u64>,
 }
 
 fn d_retention() -> u32 {
@@ -63,6 +94,8 @@ impl Store {
             pair_code_minutes: PAIR_CODE_MINUTES,
             stats: BTreeMap::new(),
             log_level: Level::default(),
+            key_rotation: None,
+            key_rotations: 0,
         }
     }
 
@@ -83,6 +116,17 @@ impl Store {
 
     pub fn node_by_name(&self, name: &str) -> Option<&NodeRecord> {
         self.nodes.values().find(|n| n.name == name)
+    }
+
+    /// The node that holds `public_key`, as its key or as its old one in
+    /// the grace of a rotation.
+    pub fn node_by_key(&self, public_key: &str) -> Option<&NodeRecord> {
+        self.nodes.values().find(|n| {
+            n.public_key == public_key
+                || n.old_key
+                    .as_ref()
+                    .is_some_and(|o| o.public_key == public_key)
+        })
     }
 
     /// Today's statistics bucket of `node`.
@@ -110,8 +154,17 @@ pub struct NodeRecord {
     pub id: String,
     /// The center's name for the node; unique among this center's nodes.
     pub name: String,
-    /// The node's Ed25519 public key for this center, hex.
+    /// The node's Ed25519 public key for this center, hex. The node id stays
+    /// the one of the key it paired with when the key is rotated.
     pub public_key: String,
+    /// The key the node rotated away from, taken until its grace ends
+    /// (docs/dev/spec/protocol.md §4.10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_key: Option<OldKey>,
+    /// How many rotations of its key the node made here: a restore keeps
+    /// the keys of the record that is further along.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub key_rotations: u32,
     pub platform: String,
     pub arch: String,
     pub paired_ms: u64,
@@ -128,6 +181,14 @@ pub struct NodeRecord {
     /// The last full descriptor, so tools stay listed while the node is offline.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub descriptor: Option<Descriptor>,
+}
+
+/// A node's replaced key and the end of its grace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OldKey {
+    pub public_key: String,
+    /// Milliseconds since the Unix epoch; from then on the key is refused.
+    pub until_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,6 +282,8 @@ mod tests {
             id: id.into(),
             name: id.into(),
             public_key: "00".into(),
+            old_key: None,
+            key_rotations: 0,
             platform: "linux".into(),
             arch: "x86_64".into(),
             paired_ms: 1,

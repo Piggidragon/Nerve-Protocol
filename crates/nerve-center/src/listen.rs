@@ -26,11 +26,14 @@ pub async fn tcp(addr: &str) -> Result<TcpListener, String> {
         .map_err(|e| format!("cannot listen on {addr}: {e}"))
 }
 
-/// A bound listener that hands each accepted connection, after TLS when it
-/// has a TLS acceptor, to a handler.
+/// A bound listener that hands each accepted connection, after TLS with the
+/// center's key when it has one, to a handler.
 pub struct Server {
     pub listener: TcpListener,
-    pub tls: Option<TlsAcceptor>,
+    /// The center whose key TLS uses, taken anew for each connection: a
+    /// rotation of the key (docs/dev/spec/protocol.md §4.10) changes it
+    /// while the listener runs.
+    tls: Option<Center>,
 }
 
 impl Server {
@@ -53,11 +56,7 @@ impl Server {
                 "{local} is not a loopback address; plain HTTP is only served on loopback"
             ));
         }
-        let tls = if plain {
-            None
-        } else {
-            Some(TlsAcceptor::from(center.identity.server_config()?))
-        };
+        let tls = (!plain).then(|| center.clone());
         Ok(Server { listener, tls })
     }
 
@@ -94,7 +93,8 @@ impl Server {
                 let _permit = permit;
                 let io: BoxIo = match tls {
                     None => Box::new(tcp),
-                    Some(acc) => {
+                    Some(center) => {
+                        let acc = TlsAcceptor::from(center.server_config());
                         let hs = tokio::time::timeout(http::HEAD_TIMEOUT, acc.accept(tcp)).await;
                         match hs {
                             Ok(Ok(s)) => Box::new(s),

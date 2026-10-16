@@ -2921,6 +2921,10 @@ mod tests {
             paused: false,
             revoked: false,
             unknown: false,
+            public_key: None,
+            key_rotations: 0,
+            pin_rotations: 0,
+            old_pin: None,
             policy: policy(&work),
         };
         cfg.centers.push(entry.clone());
@@ -3093,6 +3097,10 @@ mod tests {
             paused: false,
             revoked: false,
             unknown: false,
+            public_key: None,
+            key_rotations: 0,
+            pin_rotations: 0,
+            old_pin: None,
             policy: CenterPolicy {
                 mode,
                 folders,
@@ -3404,6 +3412,10 @@ mod windows_tests {
             paused: false,
             revoked: false,
             unknown: false,
+            public_key: None,
+            key_rotations: 0,
+            pin_rotations: 0,
+            old_pin: None,
             policy: CenterPolicy {
                 folders: vec![Folder {
                     path: work.display().to_string(),

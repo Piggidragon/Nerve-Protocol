@@ -46,6 +46,17 @@ It never holds a token.
 1791834106607  relay  lab-pc from 10.0.0.7:51544 to center home: cut off by the owner after 2 h 5 min (81234 bytes up, 90211 down)
 ```
 
+A key rotation is one line, with the public keys or pins and never a private
+key ([pairing](pairing.md#rotate-the-machines-key)):
+
+```
+1791834106607  lab  key node-key: the center took the new key <hex> in place of <hex>, which it takes for 7 d more
+```
+
+The events are `node-key`, `node-key-refused`, `node-key-unanswered` and
+`node-key-grace-ended` for the machine's key, and `center-key`,
+`center-key-refused` and `center-key-grace-ended` for the center's.
+
 ## What the log holds
 
 - Targets: paths and command lines, cut at 512 characters.

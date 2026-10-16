@@ -57,7 +57,7 @@ writes.
 | Kind | Names |
 |---|---|
 | node | `node.toml`, `key/<center>` (one per pairing), `relay-tls`, `proxy-login`, `proxy-headers` |
-| center | `tls.pem`, `state.json` |
+| center | `tls.pem`, `state.json`, and `tls.next.pem` during the grace of a key rotation |
 
 `node.toml` is the config as the node reads it, verified (a refused config is
 not backed up) and without its MAC line. The MAC key
@@ -172,9 +172,47 @@ goes on with the note.
 whole by the center (a temporary file and a rename), so a backup of a running
 center is a state it had; only the statistics may lag by up to 5 seconds.
 
+During the grace of a rotation of the center's key (protocol §4.10) the new
+key is in `tls.next.pem`, and the nodes the center told pin it already. The
+backup takes it then: read first, kept only when the `state.json` read last
+still holds the rotation unfinished, and a restore checks that it is the key
+`key_rotation.new_spki` names. Without it, the restored center would drop the
+rotation and serve the old key for good, and every told node would be locked
+out once its old pin's time is over. A restore without `tls.next.pem`
+deletes one left in the state folder, unless it is the new key of a rotation
+made after the backup (below).
+
 A restore takes the center lock, checks `center_id` (the same center is
-restored, another needs `--replace`), writes `tls.pem` and then `state.json`,
-and puts the old `tls.pem` back if the second write fails.
+restored, another needs `--replace`), writes `tls.pem`, then `tls.next.pem`
+(or deletes one there), then `state.json`. When a write fails it puts back
+the `tls.pem` and the `tls.next.pem` that were there (or deletes the one that
+was not), so the old state meets its own keys.
+
+A restore over the same center keeps what was rotated after the backup, by
+counts in `state.json`. Where the state here counts more rotations of the
+center's key (`key_rotations`), its keys stay, as long as they are the ones
+it names: in a grace, the old key in `tls.pem`, the new one in
+`tls.next.pem` and the record; after it, the newest key in `tls.pem`. Its
+nodes were told the new keys. A backup made in the grace of the same
+rotation gives way to one that ended here (also early). Where a node's
+record here counts more rotations of the node's key (`key_rotations` of the
+record), its `public_key` and `old_key` stay: the node holds only its new
+key.
+
+A node restore keeps likewise what was rotated after the backup, for the same
+pairing (name, `center_id`, `node_id`), by the counts `key_rotations` and
+`pin_rotations` of each entry: where the config being replaced counts more,
+its `public_key` stays when that key is on the machine, over the older key in
+the backup, and its `pin` and `old_pin` stay. Where it counts fewer (an older
+copy of the node), the backup's stay. The same count with another key or pin
+keeps the backup's, with a note. A pin the owner sets by hand counts as a
+rotation the node took (the settings store raises `pin_rotations`). With the same count and the same
+pin, an `old_pin` here that is gone, or whose time is over, means the center
+ended its grace after the backup, maybe because the old key leaked: the
+backup's old pin does not come back, with a note. One here that still runs
+and ends a little sooner (each later notice of the same grace is taken from
+the center's time left, so it can end some milliseconds sooner) stays, without
+a note.
 
 ## Pins
 
@@ -183,12 +221,14 @@ restore does to it:
 
 | Pin | Kept in | Restore |
 |---|---|---|
-| A center's, held by its nodes | `center.<name>.pin` in `node.toml` | Kept as saved. The center keeps it by restoring `tls.pem` |
+| A center's, held by its nodes | `center.<name>.pin` in `node.toml` | Kept as saved, unless the config being replaced counts more `pin_rotations` (it was told a newer pin, or one was set by hand): then its `pin` and `old_pin` stay. With the same count and pin, a backup's `old_pin` whose time ended here does not come back. The center keeps it by restoring `tls.pem` |
 | The relay's | `relay.pin` in `node.toml`; its key in `relay-tls` | Kept; the key is checked against it. A relay whose key is missing does not listen until `relay set` makes a new key and pin |
 | An `https://` proxy's | `connection.pin` in `node.toml` | Kept, unless `--without-proxy` leaves the whole `connection` section out: the pin goes with the proxy, and `proxy set --pin` gives it again |
 
-A restore never changes a pin and never learns one; `--without-proxy` is the
-one case where a pin is dropped, and only the proxy's. A pairing that was ended
+A restore never learns a pin. It keeps the backup's, with three exceptions: a
+center's pin here that is further along (above) stays, a center's old pin
+whose time ended here does not come back, and `--without-proxy` drops the
+proxy's pin. A pairing that was ended
 on one side after the backup is not revived: the other side no longer knows
 the node's key.
 

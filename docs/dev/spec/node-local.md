@@ -182,6 +182,12 @@ Proxy).
   `relay-tls:<config folder>` and `proxy-login:<config folder>`. Each holds
   the key's text. No copy stays in a file.
 
+While a rotation of the key for a center waits for the center's answer
+(protocol §4.10), its new key is kept beside the old one, in
+`<config>/keys/<name>.next.key` or the entry `center-key-next:<name>:<config
+folder>`, and moves with the other keys. It replaces the key once the center
+took it, and goes when the center refuses it or the pairing is removed.
+
 The header values of a proxy, and the password of an `http://` one, are in
 the keyring either way (§2), except on the installed node on Windows, which
 takes none (§2, Proxy).
@@ -445,6 +451,12 @@ settings = "off"            # off | write: may the center set this policy
 paused = false              # the center may pause; only the owner unpauses
 revoked = false             # the center sent `bye revoked`
 unknown = false             # the center answered 401
+public_key = "<64 hex>"     # after this node rotated its key (protocol §4.10): the key
+                            # it has now; node_id stays the one of the first key
+key_rotations = 1           # rotations of the node's key and of the center's it took;
+pin_rotations = 1           # a restore keeps the keys and pins of the config further along
+old_pin = { pin = "<pin>", until_ms = 1790000000000 }  # after the center rotated its
+                            # key (protocol §4.10): its old pin, taken until then
 
 [center.policy]
 mode = "allowlist"          # allowlist | folder | user (the default is allowlist)
@@ -1140,6 +1152,7 @@ Methods:
 | `sudo.status` | | `{sudo: "on"|"off"}` |
 | `sudo.on` | `password` | checks it with `sudo -v` and turns the switch on (§4) |
 | `sudo.off` | | turns the switch off and drops the password |
+| `center.rotate-key` | `center`, `end_grace` | rotates the node's key for `center` over the live link, or with `end_grace` ends the grace of the old one (protocol §4.10); `{center, public_key}`, the new key once. Waits for the center's answer, at most 15 s; an error when the node has no link to it or the center does not speak `rotate`. Also served on the control pipe (Windows) |
 | `owner.check` | | changes nothing; the CLI asks it before `install`, `setup`, `update`, `uninstall`, `backup` and `restore` |
 | `hello` | `role` (`provider`), `name`, `capabilities` | a capability provider attaches; the connection stays (§7) |
 
@@ -1173,6 +1186,7 @@ answered, which takes long on a large folder. Methods:
 | `folder.add` | `center`?, `path`, `access` (`r`, `w`, `x`, at least one), `recorded` | adds the folder, or replaces its rights (the same place in another spelling is the same folder); with `recorded` the folder is also entered in `policy.places`, as the real place the CLI settled it at |
 | `folder.set` | `center`?, `path`, `given`, `changes` (1 to 64 of `=rwx`, `+x`, `-w`) | changes the rights of a folder the center has |
 | `folder.rm` | `center`?, `path`, `given` | takes a folder away |
+| `center.rotate-key` | `center`, `end_grace` | as on the socket |
 
 `path` is the folder as the CLI judged it: for `add` the real place it
 settled the path at (`exec::settle`, as this process sees it: the pipe takes
@@ -1232,7 +1246,11 @@ reason), the relay's tunnels (`"kind": "relay"`, one per tunnel when it ends: `n
 file itself (`"kind": "config"`, `event` `refused`, `signed`, `accepted`, `restored` or
 `not_recorded`, with the file and the reason), and what the owner did to the node
 (`"kind": "node"`, `event` `install`, `setup`, `update` or `uninstall`, with
-its `steps` and the `error` that stopped it). It holds targets (paths, command lines), never
+its `steps` and the `error` that stopped it), and each key rotation
+(`"kind": "key"`, `center`, `event` `node-key`, `node-key-refused`,
+`node-key-unanswered`, `node-key-grace-ended`, `center-key`,
+`center-key-refused` or `center-key-grace-ended`, and a `detail` with the
+public keys or pins; never a private key). It holds targets (paths, command lines), never
 file content or output; a target longer than 512 characters is cut there
 and says so; the `audit/decision` event carries the same cut target, and the
 center cuts what it gets the same way and keeps at most 500 decisions and

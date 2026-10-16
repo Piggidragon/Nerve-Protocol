@@ -1377,6 +1377,10 @@ pub(crate) mod tests {
                         paused: false,
                         revoked: false,
                         unknown: false,
+                        public_key: None,
+                        key_rotations: 0,
+                        pin_rotations: 0,
+                        old_pin: None,
                         policy: Default::default(),
                     });
                 }
@@ -1433,6 +1437,10 @@ pub(crate) mod tests {
                     paused: false,
                     revoked: false,
                     unknown: false,
+                    public_key: None,
+                    key_rotations: 0,
+                    pin_rotations: 0,
+                    old_pin: None,
                     policy: Default::default(),
                 });
                 Ok(())
@@ -1475,6 +1483,10 @@ pub(crate) mod tests {
                         paused: false,
                         revoked: false,
                         unknown: false,
+                        public_key: None,
+                        key_rotations: 0,
+                        pin_rotations: 0,
+                        old_pin: None,
                         policy: Default::default(),
                     });
                 }

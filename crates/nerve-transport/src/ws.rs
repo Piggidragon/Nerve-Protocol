@@ -65,7 +65,33 @@ pub async fn connect(
     node_id: &str,
     max_message: usize,
 ) -> Result<WebSocketStream<BoxIo>, ConnectError> {
-    let io = crate::net::open(url, pin, proxy)
+    connect_pins(url, pin.as_slice(), proxy, node_id, max_message).await
+}
+
+/// [`connect`] to a center that may present any of `pins`
+/// ([`crate::net::open_pins`]).
+pub async fn connect_pins(
+    url: &CenterUrl,
+    pins: &[&str],
+    proxy: Option<&Proxy>,
+    node_id: &str,
+    max_message: usize,
+) -> Result<WebSocketStream<BoxIo>, ConnectError> {
+    connect_pins_seen(url, pins, proxy, node_id, max_message)
+        .await
+        .map(|(ws, _)| ws)
+}
+
+/// [`connect_pins`], also giving the pin of the certificate the center
+/// showed ([`crate::net::open_pins_seen`]).
+pub async fn connect_pins_seen(
+    url: &CenterUrl,
+    pins: &[&str],
+    proxy: Option<&Proxy>,
+    node_id: &str,
+    max_message: usize,
+) -> Result<(WebSocketStream<BoxIo>, Option<String>), ConnectError> {
+    let (io, seen) = crate::net::open_pins_seen(url, pins, proxy)
         .await
         .map_err(ConnectError::Other)?;
     let mut req = url
@@ -83,7 +109,7 @@ pub async fn connect(
         Err(_) => Err(ConnectError::Other(
             "the WebSocket handshake timed out".into(),
         )),
-        Ok(Ok((ws, _))) => Ok(ws),
+        Ok(Ok((ws, _))) => Ok((ws, seen)),
         Ok(Err(tokio_tungstenite::tungstenite::Error::Http(resp))) => {
             let status = resp.status().as_u16();
             if status == 401 {

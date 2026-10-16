@@ -72,6 +72,17 @@ impl Entry {
         }
     }
 
+    /// The entry with the new node key for `center` while its rotation is
+    /// under way.
+    pub fn center_next_key(paths: &NodePaths, center: &str) -> Entry {
+        Entry {
+            account: format!(
+                "center-key-next:{center}:{}",
+                absolute(&paths.config_dir).display()
+            ),
+        }
+    }
+
     /// The entry with the relay's TLS certificate and key.
     pub fn relay_tls(paths: &NodePaths) -> Entry {
         Entry {
@@ -188,6 +199,8 @@ pub(crate) enum Key<'a> {
     Config,
     /// The node key for a center.
     Center(&'a str),
+    /// The new node key for a center while its rotation is under way.
+    CenterNext(&'a str),
     /// The relay's TLS certificate and key, as PEM.
     RelayTls,
     /// The password of an `https://` proxy: the relay token.
@@ -199,6 +212,7 @@ impl Key<'_> {
         match self {
             Key::Config => paths.config_key(),
             Key::Center(c) => paths.key_file(c),
+            Key::CenterNext(c) => paths.next_key_file(c),
             Key::RelayTls => paths.relay_tls_file(),
             Key::ProxyLogin => paths.proxy_login_file(),
         }
@@ -208,6 +222,7 @@ impl Key<'_> {
         match self {
             Key::Config => Entry::config_key(paths),
             Key::Center(c) => Entry::center_key(paths, c),
+            Key::CenterNext(c) => Entry::center_next_key(paths, c),
             Key::RelayTls => Entry::relay_tls(paths),
             Key::ProxyLogin => Entry::proxy_login(paths),
         }
@@ -218,18 +233,24 @@ impl Key<'_> {
         match self {
             Key::Config => "the key of the config's MAC".into(),
             Key::Center(c) => format!("the node key for center {c}"),
+            Key::CenterNext(c) => format!("the new node key for center {c}"),
             Key::RelayTls => "the relay's TLS key".into(),
             Key::ProxyLogin => "the proxy's password (a relay token)".into(),
         }
     }
 }
 
-/// Every key of the node `cfg` describes: the config's, one per center, the
-/// relay's TLS key once the relay has a pin, and the proxy's password while
-/// the config names its user.
+/// Every key of the node `cfg` describes: the config's, one per center and
+/// the new one of a rotation under way, the relay's TLS key once the relay
+/// has a pin, and the proxy's password while the config names its user.
+/// A key that is not there is passed over.
 pub(crate) fn keys(cfg: &NodeConfig) -> Vec<Key<'_>> {
     std::iter::once(Key::Config)
-        .chain(cfg.centers.iter().map(|c| Key::Center(&c.name)))
+        .chain(
+            cfg.centers
+                .iter()
+                .flat_map(|c| [Key::Center(&c.name), Key::CenterNext(&c.name)]),
+        )
         .chain(cfg.relay.pin.is_some().then_some(Key::RelayTls))
         .chain(cfg.connection.login.is_some().then_some(Key::ProxyLogin))
         .collect()
@@ -579,21 +600,61 @@ pub fn store_center_key(
     put(paths, storage, Key::Center(center), key.to_text().trim())
 }
 
-/// Deletes the node key for `center`: from where `storage` keeps it, a file
-/// left from before a move, and while a move waits (`keys.moving`) the copy
-/// in the other place, which the start that finishes the move no longer
-/// looks for once the center is gone.
+/// Deletes the node key for `center`, and the new one of a rotation under
+/// way: from where `storage` keeps them, a file left from before a move, and
+/// while a move waits (`keys.moving`) the copy in the other place, which the
+/// start that finishes the move no longer looks for once the center is gone.
 pub fn remove_center_key(
     paths: &NodePaths,
     storage: SecretStorage,
     center: &str,
 ) -> Result<(), String> {
-    let key = Key::Center(center);
-    delete(paths, storage, key)?;
-    if storage == SecretStorage::Keyring || paths.keys_moving().exists() {
-        delete(paths, other(storage), key)?;
-    }
-    Ok(())
+    remove_secret(paths, storage, Key::Center(center))?;
+    remove_secret(paths, storage, Key::CenterNext(center))
+}
+
+/// The new node key for `center` while a rotation of it is under way
+/// (crate::rotate); `None` when none is.
+pub fn center_next_key(
+    paths: &NodePaths,
+    storage: SecretStorage,
+    center: &str,
+) -> Result<Option<NodeKey>, String> {
+    let Some(text) = read_secret(paths, storage, Key::CenterNext(center))? else {
+        return Ok(None);
+    };
+    NodeKey::from_text(&text).map(Some).map_err(|e| {
+        format!(
+            "bad new node key for center {center} in {}: {e}",
+            place(storage)
+        )
+    })
+}
+
+/// Keeps the new node key for `center` before its rotation is sent, so a
+/// rotation the center took is never lost with the process.
+pub fn store_center_next_key(
+    paths: &NodePaths,
+    storage: SecretStorage,
+    center: &str,
+    key: &NodeKey,
+) -> Result<(), String> {
+    put(
+        paths,
+        storage,
+        Key::CenterNext(center),
+        key.to_text().trim(),
+    )
+}
+
+/// Deletes the new node key for `center`: the rotation is over, taken or
+/// refused.
+pub fn remove_center_next_key(
+    paths: &NodePaths,
+    storage: SecretStorage,
+    center: &str,
+) -> Result<(), String> {
+    remove_secret(paths, storage, Key::CenterNext(center))
 }
 
 /// The text of `key` from where `storage` keeps it: with `keyring`, a key
@@ -1317,6 +1378,10 @@ mod tests {
                     paused: false,
                     revoked: false,
                     unknown: false,
+                    public_key: None,
+                    key_rotations: 0,
+                    pin_rotations: 0,
+                    old_pin: None,
                     policy: Default::default(),
                 });
                 Ok(())

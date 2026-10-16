@@ -3611,6 +3611,10 @@ mod tests {
                 paused: false,
                 revoked: false,
                 unknown: false,
+                public_key: None,
+                key_rotations: 0,
+                pin_rotations: 0,
+                old_pin: None,
                 policy: nerve_policy::CenterPolicy {
                     folders,
                     ..Default::default()
@@ -3672,6 +3676,10 @@ mod tests {
             paused: false,
             revoked: false,
             unknown: false,
+            public_key: None,
+            key_rotations: 0,
+            pin_rotations: 0,
+            old_pin: None,
             policy: nerve_policy::CenterPolicy {
                 folders: folders
                     .iter()
@@ -4312,6 +4320,10 @@ mod tests {
             paused: false,
             revoked: false,
             unknown: false,
+            public_key: None,
+            key_rotations: 0,
+            pin_rotations: 0,
+            old_pin: None,
             policy: nerve_policy::CenterPolicy {
                 folders: vec![nerve_policy::config::Folder {
                     path: home.display().to_string(),

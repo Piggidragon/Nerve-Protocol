@@ -1195,6 +1195,10 @@ mod tests {
             paused: true,
             revoked: false,
             unknown: false,
+            public_key: None,
+            key_rotations: 0,
+            pin_rotations: 0,
+            old_pin: None,
             policy: Default::default(),
         }
     }

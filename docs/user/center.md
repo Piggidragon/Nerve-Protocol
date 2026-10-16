@@ -61,6 +61,25 @@ The web UI and the HTTP MCP endpoint use plain HTTP on loopback. On any other
 address they use TLS with the same certificate. `--plain-loopback` turns TLS
 off for nodes too, but only for a loopback `--listen`.
 
+## Rotate the key
+
+In the web UI, Settings, **Center key**, press **Rotate key**. The center makes
+a new key and shows its pin once. It tells every machine that is linked, and
+every machine that links in the next 7 days, signed with the old key; each
+machine then trusts the new key too. The center keeps serving the old key for
+those 7 days, then switches to the new one. **Serve the new key now** switches
+at once.
+
+- A machine that does not link during the 7 days, or runs a `nerve-node` older
+  than 0.0.4, does not learn the new key. After the switch it cannot connect
+  and has to be [paired again](pairing.md).
+- New pairing links carry the pin of the key the center serves.
+- The switch also changes the certificate of the web UI and the HTTP MCP
+  endpoint when they use TLS. A browser asks to trust it again.
+- The center's [log](logs.md) says when the key was rotated and when the new
+  one is served. The keys are `tls.pem` and, during the 7 days, `tls.next.pem`
+  in the state folder.
+
 ## Run it without a harness
 
 The default `--mcp stdio` ends when the harness closes its input. To keep a

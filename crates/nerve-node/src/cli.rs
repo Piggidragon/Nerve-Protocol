@@ -166,6 +166,14 @@ pub enum CenterCmd {
     Pause(CenterArg),
     /// Link to a paused center again.
     Resume(CenterArg),
+    /// Give this machine a new key for a center; the center takes the old one for 7 more days. Needs the running node, linked to that center.
+    RotateKey {
+        /// End the 7 days now: the center takes only the new key from then on.
+        #[arg(long)]
+        end_grace: bool,
+        #[command(flatten)]
+        center: CenterArg,
+    },
     /// Let a center change its own rights on this machine, up to user mode and sudo, or take that right away.
     Grant {
         /// What to grant; only `settings` exists.
@@ -830,6 +838,52 @@ pub fn pick_center(cfg: &NodeConfig, given: &CenterArg) -> Result<String, String
     crate::folder_change::pick_center(cfg, given.center.as_deref())
 }
 
+/// `center rotate-key`: the running node makes the new key and sends it to
+/// the center over its link (crate::rotate), or ends the grace of the old
+/// one. The new public key is shown once.
+async fn rotate_key(
+    paths: &NodePaths,
+    center: &CenterArg,
+    end_grace: bool,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    let (cfg, _) = read_config(paths).await?;
+    let name = pick_center(&cfg, center)?;
+    let params = json!({"center": name, "end_grace": end_grace});
+    #[cfg(unix)]
+    let r = nerve_transport::ctl::call(&paths.ctl_socket(), "center.rotate-key", params).await;
+    #[cfg(windows)]
+    let r = crate::pipe::call(paths, "center.rotate-key", params).await;
+    #[cfg(not(any(unix, windows)))]
+    let r: Result<Value, String> = {
+        let _ = params;
+        Err(nerve_transport::ctl::NOT_RUNNING.to_string())
+    };
+    let v = match r {
+        Ok(v) => v,
+        Err(e) if e == nerve_transport::ctl::NOT_RUNNING => {
+            return Err(format!(
+                "the node does not run: a key rotation goes to center {name} over the node's link. Start it (`nerve-node run`, or the service), then try again"
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    let key = v["public_key"].as_str().unwrap_or_default();
+    if end_grace {
+        let _ = writeln!(
+            out,
+            "center {name} no longer takes this machine's old key; it takes only {key}"
+        );
+        return Ok(());
+    }
+    let days = nerve_proto::ROTATE_GRACE_MS / 86_400_000;
+    let _ = writeln!(
+        out,
+        "center {name} took this machine's new key:\n  {key}\nThe old key is deleted here. The center takes it for {days} more days, unless you end that now with `nerve-node center rotate-key --end-grace --center {name}`."
+    );
+    Ok(())
+}
+
 /// Changes one center's entry.
 async fn edit_center(
     paths: &NodePaths,
@@ -1395,6 +1449,9 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                 }
             }
             Ok(())
+        }
+        Cmd::Center(CenterCmd::RotateKey { end_grace, center }) => {
+            rotate_key(&paths, &center, end_grace, out).await
         }
         Cmd::Center(CenterCmd::Pause(center)) => pause_center(&paths, &center, true, out).await,
         Cmd::Center(CenterCmd::Resume(center)) => pause_center(&paths, &center, false, out).await,
@@ -2539,6 +2596,15 @@ fn audit_line(v: &Value) -> String {
             s("reason")
         );
     }
+    if v["kind"] == "key" {
+        return format!(
+            "{}  {}  key {}: {}",
+            s("ts"),
+            s("center"),
+            s("event"),
+            s("detail")
+        );
+    }
     let line = format!(
         "{}  {}  {}.{}  {}  {}",
         s("ts"),
@@ -3668,6 +3734,10 @@ mod tests {
             paused: false,
             revoked: false,
             unknown: false,
+            public_key: None,
+            key_rotations: 0,
+            pin_rotations: 0,
+            old_pin: None,
             policy: Default::default(),
         }
     }

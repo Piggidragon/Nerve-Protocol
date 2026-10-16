@@ -131,6 +131,9 @@ of the same build.
   level**: error, warn, info (the default) or debug. The level applies at once
   and stays for the next start. If the center was started with `--log`, that
   level holds for this run and the one you pick is kept for the next start.
+- **Center key.** The pin of the key the center serves. **Rotate key** makes
+  a new key and shows its pin once; **Serve the new key now** ends the 7 days
+  in which the old key is still served ([center](center.md#rotate-the-key)).
 - **Harness tokens.** Make a token with a label. It is shown once. Delete one
   to stop it.
 - **Machines.** For each online machine that gave the center the settings

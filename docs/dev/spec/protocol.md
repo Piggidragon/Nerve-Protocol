@@ -17,6 +17,23 @@ The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
   and closes. The node stops dialling that center.
 - The descriptor carries `nerve: "0"`.
 
+### 1.1 Features
+
+Additive parts of version `"0"` are named features. A side uses a feature's
+messages only when both sides named it; a peer older than a feature keeps
+working without it.
+
+- A node lists the features it speaks in `hello.features` (§4.2). A node
+  older than features sends no such field.
+- The center answers in `welcome.features` with those of them it speaks too,
+  and only when the hello had the field: a node is strict about the welcome
+  (§5.2), and an older one would refuse a field it does not know.
+- A feature name a side does not know is ignored.
+
+| Feature | Since | Section |
+|---|---|---|
+| `rotate` | nerve 0.0.4 | key rotation, §4.10 |
+
 ## 2. Identity
 
 ### 2.1 Center
@@ -30,7 +47,8 @@ The key words MUST, MUST NOT, SHOULD and MAY are used as in RFC 2119.
 
 - A node holds one Ed25519 key per center it is paired with.
 - The **node id** is the lowercase base32 (RFC 4648 alphabet, no padding) of the
-  first 16 bytes of SHA-256 of the 32-byte raw public key: 26 characters.
+  first 16 bytes of SHA-256 of the 32-byte raw public key it paired with: 26
+  characters. It stays when the key is rotated (§4.10).
 - A **node name** is 1 to 32 characters of `a-z`, `0-9` and `-`. The default is
   derived from the host name.
 
@@ -104,14 +122,17 @@ Unknown fields are refused. Answers:
    {"node_id": "…", "auth": {"sig": "<128 hex>"}, "versions": ["0"],
     "software": {"name": "nerve-node", "version": "…"},
     "limits": {"message_bytes": 4194304, "blob_bytes": 67108864, "calls": 64, "streams": 16},
-    "rev": 7, "resume": {"link": "<32 hex>", "got": 0}}
+    "rev": 7, "features": ["rotate"], "resume": {"link": "<32 hex>", "got": 0}}
    ```
    `sig` is the Ed25519 signature over the bytes
-   `"nerve-connect/0" || center_id (UTF-8) || nonce (32 raw bytes)`.
-   `resume` is optional; a node that can resume links sends it (§4.9).
-3. Center → node, notification `welcome {version, limits, resume?}`.
-   `resume {resumed, got}` answers the hello's `resume` and is sent only
-   when the hello had one (§4.9).
+   `"nerve-connect/0" || center_id (UTF-8) || nonce (32 raw bytes)`, with
+   the node's key for this center, or with its old key while the grace of a
+   rotation runs (§4.10). `features` is optional (§1.1). `resume` is
+   optional; a node that can resume links sends it (§4.9).
+3. Center → node, notification `welcome {version, limits, features?, resume?}`.
+   `features` is sent only when the hello had it (§1.1). `resume {resumed,
+   got}` answers the hello's `resume` and is sent only when the hello had one
+   (§4.9).
 
 Before `welcome`, any other message is a protocol error: the receiver sends
 `bye {reason: "protocol_error"}` and closes. A wrong signature or a `node_id`
@@ -340,6 +361,99 @@ Replay:
 - After a resume the center fetches the descriptor again, as it may have
   changed while the link was down.
 
+### 4.10 Key rotation
+
+Feature `rotate` (§1.1). Either key of a pairing can be replaced without
+pairing again: the node's key for the center, and the center's TLS key that
+nodes pin. The side whose key changes starts it, when its owner asks;
+nothing rotates on its own. The new key travels over the paired,
+authenticated link, signed by the key it replaces. The replaced key stays
+valid for a **grace** of 7 days (604800000 ms) after the rotation, then it is
+refused; the owner of the side whose key changed can end the grace earlier.
+There is at most one old key per side. A node key rotation in the grace of
+another one ends that other grace at once; the center refuses a rotation of
+its own key while one is in its grace, until the owner ends that grace. When
+the grace of a node's old key ends, in whatever way, a link that was opened
+with that key ends with `bye {reason: "replaced"}`.
+
+A peer that does not speak `rotate` cannot rotate. A node that does not
+speak it is not told of a center's new key, and after the center's grace it
+has to pair again.
+
+#### Node key
+
+1. Node → center, notification `key.rotate {public_key, sig, proof}`:
+   `public_key` is the new Ed25519 key (64 hex), `sig` the signature of the
+   node's current key and `proof` the one of the new key, both hex, over
+   `"nerve-rotate-node/0" || center_id (UTF-8) || new public key (32 raw bytes)`.
+2. The center takes the new key only when `proof` verifies under it and
+   `sig` verifies under the key it holds for the node now, and no other
+   node holds the new key (as its key or its old one). The key it held
+   becomes the old key, valid until the grace ends. The node id does not
+   change. A `key.rotate` for the key the center holds already (sent again)
+   changes nothing and is answered as taken.
+3. Center → node, notification `key.rotated {public_key, error?}`: without
+   `error` the center took `public_key`; with it, it refused and keeps the
+   key it had.
+
+A center saves the new key before it answers that it took it: the node
+deletes its old key on that answer. A center that cannot save it answers
+with an `error` and keeps the key it had.
+
+The node keeps the new key aside before it sends it, and makes it its key
+only when `key.rotated` says it was taken, also when that answer comes after
+the node stopped waiting for it. On a refusal it drops it. Without an answer
+it keeps both, signs with the old one, and sends the same `key.rotate` again
+on its next link. A `hello` may be signed with the old key until the grace
+ends (§4.2). While the new key waits for an answer, a node whose handshake
+fails tries the next one with the new key: a center that took the new key
+and whose grace for the old one has ended still links it; a link that comes
+up so settles the rotation as taken.
+
+To end the grace early, node → center `key.retire {public_key, sig}`:
+`public_key` is the node's current key, `sig` its signature (hex) over
+`"nerve-retire-node/0" || center_id || that public key (32 raw bytes)`. The
+center drops the old key and answers `key.retired {error?}`. A link that was
+opened with the old key then ends with `bye {reason: "replaced"}`; the node
+dials again with its key.
+
+#### Center key
+
+1. The center makes a new key and signs it with the old one. It keeps
+   serving the old key, so that every node can still link and be told.
+2. Center → node, notification `center.rotate {old_spki, new_spki, sig,
+   grace_ms}`, on every link up now and on every link made later while the
+   rotation is told: `old_spki` and `new_spki` are the SubjectPublicKeyInfo
+   of the old and the new key in DER, `sig` the old key's signature over
+   `"nerve-rotate-center/0" || center_id (UTF-8) || new pin (its 32 raw
+   bytes)`, all three base64url without padding. The signature is ECDSA
+   with SHA-256 (P-256) or SHA-384 (P-384) in ASN.1 form, or Ed25519, as the
+   old key is. `grace_ms` is how long the center still serves the old key.
+3. A node that pins the center checks that the pin of `old_spki` is the pin
+   it holds and that `sig` verifies under `old_spki`. Then it pins the new
+   key and takes the old pin as well until `min(grace_ms, 7 days)` from now.
+   A rotation that does not verify changes nothing. A node that checks the
+   center against system roots (no pin) ignores it. Once the old pin's time
+   is over, new connections no longer take it. A connection the node opened
+   under the old pin ends 15 seconds after that time (longer than the
+   center takes to serve its new key at the end of its grace), or at once
+   when the center tells `grace_ms: 0`; then the node drops the old pin from
+   its config and dials again with the pins it still takes (a link that can
+   resume, resumes). Pins are compared by their 32 bytes: a pin written
+   with base64 padding is the same pin.
+4. At the end of the grace, or when the owner ends it earlier, the center
+   serves the new key for every new connection; links up then go on. It
+   goes on telling the rotation with `grace_ms: 0` until 7 days after it
+   started, and a node that is told so drops the old pin at once.
+
+Pairing links carry the pin of the key the center serves. A node that
+paired during the grace is told on its first link.
+
+With resume (§4.9): the key messages are counted frames, so one that a drop
+cut off goes out again when the link resumes. A resumed link goes on under
+the key its resuming hello was signed with. A link the center ends because
+its key's grace ended ends with a `bye` and is not resumed.
+
 ## 5. Messages
 
 Text frames carry JSON-RPC 2.0. No batches; `params` is always an object.
@@ -366,6 +480,11 @@ Errors carry a string code in `error.data.code` (§5.3).
 | `bye` | notification | either | `{reason}` | |
 | `ack` | notification | either | `{got}` | (§4.9) |
 | `withdrawn` | notification | C→N | `{id}` | (§4.9) |
+| `key.rotate` | notification | N→C | `{public_key, sig, proof}` (§4.10) | |
+| `key.rotated` | notification | C→N | `{public_key, error?}` | |
+| `key.retire` | notification | N→C | `{public_key, sig}` | |
+| `key.retired` | notification | C→N | `{error?}` | |
+| `center.rotate` | notification | C→N | `{old_spki, new_spki, sig, grace_ms}` | |
 
 - `detail` is `summary`, `capability` (needs `cap`) or `full`.
 - `ctx` is `{session?}`: `session` is at most 256 bytes. Other fields are
@@ -382,7 +501,8 @@ Errors carry a string code in `error.data.code` (§5.3).
 ### 5.2 Strictness
 
 A node MUST be strict about what a center sends: unknown fields in `invoke`,
-`ctx` and `challenge`, and unknown methods, are refused. A center SHOULD be
+`ctx`, `challenge`, `welcome`, `key.rotated`, `key.retired` and
+`center.rotate`, and unknown methods, are refused. A center SHOULD be
 tolerant of unknown fields a node sends, so newer nodes keep working.
 
 ### 5.3 Error codes

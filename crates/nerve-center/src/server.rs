@@ -131,8 +131,8 @@ pub async fn start(args: &Args, lock: Lock) -> Result<Running, String> {
         tasks.push(tokio::spawn(crate::attach::serve(center.clone(), listener)));
     }
 
-    // State changes are batched; this writes them out now and then, and
-    // notes the pairing codes that ran out.
+    // State changes are batched; this writes them out now and then, notes
+    // the pairing codes that ran out, and ends the graces of key rotations.
     let c = center.clone();
     tasks.push(tokio::spawn(async move {
         let mut tick = tokio::time::interval(Duration::from_secs(5));
@@ -140,6 +140,7 @@ pub async fn start(args: &Args, lock: Lock) -> Result<Running, String> {
             tick.tick().await;
             c.flush();
             c.sweep_codes();
+            c.sweep().await;
         }
     }));
 

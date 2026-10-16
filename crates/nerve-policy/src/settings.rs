@@ -697,6 +697,28 @@ impl SettingsStore {
     }
 
     fn commit(&mut self, by: Writer, mut new: NodeConfig) -> Result<u64, SetError> {
+        // A center's pin changed by hand to another one (after a rotation
+        // of the center's key the node missed) counts as a rotation the node
+        // took: a restore then keeps it over a backup's older pin.
+        // Pins are compared by their bytes: the same pin written with base64
+        // padding is no change.
+        let same_pin = |a: &str, b: &str| match (
+            nerve_transport::tls::decode_pin(a),
+            nerve_transport::tls::decode_pin(b),
+        ) {
+            (Ok(x), Ok(y)) => x == y,
+            _ => a == b,
+        };
+        for c in new.centers.iter_mut() {
+            if let Some(o) = self.config.center(&c.name)
+                && o.center_id == c.center_id
+                && o.pin_rotations == c.pin_rotations
+                && let (Some(was), Some(now)) = (o.pin.as_deref(), c.pin.as_deref())
+                && !same_pin(was, now)
+            {
+                c.pin_rotations += 1;
+            }
+        }
         new.version = self.config.version;
         new.validate().map_err(SetError::Invalid)?;
         if new == self.config {
@@ -890,6 +912,10 @@ mod tests {
                 paused: false,
                 revoked: false,
                 unknown: false,
+                public_key: None,
+                key_rotations: 0,
+                pin_rotations: 0,
+                old_pin: None,
                 policy: CenterPolicy::default(),
             });
             Ok(())

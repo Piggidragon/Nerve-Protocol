@@ -45,6 +45,12 @@ enum Out {
 /// a connection that resumes it carries it on.
 pub struct Link {
     pub node_id: String,
+    /// The node key the hello was signed with: its key, or its old one in
+    /// the grace of a rotation (§4.10). A resume sets it to the key of the
+    /// hello that resumed it.
+    auth_key: Mutex<String>,
+    /// Whether both sides speak key rotation; a resume sets it again.
+    rotate: AtomicBool,
     pub since: Instant,
     pub since_ms: u64,
     pub limits: Limits,
@@ -54,6 +60,12 @@ pub struct Link {
     pending: Mutex<HashMap<u64, oneshot::Sender<Reply>>>,
     next_id: AtomicU64,
     closed: AtomicBool,
+    /// Woken when the link ends, so its reader stops at once and handles
+    /// nothing more the peer sends.
+    ended: Notify,
+    /// The center ended the link on purpose ([`Link::end`]): its end is no
+    /// drop. A link given up otherwise (replaced, its resume over) is one.
+    ended_on_purpose: AtomicBool,
     /// When the last frame came, in milliseconds after `since`.
     heard: AtomicU64,
     pong: Notify,
@@ -79,6 +91,8 @@ struct Wire {
 impl Link {
     fn new(
         node_id: &str,
+        auth_key: String,
+        rotate: bool,
         limits: Limits,
         out: mpsc::Sender<Out>,
         resume_id: Option<String>,
@@ -86,6 +100,8 @@ impl Link {
         let replay = resume_id.is_some().then(|| Replay::new(resume::KEEP_BYTES));
         Link {
             node_id: node_id.to_string(),
+            auth_key: Mutex::new(auth_key),
+            rotate: AtomicBool::new(rotate),
             since: Instant::now(),
             since_ms: msg::now_ms(),
             limits,
@@ -99,11 +115,23 @@ impl Link {
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             closed: AtomicBool::new(false),
+            ended: Notify::new(),
+            ended_on_purpose: AtomicBool::new(false),
             heard: AtomicU64::new(0),
             pong: Notify::new(),
             status: Mutex::new("online".into()),
             sessions: Mutex::new(Default::default()),
         }
+    }
+
+    /// The node key the hello of the connection now was signed with.
+    pub fn auth_key(&self) -> String {
+        self.auth_key.lock().unwrap().clone()
+    }
+
+    /// Whether both sides speak key rotation.
+    pub fn rotate(&self) -> bool {
+        self.rotate.load(Ordering::SeqCst)
     }
 
     /// Notes that a frame came.
@@ -377,6 +405,26 @@ impl Link {
         tokio::time::timeout(wait, notified).await.is_ok()
     }
 
+    /// Ends the link with `bye {reason}` without waiting on its queue: the
+    /// link is closed first, so no call goes to it any more and its reader
+    /// stops, and the bye goes in a task of its own, so a peer that reads
+    /// nothing holds up no caller.
+    pub(crate) fn end(&self, reason: ByeReason) {
+        self.ended_on_purpose.store(true, Ordering::SeqCst);
+        let out = {
+            let mut w = self.wire.lock().unwrap();
+            let out = w.out.clone();
+            self.close(&mut w);
+            out
+        };
+        self.fail_pending();
+        if let Some(out) = out {
+            tokio::spawn(async move {
+                let _ = out.send(Out::Bye(reason)).await;
+            });
+        }
+    }
+
     /// Ends the link: every call waiting on it fails with `connection_lost`.
     pub(crate) fn fail_all(&self) {
         self.close(&mut self.wire.lock().unwrap());
@@ -387,6 +435,8 @@ impl Link {
     /// it up any more.
     fn close(&self, w: &mut Wire) {
         self.closed.store(true, Ordering::SeqCst);
+        // A permit stays for a reader that is not waiting right now.
+        self.ended.notify_one();
         w.out = None;
         w.parked = false;
         w.replay = None;
@@ -453,7 +503,7 @@ async fn next_text(ws: &mut WebSocketStream<BoxIo>, wait: Duration) -> Option<St
 /// Runs a link from the upgraded WebSocket until it ends. `node_id` is the
 /// `Nerve-Node` header, already known to belong to a paired node.
 pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String) {
-    let Some(public_key) = center.public_key(&node_id) else {
+    let Some((public_key, old_key)) = center.node_keys(&node_id) else {
         return refuse(ws, ByeReason::Revoked).await;
     };
     let nonce = nerve_transport::keys::random_bytes(32);
@@ -498,21 +548,32 @@ pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String
             return refuse(ws, ByeReason::ProtocolError).await;
         }
     };
-    if hello.node_id != node_id
-        || !nerve_transport::keys::verify_connect(
-            &public_key,
-            &center.id(),
-            &nonce,
-            &hello.auth.sig,
-        )
-    {
+    // The node's key, or its old one while the grace of a rotation runs.
+    let signed = |k: &str| {
+        hello.node_id == node_id
+            && nerve_transport::keys::verify_connect(k, &center.id(), &nonce, &hello.auth.sig)
+    };
+    let now = msg::now_ms();
+    let auth_key = if signed(&public_key) {
+        public_key
+    } else if let Some(old) = old_key.as_ref().filter(|o| signed(&o.public_key)) {
+        if now >= old.until_ms {
+            center.note(
+                Level::Warn,
+                Some(&node_id),
+                "a link was refused: the hello is signed with the node's old key, whose grace after its rotation has ended",
+            );
+            return refuse(ws, ByeReason::ProtocolError).await;
+        }
+        old.public_key.clone()
+    } else {
         center.note(
             Level::Warn,
             Some(&node_id),
             "a link failed authentication: the hello is not signed with the key paired for this node",
         );
         return refuse(ws, ByeReason::ProtocolError).await;
-    }
+    };
     if !hello.versions.iter().any(|v| v == PROTOCOL_VERSION) {
         center.note(
             Level::Warn,
@@ -591,7 +652,22 @@ pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String
         }
     }
 
+    // Features go only to a node that named its own (§1.1): an older node
+    // refuses a field it does not know in the welcome.
+    let features = (!hello.features.is_empty()).then(|| {
+        nerve_proto::FEATURES
+            .iter()
+            .filter(|f| hello.features.iter().any(|h| h == *f))
+            .map(|f| f.to_string())
+            .collect::<Vec<_>>()
+    });
+    let rotate = features
+        .as_ref()
+        .is_some_and(|f| f.iter().any(|f| f == nerve_proto::FEATURE_ROTATE));
     let mut welcome = json!({"version": PROTOCOL_VERSION, "limits": Limits::default()});
+    if let Some(f) = features {
+        welcome["features"] = json!(f);
+    }
     // Only a node that offered a resume hears of one: an older node refuses
     // a welcome with fields it does not know.
     if hello.resume.is_some() {
@@ -629,11 +705,16 @@ pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String
 
     let resumed = carried.is_some();
     let (link, conn, again) = match carried {
-        Some(c) => c,
+        Some(c) => {
+            // The link goes on under the key this hello was signed with.
+            *c.0.auth_key.lock().unwrap() = auth_key;
+            c.0.rotate.store(rotate, Ordering::SeqCst);
+            c
+        }
         None => {
             let id = hello.resume.as_ref().map(|r| r.link.clone());
             (
-                Arc::new(Link::new(&node_id, hello.limits, tx, id)),
+                Arc::new(Link::new(&node_id, auth_key, rotate, hello.limits, tx, id)),
                 0,
                 Vec::new(),
             )
@@ -665,6 +746,22 @@ pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String
     });
     center.link_up(link.clone(), &hello, resumed);
     let up = Instant::now();
+    // The key this hello was signed with may have stopped counting while the
+    // handshake waited (on the held link): checked again now that the link
+    // is the node's, which the sweep sees from here on.
+    if !center.key_counts(&node_id, &link.auth_key()) {
+        center.note(
+            Level::Warn,
+            Some(&node_id),
+            "the link ends at once: the key its hello was signed with no longer counts (its grace ended meanwhile)",
+        );
+        link.end(ByeReason::Replaced);
+    }
+    // A node that links while the center's key rotation is told learns of
+    // it now.
+    if rotate && let Some(notice) = center.rotation_notice() {
+        link.notify(method::CENTER_ROTATE, notice).await;
+    }
 
     let mut clean = false;
     // Whether a bye ended the link, from either side: such a link does not
@@ -679,11 +776,27 @@ pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String
     let mut deadline = tokio::time::Instant::now() + quiet;
     loop {
         let next = tokio::select! {
-            n = tokio::time::timeout_at(deadline, stream.next()) => n,
+            n = tokio::time::timeout_at(deadline, stream.next()) => Some(n),
             _ = acks.tick() => {
                 link.send_ack();
                 continue;
             }
+            _ = link.ended.notified() => None,
+        };
+        // A link the center ended (its key's grace is over) handles nothing
+        // more: frames still in flight from the peer are not the node's any
+        // more.
+        let Some(next) = next.filter(|_| !link.is_closed()) else {
+            said_bye = true;
+            // A link the center ended with a bye closed cleanly; one it gave
+            // up (replaced while it did not answer) dropped.
+            if link.ended_on_purpose.load(Ordering::SeqCst) {
+                clean = true;
+                why = "the center ended the link".into();
+            } else {
+                why = "the center gave the link up".into();
+            }
+            break;
         };
         let frame = match next {
             Err(_) => {
@@ -829,6 +942,24 @@ async fn handle(center: &Center, link: &Arc<Link>, m: Message) -> Option<ByeReas
                 {
                     *link.status.lock().unwrap() = s.to_string();
                     center.changed(crate::center::Change::Nodes);
+                }
+            }
+            method::KEY_ROTATE if link.rotate() => {
+                let (r, dropped) = center.rotate_node_key(link, &params);
+                link.notify(method::KEY_ROTATED, json!(r)).await;
+                // A rotation in the grace of another ends the older key's
+                // grace, and a link opened with it ends too.
+                if let Some(key) = dropped {
+                    center.end_link_of_key(&link.node_id, &key);
+                }
+            }
+            method::KEY_RETIRE if link.rotate() => {
+                let (r, opened_with_it) = center.retire_node_key(link, &params);
+                link.notify(method::KEY_RETIRED, json!(r)).await;
+                // The key this link was opened with is refused from now on,
+                // so the link ends; the node dials again with its key.
+                if opened_with_it {
+                    link.end(ByeReason::Replaced);
                 }
             }
             method::BYE => {

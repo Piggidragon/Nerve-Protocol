@@ -38,6 +38,7 @@ mod provider;
 mod pipe;
 mod relay;
 pub mod rights;
+mod rotate;
 mod secrets;
 pub mod service;
 mod sudo;

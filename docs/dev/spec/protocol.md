@@ -434,10 +434,13 @@ dials again with its key.
    key and takes the old pin as well until `min(grace_ms, 7 days)` from now.
    A rotation that does not verify changes nothing. A node that checks the
    center against system roots (no pin) ignores it. Once the old pin's time
-   is over, the node drops it from its config. A connection the node opened
-   under the old pin ends then too, or as soon as the center tells
-   `grace_ms: 0`: the node dials again with the pins it still takes (a
-   link that can resume, resumes).
+   is over, new connections no longer take it. A connection the node opened
+   under the old pin ends 15 seconds after that time (longer than the
+   center takes to serve its new key at the end of its grace), or at once
+   when the center tells `grace_ms: 0`; then the node drops the old pin from
+   its config and dials again with the pins it still takes (a link that can
+   resume, resumes). Pins are compared by their 32 bytes: a pin written
+   with base64 padding is the same pin.
 4. At the end of the grace, or when the owner ends it earlier, the center
    serves the new key for every new connection; links up then go on. It
    goes on telling the rotation with `grace_ms: 0` until 7 days after it

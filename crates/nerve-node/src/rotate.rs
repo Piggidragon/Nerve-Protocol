@@ -440,10 +440,10 @@ pub(crate) fn center_rotated(
             until_ms: now + grace_ms,
         })
     };
-    if pin == old_pin && new_pin != old_pin {
+    if same_pin(&pin, &old_pin) && !same_pin(&new_pin, &old_pin) {
         let old_kept = keep(&old_pin);
         let saved = shared.mark_center(center, |e| {
-            if e.pin.as_deref() == Some(pin.as_str()) {
+            if e.pin.as_deref().is_some_and(|p| same_pin(p, &pin)) {
                 e.pin = Some(new_pin.clone());
                 e.old_pin = old_kept;
                 e.pin_rotations += 1;
@@ -473,16 +473,16 @@ pub(crate) fn center_rotated(
         );
         return;
     }
-    let told_before = pin == new_pin
+    let told_before = same_pin(&pin, &new_pin)
         && entry
             .old_pin
             .as_ref()
-            .is_some_and(|o| o.pin == old_pin && now + grace_ms < o.until_ms);
+            .is_some_and(|o| same_pin(&o.pin, &old_pin) && now + grace_ms < o.until_ms);
     if told_before {
         let shorter = keep(&old_pin);
         let ended = shorter.is_none();
         let saved = shared.mark_center(center, |e| {
-            if e.pin.as_deref() == Some(new_pin.as_str()) {
+            if e.pin.as_deref().is_some_and(|p| same_pin(p, &new_pin)) {
                 e.old_pin = shorter;
             }
         });
@@ -498,7 +498,7 @@ pub(crate) fn center_rotated(
         }
         return;
     }
-    if pin != new_pin {
+    if !same_pin(&pin, &new_pin) {
         tracing::warn!(
             "center {center} sent a rotation from a key this node does not pin ({old_pin}); ignored"
         );
@@ -514,10 +514,15 @@ const OLD_PIN_RETRY: Duration = Duration::from_secs(600);
 /// on a live link's tick. A save that fails is tried again only after
 /// [`OLD_PIN_RETRY`], so a full disk does not fill the log.
 pub(crate) fn drop_old_pin(shared: &Shared, center: &str) -> bool {
+    // Kept the slack longer than its time: a live link under it ends only
+    // then (crate::link::OLD_PIN_LINK_SLACK_MS). New dials take it no more
+    // from its time on (`pins_at`).
     let expired = |e: &CenterEntry| {
-        e.old_pin
-            .as_ref()
-            .is_some_and(|o| crate::now_ms() >= o.until_ms)
+        e.old_pin.as_ref().is_some_and(|o| {
+            crate::now_ms()
+                >= o.until_ms
+                    .saturating_add(crate::link::OLD_PIN_LINK_SLACK_MS)
+        })
     };
     if !shared.config().center(center).is_some_and(expired) {
         return false;
@@ -542,6 +547,18 @@ pub(crate) fn drop_old_pin(shared: &Shared, center: &str) -> bool {
     *crate::daemon::lock(&cs.old_pin_failed) = None;
     tracing::info!("center {center}: the grace of its old key has ended; its old pin is dropped");
     true
+}
+
+/// Whether two pins name the same key: compared by their 32 bytes, so a pin
+/// written with base64 padding is the same as one without.
+pub(crate) fn same_pin(a: &str, b: &str) -> bool {
+    match (
+        nerve_transport::tls::decode_pin(a),
+        nerve_transport::tls::decode_pin(b),
+    ) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => a == b,
+    }
 }
 
 /// A center's text as the node repeats it: one line, cut.

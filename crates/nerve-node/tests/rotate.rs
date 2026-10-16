@@ -642,10 +642,83 @@ async fn a_link_under_an_old_pin_ends_when_its_time_is_over() {
         nerve_proto::msg::now_ms() < until,
         "the link came up within the old pin's time"
     );
+    // A short slack past its time: the center serves its new key within it.
+    let left = until.saturating_sub(nerve_proto::msg::now_ms());
     assert!(
-        conn.ends_within(Duration::from_secs(15)).await.is_some(),
-        "the link under the old pin ends with its time"
+        conn.ends_within(Duration::from_millis(left + 8000))
+            .await
+            .is_none(),
+        "the link under the old pin stays for the slack"
     );
-    assert!(nerve_proto::msg::now_ms() >= until);
+    assert!(
+        conn.ends_within(Duration::from_secs(20)).await.is_some(),
+        "the link under the old pin ends after the slack"
+    );
+    assert!(nerve_proto::msg::now_ms() >= until + 15_000);
+    drop(daemon);
+}
+
+/// A center pin written with base64 padding names the same key: the node
+/// links under it and stays linked.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_padded_pin_links_and_stays_linked() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let a = ServerIdentity::generate(&[]).unwrap();
+    let front = tls_front(&a, center.url.port).await;
+    let daemon = node_with(dir.path(), &center, |e| {
+        e.url = format!("https://127.0.0.1:{front}");
+        e.pin = Some(format!("{}=", a.pin()));
+    })
+    .await;
+    let old = paired(&center).request.public_key;
+    let mut conn = link(&mut center, &old, Some(ROTATE)).await;
+    assert!(
+        conn.ends_within(Duration::from_secs(7)).await.is_none(),
+        "the link under the padded pin stays"
+    );
+    drop(daemon);
+}
+
+/// A dial refused for the pin says to pair again only when it goes on: right
+/// after a rotation the center may not serve its new key yet.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_pin_says_to_pair_again_only_when_it_goes_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let center = FakeCenter::start(false).await.unwrap();
+    let (a, b) = (
+        ServerIdentity::generate(&[]).unwrap(),
+        ServerIdentity::generate(&[]).unwrap(),
+    );
+    let front = tls_front(&a, center.url.port).await;
+    let daemon = node_with(dir.path(), &center, |e| {
+        e.url = format!("https://127.0.0.1:{front}");
+        e.pin = Some(b.pin());
+    })
+    .await;
+    let paths = daemon.paths().clone();
+    let status = || {
+        let paths = paths.clone();
+        async move { cli(&paths, &["status"]).await.unwrap_or_default() }
+    };
+    let mut first = String::new();
+    for _ in 0..200 {
+        first = status().await;
+        if first.contains("cannot connect") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(first.contains("may not serve its new key yet"), "{first}");
+    assert!(!first.contains("pair again"), "{first}");
+    let mut later = String::new();
+    for _ in 0..600 {
+        later = status().await;
+        if later.contains("pair again") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(later.contains("pair again"), "{later}");
     drop(daemon);
 }

@@ -581,6 +581,15 @@ pub fn euid() -> u32 {
     0
 }
 
+/// What a refused pinned certificate's message says, so a caller can tell
+/// that refusal apart (and add what to do, which depends on how often it
+/// happened: right after a rotation of the center's key the center may not
+/// serve the new key yet).
+pub const PIN_REFUSED: &str = "does not carry the key pinned at pairing";
+
+/// What to do about a pinned certificate refused again and again.
+pub const PIN_ADVICE: &str = "If the center got a new key and this node missed its rotation (it was away longer than the grace), pair again with a new pairing link.";
+
 /// A refused certificate in words that say what happened and what to do; rustls
 /// alone says `ApplicationVerificationFailure` or `CaUsedAsEndEntity`.
 fn tls_error(url: &CenterUrl, pinned: bool, e: &std::io::Error) -> String {
@@ -593,7 +602,7 @@ fn tls_error(url: &CenterUrl, pinned: bool, e: &std::io::Error) -> String {
         });
     match refused {
         Some(_) if pinned => format!(
-            "TLS with {url}: the center's certificate does not carry the key pinned at pairing. Its key changed (a new certificate), or another server answers there. If the center got a new key and this node missed its rotation (it was away longer than the grace), pair again with a new pairing link."
+            "TLS with {url}: the center's certificate {PIN_REFUSED}. Its key changed (a new certificate), or another server answers there."
         ),
         Some(c) => {
             use rustls::CertificateError as C;

@@ -44,6 +44,19 @@ const HANDSHAKE: Duration = Duration::from_secs(15);
 const PING: Duration = Duration::from_secs(20);
 const DEAD: Duration = Duration::from_secs(45);
 
+/// Dials in a row refused for the pin before the node says to pair again:
+/// more than the few seconds a center may take to serve its new key at the
+/// end of a rotation's grace.
+const PIN_REFUSALS_BEFORE_ADVICE: u32 = 3;
+
+/// How long a live link under the center's old pin outlives that pin's time
+/// (spec §4.10): longer than the center takes to serve its new key at the
+/// end of the grace (its sweep runs every 5 s), so a link to the real center
+/// does not end before the new key is served. New dials refuse the old pin
+/// at once; a center that ends its grace early says so (`grace_ms: 0`), and
+/// such a link ends at once.
+pub(crate) const OLD_PIN_LINK_SLACK_MS: u64 = 15_000;
+
 /// How a link (or a dial) ended.
 enum Outcome {
     /// Dial again after the backoff.
@@ -174,6 +187,8 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
     // handshake that fails is tried next with the new key: the center may
     // have taken it, and the grace of the old one may have ended since.
     let mut sign_next = false;
+    // Dials in a row whose certificate did not carry a pinned key.
+    let mut pin_refusals = 0u32;
     loop {
         if *stop.borrow() {
             return;
@@ -266,8 +281,24 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
                 return;
             }
             Err(ConnectError::Other(e)) => {
+                // A refused pin right after a rotation of the center's key
+                // may be a center that does not serve its new key yet: the
+                // advice to pair again comes only when it goes on.
+                let e = if e.contains(nerve_transport::net::PIN_REFUSED) {
+                    pin_refusals += 1;
+                    if pin_refusals >= PIN_REFUSALS_BEFORE_ADVICE {
+                        format!("{e} {}", nerve_transport::net::PIN_ADVICE)
+                    } else {
+                        format!(
+                            "{e} Right after a rotation of the center's key it may not serve its new key yet; the node tries again."
+                        )
+                    }
+                } else {
+                    pin_refusals = 0;
+                    e
+                };
                 cs.set_status(format!("cannot connect: {e}"));
-                if failed_dials == 0 {
+                if failed_dials == 0 || pin_refusals == PIN_REFUSALS_BEFORE_ADVICE {
                     tracing::warn!("center {name}: cannot connect: {e}");
                 } else {
                     tracing::debug!("center {name}: cannot connect: {e}");
@@ -291,6 +322,7 @@ pub(crate) async fn run_center(shared: Arc<Shared>, name: String) {
                 parked = kept;
                 if was_up {
                     failed_dials = 0;
+                    pin_refusals = 0;
                     sign_next = false;
                 } else if next.is_some() {
                     sign_next = !sign_next;
@@ -1037,9 +1069,19 @@ impl Link {
         let Some((_, entry)) = self.entry() else {
             return false;
         };
-        let pins = entry.pins_at(crate::now_ms());
         // A pairing without a pin checks the system's roots instead.
-        !pins.is_empty() && !pins.contains(&seen.as_str())
+        let Some(pin) = entry.pin.as_deref() else {
+            return false;
+        };
+        let now = crate::now_ms();
+        let taken = std::iter::once(pin).chain(
+            entry
+                .old_pin
+                .as_ref()
+                .filter(|o| now < o.until_ms.saturating_add(OLD_PIN_LINK_SLACK_MS))
+                .map(|o| o.pin.as_str()),
+        );
+        !taken.into_iter().any(|p| crate::rotate::same_pin(p, &seen))
     }
 
     /// Tells the center when its view of the node changed.

@@ -1170,6 +1170,19 @@ impl NodeConfig {
                     c.name
                 ));
             }
+            // Pins are kept in one form, base64url without padding, as the
+            // node computes them: a pin given with `=` padding names the
+            // same key, and every comparison of pins holds.
+            if let Some(p) = c.pin.as_mut()
+                && let Ok(raw) = nerve_transport::tls::decode_pin(p)
+            {
+                *p = nerve_transport::tls::b64url(&raw);
+            }
+            if let Some(o) = c.old_pin.as_mut()
+                && let Ok(raw) = nerve_transport::tls::decode_pin(&o.pin)
+            {
+                o.pin = nerve_transport::tls::b64url(&raw);
+            }
             if let Some(old) = &c.old_pin {
                 nerve_transport::tls::decode_pin(&old.pin)
                     .map_err(|e| format!("center {}: old_pin: {e}", c.name))?;
@@ -1628,6 +1641,21 @@ sudo_allow = ["sudo apt update"]
         format!(
             "[[center]]\nname = \"home\"\nurl = \"https://c.example:8443\"\ncenter_id = \"c\"\nnode_id = \"n\"\n[center.policy]\n{policy}\n"
         )
+    }
+
+    /// A center's pin given with base64 padding is kept without it: the same
+    /// key, in the one form the node compares.
+    #[test]
+    fn a_padded_center_pin_is_kept_without_padding() {
+        // Canonical base64url: the last character carries no stray bits.
+        let pin = format!("{}E", "A".repeat(42));
+        let text = format!(
+            "[[center]]\nname = \"home\"\nurl = \"https://c.example:8443\"\npin = \"{pin}=\"\ncenter_id = \"c\"\nnode_id = \"n\"\n[center.old_pin]\npin = \"{}=\"\nuntil_ms = 1\n",
+            "A".repeat(43)
+        );
+        let cfg = NodeConfig::parse(&text).unwrap();
+        assert_eq!(cfg.centers[0].pin.as_deref(), Some(pin.as_str()));
+        assert_eq!(cfg.centers[0].old_pin.as_ref().unwrap().pin, "A".repeat(43));
     }
 
     /// A rotated center's old pin round-trips through the file and is taken

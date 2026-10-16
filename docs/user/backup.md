@@ -171,6 +171,14 @@ center, a relayed node holds the pin of its relay, and a node behind an
   `center rm` on the node, or removed the node in the center, the other side
   forgot the key. The restored node dials with it and is told the center does
   not know it; pair it again.
+- **A key rotated after the backup.** A backup made before a
+  [key rotation](pairing.md#rotate-the-machines-key) holds the old key. On the
+  same machine, the restore keeps the rotated key that is still there, for
+  a node's key and for the center's, and says so. On another machine the
+  restored node has the old key, which the center takes only for the 7 days
+  after the rotation, and a restored center serves its old key, which the
+  machines it told stop taking after those 7 days. Make a new backup after
+  each rotation.
 - **Do not run the old node and the restored one together.** They have the
   same key, and a center keeps one live link per node: the second one is
   refused with an alert.

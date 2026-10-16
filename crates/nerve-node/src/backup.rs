@@ -501,6 +501,37 @@ pub fn restore(paths: &NodePaths, b: &Parsed, opts: &RestoreOpts) -> Result<Rest
             "the sudo switch is off: its password is not in a backup. `nerve-node sudo on` turns it on".into(),
         );
     }
+    // A pairing whose key was rotated after the backup was made: the config
+    // here names the rotated key, which the center holds, and the backup
+    // holds the older one, which the center takes only until its grace
+    // ends. Where the rotated key is still on this machine, it stays.
+    if let Target::Node(here) = &target {
+        for e in cfg.centers.iter_mut() {
+            let Some(rotated) = here
+                .centers
+                .iter()
+                .find(|h| h.name == e.name && h.center_id == e.center_id && h.node_id == e.node_id)
+                .and_then(|h| h.public_key.clone())
+                .filter(|k| e.public_key.as_ref() != Some(k))
+            else {
+                continue;
+            };
+            let on_this_machine = [to, secrets::other(to)].into_iter().any(|place| {
+                secrets::get(paths, place, Key::Center(&e.name))
+                    .ok()
+                    .flatten()
+                    .and_then(|t| NodeKey::from_text(&t).ok())
+                    .is_some_and(|k| k.public_hex() == rotated)
+            });
+            if on_this_machine {
+                e.public_key = Some(rotated);
+                report.notes.push(format!(
+                    "the node key for {} was rotated after the backup was made: the restore keeps the rotated key here, which the center holds, not the backup's older one",
+                    e.name
+                ));
+            }
+        }
+    }
     cfg.validate()?;
 
     let own = NodeSecrets::for_restore(paths, to);
@@ -625,7 +656,13 @@ fn write_keys<'a>(
     };
     for e in &cfg.centers {
         let key = Key::Center(&e.name);
-        match b.keys.get(&e.name) {
+        // A backup's key that is not the one the config names now (it was
+        // rotated after the backup) gives way to the one here.
+        let backed_up = b
+            .keys
+            .get(&e.name)
+            .filter(|t| NodeKey::from_text(t).is_ok_and(|k| pairs(e, &k)));
+        match backed_up {
             Some(t) => put(key, t)?,
             None => {
                 let fits = |t: &str| NodeKey::from_text(t).is_ok_and(|k| pairs(e, &k));
@@ -1548,6 +1585,64 @@ mod tests {
         assert_eq!(r.kept, ["home"], "{r:?}");
         assert_eq!(&key_text(&n, SecretStorage::Keyring, "home"), &keys["home"]);
         assert!(!n.key_file("home").exists());
+    }
+
+    /// Rotates the key for `center` here the way the node settles a
+    /// rotation: the config names the new key, which replaces the old one.
+    fn rotate_here(paths: &NodePaths, storage: SecretStorage, center: &str) -> NodeKey {
+        let k = NodeKey::generate().unwrap();
+        let mut s = open_store(paths);
+        s.update(|c| {
+            c.center_mut(center).unwrap().public_key = Some(k.public_hex());
+            Ok(())
+        })
+        .unwrap();
+        drop(s);
+        secrets::store_center_key(paths, storage, center, &k).unwrap();
+        k
+    }
+
+    /// A backup made before a rotation of the node's key holds the older
+    /// key: the restore keeps the rotated key here, which the center holds,
+    /// and the config goes on naming it.
+    #[test]
+    fn a_restore_of_a_backup_from_before_a_rotation_keeps_the_rotated_key() {
+        // The keys in files, the old key in the backup.
+        let (_a, n) = node();
+        paired(&n, SecretStorage::File, &["home"]);
+        let (_f, parsed, _) = roundtrip(&n, false);
+        assert_eq!(parsed.keys.len(), 1);
+        let rotated = rotate_here(&n, SecretStorage::File, "home");
+        let r = restore_into(&n, &parsed, None);
+        assert!(r.no_key.is_empty(), "{r:?}");
+        assert!(
+            r.notes
+                .iter()
+                .any(|t| t.contains("rotated after the backup")),
+            "{r:?}"
+        );
+        assert_eq!(
+            key_text(&n, SecretStorage::File, "home"),
+            rotated.to_text().trim()
+        );
+        let cfg = open_store(&n).config().clone();
+        assert_eq!(cfg.centers[0].public_key, Some(rotated.public_hex()));
+
+        // The keys in the keyring, none in the backup, moved into files.
+        let (_b, n) = node();
+        paired(&n, SecretStorage::Keyring, &["home"]);
+        let (_g, parsed, _) = roundtrip(&n, false);
+        assert!(parsed.keys.is_empty());
+        let rotated = rotate_here(&n, SecretStorage::Keyring, "home");
+        let r = restore_into(&n, &parsed, Some(SecretStorage::File));
+        assert_eq!(r.kept, ["home"], "{r:?}");
+        assert!(r.no_key.is_empty(), "{r:?}");
+        assert_eq!(
+            key_text(&n, SecretStorage::File, "home"),
+            rotated.to_text().trim()
+        );
+        let cfg = open_store(&n).config().clone();
+        assert_eq!(cfg.centers[0].public_key, Some(rotated.public_hex()));
     }
 
     /// A rotated key the backup lacks is taken over as well: it does not

@@ -990,3 +990,75 @@ async fn a_replaced_link_counts_as_a_drop() {
     drop(second);
     r.stop().await;
 }
+
+fn backup_of(state: &std::path::Path, d: &std::path::Path) -> nerve_center::backup::Parsed {
+    let pass = nerve_transport::backup::Passphrase::new("correct horse battery".into());
+    let file = d.join("c.bak");
+    let _ = std::fs::remove_file(&file);
+    nerve_center::backup::backup(state, &file, &pass, false, 4).unwrap();
+    nerve_center::backup::open(&std::fs::read(&file).unwrap(), &pass).unwrap()
+}
+
+/// A restore of a backup made before a rotation of the center's key keeps
+/// the new key and the rotation: the nodes were told it, in its grace and
+/// after.
+#[tokio::test]
+async fn a_restore_from_before_a_rotation_keeps_the_new_center_key() {
+    let a = tempfile::tempdir().unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let r = center(a.path(), true).await;
+    let old_pin = r.center.pin().unwrap();
+    r.stop().await;
+    let parsed = backup_of(a.path(), d.path());
+
+    // In the grace.
+    let r = center(a.path(), true).await;
+    let new_pin = r.center.rotate_key().await.unwrap()["pin"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    r.stop().await;
+    let report = nerve_center::backup::restore(a.path(), &parsed, false).unwrap();
+    assert!(
+        report.notes.iter().any(|n| n.contains("keeps the new key")),
+        "{report:?}"
+    );
+    assert!(a.path().join("tls.next.pem").exists());
+    let r = center(a.path(), true).await;
+    assert_eq!(r.center.pin().as_deref(), Some(old_pin.as_str()));
+    r.center.finish_key_rotation("test").await.unwrap();
+    assert_eq!(r.center.pin().as_deref(), Some(new_pin.as_str()));
+    r.stop().await;
+
+    // After the grace: the new key stays served.
+    nerve_center::backup::restore(a.path(), &parsed, false).unwrap();
+    let r = center(a.path(), true).await;
+    assert_eq!(r.center.pin().as_deref(), Some(new_pin.as_str()));
+    assert!(r.center.read(|s| s.key_rotation.is_some()));
+    r.stop().await;
+}
+
+/// A restore that fails after it wrote the certificate puts back what was
+/// here, the new key of a rotation in its grace too.
+#[tokio::test]
+async fn a_failed_restore_puts_back_the_new_center_key() {
+    let a = tempfile::tempdir().unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let r = center(a.path(), true).await;
+    r.stop().await;
+    let parsed = backup_of(a.path(), d.path());
+    let r = center(a.path(), true).await;
+    r.center.rotate_key().await.unwrap();
+    r.stop().await;
+    let next = std::fs::read(a.path().join("tls.next.pem")).unwrap();
+    let pem = std::fs::read(a.path().join("tls.pem")).unwrap();
+    // state.json cannot be replaced: a folder with something in it there.
+    let state = a.path().join("state.json");
+    std::fs::remove_file(&state).unwrap();
+    std::fs::create_dir(&state).unwrap();
+    std::fs::write(state.join("x"), b"x").unwrap();
+    let e = nerve_center::backup::restore(a.path(), &parsed, true).unwrap_err();
+    assert!(e.contains("nothing was restored"), "{e}");
+    assert_eq!(std::fs::read(a.path().join("tls.next.pem")).unwrap(), next);
+    assert_eq!(std::fs::read(a.path().join("tls.pem")).unwrap(), pem);
+}

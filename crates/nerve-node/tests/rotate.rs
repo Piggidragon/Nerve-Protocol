@@ -134,6 +134,19 @@ fn key(paths: &NodePaths) -> NodeKey {
     NodeKey::from_text(&std::fs::read_to_string(paths.key_file("lab")).unwrap()).unwrap()
 }
 
+/// Waits until the audit log holds `text`: the node writes node.toml first
+/// and its audit line after, so a test that saw the first may be early for
+/// the second.
+async fn audit_shows(paths: &NodePaths, text: &str) -> bool {
+    for _ in 0..200 {
+        if audit(paths).contains(text) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    false
+}
+
 fn audit(paths: &NodePaths) -> String {
     std::fs::read_to_string(paths.audit_log()).unwrap_or_default()
 }
@@ -467,13 +480,7 @@ async fn the_node_follows_a_center_key_its_old_key_signed() {
     )
     .await
     .unwrap();
-    for _ in 0..40 {
-        if audit(&paths).contains("center-key-refused") {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    assert!(audit(&paths).contains("center-key-refused"));
+    assert!(audit_shows(&paths, "center-key-refused").await);
     assert_eq!(pins(), (Some(a.pin()), None));
 
     // Signed by the pinned key: the new pin is taken, the old one for the
@@ -501,7 +508,7 @@ async fn the_node_follows_a_center_key_its_old_key_signed() {
     assert!(
         old_pin.until_ms >= before + week && old_pin.until_ms <= nerve_proto::msg::now_ms() + week
     );
-    assert!(audit(&paths).contains("\"event\":\"center-key\""));
+    assert!(audit_shows(&paths, "\"event\":\"center-key\"").await);
 
     // Told again with no grace left (the center serves the new key): the
     // old pin goes.
@@ -515,7 +522,7 @@ async fn the_node_follows_a_center_key_its_old_key_signed() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert_eq!(pins(), (Some(b.pin()), None));
-    assert!(audit(&paths).contains("center-key-grace-ended"));
+    assert!(audit_shows(&paths, "center-key-grace-ended").await);
     drop(daemon);
 }
 

@@ -179,12 +179,22 @@ still holds the rotation unfinished, and a restore checks that it is the key
 `key_rotation.new_spki` names. Without it, the restored center would drop the
 rotation and serve the old key for good, and every told node would be locked
 out once its old pin's time is over. A restore without `tls.next.pem`
-deletes one left in the state folder.
+deletes one left in the state folder, unless it is the new key of a rotation
+made after the backup (below).
 
 A restore takes the center lock, checks `center_id` (the same center is
 restored, another needs `--replace`), writes `tls.pem`, then `tls.next.pem`
-(or deletes one there), then `state.json`, and puts the old `tls.pem` back if
-a later write fails.
+(or deletes one there), then `state.json`. When a write fails it puts back
+the `tls.pem` and the `tls.next.pem` that were there (or deletes the one that
+was not), so the old state meets its own keys.
+
+A restore over the same center keeps a rotation of its key made after the
+backup, whose old key is the backup's key and whose new key is still there:
+in its grace, `tls.next.pem` and the rotation record stay; after it, the new
+key stays in `tls.pem`. Its nodes were told the new key. A node restore keeps
+likewise a node key rotated after the backup: when the config being replaced
+names, for the same pairing, a `public_key` whose key is on the machine, that
+key and its `public_key` stay, over the older key in the backup.
 
 ## Pins
 

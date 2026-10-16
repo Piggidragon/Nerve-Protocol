@@ -251,23 +251,49 @@ pub fn restore(state: &Path, b: &Parsed, replace: bool) -> Result<RestoreReport,
         _ => {}
     }
 
-    // The pin the nodes hold: said when the certificate here is another.
+    // What is here now: put back when a write fails.
     let old = std::fs::read_to_string(&id_path).ok();
+    let next_path = state.join(NEXT_IDENTITY_FILE);
+    let old_next = std::fs::read_to_string(&next_path).ok();
+
+    // What goes in: the backup's, unless the center here rotated its key
+    // since the backup was made. Its nodes were told the new key and stop
+    // taking the backup's when their old pin's time is over, so the new key
+    // and the rotation stay.
+    let mut identity_text = b.identity_text.clone();
+    let mut next_text = b.next_text.clone();
+    let mut state_text = b.state_text.clone();
+    if let Some(kept) = rotated_since(state, b, old.as_deref(), old_next.as_deref()) {
+        let mut st = b.store.clone();
+        st.key_rotation = Some(kept.rotation);
+        state_text = serde_json::to_string_pretty(&st).map_err(|e| e.to_string())?;
+        if let Some(t) = kept.identity {
+            identity_text = t;
+        }
+        next_text = kept.next;
+        report.notes.push(
+            "the center's key was rotated after the backup was made, and its nodes were told: the restore keeps the new key and the rotation, not the backup's older key".into(),
+        );
+    }
+
+    // The pin the nodes hold: said when the certificate here is another.
+    let pin = ServerIdentity::from_pem(&identity_text)
+        .map(|i| i.pin())
+        .unwrap_or_default();
     if let Some(old_pin) = old
         .as_deref()
         .and_then(|t| ServerIdentity::from_pem(t).ok())
         .map(|i| i.pin())
-        && old_pin != b.pin()
+        && old_pin != pin
     {
         report.notes.push(format!(
-            "the certificate here had the pin {old_pin}; it has the backup's pin {} now, which is the one the nodes of the backup hold",
-            b.pin()
+            "the certificate here had the pin {old_pin}; it has the backup's pin {pin} now, which is the one the nodes of the backup hold"
         ));
     }
 
     nerve_transport::files::create_private_dir(state)
         .map_err(|e| format!("cannot create {}: {e}", state.display()))?;
-    nerve_transport::files::write_private(&id_path, b.identity_text.as_bytes()).map_err(|e| {
+    nerve_transport::files::write_private(&id_path, identity_text.as_bytes()).map_err(|e| {
         format!(
             "cannot write {}: {e}; nothing was restored",
             id_path.display()
@@ -275,8 +301,7 @@ pub fn restore(state: &Path, b: &Parsed, replace: bool) -> Result<RestoreReport,
     })?;
     // The new key of a rotation in its grace, or none: a new key left here
     // from another rotation is not the backup's.
-    let next_path = state.join(NEXT_IDENTITY_FILE);
-    let next_written = match &b.next_text {
+    let next_written = match &next_text {
         Some(t) => nerve_transport::files::write_private(&next_path, t.as_bytes()),
         None => match std::fs::remove_file(&next_path) {
             Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
@@ -287,23 +312,23 @@ pub fn restore(state: &Path, b: &Parsed, replace: bool) -> Result<RestoreReport,
     let written = next_written
         .map_err(|e| (next_path.clone(), e))
         .and_then(|()| {
-            nerve_transport::files::write_private(&state_path, b.state_text.as_bytes())
+            nerve_transport::files::write_private(&state_path, state_text.as_bytes())
                 .map_err(|e| (state_path.clone(), e))
         });
     if let Err((path, e)) = written {
-        if b.next_text.is_some() {
-            let _ = std::fs::remove_file(&next_path);
-        }
-        // The old certificate goes back, or the old state would meet a key it
-        // was not paired under.
-        match &old {
+        // What was here goes back, the new key of a rotation in its grace
+        // with the certificate: the old state, which stays, holds that
+        // rotation, and its nodes were told the new key.
+        let put_back = |at: &Path, text: &Option<String>| match text {
             Some(t) => {
-                let _ = nerve_transport::files::write_private(&id_path, t.as_bytes());
+                let _ = nerve_transport::files::write_private(at, t.as_bytes());
             }
             None => {
-                let _ = std::fs::remove_file(&id_path);
+                let _ = std::fs::remove_file(at);
             }
-        }
+        };
+        put_back(&next_path, &old_next);
+        put_back(&id_path, &old);
         return Err(format!(
             "cannot write {}: {e}; nothing was restored",
             path.display()
@@ -315,6 +340,63 @@ pub fn restore(state: &Path, b: &Parsed, replace: bool) -> Result<RestoreReport,
         );
     }
     Ok(report)
+}
+
+/// What a restore keeps of a rotation of the center's key made after the
+/// backup.
+struct KeptRotation {
+    rotation: store::KeyRotation,
+    /// The certificate and key to write in place of the backup's: the new
+    /// key, when the rotation ended and the center serves it.
+    identity: Option<String>,
+    /// The new key of a rotation still in its grace.
+    next: Option<String>,
+}
+
+/// A rotation of the center's key that the center here made after the
+/// backup: same center, from the backup's key, and its new key still here
+/// (in `tls.next.pem` during the grace, in `tls.pem` after it). `None` when
+/// there is none, or the backup holds a rotation of its own.
+fn rotated_since(
+    state: &Path,
+    b: &Parsed,
+    here_identity: Option<&str>,
+    here_next: Option<&str>,
+) -> Option<KeptRotation> {
+    if b.next_text.is_some() {
+        return None;
+    }
+    let here = Store::load(state).ok().flatten()?;
+    if here.center_id != b.store.center_id {
+        return None;
+    }
+    let r = here.key_rotation?;
+    if r.old_spki != nerve_transport::tls::b64url(&b.identity.spki()) {
+        return None;
+    }
+    let spki_of = |t: &str| {
+        ServerIdentity::from_pem(t)
+            .ok()
+            .map(|i| nerve_transport::tls::b64url(&i.spki()))
+    };
+    match r.finished_ms {
+        None => {
+            let next = here_next.filter(|t| spki_of(t).as_ref() == Some(&r.new_spki))?;
+            Some(KeptRotation {
+                next: Some(next.to_string()),
+                identity: None,
+                rotation: r,
+            })
+        }
+        Some(_) => {
+            let identity = here_identity.filter(|t| spki_of(t).as_ref() == Some(&r.new_spki))?;
+            Some(KeptRotation {
+                identity: Some(identity.to_string()),
+                next: None,
+                rotation: r,
+            })
+        }
+    }
 }
 
 /// Root's backup of another user's state folder runs as that user

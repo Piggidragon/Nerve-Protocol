@@ -453,6 +453,8 @@ revoked = false             # the center sent `bye revoked`
 unknown = false             # the center answered 401
 public_key = "<64 hex>"     # after this node rotated its key (protocol §4.10): the key
                             # it has now; node_id stays the one of the first key
+key_rotations = 1           # rotations of the node's key and of the center's it took;
+pin_rotations = 1           # a restore keeps the keys and pins of the config further along
 old_pin = { pin = "<pin>", until_ms = 1790000000000 }  # after the center rotated its
                             # key (protocol §4.10): its old pin, taken until then
 

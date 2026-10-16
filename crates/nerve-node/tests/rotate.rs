@@ -204,6 +204,7 @@ async fn the_node_takes_its_new_key_once_the_center_took_it() {
     // node id stays.
     let (cfg, _) = nerve_node::cli::read_config(&paths).await.unwrap();
     assert_eq!(cfg.centers[0].public_key.as_deref(), Some(new.as_str()));
+    assert_eq!(cfg.centers[0].key_rotations, 1);
     assert_eq!(cfg.centers[0].node_id, paired(&center).node_id);
     let log = audit(&paths);
     assert!(log.contains("\"event\":\"node-key\""), "{log}");
@@ -509,6 +510,8 @@ async fn the_node_follows_a_center_key_its_old_key_signed() {
         old_pin.until_ms >= before + week && old_pin.until_ms <= nerve_proto::msg::now_ms() + week
     );
     assert!(audit_shows(&paths, "\"event\":\"center-key\"").await);
+    let (cfg, _) = futures_block(nerve_node::cli::read_config(&paths)).unwrap();
+    assert_eq!(cfg.centers[0].pin_rotations, 1);
 
     // Told again with no grace left (the center serves the new key): the
     // old pin goes.

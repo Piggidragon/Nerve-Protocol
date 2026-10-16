@@ -3612,6 +3612,8 @@ mod tests {
                 revoked: false,
                 unknown: false,
                 public_key: None,
+                key_rotations: 0,
+                pin_rotations: 0,
                 old_pin: None,
                 policy: nerve_policy::CenterPolicy {
                     folders,
@@ -3675,6 +3677,8 @@ mod tests {
             revoked: false,
             unknown: false,
             public_key: None,
+            key_rotations: 0,
+            pin_rotations: 0,
             old_pin: None,
             policy: nerve_policy::CenterPolicy {
                 folders: folders
@@ -4317,6 +4321,8 @@ mod tests {
             revoked: false,
             unknown: false,
             public_key: None,
+            key_rotations: 0,
+            pin_rotations: 0,
             old_pin: None,
             policy: nerve_policy::CenterPolicy {
                 folders: vec![nerve_policy::config::Folder {

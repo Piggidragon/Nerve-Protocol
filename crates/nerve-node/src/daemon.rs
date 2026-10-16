@@ -2083,6 +2083,8 @@ mod tests {
                     revoked: false,
                     unknown: false,
                     public_key: None,
+                    key_rotations: 0,
+                    pin_rotations: 0,
                     old_pin: None,
                     policy: Default::default(),
                 });
@@ -2227,6 +2229,8 @@ mod tests {
                     revoked: false,
                     unknown: false,
                     public_key: None,
+                    key_rotations: 0,
+                    pin_rotations: 0,
                     old_pin: None,
                     policy: Default::default(),
                 });
@@ -2316,6 +2320,8 @@ mod tests {
                     revoked: false,
                     unknown: false,
                     public_key: None,
+                    key_rotations: 0,
+                    pin_rotations: 0,
                     old_pin: None,
                     policy: nerve_policy::CenterPolicy {
                         folders: vec![Folder {
@@ -2790,6 +2796,8 @@ mod old_pin_tests {
                     revoked: false,
                     unknown: false,
                     public_key: None,
+                    key_rotations: 0,
+                    pin_rotations: 0,
                     old_pin: Some(nerve_policy::OldPin {
                         pin: "A".repeat(43),
                         until_ms: 1,

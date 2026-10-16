@@ -280,7 +280,15 @@ async fn settle(
     // nothing else changes: the key aside goes again on the next link, and
     // the center answers it the same.
     let named = new_hex.clone();
-    if !shared.mark_center(center, |e| e.public_key = Some(named)) {
+    // Counted once per key: a rotation settled again (its first try did not
+    // finish) is the same one.
+    let recorded = shared.mark_center(center, |e| {
+        if e.public_key.as_ref() != Some(&named) {
+            e.public_key = Some(named);
+            e.key_rotations += 1;
+        }
+    });
+    if !recorded {
         return Err(format!(
             "center {center} took the new key, but node.toml could not record it; the old key stays in use for now, and the new key is kept: the node settles it on its next link, or run this command again"
         ));
@@ -438,6 +446,7 @@ pub(crate) fn center_rotated(
             if e.pin.as_deref() == Some(pin.as_str()) {
                 e.pin = Some(new_pin.clone());
                 e.old_pin = old_kept;
+                e.pin_rotations += 1;
             }
         });
         // Not kept, the node pins the old key as before; the center tells

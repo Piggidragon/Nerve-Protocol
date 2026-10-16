@@ -191,10 +191,16 @@ was not), so the old state meets its own keys.
 A restore over the same center keeps a rotation of its key made after the
 backup, whose old key is the backup's key and whose new key is still there:
 in its grace, `tls.next.pem` and the rotation record stay; after it, the new
-key stays in `tls.pem`. Its nodes were told the new key. A node restore keeps
-likewise a node key rotated after the backup: when the config being replaced
-names, for the same pairing, a `public_key` whose key is on the machine, that
-key and its `public_key` stay, over the older key in the backup.
+key stays in `tls.pem`. Its nodes were told the new key. A backup made in the
+grace of the same rotation gives way only to one that ended here (also early).
+
+A node restore keeps likewise what was rotated after the backup, for the same
+pairing (name, `center_id`, `node_id`), by the counts `key_rotations` and
+`pin_rotations` of each entry: where the config being replaced counts more,
+its `public_key` stays when that key is on the machine, over the older key in
+the backup, and its `pin` and `old_pin` stay. Where it counts fewer (an older
+copy of the node), the backup's stay. The same count with another key keeps
+the backup's, with a note.
 
 ## Pins
 

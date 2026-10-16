@@ -1062,3 +1062,31 @@ async fn a_failed_restore_puts_back_the_new_center_key() {
     assert_eq!(std::fs::read(a.path().join("tls.next.pem")).unwrap(), next);
     assert_eq!(std::fs::read(a.path().join("tls.pem")).unwrap(), pem);
 }
+
+/// A backup made in the grace and restored after the grace was ended (here
+/// early) keeps the new key served: the machines that were told take only
+/// that one.
+#[tokio::test]
+async fn a_backup_from_the_grace_restored_after_its_end_keeps_the_new_key_served() {
+    let a = tempfile::tempdir().unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let r = center(a.path(), true).await;
+    let new_pin = r.center.rotate_key().await.unwrap()["pin"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    r.stop().await;
+    let parsed = backup_of(a.path(), d.path());
+    let r = center(a.path(), true).await;
+    r.center.finish_key_rotation("test").await.unwrap();
+    r.stop().await;
+    let report = nerve_center::backup::restore(a.path(), &parsed, false).unwrap();
+    assert!(
+        report.notes.iter().any(|n| n.contains("keeps the new key")),
+        "{report:?}"
+    );
+    assert!(!a.path().join("tls.next.pem").exists());
+    let r = center(a.path(), true).await;
+    assert_eq!(r.center.pin().as_deref(), Some(new_pin.as_str()));
+    r.stop().await;
+}

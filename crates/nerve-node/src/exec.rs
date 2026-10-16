@@ -2922,6 +2922,8 @@ mod tests {
             revoked: false,
             unknown: false,
             public_key: None,
+            key_rotations: 0,
+            pin_rotations: 0,
             old_pin: None,
             policy: policy(&work),
         };
@@ -3096,6 +3098,8 @@ mod tests {
             revoked: false,
             unknown: false,
             public_key: None,
+            key_rotations: 0,
+            pin_rotations: 0,
             old_pin: None,
             policy: CenterPolicy {
                 mode,
@@ -3409,6 +3413,8 @@ mod windows_tests {
             revoked: false,
             unknown: false,
             public_key: None,
+            key_rotations: 0,
+            pin_rotations: 0,
             old_pin: None,
             policy: CenterPolicy {
                 folders: vec![Folder {

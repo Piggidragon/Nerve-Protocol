@@ -173,12 +173,19 @@ center, a relayed node holds the pin of its relay, and a node behind an
   not know it; pair it again.
 - **A key rotated after the backup.** A backup made before a
   [key rotation](pairing.md#rotate-the-machines-key) holds the old key. On the
-  same machine, the restore keeps the rotated key that is still there, for
-  a node's key and for the center's, and says so. On another machine the
-  restored node has the old key, which the center takes only for the 7 days
-  after the rotation, and a restored center serves its old key, which the
-  machines it told stop taking after those 7 days. Make a new backup after
-  each rotation.
+  same machine, the restore keeps what was rotated since and is still there:
+  the node's key, the center's pin the node was told, and on a center its
+  new key. It says so. A copy of the node that is older than the backup
+  (fewer rotations) gives way to the backup. On another machine the restored
+  node has the old key, which the center takes only for the 7 days after the
+  rotation, and the center's old pin: after the center's 7 days set the new
+  one with `nerve-node config set center.<name>.pin <pin>` (the web UI shows
+  it). A restored center serves its old key, which the machines it told stop
+  taking after those 7 days. Make a new backup after each rotation.
+- **A center backup made during the 7 days of a rotation** brings back that
+  rotation. If you ended it early (**Serve the new key now**) after the
+  backup was made, press it again after a restore on another machine; on the
+  same machine the restore keeps the new key served.
 - **Do not run the old node and the restored one together.** They have the
   same key, and a center keeps one live link per node: the second one is
   refused with an alert.

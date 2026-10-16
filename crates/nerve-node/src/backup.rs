@@ -501,32 +501,54 @@ pub fn restore(paths: &NodePaths, b: &Parsed, opts: &RestoreOpts) -> Result<Rest
             "the sudo switch is off: its password is not in a backup. `nerve-node sudo on` turns it on".into(),
         );
     }
-    // A pairing whose key was rotated after the backup was made: the config
-    // here names the rotated key, which the center holds, and the backup
-    // holds the older one, which the center takes only until its grace
-    // ends. Where the rotated key is still on this machine, it stays.
+    // A pairing whose keys were rotated after the backup was made: the config
+    // here is further along (it counts more rotations) and names the keys
+    // the center holds now, the node's and the center's; the backup holds
+    // older ones, which the center takes only until their grace ends. Those
+    // here stay: the node key when it is still on this machine, the
+    // center's pins always. An older copy of the node here (fewer
+    // rotations) gives way to the backup.
     if let Target::Node(here) = &target {
         for e in cfg.centers.iter_mut() {
-            let Some(rotated) = here
+            let Some(h) = here
                 .centers
                 .iter()
                 .find(|h| h.name == e.name && h.center_id == e.center_id && h.node_id == e.node_id)
-                .and_then(|h| h.public_key.clone())
-                .filter(|k| e.public_key.as_ref() != Some(k))
             else {
                 continue;
             };
-            let on_this_machine = [to, secrets::other(to)].into_iter().any(|place| {
-                secrets::get(paths, place, Key::Center(&e.name))
-                    .ok()
-                    .flatten()
-                    .and_then(|t| NodeKey::from_text(&t).ok())
-                    .is_some_and(|k| k.public_hex() == rotated)
-            });
-            if on_this_machine {
-                e.public_key = Some(rotated);
+            if let Some(rotated) = h
+                .public_key
+                .clone()
+                .filter(|k| e.public_key.as_ref() != Some(k))
+            {
+                let on_this_machine = [to, secrets::other(to)].into_iter().any(|place| {
+                    secrets::get(paths, place, Key::Center(&e.name))
+                        .ok()
+                        .flatten()
+                        .and_then(|t| NodeKey::from_text(&t).ok())
+                        .is_some_and(|k| k.public_hex() == rotated)
+                });
+                if h.key_rotations > e.key_rotations && on_this_machine {
+                    e.public_key = Some(rotated);
+                    e.key_rotations = h.key_rotations;
+                    report.notes.push(format!(
+                        "the node key for {} was rotated after the backup was made: the restore keeps the rotated key here, which the center holds, not the backup's older one",
+                        e.name
+                    ));
+                } else if h.key_rotations == e.key_rotations {
+                    report.notes.push(format!(
+                        "the node key for {} here is another one than the backup's after as many rotations: the restore takes the backup's. If the center refuses it, pair {} again",
+                        e.name, e.name
+                    ));
+                }
+            }
+            if h.pin_rotations > e.pin_rotations && h.pin != e.pin {
+                e.pin = h.pin.clone();
+                e.old_pin = h.old_pin.clone();
+                e.pin_rotations = h.pin_rotations;
                 report.notes.push(format!(
-                    "the node key for {} was rotated after the backup was made: the restore keeps the rotated key here, which the center holds, not the backup's older one",
+                    "center {} rotated its key after the backup was made: the restore keeps the center's pin here, which it was told, not the backup's older one",
                     e.name
                 ));
             }
@@ -976,6 +998,8 @@ mod tests {
             revoked: false,
             unknown: false,
             public_key: None,
+            key_rotations: 0,
+            pin_rotations: 0,
             old_pin: None,
             policy: Default::default(),
         }
@@ -1593,13 +1617,75 @@ mod tests {
         let k = NodeKey::generate().unwrap();
         let mut s = open_store(paths);
         s.update(|c| {
-            c.center_mut(center).unwrap().public_key = Some(k.public_hex());
+            let e = c.center_mut(center).unwrap();
+            e.public_key = Some(k.public_hex());
+            e.key_rotations += 1;
             Ok(())
         })
         .unwrap();
         drop(s);
         secrets::store_center_key(paths, storage, center, &k).unwrap();
         k
+    }
+
+    /// A restore over an older copy of the node (fewer rotations) takes the
+    /// backup's newer key, not the older rotated one here.
+    #[test]
+    fn a_restore_over_an_older_copy_takes_the_backups_newer_key() {
+        let (_a, n1) = node();
+        paired(&n1, SecretStorage::File, &["home"]);
+        rotate_here(&n1, SecretStorage::File, "home");
+        let (_f1, b1, _) = roundtrip(&n1, false);
+        let k2 = rotate_here(&n1, SecretStorage::File, "home");
+        let (_f2, b2, _) = roundtrip(&n1, false);
+
+        let (_b, n2) = node();
+        restore_into(&n2, &b1, None);
+        let r = restore_into(&n2, &b2, None);
+        assert!(r.no_key.is_empty(), "{r:?}");
+        assert!(
+            !r.notes
+                .iter()
+                .any(|t| t.contains("rotated after the backup")),
+            "{r:?}"
+        );
+        assert_eq!(
+            key_text(&n2, SecretStorage::File, "home"),
+            k2.to_text().trim()
+        );
+        let cfg = open_store(&n2).config().clone();
+        assert_eq!(cfg.centers[0].public_key, Some(k2.public_hex()));
+        assert_eq!(cfg.centers[0].key_rotations, 2);
+    }
+
+    /// A restore of a backup made before a rotation of the center's key
+    /// keeps the center's pin the node was told, not the backup's older one.
+    #[test]
+    fn a_restore_from_before_a_center_rotation_keeps_the_new_pin() {
+        let (_a, n) = node();
+        paired(&n, SecretStorage::File, &["home"]);
+        let (_f, parsed, _) = roundtrip(&n, false);
+        let before = open_store(&n).config().centers[0].pin.clone();
+        let new_pin = "B".repeat(43);
+        let mut s = open_store(&n);
+        s.update(|c| {
+            let e = c.center_mut("home").unwrap();
+            e.pin = Some(new_pin.clone());
+            e.old_pin = None;
+            e.pin_rotations += 1;
+            Ok(())
+        })
+        .unwrap();
+        drop(s);
+        assert_ne!(before.as_deref(), Some(new_pin.as_str()));
+        let r = restore_into(&n, &parsed, None);
+        assert!(
+            r.notes.iter().any(|t| t.contains("keeps the center's pin")),
+            "{r:?}"
+        );
+        let cfg = open_store(&n).config().clone();
+        assert_eq!(cfg.centers[0].pin.as_deref(), Some(new_pin.as_str()));
+        assert_eq!(cfg.centers[0].pin_rotations, 1);
     }
 
     /// A backup made before a rotation of the node's key holds the older

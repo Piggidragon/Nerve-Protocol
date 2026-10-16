@@ -48,6 +48,10 @@ pub struct NodeConfig {
     pub centers: Vec<CenterEntry>,
 }
 
+fn is_zero(n: &u32) -> bool {
+    *n == 0
+}
+
 fn is_false(b: &bool) -> bool {
     !*b
 }
@@ -629,6 +633,13 @@ pub struct CenterEntry {
     /// with, whose hash `node_id` is. A backup checks the key by it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_key: Option<String>,
+    /// How many rotations of the node's key this pairing settled, and of
+    /// the center's key it took: a restore keeps the key or pin of the
+    /// config that is further along, here or in the backup.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub key_rotations: u32,
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub pin_rotations: u32,
     /// The pin the center had before it rotated its key, still taken until
     /// its grace ends (docs/dev/spec/protocol.md §4.10).
     #[serde(default, skip_serializing_if = "Option::is_none")]

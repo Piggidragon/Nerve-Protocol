@@ -1090,3 +1090,78 @@ async fn a_backup_from_the_grace_restored_after_its_end_keeps_the_new_key_served
     assert_eq!(r.center.pin().as_deref(), Some(new_pin.as_str()));
     r.stop().await;
 }
+
+/// A restore of a backup made before a node rotated its key keeps the
+/// node's record here: the node holds only its new key.
+#[tokio::test]
+async fn a_restore_from_before_a_node_rotation_keeps_the_nodes_new_key() {
+    let a = tempfile::tempdir().unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let r = center(a.path(), false).await;
+    let cid = r.center.id();
+    let (old, new) = (NodeKey::generate().unwrap(), NodeKey::generate().unwrap());
+    let id = pair(&r, &old, "box-1").await;
+    r.center.flush();
+    let parsed = backup_of(a.path(), d.path());
+    let mut ws = welcomed(&r, &id, &old).await;
+    send(
+        &mut ws,
+        Message::notification(method::KEY_ROTATE, rotate_params(&cid, &old, &new)),
+    )
+    .await;
+    next(&mut ws, method::KEY_ROTATED)
+        .await
+        .expect("key.rotated");
+    drop(ws);
+    r.stop().await;
+
+    let report = nerve_center::backup::restore(a.path(), &parsed, false).unwrap();
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.contains("box-1 rotated its key")),
+        "{report:?}"
+    );
+    let r = center(a.path(), false).await;
+    assert_eq!(r.center.public_key(&id), Some(new.public_hex()));
+    drop(welcomed(&r, &id, &new).await);
+    r.stop().await;
+}
+
+/// A restore after two rotations of the center's key since the backup keeps
+/// the keys here: the newest served, and the one in the grace aside.
+#[tokio::test]
+async fn a_restore_after_two_center_rotations_keeps_the_keys_here() {
+    let a = tempfile::tempdir().unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let r = center(a.path(), true).await;
+    r.stop().await;
+    let parsed = backup_of(a.path(), d.path());
+    let r = center(a.path(), true).await;
+    let n = r.center.rotate_key().await.unwrap()["pin"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    r.center.finish_key_rotation("test").await.unwrap();
+    let m = r.center.rotate_key().await.unwrap()["pin"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    r.stop().await;
+
+    // The second in its grace: N served, M aside.
+    nerve_center::backup::restore(a.path(), &parsed, false).unwrap();
+    assert!(a.path().join("tls.next.pem").exists());
+    let r = center(a.path(), true).await;
+    assert_eq!(r.center.pin().as_deref(), Some(n.as_str()));
+    r.center.finish_key_rotation("test").await.unwrap();
+    assert_eq!(r.center.pin().as_deref(), Some(m.as_str()));
+    r.stop().await;
+
+    // Both ended: M served.
+    nerve_center::backup::restore(a.path(), &parsed, false).unwrap();
+    let r = center(a.path(), true).await;
+    assert_eq!(r.center.pin().as_deref(), Some(m.as_str()));
+    r.stop().await;
+}

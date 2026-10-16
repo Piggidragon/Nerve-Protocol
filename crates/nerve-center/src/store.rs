@@ -47,6 +47,14 @@ pub struct Store {
     /// in their PEM files.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_rotation: Option<KeyRotation>,
+    /// How many rotations of its key the center started: a restore keeps
+    /// the keys of the state that is further along, here or in the backup.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub key_rotations: u32,
+}
+
+fn is_zero(n: &u32) -> bool {
+    *n == 0
 }
 
 /// A rotation of the center's TLS key: what `center.rotate` tells the
@@ -87,6 +95,7 @@ impl Store {
             stats: BTreeMap::new(),
             log_level: Level::default(),
             key_rotation: None,
+            key_rotations: 0,
         }
     }
 
@@ -152,6 +161,10 @@ pub struct NodeRecord {
     /// (docs/dev/spec/protocol.md §4.10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub old_key: Option<OldKey>,
+    /// How many rotations of its key the node made here: a restore keeps
+    /// the keys of the record that is further along.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub key_rotations: u32,
     pub platform: String,
     pub arch: String,
     pub paired_ms: u64,
@@ -270,6 +283,7 @@ mod tests {
             name: id.into(),
             public_key: "00".into(),
             old_key: None,
+            key_rotations: 0,
             platform: "linux".into(),
             arch: "x86_64".into(),
             paired_ms: 1,

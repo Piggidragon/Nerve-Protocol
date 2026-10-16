@@ -256,19 +256,28 @@ pub fn restore(state: &Path, b: &Parsed, replace: bool) -> Result<RestoreReport,
     let next_path = state.join(NEXT_IDENTITY_FILE);
     let old_next = std::fs::read_to_string(&next_path).ok();
 
-    // What goes in: the backup's, unless the center here rotated its key
-    // since the backup was made. Its nodes were told the new key and stop
-    // taking the backup's when their old pin's time is over, so the new key
-    // and the rotation stay.
+    // What goes in: the backup's, unless the center here is further along.
+    // Its key rotated since the backup was made: its nodes were told the new
+    // key and stop taking the backup's when their old pin's time is over, so
+    // the new key and the rotation stay. A node's key rotated since: the
+    // node holds only its new key, so its record here stays.
     let mut identity_text = b.identity_text.clone();
     let mut next_text = b.next_text.clone();
     let mut state_text = b.state_text.clone();
-    let kept_rotation = rotated_since(state, b, old.as_deref(), old_next.as_deref());
+    let here_store = Store::load(state)
+        .ok()
+        .flatten()
+        .filter(|h| h.center_id == b.store.center_id);
+    let mut st = b.store.clone();
+    let mut changed = false;
+    let kept_rotation = here_store
+        .as_ref()
+        .and_then(|h| rotated_since(h, b, old.as_deref(), old_next.as_deref()));
     let kept_any = kept_rotation.is_some();
     if let Some(kept) = kept_rotation {
-        let mut st = b.store.clone();
-        st.key_rotation = Some(kept.rotation);
-        state_text = serde_json::to_string_pretty(&st).map_err(|e| e.to_string())?;
+        st.key_rotation = kept.rotation;
+        st.key_rotations = kept.rotations;
+        changed = true;
         if let Some(t) = kept.identity {
             identity_text = t;
         }
@@ -276,6 +285,25 @@ pub fn restore(state: &Path, b: &Parsed, replace: bool) -> Result<RestoreReport,
         report.notes.push(
             "the center's key was rotated after the backup was made, and its nodes were told: the restore keeps the new key and the rotation, not the backup's older key".into(),
         );
+    }
+    if let Some(h) = &here_store {
+        for (id, n) in st.nodes.iter_mut() {
+            if let Some(hn) = h.nodes.get(id)
+                && hn.key_rotations > n.key_rotations
+            {
+                n.public_key = hn.public_key.clone();
+                n.old_key = hn.old_key.clone();
+                n.key_rotations = hn.key_rotations;
+                changed = true;
+                report.notes.push(format!(
+                    "the node {} rotated its key after the backup was made: the restore keeps its new key here, the only one it holds",
+                    n.name
+                ));
+            }
+        }
+    }
+    if changed {
+        state_text = serde_json::to_string_pretty(&st).map_err(|e| e.to_string())?;
     }
 
     // The pin the nodes hold: said when the certificate here is another.
@@ -347,68 +375,77 @@ pub fn restore(state: &Path, b: &Parsed, replace: bool) -> Result<RestoreReport,
 /// What a restore keeps of a rotation of the center's key made after the
 /// backup.
 struct KeptRotation {
-    rotation: store::KeyRotation,
-    /// The certificate and key to write in place of the backup's: the new
-    /// key, when the rotation ended and the center serves it.
+    /// The rotation record here, if it still has one.
+    rotation: Option<store::KeyRotation>,
+    /// The count of rotations here.
+    rotations: u32,
+    /// The certificate and key here, which the center serves.
     identity: Option<String>,
-    /// The new key of a rotation still in its grace.
+    /// The new key here of a rotation still in its grace.
     next: Option<String>,
 }
 
-/// A rotation of the center's key that the center here made, or ended,
-/// after the backup: same center, from the backup's key, and its new key
-/// still here (in `tls.next.pem` during the grace, in `tls.pem` after it).
-/// A backup made in the grace of the same rotation gives way only to one
-/// that ended here. `None` otherwise.
+/// The center's keys here, when the state here is further along than the
+/// backup's: it started more rotations of its key, or it ended the rotation
+/// the backup was made in the grace of. The keys come from here only, and
+/// only when they are the ones the state here names (served, and the new key
+/// of a rotation in its grace). `None` otherwise.
 fn rotated_since(
-    state: &Path,
+    here: &Store,
     b: &Parsed,
     here_identity: Option<&str>,
     here_next: Option<&str>,
 ) -> Option<KeptRotation> {
-    let here = Store::load(state).ok().flatten()?;
-    if here.center_id != b.store.center_id {
+    let further = here.key_rotations > b.store.key_rotations;
+    // A backup made in the grace of the rotation that ended here (also
+    // early): the same count, but further along here.
+    let ended_here = b.next_text.is_some()
+        && here.key_rotation.as_ref().is_some_and(|r| {
+            r.finished_ms.is_some()
+                && b.store
+                    .key_rotation
+                    .as_ref()
+                    .is_some_and(|br| br.new_spki == r.new_spki)
+        });
+    if !further && !ended_here {
         return None;
-    }
-    let r = here.key_rotation?;
-    if r.old_spki != nerve_transport::tls::b64url(&b.identity.spki()) {
-        return None;
-    }
-    // A backup made in the grace of this same rotation: only a rotation
-    // that went further here (its grace ended, maybe early) is kept.
-    if b.next_text.is_some() {
-        let same = b
-            .store
-            .key_rotation
-            .as_ref()
-            .is_some_and(|br| br.new_spki == r.new_spki);
-        if !same || r.finished_ms.is_none() {
-            return None;
-        }
     }
     let spki_of = |t: &str| {
         ServerIdentity::from_pem(t)
             .ok()
             .map(|i| nerve_transport::tls::b64url(&i.spki()))
     };
-    match r.finished_ms {
-        None => {
-            let next = here_next.filter(|t| spki_of(t).as_ref() == Some(&r.new_spki))?;
-            Some(KeptRotation {
-                next: Some(next.to_string()),
-                identity: None,
-                rotation: r,
-            })
+    let identity = here_identity?.to_string();
+    let served = spki_of(&identity)?;
+    let r = here.key_rotation.clone();
+    let next = match &r {
+        // In the grace: the old key served, the new one aside.
+        Some(r) if r.finished_ms.is_none() => {
+            if served != r.old_spki {
+                return None;
+            }
+            Some(
+                here_next
+                    .filter(|t| spki_of(t).as_ref() == Some(&r.new_spki))?
+                    .to_string(),
+            )
         }
-        Some(_) => {
-            let identity = here_identity.filter(|t| spki_of(t).as_ref() == Some(&r.new_spki))?;
-            Some(KeptRotation {
-                identity: Some(identity.to_string()),
-                next: None,
-                rotation: r,
-            })
+        // After it: the new key served.
+        Some(r) => {
+            if served != r.new_spki {
+                return None;
+            }
+            None
         }
-    }
+        // A rotation older than its record: the key served is its newest.
+        None => None,
+    };
+    Some(KeptRotation {
+        rotation: r,
+        rotations: here.key_rotations,
+        identity: Some(identity),
+        next,
+    })
 }
 
 /// Root's backup of another user's state folder runs as that user
@@ -585,6 +622,7 @@ mod tests {
             name: id.into(),
             public_key: "00".into(),
             old_key: None,
+            key_rotations: 0,
             platform: "linux".into(),
             arch: "x86_64".into(),
             paired_ms: 1,

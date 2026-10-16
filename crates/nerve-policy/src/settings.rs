@@ -697,6 +697,20 @@ impl SettingsStore {
     }
 
     fn commit(&mut self, by: Writer, mut new: NodeConfig) -> Result<u64, SetError> {
+        // A center's pin changed by hand to another one (after a rotation
+        // of the center's key the node missed) counts as a rotation the node
+        // took: a restore then keeps it over a backup's older pin.
+        for c in new.centers.iter_mut() {
+            if let Some(o) = self.config.center(&c.name)
+                && o.center_id == c.center_id
+                && o.pin.is_some()
+                && c.pin.is_some()
+                && o.pin != c.pin
+                && o.pin_rotations == c.pin_rotations
+            {
+                c.pin_rotations += 1;
+            }
+        }
         new.version = self.config.version;
         new.validate().map_err(SetError::Invalid)?;
         if new == self.config {

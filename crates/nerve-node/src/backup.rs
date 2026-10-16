@@ -548,8 +548,13 @@ pub fn restore(paths: &NodePaths, b: &Parsed, opts: &RestoreOpts) -> Result<Rest
                 e.old_pin = h.old_pin.clone();
                 e.pin_rotations = h.pin_rotations;
                 report.notes.push(format!(
-                    "center {} rotated its key after the backup was made: the restore keeps the center's pin here, which it was told, not the backup's older one",
+                    "center {} rotated its key after the backup was made: the restore keeps the center's pin here, which it was told or which was set here, not the backup's older one",
                     e.name
+                ));
+            } else if h.pin_rotations == e.pin_rotations && h.pin != e.pin {
+                report.notes.push(format!(
+                    "the pin of center {} here is another one than the backup's: the restore takes the backup's. If the node cannot link, set the center's pin with `nerve-node config set center.{}.pin <pin>`",
+                    e.name, e.name
                 ));
             }
         }
@@ -1656,6 +1661,31 @@ mod tests {
         let cfg = open_store(&n2).config().clone();
         assert_eq!(cfg.centers[0].public_key, Some(k2.public_hex()));
         assert_eq!(cfg.centers[0].key_rotations, 2);
+    }
+
+    /// A center's pin set by hand counts as a rotation the node took: a
+    /// restore of a backup from before keeps it.
+    #[test]
+    fn a_restore_keeps_a_center_pin_set_by_hand() {
+        let (_a, n) = node();
+        paired(&n, SecretStorage::File, &["home"]);
+        let (_f, parsed, _) = roundtrip(&n, false);
+        let by_hand = "C".repeat(43);
+        let mut s = open_store(&n);
+        s.update(|c| {
+            c.center_mut("home").unwrap().pin = Some(by_hand.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(s.config().centers[0].pin_rotations, 1);
+        drop(s);
+        let r = restore_into(&n, &parsed, None);
+        assert!(
+            r.notes.iter().any(|t| t.contains("keeps the center's pin")),
+            "{r:?}"
+        );
+        let cfg = open_store(&n).config().clone();
+        assert_eq!(cfg.centers[0].pin.as_deref(), Some(by_hand.as_str()));
     }
 
     /// A restore of a backup made before a rotation of the center's key

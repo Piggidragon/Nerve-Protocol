@@ -153,9 +153,11 @@ center, a relayed node holds the pin of its relay, and a node behind an
 `https://` proxy holds the proxy's.
 
 - **A restored node keeps every pin in its `node.toml`** exactly as saved. It
-  does not learn them again. The one exception is `--without-proxy`, which
-  drops the `https://` proxy's pin along with the proxy; the centers' pins and
-  the relay's stay. The node also keeps the node key of each center, so the
+  does not learn them again. There are two exceptions: `--without-proxy`
+  drops the `https://` proxy's pin along with the proxy, and a center's pin
+  that the node here was told after the backup was made (a rotation of the
+  center's key), or that was set here by hand since, stays over the backup's
+  older one (below). The relay's pin always stays. The node also keeps the node key of each center, so the
   center knows it by the same node id and needs no pairing: the pairing is
   what the node had at the time of the backup.
 - **A restored center brings back its certificate**, so the pin that its nodes
@@ -174,14 +176,17 @@ center, a relayed node holds the pin of its relay, and a node behind an
 - **A key rotated after the backup.** A backup made before a
   [key rotation](pairing.md#rotate-the-machines-key) holds the old key. On the
   same machine, the restore keeps what was rotated since and is still there:
-  the node's key, the center's pin the node was told, and on a center its
-  new key. It says so. A copy of the node that is older than the backup
-  (fewer rotations) gives way to the backup. On another machine the restored
+  the node's key, the center's pin the node was told (or that was set by
+  hand), on a center its new key and the new key of each node that rotated
+  its own. It says so. A copy that is older than the backup (fewer
+  rotations) gives way to the backup. On another machine the restored
   node has the old key, which the center takes only for the 7 days after the
   rotation, and the center's old pin: after the center's 7 days set the new
   one with `nerve-node config set center.<name>.pin <pin>` (the web UI shows
   it). A restored center serves its old key, which the machines it told stop
-  taking after those 7 days. Make a new backup after each rotation.
+  taking after those 7 days, and knows a machine that rotated its own key
+  since only by its old key, which that machine no longer has: pair it
+  again. Back up the machine, and the center, after each rotation.
 - **A center backup made during the 7 days of a rotation** brings back that
   rotation. If you ended it early (**Serve the new key now**) after the
   backup was made, press it again after a restore on another machine; on the

@@ -723,6 +723,7 @@ impl Center {
                     name: req.name.clone(),
                     public_key: req.public_key.clone(),
                     old_key: None,
+                    key_rotations: 0,
                     platform: req.platform.clone(),
                     arch: req.arch.clone(),
                     paired_ms: now_ms(),
@@ -825,9 +826,11 @@ impl Center {
         let saved = {
             let mut st = self.store.lock().unwrap();
             let before = st.key_rotation.replace(record);
+            st.key_rotations += 1;
             let r = st.save(&self.dir);
             if r.is_err() {
                 st.key_rotation = before;
+                st.key_rotations -= 1;
             }
             r
         };
@@ -1033,6 +1036,7 @@ impl Center {
                 if !verify(&n.public_key, &message, &r.sig) {
                     return Err("the rotation is not signed by the node's current key".to_string());
                 }
+                n.key_rotations += 1;
                 let old = std::mem::replace(&mut n.public_key, new.clone());
                 let dropped = n.old_key.replace(OldKey {
                     public_key: old.clone(),

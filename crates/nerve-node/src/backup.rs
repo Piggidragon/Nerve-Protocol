@@ -1755,6 +1755,56 @@ mod tests {
         );
     }
 
+    /// The same pin set again with base64 padding is no rotation: its count
+    /// stays, and a restore of a backup from the grace still leaves out the
+    /// old pin whose grace ended here.
+    #[test]
+    fn the_same_pin_padded_counts_no_rotation() {
+        let (_a, n) = node();
+        paired(&n, SecretStorage::File, &["home"]);
+        // Canonical base64url pins (the last character carries no stray bits).
+        let (p0, p1) = ("A".repeat(43), format!("{}E", "A".repeat(42)));
+        let mut s = open_store(&n);
+        s.mark(|c| {
+            let e = c.center_mut("home").unwrap();
+            e.pin = Some(p1.clone());
+            e.old_pin = Some(nerve_policy::OldPin {
+                pin: p0.clone(),
+                until_ms: crate::now_ms() + 86_400_000,
+            });
+            e.pin_rotations = 1;
+        })
+        .unwrap();
+        drop(s);
+        let (_f, parsed, _) = roundtrip(&n, false);
+        let mut s = open_store(&n);
+        s.mark(|c| c.center_mut("home").unwrap().old_pin = None)
+            .unwrap();
+        s.update(|c| {
+            c.center_mut("home").unwrap().pin = Some(format!("{p1}="));
+            Ok(())
+        })
+        .unwrap();
+        let e = s.config().centers[0].clone();
+        assert_eq!(e.pin.as_deref(), Some(p1.as_str()));
+        assert_eq!(e.pin_rotations, 1, "the same pin padded is no rotation");
+        drop(s);
+        let r = restore_into(&n, &parsed, None);
+        assert!(
+            r.notes
+                .iter()
+                .any(|t| t.contains("does not bring its old pin back")),
+            "{r:?}"
+        );
+        let cfg = open_store(&n).config().clone();
+        assert_eq!(cfg.centers[0].old_pin, None);
+        assert!(
+            !cfg.centers[0]
+                .pins_at(crate::now_ms())
+                .contains(&p0.as_str())
+        );
+    }
+
     /// A center's pin set by hand counts as a rotation the node took: a
     /// restore of a backup from before keeps it.
     #[test]

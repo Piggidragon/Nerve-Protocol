@@ -33,11 +33,15 @@ pub fn try_lock(state: &Path) -> Result<Option<Lock>, String> {
     nerve_transport::files::create_private_dir(state)
         .map_err(|e| format!("cannot create {}: {e}", state.display()))?;
     let path = state.join(LOCK_FILE);
+    // Not through a link: the folder may be another user's (the installed
+    // center's, under root's restore), and its link could make this create
+    // or open any file the caller may write.
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
         .open(&path)
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?;
     // SAFETY: flock on a file descriptor this function owns.
@@ -185,3 +189,26 @@ mod unix {
 
 #[cfg(unix)]
 pub use unix::{bind, relay, serve};
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// A link in place of the lock, as the user of an installed center's
+    /// state folder could leave for root's restore, is not followed: the
+    /// file it names is neither made nor opened.
+    #[test]
+    fn the_lock_is_not_taken_through_a_link() {
+        let d = tempfile::tempdir().unwrap();
+        let state = d.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        let target = d.path().join("made-through-the-link");
+        std::os::unix::fs::symlink(&target, state.join(LOCK_FILE)).unwrap();
+        let e = claim(&state).err().expect("a lock through a link");
+        assert!(e.contains(LOCK_FILE), "{e}");
+        assert!(!target.exists());
+        // A plain lock file is taken as before.
+        std::fs::remove_file(state.join(LOCK_FILE)).unwrap();
+        assert!(claim(&state).unwrap().is_some());
+    }
+}

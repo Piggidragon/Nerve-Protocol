@@ -9,7 +9,8 @@ systemd, run `nerve-node run` under your own service manager
 elevated on Windows, is refused unless `machine.allow_root` is set, and warns
 at start when it runs
 ([root and administrator](platforms.md#root-and-administrator)). Windows
-differs in a few places; see [Windows](#windows).
+differs in a few places; see [Windows](#windows). The center installs
+itself the same way on Linux ([center](center.md#run-it-as-a-service)).
 
 ## Install
 

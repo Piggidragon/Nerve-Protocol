@@ -217,6 +217,22 @@ so it writes and reads the backup, and the file `--passphrase-file` names, as
 `/var/lib/nerve/state/nerve.bak`, and copy it from there as root. Typing the
 passphrase needs no file.
 
+## On a center installed as a service
+
+Name its state folder with `--state-dir /var/lib/nerve-center`. Run with
+`sudo`, the commands work there as the user `nerve-center`, as the node's do
+as `nerve` ([center](center.md#run-it-as-a-service)): root follows no link
+that user put in the folder, and what a restore writes stays the center's.
+
+- `backup` writes the backup, and reads the file `--passphrase-file` names,
+  as `nerve-center`. Name a backup in a folder that user can use, such as
+  `/var/lib/nerve-center/center.bak`, and copy it from there as root.
+  Typing the passphrase needs no file.
+- `restore` reads the backup and the passphrase as root, so they may be
+  anywhere, and then restores as `nerve-center`. It needs the service
+  stopped: `sudo systemctl stop nerve-center` before, `sudo systemctl start
+  nerve-center` after.
+
 ## Messages
 
 | Message | Cause |

@@ -29,7 +29,7 @@ open port.
 | Page | Covers |
 |---|---|
 | [install.md](install.md) | Download, check, install, where files live |
-| [center.md](center.md) | Start the center, its flags and ports |
+| [center.md](center.md) | Start the center, its flags and ports, install it as a service on Linux |
 | [harness.md](harness.md) | Connect an MCP harness, the tools it gets |
 | [pairing.md](pairing.md) | Pair a machine, start the node, unpair |
 | [service.md](service.md) | Install the node as a service, set it up, update and uninstall it |

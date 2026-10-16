@@ -310,11 +310,19 @@ pub fn read_file(path: &Path) -> Result<Vec<u8>, String> {
 /// Without `overwrite` an existing file, a link included, is never touched.
 pub fn write_file(path: &Path, bytes: &[u8], overwrite: bool) -> Result<(), String> {
     let name = path.display();
-    // A folder that is not there is a typo more often than a wish.
-    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty())
-        && !dir.is_dir()
-    {
-        return Err(format!("the folder {} does not exist", dir.display()));
+    // A folder that is not there is a typo more often than a wish. One that
+    // this process may not search is there all the same, and is said so:
+    // the caller may be another user than whoever typed the path (root's
+    // command on a service's folders runs as the service's user).
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        match std::fs::metadata(dir) {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => return Err(format!("{} is not a folder", dir.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(format!("the folder {} does not exist", dir.display()));
+            }
+            Err(e) => return Err(format!("cannot use the folder {}: {e}", dir.display())),
+        }
     }
     if overwrite {
         // Through a temporary file and a rename: the old backup stays whole
@@ -546,6 +554,37 @@ mod tests {
         let err = write_file(&d.path().join("no/such/a.bak"), b"x", true).unwrap_err();
         assert!(err.contains("does not exist"), "{err}");
         assert!(!d.path().join("no").exists());
+        // Nor is a file taken for one.
+        std::fs::write(d.path().join("file"), b"x").unwrap();
+        let err = write_file(&d.path().join("file/a.bak"), b"x", true).unwrap_err();
+        assert!(err.contains("is not a folder"), "{err}");
+    }
+
+    /// A folder this process may not search is there: the message says
+    /// what stops it, not that the folder is missing. (Root searches every
+    /// folder, so this needs another user.)
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_may_not_be_searched_is_not_called_missing() {
+        use std::os::unix::fs::PermissionsExt;
+        if crate::net::euid() == 0 {
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let closed = d.path().join("closed");
+        std::fs::create_dir_all(closed.join("sub")).unwrap();
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let r = write_file(&closed.join("sub/a.bak"), b"x", false);
+        std::fs::set_permissions(&closed, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let err = r.unwrap_err();
+        assert!(!err.contains("does not exist"), "{err}");
+        assert!(
+            err.contains(&format!(
+                "cannot use the folder {}",
+                closed.join("sub").display()
+            )),
+            "{err}"
+        );
     }
 
     #[cfg(unix)]

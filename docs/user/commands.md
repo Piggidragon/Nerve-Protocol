@@ -64,5 +64,12 @@ center is paired.
 | `backup <file> [--include-keyring] [--overwrite] [--passphrase-file F]` | Write the config and keys to a file that a passphrase protects | [backup](backup.md) |
 | `restore <file> [--replace] [--secret-storage file\|keyring] [--without-proxy] [--passphrase-file F]` | Put a backup in place of this node's, or on another machine | [backup](backup.md#restore) |
 
-The center has two commands of its own: `nerve-center backup <file>` and
-`nerve-center restore <file>` ([backup](backup.md#the-center)).
+The center has five commands of its own, which a harness never runs:
+
+| Command | Does | See |
+|---|---|---|
+| `backup <file>` | Write the center's identity and state to a file that a passphrase protects | [backup](backup.md#the-center) |
+| `restore <file>` | Put a backup in place of this center's, or on another machine | [backup](backup.md#the-center) |
+| `install` | Install the center as a service under a user of its own (Linux with systemd, as root) | [center](center.md#run-it-as-a-service) |
+| `update [--from FILE]` | Put the latest release in place and restart the service | [center](center.md#update) |
+| `uninstall [--purge]` | Remove the service, its user and the program | [center](center.md#uninstall) |

@@ -1152,7 +1152,7 @@ pub fn service_log(cli: &Cli) -> Option<PathBuf> {
 /// remove the node, nor back it up or restore it. The node that runs knows
 /// its commands, so it is asked over its control socket, and refuses a
 /// caller below one of them.
-async fn owner_check(paths: &[&NodePaths]) -> Result<(), String> {
+pub async fn owner_check(paths: &[&NodePaths]) -> Result<(), String> {
     #[cfg(unix)]
     for p in paths {
         match nerve_transport::ctl::call(&p.ctl_socket(), "owner.check", json!({})).await {

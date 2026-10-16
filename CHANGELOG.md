@@ -12,7 +12,12 @@
 ### Backup, restore and moving
 
 - `nerve-node backup <file>` and `nerve-node restore <file>`, and the same for `nerve-center`, write the config and keys (the center's certificate, key and state) to one file that a passphrase protects (PBKDF2-HMAC-SHA256 and ChaCha20-Poly1305, at least 12 characters), and put them back on the same machine or another, so a node or a center can be moved without pairing again ([#122](https://github.com/Piggidragon/Nerve-Protocol/issues/122)).
-- Keys in the system keyring, and a proxy's header values, go into a backup only with `--include-keyring`. A restore never goes under a running node or center, refuses a backup of another node or center unless you add `--replace`, keeps every pin as saved and sets the sudo switch off. `nerve-center` has these two subcommands now; a harness still starts it without one.
+- Keys in the system keyring, and a proxy's header values, go into a backup only with `--include-keyring`. A restore never goes under a running node or center, refuses a backup of another node or center unless you add `--replace`, keeps every pin as saved and sets the sudo switch off. These are two of `nerve-center`'s subcommands now; a harness still starts it without one.
+
+### The center as a service
+
+- On Linux with systemd, `sudo nerve-center install` installs the center as a service that starts with the machine, under a user of its own (`nerve-center`) with its own state folder (`/var/lib/nerve-center`), with MCP over HTTP and no privilege. Its settings are in `/etc/nerve-center/center.env`, which `install` writes once with a new harness token, so the web UI asks for a login from the start. `update` replaces the program with the latest release, checked against `SHA256SUMS`, or with `--from <file>`, and puts the old one back when the new one does not start. `uninstall` removes the service, the user and the program; `--purge` also the folders ([#123](https://github.com/Piggidragon/Nerve-Protocol/issues/123)).
+- The released node's `install` and `uninstall` no longer fail on the control socket, or on a link, in its state folder: the static Linux programs opened such an entry instead of only giving it to the node's user.
 
 ### Capability providers
 

@@ -10,7 +10,7 @@ behaves the same except where this page says so.
 | `allowlist` and `user` mode run commands | Yes | Yes, in a Job Object, not confined to folders |
 | Sudo switch | Yes | On the [installed service](service.md#windows), with the administrator token of the account commands run as ([sudo on Windows](sudo.md#sudo-on-windows)) |
 | Control socket | Yes | A control pipe that takes folder changes only |
-| Install as a service | Yes, with systemd | Yes |
+| Install as a service | Yes, with systemd, the node and the [center](center.md#run-it-as-a-service) | The node |
 | Config folder | `~/.config/nerve` | `%USERPROFILE%\.config\nerve` |
 
 ## Linux

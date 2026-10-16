@@ -275,6 +275,16 @@ async fn settle(
             "center {center} refused the new key: {e}; the old key stays in use"
         ));
     }
+    // The config names the new key first, which its node id no longer does,
+    // so that a backup can tell it belongs to this pairing. Should that fail,
+    // nothing else changes: the key aside goes again on the next link, and
+    // the center answers it the same.
+    let named = new_hex.clone();
+    if !shared.mark_center(center, |e| e.public_key = Some(named)) {
+        return Err(format!(
+            "center {center} took the new key, but node.toml could not record it; the old key stays in use for now, and the new key is kept: the node settles it on its next link, or run this command again"
+        ));
+    }
     tokio::task::spawn_blocking(move || {
         crate::secrets::store_center_key(&paths, storage, &name, &next)?;
         crate::secrets::remove_center_next_key(&paths, storage, &name)
@@ -287,14 +297,6 @@ async fn settle(
             grace()
         )
     })?;
-    // The config names the key now, which its node id no longer does, so
-    // that a backup can tell it belongs to this pairing.
-    let named = new_hex.clone();
-    if !shared.mark_center(center, |e| e.public_key = Some(named)) {
-        tracing::warn!(
-            "center {center}: node.toml could not record the new key; a backup leaves the key out until it does"
-        );
-    }
     tracing::info!(
         "center {center} took this node's new key {new_hex}; the old key works there for {} more, or until `nerve-node center rotate-key --end-grace`",
         grace()

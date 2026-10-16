@@ -57,7 +57,7 @@ writes.
 | Kind | Names |
 |---|---|
 | node | `node.toml`, `key/<center>` (one per pairing), `relay-tls`, `proxy-login`, `proxy-headers` |
-| center | `tls.pem`, `state.json` |
+| center | `tls.pem`, `state.json`, and `tls.next.pem` during the grace of a key rotation |
 
 `node.toml` is the config as the node reads it, verified (a refused config is
 not backed up) and without its MAC line. The MAC key
@@ -172,9 +172,19 @@ goes on with the note.
 whole by the center (a temporary file and a rename), so a backup of a running
 center is a state it had; only the statistics may lag by up to 5 seconds.
 
+During the grace of a rotation of the center's key (protocol §4.10) the new
+key is in `tls.next.pem`, and the nodes the center told pin it already. The
+backup takes it then: read first, kept only when the `state.json` read last
+still holds the rotation unfinished, and a restore checks that it is the key
+`key_rotation.new_spki` names. Without it, the restored center would drop the
+rotation and serve the old key for good, and every told node would be locked
+out once its old pin's time is over. A restore without `tls.next.pem`
+deletes one left in the state folder.
+
 A restore takes the center lock, checks `center_id` (the same center is
-restored, another needs `--replace`), writes `tls.pem` and then `state.json`,
-and puts the old `tls.pem` back if the second write fails.
+restored, another needs `--replace`), writes `tls.pem`, then `tls.next.pem`
+(or deletes one there), then `state.json`, and puts the old `tls.pem` back if
+a later write fails.
 
 ## Pins
 

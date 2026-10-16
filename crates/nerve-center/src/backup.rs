@@ -7,6 +7,10 @@
 //! statistics. With both, the nodes find the same center again and need not
 //! pair. The log and the sockets belong to the machine and are not taken.
 //!
+//! While a rotation of its key is in its grace, the center also keeps the
+//! new key, `tls.next.pem`, which the nodes it told pin already: the backup
+//! takes it then, or a restore would lose it and with it those nodes.
+//!
 //! A backup can be made while the center runs: both files are written whole
 //! (a temporary file and a rename), so the copy is one the center had, at
 //! most five seconds behind in its statistics. A restore never runs while a
@@ -21,12 +25,14 @@ use std::path::Path;
 use nerve_transport::backup::{self, Contents, Kind, Passphrase};
 use nerve_transport::tls::ServerIdentity;
 
-use crate::center::IDENTITY_FILE;
+use crate::center::{IDENTITY_FILE, NEXT_IDENTITY_FILE};
 use crate::store::{self, Store};
 
 /// What a backup of the center holds, by logical name.
 const IDENTITY: &str = "tls.pem";
 const STATE: &str = "state.json";
+/// The new key of a center key rotation in its grace.
+const NEXT_IDENTITY: &str = "tls.next.pem";
 
 /// What was backed up, for the owner.
 #[derive(Debug)]
@@ -59,10 +65,32 @@ pub fn backup(
             }
         })
     };
-    let files = BTreeMap::from([
-        (IDENTITY.to_string(), read(IDENTITY_FILE)?),
-        (STATE.to_string(), read(store::FILE)?),
-    ]);
+    // The new key is read first: a rotation that ends meanwhile moves it to
+    // `tls.pem` and marks the state finished, so the state read last says
+    // whether it still belongs. One that starts meanwhile is taken on a
+    // second try.
+    let mut files = BTreeMap::new();
+    for _ in 0..3 {
+        let next = std::fs::read_to_string(state.join(NEXT_IDENTITY_FILE)).ok();
+        let identity = read(IDENTITY_FILE)?;
+        let state_text = read(store::FILE)?;
+        let rotating = serde_json::from_str::<Store>(&state_text)
+            .ok()
+            .and_then(|s| s.key_rotation)
+            .filter(|r| r.finished_ms.is_none());
+        let next = rotating.as_ref().and(next);
+        let complete = rotating.is_none() || next.is_some();
+        files = BTreeMap::from([
+            (IDENTITY.to_string(), identity),
+            (STATE.to_string(), state_text),
+        ]);
+        if let Some(n) = next {
+            files.insert(NEXT_IDENTITY.to_string(), n);
+        }
+        if complete {
+            break;
+        }
+    }
     let contents = Contents {
         kind: Kind::Center,
         created_ms: crate::util::now_ms(),
@@ -86,6 +114,8 @@ pub fn backup(
 pub struct Parsed {
     identity_text: String,
     state_text: String,
+    /// The new key of a center key rotation in its grace.
+    next_text: Option<String>,
     identity: ServerIdentity,
     store: Store,
     pub created_ms: u64,
@@ -116,6 +146,7 @@ pub fn parse(contents: Contents) -> Result<Parsed, String> {
         .remove(IDENTITY)
         .ok_or("the backup holds no certificate and key")?;
     let state_text = files.remove(STATE).ok_or("the backup holds no state")?;
+    let next_text = files.remove(NEXT_IDENTITY);
     if let Some(other) = files.keys().next() {
         return Err(format!(
             "the backup holds {other:?}, which this program does not know; it was made by a newer one?"
@@ -133,9 +164,25 @@ pub fn parse(contents: Contents) -> Result<Parsed, String> {
     if store.center_id.is_empty() {
         return Err("the state in the backup has no center id".into());
     }
+    // The new key of a rotation must be the one its state told the nodes.
+    if let Some(t) = &next_text {
+        let next = ServerIdentity::from_pem(t)
+            .map_err(|e| format!("the new key of the rotation in the backup: {e}"))?;
+        let told = store
+            .key_rotation
+            .as_ref()
+            .filter(|r| r.finished_ms.is_none())
+            .map(|r| r.new_spki.clone());
+        if told != Some(nerve_transport::tls::b64url(&next.spki())) {
+            return Err(
+                "the backup holds a new key of a rotation its state does not tell the nodes".into(),
+            );
+        }
+    }
     Ok(Parsed {
         identity_text,
         state_text,
+        next_text,
         identity,
         store,
         created_ms: contents.created_ms,
@@ -226,8 +273,27 @@ pub fn restore(state: &Path, b: &Parsed, replace: bool) -> Result<RestoreReport,
             id_path.display()
         )
     })?;
+    // The new key of a rotation in its grace, or none: a new key left here
+    // from another rotation is not the backup's.
+    let next_path = state.join(NEXT_IDENTITY_FILE);
+    let next_written = match &b.next_text {
+        Some(t) => nerve_transport::files::write_private(&next_path, t.as_bytes()),
+        None => match std::fs::remove_file(&next_path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        },
+    };
     let state_path = state.join(store::FILE);
-    if let Err(e) = nerve_transport::files::write_private(&state_path, b.state_text.as_bytes()) {
+    let written = next_written
+        .map_err(|e| (next_path.clone(), e))
+        .and_then(|()| {
+            nerve_transport::files::write_private(&state_path, b.state_text.as_bytes())
+                .map_err(|e| (state_path.clone(), e))
+        });
+    if let Err((path, e)) = written {
+        if b.next_text.is_some() {
+            let _ = std::fs::remove_file(&next_path);
+        }
         // The old certificate goes back, or the old state would meet a key it
         // was not paired under.
         match &old {
@@ -240,8 +306,13 @@ pub fn restore(state: &Path, b: &Parsed, replace: bool) -> Result<RestoreReport,
         }
         return Err(format!(
             "cannot write {}: {e}; nothing was restored",
-            state_path.display()
+            path.display()
         ));
+    }
+    if b.next_text.is_some() {
+        report.notes.push(
+            "the backup was made during the grace of a rotation of the center's key: its new key is restored too, and the center serves it when the grace ends".into(),
+        );
     }
     Ok(report)
 }

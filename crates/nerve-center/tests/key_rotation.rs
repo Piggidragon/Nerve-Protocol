@@ -901,3 +901,92 @@ async fn a_link_ended_with_its_grace_handles_nothing_more() {
     assert!(r.center.read(|s| s.nodes[&id].going_away.is_none()));
     r.stop().await;
 }
+
+/// A backup made during the grace of a center key rotation keeps the new
+/// key: the restored center serves the old key until the grace ends, then
+/// the new one, which the nodes it told pin.
+#[tokio::test]
+async fn a_backup_in_the_grace_keeps_the_new_center_key() {
+    let a = tempfile::tempdir().unwrap();
+    let r = center(a.path(), true).await;
+    let old_pin = r.center.pin().unwrap();
+    let new_pin = r.center.rotate_key().await.unwrap()["pin"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    r.stop().await;
+    let pass = nerve_transport::backup::Passphrase::new("correct horse battery".into());
+    let d = tempfile::tempdir().unwrap();
+    let file = d.path().join("c.bak");
+    nerve_center::backup::backup(a.path(), &file, &pass, false, 4).unwrap();
+    let parsed = nerve_center::backup::open(&std::fs::read(&file).unwrap(), &pass).unwrap();
+    let b = tempfile::tempdir().unwrap();
+    nerve_center::backup::restore(b.path(), &parsed, false).unwrap();
+    assert!(b.path().join("tls.next.pem").exists());
+
+    let r = center(b.path(), true).await;
+    assert_eq!(r.center.pin().as_deref(), Some(old_pin.as_str()));
+    assert!(r.center.read(|s| s.key_rotation.is_some()));
+    r.center
+        .finish_key_rotation("the owner ended its grace")
+        .await
+        .unwrap();
+    assert_eq!(r.center.pin().as_deref(), Some(new_pin.as_str()));
+    r.stop().await;
+}
+
+/// Whatever way a key stopped counting, a link opened with it ends at the
+/// next sweep: here it came up after the sweep that dropped its key.
+#[tokio::test]
+async fn a_link_whose_key_no_longer_counts_ends_at_the_next_sweep() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path(), false).await;
+    let cid = r.center.id();
+    let (old, new) = (NodeKey::generate().unwrap(), NodeKey::generate().unwrap());
+    let id = pair(&r, &old, "box-1").await;
+    let mut ws = welcomed(&r, &id, &old).await;
+    send(
+        &mut ws,
+        Message::notification(method::KEY_ROTATE, rotate_params(&cid, &old, &new)),
+    )
+    .await;
+    next(&mut ws, method::KEY_ROTATED)
+        .await
+        .expect("key.rotated");
+    // The old key's grace is over and gone from the state, but the link it
+    // opened is still the node's (it came up late).
+    r.center
+        .update(|s| s.nodes.get_mut(&id).unwrap().old_key = None);
+    assert!(r.center.link(&id).is_some());
+    r.center.sweep().await;
+    assert!(r.center.link(&id).is_none(), "the link of the old key ends");
+    let bye = next(&mut ws, method::BYE).await.expect("bye");
+    assert_eq!(bye["reason"], "replaced");
+    r.stop().await;
+}
+
+/// A held link replaced because it did not answer the ping still counts as
+/// a drop.
+#[tokio::test]
+async fn a_replaced_link_counts_as_a_drop() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path(), false).await;
+    let key = NodeKey::generate().unwrap();
+    let id = pair(&r, &key, "box-1").await;
+    // Not read, so it answers no ping.
+    let first = welcomed(&r, &id, &key).await;
+    let c = r.center.clone();
+    wait_for(|| c.link(&id).is_some()).await;
+    let second = welcomed(&r, &id, &key).await;
+    drop(first);
+    let drops = || {
+        c.read(|s| {
+            s.stats
+                .get(&id)
+                .map_or(0, |st| st.days.values().map(|d| d.drops).sum::<u64>())
+        })
+    };
+    wait_for(|| drops() == 1).await;
+    drop(second);
+    r.stop().await;
+}

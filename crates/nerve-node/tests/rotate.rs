@@ -523,3 +523,61 @@ async fn the_node_follows_a_center_key_its_old_key_signed() {
 fn futures_block<F: std::future::Future>(f: F) -> F::Output {
     tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(f))
 }
+
+/// When node.toml cannot record the new key, the rotation is not settled:
+/// the old key stays, the new one stays aside, and the next link settles it
+/// with the key recorded, so a backup knows it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_new_key_node_toml_cannot_record_is_settled_on_the_next_link() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let daemon = node(dir.path(), &center, None).await;
+    let paths = daemon.paths().clone();
+    let old = paired(&center).request.public_key;
+    let mut conn = link(&mut center, &old, Some(ROTATE)).await;
+    let mode = |m| {
+        std::fs::set_permissions(&paths.config_dir, std::fs::Permissions::from_mode(m)).unwrap()
+    };
+    mode(0o500);
+    // Root writes anyway; then this test says nothing.
+    let writable = std::fs::write(paths.config_dir.join("probe"), b"x").is_ok();
+    let run = rotate(&paths, &[]);
+    let p = next(&mut conn, method::KEY_ROTATE)
+        .await
+        .expect("key.rotate");
+    let new = check_rotate(&p, &center.center_id, &old);
+    conn.notify(method::KEY_ROTATED, json!({"public_key": new}))
+        .await
+        .unwrap();
+    let out = run.await.unwrap();
+    mode(0o700);
+    if writable {
+        return;
+    }
+    let e = out.expect_err("not recorded");
+    assert!(e.contains("could not record"), "{e}");
+    assert_eq!(key(&paths).public_hex(), old);
+    assert!(paths.next_key_file("lab").exists());
+
+    // The next link sends it again, and the center answers it the same.
+    drop(conn);
+    let mut conn = link(&mut center, &old, Some(ROTATE)).await;
+    let p = next(&mut conn, method::KEY_ROTATE)
+        .await
+        .expect("sent again");
+    assert_eq!(check_rotate(&p, &center.center_id, &old), new);
+    conn.notify(method::KEY_ROTATED, json!({"public_key": new}))
+        .await
+        .unwrap();
+    for _ in 0..200 {
+        if key(&paths).public_hex() == new {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(key(&paths).public_hex(), new);
+    let (cfg, _) = nerve_node::cli::read_config(&paths).await.unwrap();
+    assert_eq!(cfg.centers[0].public_key.as_deref(), Some(new.as_str()));
+    drop(daemon);
+}

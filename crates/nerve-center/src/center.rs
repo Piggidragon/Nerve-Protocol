@@ -1218,6 +1218,43 @@ impl Center {
         for (node_id, key) in expired {
             self.end_link_of_key(&node_id, &key);
         }
+        // And whatever way a key stopped counting (the grace ended, the node
+        // ended it, a newer rotation dropped it, or a link came up just
+        // after), a link opened with it ends at the next sweep.
+        let links: Vec<Arc<Link>> = self
+            .links
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|l| !l.is_closed())
+            .cloned()
+            .collect();
+        for l in links {
+            if !self.key_counts(&l.node_id, &l.auth_key()) {
+                self.note(
+                    Level::Info,
+                    Some(&l.node_id),
+                    "the link opened with the node's old key ends: that key no longer counts",
+                );
+                l.end(ByeReason::Replaced);
+            }
+        }
+    }
+
+    /// Whether a hello signed with `key` may hold a link of `node_id` now:
+    /// the node's key, or its old one while the grace runs. A node that is
+    /// not paired any more is left to its own end.
+    pub(crate) fn key_counts(&self, node_id: &str, key: &str) -> bool {
+        let now = now_ms();
+        self.read(|s| match s.nodes.get(node_id) {
+            None => true,
+            Some(n) => {
+                n.public_key == key
+                    || n.old_key
+                        .as_ref()
+                        .is_some_and(|o| o.public_key == key && now < o.until_ms)
+            }
+        })
     }
 
     // ---- Nodes ----

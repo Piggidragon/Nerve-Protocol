@@ -628,7 +628,7 @@ fn write_keys<'a>(
         match b.keys.get(&e.name) {
             Some(t) => put(key, t)?,
             None => {
-                let fits = |t: &str| NodeKey::from_text(t).is_ok_and(|k| k.node_id() == e.node_id);
+                let fits = |t: &str| NodeKey::from_text(t).is_ok_and(|k| pairs(e, &k));
                 match here(key, &fits) {
                     Some((place, text)) => {
                         if place != to {
@@ -1548,6 +1548,32 @@ mod tests {
         assert_eq!(r.kept, ["home"], "{r:?}");
         assert_eq!(&key_text(&n, SecretStorage::Keyring, "home"), &keys["home"]);
         assert!(!n.key_file("home").exists());
+    }
+
+    /// A rotated key the backup lacks is taken over as well: it does not
+    /// hash to the node id, but it is the key the config names.
+    #[test]
+    fn a_rotated_key_the_backup_lacks_is_taken_over_too() {
+        let (_a, n) = node();
+        paired(&n, SecretStorage::Keyring, &["home"]);
+        let rotated = NodeKey::generate().unwrap();
+        secrets::store_center_key(&n, SecretStorage::Keyring, "home", &rotated).unwrap();
+        let mut s = open_store(&n);
+        s.update(|c| {
+            c.centers[0].public_key = Some(rotated.public_hex());
+            Ok(())
+        })
+        .unwrap();
+        drop(s);
+        let (_f, parsed, _) = roundtrip(&n, false);
+        assert!(parsed.keys.is_empty());
+        let r = restore_into(&n, &parsed, Some(SecretStorage::File));
+        assert_eq!(r.kept, ["home"], "{r:?}");
+        assert!(r.no_key.is_empty(), "{r:?}");
+        assert_eq!(
+            key_text(&n, SecretStorage::File, "home").trim(),
+            rotated.to_text().trim()
+        );
     }
 
     #[test]

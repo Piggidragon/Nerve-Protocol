@@ -134,7 +134,9 @@ nerve-center restore ~/nerve-center.bak
 
 The backup holds `tls.pem` (the center's certificate and private key) and
 `state.json` (its id and name, the paired nodes with their public keys, the
-hashes of the harness tokens, the statistics). Not the [log](logs.md).
+hashes of the harness tokens, the statistics). During the 7 days after a
+[key rotation](center.md#rotate-the-key) it also holds the new key,
+`tls.next.pem`, which the machines already trust. Not the [log](logs.md).
 
 Back up while it runs; the statistics may be a few seconds behind. Restore
 only when no center runs on the state folder (`--state-dir`): stop the harness

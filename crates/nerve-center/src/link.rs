@@ -63,6 +63,9 @@ pub struct Link {
     /// Woken when the link ends, so its reader stops at once and handles
     /// nothing more the peer sends.
     ended: Notify,
+    /// The center ended the link on purpose ([`Link::end`]): its end is no
+    /// drop. A link given up otherwise (replaced, its resume over) is one.
+    ended_on_purpose: AtomicBool,
     /// When the last frame came, in milliseconds after `since`.
     heard: AtomicU64,
     pong: Notify,
@@ -113,6 +116,7 @@ impl Link {
             next_id: AtomicU64::new(1),
             closed: AtomicBool::new(false),
             ended: Notify::new(),
+            ended_on_purpose: AtomicBool::new(false),
             heard: AtomicU64::new(0),
             pong: Notify::new(),
             status: Mutex::new("online".into()),
@@ -406,6 +410,7 @@ impl Link {
     /// stops, and the bye goes in a task of its own, so a peer that reads
     /// nothing holds up no caller.
     pub(crate) fn end(&self, reason: ByeReason) {
+        self.ended_on_purpose.store(true, Ordering::SeqCst);
         let out = {
             let mut w = self.wire.lock().unwrap();
             let out = w.out.clone();
@@ -741,6 +746,17 @@ pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String
     });
     center.link_up(link.clone(), &hello, resumed);
     let up = Instant::now();
+    // The key this hello was signed with may have stopped counting while the
+    // handshake waited (on the held link): checked again now that the link
+    // is the node's, which the sweep sees from here on.
+    if !center.key_counts(&node_id, &link.auth_key()) {
+        center.note(
+            Level::Warn,
+            Some(&node_id),
+            "the link ends at once: the key its hello was signed with no longer counts (its grace ended meanwhile)",
+        );
+        link.end(ByeReason::Replaced);
+    }
     // A node that links while the center's key rotation is told learns of
     // it now.
     if rotate && let Some(notice) = center.rotation_notice() {
@@ -771,9 +787,15 @@ pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String
         // more: frames still in flight from the peer are not the node's any
         // more.
         let Some(next) = next.filter(|_| !link.is_closed()) else {
-            clean = true;
             said_bye = true;
-            why = "the center ended the link".into();
+            // A link the center ended with a bye closed cleanly; one it gave
+            // up (replaced while it did not answer) dropped.
+            if link.ended_on_purpose.load(Ordering::SeqCst) {
+                clean = true;
+                why = "the center ended the link".into();
+            } else {
+                why = "the center gave the link up".into();
+            }
             break;
         };
         let frame = match next {

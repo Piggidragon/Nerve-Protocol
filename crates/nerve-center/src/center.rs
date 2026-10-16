@@ -502,15 +502,19 @@ impl Center {
     /// Ends the node's link when it was opened with `key`, a key of the node
     /// whose grace ended: `bye replaced`, and no call goes to it any more.
     /// The node dials again with its key.
-    pub(crate) async fn end_link_of_key(&self, node_id: &str, key: &str) {
+    ///
+    /// It does not wait on the link: closed first, the bye goes in a task of
+    /// its own, so a peer that reads nothing cannot hold up the caller (the
+    /// sweep).
+    pub(crate) fn end_link_of_key(&self, node_id: &str, key: &str) {
         if let Some(l) = self.link(node_id).filter(|l| l.auth_key == key) {
             self.note(
                 Level::Info,
                 Some(node_id),
                 "the link opened with the node's old key ends: that key's grace is over",
             );
-            l.bye(ByeReason::Replaced).await;
             l.fail_all();
+            tokio::spawn(async move { l.bye(ByeReason::Replaced).await });
         }
     }
 
@@ -886,7 +890,9 @@ impl Center {
         .ok()
     }
 
-    /// Tells every live link that speaks rotation; how many it told.
+    /// Tells every live link that speaks rotation; how many it told. Each
+    /// is told in a task of its own: a link whose peer reads nothing cannot
+    /// hold up the owner's request or the sweep.
     async fn tell_rotation(&self) -> usize {
         let Some(notice) = self.rotation_notice() else {
             return 0;
@@ -900,7 +906,8 @@ impl Center {
             .cloned()
             .collect();
         for l in &links {
-            l.notify(msg::method::CENTER_ROTATE, notice.clone()).await;
+            let (l, notice) = (l.clone(), notice.clone());
+            tokio::spawn(async move { l.notify(msg::method::CENTER_ROTATE, notice).await });
         }
         links.len()
     }
@@ -959,27 +966,39 @@ impl Center {
             );
         }
         let now = now_ms();
-        let out = self.update_saved(|s| {
-            if s.node_by_key(&new).is_some_and(|n| n.id != link.node_id) {
-                return Err("another node holds this key".to_string());
-            }
-            let n = s
-                .nodes
-                .get_mut(&link.node_id)
-                .ok_or("the node is no longer paired")?;
-            if n.public_key == new {
-                return Ok(None);
-            }
-            if !verify(&n.public_key, &message, &r.sig) {
-                return Err("the rotation is not signed by the node's current key".to_string());
-            }
-            let old = std::mem::replace(&mut n.public_key, new.clone());
-            let dropped = n.old_key.replace(OldKey {
-                public_key: old.clone(),
-                until_ms: now + nerve_proto::ROTATE_GRACE_MS,
-            });
-            Ok(Some((old, dropped.map(|d| d.public_key))))
+        // Sent again for the key the center took already (no answer reached
+        // the node): taken, without a write, which could fail and have the
+        // node drop the key the center holds. It was saved when it was taken.
+        let held = self.read(|s| {
+            s.nodes
+                .get(&link.node_id)
+                .is_some_and(|n| n.public_key == new)
         });
+        let out = if held {
+            Ok(None)
+        } else {
+            self.update_saved(|s| {
+                if s.node_by_key(&new).is_some_and(|n| n.id != link.node_id) {
+                    return Err("another node holds this key".to_string());
+                }
+                let n = s
+                    .nodes
+                    .get_mut(&link.node_id)
+                    .ok_or("the node is no longer paired")?;
+                if n.public_key == new {
+                    return Ok(None);
+                }
+                if !verify(&n.public_key, &message, &r.sig) {
+                    return Err("the rotation is not signed by the node's current key".to_string());
+                }
+                let old = std::mem::replace(&mut n.public_key, new.clone());
+                let dropped = n.old_key.replace(OldKey {
+                    public_key: old.clone(),
+                    until_ms: now + nerve_proto::ROTATE_GRACE_MS,
+                });
+                Ok(Some((old, dropped.map(|d| d.public_key))))
+            })
+        };
         match out {
             Err(why) => (self.key_refused(link, new, why), None),
             Ok(None) => {
@@ -1153,7 +1172,7 @@ impl Center {
         }
         // A link the old key opened during its grace ends with the grace.
         for (node_id, key) in expired {
-            self.end_link_of_key(&node_id, &key).await;
+            self.end_link_of_key(&node_id, &key);
         }
     }
 

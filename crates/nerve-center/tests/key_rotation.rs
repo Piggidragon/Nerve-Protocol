@@ -727,3 +727,177 @@ async fn a_node_key_the_center_cannot_save_is_refused() {
     assert!(r.center.read(|s| s.nodes[&id].old_key.is_none()));
     r.stop().await;
 }
+
+/// A rotation sent again for the key the center took already is answered
+/// as taken without a write: a failed write must not have the node drop the
+/// key the center holds.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_rotation_sent_again_is_taken_without_a_write() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path(), false).await;
+    let cid = r.center.id();
+    let (old, new) = (NodeKey::generate().unwrap(), NodeKey::generate().unwrap());
+    let id = pair(&r, &old, "box-1").await;
+    let mut ws = welcomed(&r, &id, &old).await;
+    let rotate = Message::notification(method::KEY_ROTATE, rotate_params(&cid, &old, &new));
+    send(&mut ws, rotate.clone()).await;
+    let a = next(&mut ws, method::KEY_ROTATED)
+        .await
+        .expect("key.rotated");
+    assert!(a.get("error").is_none(), "{a}");
+    let mode = |m| std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(m));
+    mode(0o500).unwrap();
+    send(&mut ws, rotate).await;
+    let a = next(&mut ws, method::KEY_ROTATED)
+        .await
+        .expect("key.rotated");
+    mode(0o700).unwrap();
+    assert_eq!(a, json!({"public_key": new.public_hex()}));
+    assert_eq!(r.center.public_key(&id), Some(new.public_hex()));
+    r.stop().await;
+}
+
+/// Sends requests with long names on `ws` and reads nothing, until the
+/// center stops reading too: its answers fill the link's queue. How many
+/// went out.
+async fn wedge(ws: WebSocketStream<BoxIo>) -> (usize, tokio::task::JoinHandle<()>) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let task = tokio::spawn(async move {
+        let mut ws = ws;
+        let long = "x".repeat(100_000);
+        for i in 0..2000u64 {
+            let m = Message::request(i + 1000, &long, json!({}));
+            let sent =
+                tokio::time::timeout(Duration::from_secs(2), ws.send(WsMessage::text(m.encode())))
+                    .await;
+            if !matches!(sent, Ok(Ok(()))) {
+                break;
+            }
+            let _ = tx.send(());
+        }
+        let _ = tx.send(());
+        // Keeps the connection open, and reads nothing.
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        drop(ws);
+    });
+    let mut n = 0;
+    while tokio::time::timeout(Duration::from_secs(3), rx.recv())
+        .await
+        .is_ok_and(|v| v.is_some())
+    {
+        n += 1;
+    }
+    (n, task)
+}
+
+/// A link whose peer reads nothing holds up neither the sweep nor the
+/// owner's rotation of the center's key, and the sweep still ends it.
+#[tokio::test]
+async fn a_link_that_reads_nothing_holds_up_neither_the_sweep_nor_a_rotation() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path(), false).await;
+    let cid = r.center.id();
+    let (old, new) = (NodeKey::generate().unwrap(), NodeKey::generate().unwrap());
+    let id = pair(&r, &old, "box-1").await;
+    let mut ws = welcomed(&r, &id, &old).await;
+    send(
+        &mut ws,
+        Message::notification(method::KEY_ROTATE, rotate_params(&cid, &old, &new)),
+    )
+    .await;
+    next(&mut ws, method::KEY_ROTATED)
+        .await
+        .expect("key.rotated");
+    let (sent, task) = wedge(ws).await;
+    assert!(sent < 2000, "the center went on reading: {sent}");
+
+    let out = tokio::time::timeout(Duration::from_secs(10), r.center.rotate_key()).await;
+    assert!(out.expect("the rotation answers").is_ok());
+    r.center.update(|s| {
+        s.nodes
+            .get_mut(&id)
+            .unwrap()
+            .old_key
+            .as_mut()
+            .unwrap()
+            .until_ms = 1;
+        s.key_rotation.as_mut().unwrap().until_ms = 1;
+    });
+    let swept = tokio::time::timeout(Duration::from_secs(10), r.center.sweep()).await;
+    assert!(swept.is_ok(), "the sweep is held up");
+    assert!(r.center.link(&id).is_none(), "the old key's link ended");
+    assert!(
+        r.center
+            .read(|s| s.key_rotation.as_ref().unwrap().finished_ms.is_some())
+    );
+    task.abort();
+    // Not `stop`: its bye to every link waits on the queue.
+    drop(r);
+}
+
+/// A link the center ended, because its key's grace is over, handles
+/// nothing more its peer sends.
+#[tokio::test]
+async fn a_link_ended_with_its_grace_handles_nothing_more() {
+    let dir = tempfile::tempdir().unwrap();
+    let r = center(dir.path(), false).await;
+    let cid = r.center.id();
+    let (old, new) = (NodeKey::generate().unwrap(), NodeKey::generate().unwrap());
+    let id = pair(&r, &old, "box-1").await;
+    let mut ws = welcomed(&r, &id, &old).await;
+    send(
+        &mut ws,
+        Message::notification(method::KEY_ROTATE, rotate_params(&cid, &old, &new)),
+    )
+    .await;
+    next(&mut ws, method::KEY_ROTATED)
+        .await
+        .expect("key.rotated");
+    r.center.update(|s| {
+        s.nodes
+            .get_mut(&id)
+            .unwrap()
+            .old_key
+            .as_mut()
+            .unwrap()
+            .until_ms = 1;
+    });
+    r.center.sweep().await;
+    // The peer does not read the bye and goes on as the node.
+    let event = |seq: u64, cap: &str, name: &str, data: Value| {
+        Message::notification(
+            method::EVENT,
+            json!({"cap": cap, "name": name, "seq": seq, "ts": msg::now_ms(), "data": data}),
+        )
+    };
+    for seq in 1..=3 {
+        let _ = ws
+            .send(WsMessage::text(
+                event(
+                    seq,
+                    "audit",
+                    "decision",
+                    json!({"cap": "exec", "action": "run",
+                    "target": "injected", "decision": "allowed"}),
+                )
+                .encode(),
+            ))
+            .await;
+        let _ = ws
+            .send(WsMessage::text(
+                event(seq, "node", "going_away", json!({"reason": "injected"})).encode(),
+            ))
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !r.center.audit().iter().any(|e| e["target"] == "injected"),
+        "{:?}",
+        r.center.audit()
+    );
+    assert!(r.center.read(|s| s.nodes[&id].going_away.is_none()));
+    r.stop().await;
+}

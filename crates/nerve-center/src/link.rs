@@ -53,6 +53,9 @@ pub struct Link {
     pending: Mutex<HashMap<u64, oneshot::Sender<Reply>>>,
     next_id: AtomicU64,
     closed: AtomicBool,
+    /// Woken when the center closes the link, so its reader stops at once
+    /// and handles nothing more the peer sends.
+    ended: Notify,
     /// When the last frame came, in milliseconds after `since`.
     heard: AtomicU64,
     pong: Notify,
@@ -81,6 +84,7 @@ impl Link {
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
             closed: AtomicBool::new(false),
+            ended: Notify::new(),
             heard: AtomicU64::new(0),
             pong: Notify::new(),
             status: Mutex::new("online".into()),
@@ -193,6 +197,8 @@ impl Link {
 
     pub(crate) fn fail_all(&self) {
         self.closed.store(true, Ordering::SeqCst);
+        // A permit stays for a reader that is not waiting right now.
+        self.ended.notify_one();
         let pending: Vec<_> = self.pending.lock().unwrap().drain().collect();
         for (_, tx) in pending {
             let _ = tx.send(Err(lost()));
@@ -396,7 +402,19 @@ pub async fn run(center: Center, mut ws: WebSocketStream<BoxIo>, node_id: String
     let why: String;
     let mut silent = Duration::ZERO;
     loop {
-        let frame = match tokio::time::timeout(quiet, stream.next()).await {
+        // A link the center closed (its key's grace ended, a newer link
+        // replaced it) handles nothing more: frames still in flight from the
+        // peer are not the node's any more.
+        let next = tokio::select! {
+            r = tokio::time::timeout(quiet, stream.next()) => Some(r),
+            _ = link.ended.notified() => None,
+        };
+        let Some(next) = next.filter(|_| !link.is_closed()) else {
+            clean = true;
+            why = "the center ended the link".into();
+            break;
+        };
+        let frame = match next {
             Err(_) => {
                 why = format!(
                     "no frame from the node for {}, not even a ping",
@@ -506,7 +524,7 @@ async fn handle(center: &Center, link: &Arc<Link>, m: Message) -> Option<ByeReas
                 // A rotation in the grace of another ends the older key's
                 // grace, and a link opened with it ends too.
                 if let Some(key) = dropped {
-                    center.end_link_of_key(&link.node_id, &key).await;
+                    center.end_link_of_key(&link.node_id, &key);
                 }
             }
             method::KEY_RETIRE if link.rotate => {
@@ -515,8 +533,8 @@ async fn handle(center: &Center, link: &Arc<Link>, m: Message) -> Option<ByeReas
                 // The key this link was opened with is refused from now on,
                 // so the link ends; the node dials again with its key.
                 if opened_with_it {
-                    link.bye(ByeReason::Replaced).await;
                     link.fail_all();
+                    link.bye(ByeReason::Replaced).await;
                 }
             }
             method::BYE => {

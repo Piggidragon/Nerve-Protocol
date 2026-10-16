@@ -202,6 +202,9 @@ pub(crate) struct CenterState {
     /// Held while a rotation of the node's key for this center runs, so the
     /// owner's command and the one a new link resumes do not cross.
     pub rotating: tokio::sync::Mutex<()>,
+    /// When dropping an expired old pin last failed to save; it is tried
+    /// again only a while later (crate::rotate::drop_old_pin).
+    pub old_pin_failed: Mutex<Option<std::time::Instant>>,
 }
 
 impl CenterState {
@@ -487,6 +490,7 @@ impl Shared {
                     link: Mutex::new(None),
                     status: Mutex::new("not connected".into()),
                     rotating: tokio::sync::Mutex::new(()),
+                    old_pin_failed: Mutex::new(None),
                 })
             })
             .clone()
@@ -520,16 +524,23 @@ impl Shared {
     }
 
     /// Marks bookkeeping on a center (revoked, unknown) and tells everyone.
-    pub fn mark_center(&self, name: &str, f: impl FnOnce(&mut nerve_policy::CenterEntry)) {
+    /// Says whether it was saved: when not, the config in force is as it
+    /// was.
+    pub fn mark_center(&self, name: &str, f: impl FnOnce(&mut nerve_policy::CenterEntry)) -> bool {
         let r = lock(&self.store).mark(|c| {
             if let Some(e) = c.center_mut(name) {
                 f(e);
             }
         });
-        if let Err(e) = r {
-            tracing::error!("cannot save the config: {e}");
-        }
+        let saved = match r {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::error!("cannot save the config: {e}");
+                false
+            }
+        };
         self.bump();
+        saved
     }
 
     // Only the Unix control socket asks this; Windows' pipe asks the jobs of
@@ -2463,5 +2474,71 @@ mod confinement_tests {
         };
         assert_eq!(confinement_for(linux, true), linux);
         assert_eq!(confinement_for(linux, false), linux);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod old_pin_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// An expired old pin that cannot be dropped from node.toml (a full
+    /// disk) is not told as dropped, and is tried again only a while later.
+    #[tokio::test]
+    async fn an_old_pin_that_cannot_be_dropped_is_tried_again_later() {
+        let log = Log::new(Level::Info);
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("config"), d.path().join("state"));
+        let mut opts = NodeOptions::new(paths.clone());
+        opts.home = d.path().to_path_buf();
+        opts.ctl = false;
+        opts.log = Some(log.clone());
+        let daemon = Daemon::start(opts).await.unwrap();
+        let s = daemon.shared.clone();
+        lock(&s.store)
+            .update(|c| {
+                c.centers.push(nerve_policy::CenterEntry {
+                    name: "lab".into(),
+                    url: "http://127.0.0.1:1".into(),
+                    pin: Some("B".repeat(43)),
+                    center_id: "id-lab".into(),
+                    node_id: "n".into(),
+                    settings: Default::default(),
+                    paused: true,
+                    revoked: false,
+                    unknown: false,
+                    old_pin: Some(nerve_policy::OldPin {
+                        pin: "A".repeat(43),
+                        until_ms: 1,
+                    }),
+                    policy: Default::default(),
+                });
+                Ok(())
+            })
+            .unwrap();
+        let old_pin = || s.config().centers[0].old_pin.clone();
+        let mode = |m| {
+            std::fs::set_permissions(&paths.config_dir, std::fs::Permissions::from_mode(m)).unwrap()
+        };
+        mode(0o500);
+        // Root writes anyway; then this test says nothing.
+        let writable = std::fs::write(paths.config_dir.join("probe"), b"x").is_ok();
+        let dropped = crate::rotate::drop_old_pin(&s, "lab");
+        mode(0o700);
+        if writable {
+            return;
+        }
+        assert!(!dropped);
+        assert!(old_pin().is_some());
+        assert!(lock(&s.center("lab").old_pin_failed).is_some());
+        // Writable again, but within the wait: not tried yet.
+        assert!(!crate::rotate::drop_old_pin(&s, "lab"));
+        assert!(old_pin().is_some());
+        // After the wait it is.
+        *lock(&s.center("lab").old_pin_failed) =
+            std::time::Instant::now().checked_sub(Duration::from_secs(601));
+        assert!(crate::rotate::drop_old_pin(&s, "lab"));
+        assert!(old_pin().is_none());
+        drop(daemon);
     }
 }

@@ -425,12 +425,20 @@ pub(crate) fn center_rotated(
     };
     if pin == old_pin && new_pin != old_pin {
         let old_kept = keep(&old_pin);
-        shared.mark_center(center, |e| {
+        let saved = shared.mark_center(center, |e| {
             if e.pin.as_deref() == Some(pin.as_str()) {
                 e.pin = Some(new_pin.clone());
                 e.old_pin = old_kept;
             }
         });
+        // Not kept, the node pins the old key as before; the center tells
+        // the rotation again on the next link.
+        if !saved {
+            tracing::warn!(
+                "center {center} rotated its key to the pin {new_pin}, but node.toml could not be saved; the node keeps the old pin until it is told again"
+            );
+            return;
+        }
         let taken = if grace_ms > 0 {
             format!(
                 "the old one is taken for {} more",
@@ -455,12 +463,12 @@ pub(crate) fn center_rotated(
     if told_before {
         let shorter = keep(&old_pin);
         let ended = shorter.is_none();
-        shared.mark_center(center, |e| {
+        let saved = shared.mark_center(center, |e| {
             if e.pin.as_deref() == Some(new_pin.as_str()) {
                 e.old_pin = shorter;
             }
         });
-        if ended {
+        if ended && saved {
             tracing::info!(
                 "center {center} serves its new key now; the old pin {old_pin} is no longer taken"
             );
@@ -479,9 +487,14 @@ pub(crate) fn center_rotated(
     }
 }
 
+/// How long the node waits before it tries again to drop an expired old pin
+/// it could not save.
+const OLD_PIN_RETRY: Duration = Duration::from_secs(600);
+
 /// Drops the old pin of `center` from node.toml once its grace is over
 /// (it is no longer taken by then); whether it did. Asked at each dial and
-/// on a live link's tick.
+/// on a live link's tick. A save that fails is tried again only after
+/// [`OLD_PIN_RETRY`], so a full disk does not fill the log.
 pub(crate) fn drop_old_pin(shared: &Shared, center: &str) -> bool {
     let expired = |e: &CenterEntry| {
         e.old_pin
@@ -491,11 +504,24 @@ pub(crate) fn drop_old_pin(shared: &Shared, center: &str) -> bool {
     if !shared.config().center(center).is_some_and(expired) {
         return false;
     }
-    shared.mark_center(center, |e| {
+    let cs = shared.center(center);
+    if crate::daemon::lock(&cs.old_pin_failed).is_some_and(|t| t.elapsed() < OLD_PIN_RETRY) {
+        return false;
+    }
+    let saved = shared.mark_center(center, |e| {
         if expired(e) {
             e.old_pin = None;
         }
     });
+    if !saved {
+        *crate::daemon::lock(&cs.old_pin_failed) = Some(std::time::Instant::now());
+        tracing::warn!(
+            "center {center}: the grace of its old key has ended, but its old pin could not be dropped from node.toml; trying again in {}",
+            span(OLD_PIN_RETRY)
+        );
+        return false;
+    }
+    *crate::daemon::lock(&cs.old_pin_failed) = None;
     tracing::info!("center {center}: the grace of its old key has ended; its old pin is dropped");
     true
 }

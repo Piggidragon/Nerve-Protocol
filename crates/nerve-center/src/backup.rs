@@ -249,12 +249,14 @@ pub fn restore(state: &Path, b: &Parsed, replace: bool) -> Result<RestoreReport,
 /// Runs `nerve-center backup` or `nerve-center restore` on `state`.
 /// `settle` is called before anything in the state folder is touched
 /// ([`crate::service::settle_user`]: root works there as the folder's
-/// owner). A restore reads the backup and the passphrase before it, as the
-/// caller, so that they may be where only root can read.
+/// owner) and says whether it switched to that owner. A restore reads the
+/// backup and the passphrase before it, as the caller, so that they may be
+/// where only root can read. A backup is written as the owner, so a failure
+/// then says so.
 pub fn run(
     state: &Path,
     cmd: &crate::config::Cmd,
-    settle: &dyn Fn(&Path) -> Result<(), String>,
+    settle: &dyn Fn(&Path) -> Result<bool, String>,
     out: &mut dyn Write,
 ) -> Result<(), String> {
     use crate::config::Cmd;
@@ -264,9 +266,21 @@ pub fn run(
             overwrite,
             passphrase_file,
         } => {
-            settle(state)?;
-            let pass = nerve_node::prompt::passphrase(passphrase_file.as_deref(), out, true)?;
-            let r = backup(state, file, &pass, *overwrite, backup::ITERATIONS)?;
+            let as_owner = settle(state)?;
+            let owner = |e: String| {
+                if !as_owner {
+                    return e;
+                }
+                format!(
+                    "{e}. The backup runs as the owner of {} (uid {}), as root's command on another user's state folder does: name a file in a folder that user may use, such as {}, and copy it from there as root",
+                    state.display(),
+                    nerve_transport::net::euid(),
+                    state.join("center.bak").display()
+                )
+            };
+            let pass = nerve_node::prompt::passphrase(passphrase_file.as_deref(), out, true)
+                .map_err(owner)?;
+            let r = backup(state, file, &pass, *overwrite, backup::ITERATIONS).map_err(owner)?;
             print_backup(&r, file, out);
         }
         Cmd::Restore {
@@ -382,7 +396,7 @@ mod tests {
         let settled = RefCell::new(Vec::new());
         let refuse = |s: &Path| {
             settled.borrow_mut().push(s.to_path_buf());
-            Err::<(), _>("settled".to_string())
+            Err::<bool, _>("settled".to_string())
         };
         let file = d.path().join("c.bak");
         let backup = |pass: &Path| Cmd::Backup {
@@ -395,7 +409,38 @@ mod tests {
         assert_eq!(e, "settled");
         assert_eq!(*settled.borrow(), std::slice::from_ref(&state));
         assert!(!file.exists());
-        run(&state, &backup(&right), &|_| Ok(()), &mut Vec::new()).unwrap();
+        // Switched to the owner, a backup that cannot be written says so.
+        let e = run(
+            &state,
+            &Cmd::Backup {
+                file: d.path().join("no/such/c.bak"),
+                overwrite: false,
+                passphrase_file: Some(right.clone()),
+            },
+            &|_| Ok(true),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(e.contains("does not exist"), "{e}");
+        assert!(e.contains("runs as the owner of"), "{e}");
+        assert!(
+            e.contains(&state.join("center.bak").display().to_string()),
+            "{e}"
+        );
+        // Not switched, it says only what failed.
+        let e = run(
+            &state,
+            &Cmd::Backup {
+                file: d.path().join("no/such/c.bak"),
+                overwrite: false,
+                passphrase_file: Some(right.clone()),
+            },
+            &|_| Ok(false),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(!e.contains("owner"), "{e}");
+        run(&state, &backup(&right), &|_| Ok(false), &mut Vec::new()).unwrap();
         let restore = |pass: &Path| Cmd::Restore {
             file: file.clone(),
             replace: false,

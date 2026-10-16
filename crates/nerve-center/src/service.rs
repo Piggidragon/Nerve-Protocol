@@ -290,9 +290,11 @@ fn supported(sys: &dyn System, what: &str) -> Result<(), String> {
 /// as the installed center's belongs to `nerve-center`, runs as that user
 /// ([`nerve_node::service::become_owner`], as the node's commands do). Root
 /// then follows no link that user put there, and what it writes stays the
-/// center's, so the service starts on it.
-pub fn settle_user(state: &Path) -> Result<(), String> {
-    nerve_node::service::become_owner(&nerve_node::NodePaths::new(state, state), false)
+/// center's, so the service starts on it. Says whether it switched.
+pub fn settle_user(state: &Path) -> Result<bool, String> {
+    let before = nerve_transport::net::euid();
+    nerve_node::service::become_owner(&nerve_node::NodePaths::new(state, state), false)?;
+    Ok(nerve_transport::net::euid() != before)
 }
 
 /// Says a step as it is done.

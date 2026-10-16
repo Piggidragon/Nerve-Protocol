@@ -1150,8 +1150,13 @@ async fn a_restore_after_two_center_rotations_keeps_the_keys_here() {
         .to_string();
     r.stop().await;
 
-    // The second in its grace: N served, M aside.
-    nerve_center::backup::restore(a.path(), &parsed, false).unwrap();
+    // The second in its grace: N served, M aside; the restore says N.
+    let report = nerve_center::backup::restore(a.path(), &parsed, false).unwrap();
+    assert_eq!(report.pin, n);
+    let mut out = Vec::new();
+    nerve_center::backup::print_restore(&report, &parsed, &mut out);
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains(&format!("pin {n}")), "{out}");
     assert!(a.path().join("tls.next.pem").exists());
     let r = center(a.path(), true).await;
     assert_eq!(r.center.pin().as_deref(), Some(n.as_str()));
@@ -1163,5 +1168,85 @@ async fn a_restore_after_two_center_rotations_keeps_the_keys_here() {
     nerve_center::backup::restore(a.path(), &parsed, false).unwrap();
     let r = center(a.path(), true).await;
     assert_eq!(r.center.pin().as_deref(), Some(m.as_str()));
+    r.stop().await;
+}
+
+/// The end of a grace whose save failed (the new key served, the record
+/// still unfinished on disk) counts as ended for a restore: the new key the
+/// told nodes take stays.
+#[tokio::test]
+async fn a_restore_keeps_a_new_key_whose_end_was_not_saved() {
+    let a = tempfile::tempdir().unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let r = center(a.path(), true).await;
+    r.stop().await;
+    let parsed = backup_of(a.path(), d.path());
+    let r = center(a.path(), true).await;
+    let new_pin = r.center.rotate_key().await.unwrap()["pin"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    r.stop().await;
+    // What `end_rotation` leaves when its save fails: the new key moved to
+    // tls.pem, the record on disk unfinished.
+    std::fs::rename(a.path().join("tls.next.pem"), a.path().join("tls.pem")).unwrap();
+    let report = nerve_center::backup::restore(a.path(), &parsed, false).unwrap();
+    assert_eq!(report.pin, new_pin, "{report:?}");
+    assert!(!a.path().join("tls.next.pem").exists());
+    let r = center(a.path(), true).await;
+    assert_eq!(r.center.pin().as_deref(), Some(new_pin.as_str()));
+    r.stop().await;
+}
+
+/// A restore does not bring back a node's old key whose grace the node
+/// ended after the backup was made.
+#[tokio::test]
+async fn a_restore_does_not_bring_back_a_retired_node_key() {
+    let a = tempfile::tempdir().unwrap();
+    let d = tempfile::tempdir().unwrap();
+    let r = center(a.path(), false).await;
+    let cid = r.center.id();
+    let (old, new) = (NodeKey::generate().unwrap(), NodeKey::generate().unwrap());
+    let id = pair(&r, &old, "box-1").await;
+    let mut ws = welcomed(&r, &id, &old).await;
+    send(
+        &mut ws,
+        Message::notification(method::KEY_ROTATE, rotate_params(&cid, &old, &new)),
+    )
+    .await;
+    next(&mut ws, method::KEY_ROTATED)
+        .await
+        .expect("key.rotated");
+    drop(ws);
+    r.stop().await;
+    let parsed = backup_of(a.path(), d.path());
+
+    let r = center(a.path(), false).await;
+    let mut ws = welcomed(&r, &id, &new).await;
+    let retire = json!({"public_key": new.public_hex(), "sig": new.sign_retire(&cid)});
+    send(&mut ws, Message::notification(method::KEY_RETIRE, retire)).await;
+    assert_eq!(
+        next(&mut ws, method::KEY_RETIRED)
+            .await
+            .expect("key.retired"),
+        json!({})
+    );
+    drop(ws);
+    r.stop().await;
+
+    let report = nerve_center::backup::restore(a.path(), &parsed, false).unwrap();
+    assert!(
+        report
+            .notes
+            .iter()
+            .any(|n| n.contains("does not bring that key back")),
+        "{report:?}"
+    );
+    let r = center(a.path(), false).await;
+    assert!(r.center.read(|s| s.nodes[&id].old_key.is_none()));
+    let (_ws, reply) = handshake(&url(&r, false), &[], &id, &old, &["rotate"])
+        .await
+        .unwrap();
+    assert_eq!(method_of(&reply), method::BYE);
     r.stop().await;
 }

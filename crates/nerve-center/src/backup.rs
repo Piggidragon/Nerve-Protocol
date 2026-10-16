@@ -199,6 +199,9 @@ pub fn open(bytes: &[u8], pass: &Passphrase) -> Result<Parsed, String> {
 #[derive(Debug, Default)]
 pub struct RestoreReport {
     pub notes: Vec<String>,
+    /// The pin of the certificate the restore wrote: the backup's, or the
+    /// newer one here it kept.
+    pub pin: String,
 }
 
 /// What the state folder holds before a restore.
@@ -288,9 +291,10 @@ pub fn restore(state: &Path, b: &Parsed, replace: bool) -> Result<RestoreReport,
     }
     if let Some(h) = &here_store {
         for (id, n) in st.nodes.iter_mut() {
-            if let Some(hn) = h.nodes.get(id)
-                && hn.key_rotations > n.key_rotations
-            {
+            let Some(hn) = h.nodes.get(id) else {
+                continue;
+            };
+            if hn.key_rotations > n.key_rotations {
                 n.public_key = hn.public_key.clone();
                 n.old_key = hn.old_key.clone();
                 n.key_rotations = hn.key_rotations;
@@ -299,6 +303,23 @@ pub fn restore(state: &Path, b: &Parsed, replace: bool) -> Result<RestoreReport,
                     "the node {} rotated its key after the backup was made: the restore keeps its new key here, the only one it holds",
                     n.name
                 ));
+            } else if hn.key_rotations == n.key_rotations && hn.public_key == n.public_key {
+                // The same key, but its old one's grace ended here sooner
+                // (the node ended it, maybe because that key leaked): the
+                // old key does not come back.
+                let sooner = match (&hn.old_key, &n.old_key) {
+                    (_, None) => false,
+                    (None, Some(_)) => true,
+                    (Some(h), Some(b)) => h.until_ms < b.until_ms,
+                };
+                if sooner {
+                    n.old_key = hn.old_key.clone();
+                    changed = true;
+                    report.notes.push(format!(
+                        "the grace of the old key of node {} ended after the backup was made: the restore does not bring that key back",
+                        n.name
+                    ));
+                }
             }
         }
     }
@@ -369,6 +390,7 @@ pub fn restore(state: &Path, b: &Parsed, replace: bool) -> Result<RestoreReport,
             "the backup was made during the grace of a rotation of the center's key: its new key is restored too, and the center serves it when the grace ends. If that grace was ended after the backup was made, end it again (Settings, Center key, Serve the new key now): the machines that were told take only the new key".into(),
         );
     }
+    report.pin = pin;
     Ok(report)
 }
 
@@ -396,12 +418,23 @@ fn rotated_since(
     here_identity: Option<&str>,
     here_next: Option<&str>,
 ) -> Option<KeptRotation> {
+    let spki_of = |t: &str| {
+        ServerIdentity::from_pem(t)
+            .ok()
+            .map(|i| nerve_transport::tls::b64url(&i.spki()))
+    };
+    let identity = here_identity?.to_string();
+    let served = spki_of(&identity)?;
+    // A rotation whose new key is served here has ended, also when that end
+    // could not be saved: the next start settles it so, as
+    // `settle_rotation` does.
+    let ended = |r: &store::KeyRotation| r.finished_ms.is_some() || served == r.new_spki;
     let further = here.key_rotations > b.store.key_rotations;
     // A backup made in the grace of the rotation that ended here (also
     // early): the same count, but further along here.
     let ended_here = b.next_text.is_some()
         && here.key_rotation.as_ref().is_some_and(|r| {
-            r.finished_ms.is_some()
+            ended(r)
                 && b.store
                     .key_rotation
                     .as_ref()
@@ -410,17 +443,10 @@ fn rotated_since(
     if !further && !ended_here {
         return None;
     }
-    let spki_of = |t: &str| {
-        ServerIdentity::from_pem(t)
-            .ok()
-            .map(|i| nerve_transport::tls::b64url(&i.spki()))
-    };
-    let identity = here_identity?.to_string();
-    let served = spki_of(&identity)?;
     let r = here.key_rotation.clone();
     let next = match &r {
         // In the grace: the old key served, the new one aside.
-        Some(r) if r.finished_ms.is_none() => {
+        Some(r) if !ended(r) => {
             if served != r.old_spki {
                 return None;
             }
@@ -593,7 +619,11 @@ pub fn print_restore(r: &RestoreReport, b: &Parsed, out: &mut dyn Write) {
         "restored the center {} ({}), pin {} (backup made by {})",
         b.name(),
         b.store.center_id,
-        b.pin(),
+        if r.pin.is_empty() {
+            b.pin()
+        } else {
+            r.pin.clone()
+        },
         b.program
     );
     for n in &r.notes {

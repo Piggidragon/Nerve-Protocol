@@ -246,13 +246,78 @@ pub fn restore(state: &Path, b: &Parsed, replace: bool) -> Result<RestoreReport,
     Ok(report)
 }
 
+/// Root's backup of another user's state folder runs as that user
+/// ([`crate::service::settle_user`]), who may not reach every place root
+/// named. The two places that fail for that reason alone, the backup's
+/// folder and the passphrase file, are checked first and said with what to
+/// do; every other error is the backup's own.
+fn as_owner_may_reach(state: &Path, file: &Path, pass_file: Option<&Path>) -> Result<(), String> {
+    let who = format!(
+        "the owner of {} (uid {}), whom root's command on that folder runs as",
+        state.display(),
+        nerve_transport::net::euid()
+    );
+    let dir = file
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    if denied(dir, Access::Write) {
+        return Err(format!(
+            "the backup is written as {who}, and that user may not write in {}: name a file in a folder it may use, such as {}, and copy it from there as root",
+            dir.display(),
+            state.join("center.bak").display()
+        ));
+    }
+    if let Some(p) = pass_file
+        && denied(p, Access::Read)
+    {
+        return Err(format!(
+            "the passphrase file is read as {who}, and that user may not read {}: put it where that user may read it (private to it), or leave out --passphrase-file and type the passphrase",
+            p.display()
+        ));
+    }
+    Ok(())
+}
+
+enum Access {
+    Read,
+    Write,
+}
+
+/// Whether this process lacks the right to `how` at `path` (or to a folder
+/// on the way). A path that is not there is not denied: what it is used for
+/// says so.
+fn denied(path: &Path, how: Access) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+            return false;
+        };
+        let mode = match how {
+            Access::Read => libc::R_OK,
+            Access::Write => libc::W_OK | libc::X_OK,
+        };
+        // SAFETY: a valid C string; access only reads it. All the ids are
+        // the owner's after the switch, so the real ids access checks are
+        // the ones the backup runs with.
+        let r = unsafe { libc::access(c.as_ptr(), mode) };
+        r != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EACCES)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, how);
+        false
+    }
+}
+
 /// Runs `nerve-center backup` or `nerve-center restore` on `state`.
 /// `settle` is called before anything in the state folder is touched
 /// ([`crate::service::settle_user`]: root works there as the folder's
 /// owner) and says whether it switched to that owner. A restore reads the
 /// backup and the passphrase before it, as the caller, so that they may be
-/// where only root can read. A backup is written as the owner, so a failure
-/// then says so.
+/// where only root can read. A backup is written as the owner: what that
+/// user may not reach is said first ([`as_owner_may_reach`]).
 pub fn run(
     state: &Path,
     cmd: &crate::config::Cmd,
@@ -266,21 +331,11 @@ pub fn run(
             overwrite,
             passphrase_file,
         } => {
-            let as_owner = settle(state)?;
-            let owner = |e: String| {
-                if !as_owner {
-                    return e;
-                }
-                format!(
-                    "{e}. The backup runs as the owner of {} (uid {}), as root's command on another user's state folder does: name a file in a folder that user may use, such as {}, and copy it from there as root",
-                    state.display(),
-                    nerve_transport::net::euid(),
-                    state.join("center.bak").display()
-                )
-            };
-            let pass = nerve_node::prompt::passphrase(passphrase_file.as_deref(), out, true)
-                .map_err(owner)?;
-            let r = backup(state, file, &pass, *overwrite, backup::ITERATIONS).map_err(owner)?;
+            if settle(state)? {
+                as_owner_may_reach(state, file, passphrase_file.as_deref())?;
+            }
+            let pass = nerve_node::prompt::passphrase(passphrase_file.as_deref(), out, true)?;
+            let r = backup(state, file, &pass, *overwrite, backup::ITERATIONS)?;
             print_backup(&r, file, out);
         }
         Cmd::Restore {
@@ -409,38 +464,35 @@ mod tests {
         assert_eq!(e, "settled");
         assert_eq!(*settled.borrow(), std::slice::from_ref(&state));
         assert!(!file.exists());
-        // Switched to the owner, a backup that cannot be written says so.
+        // Switched to the owner, an error that the switch did not cause is
+        // said as it is: a folder that is not there, and below a backup that
+        // is there already and a short passphrase.
+        let to = |file: &Path, pass: &Path| Cmd::Backup {
+            file: file.into(),
+            overwrite: false,
+            passphrase_file: Some(pass.into()),
+        };
+        let advice = "name a file in a folder";
         let e = run(
             &state,
-            &Cmd::Backup {
-                file: d.path().join("no/such/c.bak"),
-                overwrite: false,
-                passphrase_file: Some(right.clone()),
-            },
+            &to(&d.path().join("no/such/c.bak"), &right),
             &|_| Ok(true),
             &mut Vec::new(),
         )
         .unwrap_err();
-        assert!(e.contains("does not exist"), "{e}");
-        assert!(e.contains("runs as the owner of"), "{e}");
-        assert!(
-            e.contains(&state.join("center.bak").display().to_string()),
-            "{e}"
-        );
-        // Not switched, it says only what failed.
+        assert!(e.contains("does not exist") && !e.contains(advice), "{e}");
+        run(&state, &backup(&right), &|_| Ok(false), &mut Vec::new()).unwrap();
+        let e = run(&state, &backup(&right), &|_| Ok(true), &mut Vec::new()).unwrap_err();
+        assert!(e.contains("exists already") && !e.contains(advice), "{e}");
+        let short = pass_file("short", "short");
         let e = run(
             &state,
-            &Cmd::Backup {
-                file: d.path().join("no/such/c.bak"),
-                overwrite: false,
-                passphrase_file: Some(right.clone()),
-            },
-            &|_| Ok(false),
+            &to(&d.path().join("s.bak"), &short),
+            &|_| Ok(true),
             &mut Vec::new(),
         )
         .unwrap_err();
-        assert!(!e.contains("owner"), "{e}");
-        run(&state, &backup(&right), &|_| Ok(false), &mut Vec::new()).unwrap();
+        assert!(e.contains("at least") && !e.contains(advice), "{e}");
         let restore = |pass: &Path| Cmd::Restore {
             file: file.clone(),
             replace: false,
@@ -453,6 +505,71 @@ mod tests {
         let e = run(&state, &restore(&right), &refuse, &mut Vec::new()).unwrap_err();
         assert_eq!(e, "settled");
         assert_eq!(settled.borrow().len(), 2);
+    }
+
+    /// Root's backup runs as the state folder's owner. A backup folder that
+    /// user may not write, or a passphrase file it may not read, is said
+    /// with what to do; without the switch the error is the plain one. (Root
+    /// reaches every file, so this needs another user.)
+    #[cfg(unix)]
+    #[test]
+    fn a_backup_as_the_owner_says_what_that_owner_may_not_reach() {
+        use crate::config::Cmd;
+        use std::os::unix::fs::PermissionsExt;
+        if nerve_transport::net::euid() == 0 {
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let state = d.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        center(&state, "c1");
+        let pass = d.path().join("pass");
+        nerve_transport::files::write_private(&pass, PASS.as_bytes()).unwrap();
+        let closed = d.path().join("closed");
+        std::fs::create_dir(&closed).unwrap();
+        let hidden = closed.join("pass");
+        nerve_transport::files::write_private(&hidden, PASS.as_bytes()).unwrap();
+        let read_only = d.path().join("read-only");
+        std::fs::create_dir(&read_only).unwrap();
+        let mode =
+            |p: &Path, m| std::fs::set_permissions(p, std::fs::Permissions::from_mode(m)).unwrap();
+        mode(&closed, 0o000);
+        mode(&read_only, 0o500);
+        let backup = |file: &Path, pass: &Path, switched: bool| {
+            run(
+                &state,
+                &Cmd::Backup {
+                    file: file.into(),
+                    overwrite: false,
+                    passphrase_file: Some(pass.into()),
+                },
+                &|_| Ok(switched),
+                &mut Vec::new(),
+            )
+        };
+        let folder = backup(&read_only.join("c.bak"), &pass, true);
+        let pass_file = backup(&d.path().join("c.bak"), &hidden, true);
+        let plain = backup(&d.path().join("c.bak"), &hidden, false);
+        mode(&closed, 0o700);
+        mode(&read_only, 0o700);
+        let e = folder.unwrap_err();
+        assert!(e.contains("may not write in"), "{e}");
+        assert!(
+            e.contains(&state.join("center.bak").display().to_string()),
+            "{e}"
+        );
+        let e = pass_file.unwrap_err();
+        assert!(
+            e.contains("the passphrase file is read as the owner"),
+            "{e}"
+        );
+        assert!(
+            e.contains("type the passphrase") && !e.contains("name a file"),
+            "{e}"
+        );
+        assert!(!d.path().join("c.bak").exists());
+        let e = plain.unwrap_err();
+        assert!(e.starts_with("cannot open") && !e.contains("owner"), "{e}");
     }
 
     /// A state folder of a center that has run: its identity, a paired node

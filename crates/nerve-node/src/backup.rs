@@ -556,6 +556,22 @@ pub fn restore(paths: &NodePaths, b: &Parsed, opts: &RestoreOpts) -> Result<Rest
                     "the pin of center {} here is another one than the backup's: the restore takes the backup's. If the node cannot link, set the center's pin with `nerve-node config set center.{}.pin <pin>`",
                     e.name, e.name
                 ));
+            } else if h.pin_rotations == e.pin_rotations && h.pin == e.pin {
+                // The same pin, but the old one's time ended here sooner
+                // (the center ended its grace, maybe because that key
+                // leaked): the old pin does not come back.
+                let sooner = match (&h.old_pin, &e.old_pin) {
+                    (_, None) => false,
+                    (None, Some(_)) => true,
+                    (Some(h), Some(b)) => h.until_ms < b.until_ms,
+                };
+                if sooner {
+                    e.old_pin = h.old_pin.clone();
+                    report.notes.push(format!(
+                        "the grace of center {}'s old key ended after the backup was made: the restore does not bring its old pin back",
+                        e.name
+                    ));
+                }
             }
         }
     }
@@ -1661,6 +1677,42 @@ mod tests {
         let cfg = open_store(&n2).config().clone();
         assert_eq!(cfg.centers[0].public_key, Some(k2.public_hex()));
         assert_eq!(cfg.centers[0].key_rotations, 2);
+    }
+
+    /// A restore does not bring back a center's old pin whose grace ended
+    /// (the center told the node so) after the backup was made.
+    #[test]
+    fn a_restore_does_not_bring_back_an_old_pin_whose_grace_ended() {
+        let (_a, n) = node();
+        paired(&n, SecretStorage::File, &["home"]);
+        let (p0, p1) = ("A".repeat(43), "B".repeat(43));
+        let in_grace = |c: &mut NodeConfig| {
+            let e = c.center_mut("home").unwrap();
+            e.pin = Some(p1.clone());
+            e.old_pin = Some(nerve_policy::OldPin {
+                pin: p0.clone(),
+                until_ms: crate::now_ms() + 86_400_000,
+            });
+            e.pin_rotations = 1;
+        };
+        let mut s = open_store(&n);
+        s.mark(in_grace).unwrap();
+        drop(s);
+        let (_f, parsed, _) = roundtrip(&n, false);
+        let mut s = open_store(&n);
+        s.mark(|c| c.center_mut("home").unwrap().old_pin = None)
+            .unwrap();
+        drop(s);
+        let r = restore_into(&n, &parsed, None);
+        assert!(
+            r.notes
+                .iter()
+                .any(|t| t.contains("does not bring its old pin back")),
+            "{r:?}"
+        );
+        let cfg = open_store(&n).config().clone();
+        assert_eq!(cfg.centers[0].pin.as_deref(), Some(p1.as_str()));
+        assert_eq!(cfg.centers[0].old_pin, None);
     }
 
     /// A center's pin set by hand counts as a rotation the node took: a

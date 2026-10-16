@@ -206,7 +206,10 @@ its `public_key` stays when that key is on the machine, over the older key in
 the backup, and its `pin` and `old_pin` stay. Where it counts fewer (an older
 copy of the node), the backup's stay. The same count with another key or pin
 keeps the backup's, with a note. A pin the owner sets by hand counts as a
-rotation the node took (the settings store raises `pin_rotations`).
+rotation the node took (the settings store raises `pin_rotations`). With the same count and the same
+pin, an `old_pin` here that is gone or ends sooner than the backup's stays:
+the center ended its grace after the backup, maybe because the old key
+leaked, so the old pin does not come back.
 
 ## Pins
 

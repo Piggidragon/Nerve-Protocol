@@ -5,6 +5,20 @@ The exact rules are in [spec/node-local.md](spec/node-local.md) §2 to §4.
 For how it looks to an owner, see the user guide ([modes](../user/modes.md),
 [rules](../user/rules.md)).
 
+## Three layers
+
+A call passes three layers of policy, each able only to refuse (design rule 1):
+
+1. The **center's action checker** — an optional gate on the center: a
+   deterministic blocklist, saved allow rules and an optional decision model
+   ([action-checker](action-checker.md)). It runs before the call leaves the
+   center and can only make it stricter.
+2. The **node's policy** (this page) — the authority. Whatever the center let
+   through, the node decides by the calling center's modes and rules.
+3. The **sandbox** (`nerve-sandbox`) — confinement for commands the node runs.
+
+The rest of this page is the second layer, the node.
+
 ## One policy per pairing
 
 A pairing is a **center entry**. Its policy holds:

@@ -17,8 +17,14 @@ nerve-transport.workspace = true
 nerve-node.workspace = true
 # The audit buttons write rules in the node's own rule syntax.
 nerve-policy.workspace = true
-# io-std for MCP over stdio; a feature of the existing tokio, no new crate.
-tokio = { workspace = true, features = ["io-std"] }
+# io-std for MCP over stdio; process/time/sync/signal for the action checker's
+# local llama-server; all features of the existing tokio, no new crate.
+tokio = { workspace = true, features = ["io-std", "process", "time", "sync", "signal"] }
+# The action checker's blocklist: path and command globs (globset, in the
+# lock already) and a `re:` regex form for the few defaults a glob cannot
+# express (regex, already in the lock through globset).
+globset.workspace = true
+regex = "1"
 tokio-tungstenite.workspace = true
 tokio-rustls.workspace = true
 rustls.workspace = true

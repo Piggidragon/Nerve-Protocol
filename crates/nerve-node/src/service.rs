@@ -1206,63 +1206,26 @@ pub async fn fetch_release(base: &str, asset: &str) -> Result<Vec<u8>, String> {
 }
 
 /// `GET url`, following redirects (never from https to http), through the
-/// proxy `HTTPS_PROXY` names. Errors name the host, not the whole address,
-/// which may hold a signed query.
+/// proxy `HTTPS_PROXY` names: the download the center's one-click model
+/// install shares (`nerve_transport::download`). Errors name the host, not
+/// the whole address, which may hold a signed query.
 async fn download(url: &str, max: usize) -> Result<Vec<u8>, String> {
-    let mut url = url.to_string();
-    let mut tls = None;
-    for _ in 0..6 {
-        let (at, target) = split_url(&url)?;
-        if tls == Some(true) && !at.tls {
-            return Err(format!("{} redirects from https to http", at.host));
-        }
-        tls = Some(at.tls);
-        let proxy = if at.tls {
-            nerve_transport::net::Proxy::from_env(&at.host)?
-        } else {
-            None
-        };
-        let mut io = nerve_transport::net::open(&at, None, proxy.as_ref()).await?;
-        let r = nerve_transport::http::get(&mut io, &at.authority(), &target, max)
-            .await
-            .map_err(|e| format!("{}: {e}", at.host))?;
-        match r.status {
-            200 => return Ok(r.body),
-            301 | 302 | 303 | 307 | 308 => {
-                let to = r
-                    .location
-                    .ok_or_else(|| format!("{} redirects without a Location", at.host))?;
-                url = if to.contains("://") {
-                    to
-                } else if to.starts_with('/') {
-                    format!(
-                        "{}://{}{to}",
-                        if at.tls { "https" } else { "http" },
-                        at.authority()
-                    )
-                } else {
-                    return Err(format!("{} redirects to a relative place", at.host));
-                };
-            }
-            s => return Err(format!("{} answered HTTP {s}", at.host)),
-        }
-    }
-    Err("too many redirects".into())
+    let mut body = Vec::new();
+    let opts = nerve_transport::download::Options {
+        max: max as u64,
+        idle: nerve_transport::http::HEAD_TIMEOUT,
+        // Five redirects, as the node's own loop followed before.
+        hops: 5,
+        cancel: None,
+    };
+    nerve_transport::download::fetch(url, &mut body, &opts, &mut |_, _| {}).await?;
+    Ok(body)
 }
 
 /// The server and the request target (path and query) of an http(s) URL.
+#[cfg(all(test, target_os = "linux"))]
 fn split_url(url: &str) -> Result<(nerve_proto::link::CenterUrl, String), String> {
-    let scheme_end = url.find("://").ok_or("not an http(s) address")?;
-    let rest = &url[scheme_end + 3..];
-    let end = rest.find(['/', '?']).unwrap_or(rest.len());
-    let mut target = rest[end..].to_string();
-    if !target.starts_with('/') {
-        target.insert(0, '/');
-    }
-    let at =
-        nerve_proto::link::CenterUrl::parse(&format!("{}{}", &url[..scheme_end + 3], &rest[..end]))
-            .map_err(|_| "not an http(s) address".to_string())?;
-    Ok((at, target))
+    nerve_transport::download::split_url(url)
 }
 
 /// Writes `data` to `path` through a temporary file beside it and a rename,
@@ -2701,6 +2664,34 @@ pub(crate) mod tests {
             }
         });
         format!("http://127.0.0.1:{port}/rel")
+    }
+
+    /// The release download follows five redirects, as the node's own loop
+    /// did before it moved to the shared downloader, and refuses a sixth
+    /// (review r3, finding 7).
+    #[tokio::test]
+    async fn the_download_follows_five_redirects_and_no_more() {
+        use nerve_transport::http::{Response, read_request};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // `/rN` redirects to `/r(N+1)` up to `/r6`, which answers.
+        tokio::spawn(async move {
+            while let Ok((mut io, _)) = listener.accept().await {
+                let req = read_request(&mut io, 0).await.unwrap();
+                let n: u8 = req.path.trim_start_matches("/r").parse().unwrap_or(9);
+                let r = if n >= 6 {
+                    Response::text(200, "end")
+                } else {
+                    Response::new(302, "text/plain", "")
+                        .with_header("Location", &format!("/r{}", n + 1))
+                };
+                let _ = r.write(&mut io).await;
+            }
+        });
+        let url = |n: u8| format!("http://127.0.0.1:{port}/r{n}");
+        assert_eq!(download(&url(1), 1024).await.unwrap(), b"end");
+        let e = download(&url(0), 1024).await.unwrap_err();
+        assert!(e.contains("too many redirects"), "{e}");
     }
 
     fn sha(b: &[u8]) -> String {

@@ -58,6 +58,15 @@ Get the programs from
    nerve-node rule add allow 'git status'
    ```
 
+## The action checker
+
+The center has an optional gate that checks each call before the machine gets
+it: a deterministic blocklist of dangerous commands and paths (on by default),
+saved allow rules, and an optional System One decision model that judges
+whether a call is dangerous. It can only refuse; the machine's own rules still
+decide. Set it up on the **Action checker** page of the web UI
+([docs](docs/user/action-checker.md)).
+
 ## Documentation
 
 | For | Where |

@@ -14,6 +14,7 @@ pub mod attach;
 pub mod audit;
 pub mod backup;
 pub mod center;
+pub mod checker;
 pub mod config;
 pub mod link;
 pub mod listen;

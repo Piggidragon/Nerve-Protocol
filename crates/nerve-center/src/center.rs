@@ -18,6 +18,12 @@ use nerve_transport::log::{Level, Log, Query, call_line};
 use nerve_transport::tls::ServerIdentity;
 
 use crate::audit::AuditFeed;
+use crate::checker::blocklist::Rule;
+use crate::checker::server::LocalServer;
+use crate::checker::{
+    self, AllowRule, CallInfo, Checker, CheckerConfig, Decision, Endpoint, Layer, LocalModel,
+    ModelSource, NodeSettings, NodeSwitch, Scope,
+};
 use crate::link::{Link, SHORT_CALL};
 use crate::pairing::{Codes, Outcome};
 use crate::store::{KeyRotation, NodeRecord, OldKey, Store};
@@ -92,6 +98,39 @@ pub struct Inner {
     dead_after_ms: AtomicU64,
     /// How long a dropped link waits for its resume, in milliseconds.
     grace_ms: AtomicU64,
+    /// The action checker (issue #17), rebuilt when its config changes.
+    checker: Mutex<Arc<Checker>>,
+    /// The local llama-server the checker runs, when the model is on and its
+    /// source is local; kept across unrelated rebuilds, keyed by `local_sig`.
+    local_model: Mutex<Option<Arc<LocalServer>>>,
+    local_sig: Mutex<String>,
+    /// The one-click install's progress (llama.cpp and the model download).
+    install: checker::install::Shared,
+    /// The running install's task and cancel flag, so Remove can end it and
+    /// wait for it before it deletes anything.
+    install_task: Mutex<Option<InstallTask>>,
+    /// Where the install downloads from (a local fake in a test).
+    install_from: Mutex<Arc<checker::install::Sources>>,
+    /// Set while an install swaps the local model's files or Remove deletes
+    /// them, so no config change starts the server from them meanwhile.
+    /// `manage_local_model` holds this lock for its whole run.
+    files_held: Mutex<bool>,
+}
+
+/// A one-click install running in the background.
+struct InstallTask {
+    cancel: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// While alive, the local model's files are being replaced or deleted and
+/// the server stays down; dropping it lets `rebuild_checker` start it again.
+struct FilesHeld(Center);
+
+impl Drop for FilesHeld {
+    fn drop(&mut self) {
+        *self.0.files_held.lock().unwrap() = false;
+    }
 }
 
 /// A line that may repeat: logged at most once in `QUIET_FOR`, with the count
@@ -136,11 +175,24 @@ pub struct Session {
     pub calls: AtomicU64,
     /// Nodes this session called, for `session.end`.
     nodes: Mutex<BTreeSet<String>>,
+    /// The session is tainted: a call of it returned outside content (a
+    /// successful `read`, `sense` or `execute`). The action checker's model
+    /// may be told, and its "only tainted sessions" scope acts on it.
+    tainted: AtomicBool,
 }
 
 impl Session {
     pub fn ended(&self) -> bool {
         self.ended.load(Ordering::SeqCst)
+    }
+
+    /// Whether the session is tainted (an earlier call returned content).
+    pub fn tainted(&self) -> bool {
+        self.tainted.load(Ordering::SeqCst)
+    }
+
+    fn set_tainted(&self) {
+        self.tainted.store(true, Ordering::SeqCst);
     }
 }
 
@@ -293,7 +345,7 @@ impl Center {
         let pin = public_url.tls.then(|| identity.pin());
         let server_config = identity.server_config()?;
         let (changes, _) = broadcast::channel(64);
-        Ok(Center(Arc::new(Inner {
+        let center = Center(Arc::new(Inner {
             dir,
             public_url,
             pin: Mutex::new(pin),
@@ -315,7 +367,18 @@ impl Center {
             pair_log: Mutex::new(Quiet::default()),
             dead_after_ms: AtomicU64::new(crate::link::DEAD_AFTER.as_millis() as u64),
             grace_ms: AtomicU64::new(nerve_proto::resume::GRACE.as_millis() as u64),
-        })))
+            checker: Mutex::new(Arc::new(Checker::build(CheckerConfig::default(), None))),
+            local_model: Mutex::new(None),
+            local_sig: Mutex::new(String::new()),
+            install: Arc::new(Mutex::new(checker::install::Status::default())),
+            install_task: Mutex::new(None),
+            install_from: Mutex::new(Arc::new(checker::install::Sources::real())),
+            files_held: Mutex::new(false),
+        }));
+        // Build the checker from the stored config and the endpoint token,
+        // and start the local model if it is on.
+        center.rebuild_checker();
+        Ok(center)
     }
 
     pub fn dir(&self) -> &Path {
@@ -1809,6 +1872,7 @@ impl Center {
             ended: AtomicBool::new(false),
             calls: AtomicU64::new(0),
             nodes: Mutex::new(BTreeSet::new()),
+            tainted: AtomicBool::new(false),
         });
         self.sessions
             .lock()
@@ -1875,6 +1939,7 @@ impl Center {
                     "started_ms": s.started_ms,
                     "calls": s.calls.load(Ordering::SeqCst),
                     "nodes": nodes,
+                    "tainted": s.tainted(),
                 })
             })
             .collect();
@@ -2051,6 +2116,12 @@ impl Center {
         let started = Instant::now();
         let out = self.call_inner(sess, route, args).await;
         let ms = started.elapsed().as_millis() as u64;
+        // A call that returned outside content taints the session, so the
+        // model's "only tainted sessions" scope and its state can take it in.
+        if out.is_ok() && self.checker().taint_on() && checker::taints(route.effect) {
+            sess.set_tainted();
+            self.changed(Change::Sessions);
+        }
         let code = match &out {
             Ok(_) => None,
             Err(CallError::Rpc(e)) => Some(e.kind().as_str().to_string()),
@@ -2094,6 +2165,48 @@ impl Center {
                 format!("the node {} is disabled in the center", route.node_name),
             )
             .into());
+        }
+        // The action checker (issue #17): the center's own gate, before the
+        // node. It can only refuse; the node's policy still decides what it
+        // lets through (design rule 1).
+        let checker = self.checker();
+        let os = self.read(|s| {
+            s.nodes
+                .get(&route.node_id)
+                .map(|n| n.platform.clone())
+                .unwrap_or_default()
+        });
+        let tainted = checker.taint_on() && sess.tainted();
+        let target = checker_target(route, &args);
+        let endpoint = self.resolved_endpoint(&checker);
+        let info = CallInfo {
+            cap: &route.cap,
+            action: &route.action,
+            effect: route.effect,
+            target: &target,
+            args: &args,
+            node_id: &route.node_id,
+            os: &os,
+            tainted,
+        };
+        match checker.check(&info, endpoint.as_ref()).await {
+            Decision::Refuse {
+                layer,
+                scope,
+                detail,
+                message,
+            } => {
+                self.audit_checker(sess, route, &target, "forbidden", layer, scope, &detail);
+                return Err(RpcError::forbidden(message).into());
+            }
+            Decision::Allowed {
+                layer,
+                scope,
+                detail,
+            } => {
+                self.audit_checker(sess, route, &target, "allowed", layer, scope, &detail);
+            }
+            Decision::Pass => {}
         }
         let link = self.link(&route.node_id).ok_or_else(|| {
             RpcError::new(
@@ -2215,6 +2328,519 @@ impl Center {
             json!({"retention_days": s.retention_days, "total": total, "nodes": nodes})
         })
     }
+
+    // ---- Action checker (issue #17, docs/dev/action-checker.md) ----
+
+    /// The checker as it is now.
+    pub fn checker(&self) -> Arc<Checker> {
+        self.checker.lock().unwrap().clone()
+    }
+
+    /// The file that holds the model endpoint's bearer token (a secret, so
+    /// not in `state.json`), mode 0600 in the state folder.
+    fn checker_token_path(&self) -> PathBuf {
+        self.dir.join("checker-model.token")
+    }
+
+    /// The endpoint token, or `None` when none is set.
+    pub fn checker_token(&self) -> Option<String> {
+        std::fs::read_to_string(self.checker_token_path())
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Whether an endpoint token is set (the UI never shows the token itself).
+    pub fn checker_has_token(&self) -> bool {
+        self.checker_token().is_some()
+    }
+
+    /// Sets or clears the endpoint token.
+    pub fn set_checker_token(&self, token: Option<&str>) -> Result<(), String> {
+        let path = self.checker_token_path();
+        match token.map(str::trim).filter(|t| !t.is_empty()) {
+            Some(t) => nerve_transport::files::write_private(&path, t.as_bytes())
+                .map_err(|e| format!("cannot write the model token: {e}")),
+            None => match std::fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    Err(format!("cannot remove the model token: {e}"))
+                }
+                _ => Ok(()),
+            },
+        }
+    }
+
+    /// Rebuilds the checker from the stored config and the token, and brings
+    /// the local model up or down to match. Called at start and after every
+    /// change to the checker config.
+    pub fn rebuild_checker(&self) {
+        let cfg = self.read(|s| s.checker.clone());
+        self.manage_local_model(&cfg);
+        let checker = Checker::build(cfg, self.checker_token());
+        for why in &checker.rejected {
+            self.log.record(
+                Level::Warn,
+                None,
+                &format!("the action checker left out a rule it could not parse: {why}"),
+            );
+        }
+        *self.checker.lock().unwrap() = Arc::new(checker);
+    }
+
+    /// Starts, stops or keeps the local llama-server to match `cfg`. It runs
+    /// only when the model is on (by the center's switch, or for a node by
+    /// its own), its source is local, and the one-click
+    /// install put the build and the chosen model in place. Keyed by the
+    /// CPU/GPU choice and the model, so an unrelated change does not restart
+    /// it.
+    fn manage_local_model(&self, cfg: &CheckerConfig) {
+        // Held for the whole run, so an install cannot take the files between
+        // the check below and the start.
+        let held = self.files_held.lock().unwrap();
+        let installed = checker::install::installed(&self.dir, cfg.model.local_model);
+        let want = cfg.model_wanted() && cfg.model.source == ModelSource::Local && installed;
+        // An install is swapping the files (or Remove deleting them): start
+        // nothing from them now. The install rebuilds when it is done, and
+        // the empty signature makes that start the server.
+        if want && *held {
+            return;
+        }
+        let sig = if want {
+            format!(
+                "gpu={}|model={:?}",
+                cfg.model.local_gpu, cfg.model.local_model
+            )
+        } else {
+            String::new()
+        };
+        if *self.local_sig.lock().unwrap() == sig {
+            return;
+        }
+        // Starting a server needs a runtime; without one (an off-runtime
+        // open, as in a test) leave it for the next change inside the server.
+        if want && tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        // Drop the old one (its Drop ends the process), then start the new.
+        *self.local_model.lock().unwrap() = None;
+        if want {
+            let bin = checker::install::server_bin(&self.dir);
+            let model = checker::install::model_path(&self.dir, cfg.model.local_model);
+            match bin
+                .ok_or_else(|| "the local model is not installed".to_string())
+                .and_then(|bin| {
+                    LocalServer::start(bin, model, cfg.model.local_gpu, cfg.model.timeout_ms)
+                }) {
+                Ok(srv) => {
+                    *self.local_model.lock().unwrap() = Some(Arc::new(srv));
+                    self.log.record(
+                        Level::Info,
+                        None,
+                        &format!(
+                            "the action checker is starting its local decision model on the {}",
+                            if cfg.model.local_gpu { "GPU" } else { "CPU" }
+                        ),
+                    );
+                }
+                Err(e) => self.log.record(
+                    Level::Warn,
+                    None,
+                    &format!("the action checker cannot start its local model: {e}"),
+                ),
+            }
+        }
+        *self.local_sig.lock().unwrap() = sig;
+    }
+
+    /// The model endpoint to use now: the owner's endpoint, or the local
+    /// server's once it is ready. `None` when the model is on but not
+    /// reachable (the checker then fails closed, or logs, by its setting).
+    fn resolved_endpoint(&self, checker: &Checker) -> Option<Endpoint> {
+        match checker.model_source() {
+            ModelSource::Endpoint => checker.endpoint().cloned(),
+            ModelSource::Local => {
+                let srv = self.local_model.lock().unwrap().clone()?;
+                srv.ready().then(|| srv.endpoint())
+            }
+        }
+    }
+
+    /// The local model's status for the UI, or `None` when there is no local
+    /// server running.
+    pub fn local_model_status(&self) -> Option<crate::checker::server::Status> {
+        self.local_model
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.status())
+    }
+
+    /// Replaces the checker config (after the UI validated the change),
+    /// saves it, rebuilds the checker and tells the UI. `clear_taint` clears
+    /// every session's taint mark, for when taint is switched off.
+    pub fn set_checker_config(&self, cfg: CheckerConfig, clear_taint: bool) {
+        self.update(|s| s.checker = cfg);
+        if clear_taint {
+            for s in self.sessions.lock().unwrap().values() {
+                s.tainted.store(false, Ordering::SeqCst);
+            }
+        }
+        self.rebuild_checker();
+        self.changed(Change::Nodes);
+        self.changed(Change::Sessions);
+    }
+
+    /// What the web UI's Action checker page reads: the config (no token),
+    /// whether a token is set, the default model and its licence, the
+    /// one-click install's state and the running model's status, the
+    /// platform/GPU support, and rules that did not parse.
+    pub fn checker_json(&self) -> Value {
+        let cfg = self.read(|s| s.checker.clone());
+        json!({
+            "config": cfg,
+            "has_token": self.checker_has_token(),
+            "models": checker::install::MODELS,
+            "default_blocklist": checker::config::default_blocklist(),
+            "local": self.local_model_status(),
+            "install": *self.install.lock().unwrap(),
+            "installed": checker::install::installed(&self.dir, cfg.model.local_model),
+            "installed_models": checker::install::installed_models(&self.dir),
+            "platform_supported": checker::install::platform_supported(),
+            "gpu_hint": checker::install::gpu_hint(),
+            "rejected": self.checker().rejected,
+        })
+    }
+
+    /// The one-click install's current state.
+    pub fn checker_install_status(&self) -> checker::install::Status {
+        self.install.lock().unwrap().clone()
+    }
+
+    /// Starts the one-click install of llama.cpp and the d1-3B model on the
+    /// CPU or GPU, in the background. On success it turns the local model on
+    /// with the chosen device. Refused while an install is already running.
+    /// Validates a posted checker config and, if it holds, saves it. Taint
+    /// switched off clears every session's mark.
+    pub fn apply_checker_config(&self, mut cfg: CheckerConfig) -> Result<(), String> {
+        for e in &mut cfg.blocklist {
+            Rule::parse(&e.rule)?;
+            // An entry for one node is switched off as a whole; the
+            // exceptions are for an entry of every node.
+            if e.node_id.is_some() && !e.off_for.is_empty() {
+                return Err(format!(
+                    "the blocklist entry {} is for one node, so it cannot be switched off for single nodes; switch it off instead",
+                    e.rule
+                ));
+            }
+            e.off_for.sort();
+            e.off_for.dedup();
+        }
+        for a in &cfg.allow_rules {
+            Rule::parse(&a.rule)?;
+        }
+        if !(0.0..=1.0).contains(&cfg.model.threshold) {
+            return Err("the threshold is between 0 and 1".into());
+        }
+        if cfg.model.timeout_ms < 100 {
+            return Err("the model timeout is at least 100 ms".into());
+        }
+        if cfg.model.instructions.trim().is_empty() {
+            return Err("the model question needs instructions".into());
+        }
+        // A node that follows the center in both is the same as one with no
+        // settings: keep the state free of them.
+        cfg.nodes.retain(|_, n| *n != NodeSettings::default());
+        let clear_taint = self.read(|s| s.checker.taint_on) && !cfg.taint_on;
+        self.set_checker_config(cfg, clear_taint);
+        Ok(())
+    }
+
+    /// Adds a saved allow rule, built for an audit button's `cap.action` and
+    /// `target` (exact or wildcard), for every node or one node.
+    pub fn add_checker_allow(
+        &self,
+        cap: &str,
+        action: &str,
+        target: &str,
+        wildcard: bool,
+        node_id: Option<String>,
+    ) -> Result<String, String> {
+        let rule = audit_rule("allow", cap, action, target, wildcard)?;
+        let mut cfg = self.read(|s| s.checker.clone());
+        let entry = AllowRule {
+            rule: rule.clone(),
+            node_id,
+        };
+        if !cfg.allow_rules.contains(&entry) {
+            cfg.allow_rules.push(entry);
+        }
+        self.set_checker_config(cfg, false);
+        Ok(rule)
+    }
+
+    /// Takes the local model's files for an install's swap or a Remove: marks
+    /// them held, so no config change starts the server from them, then stops
+    /// the running server and waits for its process to exit, so the files are
+    /// free to replace or delete (Windows refuses while it runs). The server
+    /// stays down until the returned guard is dropped and the checker rebuilt.
+    async fn hold_local_files(&self) -> FilesHeld {
+        let server = {
+            let mut held = self.files_held.lock().unwrap();
+            *held = true;
+            *self.local_sig.lock().unwrap() = String::new();
+            self.local_model.lock().unwrap().take()
+        };
+        if let Some(srv) = server {
+            srv.stop().await;
+        }
+        FilesHeld(self.clone())
+    }
+
+    /// Starts the one-click install of llama.cpp and `model` on the CPU or
+    /// GPU, in the background. The running model keeps judging calls while
+    /// the files download; it is stopped only for the swap at the end. On
+    /// success it turns the local model on with the chosen model and device;
+    /// for a GPU install it first checks the build really finds a device and
+    /// falls back to the CPU with a note if not. Success or failure, the local
+    /// server is then brought back in line with the config. Refused while an
+    /// install is already running.
+    pub async fn start_checker_install(&self, gpu: bool, model: LocalModel) -> Result<(), String> {
+        if !checker::install::platform_supported() {
+            return Err("this machine has no pinned local build; use the endpoint mode".into());
+        }
+        // Claim the install under the lock, so two requests cannot both start.
+        {
+            let mut st = self.install.lock().unwrap();
+            if matches!(
+                st.phase,
+                checker::install::Phase::Downloading
+                    | checker::install::Phase::Unpacking
+                    | checker::install::Phase::Verifying
+            ) {
+                return Err("an install is already running".into());
+            }
+            *st = checker::install::Status {
+                phase: checker::install::Phase::Downloading,
+                gpu,
+                model_id: model,
+                ..Default::default()
+            };
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        let from = self.install_from.lock().unwrap().clone();
+        // Keep the slot locked while spawning, so the task's own check of
+        // whether it is still current waits until its handle is stored.
+        let mut slot = self.install_task.lock().unwrap();
+        let (me, flag) = (self.clone(), cancel.clone());
+        let task = tokio::spawn(async move { me.run_install(gpu, model, flag, from).await });
+        *slot = Some(InstallTask { cancel, task });
+        Ok(())
+    }
+
+    /// The body of an install task (see [`Center::start_checker_install`]).
+    async fn run_install(
+        &self,
+        gpu: bool,
+        model: LocalModel,
+        cancel: Arc<AtomicBool>,
+        from: Arc<checker::install::Sources>,
+    ) {
+        let r = async {
+            let prepared =
+                checker::install::prepare(&self.dir, gpu, model, &self.install, &cancel, &from)
+                    .await?;
+            // Only now take the server down: the files it runs from are
+            // about to be replaced.
+            let _held = self.hold_local_files().await;
+            checker::install::commit(&self.dir, prepared)
+        }
+        .await;
+        // A Remove took over (it also ends this task): drop the result.
+        let current = self
+            .install_task
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|t| Arc::ptr_eq(&t.cancel, &cancel));
+        if !current {
+            return;
+        }
+        match &r {
+            Ok(()) => {
+                // A GPU install only counts as GPU if the build finds a
+                // device; otherwise fall back to the CPU and say so.
+                let mut use_gpu = gpu;
+                if gpu && !checker::install::gpu_available(&self.dir).await {
+                    use_gpu = false;
+                    self.note(
+                        Level::Warn,
+                        None,
+                        "the action checker's GPU build found no device; running the model on the CPU. Reinstall on CPU to keep it off the GPU.",
+                    );
+                }
+                self.update(|s| s.checker.local_installed(use_gpu, model));
+                checker::install::finish(&self.install, &r);
+                if gpu && !use_gpu {
+                    self.install.lock().unwrap().message =
+                        "no GPU device was found; running on the CPU".into();
+                }
+                self.note(
+                    Level::Info,
+                    None,
+                    format!(
+                        "the action checker's local model was installed ({})",
+                        if use_gpu { "GPU" } else { "CPU" }
+                    ),
+                );
+            }
+            Err(e) => {
+                checker::install::finish(&self.install, &r);
+                self.note(
+                    Level::Warn,
+                    None,
+                    format!("the action checker's local model install failed: {e}"),
+                );
+            }
+        }
+        // Start the new build, or the old one again after a failed swap (a
+        // failed download never stopped it).
+        self.rebuild_checker();
+        self.changed(Change::Nodes);
+    }
+
+    /// Removes the installed local build and model, and turns the local model
+    /// off. Ends a running install first and waits for its task, so nothing it
+    /// does lands after this, then stops the server, so the delete does not
+    /// fail while a file is in use. The model is turned off even when a file
+    /// could not be deleted: it cannot run from a half-removed install, and
+    /// left on it would refuse every call as unreachable.
+    pub async fn remove_checker_model(&self) -> Result<(), String> {
+        let running = self.install_task.lock().unwrap().take();
+        if let Some(t) = running {
+            t.cancel.store(true, Ordering::Relaxed);
+            // A download waiting on a silent connection only sees the flag at
+            // its next read; aborting ends it at once.
+            t.task.abort();
+            let _ = t.task.await;
+        }
+        *self.install.lock().unwrap() = checker::install::Status::default();
+        let held = self.hold_local_files().await;
+        // The server has exited; retry a couple of times for a late handle on
+        // Windows.
+        let mut last = Ok(());
+        for _ in 0..3 {
+            last = checker::install::remove(&self.dir);
+            if last.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        drop(held);
+        // The model is off everywhere then: also for a node that had it on
+        // by its own setting, which would otherwise refuse its every call
+        // with no model to ask (fail closed).
+        self.update(|s| {
+            if s.checker.model.source == ModelSource::Local {
+                s.checker.model_on = false;
+                for n in s.checker.nodes.values_mut() {
+                    if n.model == NodeSwitch::On {
+                        n.model = NodeSwitch::Inherit;
+                    }
+                }
+                s.checker.nodes.retain(|_, n| *n != NodeSettings::default());
+            }
+        });
+        self.rebuild_checker();
+        self.changed(Change::Nodes);
+        match last {
+            Ok(()) => {
+                self.note(
+                    Level::Info,
+                    None,
+                    "the action checker's local model was removed",
+                );
+                Ok(())
+            }
+            Err(e) => {
+                let e = format!("the local model is off, but not every file could be deleted: {e}");
+                self.note(Level::Warn, None, format!("the action checker: {e}"));
+                Err(e)
+            }
+        }
+    }
+
+    /// Adds a checker audit entry (a center decision) to the feed and the log.
+    /// `scope` says whether the entry, rule or switch behind it was the
+    /// center's for every node or this node's own.
+    #[allow(clippy::too_many_arguments)]
+    fn audit_checker(
+        &self,
+        sess: &Arc<Session>,
+        route: &Route,
+        target: &str,
+        decision: &str,
+        layer: Layer,
+        scope: Scope,
+        detail: &str,
+    ) {
+        let node = self.node_name(&route.node_id);
+        let mut e = Map::new();
+        e.insert("ts".into(), json!(now_ms()));
+        e.insert("cap".into(), json!(route.cap));
+        e.insert("action".into(), json!(route.action));
+        e.insert("target".into(), json!(target));
+        e.insert("decision".into(), json!(decision));
+        if decision == "forbidden" {
+            e.insert("code".into(), json!("forbidden"));
+        }
+        e.insert("session".into(), json!(sess.id));
+        e.insert("by".into(), json!("action checker"));
+        e.insert("node_id".into(), json!(route.node_id));
+        e.insert("node".into(), json!(node));
+        e.insert(
+            "checker".into(),
+            json!({"layer": layer.as_str(), "scope": scope.as_str(), "detail": detail}),
+        );
+        self.audit.lock().unwrap().push(Value::Object(e));
+        self.changed(Change::Audit);
+        let (level, verb) = if decision == "forbidden" {
+            (Level::Warn, "refused")
+        } else {
+            (Level::Info, "allowed")
+        };
+        self.note(
+            level,
+            Some(&route.node_id),
+            format!(
+                "the action checker {verb} {}.{} by its {} {} ({detail})",
+                route.cap,
+                route.action,
+                layer.as_str(),
+                match scope {
+                    Scope::Global => "for every node",
+                    Scope::Node => "for this node",
+                }
+            ),
+        );
+    }
+}
+
+/// What the checker matches on: the command line for `exec.run`, the path for
+/// an `fs` action, else `<cap>.<action>`.
+fn checker_target(route: &Route, args: &Map<String, Value>) -> String {
+    match (route.cap.as_str(), route.action.as_str()) {
+        ("exec", "run") => args
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        ("fs", _) => args
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        _ => format!("{}.{}", route.cap, route.action),
+    }
 }
 
 pub(crate) fn plural(n: u32, one: &str) -> String {
@@ -2303,6 +2929,497 @@ mod tests {
             log_level: None,
         })
         .unwrap()
+    }
+
+    fn node_record(id: &str, platform: &str) -> NodeRecord {
+        NodeRecord {
+            id: id.into(),
+            name: id.into(),
+            public_key: "00".into(),
+            old_key: None,
+            key_rotations: 0,
+            platform: platform.into(),
+            arch: "x86_64".into(),
+            paired_ms: 1,
+            disabled: false,
+            last_seen_ms: 0,
+            going_away: None,
+            descriptor: None,
+        }
+    }
+
+    fn exec_route(node: &str) -> Route {
+        Route {
+            node_id: node.into(),
+            node_name: node.into(),
+            cap: "exec".into(),
+            action: "run".into(),
+            profile: "exec".into(),
+            effect: nerve_proto::Effect::Execute,
+        }
+    }
+
+    /// The checker gate refuses a blocklisted command before the node, with a
+    /// message that says the action checker did it; an ordinary command is
+    /// not refused by it (it reaches the "node offline" step instead, since
+    /// no link is set up in this test). This is the whole point of the gate,
+    /// so without it the blocklisted command would get the same "offline".
+    #[tokio::test]
+    async fn the_checker_refuses_a_blocklisted_command_before_the_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        c.update(|s| {
+            s.nodes.insert("n1".into(), node_record("n1", "linux"));
+        });
+        let sess = c.new_session("test");
+        let args = |cmd: &str| {
+            let mut m = Map::new();
+            m.insert("command".into(), json!(cmd));
+            m
+        };
+        // Blocklisted: refused by the checker.
+        let e = c
+            .call(&sess, &exec_route("n1"), args("rm -rf /"))
+            .await
+            .unwrap_err();
+        let CallError::Rpc(e) = e;
+        assert_eq!(e.kind(), ErrorCode::Forbidden);
+        assert!(e.message.contains("action checker"), "{}", e.message);
+        // The refusal is in the audit feed, marked as the checker's.
+        let last = c.audit().pop().unwrap();
+        assert_eq!(last["by"], "action checker");
+        assert_eq!(last["checker"]["layer"], "blocklist");
+        // Ordinary work passes the checker and only then meets the offline
+        // node.
+        let e = c
+            .call(&sess, &exec_route("n1"), args("git status"))
+            .await
+            .unwrap_err();
+        let CallError::Rpc(e) = e;
+        assert_eq!(e.kind(), ErrorCode::Unavailable);
+    }
+
+    /// A block entry for one node and a global entry switched off for
+    /// another: each node gets what the owner set for it, and the audit says
+    /// whether the entry was the global one or the node's. A posted config
+    /// with an exception on a one-node entry is refused, and nodes that only
+    /// inherit are not kept.
+    #[tokio::test]
+    async fn per_node_block_entries_are_audited_with_their_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        c.update(|s| {
+            s.nodes.insert("n1".into(), node_record("n1", "linux"));
+            s.nodes.insert("n2".into(), node_record("n2", "linux"));
+        });
+        let mut cfg = c.read(|s| s.checker.clone());
+        let mut tf = cfg.blocklist[0].clone();
+        tf.rule = "exec.run:terraform destroy".into();
+        tf.builtin = false;
+        tf.node_id = Some("n1".into());
+        cfg.blocklist.push(tf.clone());
+        cfg.blocklist
+            .iter_mut()
+            .find(|e| e.rule == "exec.run:rm -rf /")
+            .unwrap()
+            .off_for = vec!["n2".into(), "n2".into()];
+        cfg.nodes.insert("n2".into(), NodeSettings::default());
+        // An exception on a one-node entry is refused as a whole.
+        let mut bad = cfg.clone();
+        bad.blocklist.last_mut().unwrap().off_for.push("n2".into());
+        assert!(c.apply_checker_config(bad).is_err());
+        c.apply_checker_config(cfg).unwrap();
+        let kept = c.read(|s| s.checker.clone());
+        assert!(kept.nodes.is_empty(), "{:?}", kept.nodes);
+        assert_eq!(
+            kept.blocklist
+                .iter()
+                .find(|e| e.rule == "exec.run:rm -rf /")
+                .unwrap()
+                .off_for,
+            ["n2"]
+        );
+        let sess = c.new_session("test");
+        let run = |node: &'static str, cmd: &'static str| {
+            let c = &c;
+            let sess = &sess;
+            async move {
+                let mut m = Map::new();
+                m.insert("command".into(), json!(cmd));
+                let CallError::Rpc(e) = c.call(sess, &exec_route(node), m).await.unwrap_err();
+                e
+            }
+        };
+        let e = run("n1", "terraform destroy").await;
+        assert_eq!(e.kind(), ErrorCode::Forbidden);
+        assert!(
+            e.message.contains("this node's own blocklist"),
+            "{}",
+            e.message
+        );
+        let last = c.audit().pop().unwrap();
+        assert_eq!(last["checker"]["scope"], "node");
+        assert_eq!(last["checker"]["detail"], "exec.run:terraform destroy");
+        let e = run("n1", "rm -rf /").await;
+        assert_eq!(e.kind(), ErrorCode::Forbidden);
+        assert_eq!(c.audit().pop().unwrap()["checker"]["scope"], "global");
+        // n2: no entry of its own, and `rm -rf /` switched off for it, so
+        // both reach the (offline) node.
+        assert_eq!(
+            run("n2", "terraform destroy").await.kind(),
+            ErrorCode::Unavailable
+        );
+        assert_eq!(run("n2", "rm -rf /").await.kind(), ErrorCode::Unavailable);
+    }
+
+    /// A command line nested too deeply for the splitter is refused by the
+    /// gate (fail closed), not passed to the node (review r1, finding 1).
+    #[tokio::test]
+    async fn the_checker_refuses_a_command_line_it_cannot_take_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        c.update(|s| {
+            s.nodes.insert("n1".into(), node_record("n1", "linux"));
+        });
+        let sess = c.new_session("test");
+        let mut args = Map::new();
+        args.insert(
+            "command".into(),
+            json!(format!("echo {}", "$(".repeat(50_000))),
+        );
+        let e = c.call(&sess, &exec_route("n1"), args).await.unwrap_err();
+        let CallError::Rpc(e) = e;
+        assert_eq!(e.kind(), ErrorCode::Forbidden);
+        assert!(e.message.contains("nests more than"), "{}", e.message);
+    }
+
+    /// With the model on but no endpoint set, the checker fails closed: a
+    /// write call is refused because the model is unreachable.
+    #[tokio::test]
+    async fn the_model_fails_closed_when_it_cannot_be_reached() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        c.update(|s| {
+            s.nodes.insert("n1".into(), node_record("n1", "linux"));
+            s.checker.model_on = true;
+            // An endpoint source with no URL: nothing to reach.
+            s.checker.model.source = ModelSource::Endpoint;
+            s.checker.model.endpoint_url = String::new();
+        });
+        c.rebuild_checker();
+        let sess = c.new_session("test");
+        let mut args = Map::new();
+        args.insert("command".into(), json!("echo hi > out.txt"));
+        let e = c.call(&sess, &exec_route("n1"), args).await.unwrap_err();
+        let CallError::Rpc(e) = e;
+        assert_eq!(e.kind(), ErrorCode::Forbidden);
+        assert!(e.message.contains("reach"), "{}", e.message);
+    }
+
+    /// A fake release server for the install: the one connection it takes
+    /// gets a head that promises 1000 bytes and ten of them, then nothing
+    /// until the returned sender fires, when the connection is closed (so the
+    /// download fails as cut short).
+    #[cfg(unix)]
+    fn held_download() -> (String, std::sync::mpsc::Sender<()>) {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            if let Some(Ok(mut c)) = l.incoming().next() {
+                let mut buf = [0u8; 4096];
+                let _ = c.read(&mut buf);
+                let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n0123456789");
+                let _ = rx.recv_timeout(Duration::from_secs(25));
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), tx)
+    }
+
+    /// An installed CPU build that is the fake `llama-server` (it answers as
+    /// a decision model), with a d1-3B file it ignores.
+    #[cfg(unix)]
+    fn install_fake_build(state: &Path) {
+        let bin = checker::install::llama_dir(state).join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        checker::server::fake::fake_llama_server(&bin);
+        std::fs::write(bin.parent().unwrap().join("variant"), "cpu").unwrap();
+        let model = checker::install::model_path(state, LocalModel::D1_3b);
+        std::fs::create_dir_all(model.parent().unwrap()).unwrap();
+        std::fs::write(model, b"x").unwrap();
+    }
+
+    /// Waits up to 20 s for `f`.
+    #[cfg(unix)]
+    async fn until(what: &str, mut f: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !f() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    fn local_ready(c: &Center) -> bool {
+        c.local_model_status()
+            .is_some_and(|s| s.phase == checker::server::Phase::Ready)
+    }
+
+    /// A center with the fake build installed and the local model on and
+    /// ready.
+    #[cfg(unix)]
+    async fn center_with_a_running_model(dir: &Path) -> Center {
+        install_fake_build(dir);
+        let c = open(dir, None);
+        c.update(|s| {
+            s.checker.model_on = true;
+            s.checker.model.source = ModelSource::Local;
+        });
+        c.rebuild_checker();
+        until("the model to be ready", || local_ready(&c)).await;
+        c
+    }
+
+    /// The local model runs when only a node has the model on, and Remove
+    /// switches it off there too, so that node does not refuse every call
+    /// for want of a model.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_with_the_model_on_runs_the_local_model_until_remove() {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().unwrap();
+            install_fake_build(dir.path());
+            let c = open(dir.path(), None);
+            c.update(|s| {
+                s.checker.model_on = false;
+                s.checker.model.source = ModelSource::Local;
+                s.checker.nodes.insert(
+                    "n1".into(),
+                    NodeSettings {
+                        blocklist: NodeSwitch::Off,
+                        model: NodeSwitch::On,
+                    },
+                );
+            });
+            c.rebuild_checker();
+            until("the model to be ready", || local_ready(&c)).await;
+            c.remove_checker_model().await.unwrap();
+            assert!(c.local_model_status().is_none());
+            let n1 = c.read(|s| s.checker.nodes.get("n1").copied());
+            assert_eq!(
+                n1,
+                Some(NodeSettings {
+                    blocklist: NodeSwitch::Off,
+                    model: NodeSwitch::Inherit,
+                })
+            );
+        })
+        .await
+        .expect("the test did not finish within 60 s");
+    }
+
+    /// A config save that only toggles taint.
+    #[cfg(unix)]
+    fn save_unrelated_change(c: &Center) {
+        let mut cfg = c.read(|s| s.checker.clone());
+        cfg.taint_on = !cfg.taint_on;
+        c.apply_checker_config(cfg).unwrap();
+    }
+
+    /// An install keeps the running model judging calls while it downloads,
+    /// a config save meanwhile does not disturb it, and a failed install
+    /// leaves the working model installed and running (review r3, findings 2
+    /// and 3).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_install_keeps_the_model_running_until_its_swap() {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().unwrap();
+            let c = center_with_a_running_model(dir.path()).await;
+            let (base, release) = held_download();
+            *c.install_from.lock().unwrap() = Arc::new(checker::install::Sources::at(&base));
+            // The switch to the GPU build starts downloading.
+            c.start_checker_install(true, LocalModel::D1_3b)
+                .await
+                .unwrap();
+            until("the download to start", || {
+                c.checker_install_status().llama.done >= 10
+            })
+            .await;
+            assert!(local_ready(&c), "the model was stopped for the download");
+            save_unrelated_change(&c);
+            assert!(local_ready(&c), "a config save disturbed the running model");
+            // The download fails: the CPU build is kept and still runs.
+            release.send(()).unwrap();
+            until("the install to fail", || {
+                c.checker_install_status().phase == checker::install::Phase::Failed
+            })
+            .await;
+            assert_eq!(checker::install::installed_variant(dir.path()), Some(false));
+            until("the model to run again", || local_ready(&c)).await;
+        })
+        .await
+        .expect("the test did not finish within 60 s");
+    }
+
+    /// A fake Hugging Face that answers each of two downloads with `body`.
+    #[cfg(unix)]
+    fn serve_model(body: &'static [u8]) -> String {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for c in l.incoming().take(2) {
+                let Ok(mut c) = c else { continue };
+                let mut buf = [0u8; 4096];
+                let _ = c.read(&mut buf);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = c.write_all(head.as_bytes());
+                let _ = c.write_all(body);
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// An install that reaches its swap brings the local server back: after
+    /// a successful switch it runs the new model, and after a swap that fails
+    /// the model it had (review r4, finding 6). The install stopped the
+    /// server for the swap, so only its closing rebuild starts it again.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_install_brings_the_model_back_after_its_swap() {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().unwrap();
+            let c = center_with_a_running_model(dir.path()).await;
+            const MODEL: &[u8] = b"a small stand-in for the model file";
+            let base = serve_model(MODEL);
+            *c.install_from.lock().unwrap() =
+                Arc::new(checker::install::Sources::with_model(&base, MODEL));
+            let phase = |c: &Center| c.checker_install_status().phase;
+            // The switch to Kev-4B keeps the CPU build and swaps the model.
+            c.start_checker_install(false, LocalModel::Kev4b)
+                .await
+                .unwrap();
+            until("the install to finish", || {
+                phase(&c) == checker::install::Phase::Done
+            })
+            .await;
+            assert_eq!(c.read(|s| s.checker.model.local_model), LocalModel::Kev4b);
+            assert!(!checker::install::model_path(dir.path(), LocalModel::D1_3b).exists());
+            until("the new model to run", || local_ready(&c)).await;
+            // A swap that fails: something is in the way where d1-3B's file
+            // goes.
+            let d1 = checker::install::model_path(dir.path(), LocalModel::D1_3b);
+            std::fs::create_dir_all(d1.join("in-the-way")).unwrap();
+            c.start_checker_install(false, LocalModel::D1_3b)
+                .await
+                .unwrap();
+            until("the install to fail", || {
+                phase(&c) == checker::install::Phase::Failed
+            })
+            .await;
+            let st = c.checker_install_status();
+            assert!(
+                st.message.contains("put the model in place"),
+                "{}",
+                st.message
+            );
+            assert_eq!(c.read(|s| s.checker.model.local_model), LocalModel::Kev4b);
+            until("the model it had to run again", || local_ready(&c)).await;
+        })
+        .await
+        .expect("the test did not finish within 60 s");
+    }
+
+    /// While an install swaps the files (or Remove deletes them), a config
+    /// save does not start the server from them; it starts again once they
+    /// are free (review r3, finding 3).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_config_save_does_not_start_the_model_while_its_files_are_held() {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().unwrap();
+            let c = center_with_a_running_model(dir.path()).await;
+            let held = c.hold_local_files().await;
+            assert!(c.local_model_status().is_none());
+            save_unrelated_change(&c);
+            assert!(
+                c.local_model_status().is_none(),
+                "a config save started the server during the swap"
+            );
+            drop(held);
+            c.rebuild_checker();
+            until("the model to run again", || local_ready(&c)).await;
+        })
+        .await
+        .expect("the test did not finish within 60 s");
+    }
+
+    /// Remove during a stalled download ends the install at once, and
+    /// nothing of that install lands afterwards: its status stays reset and
+    /// no file comes back (review r3, finding 5).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remove_ends_a_stalled_install_for_good() {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().unwrap();
+            let c = open(dir.path(), None);
+            let (base, release) = held_download();
+            *c.install_from.lock().unwrap() = Arc::new(checker::install::Sources::at(&base));
+            c.start_checker_install(false, LocalModel::D1_3b)
+                .await
+                .unwrap();
+            until("the download to start", || {
+                c.checker_install_status().llama.done >= 10
+            })
+            .await;
+            let t = Instant::now();
+            c.remove_checker_model().await.unwrap();
+            assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+            assert_eq!(
+                c.checker_install_status().phase,
+                checker::install::Phase::Idle
+            );
+            // A second install starts while the first one's connection is
+            // still open and silent.
+            let (base2, release2) = held_download();
+            *c.install_from.lock().unwrap() = Arc::new(checker::install::Sources::at(&base2));
+            c.start_checker_install(false, LocalModel::D1_3b)
+                .await
+                .unwrap();
+            until("the second download to start", || {
+                c.checker_install_status().llama.done >= 10
+            })
+            .await;
+            // The first connection now ends. A first task still waiting on it
+            // would fail, clean up the staging folder the second one is
+            // using, and could write its failure into the second's status.
+            let _ = release.send(());
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let st = c.checker_install_status();
+            assert_eq!(
+                st.phase,
+                checker::install::Phase::Downloading,
+                "{}",
+                st.message
+            );
+            let staging = checker::install::llama_dir(dir.path()).with_extension("staging");
+            assert!(
+                staging.exists(),
+                "the first install removed the second's files"
+            );
+            let _ = release2.send(());
+            until("the second install to end", || {
+                c.checker_install_status().phase == checker::install::Phase::Failed
+            })
+            .await;
+        })
+        .await
+        .expect("the test did not finish within 60 s");
     }
 
     #[test]

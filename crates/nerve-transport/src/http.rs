@@ -334,12 +334,35 @@ pub async fn get<S: AsyncRead + AsyncWrite + Unpin>(
 
 /// Reads an answer to a request sent with `Connection: close`: up to its
 /// `Content-Length`, or to the end of the connection; a chunked body is
+/// decoded. Public so a caller that wrote its own request bytes (for a header
+/// `get`/`post_json` do not offer, such as an `Authorization`) can read the
+/// answer the same way. `wait` bounds the wait for the head and for each read
+/// of the body: a caller whose server may think for long (a decision model
+/// on a slow CPU) passes its own limit instead of [`HEAD_TIMEOUT`].
+pub async fn read_client_response<S: AsyncRead + Unpin>(
+    io: &mut S,
+    max_body: usize,
+    wait: Duration,
+) -> Result<ClientResponse, String> {
+    read_response_within(io, max_body, wait).await
+}
+
+/// Reads an answer to a request sent with `Connection: close`: up to its
+/// `Content-Length`, or to the end of the connection; a chunked body is
 /// decoded.
 async fn read_response<S: AsyncRead + Unpin>(
     io: &mut S,
     max_body: usize,
 ) -> Result<ClientResponse, String> {
-    let (head, rest) = tokio::time::timeout(HEAD_TIMEOUT, read_head(io))
+    read_response_within(io, max_body, HEAD_TIMEOUT).await
+}
+
+async fn read_response_within<S: AsyncRead + Unpin>(
+    io: &mut S,
+    max_body: usize,
+    wait: Duration,
+) -> Result<ClientResponse, String> {
+    let (head, rest) = tokio::time::timeout(wait, read_head(io))
         .await
         .map_err(|_| "timed out waiting for the answer".to_string())??;
     let mut headers = [httparse::EMPTY_HEADER; 64];
@@ -371,7 +394,7 @@ async fn read_response<S: AsyncRead + Unpin>(
         if body.len() > max_body {
             return Err("answer over the size limit".into());
         }
-        let n = tokio::time::timeout(HEAD_TIMEOUT, io.read(&mut chunk))
+        let n = tokio::time::timeout(wait, io.read(&mut chunk))
             .await
             .map_err(|_| "timed out reading the answer".to_string())?
             .map_err(|e| e.to_string())?;

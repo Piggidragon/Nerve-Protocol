@@ -945,11 +945,13 @@ version = "0.0.4"
 dependencies = [
  "clap",
  "futures-util",
+ "globset",
  "libc",
  "nerve-node",
  "nerve-policy",
  "nerve-proto",
  "nerve-transport",
+ "regex",
  "ring",
  "rustls",
  "serde",

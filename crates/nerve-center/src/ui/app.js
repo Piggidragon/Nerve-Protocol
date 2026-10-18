@@ -34,7 +34,9 @@ const ICONS = {
   chev: "<path d=\"m6 9 6 6 6-6\"/>",
   help: "<circle cx=\"12\" cy=\"12\" r=\"10\"/><path d=\"M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3\"/><path d=\"M12 17h.01\"/>",
   log: "<path d=\"M15 12h-5\"/><path d=\"M15 8h-5\"/><path d=\"M19 17V5a2 2 0 0 0-2-2H4\"/><path d=\"M8 21h12a2 2 0 0 0 2-2v-1a1 1 0 0 0-1-1H11a1 1 0 0 0-1 1v1a2 2 0 1 1-4 0V5a2 2 0 1 0-4 0v2a1 1 0 0 0 1 1h3\"/>",
-  download: "<path d=\"M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4\"/><polyline points=\"7 10 12 15 17 10\"/><line x1=\"12\" x2=\"12\" y1=\"15\" y2=\"3\"/>"
+  download: "<path d=\"M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4\"/><polyline points=\"7 10 12 15 17 10\"/><line x1=\"12\" x2=\"12\" y1=\"15\" y2=\"3\"/>",
+  shield: "<path d=\"M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z\"/>",
+  bot: "<path d=\"M12 8V4H8\"/><rect width=\"16\" height=\"12\" x=\"4\" y=\"8\" rx=\"2\"/><path d=\"M2 14h2\"/><path d=\"M20 14h2\"/><path d=\"M15 13v2\"/><path d=\"M9 13v2\"/>"
 };
 
 const SVG = "http://www.w3.org/2000/svg";
@@ -42,6 +44,7 @@ const PAGES = {
   overview: { title: "Overview", view: pageOverview },
   stats: { title: "Statistics", view: pageStats },
   audit: { title: "Audit", view: pageAudit },
+  checker: { title: "Action checker", view: pageChecker },
   log: { title: "Log", view: pageLog },
   help: { title: "Help", view: pageHelp },
   settings: { title: "Settings", view: pageSettings },
@@ -52,7 +55,7 @@ let lastSig = null;
 let busy = false;
 let down = false;
 let settingsRun = 0;
-const state = { overview: null, stats: null, statsNode: null, audit: null, log: null, help: null, pairing: null, settings: null, newToken: null, newPin: null };
+const state = { overview: null, stats: null, statsNode: null, audit: null, log: null, help: null, pairing: null, settings: null, newToken: null, newPin: null, checker: null };
 
 const $ = (id) => document.getElementById(id);
 
@@ -338,6 +341,9 @@ function sessionCard(s) {
   return el("div", { class: "card" },
     el("div", { class: "card-top" }, icon("plug"), el("span", { class: "name" }, s.client || "Unknown client"),
       pill("", s.transport),
+      // The action checker marks a session tainted once a call of it returned
+      // content (issue #17).
+      s.tainted ? pill("warn", "tainted") : null,
       el("span", { class: "push" }, btn("End", "danger", act(() => api("POST", "/api/sessions/end", { id: s.id }))))),
     el("p", { class: "meta" }, `Since ${ago(s.started_ms)}, ${plural(s.calls, "call")}`),
     s.nodes.length ? el("div", { class: "chips" }, s.nodes.map((n) => el("span", { class: "chip" }, n))) : null,
@@ -540,6 +546,9 @@ function pageAudit() {
 
 function auditRow(d, n) {
   const k = DECISIONS[d.decision] || { ic: "info", tone: "", pill: "" };
+  // A decision the center's action checker made (issue #17): its own allow
+  // rules, no node grant needed.
+  if (d.by === "action checker") return checkerAuditRow(d, k);
   const write = n && n.settings_write;
   const why = !n ? "The machine is no longer paired." : !write ? "This machine did not give this center the settings grant." : "";
   const rule = (list, wildcard) => act(async () => {
@@ -570,6 +579,491 @@ function auditRow(d, n) {
       ruleBtn("Deny", "danger", "deny", false), ruleBtn("Deny as wildcard", "danger", "deny", true)) : null,
     known && !write ? el("p", { class: "meta" }, why) : null,
     cut ? el("p", { class: "meta" }, "The target was cut to its start, so no rule can name it.") : null);
+}
+
+// A row for a decision the action checker made. A refusal offers allow
+// buttons that save a checker allow rule (center-side, no node grant), unless
+// the blocklist did it: the blocklist is hard deny, so the owner removes or
+// switches the entry off on the Action checker page instead.
+function checkerAuditRow(d, k) {
+  const layer = d.checker ? d.checker.layer : "";
+  const detail = d.checker ? d.checker.detail : "";
+  // Whether the entry, rule or switch behind it was the center's for every
+  // machine or this machine's own (entries from before per-machine settings
+  // have no scope).
+  const scope = d.checker ? d.checker.scope : "";
+  // For the model it is the switch that had the model on.
+  const whose = !scope ? ""
+    : layer === "model" ? (scope === "node" ? " (on by this machine's own setting)" : " (on for every machine)")
+      : scope === "node" ? " (this machine's own)" : " (for every machine)";
+  const refused = d.decision === "forbidden";
+  const byBlocklist = layer === "blocklist";
+  const cut = /… \[cut at \d+ of \d+ characters\]$/.test(d.target || "");
+  const known = d.cap && d.action && !cut && (d.target || !["exec", "fs"].includes(d.cap));
+  const allow = (wildcard) => act(async () => {
+    const r = await api("POST", "/api/checker/allow", { cap: d.cap, action: d.action, target: d.target || "", wildcard, node_id: d.node_id });
+    notify(`Added a checker allow rule: ${r.rule}`);
+  });
+  return el("div", { class: "card audit-row" },
+    el("div", { class: "line" },
+      el("span", { class: "tone-" + k.tone }, icon(byBlocklist ? "ban" : "bot")),
+      el("b", {}, d.node), el("span", { class: "mono" }, `${d.cap}.${d.action}`),
+      pill(k.pill, `${d.decision} by the action checker`),
+      el("span", { class: "when", title: when(d.ts) }, ago(d.ts))),
+    d.target ? el("code", { class: "target mono" }, d.target) : null,
+    detail ? el("p", { class: "meta" }, `${layer === "model" ? "Decision model" : layer === "allow rule" ? "Allow rule" : "Blocklist"}${whose}: ${detail}`) : null,
+    refused && !byBlocklist && known ? el("div", { class: "actions" },
+      btn("Allow", "", allow(false)), btn("Allow as wildcard", "", allow(true))) : null,
+    byBlocklist ? el("p", { class: "meta" }, scope === "global"
+      ? "On the blocklist for every machine (hard deny). To let it through, switch the entry off for this machine (Per machine) or for every machine on the Action checker page."
+      : "On the blocklist (hard deny). Remove or switch off the entry on the Action checker page to let it through.") : null);
+}
+
+// ---- Action checker (issue #17) ----
+
+const SCOPES = [
+  { value: "effects", text: "Execute, write and actuate calls (the default)" },
+  { value: "with-reads", text: "Those and reads too" },
+  { value: "tainted-only", text: "Only calls of a tainted session" },
+];
+const SOURCES = [
+  { value: "local", text: "A llama-server the center runs" },
+  { value: "endpoint", text: "A System One endpoint" },
+];
+let checkerRun = 0;
+
+async function loadChecker() {
+  const run = ++checkerRun;
+  const [r, o] = await Promise.all([api("GET", "/api/checker"), api("GET", "/api/overview")]);
+  if (run !== checkerRun) return;
+  // The working copy the form edits; meta holds what does not change here.
+  // The fields of per-machine settings are left out when empty.
+  const cfg = r.config;
+  cfg.nodes = cfg.nodes || {};
+  state.checker = { cfg, meta: r, nodes: o.nodes || [] };
+  if (current() === "checker") draw(true);
+}
+
+// Runs a save that no button started (a picker's choice), with the error
+// shown as a button's would be.
+function quietly(fn) {
+  fn().catch((e) => { if (!e.auth) notify(e.message, "error"); });
+}
+
+function machineName(id) {
+  const n = ((state.checker && state.checker.nodes) || []).find((x) => x.id === id);
+  return n ? n.name : id;
+}
+
+// The machine picker's entries: every machine, then each paired one.
+function machineItems() {
+  return [{ value: "", text: "Every machine" }, ...((state.checker && state.checker.nodes) || []).map((n) => ({ value: n.id, text: n.name }))];
+}
+
+// Saves the working copy, then reloads so the page shows what the center kept.
+async function saveChecker() {
+  await api("POST", "/api/checker", { config: state.checker.cfg });
+  await loadChecker();
+}
+
+function pageChecker() {
+  const c = state.checker;
+  if (!c) return [empty("Loading…")];
+  const cfg = c.cfg;
+  return [
+    head("shield", "Action checker", "A gate on the center that checks each call before the machine gets it. The machine's own rules still decide; the checker can only refuse.", [
+      [cfg.blocklist_on ? "on" : "off", "blocklist", cfg.blocklist_on ? "ok" : ""],
+      [cfg.model_on ? "on" : "off", "model", cfg.model_on ? "ok" : ""],
+    ]),
+    section("Switches", "Each part has its own switch; a change takes effect for the next call.", null, el("div", { class: "card" },
+      checkerToggle("Blocklist (deterministic, on by default)", cfg.blocklist_on, (v) => { cfg.blocklist_on = v; }),
+      checkerToggle("Decision model (off by default)", cfg.model_on, (v) => { cfg.model_on = v; }),
+      checkerToggle("Taint marking (a session is tainted after a call returns content)", cfg.taint_on, (v) => { cfg.taint_on = v; }))),
+    c.meta.rejected && c.meta.rejected.length ? banner("warn", "alert", `Some rules do not parse and were left out: ${c.meta.rejected.join("; ")}`) : null,
+    blocklistCard(cfg, c.meta),
+    allowCard(cfg),
+    machinesCard(cfg),
+    modelCard(cfg, c.meta),
+  ];
+}
+
+// A switch that mutates the working copy and saves at once.
+function checkerToggle(label, on, apply) {
+  const input = el("input", { type: "checkbox", onchange: act(async (ev) => { apply(ev.currentTarget.checked); await saveChecker(); }) });
+  input.checked = !!on;
+  return el("label", { class: "switch" }, input, el("span", {}, label));
+}
+
+// One blocklist entry: its switch, rule, scope (every machine, with the
+// machines it is switched off for, or one machine) and note.
+function blockRow(cfg, e, i) {
+  const t = el("input", { type: "checkbox", onchange: act(async (ev) => { cfg.blocklist[i].on = ev.currentTarget.checked; await saveChecker(); }) });
+  t.checked = e.on;
+  const off = e.off_for || [];
+  return el("div", { class: "card entry" },
+    el("div", { class: "card-top" },
+      el("label", { class: "switch" }, t, el("code", { class: "mono" }, e.rule)),
+      e.builtin ? pill("", "default") : null,
+      pill("", e.node_id ? `only ${machineName(e.node_id)}` : "every machine"),
+      off.length ? pill("warn", `off for ${off.map(machineName).join(", ")}`) : null,
+      el("span", { class: "push" }, btn("Remove", "danger", act(async () => { cfg.blocklist.splice(i, 1); await saveChecker(); }), "trash"))),
+    e.note ? el("p", { class: "meta" }, e.note) : null);
+}
+
+function blocklistCard(cfg, meta) {
+  const ruleIn = el("input", { class: "input mono", placeholder: "exec.run:rm -rf /*  or  fs.write:/etc/sudoers", "aria-label": "New blocklist rule" });
+  const noteIn = el("input", { class: "input", placeholder: "What it guards against (optional)", "aria-label": "Note" });
+  const items = machineItems();
+  let blockNode = "";
+  const nodePicker = picker({ label: "For", search: "Search machines", none: "No machine matches.", onpick: (v) => { blockNode = v; nodePicker.set(items, v); } });
+  nodePicker.set(items, "");
+  const add = act(async () => {
+    const rule = ruleIn.value.trim();
+    if (!rule) { notify("Enter a rule.", "error"); return; }
+    cfg.blocklist.push({ rule, on: true, builtin: false, note: noteIn.value.trim(), node_id: blockNode || null });
+    ruleIn.value = ""; noteIn.value = "";
+    await saveChecker();
+  });
+  const reset = act(async () => {
+    const yes = await modal({ title: "Reset the blocklist?", message: "This replaces the whole blocklist with the built-in defaults, for every machine; your own entries (also those for one machine), entries you switched off, and entries switched off for single machines are lost.", confirm: "Reset", danger: true });
+    if (!yes) return;
+    cfg.blocklist = meta.default_blocklist.map((e) => ({ ...e }));
+    await saveChecker();
+  });
+  return section("Blocklist", "Exact commands or wildcards that are refused at once, in the machine's own rule syntax (exec.run:…, fs.write:…), for every machine or for one. A re: regex form is allowed where a glob is not enough. The blocklist wins over the allow rules and the model. An entry for every machine can be switched off for single machines under Per machine.", btn("Reset to defaults", "ghost", reset, "refresh"),
+    el("div", { class: "card" }, el("div", { class: "form-row" },
+      el("label", { class: "field grow" }, el("span", { class: "label" }, "Add a rule"), ruleIn),
+      el("label", { class: "field grow" }, el("span", { class: "label" }, "Note"), noteIn),
+      nodePicker.root),
+      el("div", { class: "actions" }, el("button", { type: "button", class: "btn primary", onclick: add }, icon("plus", "sm"), "Add"))),
+    el("p", { class: "meta" }, "What the matcher cannot see: shell variables, aliases, a script written then run, and base64. The decision model and the machine's policy are the next lines of defence."),
+    cfg.blocklist.length ? el("div", { class: "list" }, cfg.blocklist.map((e, i) => blockRow(cfg, e, i))) : empty("The blocklist is empty."));
+}
+
+// One saved allow rule, with its scope.
+function allowRow(cfg, a, i) {
+  return el("div", { class: "card entry" },
+    el("div", { class: "card-top" },
+      el("code", { class: "mono" }, a.rule),
+      pill("", a.node_id ? `only ${machineName(a.node_id)}` : "every machine"),
+      el("span", { class: "push" }, btn("Remove", "danger", act(async () => { cfg.allow_rules.splice(i, 1); await saveChecker(); }), "trash"))));
+}
+
+function allowCard(cfg) {
+  const ruleIn = el("input", { class: "input mono", placeholder: "exec.run:docker exec *", "aria-label": "New allow rule" });
+  const nodeItems = machineItems();
+  let allowNode = "";
+  const nodePicker = picker({ label: "For", search: "Search machines", none: "No machine matches.", onpick: (v) => { allowNode = v; nodePicker.set(nodeItems, v); } });
+  nodePicker.set(nodeItems, "");
+  const add = act(async () => {
+    const rule = ruleIn.value.trim();
+    if (!rule) { notify("Enter a rule.", "error"); return; }
+    cfg.allow_rules.push({ rule, node_id: allowNode || null });
+    ruleIn.value = "";
+    await saveChecker();
+  });
+  return section("Allow rules", "A call that matches an allow rule skips the decision model and goes straight to the machine. It does not skip the blocklist.", null,
+    el("div", { class: "card" }, el("div", { class: "form-row" },
+      el("label", { class: "field grow" }, el("span", { class: "label" }, "Add a rule"), ruleIn),
+      nodePicker.root),
+      el("div", { class: "actions" }, el("button", { type: "button", class: "btn primary", onclick: add }, icon("plus", "sm"), "Add"))),
+    cfg.allow_rules.length ? el("div", { class: "list" }, cfg.allow_rules.map((a, i) => allowRow(cfg, a, i))) : empty("No allow rules."));
+}
+
+// ---- Per machine: the switches, entries, exceptions and allow rules of
+// one machine (owner's decision of 2026-10-18) ----
+
+// The machines whose card is open, so a save (which redraws the page) keeps
+// them open.
+const checkerOpen = new Set();
+
+// The paired machines, and any machine the settings still name although it
+// is no longer paired, so its settings can be forgotten.
+function checkerMachines(cfg) {
+  const nodes = (state.checker && state.checker.nodes) || [];
+  const named = new Set(Object.keys(cfg.nodes || {}));
+  for (const e of cfg.blocklist) {
+    if (e.node_id) named.add(e.node_id);
+    for (const id of e.off_for || []) named.add(id);
+  }
+  for (const a of cfg.allow_rules) if (a.node_id) named.add(a.node_id);
+  const gone = [...named].filter((id) => !nodes.some((n) => n.id === id));
+  return [...nodes.map((n) => ({ id: n.id, name: n.name, paired: true })), ...gone.map((id) => ({ id, name: id, paired: false }))];
+}
+
+function machinesCard(cfg) {
+  const machines = checkerMachines(cfg);
+  return section("Per machine", "Each machine follows the center's switches unless you set the blocklist or the model on or off for it. It can have block entries of its own, and switch single entries for every machine off for itself. A block anywhere wins: the center's blocklist, this machine's entries, or the machine's own deny list; an allow rule only skips the model.", null,
+    machines.length ? el("div", { class: "list" }, machines.map((m) => machineCard(cfg, m))) : empty("No machine is paired."));
+}
+
+function machineCard(cfg, m) {
+  const own = cfg.nodes[m.id] || { blocklist: "inherit", model: "inherit" };
+  const indexed = cfg.blocklist.map((e, i) => [e, i]);
+  const entries = indexed.filter(([e]) => e.node_id === m.id);
+  const offs = indexed.filter(([e]) => !e.node_id && (e.off_for || []).includes(m.id));
+  const others = indexed.filter(([e]) => !e.node_id && !(e.off_for || []).includes(m.id));
+  const allows = cfg.allow_rules.map((a, i) => [a, i]).filter(([a]) => a.node_id === m.id);
+
+  // The blocklist or model setting: as the center, or on or off here.
+  const switchPicker = (part, label, centerOn) => {
+    const items = [
+      { value: "inherit", text: `As the center (${centerOn ? "on" : "off"})` },
+      { value: "on", text: "On for this machine" },
+      { value: "off", text: "Off for this machine" },
+    ];
+    const p = picker({
+      label, search: "Search", none: "No match.",
+      onpick: (v) => { p.set(items, v); cfg.nodes[m.id] = { ...own, [part]: v }; quietly(saveChecker); },
+    });
+    p.set(items, own[part] || "inherit");
+    return p.root;
+  };
+
+  const exceptItems = [{ value: "", text: "Pick an entry for every machine" },
+    ...others.map(([e, i]) => ({ value: String(i), text: e.note ? `${e.note}: ${e.rule}` : e.rule }))];
+  const exceptPicker = picker({
+    label: "Switch off for this machine", search: "Search entries", none: "No entry matches.",
+    onpick: (v) => {
+      exceptPicker.set(exceptItems, v);
+      if (v === "") return;
+      const e = cfg.blocklist[Number(v)];
+      e.off_for = [...(e.off_for || []), m.id];
+      quietly(saveChecker);
+    },
+  });
+  exceptPicker.set(exceptItems, "");
+  const offRow = ([e]) => el("div", { class: "card entry" },
+    el("div", { class: "card-top" },
+      el("code", { class: "mono" }, e.rule),
+      el("span", { class: "push" }, btn("Switch on again", "", act(async () => { e.off_for = (e.off_for || []).filter((id) => id !== m.id); await saveChecker(); })))),
+    e.note ? el("p", { class: "meta" }, e.note) : null);
+
+  const ruleIn = el("input", { class: "input mono", placeholder: "exec.run:terraform destroy*", "aria-label": `New blocklist rule for ${m.name}` });
+  const add = act(async () => {
+    const rule = ruleIn.value.trim();
+    if (!rule) { notify("Enter a rule.", "error"); return; }
+    cfg.blocklist.push({ rule, on: true, builtin: false, note: "", node_id: m.id });
+    ruleIn.value = "";
+    await saveChecker();
+  });
+  // A machine no longer paired: drop everything the settings hold for it.
+  const forget = act(async () => {
+    delete cfg.nodes[m.id];
+    cfg.blocklist = cfg.blocklist.filter((e) => e.node_id !== m.id).map((e) => ({ ...e, off_for: (e.off_for || []).filter((id) => id !== m.id) }));
+    cfg.allow_rules = cfg.allow_rules.filter((a) => a.node_id !== m.id);
+    checkerOpen.delete(m.id);
+    await saveChecker();
+  });
+
+  const word = (v) => (v === "on" ? "on here" : "off here");
+  const body = el("div", { class: "body" },
+    el("div", { class: "form-row" },
+      switchPicker("blocklist", "Blocklist", cfg.blocklist_on),
+      switchPicker("model", "Decision model", cfg.model_on)),
+    el("p", { class: "meta" }, "The model on here uses the center's one model and its settings below. Taint is for every machine."),
+    el("h4", { class: "sub-head" }, "Block entries for this machine only"),
+    entries.length ? el("div", { class: "list" }, entries.map(([e, i]) => blockRow(cfg, e, i))) : el("p", { class: "meta" }, "None."),
+    el("div", { class: "form-row" }, el("label", { class: "field grow" }, el("span", { class: "label" }, "Add a rule for this machine"), ruleIn)),
+    el("div", { class: "actions" }, el("button", { type: "button", class: "btn primary", onclick: add }, icon("plus", "sm"), "Add")),
+    el("h4", { class: "sub-head" }, "Entries for every machine, switched off here"),
+    offs.length ? el("div", { class: "list" }, offs.map(offRow)) : el("p", { class: "meta" }, "None."),
+    el("div", { class: "form-row" }, exceptPicker.root),
+    el("h4", { class: "sub-head" }, "Allow rules for this machine only"),
+    allows.length ? el("div", { class: "list" }, allows.map(([a, i]) => allowRow(cfg, a, i))) : el("p", { class: "meta" }, "None. Add one under Allow rules."),
+    m.paired ? null : el("div", { class: "actions" }, btn("Forget its settings", "danger", forget, "trash")));
+  const card = el("details", { class: "card", ontoggle: (ev) => { if (ev.currentTarget.open) checkerOpen.add(m.id); else checkerOpen.delete(m.id); } },
+    el("summary", {}, el("span", { class: "name" }, m.name),
+      m.paired ? null : pill("down", "not paired"),
+      own.blocklist && own.blocklist !== "inherit" ? pill(own.blocklist === "on" ? "up" : "warn", `blocklist ${word(own.blocklist)}`) : null,
+      own.model && own.model !== "inherit" ? pill(own.model === "on" ? "up" : "warn", `model ${word(own.model)}`) : null,
+      entries.length ? pill("", plural(entries.length, "own entry", "own entries")) : null,
+      offs.length ? pill("warn", `${offs.length} switched off`) : null,
+      icon("chev", "sm chev")),
+    body);
+  // Set after the build: el() would read an "open" attribute as an "on…" handler.
+  if (checkerOpen.has(m.id)) card.open = true;
+  return card;
+}
+
+function modelCard(cfg, meta) {
+  const m = cfg.model;
+  let source = m.source;
+  const srcPicker = picker({ label: "Source", search: "Search", none: "No match.", onpick: (v) => { source = v; srcPicker.set(SOURCES, v); showSource(); } });
+  srcPicker.set(SOURCES, source);
+  const endpointUrl = el("input", { class: "input mono", value: m.endpoint_url, placeholder: "https://host:9931" });
+  const endpointModel = el("input", { class: "input mono", value: m.endpoint_model, placeholder: "jev-latest (optional)" });
+  const token = el("input", { class: "input", type: "password", placeholder: meta.has_token ? "a token is set — type to replace" : "optional bearer token", autocomplete: "off" });
+  const threshold = el("input", { class: "input num", type: "number", min: "0", max: "1", step: "0.01", value: m.threshold });
+  const timeout = el("input", { class: "input num", type: "number", min: "100", value: m.timeout_ms });
+  let scope = m.scope;
+  const scopePicker = picker({ label: "Which calls the model sees", search: "Search", none: "No match.", onpick: (v) => { scope = v; scopePicker.set(SCOPES, v); } });
+  scopePicker.set(SCOPES, scope);
+  const failClosed = el("input", { type: "checkbox" }); failClosed.checked = m.fail_closed;
+  const instr = el("textarea", { class: "json", rows: "4" }, m.instructions);
+  const critTrue = el("input", { class: "input", value: m.criteria_true });
+  const critFalse = el("input", { class: "input", value: m.criteria_false });
+  const save = act(async () => {
+    m.source = source;
+    m.endpoint_url = endpointUrl.value.trim();
+    m.endpoint_model = endpointModel.value.trim();
+    m.threshold = Number(threshold.value);
+    m.timeout_ms = Number(timeout.value);
+    m.scope = scope;
+    m.fail_closed = failClosed.checked;
+    m.instructions = instr.value;
+    m.criteria_true = critTrue.value;
+    m.criteria_false = critFalse.value;
+    if (token.value) { await api("POST", "/api/checker/token", { token: token.value }); token.value = ""; }
+    await saveChecker();
+    notify("Saved.");
+  });
+  const resetQuestion = () => { instr.value = ""; critTrue.value = ""; critFalse.value = ""; notify("Cleared; Save to store the defaults."); };
+  const field = (label, input) => el("label", { class: "field grow" }, el("span", { class: "label" }, label), input);
+  const epDiv = el("div", {},
+    el("div", { class: "form-row" }, field("Endpoint URL", endpointUrl), field("Model name", endpointModel)),
+    el("div", { class: "form-row" }, field("Bearer token (kept secret, never shown back)", token),
+      meta.has_token ? el("span", { class: "push" }, btn("Clear token", "ghost", act(async () => { await api("POST", "/api/checker/token", { token: null }); await loadChecker(); }), "trash")) : null));
+  const localDiv = el("div", {}, ...localInstall(meta));
+  const showSource = () => { epDiv.hidden = source !== "endpoint"; localDiv.hidden = source !== "local"; };
+  showSource();
+  return section("Decision model", "An optional System One model that answers, in one pass, whether a call is dangerous. At or above the threshold the call is refused. An unreachable model refuses the call (fail closed) unless you switch that off below.", null,
+    el("div", { class: "card" },
+      el("div", { class: "form-row" }, srcPicker.root),
+      epDiv,
+      localDiv,
+      el("div", { class: "form-row" }, field("Threshold (0 to 1)", threshold), field("Timeout (ms)", timeout)),
+      el("div", { class: "form-row" }, scopePicker.root),
+      el("label", { class: "switch" }, failClosed, el("span", {}, "Fail closed: refuse a call when the model is unreachable (recommended). Off: allow and log it.")),
+      el("div", { class: "form-row" }, field("Question (the command text is never put here; it goes only in the state sent to the model)", instr)),
+      el("div", { class: "form-row" }, field("When true (dangerous)", critTrue), field("When false (safe)", critFalse)),
+      el("div", { class: "actions" },
+        el("button", { type: "button", class: "btn primary", onclick: save }, "Save"),
+        btn("Reset the question", "ghost", resetQuestion, "refresh"))));
+}
+
+// The local model: a one-click install of llama.cpp and the chosen model
+// (d1-3B by default, or Kev-4B), then the running status. The model picker
+// stays outside the polled container, so a poll does not close it; the
+// container is refreshed in place without rebuilding the form.
+let checkerStatusEl = null;
+let checkerPick = null;
+const INSTALLING = ["downloading", "unpacking", "verifying"];
+const gb = (bytes) => `${(bytes / 1e9).toFixed(1)} GB`;
+
+function localInstall(meta) {
+  const running = state.checker.cfg.model.local_model;
+  if (!checkerPick) checkerPick = running;
+  const items = meta.models.map((m, i) => ({ value: m.id, text: m.name + (i === 0 ? " (the default)" : "") }));
+  const p = picker({
+    label: "Model", search: "Search models", none: "No model matches.",
+    onpick: (v) => { checkerPick = v; p.set(items, v); checkerStatusEl.replaceChildren(...localInstallParts(state.checker.meta)); },
+  });
+  p.set(items, checkerPick);
+  checkerStatusEl = el("div", {});
+  checkerStatusEl.replaceChildren(...localInstallParts(meta));
+  return [
+    el("p", { class: "meta" }, "The center downloads and runs llama.cpp and the model itself, in its own state folder. Pick the model here; the device (CPU or GPU) is separate."),
+    el("div", { class: "form-row" }, p.root),
+    checkerStatusEl,
+  ];
+}
+
+const bar = (p) => {
+  const pct = p && p.total ? Math.min(100, Math.round((100 * p.done) / p.total)) : 0;
+  return el("div", { class: "pbar" }, el("div", { class: "pfill", style: `width:${pct}%` }), el("span", { class: "pct" }, `${pct}%`));
+};
+
+function localInstallParts(meta) {
+  const pin = meta.models.find((m) => m.id === checkerPick) || meta.models[0];
+  // One plain line per model, so the choice is informed: size, licence, and
+  // the measured speed and quality.
+  const line = el("p", { class: "meta" }, `${pin.name}: ${gb(pin.bytes)}, licence ${pin.licence}. ${pin.summary}`);
+  if (!meta.platform_supported) {
+    return [line, banner("warn", "alert", "This machine has no prebuilt local model for it. Use a System One endpoint instead (the other source above).")];
+  }
+  const inst = meta.install || { phase: "idle" };
+  const installing = INSTALLING.includes(inst.phase);
+  // Also offered while an install runs, so a slow download can be stopped
+  // from the page: Remove ends the install first.
+  const remove = btn("Remove", "danger", act(async () => {
+    const yes = await modal({
+      title: installing ? "Stop the install and remove the local model?" : "Remove the local model?",
+      message: installing
+        ? `Ends the install and deletes the downloaded llama.cpp and model files${meta.installed ? ", also those of the model installed now" : ""}. You can install them again later.`
+        : "Deletes the downloaded llama.cpp and model files. You can install them again later.",
+      confirm: "Remove", danger: true,
+    });
+    if (yes) { await api("POST", "/api/checker/remove"); await loadChecker(); }
+  }), "trash");
+  if (installing) {
+    const target = meta.models.find((m) => m.id === inst.model_id) || pin;
+    return [line, el("div", { class: "card" },
+      el("div", { class: "card-top" }, icon("download"), el("span", { class: "name" }, `Installing ${target.name}`), pill("warn", inst.phase)),
+      el("p", { class: "meta" }, "llama.cpp"), bar(inst.llama),
+      el("p", { class: "meta" }, `model (${gb(target.bytes)})`), bar(inst.model),
+      inst.message ? el("p", { class: "meta" }, inst.message) : null,
+      meta.local ? el("p", { class: "meta" }, "The installed model keeps checking calls until the new files are in place; it is stopped only for the swap at the end.") : null,
+      el("div", { class: "actions" }, remove))];
+  }
+  const cfg = state.checker.cfg.model;
+  const failed = inst.phase === "failed" ? banner("down", "alert", `The last install failed: ${inst.message || "unknown error"}`) : null;
+  if (meta.installed && pin.id === cfg.local_model) {
+    const dev = cfg.local_gpu ? "GPU" : "CPU";
+    const other = dev === "GPU" ? "CPU" : "GPU";
+    const reinstall = (gpu) => act(async () => { await api("POST", "/api/checker/install", { gpu, model: pin.id }); await loadChecker(); });
+    return [line, failed,
+      el("div", { class: "actions" },
+        el("span", { class: "meta" }, `Installed, running on the ${dev}.`),
+        meta.gpu_hint || dev === "GPU" ? btn(`Switch to ${other}`, "ghost", reinstall(other === "GPU")) : null,
+        remove),
+      ...localStatusParts(meta.local)];
+  }
+  const current = meta.installed ? meta.models.find((m) => m.id === cfg.local_model) : null;
+  return [line, failed,
+    current ? el("p", { class: "meta" }, `Installed now: ${current.name}. Switching downloads ${pin.name} (${gb(pin.bytes)}) and removes it; the threshold and timeout become ${pin.name.split(" (")[0]}'s defaults (${pin.threshold}, ${pin.timeout_ms / 1000} s).`) : null,
+    installButtons(meta, pin, current ? "Switch" : "Install"),
+    current ? el("div", { class: "actions" }, remove) : null];
+}
+
+function installButtons(meta, pin, verb) {
+  const install = (gpu) => act(async () => { await api("POST", "/api/checker/install", { gpu, model: pin.id }); await loadChecker(); });
+  return el("div", { class: "actions" },
+    btn(`${verb} on CPU`, "primary", install(false), "download"),
+    meta.gpu_hint ? btn(`${verb} on GPU`, "primary", install(true), "download") : null,
+    el("span", { class: "meta" }, meta.gpu_hint ? "GPU uses the Vulkan build (NVIDIA, AMD or Intel)." : "No GPU detected; CPU only."));
+}
+
+function localStatusParts(s) {
+  if (!s) {
+    return [el("p", { class: "meta" }, state.checker.cfg.model_on
+      ? "The model is on but its server is not running. The Log page says why."
+      : "The model is installed but not running. Turn the model on (the switch at the top).")];
+  }
+  const tone = s.phase === "ready" ? "up" : s.phase === "failed" ? "down" : "warn";
+  return [el("div", { class: "card" },
+    el("div", { class: "card-top" }, el("span", { class: "dot" + (s.phase === "ready" ? " up" : "") }), el("span", { class: "name" }, "Local model"), pill(tone, s.phase)),
+    s.url ? el("p", { class: "meta mono" }, s.url) : null,
+    s.message ? el("p", { class: "meta" }, s.message) : null,
+    s.output && s.output.length ? el("pre", { class: "logbox mono" }, s.output.join("\n")) : null)];
+}
+
+// Polls the install progress and the running status, so the page shows them
+// move along without rebuilding the form. A phase change that adds or removes
+// buttons (install finished, removed) triggers one redraw.
+async function pollCheckerLocal() {
+  if (!state.checker || !checkerStatusEl) return;
+  const r = await api("GET", "/api/checker");
+  if (current() !== "checker" || !checkerStatusEl) return;
+  const was = state.checker.meta;
+  const changed = was.installed !== r.installed
+    || (was.install && was.install.phase) !== (r.install && r.install.phase)
+    || JSON.stringify(was.installed_models) !== JSON.stringify(r.installed_models);
+  state.checker.meta = r;
+  // An install that finished or a removal changes the config (model, device,
+  // threshold) as well: reload it all, not just the status.
+  if (changed) { await loadChecker(); return; }
+  checkerStatusEl.replaceChildren(...localInstallParts(r));
 }
 
 // ---- Log ----
@@ -916,8 +1410,8 @@ function signature(page) {
 
 function draw(force) {
   const page = current();
-  if (page === "settings") {
-    if (force) $("page").replaceChildren(...PAGES.settings.view().flat());
+  if (page === "settings" || page === "checker") {
+    if (force) $("page").replaceChildren(...PAGES[page].view().flat());
     return;
   }
   const sig = signature(page);
@@ -969,6 +1463,8 @@ async function tick() {
     // The log asks for itself, so that a filter changed meanwhile is not
     // answered with the old filter's entries.
     if (page === "log" && logFilter.live) logLoad();
+    // The Action checker page refreshes the local model's status in place.
+    if (page === "checker") pollCheckerLocal().catch(() => {});
   } catch (e) {
     if (!e.auth && !down) notify("Cannot reach the center. Trying again.", "error");
     down = !e.auth;
@@ -1008,6 +1504,11 @@ function go() {
     state.settings = null;
     draw(true);
     loadSettings();
+  } else if (page === "checker") {
+    state.checker = null;
+    checkerPick = null;
+    draw(true);
+    loadChecker().catch((e) => { if (!e.auth) notify(e.message, "error"); });
   } else {
     draw(true);
   }

@@ -14,6 +14,8 @@ use serde::{Deserialize, Serialize};
 use nerve_proto::Descriptor;
 use nerve_transport::log::Level;
 
+use crate::checker::CheckerConfig;
+
 pub const FILE: &str = "state.json";
 /// The default statistics retention.
 pub const RETENTION_DAYS: u32 = 30;
@@ -51,6 +53,10 @@ pub struct Store {
     /// the keys of the state that is further along, here or in the backup.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub key_rotations: u32,
+    /// The action checker's settings (docs/dev/action-checker.md): the
+    /// blocklist, the saved allow rules, the decision model and the switches.
+    #[serde(default)]
+    pub checker: CheckerConfig,
 }
 
 fn is_zero(n: &u32) -> bool {
@@ -96,6 +102,7 @@ impl Store {
             log_level: Level::default(),
             key_rotation: None,
             key_rotations: 0,
+            checker: CheckerConfig::default(),
         }
     }
 

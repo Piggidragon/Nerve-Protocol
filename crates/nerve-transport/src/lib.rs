@@ -6,6 +6,7 @@
 pub mod backoff;
 pub mod backup;
 pub mod ctl;
+pub mod download;
 pub mod files;
 pub mod http;
 pub mod keys;

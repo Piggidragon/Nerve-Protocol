@@ -80,8 +80,5 @@ async fn the_local_server_starts_and_gates_a_call() {
         "got {dangerous:?}"
     );
     let ordinary = checker.check(&call("git status"), Some(&endpoint)).await;
-    assert!(
-        matches!(ordinary, Decision::Pass { .. }),
-        "got {ordinary:?}"
-    );
+    assert!(matches!(ordinary, Decision::Pass), "got {ordinary:?}");
 }

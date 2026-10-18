@@ -49,10 +49,19 @@ glob, the short and long flags that must all be present, and operand globs that
 must each be met) or a **`re:` regex** over the whole normalised command line
 for the cases a glob cannot express (fork bombs, `curl | sh`, database drops,
 Windows cmdlets). `normalize` splits on separators, pulls `$( )`, backtick and
-`sh -c` / `powershell -Command` bodies out, strips wrappers, takes the
-program's base name, and expands combined short flags, so flag order and
-`-rf`/`--recursive --force` do not matter. Its limits (variables, aliases,
-written-then-run scripts, base64) are in the user guide and the module comment.
+`sh -c` / `powershell -Command` (incl. combined `-lc`/`-xc`) bodies out, strips
+wrappers, takes the program's base name, and expands combined short flags, so
+flag order and `-rf`/`-Rf`/`--recursive --force` do not matter. The whole walk
+is bounded (`normalize::MAX_DEPTH`, `MAX_COMMANDS`); a line past the bound comes
+back as `Parsed::overflow`, and the checker refuses it (fail closed) instead of
+passing a line it could not take apart — a deeply nested `$(` can no longer
+overflow the stack. The structured matcher folds a trailing `/` or `/*` on an
+operand and matches a short flag in either case (`rm -Rf` meets `rm -rf`); the
+`re:` defaults for the order-combinatorial Windows cmdlets carry a few orderings
+each (Rust's regex has no lookahead). `fs` paths are normalised (`//`, `/.`,
+`..`) and matched case-insensitively. The limits (variables, `$HOME`, aliases,
+written-then-run scripts, base64, symlinks, the device's real canonical path)
+are in the user guide and the module comment.
 
 ## The decision model: System One
 

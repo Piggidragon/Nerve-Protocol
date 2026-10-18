@@ -56,12 +56,14 @@ impl Layer {
 /// What the checker decided about a call.
 #[derive(Debug, Clone)]
 pub enum Decision {
-    /// Nothing matched (or the model was below the threshold): send it to the
-    /// node. `note` is a line for the debug log, if any.
-    Pass { note: Option<String> },
-    /// A saved allow rule matched: send it to the node, with the model
-    /// skipped. Audited as allowed by the checker.
-    Allowed { detail: String },
+    /// Nothing ran (blocklist off and the model did not see the call): send it
+    /// to the node with no audit entry.
+    Pass,
+    /// The checker let the call through and this is worth recording: a saved
+    /// allow rule matched, or the model judged it below the threshold, or an
+    /// unreachable model was allowed-and-logged. Audited as `allowed` by the
+    /// given layer.
+    Allowed { layer: Layer, detail: String },
     /// Refused by the checker. `message` is for the agent; `detail` is the
     /// audit line.
     Refuse {
@@ -182,9 +184,31 @@ impl Checker {
             action: call.action,
             target: call.target,
         };
+        // For an `exec.run` call the command line is pulled apart once and
+        // reused across every entry. A line the splitter cannot take apart
+        // (nested past the bound) is refused rather than let through, so a
+        // crafted line cannot slip past the matcher — matching the fail-closed
+        // stance of the rest of the checker.
+        let parsed =
+            (call.cap == "exec" && call.action == "run").then(|| normalize::parse(call.target));
+        if self.cfg.blocklist_on
+            && let Some(p) = &parsed
+            && p.overflow
+        {
+            return Decision::Refuse {
+                layer: Layer::Blocklist,
+                detail: "the command line is nested too deeply to analyse".into(),
+                message: "the center's action checker refused this call: its command line is nested too deeply (too many `$( )`/`-c` levels or commands) for the checker to take apart safely. Simplify the command, or the owner can switch the blocklist off in the center's web UI (Action checker)."
+                    .into(),
+            };
+        }
+        let commands = parsed.as_ref().map(|p| p.commands.as_slice());
         // 1. Blocklist (hard deny, wins over everything).
         if self.cfg.blocklist_on
-            && let Some(b) = self.blocklist.iter().find(|b| b.rule.matches(&target))
+            && let Some(b) = self
+                .blocklist
+                .iter()
+                .find(|b| b.rule.matches_with(&target, commands))
         {
             let what = if b.note.is_empty() {
                 b.text.clone()
@@ -204,9 +228,10 @@ impl Checker {
             .allow
             .iter()
             .filter(|(_, node)| node.as_deref().is_none_or(|n| n == call.node_id))
-            .any(|(rule, _)| rule.matches(&target))
+            .any(|(rule, _)| rule.matches_with(&target, commands))
         {
             return Decision::Allowed {
+                layer: Layer::AllowRule,
                 detail: format!("a saved allow rule matched {}.{}", call.cap, call.action),
             };
         }
@@ -214,7 +239,7 @@ impl Checker {
         if self.cfg.model_on && self.model_sees(call.effect, call.tainted) {
             return self.run_model(call, endpoint).await;
         }
-        Decision::Pass { note: None }
+        Decision::Pass
     }
 
     async fn run_model(&self, call: &CallInfo<'_>, endpoint: Option<&Endpoint>) -> Decision {
@@ -229,10 +254,11 @@ impl Checker {
                     ),
                 }
             } else {
-                Decision::Pass {
-                    note: Some(format!(
-                        "the checker's model was unreachable; the call was allowed and logged (allow-and-log): {why}"
-                    )),
+                // Allowed-and-logged: recorded as an allowed decision, so the
+                // pass-through of an unreachable model leaves a trace.
+                Decision::Allowed {
+                    layer: Layer::Model,
+                    detail: format!("model unreachable, allowed and logged: {why}"),
                 }
             }
         };
@@ -250,11 +276,12 @@ impl Checker {
                     m.threshold
                 ),
             },
-            Ok(score) => Decision::Pass {
-                note: Some(format!(
-                    "the checker's model allowed the call (score {score:.2} < {:.2})",
-                    m.threshold
-                )),
+            // Below the threshold: an audited allow, with the score, so every
+            // call the model judged is on the record (brief: audit every
+            // decision of steps 1-3).
+            Ok(score) => Decision::Allowed {
+                layer: Layer::Model,
+                detail: format!("score {score:.2} < threshold {:.2}", m.threshold),
             },
             Err(e) => fail(e.to_string()),
         }
@@ -356,10 +383,7 @@ mod tests {
         let checker = Checker::build(cfg, None);
         let args = Map::new();
         let c = call("exec", "run", Effect::Execute, "rm -rf /", &args);
-        assert!(matches!(
-            checker.check(&c, None).await,
-            Decision::Pass { .. }
-        ));
+        assert!(matches!(checker.check(&c, None).await, Decision::Pass));
     }
 
     #[tokio::test]
@@ -373,10 +397,7 @@ mod tests {
         // model call even though the model is unreachable.
         let checker = Checker::build(cfg.clone(), None);
         let c = call("fs", "read", Effect::Read, "/x", &args);
-        assert!(matches!(
-            checker.check(&c, None).await,
-            Decision::Pass { .. }
-        ));
+        assert!(matches!(checker.check(&c, None).await, Decision::Pass));
         // A write is seen; with no endpoint and fail-closed it is refused.
         let c = call("fs", "write", Effect::Write, "/x", &args);
         assert!(matches!(
@@ -411,7 +432,10 @@ mod tests {
         let c = call("exec", "run", Effect::Execute, "make", &args);
         assert!(matches!(
             checker.check(&c, None).await,
-            Decision::Pass { note: Some(_) }
+            Decision::Allowed {
+                layer: Layer::Model,
+                ..
+            }
         ));
     }
 

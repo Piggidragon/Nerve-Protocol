@@ -266,15 +266,13 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
         ),
         // ---- fork bomb ----
         b("exec.run:re::\\(\\)\\s*\\{\\s*:\\s*\\|\\s*:", "a fork bomb"),
-        // ---- reckless chmod/chown of the root ----
+        // ---- reckless chmod/chown of the root (structured, so the flag and
+        //      the mode may come in any order) ----
         b(
-            "exec.run:re:(?i)\\bchmod\\b[^|&;]*-R[^|&;]*\\b777\\b[^|&;]*\\s/(\\s|$)",
+            "exec.run:chmod -R 777 /",
             "opens the whole filesystem to everyone",
         ),
-        b(
-            "exec.run:re:(?i)\\bchown\\b[^|&;]*-R[^|&;]*\\s/(\\s|$)",
-            "re-owns the whole filesystem",
-        ),
+        b("exec.run:chown -R /", "re-owns the whole filesystem"),
         // ---- destructive database commands ----
         b(
             "exec.run:re:(?i)(drop\\s+database|drop\\s+table|truncate\\s+table|droptable|dropdatabase)",
@@ -310,7 +308,7 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
             "flushes the firewall",
         ),
         b(
-            "exec.run:re:(?i)\\bkill\\b\\s*-9\\s*-1",
+            "exec.run:re:(?i)\\bkill\\b\\s+-(9|kill|sigkill)\\b\\s+-1\\b",
             "kills every process",
         ),
         // ---- opening the machine ----
@@ -324,30 +322,45 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
             "turns off the SSH service",
         ),
         b(
-            "exec.run:re:(?i)\\bgit\\b[^|&;]*push[^|&;]*--force[^|&;]*\\b(main|master)\\b",
+            "exec.run:re:(?i)\\bgit\\b[^|&;]*push[^|&;]*(--force(-with-lease)?|\\s-f\\b)[^|&;]*\\b(main|master)\\b",
             "force-pushes over a protected branch",
         ),
         b(
-            "exec.run:re:(?i)\\bgit\\b[^|&;]*push[^|&;]*\\b(main|master)\\b[^|&;]*--force",
+            "exec.run:re:(?i)\\bgit\\b[^|&;]*push[^|&;]*\\b(main|master)\\b[^|&;]*(--force(-with-lease)?|\\s-f\\b)",
+            "force-pushes over a protected branch",
+        ),
+        b(
+            "exec.run:re:(?i)\\bgit\\b[^|&;]*push[^|&;]*\\s\\+(main|master)\\b",
             "force-pushes over a protected branch",
         ),
         // ---- Windows ----
         b("exec.run:re:(?i)format-volume", "formats a volume"),
         b("exec.run:re:(?i)\\bformat\\b\\s+[a-z]:", "formats a drive"),
+        // Remove-Item of a drive root / Windows folder, with -Recurse and
+        // -Force in any order and whether the path comes before or after.
         b(
-            "exec.run:re:(?i)remove-item[^|&;]*-recurse[^|&;]*-force[^|&;]*[a-z]:\\\\?(\\s|$|windows)",
+            "exec.run:re:(?i)remove-item\\b[^|&;]*-recurse\\b[^|&;]*-force\\b[^|&;]*[a-z]:\\\\?(\\s|$|windows)",
             "recursively deletes a drive root or the Windows folder",
         ),
         b(
-            "exec.run:re:(?i)\\brd\\b\\s+/s\\s+/q\\s+[a-z]:",
+            "exec.run:re:(?i)remove-item\\b[^|&;]*-force\\b[^|&;]*-recurse\\b[^|&;]*[a-z]:\\\\?(\\s|$|windows)",
+            "recursively deletes a drive root or the Windows folder",
+        ),
+        b(
+            "exec.run:re:(?i)remove-item\\b[^|&;]*[a-z]:\\\\?(windows\\b)?[^|&;]*-recurse\\b[^|&;]*-force\\b",
+            "recursively deletes a drive root or the Windows folder",
+        ),
+        // rd/del of a drive: /s is the recursive flag; /q order does not matter.
+        b(
+            "exec.run:re:(?i)\\brd\\b[^|&;]*\\s/s\\b[^|&;]*[a-z]:",
             "recursively deletes a drive",
         ),
         b(
-            "exec.run:re:(?i)\\bdel\\b\\s+/s\\s+/q\\s+[a-z]:",
+            "exec.run:re:(?i)\\bdel\\b[^|&;]*\\s/s\\b[^|&;]*[a-z]:",
             "recursively deletes a drive",
         ),
         b(
-            "exec.run:re:(?i)vssadmin\\s+delete\\s+shadows",
+            "exec.run:re:(?i)\\bvssadmin(\\.exe)?\\s+delete\\s+shadows",
             "deletes volume shadow copies",
         ),
         b("exec.run:re:(?i)wbadmin\\s+delete", "deletes backups"),
@@ -356,7 +369,7 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
             "edits the boot configuration",
         ),
         b(
-            "exec.run:re:(?i)reg\\s+delete\\s+hklm",
+            "exec.run:re:(?i)\\breg(\\.exe)?\\s+delete\\s+[\"']?hk(lm|ey_local_machine)\\b",
             "deletes a machine registry key",
         ),
         b(

@@ -55,10 +55,18 @@ line into its commands (at `;`, `&&`, `||`, `|`, newlines, inside `$( )`,
 backticks and `sh -c '…'` / `powershell -Command` bodies), strips wrappers
 (`sudo`, `env A=B`, `nohup`, `time`, `nice`, `xargs`, …), takes the program's
 base name (`/bin/rm` → `rm`), and treats short flags in any order, split or
-joined (`-rf`, `-fr`, `-r -f`, `--recursive --force`) as the same.
+joined (`-rf`, `-fr`, `-r -f`, `-Rf`, `--recursive --force`) as the same. For a
+`fs` write it normalises the path first (`//`, `/.` and `..` are resolved, and
+the match ignores letter case), so a differently-spelled path still hits.
 
-**What it cannot see:** shell variables, aliases, a script written to a file
-and then run, and base64-encoded commands. The matcher is one line of defence;
+**What it cannot see:** shell variables and `$HOME` (it matches the literal
+`$HOME`, not your home), aliases, a script written to a file and then run, and
+base64-encoded commands. For paths it sees the path as the agent wrote it, not
+where a symlink would lead, and only this machine (the center) resolves `..` and
+`//`, not the device's real canonical path — so an unusual path spelling can
+still slip past the center, and the machine's own protected-path check is the
+backstop. A command line nested too deeply (very many `$( )` or `-c` levels) is
+refused outright rather than half-analysed. The matcher is one line of defence;
 the decision model and the machine's own policy are the next. Treat the
 blocklist as a safety net for obvious mistakes and obvious attacks, not as a
 sandbox.

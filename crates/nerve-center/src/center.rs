@@ -2167,18 +2167,10 @@ impl Center {
                 self.audit_checker(sess, route, &target, "forbidden", layer, &detail);
                 return Err(RpcError::forbidden(message).into());
             }
-            Decision::Allowed { detail } => {
-                self.audit_checker(sess, route, &target, "allowed", Layer::AllowRule, &detail);
+            Decision::Allowed { layer, detail } => {
+                self.audit_checker(sess, route, &target, "allowed", layer, &detail);
             }
-            Decision::Pass { note } => {
-                if let Some(n) = note {
-                    self.note(
-                        Level::Debug,
-                        Some(&route.node_id),
-                        format!("action checker: {n}"),
-                    );
-                }
-            }
+            Decision::Pass => {}
         }
         let link = self.link(&route.node_id).ok_or_else(|| {
             RpcError::new(
@@ -2726,6 +2718,27 @@ mod tests {
             .unwrap_err();
         let CallError::Rpc(e) = e;
         assert_eq!(e.kind(), ErrorCode::Unavailable);
+    }
+
+    /// A command line nested too deeply for the splitter is refused by the
+    /// gate (fail closed), not passed to the node (review r1, finding 1).
+    #[tokio::test]
+    async fn the_checker_refuses_a_command_line_it_cannot_take_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        c.update(|s| {
+            s.nodes.insert("n1".into(), node_record("n1", "linux"));
+        });
+        let sess = c.new_session("test");
+        let mut args = Map::new();
+        args.insert(
+            "command".into(),
+            json!(format!("echo {}", "$(".repeat(50_000))),
+        );
+        let e = c.call(&sess, &exec_route("n1"), args).await.unwrap_err();
+        let CallError::Rpc(e) = e;
+        assert_eq!(e.kind(), ErrorCode::Forbidden);
+        assert!(e.message.contains("nested too deeply"), "{}", e.message);
     }
 
     /// With the model on but no endpoint set, the checker fails closed: a

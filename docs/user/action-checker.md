@@ -5,8 +5,12 @@ the machine gets it, and can refuse it. The machine's own rules still decide
 what it lets through: the checker can only make a call stricter, never more
 permissive (a machine with nothing allowed still allows nothing).
 
-It is set up in the web UI, on the **Action checker** page. Everything it keeps
-is in the center's state, so it survives a restart and is in a backup.
+It is set up in the web UI, on the **Action checker** page. Its settings are
+in the center's state (`state.json`), so they survive a restart and are in a
+backup; the model endpoint's token and the local model are not
+([below](#the-decision-model)). A center that had no checker settings yet, such
+as one that ran 0.0.4, starts with the blocklist on and its default entries,
+so a call an earlier center passed to the machine may now be refused.
 
 ## The order
 
@@ -196,15 +200,20 @@ text generated, so a judgement is fast and cheap. There are two sources:
 - **A System One endpoint.** Give a URL (`https://` uses the system's root
   certificates), an optional bearer token and an optional model name
   (`jev-latest` for TypeSafe's hosted API). The token is a secret: it is kept
-  in a file of its own in the state folder and is never shown back. It is a
-  secret, so it is **not** in a center backup (as `state.json` holds no
-  secrets); after a restore, enter the token again.
+  in a file of its own in the state folder, `checker-model.token`, and is
+  never shown back. It is a secret, so it is **not** in a center backup (as
+  `state.json` holds no secrets); after a restore on another machine, enter
+  the token again.
 - **A local model the center installs for you.** Pick the model, then press
   **Install on CPU** (or **Install on GPU**, offered when the machine has a
   GPU). The center downloads a prebuilt `llama-server` from llama.cpp's GitHub
-  release and the model from Hugging Face into its own state folder — never
-  system-wide — checks each against a pinned SHA-256, unpacks it, and runs it on
-  loopback. GPU uses the Vulkan build (NVIDIA, AMD or Intel); after it is
+  release and the model from Hugging Face into `checker/` in its own state
+  folder — never system-wide — checks each against a pinned SHA-256, unpacks
+  it, and runs it on loopback. These files are not in a backup; after a
+  restore on another machine, install the model again, or a model that is on
+  refuses every call it sees. The [installed center
+  service](center.md#run-it-as-a-service) on Linux sees no GPU, so it runs the
+  model on the CPU. GPU uses the Vulkan build (NVIDIA, AMD or Intel); after it is
   installed the center runs the build's device probe, and if it finds no GPU it
   keeps the model on the CPU and says so (so the page never claims the GPU when
   it is really the CPU). You can switch CPU/GPU later with one click. The page

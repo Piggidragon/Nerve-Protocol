@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.0.5
+
+### The action checker
+
+- The center checks each call before the machine gets it, and can refuse it ([#17](https://github.com/Piggidragon/Nerve-Protocol/issues/17)). In this order: a blocklist of dangerous commands and paths, the allow rules saved in the center, an optional decision model, then the machine's own policy as before. A block anywhere wins: a center allow rule only skips the model, never a blocklist entry or the machine's rules. The refusal comes back to the agent as `forbidden` and says what refused it and where the owner changes that. Set it up on the new **Action checker** page of the web UI; the details are in `docs/user/action-checker.md`.
+- The blocklist is on by default. It catches an agent's mistakes (`rm -rf ~`, `mkfs`, `dd` to a disk, a force-push to `main`, their Windows equivalents), not command lines written to get past it; against those the machine's own policy counts. A download piped into a shell (`curl … | sh`, `irm … | iex`) is refused by default too, also a tool's official install one-liner. Entries can be added, removed, switched off and reset to the defaults.
+- Block entries and allow rules are for every machine or one, an entry for every machine can be switched off for one, and each machine sets the blocklist and the model to follow the center, on or off.
+- The decision model is off by default. It is a System One endpoint (`/v1/systemone`, with an optional bearer token), or a local model the center installs with one click: a pinned llama.cpp build and LiquidAI d1-3B (LFM Open License v1.0, the default) or Kev-4B (Apache-2.0), each checked against its pinned SHA-256 and run on loopback, on the CPU or the GPU (Vulkan). A model that cannot be reached or answer in time refuses the call (fail closed) unless the owner switches that to allow-and-log.
+- Taint marks a session once a call of it returned content, so the model can be given only the calls of such sessions. Every decision of the checker is on the Audit page and in the center's log.
+- The center now keeps `checker-model.token` (the endpoint's token) and the `checker/` folder (the local build and model, 1.7 or 3.0 GB) in its state folder. Neither is in a backup: after a restore on another machine, enter the token again and install the local model again; until then a model that is on refuses the calls it sees.
+- A center that ran 0.0.4 starts with the blocklist on and its default entries, so a call that 0.0.4 passed to the machine may now be refused. Switch the blocklist, or one entry, off on the Action checker page, for every machine or under **Per machine**. Nodes need no update: the checker runs on the center only.
+- A 0.0.4 center reads a 0.0.5 `state.json`, but leaves the checker's settings out the next time it writes the state (after a call or a change), so they are gone. Before you go back to 0.0.4, note your own entries, allow rules and model settings: 0.0.5 starts from the defaults again. Delete the `checker/` folder in the state folder to free its space; 0.0.4 does not use it or the token.
+
 ## 0.0.4
 
 ### Limits per command

@@ -7,7 +7,8 @@ call did not go through.
 
 The log is not the [audit log](audit.md). The audit log records the node's
 decision about every call, including the ones it allowed. The log does not
-record a call that worked.
+record a call that worked, except that the center logs every decision of its
+[action checker](action-checker.md), also the calls it let through.
 
 ## Where it is
 
@@ -108,8 +109,8 @@ a new `log.level` within a second.
 | Level | Lines |
 |---|---|
 | `error` | The state file cannot be written. A call failed inside the center or the node (`internal`) |
-| `warn` | A link dropped without a bye, went quiet (no frame for 45 s), or was replaced because the node connected again and the old link did not answer a ping; the line says how many calls wait for the node to resume the link. A node did not resume its link within 30 s, and its calls failed. A link failed authentication, or the node speaks another protocol version. A second link while the first is alive (the key may be copied). A description of a node that cannot be used. A pairing was refused: the code is unknown, used, expired or out of tries (one line in ten seconds; the number left out is told on the next line, or when the refusals stop), or the name or key is taken. Pairing codes ran out of tries. A call failed: the node is offline, busy, too slow, or the link ended. A node refused a change from the web UI. A wrong token at the web UI sign-in, and the lock after too many |
-| `info` | The center started and stopped. A link came up, with how long the node was away if it was; a node resumed its link, with the calls that waited on it; a link closed with a bye, with how long it was up. A node is going away, or changed its settings. A pairing code was made, or expired unused. A node paired, was renamed, disabled, enabled, removed or unpaired itself. A harness session started or ended. A call was refused, by the node's rules or because the node is disabled here. A call failed because of its own arguments or the node's answer (a missing file, a bad path). A harness token was made or deleted. Someone signed in to the web UI. Settings, a rule or the sudo switch were changed from the web UI. The center's settings or the log level were changed |
+| `warn` | The [action checker](action-checker.md) refused a call. Its local model could not be installed, started or wholly removed, or its GPU build found no device. A blocklist entry or an allow rule could not be read and is left out. A link dropped without a bye, went quiet (no frame for 45 s), or was replaced because the node connected again and the old link did not answer a ping; the line says how many calls wait for the node to resume the link. A node did not resume its link within 30 s, and its calls failed. A link failed authentication, or the node speaks another protocol version. A second link while the first is alive (the key may be copied). A description of a node that cannot be used. A pairing was refused: the code is unknown, used, expired or out of tries (one line in ten seconds; the number left out is told on the next line, or when the refusals stop), or the name or key is taken. Pairing codes ran out of tries. A call failed: the node is offline, busy, too slow, or the link ended. A node refused a change from the web UI. A wrong token at the web UI sign-in, and the lock after too many |
+| `info` | The center started and stopped. A link came up, with how long the node was away if it was; a node resumed its link, with the calls that waited on it; a link closed with a bye, with how long it was up. A node is going away, or changed its settings. A pairing code was made, or expired unused. A node paired, was renamed, disabled, enabled, removed or unpaired itself. A harness session started or ended. A call was refused, by the node's rules or because the node is disabled here. A call failed because of its own arguments or the node's answer (a missing file, a bad path). A harness token was made or deleted. Someone signed in to the web UI. Settings, a rule or the sudo switch were changed from the web UI. The center's settings or the log level were changed. The action checker let a call through by an allow rule or a model score below the threshold, or because its model was down and set to allow-and-log. Its local model was installed, removed, or is starting |
 | `debug` | A handshake that did not finish. A node that is not paired tried to connect. A pairing request in a wrong form. A node's description changed. A call was cancelled |
 
 The line for a refused or failed call names the action and the reason the node
@@ -122,6 +123,16 @@ exec.run failed (timeout) after 30 s: the node did not answer in time
 
 A reason can quote the path or command line of the call. The audit log has the
 whole call.
+
+A call the action checker refused has a line of its own before that one,
+which names the part that decided and the entry, rule or score, and whether it
+was the one for every machine or this machine's own:
+
+```
+the action checker refused exec.run by its blocklist for every node (exec.run:rm -rf /)
+exec.run was refused (forbidden): the center's action checker refused this call: it is on the center's blocklist for every node — wipes the root filesystem (exec.run:rm -rf /). …
+the action checker allowed exec.run by its model for every node (score 0.03 < threshold 0.80)
+```
 
 ## What the node logs
 
@@ -146,10 +157,12 @@ log; the audit log has it.
 
 ## What is never in it
 
-- A call that worked. That is in the node's audit log.
+- A call that worked. That is in the node's audit log. The action checker's
+  line for a call it let through names the rule or the score, not the call.
 - File contents and command output.
 - The sudo password, a harness token, the token typed into a wrong sign-in, a
-  pairing code, the node's key, a proxy's header values.
+  pairing code, the node's key, a proxy's header values, the token of the
+  action checker's model endpoint.
 
 The programs do not put a secret into a line. As a second guard, every line is
 checked before it is kept. These are replaced by `[redacted]`:

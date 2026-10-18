@@ -10,7 +10,7 @@ nodes. Each node decides every call by the rules its owner set.
    harness B ── MCP ──┤
                       ▼
                ┌──────────────┐
- browser ──────│ nerve-center │  pairing, links, tools, statistics, web UI
+ browser ──────│ nerve-center │  pairing, links, tools, action checker, statistics, web UI
                └──────▲───────┘
                       │ node link (WebSocket over TLS), dialled by the nodes
         ┌─────────────┴─────────────┐
@@ -23,7 +23,7 @@ nodes. Each node decides every call by the rules its owner set.
 
 | Part | Is | Holds |
 |---|---|---|
-| Center | `nerve-center`, one daemon | Its TLS key and certificate, its id and name, the paired nodes (id, name, public key, last descriptor), pairing codes, hashed harness tokens, sessions, statistics |
+| Center | `nerve-center`, one daemon | Its TLS key and certificate, its id and name, the paired nodes (id, name, public key, last descriptor), pairing codes, hashed harness tokens, sessions, statistics, the action checker's settings, its model endpoint's token and its local model |
 | Node | `nerve-node`, one daemon and a CLI | One pairing per center, the policy per center, the machine settings, the built-in capabilities, the sandbox, the sudo password while sudo is on |
 | Harness | Any MCP client | Nothing of Nerve. It only speaks MCP |
 
@@ -74,8 +74,12 @@ every call to them by the calling center's policy.
 | System keyring | With `machine.secret_storage = "keyring"`: the center keys, the config's key, the relay's TLS key and an `https://` proxy's password instead of their files. The proxy's header values, always (the installed node on Windows takes none, see node-local §2) |
 
 No call of any center reaches these two folders. See
-[settings and config](settings-and-config.md). The center keeps `tls.pem`,
-`state.json` and `log.jsonl` in its state folder ([logging](logging.md)).
+[settings and config](settings-and-config.md). The center keeps `tls.pem`
+(and `tls.next.pem` during a key rotation), `state.json`, `log.jsonl`,
+`center.lock`, `run/harness.sock` (Unix) and, for the
+[action checker](action-checker.md), `checker-model.token` and the local
+model in `checker/` in its state folder ([logging](logging.md),
+[backup](backup.md)).
 
 ## Repo layout
 
@@ -84,11 +88,11 @@ No call of any center reaches these two folders. See
 | `docs/dev/spec/` | The protocol, the node's local rules, the harness side, the conformance suite |
 | `schemas/` | JSON Schemas of the descriptor and the pair request |
 | `crates/nerve-proto` | Wire types and codecs, no I/O |
-| `crates/nerve-transport` | TLS with pinning, `CONNECT` proxies, WebSocket, the node's Ed25519 identity, the sealed sudo password, a small HTTP/1.1 server, local control sockets |
+| `crates/nerve-transport` | TLS with pinning, `CONNECT` proxies, WebSocket, the node's Ed25519 identity, the sealed sudo password, a small HTTP/1.1 server, local control sockets, the streaming downloader of the node's `update` and the checker's install |
 | `crates/nerve-policy` | The node's config, the decision engine, rules, protected paths, settings, the audit log |
 | `crates/nerve-sandbox` | Confinement for commands: Landlock on Linux, an AppContainer on Windows |
 | `crates/nerve-node` | The `nerve-node` binary: daemon and CLI |
-| `crates/nerve-center` | The `nerve-center` binary: links, MCP server, web UI |
+| `crates/nerve-center` | The `nerve-center` binary: links, MCP server, web UI, the action checker (`src/checker/`) |
 | `crates/nerve-conformance` | The conformance suite: center, node and harness parts, an echo node and a fake center |
 
 A wire change, its spec text and both ends change together.

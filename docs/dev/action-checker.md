@@ -34,8 +34,8 @@ center where the owner watches the audit feed.
 The center (`center.rs`, `call_inner`) turns a `Refuse` into a `forbidden`
 error for the harness and an audit entry, an `Allowed` into an audit entry, and
 a `Pass` into the call going on to the node. Every center decision carries a
-`by: "action checker"` and a `checker: {layer, detail}` in the audit feed and
-the log.
+`by: "action checker"` and a `checker: {layer, scope, detail}` in the audit
+feed, and a line in the log.
 
 ## The blocklist matcher
 
@@ -152,9 +152,8 @@ are in the user guide and the module comment.
 
 Decision models answer a typed question in one forward pass, no tokens
 generated. The de-facto API is TypeSafe's; `llama-server` serves the same since
-b11361 (llama.cpp PR #29818). The reference is
-`git -C ~/Services/llama.cpp show 097cf33d9:tools/server/README.md`
-(POST /v1/systemone).
+b11361 (llama.cpp PR #29818). The reference is `tools/server/README.md` in
+llama.cpp at commit `097cf33d9` (POST /v1/systemone).
 
 The center sends:
 
@@ -267,7 +266,10 @@ scope applies. Switching taint off clears every mark.
 ## Settings and persistence
 
 `CheckerConfig` (`checker/config.rs`) is a field of the center's `Store`, so it
-is in `state.json` and in a backup.
+is in `state.json` and in a backup. `Store` does not refuse unknown fields, so
+a 0.0.4 center reads a 0.0.5 `state.json` and drops `checker` the next time it
+saves; a `state.json` without it reads as `CheckerConfig::default()`, with the
+blocklist and taint on and the model off.
 
 Per node (owner's decision of 2026-10-18): a `BlockEntry` has a `node_id`
 (`None` for every node) and `off_for`, the node ids an entry for every node is
@@ -305,7 +307,7 @@ the client timeout for a slow model (e.g. Kev-4B on CPU); it is the runner
 only, not the product default.
 
 ```sh
-CUDA_VISIBLE_DEVICES= ~/Services/llama.cpp-native/build/bin/llama-server \
+CUDA_VISIBLE_DEVICES= llama-server \
     -m <model.gguf> -ngl 0 --host 127.0.0.1 --port 19931 &
 NERVE_CHECKER_ENDPOINT=http://127.0.0.1:19931 \
     cargo test -p nerve-center --test checker_eval -- --ignored --nocapture

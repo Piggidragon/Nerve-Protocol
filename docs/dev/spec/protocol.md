@@ -691,4 +691,4 @@ browser or tool) to the node; the center only relays it.
 
 ## 8. Center side
 
-The center serves harnesses. `nerve-center` is an MCP server ([harness.md](harness.md)). It maps capabilities to tools, holds sessions, and never stores file contents, command output or secrets.
+The center serves harnesses. `nerve-center` is an MCP server ([harness.md](harness.md)). It maps capabilities to tools, holds sessions, may refuse a call with its action checker before it reaches the node, and never stores file contents or command output; its one secret is the token of the checker's model endpoint.

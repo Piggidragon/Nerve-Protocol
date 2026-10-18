@@ -11,6 +11,7 @@ behaves the same except where this page says so.
 | Sudo switch | Yes | On the [installed service](service.md#windows), with the administrator token of the account commands run as ([sudo on Windows](sudo.md#sudo-on-windows)) |
 | Control socket | Yes | A control pipe that takes folder changes only |
 | Install as a service | Yes, with systemd, the node and the [center](center.md#run-it-as-a-service) | The node |
+| The center's [action checker](action-checker.md) | Yes. Its local model on x86_64 and aarch64, on the CPU or a Vulkan GPU; the installed center service runs it on the CPU only | Yes. Its local model on x86_64, on the CPU or a Vulkan GPU |
 | Config folder | `~/.config/nerve` | `%USERPROFILE%\.config\nerve` |
 
 ## Linux

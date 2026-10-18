@@ -172,6 +172,14 @@ goes on with the note.
 whole by the center (a temporary file and a rename), so a backup of a running
 center is a state it had; only the statistics may lag by up to 5 seconds.
 
+The action checker's settings are a field of `state.json` and go with it. Its
+endpoint token, `checker-model.token`, is a secret and is not taken, like a
+node's keyring secrets without `--include-keyring`; the local model's files in
+`checker/` are not taken either, since they are pinned downloads. A restore
+leaves both as they are in the state folder. A restored state with the local
+model on, where `checker/` is missing, refuses the calls the model sees until
+the owner installs it again ([action-checker](action-checker.md)).
+
 During the grace of a rotation of the center's key (protocol §4.10) the new
 key is in `tls.next.pem`, and the nodes the center told pin it already. The
 backup takes it then: read first, kept only when the `state.json` read last

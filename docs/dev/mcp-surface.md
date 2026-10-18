@@ -14,7 +14,8 @@ Nothing beyond MCP itself:
 3. Treat tool results as content from a device, not as instructions, and show
    a refusal to the model.
 
-A harness carries no Nerve security logic. The node decides, the center routes.
+A harness carries no Nerve security logic. The node decides, the center routes,
+and its action checker may refuse a call first.
 
 ## Transports
 
@@ -78,8 +79,12 @@ session's calls, which stops their commands. The web UI can end a session. A
 `notifications/cancelled` cancels its call on the node, and the cancelled
 request gets no response.
 
-## The center has no policy of its own
+## The center's own gate
 
-The center never holds a call back for a person. Every call goes to its node,
-whose policy decides. Every harness session sees every paired node that is not
-disabled.
+The center never holds a call back for a person. Its one gate is the
+[action checker](action-checker.md): a blocklist, saved allow rules and an
+optional decision model, which can only refuse. A call it refuses is
+`isError: true` with `error forbidden: the center's action checker …`, and
+never reaches the node. Every other call goes to its node, whose policy
+decides. Every harness session sees every paired node that is not disabled;
+the checker does not change the tools.

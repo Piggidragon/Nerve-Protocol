@@ -1,23 +1,30 @@
 //! Pulling a command line apart so the blocklist sees the real commands, not
 //! just the raw string (docs/dev/action-checker.md).
 //!
-//! A command line can hide a dangerous command behind separators, wrappers,
-//! groups and nested shells. [`parse`] splits the line into its individual
-//! commands: at `;`, `&&`, `||`, `|`, `&`, newlines and the parentheses of a
-//! subshell, and inside `$( )`, backticks (also within double quotes),
-//! process substitution `<( )`, `sh -c '…'` (with the `c` anywhere in the flag
-//! word: `-c`, `-lc`, `-ce`, `-c -e`), `cmd /c …` and `powershell -Command`
-//! bodies, and a here-document or here-string fed to a shell. It strips
-//! wrappers (`sudo`, `env A=B`, `nohup`, `command`, `exec`, `time`, `nice`,
-//! `xargs`, …) and shell keywords (`if`, `then`, `do`, `!`, `{`, …), takes the
-//! program's base name (`/bin/rm` → `rm`, `bash.exe` → `bash`) and expands
-//! combined short flags (`-rf` → `-r -f`) so `-rf`, `-fr` and `-r -f` all look
-//! the same.
+//! The blocklist is there to catch an agent's mistakes (a hallucinated
+//! `rm -rf ~`, a force-push to main), not to stop someone who crafts a line
+//! to get past it: that is the node's policy. So the splitter is simple and
+//! conservative: where it is unsure, it reads more text as commands, not
+//! less.
 //!
-//! A here-document that is not fed to a shell is data (a file being written):
-//! its lines are not commands, so a file that merely mentions `rm -rf /` is
-//! not refused. Only the `$( )` and backticks in an unquoted one, which the
-//! shell does run, are looked at.
+//! [`parse`] splits the line into its individual commands: at `;`, `&&`,
+//! `||`, `|`, `&`, newlines and the parentheses of a subshell, and inside
+//! `$( )`, backticks (also within double quotes, for a POSIX shell), process
+//! substitution `<( )`, `sh -c '…'` (with the `c` anywhere in the flag word:
+//! `-c`, `-lc`, `-ce`, `-c -e`), `cmd /c …` and `powershell -Command` bodies,
+//! and a here-string fed to a shell. The lines of a here-document are read as
+//! commands like any other line, whatever the document is for. A `#` at the
+//! start of a word starts a comment that runs to the end of its line. It
+//! strips wrappers (`sudo`, `env A=B`, `nohup`, `command`, `exec`, `time`,
+//! `nice`, `xargs`, …) and shell keywords (`if`, `then`, `do`, `!`, `{`, …),
+//! takes the program's base name (`/bin/rm` → `rm`, `bash.exe` → `bash`) and
+//! expands combined short flags (`-rf` → `-r -f`) so `-rf`, `-fr` and `-r -f`
+//! all look the same.
+//!
+//! The line is read by the rules of the node's shell ([`Shell`]): a POSIX
+//! shell's backslash escapes and backticks inside double quotes, or
+//! PowerShell's, where a backslash is an ordinary character (`C:\`) and a
+//! backtick is its escape.
 //!
 //! The whole walk is bounded: nesting (`$( )`, backticks, `-c` bodies, all
 //! together) at [`MAX_DEPTH`], and the number of commands at [`MAX_COMMANDS`],
@@ -148,19 +155,45 @@ const SHELLS: &[&str] = &[
 ];
 const POWERSHELLS: &[&str] = &["powershell", "pwsh"];
 
-/// The commands in `line`, with the overflow flag ignored. Kept for the tests
-/// and callers that only want the commands.
-pub fn commands(line: &str) -> Vec<Command> {
-    parse(line).commands
+/// The shell whose rules a line is read by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shell {
+    /// `sh`, `bash` and the like: `\` escapes the next character, and a
+    /// backtick inside double quotes is a command substitution.
+    Posix,
+    /// Windows PowerShell or PowerShell 7: `\` is an ordinary character (a
+    /// path separator), and a backtick is the escape character, so neither
+    /// is read the POSIX way.
+    PowerShell,
 }
 
-/// Pulls `line` apart, bounded in depth and in the number of commands.
-pub fn parse(line: &str) -> Parsed {
+impl Shell {
+    /// The shell a node runs `exec.run` in by default, by its platform: the
+    /// node uses PowerShell on Windows and `/bin/sh` everywhere else
+    /// (nerve-node `exec::shell_command`).
+    pub fn for_os(os: &str) -> Shell {
+        if os.eq_ignore_ascii_case("windows") {
+            Shell::PowerShell
+        } else {
+            Shell::Posix
+        }
+    }
+}
+
+/// The commands in `line`, read as a POSIX shell would, with the overflow flag
+/// ignored. Kept for the tests and callers that only want the commands.
+pub fn commands(line: &str) -> Vec<Command> {
+    parse(line, Shell::Posix).commands
+}
+
+/// Pulls `line` apart by the rules of `shell`, bounded in depth and in the
+/// number of commands.
+pub fn parse(line: &str, shell: Shell) -> Parsed {
     let mut w = Walk {
         commands: Vec::new(),
         overflow: None,
     };
-    w.collect(line, 0);
+    w.collect(line, shell, 0);
     Parsed {
         commands: w.commands,
         overflow: w.overflow,
@@ -175,12 +208,12 @@ struct Walk {
 }
 
 impl Walk {
-    fn collect(&mut self, line: &str, depth: usize) {
+    fn collect(&mut self, line: &str, shell: Shell, depth: usize) {
         if depth > MAX_DEPTH {
             self.overflow = Some(Overflow::Depth);
             return;
         }
-        let (segments, subs) = split_segments(line);
+        let (segments, subs) = split_segments(line, shell);
         // The line's own commands first, then the nested ones, so the outer
         // command is seen before what it runs.
         for segment in &segments {
@@ -188,15 +221,15 @@ impl Walk {
                 self.overflow = Some(Overflow::Commands);
                 return;
             }
-            if let Some(words) = tokenize(segment).filter(|w| !w.is_empty()) {
-                self.parse_command(&words, depth);
+            if let Some(words) = tokenize(segment, shell).filter(|w| !w.is_empty()) {
+                self.parse_command(&words, shell, depth);
                 if self.overflow.is_some() {
                     return;
                 }
             }
         }
         for body in subs {
-            self.collect(&body, depth + 1);
+            self.collect(&body, shell, depth + 1);
             if self.overflow.is_some() {
                 return;
             }
@@ -204,8 +237,8 @@ impl Walk {
     }
 
     /// One tokenized command, keywords and wrappers stripped, flags expanded;
-    /// a nested shell's body is walked at `depth + 1`.
-    fn parse_command(&mut self, words: &[String], depth: usize) {
+    /// a nested shell's body is walked at `depth + 1`, by that shell's rules.
+    fn parse_command(&mut self, words: &[String], shell: Shell, depth: usize) {
         let Some(i) = program_index(words) else {
             return;
         };
@@ -220,18 +253,19 @@ impl Walk {
         });
 
         // A nested shell: its `-c` / `/c` / `-Command` body is another
-        // command line.
+        // command line, read by that shell's rules (`cmd` has neither
+        // escape, so it keeps the outer line's).
         let body = if SHELLS.contains(&program.as_str()) {
-            shell_c_body(rest)
+            shell_c_body(rest).map(|b| (b, Shell::Posix))
         } else if program == "cmd" {
-            cmd_c_body(rest)
+            cmd_c_body(rest).map(|b| (b, shell))
         } else if POWERSHELLS.contains(&program.as_str()) {
-            powershell_body(rest)
+            powershell_body(rest).map(|b| (b, Shell::PowerShell))
         } else {
             None
         };
-        if let Some(body) = body {
-            self.collect(&body, depth + 1);
+        if let Some((body, inner)) = body {
+            self.collect(&body, inner, depth + 1);
         }
     }
 }
@@ -269,43 +303,43 @@ fn program_index(words: &[String]) -> Option<usize> {
     (i < words.len()).then_some(i)
 }
 
-/// The program a segment runs, for telling whether a here-document is fed to
-/// a shell.
-fn segment_program(segment: &str) -> Option<String> {
-    let words = tokenize(segment)?;
+/// The program a segment runs, for telling whether a here-string is fed to a
+/// shell.
+fn segment_program(segment: &str, shell: Shell) -> Option<String> {
+    let words = tokenize(segment, shell)?;
     let i = program_index(&words)?;
     Some(base_name(&words[i]))
-}
-
-/// A here-document waiting for its body: the lines after the current one,
-/// up to the delimiter.
-struct Pending {
-    delim: String,
-    /// `<<'EOF'` or `<<"EOF"` or `<<\EOF`: no expansion in the body.
-    quoted: bool,
-    /// `<<-`: leading tabs are stripped from the body and the delimiter line.
-    strip_tabs: bool,
 }
 
 /// Splits a command line at the separators that start a new command (`;`,
 /// `&&`, `||`, `|`, `&`, newlines, and the parentheses of a subshell), and
 /// returns the bodies that run as commands of their own separately (raw, not
 /// split) so the caller walks them at the next depth: `$( )`, backticks,
-/// `<( )`/`>( )`, and here-documents and here-strings fed to a shell. Quotes
-/// are honoured (and kept, for the tokenizer) so a separator inside a string
-/// does not split, and nothing inside single quotes expands.
-fn split_segments(line: &str) -> (Vec<String>, Vec<String>) {
+/// `<( )`/`>( )`, and here-strings fed to a shell. Quotes are honoured (and
+/// kept, for the tokenizer) so a separator inside a string does not split,
+/// and nothing inside single quotes expands.
+///
+/// A here-document gets no special reading: its lines are split like any
+/// other line, so a command in it is seen whether the document is fed to a
+/// shell or written to a file. A `#` at the start of a word starts a comment
+/// that runs to the end of the line; nothing in it (a quote, a `<<`) changes
+/// how the next lines are read.
+fn split_segments(line: &str, shell: Shell) -> (Vec<String>, Vec<String>) {
+    let posix = shell == Shell::Posix;
     let mut segments = Vec::new();
     let mut subs = Vec::new();
     let mut cur = String::new();
     let mut chars = line.chars().peekable();
     let mut quote: Option<char> = None;
-    let mut pending: Vec<Pending> = Vec::new();
     let mut herestrings: Vec<String> = Vec::new();
     // The first segment of the current line, for telling whether it feeds a
-    // shell when a here-document closes.
+    // shell when the line ends.
     let mut line_start = 0;
+    // The character before this one, for telling a word's start (where a
+    // `#` starts a comment) from the middle of a word (`a#b`, `$#`).
+    let mut prev: Option<char> = None;
     while let Some(c) = chars.next() {
+        let before = prev.replace(c);
         if let Some(q) = quote {
             cur.push(c);
             if q == '"' && c == '$' && chars.peek() == Some(&'(') {
@@ -315,12 +349,14 @@ fn split_segments(line: &str) -> (Vec<String>, Vec<String>) {
                 cur.push_str(&body);
                 cur.push(')');
                 subs.push(body);
-            } else if q == '"' && c == '`' {
+            } else if posix && q == '"' && c == '`' {
+                // Only a POSIX shell runs a backtick in double quotes; in
+                // PowerShell it is the escape character (`` `n ``).
                 let body = take_until(&mut chars, '`');
                 cur.push_str(&body);
                 cur.push('`');
                 subs.push(body);
-            } else if q == '"' && c == '\\' {
+            } else if posix && q == '"' && c == '\\' {
                 if let Some(n) = chars.next() {
                     cur.push(n);
                 }
@@ -334,7 +370,14 @@ fn split_segments(line: &str) -> (Vec<String>, Vec<String>) {
                 quote = Some(c);
                 cur.push(c);
             }
-            '\\' => {
+            '#' if before.is_none_or(|p| p.is_whitespace() || ";&|()".contains(p)) => {
+                // A comment, to the end of the line (the line break itself
+                // still ends the command).
+                while chars.peek().is_some_and(|n| *n != '\n' && *n != '\r') {
+                    chars.next();
+                }
+            }
+            '\\' if posix => {
                 // Keep the escape with its character for the tokenizer.
                 cur.push(c);
                 if let Some(n) = chars.next() {
@@ -350,43 +393,21 @@ fn split_segments(line: &str) -> (Vec<String>, Vec<String>) {
                 chars.next();
                 subs.push(take_until_balanced(&mut chars, '(', ')'));
             }
-            '<' if chars.peek() == Some(&'<') => {
+            '<' if starts_with(&chars, "<<") => {
+                // A here-string: its word is the command's input. It is read
+                // ahead on a copy, so the word is still split as usual.
                 chars.next();
-                if chars.peek() == Some(&'<') {
-                    chars.next();
-                    herestrings.push(take_word(&mut chars));
-                } else {
-                    let strip_tabs = chars.peek() == Some(&'-');
-                    if strip_tabs {
-                        chars.next();
-                    }
-                    let word = take_word(&mut chars);
-                    let quoted = word.contains(['\'', '"', '\\']);
-                    let delim: String = word.chars().filter(|c| !"'\"\\".contains(*c)).collect();
-                    if !delim.is_empty() {
-                        pending.push(Pending {
-                            delim,
-                            quoted,
-                            strip_tabs,
-                        });
-                    }
-                }
+                chars.next();
+                cur.push_str("<<<");
+                herestrings.push(take_word(&mut chars.clone()));
             }
             '\n' | '\r' => {
                 push_segment(&mut segments, &mut cur);
-                if !pending.is_empty() || !herestrings.is_empty() {
-                    let feeds = feeds_shell(&segments[line_start..]);
+                if !herestrings.is_empty() {
+                    let feeds = feeds_shell(&segments[line_start..], shell);
                     for h in herestrings.drain(..) {
                         if feeds {
                             subs.push(dequote(&h));
-                        }
-                    }
-                    for p in std::mem::take(&mut pending) {
-                        let body = take_heredoc(&mut chars, &p);
-                        if feeds {
-                            subs.push(body);
-                        } else if !p.quoted {
-                            subs.extend(substitutions(&body));
                         }
                     }
                 }
@@ -404,76 +425,28 @@ fn split_segments(line: &str) -> (Vec<String>, Vec<String>) {
     }
     push_segment(&mut segments, &mut cur);
     // A here-string on the last line.
-    if !herestrings.is_empty() && feeds_shell(&segments[line_start..]) {
+    if !herestrings.is_empty() && feeds_shell(&segments[line_start..], shell) {
         subs.extend(herestrings.iter().map(|h| dequote(h)));
     }
     (segments, subs)
 }
 
-/// Whether any segment of a line runs a shell (so a here-document on it is a
-/// script, not a file being written).
-fn feeds_shell(segments: &[String]) -> bool {
+/// Whether the next characters are `s`, without consuming them.
+fn starts_with(chars: &std::iter::Peekable<std::str::Chars>, s: &str) -> bool {
+    let mut ahead = chars.clone();
+    s.chars().all(|c| ahead.next() == Some(c))
+}
+
+/// Whether any segment of a line runs a shell (so a here-string on it is a
+/// script).
+fn feeds_shell(segments: &[String], shell: Shell) -> bool {
     segments
         .iter()
-        .filter_map(|s| segment_program(s))
+        .filter_map(|s| segment_program(s, shell))
         .any(|p| SHELLS.contains(&p.as_str()) || POWERSHELLS.contains(&p.as_str()))
 }
 
-/// Reads a here-document's body: the lines up to one that is the delimiter.
-fn take_heredoc(chars: &mut std::iter::Peekable<std::str::Chars>, p: &Pending) -> String {
-    let mut body = String::new();
-    loop {
-        let mut line = String::new();
-        let mut ended = true;
-        for c in chars.by_ref() {
-            if c == '\n' {
-                ended = false;
-                break;
-            }
-            line.push(c);
-        }
-        let line = line.strip_suffix('\r').unwrap_or(&line).to_string();
-        let check = if p.strip_tabs {
-            line.trim_start_matches('\t')
-        } else {
-            line.as_str()
-        };
-        if check == p.delim {
-            break;
-        }
-        body.push_str(check);
-        body.push('\n');
-        if ended {
-            break;
-        }
-    }
-    body
-}
-
-/// The `$( )` and backtick bodies in a here-document's text, which the shell
-/// runs even when the document is only written to a file. Quotes are not
-/// special in a here-document, so they are not honoured here.
-fn substitutions(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => {
-                chars.next();
-            }
-            '$' if chars.peek() == Some(&'(') => {
-                chars.next();
-                out.push(take_until_balanced(&mut chars, '(', ')'));
-            }
-            '`' => out.push(take_until(&mut chars, '`')),
-            _ => {}
-        }
-    }
-    out
-}
-
-/// One shell word after `<<` or `<<<`, with its quotes kept (so the caller can
-/// tell a quoted delimiter), after any blanks.
+/// One shell word after `<<<`, with its quotes kept, after any blanks.
 fn take_word(chars: &mut std::iter::Peekable<std::str::Chars>) -> String {
     while chars.peek().is_some_and(|c| *c == ' ' || *c == '\t') {
         chars.next();
@@ -574,12 +547,15 @@ fn take_until_balanced(
     out
 }
 
-/// Splits one command (no separators) into words, honouring quotes. A `\`
-/// before a blank joins it to the word; other backslashes are resolved per
-/// word by [`unescape`]. Returns `None` only for an empty line. A quote that
-/// is not closed is taken to the end, so a half-written line still yields its
-/// words.
-fn tokenize(segment: &str) -> Option<Vec<String>> {
+/// Splits one command (no separators) into words, honouring quotes. For a
+/// POSIX shell a `\` before a blank joins it to the word and other
+/// backslashes are resolved per word by [`unescape`]; for PowerShell a `\` is
+/// an ordinary character (`C:\ -Recurse` is two words). Returns `None` only for
+/// an empty line. A quote that is not closed is taken to the end, so a
+/// half-written line still yields its words.
+fn tokenize(segment: &str, shell: Shell) -> Option<Vec<String>> {
+    let posix = shell == Shell::Posix;
+    let finish = |w: &str| if posix { unescape(w) } else { w.to_string() };
     let mut words = Vec::new();
     let mut cur = String::new();
     let mut in_word = false;
@@ -599,13 +575,13 @@ fn tokenize(segment: &str) -> Option<Vec<String>> {
                 quote = Some(c);
                 in_word = true;
             }
-            '\\' if chars.peek().is_some_and(|n| n.is_whitespace()) => {
+            '\\' if posix && chars.peek().is_some_and(|n| n.is_whitespace()) => {
                 cur.push(chars.next().unwrap());
                 in_word = true;
             }
             c if c.is_whitespace() => {
                 if in_word {
-                    words.push(unescape(&std::mem::take(&mut cur)));
+                    words.push(finish(&std::mem::take(&mut cur)));
                     in_word = false;
                 }
             }
@@ -616,7 +592,7 @@ fn tokenize(segment: &str) -> Option<Vec<String>> {
         }
     }
     if in_word {
-        words.push(unescape(&cur));
+        words.push(finish(&cur));
     }
     Some(words)
 }
@@ -896,26 +872,83 @@ mod tests {
         assert_eq!(progs("cat <(rm -rf /)"), ["cat", "rm"]);
     }
 
-    /// A here-document fed to a shell is a script (its commands are seen); one
-    /// only written to a file is data (its lines are not), but a `$( )` inside
-    /// an unquoted one still runs (review r2, finding 3).
+    /// The lines of a here-document are commands like any other line,
+    /// whether it is fed to a shell or written to a file (as before review
+    /// r2; the owner's decision of 2026-10-18). A here-string fed to a shell
+    /// is a script too.
     #[test]
     fn heredocs_and_herestrings() {
-        assert_eq!(progs("bash <<'EOF'\nrm -rf /\nEOF"), ["bash", "rm"]);
+        assert_eq!(progs("bash <<'EOF'\nrm -rf /\nEOF"), ["bash", "rm", "eof"]);
         assert_eq!(
             progs("cat <<'EOF' | sh\nrm -rf /\nEOF"),
-            ["cat", "sh", "rm"]
+            ["cat", "sh", "rm", "eof"]
         );
-        assert_eq!(progs("bash <<< 'rm -rf /'"), ["bash", "rm"]);
-        // Written to a file: the lines are data.
-        let to_file = commands("cat > note.txt <<'EOF'\nrm -rf /\nEOF");
-        assert!(to_file.iter().all(|c| c.program != "rm"), "{to_file:?}");
-        // But an unquoted here-document's $( ) runs.
+        assert_eq!(
+            progs("cat > clean.sh <<'EOF'\nrm -rf /\nEOF"),
+            ["cat", "rm", "eof"]
+        );
         assert!(
             commands("cat > out <<EOF\n$(rm -rf /)\nEOF")
                 .iter()
                 .any(|c| c.program == "rm")
         );
+        assert_eq!(progs("bash <<< 'rm -rf /'"), ["bash", "rm"]);
+        // A here-string not fed to a shell stays the command's argument.
+        let c = commands("grep -c x <<< 'a b'");
+        assert_eq!(progs("grep -c x <<< 'a b'"), ["grep"]);
+        assert_eq!(c[0].operands(), ["x", "<<<", "a b"]);
+    }
+
+    /// A `#` at the start of a word starts a comment to the end of its line:
+    /// what is in it (an apostrophe, a `<<`) does not change how the next
+    /// lines are read, and a `#` inside a word is not one.
+    #[test]
+    fn a_comment_runs_to_the_end_of_its_line() {
+        assert_eq!(progs("# don't forget the cache\ngit status"), ["git"]);
+        assert_eq!(
+            progs("make # see the notes <<here\ngit status"),
+            ["make", "git"]
+        );
+        assert_eq!(progs("ls;# it's done\npwd"), ["ls", "pwd"]);
+        assert_eq!(commands("echo a#b")[0].operands(), ["a#b"]);
+        assert_eq!(commands("echo '# kept'")[0].operands(), ["# kept"]);
+        assert_eq!(
+            parse("# a note\r\nGet-ChildItem", Shell::PowerShell)
+                .commands
+                .iter()
+                .map(|c| c.program.as_str())
+                .collect::<Vec<_>>(),
+            ["get-childitem"]
+        );
+    }
+
+    /// PowerShell's rules for a Windows node: a backtick in double quotes is
+    /// its escape (`` `n ``), not a substitution, and a backslash is an
+    /// ordinary character, so a path such as `C:\` stays a word of its own.
+    #[test]
+    fn a_powershell_line_is_read_by_powershells_rules() {
+        let ps = |line: &str| -> Vec<String> {
+            parse(line, Shell::PowerShell)
+                .commands
+                .into_iter()
+                .map(|c| c.program)
+                .collect()
+        };
+        assert_eq!(
+            ps("Write-Host \"done`n\"; Get-ChildItem"),
+            ["write-host", "get-childitem"]
+        );
+        assert_eq!(
+            ps(r#"Set-Location "C:\"; Get-ChildItem"#),
+            ["set-location", "get-childitem"]
+        );
+        let c = parse(r"Remove-Item C:\ -Recurse -Force", Shell::PowerShell).commands;
+        assert_eq!(c[0].raw, [r"C:\", "-Recurse", "-Force"]);
+        // A POSIX shell inside keeps its own rules.
+        assert_eq!(ps("bash -c 'echo \"`date`\"'"), ["bash", "echo", "date"]);
+        assert_eq!(Shell::for_os("windows"), Shell::PowerShell);
+        assert_eq!(Shell::for_os("linux"), Shell::Posix);
+        assert_eq!(Shell::for_os("macos"), Shell::Posix);
     }
 
     #[test]
@@ -930,8 +963,8 @@ mod tests {
     #[test]
     fn deep_nesting_is_bounded_not_a_stack_overflow() {
         let bomb = format!("echo {}", "$(".repeat(100_000));
-        assert_eq!(parse(&bomb).overflow, Some(Overflow::Depth));
-        let ok = parse("echo $(printf '%s' $(date))");
+        assert_eq!(parse(&bomb, Shell::Posix).overflow, Some(Overflow::Depth));
+        let ok = parse("echo $(printf '%s' $(date))", Shell::Posix);
         assert_eq!(ok.overflow, None);
         assert!(ok.commands.iter().any(|c| c.program == "date"));
     }
@@ -941,13 +974,13 @@ mod tests {
     #[test]
     fn the_command_bound_catches_only_abuse() {
         let many = vec!["true"; MAX_COMMANDS + 50].join(";");
-        let p = parse(&many);
+        let p = parse(&many, Shell::Posix);
         assert_eq!(p.overflow, Some(Overflow::Commands));
         assert!(p.commands.len() <= MAX_COMMANDS);
         let script = (0..500)
             .map(|i| format!("echo {i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        assert_eq!(parse(&script).overflow, None);
+        assert_eq!(parse(&script, Shell::Posix).overflow, None);
     }
 }

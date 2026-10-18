@@ -544,7 +544,12 @@ mod tests {
     /// pulled apart once, then every default entry, with the overflow
     /// refusal first.
     fn refused_by_defaults(cmd: &str) -> bool {
-        let p = normalize::parse(cmd);
+        refused_on(normalize::Shell::Posix, cmd)
+    }
+
+    /// The same for a node whose shell is `shell` (PowerShell on Windows).
+    fn refused_on(shell: normalize::Shell, cmd: &str) -> bool {
+        let p = normalize::parse(cmd, shell);
         p.overflow.is_some()
             || defaults()
                 .iter()
@@ -571,6 +576,10 @@ mod tests {
             "git push origin main",
         ] {
             assert!(!refused_by_defaults(cmd), "should stay allowed: {cmd}");
+            assert!(
+                !refused_on(normalize::Shell::PowerShell, cmd),
+                "should stay allowed on Windows: {cmd}"
+            );
         }
     }
 
@@ -598,6 +607,45 @@ mod tests {
             "pwsh -c \"ri C:\\ -Recurse\"",
         ] {
             assert!(refused_by_defaults(cmd), "should be refused: {cmd}");
+            assert!(
+                refused_on(normalize::Shell::PowerShell, cmd),
+                "should be refused on Windows: {cmd}"
+            );
+        }
+    }
+
+    /// The Windows drive-root and Windows-folder deletes stay refused however
+    /// an ordinary PowerShell line around them is written: after a string
+    /// with a `` `n `` in it, or spread over lines with PowerShell's
+    /// backtick continuation, which the splitter does not read the way
+    /// PowerShell does (the whole-line entries, owner's decision 2026-10-18).
+    #[test]
+    fn windows_root_deletes_are_refused_however_the_line_is_laid_out() {
+        for cmd in [
+            "Write-Host \"Cleaning up`n\"; Remove-Item C:\\Windows -Recurse -Force",
+            "Remove-Item `\n  -Path C:\\ `\n  -Recurse `\n  -Force",
+            "Remove-Item -Recurse `\n  -Force C:\\Windows",
+        ] {
+            for shell in [normalize::Shell::PowerShell, normalize::Shell::Posix] {
+                assert!(
+                    refused_on(shell, cmd),
+                    "should be refused ({shell:?}): {cmd:?}"
+                );
+            }
+        }
+        // The same layout of an ordinary clean-up stays allowed.
+        for cmd in [
+            "Write-Host \"Cleaning up`n\"; Remove-Item C:\\Users\\me\\app\\build -Recurse -Force",
+            "Remove-Item `\n  -Path C:\\src\\app\\node_modules `\n  -Recurse `\n  -Force",
+            "Remove-Item C:\\Windows\\Temp\\* -Recurse -Force",
+            "Remove-Item $env:TEMP\\* -Recurse -Force",
+        ] {
+            for shell in [normalize::Shell::PowerShell, normalize::Shell::Posix] {
+                assert!(
+                    !refused_on(shell, cmd),
+                    "should stay allowed ({shell:?}): {cmd:?}"
+                );
+            }
         }
     }
 
@@ -638,8 +686,9 @@ mod tests {
     }
 
     /// Ordinary scripts and here-documents are never refused for their size,
-    /// and a here-document only written to a file (not fed to a shell) is
-    /// data: its lines are not commands (review r2, finding 3).
+    /// and a here-document that writes a file with ordinary content (a
+    /// config file, a script, a README, a Dockerfile, a workflow) is not
+    /// refused although its lines are read as commands.
     #[test]
     fn ordinary_scripts_and_heredocs_stay_allowed() {
         let mut big = String::from("cat > gen.py <<'EOF'\n");
@@ -655,15 +704,35 @@ mod tests {
         }
         assert!(!refused_by_defaults(&script), "a 300-line script");
 
-        // A here-document only written to a file that merely mentions a
-        // dangerous command is not refused; one fed to a shell is.
-        let to_file = "cat > note.txt <<'EOF'\nto clean up run rm -rf /\nEOF";
-        assert!(
-            !refused_by_defaults(to_file),
-            "a file that mentions a command"
-        );
-        let to_shell = "bash <<'EOF'\nrm -rf /\nEOF";
-        assert!(refused_by_defaults(to_shell), "a heredoc fed to bash");
+        for cmd in [
+            "cat > config.toml <<'EOF'\n[server]\nhost = \"0.0.0.0\"\nport = 8080\n# where the cache lives\ncache_dir = \"/var/cache/app\"\nEOF",
+            "cat > build.sh <<'EOF'\n#!/bin/sh\nset -eu\n# start clean, then build\nrm -rf ./build dist\nmkdir -p build\ncargo build --release\nEOF\nchmod +x build.sh",
+            "cat > README.md <<'EOF'\n# My app\n\nIt's a small tool. Run `make` to build it, and `make clean` to\nstart over (it's safe: it only removes ./build).\n\n```sh\nmake\n./build/app --help\n```\nEOF",
+            "cat > Dockerfile <<'EOF'\nFROM debian:12\nRUN apt-get update && apt-get install -y curl \\\n    && rm -rf /var/lib/apt/lists/*\nCOPY . /app\nCMD [\"/app/run\"]\nEOF",
+            "mkdir -p .github/workflows && cat > .github/workflows/ci.yml <<'EOF'\nname: ci\non: [push]\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n      - run: cargo test\nEOF",
+            "cat > clean.py <<'EOF'\nimport shutil, sys\n\ndef clean(path):\n    # don't touch anything outside the project\n    shutil.rmtree(path)\n\nif __name__ == \"__main__\":\n    clean(sys.argv[1])\nEOF",
+            "git commit -F - <<'EOF'\nDrop the old cache\n\nIt's not used any more; the new one is in ./cache.\nEOF",
+            "cat >> notes.md <<EOF\nBuilt on $(date) by $(whoami)\nEOF",
+        ] {
+            assert!(!refused_by_defaults(cmd), "should stay allowed: {cmd:?}");
+        }
+    }
+
+    /// A here-document is not a way for a mistake to go unseen: a body that
+    /// itself holds a blocklisted command is refused, whether the document is
+    /// fed to a shell or written to a file to run later, and so is a mistake
+    /// after an ordinary comment (owner's decision 2026-10-18).
+    #[test]
+    fn a_blocklisted_command_in_a_heredoc_or_after_a_comment_is_refused() {
+        for cmd in [
+            "bash <<'EOF'\nrm -rf /\nEOF",
+            "cat > cleanup.sh <<'EOF'\n#!/bin/sh\nset -e\nrm -rf ~\nEOF\nsh cleanup.sh",
+            "cat > reset.sh <<'EOF'\n# don't keep the old crontab\ncrontab -r\nEOF",
+            "# clean up what the build left, it's all generated\nrm -rf ~",
+            "make clean # don't keep the cache\nchmod -R 777 /",
+        ] {
+            assert!(refused_by_defaults(cmd), "should be refused: {cmd:?}");
+        }
     }
 
     /// Ordinary work that only mentions a dangerous word (a commit message,
@@ -741,7 +810,7 @@ mod tests {
     fn an_abusive_line_is_still_refused() {
         let many = ["true"].repeat(normalize::MAX_COMMANDS + 10).join(";");
         assert_eq!(
-            normalize::parse(&many).overflow,
+            normalize::parse(&many, normalize::Shell::Posix).overflow,
             Some(normalize::Overflow::Commands)
         );
         assert!(refused_by_defaults(&many));

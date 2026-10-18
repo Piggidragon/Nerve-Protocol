@@ -33,6 +33,12 @@ default) and taint (below). A change takes effect for the next call.
 
 ## The blocklist
 
+The blocklist is there to catch an agent's mistakes: a hallucinated
+`rm -rf ~`, a `git push --force` to `main` it should not have made, a `mkfs` on
+the wrong disk. It does not stop someone who writes commands on purpose to get
+past it; a list of patterns cannot. Against that, what counts is the machine's
+own policy: its mode, its deny rules and the folder sandbox.
+
 Entries are in the machine's own rule syntax, `<scope>:<pattern>`:
 
 - `exec.run:rm -rf /*` — a command. The program, then the flags that must be
@@ -74,33 +80,30 @@ mentions one of them is not refused.
 
 The matcher does not just look at the raw string. For a command it splits the
 line into its commands (at `;`, `&&`, `||`, `|`, newlines, inside `$( )`,
-backticks and `sh -c '…'` / `powershell -Command` bodies), strips wrappers
-(`sudo`, `env A=B`, `nohup`, `time`, `nice`, `xargs`, …), takes the program's
-base name (`/bin/rm` → `rm`), and treats short flags in any order, split or
-joined (`-rf`, `-fr`, `-r -f`, `-Rf`, `--recursive --force`) as the same. For a
-`fs` write it normalises the path first (`//`, `/.` and `..` are resolved, and
-the match ignores letter case), so a differently-spelled path still hits.
+backticks and `sh -c '…'` / `cmd /c` / `powershell -Command` bodies), strips
+wrappers (`sudo`, `env A=B`, `nohup`, `time`, `nice`, `xargs`, …), takes the
+program's base name (`/bin/rm` → `rm`), and treats short flags in any order,
+split or joined (`-rf`, `-fr`, `-r -f`, `-Rf`, `--recursive --force`) as the
+same. The lines of a here-document are read as commands too, so a script
+written with `cat > x.sh <<'EOF'` that holds `rm -rf ~` is refused, while one
+with ordinary content is not. A `#` comment runs to the end of its line. The
+line is read by the rules of the machine's shell: PowerShell on Windows,
+`/bin/sh` elsewhere. For a `fs` write it normalises the path first (`//`, `/.`
+and `..` are resolved, and the match ignores letter case), so a
+differently-spelled path still hits.
 
 **What it cannot see:** shell variables and `$HOME` (it matches the literal
 `$HOME`, not your home), aliases, a script written to a file and then run, and
-base64-encoded commands. For paths it sees the path as the agent wrote it, not
-where a symlink would lead, and only this machine (the center) resolves `..` and
-`//`, not the device's real canonical path — so an unusual path spelling can
-still slip past the center, and the machine's own protected-path check is the
-backstop. It reads a here-document only written to a file as data (its lines
-are not commands), but a command it runs through a shell — in a subshell,
-through `$( )`, `cmd /c`, a here-document fed to a shell, and so on — is pulled
-apart and checked. A command line nested absurdly deeply (more than 16 levels
-of `$( )`/`-c`) or with more than 100 000 commands — well beyond any real
-script — is refused outright rather than half-analysed. The matcher is one line
-of defence;
-the decision model and the machine's own policy are the next. Treat the
-blocklist as a safety net for obvious mistakes and obvious attacks, not as a
-sandbox.
-
-A refused call shows in the Audit page. For a blocklist refusal you change or
-remove the entry here; for a model refusal you can add an allow rule with a
-button there.
+base64-encoded commands. Its reading of a line is a simple one, not the
+shell's own, so a line written to confuse it can get past it. For paths it sees
+the path as the agent wrote it, not where a symlink would lead, and only this
+machine (the center) resolves `..` and `//`, not the device's real canonical
+path; the machine's own protected-path check is the backstop. A command line
+nested absurdly deeply (more than 16 levels of `$( )`/`-c`) or with more than
+100 000 commands, well beyond any real script, is refused outright rather than
+half-analysed. Treat the blocklist as a safety net for an agent's obvious
+mistakes, not as a sandbox: the decision model and the machine's own policy are
+the next lines of defence.
 
 ## Allow rules
 

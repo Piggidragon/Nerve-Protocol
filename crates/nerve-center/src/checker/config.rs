@@ -265,6 +265,18 @@ const WIN_RECURSE: &str = r"(?:-r(?:e(?:c(?:u(?:r(?:s(?:e)?)?)?)?)?)?(?::\$?true
 /// the variables that name them, as one whole (lower-cased) operand.
 const WIN_ROOT: &str = r"(?:[a-z]:[\\/]?\*?|[a-z]:[\\/]windows(?:[\\/]system32)?[\\/]?\*?|\$env:(?:systemroot|windir|systemdrive)[\\/]?\*?|%(?:systemroot|windir|systemdrive)%[\\/]?\*?)";
 
+/// The Windows delete commands as a word of their own on the whole line (at
+/// its start, or after a separator, a bracket, a blank or a quote), for the
+/// whole-line forms of the recursive-delete entries.
+const WIN_DELETE_WORD: &str =
+    r#"(?:^|[\s;&|(){}'"])(?:remove-item|ri|rm|del|erase|rd|rmdir)(?:\.exe)?\s"#;
+/// What stands before a target that is a whole operand: a blank, a quote, or
+/// the `:` of `-Path:C:\`.
+const WIN_BEFORE: &str = r#"[\s'":]"#;
+/// What ends a target or a switch: a blank, a quote, a bracket, a separator
+/// or the line's end.
+const WIN_AFTER: &str = r#"(?:$|[\s;&|)'"])"#;
+
 /// The database clients whose arguments (or input) may carry SQL that drops
 /// data.
 const DB_CLIENT: &str = "(?:psql|mysql|mariadb|sqlite3|mongo|mongosh)";
@@ -440,6 +452,23 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
         b(
             &format!(
                 "exec.run:cmd-re:^{WIN_DELETE}(?: .*)? {WIN_ROOT}(?: .*)? {WIN_RECURSE}(?: .*)?$"
+            ),
+            "recursively deletes a drive root or the Windows folder",
+        ),
+        // The same over the whole line, within one command (no `;`, `&` or
+        // `|` between), so these stay refused when the splitter cuts a
+        // PowerShell line differently than PowerShell does (its backtick
+        // escapes and continuations are not read as PowerShell reads them).
+        // The target is still a whole operand, so other paths stay allowed.
+        b(
+            &format!(
+                "exec.run:re:(?i){WIN_DELETE_WORD}(?:[^;&|]*?\\s)?{WIN_RECURSE}(?:\\s[^;&|]*?)?{WIN_BEFORE}{WIN_ROOT}{WIN_AFTER}"
+            ),
+            "recursively deletes a drive root or the Windows folder",
+        ),
+        b(
+            &format!(
+                "exec.run:re:(?i){WIN_DELETE_WORD}(?:[^;&|]*?{WIN_BEFORE})?{WIN_ROOT}[\\s'\")](?:[^;&|]*?\\s)?{WIN_RECURSE}{WIN_AFTER}"
             ),
             "recursively deletes a drive root or the Windows folder",
         ),

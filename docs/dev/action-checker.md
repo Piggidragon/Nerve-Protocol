@@ -39,6 +39,15 @@ the log.
 
 ## The blocklist matcher
 
+What the blocklist is for (owner's decision, 2026-10-18): it catches an
+agent's mistakes, such as a hallucinated `rm -rf ~` or a forgotten `--force`
+to `main`, before they reach the node. It is not a barrier against someone who
+crafts command lines to get past it; that is the node's policy (modes, deny
+rules, the folder sandbox). So the splitter stays simple and conservative
+(where unsure it reads more text as commands, not less), there is no catalogue
+of evasion forms, and a change is judged by two things: ordinary mistakes are
+caught, ordinary work is not refused.
+
 An entry is `<scope>:<pattern>` in the node's rule syntax. `exec.run` patterns
 match the commands `normalize::commands` pulls from the command line; `fs`
 patterns are path globs (a leading `~` becomes `*`, since the center does not
@@ -58,21 +67,34 @@ three force-push forms (`push` as git's subcommand, a force flag, and `main`/
 `master` as a whole refspec, so the next line's push of another branch is not
 joined to it); and the Windows recursive deletes, which take the target as a
 whole operand so `Remove-Item C:\Users\me\build -Recurse -Force` stays
-allowed while a drive root is refused. Whole-line `re:` is kept where the
-pattern spans commands: a download piped into a program that runs its input
-(the last stage of the pipe is a shell or an interpreter with no script of its
-own), SQL piped or fed as a here-document into a client, and the device,
-container and Windows patterns.
+allowed while a drive root is refused (with a whole-line twin, below).
+Whole-line `re:` is kept where the pattern spans commands: a download piped
+into a program that runs its input (the last stage of the pipe is a shell or
+an interpreter with no script of its own), SQL piped or fed as a
+here-document into a client, and the device, container and Windows patterns.
+Since the per-command entries rely on the splitter, a line the splitter reads
+wrongly can hide them; that is accepted for the purpose above, except for the
+Windows root deletes, which have the whole-line twin.
 
 `normalize` splits on separators and subshell parentheses, pulls `$( )`,
-backticks (also in double quotes), process substitution, `sh -c`
-(`c` anywhere in the flag word: `-lc`, `-ce`, `-c -e`), `cmd /c` and
-`powershell -Command` bodies, and here-documents/here-strings fed to a shell;
-it strips wrappers and shell keywords, drops a `.exe` suffix, and expands
-combined short flags, so flag order and `-rf`/`-Rf`/`--recursive --force` do
-not matter. A here-document only written to a file is data (its lines are not
-commands), so a file that merely mentions `rm -rf /` is not refused by the
-structured and `cmd-re:` entries (a whole-line `re:` still sees its text).
+backticks, process substitution, `sh -c` (`c` anywhere in the flag word:
+`-lc`, `-ce`, `-c -e`), `cmd /c` and `powershell -Command` bodies, and
+here-strings fed to a shell; it strips wrappers and shell keywords, drops a
+`.exe` suffix, and expands combined short flags, so flag order and
+`-rf`/`-Rf`/`--recursive --force` do not matter. A here-document gets no
+special reading: its lines are split like any other, so a command in it is
+seen whether the document is fed to a shell or written to a file, and a body
+of ordinary content (a config file, a README) is not refused because no line
+of it is a blocklisted command. A `#` at the start of a word is a comment to
+the end of the line, and nothing in it (a quote, a `<<`) changes how the next
+lines are read. The line is read by the rules of the node's shell
+(`normalize::Shell::for_os`: PowerShell on Windows, POSIX elsewhere; a nested
+`bash -c` or `powershell -Command` body by its own): only for a POSIX shell is
+`\` an escape and a backtick inside double quotes a substitution. For the
+Windows drive-root and Windows-folder deletes there are whole-line `re:`
+entries beside the per-command `cmd-re:` ones, so they stay refused where the
+splitter cuts a PowerShell line differently than PowerShell does (its backtick
+escapes and continuations); they too take the target as a whole operand.
 The whole walk is bounded: depth at `normalize::MAX_DEPTH` (16) and commands at
 `MAX_COMMANDS` (100 000, far above any real script, so ordinary heredocs are
 not refused); a line past a bound comes back as `Parsed::overflow`

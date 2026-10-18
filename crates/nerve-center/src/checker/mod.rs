@@ -184,14 +184,13 @@ impl Checker {
             action: call.action,
             target: call.target,
         };
-        // For an `exec.run` call the command line is pulled apart once and
-        // reused across every entry. A line the splitter cannot take apart
-        // (nested past the depth bound, or with more commands than any real
-        // script) is refused rather than let through, so a crafted line cannot
-        // slip past the matcher: the fail-closed stance of the rest of the
-        // checker.
-        let parsed =
-            (call.cap == "exec" && call.action == "run").then(|| normalize::parse(call.target));
+        // For an `exec.run` call the command line is pulled apart once, by
+        // the rules of the node's shell, and reused across every entry. A
+        // line the splitter cannot take apart (nested past the depth bound,
+        // or with more commands than any real script) is refused rather than
+        // let through: the fail-closed stance of the rest of the checker.
+        let parsed = (call.cap == "exec" && call.action == "run")
+            .then(|| normalize::parse(call.target, normalize::Shell::for_os(call.os)));
         if self.cfg.blocklist_on
             && let Some(p) = &parsed
             && let Some(over) = p.overflow

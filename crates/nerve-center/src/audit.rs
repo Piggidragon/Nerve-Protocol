@@ -175,4 +175,21 @@ mod tests {
         assert!(f.bytes() < 1024, "{}", f.bytes());
         assert_eq!(l[1], json!({}));
     }
+
+    /// A checker decision keeps its `checker` marker (layer and detail), with
+    /// the strings clipped and nothing else inside.
+    #[test]
+    fn the_checker_marker_is_kept() {
+        let mut f = AuditFeed::default();
+        let mut e = refused("rm -rf /".into());
+        e["by"] = json!("action checker");
+        e["checker"] =
+            json!({"layer": "blocklist", "detail": "exec.run:rm -rf /", "evil": "x".repeat(9999)});
+        f.push(e);
+        let l = f.list();
+        assert_eq!(l[0]["by"], "action checker");
+        assert_eq!(l[0]["checker"]["layer"], "blocklist");
+        assert_eq!(l[0]["checker"]["detail"], "exec.run:rm -rf /");
+        assert!(l[0]["checker"].get("evil").is_none());
+    }
 }

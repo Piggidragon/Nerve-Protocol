@@ -2660,6 +2660,97 @@ mod tests {
         .unwrap()
     }
 
+    fn node_record(id: &str, platform: &str) -> NodeRecord {
+        NodeRecord {
+            id: id.into(),
+            name: id.into(),
+            public_key: "00".into(),
+            old_key: None,
+            key_rotations: 0,
+            platform: platform.into(),
+            arch: "x86_64".into(),
+            paired_ms: 1,
+            disabled: false,
+            last_seen_ms: 0,
+            going_away: None,
+            descriptor: None,
+        }
+    }
+
+    fn exec_route(node: &str) -> Route {
+        Route {
+            node_id: node.into(),
+            node_name: node.into(),
+            cap: "exec".into(),
+            action: "run".into(),
+            profile: "exec".into(),
+            effect: nerve_proto::Effect::Execute,
+        }
+    }
+
+    /// The checker gate refuses a blocklisted command before the node, with a
+    /// message that says the action checker did it; an ordinary command is
+    /// not refused by it (it reaches the "node offline" step instead, since
+    /// no link is set up in this test). This is the whole point of the gate,
+    /// so without it the blocklisted command would get the same "offline".
+    #[tokio::test]
+    async fn the_checker_refuses_a_blocklisted_command_before_the_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        c.update(|s| {
+            s.nodes.insert("n1".into(), node_record("n1", "linux"));
+        });
+        let sess = c.new_session("test");
+        let args = |cmd: &str| {
+            let mut m = Map::new();
+            m.insert("command".into(), json!(cmd));
+            m
+        };
+        // Blocklisted: refused by the checker.
+        let e = c
+            .call(&sess, &exec_route("n1"), args("rm -rf /"))
+            .await
+            .unwrap_err();
+        let CallError::Rpc(e) = e;
+        assert_eq!(e.kind(), ErrorCode::Forbidden);
+        assert!(e.message.contains("action checker"), "{}", e.message);
+        // The refusal is in the audit feed, marked as the checker's.
+        let last = c.audit().pop().unwrap();
+        assert_eq!(last["by"], "action checker");
+        assert_eq!(last["checker"]["layer"], "blocklist");
+        // Ordinary work passes the checker and only then meets the offline
+        // node.
+        let e = c
+            .call(&sess, &exec_route("n1"), args("git status"))
+            .await
+            .unwrap_err();
+        let CallError::Rpc(e) = e;
+        assert_eq!(e.kind(), ErrorCode::Unavailable);
+    }
+
+    /// With the model on but no endpoint set, the checker fails closed: a
+    /// write call is refused because the model is unreachable.
+    #[tokio::test]
+    async fn the_model_fails_closed_when_it_cannot_be_reached() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        c.update(|s| {
+            s.nodes.insert("n1".into(), node_record("n1", "linux"));
+            s.checker.model_on = true;
+            // An endpoint source with no URL: nothing to reach.
+            s.checker.model.source = ModelSource::Endpoint;
+            s.checker.model.endpoint_url = String::new();
+        });
+        c.rebuild_checker();
+        let sess = c.new_session("test");
+        let mut args = Map::new();
+        args.insert("command".into(), json!("echo hi > out.txt"));
+        let e = c.call(&sess, &exec_route("n1"), args).await.unwrap_err();
+        let CallError::Rpc(e) = e;
+        assert_eq!(e.kind(), ErrorCode::Forbidden);
+        assert!(e.message.contains("reach"), "{}", e.message);
+    }
+
     #[test]
     fn a_new_center_is_named_nerve_center_unless_told_otherwise() {
         let dir = tempfile::tempdir().unwrap();

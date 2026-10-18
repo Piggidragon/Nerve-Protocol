@@ -34,7 +34,9 @@ const ICONS = {
   chev: "<path d=\"m6 9 6 6 6-6\"/>",
   help: "<circle cx=\"12\" cy=\"12\" r=\"10\"/><path d=\"M9.09 9a3 3 0 0 1 5.83 1c0 2-3 3-3 3\"/><path d=\"M12 17h.01\"/>",
   log: "<path d=\"M15 12h-5\"/><path d=\"M15 8h-5\"/><path d=\"M19 17V5a2 2 0 0 0-2-2H4\"/><path d=\"M8 21h12a2 2 0 0 0 2-2v-1a1 1 0 0 0-1-1H11a1 1 0 0 0-1 1v1a2 2 0 1 1-4 0V5a2 2 0 1 0-4 0v2a1 1 0 0 0 1 1h3\"/>",
-  download: "<path d=\"M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4\"/><polyline points=\"7 10 12 15 17 10\"/><line x1=\"12\" x2=\"12\" y1=\"15\" y2=\"3\"/>"
+  download: "<path d=\"M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4\"/><polyline points=\"7 10 12 15 17 10\"/><line x1=\"12\" x2=\"12\" y1=\"15\" y2=\"3\"/>",
+  shield: "<path d=\"M20 13c0 5-3.5 7.5-7.66 8.95a1 1 0 0 1-.67-.01C7.5 20.5 4 18 4 13V6a1 1 0 0 1 1-1c2 0 4.5-1.2 6.24-2.72a1.17 1.17 0 0 1 1.52 0C14.51 3.81 17 5 19 5a1 1 0 0 1 1 1z\"/>",
+  bot: "<path d=\"M12 8V4H8\"/><rect width=\"16\" height=\"12\" x=\"4\" y=\"8\" rx=\"2\"/><path d=\"M2 14h2\"/><path d=\"M20 14h2\"/><path d=\"M15 13v2\"/><path d=\"M9 13v2\"/>"
 };
 
 const SVG = "http://www.w3.org/2000/svg";
@@ -42,6 +44,7 @@ const PAGES = {
   overview: { title: "Overview", view: pageOverview },
   stats: { title: "Statistics", view: pageStats },
   audit: { title: "Audit", view: pageAudit },
+  checker: { title: "Action checker", view: pageChecker },
   log: { title: "Log", view: pageLog },
   help: { title: "Help", view: pageHelp },
   settings: { title: "Settings", view: pageSettings },
@@ -52,7 +55,7 @@ let lastSig = null;
 let busy = false;
 let down = false;
 let settingsRun = 0;
-const state = { overview: null, stats: null, statsNode: null, audit: null, log: null, help: null, pairing: null, settings: null, newToken: null, newPin: null };
+const state = { overview: null, stats: null, statsNode: null, audit: null, log: null, help: null, pairing: null, settings: null, newToken: null, newPin: null, checker: null };
 
 const $ = (id) => document.getElementById(id);
 
@@ -540,6 +543,9 @@ function pageAudit() {
 
 function auditRow(d, n) {
   const k = DECISIONS[d.decision] || { ic: "info", tone: "", pill: "" };
+  // A decision the center's action checker made (issue #17): its own allow
+  // rules, no node grant needed.
+  if (d.by === "action checker") return checkerAuditRow(d, k);
   const write = n && n.settings_write;
   const why = !n ? "The machine is no longer paired." : !write ? "This machine did not give this center the settings grant." : "";
   const rule = (list, wildcard) => act(async () => {
@@ -570,6 +576,244 @@ function auditRow(d, n) {
       ruleBtn("Deny", "danger", "deny", false), ruleBtn("Deny as wildcard", "danger", "deny", true)) : null,
     known && !write ? el("p", { class: "meta" }, why) : null,
     cut ? el("p", { class: "meta" }, "The target was cut to its start, so no rule can name it.") : null);
+}
+
+// A row for a decision the action checker made. A refusal offers allow
+// buttons that save a checker allow rule (center-side, no node grant), unless
+// the blocklist did it: the blocklist is hard deny, so the owner removes or
+// switches the entry off on the Action checker page instead.
+function checkerAuditRow(d, k) {
+  const layer = d.checker ? d.checker.layer : "";
+  const detail = d.checker ? d.checker.detail : "";
+  const refused = d.decision === "forbidden";
+  const byBlocklist = layer === "blocklist";
+  const cut = /… \[cut at \d+ of \d+ characters\]$/.test(d.target || "");
+  const known = d.cap && d.action && !cut && (d.target || !["exec", "fs"].includes(d.cap));
+  const allow = (wildcard) => act(async () => {
+    const r = await api("POST", "/api/checker/allow", { cap: d.cap, action: d.action, target: d.target || "", wildcard, node_id: d.node_id });
+    notify(`Added a checker allow rule: ${r.rule}`);
+  });
+  return el("div", { class: "card audit-row" },
+    el("div", { class: "line" },
+      el("span", { class: "tone-" + k.tone }, icon(byBlocklist ? "ban" : "bot")),
+      el("b", {}, d.node), el("span", { class: "mono" }, `${d.cap}.${d.action}`),
+      pill(k.pill, `${d.decision} by the action checker`),
+      el("span", { class: "when", title: when(d.ts) }, ago(d.ts))),
+    d.target ? el("code", { class: "target mono" }, d.target) : null,
+    detail ? el("p", { class: "meta" }, `${layer === "model" ? "Decision model" : layer === "allow rule" ? "Allow rule" : "Blocklist"}: ${detail}`) : null,
+    refused && !byBlocklist && known ? el("div", { class: "actions" },
+      btn("Allow", "", allow(false)), btn("Allow as wildcard", "", allow(true))) : null,
+    byBlocklist ? el("p", { class: "meta" }, "On the blocklist (hard deny). Remove or switch off the entry on the Action checker page to let it through.") : null);
+}
+
+// ---- Action checker (issue #17) ----
+
+const SCOPES = [
+  { value: "effects", text: "Execute, write and actuate calls (the default)" },
+  { value: "with-reads", text: "Those and reads too" },
+  { value: "tainted-only", text: "Only calls of a tainted session" },
+];
+let checkerRun = 0;
+
+async function loadChecker() {
+  const run = ++checkerRun;
+  const r = await api("GET", "/api/checker");
+  if (run !== checkerRun) return;
+  // The working copy the form edits; meta holds what does not change here.
+  state.checker = { cfg: r.config, meta: r };
+  if (current() === "checker") draw(true);
+}
+
+// Saves the working copy, then reloads so the page shows what the center kept.
+async function saveChecker() {
+  await api("POST", "/api/checker", { config: state.checker.cfg });
+  await loadChecker();
+}
+
+function pageChecker() {
+  const c = state.checker;
+  if (!c) return [empty("Loading…")];
+  const cfg = c.cfg;
+  return [
+    head("shield", "Action checker", "A gate on the center that checks each call before the machine gets it. The machine's own rules still decide; the checker can only refuse.", [
+      [cfg.blocklist_on ? "on" : "off", "blocklist", cfg.blocklist_on ? "ok" : ""],
+      [cfg.model_on ? "on" : "off", "model", cfg.model_on ? "ok" : ""],
+    ]),
+    section("Switches", "Each part has its own switch; a change takes effect for the next call.", null, el("div", { class: "card" },
+      checkerToggle("Blocklist (deterministic, on by default)", cfg.blocklist_on, (v) => { cfg.blocklist_on = v; }),
+      checkerToggle("Decision model (off by default)", cfg.model_on, (v) => { cfg.model_on = v; }),
+      checkerToggle("Taint marking (a session is tainted after a call returns content)", cfg.taint_on, (v) => { cfg.taint_on = v; }))),
+    c.meta.rejected && c.meta.rejected.length ? banner("warn", "alert", `Some rules do not parse and were left out: ${c.meta.rejected.join("; ")}`) : null,
+    blocklistCard(cfg, c.meta),
+    allowCard(cfg),
+    modelCard(cfg, c.meta),
+  ];
+}
+
+// A switch that mutates the working copy and saves at once.
+function checkerToggle(label, on, apply) {
+  const input = el("input", { type: "checkbox", onchange: act(async (ev) => { apply(ev.currentTarget.checked); await saveChecker(); }) });
+  input.checked = !!on;
+  return el("label", { class: "switch" }, input, el("span", {}, label));
+}
+
+function blocklistCard(cfg, meta) {
+  const row = (e, i) => el("div", { class: "card entry" },
+    el("div", { class: "card-top" },
+      el("label", { class: "switch" },
+        (() => { const t = el("input", { type: "checkbox", onchange: act(async (ev) => { cfg.blocklist[i].on = ev.currentTarget.checked; await saveChecker(); }) }); t.checked = e.on; return t; })(),
+        el("code", { class: "mono" }, e.rule)),
+      e.builtin ? pill("", "default") : null,
+      el("span", { class: "push" }, btn("Remove", "danger", act(async () => { cfg.blocklist.splice(i, 1); await saveChecker(); }), "trash"))),
+    e.note ? el("p", { class: "meta" }, e.note) : null);
+  const ruleIn = el("input", { class: "input mono", placeholder: "exec.run:rm -rf /*  or  fs.write:/etc/sudoers", "aria-label": "New blocklist rule" });
+  const noteIn = el("input", { class: "input", placeholder: "What it guards against (optional)", "aria-label": "Note" });
+  const add = act(async () => {
+    const rule = ruleIn.value.trim();
+    if (!rule) { notify("Enter a rule.", "error"); return; }
+    cfg.blocklist.push({ rule, on: true, builtin: false, note: noteIn.value.trim() });
+    ruleIn.value = ""; noteIn.value = "";
+    await saveChecker();
+  });
+  const reset = act(async () => {
+    const yes = await modal({ title: "Reset the blocklist?", message: "This replaces the whole blocklist with the built-in defaults; your own entries and changes are lost.", confirm: "Reset", danger: true });
+    if (!yes) return;
+    cfg.blocklist = meta.default_blocklist.map((e) => ({ ...e }));
+    await saveChecker();
+  });
+  return section("Blocklist", "Exact commands or wildcards that are refused at once, in the machine's own rule syntax (exec.run:…, fs.write:…). A re: regex form is allowed where a glob is not enough. The blocklist wins over the allow rules and the model.", btn("Reset to defaults", "ghost", reset, "refresh"),
+    el("div", { class: "card" }, el("div", { class: "form-row" },
+      el("label", { class: "field grow" }, el("span", { class: "label" }, "Add a rule"), ruleIn),
+      el("label", { class: "field grow" }, el("span", { class: "label" }, "Note"), noteIn)),
+      el("div", { class: "actions" }, el("button", { type: "button", class: "btn primary", onclick: add }, icon("plus", "sm"), "Add"))),
+    el("p", { class: "meta" }, "What the matcher cannot see: shell variables, aliases, a script written then run, and base64. The decision model and the machine's policy are the next lines of defence."),
+    cfg.blocklist.length ? el("div", { class: "list" }, cfg.blocklist.map(row)) : empty("The blocklist is empty."));
+}
+
+function allowCard(cfg) {
+  const nodes = (state.overview && state.overview.nodes) || [];
+  const nameOf = (id) => { const n = nodes.find((x) => x.id === id); return n ? n.name : id; };
+  const row = (a, i) => el("div", { class: "card entry" },
+    el("div", { class: "card-top" },
+      el("code", { class: "mono" }, a.rule),
+      pill("", a.node_id ? nameOf(a.node_id) : "every machine"),
+      el("span", { class: "push" }, btn("Remove", "danger", act(async () => { cfg.allow_rules.splice(i, 1); await saveChecker(); }), "trash"))));
+  const ruleIn = el("input", { class: "input mono", placeholder: "exec.run:docker exec *", "aria-label": "New allow rule" });
+  const nodeSel = el("select", { class: "input", "aria-label": "Machine" }, el("option", { value: "" }, "Every machine"), nodes.map((n) => el("option", { value: n.id }, n.name)));
+  const add = act(async () => {
+    const rule = ruleIn.value.trim();
+    if (!rule) { notify("Enter a rule.", "error"); return; }
+    cfg.allow_rules.push({ rule, node_id: nodeSel.value || null });
+    ruleIn.value = "";
+    await saveChecker();
+  });
+  return section("Allow rules", "A call that matches an allow rule skips the decision model and goes straight to the machine. It does not skip the blocklist.", null,
+    el("div", { class: "card" }, el("div", { class: "form-row" },
+      el("label", { class: "field grow" }, el("span", { class: "label" }, "Add a rule"), ruleIn),
+      el("label", { class: "field" }, el("span", { class: "label" }, "For"), nodeSel)),
+      el("div", { class: "actions" }, el("button", { type: "button", class: "btn primary", onclick: add }, icon("plus", "sm"), "Add"))),
+    cfg.allow_rules.length ? el("div", { class: "list" }, cfg.allow_rules.map(row)) : empty("No allow rules."));
+}
+
+function modelCard(cfg, meta) {
+  const m = cfg.model;
+  const srcSel = el("select", { class: "input", "aria-label": "Model source" },
+    el("option", { value: "local" }, "A llama-server the center runs"),
+    el("option", { value: "endpoint" }, "A System One endpoint"));
+  srcSel.value = m.source;
+  const endpointUrl = el("input", { class: "input mono", value: m.endpoint_url, placeholder: "https://host:9931" });
+  const endpointModel = el("input", { class: "input mono", value: m.endpoint_model, placeholder: "jev-latest (optional)" });
+  const token = el("input", { class: "input", type: "password", placeholder: meta.has_token ? "a token is set — type to replace" : "optional bearer token", autocomplete: "off" });
+  const llama = el("input", { class: "input mono", value: m.llama_server, placeholder: "llama-server (from PATH when empty)" });
+  const hf = el("input", { class: "input mono", value: m.hf_repo, placeholder: meta.default_hf });
+  const modelFile = el("input", { class: "input mono", value: m.model_file, placeholder: "/path/to/model.gguf (instead of -hf)" });
+  const gpu = el("input", { class: "input num", type: "number", min: "0", value: m.gpu_layers });
+  const threads = el("input", { class: "input num", type: "number", min: "0", value: m.threads });
+  const threshold = el("input", { class: "input num", type: "number", min: "0", max: "1", step: "0.01", value: m.threshold });
+  const timeout = el("input", { class: "input num", type: "number", min: "100", value: m.timeout_ms });
+  const scopeSel = el("select", { class: "input", "aria-label": "Which calls the model sees" }, SCOPES.map((o) => el("option", { value: o.value }, o.text)));
+  scopeSel.value = m.scope;
+  const failClosed = el("input", { type: "checkbox" }); failClosed.checked = m.fail_closed;
+  const instr = el("textarea", { class: "json", rows: "4" }, m.instructions);
+  const critTrue = el("input", { class: "input", value: m.criteria_true });
+  const critFalse = el("input", { class: "input", value: m.criteria_false });
+  const save = act(async () => {
+    m.source = srcSel.value;
+    m.endpoint_url = endpointUrl.value.trim();
+    m.endpoint_model = endpointModel.value.trim();
+    m.llama_server = llama.value.trim();
+    m.hf_repo = hf.value.trim();
+    m.model_file = modelFile.value.trim();
+    m.gpu_layers = Number(gpu.value) || 0;
+    m.threads = Number(threads.value) || 0;
+    m.threshold = Number(threshold.value);
+    m.timeout_ms = Number(timeout.value);
+    m.scope = scopeSel.value;
+    m.fail_closed = failClosed.checked;
+    m.instructions = instr.value;
+    m.criteria_true = critTrue.value;
+    m.criteria_false = critFalse.value;
+    if (token.value) { await api("POST", "/api/checker/token", { token: token.value }); token.value = ""; }
+    await saveChecker();
+    notify("Saved.");
+  });
+  const resetQuestion = () => { instr.value = ""; critTrue.value = ""; critFalse.value = ""; notify("Cleared; Save to store the defaults."); };
+  const field = (label, input) => el("label", { class: "field grow" }, el("span", { class: "label" }, label), input);
+  const epDiv = el("div", {},
+    el("div", { class: "form-row" }, field("Endpoint URL", endpointUrl), field("Model name", endpointModel)),
+    el("div", { class: "form-row" }, field("Bearer token (kept secret, never shown back)", token),
+      meta.has_token ? el("span", { class: "push" }, btn("Clear token", "ghost", act(async () => { await api("POST", "/api/checker/token", { token: null }); await loadChecker(); }), "trash")) : null));
+  const localDiv = el("div", {},
+    el("div", { class: "form-row" }, field("llama-server program", llama)),
+        el("div", { class: "form-row" }, field("Model to download (-hf repo:quant)", hf), field("or a local model file (-m)", modelFile)),
+        el("div", { class: "form-row" }, field("GPU layers (0 = CPU only)", gpu), field("Threads (0 = auto)", threads)),
+    el("p", { class: "meta" }, `The default model is ${meta.default_hf}. Its licence is the ${meta.licence} (not Apache). The center does not download llama.cpp; point at a build or put llama-server on PATH.`),
+    localStatus(state.checker.meta.local));
+  const showSource = () => { epDiv.hidden = srcSel.value !== "endpoint"; localDiv.hidden = srcSel.value !== "local"; };
+  srcSel.addEventListener("change", showSource);
+  showSource();
+  return section("Decision model", "An optional System One model that answers, in one pass, whether a call is dangerous. At or above the threshold the call is refused. An unreachable model refuses the call (fail closed) unless you switch that off below.", null,
+    el("div", { class: "card" },
+      el("div", { class: "form-row" }, field("Source", srcSel)),
+      epDiv,
+      localDiv,
+      el("div", { class: "form-row" }, field("Threshold (0 to 1)", threshold), field("Timeout (ms)", timeout)),
+      el("div", { class: "form-row" }, field("Which calls the model sees", scopeSel)),
+      el("label", { class: "switch" }, failClosed, el("span", {}, "Fail closed: refuse a call when the model is unreachable (recommended). Off: allow and log it.")),
+      el("div", { class: "form-row" }, field("Question (the command text is never put here; it goes only in the state sent to the model)", instr)),
+      el("div", { class: "form-row" }, field("When true (dangerous)", critTrue), field("When false (safe)", critFalse)),
+      el("div", { class: "actions" },
+        el("button", { type: "button", class: "btn primary", onclick: save }, "Save"),
+        btn("Reset the question", "ghost", resetQuestion, "refresh"))));
+}
+
+// The local server's live state. The container is kept so a poll can refresh
+// it in place, without rebuilding the form (and losing half-typed fields).
+let checkerStatusEl = null;
+function localStatus(s) {
+  checkerStatusEl = el("div", {});
+  checkerStatusEl.replaceChildren(...localStatusParts(s));
+  return checkerStatusEl;
+}
+
+function localStatusParts(s) {
+  if (!s) return [el("p", { class: "meta" }, "The local model is not running. Turn the model on (above) with the local source to start it.")];
+  const tone = s.phase === "ready" ? "up" : s.phase === "failed" ? "down" : "warn";
+  return [el("div", { class: "card" },
+    el("div", { class: "card-top" }, el("span", { class: "dot" + (s.phase === "ready" ? " up" : "") }), el("span", { class: "name" }, "Local model"), pill(tone, s.phase)),
+    s.url ? el("p", { class: "meta mono" }, s.url) : null,
+    s.message ? el("p", { class: "meta" }, s.message) : null,
+    s.output && s.output.length ? el("pre", { class: "logbox mono" }, s.output.join("\n")) : null)];
+}
+
+// Polls just the local model's status, so the Action checker page shows it
+// move from starting to ready without redrawing the form.
+async function pollCheckerLocal() {
+  if (!state.checker || !checkerStatusEl) return;
+  const r = await api("GET", "/api/checker");
+  if (current() !== "checker" || !checkerStatusEl) return;
+  state.checker.meta.local = r.local;
+  checkerStatusEl.replaceChildren(...localStatusParts(r.local));
 }
 
 // ---- Log ----
@@ -916,8 +1160,8 @@ function signature(page) {
 
 function draw(force) {
   const page = current();
-  if (page === "settings") {
-    if (force) $("page").replaceChildren(...PAGES.settings.view().flat());
+  if (page === "settings" || page === "checker") {
+    if (force) $("page").replaceChildren(...PAGES[page].view().flat());
     return;
   }
   const sig = signature(page);
@@ -969,6 +1213,8 @@ async function tick() {
     // The log asks for itself, so that a filter changed meanwhile is not
     // answered with the old filter's entries.
     if (page === "log" && logFilter.live) logLoad();
+    // The Action checker page refreshes the local model's status in place.
+    if (page === "checker") pollCheckerLocal().catch(() => {});
   } catch (e) {
     if (!e.auth && !down) notify("Cannot reach the center. Trying again.", "error");
     down = !e.auth;
@@ -1008,6 +1254,10 @@ function go() {
     state.settings = null;
     draw(true);
     loadSettings();
+  } else if (page === "checker") {
+    state.checker = null;
+    draw(true);
+    loadChecker().catch((e) => { if (!e.auth) notify(e.message, "error"); });
   } else {
     draw(true);
   }

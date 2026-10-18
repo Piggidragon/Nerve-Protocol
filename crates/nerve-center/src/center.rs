@@ -19,8 +19,10 @@ use nerve_transport::tls::ServerIdentity;
 
 use crate::audit::AuditFeed;
 use crate::checker::server::LocalServer;
+use crate::checker::blocklist::Rule;
 use crate::checker::{
-    self, CallInfo, Checker, CheckerConfig, Decision, Endpoint, Layer, ModelSource,
+    self, AllowRule, CallInfo, Checker, CheckerConfig, Decision, Endpoint, Layer, ModelSource,
+    DEFAULT_HF_REPO, DEFAULT_MODEL_LICENCE,
 };
 use crate::link::{Link, SHORT_CALL};
 use crate::pairing::{Codes, Outcome};
@@ -2435,6 +2437,68 @@ impl Center {
         self.rebuild_checker();
         self.changed(Change::Nodes);
         self.changed(Change::Sessions);
+    }
+
+    /// What the web UI's Action checker page reads: the config (no token),
+    /// whether a token is set, the default model's licence and repo, the
+    /// local model's status, and rules that did not parse.
+    pub fn checker_json(&self) -> Value {
+        let cfg = self.read(|s| s.checker.clone());
+        json!({
+            "config": cfg,
+            "has_token": self.checker_has_token(),
+            "licence": DEFAULT_MODEL_LICENCE,
+            "default_hf": DEFAULT_HF_REPO,
+            "default_blocklist": checker::config::default_blocklist(),
+            "local": self.local_model_status(),
+            "rejected": self.checker().rejected,
+        })
+    }
+
+    /// Validates a posted checker config and, if it holds, saves it. Taint
+    /// switched off clears every session's mark.
+    pub fn apply_checker_config(&self, cfg: CheckerConfig) -> Result<(), String> {
+        for e in &cfg.blocklist {
+            Rule::parse(&e.rule)?;
+        }
+        for a in &cfg.allow_rules {
+            Rule::parse(&a.rule)?;
+        }
+        if !(0.0..=1.0).contains(&cfg.model.threshold) {
+            return Err("the threshold is between 0 and 1".into());
+        }
+        if cfg.model.timeout_ms < 100 {
+            return Err("the model timeout is at least 100 ms".into());
+        }
+        if cfg.model.instructions.trim().is_empty() {
+            return Err("the model question needs instructions".into());
+        }
+        let clear_taint = self.read(|s| s.checker.taint_on) && !cfg.taint_on;
+        self.set_checker_config(cfg, clear_taint);
+        Ok(())
+    }
+
+    /// Adds a saved allow rule, built for an audit button's `cap.action` and
+    /// `target` (exact or wildcard), for every node or one node.
+    pub fn add_checker_allow(
+        &self,
+        cap: &str,
+        action: &str,
+        target: &str,
+        wildcard: bool,
+        node_id: Option<String>,
+    ) -> Result<String, String> {
+        let rule = audit_rule("allow", cap, action, target, wildcard)?;
+        let mut cfg = self.read(|s| s.checker.clone());
+        let entry = AllowRule {
+            rule: rule.clone(),
+            node_id,
+        };
+        if !cfg.allow_rules.contains(&entry) {
+            cfg.allow_rules.push(entry);
+        }
+        self.set_checker_config(cfg, false);
+        Ok(rule)
     }
 
     /// Adds a checker audit entry (a center decision) to the feed and the log.

@@ -405,6 +405,30 @@ impl Ui {
                     .map(|v| json!({"rule": rule, "result": v}))
                     .map_err(refused)
             }
+            // ---- Action checker (issue #17) ----
+            ("GET", "/api/checker") => Ok(c.checker_json()),
+            ("POST", "/api/checker") => {
+                let cfg = serde_json::from_value(b.get("config").cloned().unwrap_or(Value::Null))
+                    .map_err(|e| bad(format!("the checker settings are not valid: {e}")))?;
+                c.apply_checker_config(cfg).map(|_| json!({})).map_err(bad)
+            }
+            ("POST", "/api/checker/token") => {
+                let token = b.get("token").and_then(Value::as_str);
+                c.set_checker_token(token).map(|_| json!({})).map_err(bad)
+            }
+            // The allow buttons on a checker refusal: build the rule for the
+            // entry and save it for every node, or for the one node.
+            ("POST", "/api/checker/allow") => {
+                let wildcard = b.get("wildcard").and_then(Value::as_bool) == Some(true);
+                let node = b
+                    .get("node_id")
+                    .and_then(Value::as_str)
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_string);
+                c.add_checker_allow(&s("cap"), &s("action"), &s("target"), wildcard, node)
+                    .map(|rule| json!({"rule": rule}))
+                    .map_err(bad)
+            }
             ("GET", "/api/tokens") => Ok(c.read(|st| {
                 json!(
                     st.harness_tokens

@@ -89,7 +89,11 @@ Entries are in the machine's own rule syntax, `<scope>:<pattern>`:
 You can add entries, for every machine or for one, remove them, switch single
 ones off (for every machine, or for one machine under
 [Per machine](#per-machine)), and reset the whole list to the built-in
-defaults. The defaults block truly dangerous things and
+defaults. The built-in entries come with the release: an update brings new and
+improved ones, and what you changed of them (switched off, switched off for a
+machine, removed) stays as you set it. **Reset to defaults** clears those
+changes, so every built-in entry is back and on, and removes your own entries
+(also those for one machine). The defaults block truly dangerous things and
 leave ordinary work alone: `rm file`, `rm -rf ./build`, `rm -rf node_modules`,
 `docker ps`, `git push` and `kill <pid>` all stay allowed; wiping the root
 filesystem or a home folder, `mkfs`, `dd` to a disk, fork bombs,

@@ -8,7 +8,7 @@
 //! the install finds it and only checks its hash.
 //!
 //! ```sh
-//! NERVE_TEST_D1_MODEL=~/Services/models/decision/d1-3b/d1-3B-Q4_K_M.gguf \
+//! NERVE_TEST_D1_MODEL=/path/to/d1-3B-Q4_K_M.gguf \
 //!     cargo test -p nerve-center --test local_install -- --ignored --nocapture
 //! ```
 

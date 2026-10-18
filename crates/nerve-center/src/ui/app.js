@@ -1017,7 +1017,7 @@ function localInstallParts(meta) {
         el("span", { class: "meta" }, `Installed, running on the ${dev}.`),
         meta.gpu_hint || dev === "GPU" ? btn(`Switch to ${other}`, "ghost", reinstall(other === "GPU")) : null,
         remove),
-      ...localStatusParts(meta.local)];
+      ...localStatusParts(meta.local, meta.model_wanted)];
   }
   const current = meta.installed ? meta.models.find((m) => m.id === cfg.local_model) : null;
   return [line, failed,
@@ -1034,11 +1034,14 @@ function installButtons(meta, pin, verb) {
     el("span", { class: "meta" }, meta.gpu_hint ? "GPU uses the Vulkan build (NVIDIA, AMD or Intel)." : "No GPU detected; CPU only."));
 }
 
-function localStatusParts(s) {
+// `wanted` is the center's word on whether the model is on anywhere: by the
+// center's switch or for a single machine, the same rule that decides
+// whether the local model runs.
+function localStatusParts(s, wanted) {
   if (!s) {
-    return [el("p", { class: "meta" }, state.checker.cfg.model_on
+    return [el("p", { class: "meta" }, wanted
       ? "The model is on but its server is not running. The Log page says why."
-      : "The model is installed but not running. Turn the model on (the switch at the top).")];
+      : "The model is installed but not running. Turn the model on (the switch at the top, or for a machine under Per machine).")];
   }
   const tone = s.phase === "ready" ? "up" : s.phase === "failed" ? "down" : "warn";
   return [el("div", { class: "card" },

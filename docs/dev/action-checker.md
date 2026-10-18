@@ -33,9 +33,12 @@ center where the owner watches the audit feed.
 
 The center (`center.rs`, `call_inner`) turns a `Refuse` into a `forbidden`
 error for the harness and an audit entry, an `Allowed` into an audit entry, and
-a `Pass` into the call going on to the node. Every center decision carries a
-`by: "action checker"` and a `checker: {layer, detail}` in the audit feed and
-the log.
+a `Pass` into the call going on to the node. It checks first that the node is
+neither disabled nor offline: such a call is `unavailable` before the checker
+runs, so it costs no model call, a down model failing closed does not turn it
+into `forbidden`, and the checker audits nothing for it. Every center decision
+carries a `by: "action checker"` and a `checker: {layer, detail}` in the audit
+feed and the log.
 
 ## The blocklist matcher
 
@@ -153,7 +156,7 @@ are in the user guide and the module comment.
 Decision models answer a typed question in one forward pass, no tokens
 generated. The de-facto API is TypeSafe's; `llama-server` serves the same since
 b11361 (llama.cpp PR #29818). The reference is
-`git -C ~/Services/llama.cpp show 097cf33d9:tools/server/README.md`
+`git -C <llama.cpp checkout> show 097cf33d9:tools/server/README.md`
 (POST /v1/systemone).
 
 The center sends:
@@ -269,6 +272,22 @@ scope applies. Switching taint off clears every mark.
 `CheckerConfig` (`checker/config.rs`) is a field of the center's `Store`, so it
 is in `state.json` and in a backup.
 
+The blocklist in memory is the whole list in force; `state.json` keeps only the
+owner's part (`config::stored`): per built-in, by its stable `id`, what the
+owner changed (`on: false`, `off_for`, `removed: true`), and the owner's own
+entries:
+`"blocklist": {"builtins": {"nsenter": {"removed": true}}, "own": [...]}`. On
+load the built-ins come from the code with those choices on them, so a later
+release's new or changed built-ins reach an existing center; a choice for an id
+the code no longer has is ignored. A whole list (an array) also reads: the form
+of #130 (built-ins in full with `builtin: true`, mapped to their ids by rule
+text) and what the web UI posts (`CheckerConfig::view`, built-ins with their
+id). A built-in such a list does not hold counts as removed; a stored built-in
+the code does not know is dropped. In a list without ids such an unknown
+built-in may be an older pattern of one the code has, so then no built-in counts
+as removed (they come back on, the safe side). Reset to defaults posts the
+code's list, so it clears every choice and drops the owner's own entries.
+
 Per node (owner's decision of 2026-10-18): a `BlockEntry` has a `node_id`
 (`None` for every node) and `off_for`, the node ids an entry for every node is
 switched off for (`BlockEntry::applies_to`); an `AllowRule` has its `node_id`
@@ -305,7 +324,7 @@ the client timeout for a slow model (e.g. Kev-4B on CPU); it is the runner
 only, not the product default.
 
 ```sh
-CUDA_VISIBLE_DEVICES= ~/Services/llama.cpp-native/build/bin/llama-server \
+CUDA_VISIBLE_DEVICES= /path/to/llama-server \
     -m <model.gguf> -ngl 0 --host 127.0.0.1 --port 19931 &
 NERVE_CHECKER_ENDPOINT=http://127.0.0.1:19931 \
     cargo test -p nerve-center --test checker_eval -- --ignored --nocapture

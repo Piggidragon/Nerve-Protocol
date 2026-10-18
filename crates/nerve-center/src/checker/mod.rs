@@ -493,6 +493,7 @@ mod tests {
 
     fn entry(rule: &str, node: Option<&str>) -> BlockEntry {
         BlockEntry {
+            id: String::new(),
             rule: rule.into(),
             on: true,
             builtin: false,

@@ -27,7 +27,10 @@ pub struct CheckerConfig {
     #[serde(default = "on")]
     pub taint_on: bool,
     /// The blocklist, built-in defaults and the owner's own, each switchable.
-    #[serde(default = "default_blocklist")]
+    /// In memory it is the whole list in force; `state.json` keeps only the
+    /// owner's part of it ([`stored`]), so the built-ins come from the code
+    /// of the release that runs.
+    #[serde(default = "default_blocklist", with = "stored")]
     pub blocklist: Vec<BlockEntry>,
     /// The saved allow rules that skip the model (never the blocklist).
     #[serde(default)]
@@ -60,16 +63,29 @@ fn on() -> bool {
     true
 }
 
+fn is_on(v: &bool) -> bool {
+    *v
+}
+
+fn is_off(v: &bool) -> bool {
+    !*v
+}
+
 /// One blocklist entry: a rule in the node's `<scope>:<pattern>` syntax
 /// (`exec.run:…`, `fs.write:…`, `cap.action`), with a `re:` regex form for
 /// `exec.run` where a glob is not enough. `builtin` marks a default, so the
 /// UI can group them and "reset to defaults" can tell them from the owner's.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockEntry {
+    /// A built-in's stable id, which the owner's choices for it are kept
+    /// under, so a later release can change its pattern without losing them.
+    /// Empty for the owner's own entries.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
     pub rule: String,
     #[serde(default = "on")]
     pub on: bool,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "is_off")]
     pub builtin: bool,
     /// A short word on what the entry guards against, for the UI. Built-ins
     /// carry one; the owner's entries may leave it empty.
@@ -86,8 +102,9 @@ pub struct BlockEntry {
 }
 
 impl BlockEntry {
-    fn builtin(rule: &str, note: &str) -> BlockEntry {
+    fn builtin(id: &str, rule: &str, note: &str) -> BlockEntry {
         BlockEntry {
+            id: id.to_string(),
             rule: rule.to_string(),
             on: true,
             builtin: true,
@@ -278,6 +295,22 @@ pub enum LocalModel {
 }
 
 impl CheckerConfig {
+    /// The config as the web UI reads it: the whole blocklist in force, with
+    /// the built-ins in full, where `state.json` keeps only the owner's part.
+    /// A posted config with that list comes back through [`stored`].
+    pub fn view(&self) -> serde_json::Value {
+        let mut v = serde_json::to_value(self).unwrap_or_default();
+        v["blocklist"] = serde_json::to_value(&self.blocklist).unwrap_or_default();
+        v
+    }
+
+    /// Brings the blocklist to what a restart would read back from the
+    /// stored owner's part: the built-ins in the code's form, then the
+    /// owner's own entries.
+    pub fn settle_blocklist(&mut self) {
+        self.blocklist = stored::merge(stored::split(&self.blocklist));
+    }
+
     /// Whether the blocklist is on for `node_id`, and whether that is the
     /// center's switch or the node's own.
     pub fn blocklist_for(&self, node_id: &str) -> (bool, Scope) {
@@ -487,66 +520,111 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
     let b = BlockEntry::builtin;
     vec![
         // ---- rm of a dangerous root (also --no-preserve-root) ----
-        b("exec.run:rm -rf /", "wipes the root filesystem"),
-        b("exec.run:rm -rf /*", "wipes everything under root"),
-        b("exec.run:rm -rf ~", "wipes the home directory"),
-        b("exec.run:rm -rf ~/", "wipes the home directory"),
-        b("exec.run:rm -rf $HOME", "wipes the home directory"),
-        b("exec.run:rm -rf /home", "wipes all home directories"),
+        b("rm-root", "exec.run:rm -rf /", "wipes the root filesystem"),
+        b(
+            "rm-root-all",
+            "exec.run:rm -rf /*",
+            "wipes everything under root",
+        ),
+        b("rm-home", "exec.run:rm -rf ~", "wipes the home directory"),
+        b(
+            "rm-home-slash",
+            "exec.run:rm -rf ~/",
+            "wipes the home directory",
+        ),
+        b(
+            "rm-home-var",
+            "exec.run:rm -rf $HOME",
+            "wipes the home directory",
+        ),
+        b(
+            "rm-homes",
+            "exec.run:rm -rf /home",
+            "wipes all home directories",
+        ),
         // One level under /home only (the glob does not cross a `/`), so
         // `rm -rf /home/me/project/build` stays allowed.
-        b("exec.run:rm -rf /home/?*", "wipes a user's home directory"),
-        b("exec.run:rm -rf /root", "wipes root's home directory"),
-        b("exec.run:rm -rf /etc", "wipes system configuration"),
-        b("exec.run:rm -rf /usr", "wipes installed software"),
-        b("exec.run:rm -rf /var", "wipes system state"),
-        b("exec.run:rm -rf /boot", "wipes the boot files"),
+        b(
+            "rm-user-home",
+            "exec.run:rm -rf /home/?*",
+            "wipes a user's home directory",
+        ),
+        b(
+            "rm-root-home",
+            "exec.run:rm -rf /root",
+            "wipes root's home directory",
+        ),
+        b(
+            "rm-etc",
+            "exec.run:rm -rf /etc",
+            "wipes system configuration",
+        ),
+        b("rm-usr", "exec.run:rm -rf /usr", "wipes installed software"),
+        b("rm-var", "exec.run:rm -rf /var", "wipes system state"),
+        b("rm-boot", "exec.run:rm -rf /boot", "wipes the boot files"),
         // ---- disks and filesystems ----
         // mkfs, wipefs and userdel as the program run, so a commit message,
         // a grep or a note that only mentions them is not refused.
-        b("exec.run:mkfs*", "makes a new filesystem (destroys data)"),
         b(
+            "mkfs",
+            "exec.run:mkfs*",
+            "makes a new filesystem (destroys data)",
+        ),
+        b(
+            "dd-disk",
             "exec.run:re:(?i)\\bdd\\b[^|&;]*\\bof=/dev/(sd|nvme|vd|hd|mmcblk|disk)",
             "writes raw over a disk device",
         ),
-        b("exec.run:wipefs", "erases filesystem signatures"),
+        b("wipefs", "exec.run:wipefs", "erases filesystem signatures"),
         b(
+            "shred-device",
             "exec.run:cmd-re:^shred (?:.* )?/dev/(?:sd|nvme|vd|hd|mmcblk|disk)",
             "shreds a device",
         ),
         b(
+            "write-disk",
             "exec.run:re:(?i)>\\s*/dev/(sd|nvme|vd|hd|mmcblk|disk)",
             "writes over a disk device",
         ),
         // ---- fork bomb ----
         b(
+            "fork-bomb",
             "exec.run:re::\\(\\)\\s*\\{[\\s;]*:\\s*\\|\\s*:",
             "a fork bomb",
         ),
         // ---- reckless chmod/chown of the root (structured, so the flag and
         //      the mode may come in any order) ----
         b(
+            "chmod-root",
             "exec.run:chmod -R 777 /",
             "opens the whole filesystem to everyone",
         ),
-        b("exec.run:chown -R /", "re-owns the whole filesystem"),
+        b(
+            "chown-root",
+            "exec.run:chown -R /",
+            "re-owns the whole filesystem",
+        ),
         // ---- destructive database commands: only in what a database
         //      client runs (its arguments, input piped into it, or a
         //      here-document fed to it), so grepping for `DROP TABLE` or
         //      writing a migration that has one is not refused ----
         b(
+            "db-drop",
             &format!("exec.run:cmd-re:^{DB_CLIENT} .*{DB_DROP}"),
             "drops or truncates a database",
         ),
         b(
+            "db-drop-container",
             &format!("exec.run:cmd-re:^(?:docker|podman|kubectl) (?:.* )?{DB_CLIENT} .*{DB_DROP}"),
             "drops or truncates a database",
         ),
         b(
+            "db-drop-piped",
             &format!(r"exec.run:re:(?i){DB_DROP}[^|]*\|\s*(?:[^\s|;&]+\s+)*?{DB_CLIENT}\b"),
             "drops or truncates a database",
         ),
         b(
+            "db-drop-heredoc",
             &format!(r"exec.run:re:(?i)\b{DB_CLIENT}\b[^|&;]*<<[^|]*?{DB_DROP}"),
             "drops or truncates a database",
         ),
@@ -554,28 +632,33 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
         //      tool's own words, so a commit message or a grep that mentions
         //      the flag is not refused ----
         b(
+            "container-privileged",
             &format!("exec.run:cmd-re:^{CONTAINER} (?:.* )?--privileged(?:=true)?(?: |$)"),
             "a privileged container: root on the host",
         ),
         b(
+            "container-pid-host",
             &format!("exec.run:cmd-re:^{CONTAINER} (?:.* )?--pid(?:=| )host(?: |$)"),
             "shares the host process namespace",
         ),
         b(
+            "container-host-root",
             &format!("exec.run:cmd-re:^{CONTAINER} (?:.* )?(?:-v|--volume)(?:=| )?/:(?:/|$| )"),
             "mounts the whole host filesystem",
         ),
         b(
+            "container-docker-socket",
             &format!("exec.run:cmd-re:^{CONTAINER} (?:.* )?\\S*/var/run/docker\\.sock"),
             "mounts the docker socket: root on the host",
         ),
         b(
+            "container-exec-root",
             &format!(
                 "exec.run:cmd-re:^{CONTAINER}(?: compose)? exec{EXEC_OPTS} (?:-u|--user)(?:=| )?(?:root|0)(?::\\S*)?(?: |$)"
             ),
             "runs as root in a container",
         ),
-        b("exec.run:nsenter", "enters another namespace"),
+        b("nsenter", "exec.run:nsenter", "enters another namespace"),
         // ---- run a download unseen: piped into a program that runs its
         //      input (`| sh`, `| sudo bash -s`, `| python3 -`, PowerShell's
         //      `| iex`), not `| grep sh` or `| python -m json.tool`, also
@@ -593,12 +676,14 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
         //      "…"`), so a note that writes out a whole `sh -c '… | sh'` line
         //      is refused too ----
         b(
+            "download-pipe",
             &format!(
                 r"exec.run:re:(?i)\b{DOWNLOADER}\b[^|;&]*\|(?:[^|;&]*\|)*\s*(?:{RUNNER}{STDIN_ARGS}|{RUNS_STRING}(?:$|[\s;&|)]))"
             ),
             "runs a downloaded script unseen",
         ),
         b(
+            "download-pipe-shell-c",
             &format!(
                 r#"exec.run:re:(?i)(?:^|[\s;&|("'/])(?:sh|bash|zsh|dash|ksh|ash|powershell|pwsh)(?:\.exe)?\s+(?:[^\s;&|'"]+\s+)*?-[a-z]*c[a-z]*\s+(?:{}|{})"#,
                 quoted_body('"'),
@@ -607,39 +692,53 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
             "runs a downloaded script unseen",
         ),
         b(
+            "download-iex",
             &format!(
                 r"exec.run:re:(?i){COMMAND_START}{RUNS_STRING}\b[^|;&]*?(?:\b{DOWNLOADER}\b|\bdownloadstring\s*\()"
             ),
             "runs a downloaded script unseen",
         ),
         b(
+            "download-shell-subst",
             &format!(
                 r#"exec.run:re:(?i){COMMAND_START}(?:sh|bash|zsh|dash|ksh|ash)(?:\.exe)?\s+(?:-\S+\s+)*?(?:-[a-z]*c[a-z]*\s+["']?\$\(|<\()\s*(?:curl|wget)\b"#
             ),
             "runs a downloaded script unseen",
         ),
         // ---- cron, firewall, kill-all ----
-        b("exec.run:crontab -r", "removes all cron jobs"),
+        b(
+            "crontab-remove",
+            "exec.run:crontab -r",
+            "removes all cron jobs",
+        ),
         // A flush is `-F` (or `--flush`) with at most a table, a wait and a
         // chain: the line is lower-cased, so this keeps a rule with `-f`
         // (iptables' match for fragments) from reading as one.
         b(
+            "firewall-flush",
             r"exec.run:cmd-re:^ip6?tables(?: -t \S+| --table[ =]\S+| -w(?: \d+)?| --wait(?:=\S+)?)* (?:-f|--flush)(?: [^-\s]\S*)?(?: -t \S+)?$",
             "flushes the firewall",
         ),
         b(
+            "kill-all",
             "exec.run:re:(?i)\\bkill\\b\\s+-(9|kill|sigkill)\\b\\s+-1\\b",
             "kills every process",
         ),
         // ---- opening the machine ----
         b(
+            "overwrite-passwd",
             "exec.run:re:(?i)>\\s*/etc/passwd",
             "overwrites the user database",
         ),
-        b("exec.run:userdel", "deletes a user account"),
-        b("exec.run:passwd root", "changes root's password"),
+        b("userdel", "exec.run:userdel", "deletes a user account"),
+        b(
+            "passwd-root",
+            "exec.run:passwd root",
+            "changes root's password",
+        ),
         // The SSH service by its unit name, so `ssh-agent` is not one.
         b(
+            "ssh-off",
             r"exec.run:cmd-re:^systemctl (?:.* )?(?:stop|disable|mask) (?:.* )?(?:ssh|sshd|openssh-server)(?:\.service|\.socket)?(?: |$)",
             "turns off the SSH service",
         ),
@@ -648,18 +747,21 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
         // read as one. Three entries: the force flag before the branch,
         // after it, and a `+main` refspec (a force-push on its own).
         b(
+            "git-force-main",
             &format!(
                 r"exec.run:cmd-re:{GIT_PUSH}(?: .*)? {GIT_FORCE}(?: .*)? {GIT_PROTECTED}(?: .*)?$"
             ),
             "force-pushes over a protected branch",
         ),
         b(
+            "git-force-main-after",
             &format!(
                 r"exec.run:cmd-re:{GIT_PUSH}(?: .*)? {GIT_PROTECTED}(?: .*)? {GIT_FORCE}(?: .*)?$"
             ),
             "force-pushes over a protected branch",
         ),
         b(
+            "git-force-main-plus",
             &format!(
                 r"exec.run:cmd-re:{GIT_PUSH}(?: .*)? (?:\S*:)?\+(?:refs/heads/)?(?:main|master)(?: .*)?$"
             ),
@@ -669,8 +771,13 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
         // Format-Volume, format, bcdedit and diskpart as the program run, so
         // a code formatter's `format` subcommand (`dotnet format C:\src\App.sln`,
         // `ruff format C:\work`) is not one.
-        b("exec.run:Format-Volume", "formats a volume"),
         b(
+            "win-format-volume",
+            "exec.run:Format-Volume",
+            "formats a volume",
+        ),
+        b(
+            "win-format",
             r"exec.run:cmd-re:^format(?:\.com)? [a-z]:(?:[\\/ ]|$)",
             "formats a drive",
         ),
@@ -683,12 +790,14 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
         // with a blank in its name. Two entries: the switch before the
         // target, and after it.
         b(
+            "win-delete-root",
             &format!(
                 "exec.run:cmd-re:^{WIN_DELETE}(?: .*)? {WIN_RECURSE}(?: .*)? (?:{WIN_ROOT}|{WIN_ROOT_QUOTED})(?: .*)?$"
             ),
             "recursively deletes a drive root, a system folder or a home",
         ),
         b(
+            "win-delete-root-after",
             &format!(
                 "exec.run:cmd-re:^{WIN_DELETE}(?: .*)? (?:{WIN_ROOT}|{WIN_ROOT_QUOTED})(?: .*)? {WIN_RECURSE}(?: .*)?$"
             ),
@@ -701,47 +810,211 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
         // The target is still a whole operand, unquoted or quoted as a whole
         // (WIN_END, WIN_ROOT_QUOTED), so other paths stay allowed.
         b(
+            "win-delete-root-line",
             &format!(
                 r#"exec.run:re:(?i){WIN_DELETE_WORD}(?:[^;&|]*?\s)?{WIN_RECURSE}(?:\s[^;&|]*?)?(?:[\s:]{WIN_ROOT}{WIN_END}|{WIN_ROOT_QUOTED}{WIN_AFTER})"#
             ),
             "recursively deletes a drive root, a system folder or a home",
         ),
         b(
+            "win-delete-root-line-after",
             &format!(
                 r#"exec.run:re:(?i){WIN_DELETE_WORD}(?:(?:[^;&|]*?[\s:])?{WIN_ROOT}['"]?[\s)]|[^;&|]*?{WIN_ROOT_QUOTED}[\s)])(?:[^;&|]*?\s)?{WIN_RECURSE}{WIN_AFTER}"#
             ),
             "recursively deletes a drive root, a system folder or a home",
         ),
         b(
+            "win-vssadmin",
             "exec.run:re:(?i)\\bvssadmin(\\.exe)?\\s+delete\\s+shadows",
             "deletes volume shadow copies",
         ),
-        b("exec.run:re:(?i)wbadmin\\s+delete", "deletes backups"),
-        b("exec.run:bcdedit", "edits the boot configuration"),
         b(
+            "win-wbadmin",
+            "exec.run:re:(?i)wbadmin\\s+delete",
+            "deletes backups",
+        ),
+        b(
+            "win-bcdedit",
+            "exec.run:bcdedit",
+            "edits the boot configuration",
+        ),
+        b(
+            "win-reg-hklm",
             "exec.run:re:(?i)\\breg(\\.exe)?\\s+delete\\s+[\"']?hk(lm|ey_local_machine)\\b",
             "deletes a machine registry key",
         ),
         b(
+            "win-defender-off",
             "exec.run:re:(?i)set-mppreference[^|&;]*-disable",
             "disables Defender protection",
         ),
-        b("exec.run:re:(?i)\\bcipher\\b\\s+/w", "wipes free space"),
-        b("exec.run:diskpart", "edits disk partitions"),
+        b(
+            "win-cipher-wipe",
+            "exec.run:re:(?i)\\bcipher\\b\\s+/w",
+            "wipes free space",
+        ),
+        b("win-diskpart", "exec.run:diskpart", "edits disk partitions"),
         // ---- files: writes to dangerous places (the fs profile has no
         //      delete; a delete is an `rm` command, caught above) ----
-        b("fs.write:~/.ssh/authorized_keys", "an SSH login key list"),
-        b("fs.write:~/.bashrc", "a shell start-up file"),
-        b("fs.write:~/.bash_profile", "a shell start-up file"),
-        b("fs.write:~/.profile", "a shell start-up file"),
-        b("fs.write:~/.zshrc", "a shell start-up file"),
-        b("fs.write:/etc/sudoers", "the sudoers policy"),
-        b("fs.write:/etc/sudoers.d/*", "the sudoers policy"),
-        b("fs.write:/etc/passwd", "the user database"),
-        b("fs.write:/etc/shadow", "the password hashes"),
-        b("fs.write:/etc/crontab", "the system cron table"),
-        b("fs.write:/etc/cron.d/*", "a system cron job"),
+        b(
+            "fs-authorized-keys",
+            "fs.write:~/.ssh/authorized_keys",
+            "an SSH login key list",
+        ),
+        b("fs-bashrc", "fs.write:~/.bashrc", "a shell start-up file"),
+        b(
+            "fs-bash-profile",
+            "fs.write:~/.bash_profile",
+            "a shell start-up file",
+        ),
+        b("fs-profile", "fs.write:~/.profile", "a shell start-up file"),
+        b("fs-zshrc", "fs.write:~/.zshrc", "a shell start-up file"),
+        b("fs-sudoers", "fs.write:/etc/sudoers", "the sudoers policy"),
+        b(
+            "fs-sudoers-d",
+            "fs.write:/etc/sudoers.d/*",
+            "the sudoers policy",
+        ),
+        b("fs-passwd", "fs.write:/etc/passwd", "the user database"),
+        b("fs-shadow", "fs.write:/etc/shadow", "the password hashes"),
+        b(
+            "fs-crontab",
+            "fs.write:/etc/crontab",
+            "the system cron table",
+        ),
+        b("fs-cron-d", "fs.write:/etc/cron.d/*", "a system cron job"),
     ]
+}
+
+/// How the blocklist is kept: only the owner's part of it, so a later
+/// release's built-ins reach a center that has the list saved. Per built-in
+/// that is what the owner changed, by its id (switched off, switched off for
+/// single nodes, removed), and then the owner's own entries:
+///
+/// ```json
+/// {"builtins": {"nsenter": {"removed": true}, "rm-root": {"off_for": ["n2"]}},
+///  "own": [{"rule": "exec.run:terraform destroy*", "on": true}]}
+/// ```
+///
+/// On reading, the built-ins come from the code with those choices on them;
+/// a choice for an id the code no longer has is ignored. A whole list (an
+/// array) reads too: the form the center saved before (#130, built-ins in
+/// full with `builtin: true` and no id, mapped by their rule text) and what
+/// the web UI posts (built-ins with their id). A built-in of the code that
+/// such a list does not hold was removed by the owner; a stored built-in the
+/// code does not know is dropped.
+pub(super) mod stored {
+    use std::collections::BTreeMap;
+
+    use serde::de::Error as _;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::{BlockEntry, default_blocklist, is_off, is_on, on};
+
+    /// The owner's part of the blocklist, as `state.json` has it.
+    #[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
+    pub struct OwnerPart {
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        pub builtins: BTreeMap<String, Choice>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub own: Vec<BlockEntry>,
+    }
+
+    /// What the owner changed of one built-in.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct Choice {
+        #[serde(default, skip_serializing_if = "is_off")]
+        pub removed: bool,
+        #[serde(default = "on", skip_serializing_if = "is_on")]
+        pub on: bool,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub off_for: Vec<String>,
+    }
+
+    /// The owner's part of a whole list.
+    pub fn split(list: &[BlockEntry]) -> OwnerPart {
+        let defaults = default_blocklist();
+        let mut part = OwnerPart::default();
+        let mut seen = vec![false; defaults.len()];
+        for e in list {
+            if !e.builtin {
+                part.own.push(BlockEntry {
+                    id: String::new(),
+                    ..e.clone()
+                });
+                continue;
+            }
+            // By id, or by rule text for an entry saved before there were ids.
+            let found = defaults.iter().position(|d| {
+                if e.id.is_empty() {
+                    d.rule == e.rule
+                } else {
+                    d.id == e.id
+                }
+            });
+            let Some(i) = found.filter(|&i| !seen[i]) else {
+                continue;
+            };
+            seen[i] = true;
+            if !e.on || !e.off_for.is_empty() {
+                let choice = Choice {
+                    removed: false,
+                    on: e.on,
+                    off_for: e.off_for.clone(),
+                };
+                part.builtins.insert(defaults[i].id.clone(), choice);
+            }
+        }
+        for (d, seen) in defaults.iter().zip(seen) {
+            if !seen {
+                let removed = Choice {
+                    removed: true,
+                    on: true,
+                    off_for: Vec::new(),
+                };
+                part.builtins.insert(d.id.clone(), removed);
+            }
+        }
+        part
+    }
+
+    /// The whole list: the code's built-ins with the owner's choices on
+    /// them, then the owner's own entries.
+    pub fn merge(part: OwnerPart) -> Vec<BlockEntry> {
+        let mut list = Vec::new();
+        for mut d in default_blocklist() {
+            match part.builtins.get(&d.id) {
+                Some(c) if c.removed => continue,
+                Some(c) => {
+                    d.on = c.on;
+                    d.off_for = c.off_for.clone();
+                }
+                None => {}
+            }
+            list.push(d);
+        }
+        list.extend(part.own.into_iter().map(|e| BlockEntry {
+            id: String::new(),
+            builtin: false,
+            ..e
+        }));
+        list
+    }
+
+    pub fn serialize<S: Serializer>(list: &[BlockEntry], s: S) -> Result<S::Ok, S::Error> {
+        split(list).serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<BlockEntry>, D::Error> {
+        let v = serde_json::Value::deserialize(d)?;
+        let part = if v.is_array() {
+            let list: Vec<BlockEntry> = serde_json::from_value(v).map_err(D::Error::custom)?;
+            split(&list)
+        } else {
+            serde_json::from_value(v).map_err(D::Error::custom)?
+        };
+        Ok(merge(part))
+    }
 }
 
 #[cfg(test)]
@@ -770,6 +1043,209 @@ mod tests {
         // The default (a fresh center) has none of them either.
         let fresh = serde_json::to_string(&CheckerConfig::default()).unwrap();
         assert!(!fresh.contains("off_for") && !fresh.contains("\"nodes\""));
+    }
+
+    /// Every built-in has an id of its own and a rule of its own, so the
+    /// owner's choices are kept under the id and the form saved before ids
+    /// maps by rule text.
+    #[test]
+    fn every_builtin_has_its_own_id_and_rule() {
+        let d = default_blocklist();
+        let ids: std::collections::BTreeSet<_> = d.iter().map(|e| e.id.as_str()).collect();
+        let rules: std::collections::BTreeSet<_> = d.iter().map(|e| e.rule.as_str()).collect();
+        assert_eq!(ids.len(), d.len());
+        assert_eq!(rules.len(), d.len());
+        assert!(d.iter().all(|e| e.builtin && !e.id.is_empty()));
+    }
+
+    /// `state.json` keeps only the owner's part of the blocklist: no copy of
+    /// a built-in, only what the owner changed of it by its id, and their own
+    /// entries. A fresh center stores nothing of it.
+    #[test]
+    fn the_stored_blocklist_is_the_owners_part_only() {
+        let fresh = serde_json::to_value(CheckerConfig::default()).unwrap();
+        assert_eq!(fresh["blocklist"], serde_json::json!({}));
+
+        let mut c = CheckerConfig::default();
+        c.blocklist.retain(|e| e.id != "nsenter");
+        let mkfs = c.blocklist.iter_mut().find(|e| e.id == "mkfs").unwrap();
+        mkfs.on = false;
+        let root = c.blocklist.iter_mut().find(|e| e.id == "rm-root").unwrap();
+        root.off_for = vec!["n2".into()];
+        c.blocklist.push(BlockEntry {
+            id: String::new(),
+            rule: "exec.run:terraform destroy*".into(),
+            on: true,
+            builtin: false,
+            note: String::new(),
+            node_id: Some("n1".into()),
+            off_for: Vec::new(),
+        });
+        let saved = serde_json::to_value(&c).unwrap();
+        assert_eq!(
+            saved["blocklist"],
+            serde_json::json!({
+                "builtins": {
+                    "mkfs": {"on": false},
+                    "nsenter": {"removed": true},
+                    "rm-root": {"off_for": ["n2"]},
+                },
+                "own": [{"rule": "exec.run:terraform destroy*", "on": true, "node_id": "n1"}],
+            })
+        );
+        // Read back it is the same list.
+        let back: CheckerConfig = serde_json::from_value(saved).unwrap();
+        assert_eq!(back, c);
+    }
+
+    /// The built-ins come from the code on every load: one the stored part
+    /// does not name is there and on (a later release's new entry), a stored
+    /// choice applies to the code's pattern of that id (a changed pattern
+    /// keeps the owner's choice), a removed one stays removed, and a choice
+    /// for an id the code no longer has is ignored and not saved again.
+    #[test]
+    fn the_builtins_come_from_the_code_with_the_owners_choices() {
+        let stored = r#"{"blocklist": {
+            "builtins": {"rm-root": {"on": false, "off_for": ["n2"]},
+                         "nsenter": {"removed": true},
+                         "dropped-in-a-later-release": {"on": false}},
+            "own": [{"rule": "exec.run:terraform destroy*", "on": true, "builtin": true, "id": "x"}]}}"#;
+        let c: CheckerConfig = serde_json::from_str(stored).unwrap();
+        let d = default_blocklist();
+        assert_eq!(c.blocklist.len(), d.len() - 1 + 1);
+        let root = c.blocklist.iter().find(|e| e.id == "rm-root").unwrap();
+        assert_eq!(root.rule, d[0].rule);
+        assert!(!root.on);
+        assert_eq!(root.off_for, ["n2"]);
+        assert!(!c.blocklist.iter().any(|e| e.id == "nsenter"));
+        let mkfs = c.blocklist.iter().find(|e| e.id == "mkfs").unwrap();
+        assert!(mkfs.on && mkfs.off_for.is_empty());
+        // An own entry is the owner's, whatever it claims.
+        let own = c.blocklist.last().unwrap();
+        assert_eq!(own.rule, "exec.run:terraform destroy*");
+        assert!(!own.builtin && own.id.is_empty());
+        let again = serde_json::to_value(&c).unwrap();
+        assert!(
+            again["blocklist"]["builtins"]
+                .get("dropped-in-a-later-release")
+                .is_none(),
+            "{again}"
+        );
+
+        // A posted list carries the built-ins with their id: an old pattern
+        // under an id is replaced by the code's, the choice stays.
+        let mut posted = CheckerConfig::default().view();
+        posted["blocklist"][0]["rule"] = "exec.run:an older pattern".into();
+        posted["blocklist"][0]["on"] = false.into();
+        let c: CheckerConfig = serde_json::from_value(posted).unwrap();
+        assert_eq!(c.blocklist[0].rule, d[0].rule);
+        assert!(!c.blocklist[0].on);
+    }
+
+    /// The form the center saved before (#130): every entry in full, the
+    /// built-ins with `builtin: true` and no id. They are mapped to their ids
+    /// by rule text, keep their on/off and per-node choices, a built-in
+    /// missing from the list stays removed, the owner's own entries stay,
+    /// and saved again no copy of a built-in is left.
+    #[test]
+    fn the_list_saved_before_ids_keeps_the_owners_choices() {
+        let mut old = default_blocklist();
+        old.retain(|e| e.id != "wipefs");
+        for e in &mut old {
+            e.id = String::new();
+            if e.rule == "exec.run:mkfs*" {
+                e.on = false;
+            }
+            if e.rule == "exec.run:rm -rf /" {
+                e.off_for = vec!["n2".into()];
+            }
+        }
+        // A built-in whose pattern the code no longer has is dropped.
+        old.push(BlockEntry::builtin("", "exec.run:an old default", ""));
+        old.push(BlockEntry {
+            id: String::new(),
+            rule: "exec.run:terraform destroy*".into(),
+            on: false,
+            builtin: false,
+            note: "mine".into(),
+            node_id: None,
+            off_for: Vec::new(),
+        });
+        let mut v = serde_json::json!({"blocklist": old});
+        for e in v["blocklist"].as_array_mut().unwrap() {
+            e.as_object_mut().unwrap().remove("id");
+            // main wrote `builtin` for every entry.
+            if e.get("builtin").is_none() {
+                e["builtin"] = false.into();
+            }
+        }
+        let c: CheckerConfig = serde_json::from_value(v).unwrap();
+        let by_id = |id: &str| c.blocklist.iter().find(|e| e.id == id);
+        assert!(!by_id("mkfs").unwrap().on);
+        assert_eq!(by_id("rm-root").unwrap().off_for, ["n2"]);
+        assert!(by_id("wipefs").is_none());
+        assert!(by_id("nsenter").unwrap().on);
+        assert!(
+            !c.blocklist
+                .iter()
+                .any(|e| e.rule == "exec.run:an old default")
+        );
+        let own = c.blocklist.last().unwrap();
+        assert_eq!(
+            (own.rule.as_str(), own.on, own.note.as_str()),
+            ("exec.run:terraform destroy*", false, "mine")
+        );
+        let saved = serde_json::to_value(&c).unwrap();
+        assert_eq!(
+            saved["blocklist"],
+            serde_json::json!({
+                "builtins": {
+                    "mkfs": {"on": false},
+                    "rm-root": {"off_for": ["n2"]},
+                    "wipefs": {"removed": true},
+                },
+                "own": [{"rule": "exec.run:terraform destroy*", "on": false, "note": "mine"}],
+            })
+        );
+    }
+
+    /// A state file with no checker at all reads as the defaults, and so does
+    /// one whose checker has no blocklist.
+    #[test]
+    fn a_state_file_without_a_checker_reads_as_the_defaults() {
+        let s: crate::store::Store =
+            serde_json::from_str(r#"{"center_id": "c", "center_name": "center"}"#).unwrap();
+        assert_eq!(s.checker, CheckerConfig::default());
+        let c: CheckerConfig = serde_json::from_str(r#"{"model_on": true}"#).unwrap();
+        assert_eq!(c.blocklist, default_blocklist());
+    }
+
+    /// Reset to defaults: the page posts the built-in list as it is in the
+    /// code. Every choice for a built-in goes, and so do the owner's own
+    /// entries, as the Reset button says.
+    #[test]
+    fn reset_to_defaults_clears_every_choice_and_the_own_entries() {
+        let mut c = CheckerConfig::default();
+        c.blocklist.retain(|e| e.id != "nsenter");
+        c.blocklist[0].on = false;
+        c.blocklist.push(BlockEntry {
+            id: String::new(),
+            rule: "exec.run:terraform destroy*".into(),
+            on: true,
+            builtin: false,
+            note: String::new(),
+            node_id: None,
+            off_for: Vec::new(),
+        });
+        let mut posted = c.view();
+        posted["blocklist"] = serde_json::to_value(default_blocklist()).unwrap();
+        let mut reset: CheckerConfig = serde_json::from_value(posted).unwrap();
+        reset.settle_blocklist();
+        assert_eq!(reset.blocklist, default_blocklist());
+        assert_eq!(
+            serde_json::to_value(&reset).unwrap()["blocklist"],
+            serde_json::json!({})
+        );
     }
 
     /// The local model has to run when any node has it on, also with the

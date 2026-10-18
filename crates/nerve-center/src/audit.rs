@@ -21,8 +21,11 @@ const FIELD_MAX: usize = 200;
 /// The fields an entry keeps: the event's (docs/dev/spec/protocol.md §7.5), `by`,
 /// which the web UI shows, and the node the center adds. Anything else a
 /// node sends is dropped, so no other field can make an entry large.
-const FIELDS: [&str; 10] = [
+const FIELDS: [&str; 11] = [
     "ts", "cap", "action", "target", "decision", "code", "session", "by", "node_id", "node",
+    // The action checker's own decisions carry this: `{layer, detail}`, both
+    // short and built by the center, so it cannot blow an entry up.
+    "checker",
 ];
 
 #[derive(Debug, Default)]
@@ -82,6 +85,17 @@ fn trim(e: Value) -> Value {
             Value::Number(n) if k == "ts" => Value::Number(n),
             Value::String(s) if k == "target" => nerve_policy::audit::cut_target(&s).into(),
             Value::String(s) if k != "ts" => util::clip(&s, FIELD_MAX).into(),
+            // The checker marker: an object the center built, kept with its
+            // `layer` and `detail` strings clipped.
+            Value::Object(o) if k == "checker" => {
+                let mut m = Map::new();
+                for key in ["layer", "detail"] {
+                    if let Some(Value::String(s)) = o.get(key) {
+                        m.insert(key.into(), util::clip(s, FIELD_MAX).into());
+                    }
+                }
+                Value::Object(m)
+            }
             _ => continue,
         };
         out.insert(k, v);

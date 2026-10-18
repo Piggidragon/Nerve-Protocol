@@ -18,6 +18,10 @@ use nerve_transport::log::{Level, Log, Query, call_line};
 use nerve_transport::tls::ServerIdentity;
 
 use crate::audit::AuditFeed;
+use crate::checker::server::LocalServer;
+use crate::checker::{
+    self, CallInfo, Checker, CheckerConfig, Decision, Endpoint, Layer, ModelSource,
+};
 use crate::link::{Link, SHORT_CALL};
 use crate::pairing::{Codes, Outcome};
 use crate::store::{KeyRotation, NodeRecord, OldKey, Store};
@@ -92,6 +96,12 @@ pub struct Inner {
     dead_after_ms: AtomicU64,
     /// How long a dropped link waits for its resume, in milliseconds.
     grace_ms: AtomicU64,
+    /// The action checker (issue #17), rebuilt when its config changes.
+    checker: Mutex<Arc<Checker>>,
+    /// The local llama-server the checker runs, when the model is on and its
+    /// source is local; kept across unrelated rebuilds, keyed by `local_sig`.
+    local_model: Mutex<Option<Arc<LocalServer>>>,
+    local_sig: Mutex<String>,
 }
 
 /// A line that may repeat: logged at most once in `QUIET_FOR`, with the count
@@ -136,11 +146,24 @@ pub struct Session {
     pub calls: AtomicU64,
     /// Nodes this session called, for `session.end`.
     nodes: Mutex<BTreeSet<String>>,
+    /// The session is tainted: a call of it returned outside content (a
+    /// successful `read`, `sense` or `execute`). The action checker's model
+    /// may be told, and its "only tainted sessions" scope acts on it.
+    tainted: AtomicBool,
 }
 
 impl Session {
     pub fn ended(&self) -> bool {
         self.ended.load(Ordering::SeqCst)
+    }
+
+    /// Whether the session is tainted (an earlier call returned content).
+    pub fn tainted(&self) -> bool {
+        self.tainted.load(Ordering::SeqCst)
+    }
+
+    fn set_tainted(&self) {
+        self.tainted.store(true, Ordering::SeqCst);
     }
 }
 
@@ -293,7 +316,7 @@ impl Center {
         let pin = public_url.tls.then(|| identity.pin());
         let server_config = identity.server_config()?;
         let (changes, _) = broadcast::channel(64);
-        Ok(Center(Arc::new(Inner {
+        let center = Center(Arc::new(Inner {
             dir,
             public_url,
             pin: Mutex::new(pin),
@@ -315,7 +338,17 @@ impl Center {
             pair_log: Mutex::new(Quiet::default()),
             dead_after_ms: AtomicU64::new(crate::link::DEAD_AFTER.as_millis() as u64),
             grace_ms: AtomicU64::new(nerve_proto::resume::GRACE.as_millis() as u64),
-        })))
+            checker: Mutex::new(Arc::new(Checker::build(
+                CheckerConfig::default(),
+                None,
+            ))),
+            local_model: Mutex::new(None),
+            local_sig: Mutex::new(String::new()),
+        }));
+        // Build the checker from the stored config and the endpoint token,
+        // and start the local model if it is on.
+        center.rebuild_checker();
+        Ok(center)
     }
 
     pub fn dir(&self) -> &Path {
@@ -1809,6 +1842,7 @@ impl Center {
             ended: AtomicBool::new(false),
             calls: AtomicU64::new(0),
             nodes: Mutex::new(BTreeSet::new()),
+            tainted: AtomicBool::new(false),
         });
         self.sessions
             .lock()
@@ -1875,6 +1909,7 @@ impl Center {
                     "started_ms": s.started_ms,
                     "calls": s.calls.load(Ordering::SeqCst),
                     "nodes": nodes,
+                    "tainted": s.tainted(),
                 })
             })
             .collect();
@@ -2051,6 +2086,12 @@ impl Center {
         let started = Instant::now();
         let out = self.call_inner(sess, route, args).await;
         let ms = started.elapsed().as_millis() as u64;
+        // A call that returned outside content taints the session, so the
+        // model's "only tainted sessions" scope and its state can take it in.
+        if out.is_ok() && self.checker().taint_on() && checker::taints(route.effect) {
+            sess.set_tainted();
+            self.changed(Change::Sessions);
+        }
         let code = match &out {
             Ok(_) => None,
             Err(CallError::Rpc(e)) => Some(e.kind().as_str().to_string()),
@@ -2094,6 +2135,47 @@ impl Center {
                 format!("the node {} is disabled in the center", route.node_name),
             )
             .into());
+        }
+        // The action checker (issue #17): the center's own gate, before the
+        // node. It can only refuse; the node's policy still decides what it
+        // lets through (design rule 1).
+        let checker = self.checker();
+        let os = self.read(|s| {
+            s.nodes
+                .get(&route.node_id)
+                .map(|n| n.platform.clone())
+                .unwrap_or_default()
+        });
+        let tainted = checker.taint_on() && sess.tainted();
+        let target = checker_target(route, &args);
+        let endpoint = self.resolved_endpoint(&checker);
+        let info = CallInfo {
+            cap: &route.cap,
+            action: &route.action,
+            effect: route.effect,
+            target: &target,
+            args: &args,
+            node_id: &route.node_id,
+            os: &os,
+            tainted,
+        };
+        match checker.check(&info, endpoint.as_ref()).await {
+            Decision::Refuse {
+                layer,
+                detail,
+                message,
+            } => {
+                self.audit_checker(sess, route, &target, "forbidden", layer, &detail);
+                return Err(RpcError::forbidden(message).into());
+            }
+            Decision::Allowed { detail } => {
+                self.audit_checker(sess, route, &target, "allowed", Layer::AllowRule, &detail);
+            }
+            Decision::Pass { note } => {
+                if let Some(n) = note {
+                    self.note(Level::Debug, Some(&route.node_id), format!("action checker: {n}"));
+                }
+            }
         }
         let link = self.link(&route.node_id).ok_or_else(|| {
             RpcError::new(
@@ -2214,6 +2296,210 @@ impl Center {
             }
             json!({"retention_days": s.retention_days, "total": total, "nodes": nodes})
         })
+    }
+
+    // ---- Action checker (issue #17, docs/dev/action-checker.md) ----
+
+    /// The checker as it is now.
+    pub fn checker(&self) -> Arc<Checker> {
+        self.checker.lock().unwrap().clone()
+    }
+
+    /// The file that holds the model endpoint's bearer token (a secret, so
+    /// not in `state.json`), mode 0600 in the state folder.
+    fn checker_token_path(&self) -> PathBuf {
+        self.dir.join("checker-model.token")
+    }
+
+    /// The endpoint token, or `None` when none is set.
+    pub fn checker_token(&self) -> Option<String> {
+        std::fs::read_to_string(self.checker_token_path())
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Whether an endpoint token is set (the UI never shows the token itself).
+    pub fn checker_has_token(&self) -> bool {
+        self.checker_token().is_some()
+    }
+
+    /// Sets or clears the endpoint token.
+    pub fn set_checker_token(&self, token: Option<&str>) -> Result<(), String> {
+        let path = self.checker_token_path();
+        match token.map(str::trim).filter(|t| !t.is_empty()) {
+            Some(t) => nerve_transport::files::write_private(&path, t.as_bytes())
+                .map_err(|e| format!("cannot write the model token: {e}")),
+            None => match std::fs::remove_file(&path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    Err(format!("cannot remove the model token: {e}"))
+                }
+                _ => Ok(()),
+            },
+        }
+    }
+
+    /// Rebuilds the checker from the stored config and the token, and brings
+    /// the local model up or down to match. Called at start and after every
+    /// change to the checker config.
+    pub fn rebuild_checker(&self) {
+        let cfg = self.read(|s| s.checker.clone());
+        self.manage_local_model(&cfg);
+        let checker = Checker::build(cfg, self.checker_token());
+        for why in &checker.rejected {
+            self.log.record(
+                Level::Warn,
+                None,
+                &format!("the action checker left out a rule it could not parse: {why}"),
+            );
+        }
+        *self.checker.lock().unwrap() = Arc::new(checker);
+    }
+
+    /// Starts, stops or keeps the local llama-server to match `cfg`. The
+    /// server is keyed by the local settings, so an unrelated change does not
+    /// restart it (and swap the owner's model out or re-download).
+    fn manage_local_model(&self, cfg: &CheckerConfig) {
+        let want = cfg.model_on && cfg.model.source == ModelSource::Local;
+        let sig = if want {
+            format!(
+                "{}|{}|{}|{}|{}",
+                cfg.model.llama_server,
+                cfg.model.hf_repo,
+                cfg.model.model_file,
+                cfg.model.gpu_layers,
+                cfg.model.threads
+            )
+        } else {
+            String::new()
+        };
+        if *self.local_sig.lock().unwrap() == sig {
+            return;
+        }
+        // Starting a server needs a runtime; without one (an off-runtime
+        // open, as in a test) leave it for the next change inside the server.
+        if want && tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        // Drop the old one (its Drop ends the process), then start the new.
+        *self.local_model.lock().unwrap() = None;
+        if want {
+            match LocalServer::start(&cfg.model, &self.dir) {
+                Ok(srv) => {
+                    *self.local_model.lock().unwrap() = Some(Arc::new(srv));
+                    self.log.record(
+                        Level::Info,
+                        None,
+                        "the action checker is starting its local decision model",
+                    );
+                }
+                Err(e) => self.log.record(
+                    Level::Warn,
+                    None,
+                    &format!("the action checker cannot start its local model: {e}"),
+                ),
+            }
+        }
+        *self.local_sig.lock().unwrap() = sig;
+    }
+
+    /// The model endpoint to use now: the owner's endpoint, or the local
+    /// server's once it is ready. `None` when the model is on but not
+    /// reachable (the checker then fails closed, or logs, by its setting).
+    fn resolved_endpoint(&self, checker: &Checker) -> Option<Endpoint> {
+        match checker.model_source() {
+            ModelSource::Endpoint => checker.endpoint().cloned(),
+            ModelSource::Local => {
+                let srv = self.local_model.lock().unwrap().clone()?;
+                srv.ready().then(|| srv.endpoint())
+            }
+        }
+    }
+
+    /// The local model's status for the UI, or `None` when there is no local
+    /// server running.
+    pub fn local_model_status(&self) -> Option<crate::checker::server::Status> {
+        self.local_model.lock().unwrap().as_ref().map(|s| s.status())
+    }
+
+    /// Replaces the checker config (after the UI validated the change),
+    /// saves it, rebuilds the checker and tells the UI. `clear_taint` clears
+    /// every session's taint mark, for when taint is switched off.
+    pub fn set_checker_config(&self, cfg: CheckerConfig, clear_taint: bool) {
+        self.update(|s| s.checker = cfg);
+        if clear_taint {
+            for s in self.sessions.lock().unwrap().values() {
+                s.tainted.store(false, Ordering::SeqCst);
+            }
+        }
+        self.rebuild_checker();
+        self.changed(Change::Nodes);
+        self.changed(Change::Sessions);
+    }
+
+    /// Adds a checker audit entry (a center decision) to the feed and the log.
+    fn audit_checker(
+        &self,
+        sess: &Arc<Session>,
+        route: &Route,
+        target: &str,
+        decision: &str,
+        layer: Layer,
+        detail: &str,
+    ) {
+        let node = self.node_name(&route.node_id);
+        let mut e = Map::new();
+        e.insert("ts".into(), json!(now_ms()));
+        e.insert("cap".into(), json!(route.cap));
+        e.insert("action".into(), json!(route.action));
+        e.insert("target".into(), json!(target));
+        e.insert("decision".into(), json!(decision));
+        if decision == "forbidden" {
+            e.insert("code".into(), json!("forbidden"));
+        }
+        e.insert("session".into(), json!(sess.id));
+        e.insert("by".into(), json!("action checker"));
+        e.insert("node_id".into(), json!(route.node_id));
+        e.insert("node".into(), json!(node));
+        e.insert(
+            "checker".into(),
+            json!({"layer": layer.as_str(), "detail": detail}),
+        );
+        self.audit.lock().unwrap().push(Value::Object(e));
+        self.changed(Change::Audit);
+        let (level, verb) = if decision == "forbidden" {
+            (Level::Warn, "refused")
+        } else {
+            (Level::Info, "allowed")
+        };
+        self.note(
+            level,
+            Some(&route.node_id),
+            format!(
+                "the action checker {verb} {}.{} by its {} ({detail})",
+                route.cap,
+                route.action,
+                layer.as_str()
+            ),
+        );
+    }
+}
+
+/// What the checker matches on: the command line for `exec.run`, the path for
+/// an `fs` action, else `<cap>.<action>`.
+fn checker_target(route: &Route, args: &Map<String, Value>) -> String {
+    match (route.cap.as_str(), route.action.as_str()) {
+        ("exec", "run") => args
+            .get("command")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        ("fs", _) => args
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        _ => format!("{}.{}", route.cap, route.action),
     }
 }
 

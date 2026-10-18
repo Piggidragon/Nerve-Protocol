@@ -1460,3 +1460,28 @@ select.input {
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+.pbar {
+  position: relative;
+  height: 18px;
+  margin: 4px 0 8px;
+  border: 1px solid rgb(var(--line));
+  border-radius: 9px;
+  background: rgb(var(--raised) / 0.6);
+  overflow: hidden;
+}
+
+.pbar .pfill {
+  height: 100%;
+  background: rgb(var(--accent) / 0.5);
+  transition: width 0.3s;
+}
+
+.pbar .pct {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+}

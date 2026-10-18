@@ -1,11 +1,11 @@
-//! The local `llama-server` the center can run itself (docs/dev/action-checker.md).
+//! The local `llama-server` the center runs itself (docs/dev/action-checker.md).
 //!
-//! The center does not download llama.cpp; the owner points at a build (or
-//! one on `PATH`). The server listens on `127.0.0.1` on a free port, CPU only
-//! by default, and llama-server downloads the model (`-hf`) into a cache under
-//! the center's state folder. The center checks `/v1/models` says `decisions`
-//! and refuses a non-decision model. A server that dies is restarted with
-//! backoff; it ends with the center, with no orphan.
+//! The center installs a prebuilt `llama-server` and the d1-3B model into its
+//! state folder ([`super::install`]) and runs it from there. The server
+//! listens on `127.0.0.1` on a free port, on the CPU or (the Vulkan build) the
+//! GPU. The center checks `/v1/models` says `decisions` and refuses a
+//! non-decision model. A server that dies is restarted with backoff; it ends
+//! with the center, with no orphan.
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -17,7 +17,6 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::task::JoinHandle;
 
-use super::config::ModelConfig;
 use super::model::{self, Endpoint};
 
 /// How far along the local server is, for the UI.
@@ -68,33 +67,25 @@ impl Drop for LocalServer {
 }
 
 impl LocalServer {
-    /// Starts the supervisor for `cfg` in `state_dir`. The model cache goes
-    /// under the state folder (`LLAMA_CACHE`). It returns at once; the status
-    /// moves from starting to ready (or failed) as the server comes up.
-    pub fn start(cfg: &ModelConfig, state_dir: &Path) -> Result<LocalServer, String> {
-        if cfg.hf_repo.is_empty() && cfg.model_file.is_empty() {
-            return Err("set a model to download (-hf) or a local model file".into());
+    /// Starts the supervisor for the installed `llama-server` at `bin` with
+    /// the installed `model`, on the GPU (all layers, the Vulkan build) or the
+    /// CPU. It returns at once; the status moves from starting to ready (or
+    /// failed) as the server comes up. The model is already on disk (the
+    /// one-click install fetched it), so there is no download at start.
+    pub fn start(
+        bin: PathBuf,
+        model: PathBuf,
+        gpu: bool,
+        timeout_ms: u64,
+    ) -> Result<LocalServer, String> {
+        if !bin.exists() {
+            return Err("the local model is not installed".into());
         }
         let port = free_port()?;
         let inner = Arc::new(Mutex::new(Inner::default()));
-        let args = build_args(cfg, port);
-        let program = if cfg.llama_server.is_empty() {
-            "llama-server".to_string()
-        } else {
-            cfg.llama_server.clone()
-        };
-        let cache = state_dir.join("model-cache");
-        let gpu = cfg.gpu_layers;
-        let timeout = Duration::from_millis(cfg.timeout_ms.max(100));
-        let task = tokio::spawn(supervise(
-            program,
-            args,
-            cache,
-            gpu,
-            port,
-            timeout,
-            inner.clone(),
-        ));
+        let args = build_args(&model, gpu, port);
+        let timeout = Duration::from_millis(timeout_ms.max(100));
+        let task = tokio::spawn(supervise(bin, args, port, timeout, inner.clone()));
         Ok(LocalServer { inner, port, task })
     }
 
@@ -119,30 +110,20 @@ impl LocalServer {
     }
 }
 
-/// The llama-server command line (without the program itself), CPU only
-/// unless the owner set GPU layers.
-fn build_args(cfg: &ModelConfig, port: u16) -> Vec<String> {
-    let mut args = vec![
+/// The llama-server command line (without the program itself): the installed
+/// model file, and all layers on the GPU or none (CPU only).
+fn build_args(model: &Path, gpu: bool, port: u16) -> Vec<String> {
+    vec![
+        "-m".into(),
+        model.to_string_lossy().into_owned(),
         "--host".into(),
         "127.0.0.1".into(),
         "--port".into(),
         port.to_string(),
         "-ngl".into(),
-        cfg.gpu_layers.to_string(),
-    ];
-    if cfg.threads > 0 {
-        args.push("-t".into());
-        args.push(cfg.threads.to_string());
-    }
-    if !cfg.hf_repo.is_empty() {
-        args.push("-hf".into());
-        args.push(cfg.hf_repo.clone());
-    }
-    if !cfg.model_file.is_empty() {
-        args.push("-m".into());
-        args.push(cfg.model_file.clone());
-    }
-    args
+        // 999 puts every layer on the GPU; 0 keeps it on the CPU.
+        if gpu { "999".into() } else { "0".into() },
+    ]
 }
 
 /// A free loopback port: bind to port 0, read the port, and drop the
@@ -156,10 +137,8 @@ fn free_port() -> Result<u16, String> {
 /// Runs the server, restarting it with backoff until the task is aborted. A
 /// non-decision model is a reason not to restart.
 async fn supervise(
-    program: String,
+    program: PathBuf,
     args: Vec<String>,
-    cache: PathBuf,
-    _gpu: u32,
     port: u16,
     timeout: Duration,
     inner: Arc<Mutex<Inner>>,
@@ -170,7 +149,7 @@ async fn supervise(
             i.phase = Some(Phase::Starting);
             i.url = None;
         });
-        match run_once(&program, &args, &cache, port, timeout, &inner).await {
+        match run_once(&program, &args, port, timeout, &inner).await {
             RunEnd::NotDecision => {
                 // A clear, final failure: do not restart.
                 return;
@@ -179,7 +158,7 @@ async fn supervise(
             RunEnd::StartFailed(e) => {
                 set(&inner, |i| {
                     i.phase = Some(Phase::Failed);
-                    i.message = format!("cannot start {program}: {e}");
+                    i.message = format!("cannot start {}: {e}", program.display());
                 });
             }
         }
@@ -199,19 +178,14 @@ enum RunEnd {
 }
 
 async fn run_once(
-    program: &str,
+    program: &PathBuf,
     args: &[String],
-    cache: &Path,
     port: u16,
     timeout: Duration,
     inner: &Arc<Mutex<Inner>>,
 ) -> RunEnd {
     let mut cmd = Command::new(program);
     cmd.args(args)
-        .env("LLAMA_CACHE", cache)
-        // The owner's own model server is on the GPUs; the local checker
-        // model never touches them.
-        .env("CUDA_VISIBLE_DEVICES", "")
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -309,18 +283,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn args_are_cpu_only_by_default() {
-        let cfg = ModelConfig {
-            hf_repo: "LiquidAI/d1-3B-GGUF:Q4_K_M".into(),
-            ..Default::default()
-        };
-        let args = build_args(&cfg, 12345);
-        assert!(args.windows(2).any(|w| w == ["-ngl", "0"]));
-        assert!(args.windows(2).any(|w| w == ["--port", "12345"]));
+    fn cpu_and_gpu_args() {
+        let model = std::path::Path::new("/s/checker/model/d1-3B-Q4_K_M.gguf");
+        let cpu = build_args(model, false, 12345);
+        assert!(cpu.windows(2).any(|w| w == ["-ngl", "0"]));
+        assert!(cpu.windows(2).any(|w| w == ["--port", "12345"]));
         assert!(
-            args.windows(2)
-                .any(|w| w == ["-hf", "LiquidAI/d1-3B-GGUF:Q4_K_M"])
+            cpu.windows(2)
+                .any(|w| w == ["-m", "/s/checker/model/d1-3B-Q4_K_M.gguf"])
         );
+        let gpu = build_args(model, true, 12345);
+        assert!(gpu.windows(2).any(|w| w == ["-ngl", "999"]));
     }
 
     #[test]

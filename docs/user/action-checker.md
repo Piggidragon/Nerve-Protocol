@@ -97,17 +97,22 @@ text generated, so a judgement is fast and cheap. There are two sources:
   in a file of its own in the state folder and is never shown back. It is a
   secret, so it is **not** in a center backup (as `state.json` holds no
   secrets); after a restore, enter the token again.
-- **A llama-server the center runs.** The center starts `llama-server` itself
-  (from `PATH`, or a path you set — the center does not download llama.cpp; you
-  need a build with the `/v1/systemone` endpoint). Give a model to download
-  (`-hf <repo>:<quant>`, cached under the state folder) or a local model file.
-  It listens on loopback, on the CPU by default (GPU layers and threads are
-  settings). The center checks the model is a decision model and refuses one
-  that is not. The page shows the server's state (starting, downloading, ready
-  or failed) and the last lines of its output.
+- **A local model the center installs for you.** Press **Install on CPU** (or
+  **Install on GPU**, offered when the machine has a GPU). The center downloads
+  a prebuilt `llama-server` from llama.cpp's GitHub release and the **LiquidAI
+  d1-3B** model from Hugging Face into its own state folder — never
+  system-wide — checks each against a pinned SHA-256, unpacks it, and runs it on
+  loopback. There is no model, path or build to choose: it is d1-3B only (for
+  another model or your own llama.cpp, use the endpoint source). GPU uses the
+  Vulkan build (NVIDIA, AMD or Intel); if it cannot start, the page says so and
+  you switch to CPU with one click. The page shows a progress bar for the
+  download, then the server's state (starting, ready or failed) with the last
+  lines of its output. **Remove** deletes the downloaded files. A machine with
+  no prebuilt model for it says so and points you to the endpoint source.
 
-The default local model is **LiquidAI d1-3B** (Q4_K_M). Its licence is the
-**LFM Open License v1.0**, not Apache; check it suits you before you use it.
+The local model is **LiquidAI d1-3B** (Q4_K_M). Its licence is the **LFM Open
+License v1.0**, not Apache; it is named next to the install button — check it
+suits you before you install.
 
 **Settings:**
 

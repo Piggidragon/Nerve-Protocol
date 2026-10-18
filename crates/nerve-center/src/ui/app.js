@@ -733,11 +733,6 @@ function modelCard(cfg, meta) {
   const endpointUrl = el("input", { class: "input mono", value: m.endpoint_url, placeholder: "https://host:9931" });
   const endpointModel = el("input", { class: "input mono", value: m.endpoint_model, placeholder: "jev-latest (optional)" });
   const token = el("input", { class: "input", type: "password", placeholder: meta.has_token ? "a token is set — type to replace" : "optional bearer token", autocomplete: "off" });
-  const llama = el("input", { class: "input mono", value: m.llama_server, placeholder: "llama-server (from PATH when empty)" });
-  const hf = el("input", { class: "input mono", value: m.hf_repo, placeholder: meta.default_hf });
-  const modelFile = el("input", { class: "input mono", value: m.model_file, placeholder: "/path/to/model.gguf (instead of -hf)" });
-  const gpu = el("input", { class: "input num", type: "number", min: "0", value: m.gpu_layers });
-  const threads = el("input", { class: "input num", type: "number", min: "0", value: m.threads });
   const threshold = el("input", { class: "input num", type: "number", min: "0", max: "1", step: "0.01", value: m.threshold });
   const timeout = el("input", { class: "input num", type: "number", min: "100", value: m.timeout_ms });
   let scope = m.scope;
@@ -751,11 +746,6 @@ function modelCard(cfg, meta) {
     m.source = source;
     m.endpoint_url = endpointUrl.value.trim();
     m.endpoint_model = endpointModel.value.trim();
-    m.llama_server = llama.value.trim();
-    m.hf_repo = hf.value.trim();
-    m.model_file = modelFile.value.trim();
-    m.gpu_layers = Number(gpu.value) || 0;
-    m.threads = Number(threads.value) || 0;
     m.threshold = Number(threshold.value);
     m.timeout_ms = Number(timeout.value);
     m.scope = scope;
@@ -773,12 +763,7 @@ function modelCard(cfg, meta) {
     el("div", { class: "form-row" }, field("Endpoint URL", endpointUrl), field("Model name", endpointModel)),
     el("div", { class: "form-row" }, field("Bearer token (kept secret, never shown back)", token),
       meta.has_token ? el("span", { class: "push" }, btn("Clear token", "ghost", act(async () => { await api("POST", "/api/checker/token", { token: null }); await loadChecker(); }), "trash")) : null));
-  const localDiv = el("div", {},
-    el("div", { class: "form-row" }, field("llama-server program", llama)),
-        el("div", { class: "form-row" }, field("Model to download (-hf repo:quant)", hf), field("or a local model file (-m)", modelFile)),
-        el("div", { class: "form-row" }, field("GPU layers (0 = CPU only)", gpu), field("Threads (0 = auto)", threads)),
-    el("p", { class: "meta" }, `The default model is ${meta.default_hf}. Its licence is the ${meta.licence} (not Apache). The center does not download llama.cpp; point at a build or put llama-server on PATH.`),
-    localStatus(state.checker.meta.local));
+  const localDiv = el("div", {}, localInstall(meta));
   const showSource = () => { epDiv.hidden = source !== "endpoint"; localDiv.hidden = source !== "local"; };
   showSource();
   return section("Decision model", "An optional System One model that answers, in one pass, whether a call is dangerous. At or above the threshold the call is refused. An unreachable model refuses the call (fail closed) unless you switch that off below.", null,
@@ -796,17 +781,66 @@ function modelCard(cfg, meta) {
         btn("Reset the question", "ghost", resetQuestion, "refresh"))));
 }
 
-// The local server's live state. The container is kept so a poll can refresh
-// it in place, without rebuilding the form (and losing half-typed fields).
+// The local model: a one-click install of llama.cpp and d1-3B, then the
+// running status. The container is kept so a poll can refresh it in place
+// without rebuilding the form.
 let checkerStatusEl = null;
-function localStatus(s) {
+const INSTALLING = ["downloading", "unpacking", "verifying"];
+function localInstall(meta) {
   checkerStatusEl = el("div", {});
-  checkerStatusEl.replaceChildren(...localStatusParts(s));
+  checkerStatusEl.replaceChildren(...localInstallParts(meta));
   return checkerStatusEl;
 }
 
+const bar = (p) => {
+  const pct = p && p.total ? Math.min(100, Math.round((100 * p.done) / p.total)) : 0;
+  return el("div", { class: "pbar" }, el("div", { class: "pfill", style: `width:${pct}%` }), el("span", { class: "pct" }, `${pct}%`));
+};
+
+function localInstallParts(meta) {
+  const licence = el("p", { class: "meta" }, `The local model is ${meta.model_name}. Its licence is the ${meta.licence} (not Apache). The center downloads and runs llama.cpp and the model itself, in its own state folder.`);
+  if (!meta.platform_supported) {
+    return [licence, banner("warn", "alert", "This machine has no prebuilt local model for it. Use a System One endpoint instead (the other source above).")];
+  }
+  const inst = meta.install || { phase: "idle" };
+  const installing = INSTALLING.includes(inst.phase);
+  if (installing) {
+    return [licence, el("div", { class: "card" },
+      el("div", { class: "card-top" }, icon("download"), el("span", { class: "name" }, "Installing the local model"), pill("warn", inst.phase)),
+      el("p", { class: "meta" }, "llama.cpp"), bar(inst.llama),
+      el("p", { class: "meta" }, "model (about 1.7 GB)"), bar(inst.model),
+      inst.message ? el("p", { class: "meta" }, inst.message) : null)];
+  }
+  if (meta.installed) {
+    const dev = (state.checker.cfg.model.local_gpu) ? "GPU" : "CPU";
+    const other = dev === "GPU" ? "CPU" : "GPU";
+    const reinstall = (gpu) => act(async () => { await api("POST", "/api/checker/install", { gpu }); await loadChecker(); });
+    return [licence,
+      el("div", { class: "actions" },
+        el("span", { class: "meta" }, `Installed, running on the ${dev}.`),
+        meta.gpu_hint || dev === "GPU" ? btn(`Switch to ${other}`, "ghost", reinstall(other === "GPU")) : null,
+        btn("Remove", "danger", act(async () => {
+          const yes = await modal({ title: "Remove the local model?", message: "Deletes the downloaded llama.cpp and model files. You can install them again later.", confirm: "Remove", danger: true });
+          if (yes) { await api("POST", "/api/checker/remove"); await loadChecker(); }
+        }), "trash")),
+      ...localStatusParts(meta.local)];
+  }
+  if (inst.phase === "failed") {
+    return [licence, banner("down", "alert", `The last install failed: ${inst.message || "unknown error"}`), installButtons(meta)];
+  }
+  return [licence, installButtons(meta)];
+}
+
+function installButtons(meta) {
+  const install = (gpu) => act(async () => { await api("POST", "/api/checker/install", { gpu }); await loadChecker(); });
+  return el("div", { class: "actions" },
+    btn("Install on CPU", "primary", install(false), "download"),
+    meta.gpu_hint ? btn("Install on GPU", "primary", install(true), "download") : null,
+    el("span", { class: "meta" }, meta.gpu_hint ? "GPU uses the Vulkan build (NVIDIA, AMD or Intel)." : "No GPU detected; CPU only."));
+}
+
 function localStatusParts(s) {
-  if (!s) return [el("p", { class: "meta" }, "The local model is not running. Turn the model on (above) with the local source to start it.")];
+  if (!s) return [el("p", { class: "meta" }, "The model is installed but not running. Turn the model on (the switch at the top).")];
   const tone = s.phase === "ready" ? "up" : s.phase === "failed" ? "down" : "warn";
   return [el("div", { class: "card" },
     el("div", { class: "card-top" }, el("span", { class: "dot" + (s.phase === "ready" ? " up" : "") }), el("span", { class: "name" }, "Local model"), pill(tone, s.phase)),
@@ -815,14 +849,19 @@ function localStatusParts(s) {
     s.output && s.output.length ? el("pre", { class: "logbox mono" }, s.output.join("\n")) : null)];
 }
 
-// Polls just the local model's status, so the Action checker page shows it
-// move from starting to ready without redrawing the form.
+// Polls the install progress and the running status, so the page shows them
+// move along without rebuilding the form. A phase change that adds or removes
+// buttons (install finished, removed) triggers one redraw.
 async function pollCheckerLocal() {
   if (!state.checker || !checkerStatusEl) return;
   const r = await api("GET", "/api/checker");
   if (current() !== "checker" || !checkerStatusEl) return;
-  state.checker.meta.local = r.local;
-  checkerStatusEl.replaceChildren(...localStatusParts(r.local));
+  const was = state.checker.meta;
+  const changed = was.installed !== r.installed
+    || (was.install && was.install.phase) !== (r.install && r.install.phase);
+  state.checker.meta = r;
+  if (changed) { draw(true); return; }
+  checkerStatusEl.replaceChildren(...localInstallParts(r));
 }
 
 // ---- Log ----

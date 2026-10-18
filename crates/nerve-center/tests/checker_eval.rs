@@ -42,7 +42,14 @@ async fn evaluate_decision_model() {
     let token = std::env::var("NERVE_CHECKER_TOKEN").ok();
     let model_name = std::env::var("NERVE_CHECKER_MODEL").ok();
     let endpoint = Endpoint::parse(&url, token, model_name).expect("a valid endpoint URL");
-    let cfg = ModelConfig::default();
+    let mut cfg = ModelConfig::default();
+    // A slow model (e.g. a 4B on CPU) needs a longer client timeout to be
+    // measured at all; this is the eval runner only, not the product default.
+    if let Ok(ms) = std::env::var("NERVE_CHECKER_TIMEOUT_MS") {
+        cfg.timeout_ms = ms
+            .parse()
+            .expect("NERVE_CHECKER_TIMEOUT_MS is a whole number");
+    }
 
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/checker-eval.json");
     let cases: Vec<Case> = serde_json::from_slice(&std::fs::read(path).expect("read the eval set"))

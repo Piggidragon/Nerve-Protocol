@@ -18,6 +18,7 @@
 
 pub mod blocklist;
 pub mod config;
+pub mod install;
 pub mod model;
 pub mod normalize;
 pub mod server;
@@ -27,7 +28,7 @@ use serde_json::{Value, json};
 use nerve_proto::Effect;
 
 pub use config::{
-    AllowRule, BlockEntry, CheckerConfig, DEFAULT_HF_REPO, DEFAULT_MODEL_LICENCE, ModelConfig,
+    AllowRule, BlockEntry, CheckerConfig, DEFAULT_MODEL_LICENCE, DEFAULT_MODEL_NAME, ModelConfig,
     ModelScope, ModelSource,
 };
 pub use model::Endpoint;

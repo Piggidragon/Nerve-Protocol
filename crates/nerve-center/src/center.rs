@@ -21,7 +21,7 @@ use crate::audit::AuditFeed;
 use crate::checker::blocklist::Rule;
 use crate::checker::server::LocalServer;
 use crate::checker::{
-    self, AllowRule, CallInfo, Checker, CheckerConfig, DEFAULT_HF_REPO, DEFAULT_MODEL_LICENCE,
+    self, AllowRule, CallInfo, Checker, CheckerConfig, DEFAULT_MODEL_LICENCE, DEFAULT_MODEL_NAME,
     Decision, Endpoint, Layer, ModelSource,
 };
 use crate::link::{Link, SHORT_CALL};
@@ -104,6 +104,8 @@ pub struct Inner {
     /// source is local; kept across unrelated rebuilds, keyed by `local_sig`.
     local_model: Mutex<Option<Arc<LocalServer>>>,
     local_sig: Mutex<String>,
+    /// The one-click install's progress (llama.cpp and the model download).
+    install: checker::install::Shared,
 }
 
 /// A line that may repeat: logged at most once in `QUIET_FOR`, with the count
@@ -343,6 +345,7 @@ impl Center {
             checker: Mutex::new(Arc::new(Checker::build(CheckerConfig::default(), None))),
             local_model: Mutex::new(None),
             local_sig: Mutex::new(String::new()),
+            install: Arc::new(Mutex::new(checker::install::Status::default())),
         }));
         // Build the checker from the stored config and the endpoint token,
         // and start the local model if it is on.
@@ -2351,20 +2354,16 @@ impl Center {
         *self.checker.lock().unwrap() = Arc::new(checker);
     }
 
-    /// Starts, stops or keeps the local llama-server to match `cfg`. The
-    /// server is keyed by the local settings, so an unrelated change does not
-    /// restart it (and swap the owner's model out or re-download).
+    /// Starts, stops or keeps the local llama-server to match `cfg`. It runs
+    /// only when the model is on, its source is local, and the one-click
+    /// install put the build and the model in place. Keyed by the CPU/GPU
+    /// choice and whether it is installed, so an unrelated change does not
+    /// restart it.
     fn manage_local_model(&self, cfg: &CheckerConfig) {
-        let want = cfg.model_on && cfg.model.source == ModelSource::Local;
+        let installed = checker::install::installed(&self.dir);
+        let want = cfg.model_on && cfg.model.source == ModelSource::Local && installed;
         let sig = if want {
-            format!(
-                "{}|{}|{}|{}|{}",
-                cfg.model.llama_server,
-                cfg.model.hf_repo,
-                cfg.model.model_file,
-                cfg.model.gpu_layers,
-                cfg.model.threads
-            )
+            format!("gpu={}|installed", cfg.model.local_gpu)
         } else {
             String::new()
         };
@@ -2379,13 +2378,22 @@ impl Center {
         // Drop the old one (its Drop ends the process), then start the new.
         *self.local_model.lock().unwrap() = None;
         if want {
-            match LocalServer::start(&cfg.model, &self.dir) {
+            let bin = checker::install::server_bin(&self.dir);
+            let model = checker::install::model_path(&self.dir);
+            match bin
+                .ok_or_else(|| "the local model is not installed".to_string())
+                .and_then(|bin| {
+                    LocalServer::start(bin, model, cfg.model.local_gpu, cfg.model.timeout_ms)
+                }) {
                 Ok(srv) => {
                     *self.local_model.lock().unwrap() = Some(Arc::new(srv));
                     self.log.record(
                         Level::Info,
                         None,
-                        "the action checker is starting its local decision model",
+                        &format!(
+                            "the action checker is starting its local decision model on the {}",
+                            if cfg.model.local_gpu { "GPU" } else { "CPU" }
+                        ),
                     );
                 }
                 Err(e) => self.log.record(
@@ -2437,19 +2445,97 @@ impl Center {
     }
 
     /// What the web UI's Action checker page reads: the config (no token),
-    /// whether a token is set, the default model's licence and repo, the
-    /// local model's status, and rules that did not parse.
+    /// whether a token is set, the default model and its licence, the
+    /// one-click install's state and the running model's status, the
+    /// platform/GPU support, and rules that did not parse.
     pub fn checker_json(&self) -> Value {
         let cfg = self.read(|s| s.checker.clone());
         json!({
             "config": cfg,
             "has_token": self.checker_has_token(),
             "licence": DEFAULT_MODEL_LICENCE,
-            "default_hf": DEFAULT_HF_REPO,
+            "model_name": DEFAULT_MODEL_NAME,
             "default_blocklist": checker::config::default_blocklist(),
             "local": self.local_model_status(),
+            "install": *self.install.lock().unwrap(),
+            "installed": checker::install::installed(&self.dir),
+            "platform_supported": checker::install::platform_supported(),
+            "gpu_hint": checker::install::gpu_hint(),
             "rejected": self.checker().rejected,
         })
+    }
+
+    /// The one-click install's current state.
+    pub fn checker_install_status(&self) -> checker::install::Status {
+        self.install.lock().unwrap().clone()
+    }
+
+    /// Starts the one-click install of llama.cpp and the d1-3B model on the
+    /// CPU or GPU, in the background. On success it turns the local model on
+    /// with the chosen device. Refused while an install is already running.
+    pub fn start_checker_install(&self, gpu: bool) -> Result<(), String> {
+        if !checker::install::platform_supported() {
+            return Err("this machine has no pinned local build; use the endpoint mode".into());
+        }
+        {
+            let st = self.install.lock().unwrap();
+            if matches!(
+                st.phase,
+                checker::install::Phase::Downloading
+                    | checker::install::Phase::Unpacking
+                    | checker::install::Phase::Verifying
+            ) {
+                return Err("an install is already running".into());
+            }
+        }
+        let (dir, shared, me) = (self.dir.clone(), self.install.clone(), self.clone());
+        tokio::spawn(async move {
+            let r = checker::install::install(dir, gpu, shared).await;
+            match r {
+                Ok(()) => {
+                    me.update(|s| {
+                        s.checker.model_on = true;
+                        s.checker.model.source = ModelSource::Local;
+                        s.checker.model.local_gpu = gpu;
+                    });
+                    me.note(
+                        Level::Info,
+                        None,
+                        "the action checker's local model was installed",
+                    );
+                    me.rebuild_checker();
+                    me.changed(Change::Nodes);
+                }
+                Err(e) => me.note(
+                    Level::Warn,
+                    None,
+                    format!("the action checker's local model install failed: {e}"),
+                ),
+            }
+        });
+        Ok(())
+    }
+
+    /// Removes the installed local build and model, and turns the local model
+    /// off.
+    pub fn remove_checker_model(&self) -> Result<(), String> {
+        *self.local_model.lock().unwrap() = None;
+        *self.local_sig.lock().unwrap() = String::new();
+        checker::install::remove(&self.dir).map_err(|e| e.to_string())?;
+        *self.install.lock().unwrap() = checker::install::Status::default();
+        self.update(|s| {
+            if s.checker.model.source == ModelSource::Local {
+                s.checker.model_on = false;
+            }
+        });
+        self.rebuild_checker();
+        self.changed(Change::Nodes);
+        self.note(
+            Level::Info,
+            None,
+            "the action checker's local model was removed",
+        );
+        Ok(())
     }
 
     /// Validates a posted checker config and, if it holds, saves it. Taint

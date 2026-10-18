@@ -125,22 +125,13 @@ pub struct ModelConfig {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub endpoint_model: String,
     // ---- Local llama-server ----
-    /// The llama-server program, from `PATH` when empty.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub llama_server: String,
-    /// A model to download, `-hf <repo>:<quant>`; its cache goes under the
-    /// state folder. Empty when a local file is used instead.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub hf_repo: String,
-    /// A local GGUF file, `-m <file>`. Empty when `hf_repo` is used.
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub model_file: String,
-    /// GPU layers; 0 (CPU only) by default.
+    /// Run the installed local model on the GPU (the Vulkan build, all layers
+    /// on the GPU). `false` (the default) runs it on the CPU. The center
+    /// installs and runs llama.cpp and the d1-3B model itself
+    /// ([`crate::checker::install`]); there is no llama-server path, model repo
+    /// or model file to set any more.
     #[serde(default)]
-    pub gpu_layers: u32,
-    /// Threads; 0 lets llama-server choose.
-    #[serde(default)]
-    pub threads: u32,
+    pub local_gpu: bool,
     // ---- Tuning ----
     /// At or above this the call is refused.
     #[serde(default = "default_threshold")]
@@ -172,11 +163,7 @@ impl Default for ModelConfig {
             source: ModelSource::default(),
             endpoint_url: String::new(),
             endpoint_model: String::new(),
-            llama_server: String::new(),
-            hf_repo: DEFAULT_HF_REPO.to_string(),
-            model_file: String::new(),
-            gpu_layers: 0,
-            threads: 0,
+            local_gpu: false,
             threshold: default_threshold(),
             timeout_ms: default_timeout_ms(),
             scope: ModelScope::default(),
@@ -189,9 +176,10 @@ impl Default for ModelConfig {
 }
 
 /// The default local model: Liquid AI's d1-3B (chosen by the evaluation in
-/// docs/dev/action-checker.md). Its licence is the LFM Open License v1.0, not
-/// Apache; the UI and the docs name it.
-pub const DEFAULT_HF_REPO: &str = "LiquidAI/d1-3B-GGUF:Q4_K_M";
+/// docs/dev/action-checker.md). The center installs it from Hugging Face
+/// ([`crate::checker::install`]). Its licence is the LFM Open License v1.0,
+/// not Apache; the UI and the docs name it.
+pub const DEFAULT_MODEL_NAME: &str = "LiquidAI d1-3B (Q4_K_M)";
 /// The licence of the default local model, named in the UI and the docs.
 pub const DEFAULT_MODEL_LICENCE: &str = "LFM Open License v1.0";
 

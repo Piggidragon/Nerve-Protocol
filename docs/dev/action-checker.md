@@ -92,11 +92,27 @@ Before it trusts a model the center reads `GET /v1/models` and checks
 `architecture.output_modalities` contains `"decisions"`.
 
 **Two sources.** An **endpoint** (a URL, an optional bearer token kept in
-`checker-model.token` mode 0600, an optional model name); or a **local**
-`llama-server` the center supervises (`checker/server.rs`): a free loopback
-port, CPU only by default, the model via `-hf` (cached under the state folder
-through `LLAMA_CACHE`) or a local `-m` file, restarted with backoff, ended with
-the center (`kill_on_drop`, a process group on Unix), its state shown in the UI.
+`checker-model.token` mode 0600, an optional model name); or a **local** model
+the center installs and supervises.
+
+The local model is one-click (`checker/install.rs`, addendum 2026-10-18). The
+center downloads a prebuilt `llama-server` from llama.cpp's GitHub release
+(tag and per-asset SHA-256 pinned in `install::llama_asset`; the Vulkan build
+for GPU) and the pinned d1-3B GGUF from Hugging Face into
+`<state>/checker/llama/<tag>/` and `<state>/checker/model/` — never
+system-wide. Each download streams to disk, is checked against its pinned
+SHA-256 (and the model against its pinned length), and renames into place, so a
+half download never counts as installed; the archive is unpacked with the
+system `tar` after a scan that refuses any entry that would escape the target.
+`gpu_hint` (libvulkan + a render node, or `vulkan-1.dll`) decides whether to
+offer GPU before anything is downloaded; the GPU build's `--list-devices` is the
+real check (it never loads a model). There is no model/path/build to choose — it
+is d1-3B only. The supervisor (`checker/server.rs`) runs the installed binary
+with `-m <model>` and `-ngl 0` (CPU) or `-ngl 999` (GPU), on a free loopback
+port, restarted with backoff, ended with the center (`kill_on_drop`, a process
+group on Unix); its state and the install progress show in the UI. The endpoint
+token is the only secret and is not in a backup; the installed files are not in
+a backup either (they are re-downloaded).
 
 ## Taint
 

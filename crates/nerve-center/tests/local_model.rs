@@ -12,9 +12,11 @@
 
 use std::time::{Duration, Instant};
 
+use std::path::PathBuf;
+
 use serde_json::Map;
 
-use nerve_center::checker::config::{CheckerConfig, ModelConfig, ModelSource};
+use nerve_center::checker::config::{CheckerConfig, ModelConfig};
 use nerve_center::checker::server::{LocalServer, Phase};
 use nerve_center::checker::{CallInfo, Checker, Decision};
 use nerve_proto::Effect;
@@ -22,20 +24,14 @@ use nerve_proto::Effect;
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "needs NERVE_TEST_MODEL and NERVE_TEST_LLAMA"]
 async fn the_local_server_starts_and_gates_a_call() {
-    let model = std::env::var("NERVE_TEST_MODEL").expect("set NERVE_TEST_MODEL to a GGUF path");
-    let llama = std::env::var("NERVE_TEST_LLAMA").unwrap_or_default();
-    let dir = tempfile::tempdir().unwrap();
+    let model = PathBuf::from(
+        std::env::var("NERVE_TEST_MODEL").expect("set NERVE_TEST_MODEL to a GGUF path"),
+    );
+    let llama = PathBuf::from(
+        std::env::var("NERVE_TEST_LLAMA").expect("set NERVE_TEST_LLAMA to a llama-server"),
+    );
 
-    let mcfg = ModelConfig {
-        source: ModelSource::Local,
-        llama_server: llama,
-        hf_repo: String::new(),
-        model_file: model,
-        threshold: 0.8,
-        timeout_ms: 8000,
-        ..Default::default()
-    };
-    let server = LocalServer::start(&mcfg, dir.path()).expect("start the server");
+    let server = LocalServer::start(llama, model, false, 8000).expect("start the server");
 
     // Wait up to two minutes for it to load the model and report ready.
     let deadline = Instant::now() + Duration::from_secs(120);
@@ -57,7 +53,11 @@ async fn the_local_server_starts_and_gates_a_call() {
         CheckerConfig {
             blocklist_on: false, // isolate the model layer
             model_on: true,
-            model: mcfg,
+            model: ModelConfig {
+                threshold: 0.8,
+                timeout_ms: 8000,
+                ..Default::default()
+            },
             ..Default::default()
         },
         None,
@@ -79,6 +79,11 @@ async fn the_local_server_starts_and_gates_a_call() {
         matches!(dangerous, Decision::Refuse { .. }),
         "got {dangerous:?}"
     );
+    // The model sees this Execute call and judges it below the threshold, so
+    // the checker lets it through as an audited allow.
     let ordinary = checker.check(&call("git status"), Some(&endpoint)).await;
-    assert!(matches!(ordinary, Decision::Pass), "got {ordinary:?}");
+    assert!(
+        matches!(ordinary, Decision::Allowed { .. }),
+        "got {ordinary:?}"
+    );
 }

@@ -416,6 +416,13 @@ impl Ui {
                 let token = b.get("token").and_then(Value::as_str);
                 c.set_checker_token(token).map(|_| json!({})).map_err(bad)
             }
+            ("POST", "/api/checker/install") => {
+                let gpu = b.get("gpu").and_then(Value::as_bool) == Some(true);
+                c.start_checker_install(gpu).map(|_| json!({})).map_err(bad)
+            }
+            ("POST", "/api/checker/remove") => {
+                c.remove_checker_model().map(|_| json!({})).map_err(bad)
+            }
             // The allow buttons on a checker refusal: build the rule for the
             // entry and save it for every node, or for the one node.
             ("POST", "/api/checker/allow") => {

@@ -147,55 +147,80 @@ pub fn model_pin(model: LocalModel) -> &'static ModelPin {
 
 /// The llama.cpp asset and its SHA-256 for this platform and CPU/GPU choice,
 /// or `None` when there is no pinned asset for it (the UI then points to the
-/// endpoint mode). GPU is the Vulkan build (NVIDIA, AMD, Intel); macOS uses
-/// the Metal build that is built into the arm64 archive for both.
+/// endpoint mode). GPU is the Vulkan build (NVIDIA, AMD, Intel). Nerve runs
+/// on Linux and Windows only, so only their builds are pinned.
 pub fn llama_asset(gpu: bool) -> Option<(&'static str, &'static str)> {
     asset_for(std::env::consts::OS, std::env::consts::ARCH, gpu)
 }
 
+/// The pinned llama.cpp builds: OS and architecture (as `std::env::consts`
+/// names them), GPU or not, the asset's name and its SHA-256.
+const ASSETS: [(&str, &str, bool, &str, &str); 8] = [
+    (
+        "linux",
+        "x86_64",
+        false,
+        "llama-b11719-bin-ubuntu-x64.tar.gz",
+        "2c50edd1422cdc686a1620923a7dda9a33634509566d2821155fb3d4879510a3",
+    ),
+    (
+        "linux",
+        "x86_64",
+        true,
+        "llama-b11719-bin-ubuntu-vulkan-x64.tar.gz",
+        "9a09cce245acf8823feb99fb7ba8ddd3e878e3827564888131e0185044aa4429",
+    ),
+    (
+        "windows",
+        "x86_64",
+        false,
+        "llama-b11719-bin-win-cpu-x64.zip",
+        "1b1234d208a8b851cc27cd3d96b850d1547a4e5cfc5cd75f0a9fdd1d4c5bea20",
+    ),
+    (
+        "windows",
+        "x86_64",
+        true,
+        "llama-b11719-bin-win-vulkan-x64.zip",
+        "08dde7f4133443ac629431c35f0435e267ca73251fc002cb95e10625424e2963",
+    ),
+    (
+        "linux",
+        "aarch64",
+        false,
+        "llama-b11719-bin-ubuntu-arm64.tar.gz",
+        "290aa4432ad8e28b638285be6a75d0dd6f327d9b2d95f7048a8cf5e69704bee9",
+    ),
+    (
+        "linux",
+        "aarch64",
+        true,
+        "llama-b11719-bin-ubuntu-vulkan-arm64.tar.gz",
+        "ec2b1e886192c9e1e686e4a5a4d95079f75b98966274264e7bf6e2e13a063185",
+    ),
+    (
+        "windows",
+        "aarch64",
+        false,
+        "llama-b11719-bin-win-cpu-arm64.zip",
+        "bb066fea4e7b396560704f05f227aa39057a27ae17aca604f1ef3d1b6503a1a3",
+    ),
+    (
+        "windows",
+        "aarch64",
+        true,
+        "llama-b11719-bin-win-vulkan-arm64.zip",
+        "69bd6da42725771831c3271d2198ebb71e9531282a755edb24917b9d81b1555e",
+    ),
+];
+
 /// [`llama_asset`] for a given OS and architecture (as `std::env::consts`
 /// names them), so every platform's pin can be tested on any one.
 fn asset_for(os: &str, arch: &str, gpu: bool) -> Option<(&'static str, &'static str)> {
-    match (os, arch, gpu) {
-        ("linux", "x86_64", false) => Some((
-            "llama-b11719-bin-ubuntu-x64.tar.gz",
-            "2c50edd1422cdc686a1620923a7dda9a33634509566d2821155fb3d4879510a3",
-        )),
-        ("linux", "x86_64", true) => Some((
-            "llama-b11719-bin-ubuntu-vulkan-x64.tar.gz",
-            "9a09cce245acf8823feb99fb7ba8ddd3e878e3827564888131e0185044aa4429",
-        )),
-        ("windows", "x86_64", false) => Some((
-            "llama-b11719-bin-win-cpu-x64.zip",
-            "1b1234d208a8b851cc27cd3d96b850d1547a4e5cfc5cd75f0a9fdd1d4c5bea20",
-        )),
-        ("windows", "x86_64", true) => Some((
-            "llama-b11719-bin-win-vulkan-x64.zip",
-            "08dde7f4133443ac629431c35f0435e267ca73251fc002cb95e10625424e2963",
-        )),
-        // macOS arm64: Metal is built in, so the same archive serves CPU and GPU.
-        ("macos", "aarch64", _) => Some((
-            "llama-b11719-bin-macos-arm64.tar.gz",
-            "076a2b0d15253078b90bd520a82dc2edc6c17657968878876ba3def3e80f54ba",
-        )),
-        ("linux", "aarch64", false) => Some((
-            "llama-b11719-bin-ubuntu-arm64.tar.gz",
-            "290aa4432ad8e28b638285be6a75d0dd6f327d9b2d95f7048a8cf5e69704bee9",
-        )),
-        ("linux", "aarch64", true) => Some((
-            "llama-b11719-bin-ubuntu-vulkan-arm64.tar.gz",
-            "ec2b1e886192c9e1e686e4a5a4d95079f75b98966274264e7bf6e2e13a063185",
-        )),
-        ("windows", "aarch64", false) => Some((
-            "llama-b11719-bin-win-cpu-arm64.zip",
-            "bb066fea4e7b396560704f05f227aa39057a27ae17aca604f1ef3d1b6503a1a3",
-        )),
-        ("windows", "aarch64", true) => Some((
-            "llama-b11719-bin-win-vulkan-arm64.zip",
-            "69bd6da42725771831c3271d2198ebb71e9531282a755edb24917b9d81b1555e",
-        )),
-        _ => None,
-    }
+    ASSETS
+        .iter()
+        .find(|a| (a.0, a.1, a.2) == (os, arch, gpu))
+        .map(|a| (a.3, a.4))
 }
 
 /// Whether this platform has a pinned local build at all.
@@ -645,9 +670,6 @@ pub async fn gpu_available(state: &Path) -> bool {
 /// GPU the Vulkan build could use, so the UI can offer the GPU choice. A false
 /// positive is harmless: the GPU build then falls back, and the UI offers CPU.
 pub fn gpu_hint() -> bool {
-    if cfg!(target_os = "macos") {
-        return true; // Metal
-    }
     if cfg!(target_os = "windows") {
         return Path::new("C:/Windows/System32/vulkan-1.dll").exists();
     }
@@ -679,8 +701,8 @@ pub fn gpu_hint() -> bool {
 
 /// Lists an archive's entries and refuses any that is absolute or climbs out
 /// of the target with `..`, then extracts it with the system `tar` (GNU tar
-/// reads `.tar.gz`; the `tar` on Windows 10+ and macOS is a bsdtar that also
-/// reads `.zip`).
+/// reads `.tar.gz`; the `tar` on Windows 10+ is a bsdtar that also reads
+/// `.zip`).
 fn unpack(archive: &Path, dest: &Path) -> Result<(), String> {
     let list = std::process::Command::new("tar")
         .arg("-tf")
@@ -801,7 +823,6 @@ mod tests {
             ("linux", "aarch64"),
             ("windows", "x86_64"),
             ("windows", "aarch64"),
-            ("macos", "aarch64"),
         ] {
             for gpu in [false, true] {
                 let (name, sha) =
@@ -819,6 +840,21 @@ mod tests {
             asset_for("linux", "aarch64", true)
         );
         assert!(asset_for("freebsd", "x86_64", false).is_none());
+    }
+
+    /// Nerve runs on Linux and Windows only, so every pin is one of their
+    /// builds and any other OS has none (the UI points it to the endpoint
+    /// mode).
+    #[test]
+    fn only_linux_and_windows_builds_are_pinned() {
+        for (os, arch, gpu, name, _) in ASSETS {
+            let build = match os {
+                "linux" => "-bin-ubuntu-",
+                "windows" => "-bin-win-",
+                _ => panic!("{name} is pinned for {os} {arch} {gpu}"),
+            };
+            assert!(name.contains(build), "{name}");
+        }
     }
 
     /// The two models: d1-3B is the default and first; each has its own

@@ -1345,7 +1345,7 @@ mod tests {
         assert_eq!(ps("bash -c 'echo \"`date`\"'"), ["bash", "echo", "date"]);
         assert_eq!(Shell::for_os("windows"), Shell::PowerShell);
         assert_eq!(Shell::for_os("linux"), Shell::Posix);
-        assert_eq!(Shell::for_os("macos"), Shell::Posix);
+        assert_eq!(Shell::for_os("freebsd"), Shell::Posix);
     }
 
     /// A quote opened on a here-document's body line (an apostrophe in

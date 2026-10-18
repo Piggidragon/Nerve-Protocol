@@ -64,7 +64,8 @@ apart, an argument with a blank in it in double quotes so a pattern sees where
 it ends; the structured form's program glob ignores letter case). Defaults that
 must read one command's own words use the structured form or `cmd-re:`:
 `mkfs*`, `wipefs`, `userdel`, `passwd root`, `nsenter`, `bcdedit`, `diskpart`
-and `Format-Volume` as the program; `shred` of a device, an `iptables -F`
+and `Format-Volume` as the program, and `format` of a drive (`format D:`, so
+`dotnet format C:\src\App.sln` is not one); `shred` of a device, an `iptables -F`
 flush (with at most a table and a chain, since the lower-cased line cannot
 tell `-F` from the fragment match `-f`), `systemctl stop|disable|mask` of the
 `ssh`/`sshd` unit by name; the container flags (`--privileged`, `--pid=host`,
@@ -81,11 +82,13 @@ only as a whole quoted operand), so `Remove-Item C:\Users\me\build -Recurse
 whole-line twin, below). The structured matcher reads `${NAME}` as `$NAME`, so
 `rm -rf ${HOME}` meets `rm -rf $HOME`, and `/home/?*` is one level under
 `/home` only. Whole-line `re:` is kept where the pattern spans commands or
-looks at a redirection: a download piped into a program that runs its input
-(the last stage of the pipe is a shell or an interpreter with no script of its
-own), SQL piped or fed as a here-document into a client, `dd`/`>` to a disk
+looks at a redirection: a download run unseen (piped into a program that
+runs its input: a shell, an interpreter with no script of its own, or
+PowerShell's `iex`; given to `iex`; or run by a shell as its script,
+`sh -c "$(curl …)"` and `bash <(curl …)`, as the tools' install pages write
+them), SQL piped or fed as a here-document into a client, `dd`/`>` to a disk
 device, `> /etc/passwd`, the fork bomb, `kill -9 -1`, and the remaining
-Windows patterns (`format C:`, `vssadmin`, `wbadmin`, `reg delete HKLM`,
+Windows patterns (`vssadmin`, `wbadmin`, `reg delete HKLM`,
 `Set-MpPreference -Disable…`, `cipher /w`). A here-document is read as
 commands, so a body that only writes a file (a Dockerfile's
 `RUN curl … | bash -`) still meets the download entry; the user guide says so

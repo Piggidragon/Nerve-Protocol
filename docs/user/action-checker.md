@@ -69,17 +69,22 @@ leave ordinary work alone: `rm file`, `rm -rf ./build`, `rm -rf node_modules`,
 `docker ps`, `git push` and `kill <pid>` all stay allowed; wiping the root
 filesystem or a home folder, `mkfs`, `dd` to a disk, fork bombs,
 `chmod -R 777 /`, dropping a database, a container that gives root on the host,
-`curl … | sh`, force-pushing `main`, and the Windows equivalents
-(`Format-Volume`, `rd /s /q C:\`, `Remove-Item -Recurse` of `~` or
+running a downloaded script unseen (`curl … | sh`, `sh -c "$(curl …)"`,
+`bash <(curl …)`, and on Windows `irm … | iex` or `iex (… DownloadString …)`),
+force-pushing `main`, and the Windows equivalents (`Format-Volume`,
+`format D:`, `rd /s /q C:\`, `Remove-Item -Recurse` of `~` or
 `C:\Users\<name>`, `vssadmin delete shadows`, disabling Defender, …) are
-blocked. Most defaults look at the command that runs, not at every word on the
-line: `mkfs`, `wipefs`, `userdel`, `nsenter`, `bcdedit`, `diskpart` and
-`Format-Volume` only as the program, `shred`, `iptables -F`, stopping `sshd`
+blocked. The download entries also refuse a tool's official install one-liner;
+to run one, ask the owner, who can switch the entry off for a while (an allow
+rule does not get past the blocklist). Most defaults look at the command that
+runs, not at every word on the line: `mkfs`, `wipefs`, `userdel`, `nsenter`,
+`bcdedit`, `diskpart`, `format` and `Format-Volume` only as the program (so
+`dotnet format C:\src\App.sln` is not formatting a drive), `shred`, `iptables -F`, stopping `sshd`
 and the container flags (`--privileged`, `--pid=host`, `-v /:/…`) only in that
 command's own words, `DROP TABLE` only in what a database client (`psql`,
-`mysql`, `sqlite3`, `mongosh`, …) is given, a download only when it is piped
-into something that runs it (`| sh`, `| sudo bash -s`, `| python3 -`, not
-`| grep` or `| python -m json.tool`), and a force-push only in the `git push`
+`mysql`, `sqlite3`, `mongosh`, …) is given, a download only when something
+runs it (`| sh`, `| sudo bash -s`, `| python3 -`, `| iex`, a shell's `-c`,
+not `| grep`, `| python -m json.tool` or `-o install.sh`), and a force-push only in the `git push`
 itself. So a commit message, a `grep` or a note that merely mentions one of
 them is not refused.
 

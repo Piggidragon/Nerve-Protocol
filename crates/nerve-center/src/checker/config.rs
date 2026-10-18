@@ -315,6 +315,13 @@ const DB_DROP: &str = r#"(?:drop\s+(?:database|table)\b|truncate\s+[a-z_"]|dropd
 /// interpreter with no script of its own (only flags, or `-`/`-s` and then
 /// the script's arguments), up to the end of its command.
 const RUNS_STDIN: &str = r"(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?(?:sh|bash|zsh|dash|ksh|ash|fish|python[0-9.]*|perl|ruby|node|php)(?:\.exe)?(?:\s+-[a-z-]*)*(?:\s+(?:-s|-)(?:\s[^|;&]*)?)?\s*(?:$|[;&|)])";
+/// The downloaders: `curl` and `wget`, and PowerShell's `Invoke-RestMethod`
+/// and `Invoke-WebRequest` with their aliases (`curl` and `wget` are aliases
+/// of the latter in Windows PowerShell).
+const DOWNLOADER: &str = r"(?:curl|wget|irm|iwr|invoke-restmethod|invoke-webrequest)";
+/// PowerShell's `Invoke-Expression`, which runs a string (or what is piped
+/// into it) as code: the `| sh` of a Windows install one-liner.
+const RUNS_STRING: &str = r"(?:iex|invoke-expression)";
 /// A git refspec that names `main` or `master` as the branch pushed to, as a
 /// whole word (`main`, `HEAD:main`, `refs/heads/main`), so a branch that
 /// merely contains the word (`fix/main-menu`) is not one.
@@ -434,11 +441,28 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
             "runs as root in a container",
         ),
         b("exec.run:nsenter", "enters another namespace"),
-        // ---- pipe a download straight into a shell: the last program of
-        //      the pipe runs its input (`| sh`, `| sudo bash -s`,
-        //      `| python3 -`), not `| grep sh` or `| python -m json.tool` ----
+        // ---- run a download unseen: piped into a program that runs its
+        //      input (`| sh`, `| sudo bash -s`, `| python3 -`, PowerShell's
+        //      `| iex`), not `| grep sh` or `| python -m json.tool`; given to
+        //      `iex` (`iex (irm …)`, `iex (… .DownloadString('…'))`); or run
+        //      by a shell as its script (`sh -c "$(curl …)"`,
+        //      `bash <(curl …)`). These are the install one-liners the tools'
+        //      own pages give; an owner who wants one run switches the entry
+        //      off ----
         b(
-            &format!(r"exec.run:re:(?i)\b(?:curl|wget)\b[^|;&]*\|(?:[^|;&]*\|)*\s*{RUNS_STDIN}"),
+            &format!(
+                r#"exec.run:re:(?i)\b{DOWNLOADER}\b[^|;&]*\|(?:[^|;&]*\|)*\s*(?:{RUNS_STDIN}|{RUNS_STRING}(?:$|[\s;&|)'"]))"#
+            ),
+            "runs a downloaded script unseen",
+        ),
+        b(
+            &format!(
+                r"exec.run:re:(?i)\b{RUNS_STRING}\b[^|;&]*?(?:\b{DOWNLOADER}\b|\bdownloadstring\s*\()"
+            ),
+            "runs a downloaded script unseen",
+        ),
+        b(
+            r#"exec.run:re:(?i)(?:^|[\s;&|("'/])(?:sh|bash|zsh|dash|ksh|ash)(?:\.exe)?\s+(?:-\S+\s+)*?(?:-[a-z]*c[a-z]*\s+["']?\$\(|<\()\s*(?:curl|wget)\b"#,
             "runs a downloaded script unseen",
         ),
         // ---- cron, firewall, kill-all ----
@@ -489,10 +513,12 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
             "force-pushes over a protected branch",
         ),
         // ---- Windows ----
-        // Format-Volume, bcdedit and diskpart as the program run.
+        // Format-Volume, format, bcdedit and diskpart as the program run, so
+        // a code formatter's `format` subcommand (`dotnet format C:\src\App.sln`,
+        // `ruff format C:\work`) is not one.
         b("exec.run:Format-Volume", "formats a volume"),
         b(
-            r"exec.run:re:(?i)\bformat(?:\.com)?\s+[a-z]:",
+            r"exec.run:cmd-re:^format(?:\.com)? [a-z]:(?:[\\/ ]|$)",
             "formats a drive",
         ),
         // A recursive delete (PowerShell's Remove-Item and its aliases with

@@ -124,11 +124,41 @@ NERVE_CHECKER_ENDPOINT=http://127.0.0.1:19931 \
     cargo test -p nerve-center --test checker_eval -- --ignored --nocapture
 ```
 
-### Measured on this CPU (16 threads, `-ngl 0`, ~210 cases)
+### Measured on this CPU
 
-<!-- EVAL-TABLE -->
+An AMD CPU, `llama-server` build 11742 on 8 threads, `-ngl 0` (CPU only), the
+214-case set, the default question above. Per-model, at the threshold near the
+operating point, with the latency per call:
 
-The default model and threshold are set from this: **LiquidAI d1-3B** (Q4_K_M)
-at a threshold of **0.7**. d1-3B's licence is the **LFM Open License v1.0** (not
-Apache), named in the UI and the user guide. The threshold is chosen for the
-best catch rate at a benign refusal rate of about 2 % or less.
+| Model | Size (Q) | p50 / p95 | Threshold | Catch % | Benign-refused % | Injection catch % |
+|---|---|---|---|---|---|---|
+| **d1-3B** (LiquidAI) | 3B Q4_K_M | 1.7 s / 1.7 s | 0.80 | **60.2** | **2.5** | 66.7 |
+| d1-3B | | | 0.85 | 55.9 | 1.7 | 66.7 |
+| d1-omni-600M (LiquidAI) | 0.6B Q8_0 | 0.66 s / 0.69 s | 0.85 | 14.0 | 3.3 | 13.3 |
+| Laya (ggml-org) | ~0.4B Q8_0 | 0.87 s / 0.93 s | 0.60 | 16.1 | 0.0 | 0.0 |
+| Kev-4B (ggml-org) | 4B Q4_K_M | ~3.6 s | — | — | — | — |
+
+Full sweeps are in the commit that added this file; the shape is the same for
+each: d1-3B separates ordinary work from dangerous actions cleanly (git, ls,
+cargo, npm, docker, `rm -rf ./build`/`node_modules` all score ~0.01–0.05; `rm
+-rf /`, `mkfs`, `chmod -R 777 /`, `dd` to a disk, `DROP DATABASE`, force-push
+`main`, `userdel root` all ~0.9+). Laya and d1-omni-600M cannot tell danger from
+ordinary work at a usable benign-refusal rate. Kev-4B (4B) runs at ~3.6 s per
+call on this CPU; at the client's default 4 s timeout most calls — the longer
+dangerous ones first — time out, so it cannot be scored fairly here and is in
+any case too slow to gate every call. It is a candidate only on a machine with
+a GPU or far more CPU, with a higher timeout.
+
+**The default is LiquidAI d1-3B** (Q4_K_M) at a threshold of **0.8**: the best
+catch rate among the models that stay under about 2–3 % benign refusals, at an
+acceptable ~1.7 s on the CPU, and the best on the injection cases. The owner
+expected d1-3B to win, and it does. Its licence is the **LFM Open License
+v1.0** (not Apache), named in the UI and the user guide.
+
+The model does not stand alone: the deterministic blocklist already refuses the
+obvious dangerous commands (so many of the "missed" dangerous cases above are
+caught before the model), and the node's own policy is the authority. The model
+is the optional layer for the long tail and for injection, which is why a 60 %
+catch at a low benign-refusal rate is a good operating point rather than a
+weak one. Raise the threshold to 0.85 to trade a little catch for fewer
+benign refusals.

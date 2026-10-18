@@ -134,7 +134,8 @@ The whole walk is bounded: depth at `normalize::MAX_DEPTH` (16) and commands at
 `MAX_COMMANDS` (100 000, far above any real script, so ordinary heredocs are
 not refused); a line past a bound comes back as `Parsed::overflow`
 (`Depth`/`Commands`) and the checker refuses it (fail closed), naming which —
-a deeply nested `$(` can no longer overflow the stack. The structured matcher
+a deeply nested `$(` or a long chain of `start` words can no longer overflow
+the stack (a started program counts as one level of nesting). The structured matcher
 folds a trailing `/` or `/*` on an operand and matches a short flag in either
 case (`rm -Rf` meets `rm -rf`). `fs` paths are normalised (`//`, `/.`, `..`)
 and matched case-insensitively. The limits (variables, `$HOME`, aliases,

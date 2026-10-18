@@ -1073,7 +1073,7 @@ mod tests {
 
     /// A line built to drown the matcher is still refused (fail closed), with
     /// the reason it gives — a flat line with very many commands is a command
-    /// overflow, not a depth one.
+    /// overflow, not a depth one, and a chain of starters a depth one.
     #[test]
     fn an_abusive_line_is_still_refused() {
         let many = ["true"].repeat(normalize::MAX_COMMANDS + 10).join(";");
@@ -1082,6 +1082,40 @@ mod tests {
             Some(normalize::Overflow::Commands)
         );
         assert!(refused_by_defaults(&many));
+        let starters = ["Start-Process"]
+            .repeat(normalize::MAX_DEPTH + 10)
+            .join(" ");
+        assert_eq!(
+            normalize::parse(&starters, normalize::Shell::PowerShell).overflow,
+            Some(normalize::Overflow::Depth)
+        );
+        assert!(refused_on(normalize::Shell::PowerShell, &starters));
+    }
+
+    /// git's own `-C`/`-c` value and docker exec's option value may have a
+    /// blank in them (a repo under `C:\Users\Max Mustermann`); the entries
+    /// still see the push and the user after it (review r6, finding 2). The
+    /// same with an ordinary push or command stays allowed.
+    #[test]
+    fn an_option_value_with_a_blank_does_not_hide_the_command() {
+        for shell in [normalize::Shell::PowerShell, normalize::Shell::Posix] {
+            for cmd in [
+                r#"git -C "C:\Users\Max Mustermann\repo" push --force origin main"#,
+                r#"git -C "/home/me/My Projects/app" push -f origin main"#,
+                r#"git -c "user.name=Max Mustermann" push --force origin main"#,
+                r#"docker exec -e "MSG=hello world" -u root app sh"#,
+            ] {
+                assert!(refused_on(shell, cmd), "should be refused: {cmd:?}");
+            }
+            for cmd in [
+                r#"git -C "C:\Users\Max Mustermann\repo" push origin main"#,
+                r#"git -C "/home/me/My Projects/app" push --force origin fix/menu"#,
+                r#"git -c "user.name=Max Mustermann" commit -m "push --force main""#,
+                r#"docker exec -e "MSG=hello world" app id -u root"#,
+            ] {
+                assert!(!refused_on(shell, cmd), "should be allowed: {cmd:?}");
+            }
+        }
     }
 
     /// The fs matcher sees a non-canonical or differently-cased path (finding

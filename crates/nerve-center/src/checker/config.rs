@@ -320,13 +320,17 @@ const RUNS_STDIN: &str = r"(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?(?:sh|bash|zsh|dash|
 /// merely contains the word (`fix/main-menu`) is not one.
 const GIT_PROTECTED: &str = r"(?:\S*:)?\+?(?:refs/heads/)?(?:main|master)";
 /// `git … push`: push as git's subcommand, after git's own options only, so
-/// a commit message that mentions a push is not one.
-const GIT_PUSH: &str = r"^git(?: (?:-c|-C) \S+| -\S*)* push";
+/// a commit message that mentions a push is not one. The value of `-C` or
+/// `-c` may have a blank in it, which `Command::line` writes in double quotes
+/// (`git -C "c:\users\max mustermann\app" push`).
+const GIT_PUSH: &str = r#"^git(?: (?:-c|-C) (?:"[^"]*"|\S+)| -\S*)* push"#;
 /// The container tools whose options can give a container root on the host.
 const CONTAINER: &str = "(?:docker|podman|docker-compose|podman-compose)";
 /// `docker exec`'s options before the container, so `-u root` is read only
-/// where docker reads it, not in the command run inside (`id -u root`).
-const EXEC_OPTS: &str = r"(?: (?:-[ewu]|--(?:env|env-file|workdir|user|detach-keys)) \S+| -\S+)*?";
+/// where docker reads it, not in the command run inside (`id -u root`). A
+/// value with a blank in it is in double quotes, as for [`GIT_PUSH`].
+const EXEC_OPTS: &str =
+    r#"(?: (?:-[ewu]|--(?:env|env-file|workdir|user|detach-keys)) (?:"[^"]*"|\S+)| -\S+)*?"#;
 
 /// git push's force flags: `--force`, `--force-with-lease[=…]`, or a short
 /// flag word with `f` in it (`-f`, `-uf`).

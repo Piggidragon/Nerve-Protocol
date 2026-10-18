@@ -27,8 +27,8 @@
 //! PowerShell's, where a backslash is an ordinary character (`C:\`) and a
 //! backtick is its escape.
 //!
-//! The whole walk is bounded: nesting (`$( )`, backticks, `-c` bodies, all
-//! together) at [`MAX_DEPTH`], and the number of commands at [`MAX_COMMANDS`],
+//! The whole walk is bounded: nesting (`$( )`, backticks, `-c` bodies, the
+//! program a starter runs, all together) at [`MAX_DEPTH`], and the number of commands at [`MAX_COMMANDS`],
 //! far above any real script (the node refuses a command line over 64 KiB
 //! anyway). A line past a bound is reported as [`Parsed::overflow`], and the
 //! checker refuses it rather than pass a line it could not take apart.
@@ -37,9 +37,9 @@
 //! then run, base64. Those the decision model and the node's own policy are
 //! for.
 
-/// The deepest nesting the walk descends, counting `$( )`, backticks and
-/// `-c` bodies together. Real commands nest a few levels; past this the line
-/// is reported as overflow.
+/// The deepest nesting the walk descends, counting `$( )`, backticks, `-c`
+/// bodies and started programs together. Real commands nest a few levels;
+/// past this the line is reported as overflow.
 pub const MAX_DEPTH: usize = 16;
 /// The most commands the walk pulls from one line. A 64 KiB command line (the
 /// node's own limit) holds at most about 32 000; a script or here-document
@@ -261,8 +261,19 @@ impl Walk {
     }
 
     /// One tokenized command, keywords and wrappers stripped, flags expanded;
-    /// a nested shell's body is walked at `depth + 1`, by that shell's rules.
+    /// a nested shell's body and a started program are walked at `depth + 1`,
+    /// by that shell's rules.
     fn parse_command(&mut self, words: &[String], shell: Shell, depth: usize) {
+        // A started program is a level of its own, so a chain of starters
+        // counts against both bounds like any other nesting.
+        if depth > MAX_DEPTH {
+            self.overflow = Some(Overflow::Depth);
+            return;
+        }
+        if self.commands.len() >= MAX_COMMANDS {
+            self.overflow = Some(Overflow::Commands);
+            return;
+        }
         let Some(i) = program_index(words) else {
             return;
         };
@@ -290,14 +301,18 @@ impl Walk {
         };
         if let Some((body, inner)) = body {
             self.collect(&body, inner, depth + 1);
+            if self.overflow.is_some() {
+                return;
+            }
         }
         // `Start-Process diskpart -Verb RunAs`: the program started, with the
-        // words after it, is a command too. The words are fewer each time,
-        // so a chain of starters ends.
+        // words after it, is a command too, one level down, so a line of
+        // nothing but starters stops at the depth bound instead of recursing
+        // (and copying its words) once per word.
         if STARTERS.contains(&program.as_str())
             && let Some(started) = started_program(rest)
         {
-            self.parse_command(&started, shell, depth);
+            self.parse_command(&started, shell, depth + 1);
         }
     }
 }
@@ -1392,6 +1407,35 @@ mod tests {
         let ok = parse("echo $(printf '%s' $(date))", Shell::Posix);
         assert_eq!(ok.overflow, None);
         assert!(ok.commands.iter().any(|c| c.program == "date"));
+    }
+
+    /// A line of nothing but starters (`start start …`) stops at the depth
+    /// bound instead of recursing once per word, which overflowed the stack
+    /// of a 2 MiB thread such as a tokio worker and aborted the center
+    /// (review r6, finding 1). A short chain is still read through.
+    #[test]
+    fn a_chain_of_starters_is_bounded_not_a_stack_overflow() {
+        let run = || {
+            for (word, shell) in [
+                ("start", Shell::Posix),
+                ("saps", Shell::PowerShell),
+                ("Start-Process", Shell::PowerShell),
+            ] {
+                let chain = vec![word; 6000].join(" ");
+                let p = parse(&chain, shell);
+                assert_eq!(p.overflow, Some(Overflow::Depth), "{word}");
+                assert!(p.commands.len() <= MAX_DEPTH + 1, "{word}");
+            }
+            let short = parse("start start Start-Process diskpart", Shell::PowerShell);
+            assert_eq!(short.overflow, None);
+            assert!(short.commands.iter().any(|c| c.program == "diskpart"));
+        };
+        std::thread::Builder::new()
+            .stack_size(2 * 1024 * 1024)
+            .spawn(run)
+            .unwrap()
+            .join()
+            .unwrap();
     }
 
     /// A line with a huge number of commands overflows on the command bound,

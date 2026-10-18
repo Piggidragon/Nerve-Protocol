@@ -14,6 +14,7 @@ pages explain the design and link to the spec for detail.
 | [capabilities.md](capabilities.md) | Descriptor, capabilities, effects, profiles, messages |
 | [mcp-surface.md](mcp-surface.md) | How the center turns capabilities into MCP tools |
 | [policy-engine.md](policy-engine.md) | How the node decides a call, and the sandbox |
+| [action-checker.md](action-checker.md) | The center's action checker: blocklist, allow rules, decision model |
 | [settings-and-config.md](settings-and-config.md) | `node.toml`, the settings API, the control socket |
 | [logging.md](logging.md) | The log of the center and the node: levels, redaction, the file, the web UI's data |
 | [backup.md](backup.md) | The backup file: format, encryption, what a restore does |

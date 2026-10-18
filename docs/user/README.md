@@ -41,6 +41,7 @@ open port.
 | [config.md](config.md) | Read and change `node.toml` by name |
 | [limits.md](limits.md) | Memory, CPU and processes of one command |
 | [audit.md](audit.md) | See what was allowed and refused |
+| [action-checker.md](action-checker.md) | The center's gate: blocklist, allow rules, a decision model |
 | [logs.md](logs.md) | The log of the center and the node: levels, what is in it, where it is |
 | [stop.md](stop.md) | Panic, pause, disable, remove |
 | [backup.md](backup.md) | Back up and restore a node or a center, move one to another machine |

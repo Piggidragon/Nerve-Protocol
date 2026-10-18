@@ -91,6 +91,24 @@ refused: that is the owner's, on the machine
 ([providers](providers.md)). A target that was cut to its start gets no
 buttons.
 
+A decision the center's [action checker](action-checker.md) made shows here
+too, marked as the checker's. A model refusal gets **Allow** and **Allow as
+wildcard** buttons that save a checker allow rule (center-side, so no settings
+grant is needed). A blocklist refusal has none: it is a hard deny, so you
+change or remove the entry on the Action checker page.
+
+### Action checker
+
+The center's gate on every call ([action-checker](action-checker.md)): a
+deterministic blocklist, saved allow rules, and an optional decision model,
+each with its own switch. The page lets you edit the blocklist (add, remove,
+switch single entries off, reset to the defaults), keep allow rules for every
+machine or one, and set up the model (a System One endpoint, or a
+`llama-server` the center runs) with its threshold, timeout, question and
+which calls it sees. It shows the local model's state, and names the default
+model's licence. Taint, which marks a session once a call of it returned
+content, has its switch here too. Everything is kept in the center's state.
+
 ### Log
 
 What the center did and saw, newest first: links that dropped and came back,

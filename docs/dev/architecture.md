@@ -51,11 +51,14 @@ every call to them by the calling center's policy.
    forbidden. Nothing waits for a person to answer.
 5. **MCP is the only harness interface.** No harness names, tool names,
    session formats or hooks appear in the protocol, the center or the node.
-6. **The center is a gate and a router.** It has no agent loop, no model, no
-   memory and no chat history. It stores no file contents, command output or
-   node secrets. It does not relay messages between nodes, call one node from
-   another or install software on a node. A node's relay carries bytes, not
-   messages, and no node calls another either.
+6. **The center is a gate and a router.** It has no agent loop, no memory and
+   no chat history. It stores no file contents, command output or node
+   secrets. Its one model is optional and narrow: the action checker may ask a
+   decision model whether a call is dangerous, as a gate that can only refuse
+   ([policy-engine](policy-engine.md), [action-checker](action-checker.md)); it
+   is no agent loop and keeps no history. It does not relay messages between
+   nodes, call one node from another or install software on a node. A node's
+   relay carries bytes, not messages, and no node calls another either.
 7. **Data from a node is data.** File contents, command output and tool
    results are untrusted content at the center and in the harness. The center
    marks every tool result as device content.
@@ -97,4 +100,5 @@ A wire change, its spec text and both ends change together.
 - [Capabilities](capabilities.md)
 - [The MCP surface](mcp-surface.md)
 - [The policy engine](policy-engine.md)
+- [The action checker](action-checker.md)
 - [Settings and config](settings-and-config.md)

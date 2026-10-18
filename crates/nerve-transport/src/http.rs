@@ -334,6 +334,18 @@ pub async fn get<S: AsyncRead + AsyncWrite + Unpin>(
 
 /// Reads an answer to a request sent with `Connection: close`: up to its
 /// `Content-Length`, or to the end of the connection; a chunked body is
+/// decoded. Public so a caller that wrote its own request bytes (for a header
+/// `get`/`post_json` do not offer, such as an `Authorization`) can read the
+/// answer the same way.
+pub async fn read_client_response<S: AsyncRead + Unpin>(
+    io: &mut S,
+    max_body: usize,
+) -> Result<ClientResponse, String> {
+    read_response(io, max_body).await
+}
+
+/// Reads an answer to a request sent with `Connection: close`: up to its
+/// `Content-Length`, or to the end of the connection; a chunked body is
 /// decoded.
 async fn read_response<S: AsyncRead + Unpin>(
     io: &mut S,

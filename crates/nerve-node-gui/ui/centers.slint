@@ -1,0 +1,231 @@
+// Centers: the paired centers, pausing one, its settings grant, unpairing,
+// and pairing a new one (the dialog is in dialogs.slint).
+
+import { Theme, Type, Space, Radius, Tone } from "theme.slint";
+import { Load, CenterRow } from "data.slint";
+import { Store } from "store.slint";
+import {
+    Button, ButtonKind, Card, Pill, IconTile, Banner, Loading, PageHeader, PageFrame,
+    EmptyState, Divider, Switch,
+} from "widgets.slint";
+
+component CenterCard inherits Card {
+    in property <CenterRow> item;
+    property <bool> waiting: Store.busy == root.item.name;
+    pad: 0;
+    gap: 0;
+    HorizontalLayout {
+        padding: Space.xl;
+        spacing: Space.lg;
+        VerticalLayout {
+            alignment: start;
+            IconTile {
+                icon: @image-url("icons/centers.svg");
+                tone: root.item.link-tone == Tone.neutral ? Tone.accent : root.item.link-tone;
+                size: 40px;
+            }
+        }
+        VerticalLayout {
+            spacing: 4px;
+            horizontal-stretch: 1;
+            alignment: center;
+            HorizontalLayout {
+                spacing: Space.sm;
+                Text {
+                    text: root.item.name;
+                    color: Theme.text;
+                    font-size: Type.heading;
+                    font-weight: Type.semibold;
+                    vertical-alignment: center;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Pill {
+                        text: root.item.link;
+                        tone: root.item.link-tone;
+                        dot: true;
+                    }
+                }
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+            }
+            Text {
+                text: root.item.url;
+                color: Theme.text-muted;
+                font-size: Type.small;
+                font-family: Type.mono;
+                overflow: elide;
+            }
+        }
+        VerticalLayout {
+            alignment: start;
+            HorizontalLayout {
+                spacing: Space.sm;
+                Button {
+                    text: root.item.paused ? "Resume" : "Pause";
+                    icon: root.item.paused ? @image-url("icons/play.svg") : @image-url("icons/pause.svg");
+                    small: true;
+                    enabled: !root.waiting;
+                    clicked => {
+                        Store.center-pause(root.item.name, !root.item.paused);
+                    }
+                }
+                Button {
+                    text: "Unpair";
+                    icon: @image-url("icons/unlink.svg");
+                    kind: ButtonKind.danger-soft;
+                    small: true;
+                    enabled: !root.waiting;
+                    clicked => {
+                        Store.center-unpair(root.item.name);
+                    }
+                }
+            }
+        }
+    }
+    Divider { }
+    HorizontalLayout {
+        padding-left: Space.xl;
+        padding-right: Space.xl;
+        padding-top: Space.lg;
+        padding-bottom: Space.lg;
+        spacing: Space.xxl;
+        // Both halves start alike, so they share the width.
+        Rectangle {
+            horizontal-stretch: 1;
+            preferred-width: 200px;
+            min-width: 0;
+            VerticalLayout {
+                spacing: 4px;
+                Text {
+                    text: "Mode";
+                    color: Theme.text-faint;
+                    font-size: Type.caption;
+                    font-weight: Type.semibold;
+                }
+                Text {
+                    text: root.item.mode;
+                    color: Theme.text;
+                    font-size: Type.body;
+                    font-weight: Type.medium;
+                }
+                Text {
+                    text: root.item.mode-detail;
+                    color: Theme.text-muted;
+                    font-size: Type.caption;
+                    wrap: word-wrap;
+                }
+            }
+        }
+        Rectangle {
+            width: 1px;
+            background: Theme.border;
+        }
+        Rectangle {
+            horizontal-stretch: 1;
+            preferred-width: 200px;
+            min-width: 0;
+            HorizontalLayout {
+                spacing: Space.md;
+                VerticalLayout {
+                    spacing: 4px;
+                    horizontal-stretch: 1;
+                    Text {
+                        text: "Settings grant";
+                        color: Theme.text-faint;
+                        font-size: Type.caption;
+                        font-weight: Type.semibold;
+                    }
+                    Text {
+                        text: root.item.settings-write ? "May change this machine's settings" : "Cannot change settings";
+                        color: Theme.text;
+                        font-size: Type.body;
+                        font-weight: Type.medium;
+                    }
+                    Text {
+                        text: root.item.settings-write ? "Up to user mode and sudo, as you could yourself." : "Only you change what it may do, here or with nerve-node.";
+                        color: Theme.text-muted;
+                        font-size: Type.caption;
+                        wrap: word-wrap;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Switch {
+                        checked: root.item.settings-write;
+                        enabled: !root.waiting;
+                        label: "Settings grant of " + root.item.name;
+                        toggled(on) => {
+                            Store.center-grant(root.item.name, on);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if root.item.note != "": VerticalLayout {
+        padding-left: Space.xl;
+        padding-right: Space.xl;
+        padding-bottom: Space.lg;
+        Banner {
+            tone: root.item.note-tone;
+            text: root.item.note;
+        }
+    }
+}
+
+export component CentersPage inherits PageFrame {
+    PageHeader {
+        title: "Centers";
+        subtitle: "The centers this machine is paired with. A center's agents may do only what you allow it.";
+        Button {
+            text: "Refresh";
+            icon: @image-url("icons/refresh.svg");
+            kind: ButtonKind.ghost;
+            clicked => {
+                Store.refresh();
+            }
+        }
+        Button {
+            text: "Pair a center";
+            icon: @image-url("icons/plus.svg");
+            kind: ButtonKind.primary;
+            clicked => {
+                Store.pair-start();
+            }
+        }
+    }
+
+    if Store.status-load == Load.loading && Store.status.state == "": Loading { }
+
+    if Store.status-load == Load.failed: Banner {
+        tone: Tone.danger;
+        title: "The centers could not be read";
+        text: Store.status-error;
+        action: "Try again";
+        acted => {
+            Store.refresh();
+        }
+    }
+
+    if Store.status.state != "" && Store.centers.length == 0: Card {
+        EmptyState {
+            icon: @image-url("icons/link.svg");
+            title: "No center is paired yet";
+            text: "In the center's web UI, press Pair a machine and copy the link it shows. Paste it here: you see where it leads before anything is paired.";
+            Button {
+                text: "Pair a center";
+                icon: @image-url("icons/plus.svg");
+                kind: ButtonKind.primary;
+                clicked => {
+                    Store.pair-start();
+                }
+            }
+        }
+    }
+
+    for c in Store.centers: CenterCard {
+        item: c;
+    }
+}

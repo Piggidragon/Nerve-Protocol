@@ -1,0 +1,13 @@
+//! The node's desktop app: a window that drives `nerve-node`. Every action
+//! runs the CLI (the same program, [`runner`]) and shows its JSON answer
+//! ([`view`]), so the app has the CLI's checks and audit records and keeps
+//! no settings of its own.
+
+slint::include_modules!();
+
+pub mod app;
+#[cfg(windows)]
+pub mod console;
+pub mod headless;
+pub mod runner;
+pub mod view;

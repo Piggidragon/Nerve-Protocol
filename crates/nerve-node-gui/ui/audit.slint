@@ -1,0 +1,198 @@
+// Audit: every decision of the node, newest first, with the four buttons of
+// issue #23 on a call: allow, allow as wildcard, deny, deny as wildcard.
+// They write the rule `nerve-node rule add --action` writes, the one the
+// center's audit page writes.
+
+import { Theme, Type, Space, Radius, Tone } from "theme.slint";
+import { Load, AuditRow } from "data.slint";
+import { Store } from "store.slint";
+import {
+    Button, ButtonKind, Card, Pill, IconTile, Banner, Loading, PageHeader, PageFrame,
+    EmptyState, Divider, Segmented, Code,
+} from "widgets.slint";
+
+component AuditEntry {
+    in property <AuditRow> entry;
+    property <bool> waiting: Store.busy == "audit-" + root.entry.index;
+    HorizontalLayout {
+        padding-left: Space.xl;
+        padding-right: Space.xl;
+        padding-top: Space.lg;
+        padding-bottom: Space.lg;
+        spacing: Space.lg;
+        VerticalLayout {
+            alignment: start;
+            IconTile {
+                size: 32px;
+                tone: root.entry.tone;
+                icon: root.entry.kind == "call" ? (root.entry.tone == Tone.danger ? @image-url("icons/ban.svg") : @image-url("icons/check.svg"))
+                    : root.entry.kind == "settings" ? @image-url("icons/sliders.svg")
+                    : root.entry.kind == "relay" ? @image-url("icons/globe.svg")
+                    : root.entry.kind == "key" ? @image-url("icons/key.svg")
+                    : root.entry.kind == "config" ? @image-url("icons/edit.svg")
+                    : @image-url("icons/info.svg");
+            }
+        }
+        VerticalLayout {
+            spacing: Space.sm;
+            horizontal-stretch: 1;
+            HorizontalLayout {
+                spacing: Space.sm;
+                Text {
+                    text: root.entry.title;
+                    color: Theme.text;
+                    font-size: Type.body;
+                    font-weight: Type.semibold;
+                    font-family: root.entry.kind == "call" ? Type.mono : "";
+                    vertical-alignment: center;
+                }
+                if root.entry.badge != "": VerticalLayout {
+                    alignment: center;
+                    Pill {
+                        text: root.entry.badge;
+                        tone: root.entry.tone;
+                    }
+                }
+                if root.entry.center != "": Text {
+                    text: root.entry.center;
+                    color: Theme.text-muted;
+                    font-size: Type.small;
+                    vertical-alignment: center;
+                }
+                Rectangle {
+                    horizontal-stretch: 1;
+                }
+                Text {
+                    text: root.entry.when;
+                    color: Theme.text-faint;
+                    font-size: Type.caption;
+                    vertical-alignment: center;
+                    accessible-label: root.entry.when-exact;
+                }
+            }
+            if root.entry.target != "": Code {
+                text: root.entry.target;
+            }
+            if root.entry.detail != "": Text {
+                text: root.entry.detail;
+                color: Theme.text-muted;
+                font-size: Type.small;
+                wrap: word-wrap;
+            }
+            if root.entry.rules: HorizontalLayout {
+                spacing: 6px;
+                padding-top: 2px;
+                alignment: start;
+                Button {
+                    text: "Allow";
+                    icon: @image-url("icons/check.svg");
+                    small: true;
+                    enabled: !root.waiting;
+                    clicked => {
+                        Store.audit-rule(root.entry.index, "allow", false);
+                    }
+                }
+                Button {
+                    text: "Allow as wildcard";
+                    small: true;
+                    enabled: !root.waiting;
+                    clicked => {
+                        Store.audit-rule(root.entry.index, "allow", true);
+                    }
+                }
+                Rectangle {
+                    width: Space.xs;
+                }
+                Button {
+                    text: "Deny";
+                    icon: @image-url("icons/ban.svg");
+                    kind: ButtonKind.danger-soft;
+                    small: true;
+                    enabled: !root.waiting;
+                    clicked => {
+                        Store.audit-rule(root.entry.index, "deny", false);
+                    }
+                }
+                Button {
+                    text: "Deny as wildcard";
+                    kind: ButtonKind.danger-soft;
+                    small: true;
+                    enabled: !root.waiting;
+                    clicked => {
+                        Store.audit-rule(root.entry.index, "deny", true);
+                    }
+                }
+            }
+            if !root.entry.rules && root.entry.rules-why != "": Text {
+                text: root.entry.rules-why;
+                color: Theme.text-faint;
+                font-size: Type.caption;
+                wrap: word-wrap;
+            }
+        }
+    }
+}
+
+export component AuditPage inherits PageFrame {
+    PageHeader {
+        title: "Audit";
+        subtitle: "What the node allowed and refused, newest first, and every change to its settings.";
+        Segmented {
+            options: ["All", "Refused"];
+            current: Store.audit-refused-only ? 1 : 0;
+            chosen(i) => {
+                Store.audit-filter(i == 1);
+            }
+        }
+        Button {
+            text: "Refresh";
+            icon: @image-url("icons/refresh.svg");
+            kind: ButtonKind.ghost;
+            clicked => {
+                Store.refresh-audit();
+            }
+        }
+    }
+
+    if Store.audit-load == Load.loading && Store.audit-total == 0: Loading {
+        text: "Reading the audit log…";
+    }
+
+    if Store.audit-load == Load.failed: Banner {
+        tone: Tone.danger;
+        title: "The audit log could not be read";
+        text: Store.audit-error;
+        action: "Try again";
+        acted => {
+            Store.refresh-audit();
+        }
+    }
+
+    if Store.audit-load == Load.ready && Store.audit.length == 0: Card {
+        EmptyState {
+            icon: @image-url("icons/audit.svg");
+            title: Store.audit-refused-only ? "Nothing was refused" : "Nothing decided yet";
+            text: Store.audit-refused-only
+                ? "Every call so far was allowed. Refused calls show here, with buttons to allow them."
+                : "When a center calls this machine, the node's decision shows here, and so does every change to its settings.";
+        }
+    }
+
+    if Store.audit.length > 0: Card {
+        pad: 0;
+        gap: 0;
+        for row[i] in Store.audit: VerticalLayout {
+            if i > 0: Divider { }
+            AuditEntry {
+                entry: row;
+            }
+        }
+    }
+
+    if Store.audit.length > 0 && Store.audit-total > Store.audit.length: Text {
+        text: "Showing the latest " + Store.audit.length + " of " + Store.audit-total + ". `nerve-node audit` shows them all.";
+        color: Theme.text-faint;
+        font-size: Type.caption;
+        horizontal-alignment: center;
+    }
+}

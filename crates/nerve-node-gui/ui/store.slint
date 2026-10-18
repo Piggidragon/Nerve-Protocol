@@ -1,0 +1,68 @@
+// The app's state and its actions, shared by every page. The Rust side
+// (src/app.rs) fills it from the CLI's answers and runs the actions as
+// `nerve-node` commands; nothing here decides anything about the node.
+
+import { Tone } from "theme.slint";
+import { Page, Load, NodeStatus, CenterRow, AuditRow, PairPreview } from "data.slint";
+
+export global Store {
+    in-out property <Page> page: Page.overview;
+    in-out property <string> version;
+
+    // The node's status and its centers, both from `nerve-node status`.
+    in-out property <Load> status-load: Load.loading;
+    in-out property <string> status-error;
+    in-out property <NodeStatus> status;
+    in-out property <[CenterRow]> centers;
+
+    in-out property <Load> audit-load: Load.loading;
+    in-out property <string> audit-error;
+    in-out property <[AuditRow]> audit;
+    in-out property <int> audit-total;
+    in-out property <bool> audit-refused-only;
+
+    // Pairing: the link, then what the owner confirms.
+    in-out property <bool> pair-open;
+    in-out property <int> pair-step;
+    in-out property <string> pair-link;
+    in-out property <string> pair-name;
+    in-out property <bool> pair-busy;
+    in-out property <string> pair-error;
+    in-out property <PairPreview> pair-preview;
+
+    // What a change that waits for its answer is about (a center's name, an
+    // audit entry), so its buttons wait too.
+    in-out property <string> busy;
+
+    in-out property <bool> confirm-open;
+    in-out property <string> confirm-title;
+    in-out property <string> confirm-text;
+    in-out property <string> confirm-button;
+
+    in-out property <bool> toast-shown;
+    in-out property <string> toast;
+    in-out property <Tone> toast-tone: Tone.ok;
+
+    in-out property <bool> about-open;
+    // 0 follows the system, 1 light, 2 dark.
+    in-out property <int> appearance;
+
+    callback show(Page);
+    callback refresh();
+    callback refresh-audit();
+    callback audit-filter(bool);
+    callback audit-rule(int, string, bool);
+
+    callback pair-start();
+    callback pair-check(string, string);
+    callback pair-confirm();
+
+    callback center-pause(string, bool);
+    callback center-grant(string, bool);
+    callback center-unpair(string);
+    callback confirm-accepted();
+
+    callback panic();
+    callback unlock();
+    callback set-appearance(int);
+}

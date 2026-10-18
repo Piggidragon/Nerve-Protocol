@@ -1,0 +1,66 @@
+// What the pages show, as the app makes it from the CLI's JSON answers
+// (src/view.rs). The pages only lay it out.
+
+import { Tone } from "theme.slint";
+
+export enum Page { overview, centers, policy, audit, log, settings, help }
+
+// What the app knows of something it asks the node for.
+export enum Load { loading, ready, failed }
+
+export struct NodeStatus {
+    // running, stopped, locked
+    state: string,
+    title: string,
+    detail: string,
+    tone: Tone,
+    confinement: string,
+    centers: int,
+    connected: int,
+    sudo-on: bool,
+    limits: string,
+    // What the owner should know: why commands do not run, a lost limit.
+    warnings: [string],
+}
+
+export struct CenterRow {
+    name: string,
+    url: string,
+    // The link as words, and its colour.
+    link: string,
+    link-tone: Tone,
+    mode: string,
+    mode-detail: string,
+    settings-write: bool,
+    paused: bool,
+    // What the owner should know of this pairing: why the link fails, or
+    // that the center no longer takes this machine.
+    note: string,
+    note-tone: Tone,
+}
+
+export struct AuditRow {
+    // call, settings, node, relay, config, key
+    kind: string,
+    tone: Tone,
+    title: string,
+    // The decision or event in one or two words, in the tone's colour.
+    badge: string,
+    center: string,
+    target: string,
+    detail: string,
+    when: string,
+    when-exact: string,
+    // The four buttons: whether they work for this entry, and why not.
+    rules: bool,
+    rules-why: string,
+    // The index of the entry in the app's list, for the buttons.
+    index: int,
+}
+
+export struct PairPreview {
+    center: string,
+    tls: bool,
+    pin: string,
+    name: string,
+}

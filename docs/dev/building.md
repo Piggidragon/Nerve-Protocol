@@ -10,6 +10,16 @@ cargo build --release
 # target/release/nerve-center and target/release/nerve-node
 ```
 
+`target/release/nerve-node-gui` is the node with its desktop app
+(`crates/nerve-node-gui`). On Linux it needs the fontconfig headers to build
+(`libfontconfig1-dev` on Debian and Ubuntu), and glibc: it is no static musl
+program. Its UI is in `crates/nerve-node-gui/ui/`, its colours, type and spaces
+in `ui/theme.slint`. Screenshots of every page, light and dark:
+
+```sh
+NERVE_GUI_SHOTS=/tmp/shots cargo test -p nerve-node-gui --test shots -- --ignored
+```
+
 ## Checks
 
 ```sh

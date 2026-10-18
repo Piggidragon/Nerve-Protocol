@@ -1,0 +1,240 @@
+// The window: the sidebar of pages, the page, and the dialogs over it.
+
+import { Palette } from "std-widgets.slint";
+import { Theme, Type, Space, Radius, Size, Tone } from "theme.slint";
+import { Page, Load, NodeStatus, CenterRow, AuditRow, PairPreview } from "data.slint";
+import { Store } from "store.slint";
+import { NavItem, StatusDot, Toast } from "widgets.slint";
+import { OverviewPage } from "overview.slint";
+import { CentersPage } from "centers.slint";
+import { AuditPage } from "audit.slint";
+import { PolicyPage, LogPage, SettingsPage, HelpPage } from "planned.slint";
+import { PairDialog, ConfirmDialog, AboutDialog } from "dialogs.slint";
+
+export { Store, Type, Tone, Page, Load, NodeStatus, CenterRow, AuditRow, PairPreview }
+
+component Sidebar inherits Rectangle {
+    width: Size.sidebar;
+    background: Theme.sidebar;
+    Rectangle {
+        x: parent.width - 1px;
+        width: 1px;
+        background: Theme.border;
+    }
+    VerticalLayout {
+        padding-left: 12px;
+        padding-right: 13px;
+        padding-top: 18px;
+        padding-bottom: 12px;
+        spacing: 2px;
+        HorizontalLayout {
+            padding-left: 8px;
+            padding-bottom: 20px;
+            spacing: 11px;
+            Image {
+                source: @image-url("icons/app.svg");
+                width: 32px;
+                height: 32px;
+            }
+            VerticalLayout {
+                alignment: center;
+                spacing: 1px;
+                Text {
+                    text: "Nerve";
+                    color: Theme.text;
+                    font-size: Type.lead;
+                    font-weight: Type.bold;
+                }
+                Text {
+                    text: "Node on this machine";
+                    color: Theme.text-muted;
+                    font-size: Type.caption;
+                }
+            }
+        }
+        NavItem {
+            icon: @image-url("icons/overview.svg");
+            text: "Overview";
+            selected: Store.page == Page.overview;
+            clicked => {
+                Store.show(Page.overview);
+            }
+        }
+        NavItem {
+            icon: @image-url("icons/centers.svg");
+            text: "Centers";
+            selected: Store.page == Page.centers;
+            clicked => {
+                Store.show(Page.centers);
+            }
+        }
+        NavItem {
+            icon: @image-url("icons/shield.svg");
+            text: "What a center may do";
+            selected: Store.page == Page.policy;
+            clicked => {
+                Store.show(Page.policy);
+            }
+        }
+        NavItem {
+            icon: @image-url("icons/audit.svg");
+            text: "Audit";
+            selected: Store.page == Page.audit;
+            clicked => {
+                Store.show(Page.audit);
+            }
+        }
+        NavItem {
+            icon: @image-url("icons/log.svg");
+            text: "Log";
+            selected: Store.page == Page.log;
+            clicked => {
+                Store.show(Page.log);
+            }
+        }
+        Rectangle {
+            vertical-stretch: 1;
+        }
+        NavItem {
+            icon: @image-url("icons/settings.svg");
+            text: "Settings";
+            selected: Store.page == Page.settings;
+            clicked => {
+                Store.show(Page.settings);
+            }
+        }
+        NavItem {
+            icon: @image-url("icons/help.svg");
+            text: "Help";
+            selected: Store.page == Page.help;
+            clicked => {
+                Store.show(Page.help);
+            }
+        }
+        NavItem {
+            icon: @image-url("icons/info.svg");
+            text: "About";
+            selected: Store.about-open;
+            clicked => {
+                Store.about-open = true;
+            }
+        }
+        Rectangle {
+            height: Space.md;
+        }
+        // The node's state, on every page.
+        Rectangle {
+            border-radius: Radius.md;
+            background: Theme.dark ? #ffffff08 : #ffffff99;
+            border-width: 1px;
+            border-color: Theme.border;
+            HorizontalLayout {
+                padding: 10px;
+                spacing: 9px;
+                VerticalLayout {
+                    alignment: center;
+                    StatusDot {
+                        tone: Store.status-load == Load.failed ? Tone.danger : Store.status.tone;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    spacing: 1px;
+                    Text {
+                        text: Store.status-load == Load.failed ? "No answer"
+                            : Store.status.state == "running" ? "Running"
+                            : Store.status.state == "locked" ? "Locked"
+                            : Store.status.state == "stopped" ? "Not running" : "Asking…";
+                        color: Theme.text;
+                        font-size: Type.small;
+                        font-weight: Type.semibold;
+                    }
+                    Text {
+                        text: Store.status.state == "" ? "the node"
+                            : Store.status.centers == 0 ? "No center paired"
+                            : Store.status.state != "running" ? "No link to its centers"
+                            : Store.status.connected + " of " + Store.status.centers + " centers connected";
+                        color: Theme.text-muted;
+                        font-size: Type.caption;
+                        overflow: elide;
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component AppWindow inherits Window {
+    title: "Nerve";
+    icon: @image-url("icons/app.svg");
+    preferred-width: 1180px;
+    preferred-height: 780px;
+    min-width: 900px;
+    min-height: 580px;
+    background: Theme.window;
+    default-font-size: Type.body;
+
+    // Light or dark for the whole app, the std widgets included; the system's
+    // scheme otherwise.
+    public function set-dark(dark: bool) {
+        Palette.color-scheme = dark ? ColorScheme.dark : ColorScheme.light;
+    }
+    public function follow-system() {
+        Palette.color-scheme = ColorScheme.unknown;
+    }
+
+    HorizontalLayout {
+        Sidebar { }
+        Rectangle {
+            horizontal-stretch: 1;
+            if Store.page == Page.overview: OverviewPage {
+                width: parent.width;
+                height: parent.height;
+            }
+            if Store.page == Page.centers: CentersPage {
+                width: parent.width;
+                height: parent.height;
+            }
+            if Store.page == Page.policy: PolicyPage {
+                width: parent.width;
+                height: parent.height;
+            }
+            if Store.page == Page.audit: AuditPage {
+                width: parent.width;
+                height: parent.height;
+            }
+            if Store.page == Page.log: LogPage {
+                width: parent.width;
+                height: parent.height;
+            }
+            if Store.page == Page.settings: SettingsPage {
+                width: parent.width;
+                height: parent.height;
+            }
+            if Store.page == Page.help: HelpPage {
+                width: parent.width;
+                height: parent.height;
+            }
+        }
+    }
+
+    if Store.pair-open: PairDialog { }
+    if Store.confirm-open: ConfirmDialog { }
+    if Store.about-open: AboutDialog { }
+
+    if Store.toast-shown: Toast {
+        text: Store.toast;
+        tone: Store.toast-tone;
+        width: min(440px, root.width - 48px - Size.sidebar);
+        height: self.preferred-height;
+        x: root.width - self.width - 24px;
+        y: root.height - self.height - 24px;
+    }
+    Timer {
+        interval: 5s;
+        running: Store.toast-shown;
+        triggered => {
+            Store.toast-shown = false;
+        }
+    }
+}

@@ -1,0 +1,270 @@
+// The dialogs: pairing a center, confirming a change that cannot be undone,
+// and About with Slint's AboutSlint, as Slint's Royalty-free license asks.
+
+import { AboutSlint } from "std-widgets.slint";
+import { Theme, Type, Space, Radius, Tone } from "theme.slint";
+import { Store } from "store.slint";
+import {
+    Button, ButtonKind, Banner, Dialog, DialogButtons, Field, TextField, InfoRow, Divider, Code,
+    Icon,
+} from "widgets.slint";
+
+export component PairDialog inherits Dialog {
+    title: Store.pair-step == 0 ? "Pair a center" : "Pair with this center?";
+    subtitle: Store.pair-step == 0
+        ? "Paste the pairing link the center's web UI shows under Pair a machine. Nothing is paired until you confirm."
+        : "Check that this is the center you mean. It gets nothing yet: a new center may do nothing until you allow it.";
+    close => {
+        Store.pair-open = false;
+    }
+
+    if Store.pair-step == 0: VerticalLayout {
+        spacing: Space.lg;
+        Field {
+            label: "Pairing link";
+            link := TextField {
+                text <=> Store.pair-link;
+                placeholder: "nerve://pair?center=…";
+                mono: true;
+                label: "Pairing link";
+                invalid: Store.pair-error != "";
+                enabled: !Store.pair-busy;
+                accepted => {
+                    Store.pair-check(Store.pair-link, Store.pair-name);
+                }
+                init => {
+                    self.focus();
+                }
+            }
+        }
+        Field {
+            label: "Name on this machine";
+            hint: "Optional. Leave it empty to take the center's own name.";
+            TextField {
+                text <=> Store.pair-name;
+                placeholder: "home-lab";
+                label: "Name on this machine";
+                enabled: !Store.pair-busy;
+                accepted => {
+                    Store.pair-check(Store.pair-link, Store.pair-name);
+                }
+            }
+        }
+        if Store.pair-error != "": Banner {
+            tone: Tone.danger;
+            text: Store.pair-error;
+        }
+        DialogButtons {
+            Button {
+                text: "Cancel";
+                kind: ButtonKind.ghost;
+                clicked => {
+                    Store.pair-open = false;
+                }
+            }
+            Button {
+                text: "Continue";
+                kind: ButtonKind.primary;
+                enabled: Store.pair-link != "";
+                busy: Store.pair-busy;
+                clicked => {
+                    Store.pair-check(Store.pair-link, Store.pair-name);
+                }
+            }
+        }
+    }
+
+    if Store.pair-step == 1: VerticalLayout {
+        spacing: Space.lg;
+        Rectangle {
+            background: Theme.surface-alt;
+            border-radius: Radius.lg;
+            border-width: 1px;
+            border-color: Theme.border;
+            VerticalLayout {
+                padding: Space.lg;
+                spacing: Space.md;
+                InfoRow {
+                    label: "Center";
+                    value: Store.pair-preview.center;
+                    mono: true;
+                }
+                InfoRow {
+                    label: "Certificate";
+                    value: !Store.pair-preview.tls ? "None: plain http, nothing on the way is encrypted"
+                        : Store.pair-preview.pin != "" ? "Pinned: " + Store.pair-preview.pin
+                        : "Checked against the system's roots";
+                    mono: Store.pair-preview.tls && Store.pair-preview.pin != "";
+                    tone: Store.pair-preview.tls ? Tone.neutral : Tone.danger;
+                }
+                InfoRow {
+                    label: "Name here";
+                    value: Store.pair-preview.name != "" ? Store.pair-preview.name : "The center's own name";
+                }
+            }
+        }
+        if !Store.pair-preview.tls: Banner {
+            tone: Tone.warn;
+            title: "This link is not encrypted";
+            text: "Anyone on the way can read and change what goes between this machine and the center. Pair over plain http only on a network you trust.";
+        }
+        VerticalLayout {
+            spacing: 6px;
+            Text {
+                text: "The center starts with";
+                color: Theme.text;
+                font-size: Type.small;
+                font-weight: Type.semibold;
+            }
+            HorizontalLayout {
+                spacing: Space.sm;
+                VerticalLayout {
+                    alignment: start;
+                    padding-top: 2px;
+                    Icon {
+                        source: @image-url("icons/shield.svg");
+                        colorize: Theme.ok;
+                        size: 14px;
+                    }
+                }
+                Text {
+                    text: "Allowlist mode: nothing is allowed until you add an allow rule or choose a mode.";
+                    color: Theme.text-muted;
+                    font-size: Type.small;
+                    wrap: word-wrap;
+                }
+            }
+            HorizontalLayout {
+                spacing: Space.sm;
+                VerticalLayout {
+                    alignment: start;
+                    padding-top: 2px;
+                    Icon {
+                        source: @image-url("icons/lock.svg");
+                        colorize: Theme.ok;
+                        size: 14px;
+                    }
+                }
+                Text {
+                    text: "No settings grant: the center cannot change what it may do.";
+                    color: Theme.text-muted;
+                    font-size: Type.small;
+                    wrap: word-wrap;
+                }
+            }
+        }
+        if Store.pair-error != "": Banner {
+            tone: Tone.danger;
+            title: "Not paired";
+            text: Store.pair-error;
+        }
+        DialogButtons {
+            Button {
+                text: "Back";
+                icon: @image-url("icons/arrow-left.svg");
+                kind: ButtonKind.ghost;
+                enabled: !Store.pair-busy;
+                clicked => {
+                    Store.pair-error = "";
+                    Store.pair-step = 0;
+                }
+            }
+            Button {
+                text: "Pair";
+                icon: @image-url("icons/link.svg");
+                kind: ButtonKind.primary;
+                busy: Store.pair-busy;
+                clicked => {
+                    Store.pair-confirm();
+                }
+            }
+        }
+    }
+}
+
+export component ConfirmDialog inherits Dialog {
+    title: Store.confirm-title;
+    card-width: 460px;
+    close => {
+        Store.confirm-open = false;
+    }
+    Text {
+        text: Store.confirm-text;
+        color: Theme.text-muted;
+        font-size: Type.body;
+        wrap: word-wrap;
+    }
+    DialogButtons {
+        Button {
+            text: "Cancel";
+            kind: ButtonKind.ghost;
+            clicked => {
+                Store.confirm-open = false;
+            }
+        }
+        Button {
+            text: Store.confirm-button;
+            kind: ButtonKind.danger;
+            clicked => {
+                Store.confirm-open = false;
+                Store.confirm-accepted();
+            }
+        }
+    }
+}
+
+export component AboutDialog inherits Dialog {
+    title: "About";
+    card-width: 440px;
+    close => {
+        Store.about-open = false;
+    }
+    VerticalLayout {
+        spacing: Space.sm;
+        HorizontalLayout {
+            alignment: center;
+            Image {
+                source: @image-url("icons/app.svg");
+                width: 64px;
+                height: 64px;
+            }
+        }
+        Text {
+            text: "Nerve node";
+            color: Theme.text;
+            font-size: 18px;
+            font-weight: Type.semibold;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: "Version " + Store.version;
+            color: Theme.text-muted;
+            font-size: Type.small;
+            horizontal-alignment: center;
+        }
+        Text {
+            text: "The desktop app of the Nerve node. Every action runs nerve-node, so it has the command line's checks and writes the same audit records.";
+            color: Theme.text-muted;
+            font-size: Type.small;
+            wrap: word-wrap;
+            horizontal-alignment: center;
+        }
+        HorizontalLayout {
+            alignment: center;
+            padding-top: Space.xs;
+            Button {
+                text: "Project page";
+                icon: @image-url("icons/external.svg");
+                kind: ButtonKind.ghost;
+                small: true;
+                clicked => {
+                    Platform.open-url("https://github.com/Piggidragon/Nerve-Protocol");
+                }
+            }
+        }
+    }
+    Divider { }
+    AboutSlint {
+        preferred-height: self.min-height;
+    }
+}

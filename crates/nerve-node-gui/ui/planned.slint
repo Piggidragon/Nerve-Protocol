@@ -1,0 +1,131 @@
+// The pages that come with the next part of the app: their layout, and
+// what each part will hold. Appearance on the settings page works already.
+
+import { Theme, Type, Space, Radius, Tone } from "theme.slint";
+import { Store } from "store.slint";
+import {
+    Button, ButtonKind, Card, Pill, PageHeader, PageFrame, Planned, Segmented, EmptyState,
+    SectionTitle,
+} from "widgets.slint";
+
+export component PolicyPage inherits PageFrame {
+    PageHeader {
+        title: "What a center may do";
+        subtitle: "Its mode, the folders it may use, the commands it may run or never runs, its capabilities and sudo. Each center has its own.";
+    }
+    Planned {
+        icon: @image-url("icons/shield.svg");
+        title: "Mode";
+        text: "Allowlist (only what an allow rule names), folder (what each folder's rights allow) or user (anything you could do yourself), for a time or until you change it.";
+    }
+    Planned {
+        icon: @image-url("icons/folder.svg");
+        title: "Folders";
+        text: "The folders a center may use in folder mode, each with read, write and run rights. Chosen in the system's folder dialog.";
+    }
+    Planned {
+        icon: @image-url("icons/terminal.svg");
+        title: "Command rules";
+        text: "The allow, deny and sudo lists: add a command, or one with a wildcard, and remove one.";
+    }
+    Planned {
+        icon: @image-url("icons/sliders.svg");
+        title: "Capabilities";
+        text: "Switch a capability or a single action on, off or hidden.";
+    }
+    Planned {
+        icon: @image-url("icons/key.svg");
+        title: "Sudo";
+        text: "Turn sudo on with your password, asked here and kept in memory only, or off.";
+    }
+}
+
+export component LogPage inherits PageFrame {
+    PageHeader {
+        title: "Log";
+        subtitle: "What the node did: its starts and stops, its links, and what went wrong.";
+    }
+    Card {
+        EmptyState {
+            icon: @image-url("icons/log.svg");
+            title: "The log comes next";
+            text: "The node's log will show here as it grows, with its errors and warnings first to find.";
+        }
+    }
+}
+
+export component SettingsPage inherits PageFrame {
+    PageHeader {
+        title: "Settings";
+        subtitle: "This machine's node, how it reaches its centers, and the app itself.";
+    }
+    Card {
+        pad: Space.xl;
+        HorizontalLayout {
+            spacing: Space.lg;
+            VerticalLayout {
+                spacing: 6px;
+                horizontal-stretch: 1;
+                Text {
+                    text: "Appearance";
+                    color: Theme.text;
+                    font-size: Type.heading;
+                    font-weight: Type.semibold;
+                }
+                Text {
+                    text: "Light or dark, or as the system is set.";
+                    color: Theme.text-muted;
+                    font-size: Type.small;
+                    wrap: word-wrap;
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                Segmented {
+                    options: ["System", "Light", "Dark"];
+                    current: Store.appearance;
+                    chosen(i) => {
+                        Store.set-appearance(i);
+                    }
+                }
+            }
+        }
+    }
+    Planned {
+        icon: @image-url("icons/edit.svg");
+        title: "This machine";
+        text: "The node's name, where it keeps its keys (files or the system keyring), and every other setting by its name.";
+    }
+    Planned {
+        icon: @image-url("icons/globe.svg");
+        title: "Connection";
+        text: "The proxy the node reaches its centers through, and the relay that lets other nodes reach them through this one.";
+    }
+    Planned {
+        icon: @image-url("icons/plug.svg");
+        title: "Service";
+        text: "Install the node as a service that starts with the machine, set it up, update it and remove it. Asks for administrator rights when it needs them, and says why first.";
+    }
+    Planned {
+        icon: @image-url("icons/archive.svg");
+        title: "Backup";
+        text: "Write the config and keys to a file a passphrase protects, and put a backup back.";
+    }
+}
+
+export component HelpPage inherits PageFrame {
+    PageHeader {
+        title: "Help";
+        subtitle: "What each part of the app does, and the nerve-node command behind it.";
+    }
+    Planned {
+        icon: @image-url("icons/help.svg");
+        title: "Commands";
+        text: "Every nerve-node command by what it is for, as `nerve-node --help` has them: each action in this app runs one of them.";
+    }
+    Planned {
+        icon: @image-url("icons/info.svg");
+        title: "Guides";
+        text: "Pairing, modes and rules, sudo, the service, backups, and what to do when something does not work.";
+    }
+}

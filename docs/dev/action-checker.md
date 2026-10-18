@@ -44,22 +44,29 @@ match the commands `normalize::commands` pulls from the command line; `fs`
 patterns are path globs (a leading `~` becomes `*`, since the center does not
 know the node's home); any other `cap.action` matches that scope.
 
-For `exec.run` an entry is either a **structured command pattern** (`program`
-glob, the short and long flags that must all be present, and operand globs that
-must each be met) or a **`re:` regex** over the whole normalised command line
-for the cases a glob cannot express (fork bombs, `curl | sh`, database drops,
-Windows cmdlets). `normalize` splits on separators, pulls `$( )`, backtick and
-`sh -c` / `powershell -Command` (incl. combined `-lc`/`-xc`) bodies out, strips
-wrappers, takes the program's base name, and expands combined short flags, so
-flag order and `-rf`/`-Rf`/`--recursive --force` do not matter. The whole walk
-is bounded (`normalize::MAX_DEPTH`, `MAX_COMMANDS`); a line past the bound comes
-back as `Parsed::overflow`, and the checker refuses it (fail closed) instead of
-passing a line it could not take apart — a deeply nested `$(` can no longer
-overflow the stack. The structured matcher folds a trailing `/` or `/*` on an
-operand and matches a short flag in either case (`rm -Rf` meets `rm -rf`); the
-`re:` defaults for the order-combinatorial Windows cmdlets carry a few orderings
-each (Rust's regex has no lookahead). `fs` paths are normalised (`//`, `/.`,
-`..`) and matched case-insensitively. The limits (variables, `$HOME`, aliases,
+For `exec.run` an entry is a **structured command pattern** (`program` glob,
+the short and long flags that must all be present, and operand globs that must
+each be met), a **`re:` regex** over the whole normalised command line, or a
+**`cmd-re:` regex** over each command pulled from the line as `program args…`
+(for a pattern that must read one command's own words and a whole operand — the
+Windows recursive-delete entries, which take the target as a whole operand so
+`Remove-Item C:\Users\me\build -Recurse -Force` stays allowed while a drive
+root is refused). `normalize` splits on separators and subshell parentheses,
+pulls `$( )`, backticks (also in double quotes), process substitution, `sh -c`
+(`c` anywhere in the flag word: `-lc`, `-ce`, `-c -e`), `cmd /c` and
+`powershell -Command` bodies, and here-documents/here-strings fed to a shell;
+it strips wrappers and shell keywords, drops a `.exe` suffix, and expands
+combined short flags, so flag order and `-rf`/`-Rf`/`--recursive --force` do
+not matter. A here-document only written to a file is data (its lines are not
+commands), so a file that merely mentions `rm -rf /` is not refused. The whole
+walk is bounded: depth at `normalize::MAX_DEPTH` (16) and commands at
+`MAX_COMMANDS` (100 000, far above any real script, so ordinary heredocs are
+not refused); a line past a bound comes back as `Parsed::overflow`
+(`Depth`/`Commands`) and the checker refuses it (fail closed), naming which —
+a deeply nested `$(` can no longer overflow the stack. The structured matcher
+folds a trailing `/` or `/*` on an operand and matches a short flag in either
+case (`rm -Rf` meets `rm -rf`). `fs` paths are normalised (`//`, `/.`, `..`)
+and matched case-insensitively. The limits (variables, `$HOME`, aliases,
 written-then-run scripts, base64, symlinks, the device's real canonical path)
 are in the user guide and the module comment.
 
@@ -100,13 +107,24 @@ center downloads a prebuilt `llama-server` from llama.cpp's GitHub release
 (tag and per-asset SHA-256 pinned in `install::llama_asset`; the Vulkan build
 for GPU) and the chosen pinned GGUF from Hugging Face into
 `<state>/checker/llama/<tag>/` and `<state>/checker/model/` — never
-system-wide. Each download streams to disk, is checked against its pinned
-SHA-256 (and the model against its pinned length), and renames into place, so a
-half download never counts as installed; the archive is unpacked with the
-system `tar` after a scan that refuses any entry that would escape the target.
-`gpu_hint` (libvulkan + a render node, or `vulkan-1.dll`) decides whether to
-offer GPU before anything is downloaded; the GPU build's `--list-devices` is the
-real check (it never loads a model). There is no path or build to choose; the
+system-wide. Both go through the **shared** downloader
+`nerve_transport::download` (also used by the node's updater), which streams to
+the file, follows redirects (never https→http), has a per-read idle timeout (so
+a stalled connection ends instead of hanging) and a cancel flag; the download
+is checked against its pinned SHA-256 (and the model against its pinned length)
+before it is renamed into place, so a half or unverified download never counts
+as installed. The archive is unpacked with the system `tar` after a scan that
+refuses any entry that would escape the target, into a sibling staging folder
+that is swapped in only once the server binary and a `variant` marker are
+there, so a failed or cancelled reinstall keeps the working build.
+`gpu_hint` (libvulkan + a render node, or `vulkan-1.dll`) offers the GPU choice
+before anything is downloaded; after a GPU install the build's `--list-devices`
+(`gpu_available`, which never loads a model) is the real check, and a build
+that finds no device falls back to the CPU with a note. Installs are serialised
+and carry a cancel token the center keeps, so a second install is refused and a
+`Remove` cancels a running one and stops the server before deleting (which
+Windows refuses while a file is in use — `LocalServer::stop` ends the child and
+waits for it). There is no path or build to choose; the
 model is one of the two pinned in `install::MODELS` (`ModelConfig::local_model`,
 d1-3B by default), independent of the device. Each pin carries its repo,
 revision, file, size, SHA-256, licence, and the evaluation's default threshold

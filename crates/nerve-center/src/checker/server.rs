@@ -53,15 +53,22 @@ struct Inner {
     output: std::collections::VecDeque<String>,
 }
 
-/// A running (or restarting) local llama-server. Dropping it ends the server.
+/// A running (or restarting) local llama-server. [`LocalServer::stop`] ends
+/// the child and waits for it to exit (so its files can then be deleted, which
+/// Windows refuses while it runs); dropping it only aborts the supervisor.
 pub struct LocalServer {
     inner: Arc<Mutex<Inner>>,
     port: u16,
     task: JoinHandle<()>,
+    /// Asked to end the server.
+    shutdown: Arc<tokio::sync::Notify>,
+    /// Fired by the supervisor once the child has exited and it is returning.
+    exited: Arc<tokio::sync::Notify>,
 }
 
 impl Drop for LocalServer {
     fn drop(&mut self) {
+        self.shutdown.notify_waiters();
         self.task.abort();
     }
 }
@@ -85,8 +92,36 @@ impl LocalServer {
         let inner = Arc::new(Mutex::new(Inner::default()));
         let args = build_args(&model, gpu, port);
         let timeout = Duration::from_millis(timeout_ms.max(100));
-        let task = tokio::spawn(supervise(bin, args, port, timeout, inner.clone()));
-        Ok(LocalServer { inner, port, task })
+        let shutdown = Arc::new(tokio::sync::Notify::new());
+        let exited = Arc::new(tokio::sync::Notify::new());
+        let task = tokio::spawn(supervise(
+            bin,
+            args,
+            port,
+            timeout,
+            inner.clone(),
+            shutdown.clone(),
+            exited.clone(),
+        ));
+        Ok(LocalServer {
+            inner,
+            port,
+            task,
+            shutdown,
+            exited,
+        })
+    }
+
+    /// Ends the server and waits for the child process to exit, up to a few
+    /// seconds, so its files are free to delete or replace afterwards. Safe to
+    /// call more than once.
+    pub async fn stop(&self) {
+        let exited = self.exited.clone();
+        // Subscribe before asking, so a fast exit is not missed.
+        let wait = exited.notified();
+        tokio::pin!(wait);
+        self.shutdown.notify_waiters();
+        let _ = tokio::time::timeout(Duration::from_secs(10), wait).await;
     }
 
     /// The endpoint for the client, once the server is listening.
@@ -142,6 +177,8 @@ async fn supervise(
     port: u16,
     timeout: Duration,
     inner: Arc<Mutex<Inner>>,
+    shutdown: Arc<tokio::sync::Notify>,
+    exited: Arc<tokio::sync::Notify>,
 ) {
     let mut backoff = Duration::from_secs(1);
     loop {
@@ -149,9 +186,16 @@ async fn supervise(
             i.phase = Some(Phase::Starting);
             i.url = None;
         });
-        match run_once(&program, &args, port, timeout, &inner).await {
+        match run_once(&program, &args, port, timeout, &inner, &shutdown).await {
             RunEnd::NotDecision => {
                 // A clear, final failure: do not restart.
+                exited.notify_waiters();
+                return;
+            }
+            RunEnd::Stopped => {
+                // Asked to stop: the child has exited, its files are free.
+                set(&inner, |i| i.phase = Some(Phase::Starting));
+                exited.notify_waiters();
                 return;
             }
             RunEnd::Exited => {}
@@ -162,8 +206,14 @@ async fn supervise(
                 });
             }
         }
-        // Wait before the next try; a success resets the backoff.
-        tokio::time::sleep(backoff).await;
+        // Wait before the next try; a stop during the wait ends it at once.
+        tokio::select! {
+            _ = tokio::time::sleep(backoff) => {}
+            _ = shutdown.notified() => {
+                exited.notify_waiters();
+                return;
+            }
+        }
         backoff = (backoff * 2).min(Duration::from_secs(30));
     }
 }
@@ -171,10 +221,18 @@ async fn supervise(
 enum RunEnd {
     /// The process could not be started.
     StartFailed(String),
-    /// It ran and exited (crash or stop); restart after the backoff.
+    /// It ran and exited (crash); restart after the backoff.
     Exited,
+    /// It was asked to stop and the child has exited; do not restart.
+    Stopped,
     /// It loaded a model that is not a decision model; do not restart.
     NotDecision,
+}
+
+/// Kills the child and waits for it to exit, so its files are free.
+async fn kill_and_wait(child: &mut tokio::process::Child) {
+    let _ = child.start_kill();
+    let _ = child.wait().await;
 }
 
 async fn run_once(
@@ -183,6 +241,7 @@ async fn run_once(
     port: u16,
     timeout: Duration,
     inner: &Arc<Mutex<Inner>>,
+    shutdown: &Arc<tokio::sync::Notify>,
 ) -> RunEnd {
     let mut cmd = Command::new(program);
     cmd.args(args)
@@ -216,6 +275,10 @@ async fn run_once(
     let url = format!("http://127.0.0.1:{port}");
     loop {
         tokio::select! {
+            _ = shutdown.notified() => {
+                kill_and_wait(&mut child).await;
+                return RunEnd::Stopped;
+            }
             status = child.wait() => {
                 let how = status.map(|s| s.to_string()).unwrap_or_else(|e| e.to_string());
                 set(inner, |i| {
@@ -235,23 +298,31 @@ async fn run_once(
                             i.url = Some(url.clone());
                             i.message.clear();
                         });
-                        // Stay here until the child exits; then restart.
-                        let how = child.wait().await
-                            .map(|s| s.to_string()).unwrap_or_else(|e| e.to_string());
-                        set(inner, |i| {
-                            i.phase = Some(Phase::Starting);
-                            i.url = None;
-                            push_line(&mut i.output, format!("llama-server ended ({how})"));
-                        });
-                        return RunEnd::Exited;
+                        // Stay here until the child exits or we are stopped.
+                        tokio::select! {
+                            _ = shutdown.notified() => {
+                                kill_and_wait(&mut child).await;
+                                return RunEnd::Stopped;
+                            }
+                            status = child.wait() => {
+                                let how = status
+                                    .map(|s| s.to_string())
+                                    .unwrap_or_else(|e| e.to_string());
+                                set(inner, |i| {
+                                    i.phase = Some(Phase::Starting);
+                                    i.url = None;
+                                    push_line(&mut i.output, format!("llama-server ended ({how})"));
+                                });
+                                return RunEnd::Exited;
+                            }
+                        }
                     }
                     Ok(Ok(false)) => {
                         set(inner, |i| {
                             i.phase = Some(Phase::Failed);
                             i.message = "the loaded model is not a decision model: /v1/models has no \"decisions\". Use a System One model.".into();
                         });
-                        let _ = child.start_kill();
-                        let _ = child.wait().await;
+                        kill_and_wait(&mut child).await;
                         return RunEnd::NotDecision;
                     }
                     // Not up yet, or a transient error: keep probing.
@@ -301,5 +372,80 @@ mod tests {
         assert!(is_download("downloading model.gguf"));
         assert!(is_download("  45%|████      | 200M/440M"));
         assert!(!is_download("llama_server: model loaded"));
+    }
+    /// A fake `llama-server`: a shell script that ignores the model and serves
+    /// `/v1/models` (a decision model) and `/v1/systemone` on the `--port` it
+    /// is given, so the supervisor can be tested without a real model. Unix
+    /// only (it uses `/bin/sh` and `nc`-free shell); skipped elsewhere.
+    #[cfg(unix)]
+    fn fake_llama_server(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("llama-server");
+        // A tiny HTTP server in shell + a Python one-liner (Python is present
+        // on the test machines). It answers every request by content of the
+        // path.
+        let script = r#"#!/bin/sh
+port=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--port" ]; then port="$a"; fi
+  prev="$a"
+done
+exec python3 - "$port" <<'PY'
+import sys, http.server
+port = int(sys.argv[1])
+class H(http.server.BaseHTTPRequestHandler):
+    def _send(self, body):
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def do_GET(self):
+        self._send(b'{"data":[{"architecture":{"output_modalities":["decisions"]}}]}')
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        self.rfile.read(n)
+        self._send(b'{"answers":{"danger":{"type":"noul","noul":0.99}}}')
+    def log_message(self, *a):
+        pass
+http.server.HTTPServer(("127.0.0.1", port), H).serve_forever()
+PY
+"#;
+        std::fs::write(&bin, script).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        bin
+    }
+
+    /// The supervisor starts the (fake) server, reports it ready once it
+    /// answers `/v1/models` with a decision model, and `stop` ends the child
+    /// and returns (review r2, findings 1 and 8).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_supervisor_starts_and_stops_a_fake_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = fake_llama_server(dir.path());
+        let model = dir.path().join("model.gguf");
+        std::fs::write(&model, b"x").unwrap();
+        let server = LocalServer::start(bin, model, false, 5000).expect("start");
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while std::time::Instant::now() < deadline && !server.ready() {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        assert!(server.ready(), "never ready: {:?}", server.status());
+        // The endpoint answers.
+        let ep = server.endpoint();
+        let score = crate::checker::model::ask(
+            &ep,
+            &crate::checker::config::ModelConfig::default(),
+            serde_json::json!({"command": "x"}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(score, 0.99);
+        // Stop returns promptly and the port is freed.
+        tokio::time::timeout(Duration::from_secs(10), server.stop())
+            .await
+            .expect("stop did not return");
     }
 }

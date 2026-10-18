@@ -1206,63 +1206,25 @@ pub async fn fetch_release(base: &str, asset: &str) -> Result<Vec<u8>, String> {
 }
 
 /// `GET url`, following redirects (never from https to http), through the
-/// proxy `HTTPS_PROXY` names. Errors name the host, not the whole address,
-/// which may hold a signed query.
+/// proxy `HTTPS_PROXY` names: the download the center's one-click model
+/// install shares (`nerve_transport::download`). Errors name the host, not
+/// the whole address, which may hold a signed query.
 async fn download(url: &str, max: usize) -> Result<Vec<u8>, String> {
-    let mut url = url.to_string();
-    let mut tls = None;
-    for _ in 0..6 {
-        let (at, target) = split_url(&url)?;
-        if tls == Some(true) && !at.tls {
-            return Err(format!("{} redirects from https to http", at.host));
-        }
-        tls = Some(at.tls);
-        let proxy = if at.tls {
-            nerve_transport::net::Proxy::from_env(&at.host)?
-        } else {
-            None
-        };
-        let mut io = nerve_transport::net::open(&at, None, proxy.as_ref()).await?;
-        let r = nerve_transport::http::get(&mut io, &at.authority(), &target, max)
-            .await
-            .map_err(|e| format!("{}: {e}", at.host))?;
-        match r.status {
-            200 => return Ok(r.body),
-            301 | 302 | 303 | 307 | 308 => {
-                let to = r
-                    .location
-                    .ok_or_else(|| format!("{} redirects without a Location", at.host))?;
-                url = if to.contains("://") {
-                    to
-                } else if to.starts_with('/') {
-                    format!(
-                        "{}://{}{to}",
-                        if at.tls { "https" } else { "http" },
-                        at.authority()
-                    )
-                } else {
-                    return Err(format!("{} redirects to a relative place", at.host));
-                };
-            }
-            s => return Err(format!("{} answered HTTP {s}", at.host)),
-        }
-    }
-    Err("too many redirects".into())
+    let mut body = Vec::new();
+    let opts = nerve_transport::download::Options {
+        max: max as u64,
+        idle: nerve_transport::http::HEAD_TIMEOUT,
+        hops: 6,
+        cancel: None,
+    };
+    nerve_transport::download::fetch(url, &mut body, &opts, &mut |_, _| {}).await?;
+    Ok(body)
 }
 
 /// The server and the request target (path and query) of an http(s) URL.
+#[cfg(test)]
 fn split_url(url: &str) -> Result<(nerve_proto::link::CenterUrl, String), String> {
-    let scheme_end = url.find("://").ok_or("not an http(s) address")?;
-    let rest = &url[scheme_end + 3..];
-    let end = rest.find(['/', '?']).unwrap_or(rest.len());
-    let mut target = rest[end..].to_string();
-    if !target.starts_with('/') {
-        target.insert(0, '/');
-    }
-    let at =
-        nerve_proto::link::CenterUrl::parse(&format!("{}{}", &url[..scheme_end + 3], &rest[..end]))
-            .map_err(|_| "not an http(s) address".to_string())?;
-    Ok((at, target))
+    nerve_transport::download::split_url(url)
 }
 
 /// Writes `data` to `path` through a temporary file beside it and a rename,

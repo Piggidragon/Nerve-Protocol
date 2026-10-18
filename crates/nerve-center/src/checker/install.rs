@@ -19,15 +19,25 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-use nerve_proto::link::CenterUrl;
 
 use super::config::LocalModel;
 
 /// The pinned llama.cpp release.
 pub const LLAMA_TAG: &str = "b11719";
 const LLAMA_BASE: &str = "https://github.com/ggml-org/llama.cpp/releases/download";
+const HF_BASE: &str = "https://huggingface.co";
+
+/// Where the install downloads from: the real release and Hugging Face, or a
+/// local fake in a test.
+struct Sources<'a> {
+    llama: &'a str,
+    hf: &'a str,
+}
+
+const REAL: Sources<'static> = Sources {
+    llama: LLAMA_BASE,
+    hf: HF_BASE,
+};
 
 /// One pinned model: where it comes from, what it is, and the defaults the
 /// evaluation (docs/dev/action-checker.md) gives it.
@@ -190,10 +200,13 @@ pub fn server_bin(state: &Path) -> Option<PathBuf> {
     find_file(&llama_dir(state), want)
 }
 
-/// Whether `model` is installed: the server binary and its file are both in
-/// place.
+/// Whether `model` is installed: the build (with its `variant` marker, which
+/// is written last, so a half-unpacked build does not count) and the model
+/// file are all in place.
 pub fn installed(state: &Path, model: LocalModel) -> bool {
-    server_bin(state).is_some() && model_path(state, model).exists()
+    installed_variant(state).is_some()
+        && server_bin(state).is_some()
+        && model_path(state, model).exists()
 }
 
 /// The device the installed build is for (`Some(true)` = GPU/Vulkan,
@@ -259,14 +272,18 @@ fn set(shared: &Shared, f: impl FnOnce(&mut Status)) {
     f(&mut shared.lock().unwrap());
 }
 
-/// Downloads and verifies llama.cpp and the model into `state`, reporting
-/// progress through `shared`. Idempotent: a build or model already present and
-/// valid is not fetched again.
+/// Downloads and verifies llama.cpp and the chosen model into `state`,
+/// reporting progress through `shared`. `cancel` stops it at the next read.
+/// A build or model already present and valid is not fetched again. Nothing
+/// a server might be holding is deleted here: the caller stops the server
+/// first. The new build is staged beside the old and swapped in only once it
+/// is verified, so a failed or cancelled install never destroys a working one.
 pub async fn install(
     state: PathBuf,
     gpu: bool,
     model: LocalModel,
     shared: Shared,
+    cancel: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), String> {
     set(&shared, |s| {
         *s = Status {
@@ -276,7 +293,7 @@ pub async fn install(
             ..Default::default()
         };
     });
-    let r = install_inner(&state, gpu, model, &shared).await;
+    let r = install_inner(&state, gpu, model, &shared, &cancel, &REAL).await;
     set(&shared, |s| match &r {
         Ok(()) => s.phase = Phase::Done,
         Err(e) => {
@@ -287,46 +304,65 @@ pub async fn install(
     r
 }
 
+/// The idle timeout for an install download: a connection silent this long is
+/// given up on (a slow line still sends something inside it).
+const IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+fn opts(
+    cancel: &Arc<std::sync::atomic::AtomicBool>,
+    max: u64,
+) -> nerve_transport::download::Options {
+    nerve_transport::download::Options {
+        max,
+        idle: IDLE,
+        hops: 8,
+        cancel: Some(cancel.clone()),
+    }
+}
+
 async fn install_inner(
     state: &Path,
     gpu: bool,
     model_id: LocalModel,
     shared: &Shared,
+    cancel: &Arc<std::sync::atomic::AtomicBool>,
+    from: &Sources<'_>,
 ) -> Result<(), String> {
     let (asset, sha) =
         llama_asset(gpu).ok_or("this platform has no pinned local build; use the endpoint mode")?;
     // 1. llama.cpp, unless the right build (CPU vs GPU) is already unpacked.
-    // A device switch wipes the old build so the matching one is fetched.
+    // A device switch fetches the other build into a staging folder and
+    // swaps it in only when it is ready, so the old build survives a failure.
     let need_llama = server_bin(state).is_none() || installed_variant(state) != Some(gpu);
     if need_llama {
         let dir = llama_dir(state);
-        if dir.exists() {
-            std::fs::remove_dir_all(&dir).map_err(|e| e.to_string())?;
+        let staging = dir.with_extension("staging");
+        let _ = std::fs::remove_dir_all(&staging);
+        create_dir(&staging)?;
+        let staged = stage_build(&staging, asset, sha, gpu, from, cancel, shared).await;
+        if let Err(e) = staged {
+            // A failed or cancelled build leaves nothing staged behind.
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
         }
-        create_dir(&dir)?;
-        let archive = dir.join(asset);
-        let url = format!("{LLAMA_BASE}/{LLAMA_TAG}/{asset}");
-        fetch_to_file(&url, &archive, Some(sha), None, &mut |done, total| {
-            set(shared, |s| s.llama = Progress { done, total });
-        })
-        .await
-        .map_err(|e| format!("downloading {asset}: {e}"))?;
-        set(shared, |s| s.phase = Phase::Unpacking);
-        unpack(&archive, &dir)?;
-        let _ = std::fs::remove_file(&archive);
+        // Swap the staged build in. The caller stopped the server, so the old
+        // folder is free to remove even on Windows.
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::rename(&staging, &dir).map_err(|e| format!("cannot install the build: {e}"))?;
         if server_bin(state).is_none() {
-            return Err("the llama.cpp archive has no llama-server in it".into());
+            return Err("the llama.cpp build did not install".into());
         }
-        std::fs::write(dir.join("variant"), if gpu { "gpu" } else { "cpu" })
-            .map_err(|e| e.to_string())?;
     } else {
         set(shared, |s| {
             s.llama = Progress { done: 1, total: 1 };
         });
     }
+    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+        return Err("the install was cancelled".into());
+    }
     // 2. The model, unless it is already there with the right hash. Only one
-    // model is kept: switching to the other one deletes the first, so a
-    // switch does not leave gigabytes behind.
+    // model is kept: switching to the other one deletes the first, so a switch
+    // does not leave gigabytes behind.
     let pin = model_pin(model_id);
     let model = model_path(state, model_id);
     set(shared, |s| s.phase = Phase::Verifying);
@@ -336,14 +372,15 @@ async fn install_inner(
         set(shared, |s| s.phase = Phase::Downloading);
         create_dir(&model_dir(state))?;
         let url = format!(
-            "https://huggingface.co/{}/resolve/{}/{}",
-            pin.repo, pin.revision, pin.file
+            "{}/{}/resolve/{}/{}",
+            from.hf, pin.repo, pin.revision, pin.file
         );
-        fetch_to_file(
+        download_file(
             &url,
             &model,
-            Some(pin.sha256),
+            pin.sha256,
             Some(pin.bytes),
+            &opts(cancel, pin.bytes + 1024),
             &mut |done, total| {
                 set(shared, |s| s.model = Progress { done, total });
             },
@@ -362,6 +399,92 @@ async fn install_inner(
         let _ = std::fs::remove_file(model_path(state, other.id));
     }
     Ok(())
+}
+
+/// Downloads, unpacks and marks a llama.cpp build in `staging`, without
+/// touching the build in use.
+async fn stage_build(
+    staging: &Path,
+    asset: &str,
+    sha: &str,
+    gpu: bool,
+    from: &Sources<'_>,
+    cancel: &Arc<std::sync::atomic::AtomicBool>,
+    shared: &Shared,
+) -> Result<(), String> {
+    let archive = staging.join(asset);
+    let url = format!("{}/{LLAMA_TAG}/{asset}", from.llama);
+    download_file(
+        &url,
+        &archive,
+        sha,
+        None,
+        &opts(cancel, 512 * 1024 * 1024),
+        &mut |done, total| {
+            set(shared, |s| s.llama = Progress { done, total });
+        },
+    )
+    .await
+    .map_err(|e| format!("downloading {asset}: {e}"))?;
+    set(shared, |s| s.phase = Phase::Unpacking);
+    unpack(&archive, staging)?;
+    let _ = std::fs::remove_file(&archive);
+    if find_file(staging, server_name()).is_none() {
+        return Err("the llama.cpp archive has no llama-server in it".into());
+    }
+    std::fs::write(staging.join("variant"), if gpu { "gpu" } else { "cpu" })
+        .map_err(|e| e.to_string())
+}
+
+/// `llama-server` with the platform's extension.
+fn server_name() -> &'static str {
+    if cfg!(windows) {
+        "llama-server.exe"
+    } else {
+        "llama-server"
+    }
+}
+
+/// Streams `url` to `dest` through the shared downloader (redirects, idle
+/// timeout, never https→http), checks the SHA-256 and, when known, the exact
+/// length, then renames the `.part` into place. A failed download leaves no
+/// `dest`.
+async fn download_file(
+    url: &str,
+    dest: &Path,
+    sha: &str,
+    len: Option<u64>,
+    opts: &nerve_transport::download::Options,
+    on_progress: &mut (dyn FnMut(u64, u64) + Send),
+) -> Result<(), String> {
+    nerve_transport::init_crypto();
+    let tmp = dest.with_extension("part");
+    {
+        let mut file = std::fs::File::create(&tmp)
+            .map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+        let r = nerve_transport::download::fetch(url, &mut file, opts, &mut |done, total| {
+            on_progress(done, total.unwrap_or(0));
+        })
+        .await;
+        if let Err(e) = r {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    }
+    if let Some(want) = len {
+        let got = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
+        if got != want {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!(
+                "the download is {got} bytes, not the pinned {want}"
+            ));
+        }
+    }
+    if sha256_file(&tmp)?.as_str() != sha {
+        let _ = std::fs::remove_file(&tmp);
+        return Err("the download does not match its pinned SHA-256".into());
+    }
+    std::fs::rename(&tmp, dest).map_err(|e| e.to_string())
 }
 
 /// Whether the GPU build reports a usable device (`llama-server
@@ -415,6 +538,7 @@ pub fn gpu_hint() -> bool {
         "/usr/lib",
         "/usr/lib64",
         "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib/aarch64-linux-gnu",
         "/lib64",
     ]
     .iter()
@@ -479,201 +603,6 @@ fn unsafe_entry(name: &str) -> bool {
         || n.split(['/', '\\']).any(|c| c == "..")
 }
 
-/// Streams `url` to `dest` (through a temp file and a rename), following
-/// redirects, never https→http, checking the SHA-256 and, when known, the
-/// length. `on_progress(done, total)` is called as bytes arrive.
-async fn fetch_to_file(
-    url: &str,
-    dest: &Path,
-    expected_sha: Option<&str>,
-    expected_len: Option<u64>,
-    on_progress: &mut (dyn FnMut(u64, u64) + Send),
-) -> Result<(), String> {
-    nerve_transport::init_crypto();
-    let tmp = dest.with_extension("part");
-    let mut url = url.to_string();
-    let mut tls_seen = None;
-    for _ in 0..8 {
-        let (at, target) = split_url(&url)?;
-        if tls_seen == Some(true) && !at.tls {
-            return Err(format!("{} redirects from https to http", at.host));
-        }
-        tls_seen = Some(at.tls);
-        let proxy = if at.tls {
-            nerve_transport::net::Proxy::from_env(&at.host)?
-        } else {
-            None
-        };
-        let mut io = nerve_transport::net::open(&at, None, proxy.as_ref()).await?;
-        let req = format!(
-            "GET {target} HTTP/1.1\r\nHost: {}\r\nAccept: */*\r\nUser-Agent: nerve-center/{}\r\nConnection: close\r\n\r\n",
-            at.authority(),
-            env!("CARGO_PKG_VERSION"),
-        );
-        io.write_all(req.as_bytes())
-            .await
-            .map_err(|e| e.to_string())?;
-        let head = read_head(&mut io).await?;
-        match head.status {
-            200 => {
-                if head.chunked {
-                    return Err(
-                        "the server sent a chunked body, which is not supported here".into(),
-                    );
-                }
-                let total = head.content_length.or(expected_len).unwrap_or(0);
-                stream_body(&mut io, &head.leftover, &tmp, total, on_progress).await?;
-                if let Some(want) = expected_sha
-                    && sha256_file(&tmp)?.as_str() != want
-                {
-                    let _ = std::fs::remove_file(&tmp);
-                    return Err("the download does not match its pinned SHA-256".into());
-                }
-                if let Some(want) = expected_len {
-                    let got = std::fs::metadata(&tmp).map(|m| m.len()).unwrap_or(0);
-                    if got != want {
-                        let _ = std::fs::remove_file(&tmp);
-                        return Err(format!(
-                            "the download is {got} bytes, not the pinned {want}"
-                        ));
-                    }
-                }
-                std::fs::rename(&tmp, dest).map_err(|e| e.to_string())?;
-                return Ok(());
-            }
-            301 | 302 | 303 | 307 | 308 => {
-                let to = head
-                    .location
-                    .ok_or_else(|| format!("{} redirects without a Location", at.host))?;
-                url = absolute(&to, &at)?;
-            }
-            s => return Err(format!("{} answered HTTP {s}", at.host)),
-        }
-    }
-    Err("too many redirects".into())
-}
-
-struct Head {
-    status: u16,
-    content_length: Option<u64>,
-    location: Option<String>,
-    chunked: bool,
-    leftover: Vec<u8>,
-}
-
-/// Reads the response head (up to `\r\n\r\n`) and returns the status, the
-/// headers we care about, and any body bytes read past the head.
-async fn read_head(io: &mut nerve_transport::net::BoxIo) -> Result<Head, String> {
-    let mut buf = Vec::new();
-    let mut chunk = [0u8; 4096];
-    loop {
-        if let Some(pos) = find(&buf, b"\r\n\r\n") {
-            let (head, rest) = buf.split_at(pos + 4);
-            let text = String::from_utf8_lossy(head);
-            let mut lines = text.split("\r\n");
-            let status = lines
-                .next()
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|c| c.parse().ok())
-                .ok_or("no HTTP status in the answer")?;
-            let header = |name: &str| {
-                lines.clone().find_map(|l| {
-                    let (k, v) = l.split_once(':')?;
-                    k.trim()
-                        .eq_ignore_ascii_case(name)
-                        .then(|| v.trim().to_string())
-                })
-            };
-            return Ok(Head {
-                status,
-                content_length: header("content-length").and_then(|v| v.parse().ok()),
-                location: header("location"),
-                chunked: header("transfer-encoding")
-                    .is_some_and(|v| v.eq_ignore_ascii_case("chunked")),
-                leftover: rest.to_vec(),
-            });
-        }
-        if buf.len() > 64 * 1024 {
-            return Err("the answer's headers are too large".into());
-        }
-        let n = io.read(&mut chunk).await.map_err(|e| e.to_string())?;
-        if n == 0 {
-            return Err("the connection closed before the headers were complete".into());
-        }
-        buf.extend_from_slice(&chunk[..n]);
-    }
-}
-
-/// Streams the body to `tmp`, hashing on the way, until `total` bytes (when
-/// known) or the connection closes. A chunked body is refused (a static asset
-/// from a CDN is sent with a Content-Length).
-async fn stream_body(
-    io: &mut nerve_transport::net::BoxIo,
-    leftover: &[u8],
-    tmp: &Path,
-    total: u64,
-    on_progress: &mut (dyn FnMut(u64, u64) + Send),
-) -> Result<(), String> {
-    use std::io::Write;
-    let mut file = std::fs::File::create(tmp).map_err(|e| e.to_string())?;
-    let mut done = 0u64;
-    let mut write = |data: &[u8], done: &mut u64| -> Result<(), String> {
-        file.write_all(data).map_err(|e| e.to_string())?;
-        *done += data.len() as u64;
-        Ok(())
-    };
-    write(leftover, &mut done)?;
-    on_progress(done, total);
-    let mut chunk = [0u8; 64 * 1024];
-    while total == 0 || done < total {
-        let n = io.read(&mut chunk).await.map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
-        }
-        write(&chunk[..n], &mut done)?;
-        on_progress(done, total);
-    }
-    file.flush().map_err(|e| e.to_string())?;
-    if total != 0 && done < total {
-        let _ = std::fs::remove_file(tmp);
-        return Err("the download ended before its Content-Length".into());
-    }
-    Ok(())
-}
-
-/// The server and the request target (path and query) of an http(s) URL.
-fn split_url(url: &str) -> Result<(CenterUrl, String), String> {
-    let scheme_end = url.find("://").ok_or("not an http(s) address")?;
-    let rest = &url[scheme_end + 3..];
-    let end = rest.find(['/', '?']).unwrap_or(rest.len());
-    let mut target = rest[end..].to_string();
-    if !target.starts_with('/') {
-        target.insert(0, '/');
-    }
-    let at = CenterUrl::parse(&format!("{}{}", &url[..scheme_end + 3], &rest[..end]))
-        .map_err(|_| "not an http(s) address".to_string())?;
-    Ok((at, target))
-}
-
-/// A `Location` made absolute against the server it came from.
-fn absolute(to: &str, at: &CenterUrl) -> Result<String, String> {
-    if to.contains("://") {
-        Ok(to.to_string())
-    } else if let Some(rest) = to.strip_prefix('/') {
-        Ok(format!(
-            "{}://{}/{rest}",
-            if at.tls { "https" } else { "http" },
-            at.authority()
-        ))
-    } else {
-        Err(format!("{} redirects to a relative place", at.host))
-    }
-}
-
-fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
-    hay.windows(needle.len()).position(|w| w == needle)
-}
-
 fn create_dir(dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))
 }
@@ -721,6 +650,14 @@ fn sha256_file(path: &Path) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    /// Runs an async test body with a hard upper bound, so a hang fails in
+    /// seconds instead of blocking the test run.
+    async fn bounded<F: std::future::Future<Output = ()>>(body: F) {
+        tokio::time::timeout(std::time::Duration::from_secs(30), body)
+            .await
+            .expect("the test did not finish within 30 s");
+    }
+
     #[test]
     fn this_platform_has_an_asset_or_is_handled() {
         // Linux x86_64 (the dev/CI platform) has a pinned CPU and GPU asset.
@@ -729,14 +666,6 @@ mod tests {
             assert!(llama_asset(true).is_some());
             assert!(platform_supported());
         }
-    }
-
-    #[test]
-    fn an_unsafe_archive_entry_is_refused() {
-        // A relative Location resolves against its server.
-        let (at, _) = split_url("https://host/a/b").unwrap();
-        assert_eq!(absolute("/x/y", &at).unwrap(), "https://host/x/y");
-        assert!(absolute("relative", &at).is_err());
     }
 
     /// Every platform with a release build has a pin for CPU and GPU, each a
@@ -844,17 +773,18 @@ mod tests {
         assert!(find_file(&dest, "llama-server").is_some());
     }
 
-    /// `fetch_to_file` downloads over plain HTTP (a loopback fake), checks the
-    /// SHA-256, and rejects a wrong one.
+    /// `download_file` downloads over plain HTTP (a loopback fake), checks the
+    /// SHA-256 and the length, and rejects a wrong one, leaving no file.
     #[tokio::test]
-    async fn fetch_checks_the_hash() {
+    async fn download_file_checks_hash_and_length() {
+        bounded(download_file_checks_hash_and_length_body()).await;
+    }
+
+    async fn download_file_checks_hash_and_length_body() {
         use std::io::{Read, Write};
         let body = b"hello llama".to_vec();
-        let sha = {
-            let d = ring::digest::digest(&ring::digest::SHA256, &body);
-            nerve_proto::msg::hex(d.as_ref())
-        };
-        // A one-shot HTTP server that answers every connection with `body`.
+        let sha =
+            nerve_proto::msg::hex(ring::digest::digest(&ring::digest::SHA256, &body).as_ref());
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
         let b = body.clone();
@@ -871,22 +801,67 @@ mod tests {
                 let _ = c.write_all(&b);
             }
         });
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let o = opts(&cancel, 1 << 20);
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("f");
         let url = format!("http://127.0.0.1:{port}/x");
-        let mut noop = |_: u64, _: u64| {};
-        fetch_to_file(&url, &dest, Some(&sha), None, &mut noop)
-            .await
-            .unwrap();
+        download_file(
+            &url,
+            &dest,
+            &sha,
+            Some(body.len() as u64),
+            &o,
+            &mut |_, _| {},
+        )
+        .await
+        .unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), body);
-        // A wrong hash is refused and nothing is left in place.
+        // A wrong hash, and a wrong length, are both refused; no file is left.
         let bad = dir.path().join("g");
-        let wrong = "0".repeat(64);
         assert!(
-            fetch_to_file(&url, &bad, Some(&wrong), None, &mut noop)
+            download_file(&url, &bad, &"0".repeat(64), None, &o, &mut |_, _| {})
                 .await
                 .is_err()
         );
         assert!(!bad.exists());
+        let wrong_len = dir.path().join("h");
+        assert!(
+            download_file(&url, &wrong_len, &sha, Some(999), &o, &mut |_, _| {})
+                .await
+                .is_err()
+        );
+        assert!(!wrong_len.exists());
+    }
+
+    /// `install` leaves a working build in place when a later step fails: the
+    /// staged new build is swapped in only once verified. The download source
+    /// is a closed local port, so the test needs no network and fails fast.
+    #[tokio::test]
+    async fn a_failed_reinstall_keeps_the_working_build() {
+        bounded(async {
+            let dir = tempfile::tempdir().unwrap();
+            let ld = llama_dir(dir.path());
+            std::fs::create_dir_all(ld.join("bin")).unwrap();
+            std::fs::write(ld.join("bin").join(server_name()), b"#!/bin/sh\n").unwrap();
+            std::fs::write(ld.join("variant"), "cpu").unwrap();
+            std::fs::create_dir_all(model_dir(dir.path())).unwrap();
+            std::fs::write(model_path(dir.path(), LocalModel::D1_3b), b"x").unwrap();
+            // A GPU reinstall whose download fails: nothing listens there.
+            let dead = Sources {
+                llama: "http://127.0.0.1:9",
+                hf: "http://127.0.0.1:9",
+            };
+            let shared: Shared = Arc::new(Mutex::new(Status::default()));
+            let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let r =
+                install_inner(dir.path(), true, LocalModel::D1_3b, &shared, &cancel, &dead).await;
+            assert!(r.is_err(), "{r:?}");
+            // The old CPU build is still there and nothing is staged.
+            assert_eq!(installed_variant(dir.path()), Some(false));
+            assert!(server_bin(dir.path()).is_some());
+            assert!(!ld.with_extension("staging").exists());
+        })
+        .await;
     }
 }

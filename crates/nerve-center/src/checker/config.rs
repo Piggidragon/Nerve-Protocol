@@ -203,15 +203,21 @@ impl CheckerConfig {
     /// own default threshold and timeout; a reinstall of the same model keeps
     /// the owner's.
     pub fn local_installed(&mut self, gpu: bool, model: LocalModel) {
-        self.model_on = true;
-        self.model.source = ModelSource::Local;
-        self.model.local_gpu = gpu;
-        if self.model.local_model != model {
+        // Take the model's own tuned threshold and timeout when the model
+        // changes, or when the source becomes local from an endpoint (the
+        // first local install, whose current values are the endpoint's, not
+        // this model's). A device switch or a same-model reinstall keeps what
+        // the owner set.
+        let fresh = self.model.local_model != model || self.model.source != ModelSource::Local;
+        if fresh {
             let pin = crate::checker::install::model_pin(model);
             self.model.local_model = model;
             self.model.threshold = pin.threshold;
             self.model.timeout_ms = pin.timeout_ms;
         }
+        self.model_on = true;
+        self.model.source = ModelSource::Local;
+        self.model.local_gpu = gpu;
     }
 }
 
@@ -248,6 +254,16 @@ fn default_criteria_true() -> String {
 fn default_criteria_false() -> String {
     "Ordinary development work, safe to run.".to_string()
 }
+
+/// PowerShell's delete command and its aliases, and cmd's, for the Windows
+/// recursive-delete entries (as a program name, after `.exe` is dropped).
+const WIN_DELETE: &str = "(?:remove-item|ri|rm|del|erase|rd|rmdir)";
+/// Their recursive switch: `-Recurse` written in full or shortened as
+/// PowerShell allows, or cmd's `/s`.
+const WIN_RECURSE: &str = r"(?:-r(?:e(?:c(?:u(?:r(?:s(?:e)?)?)?)?)?)?(?::\$?true)?|/s)";
+/// A drive root (`C:`, `C:\`, `C:\*`), the Windows folder or System32, or
+/// the variables that name them, as one whole (lower-cased) operand.
+const WIN_ROOT: &str = r"(?:[a-z]:[\\/]?\*?|[a-z]:[\\/]windows(?:[\\/]system32)?[\\/]?\*?|\$env:(?:systemroot|windir|systemdrive)[\\/]?\*?|%(?:systemroot|windir|systemdrive)%[\\/]?\*?)";
 
 /// The built-in blocklist. Truly dangerous things are blocked; ordinary work
 /// (`rm file`, `rm -rf ./build`, `rm -rf node_modules`, `docker ps`,
@@ -343,43 +359,44 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
             "exec.run:re:(?i)\\bsystemctl\\b[^|&;]*\\b(stop|disable|mask)\\b[^|&;]*\\bssh",
             "turns off the SSH service",
         ),
+        // Force-push over main/master: the branch must be a whole refspec
+        // (`main`, `HEAD:main`, `+main`, `refs/heads/main`), so a branch that
+        // merely contains the word (`fix/main-menu`) is not caught.
         b(
-            "exec.run:re:(?i)\\bgit\\b[^|&;]*push[^|&;]*(--force(-with-lease)?|\\s-f\\b)[^|&;]*\\b(main|master)\\b",
+            r"exec.run:re:(?i)\bgit\b[^|&;]*\bpush\b[^|&;]*(?:--force(?:-with-lease)?(?:=\S*)?|\s-f\b)[^|&;]*(?:\s|:|\+|refs/heads/)(?:main|master)(?:[\s:;&|]|$)",
             "force-pushes over a protected branch",
         ),
         b(
-            "exec.run:re:(?i)\\bgit\\b[^|&;]*push[^|&;]*\\b(main|master)\\b[^|&;]*(--force(-with-lease)?|\\s-f\\b)",
+            r"exec.run:re:(?i)\bgit\b[^|&;]*\bpush\b[^|&;]*(?:\s|:|\+|refs/heads/)(?:main|master)(?:[\s:]|$)[^|&;]*(?:--force|\s-f\b)",
             "force-pushes over a protected branch",
         ),
         b(
-            "exec.run:re:(?i)\\bgit\\b[^|&;]*push[^|&;]*\\s\\+(main|master)\\b",
+            r"exec.run:re:(?i)\bgit\b[^|&;]*\bpush\b[^|&;]*(?:\s|:)\+(?:main|master)(?:[\s:;&|]|$)",
             "force-pushes over a protected branch",
         ),
         // ---- Windows ----
         b("exec.run:re:(?i)format-volume", "formats a volume"),
-        b("exec.run:re:(?i)\\bformat\\b\\s+[a-z]:", "formats a drive"),
-        // Remove-Item of a drive root / Windows folder, with -Recurse and
-        // -Force in any order and whether the path comes before or after.
         b(
-            "exec.run:re:(?i)remove-item\\b[^|&;]*-recurse\\b[^|&;]*-force\\b[^|&;]*[a-z]:\\\\?(\\s|$|windows)",
+            r"exec.run:re:(?i)\bformat(?:\.com)?\s+[a-z]:",
+            "formats a drive",
+        ),
+        // A recursive delete (PowerShell's Remove-Item and its aliases with
+        // -Recurse, cmd's rd/del with /s) of a drive root or the Windows
+        // folder. Matched on the one command's words, with the target as a
+        // whole operand, so `Remove-Item C:\Users\me\build -Recurse -Force`
+        // (the everyday `rm -rf ./build` on Windows) stays allowed. Two
+        // entries: the switch before the target, and after it.
+        b(
+            &format!(
+                "exec.run:cmd-re:^{WIN_DELETE}(?: .*)? {WIN_RECURSE}(?: .*)? {WIN_ROOT}(?: .*)?$"
+            ),
             "recursively deletes a drive root or the Windows folder",
         ),
         b(
-            "exec.run:re:(?i)remove-item\\b[^|&;]*-force\\b[^|&;]*-recurse\\b[^|&;]*[a-z]:\\\\?(\\s|$|windows)",
+            &format!(
+                "exec.run:cmd-re:^{WIN_DELETE}(?: .*)? {WIN_ROOT}(?: .*)? {WIN_RECURSE}(?: .*)?$"
+            ),
             "recursively deletes a drive root or the Windows folder",
-        ),
-        b(
-            "exec.run:re:(?i)remove-item\\b[^|&;]*[a-z]:\\\\?(windows\\b)?[^|&;]*-recurse\\b[^|&;]*-force\\b",
-            "recursively deletes a drive root or the Windows folder",
-        ),
-        // rd/del of a drive: /s is the recursive flag; /q order does not matter.
-        b(
-            "exec.run:re:(?i)\\brd\\b[^|&;]*\\s/s\\b[^|&;]*[a-z]:",
-            "recursively deletes a drive",
-        ),
-        b(
-            "exec.run:re:(?i)\\bdel\\b[^|&;]*\\s/s\\b[^|&;]*[a-z]:",
-            "recursively deletes a drive",
         ),
         b(
             "exec.run:re:(?i)\\bvssadmin(\\.exe)?\\s+delete\\s+shadows",
@@ -450,5 +467,15 @@ mod tests {
         assert!(c.model.local_gpu);
         c.local_installed(false, LocalModel::D1_3b);
         assert_eq!((c.model.threshold, c.model.timeout_ms), (0.8, 4000));
+
+        // The first local install, coming from an endpoint whose threshold and
+        // timeout were the endpoint's, takes the model's own (review r2,
+        // finding 10).
+        let mut e = CheckerConfig::default();
+        e.model.source = ModelSource::Endpoint;
+        e.model.threshold = 0.5;
+        e.model.timeout_ms = 1000;
+        e.local_installed(false, LocalModel::D1_3b);
+        assert_eq!((e.model.threshold, e.model.timeout_ms), (0.8, 4000));
     }
 }

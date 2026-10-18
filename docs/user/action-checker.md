@@ -65,8 +65,13 @@ base64-encoded commands. For paths it sees the path as the agent wrote it, not
 where a symlink would lead, and only this machine (the center) resolves `..` and
 `//`, not the device's real canonical path — so an unusual path spelling can
 still slip past the center, and the machine's own protected-path check is the
-backstop. A command line nested too deeply (very many `$( )` or `-c` levels) is
-refused outright rather than half-analysed. The matcher is one line of defence;
+backstop. It reads a here-document only written to a file as data (its lines
+are not commands), but a command it runs through a shell — in a subshell,
+through `$( )`, `cmd /c`, a here-document fed to a shell, and so on — is pulled
+apart and checked. A command line nested absurdly deeply (more than 16 levels
+of `$( )`/`-c`) or with more than 100 000 commands — well beyond any real
+script — is refused outright rather than half-analysed. The matcher is one line
+of defence;
 the decision model and the machine's own policy are the next. Treat the
 blocklist as a safety net for obvious mistakes and obvious attacks, not as a
 sandbox.
@@ -102,8 +107,11 @@ text generated, so a judgement is fast and cheap. There are two sources:
   GPU). The center downloads a prebuilt `llama-server` from llama.cpp's GitHub
   release and the model from Hugging Face into its own state folder — never
   system-wide — checks each against a pinned SHA-256, unpacks it, and runs it on
-  loopback. GPU uses the Vulkan build (NVIDIA, AMD or Intel); if it cannot
-  start, the page says so and you switch to CPU with one click. The page shows a
+  loopback. GPU uses the Vulkan build (NVIDIA, AMD or Intel); after it is
+  installed the center runs the build's device probe, and if it finds no GPU it
+  keeps the model on the CPU and says so (so the page never claims the GPU when
+  it is really the CPU). You can switch CPU/GPU later with one click. The page
+  shows a
   progress bar for the download, then the server's state (starting, ready or
   failed) with the last lines of its output. **Remove** deletes the downloaded
   files. A machine with no prebuilt build for it says so and points you to the

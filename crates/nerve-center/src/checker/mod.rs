@@ -186,20 +186,41 @@ impl Checker {
         };
         // For an `exec.run` call the command line is pulled apart once and
         // reused across every entry. A line the splitter cannot take apart
-        // (nested past the bound) is refused rather than let through, so a
-        // crafted line cannot slip past the matcher — matching the fail-closed
-        // stance of the rest of the checker.
+        // (nested past the depth bound, or with more commands than any real
+        // script) is refused rather than let through, so a crafted line cannot
+        // slip past the matcher: the fail-closed stance of the rest of the
+        // checker.
         let parsed =
             (call.cap == "exec" && call.action == "run").then(|| normalize::parse(call.target));
         if self.cfg.blocklist_on
             && let Some(p) = &parsed
-            && p.overflow
+            && let Some(over) = p.overflow
         {
+            let (detail, why) = match over {
+                normalize::Overflow::Depth => (
+                    format!(
+                        "the command line nests more than {} levels of $( ), backticks or -c",
+                        normalize::MAX_DEPTH
+                    ),
+                    format!(
+                        "it nests more than {} levels of `$( )`, backticks or `sh -c`",
+                        normalize::MAX_DEPTH
+                    ),
+                ),
+                normalize::Overflow::Commands => (
+                    format!(
+                        "the command line holds more than {} commands",
+                        normalize::MAX_COMMANDS
+                    ),
+                    format!("it holds more than {} commands", normalize::MAX_COMMANDS),
+                ),
+            };
             return Decision::Refuse {
                 layer: Layer::Blocklist,
-                detail: "the command line is nested too deeply to analyse".into(),
-                message: "the center's action checker refused this call: its command line is nested too deeply (too many `$( )`/`-c` levels or commands) for the checker to take apart safely. Simplify the command, or the owner can switch the blocklist off in the center's web UI (Action checker)."
-                    .into(),
+                detail,
+                message: format!(
+                    "the center's action checker refused this call: {why}, which is past what the checker takes apart, so it cannot see what the line runs. Split the command, or the owner can switch the blocklist off in the center's web UI (Action checker)."
+                ),
             };
         }
         let commands = parsed.as_ref().map(|p| p.commands.as_slice());

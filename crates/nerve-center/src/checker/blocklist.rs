@@ -29,6 +29,11 @@ enum Matcher {
     Command(CmdPattern),
     /// `exec.run` regex over the whole normalized line.
     Regex(Regex),
+    /// `exec.run` regex over each command pulled from the line, as
+    /// `program arg …` with the arguments as written and lower-cased: for a
+    /// pattern that must look at one command's words (PowerShell's
+    /// `-Recurse`, a drive root as a whole operand).
+    CmdRegex(Regex),
     /// An `fs` path glob.
     Path(GlobMatcher),
     /// Any other `cap.action`: the scope, with an optional glob over the
@@ -65,11 +70,16 @@ impl Rule {
         let matcher = if (cap.as_str(), action.as_deref()) == ("exec", Some("run")) {
             let pattern =
                 pattern.ok_or_else(|| format!("rule {rule:?}: exec.run needs a pattern"))?;
-            match pattern.strip_prefix("re:") {
-                Some(re) => Matcher::Regex(
+            if let Some(re) = pattern.strip_prefix("re:") {
+                Matcher::Regex(
                     Regex::new(re).map_err(|e| format!("rule {rule:?}: bad regex: {e}"))?,
-                ),
-                None => Matcher::Command(CmdPattern::parse(pattern)?),
+                )
+            } else if let Some(re) = pattern.strip_prefix("cmd-re:") {
+                Matcher::CmdRegex(
+                    Regex::new(re).map_err(|e| format!("rule {rule:?}: bad regex: {e}"))?,
+                )
+            } else {
+                Matcher::Command(CmdPattern::parse(pattern)?)
             }
         } else if cap == "fs" {
             let pattern =
@@ -117,6 +127,12 @@ impl Rule {
                     .any(|c| p.matches(c)),
             },
             Matcher::Regex(re) => re.is_match(&collapse_ws(call.target)),
+            Matcher::CmdRegex(re) => match commands {
+                Some(c) => c.iter().any(|c| re.is_match(&c.line())),
+                None => normalize::commands(call.target)
+                    .iter()
+                    .any(|c| re.is_match(&c.line())),
+            },
             // The center sees the raw wire path; normalise `//`, `/.` and `..`
             // and match case-insensitively so a differently-spelled or (on a
             // case-folding filesystem) differently-cased path still hits.
@@ -502,6 +518,145 @@ mod tests {
         ] {
             assert!(blocked(bad), "bypass should now be blocked: {bad}");
         }
+    }
+
+    /// The checker as the center runs it for an `exec.run` call: the line
+    /// pulled apart once, then every default entry, with the overflow
+    /// refusal first.
+    fn refused_by_defaults(cmd: &str) -> bool {
+        let p = normalize::parse(cmd);
+        p.overflow.is_some()
+            || defaults()
+                .iter()
+                .any(|r| r.matches_with(&exec(cmd), Some(&p.commands)))
+    }
+
+    /// Ordinary Windows clean-ups of an absolute path, `$env:` folders and
+    /// project folders, and force-pushes of branches that only contain the
+    /// word main, are not refused (review r2, finding 2).
+    #[test]
+    fn ordinary_windows_cleanups_and_branch_names_stay_allowed() {
+        for cmd in [
+            r"Remove-Item C:\Users\me\project\build -Recurse -Force",
+            r"Remove-Item -Path C:\src\app\node_modules -Recurse -Force",
+            "Remove-Item \"$env:TEMP\\build-cache\" -Recurse -Force",
+            r"Remove-Item .\build -ErrorAction:SilentlyContinue -Recurse -Force",
+            r"rm C:\work\dist -Recurse -Force",
+            r"rd /s /q C:\Users\me\project\build",
+            r"rd /s /q D:\builds\old",
+            r"del /s /q C:\src\app\obj\*.obj",
+            r"Remove-Item C:\Windows\Temp\setup.log",
+            "git push -f origin fix/main-menu",
+            "git push --force-with-lease origin feature/master-detail",
+            "git push origin main",
+        ] {
+            assert!(!refused_by_defaults(cmd), "should stay allowed: {cmd}");
+        }
+    }
+
+    /// The plain forms of the Windows recursive delete (aliases, cmd, the
+    /// switch before or after the target, `-Path`, `$env:`) are refused.
+    #[test]
+    fn windows_recursive_deletes_of_a_root_are_refused() {
+        for cmd in [
+            r"Remove-Item -Recurse -Force C:\Windows",
+            r"Remove-Item C:\Windows -Recurse -Force",
+            r"Remove-Item -Path C:\ -Recurse -Force",
+            r"Remove-Item -LiteralPath 'C:\' -Recurse",
+            r"rm C:\ -Recurse -Force",
+            r"rm -Recurse -Force C:\Windows",
+            r"ri C:\Windows -Recurse -Force",
+            "Remove-Item $env:SystemRoot -Recurse -Force",
+            r"Remove-Item C:\* -Recurse -Force",
+            r"rmdir /s /q C:\",
+            r"rd /q /s C:\",
+            r"del /f /s /q C:\*",
+            r"del /s /q C:\Windows\System32\*",
+            r"cmd /c rd /s /q C:\",
+            "cmd.exe /c \"rd /s /q C:\\\"",
+            "powershell.exe -Command \"Remove-Item C:\\Windows -Recurse -Force\"",
+            "pwsh -c \"ri C:\\ -Recurse\"",
+        ] {
+            assert!(refused_by_defaults(cmd), "should be refused: {cmd}");
+        }
+    }
+
+    /// Shell forms that run a command the first rounds missed (finding 4):
+    /// `c` anywhere in a `-c` flag word, subshells, groups, keywords,
+    /// backticks in double quotes, process substitution, `.exe` names,
+    /// here-documents and here-strings fed to a shell, and escapes.
+    #[test]
+    fn shell_forms_that_run_a_command_are_seen() {
+        for cmd in [
+            "bash -ce 'DANGER ~'",
+            "sh -cx 'DANGER ~'",
+            "bash -c -e 'DANGER ~'",
+            "bash -c -- 'DANGER ~'",
+            "bash -o pipefail -c 'DANGER ~'",
+            "(DANGER ~)",
+            "( DANGER ~ )",
+            "{ DANGER ~; }",
+            "if true; then DANGER ~; fi",
+            "for i in 1; do DANGER ~; done",
+            "! DANGER ~",
+            "echo \"`DANGER ~`\"",
+            "cat <(DANGER ~)",
+            "bash.exe -c 'DANGER ~'",
+            "sudo.exe DANGER ~",
+            "(crontab -r)",
+            "(cd / && chmod -R 777 /)",
+            "bash <<'EOF'\nDANGER ~\nEOF",
+            "cat <<'EOF' | sh\nDANGER ~\nEOF",
+            "bash <<< 'DANGER ~'",
+            "cat <<EOF > out.txt\n$(DANGER ~)\nEOF",
+        ] {
+            // Rewrite the DANGER placeholder to the dangerous program so the
+            // test text itself holds no destructive command line.
+            let real = cmd.replace("DANGER", "rm -rf");
+            assert!(refused_by_defaults(&real), "should be refused: {cmd:?}");
+        }
+    }
+
+    /// Ordinary scripts and here-documents are never refused for their size,
+    /// and a here-document only written to a file (not fed to a shell) is
+    /// data: its lines are not commands (review r2, finding 3).
+    #[test]
+    fn ordinary_scripts_and_heredocs_stay_allowed() {
+        let mut big = String::from("cat > gen.py <<'EOF'\n");
+        for i in 0..400 {
+            big.push_str(&format!("print({i})\n"));
+        }
+        big.push_str("EOF\n");
+        assert!(!refused_by_defaults(&big), "a 400-line heredoc to a file");
+
+        let mut script = String::new();
+        for i in 0..300 {
+            script.push_str(&format!("echo step {i}\n"));
+        }
+        assert!(!refused_by_defaults(&script), "a 300-line script");
+
+        // A here-document only written to a file that merely mentions a
+        // dangerous command is not refused; one fed to a shell is.
+        let to_file = "cat > note.txt <<'EOF'\nto clean up run rm -rf /\nEOF";
+        assert!(
+            !refused_by_defaults(to_file),
+            "a file that mentions a command"
+        );
+        let to_shell = "bash <<'EOF'\nrm -rf /\nEOF";
+        assert!(refused_by_defaults(to_shell), "a heredoc fed to bash");
+    }
+
+    /// A line built to drown the matcher is still refused (fail closed), with
+    /// the reason it gives — a flat line with very many commands is a command
+    /// overflow, not a depth one.
+    #[test]
+    fn an_abusive_line_is_still_refused() {
+        let many = ["true"].repeat(normalize::MAX_COMMANDS + 10).join(";");
+        assert_eq!(
+            normalize::parse(&many).overflow,
+            Some(normalize::Overflow::Commands)
+        );
+        assert!(refused_by_defaults(&many));
     }
 
     /// The fs matcher sees a non-canonical or differently-cased path (finding

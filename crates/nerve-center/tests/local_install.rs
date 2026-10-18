@@ -39,11 +39,13 @@ async fn the_real_cpu_build_installs_and_runs_d1() {
 
     let shared = Arc::new(Mutex::new(Status::default()));
     let started = Instant::now();
+    let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     install::install(
         state.path().to_path_buf(),
         false,
         LocalModel::D1_3b,
         shared.clone(),
+        cancel,
     )
     .await
     .expect("the install");

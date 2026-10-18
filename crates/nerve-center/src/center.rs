@@ -106,6 +106,9 @@ pub struct Inner {
     local_sig: Mutex<String>,
     /// The one-click install's progress (llama.cpp and the model download).
     install: checker::install::Shared,
+    /// The running install's cancel flag, so Remove (or a new install) can
+    /// stop it; a newer install swaps in its own.
+    install_cancel: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 /// A line that may repeat: logged at most once in `QUIET_FOR`, with the count
@@ -346,6 +349,7 @@ impl Center {
             local_model: Mutex::new(None),
             local_sig: Mutex::new(String::new()),
             install: Arc::new(Mutex::new(checker::install::Status::default())),
+            install_cancel: Mutex::new(None),
         }));
         // Build the checker from the stored config and the endpoint token,
         // and start the local model if it is on.
@@ -2476,67 +2480,6 @@ impl Center {
     /// Starts the one-click install of llama.cpp and the d1-3B model on the
     /// CPU or GPU, in the background. On success it turns the local model on
     /// with the chosen device. Refused while an install is already running.
-    pub fn start_checker_install(&self, gpu: bool, model: LocalModel) -> Result<(), String> {
-        if !checker::install::platform_supported() {
-            return Err("this machine has no pinned local build; use the endpoint mode".into());
-        }
-        {
-            let st = self.install.lock().unwrap();
-            if matches!(
-                st.phase,
-                checker::install::Phase::Downloading
-                    | checker::install::Phase::Unpacking
-                    | checker::install::Phase::Verifying
-            ) {
-                return Err("an install is already running".into());
-            }
-        }
-        let (dir, shared, me) = (self.dir.clone(), self.install.clone(), self.clone());
-        tokio::spawn(async move {
-            let r = checker::install::install(dir, gpu, model, shared).await;
-            match r {
-                Ok(()) => {
-                    me.update(|s| s.checker.local_installed(gpu, model));
-                    me.note(
-                        Level::Info,
-                        None,
-                        "the action checker's local model was installed",
-                    );
-                    me.rebuild_checker();
-                    me.changed(Change::Nodes);
-                }
-                Err(e) => me.note(
-                    Level::Warn,
-                    None,
-                    format!("the action checker's local model install failed: {e}"),
-                ),
-            }
-        });
-        Ok(())
-    }
-
-    /// Removes the installed local build and model, and turns the local model
-    /// off.
-    pub fn remove_checker_model(&self) -> Result<(), String> {
-        *self.local_model.lock().unwrap() = None;
-        *self.local_sig.lock().unwrap() = String::new();
-        checker::install::remove(&self.dir).map_err(|e| e.to_string())?;
-        *self.install.lock().unwrap() = checker::install::Status::default();
-        self.update(|s| {
-            if s.checker.model.source == ModelSource::Local {
-                s.checker.model_on = false;
-            }
-        });
-        self.rebuild_checker();
-        self.changed(Change::Nodes);
-        self.note(
-            Level::Info,
-            None,
-            "the action checker's local model was removed",
-        );
-        Ok(())
-    }
-
     /// Validates a posted checker config and, if it holds, saves it. Taint
     /// switched off clears every session's mark.
     pub fn apply_checker_config(&self, cfg: CheckerConfig) -> Result<(), String> {
@@ -2581,6 +2524,135 @@ impl Center {
         }
         self.set_checker_config(cfg, false);
         Ok(rule)
+    }
+
+    /// Stops the running local model and waits for its process to exit, then
+    /// clears it, so its files are free to delete or replace (Windows refuses
+    /// while it runs). Cheap when nothing runs.
+    async fn stop_local_model(&self) {
+        let server = self.local_model.lock().unwrap().take();
+        if let Some(srv) = server {
+            srv.stop().await;
+        }
+        *self.local_sig.lock().unwrap() = String::new();
+    }
+
+    /// Starts the one-click install of llama.cpp and `model` on the CPU or
+    /// GPU, in the background. On success it turns the local model on with the
+    /// chosen model and device; for a GPU install it first checks the build
+    /// really finds a device and falls back to the CPU with a note if not.
+    /// Refused while an install is already running; the running server is
+    /// stopped first so its files can be replaced.
+    pub async fn start_checker_install(&self, gpu: bool, model: LocalModel) -> Result<(), String> {
+        if !checker::install::platform_supported() {
+            return Err("this machine has no pinned local build; use the endpoint mode".into());
+        }
+        // Claim the install under the lock, so two requests cannot both start.
+        {
+            let mut st = self.install.lock().unwrap();
+            if matches!(
+                st.phase,
+                checker::install::Phase::Downloading
+                    | checker::install::Phase::Unpacking
+                    | checker::install::Phase::Verifying
+            ) {
+                return Err("an install is already running".into());
+            }
+            *st = checker::install::Status {
+                phase: checker::install::Phase::Downloading,
+                gpu,
+                model_id: model,
+                ..Default::default()
+            };
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        *self.install_cancel.lock().unwrap() = Some(cancel.clone());
+        // Free the files the server holds before the install replaces them.
+        self.stop_local_model().await;
+        let (dir, shared, me) = (self.dir.clone(), self.install.clone(), self.clone());
+        tokio::spawn(async move {
+            let r =
+                checker::install::install(dir.clone(), gpu, model, shared, cancel.clone()).await;
+            // A newer install or a Remove took over: drop this result.
+            let current = me
+                .install_cancel
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|c| Arc::ptr_eq(c, &cancel));
+            if !current {
+                return;
+            }
+            match r {
+                Ok(()) => {
+                    // A GPU install only counts as GPU if the build finds a
+                    // device; otherwise fall back to the CPU and say so.
+                    let mut use_gpu = gpu;
+                    if gpu && !checker::install::gpu_available(&dir).await {
+                        use_gpu = false;
+                        me.note(
+                            Level::Warn,
+                            None,
+                            "the action checker's GPU build found no device; running the model on the CPU. Reinstall on CPU to keep it off the GPU.",
+                        );
+                        me.install.lock().unwrap().message =
+                            "no GPU device was found; running on the CPU".into();
+                    }
+                    me.update(|s| s.checker.local_installed(use_gpu, model));
+                    me.note(
+                        Level::Info,
+                        None,
+                        format!(
+                            "the action checker's local model was installed ({})",
+                            if use_gpu { "GPU" } else { "CPU" }
+                        ),
+                    );
+                    me.rebuild_checker();
+                    me.changed(Change::Nodes);
+                }
+                Err(e) => me.note(
+                    Level::Warn,
+                    None,
+                    format!("the action checker's local model install failed: {e}"),
+                ),
+            }
+        });
+        Ok(())
+    }
+
+    /// Removes the installed local build and model, and turns the local model
+    /// off. Cancels a running install and stops the server first, so the
+    /// delete does not fail while a file is in use.
+    pub async fn remove_checker_model(&self) -> Result<(), String> {
+        if let Some(c) = self.install_cancel.lock().unwrap().take() {
+            c.store(true, Ordering::Relaxed);
+        }
+        self.stop_local_model().await;
+        // The server has exited; retry a couple of times for a late handle on
+        // Windows.
+        let mut last = Ok(());
+        for _ in 0..3 {
+            last = checker::install::remove(&self.dir);
+            if last.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        last.map_err(|e| e.to_string())?;
+        *self.install.lock().unwrap() = checker::install::Status::default();
+        self.update(|s| {
+            if s.checker.model.source == ModelSource::Local {
+                s.checker.model_on = false;
+            }
+        });
+        self.rebuild_checker();
+        self.changed(Change::Nodes);
+        self.note(
+            Level::Info,
+            None,
+            "the action checker's local model was removed",
+        );
+        Ok(())
     }
 
     /// Adds a checker audit entry (a center decision) to the feed and the log.
@@ -2823,7 +2895,7 @@ mod tests {
         let e = c.call(&sess, &exec_route("n1"), args).await.unwrap_err();
         let CallError::Rpc(e) = e;
         assert_eq!(e.kind(), ErrorCode::Forbidden);
-        assert!(e.message.contains("nested too deeply"), "{}", e.message);
+        assert!(e.message.contains("nests more than"), "{}", e.message);
     }
 
     /// With the model on but no endpoint set, the checker fails closed: a

@@ -424,12 +424,15 @@ impl Ui {
                         .map_err(|_| bad("the model is d1-3b or kev-4b"))?,
                 };
                 c.start_checker_install(gpu, model)
+                    .await
                     .map(|_| json!({}))
                     .map_err(bad)
             }
-            ("POST", "/api/checker/remove") => {
-                c.remove_checker_model().map(|_| json!({})).map_err(bad)
-            }
+            ("POST", "/api/checker/remove") => c
+                .remove_checker_model()
+                .await
+                .map(|_| json!({}))
+                .map_err(bad),
             // The allow buttons on a checker refusal: build the rule for the
             // entry and save it for every node, or for the one node.
             ("POST", "/api/checker/allow") => {

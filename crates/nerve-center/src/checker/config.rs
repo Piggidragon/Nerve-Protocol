@@ -311,10 +311,25 @@ const DB_CLIENT: &str = "(?:psql|mysql|mariadb|sqlite3|mongo|mongosh)";
 /// `truncate` needs a name after it, so the `truncate -s 0 app.log` file
 /// tool is not one.
 const DB_DROP: &str = r#"(?:drop\s+(?:database|table)\b|truncate\s+[a-z_"]|dropdatabase\s*\()"#;
-/// A program that runs what it reads on its standard input: a shell, or an
-/// interpreter with no script of its own (only flags, or `-`/`-s` and then
-/// the script's arguments), up to the end of its command.
-const RUNS_STDIN: &str = r"(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?(?:sh|bash|zsh|dash|ksh|ash|fish|python[0-9.]*|perl|ruby|node|php)(?:\.exe)?(?:\s+-[a-z-]*)*(?:\s+(?:-s|-)(?:\s[^|;&]*)?)?\s*(?:$|[;&|)])";
+/// A shell or an interpreter that runs what it reads on its standard input,
+/// with only flags of its own (`bash`, `sudo -E bash`, `python3 -u`).
+const RUNNER: &str = r"(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?(?:sh|bash|zsh|dash|ksh|ash|fish|python[0-9.]*|perl|ruby|node|php)(?:\.exe)?(?:\s+-[a-z-]*)*";
+/// After a [`RUNNER`]: no script of its own, only `-`/`-s` and then the
+/// script's arguments, up to the end of its command.
+const STDIN_ARGS: &str = r"(?:\s+(?:-s|-)(?:\s[^|;&]*)?)?\s*(?:$|[;&|)])";
+/// The same inside a quoted `-c` body, which ends at its closing quote.
+const BODY_ARGS: &str = r#"(?:\s+(?:-s|-)(?:\s[^|;&'"]*)?)?\s*(?:$|[;&|)'"])"#;
+/// Where a command starts on the whole line: the line's start, a separator,
+/// a bracket, or the opening quote of a shell's `-c` (or PowerShell's
+/// `-Command`) body; then wrappers (`sudo -E`, `env`, `exec`, …), variable
+/// assignments (`NONINTERACTIVE=1`) and a path (`/bin/`). So the same words
+/// in a commit message, a `printf` or a note, after other words, are not a
+/// command.
+const COMMAND_START: &str = concat!(
+    r#"(?:^|[;&|({]|-[a-z]*c(?:ommand)?\s+["'])\s*"#,
+    r"(?:(?:sudo|doas|env|exec|nohup|time|command)(?:\s+-\S+)*\s+|[a-z_][a-z0-9_]*=\S*\s+)*",
+    r"(?:\S*[\\/])?"
+);
 /// The downloaders: `curl` and `wget`, and PowerShell's `Invoke-RestMethod`
 /// and `Invoke-WebRequest` with their aliases (`curl` and `wget` are aliases
 /// of the latter in Windows PowerShell).
@@ -443,26 +458,42 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
         b("exec.run:nsenter", "enters another namespace"),
         // ---- run a download unseen: piped into a program that runs its
         //      input (`| sh`, `| sudo bash -s`, `| python3 -`, PowerShell's
-        //      `| iex`), not `| grep sh` or `| python -m json.tool`; given to
-        //      `iex` (`iex (irm …)`, `iex (… .DownloadString('…'))`); or run
-        //      by a shell as its script (`sh -c "$(curl …)"`,
-        //      `bash <(curl …)`). These are the install one-liners the tools'
-        //      own pages give; an owner who wants one run switches the entry
-        //      off ----
+        //      `| iex`), not `| grep sh` or `| python -m json.tool`, also
+        //      inside a shell's quoted `-c` body (`sudo sh -c 'curl … | sh'`,
+        //      `powershell -c "irm … | iex"`); given to `iex` (`iex (irm …)`,
+        //      `iex (… .DownloadString('…'))`); or run by a shell as its
+        //      script (`sh -c "$(curl …)"`, `bash <(curl …)`). These are the
+        //      install one-liners the tools' own pages give; an owner who
+        //      wants one run switches the entry off. Only where something
+        //      runs it: a pipe must end its command (or the `-c` body it is
+        //      in), and `iex (…)`, `sh -c "$(…)"` and `bash <(…)` must start
+        //      one (COMMAND_START), so a commit message, a note or a grep
+        //      that quotes such a one-liner is not refused. A `-c` body is
+        //      read wherever the shell's name stands (`docker exec app sh -c
+        //      "…"`), so a note that writes out a whole `sh -c '… | sh'` line
+        //      is refused too ----
         b(
             &format!(
-                r#"exec.run:re:(?i)\b{DOWNLOADER}\b[^|;&]*\|(?:[^|;&]*\|)*\s*(?:{RUNS_STDIN}|{RUNS_STRING}(?:$|[\s;&|)'"]))"#
+                r"exec.run:re:(?i)\b{DOWNLOADER}\b[^|;&]*\|(?:[^|;&]*\|)*\s*(?:{RUNNER}{STDIN_ARGS}|{RUNS_STRING}(?:$|[\s;&|)]))"
             ),
             "runs a downloaded script unseen",
         ),
         b(
             &format!(
-                r"exec.run:re:(?i)\b{RUNS_STRING}\b[^|;&]*?(?:\b{DOWNLOADER}\b|\bdownloadstring\s*\()"
+                r#"exec.run:re:(?i)(?:^|[\s;&|("'/])(?:sh|bash|zsh|dash|ksh|ash|powershell|pwsh)(?:\.exe)?\s+(?:[^\s;&|'"]+\s+)*?-[a-z]*c[a-z]*\s+["'](?:[^"']*?[\s;&|(])?{DOWNLOADER}\b[^|;&]*\|(?:[^|;&]*\|)*\s*(?:{RUNNER}{BODY_ARGS}|{RUNS_STRING}(?:$|[\s;&|)'"]))"#
             ),
             "runs a downloaded script unseen",
         ),
         b(
-            r#"exec.run:re:(?i)(?:^|[\s;&|("'/])(?:sh|bash|zsh|dash|ksh|ash)(?:\.exe)?\s+(?:-\S+\s+)*?(?:-[a-z]*c[a-z]*\s+["']?\$\(|<\()\s*(?:curl|wget)\b"#,
+            &format!(
+                r"exec.run:re:(?i){COMMAND_START}{RUNS_STRING}\b[^|;&]*?(?:\b{DOWNLOADER}\b|\bdownloadstring\s*\()"
+            ),
+            "runs a downloaded script unseen",
+        ),
+        b(
+            &format!(
+                r#"exec.run:re:(?i){COMMAND_START}(?:sh|bash|zsh|dash|ksh|ash)(?:\.exe)?\s+(?:-\S+\s+)*?(?:-[a-z]*c[a-z]*\s+["']?\$\(|<\()\s*(?:curl|wget)\b"#
+            ),
             "runs a downloaded script unseen",
         ),
         // ---- cron, firewall, kill-all ----

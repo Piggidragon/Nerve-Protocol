@@ -86,7 +86,10 @@ looks at a redirection: a download run unseen (piped into a program that
 runs its input: a shell, an interpreter with no script of its own, or
 PowerShell's `iex`; given to `iex`; or run by a shell as its script,
 `sh -c "$(curl …)"` and `bash <(curl …)`, as the tools' install pages write
-them), SQL piped or fed as a here-document into a client, `dd`/`>` to a disk
+them; only where something runs it, so a pipe must end its command or the
+quoted `-c`/`-Command` body it is in, and `iex (…)`, `sh -c "$(…)"` and
+`bash <(…)` must start a command, after wrappers and `VAR=value`, and a commit
+message that quotes the one-liner is not one), SQL piped or fed as a here-document into a client, `dd`/`>` to a disk
 device, `> /etc/passwd`, the fork bomb, `kill -9 -1`, and the remaining
 Windows patterns (`vssadmin`, `wbadmin`, `reg delete HKLM`,
 `Set-MpPreference -Disable…`, `cipher /w`). A here-document is read as
@@ -179,8 +182,9 @@ the center installs and supervises.
 
 The local model is one-click (`checker/install.rs`, addendum 2026-10-18). The
 center downloads a prebuilt `llama-server` from llama.cpp's GitHub release
-(tag and per-asset SHA-256 pinned in `install::llama_asset`; the Vulkan build
-for GPU) and the chosen pinned GGUF from Hugging Face into
+(tag and per-asset SHA-256 pinned in `install::ASSETS`, for Linux and Windows
+on x64 and arm64 only, as Nerve runs on those; the Vulkan build for GPU) and
+the chosen pinned GGUF from Hugging Face into
 `<state>/checker/llama/<tag>/` and `<state>/checker/model/` — never
 system-wide. Both go through the **shared** downloader
 `nerve_transport::download` (also used by the node's updater), which streams to

@@ -83,10 +83,14 @@ runs, not at every word on the line: `mkfs`, `wipefs`, `userdel`, `nsenter`,
 and the container flags (`--privileged`, `--pid=host`, `-v /:/…`) only in that
 command's own words, `DROP TABLE` only in what a database client (`psql`,
 `mysql`, `sqlite3`, `mongosh`, …) is given, a download only when something
-runs it (`| sh`, `| sudo bash -s`, `| python3 -`, `| iex`, a shell's `-c`,
-not `| grep`, `| python -m json.tool` or `-o install.sh`), and a force-push only in the `git push`
-itself. So a commit message, a `grep` or a note that merely mentions one of
-them is not refused.
+runs it (`| sh`, `| sudo bash -s`, `| python3 -`, `| iex` at the end of a
+command, `iex (…)`, `sh -c "$(curl …)"` or `bash <(curl …)` at its start, not
+`| grep`, `| python -m json.tool` or `-o install.sh`), and a force-push only in
+the `git push` itself. So a commit message, a `grep` or a note that merely
+mentions one of them is not refused. One exception: a shell's quoted `-c` body
+(`sudo sh -c 'curl … | sh'`, `powershell -c "irm … | iex"`) is read wherever
+the shell's name stands, so a note that writes out such a whole line, shell and
+quotes included, is refused too.
 
 The matcher does not just look at the raw string. For a command it splits the
 line into its commands (at `;`, `&&`, `||`, `|`, newlines, inside `$( )`,

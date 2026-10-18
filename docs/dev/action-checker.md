@@ -283,8 +283,10 @@ the code no longer has is ignored. A whole list (an array) also reads: the form
 of #130 (built-ins in full with `builtin: true`, mapped to their ids by rule
 text) and what the web UI posts (`CheckerConfig::view`, built-ins with their
 id). A built-in such a list does not hold counts as removed; a stored built-in
-the code does not know is dropped. Reset to defaults posts the code's list, so
-it clears every choice and drops the owner's own entries.
+the code does not know is dropped. In a list without ids such an unknown
+built-in may be an older pattern of one the code has, so then no built-in counts
+as removed (they come back on, the safe side). Reset to defaults posts the
+code's list, so it clears every choice and drops the owner's own entries.
 
 Per node (owner's decision of 2026-10-18): a `BlockEntry` has a `node_id`
 (`None` for every node) and `off_for`, the node ids an entry for every node is

@@ -902,7 +902,9 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
 /// full with `builtin: true` and no id, mapped by their rule text) and what
 /// the web UI posts (built-ins with their id). A built-in of the code that
 /// such a list does not hold was removed by the owner; a stored built-in the
-/// code does not know is dropped.
+/// code does not know is dropped. In a list without ids, a stored built-in
+/// the code does not know may be an older pattern of one it has, so then no
+/// built-in counts as removed: they all come back, on the safe side.
 pub(super) mod stored {
     use std::collections::BTreeMap;
 
@@ -936,6 +938,8 @@ pub(super) mod stored {
         let defaults = default_blocklist();
         let mut part = OwnerPart::default();
         let mut seen = vec![false; defaults.len()];
+        // A built-in saved without an id whose rule the code does not have.
+        let mut unknown_old = false;
         for e in list {
             if !e.builtin {
                 part.own.push(BlockEntry {
@@ -952,6 +956,9 @@ pub(super) mod stored {
                     d.id == e.id
                 }
             });
+            if found.is_none() && e.id.is_empty() {
+                unknown_old = true;
+            }
             let Some(i) = found.filter(|&i| !seen[i]) else {
                 continue;
             };
@@ -964,6 +971,14 @@ pub(super) mod stored {
                 };
                 part.builtins.insert(defaults[i].id.clone(), choice);
             }
+        }
+        // An older pattern of a built-in leaves that built-in unseen, which
+        // is not the owner removing it: the code changed it. A list without
+        // ids cannot tell which one it was, so then none is taken as removed.
+        // The owner may have to remove one again; no protection is lost
+        // unseen.
+        if unknown_old {
+            return part;
         }
         for (d, seen) in defaults.iter().zip(seen) {
             if !seen {
@@ -1160,8 +1175,6 @@ mod tests {
                 e.off_for = vec!["n2".into()];
             }
         }
-        // A built-in whose pattern the code no longer has is dropped.
-        old.push(BlockEntry::builtin("", "exec.run:an old default", ""));
         old.push(BlockEntry {
             id: String::new(),
             rule: "exec.run:terraform destroy*".into(),
@@ -1185,11 +1198,6 @@ mod tests {
         assert_eq!(by_id("rm-root").unwrap().off_for, ["n2"]);
         assert!(by_id("wipefs").is_none());
         assert!(by_id("nsenter").unwrap().on);
-        assert!(
-            !c.blocklist
-                .iter()
-                .any(|e| e.rule == "exec.run:an old default")
-        );
         let own = c.blocklist.last().unwrap();
         assert_eq!(
             (own.rule.as_str(), own.on, own.note.as_str()),
@@ -1206,6 +1214,42 @@ mod tests {
                 },
                 "own": [{"rule": "exec.run:terraform destroy*", "on": false, "note": "mine"}],
             })
+        );
+    }
+
+    /// A list without ids that holds a built-in in a pattern the code no
+    /// longer has (an older version of one it still has, from a build before
+    /// a review changed it, or one a later release dropped): that stored copy
+    /// is dropped, and no built-in is taken as removed, so the changed one is
+    /// back and on and nothing is lost unseen. The owner's other choices stay
+    /// (review r1, finding 1).
+    #[test]
+    fn an_older_pattern_of_a_builtin_does_not_read_as_removed() {
+        let mut old = default_blocklist();
+        old.retain(|e| e.id != "wipefs");
+        for e in &mut old {
+            if e.id == "rm-root" {
+                e.rule = "exec.run:rm -rf  /".into();
+            }
+            if e.id == "mkfs" {
+                e.on = false;
+            }
+            e.id = String::new();
+        }
+        old.push(BlockEntry::builtin("", "exec.run:an old default", ""));
+        let mut v = serde_json::json!({"blocklist": old});
+        for e in v["blocklist"].as_array_mut().unwrap() {
+            e.as_object_mut().unwrap().remove("id");
+        }
+        let c: CheckerConfig = serde_json::from_value(v).unwrap();
+        let root = c.blocklist.iter().find(|e| e.id == "rm-root").unwrap();
+        assert!(root.on && root.rule == "exec.run:rm -rf /");
+        assert!(c.blocklist.iter().any(|e| e.id == "wipefs" && e.on));
+        assert!(!c.blocklist.iter().any(|e| e.id.is_empty()));
+        assert!(!c.blocklist.iter().find(|e| e.id == "mkfs").unwrap().on);
+        assert_eq!(
+            serde_json::to_value(&c).unwrap()["blocklist"],
+            serde_json::json!({"builtins": {"mkfs": {"on": false}}})
         );
     }
 

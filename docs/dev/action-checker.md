@@ -33,9 +33,12 @@ center where the owner watches the audit feed.
 
 The center (`center.rs`, `call_inner`) turns a `Refuse` into a `forbidden`
 error for the harness and an audit entry, an `Allowed` into an audit entry, and
-a `Pass` into the call going on to the node. Every center decision carries a
-`by: "action checker"` and a `checker: {layer, scope, detail}` in the audit
-feed, and a line in the log.
+a `Pass` into the call going on to the node. It checks first that the node is
+neither disabled nor offline: such a call is `unavailable` before the checker
+runs, so it costs no model call, a down model failing closed does not turn it
+into `forbidden`, and the checker audits nothing for it. Every center decision
+carries a `by: "action checker"` and a `checker: {layer, scope, detail}` in the
+audit feed, and a line in the log.
 
 ## The blocklist matcher
 
@@ -270,6 +273,22 @@ is in `state.json` and in a backup. `Store` does not refuse unknown fields, so
 a 0.0.4 center reads a 0.0.5 `state.json` and drops `checker` the next time it
 saves; a `state.json` without it reads as `CheckerConfig::default()`, with the
 blocklist and taint on and the model off.
+
+The blocklist in memory is the whole list in force; `state.json` keeps only the
+owner's part (`config::stored`): per built-in, by its stable `id`, what the
+owner changed (`on: false`, `off_for`, `removed: true`), and the owner's own
+entries:
+`"blocklist": {"builtins": {"nsenter": {"removed": true}}, "own": [...]}`. On
+load the built-ins come from the code with those choices on them, so a later
+release's new or changed built-ins reach an existing center; a choice for an id
+the code no longer has is ignored. A whole list (an array) also reads: the form
+of #130 (built-ins in full with `builtin: true`, mapped to their ids by rule
+text) and what the web UI posts (`CheckerConfig::view`, built-ins with their
+id). A built-in such a list does not hold counts as removed; a stored built-in
+the code does not know is dropped. In a list without ids such an unknown
+built-in may be an older pattern of one the code has, so then no built-in counts
+as removed (they come back on, the safe side). Reset to defaults posts the
+code's list, so it clears every choice and drops the owner's own entries.
 
 Per node (owner's decision of 2026-10-18): a `BlockEntry` has a `node_id`
 (`None` for every node) and `off_for`, the node ids an entry for every node is

@@ -5,8 +5,8 @@
 //! It needs a decision-model GGUF and a `llama-server` with `/v1/systemone`:
 //!
 //! ```sh
-//! NERVE_TEST_MODEL=~/Services/models/decision/d1-3b/d1-3B-Q4_K_M.gguf \
-//! NERVE_TEST_LLAMA=~/Services/llama.cpp-native/build/bin/llama-server \
+//! NERVE_TEST_MODEL=/path/to/d1-3B-Q4_K_M.gguf \
+//! NERVE_TEST_LLAMA=/path/to/llama-server \
 //!     cargo test -p nerve-center --test local_model -- --ignored --nocapture
 //! ```
 

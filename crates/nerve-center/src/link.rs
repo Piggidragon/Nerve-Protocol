@@ -124,6 +124,15 @@ impl Link {
         }
     }
 
+    /// A live link for a unit test, whose connection is already gone: it
+    /// counts as online, and a call sent on it ends as `connection_lost`, so
+    /// a test can tell a call that reached the send from one stopped before.
+    #[cfg(test)]
+    pub(crate) fn for_test(node_id: &str) -> Link {
+        let (out, _) = mpsc::channel(1);
+        Link::new(node_id, String::new(), false, Limits::default(), out, None)
+    }
+
     /// The node key the hello of the connection now was signed with.
     pub fn auth_key(&self) -> String {
         self.auth_key.lock().unwrap().clone()

@@ -2166,6 +2166,19 @@ impl Center {
             )
             .into());
         }
+        // Then whether the node is there at all, before the checker: a call
+        // that cannot be sent is `unavailable`, not a checker refusal (with
+        // the model on and down, fail closed would say `forbidden`), and
+        // costs no model call.
+        let offline = || {
+            RpcError::new(
+                ErrorCode::Unavailable,
+                format!("the node {} is offline", route.node_name),
+            )
+        };
+        if self.link(&route.node_id).is_none() {
+            return Err(offline().into());
+        }
         // The action checker (issue #17): the center's own gate, before the
         // node. It can only refuse; the node's policy still decides what it
         // lets through (design rule 1).
@@ -2208,12 +2221,9 @@ impl Center {
             }
             Decision::Pass => {}
         }
-        let link = self.link(&route.node_id).ok_or_else(|| {
-            RpcError::new(
-                ErrorCode::Unavailable,
-                format!("the node {} is offline", route.node_name),
-            )
-        })?;
+        // Looked up again: the node may have gone or come back on another
+        // link while the model was asked.
+        let link = self.link(&route.node_id).ok_or_else(offline)?;
         let ctx = json!({"session": sess.id});
         sess.nodes.lock().unwrap().insert(route.node_id.clone());
         link.sessions.lock().unwrap().insert(sess.id.clone());
@@ -2491,13 +2501,16 @@ impl Center {
     }
 
     /// What the web UI's Action checker page reads: the config (no token),
-    /// whether a token is set, the default model and its licence, the
-    /// one-click install's state and the running model's status, the
-    /// platform/GPU support, and rules that did not parse.
+    /// whether a token is set, whether the model is on anywhere (for the
+    /// center or for a node, the rule that runs the local model), the
+    /// default model and its licence, the one-click install's state and the
+    /// running model's status, the platform/GPU support, and rules that did
+    /// not parse.
     pub fn checker_json(&self) -> Value {
         let cfg = self.read(|s| s.checker.clone());
         json!({
-            "config": cfg,
+            "config": cfg.view(),
+            "model_wanted": cfg.model_wanted(),
             "has_token": self.checker_has_token(),
             "models": checker::install::MODELS,
             "default_blocklist": checker::config::default_blocklist(),
@@ -2550,6 +2563,8 @@ impl Center {
         // A node that follows the center in both is the same as one with no
         // settings: keep the state free of them.
         cfg.nodes.retain(|_, n| *n != NodeSettings::default());
+        // Keep in memory what a restart reads back from the stored part.
+        cfg.settle_blocklist();
         let clear_taint = self.read(|s| s.checker.taint_on) && !cfg.taint_on;
         self.set_checker_config(cfg, clear_taint);
         Ok(())
@@ -2948,6 +2963,15 @@ mod tests {
         }
     }
 
+    /// Puts a live link for `node` in place, so its calls get past the
+    /// offline check; one that reaches the send ends as `connection_lost`.
+    fn online(c: &Center, node: &str) {
+        c.links
+            .lock()
+            .unwrap()
+            .insert(node.into(), Arc::new(Link::for_test(node)));
+    }
+
     fn exec_route(node: &str) -> Route {
         Route {
             node_id: node.into(),
@@ -2961,9 +2985,9 @@ mod tests {
 
     /// The checker gate refuses a blocklisted command before the node, with a
     /// message that says the action checker did it; an ordinary command is
-    /// not refused by it (it reaches the "node offline" step instead, since
-    /// no link is set up in this test). This is the whole point of the gate,
-    /// so without it the blocklisted command would get the same "offline".
+    /// not refused by it (it reaches the send instead, which fails on the
+    /// test's link whose connection is gone). This is the whole point of the
+    /// gate, so without it the blocklisted command would get the same end.
     #[tokio::test]
     async fn the_checker_refuses_a_blocklisted_command_before_the_node() {
         let dir = tempfile::tempdir().unwrap();
@@ -2971,6 +2995,7 @@ mod tests {
         c.update(|s| {
             s.nodes.insert("n1".into(), node_record("n1", "linux"));
         });
+        online(&c, "n1");
         let sess = c.new_session("test");
         let args = |cmd: &str| {
             let mut m = Map::new();
@@ -2989,14 +3014,64 @@ mod tests {
         let last = c.audit().pop().unwrap();
         assert_eq!(last["by"], "action checker");
         assert_eq!(last["checker"]["layer"], "blocklist");
-        // Ordinary work passes the checker and only then meets the offline
-        // node.
+        // Ordinary work passes the checker and is sent.
         let e = c
             .call(&sess, &exec_route("n1"), args("git status"))
             .await
             .unwrap_err();
         let CallError::Rpc(e) = e;
-        assert_eq!(e.kind(), ErrorCode::Unavailable);
+        assert_eq!(e.kind(), ErrorCode::ConnectionLost);
+    }
+
+    /// A call to a node that is offline or disabled is `unavailable` before
+    /// the checker runs: with the model on, unreachable and failing closed,
+    /// it is not refused as `forbidden`, and no checker decision is audited.
+    /// Once the node is online the same call reaches the checker, which
+    /// refuses and audits it as before.
+    #[tokio::test]
+    async fn an_offline_or_disabled_node_is_unavailable_before_the_checker() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        c.update(|s| {
+            s.nodes.insert("n1".into(), node_record("n1", "linux"));
+            s.checker.model_on = true;
+            s.checker.model.source = ModelSource::Endpoint;
+            s.checker.model.endpoint_url = String::new();
+        });
+        c.rebuild_checker();
+        let sess = c.new_session("test");
+        let call = || {
+            let mut args = Map::new();
+            args.insert("command".into(), json!("echo hi > out.txt"));
+            let (c, sess) = (&c, &sess);
+            async move {
+                let CallError::Rpc(e) = c.call(sess, &exec_route("n1"), args).await.unwrap_err();
+                e
+            }
+        };
+        let audited = || {
+            c.audit()
+                .iter()
+                .filter(|e| e["by"] == "action checker")
+                .count()
+        };
+        let e = call().await;
+        assert_eq!(e.kind(), ErrorCode::Unavailable, "{}", e.message);
+        assert!(e.message.contains("offline"), "{}", e.message);
+        assert_eq!(audited(), 0);
+
+        online(&c, "n1");
+        c.update(|s| s.nodes.get_mut("n1").unwrap().disabled = true);
+        let e = call().await;
+        assert_eq!(e.kind(), ErrorCode::Unavailable, "{}", e.message);
+        assert!(e.message.contains("disabled"), "{}", e.message);
+        assert_eq!(audited(), 0);
+
+        c.update(|s| s.nodes.get_mut("n1").unwrap().disabled = false);
+        let e = call().await;
+        assert_eq!(e.kind(), ErrorCode::Forbidden, "{}", e.message);
+        assert!(e.message.contains("reach"), "{}", e.message);
+        assert_eq!(audited(), 1);
     }
 
     /// A block entry for one node and a global entry switched off for
@@ -3012,6 +3087,8 @@ mod tests {
             s.nodes.insert("n1".into(), node_record("n1", "linux"));
             s.nodes.insert("n2".into(), node_record("n2", "linux"));
         });
+        online(&c, "n1");
+        online(&c, "n2");
         let mut cfg = c.read(|s| s.checker.clone());
         let mut tf = cfg.blocklist[0].clone();
         tf.rule = "exec.run:terraform destroy".into();
@@ -3064,12 +3141,59 @@ mod tests {
         assert_eq!(e.kind(), ErrorCode::Forbidden);
         assert_eq!(c.audit().pop().unwrap()["checker"]["scope"], "global");
         // n2: no entry of its own, and `rm -rf /` switched off for it, so
-        // both reach the (offline) node.
+        // both are sent to the node.
         assert_eq!(
             run("n2", "terraform destroy").await.kind(),
-            ErrorCode::Unavailable
+            ErrorCode::ConnectionLost
         );
-        assert_eq!(run("n2", "rm -rf /").await.kind(), ErrorCode::Unavailable);
+        assert_eq!(
+            run("n2", "rm -rf /").await.kind(),
+            ErrorCode::ConnectionLost
+        );
+    }
+
+    /// What the Action checker page reads: whether the model is on anywhere,
+    /// also when only one machine has it on (so the page tells "its server
+    /// is not running" from "turn the model on"), and the whole blocklist
+    /// with the built-ins in full. A post of that config is taken back as is
+    /// and saved as the owner's part only.
+    #[test]
+    fn the_checker_page_reads_the_model_on_for_one_machine_and_the_whole_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        let v = c.checker_json();
+        assert_eq!(v["model_wanted"], false);
+        let list = v["config"]["blocklist"].as_array().unwrap();
+        assert_eq!(list.len(), checker::config::default_blocklist().len());
+        assert_eq!(list[0]["id"], "rm-root");
+        assert_eq!(list[0]["builtin"], true);
+
+        c.update(|s| {
+            s.checker.nodes.insert(
+                "n1".into(),
+                NodeSettings {
+                    blocklist: NodeSwitch::Inherit,
+                    model: NodeSwitch::On,
+                },
+            );
+        });
+        let v = c.checker_json();
+        assert_eq!(v["config"]["model_on"], false);
+        assert_eq!(v["model_wanted"], true);
+
+        // The page posts the list back with one built-in switched off.
+        let mut config = v["config"].clone();
+        config["blocklist"][0]["on"] = json!(false);
+        let cfg: CheckerConfig = serde_json::from_value(config).unwrap();
+        c.apply_checker_config(cfg).unwrap();
+        let v = c.checker_json();
+        assert_eq!(v["config"]["blocklist"][0]["on"], false);
+        let saved: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join("state.json")).unwrap()).unwrap();
+        assert_eq!(
+            saved["checker"]["blocklist"],
+            json!({"builtins": {"rm-root": {"on": false}}})
+        );
     }
 
     /// A command line nested too deeply for the splitter is refused by the
@@ -3081,6 +3205,7 @@ mod tests {
         c.update(|s| {
             s.nodes.insert("n1".into(), node_record("n1", "linux"));
         });
+        online(&c, "n1");
         let sess = c.new_session("test");
         let mut args = Map::new();
         args.insert(
@@ -3107,6 +3232,7 @@ mod tests {
             s.checker.model.endpoint_url = String::new();
         });
         c.rebuild_checker();
+        online(&c, "n1");
         let sess = c.new_session("test");
         let mut args = Map::new();
         args.insert("command".into(), json!("echo hi > out.txt"));

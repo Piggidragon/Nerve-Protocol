@@ -45,8 +45,8 @@ async fn evaluate_decision_model() {
     let cfg = ModelConfig::default();
 
     let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/checker-eval.json");
-    let cases: Vec<Case> =
-        serde_json::from_slice(&std::fs::read(path).expect("read the eval set")).expect("valid JSON");
+    let cases: Vec<Case> = serde_json::from_slice(&std::fs::read(path).expect("read the eval set"))
+        .expect("valid JSON");
 
     let mut scored: Vec<(f64, bool, String)> = Vec::new();
     let mut latencies_ms: Vec<f64> = Vec::new();
@@ -71,7 +71,10 @@ async fn evaluate_decision_model() {
             }
         }
     }
-    assert!(!scored.is_empty(), "no case got a score; is the endpoint up?");
+    assert!(
+        !scored.is_empty(),
+        "no case got a score; is the endpoint up?"
+    );
 
     latencies_ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let pct = |p: f64| {

@@ -822,21 +822,31 @@ function localInstallParts(meta) {
     return [line, banner("warn", "alert", "This machine has no prebuilt local model for it. Use a System One endpoint instead (the other source above).")];
   }
   const inst = meta.install || { phase: "idle" };
-  if (INSTALLING.includes(inst.phase)) {
+  const installing = INSTALLING.includes(inst.phase);
+  // Also offered while an install runs, so a slow download can be stopped
+  // from the page: Remove ends the install first.
+  const remove = btn("Remove", "danger", act(async () => {
+    const yes = await modal({
+      title: installing ? "Stop the install and remove the local model?" : "Remove the local model?",
+      message: installing
+        ? `Ends the install and deletes the downloaded llama.cpp and model files${meta.installed ? ", also those of the model installed now" : ""}. You can install them again later.`
+        : "Deletes the downloaded llama.cpp and model files. You can install them again later.",
+      confirm: "Remove", danger: true,
+    });
+    if (yes) { await api("POST", "/api/checker/remove"); await loadChecker(); }
+  }), "trash");
+  if (installing) {
     const target = meta.models.find((m) => m.id === inst.model_id) || pin;
     return [line, el("div", { class: "card" },
       el("div", { class: "card-top" }, icon("download"), el("span", { class: "name" }, `Installing ${target.name}`), pill("warn", inst.phase)),
       el("p", { class: "meta" }, "llama.cpp"), bar(inst.llama),
       el("p", { class: "meta" }, `model (${gb(target.bytes)})`), bar(inst.model),
       inst.message ? el("p", { class: "meta" }, inst.message) : null,
-      meta.local ? el("p", { class: "meta" }, "The installed model keeps checking calls until the new files are in place; it is stopped only for the swap at the end.") : null)];
+      meta.local ? el("p", { class: "meta" }, "The installed model keeps checking calls until the new files are in place; it is stopped only for the swap at the end.") : null,
+      el("div", { class: "actions" }, remove))];
   }
   const cfg = state.checker.cfg.model;
   const failed = inst.phase === "failed" ? banner("down", "alert", `The last install failed: ${inst.message || "unknown error"}`) : null;
-  const remove = btn("Remove", "danger", act(async () => {
-    const yes = await modal({ title: "Remove the local model?", message: "Deletes the downloaded llama.cpp and model files. You can install them again later.", confirm: "Remove", danger: true });
-    if (yes) { await api("POST", "/api/checker/remove"); await loadChecker(); }
-  }), "trash");
   if (meta.installed && pin.id === cfg.local_model) {
     const dev = cfg.local_gpu ? "GPU" : "CPU";
     const other = dev === "GPU" ? "CPU" : "GPU";

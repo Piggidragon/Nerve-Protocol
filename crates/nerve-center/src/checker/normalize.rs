@@ -319,13 +319,19 @@ fn segment_program(segment: &str, shell: Shell) -> Option<String> {
 /// kept, for the tokenizer) so a separator inside a string does not split,
 /// and nothing inside single quotes expands.
 ///
-/// A here-document gets no special reading: its lines are split like any
-/// other line, so a command in it is seen whether the document is fed to a
-/// shell or written to a file. A `#` at the start of a word starts a comment
+/// The lines of a here-document are split like any other line, so a command
+/// in it is seen whether the document is fed to a shell or written to a
+/// file; only a quote does not run past the end of a body line (see
+/// [`close_body_quotes`]). A `#` at the start of a word starts a comment
 /// that runs to the end of the line; nothing in it (a quote, a `<<`) changes
 /// how the next lines are read.
 fn split_segments(line: &str, shell: Shell) -> (Vec<String>, Vec<String>) {
     let posix = shell == Shell::Posix;
+    let line = if posix {
+        close_body_quotes(line)
+    } else {
+        std::borrow::Cow::Borrowed(line)
+    };
     let mut segments = Vec::new();
     let mut subs = Vec::new();
     let mut cur = String::new();
@@ -382,6 +388,10 @@ fn split_segments(line: &str, shell: Shell) -> (Vec<String>, Vec<String>) {
                 cur.push(c);
                 if let Some(n) = chars.next() {
                     cur.push(n);
+                    // A `\` continuing a CRLF line takes the whole break.
+                    if n == '\r' && chars.peek() == Some(&'\n') {
+                        cur.push(chars.next().unwrap());
+                    }
                 }
             }
             '`' => subs.push(take_until(&mut chars, '`')),
@@ -435,6 +445,143 @@ fn split_segments(line: &str, shell: Shell) -> (Vec<String>, Vec<String>) {
 fn starts_with(chars: &std::iter::Peekable<std::str::Chars>, s: &str) -> bool {
     let mut ahead = chars.clone();
     s.chars().all(|c| ahead.next() == Some(c))
+}
+
+/// `text` with every quote or backtick still open at the end of a
+/// here-document's body line closed there.
+///
+/// The shell takes a body as plain text, so an apostrophe in it ("Don't", a
+/// Rust `'a`) or a lone `"` means nothing. The walk reads body lines as
+/// commands, though, and a quote opened there would run on past the
+/// document's end and hide every command after it in one word. Closing it at
+/// the line's end keeps each body line to itself. Lines outside a body keep
+/// their quotes as written, so a quoted string may still span lines there.
+fn close_body_quotes(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains("<<") {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 16);
+    // The end words of the documents opened on the current command line, and
+    // of the ones whose bodies come next, in order (with whether `<<-` lets
+    // tabs stand before the end word).
+    let mut opened: Vec<(String, bool)> = Vec::new();
+    let mut bodies: std::collections::VecDeque<(String, bool)> = Default::default();
+    // A quote still open from an earlier command line.
+    let mut quote: Option<char> = None;
+    for (i, raw) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if let Some((word, dash)) = bodies.front() {
+            let bare = if *dash {
+                line.trim_start_matches('\t')
+            } else {
+                line
+            };
+            if bare == word {
+                bodies.pop_front();
+                out.push_str(raw);
+            } else {
+                out.push_str(line);
+                out.push_str(&scan_line(line, None, None).1);
+                out.push_str(&raw[line.len()..]);
+            }
+            continue;
+        }
+        quote = scan_line(line, quote, Some(&mut opened)).0;
+        out.push_str(raw);
+        // A document's body starts on the line after the one that opened it,
+        // once its quotes are closed.
+        if quote.is_none() {
+            bodies.extend(opened.drain(..));
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Reads one line's quotes by the POSIX rules of [`split_segments`],
+/// starting inside `quote` (one left open by an earlier line). Returns the
+/// quote open at the line's end and what closes everything still open there
+/// (a backtick, then the quote). With `opened`, notes the end word of each
+/// here-document the line opens outside quotes.
+fn scan_line(
+    line: &str,
+    mut quote: Option<char>,
+    mut opened: Option<&mut Vec<(String, bool)>>,
+) -> (Option<char>, String) {
+    let mut chars = line.chars().peekable();
+    let mut prev: Option<char> = None;
+    let mut tick = false;
+    while let Some(c) = chars.next() {
+        let before = prev.replace(c);
+        if let Some(q) = quote {
+            if q == '"' && c == '\\' {
+                chars.next();
+            } else if q == '"' && c == '`' {
+                if !skip_ticked(&mut chars) {
+                    tick = true;
+                    break;
+                }
+            } else if c == q {
+                quote = None;
+            }
+            continue;
+        }
+        match c {
+            '\'' | '"' => quote = Some(c),
+            '\\' => {
+                chars.next();
+            }
+            '`' => {
+                if !skip_ticked(&mut chars) {
+                    tick = true;
+                    break;
+                }
+            }
+            '#' if before.is_none_or(|p| p.is_whitespace() || ";&|()".contains(p)) => break,
+            '<' if chars.peek() == Some(&'<') => {
+                chars.next();
+                if chars.peek() == Some(&'<') {
+                    // A here-string, not a document.
+                    chars.next();
+                    continue;
+                }
+                let dash = chars.peek() == Some(&'-');
+                if dash {
+                    chars.next();
+                }
+                let word = dequote(&take_word(&mut chars));
+                if let Some(o) = opened.as_deref_mut().filter(|_| !word.is_empty()) {
+                    o.push((word, dash));
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut close = String::new();
+    if tick {
+        close.push('`');
+    }
+    if let Some(q) = quote {
+        close.push(q);
+    }
+    (quote, close)
+}
+
+/// Past a backtick's closing one on the same line, if there is one; `false`
+/// (and nothing taken) when the backtick stays open to the line's end.
+fn skip_ticked(chars: &mut std::iter::Peekable<std::str::Chars>) -> bool {
+    // Read ahead on a copy and take it only when the closing one is there,
+    // so each character is read at most twice.
+    let mut ahead = chars.clone();
+    while let Some(c) = ahead.next() {
+        if c == '`' {
+            *chars = ahead;
+            return true;
+        }
+    }
+    false
 }
 
 /// Whether any segment of a line runs a shell (so a here-string on it is a
@@ -574,6 +721,13 @@ fn tokenize(segment: &str, shell: Shell) -> Option<Vec<String>> {
             '\'' | '"' => {
                 quote = Some(c);
                 in_word = true;
+            }
+            '\\' if posix && matches!(chars.peek(), Some('\n' | '\r')) => {
+                // A line continuation: the shell drops it, so the command
+                // goes on as one (`docker run \` + `--privileged img`).
+                if chars.next() == Some('\r') && chars.peek() == Some(&'\n') {
+                    chars.next();
+                }
             }
             '\\' if posix && chars.peek().is_some_and(|n| n.is_whitespace()) => {
                 cur.push(chars.next().unwrap());
@@ -949,6 +1103,49 @@ mod tests {
         assert_eq!(Shell::for_os("windows"), Shell::PowerShell);
         assert_eq!(Shell::for_os("linux"), Shell::Posix);
         assert_eq!(Shell::for_os("macos"), Shell::Posix);
+    }
+
+    /// A quote opened on a here-document's body line (an apostrophe in
+    /// prose, a Rust lifetime, a lone `"` or backtick) ends with that line,
+    /// so the commands after the document are still seen (review r4,
+    /// finding 1). Outside a body a quoted string still spans lines.
+    #[test]
+    fn a_quote_in_a_heredoc_body_ends_with_its_line() {
+        for line in [
+            "cat > notes.md <<'EOF'\nDon't run this on prod.\nEOF\nrm -rf ~",
+            "git commit -F - <<'EOF'\nFix the parser's crash\nEOF\nrm -rf ~",
+            "cat > lib.rs <<'EOF'\nfn f<'a>(x: &'a str) -> &'a str { x }\nEOF\nrm -rf ~",
+            "cat > a.txt <<EOF\nA 12\" screen\nEOF\nrm -rf ~",
+            "cat > a.md <<EOF\nSay \"don't\nEOF\nrm -rf ~",
+            "cat > a.md <<-EOF\n\tPress the ` key\n\tEOF\nrm -rf ~",
+            "cat > a.md <<\\EOF\r\nIt's done.\r\nEOF\r\nrm -rf ~",
+            "cat <<A >a <<B\nit's\nA\nit's\nB\nrm -rf ~",
+        ] {
+            let c = commands(line);
+            assert!(
+                c.iter().any(|c| c.program == "rm" && c.operands() == ["~"]),
+                "{line:?}: {c:?}"
+            );
+        }
+        assert_eq!(
+            progs("cat <<EOF\nit's\nEOF\necho 'a\nb; c' && ls"),
+            ["cat", "its", "eof", "echo", "ls"]
+        );
+        assert_eq!(progs("echo 'a\nb; c' && ls"), ["echo", "ls"]);
+        // A body line keeps its own quoted words.
+        let c = commands("cat > x.sh <<'EOF'\necho 'a; b' 'c\nEOF");
+        assert_eq!(c[1].operands(), ["a; b", "c"]);
+    }
+
+    /// A `\` at a line's end continues the command on the next line, as in
+    /// the shell, also before a CRLF.
+    #[test]
+    fn a_line_continuation_joins_the_command() {
+        let c = commands("docker run \\\n  --privileged img");
+        assert_eq!(c.len(), 1);
+        assert_eq!(c[0].raw, ["run", "--privileged", "img"]);
+        let c = commands("docker run \\\r\n  --privileged img");
+        assert_eq!(c[0].raw, ["run", "--privileged", "img"]);
     }
 
     #[test]

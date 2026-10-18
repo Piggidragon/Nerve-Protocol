@@ -33,6 +33,10 @@ const HF_BASE: &str = "https://huggingface.co";
 pub struct Sources {
     llama: String,
     hf: String,
+    /// A test's own size and SHA-256 for every model, so a small fake file
+    /// can stand in for the pinned one and an install reach its swap.
+    #[cfg(test)]
+    model: Option<(u64, String)>,
 }
 
 impl Sources {
@@ -41,7 +45,19 @@ impl Sources {
         Sources {
             llama: LLAMA_BASE.into(),
             hf: HF_BASE.into(),
+            #[cfg(test)]
+            model: None,
         }
+    }
+
+    /// The size and SHA-256 a model's download must have: its pin's, or a
+    /// test's own.
+    fn model_check<'a>(&'a self, pin: &'a ModelPin) -> (u64, &'a str) {
+        #[cfg(test)]
+        if let Some((bytes, sha)) = &self.model {
+            return (*bytes, sha);
+        }
+        (pin.bytes, pin.sha256)
     }
 
     /// A local fake serving both, for a test.
@@ -50,6 +66,18 @@ impl Sources {
         Sources {
             llama: base.into(),
             hf: base.into(),
+            model: None,
+        }
+    }
+
+    /// [`Sources::at`], with `model` (its bytes) taken as every model's
+    /// pinned file. Only the Unix tests run a fake server from it.
+    #[cfg(all(test, unix))]
+    pub(crate) fn with_model(base: &str, model: &[u8]) -> Sources {
+        let sha = ring::digest::digest(&ring::digest::SHA256, model);
+        Sources {
+            model: Some((model.len() as u64, nerve_proto::msg::hex(sha.as_ref()))),
+            ..Sources::at(base)
         }
     }
 }
@@ -420,18 +448,19 @@ async fn prepare_into(
     // 2. The model, unless it is already there with the right hash. It is
     // downloaded beside the file in use, as the server may be holding that.
     let pin = model_pin(p.model_id);
+    let (bytes, sha) = from.model_check(pin);
     let model = model_path(state, p.model_id);
     let staged = staged_model(state, p.model_id);
     set(shared, |s| s.phase = Phase::Verifying);
-    let have = model.metadata().map(|m| m.len()).unwrap_or(0) == pin.bytes
-        && sha256_file(&model).as_deref() == Ok(pin.sha256);
+    let have = model.metadata().map(|m| m.len()).unwrap_or(0) == bytes
+        && sha256_file(&model).as_deref() == Ok(sha);
     if have {
         // A download an earlier, interrupted install left is not needed.
         let _ = std::fs::remove_file(&staged);
         set(shared, |s| {
             s.model = Progress {
-                done: pin.bytes,
-                total: pin.bytes,
+                done: bytes,
+                total: bytes,
             };
         });
         return Ok(());
@@ -446,9 +475,9 @@ async fn prepare_into(
     download_file(
         &url,
         &staged,
-        pin.sha256,
-        Some(pin.bytes),
-        &opts(cancel, pin.bytes + 1024),
+        sha,
+        Some(bytes),
+        &opts(cancel, bytes + 1024),
         &mut |done, total| {
             set(shared, |s| s.model = Progress { done, total });
         },

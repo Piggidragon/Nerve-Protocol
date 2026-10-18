@@ -60,18 +60,34 @@ spaces collapsed, a `\`/`` ` `` line continuation joined, any other line break
 turned into ` ; ` so `[^;]*` stops at a command's end), or a **`cmd-re:`
 regex** over each command pulled from the line (`Command::line`: the program,
 then the arguments as tokenized, quotes removed, all lower-cased, one space
-apart). Defaults that must read one command's own words use the structured
-form or `cmd-re:`: `mkfs*`, `wipefs` and `userdel` as the program; database
-drops in a client's arguments (also `docker|podman|kubectl … psql …`); the
-three force-push forms (`push` as git's subcommand, a force flag, and `main`/
-`master` as a whole refspec, so the next line's push of another branch is not
-joined to it); and the Windows recursive deletes, which take the target as a
-whole operand so `Remove-Item C:\Users\me\build -Recurse -Force` stays
-allowed while a drive root is refused (with a whole-line twin, below).
-Whole-line `re:` is kept where the pattern spans commands: a download piped
-into a program that runs its input (the last stage of the pipe is a shell or
-an interpreter with no script of its own), SQL piped or fed as a
-here-document into a client, and the device, container and Windows patterns.
+apart; the structured form's program glob ignores letter case). Defaults that
+must read one command's own words use the structured form or `cmd-re:`:
+`mkfs*`, `wipefs`, `userdel`, `passwd root`, `nsenter`, `bcdedit`, `diskpart`
+and `Format-Volume` as the program; `shred` of a device, an `iptables -F`
+flush (with at most a table and a chain, since the lower-cased line cannot
+tell `-F` from the fragment match `-f`), `systemctl stop|disable|mask` of the
+`ssh`/`sshd` unit by name; the container flags (`--privileged`, `--pid=host`,
+`-v /:/…`, the docker socket, and `exec -u root` among `exec`'s own options);
+database drops in a client's arguments (also `docker|podman|kubectl … psql …`);
+the three force-push forms (`push` as git's subcommand, a force flag, and
+`main`/`master` as a whole refspec, so the next line's push of another branch
+is not joined to it); and the Windows recursive deletes, which take the target
+as a whole operand (a drive root, the Windows folder, Program Files, the Users
+folder or one home in it, `~`, `$HOME`, `$env:USERPROFILE`, `%USERPROFILE%`),
+so `Remove-Item C:\Users\me\build -Recurse -Force` stays allowed (with a
+whole-line twin, below). The structured matcher reads `${NAME}` as `$NAME`, so
+`rm -rf ${HOME}` meets `rm -rf $HOME`, and `/home/?*` is one level under
+`/home` only. Whole-line `re:` is kept where the pattern spans commands or
+looks at a redirection: a download piped into a program that runs its input
+(the last stage of the pipe is a shell or an interpreter with no script of its
+own), SQL piped or fed as a here-document into a client, `dd`/`>` to a disk
+device, `> /etc/passwd`, the fork bomb, `kill -9 -1`, and the remaining
+Windows patterns (`format C:`, `vssadmin`, `wbadmin`, `reg delete HKLM`,
+`Set-MpPreference -Disable…`, `cipher /w`). A here-document is read as
+commands, so a body that only writes a file (a Dockerfile's
+`RUN curl … | bash -`) still meets the download entry; the user guide says so
+and points to `fs.write` for such files, as the owner's decision rules out a
+special reading of here-documents.
 Since the per-command entries rely on the splitter, a line the splitter reads
 wrongly can hide them; that is accepted for the purpose above, except for the
 Windows root deletes, which have the whole-line twin.
@@ -85,7 +101,12 @@ here-strings fed to a shell; it strips wrappers and shell keywords, drops a
 special reading: its lines are split like any other, so a command in it is
 seen whether the document is fed to a shell or written to a file, and a body
 of ordinary content (a config file, a README) is not refused because no line
-of it is a blocklisted command. A `#` at the start of a word is a comment to
+of it is a blocklisted command. The one exception is quoting: a quote or
+backtick still open at the end of a body line is closed there
+(`close_body_quotes`), since the shell gives it no meaning in a body and an
+apostrophe ("don't") would otherwise run past the document and hide the
+commands after it. A `\` at a line's end joins the next line, as in the
+shell. A `#` at the start of a word is a comment to
 the end of the line, and nothing in it (a quote, a `<<`) changes how the next
 lines are read. The line is read by the rules of the node's shell
 (`normalize::Shell::for_os`: PowerShell on Windows, POSIX elsewhere; a nested

@@ -41,8 +41,8 @@ own policy: its mode, its deny rules and the folder sandbox.
 
 Entries are in the machine's own rule syntax, `<scope>:<pattern>`:
 
-- `exec.run:rm -rf /*` — a command. The program, then the flags that must be
-  present, then an operand pattern.
+- `exec.run:rm -rf /*` — a command. The program (in any letter case), then
+  the flags that must be present, then an operand pattern.
 - `fs.write:/etc/sudoers` — a write to a path. `~` stands for any user's home.
 - `cmd-re:` for a regular expression over **each command** of the line, e.g.
   `exec.run:cmd-re:^terraform destroy( |$)`. The checker pulls the commands
@@ -66,17 +66,21 @@ You can add entries, remove them, switch single ones off, and reset the whole
 list to the built-in defaults. The defaults block truly dangerous things and
 leave ordinary work alone: `rm file`, `rm -rf ./build`, `rm -rf node_modules`,
 `docker ps`, `git push` and `kill <pid>` all stay allowed; wiping the root
-filesystem, `mkfs`, `dd` to a disk, fork bombs, `chmod -R 777 /`, dropping a
-database, a container that gives root on the host, `curl … | sh`, force-pushing
-`main`, and the Windows equivalents (`Format-Volume`, `rd /s /q C:\`,
-`vssadmin delete shadows`, disabling Defender, …) are blocked. Most defaults
-look at the command that runs, not at every word on the line: `mkfs`,
-`wipefs` and `userdel` only as the program, `DROP TABLE` only in what a
-database client (`psql`, `mysql`, `sqlite3`, `mongosh`, …) is given, a download
-only when it is piped into something that runs it (`| sh`, `| sudo bash -s`,
-`| python3 -`, not `| grep` or `| python -m json.tool`), and a force-push only
-in the `git push` itself. So a commit message, a `grep` or a note that merely
-mentions one of them is not refused.
+filesystem or a home folder, `mkfs`, `dd` to a disk, fork bombs,
+`chmod -R 777 /`, dropping a database, a container that gives root on the host,
+`curl … | sh`, force-pushing `main`, and the Windows equivalents
+(`Format-Volume`, `rd /s /q C:\`, `Remove-Item -Recurse` of `~` or
+`C:\Users\<name>`, `vssadmin delete shadows`, disabling Defender, …) are
+blocked. Most defaults look at the command that runs, not at every word on the
+line: `mkfs`, `wipefs`, `userdel`, `nsenter`, `bcdedit`, `diskpart` and
+`Format-Volume` only as the program, `shred`, `iptables -F`, stopping `sshd`
+and the container flags (`--privileged`, `--pid=host`, `-v /:/…`) only in that
+command's own words, `DROP TABLE` only in what a database client (`psql`,
+`mysql`, `sqlite3`, `mongosh`, …) is given, a download only when it is piped
+into something that runs it (`| sh`, `| sudo bash -s`, `| python3 -`, not
+`| grep` or `| python -m json.tool`), and a force-push only in the `git push`
+itself. So a commit message, a `grep` or a note that merely mentions one of
+them is not refused.
 
 The matcher does not just look at the raw string. For a command it splits the
 line into its commands (at `;`, `&&`, `||`, `|`, newlines, inside `$( )`,
@@ -86,14 +90,20 @@ program's base name (`/bin/rm` → `rm`), and treats short flags in any order,
 split or joined (`-rf`, `-fr`, `-r -f`, `-Rf`, `--recursive --force`) as the
 same. The lines of a here-document are read as commands too, so a script
 written with `cat > x.sh <<'EOF'` that holds `rm -rf ~` is refused, while one
-with ordinary content is not. A `#` comment runs to the end of its line. The
+with ordinary content is not. A quote in a document's line (an apostrophe in
+"don't") ends with that line, so it cannot hide the commands after the
+document. This also means a file written that way with `curl … | sh` in it (a
+Dockerfile's `RUN curl … | bash -`, a CI step) is refused like the command
+itself, and an allow rule does not get past it: have the agent write such a
+file with the file tool (`fs.write`) instead, which the command entries do not
+look at. A `#` comment runs to the end of its line. The
 line is read by the rules of the machine's shell: PowerShell on Windows,
 `/bin/sh` elsewhere. For a `fs` write it normalises the path first (`//`, `/.`
 and `..` are resolved, and the match ignores letter case), so a
 differently-spelled path still hits.
 
 **What it cannot see:** shell variables and `$HOME` (it matches the literal
-`$HOME`, not your home), aliases, a script written to a file and then run, and
+`$HOME` or `${HOME}`, not your home), aliases, a script written to a file and then run, and
 base64-encoded commands. Its reading of a line is a simple one, not the
 shell's own, so a line written to confuse it can get past it. For paths it sees
 the path as the agent wrote it, not where a symlink would lead, and only this
@@ -142,7 +152,8 @@ text generated, so a judgement is fast and cheap. There are two sources:
   model already installed keeps checking calls while the new files download;
   it is stopped only for the moment the files are swapped, and if the install
   fails it keeps running as before. **Remove** turns the local model off and
-  deletes the downloaded files (also during an install, which it ends). A machine with no prebuilt build for it says so and points you to the
+  deletes the downloaded files; during an install the progress card has it
+  too, and it ends the install first. A machine with no prebuilt build for it says so and points you to the
   endpoint source; for any other model, or your own llama.cpp, use the endpoint
   source too.
 

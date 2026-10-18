@@ -261,9 +261,20 @@ const WIN_DELETE: &str = "(?:remove-item|ri|rm|del|erase|rd|rmdir)";
 /// Their recursive switch: `-Recurse` written in full or shortened as
 /// PowerShell allows, or cmd's `/s`.
 const WIN_RECURSE: &str = r"(?:-r(?:e(?:c(?:u(?:r(?:s(?:e)?)?)?)?)?)?(?::\$?true)?|/s)";
-/// A drive root (`C:`, `C:\`, `C:\*`), the Windows folder or System32, or
-/// the variables that name them, as one whole (lower-cased) operand.
-const WIN_ROOT: &str = r"(?:[a-z]:[\\/]?\*?|[a-z]:[\\/]windows(?:[\\/]system32)?[\\/]?\*?|\$env:(?:systemroot|windir|systemdrive)[\\/]?\*?|%(?:systemroot|windir|systemdrive)%[\\/]?\*?)";
+/// A drive root (`C:`, `C:\`, `C:\*`), the Windows folder or System32,
+/// Program Files, the Users folder or one user's home in it, a home as
+/// PowerShell or cmd name it (`~`, `$HOME`, `$env:USERPROFILE`,
+/// `%USERPROFILE%`), or the variables that name the others, as one whole
+/// (lower-cased) operand, with or without a trailing `\` or `\*`.
+const WIN_ROOT: &str = concat!(
+    r"(?:(?:[a-z]:",
+    r"|[a-z]:[\\/]windows(?:[\\/]system32)?",
+    r"|[a-z]:[\\/]program files(?: \(x86\))?",
+    r#"|[a-z]:[\\/]users(?:[\\/][^\\/\s'";&|)*]+)?"#,
+    r"|~|\$home|\$env:(?:systemroot|windir|systemdrive|userprofile)",
+    r"|%(?:systemroot|windir|systemdrive|userprofile)%",
+    r")[\\/]?\*?)"
+);
 
 /// The Windows delete commands as a word of their own on the whole line (at
 /// its start, or after a separator, a bracket, a blank or a quote), for the
@@ -295,6 +306,12 @@ const GIT_PROTECTED: &str = r"(?:\S*:)?\+?(?:refs/heads/)?(?:main|master)";
 /// `git … push`: push as git's subcommand, after git's own options only, so
 /// a commit message that mentions a push is not one.
 const GIT_PUSH: &str = r"^git(?: (?:-c|-C) \S+| -\S*)* push";
+/// The container tools whose options can give a container root on the host.
+const CONTAINER: &str = "(?:docker|podman|docker-compose|podman-compose)";
+/// `docker exec`'s options before the container, so `-u root` is read only
+/// where docker reads it, not in the command run inside (`id -u root`).
+const EXEC_OPTS: &str = r"(?: (?:-[ewu]|--(?:env|env-file|workdir|user|detach-keys)) \S+| -\S+)*?";
+
 /// git push's force flags: `--force`, `--force-with-lease[=…]`, or a short
 /// flag word with `f` in it (`-f`, `-uf`).
 const GIT_FORCE: &str = r"(?:--force(?:-with-lease)?(?:=\S*)?|-[a-z]*f[a-z]*)";
@@ -314,6 +331,10 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
         b("exec.run:rm -rf ~/", "wipes the home directory"),
         b("exec.run:rm -rf $HOME", "wipes the home directory"),
         b("exec.run:rm -rf /home", "wipes all home directories"),
+        // One level under /home only (the glob does not cross a `/`), so
+        // `rm -rf /home/me/project/build` stays allowed.
+        b("exec.run:rm -rf /home/?*", "wipes a user's home directory"),
+        b("exec.run:rm -rf /root", "wipes root's home directory"),
         b("exec.run:rm -rf /etc", "wipes system configuration"),
         b("exec.run:rm -rf /usr", "wipes installed software"),
         b("exec.run:rm -rf /var", "wipes system state"),
@@ -327,7 +348,10 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
             "writes raw over a disk device",
         ),
         b("exec.run:wipefs", "erases filesystem signatures"),
-        b("exec.run:re:(?i)\\bshred\\b[^|&;]*/dev/", "shreds a device"),
+        b(
+            "exec.run:cmd-re:^shred (?:.* )?/dev/(?:sd|nvme|vd|hd|mmcblk|disk)",
+            "shreds a device",
+        ),
         b(
             "exec.run:re:(?i)>\\s*/dev/(sd|nvme|vd|hd|mmcblk|disk)",
             "writes over a disk device",
@@ -364,24 +388,32 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
             &format!(r"exec.run:re:(?i)\b{DB_CLIENT}\b[^|&;]*<<[^|]*?{DB_DROP}"),
             "drops or truncates a database",
         ),
-        // ---- docker/podman that gives root on the host ----
+        // ---- docker/podman that gives root on the host: in the container
+        //      tool's own words, so a commit message or a grep that mentions
+        //      the flag is not refused ----
         b(
-            "exec.run:re:(?i)\\b(docker|podman)\\b[^|&;]*--privileged",
+            &format!("exec.run:cmd-re:^{CONTAINER} (?:.* )?--privileged(?:=true)?(?: |$)"),
             "a privileged container: root on the host",
         ),
         b(
-            "exec.run:re:(?i)\\b(docker|podman)\\b[^|&;]*--pid[= ]host",
+            &format!("exec.run:cmd-re:^{CONTAINER} (?:.* )?--pid(?:=| )host(?: |$)"),
             "shares the host process namespace",
         ),
         b(
-            "exec.run:re:(?i)\\b(docker|podman)\\b[^|&;]*-v\\s*/:(/|\\s)",
+            &format!("exec.run:cmd-re:^{CONTAINER} (?:.* )?(?:-v|--volume)(?:=| )?/:(?:/|$| )"),
             "mounts the whole host filesystem",
         ),
         b(
-            "exec.run:re:(?i)\\b(docker|podman)\\b[^|&;]*/var/run/docker\\.sock",
+            &format!("exec.run:cmd-re:^{CONTAINER} (?:.* )?\\S*/var/run/docker\\.sock"),
             "mounts the docker socket: root on the host",
         ),
-        b("exec.run:re:(?i)\\bnsenter\\b", "enters another namespace"),
+        b(
+            &format!(
+                "exec.run:cmd-re:^{CONTAINER}(?: compose)? exec{EXEC_OPTS} (?:-u|--user)(?:=| )?(?:root|0)(?::\\S*)?(?: |$)"
+            ),
+            "runs as root in a container",
+        ),
+        b("exec.run:nsenter", "enters another namespace"),
         // ---- pipe a download straight into a shell: the last program of
         //      the pipe runs its input (`| sh`, `| sudo bash -s`,
         //      `| python3 -`), not `| grep sh` or `| python -m json.tool` ----
@@ -391,8 +423,11 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
         ),
         // ---- cron, firewall, kill-all ----
         b("exec.run:crontab -r", "removes all cron jobs"),
+        // A flush is `-F` (or `--flush`) with at most a table, a wait and a
+        // chain: the line is lower-cased, so this keeps a rule with `-f`
+        // (iptables' match for fragments) from reading as one.
         b(
-            "exec.run:re:(?i)\\biptables\\b[^|&;]*-F",
+            r"exec.run:cmd-re:^ip6?tables(?: -t \S+| --table[ =]\S+| -w(?: \d+)?| --wait(?:=\S+)?)* (?:-f|--flush)(?: [^-\s]\S*)?(?: -t \S+)?$",
             "flushes the firewall",
         ),
         b(
@@ -405,8 +440,10 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
             "overwrites the user database",
         ),
         b("exec.run:userdel", "deletes a user account"),
+        b("exec.run:passwd root", "changes root's password"),
+        // The SSH service by its unit name, so `ssh-agent` is not one.
         b(
-            "exec.run:re:(?i)\\bsystemctl\\b[^|&;]*\\b(stop|disable|mask)\\b[^|&;]*\\bssh",
+            r"exec.run:cmd-re:^systemctl (?:.* )?(?:stop|disable|mask) (?:.* )?(?:ssh|sshd|openssh-server)(?:\.service|\.socket)?(?: |$)",
             "turns off the SSH service",
         ),
         // Force-push over main/master, matched on the one git command's
@@ -432,28 +469,29 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
             "force-pushes over a protected branch",
         ),
         // ---- Windows ----
-        b("exec.run:re:(?i)format-volume", "formats a volume"),
+        // Format-Volume, bcdedit and diskpart as the program run.
+        b("exec.run:Format-Volume", "formats a volume"),
         b(
             r"exec.run:re:(?i)\bformat(?:\.com)?\s+[a-z]:",
             "formats a drive",
         ),
         // A recursive delete (PowerShell's Remove-Item and its aliases with
-        // -Recurse, cmd's rd/del with /s) of a drive root or the Windows
-        // folder. Matched on the one command's words, with the target as a
-        // whole operand, so `Remove-Item C:\Users\me\build -Recurse -Force`
-        // (the everyday `rm -rf ./build` on Windows) stays allowed. Two
-        // entries: the switch before the target, and after it.
+        // -Recurse, cmd's rd/del with /s) of a drive root, a system folder or
+        // a home (WIN_ROOT). Matched on the one command's words, with the
+        // target as a whole operand, so `Remove-Item C:\Users\me\build
+        // -Recurse -Force` (the everyday `rm -rf ./build` on Windows) stays
+        // allowed. Two entries: the switch before the target, and after it.
         b(
             &format!(
                 "exec.run:cmd-re:^{WIN_DELETE}(?: .*)? {WIN_RECURSE}(?: .*)? {WIN_ROOT}(?: .*)?$"
             ),
-            "recursively deletes a drive root or the Windows folder",
+            "recursively deletes a drive root, a system folder or a home",
         ),
         b(
             &format!(
                 "exec.run:cmd-re:^{WIN_DELETE}(?: .*)? {WIN_ROOT}(?: .*)? {WIN_RECURSE}(?: .*)?$"
             ),
-            "recursively deletes a drive root or the Windows folder",
+            "recursively deletes a drive root, a system folder or a home",
         ),
         // The same over the whole line, within one command (no `;`, `&` or
         // `|` between), so these stay refused when the splitter cuts a
@@ -464,23 +502,20 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
             &format!(
                 "exec.run:re:(?i){WIN_DELETE_WORD}(?:[^;&|]*?\\s)?{WIN_RECURSE}(?:\\s[^;&|]*?)?{WIN_BEFORE}{WIN_ROOT}{WIN_AFTER}"
             ),
-            "recursively deletes a drive root or the Windows folder",
+            "recursively deletes a drive root, a system folder or a home",
         ),
         b(
             &format!(
                 "exec.run:re:(?i){WIN_DELETE_WORD}(?:[^;&|]*?{WIN_BEFORE})?{WIN_ROOT}[\\s'\")](?:[^;&|]*?\\s)?{WIN_RECURSE}{WIN_AFTER}"
             ),
-            "recursively deletes a drive root or the Windows folder",
+            "recursively deletes a drive root, a system folder or a home",
         ),
         b(
             "exec.run:re:(?i)\\bvssadmin(\\.exe)?\\s+delete\\s+shadows",
             "deletes volume shadow copies",
         ),
         b("exec.run:re:(?i)wbadmin\\s+delete", "deletes backups"),
-        b(
-            "exec.run:re:(?i)\\bbcdedit\\b",
-            "edits the boot configuration",
-        ),
+        b("exec.run:bcdedit", "edits the boot configuration"),
         b(
             "exec.run:re:(?i)\\breg(\\.exe)?\\s+delete\\s+[\"']?hk(lm|ey_local_machine)\\b",
             "deletes a machine registry key",
@@ -490,7 +525,7 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
             "disables Defender protection",
         ),
         b("exec.run:re:(?i)\\bcipher\\b\\s+/w", "wipes free space"),
-        b("exec.run:re:(?i)\\bdiskpart\\b", "edits disk partitions"),
+        b("exec.run:diskpart", "edits disk partitions"),
         // ---- files: writes to dangerous places (the fs profile has no
         //      delete; a delete is an `rm` command, caught above) ----
         b("fs.write:~/.ssh/authorized_keys", "an SSH login key list"),

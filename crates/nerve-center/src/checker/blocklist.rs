@@ -158,7 +158,10 @@ impl CmdPattern {
     fn parse(pattern: &str) -> Result<CmdPattern, String> {
         let mut words = pattern.split_whitespace();
         let program = words.next().ok_or("the pattern names no program")?;
+        // The program is matched in any case (it is lower-cased on the
+        // command), so `Format-Volume` is written as PowerShell writes it.
         let program = GlobBuilder::new(program)
+            .case_insensitive(true)
             .build()
             .map_err(|e| e.to_string())?
             .compile_matcher();
@@ -181,7 +184,7 @@ impl CmdPattern {
                 // `/*` on a pattern path is dropped so `rm -rf /etc` and
                 // `rm -rf /etc/` are the same entry.
                 operands.push(
-                    GlobBuilder::new(norm_operand(w))
+                    GlobBuilder::new(&norm_operand(w))
                         .literal_separator(true)
                         .build()
                         .map_err(|e| e.to_string())?
@@ -227,11 +230,20 @@ impl CmdPattern {
 }
 
 /// An operand path without a trailing `/` or `/*`, so `/etc`, `/etc/` and
-/// `/etc/*` (and `~`, `~/`, `~/*`) are the same target to match.
-fn norm_operand(o: &str) -> &str {
-    let o = o.strip_suffix("/*").unwrap_or(o);
+/// `/etc/*` (and `~`, `~/`, `~/*`) are the same target to match, and with a
+/// leading `${NAME}` written `$NAME`, as the shell reads both the same.
+fn norm_operand(o: &str) -> String {
+    let o = match o.strip_prefix("${").and_then(|r| r.split_once('}')) {
+        Some((name, rest))
+            if !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') =>
+        {
+            format!("${name}{rest}")
+        }
+        _ => o.to_string(),
+    };
+    let o = o.strip_suffix("/*").unwrap_or(&o);
     let trimmed = o.trim_end_matches('/');
-    if trimmed.is_empty() { o } else { trimmed }
+    if trimmed.is_empty() { o } else { trimmed }.to_string()
 }
 
 /// The long spellings a short flag is also written as, for the common
@@ -382,6 +394,8 @@ mod tests {
         ("exec", "run", "rm -rf ~/"),
         ("exec", "run", "rm -rf $HOME"),
         ("exec", "run", "rm -rf /home"),
+        ("exec", "run", "rm -rf /home/alice"),
+        ("exec", "run", "rm -rf /root"),
         ("exec", "run", "rm -rf /etc"),
         ("exec", "run", "rm -rf /usr"),
         ("exec", "run", "rm -rf /var"),
@@ -413,6 +427,8 @@ mod tests {
         ("exec", "run", "kill -9 -1"),
         ("exec", "run", ": > /etc/passwd"),
         ("exec", "run", "userdel bob"),
+        ("exec", "run", "passwd root"),
+        ("exec", "run", "docker exec -u root app sh"),
         ("exec", "run", "systemctl stop sshd"),
         ("exec", "run", "git push --force origin main"),
         ("exec", "run", "git push origin main --force"),
@@ -730,6 +746,159 @@ mod tests {
             "cat > reset.sh <<'EOF'\n# don't keep the old crontab\ncrontab -r\nEOF",
             "# clean up what the build left, it's all generated\nrm -rf ~",
             "make clean # don't keep the cache\nchmod -R 777 /",
+        ] {
+            assert!(refused_by_defaults(cmd), "should be refused: {cmd:?}");
+        }
+    }
+
+    /// An ordinary here-document with prose in it (an apostrophe, a Rust
+    /// lifetime, a lone `"`) does not hide a mistake made after it in the
+    /// same call (review r4, finding 1).
+    #[test]
+    fn a_mistake_after_an_ordinary_heredoc_is_refused() {
+        for cmd in [
+            "cat > notes.md <<'EOF'\nDon't run this on prod.\nEOF\nrm -rf ~",
+            "cat > CHANGELOG.md <<'EOF'\n- Fix the parser's crash\nEOF\ngit add -A && git commit -m release && git push --force origin main",
+            "git commit -F - <<'EOF'\nFix the parser's crash\nEOF\ngit push --force origin main",
+            "cat > README.md <<'EOF'\nIt's done.\nEOF\nsudo mkfs.ext4 /dev/sdb1",
+            "cat > README.md <<'EOF'\nIt's done.\nEOF\nchmod -R 777 /",
+            "cat > README.md <<'EOF'\nIt's done.\nEOF\npsql -c 'DROP DATABASE app'",
+            "cat > a.md <<'EOF'\nThe user's guide\nEOF\ncrontab -r",
+            "cat > lib.rs <<'EOF'\nfn f<'a>(x: &'a str) -> &'a str { x }\nEOF\nrm -rf ~",
+            "cat > a.txt <<EOF\nA 12\" screen\nEOF\nrm -rf ~",
+        ] {
+            assert!(refused_by_defaults(cmd), "should be refused: {cmd:?}");
+        }
+        // The same documents with ordinary work after them stay allowed.
+        for cmd in [
+            "cat > notes.md <<'EOF'\nDon't run this on prod.\nEOF\ngit add notes.md",
+            "git commit -F - <<'EOF'\nFix the parser's crash\nEOF\ngit push origin main",
+        ] {
+            assert!(!refused_by_defaults(cmd), "should stay allowed: {cmd:?}");
+        }
+    }
+
+    /// Deleting a home folder is refused on Windows as on Linux: PowerShell's
+    /// `~`, `$HOME` and `$env:USERPROFILE`, cmd's `%USERPROFILE%`, the Users
+    /// folder and one user's home in it, Program Files, and on Linux a home by
+    /// its absolute path, root's home and `${HOME}` (review r4, finding 2).
+    /// Clean-ups inside a home stay allowed.
+    #[test]
+    fn deleting_a_home_folder_is_refused() {
+        for cmd in [
+            r"Remove-Item -Recurse -Force ~",
+            r"Remove-Item -Recurse -Force $HOME\*",
+            r"Remove-Item -Recurse -Force $env:USERPROFILE",
+            r"Remove-Item -Recurse -Force C:\Users\alice",
+            r"Remove-Item -Recurse -Force C:\Users",
+            r"Remove-Item C:\Users\alice\ -Recurse -Force",
+            r"rd /s /q %USERPROFILE%",
+            r"Remove-Item -Recurse -Force 'C:\Program Files'",
+            "rm -rf /home/alice",
+            "rm -rf /home/alice/",
+            "rm -rf /root",
+            "rm -rf ${HOME}",
+            "rm -rf \"${HOME}/\"",
+        ] {
+            for shell in [normalize::Shell::PowerShell, normalize::Shell::Posix] {
+                assert!(
+                    refused_on(shell, cmd),
+                    "should be refused ({shell:?}): {cmd:?}"
+                );
+            }
+        }
+        for cmd in [
+            r"Remove-Item -Recurse -Force ~\AppData\Local\Temp\*",
+            r"Remove-Item -Recurse -Force $env:USERPROFILE\.cache\pip",
+            r"Remove-Item -Recurse -Force $HOME\projects\app\node_modules",
+            r"rd /s /q %USERPROFILE%\AppData\Local\Temp",
+            r"Remove-Item -Recurse -Force C:\Users\alice\project\build",
+            r"Remove-Item -Recurse -Force 'C:\Program Files\MyApp\cache'",
+            "rm -rf /home/alice/proj/build",
+            "rm -rf /root/.cache",
+            "rm -rf \"${HOME}/.cache/pip\"",
+            "rm -rf ~/build",
+        ] {
+            for shell in [normalize::Shell::PowerShell, normalize::Shell::Posix] {
+                assert!(
+                    !refused_on(shell, cmd),
+                    "should stay allowed ({shell:?}): {cmd:?}"
+                );
+            }
+        }
+    }
+
+    /// The brief's `docker exec -u root` and `passwd` of root (review r4,
+    /// finding 3), read where docker and passwd read them.
+    #[test]
+    fn a_root_shell_in_a_container_and_roots_password_are_refused() {
+        for cmd in [
+            "docker exec -u root app sh",
+            "docker exec --user root -it app bash",
+            "docker exec -it -u 0 app sh",
+            "docker exec --user=root app sh",
+            "sudo podman exec -e A=b -u root:root app sh",
+            "docker compose exec -u root web bash",
+            "passwd root",
+            "sudo passwd root",
+        ] {
+            assert!(refused_by_defaults(cmd), "should be refused: {cmd:?}");
+        }
+        for cmd in [
+            "docker exec app sh -c 'id -u root'",
+            "docker exec -u node app npm test",
+            "docker exec -u 1000 app ls",
+            "passwd",
+            "grep root /etc/passwd",
+        ] {
+            assert!(!refused_by_defaults(cmd), "should stay allowed: {cmd:?}");
+        }
+    }
+
+    /// The entries that read one command's words (review r4, finding 4):
+    /// ordinary commands and mere mentions near them stay allowed, and the
+    /// dangerous forms are still refused.
+    #[test]
+    fn the_per_command_entries_refuse_the_command_not_a_mention() {
+        for cmd in [
+            "shred -u secrets.txt 2>/dev/null",
+            "iptables -A INPUT -p tcp --tcp-flags ALL NONE -j DROP",
+            "iptables -A INPUT -p tcp --dport 443 -j ACCEPT -m comment --comment allow-https-for-web",
+            "iptables -A INPUT -f -j DROP",
+            "systemctl --user stop ssh-agent",
+            "grep -rn nsenter scripts/",
+            "man diskpart",
+            "git log --oneline --grep bcdedit",
+            "rg -n 'Format-Volume' scripts/",
+            "git commit -m 'Never run docker with --privileged'",
+            "grep -rn 'docker run --privileged' docs/",
+            "grep -rn -- '--pid=host' k8s/",
+            "docker run --rm -v \"$PWD\":/src img make",
+        ] {
+            assert!(!refused_by_defaults(cmd), "should stay allowed: {cmd:?}");
+            assert!(
+                !refused_on(normalize::Shell::PowerShell, cmd),
+                "should stay allowed on Windows: {cmd:?}"
+            );
+        }
+        for cmd in [
+            "sudo shred -n3 -z /dev/sdb",
+            "iptables -F",
+            "iptables -t nat -F",
+            "sudo iptables --flush INPUT",
+            "ip6tables -w -F",
+            "nsenter -t 1 -m -u -i -n sh",
+            "bcdedit /set {current} safeboot minimal",
+            "bcdedit.exe /deletevalue {default} bootmenupolicy",
+            "diskpart /s wipe.txt",
+            "Get-Disk 1 | Format-Volume -FileSystem NTFS",
+            "docker run --privileged ubuntu",
+            "docker-compose run --privileged svc",
+            "docker run --pid host alpine",
+            "docker run -v /:/host:ro ubuntu",
+            "docker run --mount type=bind,source=/var/run/docker.sock,target=/s img",
+            "systemctl stop ssh",
+            "systemctl disable --now sshd.service",
         ] {
             assert!(refused_by_defaults(cmd), "should be refused: {cmd:?}");
         }

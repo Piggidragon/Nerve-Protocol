@@ -3116,6 +3116,78 @@ mod tests {
         .expect("the test did not finish within 60 s");
     }
 
+    /// A fake Hugging Face that answers each of two downloads with `body`.
+    #[cfg(unix)]
+    fn serve_model(body: &'static [u8]) -> String {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for c in l.incoming().take(2) {
+                let Ok(mut c) = c else { continue };
+                let mut buf = [0u8; 4096];
+                let _ = c.read(&mut buf);
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = c.write_all(head.as_bytes());
+                let _ = c.write_all(body);
+            }
+        });
+        format!("http://127.0.0.1:{port}")
+    }
+
+    /// An install that reaches its swap brings the local server back: after
+    /// a successful switch it runs the new model, and after a swap that fails
+    /// the model it had (review r4, finding 6). The install stopped the
+    /// server for the swap, so only its closing rebuild starts it again.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_install_brings_the_model_back_after_its_swap() {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().unwrap();
+            let c = center_with_a_running_model(dir.path()).await;
+            const MODEL: &[u8] = b"a small stand-in for the model file";
+            let base = serve_model(MODEL);
+            *c.install_from.lock().unwrap() =
+                Arc::new(checker::install::Sources::with_model(&base, MODEL));
+            let phase = |c: &Center| c.checker_install_status().phase;
+            // The switch to Kev-4B keeps the CPU build and swaps the model.
+            c.start_checker_install(false, LocalModel::Kev4b)
+                .await
+                .unwrap();
+            until("the install to finish", || {
+                phase(&c) == checker::install::Phase::Done
+            })
+            .await;
+            assert_eq!(c.read(|s| s.checker.model.local_model), LocalModel::Kev4b);
+            assert!(!checker::install::model_path(dir.path(), LocalModel::D1_3b).exists());
+            until("the new model to run", || local_ready(&c)).await;
+            // A swap that fails: something is in the way where d1-3B's file
+            // goes.
+            let d1 = checker::install::model_path(dir.path(), LocalModel::D1_3b);
+            std::fs::create_dir_all(d1.join("in-the-way")).unwrap();
+            c.start_checker_install(false, LocalModel::D1_3b)
+                .await
+                .unwrap();
+            until("the install to fail", || {
+                phase(&c) == checker::install::Phase::Failed
+            })
+            .await;
+            let st = c.checker_install_status();
+            assert!(
+                st.message.contains("put the model in place"),
+                "{}",
+                st.message
+            );
+            assert_eq!(c.read(|s| s.checker.model.local_model), LocalModel::Kev4b);
+            until("the model it had to run again", || local_ready(&c)).await;
+        })
+        .await
+        .expect("the test did not finish within 60 s");
+    }
+
     /// While an install swaps the files (or Remove deletes them), a config
     /// save does not start the server from them; it starts again once they
     /// are free (review r3, finding 3).

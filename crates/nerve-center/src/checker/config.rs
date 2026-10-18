@@ -262,18 +262,32 @@ const WIN_DELETE: &str = "(?:remove-item|ri|rm|del|erase|rd|rmdir)";
 /// PowerShell allows, or cmd's `/s`.
 const WIN_RECURSE: &str = r"(?:-r(?:e(?:c(?:u(?:r(?:s(?:e)?)?)?)?)?)?(?::\$?true)?|/s)";
 /// A drive root (`C:`, `C:\`, `C:\*`), the Windows folder or System32,
-/// Program Files, the Users folder or one user's home in it, a home as
-/// PowerShell or cmd name it (`~`, `$HOME`, `$env:USERPROFILE`,
-/// `%USERPROFILE%`), or the variables that name the others, as one whole
-/// (lower-cased) operand, with or without a trailing `\` or `\*`.
+/// the Users folder or one user's home in it, a home as PowerShell or cmd
+/// name it (`~`, `$HOME`, `$env:USERPROFILE`, `%USERPROFILE%`), or the
+/// variables that name the others, as one whole (lower-cased) operand with
+/// no blank in it, with or without a trailing `\` or `\*`.
 const WIN_ROOT: &str = concat!(
     r"(?:(?:[a-z]:",
     r"|[a-z]:[\\/]windows(?:[\\/]system32)?",
-    r"|[a-z]:[\\/]program files(?: \(x86\))?",
     r#"|[a-z]:[\\/]users(?:[\\/][^\\/\s'";&|)*]+)?"#,
     r"|~|\$home|\$env:(?:systemroot|windir|systemdrive|userprofile)",
     r"|%(?:systemroot|windir|systemdrive|userprofile)%",
     r")[\\/]?\*?)"
+);
+/// The same targets, and Program Files, in quotes as a whole: what a target
+/// with a blank in it looks like (`"C:\Users\Max Mustermann"`, `'C:\Program
+/// Files (x86)'`). The closing quote must follow the target, so a path
+/// inside it (`"C:\Users\Max Mustermann\proj\build"`) is not one. On a
+/// command's line ([`Command::line`](super::normalize::Command::line)) such
+/// an argument is in double quotes.
+const WIN_ROOT_QUOTED: &str = concat!(
+    r#"["'](?:(?:[a-z]:"#,
+    r"|[a-z]:[\\/]windows(?:[\\/]system32)?",
+    r"|[a-z]:[\\/]program files(?: \(x86\))?",
+    r#"|[a-z]:[\\/]users(?:[\\/][^\\/'"*]+)?"#,
+    r"|~|\$home|\$env:(?:systemroot|windir|systemdrive|userprofile)",
+    r"|%(?:systemroot|windir|systemdrive|userprofile)%",
+    r#")[\\/]?\*?)["']"#
 );
 
 /// The Windows delete commands as a word of their own on the whole line (at
@@ -281,11 +295,13 @@ const WIN_ROOT: &str = concat!(
 /// whole-line forms of the recursive-delete entries.
 const WIN_DELETE_WORD: &str =
     r#"(?:^|[\s;&|(){}'"])(?:remove-item|ri|rm|del|erase|rd|rmdir)(?:\.exe)?\s"#;
-/// What stands before a target that is a whole operand: a blank, a quote, or
-/// the `:` of `-Path:C:\`.
-const WIN_BEFORE: &str = r#"[\s'":]"#;
-/// What ends a target or a switch: a blank, a quote, a bracket, a separator
-/// or the line's end.
+/// What ends an unquoted target on the whole line: a blank, a bracket, a
+/// separator or the line's end, or a quote that closes a string around the
+/// whole command (`cmd /c "rd /s /q C:\"`). So the quote of `~/"old stuff"`
+/// does not end the operand `~/`.
+const WIN_END: &str = r#"(?:$|[\s;&|)]|['"](?:$|[\s;&|)]))"#;
+/// What ends a switch: a blank, a quote, a bracket, a separator or the
+/// line's end.
 const WIN_AFTER: &str = r#"(?:$|[\s;&|)'"])"#;
 
 /// The database clients whose arguments (or input) may carry SQL that drops
@@ -478,18 +494,20 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
         // A recursive delete (PowerShell's Remove-Item and its aliases with
         // -Recurse, cmd's rd/del with /s) of a drive root, a system folder or
         // a home (WIN_ROOT). Matched on the one command's words, with the
-        // target as a whole operand, so `Remove-Item C:\Users\me\build
-        // -Recurse -Force` (the everyday `rm -rf ./build` on Windows) stays
-        // allowed. Two entries: the switch before the target, and after it.
+        // target as a whole operand (in quotes when it has a blank in it), so
+        // `Remove-Item C:\Users\me\build -Recurse -Force` (the everyday
+        // `rm -rf ./build` on Windows) stays allowed, also under a home
+        // with a blank in its name. Two entries: the switch before the
+        // target, and after it.
         b(
             &format!(
-                "exec.run:cmd-re:^{WIN_DELETE}(?: .*)? {WIN_RECURSE}(?: .*)? {WIN_ROOT}(?: .*)?$"
+                "exec.run:cmd-re:^{WIN_DELETE}(?: .*)? {WIN_RECURSE}(?: .*)? (?:{WIN_ROOT}|{WIN_ROOT_QUOTED})(?: .*)?$"
             ),
             "recursively deletes a drive root, a system folder or a home",
         ),
         b(
             &format!(
-                "exec.run:cmd-re:^{WIN_DELETE}(?: .*)? {WIN_ROOT}(?: .*)? {WIN_RECURSE}(?: .*)?$"
+                "exec.run:cmd-re:^{WIN_DELETE}(?: .*)? (?:{WIN_ROOT}|{WIN_ROOT_QUOTED})(?: .*)? {WIN_RECURSE}(?: .*)?$"
             ),
             "recursively deletes a drive root, a system folder or a home",
         ),
@@ -497,16 +515,17 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
         // `|` between), so these stay refused when the splitter cuts a
         // PowerShell line differently than PowerShell does (its backtick
         // escapes and continuations are not read as PowerShell reads them).
-        // The target is still a whole operand, so other paths stay allowed.
+        // The target is still a whole operand, unquoted or quoted as a whole
+        // (WIN_END, WIN_ROOT_QUOTED), so other paths stay allowed.
         b(
             &format!(
-                "exec.run:re:(?i){WIN_DELETE_WORD}(?:[^;&|]*?\\s)?{WIN_RECURSE}(?:\\s[^;&|]*?)?{WIN_BEFORE}{WIN_ROOT}{WIN_AFTER}"
+                r#"exec.run:re:(?i){WIN_DELETE_WORD}(?:[^;&|]*?\s)?{WIN_RECURSE}(?:\s[^;&|]*?)?(?:[\s:]{WIN_ROOT}{WIN_END}|{WIN_ROOT_QUOTED}{WIN_AFTER})"#
             ),
             "recursively deletes a drive root, a system folder or a home",
         ),
         b(
             &format!(
-                "exec.run:re:(?i){WIN_DELETE_WORD}(?:[^;&|]*?{WIN_BEFORE})?{WIN_ROOT}[\\s'\")](?:[^;&|]*?\\s)?{WIN_RECURSE}{WIN_AFTER}"
+                r#"exec.run:re:(?i){WIN_DELETE_WORD}(?:(?:[^;&|]*?[\s:])?{WIN_ROOT}['"]?[\s)]|[^;&|]*?{WIN_ROOT_QUOTED}[\s)])(?:[^;&|]*?\s)?{WIN_RECURSE}{WIN_AFTER}"#
             ),
             "recursively deletes a drive root, a system folder or a home",
         ),

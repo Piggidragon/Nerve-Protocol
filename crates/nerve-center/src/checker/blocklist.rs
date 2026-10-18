@@ -437,7 +437,9 @@ mod tests {
         ("exec", "run", "format C:"),
         ("exec", "run", "Remove-Item -Recurse -Force C:\\Windows"),
         ("exec", "run", "Remove-Item -Force -Recurse C:\\Windows"),
-        ("exec", "run", "Remove-Item C:\\ -Recurse -Force"),
+        // Not `C:\ -Recurse`: these are read as POSIX, where `\ ` is an
+        // escaped blank.
+        ("exec", "run", "Remove-Item C:\\Windows -Recurse -Force"),
         ("exec", "run", "rd /s /q C:\\"),
         ("exec", "run", "del /s /q C:\\*"),
         ("exec", "run", "vssadmin delete shadows /all"),
@@ -590,8 +592,26 @@ mod tests {
             "git push -f origin fix/main-menu",
             "git push --force-with-lease origin feature/master-detail",
             "git push origin main",
+            // Under a home or Program Files with a blank in its name (review
+            // r5, finding 1).
+            r#"Remove-Item -Recurse -Force "C:\Users\Max Mustermann\proj\build""#,
+            r#"Remove-Item "C:\Users\Max Mustermann\proj\build" -Recurse -Force"#,
+            r#"Remove-Item -LiteralPath "C:\Users\Max Mustermann\source\repos\app\bin" -Recurse"#,
+            r#"Remove-Item -Recurse -Force "C:\Users\Max Mustermann\AppData\Local\Temp\pip-build""#,
+            r#"rd /s /q "C:\Users\Max Mustermann\proj\build""#,
+            r#"Remove-Item -Recurse -Force "C:\Program Files (x86)\MyApp\cache""#,
         ] {
             assert!(!refused_by_defaults(cmd), "should stay allowed: {cmd}");
+            assert!(
+                !refused_on(normalize::Shell::PowerShell, cmd),
+                "should stay allowed on Windows: {cmd}"
+            );
+        }
+        // cmd run from PowerShell gets the quoted path as one argument.
+        for cmd in [
+            r#"cmd /c rd /s /q "C:\Users\Max Mustermann\proj\build""#,
+            r#"cmd /c "rd /s /q "C:\Users\Max Mustermann\proj\build"""#,
+        ] {
             assert!(
                 !refused_on(normalize::Shell::PowerShell, cmd),
                 "should stay allowed on Windows: {cmd}"
@@ -778,6 +798,63 @@ mod tests {
         }
     }
 
+    /// A PowerShell here-string with prose in it (an apostrophe in a
+    /// single-quoted one) does not hide a mistake made after it in the same
+    /// call, and its own lines are read as commands (review r5, finding 2).
+    #[test]
+    fn a_mistake_after_a_powershell_here_string_is_refused() {
+        let ps = normalize::Shell::PowerShell;
+        for cmd in [
+            "Set-Content notes.md @'\nDon't run this\n'@\nFormat-Volume -DriveLetter D",
+            "Set-Content notes.md @'\nDon't run this\n'@\nbcdedit /set {current} safeboot minimal",
+            "Set-Content notes.md @'\r\nDon't run this\r\n'@\r\ndiskpart /s wipe.txt",
+            "@'\nIt's a note\n'@ | Set-Content notes.md; git push --force origin main",
+            "$msg = @'\nDon't forget\n'@\ngit commit -m $msg\ngit push --force origin main",
+            "$msg = @\"\nThe parser's fix\n\"@\ngit commit -m $msg\ngit push --force origin main",
+            "Set-Content run.ps1 @'\nbcdedit /set testsigning on\n'@",
+        ] {
+            assert!(refused_on(ps, cmd), "should be refused on Windows: {cmd:?}");
+        }
+        for cmd in [
+            "Set-Content notes.md @'\nDon't run this\n'@\ngit push origin main",
+            "Set-Content README.md @'\nIt's a tool. Don't run diskpart here.\n'@\ngit add README.md",
+            "$msg = @'\nDon't forget\n'@\ngit commit -m $msg",
+        ] {
+            assert!(
+                !refused_on(ps, cmd),
+                "should stay allowed on Windows: {cmd:?}"
+            );
+        }
+    }
+
+    /// `Start-Process … -Verb RunAs`, a Windows agent's way to run a program
+    /// elevated, and cmd's `start` run the program they name, so it is read
+    /// as the command (review r5, finding 4).
+    #[test]
+    fn a_program_run_by_start_process_is_seen() {
+        let ps = normalize::Shell::PowerShell;
+        for cmd in [
+            "Start-Process diskpart -Verb RunAs",
+            "Start-Process bcdedit -ArgumentList \"/set testsigning on\" -Verb RunAs",
+            "Start-Process bcdedit -ArgumentList '/set {current} safeboot minimal' -Verb RunAs",
+            r"Start-Process -Verb RunAs -FilePath C:\Windows\System32\bcdedit.exe",
+            "saps -FilePath:diskpart -Wait",
+            "start \"\" /wait diskpart",
+        ] {
+            assert!(refused_on(ps, cmd), "should be refused on Windows: {cmd:?}");
+        }
+        for cmd in [
+            "Start-Process notepad notes.md",
+            "Start-Process -FilePath code -ArgumentList . -Wait",
+            "Start-Process msedge 'https://learn.microsoft.com/windows-server/administration/windows-commands/diskpart'",
+        ] {
+            assert!(
+                !refused_on(ps, cmd),
+                "should stay allowed on Windows: {cmd:?}"
+            );
+        }
+    }
+
     /// Deleting a home folder is refused on Windows as on Linux: PowerShell's
     /// `~`, `$HOME` and `$env:USERPROFILE`, cmd's `%USERPROFILE%`, the Users
     /// folder and one user's home in it, Program Files, and on Linux a home by
@@ -799,6 +876,13 @@ mod tests {
             "rm -rf /root",
             "rm -rf ${HOME}",
             "rm -rf \"${HOME}/\"",
+            "rm -r \"$HOME\"",
+            // A home or Program Files with a blank in its name, as a whole
+            // (review r5, finding 1).
+            r#"Remove-Item -Recurse -Force "C:\Users\Max Mustermann""#,
+            r"Remove-Item 'C:\Users\Max Mustermann\' -Recurse -Force",
+            r#"rd /s /q "C:\Users\Max Mustermann""#,
+            r#"Remove-Item -Recurse -Force "C:\Program Files (x86)""#,
         ] {
             for shell in [normalize::Shell::PowerShell, normalize::Shell::Posix] {
                 assert!(
@@ -806,6 +890,15 @@ mod tests {
                     "should be refused ({shell:?}): {cmd:?}"
                 );
             }
+        }
+        for cmd in [
+            r#"cmd /c rd /s /q "C:\Users\Max Mustermann""#,
+            r#"cmd /c "rd /s /q "C:\Users\Max Mustermann"""#,
+        ] {
+            assert!(
+                refused_on(normalize::Shell::PowerShell, cmd),
+                "should be refused on Windows: {cmd:?}"
+            );
         }
         for cmd in [
             r"Remove-Item -Recurse -Force ~\AppData\Local\Temp\*",
@@ -818,6 +911,12 @@ mod tests {
             "rm -rf /root/.cache",
             "rm -rf \"${HOME}/.cache/pip\"",
             "rm -rf ~/build",
+            // The quote of `"$HOME"/…` or `~/"…"` does not end the operand
+            // (review r5, finding 3).
+            "rm -r \"$HOME\"/tmp",
+            "rm -r -f \"$HOME\"/.cache/pip",
+            "rm -r \"$HOME\"/.local/share/Trash/files/*",
+            "rm -R ~/\"old stuff\"",
         ] {
             for shell in [normalize::Shell::PowerShell, normalize::Shell::Posix] {
                 assert!(

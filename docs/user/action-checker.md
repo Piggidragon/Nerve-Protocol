@@ -50,9 +50,10 @@ Entries are in the machine's own rule syntax, `<scope>:<pattern>`:
   program's base name without `.exe` and without wrappers such as `sudo`,
   then the arguments as written, all **lower-cased**, with the quotes removed
   and one space between them. So `^` is the program, and a pattern must be in
-  lower case (`^remove-item …`, not `^Remove-Item …`). An argument that was
-  quoted keeps its inner spaces, so `^psql .*drop table` matches
-  `psql -c "DROP TABLE x"`. The example blocks `terraform destroy` but not
+  lower case (`^remove-item …`, not `^Remove-Item …`). An argument with a
+  blank in it is written in double quotes, so a pattern can tell where it
+  ends: `psql -c "DROP TABLE x"` is `psql -c "drop table x"`, which
+  `^psql .*drop table` matches. The example blocks `terraform destroy` but not
   `grep "terraform destroy" notes.md`.
 - `re:` for a regular expression over the **whole line**, e.g.
   `exec.run:re:(?i)\bdd\b[^|&;]*\bof=/dev/sd`. Runs of spaces become one, a
@@ -85,13 +86,15 @@ them is not refused.
 The matcher does not just look at the raw string. For a command it splits the
 line into its commands (at `;`, `&&`, `||`, `|`, newlines, inside `$( )`,
 backticks and `sh -c '…'` / `cmd /c` / `powershell -Command` bodies), strips
-wrappers (`sudo`, `env A=B`, `nohup`, `time`, `nice`, `xargs`, …), takes the
-program's base name (`/bin/rm` → `rm`), and treats short flags in any order,
+wrappers (`sudo`, `env A=B`, `nohup`, `time`, `nice`, `xargs`, …), reads the
+program that `Start-Process` (also with `-Verb RunAs`) or `start` runs as a
+command, takes the program's base name (`/bin/rm` → `rm`), and treats short flags in any order,
 split or joined (`-rf`, `-fr`, `-r -f`, `-Rf`, `--recursive --force`) as the
 same. The lines of a here-document are read as commands too, so a script
 written with `cat > x.sh <<'EOF'` that holds `rm -rf ~` is refused, while one
-with ordinary content is not. A quote in a document's line (an apostrophe in
-"don't") ends with that line, so it cannot hide the commands after the
+with ordinary content is not. The same goes for a PowerShell here-string
+(`@'` … `'@`). A quote in a document's or a here-string's line (an apostrophe
+in "don't") ends with that line, so it cannot hide the commands after the
 document. This also means a file written that way with `curl … | sh` in it (a
 Dockerfile's `RUN curl … | bash -`, a CI step) is refused like the command
 itself, and an allow rule does not get past it: have the agent write such a

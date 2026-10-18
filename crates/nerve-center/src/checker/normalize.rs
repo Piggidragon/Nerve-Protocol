@@ -12,14 +12,15 @@
 //! `$( )`, backticks (also within double quotes, for a POSIX shell), process
 //! substitution `<( )`, `sh -c '…'` (with the `c` anywhere in the flag word:
 //! `-c`, `-lc`, `-ce`, `-c -e`), `cmd /c …` and `powershell -Command` bodies,
-//! and a here-string fed to a shell. The lines of a here-document are read as
-//! commands like any other line, whatever the document is for. A `#` at the
-//! start of a word starts a comment that runs to the end of its line. It
-//! strips wrappers (`sudo`, `env A=B`, `nohup`, `command`, `exec`, `time`,
-//! `nice`, `xargs`, …) and shell keywords (`if`, `then`, `do`, `!`, `{`, …),
-//! takes the program's base name (`/bin/rm` → `rm`, `bash.exe` → `bash`) and
-//! expands combined short flags (`-rf` → `-r -f`) so `-rf`, `-fr` and `-r -f`
-//! all look the same.
+//! and a here-string fed to a shell. The lines of a here-document (and of a
+//! PowerShell here-string) are read as commands like any other line, whatever
+//! the document is for. A `#` at the start of a word starts a comment that
+//! runs to the end of its line. It strips wrappers (`sudo`, `env A=B`,
+//! `nohup`, `command`, `exec`, `time`, `nice`, `xargs`, …) and shell keywords
+//! (`if`, `then`, `do`, `!`, `{`, …), reads the program `Start-Process` or
+//! `start` runs as a command of its own, takes the program's base name
+//! (`/bin/rm` → `rm`, `bash.exe` → `bash`) and expands combined short flags
+//! (`-rf` → `-r -f`) so `-rf`, `-fr` and `-r -f` all look the same.
 //!
 //! The line is read by the rules of the node's shell ([`Shell`]): a POSIX
 //! shell's backslash escapes and backticks inside double quotes, or
@@ -92,12 +93,21 @@ impl Command {
     }
 
     /// The command as one lower-case line, `program arg1 arg2 …` with the
-    /// arguments as written: what a `cmd-re:` pattern matches.
+    /// arguments as written: what a `cmd-re:` pattern matches. An argument
+    /// with a blank in it is written in double quotes, so a pattern can tell
+    /// where it ends (`"c:\users\max mustermann\build"` is one operand, not
+    /// `c:\users\max` and more).
     pub fn line(&self) -> String {
         let mut s = self.program.clone();
         for a in &self.raw {
             s.push(' ');
-            s.push_str(&a.to_lowercase());
+            if a.chars().any(char::is_whitespace) {
+                s.push('"');
+                s.push_str(&a.to_lowercase());
+                s.push('"');
+            } else {
+                s.push_str(&a.to_lowercase());
+            }
         }
         s
     }
@@ -154,6 +164,20 @@ const SHELLS: &[&str] = &[
     "sh", "bash", "zsh", "dash", "ksh", "mksh", "fish", "ash", "busybox",
 ];
 const POWERSHELLS: &[&str] = &["powershell", "pwsh"];
+/// PowerShell's `Start-Process` (with its aliases) and cmd's `start`: they
+/// run another program, so that program is read as a command of its own.
+/// `Start-Process … -Verb RunAs` is how a Windows agent runs a program
+/// elevated, its `sudo`.
+const STARTERS: &[&str] = &["start-process", "saps", "start"];
+/// `Start-Process`'s switches, which take no value (every other parameter
+/// takes the next word).
+const START_SWITCHES: &[&str] = &[
+    "wait",
+    "passthru",
+    "nonewwindow",
+    "loaduserprofile",
+    "usenewenvironment",
+];
 
 /// The shell whose rules a line is read by.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,6 +291,14 @@ impl Walk {
         if let Some((body, inner)) = body {
             self.collect(&body, inner, depth + 1);
         }
+        // `Start-Process diskpart -Verb RunAs`: the program started, with the
+        // words after it, is a command too. The words are fewer each time,
+        // so a chain of starters ends.
+        if STARTERS.contains(&program.as_str())
+            && let Some(started) = started_program(rest)
+        {
+            self.parse_command(&started, shell, depth);
+        }
     }
 }
 
@@ -330,7 +362,7 @@ fn split_segments(line: &str, shell: Shell) -> (Vec<String>, Vec<String>) {
     let line = if posix {
         close_body_quotes(line)
     } else {
-        std::borrow::Cow::Borrowed(line)
+        close_here_strings(line)
     };
     let mut segments = Vec::new();
     let mut subs = Vec::new();
@@ -484,12 +516,12 @@ fn close_body_quotes(text: &str) -> std::borrow::Cow<'_, str> {
                 out.push_str(raw);
             } else {
                 out.push_str(line);
-                out.push_str(&scan_line(line, None, None).1);
+                out.push_str(&scan_line(line, None, None, Shell::Posix).1);
                 out.push_str(&raw[line.len()..]);
             }
             continue;
         }
-        quote = scan_line(line, quote, Some(&mut opened)).0;
+        quote = scan_line(line, quote, Some(&mut opened), Shell::Posix).0;
         out.push_str(raw);
         // A document's body starts on the line after the one that opened it,
         // once its quotes are closed.
@@ -500,25 +532,86 @@ fn close_body_quotes(text: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(out)
 }
 
-/// Reads one line's quotes by the POSIX rules of [`split_segments`],
+/// `text` with PowerShell's here-strings made plain for the splitter: the
+/// quote of the `@'` or `@"` that opens one (at a line's end) and of the
+/// `'@` or `"@` that ends it (at a line's start) is dropped, and a quote
+/// still open at the end of a line inside it is closed there.
+///
+/// PowerShell takes a here-string's lines as plain text, so an apostrophe in
+/// them ("Don't") means nothing; read as a quote, it would run past the
+/// here-string's end and hide every command after it in one word. The lines
+/// are still read as commands, as a POSIX here-document's are
+/// ([`close_body_quotes`]).
+fn close_here_strings(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains("@'") && !text.contains("@\"") {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len() + 16);
+    // The quote of the here-string the current line is in.
+    let mut inside: Option<char> = None;
+    // A quote still open from an earlier line outside a here-string.
+    let mut quote: Option<char> = None;
+    for (i, raw) in text.split('\n').enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let eol = &raw[line.len()..];
+        let mut rest = line;
+        if let Some(q) = inside {
+            let mut end = line.chars();
+            if end.next() == Some(q) && end.next() == Some('@') {
+                // The end: its quote goes, the rest of the line is read as
+                // usual.
+                inside = None;
+                out.push(' ');
+                rest = &line[1..];
+            } else {
+                out.push_str(line);
+                out.push_str(&scan_line(line, None, None, Shell::PowerShell).1);
+                out.push_str(eol);
+                continue;
+            }
+        }
+        let body = rest.trim_end();
+        let opens = (body.ends_with("@'") || body.ends_with("@\""))
+            && scan_line(&body[..body.len() - 1], quote, None, Shell::PowerShell)
+                .0
+                .is_none();
+        if opens {
+            inside = body.chars().last();
+            out.push_str(&body[..body.len() - 1]);
+            out.push_str(&rest[body.len()..]);
+        } else {
+            quote = scan_line(rest, quote, None, Shell::PowerShell).0;
+            out.push_str(rest);
+        }
+        out.push_str(eol);
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Reads one line's quotes by the rules of [`split_segments`] for `shell`,
 /// starting inside `quote` (one left open by an earlier line). Returns the
 /// quote open at the line's end and what closes everything still open there
 /// (a backtick, then the quote). With `opened`, notes the end word of each
-/// here-document the line opens outside quotes.
+/// POSIX here-document the line opens outside quotes.
 fn scan_line(
     line: &str,
     mut quote: Option<char>,
     mut opened: Option<&mut Vec<(String, bool)>>,
+    shell: Shell,
 ) -> (Option<char>, String) {
+    let posix = shell == Shell::Posix;
     let mut chars = line.chars().peekable();
     let mut prev: Option<char> = None;
     let mut tick = false;
     while let Some(c) = chars.next() {
         let before = prev.replace(c);
         if let Some(q) = quote {
-            if q == '"' && c == '\\' {
+            if posix && q == '"' && c == '\\' {
                 chars.next();
-            } else if q == '"' && c == '`' {
+            } else if posix && q == '"' && c == '`' {
                 if !skip_ticked(&mut chars) {
                     tick = true;
                     break;
@@ -530,7 +623,7 @@ fn scan_line(
         }
         match c {
             '\'' | '"' => quote = Some(c),
-            '\\' => {
+            '\\' if posix => {
                 chars.next();
             }
             '`' => {
@@ -840,12 +933,78 @@ fn shell_c_body(rest: &[String]) -> Option<String> {
 }
 
 /// The command `cmd /c …` or `cmd /k …` runs: the words after the switch.
+/// One word is the whole command (`cmd /c "rd /s /q C:\"`: cmd drops the
+/// outer quotes); of several, one with a blank in it keeps its quotes, as
+/// cmd sees them (`cmd /c rd /s "C:\Users\Max Mustermann\build"`).
 fn cmd_c_body(rest: &[String]) -> Option<String> {
     let i = rest.iter().position(|w| {
         let l = w.to_ascii_lowercase();
         l == "/c" || l == "/k" || l == "/r"
     })?;
-    (i + 1 < rest.len()).then(|| rest[i + 1..].join(" "))
+    match &rest[i + 1..] {
+        [] => None,
+        [one] => Some(one.clone()),
+        words => Some(
+            words
+                .iter()
+                .map(|w| {
+                    if w.chars().any(char::is_whitespace) {
+                        format!("\"{w}\"")
+                    } else {
+                        w.clone()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" "),
+        ),
+    }
+}
+
+/// The program `Start-Process` or `start` runs, with the words after it:
+/// the value of `-FilePath` (or its alias `-Path`), else the first word that
+/// is not a parameter, its value, or one of cmd's `/wait`-style switches or
+/// an empty window title (`start "" diskpart`).
+fn started_program(rest: &[String]) -> Option<Vec<String>> {
+    let mut i = 0;
+    while i < rest.len() {
+        let w = &rest[i];
+        let lower = w.to_ascii_lowercase();
+        if let Some(param) = lower.strip_prefix('-').filter(|p| !p.is_empty()) {
+            let (name, inline) = match param.split_once(':') {
+                Some((n, _)) => (n, Some(&w[n.len() + 2..])),
+                None => (param, None),
+            };
+            let file = !name.is_empty()
+                && ("filepath".starts_with(name) || name == "path" || name == "pspath");
+            if file {
+                return match inline {
+                    Some(v) => Some(
+                        std::iter::once(v.to_string())
+                            .chain(rest[i + 1..].iter().cloned())
+                            .collect(),
+                    ),
+                    None => (i + 1 < rest.len()).then(|| rest[i + 1..].to_vec()),
+                };
+            }
+            let switch = START_SWITCHES.iter().any(|s| s.starts_with(name));
+            i += if switch || inline.is_some() { 1 } else { 2 };
+            continue;
+        }
+        let cmd_switch = lower
+            .strip_prefix('/')
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphabetic()));
+        if let Some(s) = cmd_switch {
+            // `/d <folder>` takes the folder.
+            i += if s == "d" { 2 } else { 1 };
+            continue;
+        }
+        if w.is_empty() {
+            i += 1;
+            continue;
+        }
+        return Some(rest[i..].to_vec());
+    }
+    None
 }
 
 /// The command `powershell -Command …` runs, with `-Command` written in full or
@@ -931,6 +1090,75 @@ mod tests {
         assert_eq!(c[0].program, "remove-item");
         assert_eq!(c[0].operands(), [r"C:\Windows\System32"]);
         assert_eq!(c[0].line(), r"remove-item c:\windows\system32 -recurse");
+    }
+
+    /// An argument with a blank in it stays one operand on the line a
+    /// `cmd-re:` reads (review r5, finding 1).
+    #[test]
+    fn an_argument_with_a_blank_is_quoted_on_the_line() {
+        let c = parse(
+            r#"Remove-Item "C:\Users\Max Mustermann\build" -Recurse"#,
+            Shell::PowerShell,
+        );
+        assert_eq!(
+            c.commands[0].line(),
+            r#"remove-item "c:\users\max mustermann\build" -recurse"#
+        );
+        let c = parse(
+            r#"cmd /c rd /s /q "C:\Users\Max Mustermann\build""#,
+            Shell::PowerShell,
+        );
+        assert_eq!(
+            c.commands[1].line(),
+            r#"rd /s /q "c:\users\max mustermann\build""#
+        );
+    }
+
+    /// The program `Start-Process` or `start` runs is a command of its own
+    /// (review r5, finding 4).
+    #[test]
+    fn a_started_program_is_a_command() {
+        for (line, program) in [
+            ("Start-Process diskpart -Verb RunAs", "diskpart"),
+            (
+                r"Start-Process -Verb RunAs -FilePath C:\Windows\System32\bcdedit.exe",
+                "bcdedit",
+            ),
+            ("saps -FilePath:diskpart -Wait", "diskpart"),
+            ("Start-Process -Wait -NoNewWindow notepad x.txt", "notepad"),
+            ("start \"\" /wait /d C:\\tmp diskpart", "diskpart"),
+        ] {
+            let progs: Vec<String> = parse(line, Shell::PowerShell)
+                .commands
+                .into_iter()
+                .map(|c| c.program)
+                .collect();
+            assert!(progs.iter().any(|p| p == program), "{line}: {progs:?}");
+        }
+    }
+
+    /// A PowerShell here-string's lines are commands, but a quote in one
+    /// (an apostrophe) ends with its line, so the commands after the
+    /// here-string are seen (review r5, finding 2).
+    #[test]
+    fn a_quote_in_a_powershell_here_string_ends_with_its_line() {
+        let progs = |line: &str| -> Vec<String> {
+            parse(line, Shell::PowerShell)
+                .commands
+                .into_iter()
+                .map(|c| c.program)
+                .collect()
+        };
+        let p = progs("Set-Content n.md @'\nDon't run this\n'@\ngit status");
+        assert_eq!(p.first().map(String::as_str), Some("set-content"));
+        assert_eq!(p.last().map(String::as_str), Some("git"));
+        let p = progs("@\"\nIt's $x\n\"@ | Set-Content n.md; git status");
+        assert!(p.contains(&"set-content".to_string()), "{p:?}");
+        assert_eq!(p.last().map(String::as_str), Some("git"));
+        // A quote across lines outside a here-string still spans them, and
+        // an `@'` inside it opens none.
+        let p = progs("Write-Host \"a\nb @'\nc\"; git status");
+        assert_eq!(p, ["write-host", "git"]);
     }
 
     #[test]

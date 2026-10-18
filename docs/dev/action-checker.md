@@ -60,7 +60,8 @@ spaces collapsed, a `\`/`` ` `` line continuation joined, any other line break
 turned into ` ; ` so `[^;]*` stops at a command's end), or a **`cmd-re:`
 regex** over each command pulled from the line (`Command::line`: the program,
 then the arguments as tokenized, quotes removed, all lower-cased, one space
-apart; the structured form's program glob ignores letter case). Defaults that
+apart, an argument with a blank in it in double quotes so a pattern sees where
+it ends; the structured form's program glob ignores letter case). Defaults that
 must read one command's own words use the structured form or `cmd-re:`:
 `mkfs*`, `wipefs`, `userdel`, `passwd root`, `nsenter`, `bcdedit`, `diskpart`
 and `Format-Volume` as the program; `shred` of a device, an `iptables -F`
@@ -73,8 +74,10 @@ the three force-push forms (`push` as git's subcommand, a force flag, and
 `main`/`master` as a whole refspec, so the next line's push of another branch
 is not joined to it); and the Windows recursive deletes, which take the target
 as a whole operand (a drive root, the Windows folder, Program Files, the Users
-folder or one home in it, `~`, `$HOME`, `$env:USERPROFILE`, `%USERPROFILE%`),
-so `Remove-Item C:\Users\me\build -Recurse -Force` stays allowed (with a
+folder or one home in it, `~`, `$HOME`, `$env:USERPROFILE`, `%USERPROFILE%`;
+one with a blank in it, such as `C:\Users\Max Mustermann` or Program Files,
+only as a whole quoted operand), so `Remove-Item C:\Users\me\build -Recurse
+-Force` and the same under `"C:\Users\Max Mustermann\…"` stay allowed (with a
 whole-line twin, below). The structured matcher reads `${NAME}` as `$NAME`, so
 `rm -rf ${HOME}` meets `rm -rf $HOME`, and `/home/?*` is one level under
 `/home` only. Whole-line `re:` is kept where the pattern spans commands or
@@ -90,12 +93,16 @@ and points to `fs.write` for such files, as the owner's decision rules out a
 special reading of here-documents.
 Since the per-command entries rely on the splitter, a line the splitter reads
 wrongly can hide them; that is accepted for the purpose above, except for the
-Windows root deletes, which have the whole-line twin.
+Windows root deletes, which have the whole-line twin. On Windows this includes
+`Format-Volume`, `bcdedit`, `diskpart` and the force-push, so the splitter
+reads a PowerShell here-string as it reads a POSIX here-document (below).
 
 `normalize` splits on separators and subshell parentheses, pulls `$( )`,
 backticks, process substitution, `sh -c` (`c` anywhere in the flag word:
 `-lc`, `-ce`, `-c -e`), `cmd /c` and `powershell -Command` bodies, and
-here-strings fed to a shell; it strips wrappers and shell keywords, drops a
+here-strings fed to a shell; it strips wrappers and shell keywords, reads the
+program `Start-Process`/`saps`/`start` runs (its `-FilePath` or first operand)
+as a command of its own, drops a
 `.exe` suffix, and expands combined short flags, so flag order and
 `-rf`/`-Rf`/`--recursive --force` do not matter. A here-document gets no
 special reading: its lines are split like any other, so a command in it is
@@ -105,7 +112,10 @@ of it is a blocklisted command. The one exception is quoting: a quote or
 backtick still open at the end of a body line is closed there
 (`close_body_quotes`), since the shell gives it no meaning in a body and an
 apostrophe ("don't") would otherwise run past the document and hide the
-commands after it. A `\` at a line's end joins the next line, as in the
+commands after it. A PowerShell here-string (`@'`/`@"` at a line's end to
+`'@`/`"@` at a line's start) gets the same (`close_here_strings`): the quotes
+of its opening and closing marks are dropped, and a quote open at the end of
+one of its lines is closed there. A `\` at a line's end joins the next line, as in the
 shell. A `#` at the start of a word is a comment to
 the end of the line, and nothing in it (a quote, a `<<`) changes how the next
 lines are read. The line is read by the rules of the node's shell
@@ -115,7 +125,11 @@ lines are read. The line is read by the rules of the node's shell
 Windows drive-root and Windows-folder deletes there are whole-line `re:`
 entries beside the per-command `cmd-re:` ones, so they stay refused where the
 splitter cuts a PowerShell line differently than PowerShell does (its backtick
-escapes and continuations); they too take the target as a whole operand.
+escapes and continuations); they too take the target as a whole operand:
+unquoted after a blank or `:`, ended by a blank, a bracket, a separator, the
+line's end or a quote that ends the line's string (`cmd /c "rd /s /q C:\"`),
+or quoted as a whole, so the quote in `rm -r "$HOME"/tmp` or `~/"old stuff"`
+does not end the operand.
 The whole walk is bounded: depth at `normalize::MAX_DEPTH` (16) and commands at
 `MAX_COMMANDS` (100 000, far above any real script, so ordinary heredocs are
 not refused); a line past a bound comes back as `Parsed::overflow`

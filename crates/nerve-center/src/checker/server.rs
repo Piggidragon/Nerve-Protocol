@@ -7,7 +7,7 @@
 //! and refuses a non-decision model. A server that dies is restarted with
 //! backoff; it ends with the center, with no orphan.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -71,7 +71,7 @@ impl LocalServer {
     /// Starts the supervisor for `cfg` in `state_dir`. The model cache goes
     /// under the state folder (`LLAMA_CACHE`). It returns at once; the status
     /// moves from starting to ready (or failed) as the server comes up.
-    pub fn start(cfg: &ModelConfig, state_dir: &PathBuf) -> Result<LocalServer, String> {
+    pub fn start(cfg: &ModelConfig, state_dir: &Path) -> Result<LocalServer, String> {
         if cfg.hf_repo.is_empty() && cfg.model_file.is_empty() {
             return Err("set a model to download (-hf) or a local model file".into());
         }
@@ -87,7 +87,13 @@ impl LocalServer {
         let gpu = cfg.gpu_layers;
         let timeout = Duration::from_millis(cfg.timeout_ms.max(100));
         let task = tokio::spawn(supervise(
-            program, args, cache, gpu, port, timeout, inner.clone(),
+            program,
+            args,
+            cache,
+            gpu,
+            port,
+            timeout,
+            inner.clone(),
         ));
         Ok(LocalServer { inner, port, task })
     }
@@ -195,7 +201,7 @@ enum RunEnd {
 async fn run_once(
     program: &str,
     args: &[String],
-    cache: &PathBuf,
+    cache: &Path,
     port: u16,
     timeout: Duration,
     inner: &Arc<Mutex<Inner>>,
@@ -311,7 +317,10 @@ mod tests {
         let args = build_args(&cfg, 12345);
         assert!(args.windows(2).any(|w| w == ["-ngl", "0"]));
         assert!(args.windows(2).any(|w| w == ["--port", "12345"]));
-        assert!(args.windows(2).any(|w| w == ["-hf", "LiquidAI/d1-3B-GGUF:Q4_K_M"]));
+        assert!(
+            args.windows(2)
+                .any(|w| w == ["-hf", "LiquidAI/d1-3B-GGUF:Q4_K_M"])
+        );
     }
 
     #[test]

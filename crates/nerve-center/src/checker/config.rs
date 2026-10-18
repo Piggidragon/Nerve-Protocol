@@ -88,37 +88,27 @@ pub struct AllowRule {
 }
 
 /// Which source the decision model comes from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ModelSource {
     /// A System One endpoint the owner points to (TypeSafe or a llama-server).
     Endpoint,
     /// A llama-server the center starts itself.
+    #[default]
     Local,
 }
 
-impl Default for ModelSource {
-    fn default() -> ModelSource {
-        ModelSource::Local
-    }
-}
-
 /// Which calls the model sees.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ModelScope {
     /// Every `Execute`, `Write` and `Actuate` effect call (the default).
+    #[default]
     Effects,
     /// Those and reads (`Read`, `Sense`) too.
     WithReads,
     /// Only the calls of a tainted session.
     TaintedOnly,
-}
-
-impl Default for ModelScope {
-    fn default() -> ModelScope {
-        ModelScope::Effects
-    }
 }
 
 /// The decision model's settings.
@@ -233,8 +223,7 @@ fn default_criteria_true() -> String {
 }
 
 fn default_criteria_false() -> String {
-    "The action is ordinary, safe work."
-        .to_string()
+    "The action is ordinary, safe work.".to_string()
 }
 
 /// The built-in blocklist. Truly dangerous things are blocked; ordinary work
@@ -257,25 +246,25 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
         b("exec.run:rm -rf /var", "wipes system state"),
         b("exec.run:rm -rf /boot", "wipes the boot files"),
         // ---- disks and filesystems ----
-        b("exec.run:re:(?i)\\bmkfs\\b", "makes a new filesystem (destroys data)"),
+        b(
+            "exec.run:re:(?i)\\bmkfs\\b",
+            "makes a new filesystem (destroys data)",
+        ),
         b(
             "exec.run:re:(?i)\\bdd\\b[^|&;]*\\bof=/dev/(sd|nvme|vd|hd|mmcblk|disk)",
             "writes raw over a disk device",
         ),
-        b("exec.run:re:(?i)\\bwipefs\\b", "erases filesystem signatures"),
         b(
-            "exec.run:re:(?i)\\bshred\\b[^|&;]*/dev/",
-            "shreds a device",
+            "exec.run:re:(?i)\\bwipefs\\b",
+            "erases filesystem signatures",
         ),
+        b("exec.run:re:(?i)\\bshred\\b[^|&;]*/dev/", "shreds a device"),
         b(
             "exec.run:re:(?i)>\\s*/dev/(sd|nvme|vd|hd|mmcblk|disk)",
             "writes over a disk device",
         ),
         // ---- fork bomb ----
-        b(
-            "exec.run:re::\\(\\)\\s*\\{\\s*:\\s*\\|\\s*:",
-            "a fork bomb",
-        ),
+        b("exec.run:re::\\(\\)\\s*\\{\\s*:\\s*\\|\\s*:", "a fork bomb"),
         // ---- reckless chmod/chown of the root ----
         b(
             "exec.run:re:(?i)\\bchmod\\b[^|&;]*-R[^|&;]*\\b777\\b[^|&;]*\\s/(\\s|$)",
@@ -315,10 +304,19 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
         ),
         // ---- cron, firewall, kill-all ----
         b("exec.run:crontab -r", "removes all cron jobs"),
-        b("exec.run:re:(?i)\\biptables\\b[^|&;]*-F", "flushes the firewall"),
-        b("exec.run:re:(?i)\\bkill\\b\\s*-9\\s*-1", "kills every process"),
+        b(
+            "exec.run:re:(?i)\\biptables\\b[^|&;]*-F",
+            "flushes the firewall",
+        ),
+        b(
+            "exec.run:re:(?i)\\bkill\\b\\s*-9\\s*-1",
+            "kills every process",
+        ),
         // ---- opening the machine ----
-        b("exec.run:re:(?i)>\\s*/etc/passwd", "overwrites the user database"),
+        b(
+            "exec.run:re:(?i)>\\s*/etc/passwd",
+            "overwrites the user database",
+        ),
         b("exec.run:re:(?i)\\buserdel\\b", "deletes a user account"),
         b(
             "exec.run:re:(?i)\\bsystemctl\\b[^|&;]*\\b(stop|disable|mask)\\b[^|&;]*\\bssh",
@@ -339,13 +337,31 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
             "exec.run:re:(?i)remove-item[^|&;]*-recurse[^|&;]*-force[^|&;]*[a-z]:\\\\?(\\s|$|windows)",
             "recursively deletes a drive root or the Windows folder",
         ),
-        b("exec.run:re:(?i)\\brd\\b\\s+/s\\s+/q\\s+[a-z]:", "recursively deletes a drive"),
-        b("exec.run:re:(?i)\\bdel\\b\\s+/s\\s+/q\\s+[a-z]:", "recursively deletes a drive"),
-        b("exec.run:re:(?i)vssadmin\\s+delete\\s+shadows", "deletes volume shadow copies"),
+        b(
+            "exec.run:re:(?i)\\brd\\b\\s+/s\\s+/q\\s+[a-z]:",
+            "recursively deletes a drive",
+        ),
+        b(
+            "exec.run:re:(?i)\\bdel\\b\\s+/s\\s+/q\\s+[a-z]:",
+            "recursively deletes a drive",
+        ),
+        b(
+            "exec.run:re:(?i)vssadmin\\s+delete\\s+shadows",
+            "deletes volume shadow copies",
+        ),
         b("exec.run:re:(?i)wbadmin\\s+delete", "deletes backups"),
-        b("exec.run:re:(?i)\\bbcdedit\\b", "edits the boot configuration"),
-        b("exec.run:re:(?i)reg\\s+delete\\s+hklm", "deletes a machine registry key"),
-        b("exec.run:re:(?i)set-mppreference[^|&;]*-disable", "disables Defender protection"),
+        b(
+            "exec.run:re:(?i)\\bbcdedit\\b",
+            "edits the boot configuration",
+        ),
+        b(
+            "exec.run:re:(?i)reg\\s+delete\\s+hklm",
+            "deletes a machine registry key",
+        ),
+        b(
+            "exec.run:re:(?i)set-mppreference[^|&;]*-disable",
+            "disables Defender protection",
+        ),
         b("exec.run:re:(?i)\\bcipher\\b\\s+/w", "wipes free space"),
         b("exec.run:re:(?i)\\bdiskpart\\b", "edits disk partitions"),
         // ---- files: writes to dangerous places (the fs profile has no

@@ -27,13 +27,13 @@ use serde_json::{Value, json};
 use nerve_proto::Effect;
 
 pub use config::{
-    AllowRule, BlockEntry, CheckerConfig, ModelConfig, ModelScope, ModelSource, DEFAULT_HF_REPO,
-    DEFAULT_MODEL_LICENCE,
+    AllowRule, BlockEntry, CheckerConfig, DEFAULT_HF_REPO, DEFAULT_MODEL_LICENCE, ModelConfig,
+    ModelScope, ModelSource,
 };
 pub use model::Endpoint;
 
-use blocklist::{Call, Rule};
 use crate::util::clip;
+use blocklist::{Call, Rule};
 
 /// Which layer made a decision, for the audit entry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,21 +132,22 @@ impl Checker {
                 Err(why) => rejected.push(why),
             }
         }
-        let endpoint = if cfg.model.source == ModelSource::Endpoint && !cfg.model.endpoint_url.is_empty() {
-            match Endpoint::parse(
-                &cfg.model.endpoint_url,
-                token,
-                Some(cfg.model.endpoint_model.clone()),
-            ) {
-                Ok(e) => Some(e),
-                Err(why) => {
-                    rejected.push(format!("the model endpoint URL: {why}"));
-                    None
+        let endpoint =
+            if cfg.model.source == ModelSource::Endpoint && !cfg.model.endpoint_url.is_empty() {
+                match Endpoint::parse(
+                    &cfg.model.endpoint_url,
+                    token,
+                    Some(cfg.model.endpoint_model.clone()),
+                ) {
+                    Ok(e) => Some(e),
+                    Err(why) => {
+                        rejected.push(format!("the model endpoint URL: {why}"));
+                        None
+                    }
                 }
-            }
-        } else {
-            None
-        };
+            } else {
+                None
+            };
         Checker {
             cfg,
             blocklist,
@@ -164,7 +165,9 @@ impl Checker {
     /// whether the session is tainted.
     fn model_sees(&self, effect: Effect, tainted: bool) -> bool {
         match self.cfg.model.scope {
-            ModelScope::Effects => matches!(effect, Effect::Write | Effect::Actuate | Effect::Execute),
+            ModelScope::Effects => {
+                matches!(effect, Effect::Write | Effect::Actuate | Effect::Execute)
+            }
             ModelScope::WithReads => true,
             ModelScope::TaintedOnly => tainted,
         }
@@ -180,21 +183,21 @@ impl Checker {
             target: call.target,
         };
         // 1. Blocklist (hard deny, wins over everything).
-        if self.cfg.blocklist_on {
-            if let Some(b) = self.blocklist.iter().find(|b| b.rule.matches(&target)) {
-                let what = if b.note.is_empty() {
-                    b.text.clone()
-                } else {
-                    format!("{} ({})", b.note, b.text)
-                };
-                return Decision::Refuse {
-                    layer: Layer::Blocklist,
-                    detail: b.text.clone(),
-                    message: format!(
-                        "the center's action checker refused this call: it is on the blocklist — {what}. The owner can change the blocklist in the center's web UI (Action checker)."
-                    ),
-                };
-            }
+        if self.cfg.blocklist_on
+            && let Some(b) = self.blocklist.iter().find(|b| b.rule.matches(&target))
+        {
+            let what = if b.note.is_empty() {
+                b.text.clone()
+            } else {
+                format!("{} ({})", b.note, b.text)
+            };
+            return Decision::Refuse {
+                layer: Layer::Blocklist,
+                detail: b.text.clone(),
+                message: format!(
+                    "the center's action checker refused this call: it is on the blocklist — {what}. The owner can change the blocklist in the center's web UI (Action checker)."
+                ),
+            };
         }
         // 2. Saved allow rules (skip the model, not the blocklist).
         if self
@@ -227,7 +230,9 @@ impl Checker {
                 }
             } else {
                 Decision::Pass {
-                    note: Some(format!("the checker's model was unreachable; the call was allowed and logged (allow-and-log): {why}")),
+                    note: Some(format!(
+                        "the checker's model was unreachable; the call was allowed and logged (allow-and-log): {why}"
+                    )),
                 }
             }
         };
@@ -246,7 +251,10 @@ impl Checker {
                 ),
             },
             Ok(score) => Decision::Pass {
-                note: Some(format!("the checker's model allowed the call (score {score:.2} < {:.2})", m.threshold)),
+                note: Some(format!(
+                    "the checker's model allowed the call (score {score:.2} < {:.2})",
+                    m.threshold
+                )),
             },
             Err(e) => fail(e.to_string()),
         }

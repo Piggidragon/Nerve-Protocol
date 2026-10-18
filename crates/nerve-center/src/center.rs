@@ -18,11 +18,11 @@ use nerve_transport::log::{Level, Log, Query, call_line};
 use nerve_transport::tls::ServerIdentity;
 
 use crate::audit::AuditFeed;
-use crate::checker::server::LocalServer;
 use crate::checker::blocklist::Rule;
+use crate::checker::server::LocalServer;
 use crate::checker::{
-    self, AllowRule, CallInfo, Checker, CheckerConfig, Decision, Endpoint, Layer, ModelSource,
-    DEFAULT_HF_REPO, DEFAULT_MODEL_LICENCE,
+    self, AllowRule, CallInfo, Checker, CheckerConfig, DEFAULT_HF_REPO, DEFAULT_MODEL_LICENCE,
+    Decision, Endpoint, Layer, ModelSource,
 };
 use crate::link::{Link, SHORT_CALL};
 use crate::pairing::{Codes, Outcome};
@@ -340,10 +340,7 @@ impl Center {
             pair_log: Mutex::new(Quiet::default()),
             dead_after_ms: AtomicU64::new(crate::link::DEAD_AFTER.as_millis() as u64),
             grace_ms: AtomicU64::new(nerve_proto::resume::GRACE.as_millis() as u64),
-            checker: Mutex::new(Arc::new(Checker::build(
-                CheckerConfig::default(),
-                None,
-            ))),
+            checker: Mutex::new(Arc::new(Checker::build(CheckerConfig::default(), None))),
             local_model: Mutex::new(None),
             local_sig: Mutex::new(String::new()),
         }));
@@ -2175,7 +2172,11 @@ impl Center {
             }
             Decision::Pass { note } => {
                 if let Some(n) = note {
-                    self.note(Level::Debug, Some(&route.node_id), format!("action checker: {n}"));
+                    self.note(
+                        Level::Debug,
+                        Some(&route.node_id),
+                        format!("action checker: {n}"),
+                    );
                 }
             }
         }
@@ -2421,7 +2422,11 @@ impl Center {
     /// The local model's status for the UI, or `None` when there is no local
     /// server running.
     pub fn local_model_status(&self) -> Option<crate::checker::server::Status> {
-        self.local_model.lock().unwrap().as_ref().map(|s| s.status())
+        self.local_model
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| s.status())
     }
 
     /// Replaces the checker config (after the UI validated the change),

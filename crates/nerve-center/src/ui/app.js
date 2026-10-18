@@ -613,6 +613,10 @@ const SCOPES = [
   { value: "with-reads", text: "Those and reads too" },
   { value: "tainted-only", text: "Only calls of a tainted session" },
 ];
+const SOURCES = [
+  { value: "local", text: "A llama-server the center runs" },
+  { value: "endpoint", text: "A System One endpoint" },
+];
 let checkerRun = 0;
 
 async function loadChecker() {
@@ -699,28 +703,30 @@ function allowCard(cfg) {
       pill("", a.node_id ? nameOf(a.node_id) : "every machine"),
       el("span", { class: "push" }, btn("Remove", "danger", act(async () => { cfg.allow_rules.splice(i, 1); await saveChecker(); }), "trash"))));
   const ruleIn = el("input", { class: "input mono", placeholder: "exec.run:docker exec *", "aria-label": "New allow rule" });
-  const nodeSel = el("select", { class: "input", "aria-label": "Machine" }, el("option", { value: "" }, "Every machine"), nodes.map((n) => el("option", { value: n.id }, n.name)));
+  const nodeItems = [{ value: "", text: "Every machine" }, ...nodes.map((n) => ({ value: n.id, text: n.name }))];
+  let allowNode = "";
+  const nodePicker = picker({ label: "For", search: "Search machines", none: "No machine matches.", onpick: (v) => { allowNode = v; nodePicker.set(nodeItems, v); } });
+  nodePicker.set(nodeItems, "");
   const add = act(async () => {
     const rule = ruleIn.value.trim();
     if (!rule) { notify("Enter a rule.", "error"); return; }
-    cfg.allow_rules.push({ rule, node_id: nodeSel.value || null });
+    cfg.allow_rules.push({ rule, node_id: allowNode || null });
     ruleIn.value = "";
     await saveChecker();
   });
   return section("Allow rules", "A call that matches an allow rule skips the decision model and goes straight to the machine. It does not skip the blocklist.", null,
     el("div", { class: "card" }, el("div", { class: "form-row" },
       el("label", { class: "field grow" }, el("span", { class: "label" }, "Add a rule"), ruleIn),
-      el("label", { class: "field" }, el("span", { class: "label" }, "For"), nodeSel)),
+      nodePicker.root),
       el("div", { class: "actions" }, el("button", { type: "button", class: "btn primary", onclick: add }, icon("plus", "sm"), "Add"))),
     cfg.allow_rules.length ? el("div", { class: "list" }, cfg.allow_rules.map(row)) : empty("No allow rules."));
 }
 
 function modelCard(cfg, meta) {
   const m = cfg.model;
-  const srcSel = el("select", { class: "input", "aria-label": "Model source" },
-    el("option", { value: "local" }, "A llama-server the center runs"),
-    el("option", { value: "endpoint" }, "A System One endpoint"));
-  srcSel.value = m.source;
+  let source = m.source;
+  const srcPicker = picker({ label: "Source", search: "Search", none: "No match.", onpick: (v) => { source = v; srcPicker.set(SOURCES, v); showSource(); } });
+  srcPicker.set(SOURCES, source);
   const endpointUrl = el("input", { class: "input mono", value: m.endpoint_url, placeholder: "https://host:9931" });
   const endpointModel = el("input", { class: "input mono", value: m.endpoint_model, placeholder: "jev-latest (optional)" });
   const token = el("input", { class: "input", type: "password", placeholder: meta.has_token ? "a token is set — type to replace" : "optional bearer token", autocomplete: "off" });
@@ -731,14 +737,15 @@ function modelCard(cfg, meta) {
   const threads = el("input", { class: "input num", type: "number", min: "0", value: m.threads });
   const threshold = el("input", { class: "input num", type: "number", min: "0", max: "1", step: "0.01", value: m.threshold });
   const timeout = el("input", { class: "input num", type: "number", min: "100", value: m.timeout_ms });
-  const scopeSel = el("select", { class: "input", "aria-label": "Which calls the model sees" }, SCOPES.map((o) => el("option", { value: o.value }, o.text)));
-  scopeSel.value = m.scope;
+  let scope = m.scope;
+  const scopePicker = picker({ label: "Which calls the model sees", search: "Search", none: "No match.", onpick: (v) => { scope = v; scopePicker.set(SCOPES, v); } });
+  scopePicker.set(SCOPES, scope);
   const failClosed = el("input", { type: "checkbox" }); failClosed.checked = m.fail_closed;
   const instr = el("textarea", { class: "json", rows: "4" }, m.instructions);
   const critTrue = el("input", { class: "input", value: m.criteria_true });
   const critFalse = el("input", { class: "input", value: m.criteria_false });
   const save = act(async () => {
-    m.source = srcSel.value;
+    m.source = source;
     m.endpoint_url = endpointUrl.value.trim();
     m.endpoint_model = endpointModel.value.trim();
     m.llama_server = llama.value.trim();
@@ -748,7 +755,7 @@ function modelCard(cfg, meta) {
     m.threads = Number(threads.value) || 0;
     m.threshold = Number(threshold.value);
     m.timeout_ms = Number(timeout.value);
-    m.scope = scopeSel.value;
+    m.scope = scope;
     m.fail_closed = failClosed.checked;
     m.instructions = instr.value;
     m.criteria_true = critTrue.value;
@@ -769,16 +776,15 @@ function modelCard(cfg, meta) {
         el("div", { class: "form-row" }, field("GPU layers (0 = CPU only)", gpu), field("Threads (0 = auto)", threads)),
     el("p", { class: "meta" }, `The default model is ${meta.default_hf}. Its licence is the ${meta.licence} (not Apache). The center does not download llama.cpp; point at a build or put llama-server on PATH.`),
     localStatus(state.checker.meta.local));
-  const showSource = () => { epDiv.hidden = srcSel.value !== "endpoint"; localDiv.hidden = srcSel.value !== "local"; };
-  srcSel.addEventListener("change", showSource);
+  const showSource = () => { epDiv.hidden = source !== "endpoint"; localDiv.hidden = source !== "local"; };
   showSource();
   return section("Decision model", "An optional System One model that answers, in one pass, whether a call is dangerous. At or above the threshold the call is refused. An unreachable model refuses the call (fail closed) unless you switch that off below.", null,
     el("div", { class: "card" },
-      el("div", { class: "form-row" }, field("Source", srcSel)),
+      el("div", { class: "form-row" }, srcPicker.root),
       epDiv,
       localDiv,
       el("div", { class: "form-row" }, field("Threshold (0 to 1)", threshold), field("Timeout (ms)", timeout)),
-      el("div", { class: "form-row" }, field("Which calls the model sees", scopeSel)),
+      el("div", { class: "form-row" }, scopePicker.root),
       el("label", { class: "switch" }, failClosed, el("span", {}, "Fail closed: refuse a call when the model is unreachable (recommended). Off: allow and log it.")),
       el("div", { class: "form-row" }, field("Question (the command text is never put here; it goes only in the state sent to the model)", instr)),
       el("div", { class: "form-row" }, field("When true (dangerous)", critTrue), field("When false (safe)", critFalse)),

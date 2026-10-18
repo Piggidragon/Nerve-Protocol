@@ -50,7 +50,9 @@ impl Rule {
     /// show it and the center can leave it out instead of matching nothing
     /// silently.
     pub fn parse(rule: &str) -> Result<Rule, String> {
-        let (scope, pattern) = rule.split_once(':').map_or((rule, None), |(s, p)| (s, Some(p)));
+        let (scope, pattern) = rule
+            .split_once(':')
+            .map_or((rule, None), |(s, p)| (s, Some(p)));
         if !nerve_policy::rules::valid_scope(scope) {
             return Err(format!(
                 "rule {rule:?}: it starts with `cap` or `cap.action`, then `:` and a pattern"
@@ -61,7 +63,8 @@ impl Rule {
             None => (scope.to_string(), None),
         };
         let matcher = if (cap.as_str(), action.as_deref()) == ("exec", Some("run")) {
-            let pattern = pattern.ok_or_else(|| format!("rule {rule:?}: exec.run needs a pattern"))?;
+            let pattern =
+                pattern.ok_or_else(|| format!("rule {rule:?}: exec.run needs a pattern"))?;
             match pattern.strip_prefix("re:") {
                 Some(re) => Matcher::Regex(
                     Regex::new(re).map_err(|e| format!("rule {rule:?}: bad regex: {e}"))?,
@@ -69,7 +72,8 @@ impl Rule {
                 None => Matcher::Command(CmdPattern::parse(pattern)?),
             }
         } else if cap == "fs" {
-            let pattern = pattern.ok_or_else(|| format!("rule {rule:?}: an fs rule needs a path"))?;
+            let pattern =
+                pattern.ok_or_else(|| format!("rule {rule:?}: an fs rule needs a path"))?;
             Matcher::Path(path_glob(pattern).map_err(|e| format!("rule {rule:?}: {e}"))?)
         } else {
             let glob = match pattern {
@@ -100,13 +104,13 @@ impl Rule {
             return false;
         }
         match &self.matcher {
-            Matcher::Command(p) => normalize::commands(call.target).iter().any(|c| p.matches(c)),
+            Matcher::Command(p) => normalize::commands(call.target)
+                .iter()
+                .any(|c| p.matches(c)),
             Matcher::Regex(re) => re.is_match(&collapse_ws(call.target)),
             Matcher::Path(g) => g.is_match(call.target),
             Matcher::Scope(None) => true,
-            Matcher::Scope(Some(g)) => {
-                g.is_match(&format!("{}.{}", call.cap, call.action))
-            }
+            Matcher::Scope(Some(g)) => g.is_match(format!("{}.{}", call.cap, call.action)),
         }
     }
 }
@@ -125,9 +129,7 @@ struct CmdPattern {
 impl CmdPattern {
     fn parse(pattern: &str) -> Result<CmdPattern, String> {
         let mut words = pattern.split_whitespace();
-        let program = words
-            .next()
-            .ok_or("the pattern names no program")?;
+        let program = words.next().ok_or("the pattern names no program")?;
         let program = GlobBuilder::new(program)
             .build()
             .map_err(|e| e.to_string())?
@@ -140,9 +142,10 @@ impl CmdPattern {
                 if !l.is_empty() {
                     long.push(l.split('=').next().unwrap_or(l).to_ascii_lowercase());
                 }
-            } else if let Some(flags) = w.strip_prefix('-').filter(|f| {
-                !f.is_empty() && f.bytes().all(|b| b.is_ascii_alphanumeric())
-            }) {
+            } else if let Some(flags) = w
+                .strip_prefix('-')
+                .filter(|f| !f.is_empty() && f.bytes().all(|b| b.is_ascii_alphanumeric()))
+            {
                 short.extend(flags.chars());
             } else {
                 // An operand glob; a single `/` separator counts, so a `/*`
@@ -313,7 +316,10 @@ mod tests {
     #[test]
     fn windows_defaults_hit_and_miss() {
         let rules = super::super::config::default_blocklist();
-        let compiled: Vec<Rule> = rules.iter().map(|e| Rule::parse(&e.rule).unwrap()).collect();
+        let compiled: Vec<Rule> = rules
+            .iter()
+            .map(|e| Rule::parse(&e.rule).unwrap())
+            .collect();
         let blocked = |cmd: &str| compiled.iter().any(|r| r.matches(&exec(cmd)));
         for bad in [
             "Format-Volume -DriveLetter D",

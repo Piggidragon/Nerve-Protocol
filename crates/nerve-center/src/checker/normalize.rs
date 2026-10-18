@@ -29,7 +29,9 @@ impl Command {
     pub fn short_flags(&self) -> Vec<char> {
         self.args
             .iter()
-            .filter(|a| a.len() == 2 && a.starts_with('-') && a.as_bytes()[1].is_ascii_alphanumeric())
+            .filter(|a| {
+                a.len() == 2 && a.starts_with('-') && a.as_bytes()[1].is_ascii_alphanumeric()
+            })
             .map(|a| a.chars().nth(1).unwrap())
             .collect()
     }
@@ -56,8 +58,8 @@ impl Command {
 /// Wrapper programs that run another command: stripped so the real program is
 /// seen. `env` and `xargs` also drop their `NAME=value` and flag arguments.
 const WRAPPERS: &[&str] = &[
-    "sudo", "doas", "env", "nohup", "command", "exec", "time", "nice", "ionice", "xargs",
-    "setsid", "stdbuf", "npx", "pnpx",
+    "sudo", "doas", "env", "nohup", "command", "exec", "time", "nice", "ionice", "xargs", "setsid",
+    "stdbuf", "npx", "pnpx",
 ];
 
 /// Programs whose `-c` / `-Command` argument is itself a command line to pull
@@ -419,7 +421,10 @@ mod tests {
     #[test]
     fn a_nested_shell_body_is_pulled_apart() {
         assert_eq!(progs("sh -c 'rm -rf /'"), ["sh", "rm"]);
-        assert_eq!(progs("bash -c \"git pull && rm -rf ~\""), ["bash", "git", "rm"]);
+        assert_eq!(
+            progs("bash -c \"git pull && rm -rf ~\""),
+            ["bash", "git", "rm"]
+        );
         assert_eq!(
             progs("powershell -Command \"Remove-Item x\""),
             ["powershell", "remove-item"]

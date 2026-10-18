@@ -29,7 +29,11 @@ pub struct Endpoint {
 
 impl Endpoint {
     /// Parses `url` (its path is fixed at `/v1/systemone`).
-    pub fn parse(url: &str, token: Option<String>, model: Option<String>) -> Result<Endpoint, String> {
+    pub fn parse(
+        url: &str,
+        token: Option<String>,
+        model: Option<String>,
+    ) -> Result<Endpoint, String> {
         let url = CenterUrl::parse(url)?;
         Ok(Endpoint {
             url,
@@ -53,8 +57,12 @@ pub enum ModelError {
 impl std::fmt::Display for ModelError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ModelError::Unreachable(e) => write!(f, "the action checker's model cannot be reached: {e}"),
-            ModelError::Bad(e) => write!(f, "the action checker's model gave no usable answer: {e}"),
+            ModelError::Unreachable(e) => {
+                write!(f, "the action checker's model cannot be reached: {e}")
+            }
+            ModelError::Bad(e) => {
+                write!(f, "the action checker's model gave no usable answer: {e}")
+            }
         }
     }
 }
@@ -64,11 +72,7 @@ const MAX_BODY: usize = 64 * 1024;
 
 /// Asks the model whether the call described by `state` is dangerous, with the
 /// question built from `cfg`. Returns the `noul` probability (0..=1).
-pub async fn ask(
-    endpoint: &Endpoint,
-    cfg: &ModelConfig,
-    state: Value,
-) -> Result<f64, ModelError> {
+pub async fn ask(endpoint: &Endpoint, cfg: &ModelConfig, state: Value) -> Result<f64, ModelError> {
     let mut body = json!({
         "state": state,
         "questions": {
@@ -112,13 +116,22 @@ async fn request(endpoint: &Endpoint, body: &Value) -> Result<Value, ModelError>
     match resp.status {
         200 => serde_json::from_slice(&resp.body)
             .map_err(|e| ModelError::Bad(format!("not JSON: {e}"))),
-        401 => Err(ModelError::Bad("401: the model endpoint refused the token".into())),
-        422 => Err(ModelError::Bad("422: the model rejected the request".into())),
-        429 => Err(ModelError::Bad("429: the model endpoint is rate-limiting".into())),
-        501 => Err(ModelError::Bad(
-            "501: the loaded model is not a decision model (/v1/models has no \"decisions\")".into(),
+        401 => Err(ModelError::Bad(
+            "401: the model endpoint refused the token".into(),
         )),
-        529 => Err(ModelError::Bad("529: the model endpoint is overloaded".into())),
+        422 => Err(ModelError::Bad(
+            "422: the model rejected the request".into(),
+        )),
+        429 => Err(ModelError::Bad(
+            "429: the model endpoint is rate-limiting".into(),
+        )),
+        501 => Err(ModelError::Bad(
+            "501: the loaded model is not a decision model (/v1/models has no \"decisions\")"
+                .into(),
+        )),
+        529 => Err(ModelError::Bad(
+            "529: the model endpoint is overloaded".into(),
+        )),
         s => Err(ModelError::Bad(format!("HTTP {s}"))),
     }
 }
@@ -164,7 +177,10 @@ pub async fn is_decision_model(endpoint: &Endpoint) -> Result<bool, ModelError> 
         .await
         .map_err(ModelError::Unreachable)?;
     if resp.status != 200 {
-        return Err(ModelError::Bad(format!("/v1/models answered HTTP {}", resp.status)));
+        return Err(ModelError::Bad(format!(
+            "/v1/models answered HTTP {}",
+            resp.status
+        )));
     }
     let v: Value = serde_json::from_slice(&resp.body)
         .map_err(|e| ModelError::Bad(format!("/v1/models is not JSON: {e}")))?;
@@ -201,9 +217,19 @@ mod tests {
 
     #[test]
     fn the_request_carries_the_token_and_the_fixed_question() {
-        let ep = Endpoint::parse("https://h:9931", Some("secret".into()), Some("jev-latest".into())).unwrap();
+        let ep = Endpoint::parse(
+            "https://h:9931",
+            Some("secret".into()),
+            Some("jev-latest".into()),
+        )
+        .unwrap();
         let body = json!({"state": {"command": "rm -rf /"}, "questions": {}});
-        let text = request_bytes(&ep.url.authority(), "/v1/systemone", ep.token.as_deref(), &body);
+        let text = request_bytes(
+            &ep.url.authority(),
+            "/v1/systemone",
+            ep.token.as_deref(),
+            &body,
+        );
         assert!(text.contains("Authorization: Bearer secret"));
         assert!(text.contains("POST /v1/systemone HTTP/1.1"));
     }

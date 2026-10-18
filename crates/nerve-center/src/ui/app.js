@@ -588,6 +588,14 @@ function auditRow(d, n) {
 function checkerAuditRow(d, k) {
   const layer = d.checker ? d.checker.layer : "";
   const detail = d.checker ? d.checker.detail : "";
+  // Whether the entry, rule or switch behind it was the center's for every
+  // machine or this machine's own (entries from before per-machine settings
+  // have no scope).
+  const scope = d.checker ? d.checker.scope : "";
+  // For the model it is the switch that had the model on.
+  const whose = !scope ? ""
+    : layer === "model" ? (scope === "node" ? " (on by this machine's own setting)" : " (on for every machine)")
+      : scope === "node" ? " (this machine's own)" : " (for every machine)";
   const refused = d.decision === "forbidden";
   const byBlocklist = layer === "blocklist";
   const cut = /… \[cut at \d+ of \d+ characters\]$/.test(d.target || "");
@@ -603,10 +611,12 @@ function checkerAuditRow(d, k) {
       pill(k.pill, `${d.decision} by the action checker`),
       el("span", { class: "when", title: when(d.ts) }, ago(d.ts))),
     d.target ? el("code", { class: "target mono" }, d.target) : null,
-    detail ? el("p", { class: "meta" }, `${layer === "model" ? "Decision model" : layer === "allow rule" ? "Allow rule" : "Blocklist"}: ${detail}`) : null,
+    detail ? el("p", { class: "meta" }, `${layer === "model" ? "Decision model" : layer === "allow rule" ? "Allow rule" : "Blocklist"}${whose}: ${detail}`) : null,
     refused && !byBlocklist && known ? el("div", { class: "actions" },
       btn("Allow", "", allow(false)), btn("Allow as wildcard", "", allow(true))) : null,
-    byBlocklist ? el("p", { class: "meta" }, "On the blocklist (hard deny). Remove or switch off the entry on the Action checker page to let it through.") : null);
+    byBlocklist ? el("p", { class: "meta" }, scope === "global"
+      ? "On the blocklist for every machine (hard deny). To let it through, switch the entry off for this machine (Per machine) or for every machine on the Action checker page."
+      : "On the blocklist (hard deny). Remove or switch off the entry on the Action checker page to let it through.") : null);
 }
 
 // ---- Action checker (issue #17) ----
@@ -624,11 +634,30 @@ let checkerRun = 0;
 
 async function loadChecker() {
   const run = ++checkerRun;
-  const r = await api("GET", "/api/checker");
+  const [r, o] = await Promise.all([api("GET", "/api/checker"), api("GET", "/api/overview")]);
   if (run !== checkerRun) return;
   // The working copy the form edits; meta holds what does not change here.
-  state.checker = { cfg: r.config, meta: r };
+  // The fields of per-machine settings are left out when empty.
+  const cfg = r.config;
+  cfg.nodes = cfg.nodes || {};
+  state.checker = { cfg, meta: r, nodes: o.nodes || [] };
   if (current() === "checker") draw(true);
+}
+
+// Runs a save that no button started (a picker's choice), with the error
+// shown as a button's would be.
+function quietly(fn) {
+  fn().catch((e) => { if (!e.auth) notify(e.message, "error"); });
+}
+
+function machineName(id) {
+  const n = ((state.checker && state.checker.nodes) || []).find((x) => x.id === id);
+  return n ? n.name : id;
+}
+
+// The machine picker's entries: every machine, then each paired one.
+function machineItems() {
+  return [{ value: "", text: "Every machine" }, ...((state.checker && state.checker.nodes) || []).map((n) => ({ value: n.id, text: n.name }))];
 }
 
 // Saves the working copy, then reloads so the page shows what the center kept.
@@ -653,6 +682,7 @@ function pageChecker() {
     c.meta.rejected && c.meta.rejected.length ? banner("warn", "alert", `Some rules do not parse and were left out: ${c.meta.rejected.join("; ")}`) : null,
     blocklistCard(cfg, c.meta),
     allowCard(cfg),
+    machinesCard(cfg),
     modelCard(cfg, c.meta),
   ];
 }
@@ -664,49 +694,64 @@ function checkerToggle(label, on, apply) {
   return el("label", { class: "switch" }, input, el("span", {}, label));
 }
 
-function blocklistCard(cfg, meta) {
-  const row = (e, i) => el("div", { class: "card entry" },
+// One blocklist entry: its switch, rule, scope (every machine, with the
+// machines it is switched off for, or one machine) and note.
+function blockRow(cfg, e, i) {
+  const t = el("input", { type: "checkbox", onchange: act(async (ev) => { cfg.blocklist[i].on = ev.currentTarget.checked; await saveChecker(); }) });
+  t.checked = e.on;
+  const off = e.off_for || [];
+  return el("div", { class: "card entry" },
     el("div", { class: "card-top" },
-      el("label", { class: "switch" },
-        (() => { const t = el("input", { type: "checkbox", onchange: act(async (ev) => { cfg.blocklist[i].on = ev.currentTarget.checked; await saveChecker(); }) }); t.checked = e.on; return t; })(),
-        el("code", { class: "mono" }, e.rule)),
+      el("label", { class: "switch" }, t, el("code", { class: "mono" }, e.rule)),
       e.builtin ? pill("", "default") : null,
+      pill("", e.node_id ? `only ${machineName(e.node_id)}` : "every machine"),
+      off.length ? pill("warn", `off for ${off.map(machineName).join(", ")}`) : null,
       el("span", { class: "push" }, btn("Remove", "danger", act(async () => { cfg.blocklist.splice(i, 1); await saveChecker(); }), "trash"))),
     e.note ? el("p", { class: "meta" }, e.note) : null);
+}
+
+function blocklistCard(cfg, meta) {
   const ruleIn = el("input", { class: "input mono", placeholder: "exec.run:rm -rf /*  or  fs.write:/etc/sudoers", "aria-label": "New blocklist rule" });
   const noteIn = el("input", { class: "input", placeholder: "What it guards against (optional)", "aria-label": "Note" });
+  const items = machineItems();
+  let blockNode = "";
+  const nodePicker = picker({ label: "For", search: "Search machines", none: "No machine matches.", onpick: (v) => { blockNode = v; nodePicker.set(items, v); } });
+  nodePicker.set(items, "");
   const add = act(async () => {
     const rule = ruleIn.value.trim();
     if (!rule) { notify("Enter a rule.", "error"); return; }
-    cfg.blocklist.push({ rule, on: true, builtin: false, note: noteIn.value.trim() });
+    cfg.blocklist.push({ rule, on: true, builtin: false, note: noteIn.value.trim(), node_id: blockNode || null });
     ruleIn.value = ""; noteIn.value = "";
     await saveChecker();
   });
   const reset = act(async () => {
-    const yes = await modal({ title: "Reset the blocklist?", message: "This replaces the whole blocklist with the built-in defaults; your own entries and changes are lost.", confirm: "Reset", danger: true });
+    const yes = await modal({ title: "Reset the blocklist?", message: "This replaces the whole blocklist with the built-in defaults, for every machine; your own entries (also those for one machine), entries you switched off, and entries switched off for single machines are lost.", confirm: "Reset", danger: true });
     if (!yes) return;
     cfg.blocklist = meta.default_blocklist.map((e) => ({ ...e }));
     await saveChecker();
   });
-  return section("Blocklist", "Exact commands or wildcards that are refused at once, in the machine's own rule syntax (exec.run:…, fs.write:…). A re: regex form is allowed where a glob is not enough. The blocklist wins over the allow rules and the model.", btn("Reset to defaults", "ghost", reset, "refresh"),
+  return section("Blocklist", "Exact commands or wildcards that are refused at once, in the machine's own rule syntax (exec.run:…, fs.write:…), for every machine or for one. A re: regex form is allowed where a glob is not enough. The blocklist wins over the allow rules and the model. An entry for every machine can be switched off for single machines under Per machine.", btn("Reset to defaults", "ghost", reset, "refresh"),
     el("div", { class: "card" }, el("div", { class: "form-row" },
       el("label", { class: "field grow" }, el("span", { class: "label" }, "Add a rule"), ruleIn),
-      el("label", { class: "field grow" }, el("span", { class: "label" }, "Note"), noteIn)),
+      el("label", { class: "field grow" }, el("span", { class: "label" }, "Note"), noteIn),
+      nodePicker.root),
       el("div", { class: "actions" }, el("button", { type: "button", class: "btn primary", onclick: add }, icon("plus", "sm"), "Add"))),
     el("p", { class: "meta" }, "What the matcher cannot see: shell variables, aliases, a script written then run, and base64. The decision model and the machine's policy are the next lines of defence."),
-    cfg.blocklist.length ? el("div", { class: "list" }, cfg.blocklist.map(row)) : empty("The blocklist is empty."));
+    cfg.blocklist.length ? el("div", { class: "list" }, cfg.blocklist.map((e, i) => blockRow(cfg, e, i))) : empty("The blocklist is empty."));
+}
+
+// One saved allow rule, with its scope.
+function allowRow(cfg, a, i) {
+  return el("div", { class: "card entry" },
+    el("div", { class: "card-top" },
+      el("code", { class: "mono" }, a.rule),
+      pill("", a.node_id ? `only ${machineName(a.node_id)}` : "every machine"),
+      el("span", { class: "push" }, btn("Remove", "danger", act(async () => { cfg.allow_rules.splice(i, 1); await saveChecker(); }), "trash"))));
 }
 
 function allowCard(cfg) {
-  const nodes = (state.overview && state.overview.nodes) || [];
-  const nameOf = (id) => { const n = nodes.find((x) => x.id === id); return n ? n.name : id; };
-  const row = (a, i) => el("div", { class: "card entry" },
-    el("div", { class: "card-top" },
-      el("code", { class: "mono" }, a.rule),
-      pill("", a.node_id ? nameOf(a.node_id) : "every machine"),
-      el("span", { class: "push" }, btn("Remove", "danger", act(async () => { cfg.allow_rules.splice(i, 1); await saveChecker(); }), "trash"))));
   const ruleIn = el("input", { class: "input mono", placeholder: "exec.run:docker exec *", "aria-label": "New allow rule" });
-  const nodeItems = [{ value: "", text: "Every machine" }, ...nodes.map((n) => ({ value: n.id, text: n.name }))];
+  const nodeItems = machineItems();
   let allowNode = "";
   const nodePicker = picker({ label: "For", search: "Search machines", none: "No machine matches.", onpick: (v) => { allowNode = v; nodePicker.set(nodeItems, v); } });
   nodePicker.set(nodeItems, "");
@@ -722,7 +767,123 @@ function allowCard(cfg) {
       el("label", { class: "field grow" }, el("span", { class: "label" }, "Add a rule"), ruleIn),
       nodePicker.root),
       el("div", { class: "actions" }, el("button", { type: "button", class: "btn primary", onclick: add }, icon("plus", "sm"), "Add"))),
-    cfg.allow_rules.length ? el("div", { class: "list" }, cfg.allow_rules.map(row)) : empty("No allow rules."));
+    cfg.allow_rules.length ? el("div", { class: "list" }, cfg.allow_rules.map((a, i) => allowRow(cfg, a, i))) : empty("No allow rules."));
+}
+
+// ---- Per machine: the switches, entries, exceptions and allow rules of
+// one machine (owner's decision of 2026-10-18) ----
+
+// The machines whose card is open, so a save (which redraws the page) keeps
+// them open.
+const checkerOpen = new Set();
+
+// The paired machines, and any machine the settings still name although it
+// is no longer paired, so its settings can be forgotten.
+function checkerMachines(cfg) {
+  const nodes = (state.checker && state.checker.nodes) || [];
+  const named = new Set(Object.keys(cfg.nodes || {}));
+  for (const e of cfg.blocklist) {
+    if (e.node_id) named.add(e.node_id);
+    for (const id of e.off_for || []) named.add(id);
+  }
+  for (const a of cfg.allow_rules) if (a.node_id) named.add(a.node_id);
+  const gone = [...named].filter((id) => !nodes.some((n) => n.id === id));
+  return [...nodes.map((n) => ({ id: n.id, name: n.name, paired: true })), ...gone.map((id) => ({ id, name: id, paired: false }))];
+}
+
+function machinesCard(cfg) {
+  const machines = checkerMachines(cfg);
+  return section("Per machine", "Each machine follows the center's switches unless you set the blocklist or the model on or off for it. It can have block entries of its own, and switch single entries for every machine off for itself. A block anywhere wins: the center's blocklist, this machine's entries, or the machine's own deny list; an allow rule only skips the model.", null,
+    machines.length ? el("div", { class: "list" }, machines.map((m) => machineCard(cfg, m))) : empty("No machine is paired."));
+}
+
+function machineCard(cfg, m) {
+  const own = cfg.nodes[m.id] || { blocklist: "inherit", model: "inherit" };
+  const indexed = cfg.blocklist.map((e, i) => [e, i]);
+  const entries = indexed.filter(([e]) => e.node_id === m.id);
+  const offs = indexed.filter(([e]) => !e.node_id && (e.off_for || []).includes(m.id));
+  const others = indexed.filter(([e]) => !e.node_id && !(e.off_for || []).includes(m.id));
+  const allows = cfg.allow_rules.map((a, i) => [a, i]).filter(([a]) => a.node_id === m.id);
+
+  // The blocklist or model setting: as the center, or on or off here.
+  const switchPicker = (part, label, centerOn) => {
+    const items = [
+      { value: "inherit", text: `As the center (${centerOn ? "on" : "off"})` },
+      { value: "on", text: "On for this machine" },
+      { value: "off", text: "Off for this machine" },
+    ];
+    const p = picker({
+      label, search: "Search", none: "No match.",
+      onpick: (v) => { p.set(items, v); cfg.nodes[m.id] = { ...own, [part]: v }; quietly(saveChecker); },
+    });
+    p.set(items, own[part] || "inherit");
+    return p.root;
+  };
+
+  const exceptItems = [{ value: "", text: "Pick an entry for every machine" },
+    ...others.map(([e, i]) => ({ value: String(i), text: e.note ? `${e.note}: ${e.rule}` : e.rule }))];
+  const exceptPicker = picker({
+    label: "Switch off for this machine", search: "Search entries", none: "No entry matches.",
+    onpick: (v) => {
+      exceptPicker.set(exceptItems, v);
+      if (v === "") return;
+      const e = cfg.blocklist[Number(v)];
+      e.off_for = [...(e.off_for || []), m.id];
+      quietly(saveChecker);
+    },
+  });
+  exceptPicker.set(exceptItems, "");
+  const offRow = ([e]) => el("div", { class: "card entry" },
+    el("div", { class: "card-top" },
+      el("code", { class: "mono" }, e.rule),
+      el("span", { class: "push" }, btn("Switch on again", "", act(async () => { e.off_for = (e.off_for || []).filter((id) => id !== m.id); await saveChecker(); })))),
+    e.note ? el("p", { class: "meta" }, e.note) : null);
+
+  const ruleIn = el("input", { class: "input mono", placeholder: "exec.run:terraform destroy*", "aria-label": `New blocklist rule for ${m.name}` });
+  const add = act(async () => {
+    const rule = ruleIn.value.trim();
+    if (!rule) { notify("Enter a rule.", "error"); return; }
+    cfg.blocklist.push({ rule, on: true, builtin: false, note: "", node_id: m.id });
+    ruleIn.value = "";
+    await saveChecker();
+  });
+  // A machine no longer paired: drop everything the settings hold for it.
+  const forget = act(async () => {
+    delete cfg.nodes[m.id];
+    cfg.blocklist = cfg.blocklist.filter((e) => e.node_id !== m.id).map((e) => ({ ...e, off_for: (e.off_for || []).filter((id) => id !== m.id) }));
+    cfg.allow_rules = cfg.allow_rules.filter((a) => a.node_id !== m.id);
+    checkerOpen.delete(m.id);
+    await saveChecker();
+  });
+
+  const word = (v) => (v === "on" ? "on here" : "off here");
+  const body = el("div", { class: "body" },
+    el("div", { class: "form-row" },
+      switchPicker("blocklist", "Blocklist", cfg.blocklist_on),
+      switchPicker("model", "Decision model", cfg.model_on)),
+    el("p", { class: "meta" }, "The model on here uses the center's one model and its settings below. Taint is for every machine."),
+    el("h4", { class: "sub-head" }, "Block entries for this machine only"),
+    entries.length ? el("div", { class: "list" }, entries.map(([e, i]) => blockRow(cfg, e, i))) : el("p", { class: "meta" }, "None."),
+    el("div", { class: "form-row" }, el("label", { class: "field grow" }, el("span", { class: "label" }, "Add a rule for this machine"), ruleIn)),
+    el("div", { class: "actions" }, el("button", { type: "button", class: "btn primary", onclick: add }, icon("plus", "sm"), "Add")),
+    el("h4", { class: "sub-head" }, "Entries for every machine, switched off here"),
+    offs.length ? el("div", { class: "list" }, offs.map(offRow)) : el("p", { class: "meta" }, "None."),
+    el("div", { class: "form-row" }, exceptPicker.root),
+    el("h4", { class: "sub-head" }, "Allow rules for this machine only"),
+    allows.length ? el("div", { class: "list" }, allows.map(([a, i]) => allowRow(cfg, a, i))) : el("p", { class: "meta" }, "None. Add one under Allow rules."),
+    m.paired ? null : el("div", { class: "actions" }, btn("Forget its settings", "danger", forget, "trash")));
+  const card = el("details", { class: "card", ontoggle: (ev) => { if (ev.currentTarget.open) checkerOpen.add(m.id); else checkerOpen.delete(m.id); } },
+    el("summary", {}, el("span", { class: "name" }, m.name),
+      m.paired ? null : pill("down", "not paired"),
+      own.blocklist && own.blocklist !== "inherit" ? pill(own.blocklist === "on" ? "up" : "warn", `blocklist ${word(own.blocklist)}`) : null,
+      own.model && own.model !== "inherit" ? pill(own.model === "on" ? "up" : "warn", `model ${word(own.model)}`) : null,
+      entries.length ? pill("", plural(entries.length, "own entry", "own entries")) : null,
+      offs.length ? pill("warn", `${offs.length} switched off`) : null,
+      icon("chev", "sm chev")),
+    body);
+  // Set after the build: el() would read an "open" attribute as an "on…" handler.
+  if (checkerOpen.has(m.id)) card.open = true;
+  return card;
 }
 
 function modelCard(cfg, meta) {

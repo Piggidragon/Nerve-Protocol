@@ -14,7 +14,10 @@
 //! 4. Otherwise the call goes to the node as today.
 //!
 //! Each part has its own switch, all in the center's web UI, all kept in the
-//! center's state.
+//! center's state. Block entries and allow rules are for every node or one
+//! node, and a node may set the blocklist and the model on or off for itself
+//! (`config::NodeSettings`). A block anywhere wins: a center allow rule only
+//! skips the model, never a block entry or the node's own policy.
 
 pub mod blocklist;
 pub mod config;
@@ -29,6 +32,7 @@ use nerve_proto::Effect;
 
 pub use config::{
     AllowRule, BlockEntry, CheckerConfig, LocalModel, ModelConfig, ModelScope, ModelSource,
+    NodeSettings, NodeSwitch, Scope,
 };
 pub use model::Endpoint;
 
@@ -62,12 +66,19 @@ pub enum Decision {
     /// The checker let the call through and this is worth recording: a saved
     /// allow rule matched, or the model judged it below the threshold, or an
     /// unreachable model was allowed-and-logged. Audited as `allowed` by the
-    /// given layer.
-    Allowed { layer: Layer, detail: String },
+    /// given layer. `scope` says whether the allow rule, or the switch that
+    /// had the model on, was the center's for every node or the node's own.
+    Allowed {
+        layer: Layer,
+        scope: Scope,
+        detail: String,
+    },
     /// Refused by the checker. `message` is for the agent; `detail` is the
-    /// audit line.
+    /// audit line; `scope` says whether the block entry, or the switch that
+    /// had the blocklist or the model on, was for every node or the node's.
     Refuse {
         layer: Layer,
+        scope: Scope,
         detail: String,
         message: String,
     },
@@ -89,11 +100,19 @@ pub struct CallInfo<'a> {
     pub tainted: bool,
 }
 
-/// One compiled blocklist entry, kept with its text and note for the audit.
+/// One compiled blocklist entry, kept with the entry for its scope, text and
+/// note.
 struct Blocked {
     rule: Rule,
+    entry: BlockEntry,
+}
+
+/// One compiled allow rule, with its text and the node it is for (`None` for
+/// every node).
+struct Allow {
+    rule: Rule,
     text: String,
-    note: String,
+    node_id: Option<String>,
 }
 
 /// The checker, built from a `CheckerConfig`. Rebuilt when the config
@@ -102,7 +121,7 @@ struct Blocked {
 pub struct Checker {
     cfg: CheckerConfig,
     blocklist: Vec<Blocked>,
-    allow: Vec<(Rule, Option<String>)>,
+    allow: Vec<Allow>,
     /// The endpoint model, when the source is an endpoint with a URL. The
     /// local source's endpoint comes from the running server at check time.
     endpoint: Option<Endpoint>,
@@ -121,8 +140,7 @@ impl Checker {
             match Rule::parse(&e.rule) {
                 Ok(rule) => blocklist.push(Blocked {
                     rule,
-                    text: e.rule.clone(),
-                    note: e.note.clone(),
+                    entry: e.clone(),
                 }),
                 Err(why) => rejected.push(why),
             }
@@ -130,7 +148,11 @@ impl Checker {
         let mut allow = Vec::new();
         for a in &cfg.allow_rules {
             match Rule::parse(&a.rule) {
-                Ok(rule) => allow.push((rule, a.node_id.clone())),
+                Ok(rule) => allow.push(Allow {
+                    rule,
+                    text: a.rule.clone(),
+                    node_id: a.node_id.clone(),
+                }),
                 Err(why) => rejected.push(why),
             }
         }
@@ -191,7 +213,8 @@ impl Checker {
         // let through: the fail-closed stance of the rest of the checker.
         let parsed = (call.cap == "exec" && call.action == "run")
             .then(|| normalize::parse(call.target, normalize::Shell::for_os(call.os)));
-        if self.cfg.blocklist_on
+        let (blocklist_on, blocklist_scope) = self.cfg.blocklist_for(call.node_id);
+        if blocklist_on
             && let Some(p) = &parsed
             && let Some(over) = p.overflow
         {
@@ -216,61 +239,94 @@ impl Checker {
             };
             return Decision::Refuse {
                 layer: Layer::Blocklist,
+                scope: blocklist_scope,
                 detail,
                 message: format!(
-                    "the center's action checker refused this call: {why}, which is past what the checker takes apart, so it cannot see what the line runs. Split the command, or the owner can switch the blocklist off in the center's web UI (Action checker)."
+                    "the center's action checker refused this call: {why}, which is past what the checker takes apart, so it cannot see what the line runs. Split the command, or the owner can switch the blocklist off in the center's web UI (Action checker); {}.",
+                    switch_text("blocklist", blocklist_scope)
                 ),
             };
         }
         let commands = parsed.as_ref().map(|p| p.commands.as_slice());
-        // 1. Blocklist (hard deny, wins over everything).
-        if self.cfg.blocklist_on
+        // 1. Blocklist (hard deny, wins over everything): the entries for
+        // every node and for this node, less those switched off for it.
+        if blocklist_on
             && let Some(b) = self
                 .blocklist
                 .iter()
+                .filter(|b| b.entry.applies_to(call.node_id))
                 .find(|b| b.rule.matches_with(&target, commands))
         {
-            let what = if b.note.is_empty() {
-                b.text.clone()
+            let e = &b.entry;
+            let what = if e.note.is_empty() {
+                e.rule.clone()
             } else {
-                format!("{} ({})", b.note, b.text)
+                format!("{} ({})", e.note, e.rule)
+            };
+            let (scope, list, off) = match e.node_id {
+                None => (
+                    Scope::Global,
+                    "the center's blocklist for every node",
+                    "switch this entry off for this node only or for every node",
+                ),
+                Some(_) => (
+                    Scope::Node,
+                    "this node's own blocklist in the center",
+                    "switch this entry off",
+                ),
             };
             return Decision::Refuse {
                 layer: Layer::Blocklist,
-                detail: b.text.clone(),
+                scope,
+                detail: e.rule.clone(),
                 message: format!(
-                    "the center's action checker refused this call: it is on the blocklist — {what}. If the owner wants it run, they can switch this entry off (or remove it) in the center's web UI (Action checker); an allow rule does not get past the blocklist."
+                    "the center's action checker refused this call: it is on {list} — {what}. If the owner wants it run, they can {off} (or remove it) in the center's web UI (Action checker); an allow rule does not get past the blocklist."
                 ),
             };
         }
-        // 2. Saved allow rules (skip the model, not the blocklist).
-        if self
-            .allow
-            .iter()
-            .filter(|(_, node)| node.as_deref().is_none_or(|n| n == call.node_id))
-            .any(|(rule, _)| rule.matches_with(&target, commands))
+        // 2. Saved allow rules (skip the model, not the blocklist). A rule
+        // for this node is named before one for every node.
+        let mine = |a: &&Allow| a.node_id.as_deref() == Some(call.node_id);
+        let every = |a: &&Allow| a.node_id.is_none();
+        if let Some(a) = (self.allow.iter().filter(mine))
+            .chain(self.allow.iter().filter(every))
+            .find(|a| a.rule.matches_with(&target, commands))
         {
+            let scope = if a.node_id.is_some() {
+                Scope::Node
+            } else {
+                Scope::Global
+            };
             return Decision::Allowed {
                 layer: Layer::AllowRule,
-                detail: format!("a saved allow rule matched {}.{}", call.cap, call.action),
+                scope,
+                detail: a.text.clone(),
             };
         }
         // 3. Decision model.
-        if self.cfg.model_on && self.model_sees(call.effect, call.tainted) {
-            return self.run_model(call, endpoint).await;
+        let (model_on, model_scope) = self.cfg.model_for(call.node_id);
+        if model_on && self.model_sees(call.effect, call.tainted) {
+            return self.run_model(call, endpoint, model_scope).await;
         }
         Decision::Pass
     }
 
-    async fn run_model(&self, call: &CallInfo<'_>, endpoint: Option<&Endpoint>) -> Decision {
+    async fn run_model(
+        &self,
+        call: &CallInfo<'_>,
+        endpoint: Option<&Endpoint>,
+        scope: Scope,
+    ) -> Decision {
         let m = &self.cfg.model;
+        let switch = switch_text("model", scope);
         let fail = |why: String| {
             if m.fail_closed {
                 Decision::Refuse {
                     layer: Layer::Model,
+                    scope,
                     detail: why.clone(),
                     message: format!(
-                        "the center's action checker could not reach its decision model, so it refused the call (fail closed): {why}. The owner can switch the checker's model off, or to allow-and-log, in the center's web UI (Action checker)."
+                        "the center's action checker could not reach its decision model, so it refused the call (fail closed): {why}. The owner can switch the checker's model off, or to allow-and-log, in the center's web UI (Action checker); {switch}."
                     ),
                 }
             } else {
@@ -278,6 +334,7 @@ impl Checker {
                 // pass-through of an unreachable model leaves a trace.
                 Decision::Allowed {
                     layer: Layer::Model,
+                    scope,
                     detail: format!("model unreachable, allowed and logged: {why}"),
                 }
             }
@@ -290,9 +347,10 @@ impl Checker {
         match model::ask(endpoint, m, state).await {
             Ok(score) if score >= m.threshold => Decision::Refuse {
                 layer: Layer::Model,
+                scope,
                 detail: format!("score {score:.2} ≥ threshold {:.2}", m.threshold),
                 message: format!(
-                    "the center's action checker's decision model judged this call dangerous (score {score:.2}, threshold {:.2}), so it refused it. The owner can change the threshold or switch the model off in the center's web UI (Action checker).",
+                    "the center's action checker's decision model judged this call dangerous (score {score:.2}, threshold {:.2}), so it refused it. The owner can change the threshold or switch the model off in the center's web UI (Action checker); {switch}.",
                     m.threshold
                 ),
             },
@@ -301,6 +359,7 @@ impl Checker {
             // decision of steps 1-3).
             Ok(score) => Decision::Allowed {
                 layer: Layer::Model,
+                scope,
                 detail: format!("score {score:.2} < threshold {:.2}", m.threshold),
             },
             Err(e) => fail(e.to_string()),
@@ -312,16 +371,23 @@ impl Checker {
         self.endpoint.as_ref()
     }
 
-    pub fn model_on(&self) -> bool {
-        self.cfg.model_on
-    }
-
     pub fn taint_on(&self) -> bool {
         self.cfg.taint_on
     }
 
     pub fn model_source(&self) -> ModelSource {
         self.cfg.model.source
+    }
+}
+
+/// The refusal's word on where the switch that had `part` on comes from, so
+/// the owner knows which one to change.
+fn switch_text(part: &str, scope: Scope) -> String {
+    match scope {
+        Scope::Global => format!(
+            "the {part} is on for this node by the center's switch for every node, which a node's own setting can also switch off for this node only"
+        ),
+        Scope::Node => format!("the {part} is on by this node's own setting"),
     }
 }
 
@@ -417,6 +483,172 @@ mod tests {
             message.contains("switch this entry off"),
             "message: {message}"
         );
+    }
+
+    /// The checker for node `node` (the `call` helper's is `n1`).
+    fn on_node<'a>(mut c: CallInfo<'a>, node: &'a str) -> CallInfo<'a> {
+        c.node_id = node;
+        c
+    }
+
+    fn entry(rule: &str, node: Option<&str>) -> BlockEntry {
+        BlockEntry {
+            rule: rule.into(),
+            on: true,
+            builtin: false,
+            note: String::new(),
+            node_id: node.map(str::to_string),
+            off_for: Vec::new(),
+        }
+    }
+
+    /// A block entry for one node refuses there only, and the refusal names
+    /// it as that node's; a global entry switched off for one node stays in
+    /// force for the others, named as the entry for every node (owner's
+    /// decision of 2026-10-18).
+    #[tokio::test]
+    async fn block_entries_are_for_every_node_or_one() {
+        let mut cfg = CheckerConfig::default();
+        cfg.blocklist
+            .push(entry("exec.run:terraform destroy", Some("n1")));
+        let root = cfg
+            .blocklist
+            .iter_mut()
+            .find(|e| e.rule == "exec.run:rm -rf /")
+            .unwrap();
+        root.off_for.push("n2".into());
+        let checker = Checker::build(cfg, None);
+        let args = Map::new();
+        let tf = call("exec", "run", Effect::Execute, "terraform destroy", &args);
+        let Decision::Refuse { scope, message, .. } = checker.check(&tf, None).await else {
+            panic!("terraform destroy should be refused on n1");
+        };
+        assert_eq!(scope, Scope::Node);
+        assert!(message.contains("this node's own blocklist"), "{message}");
+        assert!(matches!(
+            checker.check(&on_node(tf, "n2"), None).await,
+            Decision::Pass
+        ));
+        let rm = call("exec", "run", Effect::Execute, "rm -rf /", &args);
+        assert!(matches!(
+            checker.check(&on_node(rm, "n2"), None).await,
+            Decision::Pass
+        ));
+        let rm = call("exec", "run", Effect::Execute, "rm -rf /", &args);
+        let Decision::Refuse { scope, message, .. } = checker.check(&rm, None).await else {
+            panic!("rm -rf / should stay refused on n1");
+        };
+        assert_eq!(scope, Scope::Global);
+        assert!(message.contains("for every node"), "{message}");
+        assert!(message.contains("for this node only"), "{message}");
+    }
+
+    /// A node's own blocklist and model settings win over the center's
+    /// switches, either way, and a refusal names the node's setting; a node
+    /// that inherits follows the center.
+    #[tokio::test]
+    async fn a_nodes_own_switches_win_over_the_centers() {
+        let mut cfg = CheckerConfig::default();
+        cfg.model.source = ModelSource::Endpoint; // no URL: unreachable
+        cfg.nodes.insert(
+            "n1".into(),
+            NodeSettings {
+                blocklist: NodeSwitch::Off,
+                model: NodeSwitch::On,
+            },
+        );
+        let checker = Checker::build(cfg.clone(), None);
+        let args = Map::new();
+        // n1: blocklist off for it, so `rm -rf /` reaches the model, which
+        // is on for it alone and fails closed.
+        let rm = call("exec", "run", Effect::Execute, "rm -rf /", &args);
+        let Decision::Refuse {
+            layer,
+            scope,
+            message,
+            ..
+        } = checker.check(&rm, None).await
+        else {
+            panic!("the model should refuse on n1");
+        };
+        assert_eq!((layer, scope), (Layer::Model, Scope::Node));
+        assert!(message.contains("this node's own setting"), "{message}");
+        // n2 inherits: blocklist on, model off.
+        let make = call("exec", "run", Effect::Execute, "make", &args);
+        assert!(matches!(
+            checker.check(&on_node(make, "n2"), None).await,
+            Decision::Pass
+        ));
+        let rm = call("exec", "run", Effect::Execute, "rm -rf /", &args);
+        assert!(matches!(
+            checker.check(&on_node(rm, "n2"), None).await,
+            Decision::Refuse {
+                layer: Layer::Blocklist,
+                scope: Scope::Global,
+                ..
+            }
+        ));
+        // The center's blocklist off, a node's on: refused there, by the
+        // node's setting.
+        cfg.blocklist_on = false;
+        cfg.nodes.insert(
+            "n3".into(),
+            NodeSettings {
+                blocklist: NodeSwitch::On,
+                model: NodeSwitch::Inherit,
+            },
+        );
+        let checker = Checker::build(cfg, None);
+        let deep = format!("echo {}", "$(".repeat(50));
+        let c = call("exec", "run", Effect::Execute, &deep, &args);
+        let Decision::Refuse { scope, message, .. } = checker.check(&on_node(c, "n3"), None).await
+        else {
+            panic!("the overflow should be refused on n3");
+        };
+        assert_eq!(scope, Scope::Node);
+        assert!(message.contains("this node's own setting"), "{message}");
+        let rm = call("exec", "run", Effect::Execute, "rm -rf /", &args);
+        assert!(matches!(
+            checker.check(&on_node(rm, "n2"), None).await,
+            Decision::Pass
+        ));
+    }
+
+    /// An allow rule's decision names whether the rule was for every node or
+    /// this node's, and a rule for another node does not apply.
+    #[tokio::test]
+    async fn an_allow_rule_names_its_scope() {
+        let mut cfg = CheckerConfig::default();
+        cfg.blocklist_on = false;
+        cfg.allow_rules.push(AllowRule {
+            rule: "exec.run:make *".into(),
+            node_id: None,
+        });
+        cfg.allow_rules.push(AllowRule {
+            rule: "exec.run:make test".into(),
+            node_id: Some("n1".into()),
+        });
+        cfg.allow_rules.push(AllowRule {
+            rule: "exec.run:cargo *".into(),
+            node_id: Some("n2".into()),
+        });
+        let checker = Checker::build(cfg, None);
+        let args = Map::new();
+        let c = call("exec", "run", Effect::Execute, "make test", &args);
+        assert!(matches!(
+            checker.check(&c, None).await,
+            Decision::Allowed { scope: Scope::Node, ref detail, .. } if detail == "exec.run:make test"
+        ));
+        let c = call("exec", "run", Effect::Execute, "make build", &args);
+        assert!(matches!(
+            checker.check(&c, None).await,
+            Decision::Allowed {
+                scope: Scope::Global,
+                ..
+            }
+        ));
+        let c = call("exec", "run", Effect::Execute, "cargo build", &args);
+        assert!(matches!(checker.check(&c, None).await, Decision::Pass));
     }
 
     #[tokio::test]

@@ -2,9 +2,14 @@
 //! a restart and are in a backup (docs/dev/action-checker.md).
 //!
 //! The blocklist, the saved allow rules and the model each have their own
-//! switch. The endpoint token is a secret and is not here: it lives in a file
+//! switch. Block entries and allow rules are for every node or for one node,
+//! a global block entry can be switched off for single nodes, and each node
+//! can set the blocklist and the model on or off for itself or follow the
+//! center's switch (the owner's decision of 2026-10-18). The endpoint token is a secret and is not here: it lives in a file
 //! of its own in the state folder (`checker-model.token`, mode 0600), as
 //! `state.json` holds no secrets.
+
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
@@ -30,6 +35,11 @@ pub struct CheckerConfig {
     /// The decision model's source and tuning.
     #[serde(default)]
     pub model: ModelConfig,
+    /// Each node's own blocklist and model switch, by node id. A node not in
+    /// here follows the center's switches, as every node did before there
+    /// were per-node settings.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub nodes: BTreeMap<String, NodeSettings>,
 }
 
 impl Default for CheckerConfig {
@@ -41,6 +51,7 @@ impl Default for CheckerConfig {
             blocklist: default_blocklist(),
             allow_rules: Vec::new(),
             model: ModelConfig::default(),
+            nodes: BTreeMap::new(),
         }
     }
 }
@@ -64,6 +75,14 @@ pub struct BlockEntry {
     /// carry one; the owner's entries may leave it empty.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
+    /// `None` for every node (every built-in, and every entry of a state
+    /// file from before per-node entries), else the node id it is for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node_id: Option<String>,
+    /// The nodes an entry for every node is switched off for, by id, while
+    /// it stays on for the others.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub off_for: Vec<String>,
 }
 
 impl BlockEntry {
@@ -73,8 +92,69 @@ impl BlockEntry {
             on: true,
             builtin: true,
             note: note.to_string(),
+            node_id: None,
+            off_for: Vec::new(),
         }
     }
+
+    /// Whether the entry is in force for a call to `node_id`: switched on,
+    /// for every node or this one, and not switched off for this one.
+    pub fn applies_to(&self, node_id: &str) -> bool {
+        self.on
+            && self.node_id.as_deref().is_none_or(|n| n == node_id)
+            && !self.off_for.iter().any(|n| n == node_id)
+    }
+}
+
+/// A node's own setting for the blocklist or the model: follow the center's
+/// switch (the default), or on or off for this node whatever the center's
+/// switch says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeSwitch {
+    #[default]
+    Inherit,
+    On,
+    Off,
+}
+
+/// Where a decision's entry, rule or switch came from: the center's own,
+/// for every node, or the node's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scope {
+    Global,
+    Node,
+}
+
+impl Scope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Scope::Global => "global",
+            Scope::Node => "node",
+        }
+    }
+}
+
+impl NodeSwitch {
+    /// The switch in force for a node, given the center's `global` switch,
+    /// and where it comes from.
+    pub fn resolve(self, global: bool) -> (bool, Scope) {
+        match self {
+            NodeSwitch::Inherit => (global, Scope::Global),
+            NodeSwitch::On => (true, Scope::Node),
+            NodeSwitch::Off => (false, Scope::Node),
+        }
+    }
+}
+
+/// One node's own settings. Taint stays a center-wide switch, and a node's
+/// model "on" uses the center's one model and its settings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct NodeSettings {
+    #[serde(default)]
+    pub blocklist: NodeSwitch,
+    #[serde(default)]
+    pub model: NodeSwitch,
 }
 
 /// A saved allow rule of the checker: the same `<scope>:<pattern>` syntax,
@@ -198,6 +278,26 @@ pub enum LocalModel {
 }
 
 impl CheckerConfig {
+    /// Whether the blocklist is on for `node_id`, and whether that is the
+    /// center's switch or the node's own.
+    pub fn blocklist_for(&self, node_id: &str) -> (bool, Scope) {
+        let own = self.nodes.get(node_id).map(|n| n.blocklist);
+        own.unwrap_or_default().resolve(self.blocklist_on)
+    }
+
+    /// Whether the model is on for `node_id`, and whether that is the
+    /// center's switch or the node's own.
+    pub fn model_for(&self, node_id: &str) -> (bool, Scope) {
+        let own = self.nodes.get(node_id).map(|n| n.model);
+        own.unwrap_or_default().resolve(self.model_on)
+    }
+
+    /// Whether any node has the model on, so the local model server has to
+    /// run: the center's switch, or a node that switched it on for itself.
+    pub fn model_wanted(&self) -> bool {
+        self.model_on || self.nodes.values().any(|n| n.model == NodeSwitch::On)
+    }
+
     /// What a finished one-click install sets: the model on, from the local
     /// source, on `gpu`. A switch to another model also takes that model's
     /// own default threshold and timeout; a reinstall of the same model keeps
@@ -625,6 +725,52 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A state file from before per-node settings reads as today: every
+    /// block entry and allow rule for all nodes, no exceptions, every node
+    /// following the center's switches. Saved again it gains no new fields.
+    #[test]
+    fn an_old_state_file_reads_as_every_entry_for_all_nodes() {
+        let old = r#"{"blocklist_on": true, "model_on": true,
+            "blocklist": [{"rule": "exec.run:rm -rf /", "on": true, "builtin": true}],
+            "allow_rules": [{"rule": "exec.run:make *"}]}"#;
+        let c: CheckerConfig = serde_json::from_str(old).unwrap();
+        assert!(c.nodes.is_empty());
+        assert_eq!(c.blocklist[0].node_id, None);
+        assert!(c.blocklist[0].off_for.is_empty());
+        assert!(c.blocklist[0].applies_to("any-node"));
+        assert_eq!(c.blocklist_for("any-node"), (true, Scope::Global));
+        assert_eq!(c.model_for("any-node"), (true, Scope::Global));
+        let saved = serde_json::to_string(&c).unwrap();
+        for field in ["nodes", "node_id", "off_for"] {
+            assert!(!saved.contains(field), "{field} in {saved}");
+        }
+        // The default (a fresh center) has none of them either.
+        let fresh = serde_json::to_string(&CheckerConfig::default()).unwrap();
+        assert!(!fresh.contains("off_for") && !fresh.contains("\"nodes\""));
+    }
+
+    /// The local model has to run when any node has it on, also with the
+    /// center's switch off.
+    #[test]
+    fn the_model_is_wanted_when_a_node_has_it_on() {
+        let mut c = CheckerConfig::default();
+        assert!(!c.model_wanted());
+        c.nodes.insert(
+            "n1".into(),
+            NodeSettings {
+                blocklist: NodeSwitch::Inherit,
+                model: NodeSwitch::On,
+            },
+        );
+        assert!(c.model_wanted());
+        assert_eq!(c.model_for("n1"), (true, Scope::Node));
+        assert_eq!(c.model_for("n2"), (false, Scope::Global));
+        assert_eq!(
+            serde_json::to_value(c.nodes["n1"]).unwrap(),
+            serde_json::json!({"blocklist": "inherit", "model": "on"})
+        );
+    }
 
     /// A state file from before the model choice reads as d1-3B, and the
     /// models have stable names on the wire.

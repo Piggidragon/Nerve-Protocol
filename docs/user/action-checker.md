@@ -29,7 +29,30 @@ it can pass on: that the center's action checker refused it, what did so, and
 that you can change it here.
 
 Each part has its own switch: the blocklist (on by default), the model (off by
-default) and taint (below). A change takes effect for the next call.
+default) and taint (below). A change takes effect for the next call. The
+blocklist and the model can also be set for one machine (see
+[Per machine](#per-machine)).
+
+## The lists, and a block anywhere wins
+
+A call meets the center's lists first, then the machine's own:
+
+| Where | List | For | Does |
+|---|---|---|---|
+| Center | Blocklist | every machine | A matching call is refused |
+| Center | Blocklist | one machine | A matching call to that machine is refused |
+| Center | Allow rules | every machine | A matching call skips the decision model |
+| Center | Allow rules | one machine | The same, for calls to that machine |
+| Center | Decision model | every machine | Refuses a call it judges dangerous |
+| Center | Decision model | one machine, on or off | The same, or not, for calls to that machine |
+| Machine | `deny` ([rules](rules.md)) | that machine | A matching call is refused |
+| Machine | `allow` | that machine | A matching call may run (in `allowlist` mode) |
+| Machine | `sudo` | that machine | A matching `sudo` command may run |
+
+**A block anywhere wins.** If the center allows a call but the machine denies
+it, it is refused; if the machine allows it but the center blocks it, it is
+refused. A center allow rule only skips the decision model: it never gets past
+a center blocklist entry or the machine's own policy.
 
 ## The blocklist
 
@@ -63,8 +86,10 @@ Entries are in the machine's own rule syntax, `<scope>:<pattern>`:
   that only looks for a word also refuses a commit message or a `grep` that
   mentions it: prefer a command pattern or `cmd-re:` where you can.
 
-You can add entries, remove them, switch single ones off, and reset the whole
-list to the built-in defaults. The defaults block truly dangerous things and
+You can add entries, for every machine or for one, remove them, switch single
+ones off (for every machine, or for one machine under
+[Per machine](#per-machine)), and reset the whole list to the built-in
+defaults. The defaults block truly dangerous things and
 leave ordinary work alone: `rm file`, `rm -rf ./build`, `rm -rf node_modules`,
 `docker ps`, `git push` and `kill <pid>` all stay allowed; wiping the root
 filesystem or a home folder, `mkfs`, `dd` to a disk, fork bombs,
@@ -127,6 +152,31 @@ half-analysed. Treat the blocklist as a safety net for an agent's obvious
 mistakes, not as a sandbox: the decision model and the machine's own policy are
 the next lines of defence.
 
+## Per machine
+
+The **Per machine** part of the page has a card for each paired machine. In it:
+
+- **Blocklist** and **Decision model**: *As the center* (the default, it
+  follows the switch at the top), *On for this machine* or *Off for this
+  machine*. The model on for one machine uses the center's one model and its
+  settings; there is no second model. Taint is always for every machine.
+- **Block entries for this machine only.** Add a rule that is refused on this
+  machine and nowhere else. The blocklist's own **Add** can do the same with
+  its **For** choice.
+- **Entries for every machine, switched off here.** Pick an entry of the
+  blocklist for every machine (a built-in one or your own) to switch it off for
+  this machine only; it stays on for the others. **Switch on again** undoes it.
+- **Allow rules for this machine only**, to remove; add them under Allow rules.
+
+A refusal says whether the entry or switch behind it was the one for every
+machine or this machine's own, and so does its line on the Audit page, so you
+know which one to change. A state from before these settings reads as it did:
+every entry for every machine, every machine following the center's switches.
+A machine that is no longer paired but still named in the settings is listed
+too, with **Forget its settings**. **Remove** of the local model also sets a
+machine that had the model on for itself back to *As the center*, so it does
+not refuse every call for want of a model.
+
 ## Allow rules
 
 Allow rules are the same syntax, saved for every machine or for one machine. A
@@ -135,7 +185,7 @@ not skip the blocklist: the blocklist is a hard deny, so to let something
 through that the blocklist caught, remove or switch off the blocklist entry.
 
 The Audit page has **Allow** and **Allow as wildcard** buttons on a model
-refusal, which save an allow rule for you.
+refusal, which save an allow rule for that machine for you.
 
 ## The decision model
 

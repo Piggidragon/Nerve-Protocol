@@ -1439,6 +1439,16 @@ dialog.dlg .foot {
   padding: 10px 12px;
 }
 
+.sub-head {
+  margin: 16px 0 6px;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+details.card > .body .form-row {
+  margin-top: 8px;
+}
+
 .card.entry .card-top {
   gap: 8px;
 }

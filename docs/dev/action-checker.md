@@ -267,7 +267,24 @@ scope applies. Switching taint off clears every mark.
 ## Settings and persistence
 
 `CheckerConfig` (`checker/config.rs`) is a field of the center's `Store`, so it
-is in `state.json` and in a backup. The endpoint token is a secret, so it is
+is in `state.json` and in a backup.
+
+Per node (owner's decision of 2026-10-18): a `BlockEntry` has a `node_id`
+(`None` for every node) and `off_for`, the node ids an entry for every node is
+switched off for (`BlockEntry::applies_to`); an `AllowRule` has its `node_id`
+as before. `CheckerConfig::nodes` maps a node id to `NodeSettings`, a
+`NodeSwitch` (`inherit`, `on`, `off`) for the blocklist and one for the model;
+`blocklist_for`/`model_for` resolve it against the center's switch and say
+which one it was (`Scope::Global` or `Scope::Node`). Every decision carries
+that scope: of the entry or allow rule that matched, else of the switch that
+had the blocklist or model on, in `Decision`, in the refusal text and in the
+audit marker (`checker: {layer, scope, detail}`). The local model runs while
+`model_wanted` (the center's switch, or any node's `on`); Remove sets a node's
+`on` back to `inherit`. All new fields default and are left out when empty, so
+an old `state.json` reads as before (every entry for every node, every node
+inheriting) and a fresh one looks as before. A block anywhere wins: a center
+allow rule only skips the model, and the node's policy decides after the
+center. The endpoint token is a secret, so it is
 **not** in `state.json` or the backup: it lives in `checker-model.token` and
 the owner re-enters it after a restore (as with the node's keyring secrets).
 The checker is rebuilt from the config on every change (`Center::rebuild_checker`);

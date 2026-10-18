@@ -22,7 +22,7 @@ use crate::checker::blocklist::Rule;
 use crate::checker::server::LocalServer;
 use crate::checker::{
     self, AllowRule, CallInfo, Checker, CheckerConfig, Decision, Endpoint, Layer, LocalModel,
-    ModelSource,
+    ModelSource, NodeSettings, NodeSwitch, Scope,
 };
 use crate::link::{Link, SHORT_CALL};
 use crate::pairing::{Codes, Outcome};
@@ -2192,14 +2192,19 @@ impl Center {
         match checker.check(&info, endpoint.as_ref()).await {
             Decision::Refuse {
                 layer,
+                scope,
                 detail,
                 message,
             } => {
-                self.audit_checker(sess, route, &target, "forbidden", layer, &detail);
+                self.audit_checker(sess, route, &target, "forbidden", layer, scope, &detail);
                 return Err(RpcError::forbidden(message).into());
             }
-            Decision::Allowed { layer, detail } => {
-                self.audit_checker(sess, route, &target, "allowed", layer, &detail);
+            Decision::Allowed {
+                layer,
+                scope,
+                detail,
+            } => {
+                self.audit_checker(sess, route, &target, "allowed", layer, scope, &detail);
             }
             Decision::Pass => {}
         }
@@ -2383,7 +2388,8 @@ impl Center {
     }
 
     /// Starts, stops or keeps the local llama-server to match `cfg`. It runs
-    /// only when the model is on, its source is local, and the one-click
+    /// only when the model is on (by the center's switch, or for a node by
+    /// its own), its source is local, and the one-click
     /// install put the build and the chosen model in place. Keyed by the
     /// CPU/GPU choice and the model, so an unrelated change does not restart
     /// it.
@@ -2392,7 +2398,7 @@ impl Center {
         // the check below and the start.
         let held = self.files_held.lock().unwrap();
         let installed = checker::install::installed(&self.dir, cfg.model.local_model);
-        let want = cfg.model_on && cfg.model.source == ModelSource::Local && installed;
+        let want = cfg.model_wanted() && cfg.model.source == ModelSource::Local && installed;
         // An install is swapping the files (or Remove deleting them): start
         // nothing from them now. The install rebuilds when it is done, and
         // the empty signature makes that start the server.
@@ -2515,9 +2521,19 @@ impl Center {
     /// with the chosen device. Refused while an install is already running.
     /// Validates a posted checker config and, if it holds, saves it. Taint
     /// switched off clears every session's mark.
-    pub fn apply_checker_config(&self, cfg: CheckerConfig) -> Result<(), String> {
-        for e in &cfg.blocklist {
+    pub fn apply_checker_config(&self, mut cfg: CheckerConfig) -> Result<(), String> {
+        for e in &mut cfg.blocklist {
             Rule::parse(&e.rule)?;
+            // An entry for one node is switched off as a whole; the
+            // exceptions are for an entry of every node.
+            if e.node_id.is_some() && !e.off_for.is_empty() {
+                return Err(format!(
+                    "the blocklist entry {} is for one node, so it cannot be switched off for single nodes; switch it off instead",
+                    e.rule
+                ));
+            }
+            e.off_for.sort();
+            e.off_for.dedup();
         }
         for a in &cfg.allow_rules {
             Rule::parse(&a.rule)?;
@@ -2531,6 +2547,9 @@ impl Center {
         if cfg.model.instructions.trim().is_empty() {
             return Err("the model question needs instructions".into());
         }
+        // A node that follows the center in both is the same as one with no
+        // settings: keep the state free of them.
+        cfg.nodes.retain(|_, n| *n != NodeSettings::default());
         let clear_taint = self.read(|s| s.checker.taint_on) && !cfg.taint_on;
         self.set_checker_config(cfg, clear_taint);
         Ok(())
@@ -2717,9 +2736,18 @@ impl Center {
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
         drop(held);
+        // The model is off everywhere then: also for a node that had it on
+        // by its own setting, which would otherwise refuse its every call
+        // with no model to ask (fail closed).
         self.update(|s| {
             if s.checker.model.source == ModelSource::Local {
                 s.checker.model_on = false;
+                for n in s.checker.nodes.values_mut() {
+                    if n.model == NodeSwitch::On {
+                        n.model = NodeSwitch::Inherit;
+                    }
+                }
+                s.checker.nodes.retain(|_, n| *n != NodeSettings::default());
             }
         });
         self.rebuild_checker();
@@ -2742,6 +2770,9 @@ impl Center {
     }
 
     /// Adds a checker audit entry (a center decision) to the feed and the log.
+    /// `scope` says whether the entry, rule or switch behind it was the
+    /// center's for every node or this node's own.
+    #[allow(clippy::too_many_arguments)]
     fn audit_checker(
         &self,
         sess: &Arc<Session>,
@@ -2749,6 +2780,7 @@ impl Center {
         target: &str,
         decision: &str,
         layer: Layer,
+        scope: Scope,
         detail: &str,
     ) {
         let node = self.node_name(&route.node_id);
@@ -2767,7 +2799,7 @@ impl Center {
         e.insert("node".into(), json!(node));
         e.insert(
             "checker".into(),
-            json!({"layer": layer.as_str(), "detail": detail}),
+            json!({"layer": layer.as_str(), "scope": scope.as_str(), "detail": detail}),
         );
         self.audit.lock().unwrap().push(Value::Object(e));
         self.changed(Change::Audit);
@@ -2780,10 +2812,14 @@ impl Center {
             level,
             Some(&route.node_id),
             format!(
-                "the action checker {verb} {}.{} by its {} ({detail})",
+                "the action checker {verb} {}.{} by its {} {} ({detail})",
                 route.cap,
                 route.action,
-                layer.as_str()
+                layer.as_str(),
+                match scope {
+                    Scope::Global => "for every node",
+                    Scope::Node => "for this node",
+                }
             ),
         );
     }
@@ -2963,6 +2999,79 @@ mod tests {
         assert_eq!(e.kind(), ErrorCode::Unavailable);
     }
 
+    /// A block entry for one node and a global entry switched off for
+    /// another: each node gets what the owner set for it, and the audit says
+    /// whether the entry was the global one or the node's. A posted config
+    /// with an exception on a one-node entry is refused, and nodes that only
+    /// inherit are not kept.
+    #[tokio::test]
+    async fn per_node_block_entries_are_audited_with_their_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = open(dir.path(), None);
+        c.update(|s| {
+            s.nodes.insert("n1".into(), node_record("n1", "linux"));
+            s.nodes.insert("n2".into(), node_record("n2", "linux"));
+        });
+        let mut cfg = c.read(|s| s.checker.clone());
+        let mut tf = cfg.blocklist[0].clone();
+        tf.rule = "exec.run:terraform destroy".into();
+        tf.builtin = false;
+        tf.node_id = Some("n1".into());
+        cfg.blocklist.push(tf.clone());
+        cfg.blocklist
+            .iter_mut()
+            .find(|e| e.rule == "exec.run:rm -rf /")
+            .unwrap()
+            .off_for = vec!["n2".into(), "n2".into()];
+        cfg.nodes.insert("n2".into(), NodeSettings::default());
+        // An exception on a one-node entry is refused as a whole.
+        let mut bad = cfg.clone();
+        bad.blocklist.last_mut().unwrap().off_for.push("n2".into());
+        assert!(c.apply_checker_config(bad).is_err());
+        c.apply_checker_config(cfg).unwrap();
+        let kept = c.read(|s| s.checker.clone());
+        assert!(kept.nodes.is_empty(), "{:?}", kept.nodes);
+        assert_eq!(
+            kept.blocklist
+                .iter()
+                .find(|e| e.rule == "exec.run:rm -rf /")
+                .unwrap()
+                .off_for,
+            ["n2"]
+        );
+        let sess = c.new_session("test");
+        let run = |node: &'static str, cmd: &'static str| {
+            let c = &c;
+            let sess = &sess;
+            async move {
+                let mut m = Map::new();
+                m.insert("command".into(), json!(cmd));
+                let CallError::Rpc(e) = c.call(sess, &exec_route(node), m).await.unwrap_err();
+                e
+            }
+        };
+        let e = run("n1", "terraform destroy").await;
+        assert_eq!(e.kind(), ErrorCode::Forbidden);
+        assert!(
+            e.message.contains("this node's own blocklist"),
+            "{}",
+            e.message
+        );
+        let last = c.audit().pop().unwrap();
+        assert_eq!(last["checker"]["scope"], "node");
+        assert_eq!(last["checker"]["detail"], "exec.run:terraform destroy");
+        let e = run("n1", "rm -rf /").await;
+        assert_eq!(e.kind(), ErrorCode::Forbidden);
+        assert_eq!(c.audit().pop().unwrap()["checker"]["scope"], "global");
+        // n2: no entry of its own, and `rm -rf /` switched off for it, so
+        // both reach the (offline) node.
+        assert_eq!(
+            run("n2", "terraform destroy").await.kind(),
+            ErrorCode::Unavailable
+        );
+        assert_eq!(run("n2", "rm -rf /").await.kind(), ErrorCode::Unavailable);
+    }
+
     /// A command line nested too deeply for the splitter is refused by the
     /// gate (fail closed), not passed to the node (review r1, finding 1).
     #[tokio::test]
@@ -3070,6 +3179,44 @@ mod tests {
         c.rebuild_checker();
         until("the model to be ready", || local_ready(&c)).await;
         c
+    }
+
+    /// The local model runs when only a node has the model on, and Remove
+    /// switches it off there too, so that node does not refuse every call
+    /// for want of a model.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_node_with_the_model_on_runs_the_local_model_until_remove() {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().unwrap();
+            install_fake_build(dir.path());
+            let c = open(dir.path(), None);
+            c.update(|s| {
+                s.checker.model_on = false;
+                s.checker.model.source = ModelSource::Local;
+                s.checker.nodes.insert(
+                    "n1".into(),
+                    NodeSettings {
+                        blocklist: NodeSwitch::Off,
+                        model: NodeSwitch::On,
+                    },
+                );
+            });
+            c.rebuild_checker();
+            until("the model to be ready", || local_ready(&c)).await;
+            c.remove_checker_model().await.unwrap();
+            assert!(c.local_model_status().is_none());
+            let n1 = c.read(|s| s.checker.nodes.get("n1").copied());
+            assert_eq!(
+                n1,
+                Some(NodeSettings {
+                    blocklist: NodeSwitch::Off,
+                    model: NodeSwitch::Inherit,
+                })
+            );
+        })
+        .await
+        .expect("the test did not finish within 60 s");
     }
 
     /// A config save that only toggles taint.

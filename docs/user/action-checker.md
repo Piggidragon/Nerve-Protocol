@@ -86,7 +86,9 @@ text generated, so a judgement is fast and cheap. There are two sources:
 - **A System One endpoint.** Give a URL (`https://` uses the system's root
   certificates), an optional bearer token and an optional model name
   (`jev-latest` for TypeSafe's hosted API). The token is a secret: it is kept
-  in a file of its own in the state folder and is never shown back.
+  in a file of its own in the state folder and is never shown back. It is a
+  secret, so it is **not** in a center backup (as `state.json` holds no
+  secrets); after a restore, enter the token again.
 - **A llama-server the center runs.** The center starts `llama-server` itself
   (from `PATH`, or a path you set — the center does not download llama.cpp; you
   need a build with the `/v1/systemone` endpoint). Give a model to download

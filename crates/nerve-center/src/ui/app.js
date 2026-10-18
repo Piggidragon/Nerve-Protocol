@@ -341,6 +341,9 @@ function sessionCard(s) {
   return el("div", { class: "card" },
     el("div", { class: "card-top" }, icon("plug"), el("span", { class: "name" }, s.client || "Unknown client"),
       pill("", s.transport),
+      // The action checker marks a session tainted once a call of it returned
+      // content (issue #17).
+      s.tainted ? pill("warn", "tainted") : null,
       el("span", { class: "push" }, btn("End", "danger", act(() => api("POST", "/api/sessions/end", { id: s.id }))))),
     el("p", { class: "meta" }, `Since ${ago(s.started_ms)}, ${plural(s.calls, "call")}`),
     s.nodes.length ? el("div", { class: "chips" }, s.nodes.map((n) => el("span", { class: "chip" }, n))) : null,

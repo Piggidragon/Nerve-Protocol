@@ -299,6 +299,7 @@ fn model_state(call: &CallInfo<'_>) -> Value {
 }
 
 #[cfg(test)]
+#[allow(clippy::field_reassign_with_default)]
 mod tests {
     use super::*;
     use serde_json::Map;

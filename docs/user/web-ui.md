@@ -37,7 +37,9 @@ ssh -L 7480:127.0.0.1:7480 user@center-host
   Disable or Enable, Remove.
 - **Pair a machine.** Makes a [pairing](pairing.md) command, address, code and
   pin.
-- **Sessions.** The harnesses connected now. **End** stops one session.
+- **Sessions.** The harnesses connected now, each marked `tainted` once the
+  [action checker](action-checker.md#taint) marked it. **End** stops one
+  session.
 - Alerts, for example a machine whose key is in use twice.
 
 A disabled machine stays paired and connected. The agent gets none of its tools
@@ -107,10 +109,12 @@ switch single entries off, reset to the defaults) with entries for every
 machine or one, keep allow rules for every machine or one, set the blocklist
 and the model on or off per machine and switch single entries off for one
 machine (**Per machine**), and set up the model (a System One endpoint, or a
-`llama-server` the center runs) with its threshold, timeout, question and
-which calls it sees. It shows the local model's state, and names the default
-model's licence. Taint, which marks a session once a call of it returned
-content, has its switch here too. Everything is kept in the center's state.
+local model the center installs with one click, d1-3B or Kev-4B) with its
+threshold, timeout, question and which calls it sees. It shows the install's
+progress and the local model's state, and names each model's size and
+licence. Taint, which marks a session once a call of it returned content, has
+its switch here too. Everything is kept in the center's state, except the
+endpoint token and the local model's files.
 
 ### Log
 

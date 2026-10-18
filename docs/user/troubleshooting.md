@@ -2,7 +2,9 @@
 
 Start with `nerve-node status`, `nerve-node center ls` and
 `nerve-node audit --denied` on the machine. The refusal in the audit log is
-the same text the agent saw.
+the same text the agent saw. A refusal that starts with `the center's action
+checker` comes from the center, not the machine, so it is not in the
+machine's audit log: see [below](#the-centers-action-checker-refuses-a-call).
 
 For a link that drops, a pairing that fails or an error, open the center's
 [log](logs.md), in the web UI under **Log** or in `log.jsonl`, and the node's
@@ -47,6 +49,45 @@ names its reason.
 
 The agent sees only the tools a machine could allow. If it sees only `nodes`,
 nothing is allowed yet.
+
+## The center's action checker refuses a call
+
+The [action checker](action-checker.md) runs on the center, before the
+machine gets the call. Its refusals are `forbidden` too, and start with
+`the center's action checker`. They are on the center's Audit page, marked as
+the checker's, and in its [log](logs.md); the machine never saw the call.
+Change them on the **Action checker** page of the web UI.
+
+| Message | Cause | Fix |
+|---|---|---|
+| `… refused this call: it is on the center's blocklist for every node — …` or `… on this node's own blocklist in the center — …` | A blocklist entry matches; the message names it. A center that ran 0.0.4 has the blocklist on from 0.0.5 on | If the call should run, switch the entry off (for this machine only or for every machine) or remove it. An allow rule does not get past the blocklist. **Per machine** switches the whole blocklist off for one machine |
+| `… refused this call: it nests more than 16 levels of …` or `… it holds more than 100000 commands, which is past what the checker takes apart …` | The command line is too deep or too long for the checker to read | Split the command, or switch the blocklist off |
+| `… decision model judged this call dangerous (score …, threshold …)` | The model scored the call at or above the threshold | On the Audit page, **Allow** or **Allow as wildcard** saves an allow rule for that machine. Or raise the threshold, or switch the model off |
+| `… could not reach its decision model, so it refused the call (fail closed): the model is not reachable` | The model is on, but the local model is not installed, still starting or failed, or no endpoint URL is set. After a center restart the local model refuses calls until it has loaded | See the model's state on the Action checker page and the Log. Install the local model, set the endpoint, or switch the model off |
+| `… (fail closed): the action checker's model cannot be reached: timed out after … ms` | The model took longer than its timeout. A small CPU is much slower than a desktop one | Raise the timeout, run the model on the GPU, use d1-3B instead of Kev-4B, or use an endpoint |
+| `… (fail closed): the action checker's model gave no usable answer: 401: the model endpoint refused the token` | The endpoint's token is wrong or missing. A backup does not hold it | Enter the token again |
+| `… gave no usable answer: 501: the loaded model is not a decision model …` | The endpoint serves a model that is not a System One model | Load a decision model there, or name one as the model |
+| `… gave no usable answer: 429: …` or `529: …` | The endpoint is rate-limiting or overloaded | Wait, or switch the model to allow-and-log |
+
+To let calls through while the model is down, switch it from fail closed to
+allow-and-log; each such call is then logged and on the Audit page.
+
+## The local model does not install or run
+
+The Action checker page shows `The last install failed: …`, and the center's
+log `the action checker's local model install failed: …`.
+
+| Message | Cause | Fix |
+|---|---|---|
+| `downloading …: …`, `no data for … s; the download stalled` | The center cannot reach GitHub or Hugging Face, or the connection stopped | Check the network. The center uses `HTTPS_PROXY` when it is set. Install again |
+| `the download does not match its pinned SHA-256`, `the download is … bytes, not the pinned …` | The file is not the one the center pins: a damaged download, or a proxy that changes files | Install again. Nothing unverified is used |
+| `cannot run tar: …`, `tar could not unpack the archive: …` | The center unpacks with the system `tar` | Install `tar` (and `gzip` on Linux); Windows 10 and later have it |
+| `This machine has no prebuilt local model for it.` (on the page, with no install button) | The center pins llama.cpp builds for Linux and Windows on x86_64 and arm64 only | Use a System One endpoint |
+| `no GPU device was found; running on the CPU` | The GPU build found no device. The installed center service on Linux sees no GPU | Keep it on the CPU, or use an endpoint on a machine with a GPU |
+| `the action checker cannot start its local model: …` in the log, or the model's state `failed` with its last lines of output | The installed server does not start | See its output on the page. **Remove** and install again |
+
+A failed install keeps the model installed before it, which goes on checking
+calls.
 
 ## Pairing fails
 

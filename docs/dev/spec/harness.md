@@ -121,11 +121,17 @@ its call on the node, and the cancelled request gets no response.
 
 ## 6. Refused calls
 
-The center holds no rule of its own and never holds a call back for a person.
-Every call goes to its node, whose policy decides: what no mode and no rule
-allows is refused at once with `error forbidden: <reasons>`, and nothing is
-run. The owner allows more on the node (`nerve-node rule add allow`, `mode set`, `folder
-add`) or, with the settings grant, from the audit tab.
+The center never holds a call back for a person. Its only gate is the action
+checker ([action-checker](../action-checker.md)): before a call is sent to its
+node, the center's blocklist, its saved allow rules and an optional decision
+model may refuse it, with `error forbidden: the center's action checker …`
+naming what refused it; such a call never reaches the node. The checker can
+only refuse, and a call it lets through goes to its node, whose policy
+decides: what no mode and no rule allows is refused at once with
+`error forbidden: <reasons>`, and nothing is run. The owner allows more on the
+node (`nerve-node rule add allow`, `mode set`, `folder add`) or, with the
+settings grant, from the audit tab; a checker refusal is changed on the
+center's action checker tab.
 
 ## 7. Web UI
 
@@ -143,7 +149,12 @@ usage and a short explanation; the center reads the list from the node's own
 CLI definition, `GET /api/help`, so it matches `nerve-node --help` of the
 same version), settings (center name, statistics retention, how long a
 pairing code is valid: 1 to 1440 minutes, 10 by default, harness tokens,
-per-node settings and the node's sudo switch). The sudo password is sealed in the browser for the
+per-node settings and the node's sudo switch), action checker (the
+blocklist, the allow rules, the decision model, taint and the per-node
+switches: `GET` and `POST /api/checker`, the endpoint token with
+`POST /api/checker/token`, which is never sent back, the local model with
+`POST /api/checker/install` and `/api/checker/remove`, and the audit tab's
+allow buttons on a model refusal with `POST /api/checker/allow`). The sudo password is sealed in the browser for the
 node's signed offer (protocol §7.4.1); the center checks the offer's
 signature against the paired node key, relays the sealed box
 (`POST /api/nodes/sudo/offer`, `POST /api/nodes/sudo`) and keeps no copy. The pages,
@@ -181,5 +192,9 @@ not offered.
 
 `<state>/tls.pem` (identity), `<state>/state.json` (center id and name, nodes
 with their public keys and last descriptors, hashed harness tokens, daily
-statistics: counts and timings, kept `retention_days`). It never
-stores file contents, command output, arguments or secrets.
+statistics: counts and timings, kept `retention_days`, the action checker's
+settings). For the action checker also `<state>/checker-model.token` (the
+model endpoint's bearer token, mode 0600) and `<state>/checker/` (the
+installed llama.cpp build and model). It never stores file contents, command
+output or arguments; the endpoint token is its one secret, and it is in no
+backup.

@@ -42,6 +42,24 @@ is run by hand on a Windows test machine with `cargo test -- --ignored`. The
 Windows job also skips by name the tests that fail on Windows today; the comment
 in the workflow says which and why, and the skip goes when the test is fixed.
 
+The action checker's tests that need a real model or download are
+`#[ignore]` too, and name what they need
+([action-checker](action-checker.md)):
+
+| Test | Needs | Does |
+|---|---|---|
+| `tests/local_install.rs` | `NERVE_TEST_D1_MODEL`, a local copy of the d1-3B GGUF; the network. `NERVE_TEST_TIMEOUT_MS` (8000 by default) for a slow machine | Downloads the pinned llama.cpp CPU build through the center, starts d1-3B with it and checks a call each way. The second test drives the center: install, switch to the GPU (only with `NERVE_TEST_GPU_SWITCH=1`), Remove |
+| `tests/local_model.rs` | `NERVE_TEST_MODEL` (a decision-model GGUF) and `NERVE_TEST_LLAMA` (a `llama-server` with `/v1/systemone`) | Starts the server through the checker's supervisor and checks a call each way |
+| `tests/checker_eval.rs` | `NERVE_CHECKER_ENDPOINT`, a System One endpoint; `NERVE_CHECKER_TOKEN`, `NERVE_CHECKER_MODEL` and `NERVE_CHECKER_TIMEOUT_MS` are optional | The evaluation: sends the cases of `tests/data/checker-eval.json` and prints, per threshold, how many dangerous and benign cases were refused and the latency |
+
+```sh
+NERVE_TEST_D1_MODEL=<d1-3B-Q4_K_M.gguf> \
+    cargo test -p nerve-center --test local_install -- --ignored --nocapture
+llama-server -m <model.gguf> -ngl 0 --host 127.0.0.1 --port 19931 &
+NERVE_CHECKER_ENDPOINT=http://127.0.0.1:19931 \
+    cargo test -p nerve-center --test checker_eval -- --ignored --nocapture
+```
+
 `cargo test` runs the unit tests, the integration tests and the
 [conformance suite](spec/conformance.md). The end-to-end tests, which
 start the real `nerve-center` and `nerve-node`, run on Unix. To run only the

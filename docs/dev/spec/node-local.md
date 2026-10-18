@@ -599,8 +599,7 @@ console from then on.
 
 `nerve-node proxy set <url> [--header "Name: value"]...` sets the proxy. The
 header values are secrets: the node keeps them in the system keyring
-(Keychain on macOS, Credential Manager on Windows, the Secret Service on
-Linux), in one entry per node under the service `nerve`, named
+(Credential Manager on Windows, the Secret Service on Linux), in one entry per node under the service `nerve`, named
 `proxy:<config folder>`. A user name and password in the URL
 (`http://user:password@host:port`) become a `Proxy-Authorization: Basic`
 header in the same entry. `node.toml` keeps only the URL without them and the

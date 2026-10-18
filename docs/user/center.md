@@ -107,7 +107,8 @@ second instance cannot attach and fails.
 `nerve-center backup <file>` writes `tls.pem` and `state.json` to one file
 that a passphrase protects; `nerve-center restore <file>` puts them back, on
 this machine or another. The nodes then find the same center by the same pin
-and need not pair again ([backup](backup.md)).
+and need not pair again ([backup](backup.md)). The action checker's settings
+come with `state.json`; its endpoint token and its local model do not.
 
 ## What the center keeps
 
@@ -116,10 +117,15 @@ In the state folder:
 | File | Holds |
 |---|---|
 | `tls.pem` | The center's key and certificate |
-| `state.json` | Center id and name, paired machines with their public keys and last descriptions, hashed harness tokens, daily statistics |
-| `log.jsonl` | The [log](logs.md): links, pairing, changes, refused and failed calls, errors. `log.jsonl.1` is the older half |
+| `tls.next.pem` | The new key, during the 7 days after a [key rotation](#rotate-the-key) |
+| `state.json` | Center id and name, paired machines with their public keys and last descriptions, hashed harness tokens, daily statistics, the settings of the [action checker](action-checker.md) |
+| `log.jsonl` | The [log](logs.md): links, pairing, changes, refused and failed calls, the action checker's decisions, errors. `log.jsonl.1` is the older half |
+| `checker-model.token` | The bearer token of the action checker's model endpoint, when you set one (mode 0600) |
+| `checker/` | The action checker's local model, when you installed it: the llama.cpp build and the model file, 1.7 or 3.0 GB |
 
-It never stores file contents, command output, arguments or secrets.
+It never stores file contents, command output or arguments. The one secret is
+the endpoint token, which is in a file of its own and not in a
+[backup](backup.md#the-center).
 
 ## Run it as a service
 
@@ -175,7 +181,7 @@ this machine while the service runs: the node port is taken.
 
 | What | Where |
 |---|---|
-| Identity and TLS key, paired machines, statistics, [log](logs.md), harness socket | `/var/lib/nerve-center` |
+| Identity and TLS key, paired machines, statistics, the [action checker](action-checker.md)'s settings and local model, [log](logs.md), harness socket | `/var/lib/nerve-center` |
 | Settings | `/etc/nerve-center/center.env` |
 | The program | `/usr/local/bin/nerve-center` |
 | The unit | `/etc/systemd/system/nerve-center.service` |
@@ -213,7 +219,8 @@ change how it is started.
 
 The service has no privilege: no capability, and no new privileges through
 a setuid program. It may write its state folder and nothing else on the
-machine, and sees no home folders and no shared memory (`/dev/shm`). The
+machine, and sees no home folders, no shared memory (`/dev/shm`) and no
+hardware devices, so the action checker's local model runs on the CPU there. The
 unit also keeps it from the kernel interfaces a center never needs: it may
 not make namespaces, open other sockets than IPv4, IPv6 and Unix ones, or
 make system calls outside systemd's `@system-service` set, and it cannot

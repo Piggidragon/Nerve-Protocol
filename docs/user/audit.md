@@ -84,6 +84,8 @@ was refused or failed is in both, in the log with its reason.
 
 ## In the web UI
 
-The Audit page lists the latest decisions of all machines, newest first. It
-keeps at most 500 decisions or 1 MiB, in memory. See
+The Audit page lists the latest decisions of all machines, newest first, and
+those of the center's [action checker](action-checker.md), which refuses some
+calls before a machine sees them; those are not in the machine's audit log.
+It keeps at most 500 decisions or 1 MiB, in memory. See
 [the web UI](web-ui.md#audit).

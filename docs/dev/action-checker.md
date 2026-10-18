@@ -37,8 +37,8 @@ a `Pass` into the call going on to the node. It checks first that the node is
 neither disabled nor offline: such a call is `unavailable` before the checker
 runs, so it costs no model call, a down model failing closed does not turn it
 into `forbidden`, and the checker audits nothing for it. Every center decision
-carries a `by: "action checker"` and a `checker: {layer, detail}` in the audit
-feed and the log.
+carries a `by: "action checker"` and a `checker: {layer, scope, detail}` in the
+audit feed, and a line in the log.
 
 ## The blocklist matcher
 
@@ -155,9 +155,8 @@ are in the user guide and the module comment.
 
 Decision models answer a typed question in one forward pass, no tokens
 generated. The de-facto API is TypeSafe's; `llama-server` serves the same since
-b11361 (llama.cpp PR #29818). The reference is
-`git -C <llama.cpp checkout> show 097cf33d9:tools/server/README.md`
-(POST /v1/systemone).
+b11361 (llama.cpp PR #29818). The reference is `tools/server/README.md` in
+llama.cpp at commit `097cf33d9` (POST /v1/systemone).
 
 The center sends:
 
@@ -270,7 +269,10 @@ scope applies. Switching taint off clears every mark.
 ## Settings and persistence
 
 `CheckerConfig` (`checker/config.rs`) is a field of the center's `Store`, so it
-is in `state.json` and in a backup.
+is in `state.json` and in a backup. `Store` does not refuse unknown fields, so
+a 0.0.4 center reads a 0.0.5 `state.json` and drops `checker` the next time it
+saves; a `state.json` without it reads as `CheckerConfig::default()`, with the
+blocklist and taint on and the model off.
 
 The blocklist in memory is the whole list in force; `state.json` keeps only the
 owner's part (`config::stored`): per built-in, by its stable `id`, what the
@@ -324,7 +326,7 @@ the client timeout for a slow model (e.g. Kev-4B on CPU); it is the runner
 only, not the product default.
 
 ```sh
-CUDA_VISIBLE_DEVICES= /path/to/llama-server \
+CUDA_VISIBLE_DEVICES= llama-server \
     -m <model.gguf> -ngl 0 --host 127.0.0.1 --port 19931 &
 NERVE_CHECKER_ENDPOINT=http://127.0.0.1:19931 \
     cargo test -p nerve-center --test checker_eval -- --ignored --nocapture

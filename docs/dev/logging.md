@@ -156,6 +156,15 @@ The calls are logged in `Center::call`, where a result is known:
 `call_outcome` in `nerve_transport::log` has the table, and the node uses the
 same one for the calls it answers.
 
+The action checker's decisions are logged in `Center::audit_checker`, beside
+their audit entry: a refusal at `warn` ("the action checker refused
+`<cap>.<action>` by its `<layer>` for every node|for this node (`<detail>`)"),
+before the call's own `info` line, and a call it let through at `info`
+("… allowed …"). The detail is the entry or allow rule, the score, or the
+model's error, never the command line. Its local model logs installs, removals
+and starts, and `warn` when one fails or the GPU build finds no device; a rule
+the checker cannot parse is a `warn` when it is rebuilt.
+
 Links are logged where the link task ends (`link.rs`), with the reason in
 words. The center keeps when each node's link last ended in memory (`down`),
 so the next link says how long the node was away. A link is closed after 45 s

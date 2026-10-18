@@ -83,6 +83,16 @@ error forbidden: no allow rule matches /etc/hostname
 The message says what is missing. The model can pass it on, and you add the
 rule on the machine ([rules](rules.md)).
 
+The center's [action checker](action-checker.md) can refuse a call before the
+machine gets it. That refusal is `forbidden` too, and says so:
+
+```
+error forbidden: the center's action checker refused this call: it is on the center's blocklist for every node — wipes the root filesystem (exec.run:rm -rf /). If the owner wants it run, they can switch this entry off for this node only or for every node (or remove it) in the center's web UI (Action checker); an allow rule does not get past the blocklist.
+```
+
+You change that on the center, not on the machine
+([troubleshooting](troubleshooting.md#the-centers-action-checker-refuses-a-call)).
+
 ## Sessions
 
 Each MCP connection is one session. The center tells the machines a session

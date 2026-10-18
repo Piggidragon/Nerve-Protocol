@@ -134,9 +134,16 @@ nerve-center restore ~/nerve-center.bak
 
 The backup holds `tls.pem` (the center's certificate and private key) and
 `state.json` (its id and name, the paired nodes with their public keys, the
-hashes of the harness tokens, the statistics). During the 7 days after a
+hashes of the harness tokens, the statistics, the settings of the
+[action checker](action-checker.md)). During the 7 days after a
 [key rotation](center.md#rotate-the-key) it also holds the new key,
 `tls.next.pem`, which the machines already trust. Not the [log](logs.md).
+
+Not the action checker's endpoint token (`checker-model.token`), which is a
+secret, and not its local model (the `checker/` folder), which is downloaded
+again. After a restore on another machine, enter the token again, or install
+the local model again (**Install on CPU** on the Action checker page): until
+then a model that is on refuses every call it sees (fail closed).
 
 Back up while it runs; the statistics may be a few seconds behind. Restore
 only when no center runs on the state folder (`--state-dir`): stop the harness

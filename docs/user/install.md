@@ -84,7 +84,7 @@ See [building](../dev/building.md).
 |---|---|---|---|
 | Node: `node.toml`, one key per center | `~/.config/nerve` | `%USERPROFILE%\.config\nerve` | `--config-dir`, `NERVE_CONFIG_DIR` |
 | Node: audit log, [log](logs.md), control socket and its token (Linux), config key, the last version of `node.toml`, the record of the folder grants (Windows) | `~/.local/state/nerve` | `%USERPROFILE%\.local\state\nerve` | `--state-dir`, `NERVE_STATE_DIR` |
-| Center: identity, paired machines, statistics, [log](logs.md) | `$XDG_STATE_HOME/nerve-center`, else `~/.local/state/nerve-center` | `%LOCALAPPDATA%\nerve-center` | `--state-dir`, `NERVE_STATE_DIR` |
+| Center: identity, paired machines, statistics, [log](logs.md), the [action checker](action-checker.md)'s settings and local model | `$XDG_STATE_HOME/nerve-center`, else `~/.local/state/nerve-center` | `%LOCALAPPDATA%\nerve-center` | `--state-dir`, `NERVE_STATE_DIR` |
 
 A node [installed as a service](service.md) keeps its files in `/etc/nerve`
 and `/var/lib/nerve/state`, on Windows in `C:\ProgramData\Nerve\config` and

@@ -141,14 +141,24 @@ group on Unix); its state and the install progress show in the UI. The endpoint
 token is the only secret and is not in a backup; the installed files are not in
 a backup either (they are re-downloaded).
 
-The download, hash check and unpacking are unit-tested against a loopback fake
-(`install::tests`). `tests/local_install.rs` is an `#[ignore]` end-to-end test
+The download, hash and length checks, the archive-entry scan, a failed
+reinstall keeping the old build, redirects, chunked bodies, the https→http rule
+and a stalled connection are unit-tested against loopback fakes
+(`install::tests`, `nerve_transport::download::tests`); the supervisor's start,
+ready and stop against a fake `llama-server` script (`server::tests`, Unix).
+`tests/local_install.rs` has two `#[ignore]` end-to-end tests. The first
 that does the real thing: it downloads the pinned CPU build of this platform
 through the center's downloader, unpacks it, starts d1-3B with it (from a local
 copy named by `NERVE_TEST_D1_MODEL`, so the 1.7 GB file is not fetched again)
 and checks a dangerous call is refused by its score and an ordinary one allowed.
 It passed on Linux x86_64 (`ubuntu-x64`, 17 968 546 bytes) and on the Windows
-test VM (`win-cpu-x64`, 19 662 517 bytes, unpacked by the system bsdtar).
+test VM (`win-cpu-x64`, 19 662 517 bytes, unpacked by the system bsdtar). The
+second drives the center itself: install on the CPU, wait for ready, switch to
+the GPU build while the model runs (`NERVE_TEST_GPU_SWITCH=1`, only on a machine
+whose GPUs may be used), then Remove while it runs. On the Windows VM (no usable
+GPU: `--list-devices` finds none) it switched, fell back to the CPU with a note,
+and removed every file while the server was running (2026-10-18); on Linux it
+ran without the GPU step.
 
 ## Taint
 

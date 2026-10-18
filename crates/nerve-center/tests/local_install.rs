@@ -120,3 +120,77 @@ async fn the_real_cpu_build_installs_and_runs_d1() {
     println!("git status -> {allowed:?} in {:?}", t.elapsed());
     assert!(matches!(allowed, Decision::Allowed { .. }), "{allowed:?}");
 }
+
+/// The center end to end with the real pinned build: install on the CPU, wait
+/// for the model to be ready, optionally switch to the GPU build while it runs
+/// (`NERVE_TEST_GPU_SWITCH=1`, for a machine whose GPUs may be used; on one
+/// without a device it must fall back to the CPU), then Remove while it runs.
+/// On Windows a running `llama-server.exe` holds its files, so Remove and the
+/// switch only work if the center stops it first (review r2, finding 1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "downloads the real pinned llama.cpp build; needs NERVE_TEST_D1_MODEL"]
+async fn the_center_installs_switches_and_removes_a_running_model() {
+    use nerve_center::center::{Center, Options};
+    let d1 = PathBuf::from(
+        std::env::var("NERVE_TEST_D1_MODEL").expect("set NERVE_TEST_D1_MODEL to the d1-3B GGUF"),
+    );
+    let state = tempfile::tempdir().unwrap();
+    let model = install::model_path(state.path(), LocalModel::D1_3b);
+    std::fs::create_dir_all(model.parent().unwrap()).unwrap();
+    if std::fs::hard_link(&d1, &model).is_err() {
+        std::fs::copy(&d1, &model).unwrap();
+    }
+    nerve_transport::init_crypto();
+    let c = Center::open(Options {
+        state_dir: state.path().to_path_buf(),
+        name: None,
+        public_url: "http://127.0.0.1:7443".into(),
+        log: None,
+        log_level: None,
+    })
+    .unwrap();
+    let wait_ready = |c: Center, what: &'static str| async move {
+        let deadline = Instant::now() + Duration::from_secs(600);
+        loop {
+            let inst = c.checker_install_status();
+            assert_ne!(inst.phase, InstallPhase::Failed, "{what}: {}", inst.message);
+            if let Some(s) = c.local_model_status() {
+                assert_ne!(s.phase, Phase::Failed, "{what}: {s:?}");
+                if s.phase == Phase::Ready {
+                    return;
+                }
+            }
+            assert!(Instant::now() < deadline, "{what}: never ready");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    };
+
+    c.start_checker_install(false, LocalModel::D1_3b)
+        .await
+        .unwrap();
+    wait_ready(c.clone(), "CPU install").await;
+    println!("installed and ready on the CPU");
+
+    if std::env::var("NERVE_TEST_GPU_SWITCH").is_ok() {
+        c.start_checker_install(true, LocalModel::D1_3b)
+            .await
+            .unwrap();
+        wait_ready(c.clone(), "GPU switch").await;
+        let gpu = c.read(|s| s.checker.model.local_gpu);
+        println!(
+            "switched while running; running on the {} ({})",
+            if gpu { "GPU" } else { "CPU" },
+            c.checker_install_status().message
+        );
+        assert_eq!(install::installed_variant(state.path()), Some(true));
+    }
+
+    // Remove while the model runs.
+    c.remove_checker_model()
+        .await
+        .expect("remove while running");
+    assert!(!state.path().join("checker").exists(), "files left behind");
+    assert!(!c.read(|s| s.checker.model_on));
+    assert!(c.local_model_status().is_none());
+    println!("removed while running");
+}

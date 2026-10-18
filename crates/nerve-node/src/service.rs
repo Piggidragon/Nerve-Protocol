@@ -1222,7 +1222,7 @@ async fn download(url: &str, max: usize) -> Result<Vec<u8>, String> {
 }
 
 /// The server and the request target (path and query) of an http(s) URL.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn split_url(url: &str) -> Result<(nerve_proto::link::CenterUrl, String), String> {
     nerve_transport::download::split_url(url)
 }

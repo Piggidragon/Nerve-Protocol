@@ -132,6 +132,12 @@ pub struct ModelConfig {
     /// or model file to set any more.
     #[serde(default)]
     pub local_gpu: bool,
+    /// Which model the one-click local mode installs and runs: d1-3B (the
+    /// default, faster on a CPU) or Kev-4B (catches more, slower). The pins
+    /// and each model's default threshold and timeout are in
+    /// [`crate::checker::install::model_pin`].
+    #[serde(default)]
+    pub local_model: LocalModel,
     // ---- Tuning ----
     /// At or above this the call is refused.
     #[serde(default = "default_threshold")]
@@ -164,6 +170,7 @@ impl Default for ModelConfig {
             endpoint_url: String::new(),
             endpoint_model: String::new(),
             local_gpu: false,
+            local_model: LocalModel::default(),
             threshold: default_threshold(),
             timeout_ms: default_timeout_ms(),
             scope: ModelScope::default(),
@@ -175,14 +182,41 @@ impl Default for ModelConfig {
     }
 }
 
-/// The default local model: Liquid AI's d1-3B (chosen by the evaluation in
-/// docs/dev/action-checker.md). The center installs it from Hugging Face
-/// ([`crate::checker::install`]). Its licence is the LFM Open License v1.0,
-/// not Apache; the UI and the docs name it.
-pub const DEFAULT_MODEL_NAME: &str = "LiquidAI d1-3B (Q4_K_M)";
-/// The licence of the default local model, named in the UI and the docs.
-pub const DEFAULT_MODEL_LICENCE: &str = "LFM Open License v1.0";
+/// The model the one-click local mode runs. Both are pinned in
+/// [`crate::checker::install`]; the evaluation in docs/dev/action-checker.md
+/// is why d1-3B is the default (it is about 2.5 times faster on a CPU) and
+/// when Kev-4B is the better pick (it catches more).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum LocalModel {
+    /// LiquidAI d1-3B, Q4_K_M. LFM Open License v1.0.
+    #[default]
+    #[serde(rename = "d1-3b")]
+    D1_3b,
+    /// ggml-org Kev-4B, Q4_K_M. Apache-2.0.
+    #[serde(rename = "kev-4b")]
+    Kev4b,
+}
 
+impl CheckerConfig {
+    /// What a finished one-click install sets: the model on, from the local
+    /// source, on `gpu`. A switch to another model also takes that model's
+    /// own default threshold and timeout; a reinstall of the same model keeps
+    /// the owner's.
+    pub fn local_installed(&mut self, gpu: bool, model: LocalModel) {
+        self.model_on = true;
+        self.model.source = ModelSource::Local;
+        self.model.local_gpu = gpu;
+        if self.model.local_model != model {
+            let pin = crate::checker::install::model_pin(model);
+            self.model.local_model = model;
+            self.model.threshold = pin.threshold;
+            self.model.timeout_ms = pin.timeout_ms;
+        }
+    }
+}
+
+/// The default threshold and timeout are d1-3B's (the default model); a
+/// switch to Kev-4B sets that model's own (`install::model_pin`).
 fn default_threshold() -> f64 {
     0.8
 }
@@ -380,4 +414,41 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
         b("fs.write:/etc/crontab", "the system cron table"),
         b("fs.write:/etc/cron.d/*", "a system cron job"),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A state file from before the model choice reads as d1-3B, and the
+    /// models have stable names on the wire.
+    #[test]
+    fn the_local_model_defaults_to_d1_and_has_stable_names() {
+        let old: ModelConfig = serde_json::from_str(r#"{"source": "local"}"#).unwrap();
+        assert_eq!(old.local_model, LocalModel::D1_3b);
+        assert_eq!(serde_json::to_value(LocalModel::Kev4b).unwrap(), "kev-4b");
+        assert_eq!(
+            serde_json::from_value::<LocalModel>("d1-3b".into()).unwrap(),
+            LocalModel::D1_3b
+        );
+    }
+
+    /// Switching to Kev-4B takes its own threshold and timeout; reinstalling
+    /// the same model (or switching the device) keeps what the owner set.
+    #[test]
+    fn a_model_switch_takes_that_models_defaults() {
+        let mut c = CheckerConfig::default();
+        c.local_installed(false, LocalModel::Kev4b);
+        assert!(c.model_on);
+        assert_eq!(c.model.source, ModelSource::Local);
+        assert_eq!(c.model.local_model, LocalModel::Kev4b);
+        assert_eq!(c.model.threshold, 0.5);
+        assert!(c.model.timeout_ms >= 10_000);
+        c.model.threshold = 0.6;
+        c.local_installed(true, LocalModel::Kev4b);
+        assert_eq!(c.model.threshold, 0.6, "the owner's threshold stays");
+        assert!(c.model.local_gpu);
+        c.local_installed(false, LocalModel::D1_3b);
+        assert_eq!((c.model.threshold, c.model.timeout_ms), (0.8, 4000));
+    }
 }

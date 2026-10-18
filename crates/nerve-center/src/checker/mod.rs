@@ -28,8 +28,7 @@ use serde_json::{Value, json};
 use nerve_proto::Effect;
 
 pub use config::{
-    AllowRule, BlockEntry, CheckerConfig, DEFAULT_MODEL_LICENCE, DEFAULT_MODEL_NAME, ModelConfig,
-    ModelScope, ModelSource,
+    AllowRule, BlockEntry, CheckerConfig, LocalModel, ModelConfig, ModelScope, ModelSource,
 };
 pub use model::Endpoint;
 

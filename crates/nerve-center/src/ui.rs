@@ -418,7 +418,14 @@ impl Ui {
             }
             ("POST", "/api/checker/install") => {
                 let gpu = b.get("gpu").and_then(Value::as_bool) == Some(true);
-                c.start_checker_install(gpu).map(|_| json!({})).map_err(bad)
+                let model = match b.get("model") {
+                    None | Some(Value::Null) => c.read(|st| st.checker.model.local_model),
+                    Some(v) => serde_json::from_value(v.clone())
+                        .map_err(|_| bad("the model is d1-3b or kev-4b"))?,
+                };
+                c.start_checker_install(gpu, model)
+                    .map(|_| json!({}))
+                    .map_err(bad)
             }
             ("POST", "/api/checker/remove") => {
                 c.remove_checker_model().map(|_| json!({})).map_err(bad)

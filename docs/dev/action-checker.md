@@ -98,7 +98,7 @@ the center installs and supervises.
 The local model is one-click (`checker/install.rs`, addendum 2026-10-18). The
 center downloads a prebuilt `llama-server` from llama.cpp's GitHub release
 (tag and per-asset SHA-256 pinned in `install::llama_asset`; the Vulkan build
-for GPU) and the pinned d1-3B GGUF from Hugging Face into
+for GPU) and the chosen pinned GGUF from Hugging Face into
 `<state>/checker/llama/<tag>/` and `<state>/checker/model/` — never
 system-wide. Each download streams to disk, is checked against its pinned
 SHA-256 (and the model against its pinned length), and renames into place, so a
@@ -106,13 +106,31 @@ half download never counts as installed; the archive is unpacked with the
 system `tar` after a scan that refuses any entry that would escape the target.
 `gpu_hint` (libvulkan + a render node, or `vulkan-1.dll`) decides whether to
 offer GPU before anything is downloaded; the GPU build's `--list-devices` is the
-real check (it never loads a model). There is no model/path/build to choose — it
-is d1-3B only. The supervisor (`checker/server.rs`) runs the installed binary
+real check (it never loads a model). There is no path or build to choose; the
+model is one of the two pinned in `install::MODELS` (`ModelConfig::local_model`,
+d1-3B by default), independent of the device. Each pin carries its repo,
+revision, file, size, SHA-256, licence, and the evaluation's default threshold
+and timeout (d1-3B 0.8 / 4 s, Kev-4B 0.5 / 15 s); a model switch
+(`CheckerConfig::local_installed`) downloads the other file, deletes the first,
+and takes that model's defaults, while a reinstall of the same model keeps the
+owner's. The model client waits up to the checker's own timeout for an answer
+(`http::read_client_response` takes it), not the transport's fixed 15 s head
+timeout, so a slow model on a small CPU is not cut short. The supervisor
+(`checker/server.rs`) runs the installed binary
 with `-m <model>` and `-ngl 0` (CPU) or `-ngl 999` (GPU), on a free loopback
 port, restarted with backoff, ended with the center (`kill_on_drop`, a process
 group on Unix); its state and the install progress show in the UI. The endpoint
 token is the only secret and is not in a backup; the installed files are not in
 a backup either (they are re-downloaded).
+
+The download, hash check and unpacking are unit-tested against a loopback fake
+(`install::tests`). `tests/local_install.rs` is an `#[ignore]` end-to-end test
+that does the real thing: it downloads the pinned CPU build of this platform
+through the center's downloader, unpacks it, starts d1-3B with it (from a local
+copy named by `NERVE_TEST_D1_MODEL`, so the 1.7 GB file is not fetched again)
+and checks a dangerous call is refused by its score and an ordinary one allowed.
+It passed on Linux x86_64 (`ubuntu-x64`, 17 968 546 bytes) and on the Windows
+test VM (`win-cpu-x64`, 19 662 517 bytes, unpacked by the system bsdtar).
 
 ## Taint
 
@@ -179,11 +197,21 @@ default stays 4 s for d1-3B) it is too slow to sit in front of every call. It
 is the pick on a machine with a GPU or much more CPU; on this CPU d1-3B's 1.7 s
 wins.
 
-**The default is LiquidAI d1-3B** (Q4_K_M) at a threshold of **0.8**: the best
-catch rate among the models that stay under about 2–3 % benign refusals, at an
-acceptable ~1.7 s on the CPU, and the best on the injection cases. The owner
-expected d1-3B to win, and it does. Its licence is the **LFM Open License
-v1.0** (not Apache), named in the UI and the user guide.
+**The default is LiquidAI d1-3B** (Q4_K_M) at a threshold of **0.8**, for one
+reason: speed on a CPU. At ~1.7 s per call it can sit in front of every
+execute/write call; Kev-4B takes ~4–5 s. On quality d1-3B is **not** the best:
+Kev-4B catches more dangerous actions (78.5 % vs 60.2 %) and far more injection
+attempts (93 % vs 67 %) at fewer benign refusals (1.7 % vs 2.5 %). **Pick
+Kev-4B** when catching more matters more than a few seconds per call, or on a
+machine with a GPU, where its latency drops; it is the second model of the
+one-click local mode (Apache-2.0), with its own default threshold of 0.5 and a
+15 s timeout. d1-3B's licence is the **LFM Open License v1.0** (not Apache);
+both licences are named in the UI and the user guide.
+
+On a small CPU both are slower: on the 4-vCPU Windows test VM d1-3B took about
+35 s per call (the real one-click install with the pinned `win-cpu-x64` build,
+2026-10-18). There the default 4 s timeout fails closed on every call; raise the
+timeout, use a GPU, or use an endpoint.
 
 The model does not stand alone: the deterministic blocklist already refuses the
 obvious dangerous commands (so many of the "missed" dangerous cases above are

@@ -87,14 +87,14 @@ pub async fn ask(endpoint: &Endpoint, cfg: &ModelConfig, state: Value) -> Result
         body["model"] = json!(m);
     }
     let timeout = Duration::from_millis(cfg.timeout_ms.max(100));
-    let value = tokio::time::timeout(timeout, request(endpoint, &body))
+    let value = tokio::time::timeout(timeout, request(endpoint, &body, timeout))
         .await
         .map_err(|_| ModelError::Unreachable(format!("timed out after {} ms", cfg.timeout_ms)))??;
     parse_noul(&value)
 }
 
 /// Sends one request and returns its JSON body, mapping HTTP errors.
-async fn request(endpoint: &Endpoint, body: &Value) -> Result<Value, ModelError> {
+async fn request(endpoint: &Endpoint, body: &Value, wait: Duration) -> Result<Value, ModelError> {
     let url = &endpoint.url;
     let proxy = if url.tls {
         nerve_transport::net::Proxy::from_env(&url.host).map_err(ModelError::Unreachable)?
@@ -110,7 +110,10 @@ async fn request(endpoint: &Endpoint, body: &Value) -> Result<Value, ModelError>
     io.write_all(req.as_bytes())
         .await
         .map_err(|e| ModelError::Unreachable(e.to_string()))?;
-    let resp = nerve_transport::http::read_client_response(&mut io, MAX_BODY)
+    // The model may think longer than the transport's usual head timeout (a
+    // 4B model on a small CPU); the caller's own timeout around this call is
+    // the limit, so this read does not cut it short at 15 s.
+    let resp = nerve_transport::http::read_client_response(&mut io, MAX_BODY, wait)
         .await
         .map_err(ModelError::Unreachable)?;
     match resp.status {
@@ -201,6 +204,39 @@ pub async fn is_decision_model(endpoint: &Endpoint) -> Result<bool, ModelError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A model that thinks longer than the transport's usual 15 s head
+    /// timeout is still read when the checker's own timeout allows it (a
+    /// 4B model, or d1-3B on a small VM CPU, can take that long). Found on the
+    /// Windows test VM, where every call was cut at 15 s.
+    #[tokio::test]
+    async fn a_slow_model_is_waited_for_up_to_the_checkers_timeout() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut c, _)) = listener.accept() {
+                let mut buf = [0u8; 8192];
+                let _ = c.read(&mut buf);
+                std::thread::sleep(Duration::from_secs(16));
+                let body = r#"{"answers":{"danger":{"type":"noul","noul":0.9}}}"#;
+                let _ = write!(
+                    c,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let ep = Endpoint::parse(&format!("http://127.0.0.1:{port}"), None, None).unwrap();
+        let cfg = ModelConfig {
+            timeout_ms: 25_000,
+            ..Default::default()
+        };
+        let score = ask(&ep, &cfg, json!({"command": "rm -rf /"}))
+            .await
+            .unwrap();
+        assert_eq!(score, 0.9);
+    }
 
     #[test]
     fn a_noul_answer_is_read() {

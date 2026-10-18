@@ -97,22 +97,39 @@ text generated, so a judgement is fast and cheap. There are two sources:
   in a file of its own in the state folder and is never shown back. It is a
   secret, so it is **not** in a center backup (as `state.json` holds no
   secrets); after a restore, enter the token again.
-- **A local model the center installs for you.** Press **Install on CPU** (or
-  **Install on GPU**, offered when the machine has a GPU). The center downloads
-  a prebuilt `llama-server` from llama.cpp's GitHub release and the **LiquidAI
-  d1-3B** model from Hugging Face into its own state folder — never
+- **A local model the center installs for you.** Pick the model, then press
+  **Install on CPU** (or **Install on GPU**, offered when the machine has a
+  GPU). The center downloads a prebuilt `llama-server` from llama.cpp's GitHub
+  release and the model from Hugging Face into its own state folder — never
   system-wide — checks each against a pinned SHA-256, unpacks it, and runs it on
-  loopback. There is no model, path or build to choose: it is d1-3B only (for
-  another model or your own llama.cpp, use the endpoint source). GPU uses the
-  Vulkan build (NVIDIA, AMD or Intel); if it cannot start, the page says so and
-  you switch to CPU with one click. The page shows a progress bar for the
-  download, then the server's state (starting, ready or failed) with the last
-  lines of its output. **Remove** deletes the downloaded files. A machine with
-  no prebuilt model for it says so and points you to the endpoint source.
+  loopback. GPU uses the Vulkan build (NVIDIA, AMD or Intel); if it cannot
+  start, the page says so and you switch to CPU with one click. The page shows a
+  progress bar for the download, then the server's state (starting, ready or
+  failed) with the last lines of its output. **Remove** deletes the downloaded
+  files. A machine with no prebuilt build for it says so and points you to the
+  endpoint source; for any other model, or your own llama.cpp, use the endpoint
+  source too.
 
-The local model is **LiquidAI d1-3B** (Q4_K_M). Its licence is the **LFM Open
-License v1.0**, not Apache; it is named next to the install button — check it
-suits you before you install.
+There are two local models; the page shows each one's size, licence, speed and
+quality in one line:
+
+| Model | Size | Licence | On a desktop CPU |
+|---|---|---|---|
+| **LiquidAI d1-3B** (the default) | 1.7 GB | LFM Open License v1.0 (not Apache) | Faster: about 1.7 s per call. Catches about 60 % of dangerous actions and 67 % of injection attempts, refuses about 2.5 % of ordinary work |
+| **Kev-4B** (ggml-org) | 3.0 GB | Apache-2.0 | Catches more: about 79 % of dangerous actions and 93 % of injection attempts, refuses about 1.7 % of ordinary work, but about 4 to 5 s per call |
+
+Pick d1-3B when the checker should stay quick on a CPU, Kev-4B when catching
+more matters more than a few seconds per call, or when the machine has a GPU.
+Switching the model downloads the other one and removes the first. Each model
+comes with its own default threshold and timeout (d1-3B 0.8 and 4 s, Kev-4B 0.5
+and 15 s, so Kev-4B's normal calls are not cut off); a switch sets them, and you
+can change them afterwards. Check that a model's licence suits you before you
+install it.
+
+The speeds above are for a desktop CPU. A small machine is much slower (d1-3B
+took about 35 s per call on a 4-core virtual machine); there, raise the timeout,
+use the GPU, or use an endpoint, or the checker refuses every call it cannot
+judge in time.
 
 **Settings:**
 
@@ -120,7 +137,7 @@ suits you before you install.
   call (reads are not sent). You can add reads, or have it see only the calls
   of a tainted session (see below).
 - **Threshold.** At or above this probability the call is refused. The default
-  is tuned so ordinary work is almost never refused.
+  (per model, see above) is tuned so ordinary work is almost never refused.
 - **Timeout**, and what to do on an error or a timeout: **fail closed** (refuse
   the call, the default and the safe choice) or allow-and-log.
 - **The question.** The instructions and the true/false criteria the model is

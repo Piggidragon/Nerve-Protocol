@@ -6,10 +6,11 @@
 //! folder — never system-wide — verifies each against a pinned SHA-256,
 //! unpacks the archive with the system `tar` (refusing any entry that would
 //! leave the target folder), and runs `llama-server -m <model>` on the CPU or,
-//! with the Vulkan build, the GPU. There is no model choice: it is d1-3B only
-//! (the endpoint mode is for another model or another llama.cpp).
+//! with the Vulkan build, the GPU. The model is one of two pinned ones,
+//! d1-3B (the default) or Kev-4B, whatever the device; the endpoint mode is
+//! for any other model or another llama.cpp.
 //!
-//! Everything is pinned in code (the release tag, each asset's hash, and the
+//! Everything is pinned in code (the release tag, each asset's hash, and each
 //! model's repo/revision/file/size/hash), so an install fetches exactly the
 //! bytes verified on 2026-10-18 or fails.
 
@@ -22,23 +23,87 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use nerve_proto::link::CenterUrl;
 
+use super::config::LocalModel;
+
 /// The pinned llama.cpp release.
 pub const LLAMA_TAG: &str = "b11719";
 const LLAMA_BASE: &str = "https://github.com/ggml-org/llama.cpp/releases/download";
 
-/// The pinned d1-3B model on Hugging Face.
-const MODEL_REPO: &str = "LiquidAI/d1-3B-GGUF";
-const MODEL_REVISION: &str = "bb1e436ea78eb96a3f1acb6da865f70c2fbeb563";
-const MODEL_FILE: &str = "d1-3B-Q4_K_M.gguf";
-const MODEL_LEN: u64 = 1_674_456_672;
-const MODEL_SHA: &str = "16aff27ea2eefdc32b9897f43854a5d3170c1dc8dccb9c756905af30a4e22402";
+/// One pinned model: where it comes from, what it is, and the defaults the
+/// evaluation (docs/dev/action-checker.md) gives it.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ModelPin {
+    pub id: LocalModel,
+    pub name: &'static str,
+    #[serde(skip)]
+    repo: &'static str,
+    #[serde(skip)]
+    revision: &'static str,
+    #[serde(skip)]
+    pub file: &'static str,
+    pub bytes: u64,
+    #[serde(skip)]
+    sha256: &'static str,
+    pub licence: &'static str,
+    /// The default threshold from the evaluation.
+    pub threshold: f64,
+    /// A timeout its normal calls on a CPU stay well inside.
+    pub timeout_ms: u64,
+    /// One plain line on speed and quality, for the UI.
+    pub summary: &'static str,
+}
+
+/// The two models the local mode offers, the default first.
+pub const MODELS: [ModelPin; 2] = [
+    ModelPin {
+        id: LocalModel::D1_3b,
+        name: "LiquidAI d1-3B (Q4_K_M)",
+        repo: "LiquidAI/d1-3B-GGUF",
+        revision: "bb1e436ea78eb96a3f1acb6da865f70c2fbeb563",
+        file: "d1-3B-Q4_K_M.gguf",
+        bytes: 1_674_456_672,
+        sha256: "16aff27ea2eefdc32b9897f43854a5d3170c1dc8dccb9c756905af30a4e22402",
+        licence: "LFM Open License v1.0",
+        threshold: 0.8,
+        timeout_ms: 4000,
+        summary: "Faster: about 1.7 s per call on a desktop CPU. Catches about 60 % of dangerous actions and 67 % of injection attempts; refuses about 2.5 % of ordinary work.",
+    },
+    ModelPin {
+        id: LocalModel::Kev4b,
+        name: "ggml-org Kev-4B (Q4_K_M)",
+        repo: "ggml-org/Kev-4B-GGUF",
+        revision: "d924f2e2c3872da8b8aaf3eb4453b4126deceb79",
+        file: "Kev-4B-Q4_K_M.gguf",
+        bytes: 3_033_489_824,
+        sha256: "33ae6b18926502b2209a1bf7d3b61a350d65938441515c686bb87d226a19eff9",
+        licence: "Apache-2.0",
+        threshold: 0.5,
+        // p95 was 5.2 s on the test CPU; leave room for a busy machine.
+        timeout_ms: 15_000,
+        summary: "Catches more: about 79 % of dangerous actions and 93 % of injection attempts, refusing about 1.7 % of ordinary work, but about 4 to 5 s per call on a desktop CPU.",
+    },
+];
+
+/// The pin of `model`.
+pub fn model_pin(model: LocalModel) -> &'static ModelPin {
+    MODELS
+        .iter()
+        .find(|m| m.id == model)
+        .expect("every LocalModel has a pin")
+}
 
 /// The llama.cpp asset and its SHA-256 for this platform and CPU/GPU choice,
 /// or `None` when there is no pinned asset for it (the UI then points to the
 /// endpoint mode). GPU is the Vulkan build (NVIDIA, AMD, Intel); macOS uses
 /// the Metal build that is built into the arm64 archive for both.
 pub fn llama_asset(gpu: bool) -> Option<(&'static str, &'static str)> {
-    match (std::env::consts::OS, std::env::consts::ARCH, gpu) {
+    asset_for(std::env::consts::OS, std::env::consts::ARCH, gpu)
+}
+
+/// [`llama_asset`] for a given OS and architecture (as `std::env::consts`
+/// names them), so every platform's pin can be tested on any one.
+fn asset_for(os: &str, arch: &str, gpu: bool) -> Option<(&'static str, &'static str)> {
+    match (os, arch, gpu) {
         ("linux", "x86_64", false) => Some((
             "llama-b11719-bin-ubuntu-x64.tar.gz",
             "2c50edd1422cdc686a1620923a7dda9a33634509566d2821155fb3d4879510a3",
@@ -60,8 +125,22 @@ pub fn llama_asset(gpu: bool) -> Option<(&'static str, &'static str)> {
             "llama-b11719-bin-macos-arm64.tar.gz",
             "076a2b0d15253078b90bd520a82dc2edc6c17657968878876ba3def3e80f54ba",
         )),
-        // arm64 Linux/Windows assets exist but their digests are not pinned
-        // here yet; until they are, those platforms use the endpoint mode.
+        ("linux", "aarch64", false) => Some((
+            "llama-b11719-bin-ubuntu-arm64.tar.gz",
+            "290aa4432ad8e28b638285be6a75d0dd6f327d9b2d95f7048a8cf5e69704bee9",
+        )),
+        ("linux", "aarch64", true) => Some((
+            "llama-b11719-bin-ubuntu-vulkan-arm64.tar.gz",
+            "ec2b1e886192c9e1e686e4a5a4d95079f75b98966274264e7bf6e2e13a063185",
+        )),
+        ("windows", "aarch64", false) => Some((
+            "llama-b11719-bin-win-cpu-arm64.zip",
+            "bb066fea4e7b396560704f05f227aa39057a27ae17aca604f1ef3d1b6503a1a3",
+        )),
+        ("windows", "aarch64", true) => Some((
+            "llama-b11719-bin-win-vulkan-arm64.zip",
+            "69bd6da42725771831c3271d2198ebb71e9531282a755edb24917b9d81b1555e",
+        )),
         _ => None,
     }
 }
@@ -82,9 +161,22 @@ pub fn llama_dir(state: &Path) -> PathBuf {
     checker_dir(state).join("llama").join(LLAMA_TAG)
 }
 
-/// The model file's path.
-pub fn model_path(state: &Path) -> PathBuf {
-    checker_dir(state).join("model").join(MODEL_FILE)
+fn model_dir(state: &Path) -> PathBuf {
+    checker_dir(state).join("model")
+}
+
+/// The path of `model`'s file.
+pub fn model_path(state: &Path, model: LocalModel) -> PathBuf {
+    model_dir(state).join(model_pin(model).file)
+}
+
+/// The models whose file is in place.
+pub fn installed_models(state: &Path) -> Vec<LocalModel> {
+    MODELS
+        .iter()
+        .filter(|m| model_path(state, m.id).exists())
+        .map(|m| m.id)
+        .collect()
 }
 
 /// The `llama-server` binary inside the unpacked build, wherever the archive
@@ -98,10 +190,10 @@ pub fn server_bin(state: &Path) -> Option<PathBuf> {
     find_file(&llama_dir(state), want)
 }
 
-/// Whether the local model is installed: the server binary and the model file
-/// are both in place.
-pub fn installed(state: &Path) -> bool {
-    server_bin(state).is_some() && model_path(state).exists()
+/// Whether `model` is installed: the server binary and its file are both in
+/// place.
+pub fn installed(state: &Path, model: LocalModel) -> bool {
+    server_bin(state).is_some() && model_path(state, model).exists()
 }
 
 /// The device the installed build is for (`Some(true)` = GPU/Vulkan,
@@ -156,6 +248,8 @@ pub struct Status {
     pub model: Progress,
     /// The CPU/GPU choice this install is for.
     pub gpu: bool,
+    /// The model this install is for.
+    pub model_id: LocalModel,
 }
 
 /// A handle the center keeps while an install runs.
@@ -168,15 +262,21 @@ fn set(shared: &Shared, f: impl FnOnce(&mut Status)) {
 /// Downloads and verifies llama.cpp and the model into `state`, reporting
 /// progress through `shared`. Idempotent: a build or model already present and
 /// valid is not fetched again.
-pub async fn install(state: PathBuf, gpu: bool, shared: Shared) -> Result<(), String> {
+pub async fn install(
+    state: PathBuf,
+    gpu: bool,
+    model: LocalModel,
+    shared: Shared,
+) -> Result<(), String> {
     set(&shared, |s| {
         *s = Status {
             phase: Phase::Downloading,
             gpu,
+            model_id: model,
             ..Default::default()
         };
     });
-    let r = install_inner(&state, gpu, &shared).await;
+    let r = install_inner(&state, gpu, model, &shared).await;
     set(&shared, |s| match &r {
         Ok(()) => s.phase = Phase::Done,
         Err(e) => {
@@ -187,7 +287,12 @@ pub async fn install(state: PathBuf, gpu: bool, shared: Shared) -> Result<(), St
     r
 }
 
-async fn install_inner(state: &Path, gpu: bool, shared: &Shared) -> Result<(), String> {
+async fn install_inner(
+    state: &Path,
+    gpu: bool,
+    model_id: LocalModel,
+    shared: &Shared,
+) -> Result<(), String> {
     let (asset, sha) =
         llama_asset(gpu).ok_or("this platform has no pinned local build; use the endpoint mode")?;
     // 1. llama.cpp, unless the right build (CPU vs GPU) is already unpacked.
@@ -219,35 +324,43 @@ async fn install_inner(state: &Path, gpu: bool, shared: &Shared) -> Result<(), S
             s.llama = Progress { done: 1, total: 1 };
         });
     }
-    // 2. The model, unless it is already there with the right hash.
-    let model = model_path(state);
-    let have = model.metadata().map(|m| m.len()).unwrap_or(0) == MODEL_LEN
-        && sha256_file(&model).as_deref() == Ok(MODEL_SHA);
+    // 2. The model, unless it is already there with the right hash. Only one
+    // model is kept: switching to the other one deletes the first, so a
+    // switch does not leave gigabytes behind.
+    let pin = model_pin(model_id);
+    let model = model_path(state, model_id);
+    set(shared, |s| s.phase = Phase::Verifying);
+    let have = model.metadata().map(|m| m.len()).unwrap_or(0) == pin.bytes
+        && sha256_file(&model).as_deref() == Ok(pin.sha256);
     if !have {
         set(shared, |s| s.phase = Phase::Downloading);
-        create_dir(model.parent().unwrap())?;
-        let url =
-            format!("https://huggingface.co/{MODEL_REPO}/resolve/{MODEL_REVISION}/{MODEL_FILE}");
+        create_dir(&model_dir(state))?;
+        let url = format!(
+            "https://huggingface.co/{}/resolve/{}/{}",
+            pin.repo, pin.revision, pin.file
+        );
         fetch_to_file(
             &url,
             &model,
-            Some(MODEL_SHA),
-            Some(MODEL_LEN),
+            Some(pin.sha256),
+            Some(pin.bytes),
             &mut |done, total| {
                 set(shared, |s| s.model = Progress { done, total });
             },
         )
         .await
-        .map_err(|e| format!("downloading the model: {e}"))?;
+        .map_err(|e| format!("downloading {}: {e}", pin.name))?;
     } else {
         set(shared, |s| {
             s.model = Progress {
-                done: MODEL_LEN,
-                total: MODEL_LEN,
+                done: pin.bytes,
+                total: pin.bytes,
             };
         });
     }
-    set(shared, |s| s.phase = Phase::Verifying);
+    for other in MODELS.iter().filter(|m| m.id != model_id) {
+        let _ = std::fs::remove_file(model_path(state, other.id));
+    }
     Ok(())
 }
 
@@ -624,6 +737,58 @@ mod tests {
         let (at, _) = split_url("https://host/a/b").unwrap();
         assert_eq!(absolute("/x/y", &at).unwrap(), "https://host/x/y");
         assert!(absolute("relative", &at).is_err());
+    }
+
+    /// Every platform with a release build has a pin for CPU and GPU, each a
+    /// distinct asset of the pinned tag with a 64-hex SHA-256.
+    #[test]
+    fn every_platform_is_pinned() {
+        for (os, arch) in [
+            ("linux", "x86_64"),
+            ("linux", "aarch64"),
+            ("windows", "x86_64"),
+            ("windows", "aarch64"),
+            ("macos", "aarch64"),
+        ] {
+            for gpu in [false, true] {
+                let (name, sha) =
+                    asset_for(os, arch, gpu).unwrap_or_else(|| panic!("{os} {arch} {gpu}"));
+                assert!(
+                    name.starts_with(&format!("llama-{LLAMA_TAG}-bin-")),
+                    "{name}"
+                );
+                assert_eq!(sha.len(), 64, "{name}");
+                assert!(sha.bytes().all(|b| b.is_ascii_hexdigit()), "{name}");
+            }
+        }
+        assert_ne!(
+            asset_for("linux", "aarch64", false),
+            asset_for("linux", "aarch64", true)
+        );
+        assert!(asset_for("freebsd", "x86_64", false).is_none());
+    }
+
+    /// The two models: d1-3B is the default and first; each has its own
+    /// pins and evaluation defaults, and Kev-4B's timeout leaves room for
+    /// its measured 4 to 5 s per call on a CPU.
+    #[test]
+    fn the_two_models_have_their_own_pins_and_defaults() {
+        assert_eq!(MODELS[0].id, LocalModel::default());
+        let d1 = model_pin(LocalModel::D1_3b);
+        let kev = model_pin(LocalModel::Kev4b);
+        assert_eq!((d1.threshold, kev.threshold), (0.8, 0.5));
+        assert!(kev.timeout_ms >= 10_000, "{}", kev.timeout_ms);
+        assert!(d1.timeout_ms >= 2_000);
+        assert_ne!(d1.file, kev.file);
+        assert_eq!(kev.bytes, 3_033_489_824);
+        assert_eq!(kev.licence, "Apache-2.0");
+        let dir = tempfile::tempdir().unwrap();
+        assert!(installed_models(dir.path()).is_empty());
+        std::fs::create_dir_all(model_dir(dir.path())).unwrap();
+        std::fs::write(model_path(dir.path(), LocalModel::Kev4b), b"x").unwrap();
+        assert_eq!(installed_models(dir.path()), [LocalModel::Kev4b]);
+        // No server binary yet: not installed, whatever the model file.
+        assert!(!installed(dir.path(), LocalModel::Kev4b));
     }
 
     #[test]

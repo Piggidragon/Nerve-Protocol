@@ -21,8 +21,8 @@ use crate::audit::AuditFeed;
 use crate::checker::blocklist::Rule;
 use crate::checker::server::LocalServer;
 use crate::checker::{
-    self, AllowRule, CallInfo, Checker, CheckerConfig, DEFAULT_MODEL_LICENCE, DEFAULT_MODEL_NAME,
-    Decision, Endpoint, Layer, ModelSource,
+    self, AllowRule, CallInfo, Checker, CheckerConfig, Decision, Endpoint, Layer, LocalModel,
+    ModelSource,
 };
 use crate::link::{Link, SHORT_CALL};
 use crate::pairing::{Codes, Outcome};
@@ -2356,14 +2356,17 @@ impl Center {
 
     /// Starts, stops or keeps the local llama-server to match `cfg`. It runs
     /// only when the model is on, its source is local, and the one-click
-    /// install put the build and the model in place. Keyed by the CPU/GPU
-    /// choice and whether it is installed, so an unrelated change does not
-    /// restart it.
+    /// install put the build and the chosen model in place. Keyed by the
+    /// CPU/GPU choice and the model, so an unrelated change does not restart
+    /// it.
     fn manage_local_model(&self, cfg: &CheckerConfig) {
-        let installed = checker::install::installed(&self.dir);
+        let installed = checker::install::installed(&self.dir, cfg.model.local_model);
         let want = cfg.model_on && cfg.model.source == ModelSource::Local && installed;
         let sig = if want {
-            format!("gpu={}|installed", cfg.model.local_gpu)
+            format!(
+                "gpu={}|model={:?}",
+                cfg.model.local_gpu, cfg.model.local_model
+            )
         } else {
             String::new()
         };
@@ -2379,7 +2382,7 @@ impl Center {
         *self.local_model.lock().unwrap() = None;
         if want {
             let bin = checker::install::server_bin(&self.dir);
-            let model = checker::install::model_path(&self.dir);
+            let model = checker::install::model_path(&self.dir, cfg.model.local_model);
             match bin
                 .ok_or_else(|| "the local model is not installed".to_string())
                 .and_then(|bin| {
@@ -2453,12 +2456,12 @@ impl Center {
         json!({
             "config": cfg,
             "has_token": self.checker_has_token(),
-            "licence": DEFAULT_MODEL_LICENCE,
-            "model_name": DEFAULT_MODEL_NAME,
+            "models": checker::install::MODELS,
             "default_blocklist": checker::config::default_blocklist(),
             "local": self.local_model_status(),
             "install": *self.install.lock().unwrap(),
-            "installed": checker::install::installed(&self.dir),
+            "installed": checker::install::installed(&self.dir, cfg.model.local_model),
+            "installed_models": checker::install::installed_models(&self.dir),
             "platform_supported": checker::install::platform_supported(),
             "gpu_hint": checker::install::gpu_hint(),
             "rejected": self.checker().rejected,
@@ -2473,7 +2476,7 @@ impl Center {
     /// Starts the one-click install of llama.cpp and the d1-3B model on the
     /// CPU or GPU, in the background. On success it turns the local model on
     /// with the chosen device. Refused while an install is already running.
-    pub fn start_checker_install(&self, gpu: bool) -> Result<(), String> {
+    pub fn start_checker_install(&self, gpu: bool, model: LocalModel) -> Result<(), String> {
         if !checker::install::platform_supported() {
             return Err("this machine has no pinned local build; use the endpoint mode".into());
         }
@@ -2490,14 +2493,10 @@ impl Center {
         }
         let (dir, shared, me) = (self.dir.clone(), self.install.clone(), self.clone());
         tokio::spawn(async move {
-            let r = checker::install::install(dir, gpu, shared).await;
+            let r = checker::install::install(dir, gpu, model, shared).await;
             match r {
                 Ok(()) => {
-                    me.update(|s| {
-                        s.checker.model_on = true;
-                        s.checker.model.source = ModelSource::Local;
-                        s.checker.model.local_gpu = gpu;
-                    });
+                    me.update(|s| s.checker.local_installed(gpu, model));
                     me.note(
                         Level::Info,
                         None,

@@ -758,8 +758,6 @@ impl WinSystem for WinHost {
     }
 
     fn read_password(&self, prompt: &str, out: &mut dyn Write) -> Result<String, String> {
-        let _ = write!(out, "{prompt}");
-        let _ = out.flush();
         // SAFETY: plain calls on this process's stdin; the mode is restored.
         let console = unsafe {
             let h = GetStdHandle(STD_INPUT_HANDLE);
@@ -769,14 +767,20 @@ impl WinSystem for WinHost {
                 (h, mode)
             })
         };
+        // A program that pipes the password in (the desktop app) is not
+        // asked, so its output stays the command's own.
+        if console.is_some() {
+            let _ = write!(out, "{prompt}");
+            let _ = out.flush();
+        }
         let mut line = String::new();
         let r = std::io::stdin().lock().read_line(&mut line);
         if let Some((h, mode)) = console {
             // SAFETY: as above.
             unsafe { SetConsoleMode(h, mode) };
+            // A console without echo does not end the line.
+            let _ = writeln!(out);
         }
-        // Neither a console without echo nor a pipe ends the line.
-        let _ = writeln!(out);
         r.map_err(|e| e.to_string())?;
         let password = line.trim_end_matches(['\n', '\r']).to_string();
         line.clear();

@@ -13,6 +13,7 @@ pub mod cgroup;
 pub mod cli;
 pub mod daemon;
 pub mod descriptor;
+pub mod entry;
 // The Event Log is Windows-only in use, and its message table is build.rs's;
 // both are tested everywhere.
 #[cfg_attr(not(test), allow(dead_code))]

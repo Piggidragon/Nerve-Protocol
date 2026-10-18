@@ -65,6 +65,15 @@ nerve-node config add center.lab.policy.deny  'fs:~/private/*'
 The web UI's [Audit](web-ui.md#audit) page writes the same rules with four
 buttons. That needs the [settings grant](settings-grant.md).
 
+`--action` makes the rule such a button makes for an audit entry of that
+action: the entry's path, or the folder it is in with `--wildcard`. An action
+without a path takes `''`, and covers its capability with `--wildcard`.
+
+```sh
+nerve-node rule add allow /srv/data/report.txt --action fs.read
+nerve-node rule add deny /srv/data/report.txt --action fs.write --wildcard   # fs.write:/srv/data/*
+```
+
 ## Rule syntax
 
 A rule is `<scope>` or `<scope>:<pattern>`.

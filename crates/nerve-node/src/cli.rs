@@ -21,6 +21,8 @@ use crate::folder_change::{Applied, FolderChange};
 use crate::paths::NodePaths;
 use crate::service::{Host, Layout};
 
+mod json;
+
 #[derive(Debug, Parser)]
 #[command(
     name = "nerve-node",
@@ -34,6 +36,9 @@ pub struct Cli {
     /// Where the control socket and the audit log live [env: NERVE_STATE_DIR] [default: ~/.local/state/nerve, or /var/lib/nerve/state when installed as a service]
     #[arg(long, global = true)]
     pub state_dir: Option<PathBuf>,
+    /// Print JSON for programs instead of text: the read commands their data, the others the lines they print, an error {"error": ...}
+    #[arg(long, global = true)]
+    pub json: bool,
     #[command(subcommand)]
     pub cmd: Cmd,
 }
@@ -223,6 +228,9 @@ pub enum RuleCmd {
         /// Cover every command that starts with the same program.
         #[arg(long)]
         wildcard: bool,
+        /// Make the rule of an audit entry of this action instead, as the audit buttons do: `fs.read` takes a path and covers its folder with --wildcard, an action without a target takes "" and covers its capability.
+        #[arg(long, value_name = "CAP.ACTION")]
+        action: Option<String>,
         #[command(flatten)]
         center: CenterArg,
     },
@@ -235,6 +243,9 @@ pub enum RuleCmd {
         /// The entry was added with --wildcard.
         #[arg(long)]
         wildcard: bool,
+        /// The entry was added with this --action.
+        #[arg(long, value_name = "CAP.ACTION")]
+        action: Option<String>,
         #[command(flatten)]
         center: CenterArg,
     },
@@ -982,7 +993,10 @@ impl List {
     /// (`fs.read:~/notes/*`, `fs:~/private/*`) is refused. As a command it
     /// would become a rule that never matches. A single letter before the `:`
     /// is a drive (`C:\tools\x.exe`), not a capability.
-    fn entry(self, command: &str, wildcard: bool) -> Result<String, String> {
+    fn entry(self, command: &str, wildcard: bool, action: Option<&str>) -> Result<String, String> {
+        if let Some(action) = action {
+            return self.action_rule(action, command, wildcard);
+        }
         if matches!(self, List::Allow | List::Deny)
             && let Some((scope, _)) = command.trim().split_once(':')
             && (scope.contains('.') || scope.len() > 1)
@@ -994,6 +1008,27 @@ impl List {
             ));
         }
         self.command_rule(command, wildcard)
+    }
+
+    /// The rule of an audit entry of `action` (`fs.read`) with `target`, as
+    /// the audit buttons of the desktop app and of the center make it
+    /// ([`rules::rule_for`]). The sudo list takes sudo commands only.
+    fn action_rule(self, action: &str, target: &str, wildcard: bool) -> Result<String, String> {
+        // A cut target is no longer the call's, so no rule can name it.
+        if nerve_policy::audit::is_cut_target(target) {
+            return Err("the target was cut to its start, so a rule cannot name it".into());
+        }
+        let (cap, act) = action
+            .split_once('.')
+            .ok_or_else(|| format!("{action:?} is not a capability and action, like fs.read"))?;
+        match self {
+            List::Sudo if (cap, act) != ("exec", "run") => {
+                Err("the sudo list is for sudo commands (--action exec.run)".into())
+            }
+            List::Sudo => self.command_rule(target, wildcard),
+            List::Allow if (cap, act) == ("exec", "run") => self.command_rule(target, wildcard),
+            List::Allow | List::Deny => rules::rule_for(cap, act, target, wildcard),
+        }
     }
 
     /// The rule a command line stands for. The allow and deny lists hold
@@ -1022,9 +1057,10 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
             list,
             command,
             wildcard,
+            action,
             center,
         } => {
-            let rule = list.entry(&command, wildcard)?;
+            let rule = list.entry(&command, wildcard, action.as_deref())?;
             let name = edit_center(paths, &center, |e| {
                 push_unique(list.of(&mut e.policy), &rule);
                 Ok(())
@@ -1040,6 +1076,7 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
             list,
             command,
             wildcard,
+            action,
             center,
         } => {
             let removed = std::sync::Mutex::new(String::new());
@@ -1049,7 +1086,10 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
                 // An entry copied from `ls` goes as it is, so rules for
                 // files and other actions can be removed too. The arguments
                 // of `add` stand for the command rule they made.
-                let made = list.command_rule(&command, wildcard);
+                let made = match &action {
+                    Some(a) => list.action_rule(a, &command, wildcard),
+                    None => list.command_rule(&command, wildcard),
+                };
                 let rule = match made {
                     Ok(made) if made != command && l.contains(&command) && l.contains(&made) => {
                         return Err(format!(
@@ -1125,21 +1165,38 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
     if !service {
         crate::service::check_access(&paths)?;
     }
+    if !cli.json {
+        return said(paths, cli.cmd, out).await;
+    }
+    // The read commands have a JSON form of their own; the others give the
+    // lines they print as a list.
+    if json::own_form(&cli.cmd) {
+        return json::command(&paths, cli.cmd, out).await;
+    }
+    let mut lines = Vec::new();
+    said(paths, cli.cmd, &mut lines).await?;
+    json::lines(&lines, out)
+}
+
+/// [`execute`] with the text output, and what it says when a change is
+/// only in the file.
+async fn said(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), String> {
+    let service = cmd.is_service();
     // The daemon writes the file itself while it runs; the service commands
     // leave it alone (or delete it with the rest). Sudo on Windows says
     // itself when its change counts (crate::winsudo).
     // A restore says itself what comes next.
-    let own_say = (cfg!(windows) && matches!(cli.cmd, Cmd::Sudo(_)))
-        || matches!(cli.cmd, Cmd::Restore { .. });
-    let before = (!matches!(cli.cmd, Cmd::Run) && !service && !own_say)
+    let own_say =
+        (cfg!(windows) && matches!(cmd, Cmd::Sudo(_))) || matches!(cmd, Cmd::Restore { .. });
+    let before = (!matches!(cmd, Cmd::Run) && !service && !own_say)
         .then(|| std::fs::read(paths.config_file()).ok());
     // On Windows the running node takes folder changes over its pipe, and
     // nothing else yet.
     let folders = matches!(
-        cli.cmd,
+        cmd,
         Cmd::Folder(FolderCmd::Add { .. } | FolderCmd::Set { .. } | FolderCmd::Rm { .. })
     );
-    let r = command(paths.clone(), cli.cmd, out).await;
+    let r = command(paths.clone(), cmd, out).await;
     if r.is_ok()
         && let Some(before) = before
         && std::fs::read(paths.config_file()).ok() != before
@@ -1668,7 +1725,7 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             w(out, "unlocked".into());
             Ok(())
         }
-        Cmd::Audit { follow, denied } => audit(&paths, follow, denied, out).await,
+        Cmd::Audit { follow, denied } => audit(&paths, follow, denied, false, out).await,
         Cmd::Proxy(c) => proxy_cmd(&paths, c, out).await,
         Cmd::Relay(c) => relay_cmd(&paths, c, out).await,
         Cmd::Sudo(c) => sudo_cmd(&paths, c, out).await,
@@ -2401,12 +2458,7 @@ async fn sudo_cmd(paths: &NodePaths, c: SudoCmd, out: &mut dyn Write) -> Result<
                 w(out, "sudo: off");
             }
             SudoCmd::Status => {
-                let on = match call(&sock, "sudo.status", json!({})).await {
-                    Ok(v) => v["sudo"] == "on",
-                    // A node that does not run holds no password.
-                    Err(e) if e == NOT_RUNNING => false,
-                    Err(e) => return Err(e),
-                };
+                let on = sudo_is_on(paths).await?;
                 w(out, if on { "sudo: on" } else { "sudo: off" });
             }
         }
@@ -2422,7 +2474,7 @@ async fn sudo_cmd(paths: &NodePaths, c: SudoCmd, out: &mut dyn Write) -> Result<
             }
             SudoCmd::Off => crate::winsudo::off(paths, &WinHost, out).await,
             SudoCmd::Status => {
-                let on = crate::winsudo::status(paths)?;
+                let on = sudo_is_on(paths).await?;
                 w(out, if on { "sudo: on" } else { "sudo: off" });
                 Ok(())
             }
@@ -2435,6 +2487,29 @@ async fn sudo_cmd(paths: &NodePaths, c: SudoCmd, out: &mut dyn Write) -> Result<
             SudoCmd::Status => Ok(()),
             _ => Err("the sudo switch works on Linux and Windows only".into()),
         }
+    }
+}
+
+/// Whether sudo is on: the running node holds the password (on Windows the
+/// signed config says so and the password is kept, crate::winsudo).
+async fn sudo_is_on(paths: &NodePaths) -> Result<bool, String> {
+    #[cfg(unix)]
+    {
+        match nerve_transport::ctl::call(&paths.ctl_socket(), "sudo.status", json!({})).await {
+            Ok(v) => Ok(v["sudo"] == "on"),
+            // A node that does not run holds no password.
+            Err(e) if e == nerve_transport::ctl::NOT_RUNNING => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+    #[cfg(windows)]
+    {
+        crate::winsudo::status(paths)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = paths;
+        Ok(false)
     }
 }
 
@@ -2624,14 +2699,17 @@ fn audit_line(v: &Value) -> String {
 /// `--follow` looks again every 500 ms and shows the lines after the last one
 /// it showed, wherever that line is now: in `audit.jsonl.1` after a rotation,
 /// so the old file is finished before the new one, or further up after the
-/// log dropped old refusals.
+/// log dropped old refusals. With `json` the entries are as the log holds
+/// them: one list, or with `follow` one JSON line each.
 async fn audit(
     paths: &NodePaths,
     follow: bool,
     denied: bool,
+    json: bool,
     out: &mut dyn Write,
 ) -> Result<(), String> {
     let log = AuditLog::new(paths.audit_log());
+    let mut entries = Vec::new();
     let mut shown = Shown::default();
     let mut stamp = None;
     loop {
@@ -2659,10 +2737,21 @@ async fn audit(
             if denied && !refused {
                 continue;
             }
-            let _ = writeln!(out, "{}", audit_line(&v));
+            match (json, follow) {
+                (false, _) => {
+                    let _ = writeln!(out, "{}", audit_line(&v));
+                }
+                (true, false) => entries.push(v),
+                (true, true) => {
+                    let _ = writeln!(out, "{v}");
+                }
+            }
         }
         shown.saw(&lines);
         if !follow {
+            if json {
+                let _ = writeln!(out, "{}", json!({ "entries": entries }));
+            }
             return Ok(());
         }
         let _ = out.flush();
@@ -6671,7 +6760,7 @@ mod tests {
         append(decided(1, "fs", "read", "first", "allowed"));
         let seen = Seen::default();
         let mut out = seen.clone();
-        let follow = audit(&paths, true, false, &mut out);
+        let follow = audit(&paths, true, false, false, &mut out);
         let writer = async {
             seen.until("first").await;
             append(decided(2, "fs", "read", "before-the-rotation", "allowed"));
@@ -6699,5 +6788,290 @@ mod tests {
             ],
             "{text}"
         );
+    }
+
+    fn json_of(paths: &NodePaths, args: &[&str]) -> Value {
+        let mut a = vec!["--json"];
+        a.extend_from_slice(args);
+        let out = run(paths, &a).unwrap();
+        assert_eq!(out.lines().count(), 1, "one JSON line: {out}");
+        serde_json::from_str(&out).unwrap_or_else(|e| panic!("{e}: {out}"))
+    }
+
+    /// The read commands print their data as JSON for the desktop app,
+    /// which never reads the text meant for people.
+    #[test]
+    fn the_read_commands_print_json() {
+        let (d, paths) = setup(&["home"]);
+        let work = d.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        run(
+            &paths,
+            &["folder", "add", &work.display().to_string(), "+r", "+x"],
+        )
+        .unwrap();
+        run(&paths, &["rule", "add", "allow", "git status"]).unwrap();
+        run(&paths, &["rule", "add", "deny", "rm", "--wildcard"]).unwrap();
+        run(&paths, &["cap", "set", "fs.write", "off"]).unwrap();
+        run(&paths, &["mode", "set", "folder"]).unwrap();
+
+        let v = json_of(&paths, &["status"]);
+        assert_eq!(v["daemon"], "not running", "{v}");
+        assert_eq!(v["locked"], false, "{v}");
+        assert_eq!(v["sudo"], "off", "{v}");
+        assert_eq!(v["centers"][0]["name"], "home", "{v}");
+        assert_eq!(v["centers"][0]["mode"], "folder", "{v}");
+        assert!(v["centers"][0]["status"].is_null(), "{v}");
+        assert!(v["command_limits"]["memory_mb"].is_u64(), "{v}");
+
+        let v = json_of(&paths, &["center", "ls"]);
+        let c = &v["centers"][0];
+        assert_eq!(
+            (
+                &c["name"],
+                &c["url"],
+                &c["mode"],
+                &c["settings"],
+                &c["paused"]
+            ),
+            (
+                &json!("home"),
+                &json!("http://127.0.0.1:1"),
+                &json!("folder"),
+                &json!("off"),
+                &json!(false)
+            ),
+            "{v}"
+        );
+
+        let v = json_of(&paths, &["folder", "ls"]);
+        assert_eq!(v["center"], "home");
+        let f = &v["folders"][0];
+        assert_eq!(
+            (&f["rights"], &f["read"], &f["write"], &f["execute"]),
+            (&json!("r-x"), &json!(true), &json!(false), &json!(true)),
+            "{v}"
+        );
+
+        let v = json_of(&paths, &["rule", "ls"]);
+        assert_eq!(v["allow"], json!(["exec.run:git status"]), "{v}");
+        assert_eq!(v["deny"], json!(["exec.run:rm *"]), "{v}");
+        assert_eq!(v["sudo"], json!([]), "{v}");
+        let v = json_of(&paths, &["rule", "ls", "deny"]);
+        assert!(v.get("allow").is_none() && v["deny"].is_array(), "{v}");
+
+        let v = json_of(&paths, &["cap", "ls"]);
+        assert_eq!(v["caps"], json!({"fs.write": "off"}), "{v}");
+
+        let v = json_of(&paths, &["config", "get", "center.home.policy.mode"]);
+        assert_eq!(
+            v,
+            json!({"key": "center.home.policy.mode", "value": "folder"})
+        );
+        let v = json_of(&paths, &["config", "get", "center.home.policy.allow"]);
+        assert_eq!(v["value"], json!(["exec.run:git status"]), "{v}");
+
+        assert_eq!(json_of(&paths, &["proxy", "ls"]), json!({"proxy": null}));
+        let v = json_of(&paths, &["relay", "ls"]);
+        assert!(v["listen"].is_null() && v["tunnels"].is_null(), "{v}");
+        assert_eq!(v["nodes"], json!([]), "{v}");
+        assert_eq!(json_of(&paths, &["sudo", "status"]), json!({"sudo": "off"}));
+    }
+
+    /// The other commands give the lines they print, so a program can show
+    /// them, and say nothing else on stdout.
+    #[test]
+    fn a_change_with_json_gives_its_lines() {
+        let (_d, paths) = setup(&["home"]);
+        let v = json_of(&paths, &["mode", "set", "user"]);
+        let m = v["messages"].as_array().unwrap();
+        assert_eq!(m[0], "home: mode user", "{v}");
+        assert!(m[1].as_str().unwrap().contains(NEXT_START), "{v}");
+        assert_eq!(load(&paths).center("home").unwrap().policy.mode, Mode::User);
+    }
+
+    /// Without --yes, `center add --json` shows what the owner confirms and
+    /// pairs nothing: the desktop app asks, then runs it with --yes.
+    #[test]
+    fn center_add_json_without_yes_only_shows_the_link() {
+        let (_d, paths) = setup(&[]);
+        let before = std::fs::read(paths.config_file()).unwrap();
+        let v = json_of(
+            &paths,
+            &[
+                "center",
+                "add",
+                "nerve://pair?center=https%3A%2F%2Fc.example%3A8443&code=abc&pin=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "--name",
+                "lab",
+            ],
+        );
+        assert_eq!(v["paired"], false, "{v}");
+        assert_eq!(v["preview"]["center"], "https://c.example:8443", "{v}");
+        assert_eq!(v["preview"]["tls"], true, "{v}");
+        assert_eq!(v["preview"]["pin"], "A".repeat(43), "{v}");
+        assert_eq!(v["preview"]["name"], "lab", "{v}");
+        assert_eq!(std::fs::read(paths.config_file()).unwrap(), before);
+        let e = run(&paths, &["--json", "center", "add", "nerve://x"]).unwrap_err();
+        assert!(e.contains("nerve://pair?"), "{e}");
+    }
+
+    #[test]
+    fn audit_json_gives_the_entries_as_the_log_holds_them() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("c"), d.path().join("s"));
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        std::fs::write(
+            paths.audit_log(),
+            decided(1, "fs", "read", "/srv/a", "allowed")
+                + &decided(2, "exec", "run", "ls", "forbidden"),
+        )
+        .unwrap();
+        let v = json_of(&paths, &["audit"]);
+        let e = v["entries"].as_array().unwrap();
+        assert_eq!(e.len(), 2, "{v}");
+        assert_eq!(
+            (&e[0]["target"], &e[1]["decision"]),
+            (&json!("/srv/a"), &json!("forbidden"))
+        );
+        let v = json_of(&paths, &["audit", "--denied"]);
+        assert_eq!(v["entries"].as_array().unwrap().len(), 1, "{v}");
+    }
+
+    /// `rule add --action` makes the rule an audit button makes for an entry
+    /// of that action, and `rule rm` takes the same arguments.
+    #[test]
+    fn rule_add_with_an_action_makes_the_audit_buttons_rule() {
+        let (_d, paths) = setup(&["home"]);
+        let policy = || load(&paths).centers[0].policy.clone();
+        run(
+            &paths,
+            &[
+                "rule",
+                "add",
+                "allow",
+                "/srv/data/a.txt",
+                "--action",
+                "fs.read",
+            ],
+        )
+        .unwrap();
+        run(
+            &paths,
+            &[
+                "rule",
+                "add",
+                "deny",
+                "/srv/data/a.txt",
+                "--action",
+                "fs.write",
+                "--wildcard",
+            ],
+        )
+        .unwrap();
+        run(
+            &paths,
+            &[
+                "rule",
+                "add",
+                "allow",
+                "",
+                "--action",
+                "settings.read",
+                "--wildcard",
+            ],
+        )
+        .unwrap();
+        run(
+            &paths,
+            &[
+                "rule",
+                "add",
+                "deny",
+                "make all",
+                "--action",
+                "exec.run",
+                "--wildcard",
+            ],
+        )
+        .unwrap();
+        run(
+            &paths,
+            &[
+                "rule",
+                "add",
+                "sudo",
+                "sudo apt update",
+                "--action",
+                "exec.run",
+                "--wildcard",
+            ],
+        )
+        .unwrap();
+        assert_eq!(policy().allow, ["fs.read:/srv/data/a.txt", "settings"]);
+        assert_eq!(policy().deny, ["fs.write:/srv/data/*", "exec.run:make *"]);
+        assert_eq!(policy().sudo_allow, ["sudo apt *"]);
+        // The same as the center's buttons for the same entries.
+        for (list, cap, action, target, wildcard) in [
+            ("allow", "fs", "read", "/srv/data/a.txt", false),
+            ("deny", "fs", "write", "/srv/data/a.txt", true),
+            ("deny", "exec", "run", "make all", true),
+        ] {
+            let rule = rules::rule_for(cap, action, target, wildcard).unwrap();
+            let l = if list == "allow" {
+                policy().allow
+            } else {
+                policy().deny
+            };
+            assert!(l.contains(&rule), "{rule}");
+        }
+        run(
+            &paths,
+            &[
+                "rule",
+                "rm",
+                "deny",
+                "/srv/data/a.txt",
+                "--action",
+                "fs.write",
+                "--wildcard",
+            ],
+        )
+        .unwrap();
+        assert_eq!(policy().deny, ["exec.run:make *"]);
+
+        let e = run(
+            &paths,
+            &["rule", "add", "sudo", "/etc/x", "--action", "fs.read"],
+        )
+        .unwrap_err();
+        assert!(e.contains("sudo commands"), "{e}");
+        let e = run(
+            &paths,
+            &[
+                "rule",
+                "add",
+                "allow",
+                "sudo apt update",
+                "--action",
+                "exec.run",
+            ],
+        )
+        .unwrap_err();
+        assert!(e.contains("sudo list"), "{e}");
+        let e = run(&paths, &["rule", "add", "allow", "x", "--action", "read"]).unwrap_err();
+        assert!(e.contains("capability and action"), "{e}");
+        let cut = format!(
+            "{}… [cut at {n} of {} characters]",
+            "a".repeat(nerve_policy::audit::TARGET_MAX_CHARS),
+            nerve_policy::audit::TARGET_MAX_CHARS + 5,
+            n = nerve_policy::audit::TARGET_MAX_CHARS
+        );
+        let e = run(
+            &paths,
+            &["rule", "add", "deny", &cut, "--action", "exec.run"],
+        )
+        .unwrap_err();
+        assert!(e.contains("cut"), "{e}");
     }
 }

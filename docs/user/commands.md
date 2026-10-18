@@ -36,8 +36,8 @@ center is paired.
 | `folder add <path> +r +w +x` | Grant a folder | [modes](modes.md#folders) |
 | `folder set <path> -w` | Change a folder's rights | [modes](modes.md#folders) |
 | `folder rm <path>`, `folder ls` | Remove or list folders | [modes](modes.md#folders) |
-| `rule add allow\|deny\|sudo '<command>' [--wildcard]` | Add a command rule | [rules](rules.md) |
-| `rule rm allow\|deny\|sudo '<command>' [--wildcard]` | Remove a command rule | [rules](rules.md#list-and-remove-rules) |
+| `rule add allow\|deny\|sudo '<command>' [--wildcard] [--action A]` | Add a command rule, or with `--action` the rule of an audit entry | [rules](rules.md) |
+| `rule rm allow\|deny\|sudo '<command>' [--wildcard] [--action A]` | Remove a rule | [rules](rules.md#list-and-remove-rules) |
 | `rule ls [allow\|deny\|sudo]` | List rules | [rules](rules.md#list-and-remove-rules) |
 | `cap set <cap> on\|off\|hidden`, `cap ls` | Switch a capability or action | [rules](rules.md#switch-a-capability-off) |
 | `sudo on`, `sudo off`, `sudo status` | The sudo switch | [sudo](sudo.md) |
@@ -74,3 +74,25 @@ The center has five commands of its own, which a harness never runs:
 | `install` | Install the center as a service under a user of its own (Linux with systemd, as root) | [center](center.md#run-it-as-a-service) |
 | `update [--from FILE]` | Put the latest release in place and restart the service | [center](center.md#update) |
 | `uninstall [--purge]` | Remove the service, its user and the program | [center](center.md#uninstall) |
+
+## For programs: `--json`
+
+A program that drives `nerve-node`, such as a script, adds `--json` and reads
+one JSON value from stdout:
+
+- The read commands print their data: `status`, `center ls`, `folder ls`,
+  `rule ls`, `cap ls`, `config get`, `proxy ls`, `relay ls`, `sudo status`
+  and `audit` (`{"entries": [...]}`, the entries as the audit log holds
+  them; with `--follow` one entry a line). `status` has `"daemon"`:
+  `"running"`, with what the running node says, or `"not running"`.
+- `center add` without `--yes` prints what you would confirm
+  (`{"paired": false, "preview": {...}}`) and pairs nothing; with `--yes` it
+  pairs.
+- Every other command prints the lines it shows as `{"messages": [...]}`.
+- An error is `{"error": "..."}`, and the exit code is 1. stderr carries the
+  log's events, so read the error from stdout.
+
+When stdin is no terminal, nothing waits for typing: a password (`sudo on`, the
+account's on Windows) or a passphrase (`backup`, `restore`) is the first line
+of stdin, or of the file `--passphrase-file` names. `setup` reads its answers
+from stdin one line each. `center add` needs `--yes`.

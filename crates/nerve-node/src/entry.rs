@@ -46,8 +46,10 @@ pub fn main() -> i32 {
         Err(e) => {
             // A program that asked for JSON reads the error from stdout too:
             // stderr also carries the log's events.
+            // A closed stdout leaves only stderr to say it.
             if json {
-                println!("{}", serde_json::json!({ "error": e }));
+                use std::io::Write;
+                let _ = writeln!(std::io::stdout(), "{}", serde_json::json!({ "error": e }));
             }
             eprintln!("nerve-node: {e}");
             1

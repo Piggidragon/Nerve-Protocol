@@ -828,7 +828,8 @@ function localInstallParts(meta) {
       el("div", { class: "card-top" }, icon("download"), el("span", { class: "name" }, `Installing ${target.name}`), pill("warn", inst.phase)),
       el("p", { class: "meta" }, "llama.cpp"), bar(inst.llama),
       el("p", { class: "meta" }, `model (${gb(target.bytes)})`), bar(inst.model),
-      inst.message ? el("p", { class: "meta" }, inst.message) : null)];
+      inst.message ? el("p", { class: "meta" }, inst.message) : null,
+      meta.local ? el("p", { class: "meta" }, "The installed model keeps checking calls until the new files are in place; it is stopped only for the swap at the end.") : null)];
   }
   const cfg = state.checker.cfg.model;
   const failed = inst.phase === "failed" ? banner("down", "alert", `The last install failed: ${inst.message || "unknown error"}`) : null;
@@ -863,7 +864,11 @@ function installButtons(meta, pin, verb) {
 }
 
 function localStatusParts(s) {
-  if (!s) return [el("p", { class: "meta" }, "The model is installed but not running. Turn the model on (the switch at the top).")];
+  if (!s) {
+    return [el("p", { class: "meta" }, state.checker.cfg.model_on
+      ? "The model is on but its server is not running. The Log page says why."
+      : "The model is installed but not running. Turn the model on (the switch at the top).")];
+  }
   const tone = s.phase === "ready" ? "up" : s.phase === "failed" ? "down" : "warn";
   return [el("div", { class: "card" },
     el("div", { class: "card-top" }, el("span", { class: "dot" + (s.phase === "ready" ? " up" : "") }), el("span", { class: "name" }, "Local model"), pill(tone, s.phase)),

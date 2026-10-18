@@ -149,11 +149,18 @@ async fn the_center_installs_switches_and_removes_a_running_model() {
         log_level: None,
     })
     .unwrap();
+    // Ready once the install has ended and the model it put in place runs
+    // (the old model keeps running while a switch downloads).
     let wait_ready = |c: Center, what: &'static str| async move {
         let deadline = Instant::now() + Duration::from_secs(600);
         loop {
             let inst = c.checker_install_status();
             assert_ne!(inst.phase, InstallPhase::Failed, "{what}: {}", inst.message);
+            if inst.phase != InstallPhase::Done {
+                assert!(Instant::now() < deadline, "{what}: the install never ended");
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
             if let Some(s) = c.local_model_status() {
                 assert_ne!(s.phase, Phase::Failed, "{what}: {s:?}");
                 if s.phase == Phase::Ready {
@@ -175,6 +182,19 @@ async fn the_center_installs_switches_and_removes_a_running_model() {
         c.start_checker_install(true, LocalModel::D1_3b)
             .await
             .unwrap();
+        // The running model keeps judging calls during the download, and a
+        // config save meanwhile (here taint toggled twice) must not start a
+        // server from the files the switch is about to replace (review r3,
+        // findings 2 and 3).
+        for _ in 0..2 {
+            let mut cfg = c.read(|s| s.checker.clone());
+            cfg.taint_on = !cfg.taint_on;
+            c.apply_checker_config(cfg).unwrap();
+            if let Some(s) = c.local_model_status() {
+                println!("during the switch the model is {:?}", s.phase);
+            }
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
         wait_ready(c.clone(), "GPU switch").await;
         let gpu = c.read(|s| s.checker.model.local_gpu);
         println!(

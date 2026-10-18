@@ -265,6 +265,28 @@ const WIN_RECURSE: &str = r"(?:-r(?:e(?:c(?:u(?:r(?:s(?:e)?)?)?)?)?)?(?::\$?true
 /// the variables that name them, as one whole (lower-cased) operand.
 const WIN_ROOT: &str = r"(?:[a-z]:[\\/]?\*?|[a-z]:[\\/]windows(?:[\\/]system32)?[\\/]?\*?|\$env:(?:systemroot|windir|systemdrive)[\\/]?\*?|%(?:systemroot|windir|systemdrive)%[\\/]?\*?)";
 
+/// The database clients whose arguments (or input) may carry SQL that drops
+/// data.
+const DB_CLIENT: &str = "(?:psql|mysql|mariadb|sqlite3|mongo|mongosh)";
+/// The SQL (and MongoDB call) that drops or empties a database or table.
+/// `truncate` needs a name after it, so the `truncate -s 0 app.log` file
+/// tool is not one.
+const DB_DROP: &str = r#"(?:drop\s+(?:database|table)\b|truncate\s+[a-z_"]|dropdatabase\s*\()"#;
+/// A program that runs what it reads on its standard input: a shell, or an
+/// interpreter with no script of its own (only flags, or `-`/`-s` and then
+/// the script's arguments), up to the end of its command.
+const RUNS_STDIN: &str = r"(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?(?:sh|bash|zsh|dash|ksh|ash|fish|python[0-9.]*|perl|ruby|node|php)(?:\.exe)?(?:\s+-[a-z-]*)*(?:\s+(?:-s|-)(?:\s[^|;&]*)?)?\s*(?:$|[;&|)])";
+/// A git refspec that names `main` or `master` as the branch pushed to, as a
+/// whole word (`main`, `HEAD:main`, `refs/heads/main`), so a branch that
+/// merely contains the word (`fix/main-menu`) is not one.
+const GIT_PROTECTED: &str = r"(?:\S*:)?\+?(?:refs/heads/)?(?:main|master)";
+/// `git … push`: push as git's subcommand, after git's own options only, so
+/// a commit message that mentions a push is not one.
+const GIT_PUSH: &str = r"^git(?: (?:-c|-C) \S+| -\S*)* push";
+/// git push's force flags: `--force`, `--force-with-lease[=…]`, or a short
+/// flag word with `f` in it (`-f`, `-uf`).
+const GIT_FORCE: &str = r"(?:--force(?:-with-lease)?(?:=\S*)?|-[a-z]*f[a-z]*)";
+
 /// The built-in blocklist. Truly dangerous things are blocked; ordinary work
 /// (`rm file`, `rm -rf ./build`, `rm -rf node_modules`, `docker ps`,
 /// `git push`, `kill <pid>`) is not. What the node already protects
@@ -285,25 +307,24 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
         b("exec.run:rm -rf /var", "wipes system state"),
         b("exec.run:rm -rf /boot", "wipes the boot files"),
         // ---- disks and filesystems ----
-        b(
-            "exec.run:re:(?i)\\bmkfs\\b",
-            "makes a new filesystem (destroys data)",
-        ),
+        // mkfs, wipefs and userdel as the program run, so a commit message,
+        // a grep or a note that only mentions them is not refused.
+        b("exec.run:mkfs*", "makes a new filesystem (destroys data)"),
         b(
             "exec.run:re:(?i)\\bdd\\b[^|&;]*\\bof=/dev/(sd|nvme|vd|hd|mmcblk|disk)",
             "writes raw over a disk device",
         ),
-        b(
-            "exec.run:re:(?i)\\bwipefs\\b",
-            "erases filesystem signatures",
-        ),
+        b("exec.run:wipefs", "erases filesystem signatures"),
         b("exec.run:re:(?i)\\bshred\\b[^|&;]*/dev/", "shreds a device"),
         b(
             "exec.run:re:(?i)>\\s*/dev/(sd|nvme|vd|hd|mmcblk|disk)",
             "writes over a disk device",
         ),
         // ---- fork bomb ----
-        b("exec.run:re::\\(\\)\\s*\\{\\s*:\\s*\\|\\s*:", "a fork bomb"),
+        b(
+            "exec.run:re::\\(\\)\\s*\\{[\\s;]*:\\s*\\|\\s*:",
+            "a fork bomb",
+        ),
         // ---- reckless chmod/chown of the root (structured, so the flag and
         //      the mode may come in any order) ----
         b(
@@ -311,9 +332,24 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
             "opens the whole filesystem to everyone",
         ),
         b("exec.run:chown -R /", "re-owns the whole filesystem"),
-        // ---- destructive database commands ----
+        // ---- destructive database commands: only in what a database
+        //      client runs (its arguments, input piped into it, or a
+        //      here-document fed to it), so grepping for `DROP TABLE` or
+        //      writing a migration that has one is not refused ----
         b(
-            "exec.run:re:(?i)(drop\\s+database|drop\\s+table|truncate\\s+table|droptable|dropdatabase)",
+            &format!("exec.run:cmd-re:^{DB_CLIENT} .*{DB_DROP}"),
+            "drops or truncates a database",
+        ),
+        b(
+            &format!("exec.run:cmd-re:^(?:docker|podman|kubectl) (?:.* )?{DB_CLIENT} .*{DB_DROP}"),
+            "drops or truncates a database",
+        ),
+        b(
+            &format!(r"exec.run:re:(?i){DB_DROP}[^|]*\|\s*(?:[^\s|;&]+\s+)*?{DB_CLIENT}\b"),
+            "drops or truncates a database",
+        ),
+        b(
+            &format!(r"exec.run:re:(?i)\b{DB_CLIENT}\b[^|&;]*<<[^|]*?{DB_DROP}"),
             "drops or truncates a database",
         ),
         // ---- docker/podman that gives root on the host ----
@@ -334,9 +370,11 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
             "mounts the docker socket: root on the host",
         ),
         b("exec.run:re:(?i)\\bnsenter\\b", "enters another namespace"),
-        // ---- pipe a download straight into a shell ----
+        // ---- pipe a download straight into a shell: the last program of
+        //      the pipe runs its input (`| sh`, `| sudo bash -s`,
+        //      `| python3 -`), not `| grep sh` or `| python -m json.tool` ----
         b(
-            "exec.run:re:(?i)\\b(curl|wget|fetch)\\b[^|]*\\|[^|]*\\b(sh|bash|zsh|python|perl)\\b",
+            &format!(r"exec.run:re:(?i)\b(?:curl|wget)\b[^|;&]*\|(?:[^|;&]*\|)*\s*{RUNS_STDIN}"),
             "runs a downloaded script unseen",
         ),
         // ---- cron, firewall, kill-all ----
@@ -354,24 +392,31 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
             "exec.run:re:(?i)>\\s*/etc/passwd",
             "overwrites the user database",
         ),
-        b("exec.run:re:(?i)\\buserdel\\b", "deletes a user account"),
+        b("exec.run:userdel", "deletes a user account"),
         b(
             "exec.run:re:(?i)\\bsystemctl\\b[^|&;]*\\b(stop|disable|mask)\\b[^|&;]*\\bssh",
             "turns off the SSH service",
         ),
-        // Force-push over main/master: the branch must be a whole refspec
-        // (`main`, `HEAD:main`, `+main`, `refs/heads/main`), so a branch that
-        // merely contains the word (`fix/main-menu`) is not caught.
+        // Force-push over main/master, matched on the one git command's
+        // words, so a force-push of another branch on the next line is not
+        // read as one. Three entries: the force flag before the branch,
+        // after it, and a `+main` refspec (a force-push on its own).
         b(
-            r"exec.run:re:(?i)\bgit\b[^|&;]*\bpush\b[^|&;]*(?:--force(?:-with-lease)?(?:=\S*)?|\s-f\b)[^|&;]*(?:\s|:|\+|refs/heads/)(?:main|master)(?:[\s:;&|]|$)",
+            &format!(
+                r"exec.run:cmd-re:{GIT_PUSH}(?: .*)? {GIT_FORCE}(?: .*)? {GIT_PROTECTED}(?: .*)?$"
+            ),
             "force-pushes over a protected branch",
         ),
         b(
-            r"exec.run:re:(?i)\bgit\b[^|&;]*\bpush\b[^|&;]*(?:\s|:|\+|refs/heads/)(?:main|master)(?:[\s:]|$)[^|&;]*(?:--force|\s-f\b)",
+            &format!(
+                r"exec.run:cmd-re:{GIT_PUSH}(?: .*)? {GIT_PROTECTED}(?: .*)? {GIT_FORCE}(?: .*)?$"
+            ),
             "force-pushes over a protected branch",
         ),
         b(
-            r"exec.run:re:(?i)\bgit\b[^|&;]*\bpush\b[^|&;]*(?:\s|:)\+(?:main|master)(?:[\s:;&|]|$)",
+            &format!(
+                r"exec.run:cmd-re:{GIT_PUSH}(?: .*)? (?:\S*:)?\+(?:refs/heads/)?(?:main|master)(?: .*)?$"
+            ),
             "force-pushes over a protected branch",
         ),
         // ---- Windows ----

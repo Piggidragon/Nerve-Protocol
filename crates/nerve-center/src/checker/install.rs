@@ -29,15 +29,30 @@ const HF_BASE: &str = "https://huggingface.co";
 
 /// Where the install downloads from: the real release and Hugging Face, or a
 /// local fake in a test.
-struct Sources<'a> {
-    llama: &'a str,
-    hf: &'a str,
+#[derive(Debug, Clone)]
+pub struct Sources {
+    llama: String,
+    hf: String,
 }
 
-const REAL: Sources<'static> = Sources {
-    llama: LLAMA_BASE,
-    hf: HF_BASE,
-};
+impl Sources {
+    /// llama.cpp's GitHub release and Hugging Face.
+    pub fn real() -> Sources {
+        Sources {
+            llama: LLAMA_BASE.into(),
+            hf: HF_BASE.into(),
+        }
+    }
+
+    /// A local fake serving both, for a test.
+    #[cfg(test)]
+    pub(crate) fn at(base: &str) -> Sources {
+        Sources {
+            llama: base.into(),
+            hf: base.into(),
+        }
+    }
+}
 
 /// One pinned model: where it comes from, what it is, and the defaults the
 /// evaluation (docs/dev/action-checker.md) gives it.
@@ -272,12 +287,10 @@ fn set(shared: &Shared, f: impl FnOnce(&mut Status)) {
     f(&mut shared.lock().unwrap());
 }
 
-/// Downloads and verifies llama.cpp and the chosen model into `state`,
-/// reporting progress through `shared`. `cancel` stops it at the next read.
-/// A build or model already present and valid is not fetched again. Nothing
-/// a server might be holding is deleted here: the caller stops the server
-/// first. The new build is staged beside the old and swapped in only once it
-/// is verified, so a failed or cancelled install never destroys a working one.
+/// Downloads, verifies and swaps in llama.cpp and the chosen model in one go:
+/// [`prepare`], [`commit`] and [`finish`] with the real sources. For a caller
+/// with no server running from these files (the end-to-end test); the center
+/// stops its server between the two steps.
 pub async fn install(
     state: PathBuf,
     gpu: bool,
@@ -285,23 +298,23 @@ pub async fn install(
     shared: Shared,
     cancel: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<(), String> {
-    set(&shared, |s| {
-        *s = Status {
-            phase: Phase::Downloading,
-            gpu,
-            model_id: model,
-            ..Default::default()
-        };
-    });
-    let r = install_inner(&state, gpu, model, &shared, &cancel, &REAL).await;
-    set(&shared, |s| match &r {
+    let r = match prepare(&state, gpu, model, &shared, &cancel, &Sources::real()).await {
+        Ok(p) => commit(&state, p),
+        Err(e) => Err(e),
+    };
+    finish(&shared, &r);
+    r
+}
+
+/// Writes an install's end into its status: done, or failed with the reason.
+pub fn finish(shared: &Shared, r: &Result<(), String>) {
+    set(shared, |s| match r {
         Ok(()) => s.phase = Phase::Done,
         Err(e) => {
             s.phase = Phase::Failed;
             s.message = e.clone();
         }
     });
-    r
 }
 
 /// The idle timeout for an install download: a connection silent this long is
@@ -320,38 +333,82 @@ fn opts(
     }
 }
 
-async fn install_inner(
+/// What [`prepare`] fetched and verified, waiting beside the files in use to
+/// be swapped in by [`commit`].
+#[derive(Debug)]
+pub struct Prepared {
+    /// The new llama.cpp build, unpacked in its staging folder, when the
+    /// right one (CPU or GPU) was not installed yet.
+    build: Option<PathBuf>,
+    /// The new model file, when it was not in place with the right hash.
+    model: Option<PathBuf>,
+    model_id: LocalModel,
+}
+
+/// Where a model's verified download waits for [`commit`].
+fn staged_model(state: &Path, model: LocalModel) -> PathBuf {
+    model_dir(state).join(format!("{}.download", model_pin(model).file))
+}
+
+/// Downloads and verifies llama.cpp and the chosen model into staging places
+/// beside the installed files, reporting progress through `shared`. `cancel`
+/// stops it at the next read. A build or model already present and valid is
+/// not fetched again. Nothing a running server uses is touched, so the
+/// current model keeps judging calls for the whole download; only
+/// [`commit`] swaps the files, with the server stopped. A failed or
+/// cancelled step leaves nothing staged behind.
+pub async fn prepare(
     state: &Path,
     gpu: bool,
     model_id: LocalModel,
     shared: &Shared,
     cancel: &Arc<std::sync::atomic::AtomicBool>,
-    from: &Sources<'_>,
+    from: &Sources,
+) -> Result<Prepared, String> {
+    set(shared, |s| {
+        *s = Status {
+            phase: Phase::Downloading,
+            gpu,
+            model_id,
+            ..Default::default()
+        };
+    });
+    let mut p = Prepared {
+        build: None,
+        model: None,
+        model_id,
+    };
+    let r = prepare_into(&mut p, state, gpu, shared, cancel, from).await;
+    if r.is_err() {
+        if let Some(b) = &p.build {
+            let _ = std::fs::remove_dir_all(b);
+        }
+        if let Some(m) = &p.model {
+            let _ = std::fs::remove_file(m);
+        }
+    }
+    r.map(|()| p)
+}
+
+async fn prepare_into(
+    p: &mut Prepared,
+    state: &Path,
+    gpu: bool,
+    shared: &Shared,
+    cancel: &Arc<std::sync::atomic::AtomicBool>,
+    from: &Sources,
 ) -> Result<(), String> {
     let (asset, sha) =
         llama_asset(gpu).ok_or("this platform has no pinned local build; use the endpoint mode")?;
     // 1. llama.cpp, unless the right build (CPU vs GPU) is already unpacked.
-    // A device switch fetches the other build into a staging folder and
-    // swaps it in only when it is ready, so the old build survives a failure.
+    // The other build goes into a staging folder beside the one in use.
     let need_llama = server_bin(state).is_none() || installed_variant(state) != Some(gpu);
     if need_llama {
-        let dir = llama_dir(state);
-        let staging = dir.with_extension("staging");
+        let staging = llama_dir(state).with_extension("staging");
         let _ = std::fs::remove_dir_all(&staging);
         create_dir(&staging)?;
-        let staged = stage_build(&staging, asset, sha, gpu, from, cancel, shared).await;
-        if let Err(e) = staged {
-            // A failed or cancelled build leaves nothing staged behind.
-            let _ = std::fs::remove_dir_all(&staging);
-            return Err(e);
-        }
-        // Swap the staged build in. The caller stopped the server, so the old
-        // folder is free to remove even on Windows.
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::rename(&staging, &dir).map_err(|e| format!("cannot install the build: {e}"))?;
-        if server_bin(state).is_none() {
-            return Err("the llama.cpp build did not install".into());
-        }
+        p.build = Some(staging.clone());
+        stage_build(&staging, asset, sha, gpu, from, cancel, shared).await?;
     } else {
         set(shared, |s| {
             s.llama = Progress { done: 1, total: 1 };
@@ -360,42 +417,80 @@ async fn install_inner(
     if cancel.load(std::sync::atomic::Ordering::Relaxed) {
         return Err("the install was cancelled".into());
     }
-    // 2. The model, unless it is already there with the right hash. Only one
-    // model is kept: switching to the other one deletes the first, so a switch
-    // does not leave gigabytes behind.
-    let pin = model_pin(model_id);
-    let model = model_path(state, model_id);
+    // 2. The model, unless it is already there with the right hash. It is
+    // downloaded beside the file in use, as the server may be holding that.
+    let pin = model_pin(p.model_id);
+    let model = model_path(state, p.model_id);
+    let staged = staged_model(state, p.model_id);
     set(shared, |s| s.phase = Phase::Verifying);
     let have = model.metadata().map(|m| m.len()).unwrap_or(0) == pin.bytes
         && sha256_file(&model).as_deref() == Ok(pin.sha256);
-    if !have {
-        set(shared, |s| s.phase = Phase::Downloading);
-        create_dir(&model_dir(state))?;
-        let url = format!(
-            "{}/{}/resolve/{}/{}",
-            from.hf, pin.repo, pin.revision, pin.file
-        );
-        download_file(
-            &url,
-            &model,
-            pin.sha256,
-            Some(pin.bytes),
-            &opts(cancel, pin.bytes + 1024),
-            &mut |done, total| {
-                set(shared, |s| s.model = Progress { done, total });
-            },
-        )
-        .await
-        .map_err(|e| format!("downloading {}: {e}", pin.name))?;
-    } else {
+    if have {
+        // A download an earlier, interrupted install left is not needed.
+        let _ = std::fs::remove_file(&staged);
         set(shared, |s| {
             s.model = Progress {
                 done: pin.bytes,
                 total: pin.bytes,
             };
         });
+        return Ok(());
     }
-    for other in MODELS.iter().filter(|m| m.id != model_id) {
+    set(shared, |s| s.phase = Phase::Downloading);
+    create_dir(&model_dir(state))?;
+    let url = format!(
+        "{}/{}/resolve/{}/{}",
+        from.hf, pin.repo, pin.revision, pin.file
+    );
+    p.model = Some(staged.clone());
+    download_file(
+        &url,
+        &staged,
+        pin.sha256,
+        Some(pin.bytes),
+        &opts(cancel, pin.bytes + 1024),
+        &mut |done, total| {
+            set(shared, |s| s.model = Progress { done, total });
+        },
+    )
+    .await
+    .map_err(|e| format!("downloading {}: {e}", pin.name))
+}
+
+/// Swaps in what [`prepare`] staged, and deletes the other model, so a
+/// switch does not leave gigabytes behind. The caller has stopped the server
+/// (Windows refuses to move or delete a file a running process holds). The
+/// old build is moved aside first and put back if the new one cannot take
+/// its place, so a failed swap keeps the working build.
+pub fn commit(state: &Path, p: Prepared) -> Result<(), String> {
+    if let Some(staging) = &p.build {
+        let dir = llama_dir(state);
+        let old = dir.with_extension("old");
+        let _ = std::fs::remove_dir_all(&old);
+        let had = dir.exists();
+        if had {
+            std::fs::rename(&dir, &old).map_err(|e| {
+                let _ = std::fs::remove_dir_all(staging);
+                format!("cannot replace the build: {e}")
+            })?;
+        }
+        if let Err(e) = std::fs::rename(staging, &dir) {
+            if had {
+                let _ = std::fs::rename(&old, &dir);
+            }
+            let _ = std::fs::remove_dir_all(staging);
+            return Err(format!("cannot install the build: {e}"));
+        }
+        let _ = std::fs::remove_dir_all(&old);
+        if server_bin(state).is_none() {
+            return Err("the llama.cpp build did not install".into());
+        }
+    }
+    if let Some(staged) = &p.model {
+        std::fs::rename(staged, model_path(state, p.model_id))
+            .map_err(|e| format!("cannot put the model in place: {e}"))?;
+    }
+    for other in MODELS.iter().filter(|m| m.id != p.model_id) {
         let _ = std::fs::remove_file(model_path(state, other.id));
     }
     Ok(())
@@ -408,7 +503,7 @@ async fn stage_build(
     asset: &str,
     sha: &str,
     gpu: bool,
-    from: &Sources<'_>,
+    from: &Sources,
     cancel: &Arc<std::sync::atomic::AtomicBool>,
     shared: &Shared,
 ) -> Result<(), String> {
@@ -771,6 +866,69 @@ mod tests {
         std::fs::create_dir_all(&dest).unwrap();
         unpack(&archive, &dest).unwrap();
         assert!(find_file(&dest, "llama-server").is_some());
+
+        // An archive whose entry climbs out of the target (`../evil.txt`,
+        // kept as written with `-P`) is refused and nothing lands outside.
+        let evil = dir.path().join("evil.txt");
+        std::fs::write(&evil, b"x").unwrap();
+        let bad = dir.path().join("bad.tar");
+        assert!(
+            std::process::Command::new("tar")
+                .args(["-cPf"])
+                .arg(&bad)
+                .arg("-C")
+                .arg(&src)
+                .arg("../evil.txt")
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::remove_file(&evil).unwrap();
+        let out = dir.path().join("out2");
+        std::fs::create_dir_all(&out).unwrap();
+        let e = unpack(&bad, &out).unwrap_err();
+        assert!(e.contains("unsafe path"), "{e}");
+        assert!(!evil.exists(), "an entry was written outside the target");
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 0);
+    }
+
+    /// `commit` swaps a staged build and model in, keeps nothing of the old
+    /// build, and deletes the other model; `prepare` of a build that is
+    /// already right leaves the installed files alone.
+    #[test]
+    fn commit_swaps_in_the_staged_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path();
+        let ld = llama_dir(state);
+        std::fs::create_dir_all(ld.join("bin")).unwrap();
+        std::fs::write(ld.join("bin").join(server_name()), b"old").unwrap();
+        std::fs::write(ld.join("variant"), "cpu").unwrap();
+        std::fs::create_dir_all(model_dir(state)).unwrap();
+        std::fs::write(model_path(state, LocalModel::D1_3b), b"d1").unwrap();
+        let staging = ld.with_extension("staging");
+        std::fs::create_dir_all(staging.join("bin")).unwrap();
+        std::fs::write(staging.join("bin").join(server_name()), b"new").unwrap();
+        std::fs::write(staging.join("variant"), "gpu").unwrap();
+        let staged = staged_model(state, LocalModel::Kev4b);
+        std::fs::write(&staged, b"kev").unwrap();
+        commit(
+            state,
+            Prepared {
+                build: Some(staging.clone()),
+                model: Some(staged.clone()),
+                model_id: LocalModel::Kev4b,
+            },
+        )
+        .unwrap();
+        assert_eq!(installed_variant(state), Some(true));
+        assert_eq!(std::fs::read(server_bin(state).unwrap()).unwrap(), b"new");
+        assert_eq!(
+            std::fs::read(model_path(state, LocalModel::Kev4b)).unwrap(),
+            b"kev"
+        );
+        assert!(!model_path(state, LocalModel::D1_3b).exists());
+        assert!(!staging.exists() && !staged.exists());
+        assert!(!ld.with_extension("old").exists());
     }
 
     /// `download_file` downloads over plain HTTP (a loopback fake), checks the
@@ -848,14 +1006,10 @@ mod tests {
             std::fs::create_dir_all(model_dir(dir.path())).unwrap();
             std::fs::write(model_path(dir.path(), LocalModel::D1_3b), b"x").unwrap();
             // A GPU reinstall whose download fails: nothing listens there.
-            let dead = Sources {
-                llama: "http://127.0.0.1:9",
-                hf: "http://127.0.0.1:9",
-            };
+            let dead = Sources::at("http://127.0.0.1:9");
             let shared: Shared = Arc::new(Mutex::new(Status::default()));
             let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let r =
-                install_inner(dir.path(), true, LocalModel::D1_3b, &shared, &cancel, &dead).await;
+            let r = prepare(dir.path(), true, LocalModel::D1_3b, &shared, &cancel, &dead).await;
             assert!(r.is_err(), "{r:?}");
             // The old CPU build is still there and nothing is staged.
             assert_eq!(installed_variant(dir.path()), Some(false));

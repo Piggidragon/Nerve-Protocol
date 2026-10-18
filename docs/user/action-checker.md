@@ -38,8 +38,23 @@ Entries are in the machine's own rule syntax, `<scope>:<pattern>`:
 - `exec.run:rm -rf /*` — a command. The program, then the flags that must be
   present, then an operand pattern.
 - `fs.write:/etc/sudoers` — a write to a path. `~` stands for any user's home.
-- `re:` for a regular expression where a wildcard is not enough, e.g.
-  `exec.run:re:(?i)\bmkfs\b`.
+- `cmd-re:` for a regular expression over **each command** of the line, e.g.
+  `exec.run:cmd-re:^terraform destroy( |$)`. The checker pulls the commands
+  apart (see below) and writes each one as `program arg1 arg2 …`: the
+  program's base name without `.exe` and without wrappers such as `sudo`,
+  then the arguments as written, all **lower-cased**, with the quotes removed
+  and one space between them. So `^` is the program, and a pattern must be in
+  lower case (`^remove-item …`, not `^Remove-Item …`). An argument that was
+  quoted keeps its inner spaces, so `^psql .*drop table` matches
+  `psql -c "DROP TABLE x"`. The example blocks `terraform destroy` but not
+  `grep "terraform destroy" notes.md`.
+- `re:` for a regular expression over the **whole line**, e.g.
+  `exec.run:re:(?i)\bdd\b[^|&;]*\bof=/dev/sd`. Runs of spaces become one, a
+  line ended by `\` (or PowerShell's `` ` ``) is joined with the next, and any
+  other line break becomes ` ; `, so `[^;]*` stops at the end of a command.
+  It sees everything on the line, quotes and comments included, so a pattern
+  that only looks for a word also refuses a commit message or a `grep` that
+  mentions it: prefer a command pattern or `cmd-re:` where you can.
 
 You can add entries, remove them, switch single ones off, and reset the whole
 list to the built-in defaults. The defaults block truly dangerous things and
@@ -48,7 +63,14 @@ leave ordinary work alone: `rm file`, `rm -rf ./build`, `rm -rf node_modules`,
 filesystem, `mkfs`, `dd` to a disk, fork bombs, `chmod -R 777 /`, dropping a
 database, a container that gives root on the host, `curl … | sh`, force-pushing
 `main`, and the Windows equivalents (`Format-Volume`, `rd /s /q C:\`,
-`vssadmin delete shadows`, disabling Defender, …) are blocked.
+`vssadmin delete shadows`, disabling Defender, …) are blocked. Most defaults
+look at the command that runs, not at every word on the line: `mkfs`,
+`wipefs` and `userdel` only as the program, `DROP TABLE` only in what a
+database client (`psql`, `mysql`, `sqlite3`, `mongosh`, …) is given, a download
+only when it is piped into something that runs it (`| sh`, `| sudo bash -s`,
+`| python3 -`, not `| grep` or `| python -m json.tool`), and a force-push only
+in the `git push` itself. So a commit message, a `grep` or a note that merely
+mentions one of them is not refused.
 
 The matcher does not just look at the raw string. For a command it splits the
 line into its commands (at `;`, `&&`, `||`, `|`, newlines, inside `$( )`,
@@ -113,8 +135,11 @@ text generated, so a judgement is fast and cheap. There are two sources:
   it is really the CPU). You can switch CPU/GPU later with one click. The page
   shows a
   progress bar for the download, then the server's state (starting, ready or
-  failed) with the last lines of its output. **Remove** deletes the downloaded
-  files. A machine with no prebuilt build for it says so and points you to the
+  failed) with the last lines of its output. During a reinstall or a switch the
+  model already installed keeps checking calls while the new files download;
+  it is stopped only for the moment the files are swapped, and if the install
+  fails it keeps running as before. **Remove** turns the local model off and
+  deletes the downloaded files (also during an install, which it ends). A machine with no prebuilt build for it says so and points you to the
   endpoint source; for any other model, or your own llama.cpp, use the endpoint
   source too.
 

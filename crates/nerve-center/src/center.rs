@@ -106,9 +106,31 @@ pub struct Inner {
     local_sig: Mutex<String>,
     /// The one-click install's progress (llama.cpp and the model download).
     install: checker::install::Shared,
-    /// The running install's cancel flag, so Remove (or a new install) can
-    /// stop it; a newer install swaps in its own.
-    install_cancel: Mutex<Option<Arc<AtomicBool>>>,
+    /// The running install's task and cancel flag, so Remove can end it and
+    /// wait for it before it deletes anything.
+    install_task: Mutex<Option<InstallTask>>,
+    /// Where the install downloads from (a local fake in a test).
+    install_from: Mutex<Arc<checker::install::Sources>>,
+    /// Set while an install swaps the local model's files or Remove deletes
+    /// them, so no config change starts the server from them meanwhile.
+    /// `manage_local_model` holds this lock for its whole run.
+    files_held: Mutex<bool>,
+}
+
+/// A one-click install running in the background.
+struct InstallTask {
+    cancel: Arc<AtomicBool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+/// While alive, the local model's files are being replaced or deleted and
+/// the server stays down; dropping it lets `rebuild_checker` start it again.
+struct FilesHeld(Center);
+
+impl Drop for FilesHeld {
+    fn drop(&mut self) {
+        *self.0.files_held.lock().unwrap() = false;
+    }
 }
 
 /// A line that may repeat: logged at most once in `QUIET_FOR`, with the count
@@ -349,7 +371,9 @@ impl Center {
             local_model: Mutex::new(None),
             local_sig: Mutex::new(String::new()),
             install: Arc::new(Mutex::new(checker::install::Status::default())),
-            install_cancel: Mutex::new(None),
+            install_task: Mutex::new(None),
+            install_from: Mutex::new(Arc::new(checker::install::Sources::real())),
+            files_held: Mutex::new(false),
         }));
         // Build the checker from the stored config and the endpoint token,
         // and start the local model if it is on.
@@ -2364,8 +2388,17 @@ impl Center {
     /// CPU/GPU choice and the model, so an unrelated change does not restart
     /// it.
     fn manage_local_model(&self, cfg: &CheckerConfig) {
+        // Held for the whole run, so an install cannot take the files between
+        // the check below and the start.
+        let held = self.files_held.lock().unwrap();
         let installed = checker::install::installed(&self.dir, cfg.model.local_model);
         let want = cfg.model_on && cfg.model.source == ModelSource::Local && installed;
+        // An install is swapping the files (or Remove deleting them): start
+        // nothing from them now. The install rebuilds when it is done, and
+        // the empty signature makes that start the server.
+        if want && *held {
+            return;
+        }
         let sig = if want {
             format!(
                 "gpu={}|model={:?}",
@@ -2526,23 +2559,32 @@ impl Center {
         Ok(rule)
     }
 
-    /// Stops the running local model and waits for its process to exit, then
-    /// clears it, so its files are free to delete or replace (Windows refuses
-    /// while it runs). Cheap when nothing runs.
-    async fn stop_local_model(&self) {
-        let server = self.local_model.lock().unwrap().take();
+    /// Takes the local model's files for an install's swap or a Remove: marks
+    /// them held, so no config change starts the server from them, then stops
+    /// the running server and waits for its process to exit, so the files are
+    /// free to replace or delete (Windows refuses while it runs). The server
+    /// stays down until the returned guard is dropped and the checker rebuilt.
+    async fn hold_local_files(&self) -> FilesHeld {
+        let server = {
+            let mut held = self.files_held.lock().unwrap();
+            *held = true;
+            *self.local_sig.lock().unwrap() = String::new();
+            self.local_model.lock().unwrap().take()
+        };
         if let Some(srv) = server {
             srv.stop().await;
         }
-        *self.local_sig.lock().unwrap() = String::new();
+        FilesHeld(self.clone())
     }
 
     /// Starts the one-click install of llama.cpp and `model` on the CPU or
-    /// GPU, in the background. On success it turns the local model on with the
-    /// chosen model and device; for a GPU install it first checks the build
-    /// really finds a device and falls back to the CPU with a note if not.
-    /// Refused while an install is already running; the running server is
-    /// stopped first so its files can be replaced.
+    /// GPU, in the background. The running model keeps judging calls while
+    /// the files download; it is stopped only for the swap at the end. On
+    /// success it turns the local model on with the chosen model and device;
+    /// for a GPU install it first checks the build really finds a device and
+    /// falls back to the CPU with a note if not. Success or failure, the local
+    /// server is then brought back in line with the config. Refused while an
+    /// install is already running.
     pub async fn start_checker_install(&self, gpu: bool, model: LocalModel) -> Result<(), String> {
         if !checker::install::platform_supported() {
             return Err("this machine has no pinned local build; use the endpoint mode".into());
@@ -2566,68 +2608,104 @@ impl Center {
             };
         }
         let cancel = Arc::new(AtomicBool::new(false));
-        *self.install_cancel.lock().unwrap() = Some(cancel.clone());
-        // Free the files the server holds before the install replaces them.
-        self.stop_local_model().await;
-        let (dir, shared, me) = (self.dir.clone(), self.install.clone(), self.clone());
-        tokio::spawn(async move {
-            let r =
-                checker::install::install(dir.clone(), gpu, model, shared, cancel.clone()).await;
-            // A newer install or a Remove took over: drop this result.
-            let current = me
-                .install_cancel
-                .lock()
-                .unwrap()
-                .as_ref()
-                .is_some_and(|c| Arc::ptr_eq(c, &cancel));
-            if !current {
-                return;
-            }
-            match r {
-                Ok(()) => {
-                    // A GPU install only counts as GPU if the build finds a
-                    // device; otherwise fall back to the CPU and say so.
-                    let mut use_gpu = gpu;
-                    if gpu && !checker::install::gpu_available(&dir).await {
-                        use_gpu = false;
-                        me.note(
-                            Level::Warn,
-                            None,
-                            "the action checker's GPU build found no device; running the model on the CPU. Reinstall on CPU to keep it off the GPU.",
-                        );
-                        me.install.lock().unwrap().message =
-                            "no GPU device was found; running on the CPU".into();
-                    }
-                    me.update(|s| s.checker.local_installed(use_gpu, model));
-                    me.note(
-                        Level::Info,
-                        None,
-                        format!(
-                            "the action checker's local model was installed ({})",
-                            if use_gpu { "GPU" } else { "CPU" }
-                        ),
-                    );
-                    me.rebuild_checker();
-                    me.changed(Change::Nodes);
-                }
-                Err(e) => me.note(
-                    Level::Warn,
-                    None,
-                    format!("the action checker's local model install failed: {e}"),
-                ),
-            }
-        });
+        let from = self.install_from.lock().unwrap().clone();
+        // Keep the slot locked while spawning, so the task's own check of
+        // whether it is still current waits until its handle is stored.
+        let mut slot = self.install_task.lock().unwrap();
+        let (me, flag) = (self.clone(), cancel.clone());
+        let task = tokio::spawn(async move { me.run_install(gpu, model, flag, from).await });
+        *slot = Some(InstallTask { cancel, task });
         Ok(())
     }
 
-    /// Removes the installed local build and model, and turns the local model
-    /// off. Cancels a running install and stops the server first, so the
-    /// delete does not fail while a file is in use.
-    pub async fn remove_checker_model(&self) -> Result<(), String> {
-        if let Some(c) = self.install_cancel.lock().unwrap().take() {
-            c.store(true, Ordering::Relaxed);
+    /// The body of an install task (see [`Center::start_checker_install`]).
+    async fn run_install(
+        &self,
+        gpu: bool,
+        model: LocalModel,
+        cancel: Arc<AtomicBool>,
+        from: Arc<checker::install::Sources>,
+    ) {
+        let r = async {
+            let prepared =
+                checker::install::prepare(&self.dir, gpu, model, &self.install, &cancel, &from)
+                    .await?;
+            // Only now take the server down: the files it runs from are
+            // about to be replaced.
+            let _held = self.hold_local_files().await;
+            checker::install::commit(&self.dir, prepared)
         }
-        self.stop_local_model().await;
+        .await;
+        // A Remove took over (it also ends this task): drop the result.
+        let current = self
+            .install_task
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|t| Arc::ptr_eq(&t.cancel, &cancel));
+        if !current {
+            return;
+        }
+        match &r {
+            Ok(()) => {
+                // A GPU install only counts as GPU if the build finds a
+                // device; otherwise fall back to the CPU and say so.
+                let mut use_gpu = gpu;
+                if gpu && !checker::install::gpu_available(&self.dir).await {
+                    use_gpu = false;
+                    self.note(
+                        Level::Warn,
+                        None,
+                        "the action checker's GPU build found no device; running the model on the CPU. Reinstall on CPU to keep it off the GPU.",
+                    );
+                }
+                self.update(|s| s.checker.local_installed(use_gpu, model));
+                checker::install::finish(&self.install, &r);
+                if gpu && !use_gpu {
+                    self.install.lock().unwrap().message =
+                        "no GPU device was found; running on the CPU".into();
+                }
+                self.note(
+                    Level::Info,
+                    None,
+                    format!(
+                        "the action checker's local model was installed ({})",
+                        if use_gpu { "GPU" } else { "CPU" }
+                    ),
+                );
+            }
+            Err(e) => {
+                checker::install::finish(&self.install, &r);
+                self.note(
+                    Level::Warn,
+                    None,
+                    format!("the action checker's local model install failed: {e}"),
+                );
+            }
+        }
+        // Start the new build, or the old one again after a failed swap (a
+        // failed download never stopped it).
+        self.rebuild_checker();
+        self.changed(Change::Nodes);
+    }
+
+    /// Removes the installed local build and model, and turns the local model
+    /// off. Ends a running install first and waits for its task, so nothing it
+    /// does lands after this, then stops the server, so the delete does not
+    /// fail while a file is in use. The model is turned off even when a file
+    /// could not be deleted: it cannot run from a half-removed install, and
+    /// left on it would refuse every call as unreachable.
+    pub async fn remove_checker_model(&self) -> Result<(), String> {
+        let running = self.install_task.lock().unwrap().take();
+        if let Some(t) = running {
+            t.cancel.store(true, Ordering::Relaxed);
+            // A download waiting on a silent connection only sees the flag at
+            // its next read; aborting ends it at once.
+            t.task.abort();
+            let _ = t.task.await;
+        }
+        *self.install.lock().unwrap() = checker::install::Status::default();
+        let held = self.hold_local_files().await;
         // The server has exited; retry a couple of times for a late handle on
         // Windows.
         let mut last = Ok(());
@@ -2638,8 +2716,7 @@ impl Center {
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
-        last.map_err(|e| e.to_string())?;
-        *self.install.lock().unwrap() = checker::install::Status::default();
+        drop(held);
         self.update(|s| {
             if s.checker.model.source == ModelSource::Local {
                 s.checker.model_on = false;
@@ -2647,12 +2724,21 @@ impl Center {
         });
         self.rebuild_checker();
         self.changed(Change::Nodes);
-        self.note(
-            Level::Info,
-            None,
-            "the action checker's local model was removed",
-        );
-        Ok(())
+        match last {
+            Ok(()) => {
+                self.note(
+                    Level::Info,
+                    None,
+                    "the action checker's local model was removed",
+                );
+                Ok(())
+            }
+            Err(e) => {
+                let e = format!("the local model is off, but not every file could be deleted: {e}");
+                self.note(Level::Warn, None, format!("the action checker: {e}"));
+                Err(e)
+            }
+        }
     }
 
     /// Adds a checker audit entry (a center decision) to the feed and the log.
@@ -2919,6 +3005,202 @@ mod tests {
         let CallError::Rpc(e) = e;
         assert_eq!(e.kind(), ErrorCode::Forbidden);
         assert!(e.message.contains("reach"), "{}", e.message);
+    }
+
+    /// A fake release server for the install: the one connection it takes
+    /// gets a head that promises 1000 bytes and ten of them, then nothing
+    /// until the returned sender fires, when the connection is closed (so the
+    /// download fails as cut short).
+    #[cfg(unix)]
+    fn held_download() -> (String, std::sync::mpsc::Sender<()>) {
+        use std::io::{Read, Write};
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            if let Some(Ok(mut c)) = l.incoming().next() {
+                let mut buf = [0u8; 4096];
+                let _ = c.read(&mut buf);
+                let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n0123456789");
+                let _ = rx.recv_timeout(Duration::from_secs(25));
+            }
+        });
+        (format!("http://127.0.0.1:{port}"), tx)
+    }
+
+    /// An installed CPU build that is the fake `llama-server` (it answers as
+    /// a decision model), with a d1-3B file it ignores.
+    #[cfg(unix)]
+    fn install_fake_build(state: &Path) {
+        let bin = checker::install::llama_dir(state).join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        checker::server::fake::fake_llama_server(&bin);
+        std::fs::write(bin.parent().unwrap().join("variant"), "cpu").unwrap();
+        let model = checker::install::model_path(state, LocalModel::D1_3b);
+        std::fs::create_dir_all(model.parent().unwrap()).unwrap();
+        std::fs::write(model, b"x").unwrap();
+    }
+
+    /// Waits up to 20 s for `f`.
+    #[cfg(unix)]
+    async fn until(what: &str, mut f: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !f() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    #[cfg(unix)]
+    fn local_ready(c: &Center) -> bool {
+        c.local_model_status()
+            .is_some_and(|s| s.phase == checker::server::Phase::Ready)
+    }
+
+    /// A center with the fake build installed and the local model on and
+    /// ready.
+    #[cfg(unix)]
+    async fn center_with_a_running_model(dir: &Path) -> Center {
+        install_fake_build(dir);
+        let c = open(dir, None);
+        c.update(|s| {
+            s.checker.model_on = true;
+            s.checker.model.source = ModelSource::Local;
+        });
+        c.rebuild_checker();
+        until("the model to be ready", || local_ready(&c)).await;
+        c
+    }
+
+    /// A config save that only toggles taint.
+    #[cfg(unix)]
+    fn save_unrelated_change(c: &Center) {
+        let mut cfg = c.read(|s| s.checker.clone());
+        cfg.taint_on = !cfg.taint_on;
+        c.apply_checker_config(cfg).unwrap();
+    }
+
+    /// An install keeps the running model judging calls while it downloads,
+    /// a config save meanwhile does not disturb it, and a failed install
+    /// leaves the working model installed and running (review r3, findings 2
+    /// and 3).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_install_keeps_the_model_running_until_its_swap() {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().unwrap();
+            let c = center_with_a_running_model(dir.path()).await;
+            let (base, release) = held_download();
+            *c.install_from.lock().unwrap() = Arc::new(checker::install::Sources::at(&base));
+            // The switch to the GPU build starts downloading.
+            c.start_checker_install(true, LocalModel::D1_3b)
+                .await
+                .unwrap();
+            until("the download to start", || {
+                c.checker_install_status().llama.done >= 10
+            })
+            .await;
+            assert!(local_ready(&c), "the model was stopped for the download");
+            save_unrelated_change(&c);
+            assert!(local_ready(&c), "a config save disturbed the running model");
+            // The download fails: the CPU build is kept and still runs.
+            release.send(()).unwrap();
+            until("the install to fail", || {
+                c.checker_install_status().phase == checker::install::Phase::Failed
+            })
+            .await;
+            assert_eq!(checker::install::installed_variant(dir.path()), Some(false));
+            until("the model to run again", || local_ready(&c)).await;
+        })
+        .await
+        .expect("the test did not finish within 60 s");
+    }
+
+    /// While an install swaps the files (or Remove deletes them), a config
+    /// save does not start the server from them; it starts again once they
+    /// are free (review r3, finding 3).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_config_save_does_not_start_the_model_while_its_files_are_held() {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().unwrap();
+            let c = center_with_a_running_model(dir.path()).await;
+            let held = c.hold_local_files().await;
+            assert!(c.local_model_status().is_none());
+            save_unrelated_change(&c);
+            assert!(
+                c.local_model_status().is_none(),
+                "a config save started the server during the swap"
+            );
+            drop(held);
+            c.rebuild_checker();
+            until("the model to run again", || local_ready(&c)).await;
+        })
+        .await
+        .expect("the test did not finish within 60 s");
+    }
+
+    /// Remove during a stalled download ends the install at once, and
+    /// nothing of that install lands afterwards: its status stays reset and
+    /// no file comes back (review r3, finding 5).
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn remove_ends_a_stalled_install_for_good() {
+        tokio::time::timeout(Duration::from_secs(60), async {
+            let dir = tempfile::tempdir().unwrap();
+            let c = open(dir.path(), None);
+            let (base, release) = held_download();
+            *c.install_from.lock().unwrap() = Arc::new(checker::install::Sources::at(&base));
+            c.start_checker_install(false, LocalModel::D1_3b)
+                .await
+                .unwrap();
+            until("the download to start", || {
+                c.checker_install_status().llama.done >= 10
+            })
+            .await;
+            let t = Instant::now();
+            c.remove_checker_model().await.unwrap();
+            assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+            assert_eq!(
+                c.checker_install_status().phase,
+                checker::install::Phase::Idle
+            );
+            // A second install starts while the first one's connection is
+            // still open and silent.
+            let (base2, release2) = held_download();
+            *c.install_from.lock().unwrap() = Arc::new(checker::install::Sources::at(&base2));
+            c.start_checker_install(false, LocalModel::D1_3b)
+                .await
+                .unwrap();
+            until("the second download to start", || {
+                c.checker_install_status().llama.done >= 10
+            })
+            .await;
+            // The first connection now ends. A first task still waiting on it
+            // would fail, clean up the staging folder the second one is
+            // using, and could write its failure into the second's status.
+            let _ = release.send(());
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let st = c.checker_install_status();
+            assert_eq!(
+                st.phase,
+                checker::install::Phase::Downloading,
+                "{}",
+                st.message
+            );
+            let staging = checker::install::llama_dir(dir.path()).with_extension("staging");
+            assert!(
+                staging.exists(),
+                "the first install removed the second's files"
+            );
+            let _ = release2.send(());
+            until("the second install to end", || {
+                c.checker_install_status().phase == checker::install::Phase::Failed
+            })
+            .await;
+        })
+        .await
+        .expect("the test did not finish within 60 s");
     }
 
     #[test]

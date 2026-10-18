@@ -46,20 +46,34 @@ know the node's home); any other `cap.action` matches that scope.
 
 For `exec.run` an entry is a **structured command pattern** (`program` glob,
 the short and long flags that must all be present, and operand globs that must
-each be met), a **`re:` regex** over the whole normalised command line, or a
-**`cmd-re:` regex** over each command pulled from the line as `program args…`
-(for a pattern that must read one command's own words and a whole operand — the
-Windows recursive-delete entries, which take the target as a whole operand so
-`Remove-Item C:\Users\me\build -Recurse -Force` stays allowed while a drive
-root is refused). `normalize` splits on separators and subshell parentheses,
-pulls `$( )`, backticks (also in double quotes), process substitution, `sh -c`
+each be met), a **`re:` regex** over the whole command line (`collapse_ws`:
+spaces collapsed, a `\`/`` ` `` line continuation joined, any other line break
+turned into ` ; ` so `[^;]*` stops at a command's end), or a **`cmd-re:`
+regex** over each command pulled from the line (`Command::line`: the program,
+then the arguments as tokenized, quotes removed, all lower-cased, one space
+apart). Defaults that must read one command's own words use the structured
+form or `cmd-re:`: `mkfs*`, `wipefs` and `userdel` as the program; database
+drops in a client's arguments (also `docker|podman|kubectl … psql …`); the
+three force-push forms (`push` as git's subcommand, a force flag, and `main`/
+`master` as a whole refspec, so the next line's push of another branch is not
+joined to it); and the Windows recursive deletes, which take the target as a
+whole operand so `Remove-Item C:\Users\me\build -Recurse -Force` stays
+allowed while a drive root is refused. Whole-line `re:` is kept where the
+pattern spans commands: a download piped into a program that runs its input
+(the last stage of the pipe is a shell or an interpreter with no script of its
+own), SQL piped or fed as a here-document into a client, and the device,
+container and Windows patterns.
+
+`normalize` splits on separators and subshell parentheses, pulls `$( )`,
+backticks (also in double quotes), process substitution, `sh -c`
 (`c` anywhere in the flag word: `-lc`, `-ce`, `-c -e`), `cmd /c` and
 `powershell -Command` bodies, and here-documents/here-strings fed to a shell;
 it strips wrappers and shell keywords, drops a `.exe` suffix, and expands
 combined short flags, so flag order and `-rf`/`-Rf`/`--recursive --force` do
 not matter. A here-document only written to a file is data (its lines are not
-commands), so a file that merely mentions `rm -rf /` is not refused. The whole
-walk is bounded: depth at `normalize::MAX_DEPTH` (16) and commands at
+commands), so a file that merely mentions `rm -rf /` is not refused by the
+structured and `cmd-re:` entries (a whole-line `re:` still sees its text).
+The whole walk is bounded: depth at `normalize::MAX_DEPTH` (16) and commands at
 `MAX_COMMANDS` (100 000, far above any real script, so ordinary heredocs are
 not refused); a line past a bound comes back as `Parsed::overflow`
 (`Depth`/`Commands`) and the checker refuses it (fail closed), naming which —
@@ -120,11 +134,22 @@ there, so a failed or cancelled reinstall keeps the working build.
 `gpu_hint` (libvulkan + a render node, or `vulkan-1.dll`) offers the GPU choice
 before anything is downloaded; after a GPU install the build's `--list-devices`
 (`gpu_available`, which never loads a model) is the real check, and a build
-that finds no device falls back to the CPU with a note. Installs are serialised
-and carry a cancel token the center keeps, so a second install is refused and a
-`Remove` cancels a running one and stops the server before deleting (which
-Windows refuses while a file is in use — `LocalServer::stop` ends the child and
-waits for it). There is no path or build to choose; the
+that finds no device falls back to the CPU with a note. An install runs in
+two steps: `install::prepare` downloads and verifies the new build into
+`<tag>.staging` and the new model into `<file>.download`, beside the files in
+use, while the running server keeps judging calls; then the center takes the
+files (`Center::hold_local_files`: a `files_held` flag that
+`manage_local_model` checks under the same lock, so a config save cannot start
+a server from them, then `LocalServer::stop`, which ends the child and waits
+for it) and `install::commit` swaps them in (the old build is moved aside and
+put back if the swap fails) and deletes the other model. Success or failure,
+the install ends with `rebuild_checker`, which starts the new build or the old
+one again. Installs are serialised (the phase is claimed under the status
+lock) and the center keeps the task's handle: `Remove` aborts it and waits for
+it, so a stalled download ends at once and nothing of it lands later, then
+takes the files the same way, deletes them, and turns the local model off even
+when a delete failed (a half-removed model cannot run, and left on it would
+refuse every call). There is no path or build to choose; the
 model is one of the two pinned in `install::MODELS` (`ModelConfig::local_model`,
 d1-3B by default), independent of the device. Each pin carries its repo,
 revision, file, size, SHA-256, licence, and the evaluation's default threshold
@@ -141,11 +166,17 @@ group on Unix); its state and the install progress show in the UI. The endpoint
 token is the only secret and is not in a backup; the installed files are not in
 a backup either (they are re-downloaded).
 
-The download, hash and length checks, the archive-entry scan, a failed
-reinstall keeping the old build, redirects, chunked bodies, the https→http rule
-and a stalled connection are unit-tested against loopback fakes
+The download, hash and length checks, the archive-entry scan (an archive with
+a `../` entry), a failed reinstall keeping the old build, the swap, redirects
+and their limit, chunked bodies, bytes past `Content-Length`, the https→http
+rule and a stalled connection are unit-tested against loopback fakes
 (`install::tests`, `nerve_transport::download::tests`); the supervisor's start,
-ready and stop against a fake `llama-server` script (`server::tests`, Unix).
+ready and stop (bounded below its own cap, and the port closed afterwards)
+against a fake `llama-server` script (`server::tests`, Unix). The center's
+side runs against the same fake and a release server that stalls on demand
+(`center::tests`, Unix): the model keeps running during an install's download
+and after a failed one, a config save while the files are held starts
+nothing, and a Remove during a stalled download ends it for good.
 `tests/local_install.rs` has two `#[ignore]` end-to-end tests. The first
 that does the real thing: it downloads the pinned CPU build of this platform
 through the center's downloader, unpacks it, starts d1-3B with it (from a local
@@ -157,8 +188,9 @@ second drives the center itself: install on the CPU, wait for ready, switch to
 the GPU build while the model runs (`NERVE_TEST_GPU_SWITCH=1`, only on a machine
 whose GPUs may be used), then Remove while it runs. On the Windows VM (no usable
 GPU: `--list-devices` finds none) it switched, fell back to the CPU with a note,
-and removed every file while the server was running (2026-10-18); on Linux it
-ran without the GPU step.
+and removed every file while the server was running (2026-10-18; re-run after
+review round 3 with two config saves during the switch, while the CPU model
+stayed ready); on Linux it ran without the GPU step.
 
 ## Taint
 

@@ -116,11 +116,18 @@ impl LocalServer {
     /// seconds, so its files are free to delete or replace afterwards. Safe to
     /// call more than once.
     pub async fn stop(&self) {
+        // A supervisor that already returned (a non-decision model) has no
+        // child left to wait for.
+        if self.task.is_finished() {
+            return;
+        }
         let exited = self.exited.clone();
         // Subscribe before asking, so a fast exit is not missed.
         let wait = exited.notified();
         tokio::pin!(wait);
-        self.shutdown.notify_waiters();
+        // `notify_one` keeps the request when the supervisor is not waiting at
+        // this instant (it may be in a readiness probe), so it is not lost.
+        self.shutdown.notify_one();
         let _ = tokio::time::timeout(Duration::from_secs(10), wait).await;
     }
 
@@ -349,36 +356,14 @@ fn set(inner: &Arc<Mutex<Inner>>, f: impl FnOnce(&mut Inner)) {
     f(&mut inner.lock().unwrap());
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn cpu_and_gpu_args() {
-        let model = std::path::Path::new("/s/checker/model/d1-3B-Q4_K_M.gguf");
-        let cpu = build_args(model, false, 12345);
-        assert!(cpu.windows(2).any(|w| w == ["-ngl", "0"]));
-        assert!(cpu.windows(2).any(|w| w == ["--port", "12345"]));
-        assert!(
-            cpu.windows(2)
-                .any(|w| w == ["-m", "/s/checker/model/d1-3B-Q4_K_M.gguf"])
-        );
-        let gpu = build_args(model, true, 12345);
-        assert!(gpu.windows(2).any(|w| w == ["-ngl", "999"]));
-    }
-
-    #[test]
-    fn a_download_line_is_recognised() {
-        assert!(is_download("downloading model.gguf"));
-        assert!(is_download("  45%|████      | 200M/440M"));
-        assert!(!is_download("llama_server: model loaded"));
-    }
+/// Test helpers the center's own tests share.
+#[cfg(all(test, unix))]
+pub(crate) mod fake {
     /// A fake `llama-server`: a shell script that ignores the model and serves
     /// `/v1/models` (a decision model) and `/v1/systemone` on the `--port` it
     /// is given, so the supervisor can be tested without a real model. Unix
     /// only (it uses `/bin/sh` and `nc`-free shell); skipped elsewhere.
-    #[cfg(unix)]
-    fn fake_llama_server(dir: &std::path::Path) -> std::path::PathBuf {
+    pub(crate) fn fake_llama_server(dir: &std::path::Path) -> std::path::PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let bin = dir.join("llama-server");
         // A tiny HTTP server in shell + a Python one-liner (Python is present
@@ -416,15 +401,41 @@ PY
         std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
         bin
     }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cpu_and_gpu_args() {
+        let model = std::path::Path::new("/s/checker/model/d1-3B-Q4_K_M.gguf");
+        let cpu = build_args(model, false, 12345);
+        assert!(cpu.windows(2).any(|w| w == ["-ngl", "0"]));
+        assert!(cpu.windows(2).any(|w| w == ["--port", "12345"]));
+        assert!(
+            cpu.windows(2)
+                .any(|w| w == ["-m", "/s/checker/model/d1-3B-Q4_K_M.gguf"])
+        );
+        let gpu = build_args(model, true, 12345);
+        assert!(gpu.windows(2).any(|w| w == ["-ngl", "999"]));
+    }
+
+    #[test]
+    fn a_download_line_is_recognised() {
+        assert!(is_download("downloading model.gguf"));
+        assert!(is_download("  45%|████      | 200M/440M"));
+        assert!(!is_download("llama_server: model loaded"));
+    }
     /// The supervisor starts the (fake) server, reports it ready once it
     /// answers `/v1/models` with a decision model, and `stop` ends the child
-    /// and returns (review r2, findings 1 and 8).
+    /// and returns once it has exited (review r2, findings 1 and 8; r3,
+    /// finding 6).
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn the_supervisor_starts_and_stops_a_fake_server() {
         let dir = tempfile::tempdir().unwrap();
-        let bin = fake_llama_server(dir.path());
+        let bin = super::fake::fake_llama_server(dir.path());
         let model = dir.path().join("model.gguf");
         std::fs::write(&model, b"x").unwrap();
         let server = LocalServer::start(bin, model, false, 5000).expect("start");
@@ -443,9 +454,16 @@ PY
         .await
         .unwrap();
         assert_eq!(score, 0.99);
-        // Stop returns promptly and the port is freed.
-        tokio::time::timeout(Duration::from_secs(10), server.stop())
+        // Stop returns well inside its own 10 s cap, because the child has
+        // exited (not because the cap ran out), and the port is free: the
+        // process is gone (review r3, finding 6).
+        let port = server.port;
+        tokio::time::timeout(Duration::from_secs(4), server.stop())
             .await
-            .expect("stop did not return");
+            .expect("stop did not end the child");
+        assert!(
+            std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
+            "the server still answers after stop"
+        );
     }
 }

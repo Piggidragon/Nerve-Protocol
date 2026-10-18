@@ -1214,7 +1214,8 @@ async fn download(url: &str, max: usize) -> Result<Vec<u8>, String> {
     let opts = nerve_transport::download::Options {
         max: max as u64,
         idle: nerve_transport::http::HEAD_TIMEOUT,
-        hops: 6,
+        // Five redirects, as the node's own loop followed before.
+        hops: 5,
         cancel: None,
     };
     nerve_transport::download::fetch(url, &mut body, &opts, &mut |_, _| {}).await?;
@@ -2663,6 +2664,34 @@ pub(crate) mod tests {
             }
         });
         format!("http://127.0.0.1:{port}/rel")
+    }
+
+    /// The release download follows five redirects, as the node's own loop
+    /// did before it moved to the shared downloader, and refuses a sixth
+    /// (review r3, finding 7).
+    #[tokio::test]
+    async fn the_download_follows_five_redirects_and_no_more() {
+        use nerve_transport::http::{Response, read_request};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // `/rN` redirects to `/r(N+1)` up to `/r6`, which answers.
+        tokio::spawn(async move {
+            while let Ok((mut io, _)) = listener.accept().await {
+                let req = read_request(&mut io, 0).await.unwrap();
+                let n: u8 = req.path.trim_start_matches("/r").parse().unwrap_or(9);
+                let r = if n >= 6 {
+                    Response::text(200, "end")
+                } else {
+                    Response::new(302, "text/plain", "")
+                        .with_header("Location", &format!("/r{}", n + 1))
+                };
+                let _ = r.write(&mut io).await;
+            }
+        });
+        let url = |n: u8| format!("http://127.0.0.1:{port}/r{n}");
+        assert_eq!(download(&url(1), 1024).await.unwrap(), b"end");
+        let e = download(&url(0), 1024).await.unwrap_err();
+        assert!(e.contains("too many redirects"), "{e}");
     }
 
     fn sha(b: &[u8]) -> String {

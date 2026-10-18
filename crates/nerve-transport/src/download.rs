@@ -212,7 +212,13 @@ async fn read_body<R: AsyncRead + Unpin>(
         return Ok(done);
     }
     let total = head.length;
-    put(&head.rest, &mut done)?;
+    // The bytes read with the head count towards the length too: anything
+    // past `Content-Length` is not the body.
+    let first = match total {
+        Some(t) => &head.rest[..head.rest.len().min(t as usize)],
+        None => &head.rest[..],
+    };
+    put(first, &mut done)?;
     on_progress(done, total);
     let mut chunk = vec![0u8; 64 * 1024];
     while total.is_none_or(|t| done < t) {
@@ -401,6 +407,47 @@ mod tests {
             .await
             .unwrap_err();
         assert!(e.contains("size limit"), "{e}");
+    }
+
+    /// Bytes past `Content-Length` are not the body, also when they come in
+    /// the same read as the head (review r3, finding 7).
+    #[tokio::test]
+    async fn bytes_past_the_length_are_dropped() {
+        let port = serve(|_| {
+            (
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhelloEXTRA-BYTES".to_vec(),
+                false,
+            )
+        });
+        let body = get(&format!("http://127.0.0.1:{port}/x"), &opts())
+            .await
+            .unwrap();
+        assert_eq!(body, b"hello");
+    }
+
+    /// `hops` is the number of redirects followed: one more is refused.
+    #[tokio::test]
+    async fn hops_redirects_are_followed_and_no_more() {
+        // `/rN` redirects to `/r(N+1)` up to `/r3`, which answers.
+        let port = serve(|p| match p {
+            "/r3" => (ok("end"), false),
+            p => {
+                let n: u8 = p.trim_start_matches("/r").parse().unwrap_or(9);
+                (
+                    format!(
+                        "HTTP/1.1 302 Found\r\nLocation: /r{}\r\nContent-Length: 0\r\n\r\n",
+                        n + 1
+                    )
+                    .into_bytes(),
+                    false,
+                )
+            }
+        });
+        let two = Options { hops: 2, ..opts() };
+        let url = |n: u8| format!("http://127.0.0.1:{port}/r{n}");
+        assert_eq!(get(&url(1), &two).await.unwrap(), b"end");
+        let e = get(&url(0), &two).await.unwrap_err();
+        assert!(e.contains("too many redirects"), "{e}");
     }
 
     /// A server that sends the head and a few bytes, then nothing, is given

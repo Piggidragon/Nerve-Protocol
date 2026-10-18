@@ -213,7 +213,10 @@ text generated, so a judgement is fast and cheap. There are two sources:
   failed) with the last lines of its output. During a reinstall or a switch the
   model already installed keeps checking calls while the new files download;
   it is stopped only for the moment the files are swapped, and if the install
-  fails it keeps running as before. **Remove** turns the local model off and
+  fails it keeps running as before. An install switches the model on at the
+  top, unless a machine already has it on for itself while the top switch is
+  off; then a switch of the device or the model leaves the other machines as
+  they were. **Remove** turns the local model off and
   deletes the downloaded files; during an install the progress card has it
   too, and it ends the install first. A machine with no prebuilt build for it says so and points you to the
   endpoint source; for any other model, or your own llama.cpp, use the endpoint

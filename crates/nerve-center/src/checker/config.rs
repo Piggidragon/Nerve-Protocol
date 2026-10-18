@@ -298,8 +298,8 @@ impl CheckerConfig {
         self.model_on || self.nodes.values().any(|n| n.model == NodeSwitch::On)
     }
 
-    /// What a finished one-click install sets: the model on, from the local
-    /// source, on `gpu`. A switch to another model also takes that model's
+    /// What a finished one-click install sets: the local source on `gpu`, and
+    /// the model on unless a node already has it on for itself. A switch to another model also takes that model's
     /// own default threshold and timeout; a reinstall of the same model keeps
     /// the owner's.
     pub fn local_installed(&mut self, gpu: bool, model: LocalModel) {
@@ -315,7 +315,13 @@ impl CheckerConfig {
             self.model.threshold = pin.threshold;
             self.model.timeout_ms = pin.timeout_ms;
         }
-        self.model_on = true;
+        // Switch the model on with the first install, the owner's reason to
+        // install it. When a node already has it on for itself and the
+        // center's switch is off, keep that: a device or model switch must
+        // not turn the model on for every other node too.
+        if !self.model_wanted() {
+            self.model_on = true;
+        }
         self.model.source = ModelSource::Local;
         self.model.local_gpu = gpu;
     }
@@ -417,8 +423,22 @@ const RUNNER: &str = r"(?:sudo\s+(?:-\S+\s+)*)?(?:\S*/)?(?:sh|bash|zsh|dash|ksh|
 /// After a [`RUNNER`]: no script of its own, only `-`/`-s` and then the
 /// script's arguments, up to the end of its command.
 const STDIN_ARGS: &str = r"(?:\s+(?:-s|-)(?:\s[^|;&]*)?)?\s*(?:$|[;&|)])";
-/// The same inside a quoted `-c` body, which ends at its closing quote.
-const BODY_ARGS: &str = r#"(?:\s+(?:-s|-)(?:\s[^|;&'"]*)?)?\s*(?:$|[;&|)'"])"#;
+/// The same inside a shell's `-c` body quoted with `q`, which ends at its
+/// own closing quote. A quote of the other kind is not that end: after
+/// `python3 -c` it opens the interpreter's own script
+/// (`sh -c "curl … | python3 -c '…'"`), which does not read the download.
+fn body_args(q: char) -> String {
+    format!(r#"(?:\s+(?:-s|-)(?:\s[^|;&{q}]*)?)?\s*(?:$|[;&|){q}])"#)
+}
+
+/// A shell's `-c` body quoted with `q` that pipes a download into a
+/// [`RUNNER`] reading it (with [`body_args`]) or into `iex`.
+fn quoted_body(q: char) -> String {
+    format!(
+        r#"{q}(?:[^"']*?[\s;&|(])?{DOWNLOADER}\b[^|;&]*\|(?:[^|;&]*\|)*\s*(?:{RUNNER}{}|{RUNS_STRING}(?:$|[\s;&|)'"]))"#,
+        body_args(q)
+    )
+}
 /// Where a command starts on the whole line: the line's start, a separator,
 /// a bracket, or the opening quote of a shell's `-c` (or PowerShell's
 /// `-Command`) body; then wrappers (`sudo -E`, `env`, `exec`, …), variable
@@ -580,7 +600,9 @@ pub fn default_blocklist() -> Vec<BlockEntry> {
         ),
         b(
             &format!(
-                r#"exec.run:re:(?i)(?:^|[\s;&|("'/])(?:sh|bash|zsh|dash|ksh|ash|powershell|pwsh)(?:\.exe)?\s+(?:[^\s;&|'"]+\s+)*?-[a-z]*c[a-z]*\s+["'](?:[^"']*?[\s;&|(])?{DOWNLOADER}\b[^|;&]*\|(?:[^|;&]*\|)*\s*(?:{RUNNER}{BODY_ARGS}|{RUNS_STRING}(?:$|[\s;&|)'"]))"#
+                r#"exec.run:re:(?i)(?:^|[\s;&|("'/])(?:sh|bash|zsh|dash|ksh|ash|powershell|pwsh)(?:\.exe)?\s+(?:[^\s;&|'"]+\s+)*?-[a-z]*c[a-z]*\s+(?:{}|{})"#,
+                quoted_body('"'),
+                quoted_body('\'')
             ),
             "runs a downloaded script unseen",
         ),
@@ -812,5 +834,31 @@ mod tests {
         e.model.timeout_ms = 1000;
         e.local_installed(false, LocalModel::D1_3b);
         assert_eq!((e.model.threshold, e.model.timeout_ms), (0.8, 4000));
+    }
+
+    /// An install switches the model on for every node only when nothing has
+    /// it on yet: with it on for one node only, a device or model switch
+    /// keeps it that way (review r9, finding 1).
+    #[test]
+    fn a_switch_keeps_a_model_that_is_on_for_one_node_only() {
+        let mut c = CheckerConfig::default();
+        c.local_installed(false, LocalModel::D1_3b);
+        assert!(c.model_on, "the first install switches it on");
+
+        c.model_on = false;
+        c.nodes.insert(
+            "n1".into(),
+            NodeSettings {
+                blocklist: NodeSwitch::Inherit,
+                model: NodeSwitch::On,
+            },
+        );
+        c.local_installed(true, LocalModel::D1_3b);
+        c.local_installed(true, LocalModel::Kev4b);
+        assert!(!c.model_on);
+        assert_eq!(c.model_for("n1"), (true, Scope::Node));
+        assert_eq!(c.model_for("n2"), (false, Scope::Global));
+        assert!(c.model.local_gpu);
+        assert_eq!(c.model.local_model, LocalModel::Kev4b);
     }
 }

@@ -43,6 +43,11 @@ export global Store {
     in-out property <string> confirm-title;
     in-out property <string> confirm-text;
     in-out property <string> confirm-button;
+    // A choice the question offers, such as ending the old key's days at
+    // once; none when empty.
+    in-out property <string> confirm-option;
+    in-out property <string> confirm-option-detail;
+    in-out property <bool> confirm-option-on;
 
     in-out property <bool> toast-shown;
     in-out property <string> toast;
@@ -90,6 +95,10 @@ export global Store {
     // A change was made that the running service takes only when it starts
     // again (src/app.rs, Ctl::done): the Overview offers the restart.
     in-out property <bool> restart-due;
+    // Whether the node's keys may go into the system keyring here, and why
+    // not (src/app.rs, Ctl::keyring_state).
+    in-out property <bool> keyring-usable;
+    in-out property <string> keyring-why;
 
     // Elevation: an installed node's files are the system's, so the app asks
     // for administrator rights once, and says why first.
@@ -248,6 +257,17 @@ export global Prefs {
     callback raw-get();
     callback raw-set();
     callback raw-unset();
+    callback raw-add();
+    // The account commands run as (machine.user), choosing another, and on
+    // Windows giving the service its new password.
+    in-out property <string> account;
+    in-out property <string> account-new;
+    in-out property <string> account-password;
+    in-out property <string> account-error;
+    in-out property <bool> account-busy;
+    callback account-use();
+    callback account-password-save();
+    callback raw-remove();
     callback accept-file();
 
     in-out property <bool> backup-open;
@@ -265,6 +285,7 @@ export global Prefs {
     in-out property <string> restore-pass;
     in-out property <bool> restore-replace;
     in-out property <bool> restore-without-proxy;
+    in-out property <bool> restore-in-files;
     in-out property <string> restore-error;
     in-out property <bool> restore-busy;
     callback restore-choose();

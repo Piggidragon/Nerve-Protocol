@@ -139,3 +139,27 @@ fn a_proxy_password_comes_on_stdin() {
     let config = std::fs::read_to_string(d.path().join("config/node.toml")).unwrap();
     assert!(!config.contains("s3cret"), "{config}");
 }
+
+/// Without a session bus nothing answers for the keyring, and `config get`
+/// of where the keys go says so, for a program that offers the choice.
+#[cfg(target_os = "linux")]
+#[test]
+fn where_the_keys_go_says_whether_the_keyring_can_hold_them() {
+    let d = tempfile::tempdir().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_nerve-node"))
+        .arg("--config-dir")
+        .arg(d.path().join("config"))
+        .arg("--state-dir")
+        .arg(d.path().join("state"))
+        .args(["--json", "config", "get", "machine.secret_storage"])
+        .env("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
+        .env("XDG_RUNTIME_DIR", d.path())
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["value"], "file", "{v}");
+    assert_eq!(v["keyring"]["usable"], false, "{v}");
+    let reason = v["keyring"]["reason"].as_str().unwrap();
+    assert!(["no-answer", "old-landlock"].contains(&reason), "{v}");
+    assert!(!v["keyring"]["why"].as_str().unwrap().is_empty());
+}

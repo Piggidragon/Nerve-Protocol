@@ -93,13 +93,17 @@ export component SettingsPage inherits PageFrame {
                     font-weight: Type.semibold;
                 }
                 Text {
-                    text: Prefs.storage == 0 ? "In files of the config folder, readable by the node's account only." : "In the system keyring, unlocked with your session.";
+                    text: Prefs.storage == 1 ? "In the system keyring of the account the node runs as."
+                        : Store.keyring-usable ? "In files of the config folder, readable by the node's account only."
+                        : "In files of the config folder, readable by the node's account only. " + Store.keyring-why;
                     color: Theme.text-muted;
                     font-size: Type.caption;
                     wrap: word-wrap;
                 }
             }
-            VerticalLayout {
+            // Only a choice where the keyring can be one; keys there can
+            // always go back into files.
+            if Store.keyring-usable || Prefs.storage == 1: VerticalLayout {
                 alignment: center;
                 Segmented {
                     options: ["Files", "System keyring"];
@@ -108,6 +112,81 @@ export component SettingsPage inherits PageFrame {
                         Prefs.storage-set(i);
                     }
                 }
+            }
+        }
+    }
+
+    Group {
+        icon: @image-url("icons/shield.svg");
+        title: "Account for commands";
+        text: Install.windows ? "Commands from your centers run as this account. The service starts them with its password, which it keeps encrypted for this machine."
+            : "Commands from your centers run as this account. One that only the node uses keeps them away from your own files and sessions.";
+        Text {
+            text: Prefs.account != "" ? "Commands run as " + Prefs.account + "." : "No account yet: the node runs no command until one is chosen.";
+            color: Theme.text;
+            font-size: Type.small;
+            wrap: word-wrap;
+        }
+        Reveal {
+            shown: !Install.windows;
+            Field {
+                label: "Another account";
+                hint: "An account that is not there is made, with a group and a home of its own and no login. Not your own account: commands would act as you.";
+                HorizontalLayout {
+                    spacing: Space.md;
+                    TextField {
+                        horizontal-stretch: 1;
+                        text <=> Prefs.account-new;
+                        mono: true;
+                        placeholder: "nerve-work";
+                        label: "Another account";
+                        accepted => {
+                            Prefs.account-use();
+                        }
+                    }
+                    Button {
+                        text: "Use";
+                        enabled: Prefs.account-new != "";
+                        busy: Prefs.account-busy;
+                        clicked => {
+                            Prefs.account-use();
+                        }
+                    }
+                }
+            }
+        }
+        Reveal {
+            shown: Install.windows && Prefs.account != "";
+            Field {
+                label: "Its password";
+                hint: "When the password of " + Prefs.account + " changes, commands fail until the service has the new one.";
+                HorizontalLayout {
+                    spacing: Space.md;
+                    TextField {
+                        horizontal-stretch: 1;
+                        text <=> Prefs.account-password;
+                        password: true;
+                        label: "Its password";
+                        accepted => {
+                            Prefs.account-password-save();
+                        }
+                    }
+                    Button {
+                        text: "Save";
+                        enabled: Prefs.account-password != "";
+                        busy: Prefs.account-busy;
+                        clicked => {
+                            Prefs.account-password-save();
+                        }
+                    }
+                }
+            }
+        }
+        Reveal {
+            shown: Prefs.account-error != "";
+            Banner {
+                tone: Tone.danger;
+                text: Prefs.account-error;
             }
         }
     }
@@ -373,7 +452,7 @@ export component SettingsPage inherits PageFrame {
     Group {
         icon: @image-url("icons/sliders.svg");
         title: "Any setting";
-        text: "Every setting of node.toml by its dotted name, like log.level or center.<name>.policy.mode. The node checks each change as it checks the command line's.";
+        text: "Every setting of node.toml by its dotted name, like log.level or center.<name>.policy.mode. Add and Remove change a list, like center.<name>.policy.allow or policy.protected.allow. The node checks each change as it checks the command line's.";
         VerticalLayout {
             HorizontalLayout {
                 spacing: Space.md;
@@ -434,6 +513,22 @@ export component SettingsPage inherits PageFrame {
                     enabled: Prefs.raw-key != "" && Prefs.raw-value != "";
                     clicked => {
                         Prefs.raw-set();
+                    }
+                }
+                Button {
+                    text: "Add";
+                    icon: @image-url("icons/plus.svg");
+                    enabled: Prefs.raw-key != "" && Prefs.raw-value != "";
+                    clicked => {
+                        Prefs.raw-add();
+                    }
+                }
+                Button {
+                    text: "Remove";
+                    kind: ButtonKind.ghost;
+                    enabled: Prefs.raw-key != "" && Prefs.raw-value != "";
+                    clicked => {
+                        Prefs.raw-remove();
                     }
                 }
                 Button {

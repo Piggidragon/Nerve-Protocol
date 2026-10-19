@@ -66,7 +66,7 @@ center is paired.
 |---|---|---|
 | `install` | Install the node as a service under its own user (Linux as root, Windows as administrator) | [service](service.md#install) |
 | `setup` | Name the node, choose the account commands run as, choose where the keys are, pair the first center, choose its mode | [service](service.md#setup) |
-| `setup --create-user <name>` | Make an account only the node uses, and run commands as it (Linux, installed node) | [service](service.md#setup) |
+| `setup --create-user <name> [--account-only]` | Make an account only the node uses, and run commands as it (Linux, installed node); with `--account-only` ask nothing else | [service](service.md#setup) |
 | `update [--from FILE]` | Put the latest release in place and restart the service | [service](service.md#update) |
 | `service start\|stop\|restart` | Start, stop or restart the installed service | [service](service.md#start-and-stop) |
 | `service status` | Show whether the node is installed as a service, whether it runs, and its program and version | [service](service.md#start-and-stop) |
@@ -99,7 +99,10 @@ one JSON value from stdout:
   `"starting"`, `"stopping"` or `"failed"`; `null` when not installed),
   `"enabled"` (it starts with the machine), `"program"` (where the program
   is installed), `"present"` (whether it is there) and `"version"`. It needs
-  no root.
+  no root. `config get machine.secret_storage` also has `"keyring"`:
+  `{"usable": true}`, or `"usable": false` with `"reason"`
+  (`"windows-service"`, `"old-landlock"`, or `"no-answer"`: no keyring
+  answers for the account the node runs as) and `"why"` in words.
 - `center add` without `--yes` prints what you would confirm
   (`{"paired": false, "preview": {...}}`) and pairs nothing; with `--yes` it
   pairs.
@@ -113,4 +116,5 @@ of stdin, or of the file `--passphrase-file` names. `proxy set
 http://user@host:port --password-stdin` takes the proxy's password from the
 first line of stdin, and `--headers-stdin` the headers from the lines after
 it, one `Name: value` each, so neither shows in the process list. `setup` reads its answers
-from stdin one line each. `center add` needs `--yes`.
+from stdin one line each; `setup --create-user <name> --account-only` asks
+nothing and chooses only that account. `center add` needs `--yes`.

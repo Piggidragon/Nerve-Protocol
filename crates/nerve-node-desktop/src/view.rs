@@ -265,6 +265,55 @@ pub fn rule_list_of(v: &Value, list: &str) -> Vec<SharedString> {
         .collect()
 }
 
+/// Why the keys cannot go into the system keyring here, by the `reason` of
+/// `config get machine.secret_storage --json`.
+pub fn no_keyring(reason: &str) -> &'static str {
+    match reason {
+        "windows-service" => {
+            "Not on Windows: the service runs as its own account, and a keyring belongs to one account, so the service would not find its keys there."
+        }
+        "old-landlock" => {
+            "Not on this Linux: below version 7.1 it cannot keep commands away from the keyring."
+        }
+        _ => {
+            "No keyring answers for the account the node runs as. It has no desktop session of its own, so its keys stay in files."
+        }
+    }
+}
+
+/// What the app says after `center rotate-key` gave the center `name` a new
+/// key (`said`): the key as the CLI showed it, and, in the app's words
+/// instead of the CLI's command line, whether the center still takes the
+/// old one, after `--end-grace` (`ended`) or without it.
+pub fn new_key(name: &str, said: &Value, ended: Option<Result<Value, String>>) -> String {
+    let key: Vec<&str> = said["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .take(2)
+        .collect();
+    let then = match ended {
+        None => format!("The old key is deleted here. {name} takes it for 7 more days."),
+        Some(Ok(_)) => format!("The old key is deleted here, and {name} no longer takes it."),
+        Some(Err(e)) => {
+            format!("The old key is deleted here, but {name} still takes it for 7 more days: {e}")
+        }
+    };
+    format!("{}\n{then}", key.join("\n"))
+}
+
+/// Whether a rule typed for the allow or deny list is in the pattern form
+/// for files and other actions (`fs.read:~/notes/*`, `fs:~/private/*`),
+/// which `rule add` refuses as a command and `config add` takes: the test of
+/// nerve-node's `rule add` (`List::entry`). A single letter before the `:`
+/// is a drive (`C:\tools\x.exe`), not a capability.
+pub fn pattern_rule(text: &str) -> bool {
+    text.trim().split_once(':').is_some_and(|(scope, _)| {
+        (scope.contains('.') || scope.len() > 1) && nerve_policy::rules::valid_scope(scope)
+    })
+}
+
 /// The capability switches of `cap ls --json`: each capability the node
 /// knows, then its actions, with what is set (on when nothing is).
 pub fn caps(v: &Value) -> Vec<CapRow> {
@@ -826,6 +875,39 @@ mod tests {
     use slint::Model;
 
     const NOW: u64 = 1_760_800_000_000;
+
+    #[test]
+    fn a_new_key_is_said_without_the_command_line() {
+        // What `center rotate-key --json` says (cli.rs, rotate_key).
+        let said = json!({"messages": [
+            "center lab took this machine's new key:",
+            "  ed25519:AAAA",
+            "The old key is deleted here. The center takes it for 7 more days, unless you end that now with `nerve-node center rotate-key --end-grace --center lab`.",
+        ]});
+        let text = new_key("lab", &said, None);
+        assert!(text.starts_with("center lab took this machine's new key:\n  ed25519:AAAA\n"));
+        assert!(text.ends_with("lab takes it for 7 more days."), "{text}");
+        assert!(!text.contains("nerve-node"), "{text}");
+        let ended = new_key("lab", &said, Some(Ok(json!({}))));
+        assert!(ended.ends_with("lab no longer takes it."), "{ended}");
+        let failed = new_key("lab", &said, Some(Err("the link dropped".into())));
+        assert!(failed.contains("still takes it") && failed.contains("the link dropped"));
+    }
+
+    #[test]
+    fn a_pattern_for_files_is_told_from_a_command() {
+        for p in ["fs.read:~/notes/*", "fs:~/private/*", "exec.run:make *"] {
+            assert!(pattern_rule(p), "{p}");
+        }
+        for c in [
+            "cargo build",
+            "C:\\tools\\x.exe",
+            "git commit -m a:b",
+            "echo x:y",
+        ] {
+            assert!(!pattern_rule(c), "{c}");
+        }
+    }
 
     #[test]
     fn a_running_node_and_its_links() {

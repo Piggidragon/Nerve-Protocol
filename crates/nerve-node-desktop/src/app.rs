@@ -228,9 +228,9 @@ impl Ctl {
             ))));
         let store = window.global::<Store>();
         store.set_version(env!("CARGO_PKG_VERSION").into());
-        window
-            .global::<Install>()
-            .set_version(env!("CARGO_PKG_VERSION").into());
+        let install = window.global::<Install>();
+        install.set_version(env!("CARGO_PKG_VERSION").into());
+        install.set_windows(cfg!(windows));
 
         let c = ctl.clone();
         store.on_show(move |page| c.show(page));
@@ -413,7 +413,11 @@ impl Ctl {
             said = said_of(v);
         }
         if !lines(v).any(next_start) {
-            self.toast(said, Tone::Ok);
+            // A warning that came with it, such as folder mode running no
+            // command once the keys are in the keyring, is no plain "done".
+            let warned = lines(v)
+                .any(|l| l.starts_with("Warning") || l.starts_with("folder mode runs no command"));
+            self.toast(said, if warned { Tone::Warn } else { Tone::Ok });
             return;
         }
         let running = self
@@ -433,6 +437,19 @@ impl Ctl {
         if running {
             self.with_store(|s| s.set_restart_due(true));
         }
+    }
+
+    /// Whether the keys may go into the system keyring here, from what
+    /// `config get machine.secret_storage` said, in the app's words when
+    /// they may not; both the first-run steps and Settings offer it.
+    fn keyring_state(&self, said: &Value) {
+        let k = &said["keyring"];
+        let usable = k["usable"] == true;
+        let why = view::no_keyring(k["reason"].as_str().unwrap_or_default());
+        self.with_store(|s| {
+            s.set_keyring_usable(usable);
+            s.set_keyring_why(if usable { "" } else { why }.into());
+        });
     }
 
     fn toast(&self, text: impl Into<SharedString>, tone: Tone) {
@@ -673,6 +690,9 @@ impl Ctl {
             s.set_confirm_title(title.into());
             s.set_confirm_text(text.into());
             s.set_confirm_button(button.into());
+            s.set_confirm_option(SharedString::new());
+            s.set_confirm_option_detail(SharedString::new());
+            s.set_confirm_option_on(false);
             s.set_confirm_open(true);
         });
     }
@@ -693,6 +713,15 @@ impl Ctl {
             format!("This machine makes a new key for {name} and sends it over the link; the old one is deleted here. {name} takes the old key for 7 more days. The node must run and be linked to {name}."),
             "Make a new key",
         );
+        self.with_store(|s| {
+            s.set_confirm_option("End the old key's 7 days at once".into());
+            s.set_confirm_option_detail(
+                format!(
+                    "For a key that may have leaked: {name} takes only the new key from then on."
+                )
+                .into(),
+            );
+        });
     }
 
     fn confirmed(self: &Rc<Self>) {
@@ -710,18 +739,34 @@ impl Ctl {
                 self.change(&name, args, format!("Unpaired {name}."));
             }
             Pending::RotateKey(name) => {
-                let args = vec![
-                    "center".into(),
-                    "rotate-key".into(),
-                    "--center".into(),
-                    name.clone(),
-                ];
+                let at_once = self
+                    .with_store(|s| s.get_confirm_option_on())
+                    .unwrap_or(false);
+                let args = |end: bool| {
+                    let mut a = vec!["center".into(), "rotate-key".into()];
+                    if end {
+                        a.push("--end-grace".into());
+                    }
+                    a.extend(["--center".into(), name.clone()]);
+                    a
+                };
+                let end_grace = args(true);
                 self.with_store(|s| s.set_busy(name.as_str().into()));
-                self.command(args, None, move |c, answer| {
-                    c.with_store(|s| s.set_busy(SharedString::new()));
+                self.command(args(false), None, move |c, answer| {
+                    let title = format!("New key for {name}");
                     match answer {
-                        Ok(v) => c.show_once(&format!("New key for {name}"), &messages(&v)),
-                        Err(e) => c.toast(e, Tone::Danger),
+                        Ok(v) if at_once => c.command(end_grace, None, move |c, answer| {
+                            c.with_store(|s| s.set_busy(SharedString::new()));
+                            c.show_once(&title, &view::new_key(&name, &v, Some(answer)));
+                        }),
+                        Ok(v) => {
+                            c.with_store(|s| s.set_busy(SharedString::new()));
+                            c.show_once(&title, &view::new_key(&name, &v, None));
+                        }
+                        Err(e) => {
+                            c.with_store(|s| s.set_busy(SharedString::new()));
+                            c.toast(e, Tone::Danger);
+                        }
                     }
                 });
             }

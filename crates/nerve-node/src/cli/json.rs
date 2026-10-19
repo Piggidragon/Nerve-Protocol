@@ -118,7 +118,13 @@ pub(super) async fn command(
             let v = lookup(&toml::Value::Table(doc), &segments(&key))
                 .ok_or_else(|| format!("{key} is not set"))?;
             let value = serde_json::to_value(&v).map_err(|e| e.to_string())?;
-            json!({ "key": key, "value": value })
+            let mut v = json!({ "key": key, "value": value });
+            // A program that offers the choice, as setup does, needs to know
+            // whether the keyring can be one here.
+            if key == "machine.secret_storage" {
+                v["keyring"] = keyring_here(paths);
+            }
+            v
         }
         Cmd::Proxy(ProxyCmd::Ls) => proxy(paths).await?,
         Cmd::Relay(RelayCmd::Ls) => relay(paths).await?,
@@ -128,6 +134,40 @@ pub(super) async fn command(
         _ => return Err("this command has no JSON form of its own".into()),
     };
     print(out, v)
+}
+
+/// Whether the node's keys could go into the system keyring here: where
+/// `setup` would not offer it (`reason` `windows-service` or
+/// `old-landlock`), and whether a keyring answers for the account the node
+/// runs as (`no-answer`); `why` says it in words.
+fn keyring_here(paths: &NodePaths) -> Value {
+    if let Some(n) = crate::secrets::no_keyring(paths) {
+        let reason = match n {
+            crate::secrets::NoKeyring::WindowsService => "windows-service",
+            crate::secrets::NoKeyring::OldLandlock(_) => "old-landlock",
+        };
+        return json!({ "usable": false, "reason": reason, "why": n.why() });
+    }
+    // The installed program, which the node's user can run, asks its
+    // keyring, as setup's does.
+    let layout = Layout::system();
+    let keyring = if layout.installed() && *paths == layout.paths {
+        crate::keyring_setup::HostKeyring {
+            exe: layout.bin.clone(),
+        }
+    } else {
+        crate::keyring_setup::HostKeyring::this_program()
+    };
+    let answer = crate::keyring_setup::me().and_then(|me| {
+        use crate::keyring_setup::Keyring;
+        keyring
+            .check(&me)
+            .map_err(|e| format!("no system keyring answers for {} ({e})", me.name))
+    });
+    match answer {
+        Ok(()) => json!({ "usable": true }),
+        Err(why) => json!({ "usable": false, "reason": "no-answer", "why": why }),
+    }
 }
 
 /// `status`: what the running node says of itself, with `"daemon":

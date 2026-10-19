@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use slint::{ComponentHandle, SharedString};
 
-use super::Ctl;
+use super::{Ctl, messages};
 use crate::broker;
 use crate::{Store, Tone};
 
@@ -142,6 +142,9 @@ impl Ctl {
             ],
             None,
             |c, v| {
+                if let Ok(v) = &v {
+                    c.keyring_state(v);
+                }
                 if v.is_ok_and(|v| v["value"] == "keyring") {
                     c.with_store(|s| s.set_setup_storage(1));
                 }
@@ -157,11 +160,18 @@ impl Ctl {
         });
     }
 
-    /// Runs a step's command, then goes to `next`.
-    fn setup_run(self: &Rc<Self>, args: Vec<String>, next: i32) {
+    /// Runs a step's command, then goes to `next`. With `say`, what the
+    /// command said comes in a toast: where the keys went, and what that
+    /// changes.
+    fn setup_run(self: &Rc<Self>, args: Vec<String>, next: i32, say: bool) {
         self.with_store(|s| s.set_setup_busy(true));
         self.command(args, None, move |c, answer| match answer {
-            Ok(_) => c.setup_go(next),
+            Ok(v) => {
+                if say && !messages(&v).is_empty() {
+                    c.done(&v, "");
+                }
+                c.setup_go(next)
+            }
             Err(e) => {
                 c.with_store(|s| {
                     s.set_setup_busy(false);
@@ -201,7 +211,7 @@ impl Ctl {
                         "node.name".into(),
                         name.into(),
                     ];
-                    self.setup_run(args, 1);
+                    self.setup_run(args, 1, false);
                 }
             }
             1 => {
@@ -212,12 +222,12 @@ impl Ctl {
                     "machine.secret_storage".into(),
                     to.into(),
                 ];
-                self.setup_run(args, 2);
+                self.setup_run(args, 2, true);
             }
             2 => self.pair(&link, &pair_name, pair_step == 1),
             3 => {
                 let args = vec!["mode".into(), "set".into(), mode, "--center".into(), center];
-                self.setup_run(args, 4);
+                self.setup_run(args, 4, false);
             }
             _ => {
                 let stopped = self

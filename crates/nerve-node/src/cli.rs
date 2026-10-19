@@ -116,6 +116,9 @@ pub enum Cmd {
         /// Run commands as this account instead of asking, and make it if it is not there: a group and a home (/home/NAME) of its own, no login (installed node).
         #[arg(long, value_name = "NAME")]
         create_user: Option<String>,
+        /// With --create-user: only choose (and make) that account, and ask nothing else.
+        #[arg(long, requires = "create_user")]
+        account_only: bool,
     },
     /// Replace the installed program with the latest release and restart the service; config, keys and audit log stay.
     Update {
@@ -1907,7 +1910,10 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                 )
             }
         }
-        Cmd::Setup { create_user } => {
+        Cmd::Setup {
+            create_user,
+            account_only,
+        } => {
             owner_check(&[&paths]).await?;
             // Windows takes the account of the commands, and its password,
             // at install.
@@ -1928,10 +1934,14 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                 },
                 None => crate::keyring_setup::HostKeyring::this_program(),
             };
+            let ask = |name| Setup {
+                create_user: name,
+                account_only,
+            };
             setup(
                 &paths,
                 machine,
-                create_user.as_deref(),
+                ask(create_user.as_deref()),
                 &keyring,
                 &mut input,
                 out,
@@ -2024,16 +2034,25 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
 /// commands: `create_user` names it (and makes it) instead of asking. Keys
 /// in the system keyring need one that answers; `keyring` checks it, and
 /// installs one when the owner says so ([`crate::keyring_setup`]).
+/// What `setup` was told on its command line.
+#[derive(Clone, Copy, Default)]
+pub struct Setup<'a> {
+    /// The account commands run as, made if it is not there.
+    pub create_user: Option<&'a str>,
+    /// Choose that account and end, asking nothing.
+    pub account_only: bool,
+}
+
 pub async fn setup(
     paths: &NodePaths,
     machine: Option<&dyn crate::service::System>,
-    create_user: Option<&str>,
+    told: Setup<'_>,
     keyring: &dyn crate::keyring_setup::Keyring,
     input: &mut dyn BufRead,
     out: &mut dyn Write,
 ) -> Result<(), String> {
     let mut steps = Vec::new();
-    let r = setup_steps(paths, machine, create_user, keyring, input, out, &mut steps).await;
+    let r = setup_steps(paths, machine, told, keyring, input, out, &mut steps).await;
     let log = AuditLog::new(paths.audit_log());
     if let Err(e) = log.node("setup", &steps, r.as_ref().err().map(String::as_str)) {
         let _ = writeln!(out, "the audit log cannot be written: {e}");
@@ -2117,12 +2136,13 @@ async fn account_chosen(
 async fn setup_steps(
     paths: &NodePaths,
     machine: Option<&dyn crate::service::System>,
-    create_user: Option<&str>,
+    told: Setup<'_>,
     keyring: &dyn crate::keyring_setup::Keyring,
     input: &mut dyn BufRead,
     out: &mut dyn Write,
     steps: &mut Vec<String>,
 ) -> Result<(), String> {
+    let create_user = told.create_user;
     if create_user.is_some() && machine.is_none() {
         return Err(
             "--create-user chooses the account commands run as on a node installed as a service (`sudo nerve-node install`); this node runs them as its own user".into(),
@@ -2133,7 +2153,8 @@ async fn setup_steps(
     // into files below. The installed node on Windows asks none: the keyring
     // setup reaches is not the service's.
     let no_keyring = crate::secrets::no_keyring(paths);
-    if crate::secrets::stated_storage(paths) == SecretStorage::Keyring
+    if !told.account_only
+        && crate::secrets::stated_storage(paths) == SecretStorage::Keyring
         && no_keyring != Some(crate::secrets::NoKeyring::WindowsService)
     {
         let me = crate::keyring_setup::me()?;
@@ -2145,6 +2166,10 @@ async fn setup_steps(
         let c = crate::service::create_account(sys, paths, name, &invoker(), out)?;
         let chosen = (c.made || cfg.machine.user.as_deref() != Some(name)).then_some(c);
         account_chosen(paths, chosen, out, steps).await?;
+        // A program that sets the account alone, such as the desktop app.
+        if told.account_only {
+            return Ok(());
+        }
     }
     let _ = writeln!(out, "Set up this node. Enter keeps what is in [brackets].");
     let current = crate::descriptor::node_name(&cfg);
@@ -5017,14 +5042,18 @@ mod tests {
         create_user: Option<&str>,
         answers: &str,
     ) -> (Result<(), String>, String) {
+        let told = Setup {
+            create_user,
+            account_only: false,
+        };
         let keyring = crate::keyring_setup::tests::FakeKeyring::new(true);
-        setup_keyring(paths, machine, create_user, &keyring, answers)
+        setup_keyring(paths, machine, told, &keyring, answers)
     }
 
     fn setup_keyring(
         paths: &NodePaths,
         machine: Option<&dyn crate::service::System>,
-        create_user: Option<&str>,
+        told: Setup<'_>,
         keyring: &dyn crate::keyring_setup::Keyring,
         answers: &str,
     ) -> (Result<(), String>, String) {
@@ -5035,12 +5064,7 @@ mod tests {
         let mut out = Vec::new();
         let mut input = std::io::Cursor::new(answers.as_bytes().to_vec());
         let r = rt.block_on(super::setup(
-            paths,
-            machine,
-            create_user,
-            keyring,
-            &mut input,
-            &mut out,
+            paths, machine, told, keyring, &mut input, &mut out,
         ));
         (r, String::from_utf8(out).unwrap())
     }
@@ -5052,8 +5076,9 @@ mod tests {
     fn setup_creates_the_account_of_the_commands_when_asked() {
         use crate::service::System;
         let cli = Cli::try_parse_from(["nerve-node", "setup", "--create-user", "bob"]).unwrap();
-        assert!(matches!(cli.cmd, Cmd::Setup { create_user: Some(ref n) } if n == "bob"));
+        assert!(matches!(cli.cmd, Cmd::Setup { create_user: Some(ref n), .. } if n == "bob"));
         assert!(Cli::try_parse_from(["nerve-node", "setup", "--create-user"]).is_err());
+        assert!(Cli::try_parse_from(["nerve-node", "setup", "--account-only"]).is_err());
         let (_d, paths) = setup(&["home"]);
         let sys = crate::service::tests::Fake::new();
         // Name, the keys stay in files, no link, user mode for the one
@@ -5093,6 +5118,32 @@ mod tests {
                 .as_deref(),
             Some("bob")
         );
+    }
+
+    /// `setup --create-user NAME --account-only`, the desktop app's way to
+    /// the account: the account and nothing else, asking nothing, also with
+    /// keys stated in a keyring that does not answer.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn setup_chooses_only_the_account_when_told() {
+        let (_d, paths) = setup(&["home"]);
+        let sys = crate::service::tests::Fake::new();
+        let told = Setup {
+            create_user: Some("carol"),
+            account_only: true,
+        };
+        let keyring = crate::keyring_setup::tests::FakeKeyring::new(false);
+        let (r, out) = setup_keyring(&paths, Some(&sys), told, &keyring, "");
+        r.unwrap();
+        assert!(out.contains("commands run as carol"), "{out}");
+        assert!(!out.contains("Name of this node"), "{out}");
+        assert!(
+            sys.calls()
+                .contains(&"useradd carol /home/carol".to_string())
+        );
+        let cfg = SettingsStore::peek(&paths.config_file(), &paths.config_key()).unwrap();
+        assert_eq!(cfg.machine.user.as_deref(), Some("carol"));
+        assert!(cfg.node.name.is_none());
     }
 
     fn node_audit(paths: &NodePaths) -> Vec<Value> {
@@ -5259,6 +5310,31 @@ mod tests {
     /// refuses the keyring and changes nothing, and setup does not ask
     /// where the keys go but takes keys left in the keyring into files.
     #[test]
+    fn config_get_says_whether_the_keyring_can_hold_the_keys() {
+        let (_d, paths) = setup(&["home"]);
+        crate::secrets::for_tests::pretend_windows_service(&paths);
+        let said = run(
+            &paths,
+            &["--json", "config", "get", "machine.secret_storage"],
+        )
+        .unwrap();
+        let v: Value = serde_json::from_str(said.trim()).unwrap();
+        assert_eq!(v["value"], "file");
+        assert_eq!(v["keyring"]["usable"], false, "{v}");
+        assert_eq!(v["keyring"]["reason"], "windows-service");
+        assert!(
+            v["keyring"]["why"]
+                .as_str()
+                .unwrap()
+                .contains("Credential Manager")
+        );
+        // Another key says nothing of it.
+        let said = run(&paths, &["--json", "config", "get", "log.level"]).unwrap();
+        let v: Value = serde_json::from_str(said.trim()).unwrap();
+        assert!(v.get("keyring").is_none(), "{v}");
+    }
+
+    #[test]
     fn the_installed_node_on_windows_keeps_its_keys_in_files() {
         let (_d, paths) = setup(&["home"]);
         let key = nerve_transport::keys::NodeKey::generate().unwrap();
@@ -5361,7 +5437,7 @@ mod tests {
         pretend_landlock(&paths, Landlock::Abi(5));
         crate::secrets::store::set_unreachable(true);
         let k = crate::keyring_setup::tests::FakeKeyring::new(false);
-        let (r, out) = setup_keyring(&paths, None, None, &k, "y\n\n\n");
+        let (r, out) = setup_keyring(&paths, None, Setup::default(), &k, "y\n\n\n");
         crate::secrets::store::set_unreachable(false);
         r.unwrap();
         assert!(out.contains("Install it now? [y/N]"), "{out}");
@@ -5377,13 +5453,13 @@ mod tests {
         let (_d, paths) = setup(&[]);
         crate::secrets::store::set_unreachable(true);
         let k = crate::keyring_setup::tests::FakeKeyring::new(false);
-        let (r, out) = setup_keyring(&paths, None, None, &k, "\nkeyring\nn\n");
+        let (r, out) = setup_keyring(&paths, None, Setup::default(), &k, "\nkeyring\nn\n");
         let e = r.unwrap_err();
         assert!(e.contains("no system keyring answers"), "{e}");
         assert!(out.contains("Install it now? [y/N]"), "{out}");
         assert!(k.installed.borrow().is_empty());
         assert_eq!(load(&paths).machine.secret_storage, SecretStorage::File);
-        let (r, out) = setup_keyring(&paths, None, None, &k, "\nkeyring\ny\n\n");
+        let (r, out) = setup_keyring(&paths, None, Setup::default(), &k, "\nkeyring\ny\n\n");
         r.unwrap();
         assert_eq!(k.installed.borrow().len(), 1);
         assert!(out.contains("the system keyring answers"), "{out}");
@@ -5536,7 +5612,7 @@ mod tests {
         ready.recv().unwrap();
         // The keyring answers setup: nothing to install.
         let k = crate::keyring_setup::tests::FakeKeyring::new(true);
-        let (r, _) = setup_keyring(&paths, None, None, &k, "\nkeyring\n");
+        let (r, _) = setup_keyring(&paths, None, Setup::default(), &k, "\nkeyring\n");
         let e = r.unwrap_err();
         assert!(
             e.contains("restart it, then run `nerve-node setup` again"),
@@ -5545,7 +5621,7 @@ mod tests {
         assert!(k.installed.borrow().is_empty());
         let sys = crate::service::tests::Fake::new();
         // Name, the account question of the installed node, the keys.
-        let (r, out) = setup_keyring(&paths, Some(&sys), None, &k, "\n\nkeyring\n");
+        let (r, out) = setup_keyring(&paths, Some(&sys), Setup::default(), &k, "\n\nkeyring\n");
         assert!(
             sys.calls()
                 .contains(&format!("systemctl restart {}", crate::service::UNIT_NAME)),
@@ -5589,11 +5665,11 @@ mod tests {
         .unwrap();
         crate::secrets::store::set_unreachable(true);
         let k = crate::keyring_setup::tests::FakeKeyring::new(false);
-        let (r, out) = setup_keyring(&paths, None, None, &k, "\n");
+        let (r, out) = setup_keyring(&paths, None, Setup::default(), &k, "\n");
         assert!(r.unwrap_err().contains("no system keyring answers"));
         assert!(!out.contains("Name of this node"), "{out}");
         assert!(run(&paths, &["status"]).is_err());
-        let (r, out) = setup_keyring(&paths, None, None, &k, "y\n\n\n\n");
+        let (r, out) = setup_keyring(&paths, None, Setup::default(), &k, "y\n\n\n\n");
         r.unwrap();
         assert!(out.contains("Name of this node"), "{out}");
         assert!(run(&paths, &["status"]).is_ok());

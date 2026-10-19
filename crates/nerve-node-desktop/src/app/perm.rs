@@ -304,6 +304,31 @@ impl Ctl {
             return;
         }
         let word = LISTS[list.clamp(0, 2) as usize];
+        let cleared = |c: &Ctl| {
+            c.with_perm(|p| {
+                p.set_rule_text(SharedString::new());
+                p.set_rule_wildcard(false);
+            });
+        };
+        // A pattern for files or another action goes into the list as it
+        // is, as `config add` puts it there; `rule remove` takes it out
+        // again as `rule ls` shows it.
+        if word != "sudo" && view::pattern_rule(&text) {
+            let key = format!("center.{}.policy.{word}", self.perm_center());
+            let args = vec!["config".into(), "add".into(), key, text];
+            self.command(args, None, move |c, answer| {
+                match answer {
+                    Ok(v) => {
+                        cleared(c);
+                        c.done(&v, format!("Added to the {word} list."));
+                    }
+                    Err(e) => c.toast(e, Tone::Danger),
+                }
+                c.refresh_status();
+                c.perm_load();
+            });
+            return;
+        }
         let mut args = vec!["rule".into(), "add".into(), word.into(), text.clone()];
         if wildcard {
             args.push("--wildcard".into());
@@ -312,12 +337,7 @@ impl Ctl {
             args,
             None,
             format!("Added to the {word} list."),
-            |c| {
-                c.with_perm(|p| {
-                    p.set_rule_text(SharedString::new());
-                    p.set_rule_wildcard(false);
-                });
-            },
+            cleared,
             |c, e| c.toast(e, Tone::Danger),
         );
     }

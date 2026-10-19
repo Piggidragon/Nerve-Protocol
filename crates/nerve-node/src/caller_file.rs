@@ -12,6 +12,9 @@
 use std::path::{Path, PathBuf};
 
 /// What the command does with its file.
+// Opened elsewhere only on Linux, where root's command becomes the node's
+// user.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub enum Job {
     Read(PathBuf),
     Write { path: PathBuf, overwrite: bool },

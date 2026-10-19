@@ -25,20 +25,30 @@ impl Ctl {
                     r.run(&["config", "get", "machine.secret_storage"]),
                     r.run(&["proxy", "ls"]),
                     r.run(&["relay", "ls"]),
+                    r.run(&["config", "get", "machine.user"]),
                 )
             },
-            |c, (name, storage, proxy, relay)| {
+            |c, (name, storage, proxy, relay, account)| {
                 // A setting that is not set has its default: no name, keys
                 // in files.
                 let name = name
                     .ok()
                     .and_then(|v| v["value"].as_str().map(str::to_string))
                     .unwrap_or_default();
+                if let Ok(v) = &storage {
+                    c.keyring_state(v);
+                }
                 let keyring = storage.is_ok_and(|v| v["value"] == "keyring");
                 let all = proxy.and_then(|p| Ok((p, relay?)));
+                // Not set: no account, and the node runs no command.
+                let account = account
+                    .ok()
+                    .and_then(|v| v["value"].as_str().map(str::to_string))
+                    .unwrap_or_default();
                 c.with_prefs(|p| {
                     p.set_name(name.into());
                     p.set_storage(i32::from(keyring));
+                    p.set_account(account.into());
                 });
                 match all {
                     Ok((proxy, relay)) => {
@@ -323,7 +333,9 @@ impl Ctl {
         );
     }
 
-    fn raw_change(self: &Rc<Self>, set: bool) {
+    /// `config set`, `unset`, `add` or `remove` (`verb`) of the setting
+    /// the page names.
+    fn raw_change(self: &Rc<Self>, verb: &'static str) {
         let Some((key, value)) = self.with_prefs(|p| {
             (
                 p.get_raw_key().trim().to_string(),
@@ -332,11 +344,10 @@ impl Ctl {
         }) else {
             return;
         };
-        let args = if set {
-            vec!["config".into(), "set".into(), key, value]
-        } else {
-            vec!["config".into(), "unset".into(), key]
-        };
+        let mut args = vec!["config".into(), verb.into(), key];
+        if verb != "unset" {
+            args.push(value);
+        }
         self.command(args, None, |c, answer| {
             match answer {
                 Ok(v) => {
@@ -352,6 +363,80 @@ impl Ctl {
                 }
             }
             c.refresh_status();
+        });
+    }
+
+    /// `setup --create-user NAME --account-only`: commands run as another
+    /// account, made when it is not there. What the CLI warns about such an
+    /// account is shown until the owner closes it.
+    fn account_use(self: &Rc<Self>) {
+        let Some(name) = self.with_prefs(|p| p.get_account_new().trim().to_string()) else {
+            return;
+        };
+        if name.is_empty() {
+            return;
+        }
+        let args = vec![
+            "setup".into(),
+            "--create-user".into(),
+            name.clone(),
+            "--account-only".into(),
+        ];
+        self.account_change(args, None, format!("Commands run as {name}"));
+    }
+
+    /// `install` again with the account's new password on stdin: on
+    /// Windows the service starts commands with it.
+    fn account_password_save(self: &Rc<Self>) {
+        let Some(password) = self.with_prefs(|p| p.get_account_password().to_string()) else {
+            return;
+        };
+        if password.is_empty() {
+            return;
+        }
+        let account = self
+            .with_prefs(|p| p.get_account().to_string())
+            .unwrap_or_default();
+        self.account_change(
+            vec!["install".into()],
+            Some(password),
+            format!("The service has the new password of {account}"),
+        );
+    }
+
+    fn account_change(self: &Rc<Self>, args: Vec<String>, input: Option<String>, title: String) {
+        self.with_prefs(|p| {
+            p.set_account_busy(true);
+            p.set_account_error(SharedString::new());
+        });
+        self.command(args, input, move |c, answer| {
+            c.with_prefs(|p| {
+                p.set_account_busy(false);
+                p.set_account_password(SharedString::new());
+            });
+            match answer {
+                Ok(v) => {
+                    let (_, warnings) = super::install::steps(&v);
+                    // install says a password that does not log the account
+                    // on as a warning, and goes on without it.
+                    if let Some(no) = warnings
+                        .iter()
+                        .find(|w| w.starts_with("no account for commands"))
+                    {
+                        c.with_prefs(|p| p.set_account_error(no.as_str().into()));
+                    } else if warnings.is_empty() {
+                        c.with_prefs(|p| p.set_account_new(SharedString::new()));
+                        c.toast(format!("{title}."), Tone::Ok);
+                    } else {
+                        c.with_prefs(|p| p.set_account_new(SharedString::new()));
+                        c.show_once(&title, &warnings.join("\n"));
+                    }
+                }
+                Err(e) => {
+                    c.with_prefs(|p| p.set_account_error(e.into()));
+                }
+            }
+            c.prefs_load();
         });
     }
 
@@ -377,6 +462,7 @@ impl Ctl {
                         p.set_restore_pass(SharedString::new());
                         p.set_restore_replace(false);
                         p.set_restore_without_proxy(false);
+                        p.set_restore_in_files(false);
                         p.set_restore_error(SharedString::new());
                         p.set_restore_open(true);
                     } else {
@@ -433,12 +519,13 @@ impl Ctl {
     }
 
     fn restore_confirm(self: &Rc<Self>) {
-        let Some((file, pass, replace, without_proxy)) = self.with_prefs(|p| {
+        let Some((file, pass, replace, without_proxy, in_files)) = self.with_prefs(|p| {
             (
                 p.get_restore_file().to_string(),
                 p.get_restore_pass().to_string(),
                 p.get_restore_replace(),
                 p.get_restore_without_proxy(),
+                p.get_restore_in_files(),
             )
         }) else {
             return;
@@ -449,6 +536,9 @@ impl Ctl {
         }
         if without_proxy {
             args.push("--without-proxy".into());
+        }
+        if in_files {
+            args.extend(["--secret-storage".into(), "file".into()]);
         }
         self.with_prefs(|p| p.set_restore_busy(true));
         self.command(args, Some(pass), |c, answer| {
@@ -531,9 +621,17 @@ pub(super) fn wire(ctl: &Rc<Ctl>, window: &crate::AppWindow) {
     let c = ctl.clone();
     p.on_raw_get(move || c.raw_get());
     let c = ctl.clone();
-    p.on_raw_set(move || c.raw_change(true));
+    p.on_raw_set(move || c.raw_change("set"));
     let c = ctl.clone();
-    p.on_raw_unset(move || c.raw_change(false));
+    p.on_raw_unset(move || c.raw_change("unset"));
+    let c = ctl.clone();
+    p.on_raw_add(move || c.raw_change("add"));
+    let c = ctl.clone();
+    p.on_account_use(move || c.account_use());
+    let c = ctl.clone();
+    p.on_account_password_save(move || c.account_password_save());
+    let c = ctl.clone();
+    p.on_raw_remove(move || c.raw_change("remove"));
     let c = ctl.clone();
     p.on_accept_file(move || {
         c.confirm(

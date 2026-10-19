@@ -188,6 +188,8 @@ it, and asks the other questions. An account that is there already is
 taken if the node can use it. `nerve`, an account that could open the
 node's folders, and a name other than a-z, 0-9, `_` and `-` are refused
 before anything changes. `--create-user` works on an installed node only.
+With `--account-only` setup chooses that account and asks nothing else; the
+desktop app does that in Settings, **Account for commands**.
 
 ## Start and stop
 

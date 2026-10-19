@@ -199,6 +199,17 @@ export component ConfirmDialog inherits Dialog {
     close => {
         Store.confirm-open = false;
     }
+    Reveal {
+        shown: Store.confirm-option != "";
+        CheckBox {
+            text: Store.confirm-option;
+            detail: Store.confirm-option-detail;
+            checked: Store.confirm-option-on;
+            toggled(on) => {
+                Store.confirm-option-on = on;
+            }
+        }
+    }
     DialogButtons {
         Button {
             text: "Cancel";
@@ -635,6 +646,14 @@ export component RestoreDialog inherits Dialog {
         checked: Prefs.restore-without-proxy;
         toggled(on) => {
             Prefs.restore-without-proxy = on;
+        }
+    }
+    CheckBox {
+        text: "Keep its keys in files here";
+        detail: "For a backup of a machine that kept them in the system keyring, when this one has none or may not use it, as the installed node on Windows.";
+        checked: Prefs.restore-in-files;
+        toggled(on) => {
+            Prefs.restore-in-files = on;
         }
     }
     DialogButtons {

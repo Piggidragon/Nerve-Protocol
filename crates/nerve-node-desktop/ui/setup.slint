@@ -65,7 +65,10 @@ export component SetupDialog inherits Dialog {
                     OptionTile {
                         icon: @image-url("icons/key.svg");
                         title: "System keyring";
-                        text: "In the keyring of your session, which must be unlocked for the node to start.";
+                        text: Store.keyring-usable || Store.setup-storage == 1
+                            ? "In the system keyring of the account the node runs as, which must answer whenever the node starts."
+                            : Store.keyring-why;
+                        enabled: Store.keyring-usable || Store.setup-storage == 1;
                         selected: Store.setup-storage == 1;
                         clicked => {
                             Store.setup-storage = 1;

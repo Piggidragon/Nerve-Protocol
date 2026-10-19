@@ -81,6 +81,12 @@ fn logged_at(paths: &NodePaths, ts: u64, msg: &str) {
 
 #[test]
 fn the_app_drives_the_cli_end_to_end() {
+    // No keyring answers the CLI's probe: the app must not offer one.
+    // SAFETY: before this test starts any thread.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        std::env::set_var("DBUS_SESSION_BUS_ADDRESS", "unix:path=/nonexistent")
+    };
     let _screen = Screen::install(1180, 780, 1.0).unwrap();
     let dir = tempfile::tempdir().unwrap();
     let root: &Path = dir.path();
@@ -370,6 +376,14 @@ fn the_app_drives_the_cli_end_to_end() {
     assert_eq!(perm.get_rule_text(), "");
     perm.invoke_rule_remove(0, "exec.run:cargo *".into());
     assert!(!allowed("exec.run:cargo *"));
+    // A pattern for files goes in as it is, as `config add` adds it, and
+    // comes out as `rule ls` shows it.
+    perm.set_rule_text("fs.read:~/notes/*".into());
+    perm.invoke_rule_add();
+    assert!(allowed("fs.read:~/notes/*"), "{}", store.get_toast());
+    assert!(perm.get_allow().iter().any(|r| r == "fs.read:~/notes/*"));
+    perm.invoke_rule_remove(0, "fs.read:~/notes/*".into());
+    assert!(!allowed("fs.read:~/notes/*"));
     perm.invoke_cap_set("exec.run".into(), 1);
     assert_eq!(
         config(&paths).centers[0].policy.caps.get("exec.run"),
@@ -441,6 +455,34 @@ fn the_app_drives_the_cli_end_to_end() {
     prefs.invoke_raw_set();
     assert_eq!(prefs.get_raw_error(), "");
     assert_eq!(prefs.get_raw_shown(), "debug");
+    // A list grows and shrinks by one entry, as `config add` and `config
+    // remove` change it.
+    prefs.set_raw_key("center.home.policy.deny".into());
+    prefs.set_raw_value("fs:~/private/*".into());
+    prefs.invoke_raw_add();
+    assert_eq!(prefs.get_raw_error(), "");
+    // The account commands run as: none here, and choosing one is the
+    // installed node's (setup --create-user), which the CLI says.
+    assert_eq!(prefs.get_account(), "");
+    prefs.set_account_new("nerve-work".into());
+    prefs.invoke_account_use();
+    assert!(
+        prefs.get_account_error().contains("installed as a service"),
+        "{}",
+        prefs.get_account_error()
+    );
+    assert!(!prefs.get_account_busy());
+    let denied = |r: &str| {
+        config(&paths).centers[0]
+            .policy
+            .deny
+            .contains(&r.to_string())
+    };
+    assert!(denied("fs:~/private/*"));
+    prefs.set_raw_value("fs:~/private/*".into());
+    prefs.invoke_raw_remove();
+    assert_eq!(prefs.get_raw_error(), "");
+    assert!(!denied("fs:~/private/*"));
     prefs.set_relay_new_node("laptop-2".into());
     prefs.invoke_relay_add();
     assert!(prefs.get_once_open());
@@ -558,6 +600,14 @@ fn the_app_drives_the_cli_end_to_end() {
     let second = rt.block_on(FakeCenter::start(true)).unwrap();
     store.invoke_setup_start();
     assert!(store.get_setup_open());
+    if cfg!(target_os = "linux") {
+        assert!(!store.get_keyring_usable());
+        assert!(
+            store.get_keyring_why().contains("keyring"),
+            "{}",
+            store.get_keyring_why()
+        );
+    }
     store.set_setup_name("studio".into());
     store.invoke_setup_next();
     assert_eq!(store.get_setup_step(), 1, "{}", store.get_setup_error());

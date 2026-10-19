@@ -23,6 +23,7 @@
 - `cap ls --json` lists the switchable capabilities (`known`).
 - Commands run through `pkexec` take the user who ran it as the account of the commands at `install`, as with `sudo`.
 - On Windows, the text `status` asks the running service through the control pipe, as `status --json` does.
+- `setup --create-user <name> --account-only` chooses the account of the commands and asks nothing else. `config get machine.secret_storage --json` says whether the keyring can hold the keys here (`"keyring"`).
 - On the installed node, `sudo nerve-node backup` and `restore` open the backup file as the user who ran `sudo` (or `pkexec`), so a backup in your own folders works and is yours; the command itself still runs as `nerve`.
 
 ## 0.0.5

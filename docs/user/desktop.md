@@ -3,10 +3,12 @@
 `nerve-node-desktop` is the node with a window, for a machine with a desktop:
 Linux x86_64 with GNOME or KDE Plasma (Wayland or X11), and Windows x86_64.
 It is one program: it holds the node, its CLI and the app. It installs
-itself like any other program, runs the node as a service, and does
-everything `nerve-node` does in a terminal (pairing, modes, folders, rules,
-sudo, the proxy, the relay, the audit log, backups) without one. The window
-runs the CLI for every action, so it has the CLI's checks and audit records.
+itself like any other program, runs the node as a service, and does what
+`nerve-node` does in a terminal (pairing, modes, folders, rules, sudo, the
+proxy, the relay, the audit log, backups, the account commands run as)
+without one; two things stay with the terminal ([settings](#settings)). The
+window runs the CLI for every action, so it has the CLI's checks and audit
+records.
 
 ## Download
 
@@ -114,6 +116,33 @@ machine. **Stop** ends the node's links and runs nothing until **Start**;
 **Restart** stops and starts it. A stopped service starts again with the
 machine. In a terminal this is `nerve-node service stop|start|restart`
 ([service](service.md#start-and-stop)).
+
+On Windows the running service takes folder changes at once and every other
+change when it starts again. The app says so after such a change, and the
+Overview offers **Restart**.
+
+## Settings
+
+- **Account for commands**: the account commands from your centers run as.
+  On Linux, name another one to use it; one that is not there is made, as
+  `setup --create-user` makes it. On Windows, enter its new password there
+  when it changed: the service needs it to start commands.
+- **Keys**: in files, or in the system keyring where one can hold them. Where
+  it cannot (the installed node on Windows, Linux below 7.1, no keyring
+  answering for the account the node runs as), the app says why and keeps
+  them in files.
+- **Backup…** and **Restore…** write and read the file as you, in your own
+  folders. **Keep its keys in files here** restores the backup of a machine
+  that kept them in a keyring onto one without.
+- **Any setting**: shows and sets any setting, and **Add** and **Remove**
+  change a list, such as `policy.protected.allow`. On **Permissions**, a
+  pattern for files (`fs.read:~/notes/*`) goes on the allow or deny list as
+  it is.
+
+What stays with the terminal: restoring the keys straight into the keyring
+(`restore --secret-storage keyring`; restore, then switch **Keys** to the
+keyring), and the keyring `setup` installs for the node's account on a
+Linux without a desktop session for it.
 
 ## Pairing links
 

@@ -806,7 +806,8 @@ fn default_account(layout: &Layout, sys: &dyn System, invoker: &str, steps: &mut
     match r {
         Ok(step) => steps.did(step),
         Err(e) => steps.did(format!(
-            "no account for commands: {e}; `sudo nerve-node setup` chooses one"
+            "no account for commands: {e}; {}",
+            crate::account::NO_ACCOUNT_SETUP
         )),
     }
 }

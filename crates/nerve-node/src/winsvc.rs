@@ -475,7 +475,8 @@ fn command_account(layout: &Layout, sys: &dyn WinSystem, invoker: &str, steps: &
     match r {
         Ok(step) => steps.did(step),
         Err(e) => steps.did(format!(
-            "no account for commands: {e}; `nerve-node install` asks again"
+            "no account for commands: {e}; {}",
+            crate::account::NO_ACCOUNT_INSTALL
         )),
     }
 }

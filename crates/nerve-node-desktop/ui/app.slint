@@ -4,7 +4,7 @@ import { Palette } from "std-widgets.slint";
 import { Theme, Type, Space, Radius, Size, Tone } from "theme.slint";
 import {
     Page, Load, NodeStatus, CenterRow, AuditRow, PairPreview, FolderRow, CapRow, LogRow,
-    HelpSection, HelpCard, HelpVerb, HelpArg, RelayNodeRow,
+    HelpSection, HelpCard, HelpVerb, HelpArg, RelayNodeRow, Pick,
 } from "data.slint";
 import { Store, Perm, Logs, Manual, Prefs, Install } from "store.slint";
 import { NavItem, StatusDot, Toast, Banner, Reveal } from "widgets.slint";
@@ -19,12 +19,14 @@ import { SetupDialog } from "setup.slint";
 import {
     PairDialog, ConfirmDialog, AboutDialog, ModeDialog, FolderDialog, SudoDialog, ProxyDialog,
     OnceDialog, BackupDialog, RestoreDialog, ElevateDialog, UpdateDialog, UninstallDialog,
+    RelayNodeDialog,
 } from "dialogs.slint";
 import { InstallerView } from "installer.slint";
 
 export {
     Store, Perm, Logs, Manual, Prefs, Install, Type, Tone, Page, Load, NodeStatus, CenterRow, AuditRow,
     PairPreview, FolderRow, CapRow, LogRow, HelpSection, HelpCard, HelpVerb, HelpArg, RelayNodeRow,
+    Pick,
 }
 
 component Sidebar inherits Rectangle {
@@ -247,6 +249,7 @@ export component AppWindow inherits Window {
     if Perm.sudo-open: SudoDialog { }
     if Prefs.proxy-open: ProxyDialog { }
     if Prefs.once-open: OnceDialog { }
+    if Prefs.relay-edit-open: RelayNodeDialog { }
     if Prefs.backup-open: BackupDialog { }
     if Prefs.restore-open: RestoreDialog { }
     if Store.setup-open: SetupDialog { }

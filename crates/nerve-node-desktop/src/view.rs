@@ -406,6 +406,15 @@ pub fn relay_nodes(v: &Value) -> Vec<RelayNodeRow> {
                 .filter_map(Value::as_str)
                 .collect();
             RelayNodeRow {
+                centers: ModelRc::new(VecModel::from(
+                    centers
+                        .iter()
+                        .map(|c| SharedString::from(*c))
+                        .collect::<Vec<_>>(),
+                )),
+                own_limits: n["own_limits"] == true,
+                max_links: n["max_links"].as_i64().unwrap_or_default() as i32,
+                max_opens: n["max_opens_per_minute"].as_i64().unwrap_or_default() as i32,
                 name: s(&n["name"]).into(),
                 reach: if centers.is_empty() {
                     "may reach every https center of this node".to_string()

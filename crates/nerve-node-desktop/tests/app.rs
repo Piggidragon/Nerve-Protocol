@@ -371,6 +371,40 @@ fn the_app_drives_the_cli_end_to_end() {
     );
     assert_eq!(prefs.get_relay_nodes().row_count(), 1);
     prefs.set_once_open(false);
+    // Its centers and limits, in its dialog.
+    prefs.invoke_relay_edit(0);
+    assert!(prefs.get_relay_edit_open());
+    assert_eq!(prefs.get_relay_edit_name(), "laptop-2");
+    let picks = prefs.get_relay_edit_centers();
+    assert_eq!(picks.row_count(), 1);
+    assert!(!picks.row_data(0).unwrap().on);
+    prefs.invoke_relay_edit_pick(0, true);
+    prefs.set_relay_edit_own(true);
+    prefs.set_relay_edit_links("3".into());
+    prefs.set_relay_edit_opens("12".into());
+    prefs.invoke_relay_edit_save();
+    assert!(
+        !prefs.get_relay_edit_open(),
+        "{}",
+        prefs.get_relay_edit_error()
+    );
+    let node = config(&paths).relay.nodes[0].clone();
+    assert_eq!(node.centers, ["home"]);
+    assert_eq!(
+        (node.max_links, node.max_opens_per_minute),
+        (Some(3), Some(12))
+    );
+    // Back to every center and the relay's limits.
+    prefs.invoke_relay_edit(0);
+    assert!(prefs.get_relay_edit_own() && prefs.get_relay_edit_centers().row_data(0).unwrap().on);
+    prefs.invoke_relay_edit_pick(0, false);
+    prefs.set_relay_edit_own(false);
+    prefs.invoke_relay_edit_save();
+    let node = config(&paths).relay.nodes[0].clone();
+    assert!(
+        node.centers.is_empty() && node.max_links.is_none(),
+        "{node:?}"
+    );
     let backup = root.join("node.backup");
     let file = backup.clone();
     ctl.set_chooser(Arc::new(move |_| Some(file.clone())));

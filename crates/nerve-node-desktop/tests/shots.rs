@@ -435,11 +435,17 @@ fn every_page_light_and_dark() {
     prefs.invoke_proxy_edit();
     prefs.set_proxy_new_url("http://proxy.example:3128".into());
     prefs.set_proxy_new_headers("Proxy-Authorization: Bearer …".into());
+    prefs.set_proxy_new_password("correct horse".into());
     shots.take("settings-proxy");
     prefs.set_proxy_open(false);
     prefs.invoke_relay_token("laptop-2".into());
     shots.take("settings-relay-token");
     prefs.set_once_open(false);
+    prefs.invoke_relay_edit(0);
+    prefs.invoke_relay_edit_pick(0, true);
+    prefs.set_relay_edit_own(true);
+    shots.take("settings-relay-node");
+    prefs.set_relay_edit_open(false);
     let backup = root.join("nerve-node.backup");
     ctl.set_chooser(Arc::new(move |_| Some(backup.clone())));
     prefs.invoke_backup_choose();

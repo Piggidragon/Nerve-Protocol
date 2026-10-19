@@ -3,10 +3,10 @@
 
 use std::rc::Rc;
 
-use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use super::{Choose, Ctl, Pending, messages};
-use crate::{Load, Prefs, Tone, view};
+use crate::{Load, Pick, Prefs, Tone, view};
 
 impl Ctl {
     pub(super) fn prefs_load(self: &Rc<Self>) {
@@ -181,6 +181,111 @@ impl Ctl {
                 }
             }
             c.prefs_load();
+        });
+    }
+
+    /// Opens the dialog of the relayed node in row `i`: the centers this
+    /// node has paired, and those the relayed node may reach, ticked.
+    fn relay_edit(&self, i: usize) {
+        let Some(row) = self
+            .with_prefs(|p| p.get_relay_nodes().row_data(i))
+            .flatten()
+        else {
+            return;
+        };
+        let reach: Vec<String> = row.centers.iter().map(|c| c.to_string()).collect();
+        let mut names = self.centers.borrow().clone();
+        // One it may reach that is no longer paired stays in sight.
+        for c in &reach {
+            if !names.contains(c) {
+                names.push(c.clone());
+            }
+        }
+        let picks: Vec<Pick> = names
+            .into_iter()
+            .map(|n| Pick {
+                on: reach.contains(&n),
+                name: n.into(),
+            })
+            .collect();
+        self.with_prefs(|p| {
+            p.set_relay_edit_name(row.name.clone());
+            p.set_relay_edit_centers(ModelRc::new(VecModel::from(picks)));
+            p.set_relay_edit_own(row.own_limits);
+            p.set_relay_edit_links(row.max_links.to_string().into());
+            p.set_relay_edit_opens(row.max_opens.to_string().into());
+            p.set_relay_edit_error(SharedString::new());
+            p.set_relay_edit_busy(false);
+            p.set_relay_edit_open(true);
+        });
+    }
+
+    fn relay_edit_pick(&self, i: usize, on: bool) {
+        self.with_prefs(|p| {
+            let picks = p.get_relay_edit_centers();
+            if let Some(mut pick) = picks.row_data(i) {
+                pick.on = on;
+                picks.set_row_data(i, pick);
+            }
+        });
+    }
+
+    /// `relay set-centers`, then `relay set-limits`: its own limits, or the
+    /// relay's again.
+    fn relay_edit_save(self: &Rc<Self>) {
+        let Some((name, centers, own, links, opens)) = self.with_prefs(|p| {
+            (
+                p.get_relay_edit_name().to_string(),
+                p.get_relay_edit_centers()
+                    .iter()
+                    .filter(|c| c.on)
+                    .map(|c| c.name.to_string())
+                    .collect::<Vec<_>>(),
+                p.get_relay_edit_own(),
+                p.get_relay_edit_links().trim().to_string(),
+                p.get_relay_edit_opens().trim().to_string(),
+            )
+        }) else {
+            return;
+        };
+        let mut set_centers = vec!["relay".into(), "set-centers".into(), name.clone()];
+        for c in centers {
+            set_centers.push("--center".into());
+            set_centers.push(c);
+        }
+        let mut set_limits = vec!["relay".into(), "set-limits".into(), name.clone()];
+        if own {
+            set_limits.extend([
+                "--max-links".into(),
+                links,
+                "--max-opens-per-minute".into(),
+                opens,
+            ]);
+        }
+        let failed = |c: &Rc<Ctl>, e: String| {
+            c.with_prefs(|p| {
+                p.set_relay_edit_busy(false);
+                p.set_relay_edit_error(e.into());
+            });
+            c.prefs_load();
+        };
+        self.with_prefs(|p| {
+            p.set_relay_edit_busy(true);
+            p.set_relay_edit_error(SharedString::new());
+        });
+        self.command(set_centers, None, move |c, answer| match answer {
+            Ok(_) => c.command(set_limits, None, move |c, answer| match answer {
+                Ok(_) => {
+                    c.with_prefs(|p| {
+                        p.set_relay_edit_busy(false);
+                        p.set_relay_edit_open(false);
+                    });
+                    c.toast(format!("{name}'s centers and limits are saved."), Tone::Ok);
+                    c.prefs_load();
+                }
+                Err(e) => failed(c, e),
+            }),
+            Err(e) => failed(c, e),
         });
     }
 
@@ -416,6 +521,12 @@ pub(super) fn wire(ctl: &Rc<Ctl>, window: &crate::AppWindow) {
             String::new(),
         )
     });
+    let c = ctl.clone();
+    p.on_relay_edit(move |i| c.relay_edit(i as usize));
+    let c = ctl.clone();
+    p.on_relay_edit_pick(move |i, on| c.relay_edit_pick(i as usize, on));
+    let c = ctl.clone();
+    p.on_relay_edit_save(move || c.relay_edit_save());
     let c = ctl.clone();
     p.on_raw_get(move || c.raw_get());
     let c = ctl.clone();

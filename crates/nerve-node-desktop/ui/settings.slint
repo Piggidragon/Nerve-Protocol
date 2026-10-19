@@ -300,6 +300,14 @@ export component SettingsPage inherits PageFrame {
                                 }
                             }
                             Button {
+                                text: "Edit…";
+                                small: true;
+                                kind: ButtonKind.ghost;
+                                clicked => {
+                                    Prefs.relay-edit(i);
+                                }
+                            }
+                            Button {
                                 text: "New token";
                                 small: true;
                                 kind: ButtonKind.ghost;

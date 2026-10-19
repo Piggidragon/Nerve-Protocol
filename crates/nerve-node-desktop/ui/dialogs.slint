@@ -808,3 +808,83 @@ export component UninstallDialog inherits Dialog {
         }
     }
 }
+
+// A node that reaches this node's centers through the relay: which centers,
+// and its own limits, for a relay behind this one that carries many nodes.
+export component RelayNodeDialog inherits Dialog {
+    title: Prefs.relay-edit-name;
+    subtitle: "A node that reaches this node's centers through the relay.";
+    card-width: 540px;
+    close => {
+        Prefs.relay-edit-open = false;
+    }
+    Field {
+        label: "Centers it may reach";
+        hint: "None ticked: every https center of this node, also one paired later.";
+        VerticalLayout {
+            spacing: Space.sm;
+            for p[i] in Prefs.relay-edit-centers: CheckBox {
+                checked: p.on;
+                text: p.name;
+                toggled(on) => {
+                    Prefs.relay-edit-pick(i, on);
+                }
+            }
+        }
+    }
+    Field {
+        label: "Limits";
+        hint: Prefs.relay-edit-own ? "For a relay behind this one, which carries many nodes." : "The limits every node of the relay has.";
+        VerticalLayout {
+            spacing: Space.md;
+            HorizontalLayout {
+                alignment: start;
+                Segmented {
+                    options: ["The relay's", "Its own"];
+                    current: Prefs.relay-edit-own ? 1 : 0;
+                    chosen(i) => {
+                        Prefs.relay-edit-own = i == 1;
+                    }
+                }
+            }
+            Reveal {
+                shown: Prefs.relay-edit-own;
+                HorizontalLayout {
+                    spacing: Space.md;
+                    Field {
+                        label: "Tunnels at once";
+                        TextField {
+                            text <=> Prefs.relay-edit-links;
+                            label: "Tunnels at once";
+                        }
+                    }
+                    Field {
+                        label: "Tunnels opened a minute";
+                        TextField {
+                            text <=> Prefs.relay-edit-opens;
+                            label: "Tunnels opened a minute";
+                        }
+                    }
+                }
+            }
+        }
+    }
+    DialogButtons {
+        error: Prefs.relay-edit-error;
+        Button {
+            text: "Cancel";
+            kind: ButtonKind.ghost;
+            clicked => {
+                Prefs.relay-edit-open = false;
+            }
+        }
+        Button {
+            text: "Save";
+            kind: ButtonKind.primary;
+            busy: Prefs.relay-edit-busy;
+            clicked => {
+                Prefs.relay-edit-save();
+            }
+        }
+    }
+}

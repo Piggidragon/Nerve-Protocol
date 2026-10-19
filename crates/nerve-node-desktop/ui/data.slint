@@ -118,4 +118,17 @@ export struct RelayNodeRow {
     name: string,
     reach: string,
     limits: string,
+    // What its dialog starts from: the centers it may reach (none: every
+    // https center), whether it has limits of its own, and the limits it
+    // gets.
+    centers: [string],
+    own-limits: bool,
+    max-links: int,
+    max-opens: int,
+}
+
+// A choice of a list, ticked or not.
+export struct Pick {
+    name: string,
+    on: bool,
 }

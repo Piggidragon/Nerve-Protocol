@@ -5,7 +5,7 @@
 import { Tone } from "theme.slint";
 import {
     Page, Load, NodeStatus, CenterRow, AuditRow, PairPreview, FolderRow, CapRow, LogRow,
-    HelpSection, RelayNodeRow,
+    HelpSection, RelayNodeRow, Pick,
 } from "data.slint";
 
 export global Store {
@@ -208,6 +208,19 @@ export global Prefs {
     callback relay-add();
     callback relay-token(string);
     callback relay-remove(string);
+    // One relayed node's centers and limits, in its dialog: no center
+    // ticked lets it reach every https center of this node.
+    in-out property <bool> relay-edit-open;
+    in-out property <string> relay-edit-name;
+    in-out property <[Pick]> relay-edit-centers;
+    in-out property <bool> relay-edit-own;
+    in-out property <string> relay-edit-links;
+    in-out property <string> relay-edit-opens;
+    in-out property <string> relay-edit-error;
+    in-out property <bool> relay-edit-busy;
+    callback relay-edit(int);
+    callback relay-edit-pick(int, bool);
+    callback relay-edit-save();
 
     // A token or a key shown once, with what to do with it.
     in-out property <bool> once-open;

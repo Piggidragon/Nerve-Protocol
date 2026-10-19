@@ -109,6 +109,8 @@ pub struct Ctl {
     /// Starts the installed app (src/app/install.rs), which is there.
     launcher: RefCell<Launcher>,
     program: RefCell<PathBuf>,
+    /// The app's own settings file (crate::settings), when it keeps one.
+    settings: RefCell<Option<PathBuf>>,
     /// How the broker starts when the node is installed as a service.
     elevate: Cell<Option<Launch>>,
     /// A `nerve://` link the app was opened with, paired once it can be.
@@ -186,6 +188,7 @@ impl Ctl {
             asking_service: Cell::new(false),
             launcher: RefCell::new(install::system_launcher()),
             program: RefCell::new(PathBuf::new()),
+            settings: RefCell::new(None),
             elevate: Cell::new(None),
             link: RefCell::new(None),
             first_run: Cell::new(false),
@@ -696,7 +699,24 @@ impl Ctl {
         self.change("node", vec![args.into()], said.into());
     }
 
+    /// Keeps the app's settings in `file`, and takes the appearance saved
+    /// there.
+    pub fn keep_settings(&self, file: PathBuf) {
+        let appearance = crate::settings::appearance(&file);
+        *self.settings.borrow_mut() = Some(file);
+        self.show_appearance(appearance);
+    }
+
     fn set_appearance(&self, i: i32) {
+        self.show_appearance(i);
+        if let Some(file) = self.settings.borrow().as_ref()
+            && let Err(e) = crate::settings::save_appearance(file, i)
+        {
+            self.toast(format!("The appearance is not saved: {e}"), Tone::Danger);
+        }
+    }
+
+    fn show_appearance(&self, i: i32) {
         let Some(w) = self.window.upgrade() else {
             return;
         };
@@ -722,6 +742,9 @@ pub fn run(link: Option<String>) -> Result<(), String> {
     let _ = slint::set_xdg_app_id(crate::parts::PROGRAM);
     let window = AppWindow::new().map_err(|e| format!("cannot open the window: {e}"))?;
     let ctl = Ctl::attach(&window, runner, Exec::Threads);
+    if let Some(file) = crate::settings::file() {
+        ctl.keep_settings(file);
+    }
     if here.is_none() || here != installed {
         ctl.installer(Launch::Elevated, &layout.bin);
     } else {

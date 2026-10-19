@@ -528,6 +528,16 @@ fn the_app_drives_the_cli_end_to_end() {
     );
     prefs.invoke_proxy_remove();
 
+    // The appearance the owner chose is kept in the app's own file.
+    let settings = root.join("app/settings.json");
+    ctl.keep_settings(settings.clone());
+    assert_eq!(store.get_appearance(), 0);
+    store.invoke_set_appearance(2);
+    assert_eq!(nerve_node_desktop::settings::appearance(&settings), 2);
+    store.set_appearance(0);
+    ctl.keep_settings(settings);
+    assert_eq!(store.get_appearance(), 2);
+
     // A service command goes through the broker too, and says when it
     // cannot be done: here no service is installed.
     store.invoke_service("stop".into());

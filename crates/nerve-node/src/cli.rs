@@ -1275,9 +1275,28 @@ fn invoker() -> String {
     if let Ok(me) = crate::win_user::current_user() {
         return me;
     }
-    std::env::var("SUDO_USER")
-        .ok()
+    invoker_of(
+        std::env::var("SUDO_USER").ok(),
+        std::env::var("PKEXEC_UID").ok(),
+        crate::account::name_of,
+    )
+}
+
+/// [`invoker`] from `SUDO_USER`, else `PKEXEC_UID`: polkit's pkexec, with
+/// which the desktop app asks for root, names the user who asked by uid.
+fn invoker_of(
+    sudo_user: Option<String>,
+    pkexec_uid: Option<String>,
+    name_of: impl Fn(u32) -> Option<String>,
+) -> String {
+    sudo_user
         .filter(|u| !u.is_empty())
+        .or_else(|| {
+            pkexec_uid
+                .and_then(|u| u.trim().parse::<u32>().ok())
+                .filter(|u| *u != 0)
+                .and_then(name_of)
+        })
         .unwrap_or_else(|| "root".into())
 }
 
@@ -3962,6 +3981,23 @@ fn table_at<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_invoker_is_who_ran_sudo_or_pkexec() {
+        let alice = |uid: u32| (uid == 1000).then(|| "alice".to_string());
+        assert_eq!(
+            invoker_of(Some("bob".into()), Some("1000".into()), alice),
+            "bob"
+        );
+        assert_eq!(invoker_of(None, Some("1000".into()), alice), "alice");
+        assert_eq!(
+            invoker_of(Some(String::new()), Some("1000".into()), alice),
+            "alice"
+        );
+        assert_eq!(invoker_of(None, Some("1001".into()), alice), "root");
+        assert_eq!(invoker_of(None, Some("0".into()), alice), "root");
+        assert_eq!(invoker_of(None, None, alice), "root");
+    }
 
     /// A folder in a home the node's user may not look into (the installed
     /// node's CLI runs as `nerve`) is kept as given, in its normal form;

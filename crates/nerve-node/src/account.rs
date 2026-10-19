@@ -377,6 +377,28 @@ fn lookup_nss(name: &str) -> Result<Option<Account>, String> {
     Ok(Some(a))
 }
 
+/// The name of the account with `uid`, from the system's account database.
+pub fn name_of(uid: u32) -> Option<String> {
+    #[cfg(windows)]
+    {
+        let _ = uid;
+        None
+    }
+    #[cfg(not(windows))]
+    {
+        let o = plain("getent")
+            .args(["passwd", &uid.to_string()])
+            .output()
+            .ok()?;
+        if !o.status.success() {
+            return None;
+        }
+        parse_passwd(&String::from_utf8_lossy(&o.stdout))
+            .filter(|a| a.uid == uid)
+            .map(|a| a.name)
+    }
+}
+
 /// One line of `getent passwd`.
 pub fn parse_passwd(line: &str) -> Option<Account> {
     let f: Vec<&str> = line.trim_end_matches(['\n', '\r']).split(':').collect();

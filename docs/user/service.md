@@ -34,7 +34,8 @@ Whatever the downloaded file is called, `install` puts it in place as
 2. Makes the folders, private to `nerve` (mode 0700). Folders an earlier
    install left behind are given to the new user.
 3. Sets the account that [commands run as](#the-account-commands-run-as):
-   the account that ran `sudo`. An account chosen before stays. When you
+   the account that ran `sudo` (or polkit's `pkexec`, with which the
+   [desktop app](desktop.md) asks). An account chosen before stays. When you
    are logged in as root without `sudo`, it is root, and `install` warns
    that commands from a center then run as root. It warns about the account
    that ran `sudo` as well, since a person logs in as it, and about any

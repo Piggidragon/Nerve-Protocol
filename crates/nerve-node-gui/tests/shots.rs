@@ -23,6 +23,13 @@ use slint::{ComponentHandle, Model};
 const WIDTH: u32 = 1180;
 const HEIGHT: u32 = 780;
 const SCALE: f32 = 2.0;
+/// Long values, so the shots show how they fit.
+const OFFICE: &str = "office-workstation-second-floor";
+const LAB_URL: &str =
+    "https://nerve-center.platform-engineering.internal.example.com:8443/teams/nerve";
+const DEEP: &str =
+    "alex/projects/clients/northwind/infrastructure/terraform/modules/networking/vpc-peering";
+const LONG_RULE: &str = "docker compose -f deploy/docker-compose.production.yml --project-name northwind-platform up -d --remove-orphans";
 
 struct Shots<'a> {
     screen: Screen,
@@ -162,8 +169,13 @@ fn every_page_light_and_dark() {
     // The first-run steps, as the app opens them on a new node.
     let home = rt.block_on(FakeCenter::start(true)).unwrap();
     store.invoke_setup_start();
-    store.set_setup_name("studio".into());
+    store.set_setup_name("build-server-basement-rack3-left".into());
     shots.take("setup-name");
+    // A name the node refuses: the step says why.
+    store.set_setup_name("build-server-in-the-basement-rack-3-left-side".into());
+    store.invoke_setup_next();
+    shots.take("setup-name-refused");
+    store.set_setup_name("build-server-basement-rack3-left".into());
     store.invoke_setup_next();
     shots.take("setup-keys");
     store.invoke_setup_next();
@@ -195,20 +207,21 @@ fn every_page_light_and_dark() {
         "add",
         &office.link().render(),
         "--name",
-        "office",
+        OFFICE,
         "--yes",
     ]);
     run(&["center", "grant", "settings", "write", "--center", "home"]);
     run(&["mode", "set", "user", "--for", "8", "--center", "lab"]);
-    run(&["center", "pause", "--center", "office"]);
-    // lab's center went away.
-    run(&["config", "set", "center.lab.url", "http://127.0.0.1:9"]);
+    run(&["center", "pause", "--center", OFFICE]);
+    // lab's center is far away, and cannot be reached.
+    run(&["config", "set", "center.lab.url", LAB_URL]);
     drop(lab);
     // home's folders and rules.
     for (folder, rights) in [
         ("alex/projects/site", vec!["+r", "+w", "+x"]),
         ("alex/Documents", vec!["+r"]),
         ("alex/scratch", vec!["+r", "+w"]),
+        (DEEP, vec!["+r", "+x"]),
     ] {
         let p = root.join(folder);
         std::fs::create_dir_all(&p).unwrap();
@@ -221,6 +234,7 @@ fn every_page_light_and_dark() {
     for (list, rule) in [
         ("allow", "git status"),
         ("allow", "cargo test --workspace"),
+        ("allow", LONG_RULE),
         ("deny", "git push --force origin main"),
         ("deny", "rm -rf /"),
         ("sudo", "sudo systemctl restart nginx"),
@@ -243,7 +257,7 @@ fn every_page_light_and_dark() {
     decided(
         &paths,
         26 * 3_600_000,
-        "office",
+        OFFICE,
         ("fs", "list"),
         &format!("{alex}/Documents"),
         Some(&format!("no allow rule matches {alex}/Documents")),
@@ -273,6 +287,26 @@ fn every_page_light_and_dark() {
         ("exec", "run"),
         "sudo systemctl restart nginx",
         Some("no sudo allow entry matches the command \"sudo systemctl restart nginx\""),
+    );
+    decided(
+        &paths,
+        11 * 60_000,
+        "home",
+        ("fs", "read"),
+        &format!("{}/{DEEP}/main.tf", root.display()),
+        None,
+    );
+    decided(
+        &paths,
+        8 * 60_000,
+        "home",
+        ("exec", "run"),
+        &format!(
+            "{LONG_RULE} && docker compose -f deploy/docker-compose.production.yml logs --tail 200 --follow api worker scheduler"
+        ),
+        Some(
+            "no allow rule matches the command: it chains commands or holds an expression (; & | $ ` ( ) < > @ { } % ' \" # , \\, a line break, or a word such as powershell, cmd, iex or -Command); only an allow rule that names it exactly covers that",
+        ),
     );
     decided(
         &paths,
@@ -322,7 +356,7 @@ fn every_page_light_and_dark() {
     shots.take("overview");
     store.invoke_show(Page::Centers);
     shots.take("centers");
-    store.invoke_center_unpair("office".into());
+    store.invoke_center_unpair(OFFICE.into());
     shots.take("centers-unpair");
     store.set_confirm_open(false);
 

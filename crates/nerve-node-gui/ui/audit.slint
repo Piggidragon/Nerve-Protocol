@@ -9,6 +9,7 @@ import { Store } from "store.slint";
 import {
     Button, ButtonKind, Card, Pill, IconTile, Banner, Loading, PageHeader, PageFrame,
     EmptyState, Divider, Segmented, Code,
+    Reveal,
 } from "widgets.slint";
 
 component AuditEntry {
@@ -58,6 +59,8 @@ component AuditEntry {
                     color: Theme.text-muted;
                     font-size: Type.small;
                     vertical-alignment: center;
+                    overflow: elide;
+                    min-width: 40px;
                 }
                 Rectangle {
                     horizontal-stretch: 1;
@@ -137,6 +140,12 @@ export component AuditPage inherits PageFrame {
     PageHeader {
         title: "Audit";
         subtitle: "What the node allowed and refused, newest first, and every change to its settings.";
+        error-title: "The audit log could not be read";
+        error: Store.audit-error;
+        error-action: "Try again";
+        error-acted => {
+            Store.refresh-audit();
+        }
         Segmented {
             options: ["All", "Refused"];
             current: Store.audit-refused-only ? 1 : 0;
@@ -158,16 +167,6 @@ export component AuditPage inherits PageFrame {
         text: "Reading the audit log…";
     }
 
-    if Store.audit-load == Load.failed: Banner {
-        tone: Tone.danger;
-        title: "The audit log could not be read";
-        text: Store.audit-error;
-        action: "Try again";
-        acted => {
-            Store.refresh-audit();
-        }
-    }
-
     if Store.audit-load == Load.ready && Store.audit.length == 0: Card {
         EmptyState {
             icon: @image-url("icons/audit.svg");
@@ -178,13 +177,16 @@ export component AuditPage inherits PageFrame {
         }
     }
 
-    if Store.audit.length > 0: Card {
-        pad: 0;
-        gap: 0;
-        for row[i] in Store.audit: VerticalLayout {
-            if i > 0: Divider { }
-            AuditEntry {
-                entry: row;
+    Reveal {
+        shown: Store.audit.length > 0;
+        Card {
+            pad: 0;
+            gap: 0;
+            for row[i] in Store.audit: VerticalLayout {
+                if i > 0: Divider { }
+                AuditEntry {
+                    entry: row;
+                }
             }
         }
     }

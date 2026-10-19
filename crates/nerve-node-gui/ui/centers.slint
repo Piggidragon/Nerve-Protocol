@@ -6,7 +6,7 @@ import { Load, CenterRow } from "data.slint";
 import { Store } from "store.slint";
 import {
     Button, ButtonKind, Card, Pill, IconTile, Banner, Loading, PageHeader, PageFrame,
-    EmptyState, Divider, Switch,
+    EmptyState, Divider, Switch, Reveal,
 } from "widgets.slint";
 
 component CenterCard inherits Card {
@@ -37,6 +37,8 @@ component CenterCard inherits Card {
                     font-size: Type.heading;
                     font-weight: Type.semibold;
                     vertical-alignment: center;
+                    overflow: elide;
+                    min-width: 40px;
                 }
                 VerticalLayout {
                     alignment: center;
@@ -108,6 +110,7 @@ component CenterCard inherits Card {
             min-width: 0;
             VerticalLayout {
                 spacing: 4px;
+                alignment: start;
                 Text {
                     text: "Mode";
                     color: Theme.text-faint;
@@ -140,6 +143,7 @@ component CenterCard inherits Card {
                 spacing: Space.md;
                 VerticalLayout {
                     spacing: 4px;
+                    alignment: start;
                     horizontal-stretch: 1;
                     Text {
                         text: "Settings grant";
@@ -174,13 +178,16 @@ component CenterCard inherits Card {
             }
         }
     }
-    if root.item.note != "": VerticalLayout {
-        padding-left: Space.xl;
-        padding-right: Space.xl;
-        padding-bottom: Space.lg;
-        Banner {
-            tone: root.item.note-tone;
-            text: root.item.note;
+    Reveal {
+        shown: root.item.note != "";
+        VerticalLayout {
+            padding-left: Space.xl;
+            padding-right: Space.xl;
+            padding-bottom: Space.lg;
+            Banner {
+                tone: root.item.note-tone;
+                text: root.item.note;
+            }
         }
     }
 }
@@ -189,6 +196,12 @@ export component CentersPage inherits PageFrame {
     PageHeader {
         title: "Centers";
         subtitle: "The centers this machine is paired with. A center's agents may do only what you allow it.";
+        error-title: "The centers could not be read";
+        error: Store.status-error;
+        error-action: "Try again";
+        error-acted => {
+            Store.refresh();
+        }
         Button {
             text: "Refresh";
             icon: @image-url("icons/refresh.svg");
@@ -208,16 +221,6 @@ export component CentersPage inherits PageFrame {
     }
 
     if Store.status-load == Load.loading && Store.status.state == "": Loading { }
-
-    if Store.status-load == Load.failed: Banner {
-        tone: Tone.danger;
-        title: "The centers could not be read";
-        text: Store.status-error;
-        action: "Try again";
-        acted => {
-            Store.refresh();
-        }
-    }
 
     if Store.status.state != "" && Store.centers.length == 0: Card {
         EmptyState {

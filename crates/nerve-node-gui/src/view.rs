@@ -562,6 +562,37 @@ fn changed(key: &str, old: &Value, new: &Value, out: &mut Vec<String>) {
         }
         return;
     }
+    // A list of words, such as rules: what came and what went.
+    let words = |v: &Value| -> Option<Vec<String>> {
+        if v.is_null() {
+            return Some(Vec::new());
+        }
+        v.as_array()?
+            .iter()
+            .map(|e| e.as_str().map(str::to_string))
+            .collect()
+    };
+    if (old.is_array() || new.is_array())
+        && let (Some(a), Some(b)) = (words(old), words(new))
+    {
+        let added: Vec<&str> = b
+            .iter()
+            .filter(|w| !a.contains(w))
+            .map(String::as_str)
+            .collect();
+        let removed: Vec<&str> = a
+            .iter()
+            .filter(|w| !b.contains(w))
+            .map(String::as_str)
+            .collect();
+        if !added.is_empty() {
+            out.push(format!("{key} + {}", added.join(", ")));
+        }
+        if !removed.is_empty() {
+            out.push(format!("{key} − {}", removed.join(", ")));
+        }
+        return;
+    }
     out.push(format!("{key}: {} → {}", short(old), short(new)));
 }
 
@@ -870,7 +901,7 @@ mod tests {
         let whole = audit(&[whole], &centers, NOW);
         assert_eq!(
             whole[0].detail,
-            "By local. center.home.policy.allow: nothing → [\"exec.run:cargo *\"]; center.lab.paused: false → true; center.new added"
+            "By local. center.home.policy.allow + exec.run:cargo *; center.lab.paused: false → true; center.new added"
         );
         assert!(!rows[3].rules);
         assert_eq!(rows[4].when, "2 min ago");

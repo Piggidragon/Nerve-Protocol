@@ -6,13 +6,20 @@ import { Page, Load } from "data.slint";
 import { Store } from "store.slint";
 import {
     Button, ButtonKind, Card, Pill, StatusDot, IconTile, Banner, Loading, PageHeader,
-    PageFrame, SectionTitle, StatTile, Divider, Icon,
+    PageFrame, SectionTitle, StatTile, Divider, Icon, Reveal,
 } from "widgets.slint";
 
 export component OverviewPage inherits PageFrame {
+    gap: 0;
     PageHeader {
         title: "Overview";
         subtitle: "How the node on this machine is doing.";
+        error-title: "The node did not answer";
+        error: Store.status-error;
+        error-action: "Try again";
+        error-acted => {
+            Store.refresh();
+        }
         Button {
             text: "Refresh";
             icon: @image-url("icons/refresh.svg");
@@ -25,237 +32,244 @@ export component OverviewPage inherits PageFrame {
 
     if Store.status-load == Load.loading && Store.status.state == "": Loading { }
 
-    if Store.status-load == Load.failed: Banner {
-        tone: Tone.danger;
-        title: "The node did not answer";
-        text: Store.status-error;
-        action: "Try again";
-        acted => {
-            Store.refresh();
-        }
-    }
-
-    if Store.status.state != "": Card {
-        pad: Space.xxl;
-        HorizontalLayout {
-            spacing: Space.xl;
-            VerticalLayout {
-                alignment: start;
-                IconTile {
-                    size: 52px;
-                    tone: Store.status.tone;
-                    icon: Store.status.state == "locked" ? @image-url("icons/lock.svg")
-                        : Store.status.state == "running" ? @image-url("icons/activity.svg")
-                        : @image-url("icons/wait.svg");
-                }
-            }
-            VerticalLayout {
-                spacing: 6px;
-                horizontal-stretch: 1;
-                alignment: center;
-                Text {
-                    text: Store.status.title;
-                    color: Theme.text;
-                    font-size: 19px;
-                    font-weight: Type.semibold;
-                    wrap: word-wrap;
-                }
-                Text {
-                    text: Store.status.detail;
-                    color: Theme.text-muted;
-                    font-size: Type.body;
-                    wrap: word-wrap;
-                }
-                if Store.status.confinement != "": HorizontalLayout {
-                    spacing: 6px;
-                    padding-top: 4px;
-                    VerticalLayout {
-                        alignment: center;
-                        Icon {
-                            source: @image-url("icons/shield.svg");
-                            colorize: Theme.text-faint;
-                            size: 14px;
-                        }
+    Reveal {
+        shown: Store.status.state != "";
+        gap: Space.xxl;
+        Card {
+            pad: Space.xxl;
+            HorizontalLayout {
+                spacing: Space.xl;
+                VerticalLayout {
+                    alignment: start;
+                    IconTile {
+                        size: 52px;
+                        tone: Store.status.tone;
+                        icon: Store.status.state == "locked" ? @image-url("icons/lock.svg")
+                            : Store.status.state == "running" ? @image-url("icons/activity.svg")
+                            : @image-url("icons/wait.svg");
                     }
+                }
+                VerticalLayout {
+                    spacing: 6px;
+                    horizontal-stretch: 1;
+                    alignment: center;
                     Text {
-                        text: "Confinement: " + Store.status.confinement;
-                        color: Theme.text-faint;
-                        font-size: Type.caption;
-                        vertical-alignment: center;
+                        text: Store.status.title;
+                        color: Theme.text;
+                        font-size: 19px;
+                        font-weight: Type.semibold;
                         wrap: word-wrap;
                     }
-                }
-            }
-            VerticalLayout {
-                alignment: center;
-                HorizontalLayout {
-                    spacing: Space.sm;
-                    if Store.status.state == "stopped" && !Store.installed: Button {
-                        text: "Start the node";
-                        icon: @image-url("icons/play.svg");
-                        kind: ButtonKind.primary;
-                        busy: Store.busy == "run";
-                        clicked => {
-                            Store.node-start();
-                        }
+                    Text {
+                        text: Store.status.detail;
+                        color: Theme.text-muted;
+                        font-size: Type.body;
+                        wrap: word-wrap;
                     }
-                    if Store.status.state == "running" && Store.started-here: Button {
-                        text: "Stop";
-                        icon: @image-url("icons/pause.svg");
-                        busy: Store.busy == "run";
-                        clicked => {
-                            Store.node-stop();
-                        }
-                    }
-                    if Store.status.state == "locked": Button {
-                        text: "Unlock";
-                        icon: @image-url("icons/unlock.svg");
-                        kind: ButtonKind.primary;
-                        busy: Store.busy == "node";
-                        clicked => {
-                            Store.unlock();
-                        }
-                    }
-                    if Store.status.state != "locked": Button {
-                        text: "Panic";
-                        icon: @image-url("icons/octagon.svg");
-                        kind: ButtonKind.danger-soft;
-                        busy: Store.busy == "node";
-                        why-disabled: "Ends every link and runs nothing until you unlock";
-                        clicked => {
-                            Store.panic();
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    if Store.status.warnings.length > 0: VerticalLayout {
-        spacing: Space.sm;
-        for warning in Store.status.warnings: Banner {
-            tone: Tone.warn;
-            text: warning;
-        }
-    }
-
-    if Store.status.state != "": HorizontalLayout {
-        spacing: Space.lg;
-        StatTile {
-            icon: @image-url("icons/centers.svg");
-            label: "Centers";
-            value: Store.status.centers == 0 ? "None paired"
-                : Store.status.centers == 1 ? "1 paired" : Store.status.centers + " paired";
-            detail: Store.status.state != "running" ? "No link while the node does not run"
-                : Store.status.connected + " of " + Store.status.centers + " connected";
-            tone: Store.status.connected > 0 ? Tone.ok : Tone.accent;
-        }
-        StatTile {
-            icon: @image-url("icons/key.svg");
-            label: "Sudo";
-            value: Store.status.sudo-on ? "On" : "Off";
-            detail: Store.status.sudo-on ? "Commands on the sudo list run with sudo" : "No command runs with sudo";
-            tone: Store.status.sudo-on ? Tone.warn : Tone.accent;
-        }
-        StatTile {
-            icon: @image-url("icons/cpu.svg");
-            label: "Limits per command";
-            value: Store.status.limits;
-            detail: "Memory, CPU and processes of each command";
-        }
-    }
-
-    if Store.status.state != "": VerticalLayout {
-        spacing: Space.md;
-        SectionTitle {
-            text: "Centers";
-            Button {
-                text: "Manage";
-                kind: ButtonKind.ghost;
-                small: true;
-                clicked => {
-                    Store.show(Page.centers);
-                }
-            }
-        }
-        if Store.centers.length == 0: Card {
-            HorizontalLayout {
-                spacing: Space.lg;
-                Text {
-                    horizontal-stretch: 1;
-                    text: "No center is paired yet. Pair one to let its agents use this machine, with only what you allow.";
-                    color: Theme.text-muted;
-                    font-size: Type.body;
-                    wrap: word-wrap;
-                    vertical-alignment: center;
-                }
-                Button {
-                    text: "Set up…";
-                    kind: ButtonKind.ghost;
-                    clicked => {
-                        Store.setup-start();
-                    }
-                }
-                Button {
-                    text: "Pair a center";
-                    icon: @image-url("icons/plus.svg");
-                    kind: ButtonKind.primary;
-                    clicked => {
-                        Store.pair-start();
-                    }
-                }
-            }
-        }
-        if Store.centers.length > 0: Card {
-            pad: 0;
-            gap: 0;
-            for c[i] in Store.centers: VerticalLayout {
-                if i > 0: Divider { }
-                HorizontalLayout {
-                    padding-left: Space.xl;
-                    padding-right: Space.xl;
-                    padding-top: 14px;
-                    padding-bottom: 14px;
-                    spacing: Space.md;
-                    VerticalLayout {
-                        alignment: center;
-                        StatusDot {
-                            tone: c.link-tone;
-                        }
-                    }
-                    VerticalLayout {
-                        spacing: 2px;
-                        horizontal-stretch: 1;
-                        Text {
-                            text: c.name;
-                            color: Theme.text;
-                            font-size: Type.body;
-                            font-weight: Type.semibold;
+                    if Store.status.confinement != "": HorizontalLayout {
+                        spacing: 6px;
+                        padding-top: 4px;
+                        VerticalLayout {
+                            alignment: center;
+                            Icon {
+                                source: @image-url("icons/shield.svg");
+                                colorize: Theme.text-faint;
+                                size: 14px;
+                            }
                         }
                         Text {
-                            text: c.url;
+                            text: "Confinement: " + Store.status.confinement;
                             color: Theme.text-faint;
                             font-size: Type.caption;
-                            font-family: Type.mono;
+                            vertical-alignment: center;
+                            wrap: word-wrap;
+                        }
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    HorizontalLayout {
+                        spacing: Space.sm;
+                        if Store.status.state == "stopped" && !Store.installed: Button {
+                            text: "Start the node";
+                            icon: @image-url("icons/play.svg");
+                            kind: ButtonKind.primary;
+                            busy: Store.busy == "run";
+                            clicked => {
+                                Store.node-start();
+                            }
+                        }
+                        if Store.status.state == "running" && Store.started-here: Button {
+                            text: "Stop";
+                            icon: @image-url("icons/pause.svg");
+                            busy: Store.busy == "run";
+                            clicked => {
+                                Store.node-stop();
+                            }
+                        }
+                        if Store.status.state == "locked": Button {
+                            text: "Unlock";
+                            icon: @image-url("icons/unlock.svg");
+                            kind: ButtonKind.primary;
+                            busy: Store.busy == "node";
+                            clicked => {
+                                Store.unlock();
+                            }
+                        }
+                        if Store.status.state != "locked": Button {
+                            text: "Panic";
+                            icon: @image-url("icons/octagon.svg");
+                            kind: ButtonKind.danger-soft;
+                            busy: Store.busy == "node";
+                            why-disabled: "Ends every link and runs nothing until you unlock";
+                            clicked => {
+                                Store.panic();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Reveal {
+        shown: Store.status.warnings.length > 0;
+        gap: Space.xxl;
+        VerticalLayout {
+            spacing: Space.sm;
+            for warning in Store.status.warnings: Banner {
+                tone: Tone.warn;
+                text: warning;
+            }
+        }
+    }
+
+    Reveal {
+        shown: Store.status.state != "";
+        gap: Space.xxl;
+        HorizontalLayout {
+            spacing: Space.lg;
+            StatTile {
+                icon: @image-url("icons/centers.svg");
+                label: "Centers";
+                value: Store.status.centers == 0 ? "None paired"
+                    : Store.status.centers == 1 ? "1 paired" : Store.status.centers + " paired";
+                detail: Store.status.state != "running" ? "No link while the node does not run"
+                    : Store.status.connected + " of " + Store.status.centers + " connected";
+                tone: Store.status.connected > 0 ? Tone.ok : Tone.accent;
+            }
+            StatTile {
+                icon: @image-url("icons/key.svg");
+                label: "Sudo";
+                value: Store.status.sudo-on ? "On" : "Off";
+                detail: Store.status.sudo-on ? "Commands on the sudo list run with sudo" : "No command runs with sudo";
+                tone: Store.status.sudo-on ? Tone.warn : Tone.accent;
+            }
+            StatTile {
+                icon: @image-url("icons/cpu.svg");
+                label: "Limits per command";
+                value: Store.status.limits;
+                detail: "Memory, CPU and processes of each command";
+            }
+        }
+    }
+
+    Reveal {
+        shown: Store.status.state != "";
+        gap: Space.xxl;
+        VerticalLayout {
+            spacing: Space.md;
+            SectionTitle {
+                text: "Centers";
+                Button {
+                    text: "Manage";
+                    kind: ButtonKind.ghost;
+                    small: true;
+                    clicked => {
+                        Store.show(Page.centers);
+                    }
+                }
+            }
+            if Store.centers.length == 0: Card {
+                HorizontalLayout {
+                    spacing: Space.lg;
+                    Text {
+                        horizontal-stretch: 1;
+                        text: "No center is paired yet. Pair one to let its agents use this machine, with only what you allow.";
+                        color: Theme.text-muted;
+                        font-size: Type.body;
+                        wrap: word-wrap;
+                        vertical-alignment: center;
+                    }
+                    Button {
+                        text: "Set up…";
+                        kind: ButtonKind.ghost;
+                        clicked => {
+                            Store.setup-start();
+                        }
+                    }
+                    Button {
+                        text: "Pair a center";
+                        icon: @image-url("icons/plus.svg");
+                        kind: ButtonKind.primary;
+                        clicked => {
+                            Store.pair-start();
+                        }
+                    }
+                }
+            }
+            if Store.centers.length > 0: Card {
+                pad: 0;
+                gap: 0;
+                for c[i] in Store.centers: VerticalLayout {
+                    if i > 0: Divider { }
+                    HorizontalLayout {
+                        padding-left: Space.xl;
+                        padding-right: Space.xl;
+                        padding-top: 14px;
+                        padding-bottom: 14px;
+                        spacing: Space.md;
+                        VerticalLayout {
+                            alignment: center;
+                            StatusDot {
+                                tone: c.link-tone;
+                            }
+                        }
+                        VerticalLayout {
+                            spacing: 2px;
+                            horizontal-stretch: 1;
+                            Text {
+                                text: c.name;
+                                color: Theme.text;
+                                font-size: Type.body;
+                                font-weight: Type.semibold;
+                                overflow: elide;
+                            }
+                            Text {
+                                text: c.url;
+                                color: Theme.text-faint;
+                                font-size: Type.caption;
+                                font-family: Type.mono;
+                                overflow: elide;
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Pill {
+                                text: c.mode;
+                                tone: Tone.accent;
+                            }
+                        }
+                        Text {
+                            min-width: 120px;
+                            text: c.link;
+                            color: Theme.tone(c.link-tone);
+                            font-size: Type.small;
+                            font-weight: Type.medium;
+                            vertical-alignment: center;
+                            horizontal-alignment: right;
                             overflow: elide;
                         }
-                    }
-                    VerticalLayout {
-                        alignment: center;
-                        Pill {
-                            text: c.mode;
-                            tone: Tone.accent;
-                        }
-                    }
-                    Text {
-                        min-width: 120px;
-                        text: c.link;
-                        color: Theme.tone(c.link-tone);
-                        font-size: Type.small;
-                        font-weight: Type.medium;
-                        vertical-alignment: center;
-                        horizontal-alignment: right;
-                        overflow: elide;
                     }
                 }
             }

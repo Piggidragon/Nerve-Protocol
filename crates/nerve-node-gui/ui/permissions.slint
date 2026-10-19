@@ -8,6 +8,7 @@ import { Store, Perm } from "store.slint";
 import {
     Button, ButtonKind, Card, Pill, Banner, Loading, PageHeader, PageFrame, EmptyState, Divider,
     Segmented, SectionTitle, OptionTile, Chip, ListRow, TextField, Switch, Icon, Code,
+    Reveal,
 } from "widgets.slint";
 
 component Section inherits Card {
@@ -76,13 +77,16 @@ component ModeSection inherits Section {
             }
         }
     }
-    if Perm.mode-until != "": HorizontalLayout {
-        padding-left: Space.xl;
-        padding-right: Space.xl;
-        padding-bottom: Space.lg;
-        Banner {
-            tone: Tone.accent;
-            text: Perm.mode-until;
+    Reveal {
+        shown: Perm.mode-until != "";
+        HorizontalLayout {
+            padding-left: Space.xl;
+            padding-right: Space.xl;
+            padding-bottom: Space.lg;
+            Banner {
+                tone: Tone.accent;
+                text: Perm.mode-until;
+            }
         }
     }
 }
@@ -90,13 +94,16 @@ component ModeSection inherits Section {
 component FolderSection inherits Section {
     title: "Folders";
     text: "The folders " + Perm.center + " may use in folder mode: read, write, and run commands in them.";
-    if Perm.mode != "folder" && Perm.folders.length > 0: HorizontalLayout {
-        padding-left: Space.xl;
-        padding-right: Space.xl;
-        padding-bottom: Space.md;
-        Banner {
-            tone: Tone.neutral;
-            text: "Folders count in folder mode only; " + Perm.center + " is in " + Perm.mode + " mode now.";
+    Reveal {
+        shown: Perm.mode != "folder" && Perm.folders.length > 0;
+        HorizontalLayout {
+            padding-left: Space.xl;
+            padding-right: Space.xl;
+            padding-bottom: Space.md;
+            Banner {
+                tone: Tone.neutral;
+                text: "Folders count in folder mode only; " + Perm.center + " is in " + Perm.mode + " mode now.";
+            }
         }
     }
     for f[i] in Perm.folders: ListRow {
@@ -210,7 +217,7 @@ component RuleSection inherits Section {
             font-size: Type.small;
             font-family: Type.mono;
             vertical-alignment: center;
-            wrap: char-wrap;
+            wrap: word-wrap;
         }
         Button {
             icon: @image-url("icons/x.svg");
@@ -350,6 +357,12 @@ export component PermissionsPage inherits PageFrame {
     PageHeader {
         title: "Permissions";
         subtitle: "What each center may do on this machine. A new center may do nothing until you allow it here.";
+        error-title: "What " + Perm.center + " may do could not be read";
+        error: Perm.error;
+        error-action: "Try again";
+        error-acted => {
+            Perm.refresh();
+        }
         Button {
             text: "Refresh";
             icon: @image-url("icons/refresh.svg");
@@ -396,22 +409,15 @@ export component PermissionsPage inherits PageFrame {
 
     if Perm.centers.length > 0 && Perm.load == Load.loading && Perm.caps.length == 0: Loading { }
 
-    if Perm.load == Load.failed: Banner {
-        tone: Tone.danger;
-        title: "What " + Perm.center + " may do could not be read";
-        text: Perm.error;
-        action: "Try again";
-        acted => {
-            Perm.refresh();
+    Reveal {
+        shown: Perm.centers.length > 0 && Perm.caps.length > 0;
+        VerticalLayout {
+            spacing: Space.xxl;
+            ModeSection { }
+            FolderSection { }
+            RuleSection { }
+            CapSection { }
+            SudoSection { }
         }
-    }
-
-    if Perm.centers.length > 0 && Perm.caps.length > 0: VerticalLayout {
-        spacing: Space.xxl;
-        ModeSection { }
-        FolderSection { }
-        RuleSection { }
-        CapSection { }
-        SudoSection { }
     }
 }

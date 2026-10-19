@@ -6,7 +6,7 @@ import { Load, RelayNodeRow } from "data.slint";
 import { Store, Prefs } from "store.slint";
 import {
     Button, ButtonKind, Card, Pill, Banner, PageHeader, PageFrame, Planned, Segmented, Divider,
-    TextField, Field, InfoRow, ListRow, Icon, IconTile,
+    TextField, Field, InfoRow, ListRow, Icon, IconTile, Reveal,
 } from "widgets.slint";
 
 // A setting card: its icon, title and sentence on top, its controls below.
@@ -49,12 +49,8 @@ export component SettingsPage inherits PageFrame {
     PageHeader {
         title: "Settings";
         subtitle: "This machine's node, how it reaches its centers, its backups, and the app.";
-    }
-
-    if Prefs.load == Load.failed: Banner {
-        tone: Tone.danger;
-        title: "The settings could not be read";
-        text: Prefs.error;
+        error-title: "The settings could not be read";
+        error: Prefs.error;
     }
 
     Group {
@@ -123,64 +119,88 @@ export component SettingsPage inherits PageFrame {
         icon: @image-url("icons/globe.svg");
         title: "Proxy";
         text: "The node reaches its centers directly, or through an HTTP proxy or a relay. Header values and a password go into the system keyring, never into node.toml.";
-        if Prefs.proxy == "": HorizontalLayout {
-            spacing: Space.md;
-            Text {
-                horizontal-stretch: 1;
-                text: "Direct: no proxy.";
-                color: Theme.text-muted;
-                font-size: Type.small;
-                vertical-alignment: center;
-            }
-            Button {
-                text: "Set a proxy…";
-                small: true;
-                clicked => {
-                    Prefs.proxy-edit();
-                }
-            }
-        }
-        if Prefs.proxy != "": VerticalLayout {
-            spacing: Space.sm;
-            InfoRow {
-                label: "Proxy";
-                value: Prefs.proxy;
-                mono: true;
-            }
-            if Prefs.proxy-pin != "": InfoRow {
-                label: "Pin";
-                value: Prefs.proxy-pin;
-                mono: true;
-            }
-            if Prefs.proxy-login != "": InfoRow {
-                label: "Login";
-                value: Prefs.proxy-login;
-            }
-            if Prefs.proxy-headers != "": InfoRow {
-                label: "Headers";
-                value: Prefs.proxy-headers;
-                mono: true;
-            }
-            if Prefs.proxy-problem != "": Banner {
-                tone: Tone.warn;
-                text: Prefs.proxy-problem;
-            }
-            HorizontalLayout {
-                alignment: end;
-                spacing: Space.sm;
-                Button {
-                    text: "Change…";
-                    small: true;
-                    clicked => {
-                        Prefs.proxy-edit();
+        VerticalLayout {
+            Reveal {
+                shown: Prefs.proxy == "";
+                HorizontalLayout {
+                    spacing: Space.md;
+                    Text {
+                        horizontal-stretch: 1;
+                        text: "Direct: no proxy.";
+                        color: Theme.text-muted;
+                        font-size: Type.small;
+                        vertical-alignment: center;
+                    }
+                    Button {
+                        text: "Set a proxy…";
+                        small: true;
+                        clicked => {
+                            Prefs.proxy-edit();
+                        }
                     }
                 }
-                Button {
-                    text: "Remove";
-                    kind: ButtonKind.danger-soft;
-                    small: true;
-                    clicked => {
-                        Prefs.proxy-remove();
+            }
+            Reveal {
+                shown: Prefs.proxy != "";
+                VerticalLayout {
+                    InfoRow {
+                        label: "Proxy";
+                        value: Prefs.proxy;
+                        mono: true;
+                    }
+                    Reveal {
+                        shown: Prefs.proxy-pin != "";
+                        gap: Space.sm;
+                        InfoRow {
+                            label: "Pin";
+                            value: Prefs.proxy-pin;
+                            mono: true;
+                        }
+                    }
+                    Reveal {
+                        shown: Prefs.proxy-login != "";
+                        gap: Space.sm;
+                        InfoRow {
+                            label: "Login";
+                            value: Prefs.proxy-login;
+                        }
+                    }
+                    Reveal {
+                        shown: Prefs.proxy-headers != "";
+                        gap: Space.sm;
+                        InfoRow {
+                            label: "Headers";
+                            value: Prefs.proxy-headers;
+                            mono: true;
+                        }
+                    }
+                    Reveal {
+                        shown: Prefs.proxy-problem != "";
+                        gap: Space.sm;
+                        Banner {
+                            tone: Tone.warn;
+                            text: Prefs.proxy-problem;
+                        }
+                    }
+                    HorizontalLayout {
+                        alignment: end;
+                        spacing: Space.sm;
+                        padding-top: Space.sm;
+                        Button {
+                            text: "Change…";
+                            small: true;
+                            clicked => {
+                                Prefs.proxy-edit();
+                            }
+                        }
+                        Button {
+                            text: "Remove";
+                            kind: ButtonKind.danger-soft;
+                            small: true;
+                            clicked => {
+                                Prefs.proxy-remove();
+                            }
+                        }
                     }
                 }
             }
@@ -191,100 +211,117 @@ export component SettingsPage inherits PageFrame {
         icon: @image-url("icons/plug.svg");
         title: "Relay";
         text: "Let nodes that cannot reach a center themselves reach this node's centers through it. Each such node gets a token of its own.";
-        if Prefs.relay-listen == "": HorizontalLayout {
-            spacing: Space.md;
-            Field {
-                horizontal-stretch: 1;
-                label: "Listen on";
-                hint: "An address and port of this machine the other nodes reach.";
-                TextField {
-                    text <=> Prefs.relay-address;
-                    mono: true;
-                    label: "Listen on";
-                }
-            }
-            VerticalLayout {
-                alignment: start;
-                padding-top: 22px;
-                Button {
-                    text: "Turn on";
-                    clicked => {
-                        Prefs.relay-on();
-                    }
-                }
-            }
-        }
-        if Prefs.relay-listen != "": VerticalLayout {
-            spacing: Space.md;
-            HorizontalLayout {
-                spacing: Space.md;
-                VerticalLayout {
-                    alignment: center;
-                    Pill {
-                        text: "On";
-                        tone: Tone.ok;
-                        dot: true;
-                    }
-                }
-                Text {
-                    horizontal-stretch: 1;
-                    text: Prefs.relay-listen + (Prefs.relay-status != "" ? "  ·  " + Prefs.relay-status : "");
-                    color: Theme.text;
-                    font-size: Type.small;
-                    font-family: Type.mono;
-                    vertical-alignment: center;
-                }
-                Button {
-                    text: "Turn off";
-                    small: true;
-                    clicked => {
-                        Prefs.relay-off();
-                    }
-                }
-            }
-            if Prefs.relay-pin != "": InfoRow {
-                label: "Its pin";
-                value: Prefs.relay-pin;
-                mono: true;
-            }
-        }
-        if Prefs.relay-nodes.length > 0: Rectangle {
-            border-radius: Radius.md;
-            border-width: 1px;
-            border-color: Theme.border;
-            VerticalLayout {
-                for n[i] in Prefs.relay-nodes: ListRow {
-                    first: i == 0;
-                    VerticalLayout {
+        VerticalLayout {
+            Reveal {
+                shown: Prefs.relay-listen == "";
+                HorizontalLayout {
+                    spacing: Space.md;
+                    Field {
                         horizontal-stretch: 1;
-                        spacing: 2px;
+                        label: "Listen on";
+                        hint: "An address and port of this machine the other nodes reach.";
+                        TextField {
+                            text <=> Prefs.relay-address;
+                            mono: true;
+                            label: "Listen on";
+                        }
+                    }
+                    VerticalLayout {
+                        alignment: start;
+                        padding-top: 22px;
+                        Button {
+                            text: "Turn on";
+                            clicked => {
+                                Prefs.relay-on();
+                            }
+                        }
+                    }
+                }
+            }
+            Reveal {
+                shown: Prefs.relay-listen != "";
+                VerticalLayout {
+                    HorizontalLayout {
+                        spacing: Space.md;
+                        VerticalLayout {
+                            alignment: center;
+                            Pill {
+                                text: "On";
+                                tone: Tone.ok;
+                                dot: true;
+                            }
+                        }
                         Text {
-                            text: n.name;
+                            horizontal-stretch: 1;
+                            text: Prefs.relay-listen + (Prefs.relay-status != "" ? "  ·  " + Prefs.relay-status : "");
                             color: Theme.text;
                             font-size: Type.small;
-                            font-weight: Type.semibold;
+                            font-family: Type.mono;
+                            vertical-alignment: center;
+                            overflow: elide;
                         }
-                        Text {
-                            text: n.reach + (n.limits != "" ? "; " + n.limits : "");
-                            color: Theme.text-muted;
-                            font-size: Type.caption;
-                            wrap: word-wrap;
-                        }
-                    }
-                    Button {
-                        text: "New token";
-                        small: true;
-                        kind: ButtonKind.ghost;
-                        clicked => {
-                            Prefs.relay-token(n.name);
+                        Button {
+                            text: "Turn off";
+                            small: true;
+                            clicked => {
+                                Prefs.relay-off();
+                            }
                         }
                     }
-                    Button {
-                        text: "Remove";
-                        small: true;
-                        kind: ButtonKind.danger-soft;
-                        clicked => {
-                            Prefs.relay-remove(n.name);
+                    Reveal {
+                        shown: Prefs.relay-pin != "";
+                        gap: Space.md;
+                        InfoRow {
+                            label: "Its pin";
+                            value: Prefs.relay-pin;
+                            mono: true;
+                        }
+                    }
+                }
+            }
+            Reveal {
+                shown: Prefs.relay-nodes.length > 0;
+                gap: Space.lg;
+                Rectangle {
+                    border-radius: Radius.md;
+                    border-width: 1px;
+                    border-color: Theme.border;
+                    VerticalLayout {
+                        for n[i] in Prefs.relay-nodes: ListRow {
+                            first: i == 0;
+                            VerticalLayout {
+                                horizontal-stretch: 1;
+                                spacing: 2px;
+                                Text {
+                                    text: n.name;
+                                    color: Theme.text;
+                                    font-size: Type.small;
+                                    font-weight: Type.semibold;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: n.reach + (n.limits != "" ? "; " + n.limits : "");
+                                    color: Theme.text-muted;
+                                    font-size: Type.caption;
+                                    wrap: word-wrap;
+                                }
+                            }
+                            Button {
+                                text: "New token";
+                                small: true;
+                                kind: ButtonKind.ghost;
+                                clicked => {
+                                    Prefs.relay-token(n.name);
+                                }
+                            }
+                            Button {
+                                text: "Remove";
+                                small: true;
+                                kind: ButtonKind.danger-soft;
+                                clicked => {
+                                    Prefs.relay-remove(n.name);
+                                }
+                            }
                         }
                     }
                 }
@@ -336,73 +373,85 @@ export component SettingsPage inherits PageFrame {
         icon: @image-url("icons/sliders.svg");
         title: "Any setting";
         text: "Every setting of node.toml by its dotted name, like log.level or center.<name>.policy.mode. The node checks each change as it checks the command line's.";
-        HorizontalLayout {
-            spacing: Space.md;
-            TextField {
-                horizontal-stretch: 1;
-                text <=> Prefs.raw-key;
-                mono: true;
-                placeholder: "node.name";
-                label: "Setting";
-                accepted => {
-                    Prefs.raw-get();
+        VerticalLayout {
+            HorizontalLayout {
+                spacing: Space.md;
+                TextField {
+                    horizontal-stretch: 1;
+                    text <=> Prefs.raw-key;
+                    mono: true;
+                    placeholder: "node.name";
+                    label: "Setting";
+                    accepted => {
+                        Prefs.raw-get();
+                    }
+                }
+                Button {
+                    text: "Show";
+                    enabled: Prefs.raw-key != "";
+                    clicked => {
+                        Prefs.raw-get();
+                    }
                 }
             }
-            Button {
-                text: "Show";
-                enabled: Prefs.raw-key != "";
-                clicked => {
-                    Prefs.raw-get();
-                }
-            }
-        }
-        if Prefs.raw-shown != "": VerticalLayout {
-            spacing: Space.sm;
-            Text {
-                text: "Now";
-                color: Theme.text-faint;
-                font-size: Type.caption;
-                font-weight: Type.semibold;
-            }
-            Text {
-                text: Prefs.raw-shown;
-                color: Theme.text;
-                font-size: Type.small;
-                font-family: Type.mono;
-                wrap: char-wrap;
-            }
-        }
-        HorizontalLayout {
-            spacing: Space.md;
-            TextField {
-                horizontal-stretch: 1;
-                text <=> Prefs.raw-value;
-                mono: true;
-                placeholder: "new value";
-                label: "New value";
-                accepted => {
-                    Prefs.raw-set();
-                }
-            }
-            Button {
-                text: "Set";
-                enabled: Prefs.raw-key != "" && Prefs.raw-value != "";
-                clicked => {
-                    Prefs.raw-set();
-                }
-            }
-            Button {
-                text: "Unset";
-                kind: ButtonKind.ghost;
-                enabled: Prefs.raw-key != "";
-                clicked => {
-                    Prefs.raw-unset();
+            Reveal {
+                shown: Prefs.raw-shown != "";
+                gap: Space.lg;
+                VerticalLayout {
+                    spacing: Space.sm;
+                    Text {
+                        text: "Now";
+                        color: Theme.text-faint;
+                        font-size: Type.caption;
+                        font-weight: Type.semibold;
+                    }
+                    Text {
+                        text: Prefs.raw-shown;
+                        color: Theme.text;
+                        font-size: Type.small;
+                        font-family: Type.mono;
+                        wrap: char-wrap;
+                    }
                 }
             }
         }
-        if Prefs.raw-error != "": Banner {
-            tone: Tone.danger;
-            text: Prefs.raw-error;
+        VerticalLayout {
+            HorizontalLayout {
+                spacing: Space.md;
+                TextField {
+                    horizontal-stretch: 1;
+                    text <=> Prefs.raw-value;
+                    mono: true;
+                    placeholder: "new value";
+                    label: "New value";
+                    accepted => {
+                        Prefs.raw-set();
+                    }
+                }
+                Button {
+                    text: "Set";
+                    enabled: Prefs.raw-key != "" && Prefs.raw-value != "";
+                    clicked => {
+                        Prefs.raw-set();
+                    }
+                }
+                Button {
+                    text: "Unset";
+                    kind: ButtonKind.ghost;
+                    enabled: Prefs.raw-key != "";
+                    clicked => {
+                        Prefs.raw-unset();
+                    }
+                }
+            }
+            Reveal {
+                shown: Prefs.raw-error != "";
+                gap: Space.lg;
+                Banner {
+                    tone: Tone.danger;
+                    text: Prefs.raw-error;
+                }
+            }
         }
         Divider { }
         HorizontalLayout {

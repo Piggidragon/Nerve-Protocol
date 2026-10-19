@@ -6,7 +6,7 @@ import { Theme, Type, Space, Radius, Tone } from "theme.slint";
 import { Store, Perm, Prefs } from "store.slint";
 import {
     Button, ButtonKind, Banner, Dialog, DialogButtons, Field, TextField, InfoRow, Divider, Code,
-    Icon, CheckBox, Segmented, TextArea, CopyText, OptionTile, Steps,
+    Icon, CheckBox, Segmented, TextArea, CopyText, OptionTile, Steps, Reveal,
 } from "widgets.slint";
 
 export component PairDialog inherits Dialog {
@@ -18,7 +18,11 @@ export component PairDialog inherits Dialog {
         Store.pair-open = false;
     }
 
-    if Store.pair-step == 0: VerticalLayout {
+    // One step at a time; both stay in place (see Reveal).
+    VerticalLayout {
+    Reveal {
+        shown: Store.pair-step == 0;
+      VerticalLayout {
         spacing: Space.lg;
         Field {
             label: "Pairing link";
@@ -50,11 +54,8 @@ export component PairDialog inherits Dialog {
                 }
             }
         }
-        if Store.pair-error != "": Banner {
-            tone: Tone.danger;
-            text: Store.pair-error;
-        }
         DialogButtons {
+            error: Store.pair-error;
             Button {
                 text: "Cancel";
                 kind: ButtonKind.ghost;
@@ -72,10 +73,14 @@ export component PairDialog inherits Dialog {
                 }
             }
         }
+      }
     }
 
-    if Store.pair-step == 1: VerticalLayout {
+    Reveal {
+        shown: Store.pair-step == 1;
+      VerticalLayout {
         spacing: Space.lg;
+        VerticalLayout {
         Rectangle {
             background: Theme.surface-alt;
             border-radius: Radius.lg;
@@ -103,10 +108,15 @@ export component PairDialog inherits Dialog {
                 }
             }
         }
-        if !Store.pair-preview.tls: Banner {
-            tone: Tone.warn;
-            title: "This link is not encrypted";
-            text: "Anyone on the way can read and change what goes between this machine and the center. Pair over plain http only on a network you trust.";
+        Reveal {
+            shown: !Store.pair-preview.tls;
+            gap: Space.lg;
+            Banner {
+                tone: Tone.warn;
+                title: "This link is not encrypted";
+                text: "Anyone on the way can read and change what goes between this machine and the center. Pair over plain http only on a network you trust.";
+            }
+        }
         }
         VerticalLayout {
             spacing: 6px;
@@ -153,12 +163,9 @@ export component PairDialog inherits Dialog {
                 }
             }
         }
-        if Store.pair-error != "": Banner {
-            tone: Tone.danger;
-            title: "Not paired";
-            text: Store.pair-error;
-        }
         DialogButtons {
+            error: Store.pair-error;
+            error-title: "Not paired";
             Button {
                 text: "Back";
                 icon: @image-url("icons/arrow-left.svg");
@@ -179,6 +186,8 @@ export component PairDialog inherits Dialog {
                 }
             }
         }
+      }
+    }
     }
 }
 
@@ -279,7 +288,6 @@ export component ModeDialog inherits Dialog {
         Perm.mode-open = false;
     }
     VerticalLayout {
-        spacing: Space.md;
         Segmented {
             options: ["Until I change it", "For a time"];
             current: Perm.mode-timed ? 1 : 0;
@@ -287,23 +295,24 @@ export component ModeDialog inherits Dialog {
                 Perm.mode-timed = i == 1;
             }
         }
-        if Perm.mode-timed: Field {
-            label: "Hours";
-            hint: "Then the center goes back to allowlist mode by itself.";
-            TextField {
-                text <=> Perm.mode-hours;
+        Reveal {
+            shown: Perm.mode-timed;
+            gap: Space.md;
+            Field {
                 label: "Hours";
-                accepted => {
-                    Perm.mode-apply();
+                hint: "Then the center goes back to allowlist mode by itself.";
+                TextField {
+                    text <=> Perm.mode-hours;
+                    label: "Hours";
+                    accepted => {
+                        Perm.mode-apply();
+                    }
                 }
             }
         }
     }
-    if Perm.mode-error != "": Banner {
-        tone: Tone.danger;
-        text: Perm.mode-error;
-    }
     DialogButtons {
+        error: Perm.mode-error;
         Button {
             text: "Cancel";
             kind: ButtonKind.ghost;
@@ -358,11 +367,8 @@ export component FolderDialog inherits Dialog {
             }
         }
     }
-    if Perm.folder-error != "": Banner {
-        tone: Tone.danger;
-        text: Perm.folder-error;
-    }
     DialogButtons {
+        error: Perm.folder-error;
         Button {
             text: "Cancel";
             kind: ButtonKind.ghost;
@@ -403,11 +409,8 @@ export component SudoDialog inherits Dialog {
             }
         }
     }
-    if Perm.sudo-error != "": Banner {
-        tone: Tone.danger;
-        text: Perm.sudo-error;
-    }
     DialogButtons {
+        error: Perm.sudo-error;
         Button {
             text: "Cancel";
             kind: ButtonKind.ghost;
@@ -463,11 +466,8 @@ export component ProxyDialog inherits Dialog {
             placeholder: "Proxy-Authorization: Bearer …";
         }
     }
-    if Prefs.proxy-error != "": Banner {
-        tone: Tone.danger;
-        text: Prefs.proxy-error;
-    }
     DialogButtons {
+        error: Prefs.proxy-error;
         Button {
             text: "Cancel";
             kind: ButtonKind.ghost;
@@ -550,11 +550,8 @@ export component BackupDialog inherits Dialog {
             Prefs.backup-keyring = on;
         }
     }
-    if Prefs.backup-error != "": Banner {
-        tone: Tone.danger;
-        text: Prefs.backup-error;
-    }
     DialogButtons {
+        error: Prefs.backup-error;
         Button {
             text: "Cancel";
             kind: ButtonKind.ghost;
@@ -614,11 +611,8 @@ export component RestoreDialog inherits Dialog {
             Prefs.restore-without-proxy = on;
         }
     }
-    if Prefs.restore-error != "": Banner {
-        tone: Tone.danger;
-        text: Prefs.restore-error;
-    }
     DialogButtons {
+        error: Prefs.restore-error;
         Button {
             text: "Cancel";
             kind: ButtonKind.ghost;
@@ -652,11 +646,8 @@ export component ElevateDialog inherits Dialog {
         font-size: Type.small;
         wrap: word-wrap;
     }
-    if Store.elevate-error != "": Banner {
-        tone: Tone.danger;
-        text: Store.elevate-error;
-    }
     DialogButtons {
+        error: Store.elevate-error;
         Button {
             text: "Not now";
             kind: ButtonKind.ghost;

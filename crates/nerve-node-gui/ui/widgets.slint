@@ -11,6 +11,23 @@ export component Icon inherits Image {
     image-fit: contain;
 }
 
+// Content that shows only sometimes, such as an error. Use it instead of an
+// `if` around anything with text that wraps: Slint measures the height of an
+// `if`'s content at its unwrapped width, so wrapped lines run out of the
+// box, while this is measured where it stands. Hidden, it takes no room;
+// shown, `gap` stands above it, so the layout around it needs no spacing of
+// its own for it.
+export component Reveal inherits Rectangle {
+    in property <bool> shown;
+    in property <length> gap;
+    visible: root.shown;
+    height: root.shown ? self.preferred-height : 0px;
+    VerticalLayout {
+        padding-top: root.gap;
+        @children
+    }
+}
+
 // Three dots that pulse: the app is waiting for the node.
 export component Dots {
     in property <color> color: Theme.text-muted;
@@ -368,34 +385,55 @@ export component Loading {
     }
 }
 
+// A page's title, what the page is for, its buttons, and below them what
+// went wrong when the node did not answer.
 export component PageHeader {
     in property <string> title;
     in property <string> subtitle;
-    HorizontalLayout {
-        spacing: Space.xl;
-        VerticalLayout {
-            spacing: 6px;
-            horizontal-stretch: 1;
-            alignment: start;
-            Text {
-                text: root.title;
-                color: Theme.text;
-                font-size: Type.title;
-                font-weight: Type.semibold;
-                accessible-role: AccessibleRole.text;
+    in property <string> error-title;
+    in property <string> error;
+    in property <string> error-action;
+    callback error-acted();
+    VerticalLayout {
+        HorizontalLayout {
+            spacing: Space.xl;
+            VerticalLayout {
+                spacing: 6px;
+                horizontal-stretch: 1;
+                alignment: start;
+                Text {
+                    text: root.title;
+                    color: Theme.text;
+                    font-size: Type.title;
+                    font-weight: Type.semibold;
+                    accessible-role: AccessibleRole.text;
+                }
+                Text {
+                    text: root.subtitle;
+                    color: Theme.text-muted;
+                    font-size: Type.body;
+                    wrap: word-wrap;
+                }
             }
-            if root.subtitle != "": Text {
-                text: root.subtitle;
-                color: Theme.text-muted;
-                font-size: Type.body;
-                wrap: word-wrap;
+            VerticalLayout {
+                alignment: start;
+                HorizontalLayout {
+                    spacing: Space.sm;
+                    @children
+                }
             }
         }
-        VerticalLayout {
-            alignment: start;
-            HorizontalLayout {
-                spacing: Space.sm;
-                @children
+        Reveal {
+            shown: root.error != "";
+            gap: Space.xxl;
+            Banner {
+                tone: Tone.danger;
+                title: root.error-title;
+                text: root.error;
+                action: root.error-action;
+                acted => {
+                    root.error-acted();
+                }
             }
         }
     }
@@ -507,6 +545,9 @@ export component Segmented {
                     font-size: Type.small;
                     font-weight: i == root.current ? Type.semibold : Type.medium;
                     vertical-alignment: center;
+                    // A long center name does not push the row off the page.
+                    max-width: 180px;
+                    overflow: elide;
                 }
             }
             t := TouchArea {
@@ -583,14 +624,59 @@ export component TextField {
         border-width: input.has-focus ? 2px : 1px;
         border-color: root.invalid ? Theme.danger : input.has-focus ? Theme.accent : Theme.border-strong;
     }
-    HorizontalLayout {
-        padding-left: 12px;
-        padding-right: 12px;
-        Rectangle {
-            clip: true;
+    // The text stays inside the field: a long one scrolls with the cursor,
+    // as a line edit of the desktop does.
+    view := Rectangle {
+        x: 12px;
+        width: parent.width - 24px;
+        clip: true;
+        Text {
+            width: 100%;
+            height: 100%;
+            text: root.placeholder;
+            visible: root.text == "";
+            color: Theme.text-faint;
+            font-size: Type.body;
+            font-family: root.mono ? Type.mono : "";
+            vertical-alignment: center;
+            overflow: elide;
+        }
+        ContextMenuArea {
+            enabled: root.enabled;
+            Menu {
+                MenuItem {
+                    title: "Cut";
+                    enabled: !root.password && root.text != "";
+                    activated => {
+                        input.cut();
+                    }
+                }
+                MenuItem {
+                    title: "Copy";
+                    enabled: !root.password && root.text != "";
+                    activated => {
+                        input.copy();
+                    }
+                }
+                MenuItem {
+                    title: "Paste";
+                    activated => {
+                        input.paste();
+                    }
+                }
+                MenuItem {
+                    title: "Select all";
+                    enabled: root.text != "";
+                    activated => {
+                        input.select-all();
+                    }
+                }
+            }
             input := TextInput {
-                width: parent.width;
-                height: parent.height;
+                property <length> shift;
+                x: min(0px, max(parent.width - self.width - self.text-cursor-width, self.shift));
+                width: max(parent.width - self.text-cursor-width, self.preferred-width);
+                height: 100%;
                 text <=> root.text;
                 enabled: root.enabled;
                 single-line: true;
@@ -601,23 +687,20 @@ export component TextField {
                 vertical-alignment: center;
                 selection-background-color: Theme.accent.transparentize(0.6);
                 selection-foreground-color: Theme.text;
+                accessible-role: none;
+                cursor-position-changed(at) => {
+                    if at.x + self.shift < 0 {
+                        self.shift = -at.x;
+                    } else if at.x + self.shift > view.width - self.text-cursor-width {
+                        self.shift = view.width - at.x - self.text-cursor-width;
+                    }
+                }
                 accepted => {
                     root.accepted(self.text);
                 }
                 edited => {
                     root.edited(self.text);
                 }
-            }
-            Text {
-                width: parent.width;
-                height: parent.height;
-                text: root.placeholder;
-                visible: root.text == "";
-                color: Theme.text-faint;
-                font-size: Type.body;
-                font-family: root.mono ? Type.mono : "";
-                vertical-alignment: center;
-                overflow: elide;
             }
         }
     }
@@ -665,7 +748,8 @@ export component InfoRow {
             color: root.tone == Tone.neutral ? Theme.text : Theme.tone(root.tone);
             font-size: Type.small;
             font-family: root.mono ? Type.mono : "";
-            wrap: word-wrap;
+            // A URL or a pin has no spaces to break at.
+            wrap: root.mono ? TextWrap.char-wrap : TextWrap.word-wrap;
         }
     }
 }
@@ -674,6 +758,9 @@ export component InfoRow {
 export component Code inherits Rectangle {
     in property <string> text;
     in property <length> size: Type.small;
+    // Breaks at spaces, slashes and dashes; a word longer than the box is
+    // cut at its edge, never drawn past it.
+    clip: true;
     background: Theme.inset;
     border-radius: Radius.sm;
     border-width: 1px;
@@ -688,7 +775,8 @@ export component Code inherits Rectangle {
             color: Theme.text;
             font-size: root.size;
             font-family: Type.mono;
-            wrap: char-wrap;
+            wrap: word-wrap;
+            min-width: 0;
         }
     }
 }
@@ -746,11 +834,14 @@ export component Dialog inherits Rectangle {
                         font-weight: Type.semibold;
                         wrap: word-wrap;
                     }
-                    if root.subtitle != "": Text {
-                        text: root.subtitle;
-                        color: Theme.text-muted;
-                        font-size: Type.body;
-                        wrap: word-wrap;
+                    Reveal {
+                        shown: root.subtitle != "";
+                        Text {
+                            text: root.subtitle;
+                            color: Theme.text-muted;
+                            font-size: Type.body;
+                            wrap: word-wrap;
+                        }
                     }
                 }
                 VerticalLayout {
@@ -772,10 +863,28 @@ export component Dialog inherits Rectangle {
 }
 
 // The buttons at the foot of a dialog, the main one last.
-export component DialogButtons inherits HorizontalLayout {
-    alignment: end;
-    spacing: Space.sm;
-    padding-top: Space.xs;
+// The buttons at the foot of a dialog, the main one last, and above them
+// what went wrong when the last try failed.
+export component DialogButtons inherits VerticalLayout {
+    in property <string> error;
+    in property <string> error-title;
+    Reveal {
+        shown: root.error != "";
+        Banner {
+            tone: Tone.danger;
+            title: root.error-title;
+            text: root.error;
+        }
+        Rectangle {
+            height: Space.xl;
+        }
+    }
+    HorizontalLayout {
+        alignment: end;
+        spacing: Space.sm;
+        padding-top: Space.xs;
+        @children
+    }
 }
 
 // A short note in the corner that something was done, or failed.
@@ -815,6 +924,9 @@ export component Toast inherits Rectangle {
 
 // A page: its content scrolls, at most Size.content-max wide, in the middle.
 export component PageFrame {
+    // The space between the page's parts; a page whose parts are Reveals
+    // sets 0 and gives each its gap.
+    in property <length> gap: Space.xxl;
     // The side margins grow on a wide window, so the content keeps its width.
     property <length> side: max(Space.page, (scroll.visible-width - Size.content-max) / 2);
     scroll := ScrollView {
@@ -828,7 +940,7 @@ export component PageFrame {
             padding-right: root.side;
             padding-top: 28px;
             padding-bottom: Space.page;
-            spacing: Space.xxl;
+            spacing: root.gap;
             alignment: start;
             @children
         }

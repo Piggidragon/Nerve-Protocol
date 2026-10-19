@@ -6,7 +6,7 @@
 import { Theme, Type, Space, Radius, Tone } from "theme.slint";
 import { Store } from "store.slint";
 import {
-    Button, ButtonKind, Banner, Dialog, Field, TextField, InfoRow, OptionTile, Steps,
+    Button, ButtonKind, Banner, Dialog, Field, TextField, InfoRow, OptionTile, Steps, Reveal,
 } from "widgets.slint";
 
 export component SetupDialog inherits Dialog {
@@ -26,131 +26,154 @@ export component SetupDialog inherits Dialog {
         Store.setup-open = false;
     }
 
-    if Store.setup-step == 0: Field {
-        label: "Name";
-        hint: "Leave it as it is to take the host name.";
-        TextField {
-            text <=> Store.setup-name;
-            label: "Name";
-            accepted => {
-                Store.setup-next();
-            }
-        }
-    }
-
-    if Store.setup-step == 1: HorizontalLayout {
-        spacing: Space.md;
-        OptionTile {
-            icon: @image-url("icons/archive.svg");
-            title: "Files";
-            text: "In the config folder, readable by the node's account only.";
-            selected: Store.setup-storage == 0;
-            clicked => {
-                Store.setup-storage = 0;
-            }
-        }
-        OptionTile {
-            icon: @image-url("icons/key.svg");
-            title: "System keyring";
-            text: "In the keyring of your session, which must be unlocked for the node to start.";
-            selected: Store.setup-storage == 1;
-            clicked => {
-                Store.setup-storage = 1;
-            }
-        }
-    }
-
-    if Store.setup-step == 2 && Store.pair-step == 0: VerticalLayout {
-        spacing: Space.lg;
-        Field {
-            label: "Pairing link";
-            TextField {
-                text <=> Store.pair-link;
-                placeholder: "nerve://pair?center=…";
-                mono: true;
-                label: "Pairing link";
-                invalid: Store.pair-error != "";
-                accepted => {
-                    Store.setup-next();
+    // One step at a time; every step stays in place (see Reveal). The last
+    // step says all in its title.
+    Reveal {
+        shown: Store.setup-step < 4 || Store.setup-error != "";
+        Reveal {
+            shown: Store.setup-step == 0;
+            Field {
+                label: "Name";
+                hint: "Leave it as it is to take the host name.";
+                TextField {
+                    text <=> Store.setup-name;
+                    label: "Name";
+                    edited => {
+                        Store.setup-error = "";
+                    }
+                    accepted => {
+                        Store.setup-next();
+                    }
                 }
             }
         }
-        Field {
-            label: "Name on this machine";
-            hint: "Optional. Leave it empty to take the center's own name.";
-            TextField {
-                text <=> Store.pair-name;
-                placeholder: "home-lab";
-                label: "Name on this machine";
+
+        Reveal {
+            shown: Store.setup-step == 1;
+            HorizontalLayout {
+                spacing: Space.md;
+                OptionTile {
+                    icon: @image-url("icons/archive.svg");
+                    title: "Files";
+                    text: "In the config folder, readable by the node's account only.";
+                    selected: Store.setup-storage == 0;
+                    clicked => {
+                        Store.setup-storage = 0;
+                    }
+                }
+                OptionTile {
+                    icon: @image-url("icons/key.svg");
+                    title: "System keyring";
+                    text: "In the keyring of your session, which must be unlocked for the node to start.";
+                    selected: Store.setup-storage == 1;
+                    clicked => {
+                        Store.setup-storage = 1;
+                    }
+                }
+            }
+        }
+
+        Reveal {
+            shown: Store.setup-step == 2 && Store.pair-step == 0;
+            VerticalLayout {
+                spacing: Space.lg;
+                Field {
+                    label: "Pairing link";
+                    TextField {
+                        text <=> Store.pair-link;
+                        placeholder: "nerve://pair?center=…";
+                        mono: true;
+                        label: "Pairing link";
+                        invalid: Store.pair-error != "";
+                        accepted => {
+                            Store.setup-next();
+                        }
+                    }
+                }
+                Field {
+                    label: "Name on this machine";
+                    hint: "Optional. Leave it empty to take the center's own name.";
+                    TextField {
+                        text <=> Store.pair-name;
+                        placeholder: "home-lab";
+                        label: "Name on this machine";
+                    }
+                }
+            }
+        }
+
+        Reveal {
+            shown: Store.setup-step == 2 && Store.pair-step == 1;
+            Rectangle {
+                background: Theme.surface-alt;
+                border-radius: Radius.lg;
+                border-width: 1px;
+                border-color: Theme.border;
+                VerticalLayout {
+                    padding: Space.lg;
+                    spacing: Space.md;
+                    InfoRow {
+                        label: "Center";
+                        value: Store.pair-preview.center;
+                        mono: true;
+                    }
+                    InfoRow {
+                        label: "Certificate";
+                        value: !Store.pair-preview.tls ? "None: plain http, nothing on the way is encrypted"
+                            : Store.pair-preview.pin != "" ? "Pinned: " + Store.pair-preview.pin
+                            : "Checked against the system's roots";
+                        mono: Store.pair-preview.tls && Store.pair-preview.pin != "";
+                        tone: Store.pair-preview.tls ? Tone.neutral : Tone.danger;
+                    }
+                }
+            }
+        }
+
+
+        Reveal {
+            shown: Store.setup-step == 3;
+            HorizontalLayout {
+                spacing: Space.md;
+                OptionTile {
+                    icon: @image-url("icons/shield.svg");
+                    title: "Allowlist";
+                    text: "Only what an allow rule names. Nothing yet.";
+                    selected: Store.setup-mode == "allowlist";
+                    clicked => {
+                        Store.setup-mode = "allowlist";
+                    }
+                }
+                OptionTile {
+                    icon: @image-url("icons/folder.svg");
+                    title: "Folder";
+                    text: "What each folder you add allows, in it.";
+                    selected: Store.setup-mode == "folder";
+                    clicked => {
+                        Store.setup-mode = "folder";
+                    }
+                }
+                OptionTile {
+                    icon: @image-url("icons/key.svg");
+                    title: "User";
+                    text: "Anything you could do yourself, protected files aside.";
+                    selected: Store.setup-mode == "user";
+                    clicked => {
+                        Store.setup-mode = "user";
+                    }
+                }
+            }
+        }
+
+
+        Reveal {
+            shown: (Store.setup-step == 2 ? Store.pair-error : Store.setup-error) != "";
+            gap: Space.xl;
+            Banner {
+                tone: Tone.danger;
+                text: Store.setup-step == 2 ? Store.pair-error : Store.setup-error;
             }
         }
     }
-
-    if Store.setup-step == 2 && Store.pair-step == 1: Rectangle {
-        background: Theme.surface-alt;
-        border-radius: Radius.lg;
-        border-width: 1px;
-        border-color: Theme.border;
-        VerticalLayout {
-            padding: Space.lg;
-            spacing: Space.md;
-            InfoRow {
-                label: "Center";
-                value: Store.pair-preview.center;
-                mono: true;
-            }
-            InfoRow {
-                label: "Certificate";
-                value: !Store.pair-preview.tls ? "None: plain http, nothing on the way is encrypted"
-                    : Store.pair-preview.pin != "" ? "Pinned: " + Store.pair-preview.pin
-                    : "Checked against the system's roots";
-                mono: Store.pair-preview.tls && Store.pair-preview.pin != "";
-                tone: Store.pair-preview.tls ? Tone.neutral : Tone.danger;
-            }
-        }
-    }
-
-    if Store.setup-step == 2 && Store.pair-error != "": Banner {
-        tone: Tone.danger;
-        text: Store.pair-error;
-    }
-
-    if Store.setup-step == 3: HorizontalLayout {
-        spacing: Space.md;
-        OptionTile {
-            icon: @image-url("icons/shield.svg");
-            title: "Allowlist";
-            text: "Only what an allow rule names. Nothing yet.";
-            selected: Store.setup-mode == "allowlist";
-            clicked => {
-                Store.setup-mode = "allowlist";
-            }
-        }
-        OptionTile {
-            icon: @image-url("icons/folder.svg");
-            title: "Folder";
-            text: "What each folder you add allows, in it.";
-            selected: Store.setup-mode == "folder";
-            clicked => {
-                Store.setup-mode = "folder";
-            }
-        }
-        OptionTile {
-            icon: @image-url("icons/key.svg");
-            title: "User";
-            text: "Anything you could do yourself, protected files aside.";
-            selected: Store.setup-mode == "user";
-            clicked => {
-                Store.setup-mode = "user";
-            }
-        }
-    }
-
-    if Store.setup-step != 2 && Store.setup-error != "": Banner {
-        tone: Tone.danger;
-        text: Store.setup-error;
-    }
-
     HorizontalLayout {
         spacing: Space.sm;
         padding-top: Space.xs;

@@ -30,7 +30,7 @@ const INSTALLER: (u32, u32) = (760, 640);
 const SMALL: (u32, u32) = (1280, 800);
 /// The shots also taken on [`SMALL`], as `<name>-1280x800`: the installer's
 /// steps and the dialogs.
-const ALSO_SMALL: [&str; 15] = [
+const ALSO_SMALL: [&str; 17] = [
     "setup-",
     "pair-",
     "centers-unpair",
@@ -40,6 +40,8 @@ const ALSO_SMALL: [&str; 15] = [
     "settings-proxy",
     "settings-relay-",
     "settings-backup",
+    "settings-restore",
+    "centers-new-key",
     "settings-no-file-dialog",
     "settings-update",
     "settings-uninstall",
@@ -217,6 +219,12 @@ fn every_page_light_and_dark() {
     store.set_setup_name("build-server-basement-rack3-left".into());
     store.invoke_setup_next();
     shots.take("setup-keys");
+    // Where no keyring can hold the keys, the tile says why.
+    let usable = store.get_keyring_usable();
+    store.set_keyring_usable(false);
+    store.set_keyring_why(nerve_node_desktop::view::no_keyring("no-answer").into());
+    shots.take("setup-keys-no-keyring");
+    store.set_keyring_usable(usable);
     store.invoke_setup_next();
     store.set_pair_link(home.link().render().into());
     store.set_pair_name("home".into());
@@ -397,10 +405,18 @@ fn every_page_light_and_dark() {
     store.set_busy("service-restart".into());
     shots.take("overview-service-restarting");
     store.set_busy("".into());
+    // A change the running service takes only when it starts again.
+    store.set_restart_due(true);
+    shots.take("overview-restart-due");
+    store.set_restart_due(false);
     store.invoke_show(Page::Centers);
     shots.take("centers");
     store.invoke_center_unpair(OFFICE.into());
     shots.take("centers-unpair");
+    store.set_confirm_open(false);
+    store.invoke_center_rotate(OFFICE.into());
+    store.set_confirm_option_on(true);
+    shots.take("centers-new-key");
     store.set_confirm_open(false);
 
     store.invoke_show(Page::Audit);
@@ -426,6 +442,12 @@ fn every_page_light_and_dark() {
     });
     shots.take("audit-refused");
     store.invoke_audit_filter(false);
+    // The newest few, and the button for more.
+    store.set_audit_limit(4);
+    store.invoke_refresh_audit();
+    until(&ctl, || store.get_audit().row_count() == 4);
+    shots.take_full("audit-more", 1500);
+    store.set_audit_limit(200);
 
     store.invoke_panic();
     store.invoke_show(Page::Overview);
@@ -454,6 +476,27 @@ fn every_page_light_and_dark() {
     perm.set_sudo_password("hunter2hunter2".into());
     shots.take("permissions-sudo");
     perm.set_sudo_open(false);
+    // Many centers: a list that names each in full.
+    let centers = perm.get_centers();
+    let many: Vec<slint::SharedString> = [
+        "home",
+        "lab",
+        OFFICE,
+        "build-farm-eu-west",
+        "staging-cluster",
+        "personal-laptop",
+        "ci-runner-pool",
+        "backup-vault",
+        "media-server",
+        "kids-pc",
+    ]
+    .map(Into::into)
+    .to_vec();
+    perm.set_centers(slint::ModelRc::new(slint::VecModel::from(many)));
+    perm.set_current(0);
+    shots.take("permissions-many-centers");
+    perm.set_centers(centers);
+    perm.invoke_pick(0);
 
     // The log the running node wrote.
     store.invoke_show(Page::Log);
@@ -466,7 +509,18 @@ fn every_page_light_and_dark() {
         .set_program("/usr/local/bin/nerve-node-desktop".into());
     store.invoke_show(Page::Settings);
     shots.take("settings");
-    shots.take_full("settings", 1900);
+    shots.take_full("settings", 2350);
+    // Where no keyring can hold the keys, and an account to choose.
+    store.set_keyring_usable(false);
+    store.set_keyring_why(nerve_node_desktop::view::no_keyring("windows-service").into());
+    prefs.set_account_new("nerve-work".into());
+    prefs.set_raw_key("center.home.policy.allow".into());
+    prefs.set_raw_value("fs.read:~/notes/*".into());
+    shots.take_full("settings-choices", 2350);
+    store.set_keyring_usable(usable);
+    prefs.set_account_new("".into());
+    prefs.set_raw_key("".into());
+    prefs.set_raw_value("".into());
     prefs.invoke_proxy_edit();
     prefs.set_proxy_new_url("http://proxy.example:3128".into());
     prefs.set_proxy_new_headers("Proxy-Authorization: Bearer …".into());
@@ -495,6 +549,13 @@ fn every_page_light_and_dark() {
     shots.take("settings-no-file-dialog");
     store.set_missing_open(false);
     prefs.set_backup_open(false);
+    let backup = root.join("nerve-node.backup");
+    ctl.set_chooser(Arc::new(move |_| Ok(Some(backup.clone()))));
+    prefs.invoke_restore_choose();
+    prefs.set_restore_pass("correct horse battery".into());
+    prefs.set_restore_in_files(true);
+    shots.take("settings-restore");
+    prefs.set_restore_open(false);
 
     // Settings' update and uninstall.
     let install = window.global::<Install>();

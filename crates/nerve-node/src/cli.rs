@@ -2956,7 +2956,15 @@ async fn log_cmd(
     // can be as long already.
     let head = |b: &[u8]| b[..b.len().min(64)].to_vec();
     let mut first = head(&current);
-    bytes.extend_from_slice(&current);
+    // A line the node is still writing waits for its end, also at the
+    // start: read now, its first half would be no line, and the rest,
+    // read later, none either.
+    let whole = current
+        .iter()
+        .rposition(|b| *b == b'\n')
+        .map_or(0, |i| i + 1);
+    bytes.extend_from_slice(&current[..whole]);
+    let mut rest: Vec<u8> = current[whole..].to_vec();
     let parse = |bytes: &[u8]| -> Vec<Value> {
         String::from_utf8_lossy(bytes)
             .lines()
@@ -2981,8 +2989,6 @@ async fn log_cmd(
     for v in &lines {
         show(out, v);
     }
-    // A line still being written waits for its end.
-    let mut rest: Vec<u8> = Vec::new();
     if !follow {
         return Ok(());
     }
@@ -7577,6 +7583,44 @@ mod tests {
             ["first", "before-the-move", "after-the-move"],
             "{text}"
         );
+    }
+
+    /// A line half written when `log --follow` starts is shown once it is
+    /// whole, not lost.
+    #[tokio::test]
+    async fn log_follow_waits_for_a_line_half_written_at_its_start() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("c"), d.path().join("s"));
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        let file = paths.log_file();
+        let append = |text: &str| {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&file)
+                .unwrap();
+            f.write_all(text.as_bytes()).unwrap();
+        };
+        let half = logged(2, "info", "half-written");
+        let (start, end) = half.split_at(half.len() / 2);
+        append(&logged(1, "info", "first"));
+        append(start);
+        let seen = Seen::default();
+        let mut out = seen.clone();
+        let follow = log_cmd(&paths, true, None, true, &mut out);
+        let writer = async {
+            seen.until("first").await;
+            append(end);
+            seen.until("half-written").await;
+        };
+        tokio::select! {
+            r = follow => panic!("follow ended: {r:?}"),
+            () = writer => {}
+            () = tokio::time::sleep(Duration::from_secs(5)) => {
+                panic!("the line written in two halves never came: {}", seen.text())
+            }
+        }
     }
 
     /// `cap ls --json` names what `cap set` switches, so the app need not.

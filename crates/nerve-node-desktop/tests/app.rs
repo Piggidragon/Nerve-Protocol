@@ -47,9 +47,11 @@ fn decided(paths: &NodePaths, ts: u64, center: &str, cap: &str, action: &str, ta
 }
 
 /// Waits for a command that keeps answering (`audit --follow`) to bring
-/// what `done` looks for into the window.
+/// what `done` looks for into the window. Each page starts its command
+/// anew, and on a Windows machine busy with a whole test run, starting this
+/// crate's program took longer than the 10 seconds given before.
 fn until(ctl: &Ctl, what: &str, done: impl Fn() -> bool) {
-    for _ in 0..100 {
+    for _ in 0..300 {
         ctl.pump();
         if done() {
             return;
@@ -71,12 +73,13 @@ fn logged_at(paths: &NodePaths, ts: u64, msg: &str) {
         .append(true)
         .open(paths.log_file())
         .unwrap();
-    writeln!(
-        f,
-        "{}",
+    // One write per line, as the node writes its log: a follower never
+    // sees half of one.
+    let line = format!(
+        "{}\n",
         serde_json::json!({"ts": ts, "level": "warn", "msg": msg})
-    )
-    .unwrap();
+    );
+    f.write_all(line.as_bytes()).unwrap();
 }
 
 #[test]
@@ -466,8 +469,14 @@ fn the_app_drives_the_cli_end_to_end() {
     assert_eq!(prefs.get_account(), "");
     prefs.set_account_new("nerve-work".into());
     prefs.invoke_account_use();
+    // On Windows the account is install's, which the CLI says instead.
+    let why = if cfg!(windows) {
+        "nerve-node install"
+    } else {
+        "installed as a service"
+    };
     assert!(
-        prefs.get_account_error().contains("installed as a service"),
+        prefs.get_account_error().contains(why),
         "{}",
         prefs.get_account_error()
     );

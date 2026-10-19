@@ -121,72 +121,78 @@ export component SettingsPage inherits PageFrame {
         title: "Account for commands";
         text: Install.windows ? "Commands from your centers run as this account. The service starts them with its password, which it keeps encrypted for this machine."
             : "Commands from your centers run as this account. One that only the node uses keeps them away from your own files and sessions.";
-        Text {
-            text: Prefs.account != "" ? "Commands run as " + Prefs.account + "." : "No account yet: the node runs no command until one is chosen.";
-            color: Theme.text;
-            font-size: Type.small;
-            wrap: word-wrap;
-        }
-        Reveal {
-            shown: !Install.windows;
-            Field {
-                label: "Another account";
-                hint: "An account that is not there is made, with a group and a home of its own and no login. Not your own account: commands would act as you.";
-                HorizontalLayout {
-                    spacing: Space.md;
-                    TextField {
-                        horizontal-stretch: 1;
-                        text <=> Prefs.account-new;
-                        mono: true;
-                        placeholder: "nerve-work";
-                        label: "Another account";
-                        accepted => {
-                            Prefs.account-use();
+        // One block: a hidden part takes no room, nor the space around it.
+        VerticalLayout {
+            Text {
+                text: Prefs.account != "" ? "Commands run as " + Prefs.account + "." : "No account yet: the node runs no command until one is chosen.";
+                color: Theme.text;
+                font-size: Type.small;
+                wrap: word-wrap;
+            }
+            Reveal {
+                shown: !Install.windows;
+                gap: Space.lg;
+                Field {
+                    label: "Another account";
+                    hint: "An account that is not there is made, with a group and a home of its own and no login. Not your own account: commands would act as you.";
+                    HorizontalLayout {
+                        spacing: Space.md;
+                        TextField {
+                            horizontal-stretch: 1;
+                            text <=> Prefs.account-new;
+                            mono: true;
+                            placeholder: "nerve-work";
+                            label: "Another account";
+                            accepted => {
+                                Prefs.account-use();
+                            }
                         }
-                    }
-                    Button {
-                        text: "Use";
-                        enabled: Prefs.account-new != "";
-                        busy: Prefs.account-busy;
-                        clicked => {
-                            Prefs.account-use();
+                        Button {
+                            text: "Use";
+                            enabled: Prefs.account-new != "";
+                            busy: Prefs.account-busy;
+                            clicked => {
+                                Prefs.account-use();
+                            }
                         }
                     }
                 }
             }
-        }
-        Reveal {
-            shown: Install.windows && Prefs.account != "";
-            Field {
-                label: "Its password";
-                hint: "When the password of " + Prefs.account + " changes, commands fail until the service has the new one.";
-                HorizontalLayout {
-                    spacing: Space.md;
-                    TextField {
-                        horizontal-stretch: 1;
-                        text <=> Prefs.account-password;
-                        password: true;
-                        label: "Its password";
-                        accepted => {
-                            Prefs.account-password-save();
+            Reveal {
+                shown: Install.windows && Prefs.account != "";
+                gap: Space.lg;
+                Field {
+                    label: "Its password";
+                    hint: "When the password of " + Prefs.account + " changes, commands fail until the service has the new one.";
+                    HorizontalLayout {
+                        spacing: Space.md;
+                        TextField {
+                            horizontal-stretch: 1;
+                            text <=> Prefs.account-password;
+                            password: true;
+                            label: "Its password";
+                            accepted => {
+                                Prefs.account-password-save();
+                            }
                         }
-                    }
-                    Button {
-                        text: "Save";
-                        enabled: Prefs.account-password != "";
-                        busy: Prefs.account-busy;
-                        clicked => {
-                            Prefs.account-password-save();
+                        Button {
+                            text: "Save";
+                            enabled: Prefs.account-password != "";
+                            busy: Prefs.account-busy;
+                            clicked => {
+                                Prefs.account-password-save();
+                            }
                         }
                     }
                 }
             }
-        }
-        Reveal {
-            shown: Prefs.account-error != "";
-            Banner {
-                tone: Tone.danger;
-                text: Prefs.account-error;
+            Reveal {
+                shown: Prefs.account-error != "";
+                gap: Space.lg;
+                Banner {
+                    tone: Tone.danger;
+                    text: Prefs.account-error;
+                }
             }
         }
     }

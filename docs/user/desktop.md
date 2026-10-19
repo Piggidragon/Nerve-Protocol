@@ -118,10 +118,10 @@ On Linux, `nerve-node-desktop <command>` is `nerve-node <command>`, with
 `nerve-node`, the command `nerve-node` runs the app's program, which says
 `nerve-node-desktop` for `--version`. On Windows the app has no console, so a
 terminal does not wait for it, also not for `nerve-node.exe` once it is a link
-to the app. Wait for it with `start /wait "" "C:\Program Files\Nerve\nerve-node.exe" status`
-in cmd, or `& "C:\Program Files\Nerve\nerve-node.exe" status | Out-Default` in
-PowerShell; the CLI edition `nerve-node.exe` from the release is a console
-program ([commands](commands.md)).
+to the app. A pipe makes the terminal wait: `"C:\Program Files\Nerve\nerve-node.exe" status | more`
+in cmd, `& "C:\Program Files\Nerve\nerve-node.exe" status | Out-Default` in
+PowerShell. A batch file waits for it as it is. The CLI edition `nerve-node.exe`
+from the release is a console program ([commands](commands.md)).
 
 ## The app's own settings
 

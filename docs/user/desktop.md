@@ -83,6 +83,30 @@ administrator rights once each time it opens, with the same system dialog,
 and says why first. It keeps them while it is open. Every change still runs as
 a `nerve-node` command.
 
+The app's link to the rights is its own: on Linux the app closes itself to
+the other processes of your user once it asks (they can neither open that
+link nor trace the app), and its file dialogs then run in a process of
+their own, which the desktop portal answers; on Windows the link is open
+to the app's process alone. On Windows the app also loads the system's
+DLLs from System32 only, never from the folder it was downloaded to.
+
+What this does not cover, while the app is open with the rights:
+
+- On Windows, any program that runs as you may reach into the app's
+  process and act through it: Windows does not keep a user's programs
+  apart.
+- On X11 every program in your desktop session can send key presses and
+  clicks to any window, this one too. Wayland does not let it.
+- A program that runs as you can change how the app starts, for example
+  through your session's environment or a menu entry of its own in your
+  home folder, and run in its place.
+- A file you pick in the app, such as a backup to restore or a program to
+  update from, lies in your folders, which any program that runs as you
+  may change before the node reads it.
+
+So the rights are as safe as your desktop session. Close the app when you
+are done; that gives them back.
+
 ## Start and stop
 
 The **Overview** shows the service: whether it runs and starts with the
@@ -95,7 +119,12 @@ machine. In a terminal this is `nerve-node service stop|start|restart`
 
 A `nerve://` link opens in Nerve and goes straight to what the pairing would
 be. Nothing is paired until you confirm. Nerve has one window: opening it
-again, or a link while it is open, goes to the window that is open.
+again, or a link while it is open, goes to the window that is open. A link
+carries the pairing's code and pin, so it goes only to a window of your
+own: where the app cannot make sure of that (on Windows, when a program
+that is not your Nerve holds the name the window listens by; on Linux,
+when `$XDG_RUNTIME_DIR` is not a folder only you may open), each start
+opens a window of its own and says so.
 
 ## Update
 

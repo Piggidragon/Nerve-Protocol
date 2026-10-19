@@ -13,9 +13,15 @@
 //! ends. Its first line is `{"hello": …}`, so the app knows it runs.
 //!
 //! Only the app reaches the broker: on Linux over the broker's stdin and
-//! stdout, which pkexec hands from the app; on Windows over a named pipe
-//! the broker makes, open to the app's user only, which it serves to the
-//! app's process alone (`win`).
+//! stdout, which pkexec hands from the app, with the app closed to the
+//! other processes of its user ([`shut_out_the_user`]); on Windows over a
+//! named pipe the broker makes, open to the app's user only, which it
+//! serves to the app's process alone (`win`).
+//!
+//! The broker lives as long as the app: the owner gives the rights once
+//! each time the app opens. A secret in each request would add nothing on
+//! Linux: it would travel over the same pipe, which any process that can
+//! open it at all can also read.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -350,6 +356,8 @@ fn launch_stdio(exe: &Path, how: Launch) -> Result<Arc<Client>, String> {
 fn elevate(pkexec: &Path, exe: &Path) -> Result<Arc<Client>, String> {
     use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
+    #[cfg(target_os = "linux")]
+    shut_out_the_user()?;
     let mut child = Command::new(pkexec)
         .arg("--disable-internal-agent")
         .arg(exe)
@@ -400,6 +408,32 @@ fn elevate(pkexec: &Path, exe: &Path) -> Result<Arc<Client>, String> {
     }
 }
 
+/// Closes this process to the other processes of its user, before it holds
+/// the pipe to the root broker. Linux lets a process open the pipes of
+/// another process of the same user through `/proc/<pid>/fd`, and trace
+/// it, unless that process is not dumpable: then its `/proc` entries are
+/// root's. It stays so for the rest of the app's life, as the broker does.
+/// The desktop portal refuses a caller it cannot look at in `/proc`, so the
+/// app's file dialogs run in a process of their own
+/// ([`crate::dialog`]).
+#[cfg(target_os = "linux")]
+fn shut_out_the_user() -> Result<(), String> {
+    // SAFETY: prctl with integer arguments only.
+    let (set, now) = unsafe {
+        (
+            libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0),
+            libc::prctl(libc::PR_GET_DUMPABLE, 0, 0, 0, 0),
+        )
+    };
+    if set != 0 || now != 0 {
+        return Err(format!(
+            "cannot keep other programs away from the administrator rights: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
 /// The broker's start: `__desktop-broker`, on Windows with the pipe's name and
 /// the app's process id. The exit code.
 pub fn main(args: &[String]) -> i32 {
@@ -434,12 +468,12 @@ pub(crate) mod win {
         SDDL_REVISION_1,
     };
     use windows_sys::Win32::Security::{
-        GetTokenInformation, PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER,
-        TokenUser,
+        GetTokenInformation, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES, TOKEN_QUERY,
+        TOKEN_USER, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_READ_ATTRIBUTES, PIPE_ACCESS_INBOUND,
-        PIPE_ACCESS_OUTBOUND,
+        PIPE_ACCESS_OUTBOUND, SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
     };
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId,
@@ -447,7 +481,8 @@ pub(crate) mod win {
         PIPE_TYPE_BYTE, PIPE_WAIT,
     };
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, GetProcessId, OpenProcessToken, WaitForSingleObject,
+        GetCurrentProcess, GetProcessId, OpenProcess, OpenProcessToken,
+        PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
     };
     use windows_sys::Win32::UI::Shell::{
         SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW, ShellExecuteExW,
@@ -462,11 +497,30 @@ pub(crate) mod win {
 
     /// The SID of the user this process runs as, as text.
     pub(crate) fn own_sid() -> Result<String, String> {
-        // SAFETY: the token of this process, read into a buffer of the size
-        // Windows asks for; the strings it allocates are freed.
+        // SAFETY: the pseudo handle of this process, which needs no closing.
+        user_of(unsafe { GetCurrentProcess() })
+    }
+
+    /// The SID of the user the process `pid` runs as, as text.
+    pub(crate) fn sid_of(pid: u32) -> Result<String, String> {
+        // SAFETY: a handle to query the process, closed again.
+        unsafe {
+            let p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if p.is_null() {
+                return Err(format!("process {pid}: error {}", GetLastError()));
+            }
+            let sid = user_of(p);
+            CloseHandle(p);
+            sid
+        }
+    }
+
+    fn user_of(process: HANDLE) -> Result<String, String> {
+        // SAFETY: the token of the process, read into a buffer of the size
+        // Windows asks for.
         unsafe {
             let mut token: HANDLE = std::ptr::null_mut();
-            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            if OpenProcessToken(process, TOKEN_QUERY, &mut token) == 0 {
                 return Err(format!("the process token: error {}", GetLastError()));
             }
             let mut len = 0u32;
@@ -478,14 +532,25 @@ pub(crate) mod win {
                 return Err(format!("the token's user: error {}", GetLastError()));
             }
             let user = &*(buf.as_ptr() as *const TOKEN_USER);
+            sid_text(user.User.Sid)
+        }
+    }
+
+    /// `sid` as text.
+    ///
+    /// # Safety
+    /// `sid` points to a valid SID.
+    pub(crate) unsafe fn sid_text(sid: PSID) -> Result<String, String> {
+        // SAFETY: the string Windows allocates is read and freed.
+        unsafe {
             let mut text: *mut u16 = std::ptr::null_mut();
-            if ConvertSidToStringSidW(user.User.Sid, &mut text) == 0 {
+            if ConvertSidToStringSidW(sid, &mut text) == 0 {
                 return Err(format!("the user's SID: error {}", GetLastError()));
             }
             let n = (0..).take_while(|i| *text.add(*i) != 0).count();
-            let sid = String::from_utf16_lossy(std::slice::from_raw_parts(text, n));
+            let s = String::from_utf16_lossy(std::slice::from_raw_parts(text, n));
             LocalFree(text as HLOCAL);
-            Ok(sid)
+            Ok(s)
         }
     }
 
@@ -589,6 +654,9 @@ pub(crate) mod win {
             } else {
                 o.read(true);
             }
+            // Whoever serves the pipe learns who connects, but cannot act
+            // as the app.
+            o.security_qos_flags(SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION);
             match o.open(name) {
                 Ok(f) => break f,
                 Err(e) if !running() => {
@@ -723,12 +791,25 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn pkexec_runs_and_a_missing_agent_is_said() {
-        use std::os::unix::fs::PermissionsExt;
         let d = tempfile::tempdir().unwrap();
         let script = |name: &str, body: &str| {
             let p = d.path().join(name);
-            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            // Written by a process of its own: were this process to hold the
+            // file open for writing even for a moment, a child another test
+            // forks then could keep it open, and Linux would refuse to run
+            // it (ETXTBSY).
+            let mut sh = std::process::Command::new("/bin/sh")
+                .args(["-c", "cat > \"$0\" && chmod 755 \"$0\""])
+                .arg(&p)
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let mut input = sh.stdin.take().unwrap();
+            input
+                .write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+                .unwrap();
+            drop(input);
+            assert!(sh.wait().unwrap().success());
             p
         };
         let broker = script(

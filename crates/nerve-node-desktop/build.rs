@@ -13,6 +13,23 @@
 #[path = "../nerve-node/src/eventlog.rs"]
 mod eventlog;
 
+/// The DLLs the Windows program imports that are not among Windows'
+/// KnownDLLs (`HKLM\SYSTEM\CurrentControlSet\Control\Session
+/// Manager\KnownDLLs`), as `llvm-readobj --coff-imports` lists them.
+const DELAYED: [&str; 11] = [
+    "bcrypt.dll",
+    "bcryptprimitives.dll",
+    "comctl32.dll",
+    "crypt32.dll",
+    "dwmapi.dll",
+    "dwrite.dll",
+    "netapi32.dll",
+    "opengl32.dll",
+    "uiautomationcore.dll",
+    "userenv.dll",
+    "uxtheme.dll",
+];
+
 fn main() {
     let config = slint_build::CompilerConfiguration::new().with_style("fluent".into());
     slint_build::compile_with_config("ui/app.slint", config).expect("the Slint files compile");
@@ -24,6 +41,19 @@ fn main() {
     if os != "windows" || env != "msvc" {
         return;
     }
+    // Windows looks for a DLL in the program's own folder before System32,
+    // except for its KnownDLLs. The downloaded program runs from the
+    // downloads, and elevated when it installs, so a DLL put beside it
+    // would run as administrator. The DLLs it takes that are not KnownDLLs
+    // load on first use instead, after main told Windows to look in System32
+    // only (tests/dlls.rs checks that no other is loaded at start).
+    for dll in DELAYED {
+        println!("cargo:rustc-link-arg-bins=/DELAYLOAD:{dll}");
+    }
+    println!("cargo:rustc-link-arg-bins=delayimp.lib");
+    // The bin's test harness imports none of them, and the linker would
+    // say so for each (LNK4199).
+    println!("cargo:rustc-link-arg-bins=/IGNORE:4199");
     let mut res = eventlog::resource();
     icon(
         &mut res,

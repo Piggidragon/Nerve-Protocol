@@ -57,22 +57,13 @@ pub type Launcher = Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + 
 /// The system's own dialogs: the desktop portal on Linux, so they work on
 /// Wayland and look like the desktop's.
 fn system_chooser() -> Chooser {
-    Arc::new(|c| {
-        // The dialogs on Linux are the desktop portal's; without it rfd
-        // shows nothing and says nothing.
-        #[cfg(target_os = "linux")]
-        crate::deps::portal_here()?;
-        let d = rfd::FileDialog::new();
-        Ok(match c {
-            Choose::Folder => d.set_title("A folder for the center").pick_folder(),
-            Choose::SaveBackup => d
-                .set_title("Back up the node")
-                .set_file_name("nerve-node.backup")
-                .save_file(),
-            Choose::OpenBackup => d.set_title("Restore a backup").pick_file(),
-            Choose::Program => d.set_title("The new nerve-node-desktop").pick_file(),
-        })
-    })
+    // The app on Linux is closed to /proc once it has the rights
+    // (crate::broker), and the portal then refuses it: a dialog asked by a
+    // process of its own, started fresh, is the portal's to show.
+    #[cfg(target_os = "linux")]
+    return Arc::new(|c| crate::dialog::apart(std::path::Path::new("/proc/self/exe"), c));
+    #[cfg(not(target_os = "linux"))]
+    Arc::new(crate::dialog::show)
 }
 
 /// The change that waits for the owner's yes in the confirm dialog.
@@ -720,6 +711,9 @@ impl Ctl {
     /// Makes this window the user's one window: what a later start asks
     /// comes here.
     pub fn take_starts(&self, instance: crate::instance::Instance) {
+        if let Some(note) = instance.note() {
+            self.toast(note, Tone::Warn);
+        }
         instance.listen(|asked| {
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(c) = CURRENT.with(|c| c.borrow().clone()) {

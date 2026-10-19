@@ -4,6 +4,13 @@
 //! (in `$XDG_RUNTIME_DIR` on Linux, a named pipe open to that user on
 //! Windows); a later start sends it one line, `{"link": …}`,
 //! `{"uninstall": true}` or `{}`, and ends.
+//!
+//! A link can carry a pairing's code and pin, so a start sends nothing to
+//! a socket or pipe that another user could have made: on Linux the
+//! socket's folder is this user's alone and the window at the other end
+//! runs as this user; on Windows the pipe's server runs as this user and
+//! the pipe is this user's. Where that is not so, the start opens a window
+//! of its own, which says why ([`Instance::note`]).
 
 use std::io::{BufRead, BufReader, Write};
 
@@ -82,6 +89,7 @@ pub struct Instance {
     listener: Option<(std::os::unix::net::UnixListener, std::path::PathBuf)>,
     #[cfg(windows)]
     pipe: Option<win::Pipe>,
+    note: Option<&'static str>,
 }
 
 impl Instance {
@@ -91,7 +99,20 @@ impl Instance {
             listener: None,
             #[cfg(windows)]
             pipe: None,
+            note: None,
         }
+    }
+
+    /// A window that takes no later starts, for the reason `note` says.
+    fn alone(note: &'static str) -> Instance {
+        let mut i = Instance::none();
+        i.note = Some(note);
+        i
+    }
+
+    /// Why this window takes no later starts, when the owner should know.
+    pub fn note(&self) -> Option<&'static str> {
+        self.note
     }
 
     /// Hands what each later start asks to `on`, on a thread of its own.
@@ -103,6 +124,9 @@ impl Instance {
             std::thread::spawn(move || {
                 for conn in l.incoming() {
                     let Ok(conn) = conn else { break };
+                    if !unix::peer_is_me(&conn) {
+                        continue;
+                    }
                     let mut text = String::new();
                     if BufReader::new(conn).read_line(&mut text).is_ok()
                         && let Some(a) = asked(&text)
@@ -134,23 +158,66 @@ impl Drop for Instance {
 
 #[cfg(unix)]
 mod unix {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::Path;
 
     use super::*;
 
+    pub(super) const NOT_PRIVATE: &str = "This window does not take later starts of Nerve and the nerve:// links opened while it is open: the folder its socket would be in ($XDG_RUNTIME_DIR) is not yours alone, so each opens a window of its own.";
+
+    fn me() -> u32 {
+        // SAFETY: a plain query.
+        unsafe { libc::geteuid() }
+    }
+
+    /// Whether `dir` is a folder of this user's that nobody else may open,
+    /// as `$XDG_RUNTIME_DIR` must be.
+    fn private(dir: &Path) -> bool {
+        std::fs::metadata(dir).is_ok_and(|m| m.is_dir() && m.uid() == me() && m.mode() & 0o077 == 0)
+    }
+
+    /// Whether the process at the other end of `s` runs as this user.
+    pub fn peer_is_me(s: &UnixStream) -> bool {
+        let mut cred = libc::ucred {
+            pid: 0,
+            uid: u32::MAX,
+            gid: u32::MAX,
+        };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: the socket's credentials, into a buffer of their size.
+        let got = unsafe {
+            libc::getsockopt(
+                s.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut cred as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        };
+        got == 0 && cred.uid == me()
+    }
+
     /// [`claim`] with the socket at `path`.
     pub fn claim_at(path: &Path, start: &Asked) -> Claimed {
-        if let Ok(mut s) = UnixStream::connect(path)
-            && writeln!(s, "{}", line(start)).is_ok()
-        {
-            return Claimed::Forwarded;
+        if !path.parent().is_some_and(private) {
+            return Claimed::First(Instance::alone(NOT_PRIVATE));
+        }
+        if let Ok(mut s) = UnixStream::connect(path) {
+            if !peer_is_me(&s) {
+                return Claimed::First(Instance::alone(NOT_PRIVATE));
+            }
+            if writeln!(s, "{}", line(start)).is_ok() {
+                return Claimed::Forwarded;
+            }
         }
         // Nobody listens: a socket left by a window that crashed goes.
         let _ = std::fs::remove_file(path);
         match UnixListener::bind(path) {
             Ok(l) => Claimed::First(Instance {
                 listener: Some((l, path.to_path_buf())),
+                note: None,
             }),
             Err(_) => Claimed::First(Instance::none()),
         }
@@ -159,24 +226,33 @@ mod unix {
 
 #[cfg(windows)]
 mod win {
-    use std::os::windows::io::FromRawHandle;
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
 
     use windows_sys::Win32::Foundation::{
-        CloseHandle, GetLastError, HLOCAL, INVALID_HANDLE_VALUE, LocalFree,
+        CloseHandle, GENERIC_WRITE, GetLastError, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree,
     };
     use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
+        SE_KERNEL_OBJECT,
     };
-    use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+    use windows_sys::Win32::Security::{
+        OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID, SECURITY_ATTRIBUTES,
+    };
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_INBOUND,
+        FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_READ_ATTRIBUTES, PIPE_ACCESS_INBOUND, READ_CONTROL,
+        SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
     };
     use windows_sys::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-        PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+        ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeServerProcessId, PIPE_READMODE_BYTE,
+        PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+        WaitNamedPipeW,
     };
 
     use super::*;
+    use crate::broker::win::{own_sid, sid_text};
+
+    pub(super) const HELD: &str = "This window does not take later starts of Nerve and the nerve:// links opened while it is open: a program that is not your Nerve holds the name they would go to, so nothing is sent to it and each opens a window of its own.";
 
     fn wide(s: &str) -> Vec<u16> {
         s.encode_utf16().chain(Some(0)).collect()
@@ -189,10 +265,11 @@ mod win {
         first: std::sync::Mutex<Option<isize>>,
     }
 
-    /// An instance of the pipe, open to SYSTEM, the administrators and
-    /// this user only; the first one owns the name.
+    /// An instance of the pipe, owned by this user and open to this user
+    /// alone; the first one owns the name, and only this user may make the
+    /// others.
     fn make(name: &str, sid: &str, first: bool) -> Option<isize> {
-        let sddl = wide(&format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;{sid})"));
+        let sddl = wide(&format!("O:{sid}D:P(A;;GA;;;{sid})"));
         // SAFETY: the descriptor Windows makes from the SDDL is freed after
         // the pipe took it.
         unsafe {
@@ -233,24 +310,100 @@ mod win {
     }
 
     pub fn claim(start: &Asked) -> Claimed {
-        let Ok(sid) = crate::broker::win::own_sid() else {
+        let Ok(sid) = own_sid() else {
             return Claimed::First(Instance::none());
         };
-        let name = format!(r"\\.\pipe\nerve-node-desktop-{sid}");
-        if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&name)
-            && writeln!(f, "{}", line(start)).is_ok()
-        {
+        claim_at(&format!(r"\\.\pipe\nerve-node-desktop-{sid}"), &sid, start)
+    }
+
+    /// [`claim`] with the pipe `name`, for the user `sid`.
+    pub(super) fn claim_at(name: &str, sid: &str, start: &Asked) -> Claimed {
+        if send(name, sid, start) {
             return Claimed::Forwarded;
         }
-        match make(&name, &sid, true) {
-            Some(h) => Claimed::First(Instance {
+        if let Some(h) = make(name, sid, true) {
+            return Claimed::First(Instance {
                 pipe: Some(Pipe {
-                    name,
-                    sid,
+                    name: name.to_string(),
+                    sid: sid.to_string(),
                     first: std::sync::Mutex::new(Some(h)),
                 }),
-            }),
-            None => Claimed::First(Instance::none()),
+                note: None,
+            });
+        }
+        // The name is held: by a window of this user's that opened just
+        // now, or by another program, which gets nothing.
+        if send(name, sid, start) {
+            return Claimed::Forwarded;
+        }
+        Claimed::First(Instance::alone(HELD))
+    }
+
+    /// Sends `start` to the window that holds the pipe `name`, if that is
+    /// this user's (`sid`); whether it went.
+    fn send(name: &str, sid: &str, start: &Asked) -> bool {
+        let open = || {
+            std::fs::OpenOptions::new()
+                // Writing, and what the checks in `mine` read.
+                .access_mode(GENERIC_WRITE | FILE_READ_ATTRIBUTES | READ_CONTROL)
+                // Whoever serves the pipe learns who connects, but cannot
+                // act as this user.
+                .security_qos_flags(SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION)
+                .open(name)
+        };
+        let f = match open() {
+            // ERROR_PIPE_BUSY: the window is between two starts.
+            Err(e) if e.raw_os_error() == Some(231) => {
+                // SAFETY: a wait on the pipe's name, which lives until it
+                // returns.
+                unsafe { WaitNamedPipeW(wide(name).as_ptr(), 2000) };
+                open()
+            }
+            other => other,
+        };
+        match f {
+            Ok(mut f) => mine(&f, sid) && writeln!(f, "{}", line(start)).is_ok(),
+            Err(_) => false,
+        }
+    }
+
+    /// Whether the pipe `f` is open to is this user's (`sid`): the process
+    /// that serves it runs as this user, and the pipe's owner is this user,
+    /// which a program of another user cannot make it.
+    fn mine(f: &std::fs::File, sid: &str) -> bool {
+        let h = f.as_raw_handle() as HANDLE;
+        let mut server = 0u32;
+        // SAFETY: a query on the open pipe.
+        if unsafe { GetNamedPipeServerProcessId(h, &mut server) } == 0 {
+            return false;
+        }
+        crate::broker::win::sid_of(server).as_deref() == Ok(sid)
+            && owner_of(h).as_deref() == Ok(sid)
+    }
+
+    /// The owner of the object `h` is open to, as a SID's text.
+    fn owner_of(h: HANDLE) -> Result<String, String> {
+        // SAFETY: the owner points into the descriptor Windows allocates,
+        // which is freed after the owner was read.
+        unsafe {
+            let mut owner: PSID = std::ptr::null_mut();
+            let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            let e = GetSecurityInfo(
+                h,
+                SE_KERNEL_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut sd,
+            );
+            if e != 0 {
+                return Err(format!("the pipe's owner: error {e}"));
+            }
+            let text = sid_text(owner);
+            LocalFree(sd as HLOCAL);
+            text
         }
     }
 
@@ -295,9 +448,35 @@ mod win {
 mod tests {
     use super::*;
 
+    /// In a folder that other users may open, a socket there could be
+    /// theirs: a start sends nothing to it and opens a window that says so.
+    #[test]
+    fn a_folder_others_may_open_gets_no_link() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o733)).unwrap();
+        let sock = d.path().join("app.sock");
+        let theirs = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        theirs.set_nonblocking(true).unwrap();
+        let link = Asked::link("nerve://pair?center=x&code=c0de&pin=p1n");
+        let Claimed::First(alone) = unix::claim_at(&sock, &link) else {
+            panic!("the link went to a socket in a folder others may open");
+        };
+        assert_eq!(alone.note(), Some(unix::NOT_PRIVATE));
+        assert!(theirs.accept().is_err(), "the start connected");
+        // Nor does a start take the socket's place there.
+        drop(theirs);
+        std::fs::remove_file(&sock).unwrap();
+        assert!(matches!(unix::claim_at(&sock, &link), Claimed::First(_)));
+        assert!(!sock.exists());
+    }
+
     #[test]
     fn a_second_start_goes_to_the_first() {
+        use std::os::unix::fs::PermissionsExt;
         let d = tempfile::tempdir().unwrap();
+        // Private, as $XDG_RUNTIME_DIR is.
+        std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         let sock = d.path().join("app.sock");
         let none = Asked::default();
         let Claimed::First(first) = unix::claim_at(&sock, &none) else {
@@ -322,10 +501,12 @@ mod tests {
             assert_eq!(&got, start);
         }
         // Gone with the window: the next start is the first again, also
-        // over a socket a crash left.
+        // over a socket a crash left. That one is a datagram socket, which
+        // no start can connect to: a listener closed here could still be
+        // open a moment in a child another test forks.
         drop(first);
         assert!(!sock.exists());
-        std::os::unix::net::UnixListener::bind(&sock)
+        std::os::unix::net::UnixDatagram::bind(&sock)
             .map(drop)
             .unwrap();
         assert!(matches!(unix::claim_at(&sock, &none), Claimed::First(_)));
@@ -335,6 +516,93 @@ mod tests {
 #[cfg(all(test, windows))]
 mod win_tests {
     use super::*;
+
+    /// A start sends nothing to a pipe of the name that is not this
+    /// user's, and opens a window that says so. The pipe here is owned by
+    /// the administrators, which only an elevated test can make; another
+    /// user's program, the other way it could be not this user's, was run
+    /// on the Windows test machine (review issue-10 r1).
+    #[test]
+    fn a_pipe_that_is_not_this_users_gets_nothing() {
+        use std::io::Read;
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Foundation::{HLOCAL, INVALID_HANDLE_VALUE, LocalFree};
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_FIRST_PIPE_INSTANCE, PIPE_ACCESS_INBOUND,
+        };
+        use windows_sys::Win32::System::Pipes::{ConnectNamedPipe, CreateNamedPipeW};
+
+        let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+        let name = format!(
+            r"\\.\pipe\nerve-node-desktop-test-{}",
+            nerve_transport::keys::random_token(12)
+        );
+        // Owned by the administrators, open to everyone, as a squatter's
+        // pipe would be open to its victim.
+        let sddl = wide("O:BAD:P(A;;GA;;;WD)");
+        // SAFETY: the descriptor is freed after the pipe took it.
+        let h = unsafe {
+            let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+            assert_ne!(
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut sd,
+                    std::ptr::null_mut(),
+                ),
+                0
+            );
+            let sa = SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: sd,
+                bInheritHandle: 0,
+            };
+            let h = CreateNamedPipeW(
+                wide(&name).as_ptr(),
+                PIPE_ACCESS_INBOUND | FILE_FLAG_FIRST_PIPE_INSTANCE,
+                0,
+                1,
+                0,
+                4096,
+                0,
+                &sa,
+            );
+            LocalFree(sd as HLOCAL);
+            h
+        };
+        if h == INVALID_HANDLE_VALUE {
+            eprintln!("skipped: only an elevated test can give a pipe to the administrators");
+            return;
+        }
+        let h = h as isize;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (end, ended) = std::sync::mpsc::channel::<()>();
+        std::thread::spawn(move || {
+            // SAFETY: the pipe this test made, owned by the File after.
+            unsafe { ConnectNamedPipe(h as _, std::ptr::null_mut()) };
+            let mut f = unsafe { std::fs::File::from_raw_handle(h as _) };
+            let mut got = String::new();
+            let _ = f.read_to_string(&mut got);
+            let _ = tx.send(got);
+            // The name stays held until the test is done.
+            let _ = ended.recv();
+        });
+        let sid = crate::broker::win::own_sid().unwrap();
+        let link = Asked::link("nerve://pair?center=x&code=c0de&pin=p1n");
+        let Claimed::First(alone) = win::claim_at(&name, &sid, &link) else {
+            panic!("the link went to a pipe that is not this user's");
+        };
+        assert_eq!(alone.note(), Some(win::HELD));
+        // Whether the start connected or not, the pipe's server ends now.
+        let _ = std::fs::OpenOptions::new().write(true).open(&name);
+        let got = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        let _ = end.send(());
+        assert_eq!(got, "", "the pipe got {got}");
+    }
 
     /// On the user's own pipe: run where the app is not open.
     #[test]

@@ -4,6 +4,13 @@
 //! release file `update` takes, and what `--version` says; the desktop app
 //! also installs and removes its own parts (the menu entry, the `nerve://`
 //! handler) with the node, through [`Parts`].
+//!
+//! The edition is the running program's own: each program's `main` sets it
+//! before anything else, and nothing reads the name it was started by
+//! (argv[0]). Through a link named `nerve-node`, as a node installed alone
+//! becomes when the desktop app takes it over
+//! ([`crate::service::node_beside`]), the app is still the app, so `update`
+//! there updates the app.
 
 use std::path::Path;
 use std::sync::OnceLock;

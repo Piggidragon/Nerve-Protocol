@@ -7,8 +7,8 @@ import { Load, FolderRow, CapRow } from "data.slint";
 import { Store, Perm } from "store.slint";
 import {
     Button, ButtonKind, Card, Pill, Banner, Loading, PageHeader, PageFrame, EmptyState, Divider,
-    Segmented, SectionTitle, OptionTile, Chip, ListRow, TextField, Switch, Icon, Code,
-    Reveal,
+    Segmented, SectionTitle, OptionTile, Chip, ListRow, TextField, Switch, Icon, Code, Reveal,
+    PathText,
 } from "widgets.slint";
 
 component Section inherits Card {
@@ -115,14 +115,13 @@ component FolderSection inherits Section {
                 colorize: Theme.text-muted;
             }
         }
-        Text {
+        // A deep folder keeps its own name in sight.
+        VerticalLayout {
             horizontal-stretch: 1;
-            text: f.path;
-            color: Theme.text;
-            font-size: Type.small;
-            font-family: Type.mono;
-            vertical-alignment: center;
-            overflow: elide;
+            alignment: center;
+            PathText {
+                text: f.path;
+            }
         }
         HorizontalLayout {
             spacing: 4px;
@@ -354,6 +353,7 @@ component SudoSection inherits Section {
 }
 
 export component PermissionsPage inherits PageFrame {
+    gap: 0;
     PageHeader {
         title: "Permissions";
         subtitle: "What each center may do on this machine. A new center may do nothing until you allow it here.";
@@ -373,36 +373,44 @@ export component PermissionsPage inherits PageFrame {
         }
     }
 
-    if Store.status.state != "" && Perm.centers.length == 0: Card {
-        EmptyState {
-            icon: @image-url("icons/shield.svg");
-            title: "No center is paired yet";
-            text: "Permissions belong to a center. Pair one, and choose here what it may do.";
-            Button {
-                text: "Pair a center";
-                icon: @image-url("icons/plus.svg");
-                kind: ButtonKind.primary;
-                clicked => {
-                    Store.pair-start();
+    Reveal {
+        shown: Store.status.state != "" && Perm.centers.length == 0;
+        gap: Space.xxl;
+        Card {
+            EmptyState {
+                icon: @image-url("icons/shield.svg");
+                title: "No center is paired yet";
+                text: "Permissions belong to a center. Pair one, and choose here what it may do.";
+                Button {
+                    text: "Pair a center";
+                    icon: @image-url("icons/plus.svg");
+                    kind: ButtonKind.primary;
+                    clicked => {
+                        Store.pair-start();
+                    }
                 }
             }
         }
     }
 
-    if Perm.centers.length > 1: HorizontalLayout {
-        alignment: start;
-        spacing: Space.md;
-        Text {
-            text: "Center";
-            color: Theme.text-muted;
-            font-size: Type.small;
-            vertical-alignment: center;
-        }
-        Segmented {
-            options: Perm.centers;
-            current: Perm.current;
-            chosen(i) => {
-                Perm.pick(i);
+    Reveal {
+        shown: Perm.centers.length > 1;
+        gap: Space.xxl;
+        HorizontalLayout {
+            alignment: start;
+            spacing: Space.md;
+            Text {
+                text: "Center";
+                color: Theme.text-muted;
+                font-size: Type.small;
+                vertical-alignment: center;
+            }
+            Segmented {
+                options: Perm.centers;
+                current: Perm.current;
+                chosen(i) => {
+                    Perm.pick(i);
+                }
             }
         }
     }
@@ -411,6 +419,7 @@ export component PermissionsPage inherits PageFrame {
 
     Reveal {
         shown: Perm.centers.length > 0 && Perm.caps.length > 0;
+        gap: Space.xxl;
         VerticalLayout {
             spacing: Space.xxl;
             ModeSection { }

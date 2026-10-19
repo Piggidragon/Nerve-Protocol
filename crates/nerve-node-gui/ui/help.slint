@@ -5,7 +5,7 @@
 import { Theme, Type, Space, Radius, Tone } from "theme.slint";
 import { HelpSection, HelpCard } from "data.slint";
 import { Manual } from "store.slint";
-import { Card, PageHeader, PageFrame, Divider, Code, Banner } from "widgets.slint";
+import { Card, PageHeader, PageFrame, Divider, Code, Banner, Fit, Reveal } from "widgets.slint";
 
 component CommandCard inherits Card {
     in property <HelpCard> card;
@@ -16,7 +16,6 @@ component CommandCard inherits Card {
         padding-right: Space.xl;
         padding-top: Space.lg;
         padding-bottom: Space.md;
-        spacing: 4px;
         Text {
             text: root.card.name;
             color: Theme.text;
@@ -24,14 +23,18 @@ component CommandCard inherits Card {
             font-weight: Type.semibold;
             font-family: Type.mono;
         }
-        if root.card.about != "": Text {
-            text: root.card.about;
-            color: Theme.text-muted;
-            font-size: Type.small;
-            wrap: word-wrap;
+        Reveal {
+            shown: root.card.about != "";
+            gap: 4px;
+            Text {
+                text: root.card.about;
+                color: Theme.text-muted;
+                font-size: Type.small;
+                wrap: word-wrap;
+            }
         }
     }
-    for v[i] in root.card.verbs: VerticalLayout {
+    for v[i] in root.card.verbs: Fit {
         Divider { }
         VerticalLayout {
             padding-left: Space.xl;
@@ -48,22 +51,24 @@ component CommandCard inherits Card {
                 font-size: Type.small;
                 wrap: word-wrap;
             }
-            for a in v.args: HorizontalLayout {
-                spacing: Space.md;
-                Text {
-                    width: 200px;
-                    text: a.name;
-                    color: Theme.text-muted;
-                    font-size: Type.caption;
-                    font-family: Type.mono;
-                    wrap: char-wrap;
-                }
-                Text {
-                    horizontal-stretch: 1;
-                    text: a.about;
-                    color: Theme.text-muted;
-                    font-size: Type.caption;
-                    wrap: word-wrap;
+            for a in v.args: Fit {
+                HorizontalLayout {
+                    spacing: Space.md;
+                    Text {
+                        width: 200px;
+                        text: a.name;
+                        color: Theme.text-muted;
+                        font-size: Type.caption;
+                        font-family: Type.mono;
+                        wrap: char-wrap;
+                    }
+                    Text {
+                        horizontal-stretch: 1;
+                        text: a.about;
+                        color: Theme.text-muted;
+                        font-size: Type.caption;
+                        wrap: word-wrap;
+                    }
                 }
             }
         }
@@ -79,26 +84,33 @@ export component HelpPage inherits PageFrame {
         tone: Tone.accent;
         text: "Every command takes --config-dir and --state-dir; one that works on a center takes --center <name> when more than one is paired. The user guide is in docs/user/ of the project.";
     }
-    for s in Manual.sections: VerticalLayout {
-        spacing: Space.md;
+    for s in Manual.sections: Fit {
         VerticalLayout {
-            spacing: 4px;
-            padding-top: Space.sm;
-            Text {
-                text: s.name;
-                color: Theme.text;
-                font-size: Type.heading;
-                font-weight: Type.semibold;
+            spacing: Space.md;
+            VerticalLayout {
+                padding-top: Space.sm;
+                Text {
+                    text: s.name;
+                    color: Theme.text;
+                    font-size: Type.heading;
+                    font-weight: Type.semibold;
+                }
+                Reveal {
+                    shown: s.about != "";
+                    gap: 4px;
+                    Text {
+                        text: s.about;
+                        color: Theme.text-muted;
+                        font-size: Type.small;
+                        wrap: word-wrap;
+                    }
+                }
             }
-            if s.about != "": Text {
-                text: s.about;
-                color: Theme.text-muted;
-                font-size: Type.small;
-                wrap: word-wrap;
+            for c in s.cards: Fit {
+                CommandCard {
+                    card: c;
+                }
             }
-        }
-        for c in s.cards: CommandCard {
-            card: c;
         }
     }
 }

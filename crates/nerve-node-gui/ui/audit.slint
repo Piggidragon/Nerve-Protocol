@@ -8,8 +8,7 @@ import { Load, AuditRow } from "data.slint";
 import { Store } from "store.slint";
 import {
     Button, ButtonKind, Card, Pill, IconTile, Banner, Loading, PageHeader, PageFrame,
-    EmptyState, Divider, Segmented, Code,
-    Reveal,
+    EmptyState, Divider, Segmented, Code, Reveal, Fit,
 } from "widgets.slint";
 
 component AuditEntry {
@@ -34,8 +33,9 @@ component AuditEntry {
                     : @image-url("icons/info.svg");
             }
         }
+        // Its parts come and go with the entry, each with the gap above it
+        // (see Reveal).
         VerticalLayout {
-            spacing: Space.sm;
             horizontal-stretch: 1;
             HorizontalLayout {
                 spacing: Space.sm;
@@ -60,7 +60,7 @@ component AuditEntry {
                     font-size: Type.small;
                     vertical-alignment: center;
                     overflow: elide;
-                    min-width: 40px;
+                    min-width: min(40px, self.preferred-width);
                 }
                 Rectangle {
                     horizontal-stretch: 1;
@@ -73,70 +73,86 @@ component AuditEntry {
                     accessible-label: root.entry.when-exact;
                 }
             }
-            if root.entry.target != "": Code {
-                text: root.entry.target;
-            }
-            if root.entry.detail != "": Text {
-                text: root.entry.detail;
-                color: Theme.text-muted;
-                font-size: Type.small;
-                wrap: word-wrap;
-            }
-            if root.entry.rules: HorizontalLayout {
-                spacing: 6px;
-                padding-top: 2px;
-                alignment: start;
-                Button {
-                    text: "Allow";
-                    icon: @image-url("icons/check.svg");
-                    small: true;
-                    enabled: !root.waiting;
-                    clicked => {
-                        Store.audit-rule(root.entry.index, "allow", false);
-                    }
-                }
-                Button {
-                    text: "Allow as wildcard";
-                    small: true;
-                    enabled: !root.waiting;
-                    clicked => {
-                        Store.audit-rule(root.entry.index, "allow", true);
-                    }
-                }
-                Rectangle {
-                    width: Space.xs;
-                }
-                Button {
-                    text: "Deny";
-                    icon: @image-url("icons/ban.svg");
-                    kind: ButtonKind.danger-soft;
-                    small: true;
-                    enabled: !root.waiting;
-                    clicked => {
-                        Store.audit-rule(root.entry.index, "deny", false);
-                    }
-                }
-                Button {
-                    text: "Deny as wildcard";
-                    kind: ButtonKind.danger-soft;
-                    small: true;
-                    enabled: !root.waiting;
-                    clicked => {
-                        Store.audit-rule(root.entry.index, "deny", true);
-                    }
+            Reveal {
+                shown: root.entry.target != "";
+                gap: Space.sm;
+                Code {
+                    text: root.entry.target;
                 }
             }
-            if !root.entry.rules && root.entry.rules-why != "": Text {
-                text: root.entry.rules-why;
-                color: Theme.text-faint;
-                font-size: Type.caption;
-                wrap: word-wrap;
+            Reveal {
+                shown: root.entry.detail != "";
+                gap: Space.sm;
+                Text {
+                    text: root.entry.detail;
+                    color: Theme.text-muted;
+                    font-size: Type.small;
+                    wrap: word-wrap;
+                }
+            }
+            Reveal {
+                shown: root.entry.rules;
+                gap: Space.sm + 2px;
+                HorizontalLayout {
+                    spacing: 6px;
+                    alignment: start;
+                    Button {
+                        text: "Allow";
+                        icon: @image-url("icons/check.svg");
+                        small: true;
+                        enabled: !root.waiting;
+                        clicked => {
+                            Store.audit-rule(root.entry.index, "allow", false);
+                        }
+                    }
+                    Button {
+                        text: "Allow as wildcard";
+                        small: true;
+                        enabled: !root.waiting;
+                        clicked => {
+                            Store.audit-rule(root.entry.index, "allow", true);
+                        }
+                    }
+                    Rectangle {
+                        width: Space.xs;
+                    }
+                    Button {
+                        text: "Deny";
+                        icon: @image-url("icons/ban.svg");
+                        kind: ButtonKind.danger-soft;
+                        small: true;
+                        enabled: !root.waiting;
+                        clicked => {
+                            Store.audit-rule(root.entry.index, "deny", false);
+                        }
+                    }
+                    Button {
+                        text: "Deny as wildcard";
+                        kind: ButtonKind.danger-soft;
+                        small: true;
+                        enabled: !root.waiting;
+                        clicked => {
+                            Store.audit-rule(root.entry.index, "deny", true);
+                        }
+                    }
+                }
+            }
+            Reveal {
+                shown: !root.entry.rules && root.entry.rules-why != "";
+                gap: Space.sm;
+                Text {
+                    text: root.entry.rules-why;
+                    color: Theme.text-faint;
+                    font-size: Type.caption;
+                    wrap: word-wrap;
+                }
             }
         }
     }
 }
 
 export component AuditPage inherits PageFrame {
+    gap: 0;
     PageHeader {
         title: "Audit";
         subtitle: "What the node allowed and refused, newest first, and every change to its settings.";
@@ -167,23 +183,31 @@ export component AuditPage inherits PageFrame {
         text: "Reading the audit log…";
     }
 
-    if Store.audit-load == Load.ready && Store.audit.length == 0: Card {
-        EmptyState {
-            icon: @image-url("icons/audit.svg");
-            title: Store.audit-refused-only ? "Nothing was refused" : "Nothing decided yet";
-            text: Store.audit-refused-only
-                ? "Every call so far was allowed. Refused calls show here, with buttons to allow them."
-                : "When a center calls this machine, the node's decision shows here, and so does every change to its settings.";
+    Reveal {
+        shown: Store.audit-load == Load.ready && Store.audit.length == 0;
+        gap: Space.xxl;
+        Card {
+            EmptyState {
+                icon: @image-url("icons/audit.svg");
+                title: Store.audit-refused-only ? "Nothing was refused" : "Nothing decided yet";
+                text: Store.audit-refused-only
+                    ? "Every call so far was allowed. Refused calls show here, with buttons to allow them."
+                    : "When a center calls this machine, the node's decision shows here, and so does every change to its settings.";
+            }
         }
     }
 
     Reveal {
         shown: Store.audit.length > 0;
+        gap: Space.xxl;
         Card {
             pad: 0;
             gap: 0;
-            for row[i] in Store.audit: VerticalLayout {
-                if i > 0: Divider { }
+            for row[i] in Store.audit: Fit {
+                Divider {
+                    visible: i > 0;
+                    height: i > 0 ? 1px : 0;
+                }
                 AuditEntry {
                     entry: row;
                 }
@@ -191,10 +215,15 @@ export component AuditPage inherits PageFrame {
         }
     }
 
-    if Store.audit.length >= 200: Text {
-        text: "The newest " + Store.audit.length + " entries. `nerve-node audit` shows them all.";
-        color: Theme.text-faint;
-        font-size: Type.caption;
-        horizontal-alignment: center;
+    Reveal {
+        shown: Store.audit.length >= 200;
+        gap: Space.lg;
+        Text {
+            text: "The newest " + Store.audit.length + " entries. `nerve-node audit` shows them all.";
+            color: Theme.text-faint;
+            font-size: Type.caption;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
     }
 }

@@ -28,6 +28,17 @@ export component Reveal inherits Rectangle {
     }
 }
 
+// A row of a `for` whose content wraps. Slint measures a repeated row
+// without the width it gets, so wrapped lines would not count in the height
+// of the list around it; this takes its height where it stands, as Reveal
+// does.
+export component Fit inherits Rectangle {
+    height: self.preferred-height;
+    VerticalLayout {
+        @children
+    }
+}
+
 // Three dots that pulse: the app is waiting for the node.
 export component Dots {
     in property <color> color: Theme.text-muted;
@@ -281,21 +292,27 @@ export component Banner inherits Rectangle {
             }
         }
         VerticalLayout {
-            spacing: 2px;
             horizontal-stretch: 1;
             alignment: center;
-            if root.title != "": Text {
-                text: root.title;
-                color: Theme.text;
-                font-size: Type.body;
-                font-weight: Type.semibold;
-                wrap: word-wrap;
+            Reveal {
+                shown: root.title != "";
+                Text {
+                    text: root.title;
+                    color: Theme.text;
+                    font-size: Type.body;
+                    font-weight: Type.semibold;
+                    wrap: word-wrap;
+                }
             }
-            if root.text != "": Text {
-                text: root.text;
-                color: root.title == "" ? Theme.text : Theme.text-muted;
-                font-size: Type.small;
-                wrap: word-wrap;
+            Reveal {
+                shown: root.text != "";
+                gap: root.title != "" ? 2px : 0;
+                Text {
+                    text: root.text;
+                    color: root.title == "" ? Theme.text : Theme.text-muted;
+                    font-size: Type.small;
+                    wrap: word-wrap;
+                }
             }
         }
         if root.action != "": VerticalLayout {
@@ -545,6 +562,7 @@ export component Segmented {
                     font-size: Type.small;
                     font-weight: i == root.current ? Type.semibold : Type.medium;
                     vertical-alignment: center;
+                    horizontal-alignment: center;
                     // A long center name does not push the row off the page.
                     max-width: 180px;
                     overflow: elide;
@@ -613,7 +631,7 @@ export component TextField {
     callback accepted(string);
     callback edited(string);
     forward-focus: input;
-    height: 38px;
+    height: Size.field;
     accessible-role: text-input;
     accessible-label: root.label;
     accessible-value: root.text;
@@ -711,19 +729,25 @@ export component Field {
     in property <string> label;
     in property <string> hint;
     VerticalLayout {
-        spacing: 6px;
-        Text {
-            text: root.label;
-            color: Theme.text;
-            font-size: Type.small;
-            font-weight: Type.semibold;
+        VerticalLayout {
+            spacing: 6px;
+            Text {
+                text: root.label;
+                color: Theme.text;
+                font-size: Type.small;
+                font-weight: Type.semibold;
+            }
+            @children
         }
-        @children
-        if root.hint != "": Text {
-            text: root.hint;
-            color: Theme.text-muted;
-            font-size: Type.caption;
-            wrap: word-wrap;
+        Reveal {
+            shown: root.hint != "";
+            gap: 6px;
+            Text {
+                text: root.hint;
+                color: Theme.text-muted;
+                font-size: Type.caption;
+                wrap: word-wrap;
+            }
         }
     }
 }
@@ -781,6 +805,52 @@ export component Code inherits Rectangle {
     }
 }
 
+// A path on one line that keeps its end: one too long for its place loses
+// its start, shown as "…", so the folder's own name stays in sight. It is
+// set in the monospace font, so the cut falls between two characters.
+export component PathText {
+    in property <string> text;
+    in property <color> color: Theme.text;
+    in property <length> font-size: Type.small;
+    // The width of one character, from ten of them for the fractions.
+    property <length> char: probe.preferred-width / 10;
+    property <bool> long: full.preferred-width > root.width;
+    property <int> cut: root.long ? Math.ceil((full.preferred-width + dots.preferred-width - root.width) / root.char) : 0;
+    min-width: 0;
+    preferred-width: full.preferred-width;
+    height: full.preferred-height;
+    accessible-role: AccessibleRole.text;
+    accessible-label: root.text;
+    probe := Text {
+        visible: false;
+        text: "0000000000";
+        font-size: root.font-size;
+        font-family: Type.mono;
+    }
+    dots := Text {
+        x: 0;
+        visible: root.long;
+        text: "…";
+        color: Theme.text-faint;
+        font-size: root.font-size;
+        font-family: Type.mono;
+    }
+    Rectangle {
+        x: root.long ? dots.preferred-width : 0;
+        width: root.width - self.x;
+        clip: true;
+        full := Text {
+            x: -root.cut * root.char;
+            width: self.preferred-width;
+            text: root.text;
+            color: root.color;
+            font-size: root.font-size;
+            font-family: Type.mono;
+            accessible-role: none;
+        }
+    }
+}
+
 export component Divider inherits Rectangle {
     height: 1px;
     background: Theme.border;
@@ -825,7 +895,6 @@ export component Dialog inherits Rectangle {
             HorizontalLayout {
                 spacing: Space.md;
                 VerticalLayout {
-                    spacing: 6px;
                     horizontal-stretch: 1;
                     Text {
                         text: root.title;
@@ -836,6 +905,7 @@ export component Dialog inherits Rectangle {
                     }
                     Reveal {
                         shown: root.subtitle != "";
+                        gap: 6px;
                         Text {
                             text: root.subtitle;
                             color: Theme.text-muted;
@@ -961,9 +1031,12 @@ export component StatTile inherits Rectangle {
     // The same start for every tile, so a row of them shares the width.
     horizontal-stretch: 1;
     preferred-width: 160px;
+    // A row of tiles is as high as its tallest; the others keep their lines
+    // at the top, so the labels and values line up across the row.
     VerticalLayout {
         padding: Space.lg + 2px;
         spacing: Space.sm;
+        alignment: start;
         HorizontalLayout {
             spacing: Space.sm;
             VerticalLayout {
@@ -979,14 +1052,18 @@ export component StatTile inherits Rectangle {
                 font-size: Type.small;
                 font-weight: Type.medium;
                 vertical-alignment: center;
+                overflow: elide;
+                min-width: 0;
             }
         }
+        // Long words elide, so a row of tiles keeps one width.
         Text {
             text: root.value;
             color: Theme.text;
             font-size: 20px;
             font-weight: Type.semibold;
             overflow: elide;
+            min-width: 0;
         }
         Text {
             text: root.detail;
@@ -1079,18 +1156,21 @@ export component CheckBox {
             }
         }
         VerticalLayout {
-            spacing: 2px;
             Text {
                 text: root.text;
                 color: Theme.text;
                 font-size: Type.body;
                 wrap: word-wrap;
             }
-            if root.detail != "": Text {
-                text: root.detail;
-                color: Theme.text-muted;
-                font-size: Type.caption;
-                wrap: word-wrap;
+            Reveal {
+                shown: root.detail != "";
+                gap: 2px;
+                Text {
+                    text: root.detail;
+                    color: Theme.text-muted;
+                    font-size: Type.caption;
+                    wrap: word-wrap;
+                }
             }
         }
     }
@@ -1203,11 +1283,16 @@ export component OptionTile inherits Rectangle {
     }
     opacity: root.enabled ? 1 : 0.5;
     animate background { duration: 110ms; }
+    // Tiles in a row share the tallest one's height; each starts at its top,
+    // so their titles line up.
     VerticalLayout {
         padding: Space.lg;
         spacing: Space.sm;
+        alignment: start;
         HorizontalLayout {
             spacing: Space.sm;
+            // As high as the badge, with or without one.
+            min-height: 22px;
             VerticalLayout {
                 alignment: center;
                 Icon {
@@ -1311,16 +1396,22 @@ export component Steps {
 }
 
 // A row of a list inside a card: its content, and a line above all but the
-// first.
-export component ListRow inherits VerticalLayout {
+// first. A row of a `for`, so it takes its height as Fit does.
+export component ListRow inherits Rectangle {
     in property <bool> first;
-    if !root.first: Divider { }
-    HorizontalLayout {
-        padding-left: Space.xl;
-        padding-right: Space.lg;
-        padding-top: 10px;
-        padding-bottom: 10px;
-        spacing: Space.md;
-        @children
+    height: self.preferred-height;
+    VerticalLayout {
+        Divider {
+            visible: !root.first;
+            height: root.first ? 0 : 1px;
+        }
+        HorizontalLayout {
+            padding-left: Space.xl;
+            padding-right: Space.lg;
+            padding-top: 10px;
+            padding-bottom: 10px;
+            spacing: Space.md;
+            @children
+        }
     }
 }

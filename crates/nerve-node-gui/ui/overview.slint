@@ -6,7 +6,7 @@ import { Page, Load } from "data.slint";
 import { Store } from "store.slint";
 import {
     Button, ButtonKind, Card, Pill, StatusDot, IconTile, Banner, Loading, PageHeader,
-    PageFrame, SectionTitle, StatTile, Divider, Icon, Reveal,
+    PageFrame, SectionTitle, StatTile, Divider, Icon, Reveal, Fit,
 } from "widgets.slint";
 
 export component OverviewPage inherits PageFrame {
@@ -50,7 +50,6 @@ export component OverviewPage inherits PageFrame {
                     }
                 }
                 VerticalLayout {
-                    spacing: 6px;
                     horizontal-stretch: 1;
                     alignment: center;
                     Text {
@@ -60,29 +59,36 @@ export component OverviewPage inherits PageFrame {
                         font-weight: Type.semibold;
                         wrap: word-wrap;
                     }
-                    Text {
-                        text: Store.status.detail;
-                        color: Theme.text-muted;
-                        font-size: Type.body;
-                        wrap: word-wrap;
-                    }
-                    if Store.status.confinement != "": HorizontalLayout {
-                        spacing: 6px;
-                        padding-top: 4px;
-                        VerticalLayout {
-                            alignment: center;
-                            Icon {
-                                source: @image-url("icons/shield.svg");
-                                colorize: Theme.text-faint;
-                                size: 14px;
-                            }
-                        }
+                    Reveal {
+                        shown: Store.status.detail != "";
+                        gap: 6px;
                         Text {
-                            text: "Confinement: " + Store.status.confinement;
-                            color: Theme.text-faint;
-                            font-size: Type.caption;
-                            vertical-alignment: center;
+                            text: Store.status.detail;
+                            color: Theme.text-muted;
+                            font-size: Type.body;
                             wrap: word-wrap;
+                        }
+                    }
+                    Reveal {
+                        shown: Store.status.confinement != "";
+                        gap: 10px;
+                        HorizontalLayout {
+                            spacing: 6px;
+                            VerticalLayout {
+                                alignment: center;
+                                Icon {
+                                    source: @image-url("icons/shield.svg");
+                                    colorize: Theme.text-faint;
+                                    size: 14px;
+                                }
+                            }
+                            Text {
+                                text: "Confinement: " + Store.status.confinement;
+                                color: Theme.text-faint;
+                                font-size: Type.caption;
+                                vertical-alignment: center;
+                                wrap: word-wrap;
+                            }
                         }
                     }
                 }
@@ -178,7 +184,6 @@ export component OverviewPage inherits PageFrame {
         shown: Store.status.state != "";
         gap: Space.xxl;
         VerticalLayout {
-            spacing: Space.md;
             SectionTitle {
                 text: "Centers";
                 Button {
@@ -190,85 +195,96 @@ export component OverviewPage inherits PageFrame {
                     }
                 }
             }
-            if Store.centers.length == 0: Card {
-                HorizontalLayout {
-                    spacing: Space.lg;
-                    Text {
-                        horizontal-stretch: 1;
-                        text: "No center is paired yet. Pair one to let its agents use this machine, with only what you allow.";
-                        color: Theme.text-muted;
-                        font-size: Type.body;
-                        wrap: word-wrap;
-                        vertical-alignment: center;
-                    }
-                    Button {
-                        text: "Set up…";
-                        kind: ButtonKind.ghost;
-                        clicked => {
-                            Store.setup-start();
+            Reveal {
+                shown: Store.centers.length == 0;
+                gap: Space.md;
+                Card {
+                    HorizontalLayout {
+                        spacing: Space.lg;
+                        Text {
+                            horizontal-stretch: 1;
+                            text: "No center is paired yet. Pair one to let its agents use this machine, with only what you allow.";
+                            color: Theme.text-muted;
+                            font-size: Type.body;
+                            wrap: word-wrap;
+                            vertical-alignment: center;
                         }
-                    }
-                    Button {
-                        text: "Pair a center";
-                        icon: @image-url("icons/plus.svg");
-                        kind: ButtonKind.primary;
-                        clicked => {
-                            Store.pair-start();
+                        Button {
+                            text: "Set up…";
+                            kind: ButtonKind.ghost;
+                            clicked => {
+                                Store.setup-start();
+                            }
+                        }
+                        Button {
+                            text: "Pair a center";
+                            icon: @image-url("icons/plus.svg");
+                            kind: ButtonKind.primary;
+                            clicked => {
+                                Store.pair-start();
+                            }
                         }
                     }
                 }
             }
-            if Store.centers.length > 0: Card {
-                pad: 0;
-                gap: 0;
-                for c[i] in Store.centers: VerticalLayout {
-                    if i > 0: Divider { }
-                    HorizontalLayout {
-                        padding-left: Space.xl;
-                        padding-right: Space.xl;
-                        padding-top: 14px;
-                        padding-bottom: 14px;
-                        spacing: Space.md;
-                        VerticalLayout {
-                            alignment: center;
-                            StatusDot {
-                                tone: c.link-tone;
-                            }
+            Reveal {
+                shown: Store.centers.length > 0;
+                gap: Space.md;
+                Card {
+                    pad: 0;
+                    gap: 0;
+                    for c[i] in Store.centers: Fit {
+                        Divider {
+                            visible: i > 0;
+                            height: i > 0 ? 1px : 0;
                         }
-                        VerticalLayout {
-                            spacing: 2px;
-                            horizontal-stretch: 1;
+                        HorizontalLayout {
+                            padding-left: Space.xl;
+                            padding-right: Space.xl;
+                            padding-top: 14px;
+                            padding-bottom: 14px;
+                            spacing: Space.md;
+                            VerticalLayout {
+                                alignment: center;
+                                StatusDot {
+                                    tone: c.link-tone;
+                                }
+                            }
+                            VerticalLayout {
+                                spacing: 2px;
+                                horizontal-stretch: 1;
+                                Text {
+                                    text: c.name;
+                                    color: Theme.text;
+                                    font-size: Type.body;
+                                    font-weight: Type.semibold;
+                                    overflow: elide;
+                                }
+                                Text {
+                                    text: c.url;
+                                    color: Theme.text-faint;
+                                    font-size: Type.caption;
+                                    font-family: Type.mono;
+                                    overflow: elide;
+                                }
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                Pill {
+                                    text: c.mode;
+                                    tone: Tone.accent;
+                                }
+                            }
                             Text {
-                                text: c.name;
-                                color: Theme.text;
-                                font-size: Type.body;
-                                font-weight: Type.semibold;
+                                min-width: 120px;
+                                text: c.link;
+                                color: Theme.tone(c.link-tone);
+                                font-size: Type.small;
+                                font-weight: Type.medium;
+                                vertical-alignment: center;
+                                horizontal-alignment: right;
                                 overflow: elide;
                             }
-                            Text {
-                                text: c.url;
-                                color: Theme.text-faint;
-                                font-size: Type.caption;
-                                font-family: Type.mono;
-                                overflow: elide;
-                            }
-                        }
-                        VerticalLayout {
-                            alignment: center;
-                            Pill {
-                                text: c.mode;
-                                tone: Tone.accent;
-                            }
-                        }
-                        Text {
-                            min-width: 120px;
-                            text: c.link;
-                            color: Theme.tone(c.link-tone);
-                            font-size: Type.small;
-                            font-weight: Type.medium;
-                            vertical-alignment: center;
-                            horizontal-alignment: right;
-                            overflow: elide;
                         }
                     }
                 }

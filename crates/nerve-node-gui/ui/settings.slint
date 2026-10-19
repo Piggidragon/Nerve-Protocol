@@ -57,13 +57,14 @@ export component SettingsPage inherits PageFrame {
         icon: @image-url("icons/edit.svg");
         title: "This machine";
         text: "The name centers see, and where the node keeps its keys.";
-        HorizontalLayout {
-            spacing: Space.md;
-            Field {
-                horizontal-stretch: 1;
-                label: "Name";
-                hint: "Centers show this machine by it. Empty: the host name, " + Prefs.name-shown + ".";
+        Field {
+            label: "Name";
+            hint: "Centers show this machine by it. Empty: the host name, " + Prefs.name-shown + ".";
+            // The button sits on the field's line, as tall as the field.
+            HorizontalLayout {
+                spacing: Space.md;
                 TextField {
+                    horizontal-stretch: 1;
                     text <=> Prefs.name;
                     placeholder: Prefs.name-shown;
                     label: "Name";
@@ -71,10 +72,6 @@ export component SettingsPage inherits PageFrame {
                         Prefs.name-save(Prefs.name);
                     }
                 }
-            }
-            VerticalLayout {
-                alignment: start;
-                padding-top: 22px;
                 Button {
                     text: "Save";
                     clicked => {
@@ -214,21 +211,17 @@ export component SettingsPage inherits PageFrame {
         VerticalLayout {
             Reveal {
                 shown: Prefs.relay-listen == "";
-                HorizontalLayout {
-                    spacing: Space.md;
-                    Field {
-                        horizontal-stretch: 1;
-                        label: "Listen on";
-                        hint: "An address and port of this machine the other nodes reach.";
+                Field {
+                    label: "Listen on";
+                    hint: "An address and port of this machine the other nodes reach.";
+                    HorizontalLayout {
+                        spacing: Space.md;
                         TextField {
+                            horizontal-stretch: 1;
                             text <=> Prefs.relay-address;
                             mono: true;
                             label: "Listen on";
                         }
-                    }
-                    VerticalLayout {
-                        alignment: start;
-                        padding-top: 22px;
                         Button {
                             text: "Turn on";
                             clicked => {

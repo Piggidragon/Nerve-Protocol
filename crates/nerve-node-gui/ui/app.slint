@@ -7,7 +7,7 @@ import {
     HelpSection, HelpCard, HelpVerb, HelpArg, RelayNodeRow,
 } from "data.slint";
 import { Store, Perm, Logs, Manual, Prefs } from "store.slint";
-import { NavItem, StatusDot, Toast, Banner } from "widgets.slint";
+import { NavItem, StatusDot, Toast, Banner, Reveal } from "widgets.slint";
 import { OverviewPage } from "overview.slint";
 import { CentersPage } from "centers.slint";
 import { AuditPage } from "audit.slint";
@@ -157,13 +157,16 @@ component Sidebar inherits Rectangle {
                         text: Store.status-load == Load.failed ? "No answer"
                             : Store.status.state == "running" ? "Running"
                             : Store.status.state == "locked" ? "Locked"
-                            : Store.status.state == "stopped" ? "Not running" : "Asking…";
+                            : Store.status.state == "stopped" ? "Not running" : "Asking the node…";
                         color: Theme.text;
                         font-size: Type.small;
                         font-weight: Type.semibold;
                     }
                     Text {
-                        text: Store.status.state == "" ? "the node"
+                        // What the node said last is stale once it does
+                        // not answer.
+                        text: Store.status-load == Load.failed ? "Its state is unknown"
+                            : Store.status.state == "" ? "One moment"
                             : Store.status.centers == 0 ? "No center paired"
                             : Store.status.state != "running" ? "No link to its centers"
                             : Store.status.connected + " of " + Store.status.centers + " centers connected";
@@ -202,19 +205,22 @@ export component AppWindow inherits Window {
             horizontal-stretch: 1;
             // On an installed node every page needs the rights the app asks
             // for; until it has them, this says why and how.
-            if Store.elevate-needed: Rectangle {
-                background: Theme.window;
-                VerticalLayout {
-                    padding-left: Space.page;
-                    padding-right: Space.page;
-                    padding-top: Space.lg;
-                    Banner {
-                        tone: Tone.accent;
-                        title: "The node is installed as a service";
-                        text: "Its settings belong to the system. Give the app administrator rights to see and change them.";
-                        action: "Continue…";
-                        acted => {
-                            Store.elevate-open = true;
+            Reveal {
+                shown: Store.elevate-needed;
+                Rectangle {
+                    background: Theme.window;
+                    VerticalLayout {
+                        padding-left: Space.page;
+                        padding-right: Space.page;
+                        padding-top: Space.lg;
+                        Banner {
+                            tone: Tone.accent;
+                            title: "The node is installed as a service";
+                            text: "Its settings belong to the system. Give the app administrator rights to see and change them.";
+                            action: "Continue…";
+                            acted => {
+                                Store.elevate-open = true;
+                            }
                         }
                     }
                 }

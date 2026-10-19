@@ -193,15 +193,10 @@ export component PairDialog inherits Dialog {
 
 export component ConfirmDialog inherits Dialog {
     title: Store.confirm-title;
+    subtitle: Store.confirm-text;
     card-width: 460px;
     close => {
         Store.confirm-open = false;
-    }
-    Text {
-        text: Store.confirm-text;
-        color: Theme.text-muted;
-        font-size: Type.body;
-        wrap: word-wrap;
     }
     DialogButtons {
         Button {

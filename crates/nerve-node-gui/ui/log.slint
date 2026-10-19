@@ -6,11 +6,11 @@ import { Load, LogRow } from "data.slint";
 import { Logs } from "store.slint";
 import {
     Button, ButtonKind, Card, Pill, Banner, Loading, PageHeader, PageFrame, EmptyState, Segmented,
-    ListRow, StatusDot,
-    Reveal,
+    ListRow, StatusDot, Reveal,
 } from "widgets.slint";
 
 export component LogPage inherits PageFrame {
+    gap: 0;
     PageHeader {
         title: "Log";
         subtitle: "What the node did: its starts and stops, its links, and what went wrong. New lines come in as they are written.";
@@ -29,18 +29,23 @@ export component LogPage inherits PageFrame {
         text: "Reading the log…";
     }
 
-    if Logs.load == Load.ready && Logs.rows.length == 0: Card {
-        EmptyState {
-            icon: @image-url("icons/log.svg");
-            title: Logs.problems-only ? "No problems" : "Nothing logged yet";
-            text: Logs.problems-only
-                ? "No error or warning in the log. Everything else is under All."
-                : "The node writes its log while it runs. Start it, and its lines show here.";
+    Reveal {
+        shown: Logs.load == Load.ready && Logs.rows.length == 0;
+        gap: Space.xxl;
+        Card {
+            EmptyState {
+                icon: @image-url("icons/log.svg");
+                title: Logs.problems-only ? "No problems" : "Nothing logged yet";
+                text: Logs.problems-only
+                    ? "No error or warning in the log. Everything else is under All."
+                    : "The node writes its log while it runs. Start it, and its lines show here.";
+            }
         }
     }
 
     Reveal {
         shown: Logs.rows.length > 0;
+        gap: Space.xxl;
         Card {
             pad: 0;
             gap: 0;
@@ -86,10 +91,15 @@ export component LogPage inherits PageFrame {
         }
     }
 
-    if Logs.rows.length >= 300: Text {
-        text: "The newest " + Logs.rows.length + " lines. `nerve-node log` shows them all.";
-        color: Theme.text-faint;
-        font-size: Type.caption;
-        horizontal-alignment: center;
+    Reveal {
+        shown: Logs.rows.length >= 300;
+        gap: Space.lg;
+        Text {
+            text: "The newest " + Logs.rows.length + " lines. `nerve-node log` shows them all.";
+            color: Theme.text-faint;
+            font-size: Type.caption;
+            horizontal-alignment: center;
+            wrap: word-wrap;
+        }
     }
 }

@@ -6,7 +6,7 @@ import { Load, CenterRow } from "data.slint";
 import { Store } from "store.slint";
 import {
     Button, ButtonKind, Card, Pill, IconTile, Banner, Loading, PageHeader, PageFrame,
-    EmptyState, Divider, Switch, Reveal,
+    EmptyState, Divider, Switch, Reveal, Fit,
 } from "widgets.slint";
 
 component CenterCard inherits Card {
@@ -38,7 +38,9 @@ component CenterCard inherits Card {
                     font-weight: Type.semibold;
                     vertical-alignment: center;
                     overflow: elide;
-                    min-width: 40px;
+                    // A short name keeps its own width, so the pill sits
+                    // right after it.
+                    min-width: min(40px, self.preferred-width);
                 }
                 VerticalLayout {
                     alignment: center;
@@ -193,6 +195,7 @@ component CenterCard inherits Card {
 }
 
 export component CentersPage inherits PageFrame {
+    gap: 0;
     PageHeader {
         title: "Centers";
         subtitle: "The centers this machine is paired with. A center's agents may do only what you allow it.";
@@ -222,23 +225,36 @@ export component CentersPage inherits PageFrame {
 
     if Store.status-load == Load.loading && Store.status.state == "": Loading { }
 
-    if Store.status.state != "" && Store.centers.length == 0: Card {
-        EmptyState {
-            icon: @image-url("icons/link.svg");
-            title: "No center is paired yet";
-            text: "In the center's web UI, press Pair a machine and copy the link it shows. Paste it here: you see where it leads before anything is paired.";
-            Button {
-                text: "Pair a center";
-                icon: @image-url("icons/plus.svg");
-                kind: ButtonKind.primary;
-                clicked => {
-                    Store.pair-start();
+    Reveal {
+        shown: Store.status.state != "" && Store.centers.length == 0;
+        gap: Space.xxl;
+        Card {
+            EmptyState {
+                icon: @image-url("icons/link.svg");
+                title: "No center is paired yet";
+                text: "In the center's web UI, press Pair a machine and copy the link it shows. Paste it here: you see where it leads before anything is paired.";
+                Button {
+                    text: "Pair a center";
+                    icon: @image-url("icons/plus.svg");
+                    kind: ButtonKind.primary;
+                    clicked => {
+                        Store.pair-start();
+                    }
                 }
             }
         }
     }
 
-    for c in Store.centers: CenterCard {
-        item: c;
+    Reveal {
+        shown: Store.centers.length > 0;
+        gap: Space.xxl;
+        VerticalLayout {
+            spacing: Space.xxl;
+            for c in Store.centers: Fit {
+                CenterCard {
+                    item: c;
+                }
+            }
+        }
     }
 }

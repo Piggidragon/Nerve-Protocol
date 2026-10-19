@@ -363,6 +363,7 @@ fn every_page_light_and_dark() {
     store.invoke_show(Page::Audit);
     until(&ctl, || store.get_audit().row_count() >= 7);
     shots.take("audit");
+    shots.take_full("audit", 2300);
     let rows = store.get_audit();
     let build = (0..rows.row_count())
         .find(|i| rows.row_data(*i).unwrap().target == "npm run build")

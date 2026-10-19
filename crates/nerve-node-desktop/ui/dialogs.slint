@@ -750,7 +750,7 @@ export component UninstallDialog inherits Dialog {
         : "Uninstall Nerve?";
     subtitle: Install.step == "done" ? (Install.purge ? "The node, the app and the node's data are gone from this machine." : "The node and the app are gone. The node's data stays; install Nerve again, and the node takes it up.")
         : Install.step == "working" ? ""
-        : "The service, its user nerve, the program and its menu entry go, and this window closes. Choose what happens to the node's data.";
+        : "The service, its user nerve, the program, its menu entry and its link handler go. Choose what happens to the node's data.";
     card-width: 600px;
     close => {
         if (Install.step == "done") {

@@ -124,11 +124,9 @@ Through a [relay](relay.md), `status` names what the relay answered:
 | `the proxy refused the tunnel to …: 502 …` | The relay cannot reach the center, or the relay's own proxy or relay refused it (in a chain, the outer relay's limits for the inner one) | Check the relay's own link and its log; in a chain, give the inner relay limits of its own on the outer relay with `relay set-limits` ([relay](relay.md#limits)) |
 
 If `status` says `daemon: not running`, start `nerve-node run`. On Windows
-`status` does not ask the node yet: it says `daemon: not known (no control
-socket on Windows); a change takes effect at the next start of the node`
-whether the node runs or not, so look at the service (`Get-Service nerve-node`)
-or the [log](logs.md) instead. (Folder changes do reach a running node at once,
-over the [control pipe](platforms.md#the-control-pipe).) On a node
+`status` asks the node over its [control pipe](platforms.md#the-control-pipe).
+There a running node takes only folder changes at once; the others count from
+its next start. On a node
 [installed as a service](service.md), start the service instead:
 `sudo systemctl start nerve-node`, on Windows `Start-Service nerve-node`. A
 node started there by hand lacks the privileges the service has, so it

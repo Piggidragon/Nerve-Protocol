@@ -45,7 +45,11 @@ pub(super) async fn command(
 ) -> Result<(), String> {
     let v = match cmd {
         Cmd::Status => status(paths).await?,
-        Cmd::Audit { follow, denied } => return audit(paths, follow, denied, true, out).await,
+        Cmd::Audit {
+            follow,
+            denied,
+            last,
+        } => return audit(paths, follow, denied, last, true, out).await,
         Cmd::Center(CenterCmd::Ls) => centers(paths).await?,
         Cmd::Center(CenterCmd::Add { link, name, yes }) => {
             pair(paths, &link, name.as_deref(), yes).await?
@@ -114,25 +118,6 @@ pub(super) async fn command(
         _ => return Err("this command has no JSON form of its own".into()),
     };
     print(out, v)
-}
-
-/// The running node's status: over the control socket, on Windows over its
-/// pipe; `None` when no node runs.
-async fn live_status(paths: &NodePaths) -> Result<Option<Value>, String> {
-    #[cfg(unix)]
-    let r = nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await;
-    #[cfg(windows)]
-    let r = crate::pipe::call(paths, "status", json!({})).await;
-    #[cfg(not(any(unix, windows)))]
-    let r: Result<Value, String> = {
-        let _ = paths;
-        Err(nerve_transport::ctl::NOT_RUNNING.to_string())
-    };
-    match r {
-        Ok(v) => Ok(Some(v)),
-        Err(e) if e == nerve_transport::ctl::NOT_RUNNING => Ok(None),
-        Err(e) => Err(e),
-    }
 }
 
 /// `status`: what the running node says of itself, with `"daemon":

@@ -6,6 +6,9 @@ Run them as a normal user on the machine, or with `sudo` when the node is
 `nerve-node <command> --help` list the same. The center's web UI has a Help
 page with them too.
 
+On Windows, `nerve-node-gui.exe` is the desktop app. It runs these commands
+itself, but a terminal does not wait for it: in a terminal use `nerve-node.exe`.
+
 Every command takes `--config-dir` and `--state-dir`
 ([where files live](install.md#where-files-live)). A command that works on
 one center takes `--center <name>`. You need it only when more than one
@@ -50,7 +53,7 @@ center is paired.
 |---|---|---|
 | `run` | Run the node in the foreground | [pairing](pairing.md) |
 | `status` | Show whether it runs, the links, the confinement and the [limits per command](limits.md) | [troubleshooting](troubleshooting.md) |
-| `audit [--denied] [--follow]` | Show what was allowed and refused | [audit](audit.md) |
+| `audit [--denied] [--last N] [--follow]` | Show what was allowed and refused | [audit](audit.md) |
 | `panic`, `unlock` | Stop everything, then allow it again | [stop](stop.md#panic) |
 
 ## Install and set up

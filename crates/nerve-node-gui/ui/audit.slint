@@ -189,8 +189,8 @@ export component AuditPage inherits PageFrame {
         }
     }
 
-    if Store.audit.length > 0 && Store.audit-total > Store.audit.length: Text {
-        text: "Showing the latest " + Store.audit.length + " of " + Store.audit-total + ". `nerve-node audit` shows them all.";
+    if Store.audit.length >= 200: Text {
+        text: "The newest " + Store.audit.length + " entries. `nerve-node audit` shows them all.";
         color: Theme.text-faint;
         font-size: Type.caption;
         horizontal-alignment: center;

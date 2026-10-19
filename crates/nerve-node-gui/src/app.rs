@@ -12,6 +12,9 @@ use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use crate::runner::Runner;
 use crate::{AppWindow, Load, Page, PairPreview, Store, Tone, Type, view};
 
+/// How many audit entries the app asks for: the newest the page shows.
+const LAST: &str = "200";
+
 /// Where the commands run: on threads of their own, answering on the
 /// window's event loop; or at once, for tests and the screenshots, which
 /// have no event loop.
@@ -242,9 +245,9 @@ impl Ctl {
             move |r| {
                 let status = r.run(&["status"]);
                 let args: &[&str] = if refused {
-                    &["audit", "--denied"]
+                    &["audit", "--denied", "--last", LAST]
                 } else {
-                    &["audit"]
+                    &["audit", "--last", LAST]
                 };
                 (status, r.run(args))
             },

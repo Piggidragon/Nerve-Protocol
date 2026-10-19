@@ -92,6 +92,9 @@ pub enum Cmd {
         /// Show only the calls that were refused.
         #[arg(long)]
         denied: bool,
+        /// Show only the newest N entries (with --follow, then the new ones).
+        #[arg(long, value_name = "N")]
+        last: Option<usize>,
     },
     /// Stop everything at once; nothing runs until `unlock`.
     Panic,
@@ -1356,14 +1359,22 @@ fn limits_lines(v: &Value) -> Vec<String> {
     lines
 }
 
-/// What `status` says when no daemon answered. With a control socket
-/// (Unix) that means none runs; without one a running node cannot be told
-/// apart from a stopped one.
-fn no_daemon_status(socket: bool) -> String {
-    if socket {
-        "daemon: not running".into()
-    } else {
-        format!("daemon: not known (no control socket on Windows); a change {NEXT_START}")
+/// The running node's status: over the control socket, on Windows over its
+/// pipe; `None` when no node runs.
+async fn live_status(paths: &NodePaths) -> Result<Option<Value>, String> {
+    #[cfg(unix)]
+    let r = nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await;
+    #[cfg(windows)]
+    let r = crate::pipe::call(paths, "status", json!({})).await;
+    #[cfg(not(any(unix, windows)))]
+    let r: Result<Value, String> = {
+        let _ = paths;
+        Err(nerve_transport::ctl::NOT_RUNNING.to_string())
+    };
+    match r {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if e == nerve_transport::ctl::NOT_RUNNING => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
@@ -1532,76 +1543,72 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             Ok(())
         }
         Cmd::Status => {
-            #[cfg(unix)]
-            match nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await {
-                Ok(v) => {
+            // On Windows the node answers over its control pipe.
+            if let Some(v) = live_status(&paths).await? {
+                w(
+                    out,
+                    format!(
+                        "daemon: running (confinement {})",
+                        v["confinement"].as_str().unwrap_or("?")
+                    ),
+                );
+                if let Some(why) = v["folder_commands_off"].as_str() {
+                    w(out, format!("folder mode runs no command: {why}"));
+                }
+                for line in limits_lines(&v["command_limits"]) {
+                    w(out, line);
+                }
+                if v["locked"] == true {
+                    w(
+                        out,
+                        "LOCKED (panic): nothing runs until `nerve-node unlock`".into(),
+                    );
+                }
+                for c in v["centers"].as_array().into_iter().flatten() {
                     w(
                         out,
                         format!(
-                            "daemon: running (confinement {})",
-                            v["confinement"].as_str().unwrap_or("?")
+                            "{}  {}  mode {}",
+                            c["name"].as_str().unwrap_or_default(),
+                            c["status"].as_str().unwrap_or_default(),
+                            c["mode"].as_str().unwrap_or_default(),
                         ),
                     );
-                    if let Some(why) = v["folder_commands_off"].as_str() {
-                        w(out, format!("folder mode runs no command: {why}"));
-                    }
-                    for line in limits_lines(&v["command_limits"]) {
-                        w(out, line);
-                    }
-                    if v["locked"] == true {
-                        w(
-                            out,
-                            "LOCKED (panic): nothing runs until `nerve-node unlock`".into(),
-                        );
-                    }
-                    for c in v["centers"].as_array().into_iter().flatten() {
-                        w(
-                            out,
-                            format!(
-                                "{}  {}  mode {}",
-                                c["name"].as_str().unwrap_or_default(),
-                                c["status"].as_str().unwrap_or_default(),
-                                c["mode"].as_str().unwrap_or_default(),
-                            ),
-                        );
-                    }
-                    for p in v["providers"].as_array().into_iter().flatten() {
-                        let caps: Vec<&str> = p["capabilities"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .filter_map(Value::as_str)
-                            .collect();
-                        w(
-                            out,
-                            format!(
-                                "provider {} attached: {}",
-                                p["name"].as_str().unwrap_or_default(),
-                                caps.join(", ")
-                            ),
-                        );
-                    }
-                    let relay = &v["relay"];
-                    if relay["listen"].is_string() {
-                        let tunnels = relay["tunnels"].as_array().map_or(0, Vec::len);
-                        w(
-                            out,
-                            format!(
-                                "relay: {}, {tunnels} tunnels open (`nerve-node relay ls` names them)",
-                                relay["status"].as_str().unwrap_or_default()
-                            ),
-                        );
-                    }
-                    return Ok(());
                 }
-                Err(e) if e != nerve_transport::ctl::NOT_RUNNING => return Err(e),
-                Err(_) => {}
+                for p in v["providers"].as_array().into_iter().flatten() {
+                    let caps: Vec<&str> = p["capabilities"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                        .collect();
+                    w(
+                        out,
+                        format!(
+                            "provider {} attached: {}",
+                            p["name"].as_str().unwrap_or_default(),
+                            caps.join(", ")
+                        ),
+                    );
+                }
+                let relay = &v["relay"];
+                if relay["listen"].is_string() {
+                    let tunnels = relay["tunnels"].as_array().map_or(0, Vec::len);
+                    w(
+                        out,
+                        format!(
+                            "relay: {}, {tunnels} tunnels open (`nerve-node relay ls` names them)",
+                            relay["status"].as_str().unwrap_or_default()
+                        ),
+                    );
+                }
+                return Ok(());
             }
             let cfg = SettingsStore::peek_with(
                 &paths.config_file(),
                 &crate::secrets::NodeSecrets::for_cli(&paths),
             )?;
-            w(out, no_daemon_status(cfg!(unix)));
+            w(out, "daemon: not running".into());
             let limits =
                 crate::cgroup::status(&cfg.limits.command, &Err("the node does not run".into()));
             if let Some(line) = limits_lines(&limits).first() {
@@ -1725,7 +1732,11 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             w(out, "unlocked".into());
             Ok(())
         }
-        Cmd::Audit { follow, denied } => audit(&paths, follow, denied, false, out).await,
+        Cmd::Audit {
+            follow,
+            denied,
+            last,
+        } => audit(&paths, follow, denied, last, false, out).await,
         Cmd::Proxy(c) => proxy_cmd(&paths, c, out).await,
         Cmd::Relay(c) => relay_cmd(&paths, c, out).await,
         Cmd::Sudo(c) => sudo_cmd(&paths, c, out).await,
@@ -2705,12 +2716,16 @@ async fn audit(
     paths: &NodePaths,
     follow: bool,
     denied: bool,
+    last: Option<usize>,
     json: bool,
     out: &mut dyn Write,
 ) -> Result<(), String> {
     let log = AuditLog::new(paths.audit_log());
     let mut entries = Vec::new();
     let mut shown = Shown::default();
+    // --last cuts what is there at the start; with --follow every new
+    // entry comes after it.
+    let mut first = true;
     let mut stamp = None;
     loop {
         // Both files as they are now; the same as at the last look is
@@ -2728,15 +2743,20 @@ async fn audit(
         let lines = log
             .lines()
             .map_err(|e| format!("{}: {e}", log.path().display()))?;
-        for line in &lines[shown.next(&lines)..] {
-            let Ok(v) = serde_json::from_str::<Value>(line) else {
-                continue;
-            };
-            let refused = v["decision"].as_str() == Some("forbidden")
-                || v["event"].as_str() == Some("refused");
-            if denied && !refused {
-                continue;
-            }
+        let mut new: Vec<Value> = lines[shown.next(&lines)..]
+            .iter()
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .filter(|v| {
+                !denied
+                    || v["decision"].as_str() == Some("forbidden")
+                    || v["event"].as_str() == Some("refused")
+            })
+            .collect();
+        if first && let Some(n) = last {
+            new.drain(..new.len().saturating_sub(n));
+        }
+        first = false;
+        for v in new {
             match (json, follow) {
                 (false, _) => {
                     let _ = writeln!(out, "{}", audit_line(&v));
@@ -6760,7 +6780,7 @@ mod tests {
         append(decided(1, "fs", "read", "first", "allowed"));
         let seen = Seen::default();
         let mut out = seen.clone();
-        let follow = audit(&paths, true, false, false, &mut out);
+        let follow = audit(&paths, true, false, None, false, &mut out);
         let writer = async {
             seen.until("first").await;
             append(decided(2, "fs", "read", "before-the-rotation", "allowed"));
@@ -6936,6 +6956,23 @@ mod tests {
         );
         let v = json_of(&paths, &["audit", "--denied"]);
         assert_eq!(v["entries"].as_array().unwrap().len(), 1, "{v}");
+        // The newest only, after --denied picked.
+        let v = json_of(&paths, &["audit", "--last", "1"]);
+        assert_eq!(v["entries"][0]["target"], "ls", "{v}");
+        assert_eq!(v["entries"].as_array().unwrap().len(), 1, "{v}");
+        std::fs::write(
+            paths.audit_log(),
+            decided(1, "exec", "run", "a", "forbidden")
+                + &decided(2, "exec", "run", "b", "forbidden")
+                + &decided(3, "fs", "read", "/c", "allowed"),
+        )
+        .unwrap();
+        let v = json_of(&paths, &["audit", "--denied", "--last", "1"]);
+        assert_eq!(v["entries"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(v["entries"][0]["target"], "b", "{v}");
+        let out = run(&paths, &["audit", "--last", "2"]).unwrap();
+        assert_eq!(out.lines().count(), 2, "{out}");
+        assert!(out.contains("fs.read  /c"), "{out}");
     }
 
     /// `rule add --action` makes the rule an audit button makes for an entry

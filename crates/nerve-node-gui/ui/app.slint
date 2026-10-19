@@ -70,7 +70,7 @@ component Sidebar inherits Rectangle {
         }
         NavItem {
             icon: @image-url("icons/shield.svg");
-            text: "What a center may do";
+            text: "Permissions";
             selected: Store.page == Page.policy;
             clicked => {
                 Store.show(Page.policy);

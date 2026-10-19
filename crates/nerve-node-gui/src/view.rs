@@ -8,7 +8,7 @@ use slint::{ModelRc, SharedString, VecModel};
 
 use crate::{AuditRow, CenterRow, NodeStatus, Tone};
 
-/// The most audit entries the page shows.
+/// The most audit entries the page shows (crate::app asks for as many).
 pub const AUDIT_SHOWN: usize = 200;
 
 fn s(v: &Value) -> &str {

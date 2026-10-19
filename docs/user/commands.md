@@ -7,7 +7,10 @@ Run them as a normal user on the machine, or with `sudo` when the node is
 page with them too.
 
 On Windows, `nerve-node-desktop.exe` is the desktop app. It runs these commands
-itself, but a terminal does not wait for it: in a terminal use `nerve-node.exe`.
+itself, but a terminal does not wait for it: in a terminal use `nerve-node.exe`
+from the release. Where the app took over the installed node, the installed
+`nerve-node.exe` is a link to the app; see [the desktop app](desktop.md#in-a-terminal)
+for how a terminal waits for it.
 
 Every command takes `--config-dir` and `--state-dir`
 ([where files live](install.md#where-files-live)). A command that works on

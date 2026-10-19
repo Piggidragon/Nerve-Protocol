@@ -716,17 +716,20 @@ impl Ctl {
     }
 
     /// Another start of the app: this window comes to the front, and the
-    /// app opens the link it was given.
+    /// app opens the link it was given, or its uninstall.
     pub fn started_again(self: &Rc<Self>, asked: crate::instance::Asked) {
         if let Some(w) = self.window.upgrade() {
             let _ = w.show();
             w.window().set_minimized(false);
         }
         let installer = self.with_install(|i| i.get_shown()).unwrap_or(false);
-        if let Some(link) = asked.link
-            && !installer
-        {
+        if installer {
+            return;
+        }
+        if let Some(link) = asked.link {
             self.open_link(link);
+        } else if asked.uninstall {
+            self.ask_uninstall();
         }
     }
 
@@ -761,11 +764,12 @@ impl Ctl {
 }
 
 /// Opens the window and runs until it is closed. The installed program
-/// opens the app, with `link` when it was opened with a `nerve://` link;
-/// any other copy of it, such as the file just downloaded, the installer.
-pub fn run(link: Option<String>) -> Result<(), String> {
+/// opens the app, at what `start` asks (the pairing of a `nerve://` link,
+/// or the uninstall); any other copy of it, such as the file just
+/// downloaded, the installer.
+pub fn run(start: crate::instance::Asked) -> Result<(), String> {
     // A window of this user's is open already: it takes this start.
-    let instance = match crate::instance::claim(link.as_deref()) {
+    let instance = match crate::instance::claim(&start) {
         crate::instance::Claimed::Forwarded => return Ok(()),
         crate::instance::Claimed::First(i) => i,
     };
@@ -795,8 +799,9 @@ pub fn run(link: Option<String>) -> Result<(), String> {
         if nerve_node::service::check_access(&paths).is_err() {
             ctl.needs_rights(Launch::Elevated);
         }
-        match link {
+        match start.link {
             Some(link) => ctl.open_link(link),
+            None if start.uninstall => ctl.ask_uninstall(),
             None => ctl.offer_setup(),
         }
         ctl.watch();

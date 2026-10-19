@@ -62,11 +62,14 @@ mode. The downloaded file is no longer needed.
 | The program, which the service runs too | `/usr/local/bin/nerve-node-desktop` | `C:\Program Files\Nerve\nerve-node-desktop.exe` |
 | The menu entry | `/usr/local/share/applications/nerve-node-desktop.desktop`, its icon in `/usr/local/share/icons/hicolor` | `Nerve` in the Start menu of all users |
 | `nerve://` links | the entry's `x-scheme-handler/nerve`, the default in `/etc/xdg/mimeapps.list` | `HKEY_LOCAL_MACHINE\Software\Classes\nerve` |
+| Apps & features | | `Nerve`, in `HKEY_LOCAL_MACHINE\Software\Microsoft\Windows\CurrentVersion\Uninstall\Nerve` |
 | The node's files, the service | as `nerve-node install` puts them ([service](service.md#install)) | as on Windows ([service](service.md#windows)) |
 
 A node installed before with `nerve-node install` keeps its settings, pairings
 and keys: the installer adds the app, and the service runs the app's program
-from then on.
+from then on. The old program, `/usr/local/bin/nerve-node` (on Windows
+`C:\Program Files\Nerve\nerve-node.exe`), becomes a link to the app's, so the
+command `nerve-node` keeps working and there is one program to update.
 
 ## Administrator rights
 
@@ -101,15 +104,24 @@ opens the new version. Opening a newer downloaded file offers **Update** too.
 
 **Settings**, **Nerve on this machine**, **Uninstall…**. Choose whether the
 node's data (settings, pairings, keys, audit log) stays or goes. The service,
-its user, the program, the menu entry and the link handler go; the window
-closes. Opening the downloaded file again offers **Uninstall…** too. Kept
-data comes back with the next install ([uninstall](service.md#uninstall)).
+its user, the program, the menu entry, the link handler and the `nerve-node`
+link go, and the window says "Nerve is removed" until you close it. Opening
+the downloaded file again offers **Uninstall…** too, and on Windows so does
+**Uninstall** at Nerve in **Settings**, **Apps** (Apps & features): it opens
+the same in the app. Kept data comes back with the next install
+([uninstall](service.md#uninstall)).
 
 ## In a terminal
 
 On Linux, `nerve-node-desktop <command>` is `nerve-node <command>`, with
-`sudo` on the installed node. On Windows the app has no console, so a terminal
-does not wait for it: use `nerve-node.exe` there ([commands](commands.md)).
+`sudo` on the installed node; where the app took over a node installed with
+`nerve-node`, the command `nerve-node` runs the app's program, which says
+`nerve-node-desktop` for `--version`. On Windows the app has no console, so a
+terminal does not wait for it, also not for `nerve-node.exe` once it is a link
+to the app. Wait for it with `start /wait "" "C:\Program Files\Nerve\nerve-node.exe" status`
+in cmd, or `& "C:\Program Files\Nerve\nerve-node.exe" status | Out-Default` in
+PowerShell; the CLI edition `nerve-node.exe` from the release is a console
+program ([commands](commands.md)).
 
 ## The app's own settings
 

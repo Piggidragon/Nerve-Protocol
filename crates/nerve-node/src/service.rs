@@ -749,7 +749,8 @@ fn install_steps(
         write_file(&layout.bin, &program, 0o755)?;
         steps.did(format!("put the program at {}", layout.bin.display()));
     }
-    install_parts(layout, steps)?;
+    // The old program goes over at once: a running one keeps its file.
+    install_parts(layout, steps, &|_| Ok(()))?;
     // A node whose keys are in the system keyring does not start without
     // one that answers for its user; the installed program asks it.
     if in_keyring {
@@ -1207,7 +1208,7 @@ async fn update_steps(
         });
     }
     steps.did(format!("restarted the service {UNIT_NAME}"));
-    install_parts(layout, steps)
+    install_parts(layout, steps, &|_| Ok(()))
 }
 
 /// The release file of `program` for this machine. The desktop app comes
@@ -1225,23 +1226,104 @@ pub(crate) fn asset_name(program: &str) -> Result<String, String> {
 }
 
 /// Puts the parts of `layout`'s program beside it ([`crate::edition::Parts`]),
-/// once the program is in place.
-pub(crate) fn install_parts(layout: &Layout, steps: &mut Steps) -> Result<(), String> {
+/// once the program is in place, and makes the node alone that was installed
+/// before it a link to it ([`link_node`]).
+pub(crate) fn install_parts(
+    layout: &Layout,
+    steps: &mut Steps,
+    set_aside: &dyn Fn(&Path) -> Result<(), String>,
+) -> Result<(), String> {
     if let Some(parts) = layout.edition.parts {
         for step in parts.install(&layout.bin)? {
+            steps.did(step);
+        }
+    }
+    link_node(layout, steps, set_aside)
+}
+
+/// Removes them again, and that link, before the program goes.
+pub(crate) fn uninstall_parts(layout: &Layout, steps: &mut Steps) -> Result<(), String> {
+    unlink_node(layout, steps)?;
+    if let Some(parts) = layout.edition.parts {
+        for step in parts.uninstall(&layout.bin)? {
             steps.did(step);
         }
     }
     Ok(())
 }
 
-/// Removes them again, before the program goes.
-pub(crate) fn uninstall_parts(layout: &Layout, steps: &mut Steps) -> Result<(), String> {
-    if let Some(parts) = layout.edition.parts {
-        for step in parts.uninstall(&layout.bin)? {
-            steps.did(step);
-        }
+/// Where `install` of the node alone put its program, beside `layout`'s
+/// when that is another edition's: `nerve-node` (`nerve-node.exe`).
+pub fn node_beside(layout: &Layout) -> Option<PathBuf> {
+    let node = crate::edition::NODE.program;
+    if layout.edition.program == node {
+        return None;
     }
+    let mut p = layout.bin.with_file_name(node);
+    if let Some(ext) = layout.bin.extension() {
+        p.set_extension(ext);
+    }
+    Some(p)
+}
+
+/// A node installed with `nerve-node` and then taken over by the desktop
+/// app keeps its terminal command: the old program becomes a link to the
+/// app's, which runs the CLI as `nerve-node` does, so one program stays and
+/// it is never an older one. The edition comes from the program the link
+/// leads to (crate::edition), so `nerve-node update` through it updates the
+/// app. Nothing is made where no node alone was installed. `set_aside` moves
+/// the old program out of the way when it cannot be replaced at once (on
+/// Windows, while the Event Log holds it).
+fn link_node(
+    layout: &Layout,
+    steps: &mut Steps,
+    set_aside: &dyn Fn(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    let Some(node) = node_beside(layout) else {
+        return Ok(());
+    };
+    // A link is there already (this one, or another's to leave alone).
+    if !std::fs::symlink_metadata(&node).is_ok_and(|m| m.is_file()) {
+        return Ok(());
+    }
+    let at = |e: std::io::Error| format!("{}: {e}", node.display());
+    // Made beside it first and moved over it, so the command is never
+    // missing.
+    let name = node
+        .file_name()
+        .map_or_else(Default::default, |n| n.to_string_lossy());
+    let tmp = node.with_file_name(format!(".{name}.link"));
+    let _ = std::fs::remove_file(&tmp);
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&layout.bin, &tmp).map_err(at)?;
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(&layout.bin, &tmp).map_err(at)?;
+    let r = set_aside(&node).and_then(|()| std::fs::rename(&tmp, &node).map_err(at));
+    if r.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    r?;
+    steps.did(format!(
+        "{} is a link to {} now, so the command {} runs it",
+        node.display(),
+        layout.bin.display(),
+        crate::edition::NODE.program
+    ));
+    Ok(())
+}
+
+/// Removes the link [`link_node`] made, and no other.
+fn unlink_node(layout: &Layout, steps: &mut Steps) -> Result<(), String> {
+    let Some(node) = node_beside(layout) else {
+        return Ok(());
+    };
+    let ours = std::fs::symlink_metadata(&node).is_ok_and(|m| m.file_type().is_symlink())
+        && std::fs::read_link(&node).is_ok_and(|t| t == layout.bin);
+    if !ours {
+        return Ok(());
+    }
+    std::fs::remove_file(&node).map_err(|e| format!("{}: {e}", node.display()))?;
+    steps.did(format!("removed the link {}", node.display()));
     Ok(())
 }
 
@@ -3063,6 +3145,65 @@ pub(crate) mod tests {
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("removed the menu entry"), "{out}");
         assert!(!entry.exists() && !l.bin.exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_app_makes_the_node_installed_alone_a_link_to_it_and_removes_it() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        // A node installed with nerve-node.
+        let node = installed(d.path(), &sys, "1.0.0");
+        let l = Layout {
+            bin: d.path().join("usr/local/bin/nerve-node-desktop"),
+            edition: &DESKTOP,
+            ..layout(d.path())
+        };
+        assert_eq!(node_beside(&l).as_ref(), Some(&node.bin));
+        assert_eq!(node_beside(&node), None);
+        let exe = d.path().join("Downloads/nerve-node-desktop-x86_64-linux");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "nerve-node-desktop 1.0.0\n").unwrap();
+        let mut out = Vec::new();
+        install(&l, &sys, &exe, "alice", &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("nerve-node is a link to"), "{out}");
+        assert_eq!(std::fs::read_link(&node.bin).unwrap(), l.bin);
+        // The command runs the app's program.
+        assert_eq!(
+            std::fs::read_to_string(&node.bin).unwrap(),
+            "nerve-node-desktop 1.0.0\n"
+        );
+        assert!(!node.bin.with_file_name(".nerve-node.link").exists());
+
+        // Again, and after an update, the link stays as it is.
+        let mut out = Vec::new();
+        install(&l, &sys, &exe, "alice", &mut out).unwrap();
+        assert!(!String::from_utf8(out).unwrap().contains("is a link"));
+        let new = d.path().join("new");
+        std::fs::write(&new, "nerve-node-desktop 1.1.0\n").unwrap();
+        update(&l, &sys, Some(&new), &mut Vec::new()).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&node.bin).unwrap(),
+            "nerve-node-desktop 1.1.0\n"
+        );
+
+        let mut out = Vec::new();
+        uninstall(&l, &sys, false, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("removed the link"), "{out}");
+        assert!(std::fs::symlink_metadata(&node.bin).is_err());
+        assert!(!l.bin.exists());
+
+        // No node alone was there: no link is made; a link of another's
+        // stays.
+        install(&l, &sys, &exe, "alice", &mut Vec::new()).unwrap();
+        assert!(std::fs::symlink_metadata(&node.bin).is_err());
+        let other = d.path().join("other");
+        std::os::unix::fs::symlink(&other, &node.bin).unwrap();
+        install(&l, &sys, &exe, "alice", &mut Vec::new()).unwrap();
+        uninstall(&l, &sys, false, &mut Vec::new()).unwrap();
+        assert_eq!(std::fs::read_link(&node.bin).unwrap(), other);
     }
 
     #[test]

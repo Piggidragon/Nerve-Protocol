@@ -7,9 +7,10 @@
 //!   and KDE read, its icon in the hicolor theme of `/usr/local/share/icons`,
 //!   and `x-scheme-handler/nerve` in the entry and as the default in
 //!   `/etc/xdg/mimeapps.list`.
-//! - Windows: a shortcut in the Start menu of all users, and the URL
-//!   protocol `nerve` in `HKLM\Software\Classes`. The program carries its
-//!   icon itself (build.rs).
+//! - Windows: a shortcut in the Start menu of all users, the URL protocol
+//!   `nerve` in `HKLM\Software\Classes`, and the entry in Apps & features
+//!   (`HKLM\…\Uninstall\Nerve`), whose Uninstall opens the app's
+//!   ([`UNINSTALL_ARG`]). The program carries its icon itself (build.rs).
 
 use std::path::{Path, PathBuf};
 
@@ -45,6 +46,11 @@ impl Parts for Desktop {
         }
     }
 }
+
+/// The argument that opens the app on its uninstall: what Windows' Apps &
+/// features runs. Not a command of `nerve-node`, so no command line takes
+/// it for one.
+pub const UNINSTALL_ARG: &str = "__desktop-uninstall";
 
 /// The scheme of the links the app opens.
 pub const SCHEME: &str = "nerve";
@@ -291,7 +297,31 @@ fn write(path: &Path, data: &[u8], mode: u32) -> Result<(), String> {
     nerve_node::service::write_file(path, data, mode)
 }
 
-/// The Start menu shortcut and the URL protocol.
+/// The texts of Nerve's entry in Apps & features on Windows, for the
+/// program `bin` of `version`: Uninstall there runs `bin` with
+/// [`UNINSTALL_ARG`].
+pub fn apps_entry(bin: &Path, version: &str) -> Vec<(&'static str, String)> {
+    let exe = bin.display().to_string();
+    let folder = bin
+        .parent()
+        .map(|d| d.display().to_string())
+        .unwrap_or_default();
+    vec![
+        ("DisplayName", "Nerve".to_string()),
+        ("Publisher", "Nerve Protocol".to_string()),
+        ("DisplayVersion", version.to_string()),
+        ("DisplayIcon", format!("\"{exe}\",0")),
+        ("UninstallString", format!("\"{exe}\" {UNINSTALL_ARG}")),
+        ("InstallLocation", folder),
+        ("URLInfoAbout", env!("CARGO_PKG_REPOSITORY").to_string()),
+        (
+            "Comments",
+            "Decide what your Nerve centers may do on this machine".to_string(),
+        ),
+    ]
+}
+
+/// The Start menu shortcut, the URL protocol and the Apps & features entry.
 #[cfg(windows)]
 mod win {
     use std::ffi::c_void;
@@ -303,7 +333,7 @@ mod win {
         CoUninitialize,
     };
     use windows_sys::Win32::System::Registry::{
-        HKEY_LOCAL_MACHINE, REG_SZ, RegDeleteTreeW, RegSetKeyValueW,
+        HKEY_LOCAL_MACHINE, REG_DWORD, REG_SZ, RegDeleteTreeW, RegSetKeyValueW,
     };
     use windows_sys::Win32::UI::Shell::{SHCNE_ASSOCCHANGED, SHCNF_IDLIST, SHChangeNotify};
     use windows_sys::core::{GUID, HRESULT};
@@ -326,6 +356,58 @@ mod win {
         format!("Software\\Classes\\{SCHEME}")
     }
 
+    /// The entry in Apps & features (Settings) and Programs and Features.
+    const UNINSTALL_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\Nerve";
+
+    /// The version `bin` says: the program installed, which is not this one
+    /// when an older one installs a newer.
+    fn version_of(bin: &Path) -> String {
+        std::process::Command::new(bin)
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| {
+                let said = String::from_utf8_lossy(&o.stdout);
+                said.trim()
+                    .strip_prefix(super::PROGRAM)
+                    .map(|v| v.trim().to_string())
+            })
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+    }
+
+    /// Puts Nerve in Apps & features: its name, publisher, version and
+    /// icon, and Uninstall, which opens the app's uninstall at `bin` (the
+    /// app asks keep or delete, then the rights).
+    fn put_entry(bin: &Path) -> Result<(), String> {
+        for (name, value) in super::apps_entry(bin, &version_of(bin)) {
+            set_value(UNINSTALL_KEY, Some(name), &value)?;
+        }
+        // One program, nothing to change or repair; its size in KB.
+        let size = std::fs::metadata(bin).map_or(0, |m| m.len().div_ceil(1024)) as u32;
+        for (name, value) in [("NoModify", 1), ("NoRepair", 1), ("EstimatedSize", size)] {
+            set_dword(UNINSTALL_KEY, name, value)?;
+        }
+        Ok(())
+    }
+
+    /// Deletes `key` below HKEY_LOCAL_MACHINE; `false` when it was not there.
+    fn delete_key(key: &str) -> Result<bool, String> {
+        let k = wide(key);
+        // SAFETY: a NUL-terminated key below HKEY_LOCAL_MACHINE.
+        let e = unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, k.as_ptr()) };
+        match e {
+            0 => Ok(true),
+            ERROR_FILE_NOT_FOUND => Ok(false),
+            e => Err(format!(
+                "HKEY_LOCAL_MACHINE\\{key}: {}",
+                std::io::Error::from_raw_os_error(e as i32)
+            )),
+        }
+    }
+
     pub fn install(bin: &Path) -> Result<Vec<String>, String> {
         let mut did = Vec::new();
         let link = shortcut();
@@ -345,6 +427,8 @@ mod win {
             "nerve:// links open in Nerve (HKEY_LOCAL_MACHINE\\{key})"
         ));
         associations_changed();
+        put_entry(bin)?;
+        did.push("put Nerve in Apps & features, where Uninstall removes it".to_string());
         Ok(did)
     }
 
@@ -356,18 +440,12 @@ mod win {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(format!("{}: {e}", link.display())),
         }
-        let key = wide(&classes());
-        // SAFETY: a NUL-terminated key below HKEY_LOCAL_MACHINE.
-        let e = unsafe { RegDeleteTreeW(HKEY_LOCAL_MACHINE, key.as_ptr()) };
-        if e == 0 {
+        if delete_key(&classes())? {
             did.push("nerve:// links no longer open in Nerve".to_string());
             associations_changed();
-        } else if e != ERROR_FILE_NOT_FOUND {
-            return Err(format!(
-                "HKEY_LOCAL_MACHINE\\{}: {}",
-                classes(),
-                std::io::Error::from_raw_os_error(e as i32)
-            ));
+        }
+        if delete_key(UNINSTALL_KEY)? {
+            did.push("removed Nerve from Apps & features".to_string());
         }
         Ok(did)
     }
@@ -399,6 +477,30 @@ mod win {
                 REG_SZ,
                 v.as_ptr().cast(),
                 (v.len() * 2) as u32,
+            )
+        };
+        if e != 0 {
+            return Err(format!(
+                "HKEY_LOCAL_MACHINE\\{key}: {}",
+                std::io::Error::from_raw_os_error(e as i32)
+            ));
+        }
+        Ok(())
+    }
+
+    fn set_dword(key: &str, name: &str, value: u32) -> Result<(), String> {
+        let k = wide(key);
+        let n = wide(name);
+        // SAFETY: NUL-terminated strings; the data is the four bytes of
+        // `value`.
+        let e = unsafe {
+            RegSetKeyValueW(
+                HKEY_LOCAL_MACHINE,
+                k.as_ptr(),
+                n.as_ptr(),
+                REG_DWORD,
+                (&value as *const u32).cast(),
+                4,
             )
         };
         if e != 0 {
@@ -567,6 +669,23 @@ mod tests {
             e.contains("\nExec=\"/opt/my apps/nerve-node-desktop\" %u\n"),
             "{e}"
         );
+    }
+
+    #[test]
+    fn apps_and_features_uninstalls_with_the_app_at_its_place() {
+        let bin = Path::new(r"C:\Program Files\Nerve\nerve-node-desktop.exe");
+        let entry: std::collections::HashMap<_, _> = apps_entry(bin, "0.0.6").into_iter().collect();
+        assert_eq!(entry["DisplayName"], "Nerve");
+        assert_eq!(entry["DisplayVersion"], "0.0.6");
+        assert_eq!(
+            entry["UninstallString"],
+            format!(r#""C:\Program Files\Nerve\nerve-node-desktop.exe" {UNINSTALL_ARG}"#)
+        );
+        assert_eq!(
+            entry["DisplayIcon"],
+            r#""C:\Program Files\Nerve\nerve-node-desktop.exe",0"#
+        );
+        assert!(!entry["Publisher"].is_empty());
     }
 
     #[cfg(not(windows))]

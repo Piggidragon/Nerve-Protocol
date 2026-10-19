@@ -2,8 +2,8 @@
 //! link the desktop opens with the app, goes to the window that is open
 //! already. The first start listens on a socket only its user can reach
 //! (in `$XDG_RUNTIME_DIR` on Linux, a named pipe open to that user on
-//! Windows); a later start sends it one line, `{"link": …}` or `{}`, and
-//! ends.
+//! Windows); a later start sends it one line, `{"link": …}`,
+//! `{"uninstall": true}` or `{}`, and ends.
 
 use std::io::{BufRead, BufReader, Write};
 
@@ -17,30 +17,48 @@ pub enum Claimed {
     Forwarded,
 }
 
-/// What a later start asks of the open window.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What a start of the app asks of its window, or of the open one.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Asked {
     /// The `nerve://` link it was opened with.
     pub link: Option<String>,
+    /// Its uninstall (crate::parts::UNINSTALL_ARG, from Apps & features).
+    pub uninstall: bool,
 }
 
-fn line(link: Option<&str>) -> String {
-    match link {
-        Some(l) => json!({ "link": l }).to_string(),
-        None => json!({}).to_string(),
+impl Asked {
+    /// Opened with `link`.
+    pub fn link(link: &str) -> Asked {
+        Asked {
+            link: Some(link.to_string()),
+            ..Asked::default()
+        }
     }
+}
+
+fn line(a: &Asked) -> String {
+    let mut v = json!({});
+    if let Some(l) = &a.link {
+        v["link"] = json!(l);
+    }
+    if a.uninstall {
+        v["uninstall"] = json!(true);
+    }
+    v.to_string()
 }
 
 fn asked(line: &str) -> Option<Asked> {
     let v: Value = serde_json::from_str(line.trim()).ok()?;
     Some(Asked {
         link: v["link"].as_str().map(str::to_string),
+        uninstall: v["uninstall"] == true,
     })
 }
 
-/// Claims the app for this user, or hands `link` to the window that has it.
-/// Where no place for the socket is known, every start opens a window.
-pub fn claim(link: Option<&str>) -> Claimed {
+/// Claims the app for this user, or hands what this start asks to the
+/// window that has it. Where no place for the socket is known, every start
+/// opens a window.
+pub fn claim(start: &Asked) -> Claimed {
     #[cfg(unix)]
     {
         let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR").filter(|d| !d.is_empty()) else {
@@ -48,12 +66,12 @@ pub fn claim(link: Option<&str>) -> Claimed {
         };
         unix::claim_at(
             &std::path::Path::new(&dir).join("nerve-node-desktop.sock"),
-            link,
+            start,
         )
     }
     #[cfg(windows)]
     {
-        win::claim(link)
+        win::claim(start)
     }
 }
 
@@ -122,9 +140,9 @@ mod unix {
     use super::*;
 
     /// [`claim`] with the socket at `path`.
-    pub fn claim_at(path: &Path, link: Option<&str>) -> Claimed {
+    pub fn claim_at(path: &Path, start: &Asked) -> Claimed {
         if let Ok(mut s) = UnixStream::connect(path)
-            && writeln!(s, "{}", line(link)).is_ok()
+            && writeln!(s, "{}", line(start)).is_ok()
         {
             return Claimed::Forwarded;
         }
@@ -214,13 +232,13 @@ mod win {
         }
     }
 
-    pub fn claim(link: Option<&str>) -> Claimed {
+    pub fn claim(start: &Asked) -> Claimed {
         let Ok(sid) = crate::broker::win::own_sid() else {
             return Claimed::First(Instance::none());
         };
         let name = format!(r"\\.\pipe\nerve-node-desktop-{sid}");
         if let Ok(mut f) = std::fs::OpenOptions::new().write(true).open(&name)
-            && writeln!(f, "{}", line(link)).is_ok()
+            && writeln!(f, "{}", line(start)).is_ok()
         {
             return Claimed::Forwarded;
         }
@@ -281,7 +299,8 @@ mod tests {
     fn a_second_start_goes_to_the_first() {
         let d = tempfile::tempdir().unwrap();
         let sock = d.path().join("app.sock");
-        let Claimed::First(first) = unix::claim_at(&sock, None) else {
+        let none = Asked::default();
+        let Claimed::First(first) = unix::claim_at(&sock, &none) else {
             panic!("the first start is the first");
         };
         let (tx, rx) = std::sync::mpsc::channel();
@@ -289,19 +308,19 @@ mod tests {
         first.listen(move |a| {
             let _ = tx.lock().unwrap().send(a);
         });
-        assert!(matches!(
-            unix::claim_at(&sock, Some("nerve://pair?center=x")),
-            Claimed::Forwarded
-        ));
-        let got = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-        assert_eq!(got.link.as_deref(), Some("nerve://pair?center=x"));
-        assert!(matches!(unix::claim_at(&sock, None), Claimed::Forwarded));
-        assert_eq!(
-            rx.recv_timeout(std::time::Duration::from_secs(5))
-                .unwrap()
-                .link,
-            None
-        );
+        let starts = [
+            Asked::link("nerve://pair?center=x"),
+            none.clone(),
+            Asked {
+                uninstall: true,
+                ..Asked::default()
+            },
+        ];
+        for start in &starts {
+            assert!(matches!(unix::claim_at(&sock, start), Claimed::Forwarded));
+            let got = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            assert_eq!(&got, start);
+        }
         // Gone with the window: the next start is the first again, also
         // over a socket a crash left.
         drop(first);
@@ -309,7 +328,7 @@ mod tests {
         std::os::unix::net::UnixListener::bind(&sock)
             .map(drop)
             .unwrap();
-        assert!(matches!(unix::claim_at(&sock, None), Claimed::First(_)));
+        assert!(matches!(unix::claim_at(&sock, &none), Claimed::First(_)));
     }
 }
 
@@ -320,7 +339,7 @@ mod win_tests {
     /// On the user's own pipe: run where the app is not open.
     #[test]
     fn a_second_start_goes_to_the_first_over_the_pipe() {
-        let Claimed::First(first) = claim(None) else {
+        let Claimed::First(first) = claim(&Asked::default()) else {
             panic!("the app is open: close it to run this test");
         };
         let (tx, rx) = std::sync::mpsc::channel();
@@ -328,14 +347,18 @@ mod win_tests {
         first.listen(move |a| {
             let _ = tx.lock().unwrap().send(a);
         });
-        for link in [
-            Some("nerve://pair?center=x"),
-            None,
-            Some("nerve://pair?center=y"),
+        for start in [
+            Asked::link("nerve://pair?center=x"),
+            Asked::default(),
+            Asked {
+                uninstall: true,
+                ..Asked::default()
+            },
+            Asked::link("nerve://pair?center=y"),
         ] {
-            assert!(matches!(claim(link), Claimed::Forwarded));
+            assert!(matches!(claim(&start), Claimed::Forwarded));
             let got = rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-            assert_eq!(got.link.as_deref(), link);
+            assert_eq!(got, start);
         }
     }
 }

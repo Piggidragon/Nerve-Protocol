@@ -544,13 +544,30 @@ fn the_app_drives_the_cli_end_to_end() {
     assert_eq!(store.get_toast_tone(), nerve_node_desktop::Tone::Danger);
     assert!(store.get_busy().is_empty());
 
+    // Uninstall in Apps & features (Windows) while the app is open: the
+    // window opens its uninstall, which asks keep or delete first.
+    let install = window.global::<Install>();
+    let uninstall = nerve_node_desktop::instance::Asked {
+        uninstall: true,
+        ..Default::default()
+    };
+    ctl.started_again(uninstall.clone());
+    assert!(install.get_uninstall_open());
+    assert_eq!(
+        (install.get_action().as_str(), install.get_step().as_str()),
+        ("uninstall", "choose")
+    );
+    install.set_uninstall_open(false);
+
     // The installer, as a downloaded copy shows it: what it installs, and
     // why it did not when the system refused (here: no root).
-    let install = window.global::<Install>();
     let bin = root.join("usr/local/bin/nerve-node-desktop");
     ctl.installer(Launch::Plain, &bin);
     assert!(install.get_shown());
     assert_eq!(install.get_program(), bin.display().to_string());
+    // It has no uninstall dialog of its own to open.
+    ctl.started_again(uninstall);
+    assert!(!install.get_uninstall_open());
     if install.get_step() == "welcome" {
         install.invoke_install();
         assert_eq!(install.get_step(), "welcome");

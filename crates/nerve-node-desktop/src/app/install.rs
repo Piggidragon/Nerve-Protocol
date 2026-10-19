@@ -249,7 +249,8 @@ impl Ctl {
         self.run_service_command("uninstall", args, None);
     }
 
-    fn ask_uninstall(&self) {
+    /// Opens the uninstall: keep or delete the node's data, then go.
+    pub fn ask_uninstall(&self) {
         self.with_install(|i| {
             i.set_action("uninstall".into());
             i.set_purge(false);

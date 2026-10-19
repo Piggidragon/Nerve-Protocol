@@ -8,6 +8,8 @@
 // `start /wait` runs this one.
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+use nerve_node_desktop::instance::Asked;
+
 fn main() {
     // This program is the desktop app's edition of the node: installed as
     // nerve-node-desktop, with its menu entry and link handler.
@@ -26,21 +28,24 @@ fn main() {
     }
     // A nerve:// link alone, which the desktop hands to the app when one is
     // opened (no command of nerve-node): the app goes straight to pairing.
-    if let [Some(link)] = words.as_slice()
-        && link.to_ascii_lowercase().starts_with("nerve://")
-    {
-        if let Err(e) = nerve_node_desktop::app::run(Some(link.to_string())) {
-            eprintln!("nerve-node-desktop: {e}");
-            std::process::exit(1);
+    // The uninstall of Apps & features on Windows opens the app's.
+    let start = match words.as_slice() {
+        [Some(link)] if link.to_ascii_lowercase().starts_with("nerve://") => {
+            Some(Asked::link(link))
         }
-        return;
-    }
-    if !args.is_empty() {
+        [Some(arg)] if *arg == nerve_node_desktop::parts::UNINSTALL_ARG => Some(Asked {
+            uninstall: true,
+            ..Asked::default()
+        }),
+        [] => Some(Asked::default()),
+        _ => None,
+    };
+    let Some(start) = start else {
         #[cfg(windows)]
         nerve_node_desktop::console::attach();
         std::process::exit(nerve_node::entry::main());
-    }
-    if let Err(e) = nerve_node_desktop::app::run(None) {
+    };
+    if let Err(e) = nerve_node_desktop::app::run(start) {
         eprintln!("nerve-node-desktop: {e}");
         std::process::exit(1);
     }

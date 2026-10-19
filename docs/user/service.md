@@ -239,7 +239,8 @@ sudo nerve-node uninstall --purge   # deletes them too
 the old uid gets the keys. The account of the commands stays, also one that
 `setup` made; `sudo userdel -r <name>` removes it. A later `install` takes them up again: the node
 comes back with its pairings, rules and audit log. `--purge` deletes them,
-keys and audit log included.
+keys and audit log included. The [desktop app](desktop.md)'s uninstall also
+removes its menu entry, its link handler and the `nerve-node` link it made.
 
 ## Windows
 

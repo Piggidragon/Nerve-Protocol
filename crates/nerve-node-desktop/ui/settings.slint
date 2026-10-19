@@ -125,7 +125,7 @@ export component SettingsPage inherits PageFrame {
         VerticalLayout {
             Text {
                 text: Prefs.account != "" ? "Commands run as " + Prefs.account + "."
-                    : Install.windows ? "No account yet: the node runs no command until the service has the password of yours, " + Install.account + ", which commands then run as."
+                    : Install.windows ? "No account yet: once the service has your Windows password, commands run as you, " + Install.account + ". Until then the node runs none."
                     : "No account yet: the node runs no command until one is chosen.";
                 color: Theme.text;
                 font-size: Type.small;

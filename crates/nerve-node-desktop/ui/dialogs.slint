@@ -502,16 +502,29 @@ export component ProxyDialog inherits Dialog {
     }
 }
 
-// A token shown once, with what the node said to do with it.
+// What a command did, to read once: a token or a key to copy (`once-copy`),
+// what to do with it, or what a restore did (`once-text`).
 export component OnceDialog inherits Dialog {
     title: Prefs.once-title;
-    subtitle: "It is shown only now: copy it to the other node.";
+    subtitle: Prefs.once-note;
     card-width: 620px;
     close => {
         Prefs.once-open = false;
     }
-    CopyText {
-        text: Prefs.once-text;
+    Reveal {
+        shown: Prefs.once-text != "";
+        Text {
+            text: Prefs.once-text;
+            color: Theme.text;
+            font-size: Type.small;
+            wrap: word-wrap;
+        }
+    }
+    Reveal {
+        shown: Prefs.once-copy != "";
+        CopyText {
+            text: Prefs.once-copy;
+        }
     }
     DialogButtons {
         Button {

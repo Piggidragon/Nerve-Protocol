@@ -542,7 +542,9 @@ fn the_app_drives_the_cli_end_to_end() {
     assert!(prefs.get_once_open());
     // In the app's words: the proxy and pin laptop-2 enters, and where.
     assert!(
-        prefs.get_once_text().contains("Proxy: https://laptop-2:")
+        prefs
+            .get_once_copy()
+            .starts_with("Proxy: https://laptop-2:")
             && prefs.get_once_text().contains("under Settings, Proxy")
             && !prefs.get_once_text().contains("on laptop-2, run:"),
         "{}",

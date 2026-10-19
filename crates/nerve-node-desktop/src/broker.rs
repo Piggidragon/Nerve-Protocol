@@ -481,7 +481,7 @@ pub mod win {
         PIPE_TYPE_BYTE, PIPE_WAIT,
     };
     use windows_sys::Win32::System::Threading::{
-        GetCurrentProcess, GetProcessId, OpenProcess, OpenProcessToken,
+        GetCurrentProcess, GetExitCodeProcess, GetProcessId, OpenProcess, OpenProcessToken,
         PROCESS_QUERY_LIMITED_INFORMATION, WaitForSingleObject,
     };
     use windows_sys::Win32::UI::Shell::{
@@ -556,9 +556,13 @@ pub mod win {
 
     /// One end of the broker: a pipe one way, open to SYSTEM, the
     /// administrators and the app's user (`sid`) alone, connected to the
-    /// app's process (`app`) only, which must run as that user. Each way has
-    /// a pipe of its own: a synchronous pipe handle reads and writes one at
-    /// a time, so a read that waits would hold up every write.
+    /// app's process (`app`) only. Only a process of those may open it, and
+    /// the one connected must be the app's; its user is not read again: a
+    /// broker that is not elevated (an administrator's, for a standard user,
+    /// whose token is filtered until UAC raises it) may not open another
+    /// user's process. Each way has a pipe of its own: a synchronous pipe
+    /// handle reads and writes one at a time, so a read that waits would
+    /// hold up every write.
     fn serve_end(name: &str, sid: &str, inbound: bool, app: u32) -> Option<std::fs::File> {
         let sddl = wide(&format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;{sid})"));
         // SAFETY: the descriptor Windows makes from the SDDL is freed after
@@ -604,10 +608,7 @@ pub mod win {
                 return None;
             }
             let mut client = 0u32;
-            if GetNamedPipeClientProcessId(h, &mut client) == 0
-                || client != app
-                || sid_of(client).as_deref() != Ok(sid)
-            {
+            if GetNamedPipeClientProcessId(h, &mut client) == 0 || client != app {
                 CloseHandle(h);
                 return None;
             }
@@ -778,12 +779,22 @@ pub mod win {
         // it is closed below (or, for a child, with the child).
         let broker = unsafe { GetProcessId(process) };
         let running = || unsafe { WaitForSingleObject(process, 0) } != 0;
-        let ends = open_end(&format!("{name}-in"), true, broker, &running).and_then(|i| {
-            Ok((
-                i,
-                open_end(&format!("{name}-out"), false, broker, &running)?,
-            ))
-        });
+        let ends = open_end(&format!("{name}-in"), true, broker, &running)
+            .and_then(|i| {
+                Ok((
+                    i,
+                    open_end(&format!("{name}-out"), false, broker, &running)?,
+                ))
+            })
+            .map_err(|e| {
+                let mut code = 0u32;
+                // SAFETY: a query on the broker's process handle.
+                if !running() && unsafe { GetExitCodeProcess(process, &mut code) } != 0 {
+                    format!("{e} (exit code {code})")
+                } else {
+                    e
+                }
+            });
         if close {
             // SAFETY: the handle the caller gave away.
             unsafe { CloseHandle(process) };

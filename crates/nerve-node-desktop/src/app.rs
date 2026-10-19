@@ -68,6 +68,9 @@ fn system_chooser() -> Chooser {
     Arc::new(crate::dialog::show)
 }
 
+/// Under a key or token shown once.
+const KEY_NOTE: &str = "It is shown only now: copy it to the other node.";
+
 /// The change that waits for the owner's yes in the confirm dialog.
 enum Pending {
     Unpair(String),
@@ -831,11 +834,16 @@ impl Ctl {
                     match answer {
                         Ok(v) if at_once => c.command(end_grace, None, move |c, answer| {
                             c.with_store(|s| s.set_busy(SharedString::new()));
-                            c.show_once(&title, &view::new_key(&name, &v, Some(answer)));
+                            c.show_once(
+                                &title,
+                                KEY_NOTE,
+                                "",
+                                &view::new_key(&name, &v, Some(answer)),
+                            );
                         }),
                         Ok(v) => {
                             c.with_store(|s| s.set_busy(SharedString::new()));
-                            c.show_once(&title, &view::new_key(&name, &v, None));
+                            c.show_once(&title, KEY_NOTE, "", &view::new_key(&name, &v, None));
                         }
                         Err(e) => {
                             c.with_store(|s| s.set_busy(SharedString::new()));
@@ -866,10 +874,14 @@ impl Ctl {
         });
     }
 
-    fn show_once(&self, title: &str, text: &str) {
+    /// `note` under the title, `text` to read and `copy` to copy, each
+    /// left out when empty.
+    fn show_once(&self, title: &str, note: &str, text: &str, copy: &str) {
         self.with_prefs(|p| {
             p.set_once_title(title.into());
+            p.set_once_note(note.into());
             p.set_once_text(text.into());
+            p.set_once_copy(copy.into());
             p.set_once_open(true);
         });
     }

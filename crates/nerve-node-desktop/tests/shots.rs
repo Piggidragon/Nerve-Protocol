@@ -412,7 +412,7 @@ fn every_page_light_and_dark() {
     store.set_toast("home is paused: its link ends until you resume it.\nThe node restarts in a moment to take it.".into());
     store.set_toast_tone(nerve_node_desktop::Tone::Ok);
     store.set_toast_shown(true);
-    shots.take("overview-restart-soon");
+    shots.take_as_is("overview-restart-soon");
     store.set_toast_shown(false);
     store.set_restart_due(false);
     store.invoke_show(Page::Centers);
@@ -572,6 +572,8 @@ fn every_page_light_and_dark() {
         ],
     }});
     prefs.set_once_title("The backup is restored".into());
+    prefs.set_once_note("".into());
+    prefs.set_once_copy("".into());
     prefs.set_once_text(
         nerve_node_desktop::view::restored(
             &restored,

@@ -301,18 +301,18 @@ impl Ctl {
         self.command(args, None, move |c, answer| {
             match answer {
                 Ok(v) => {
-                    let mut text = view::relay_token(&v);
+                    let (mut text, copy) = view::relay_token(&v);
                     let restart = c.restart_for(&v);
                     match restart {
                         super::Restart::Soon | super::Restart::AtEnd => text.push_str(
-                            "\n\nThe node restarts in a moment, so that the relay takes the token.",
+                            " This node restarts in a moment, so that the relay takes the token.",
                         ),
                         super::Restart::AtStart => {
-                            text.push_str("\n\nThe relay takes the token when the node starts.")
+                            text.push_str(" The relay takes the token when this node starts.")
                         }
                         super::Restart::No => {}
                     }
-                    c.show_once(&title, &text);
+                    c.show_once(&title, super::KEY_NOTE, &text, &copy);
                     if restart == super::Restart::Soon {
                         c.restart_soon();
                     }
@@ -448,7 +448,7 @@ impl Ctl {
                         c.toast(format!("{title}."), Tone::Ok);
                     } else {
                         c.with_prefs(|p| p.set_account_new(SharedString::new()));
-                        c.show_once(&title, &warnings.join("\n"));
+                        c.show_once(&title, "", &warnings.join("\n"), "");
                     }
                 }
                 Err(e) => {
@@ -528,7 +528,7 @@ impl Ctl {
             match answer {
                 Ok(v) => {
                     c.with_prefs(|p| p.set_backup_open(false));
-                    c.show_once("The backup is written", &messages(&v));
+                    c.show_once("The backup is written", "", &messages(&v), "");
                 }
                 Err(e) => {
                     c.with_prefs(|p| p.set_backup_error(e.into()));
@@ -634,7 +634,7 @@ impl Ctl {
         match answer {
             Ok(v) => {
                 self.with_prefs(|p| p.set_restore_open(false));
-                self.show_once("The backup is restored", &view::restored(&v, &then));
+                self.show_once("The backup is restored", "", &view::restored(&v, &then), "");
             }
             Err(e) => {
                 let e = if said_start {

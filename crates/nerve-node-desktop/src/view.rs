@@ -304,31 +304,31 @@ pub fn new_key(name: &str, said: &Value, ended: Option<Result<Value, String>>) -
 }
 
 /// The token of `relay add` or `relay token` (`said["token"]`), in the
-/// app's words: what the other node needs, and where it enters it.
-pub fn relay_token(said: &Value) -> String {
+/// app's words: what the other node may do and where it enters the token,
+/// and what to copy to it (the proxy with the token, the pin, and the
+/// command for a node without the app).
+pub fn relay_token(said: &Value) -> (String, String) {
     let t = &said["token"];
     let (node, proxy, pin) = (s(&t["node"]), s(&t["proxy"]), s(&t["pin"]));
     let mut text = format!(
-        "{node} may use this relay now; it may reach {}. Its token is in the proxy address below, shown only now.\n\nProxy: {proxy}\nPin: {pin}",
+        "{node} may use this relay now; it may reach {}. On {node}, enter the proxy and its pin below in the Nerve app, under Settings, Proxy; on a node without the app, run the command below there.",
         s(&t["reach"])
     );
     if proxy.contains("<address of this machine>") {
         text.push_str(
-            "\n\nPut the address under which the other node reaches this machine in place of <address of this machine>.",
+            " Put the address under which it reaches this machine in place of <address of this machine>.",
         );
     }
-    text.push_str(&format!(
-        "\n\nOn {node}, enter both in the Nerve app under Settings, Proxy; on a node without the app, in a terminal there:\nnerve-node proxy set '{proxy}' --pin {pin}"
-    ));
     if t["new_pin"] == true {
         text.push_str(
-            "\n\nThe relay has a new certificate: the other nodes behind it need its new pin too.",
+            " The relay has a new certificate: the other nodes behind it need its new pin too.",
         );
     }
     if t["relay_off"] == true {
-        text.push_str("\n\nThe relay is off: turn it on here under Settings, Relay.");
+        text.push_str(" The relay is off: turn it on here under Settings, Relay.");
     }
-    text
+    let copy = format!("Proxy: {proxy}\nPin: {pin}\n\nnerve-node proxy set '{proxy}' --pin {pin}");
+    (text, copy)
 }
 
 /// What `restore` did (`said["restored"]`), in the app's words: the
@@ -374,8 +374,13 @@ pub fn restored(said: &Value, started: &str) -> String {
         }
     }
     lines.extend(said);
-    lines.push(started.to_string());
-    lines.join("\n")
+    // What it did, what to do, and the node, each a paragraph.
+    let mut text = lines[0].clone();
+    if lines.len() > 1 {
+        text.push_str("\n\n");
+        text.push_str(&lines[1..].join("\n"));
+    }
+    format!("{text}\n\n{started}")
 }
 
 /// `text` as a sentence: its first letter up, a full stop at its end.
@@ -964,15 +969,16 @@ mod tests {
             "proxy": "https://lab-pc:t0k@<address of this machine>:7491",
             "reach": "every https center of this node", "new_pin": false, "relay_off": true,
         }});
-        let text = relay_token(&v);
-        assert!(text.contains("Proxy: https://lab-pc:t0k@"), "{text}");
-        assert!(text.contains("Pin: p1n"), "{text}");
+        let (text, copy) = relay_token(&v);
+        assert!(copy.starts_with("Proxy: https://lab-pc:t0k@"), "{copy}");
+        assert!(copy.contains("Pin: p1n"), "{copy}");
         assert!(
             text.contains("in place of <address of this machine>"),
             "{text}"
         );
+        assert!(text.contains("under Settings, Proxy"), "{text}");
         assert!(text.contains("under Settings, Relay"), "{text}");
-        assert!(!text.contains('`'), "{text}");
+        assert!(!text.contains('`') && !copy.contains('`'), "{text}");
     }
 
     /// A restore in the app's words: the CLI's commands become the places

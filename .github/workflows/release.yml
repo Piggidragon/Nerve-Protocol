@@ -143,7 +143,7 @@ jobs:
       - name: The version is the one in Cargo.toml
         run: |
           meta=$(cargo metadata --locked --no-deps --format-version 1)
-          for p in nerve-center nerve-node; do
+          for p in nerve-center nerve-node nerve-node-desktop; do
             v=$(jq -r --arg p "$p" '.packages[] | select(.name == $p) | .version' <<< "$meta")
             if [ "$v" != "$VERSION" ]; then
               echo "the version is $VERSION, Cargo.toml says $p ${v:-(missing)}" >&2
@@ -230,6 +230,45 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  # The desktop app for Linux (crates/nerve-node-desktop): the node with its
+  # window in one program. It links the system's fontconfig and glibc, so it
+  # is not static; built on Ubuntu 24.04, it runs where glibc is 2.39 or newer.
+  desktop-linux:
+    needs: check
+    runs-on: ubuntu-24.04
+    env:
+      SUFFIX: x86_64-linux
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.check.outputs.sha }}
+          persist-credentials: false
+      - name: Toolchain
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+      - name: Build dependencies of the desktop app
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libfontconfig1-dev
+      - name: Build
+        run: |
+          cargo build --release --locked -p nerve-node-desktop
+          mkdir dist
+          cp target/release/nerve-node-desktop "dist/nerve-node-desktop-$SUFFIX"
+      - name: The version the tag names, and the glibc it needs
+        run: |
+          said=$("dist/nerve-node-desktop-$SUFFIX" --version)
+          if [ "$said" != "nerve-node-desktop $VERSION" ]; then
+            echo "nerve-node-desktop-$SUFFIX says '$said', not 'nerve-node-desktop $VERSION'" >&2
+            exit 1
+          fi
+          glibc=$(objdump -T "dist/nerve-node-desktop-$SUFFIX" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n 1)
+          echo "- nerve-node-desktop-$SUFFIX needs $glibc" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nerve-desktop-${{ env.SUFFIX }}
+          path: dist/*
+          if-no-files-found: error
+
   # The conformance suite (crates/nerve-conformance) against the binaries that
   # were built, not against the source: the end-to-end tests start the real
   # `nerve-center` and `nerve-node` from NERVE_CENTER_BIN and NERVE_NODE_BIN
@@ -294,14 +333,16 @@ jobs:
         env:
           CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_RUSTFLAGS: "-C target-feature=+crt-static"
         run: |
-          cargo build --release --locked --target "$TARGET" -p nerve-center -p nerve-node
+          cargo build --release --locked --target "$TARGET" -p nerve-center -p nerve-node -p nerve-node-desktop
           mkdir dist
-          for b in nerve-center nerve-node; do
+          for b in nerve-center nerve-node nerve-node-desktop; do
             cp "target/$TARGET/release/$b.exe" "dist/$b-$SUFFIX.exe"
           done
+      # The desktop app is a program without a console; run from bash, it
+      # writes to the pipe it is given all the same.
       - name: No Visual C++ runtime, and the version the tag names
         run: |
-          for b in nerve-center nerve-node; do
+          for b in nerve-center nerve-node nerve-node-desktop; do
             if grep -aqi 'vcruntime140' "dist/$b-$SUFFIX.exe"; then
               echo "$b-$SUFFIX.exe imports the Visual C++ runtime" >&2
               exit 1
@@ -324,7 +365,7 @@ jobs:
   # before there is a tag. If anything here fails, the last step removes the
   # draft and the tag this run created, and nothing else (see there).
   publish:
-    needs: [check, linux, windows, conformance]
+    needs: [check, linux, desktop-linux, windows, conformance]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -347,9 +388,10 @@ jobs:
       - name: The checksums
         run: |
           cd dist
+          # nerve-node-* takes the desktop app's two as well.
           files=(nerve-center-* nerve-node-*)
-          if [ "${#files[@]}" != 6 ]; then
-            echo "expected 6 binaries, got: ${files[*]}" >&2
+          if [ "${#files[@]}" != 8 ]; then
+            echo "expected 8 binaries, got: ${files[*]}" >&2
             exit 1
           fi
           sha256sum "${files[@]}" > SHA256SUMS
@@ -366,7 +408,7 @@ jobs:
               prerelease=true
               ;;
           esac
-          footer="Static Linux binaries (x86_64, aarch64) and Windows x86_64 programs of \`nerve-center\` and \`nerve-node\`, built from $SHA. SHA256SUMS lists their checksums. They are not signed; \`nerve-node update\` checks the one it downloads against SHA256SUMS (docs/user/service.md)."
+          footer="Static Linux binaries (x86_64, aarch64) and Windows x86_64 programs of \`nerve-center\` and \`nerve-node\`, and the desktop app \`nerve-node-desktop\` for Linux x86_64 (glibc 2.39 or newer) and Windows x86_64, built from $SHA. SHA256SUMS lists their checksums. They are not signed; \`nerve-node update\` and the desktop app's update check the one they download against SHA256SUMS (docs/user/service.md, docs/user/desktop.md)."
           # A pre-release's body is the footer alone.
           if [ "$KIND" = release ]; then
             { cat notes/changelog.md; echo; echo "$footer"; } > release-notes.md

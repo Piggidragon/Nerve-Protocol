@@ -8,7 +8,7 @@ workflow from" on `main` and fill in:
 |---|---|
 | `branch` | The branch to build from. Default `main` |
 | `kind` | `pre-release` or `release` |
-| `version` | `x.y.z`, the version of `nerve-center` and `nerve-node` in the workspace `Cargo.toml` |
+| `version` | `x.y.z`, the version of `nerve-center`, `nerve-node` and `nerve-node-desktop` in the workspace `Cargo.toml` |
 
 ## Rules
 
@@ -40,12 +40,19 @@ workflow from" on `main` and fill in:
    `aarch64-unknown-linux-musl` (static) and `x86_64-pc-windows-msvc` (static C
    runtime). Each Linux binary must be static. Each binary must print its
    version from `--version`, and it must equal the one given.
+   It also builds the desktop app `nerve-node-desktop`: for Linux x86_64 on
+   Ubuntu 24.04 (it links glibc and fontconfig, so it runs where glibc is 2.39
+   or newer; the run's summary says the glibc it needs) and for Windows x86_64
+   (static C runtime). It must print `nerve-node-desktop <version>`.
 3. Runs the conformance suite (`cargo test -p nerve-conformance`) against the
    Linux binaries that were just built, the ones to be released, with
    `NERVE_CENTER_BIN` and `NERVE_NODE_BIN` set to them. `x86_64` runs on an
    x86_64 runner and `aarch64` on an arm64 runner. The Windows binaries are
    built but not run by the workflow.
-4. Publishes a GitHub Release with the six binaries and `SHA256SUMS`. A release
+4. Publishes a GitHub Release with the eight binaries and `SHA256SUMS`. The
+   desktop app's update takes `nerve-node-desktop-x86_64-linux` or
+   `nerve-node-desktop-x86_64-windows.exe` from there, as `nerve-node update`
+   takes `nerve-node-*`. A release
    is marked latest. A pre-release is marked as a pre-release.
 
 The binaries are not signed. The workflow uses no secrets. Only its last job

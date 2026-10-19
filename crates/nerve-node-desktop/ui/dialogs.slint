@@ -445,7 +445,7 @@ export component ProxyDialog inherits Dialog {
     }
     Field {
         label: "Password";
-        hint: "Optional. The password of the user in the URL; it goes into the system keyring.";
+        hint: "Optional. The password of the user in the URL; it is kept apart from node.toml.";
         TextField {
             text <=> Prefs.proxy-new-password;
             password: true;

@@ -78,7 +78,7 @@ pub fn backup(
     pass.check_new()?;
     let (contents, report) = collect(paths, cfg, opts.include_keyring)?;
     let bytes = backup::seal_with(&contents, pass, opts.rounds)?;
-    backup::write_file(file, &bytes, opts.overwrite)?;
+    crate::caller_file::write(file, &bytes, opts.overwrite)?;
     Ok(report)
 }
 

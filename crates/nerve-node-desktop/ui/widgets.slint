@@ -529,6 +529,145 @@ export component NavItem {
     }
 }
 
+// The foot of a list that shows the newest entries only: how many, and a
+// button that asks for more while there may be.
+export component MoreFoot inherits VerticalLayout {
+    in property <string> text;
+    in property <bool> more;
+    callback clicked();
+    spacing: Space.sm;
+    Text {
+        text: root.text;
+        color: Theme.text-faint;
+        font-size: Type.caption;
+        horizontal-alignment: center;
+        wrap: word-wrap;
+    }
+    if root.more: HorizontalLayout {
+        alignment: center;
+        Button {
+            text: "Show more";
+            kind: ButtonKind.ghost;
+            small: true;
+            clicked => {
+                root.clicked();
+            }
+        }
+    }
+}
+
+// One of many choices, for when a Segmented row would squeeze them: a button
+// that names the chosen one in full and opens the list of all of them.
+export component Picker {
+    in property <[string]> options;
+    in property <int> current;
+    in property <string> label;
+    callback chosen(int);
+    horizontal-stretch: 0;
+    min-height: Size.control;
+    accessible-role: combobox;
+    accessible-label: root.label;
+    accessible-value: root.options[root.current];
+    accessible-action-default => {
+        popup.show();
+    }
+
+    Rectangle {
+        background: touch.has-hover ? Theme.hover : Theme.surface;
+        border-radius: Radius.md;
+        border-width: 1px;
+        border-color: Theme.border-strong;
+    }
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 10px;
+        spacing: Space.sm;
+        Text {
+            text: root.options[root.current];
+            color: Theme.text;
+            font-size: Type.small;
+            font-weight: Type.semibold;
+            vertical-alignment: center;
+            // The whole name, up to the longest a center has (32
+            // characters): the row around it does not squeeze it.
+            min-width: min(self.preferred-width, 320px);
+            max-width: 320px;
+            overflow: elide;
+        }
+        VerticalLayout {
+            alignment: center;
+            Icon {
+                source: @image-url("icons/chev.svg");
+                colorize: Theme.text-muted;
+            }
+        }
+    }
+    touch := TouchArea {
+        mouse-cursor: MouseCursor.pointer;
+        clicked => {
+            popup.show();
+        }
+    }
+    popup := PopupWindow {
+        x: 0;
+        y: root.height + 4px;
+        width: max(root.width, 240px);
+        height: min(list.preferred-height, 320px);
+        Rectangle {
+            background: Theme.surface;
+            border-radius: Radius.md;
+            border-width: 1px;
+            border-color: Theme.border;
+            drop-shadow-blur: 18px;
+            drop-shadow-offset-y: 6px;
+            drop-shadow-color: #00000033;
+            clip: true;
+            Flickable {
+                content-height: list.preferred-height;
+                list := VerticalLayout {
+                    padding: 4px;
+                    for option[i] in root.options: Rectangle {
+                        height: Size.control;
+                        border-radius: Radius.sm;
+                        background: row.has-hover ? Theme.hover : transparent;
+                        accessible-role: list-item;
+                        accessible-label: option;
+                        accessible-item-selected: i == root.current;
+                        HorizontalLayout {
+                            padding-left: 10px;
+                            padding-right: 10px;
+                            spacing: Space.sm;
+                            Text {
+                                text: option;
+                                color: i == root.current ? Theme.text : Theme.text-muted;
+                                font-size: Type.small;
+                                font-weight: i == root.current ? Type.semibold : Type.medium;
+                                vertical-alignment: center;
+                                horizontal-stretch: 1;
+                                overflow: elide;
+                            }
+                            VerticalLayout {
+                                alignment: center;
+                                Icon {
+                                    source: @image-url("icons/check.svg");
+                                    colorize: Theme.accent;
+                                    opacity: i == root.current ? 1 : 0;
+                                }
+                            }
+                        }
+                        row := TouchArea {
+                            mouse-cursor: MouseCursor.pointer;
+                            clicked => {
+                                root.chosen(i);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 // A row of choices of which one is on.
 export component Segmented {
     in property <[string]> options;

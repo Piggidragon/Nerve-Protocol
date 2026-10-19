@@ -82,7 +82,11 @@ export component HelpPage inherits PageFrame {
     }
     Banner {
         tone: Tone.accent;
-        text: "Every command takes --config-dir and --state-dir; one that works on a center takes --center <name> when more than one is paired. The user guide is in docs/user/ of the project.";
+        text: "Every command takes --config-dir and --state-dir; one that works on a center takes --center <name> when more than one is paired. The user guide explains each of them.";
+        action: "User guide";
+        acted => {
+            Platform.open-url("https://github.com/Piggidragon/Nerve-Protocol/tree/main/docs/user");
+        }
     }
     for s in Manual.sections: Fit {
         VerticalLayout {

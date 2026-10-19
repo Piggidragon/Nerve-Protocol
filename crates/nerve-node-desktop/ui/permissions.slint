@@ -7,7 +7,7 @@ import { Load, FolderRow, CapRow } from "data.slint";
 import { Store, Perm } from "store.slint";
 import {
     Button, ButtonKind, Card, Pill, Banner, Loading, PageHeader, PageFrame, EmptyState, Divider,
-    Segmented, SectionTitle, OptionTile, Chip, ListRow, TextField, Switch, Icon, Code, Reveal,
+    Segmented, Picker, SectionTitle, OptionTile, Chip, ListRow, TextField, Switch, Icon, Code, Reveal,
     PathText,
 } from "widgets.slint";
 
@@ -405,9 +405,19 @@ export component PermissionsPage inherits PageFrame {
                 font-size: Type.small;
                 vertical-alignment: center;
             }
-            Segmented {
+            // A few centers side by side; more in a list, which names each
+            // in full instead of squeezing them all.
+            if Perm.centers.length <= 4: Segmented {
                 options: Perm.centers;
                 current: Perm.current;
+                chosen(i) => {
+                    Perm.pick(i);
+                }
+            }
+            if Perm.centers.length > 4: Picker {
+                options: Perm.centers;
+                current: Perm.current;
+                label: "Center";
                 chosen(i) => {
                     Perm.pick(i);
                 }

@@ -4,7 +4,7 @@
 //! scrolls inside the window.
 
 use nerve_node_desktop::headless::Screen;
-use nerve_node_desktop::{AppWindow, Install, Pick, Prefs, Store};
+use nerve_node_desktop::{AppWindow, Install, Load, Page, Perm, Pick, Prefs, Store};
 use slint::{ComponentHandle, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
 
 /// What a screen of 1280x800 leaves a window's content: less a panel (the
@@ -152,5 +152,41 @@ fn every_installer_step_and_dialog_fits_a_small_screen() {
     assert!(
         bottom(&screen.draw(), 20) == foot[foot.len() - 20 * APP.0 as usize..],
         "a dialog longer than the window runs out of it"
+    );
+    prefs.set_relay_edit_open(false);
+
+    // Ten centers on the Permissions page: the chosen one is named in full,
+    // not squeezed to an ellipsis with the others. Drawn with its name
+    // spelled two ways, the window differs only if the name is drawn.
+    let perm = window.global::<Perm>();
+    let names = |first: &str| {
+        let mut names = vec![SharedString::from(first)];
+        names.extend(
+            [
+                "lab",
+                "office-workstation-second-floor",
+                "build-farm-eu-west",
+                "staging-cluster",
+                "personal-laptop",
+                "ci-runner-pool",
+                "backup-vault",
+                "media-server",
+                "kids-pc",
+            ]
+            .map(SharedString::from),
+        );
+        ModelRc::new(VecModel::from(names))
+    };
+    store.set_page(Page::Policy);
+    // Nothing that moves: the page's loading dots would differ anyway.
+    perm.set_load(Load::Failed);
+    store.set_status_load(Load::Failed);
+    perm.set_current(0);
+    perm.set_centers(names("home"));
+    let one = screen.draw();
+    perm.set_centers(names("hxme"));
+    assert!(
+        screen.draw().as_slice() != one.as_slice(),
+        "the chosen center's name is not drawn among ten centers"
     );
 }

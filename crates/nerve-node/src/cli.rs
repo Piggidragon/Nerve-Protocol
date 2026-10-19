@@ -1268,10 +1268,23 @@ pub fn settle_user(cli: &Cli) -> Result<(), String> {
     if cli.cmd.is_service() {
         return Ok(());
     }
-    crate::service::become_owner(
-        &NodePaths::from_args(cli.config_dir.clone(), cli.state_dir.clone()),
-        matches!(cli.cmd, Cmd::Setup { .. }),
-    )
+    let paths = NodePaths::from_args(cli.config_dir.clone(), cli.state_dir.clone());
+    // The backup file is the asker's, in the asker's folders: it is opened
+    // as the user who ran sudo (crate::caller_file), not as the node's.
+    if crate::service::becomes_owner(&paths) {
+        use crate::caller_file::{Job, prepare};
+        match &cli.cmd {
+            Cmd::Backup {
+                file, overwrite, ..
+            } => prepare(Job::Write {
+                path: file.clone(),
+                overwrite: *overwrite,
+            })?,
+            Cmd::Restore { file, .. } => prepare(Job::Read(file.clone()))?,
+            _ => {}
+        }
+    }
+    crate::service::become_owner(&paths, matches!(cli.cmd, Cmd::Setup { .. }))
 }
 
 /// The account that ran this command through sudo, else root. On Windows
@@ -1838,7 +1851,7 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             passphrase_file,
         } => {
             owner_check(&[&paths]).await?;
-            let bytes = nerve_transport::backup::read_file(&file)?;
+            let bytes = crate::caller_file::read(&file)?;
             let kind = nerve_transport::backup::kind_of(&bytes)?;
             if kind != nerve_transport::backup::Kind::Node {
                 return Err(format!(

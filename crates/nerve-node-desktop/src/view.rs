@@ -11,9 +11,6 @@ use crate::{
     NodeStatus, RelayNodeRow, Tone,
 };
 
-/// The most audit entries the page shows (crate::app asks for as many).
-pub const AUDIT_SHOWN: usize = 200;
-
 fn s(v: &Value) -> &str {
     v.as_str().unwrap_or_default()
 }
@@ -654,12 +651,11 @@ fn short(v: &Value) -> String {
     }
 }
 
-/// The audit entries to show, at most [`AUDIT_SHOWN`], from the `newest`
-/// first. `centers` are the paired ones, whose entries take rule buttons.
+/// The audit entries to show, from the `newest` first (crate::app asks for
+/// as many as the page shows). `centers` are the paired ones, whose entries take rule buttons.
 pub fn audit(newest: &[Value], centers: &[String], now_ms: u64) -> Vec<AuditRow> {
     newest
         .iter()
-        .take(AUDIT_SHOWN)
         .enumerate()
         .map(|(i, e)| audit_row(e, i, centers, now_ms))
         .collect()

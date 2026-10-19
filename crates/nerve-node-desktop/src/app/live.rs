@@ -11,10 +11,10 @@ use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 use super::{CURRENT, Ctl, Exec, now_ms};
 use crate::{Load, Logs, Page, view};
 
-/// How many audit entries the app asks for: the newest the page shows.
-pub(super) const AUDIT_LAST: &str = "200";
-/// How many log lines the page shows.
-const LOG_LAST: usize = 300;
+/// The most audit entries and log lines a page asks for once the owner
+/// wants more than the newest few (`Store.audit-limit`, `Logs.limit`): the
+/// page lays out every row it holds.
+const MOST: i32 = 1000;
 
 impl Ctl {
     pub(super) fn stop_follow(&self) {
@@ -75,7 +75,11 @@ impl Ctl {
                 s.get_audit_refused_only()
             })
             .unwrap_or(false);
-        let mut args = vec!["audit", "--follow", "--last", AUDIT_LAST];
+        let last = self
+            .with_store(|s| s.get_audit_limit())
+            .unwrap_or_default()
+            .to_string();
+        let mut args = vec!["audit", "--follow", "--last", &last];
         if refused {
             args.push("--denied");
         }
@@ -94,7 +98,12 @@ impl Ctl {
             l.set_load(Load::Loading);
             l.set_rows(ModelRc::default());
         }
-        let last = LOG_LAST.to_string();
+        let last = self
+            .window
+            .upgrade()
+            .map(|w| w.global::<Logs>().get_limit())
+            .unwrap_or_default()
+            .to_string();
         self.start_follow(vec!["log", "--follow", "--last", &last]);
     }
 
@@ -159,14 +168,18 @@ impl Ctl {
             return;
         }
         let log = self.page() == Some(Page::Log);
+        let keep = if log {
+            self.window
+                .upgrade()
+                .map(|w| w.global::<Logs>().get_limit())
+        } else {
+            self.with_store(|s| s.get_audit_limit())
+        };
+        let keep = keep.unwrap_or_default().max(0) as usize;
         for entry in batch {
             match entry {
                 Ok(v) => {
-                    let (list, keep) = if log {
-                        (&self.log, LOG_LAST)
-                    } else {
-                        (&self.audit, view::AUDIT_SHOWN)
-                    };
+                    let list = if log { &self.log } else { &self.audit };
                     let mut l = list.borrow_mut();
                     l.insert(0, v);
                     l.truncate(keep);
@@ -201,6 +214,29 @@ impl Ctl {
         }
     }
 
+    /// Says again how long ago each shown entry was, as of `now`: the timer
+    /// that asks for the status calls it, so that "just now" does not stay
+    /// on an entry of an hour ago while the node writes nothing new. Only
+    /// the rows whose time reads differently change, so the list keeps its
+    /// place.
+    pub fn refresh_times(&self, now: u64) {
+        match self.page() {
+            Some(Page::Log) => {
+                let Some(w) = self.window.upgrade() else {
+                    return;
+                };
+                let l = w.global::<Logs>();
+                let rows = view::log_rows(&self.log.borrow(), l.get_problems_only(), now);
+                retime(&l.get_rows(), rows, |r| &r.when);
+            }
+            Some(Page::Audit) => {
+                let rows = view::audit(&self.audit.borrow(), &self.centers.borrow(), now);
+                self.with_store(|s| retime(&s.get_audit(), rows, |r| &r.when));
+            }
+            _ => {}
+        }
+    }
+
     /// Shows the log again, all of it or its problems.
     pub(super) fn log_filter(&self, problems: bool) {
         let rows = view::log_rows(&self.log.borrow(), problems, now_ms());
@@ -212,7 +248,41 @@ impl Ctl {
     }
 }
 
+/// Puts each of `rows` whose time (`when`) differs from the shown one in
+/// its place; a list that is not the shown one's length is left alone (an
+/// entry came, and the next batch shows it whole).
+fn retime<T: Clone + 'static>(
+    shown: &ModelRc<T>,
+    rows: Vec<T>,
+    when: impl Fn(&T) -> &SharedString,
+) {
+    use slint::Model;
+    if shown.row_count() != rows.len() {
+        return;
+    }
+    for (i, row) in rows.into_iter().enumerate() {
+        if shown
+            .row_data(i)
+            .is_some_and(|old| when(&old) != when(&row))
+        {
+            shown.set_row_data(i, row);
+        }
+    }
+}
+
 pub(super) fn wire(ctl: &Rc<Ctl>, window: &crate::AppWindow) {
+    let c = ctl.clone();
+    window.global::<crate::Store>().on_audit_more(move || {
+        c.with_store(|s| s.set_audit_limit(MOST));
+        c.follow_audit();
+    });
+    let c = ctl.clone();
+    window.global::<Logs>().on_more(move || {
+        if let Some(w) = c.window.upgrade() {
+            w.global::<Logs>().set_limit(MOST);
+        }
+        c.follow_log();
+    });
     let c = ctl.clone();
     window
         .global::<Logs>()

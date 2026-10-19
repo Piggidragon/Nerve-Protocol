@@ -81,10 +81,7 @@ impl Ctl {
     fn prefs_change(self: &Rc<Self>, args: Vec<String>, input: Option<String>, said: String) {
         self.command(args, input, move |c, answer| {
             match answer {
-                Ok(v) => {
-                    let said = if said.is_empty() { messages(&v) } else { said };
-                    c.toast(said, Tone::Ok);
-                }
+                Ok(v) => c.done(&v, said),
                 Err(e) => c.toast(e, Tone::Danger),
             }
             c.prefs_load();
@@ -174,7 +171,7 @@ impl Ctl {
                         p.set_proxy_open(false);
                         p.set_proxy_new_password(SharedString::new());
                     });
-                    c.toast(messages(&v), Tone::Ok);
+                    c.done(&v, "");
                 }
                 Err(e) => {
                     c.with_prefs(|p| p.set_proxy_error(e.into()));
@@ -275,12 +272,12 @@ impl Ctl {
         });
         self.command(set_centers, None, move |c, answer| match answer {
             Ok(_) => c.command(set_limits, None, move |c, answer| match answer {
-                Ok(_) => {
+                Ok(v) => {
                     c.with_prefs(|p| {
                         p.set_relay_edit_busy(false);
                         p.set_relay_edit_open(false);
                     });
-                    c.toast(format!("{name}'s centers and limits are saved."), Tone::Ok);
+                    c.done(&v, format!("{name}'s centers and limits are saved."));
                     c.prefs_load();
                 }
                 Err(e) => failed(c, e),
@@ -347,7 +344,7 @@ impl Ctl {
                         p.set_raw_value(SharedString::new());
                         p.set_raw_error(SharedString::new());
                     });
-                    c.toast(messages(&v), Tone::Ok);
+                    c.done(&v, "");
                     c.raw_get();
                 }
                 Err(e) => {

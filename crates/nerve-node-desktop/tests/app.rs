@@ -60,6 +60,10 @@ fn until(ctl: &Ctl, what: &str, done: impl Fn() -> bool) {
 }
 
 fn logged(paths: &NodePaths, msg: &str) {
+    logged_at(paths, 1, msg);
+}
+
+fn logged_at(paths: &NodePaths, ts: u64, msg: &str) {
     use std::io::Write;
     std::fs::create_dir_all(&paths.state_dir).unwrap();
     let mut f = std::fs::OpenOptions::new()
@@ -70,7 +74,7 @@ fn logged(paths: &NodePaths, msg: &str) {
     writeln!(
         f,
         "{}",
-        serde_json::json!({"ts": 1, "level": "warn", "msg": msg})
+        serde_json::json!({"ts": ts, "level": "warn", "msg": msg})
     )
     .unwrap();
 }
@@ -147,6 +151,36 @@ fn the_app_drives_the_cli_end_to_end() {
         nerve_policy::config::SettingsGrant::Write
     );
     assert!(store.get_centers().row_data(0).unwrap().settings_write);
+    // No node runs, so each change counts when it starts, and the app says
+    // so instead of a plain "done". With the service running (as the
+    // installed node on Windows, which takes only folder changes while it
+    // runs), the Overview offers the restart.
+    assert_eq!(
+        store.get_toast_tone(),
+        nerve_node_desktop::Tone::Warn,
+        "{}",
+        store.get_toast()
+    );
+    assert!(
+        store
+            .get_toast()
+            .starts_with("home may change this machine's settings now.")
+            && store.get_toast().contains("takes it when it starts"),
+        "{}",
+        store.get_toast()
+    );
+    assert!(!store.get_restart_due());
+    store.set_service_state("running".into());
+    store.invoke_center_pause("home".into(), true);
+    assert!(store.get_restart_due());
+    assert!(
+        store.get_toast().contains("restart it on the Overview"),
+        "{}",
+        store.get_toast()
+    );
+    store.invoke_center_pause("home".into(), false);
+    store.set_service_state("".into());
+    store.set_restart_due(false);
     let settings = audit(&paths)
         .iter()
         .filter(|e| e["kind"] == "settings" && e["by"] == "local")
@@ -299,6 +333,29 @@ fn the_app_drives_the_cli_end_to_end() {
     perm.invoke_folder_remove(path);
     assert!(config(&paths).centers[0].policy.folders.is_empty());
 
+    // The answer of a reading the page asked for before its last one (the
+    // owner picked another center meanwhile) comes late: it is dropped.
+    let stale = ctl.perm_asked();
+    store.invoke_show(Page::Policy);
+    assert!(ctl.perm_asked() > stale);
+    let elsewhere = serde_json::json!({"center": "other", "folders": [
+        {"path": "/elsewhere", "rights": "r--", "read": true, "write": false, "execute": false}
+    ]});
+    let rules = serde_json::json!({"center": "other", "allow": ["exec.run:elsewhere"], "deny": [], "sudo": []});
+    let caps = serde_json::json!({"center": "other", "caps": {}, "known": {}});
+    ctl.perm_loaded(
+        stale,
+        (
+            Ok(elsewhere),
+            Ok(rules),
+            Ok(caps),
+            Ok(serde_json::json!({"sudo": "on"})),
+        ),
+    );
+    assert_eq!(perm.get_folders().row_count(), 0);
+    assert!(perm.get_allow().iter().all(|r| r != "exec.run:elsewhere"));
+    assert!(!perm.get_sudo_on());
+
     let allowed = |r: &str| {
         config(&paths).centers[0]
             .policy
@@ -350,6 +407,27 @@ fn the_app_drives_the_cli_end_to_end() {
         logs.get_rows().row_count() == 2
     });
     assert_eq!(logs.get_rows().row_data(0).unwrap().msg, "cannot connect");
+    // How long ago moves on while the node writes nothing new.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    logged_at(&paths, now, "link up");
+    until(&ctl, "the newest log line", || {
+        logs.get_rows().row_count() == 3
+    });
+    assert_eq!(logs.get_rows().row_data(0).unwrap().when, "just now");
+    ctl.refresh_times(now + 2 * 3600 * 1000);
+    assert_eq!(logs.get_rows().row_data(0).unwrap().when, "2 h ago");
+    // The page shows the newest lines, and more when asked.
+    logs.set_limit(2);
+    store.invoke_show(Page::Log);
+    until(&ctl, "the two newest lines", || {
+        logs.get_rows().row_count() == 2
+    });
+    logs.invoke_more();
+    assert_eq!(logs.get_limit(), 1000);
+    until(&ctl, "every line", || logs.get_rows().row_count() == 3);
 
     // Settings: the name, any setting, a relay node's token, a backup and
     // its restore, the passphrase piped in.

@@ -8,7 +8,7 @@ import { Load, AuditRow } from "data.slint";
 import { Store } from "store.slint";
 import {
     Button, ButtonKind, Card, Pill, IconTile, Banner, Loading, PageHeader, PageFrame,
-    EmptyState, Divider, Segmented, Code, Reveal, Fit,
+    EmptyState, Divider, Segmented, Code, Reveal, Fit, MoreFoot,
 } from "widgets.slint";
 
 component AuditEntry {
@@ -216,14 +216,15 @@ export component AuditPage inherits PageFrame {
     }
 
     Reveal {
-        shown: Store.audit.length >= 200;
+        shown: Store.audit.length >= Store.audit-limit;
         gap: Space.lg;
-        Text {
-            text: "The newest " + Store.audit.length + " entries. `nerve-node audit` shows them all.";
-            color: Theme.text-faint;
-            font-size: Type.caption;
-            horizontal-alignment: center;
-            wrap: word-wrap;
+        MoreFoot {
+            text: Store.audit-limit < 1000 ? "The newest " + Store.audit.length + " entries."
+                : "The newest " + Store.audit.length + " entries. The node keeps the older ones in its audit log.";
+            more: Store.audit-limit < 1000;
+            clicked => {
+                Store.audit-more();
+            }
         }
     }
 }

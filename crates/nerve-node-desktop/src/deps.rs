@@ -129,20 +129,23 @@ pub fn pkexec_failed(code: Option<i32>, said: &str) -> Option<String> {
     (code == Some(127) && NO_AGENT_SAID.iter().any(|s| said.contains(s))).then(no_agent)
 }
 
-/// `program` in the folders of `path` (`PATH`), or in `/usr/bin`.
-pub fn find_program(program: &str, path: Option<&str>) -> Option<PathBuf> {
-    path.unwrap_or_default()
-        .split(':')
-        .filter(|d| !d.is_empty())
-        .chain(["/usr/bin"])
-        .map(|d| Path::new(d).join(program))
+/// `program` in the folders of `path` (`PATH`, split as this system splits
+/// it: `;` on Windows, where a drive letter is followed by `:`), or in
+/// `/usr/bin`.
+pub fn find_program(program: &str, path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    path.map(std::env::split_paths)
+        .into_iter()
+        .flatten()
+        .filter(|d| !d.as_os_str().is_empty())
+        .chain([PathBuf::from("/usr/bin")])
+        .map(|d| d.join(program))
         .find(|p| p.is_file())
 }
 
 /// pkexec on this machine, before the app asks ([`polkit`]).
 #[cfg(unix)]
 pub fn pkexec_here() -> Result<PathBuf, String> {
-    let path = std::env::var("PATH").ok();
+    let path = std::env::var_os("PATH");
     let pkexec = find_program("pkexec", path.as_deref());
     polkit(pkexec.as_deref())?;
     Ok(pkexec.unwrap_or_default())
@@ -284,12 +287,12 @@ mod tests {
 
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("pkexec-test"), "").unwrap();
-        let path = format!("/nowhere:{}", d.path().display());
+        let path = std::env::join_paths([Path::new("/nowhere"), d.path()]).unwrap();
         assert_eq!(
             find_program("pkexec-test", Some(&path)),
             Some(d.path().join("pkexec-test"))
         );
-        assert_eq!(find_program("pkexec-test", Some("/nowhere")), None);
+        assert_eq!(find_program("pkexec-test", Some("/nowhere".as_ref())), None);
     }
 
     #[test]

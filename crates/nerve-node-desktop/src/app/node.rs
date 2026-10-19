@@ -52,7 +52,11 @@ impl Ctl {
             move |c, answer| {
                 c.with_store(|s| s.set_busy(SharedString::new()));
                 match answer {
-                    Ok(_) => c.toast(said, Tone::Ok),
+                    Ok(_) => {
+                        // A start takes every change the node waited with.
+                        c.with_store(|s| s.set_restart_due(false));
+                        c.toast(said, Tone::Ok);
+                    }
                     Err(e) => c.toast(e, Tone::Danger),
                 }
                 c.refresh_service();

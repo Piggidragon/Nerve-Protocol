@@ -33,7 +33,7 @@ fn another_process_of_the_user_cannot_write_to_the_broker() {
     // Only the script's folder: the real pkexec must never be asked.
     let path = d.path().to_str().unwrap();
     assert_eq!(
-        nerve_node_desktop::deps::find_program("pkexec", Some(path)),
+        nerve_node_desktop::deps::find_program("pkexec", Some(path.as_ref())),
         Some(pkexec.clone())
     );
     // SAFETY: the only test of this program, before any thread of its own.

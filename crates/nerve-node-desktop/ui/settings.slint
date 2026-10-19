@@ -115,7 +115,7 @@ export component SettingsPage inherits PageFrame {
     Group {
         icon: @image-url("icons/globe.svg");
         title: "Proxy";
-        text: "The node reaches its centers directly, or through an HTTP proxy or a relay. Header values and a password go into the system keyring, never into node.toml.";
+        text: "The node reaches its centers directly, or through an HTTP proxy or a relay. Header values and a password are kept with the node's own keys, never in node.toml.";
         VerticalLayout {
             Reveal {
                 shown: Prefs.proxy == "";
@@ -554,7 +554,7 @@ export component SettingsPage inherits PageFrame {
                     font-weight: Type.semibold;
                 }
                 Text {
-                    text: "Removes the service, its user, the program and its menu entry, and closes this window. You choose whether the node's settings, pairings and keys stay.";
+                    text: "Removes the service, its user, the program and its menu entry. You choose whether the node's settings, pairings and keys stay.";
                     color: Theme.text-muted;
                     font-size: Type.caption;
                     wrap: word-wrap;

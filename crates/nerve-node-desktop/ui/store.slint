@@ -23,6 +23,8 @@ export global Store {
     in-out property <[AuditRow]> audit;
     in-out property <int> audit-total;
     in-out property <bool> audit-refused-only;
+    // How many of the newest entries the page asks for (src/app/live.rs).
+    in-out property <int> audit-limit: 200;
 
     // Pairing: the link, then what the owner confirms.
     in-out property <bool> pair-open;
@@ -58,6 +60,7 @@ export global Store {
     callback show(Page);
     callback refresh();
     callback refresh-audit();
+    callback audit-more();
     callback audit-filter(bool);
     callback audit-rule(int, string, bool);
 
@@ -84,6 +87,9 @@ export global Store {
     in-out property <bool> service-enabled;
     // start, stop or restart.
     callback service(string);
+    // A change was made that the running service takes only when it starts
+    // again (src/app.rs, Ctl::done): the Overview offers the restart.
+    in-out property <bool> restart-due;
 
     // Elevation: an installed node's files are the system's, so the app asks
     // for administrator rights once, and says why first.
@@ -168,7 +174,10 @@ export global Logs {
     in-out property <string> error;
     in-out property <[LogRow]> rows;
     in-out property <bool> problems-only;
+    // How many of the newest lines the page asks for (src/app/live.rs).
+    in-out property <int> limit: 300;
     callback filter(bool);
+    callback more();
 }
 
 // The Help page: the CLI's own command list.

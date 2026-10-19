@@ -11,6 +11,15 @@ use crate::{Load, Perm, Tone, view};
 
 const LISTS: [&str; 3] = ["allow", "deny", "sudo"];
 
+/// What `folder ls`, `rule ls`, `cap ls` and `sudo status` answered for the
+/// page's center.
+pub type PermAnswers = (
+    Result<Value, String>,
+    Result<Value, String>,
+    Result<Value, String>,
+    Result<Value, String>,
+);
+
 impl Ctl {
     /// The centers to choose from, as the status said them; the page keeps
     /// its center while it is paired.
@@ -65,6 +74,8 @@ impl Ctl {
         if center.is_empty() || self.waiting_for_rights() {
             return;
         }
+        let asked = self.perm_asked.get() + 1;
+        self.perm_asked.set(asked);
         self.with_perm(|p| p.set_load(Load::Loading));
         self.perm_mode();
         self.job(
@@ -78,36 +89,47 @@ impl Ctl {
                     r.run(&["sudo", "status"]),
                 )
             },
-            |c, (folders, rules, caps, sudo)| {
-                let all = folders.and_then(|f| Ok((f, rules?, caps?, sudo?)));
-                match all {
-                    Ok((f, r, k, s)) => {
-                        c.with_perm(|p| {
-                            p.set_folders(ModelRc::new(VecModel::from(view::folders(&f))));
-                            p.set_allow(ModelRc::new(VecModel::from(view::rule_list_of(
-                                &r, "allow",
-                            ))));
-                            p.set_deny(ModelRc::new(VecModel::from(view::rule_list_of(
-                                &r, "deny",
-                            ))));
-                            p.set_sudo_list(ModelRc::new(VecModel::from(view::rule_list_of(
-                                &r, "sudo",
-                            ))));
-                            p.set_caps(ModelRc::new(VecModel::from(view::caps(&k))));
-                            p.set_sudo_on(s["sudo"] == "on");
-                            p.set_load(Load::Ready);
-                            p.set_error(SharedString::new());
-                        });
-                    }
-                    Err(e) => {
-                        c.with_perm(|p| {
-                            p.set_load(Load::Failed);
-                            p.set_error(e.into());
-                        });
-                    }
-                }
-            },
+            move |c, answers| c.perm_loaded(asked, answers),
         );
+    }
+
+    /// The reading of the page that runs now, or ran last.
+    pub fn perm_asked(&self) -> u64 {
+        self.perm_asked.get()
+    }
+
+    /// Shows what reading `asked` of the page found, unless the page asked
+    /// again since: two readings run at once when the owner picks one
+    /// center and then another, and the one that ends last must not put the
+    /// first center's folders and rules under the second one's name.
+    pub fn perm_loaded(&self, asked: u64, answers: PermAnswers) {
+        if asked != self.perm_asked.get() {
+            return;
+        }
+        let (folders, rules, caps, sudo) = answers;
+        let all = folders.and_then(|f| Ok((f, rules?, caps?, sudo?)));
+        match all {
+            Ok((f, r, k, s)) => {
+                self.with_perm(|p| {
+                    p.set_folders(ModelRc::new(VecModel::from(view::folders(&f))));
+                    p.set_allow(ModelRc::new(VecModel::from(view::rule_list_of(
+                        &r, "allow",
+                    ))));
+                    p.set_deny(ModelRc::new(VecModel::from(view::rule_list_of(&r, "deny"))));
+                    p.set_sudo_list(ModelRc::new(VecModel::from(view::rule_list_of(&r, "sudo"))));
+                    p.set_caps(ModelRc::new(VecModel::from(view::caps(&k))));
+                    p.set_sudo_on(s["sudo"] == "on");
+                    p.set_load(Load::Ready);
+                    p.set_error(SharedString::new());
+                });
+            }
+            Err(e) => {
+                self.with_perm(|p| {
+                    p.set_load(Load::Failed);
+                    p.set_error(e.into());
+                });
+            }
+        }
     }
 
     fn perm_center(&self) -> String {
@@ -129,9 +151,9 @@ impl Ctl {
         args.push(self.perm_center());
         self.command(args, input, move |c, answer| {
             match answer {
-                Ok(_) => {
+                Ok(v) => {
                     close(c);
-                    c.toast(said, Tone::Ok);
+                    c.done(&v, said);
                 }
                 Err(e) => failed(c, e),
             }
@@ -342,9 +364,9 @@ impl Ctl {
                     p.set_sudo_password(SharedString::new());
                 });
                 match answer {
-                    Ok(_) => {
+                    Ok(v) => {
                         c.with_perm(|p| p.set_sudo_open(false));
-                        c.toast("Sudo is on.", Tone::Ok);
+                        c.done(&v, "Sudo is on.");
                     }
                     Err(e) => {
                         c.with_perm(|p| p.set_sudo_error(e.into()));
@@ -358,7 +380,7 @@ impl Ctl {
     fn sudo_off(self: &Rc<Self>) {
         self.command(vec!["sudo".into(), "off".into()], None, |c, answer| {
             match answer {
-                Ok(_) => c.toast("Sudo is off.", Tone::Ok),
+                Ok(v) => c.done(&v, "Sudo is off."),
                 Err(e) => c.toast(e, Tone::Danger),
             }
             c.perm_load();

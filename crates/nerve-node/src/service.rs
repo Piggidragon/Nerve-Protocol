@@ -1800,18 +1800,9 @@ pub fn become_owner(paths: &NodePaths, keep_root: bool) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if nerve_transport::net::euid() != 0 {
-            return Ok(());
-        }
-        let Some(m) = [&paths.config_dir, &paths.state_dir]
-            .iter()
-            .find_map(|d| std::fs::metadata(d).ok())
-        else {
+        let Some(m) = owner_to_become(paths) else {
             return Ok(());
         };
-        if m.uid() == 0 {
-            return Ok(());
-        }
         #[cfg(target_os = "linux")]
         let (setgid, setuid) = {
             let saved = |id: u32| if keep_root { 0 } else { id };
@@ -1856,6 +1847,32 @@ pub fn become_owner(paths: &NodePaths, keep_root: bool) -> Result<(), String> {
     {
         let _ = (paths, keep_root);
         Ok(())
+    }
+}
+
+/// The folders whose owner root's command becomes ([`become_owner`]): the
+/// first of them that is there, when this process is root and they are not
+/// root's.
+#[cfg(unix)]
+fn owner_to_become(paths: &NodePaths) -> Option<std::fs::Metadata> {
+    use std::os::unix::fs::MetadataExt;
+    if nerve_transport::net::euid() != 0 {
+        return None;
+    }
+    [&paths.config_dir, &paths.state_dir]
+        .iter()
+        .find_map(|d| std::fs::metadata(d).ok())
+        .filter(|m| m.uid() != 0)
+}
+
+/// Whether [`become_owner`] makes this process another user.
+pub fn becomes_owner(paths: &NodePaths) -> bool {
+    #[cfg(unix)]
+    return owner_to_become(paths).is_some();
+    #[cfg(not(unix))]
+    {
+        let _ = paths;
+        false
     }
 }
 

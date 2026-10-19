@@ -243,10 +243,11 @@ live link per node, so stop the old node before the new one connects.
 ## On a node installed as a service
 
 The command runs as the user `nerve` after `sudo` (see [service](service.md)),
-so it writes and reads the backup, and the file `--passphrase-file` names, as
-`nerve`. Name a backup in a folder `nerve` can use, such as
-`/var/lib/nerve/state/nerve.bak`, and copy it from there as root. Typing the
-passphrase needs no file.
+but it opens the backup file as you, the user who ran `sudo`: name one in
+your own folders, such as `~/nerve.bak`. A backup written there is yours,
+readable by you only. Run as root without `sudo`, it opens the file as root.
+The file `--passphrase-file` names is read as `nerve`; typing the passphrase
+needs no file. The desktop app works the same way with the files you pick.
 
 ## On a center installed as a service
 

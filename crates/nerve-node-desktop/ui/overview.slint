@@ -155,7 +155,8 @@ export component OverviewPage inherits PageFrame {
                         wrap: word-wrap;
                     }
                     Text {
-                        text: Store.service-state == "running" ? (Store.service-enabled ? "The node runs in the background as the user nerve, and starts with the machine." : "The node runs in the background as the user nerve.")
+                        text: Store.service-state == "running" && Store.restart-due ? "Some changes wait for a restart: the node takes them when it starts again."
+                            : Store.service-state == "running" ? (Store.service-enabled ? "The node runs in the background as the user nerve, and starts with the machine." : "The node runs in the background as the user nerve.")
                             : Store.service-state == "failed" ? "The Log page says why. Start it again once that is fixed."
                             : Store.service-state == "stopped" ? (Store.service-enabled ? "Start it to link this machine to its centers. It starts again with the machine." : "Start it to link this machine to its centers.")
                             : "One moment.";
@@ -180,7 +181,7 @@ export component OverviewPage inherits PageFrame {
                         if Store.service-state == "running": Button {
                             text: "Restart";
                             icon: @image-url("icons/refresh.svg");
-                            kind: ButtonKind.ghost;
+                            kind: Store.restart-due ? ButtonKind.primary : ButtonKind.ghost;
                             busy: Store.busy == "service-restart";
                             enabled: Store.busy != "service-stop";
                             clicked => {

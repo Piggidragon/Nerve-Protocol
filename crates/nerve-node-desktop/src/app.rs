@@ -24,6 +24,8 @@ mod node;
 mod perm;
 mod prefs;
 
+pub use perm::PermAnswers;
+
 /// Where the commands run: on threads of their own, answering on the
 /// window's event loop; or at once, for tests and the screenshots, which
 /// have no event loop.
@@ -116,6 +118,9 @@ pub struct Ctl {
     link: RefCell<Option<String>>,
     /// Open the first-run steps when nothing is paired yet.
     first_run: Cell<bool>,
+    /// Which reading of the Permissions page is the latest: an answer for
+    /// an earlier one (another center picked meanwhile) is dropped.
+    perm_asked: Cell<u64>,
 }
 
 thread_local! {
@@ -154,11 +159,31 @@ fn strings(args: &[String]) -> Vec<&str> {
 
 /// The lines a change said (`{"messages": [...]}`), as one text.
 fn messages(v: &Value) -> String {
+    lines(v).collect::<Vec<_>>().join("\n")
+}
+
+fn lines(v: &Value) -> impl Iterator<Item = &str> {
     v["messages"]
         .as_array()
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
+}
+
+/// Whether a line says that the node takes a change only at its next start:
+/// the installed node on Windows takes nothing but folder changes while it
+/// runs, and a node that does not run takes everything when it starts
+/// (`said` in nerve-node's cli.rs, and its relay changes).
+fn next_start(line: &str) -> bool {
+    line.contains("takes effect at the next start of the node")
+        || line.contains("takes this change only at its next start")
+}
+
+/// What a change said, without the line about the next start, which
+/// [`Ctl::done`] says in words of its own.
+fn said_of(v: &Value) -> String {
+    lines(v)
+        .filter(|l| !next_start(l))
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -192,6 +217,7 @@ impl Ctl {
             elevate: Cell::new(None),
             link: RefCell::new(None),
             first_run: Cell::new(false),
+            perm_asked: Cell::new(0),
         });
         CURRENT.with(|c| *c.borrow_mut() = Some(ctl.clone()));
         window.global::<Type>().set_mono(mono_font().into());
@@ -292,6 +318,7 @@ impl Ctl {
             move || {
                 if let Some(c) = c.upgrade() {
                     c.refresh_status();
+                    c.refresh_times(now_ms());
                 }
             },
         );
@@ -374,6 +401,38 @@ impl Ctl {
                 done(c, answer)
             },
         );
+    }
+
+    /// Says that a change is made: `said`, or what the command said when
+    /// `said` is empty. When the command said the node takes the change
+    /// only at its next start, the toast says so and, while the service
+    /// runs, the Overview offers the restart, instead of a plain "done".
+    fn done(&self, v: &Value, said: impl Into<String>) {
+        let mut said = said.into();
+        if said.is_empty() {
+            said = said_of(v);
+        }
+        if !lines(v).any(next_start) {
+            self.toast(said, Tone::Ok);
+            return;
+        }
+        let running = self
+            .with_store(|s| s.get_service_state() == "running")
+            .unwrap_or(false);
+        let then = if running {
+            "The node takes it when it starts again: restart it on the Overview."
+        } else {
+            "The node takes it when it starts."
+        };
+        let text = if said.is_empty() {
+            then.to_string()
+        } else {
+            format!("{said}\n{then}")
+        };
+        self.toast(text, Tone::Warn);
+        if running {
+            self.with_store(|s| s.set_restart_due(true));
+        }
     }
 
     fn toast(&self, text: impl Into<SharedString>, tone: Tone) {
@@ -489,13 +548,13 @@ impl Ctl {
         self.command(args, None, move |c, answer| {
             c.with_store(|s| s.set_busy(SharedString::new()));
             match answer {
-                Ok(_) => {
+                Ok(v) => {
                     let list = match list {
                         "sudo" => "sudo allow list",
                         "deny" => "deny list",
                         _ => "allow list",
                     };
-                    c.toast(format!("Added to the {list} of {center}."), Tone::Ok);
+                    c.done(&v, format!("Added to the {list} of {center}."));
                 }
                 Err(e) => c.toast(e, Tone::Danger),
             }
@@ -572,7 +631,7 @@ impl Ctl {
         self.command(args, None, move |c, answer| {
             c.with_store(|s| s.set_busy(SharedString::new()));
             match answer {
-                Ok(_) => c.toast(said, Tone::Ok),
+                Ok(v) => c.done(&v, said),
                 Err(e) => c.toast(e, Tone::Danger),
             }
             c.refresh_status();
@@ -669,7 +728,7 @@ impl Ctl {
             Pending::Accept => {
                 self.command(vec!["config".into(), "accept".into()], None, |c, answer| {
                     match answer {
-                        Ok(v) => c.toast(messages(&v), Tone::Ok),
+                        Ok(v) => c.done(&v, ""),
                         Err(e) => c.toast(e, Tone::Danger),
                     }
                     c.refresh_status();

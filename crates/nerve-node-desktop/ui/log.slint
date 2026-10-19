@@ -6,7 +6,7 @@ import { Load, LogRow } from "data.slint";
 import { Logs } from "store.slint";
 import {
     Button, ButtonKind, Card, Pill, Banner, Loading, PageHeader, PageFrame, EmptyState, Segmented,
-    ListRow, StatusDot, Reveal,
+    ListRow, StatusDot, Reveal, MoreFoot,
 } from "widgets.slint";
 
 export component LogPage inherits PageFrame {
@@ -92,14 +92,15 @@ export component LogPage inherits PageFrame {
     }
 
     Reveal {
-        shown: Logs.rows.length >= 300;
+        shown: Logs.rows.length >= Logs.limit;
         gap: Space.lg;
-        Text {
-            text: "The newest " + Logs.rows.length + " lines. `nerve-node log` shows them all.";
-            color: Theme.text-faint;
-            font-size: Type.caption;
-            horizontal-alignment: center;
-            wrap: word-wrap;
+        MoreFoot {
+            text: Logs.limit < 1000 ? "The newest " + Logs.rows.length + " lines."
+                : "The newest " + Logs.rows.length + " lines. The node keeps the older ones in its log file.";
+            more: Logs.limit < 1000;
+            clicked => {
+                Logs.more();
+            }
         }
     }
 }

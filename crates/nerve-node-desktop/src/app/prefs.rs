@@ -368,7 +368,11 @@ impl Ctl {
         self.job(
             move |_| chooser(what),
             move |c, picked| {
-                let Some(path) = picked else { return };
+                let path = match picked {
+                    Ok(Some(path)) => path,
+                    Ok(None) => return,
+                    Err(e) => return c.no_chooser(e),
+                };
                 let file: SharedString = path.display().to_string().into();
                 c.with_prefs(|p| {
                     if restore {

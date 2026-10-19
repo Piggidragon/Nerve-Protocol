@@ -111,6 +111,32 @@ the downloaded file again offers **Uninstall…** too, and on Windows so does
 the same in the app. Kept data comes back with the next install
 ([uninstall](service.md#uninstall)).
 
+## What the app needs
+
+On Linux the window uses parts of the desktop. GNOME and KDE Plasma bring all
+of them; on another desktop, install what is missing.
+
+| Part | What it is for | GNOME | KDE Plasma | Other desktops |
+|---|---|---|---|---|
+| A display, Wayland or X11 | The window | yes | yes | yes |
+| OpenGL (Mesa's libEGL, libGL) | Drawing with the GPU; without it the app draws in software | yes | yes | usually |
+| `pkexec` and a polkit authentication agent | Asking for administrator rights | built into GNOME Shell | `polkit-kde-agent-1`, part of Plasma | `polkit` and an agent, for example `polkit-gnome`, `lxpolkit`, `mate-polkit` |
+| `xdg-desktop-portal` with a file chooser | The file and folder dialogs | `xdg-desktop-portal-gnome` | `xdg-desktop-portal-kde` | `xdg-desktop-portal` and `-gtk` or `-wlr` |
+| `update-desktop-database` (desktop-file-utils) | Telling the desktop at once that Nerve opens `nerve://` links | yes | yes | install it, or log out and in after installing |
+
+When a part is missing, the app says so:
+
+| Missing | What happens |
+|---|---|
+| A display | The app does not start. It prints `no display: …` and shows it as a desktop notification where it can |
+| OpenGL | The app starts again drawing in software, and prints that it does. If that fails too, it prints `the window did not open …` |
+| `pkexec` | Instead of the system's question: "There is no pkexec on this machine …", with the package to install |
+| The polkit agent | Instead of the system's question: "No polkit authentication agent is running …", with agents to install |
+| The portal | The button that opens a file or folder dialog says "No file dialog: …" and names the portal packages |
+| `update-desktop-database` | Installing goes on, and its last step warns that the desktop may not know about the `nerve://` handler yet |
+
+Windows needs nothing besides the app.
+
 ## In a terminal
 
 On Linux, `nerve-node-desktop <command>` is `nerve-node <command>`, with

@@ -45,8 +45,32 @@ fn main() {
         nerve_node_desktop::console::attach();
         std::process::exit(nerve_node::entry::main());
     };
-    if let Err(e) = nerve_node_desktop::app::run(start) {
+    use nerve_node_desktop::app::Failed;
+    use nerve_node_desktop::deps;
+    let fail = |e: &str| -> ! {
         eprintln!("nerve-node-desktop: {e}");
+        // Started from the menu, nobody reads stderr.
+        deps::notify("Nerve cannot open its window", e);
         std::process::exit(1);
+    };
+    match nerve_node_desktop::app::run(start) {
+        Ok(()) => {}
+        Err(Failed::NoDisplay(e)) => fail(&e),
+        Err(Failed::Window(e)) => {
+            let chosen = std::env::var(deps::BACKEND_VAR).ok();
+            match deps::after_window_error(&e, chosen.as_deref()) {
+                deps::Next::Software => {
+                    eprintln!(
+                        "nerve-node-desktop: the GPU renderer did not start ({e}); drawing in software"
+                    );
+                    std::process::exit(deps::rerun_in_software());
+                }
+                deps::Next::Fail(e) => fail(&e),
+            }
+        }
+        Err(Failed::Other(e)) => {
+            eprintln!("nerve-node-desktop: {e}");
+            std::process::exit(1);
+        }
     }
 }

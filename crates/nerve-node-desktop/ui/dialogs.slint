@@ -513,6 +513,27 @@ export component OnceDialog inherits Dialog {
     }
 }
 
+// A part of the desktop is missing for what the owner asked: what, and
+// what to install.
+export component MissingDialog inherits Dialog {
+    title: Store.missing-title;
+    subtitle: "Nerve needs a part of the desktop for this that is not on this machine.";
+    card-width: 560px;
+    close => {
+        Store.missing-open = false;
+    }
+    DialogButtons {
+        error: Store.missing-text;
+        Button {
+            text: "Close";
+            kind: ButtonKind.primary;
+            clicked => {
+                Store.missing-open = false;
+            }
+        }
+    }
+}
+
 export component BackupDialog inherits Dialog {
     title: "Back up this node";
     subtitle: "The config and the keys go into the file, sealed with the passphrase. Without it the file is no use to anyone, you included.";

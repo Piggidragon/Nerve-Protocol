@@ -198,8 +198,10 @@ impl Ctl {
         let chooser = self.chooser.borrow().clone();
         self.job(
             move |_| chooser(Choose::Folder),
-            |c, picked| {
-                if let Some(path) = picked {
+            |c, picked| match picked {
+                Err(e) => c.no_chooser(e),
+                Ok(None) => {}
+                Ok(Some(path)) => {
                     c.with_perm(|p| {
                         p.set_folder_path(path.display().to_string().into());
                         p.set_folder_read(true);

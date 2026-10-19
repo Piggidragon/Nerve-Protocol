@@ -19,6 +19,7 @@ import { SetupDialog } from "setup.slint";
 import {
     PairDialog, ConfirmDialog, AboutDialog, ModeDialog, FolderDialog, SudoDialog, ProxyDialog,
     OnceDialog, BackupDialog, RestoreDialog, ElevateDialog, UpdateDialog, UninstallDialog,
+    MissingDialog,
     RelayNodeDialog,
 } from "dialogs.slint";
 import { InstallerView } from "installer.slint";
@@ -256,6 +257,7 @@ export component AppWindow inherits Window {
     if Store.elevate-open: ElevateDialog { }
     if Install.update-open: UpdateDialog { }
     if Install.uninstall-open: UninstallDialog { }
+    if Store.missing-open: MissingDialog { }
 
     if Store.toast-shown: Toast {
         text: Store.toast;

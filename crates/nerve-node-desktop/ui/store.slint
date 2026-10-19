@@ -47,6 +47,11 @@ export global Store {
     in-out property <Tone> toast-tone: Tone.ok;
 
     in-out property <bool> about-open;
+    // A part of the desktop the app needs is missing (src/deps.rs): what,
+    // and what to install.
+    in-out property <bool> missing-open;
+    in-out property <string> missing-title;
+    in-out property <string> missing-text;
     // 0 follows the system, 1 light, 2 dark.
     in-out property <int> appearance;
 

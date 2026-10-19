@@ -409,7 +409,7 @@ fn every_page_light_and_dark() {
     let picked = root.join("alex/projects/api");
     std::fs::create_dir_all(&picked).unwrap();
     ctl.set_chooser(Arc::new(move |c| {
-        (c == Choose::Folder).then(|| picked.clone())
+        Ok((c == Choose::Folder).then(|| picked.clone()))
     }));
     perm.invoke_folder_choose();
     perm.set_folder_write(true);
@@ -447,11 +447,18 @@ fn every_page_light_and_dark() {
     shots.take("settings-relay-node");
     prefs.set_relay_edit_open(false);
     let backup = root.join("nerve-node.backup");
-    ctl.set_chooser(Arc::new(move |_| Some(backup.clone())));
+    ctl.set_chooser(Arc::new(move |_| Ok(Some(backup.clone()))));
     prefs.invoke_backup_choose();
     prefs.set_backup_pass("correct horse battery".into());
     prefs.set_backup_pass2("correct horse".into());
     shots.take("settings-backup");
+    let no_portal = nerve_node_desktop::deps::portal(Some((false, ""))).unwrap_err();
+    prefs.set_backup_open(false);
+    let e = no_portal.clone();
+    ctl.set_chooser(Arc::new(move |_| Err(e.clone())));
+    prefs.invoke_backup_choose();
+    shots.take("settings-no-file-dialog");
+    store.set_missing_open(false);
     prefs.set_backup_open(false);
 
     // Settings' update and uninstall.
@@ -461,9 +468,12 @@ fn every_page_light_and_dark() {
     shots.take("settings-update");
     let new = root.join("Downloads/nerve-node-desktop-x86_64-linux");
     std::fs::create_dir_all(new.parent().unwrap()).unwrap();
-    ctl.set_chooser(Arc::new(move |_| Some(new.clone())));
+    ctl.set_chooser(Arc::new(move |_| Ok(Some(new.clone()))));
     install.invoke_choose_file();
     shots.take("settings-update-file");
+    install.set_error(no_portal.clone().into());
+    shots.take("settings-update-no-file-dialog");
+    install.set_error("".into());
     install.set_step("working".into());
     shots.take("settings-update-working");
     install.set_step("done".into());
@@ -509,6 +519,13 @@ fn every_page_light_and_dark() {
     // An installed node: why the app asks for administrator rights.
     ctl.needs_rights(Launch::Plain);
     shots.take("elevate");
+    // Without a polkit agent to ask (crate::deps), the dialog says what to
+    // install instead of asking.
+    let no_agent =
+        nerve_node_desktop::deps::polkit(Some(Path::new("/usr/bin/pkexec")), false).unwrap_err();
+    store.set_elevate_error(no_agent.clone().into());
+    shots.take("elevate-no-polkit-agent");
+    store.set_elevate_error("".into());
     store.invoke_elevate_allow();
 
     // A node.toml changed by hand: the CLI refuses it, and the app says so.
@@ -535,6 +552,8 @@ fn every_page_light_and_dark() {
     // The system refuses (here: no root); the step says why.
     install.invoke_install();
     shots.take("installer-failed");
+    install.set_error(no_agent.into());
+    shots.take("installer-no-polkit-agent");
     install.set_error("".into());
     install.set_windows(true);
     install.set_account("alex".into());
@@ -590,6 +609,10 @@ fn every_page_light_and_dark() {
         "Warning: alex is the account that ran sudo, and a person logs in as it: a command from a center can do what you can. `sudo nerve-node setup --create-user nerve-work` makes an account only the node uses.",
     ]));
     shots.take("installer-done");
+    install.set_warnings(lines(&[
+        "Warning: update-desktop-database is not on this machine, so the desktop may not know yet that Nerve opens nerve:// links. Install desktop-file-utils, or log out and in.",
+    ]));
+    shots.take("installer-done-no-desktop-database");
     install.set_warnings(lines(&[]));
     install.set_step("installed".into());
     install.set_installed_version("0.0.4".into());

@@ -328,6 +328,10 @@ fn launch_stdio(exe: &Path, how: Launch) -> Result<Arc<Client>, String> {
         // pkexec hands its stdin and stdout to the program, and asks with
         // the desktop's polkit agent.
         Launch::Elevated => {
+            // Without pkexec, or an agent to ask, pkexec could only fail:
+            // the owner reads what to install instead.
+            #[cfg(target_os = "linux")]
+            crate::deps::polkit_here()?;
             let mut c = Command::new("pkexec");
             c.arg(exe);
             c

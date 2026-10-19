@@ -277,8 +277,13 @@ impl Ctl {
         let chooser = self.chooser.borrow().clone();
         self.job(
             move |_| chooser(Choose::Program),
-            |c, picked: Option<PathBuf>| {
-                if let Some(p) = picked {
+            |c, picked: Result<Option<PathBuf>, String>| match picked {
+                // The update dialog is open: it says why.
+                Err(e) => {
+                    c.with_install(|i| i.set_error(e.into()));
+                }
+                Ok(None) => {}
+                Ok(Some(p)) => {
                     c.with_install(|i| {
                         i.set_source(1);
                         i.set_file(p.display().to_string().into());

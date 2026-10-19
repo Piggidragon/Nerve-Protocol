@@ -47,7 +47,9 @@ pub enum Choose {
 }
 
 /// Shows the system's dialog for a [`Choose`]; tests answer for it.
-pub type Chooser = Arc<dyn Fn(Choose) -> Option<PathBuf> + Send + Sync>;
+/// What the owner picked, `None` when they closed the dialog; an error
+/// when no dialog can open (crate::deps::portal).
+pub type Chooser = Arc<dyn Fn(Choose) -> Result<Option<PathBuf>, String> + Send + Sync>;
 
 /// Starts the installed app, as the menu entry does; tests answer for it.
 pub type Launcher = Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>;
@@ -56,8 +58,12 @@ pub type Launcher = Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + 
 /// Wayland and look like the desktop's.
 fn system_chooser() -> Chooser {
     Arc::new(|c| {
+        // The dialogs on Linux are the desktop portal's; without it rfd
+        // shows nothing and says nothing.
+        #[cfg(target_os = "linux")]
+        crate::deps::portal_here()?;
         let d = rfd::FileDialog::new();
-        match c {
+        Ok(match c {
             Choose::Folder => d.set_title("A folder for the center").pick_folder(),
             Choose::SaveBackup => d
                 .set_title("Back up the node")
@@ -65,7 +71,7 @@ fn system_chooser() -> Chooser {
                 .save_file(),
             Choose::OpenBackup => d.set_title("Restore a backup").pick_file(),
             Choose::Program => d.set_title("The new nerve-node-desktop").pick_file(),
-        }
+        })
     })
 }
 
@@ -682,6 +688,15 @@ impl Ctl {
     }
 
     /// Shows what a command said once, such as a token, to copy.
+    /// No file dialog could open: why, and what to install.
+    fn no_chooser(&self, e: String) {
+        self.with_store(|s| {
+            s.set_missing_title("No file dialog".into());
+            s.set_missing_text(e.into());
+            s.set_missing_open(true);
+        });
+    }
+
     fn show_once(&self, title: &str, text: &str) {
         self.with_prefs(|p| {
             p.set_once_title(title.into());
@@ -767,20 +782,25 @@ impl Ctl {
 /// opens the app, at what `start` asks (the pairing of a `nerve://` link,
 /// or the uninstall); any other copy of it, such as the file just
 /// downloaded, the installer.
-pub fn run(start: crate::instance::Asked) -> Result<(), String> {
+pub fn run(start: crate::instance::Asked) -> Result<(), Failed> {
+    // Said before anything else: without a display nothing below can be
+    // shown (crate::deps).
+    if let Some(e) = crate::deps::no_display_here() {
+        return Err(Failed::NoDisplay(e));
+    }
     // A window of this user's is open already: it takes this start.
     let instance = match crate::instance::claim(&start) {
         crate::instance::Claimed::Forwarded => return Ok(()),
         crate::instance::Claimed::First(i) => i,
     };
-    let runner = Runner::this_program()?;
+    let runner = Runner::this_program().map_err(Failed::Other)?;
     let layout = nerve_node::service::Layout::system();
     let here = std::env::current_exe().and_then(std::fs::canonicalize).ok();
     let installed = std::fs::canonicalize(&layout.bin).ok();
     // The window's name on Wayland and X11, by which the desktop finds its
     // menu entry (crate::parts).
     let _ = slint::set_xdg_app_id(crate::parts::PROGRAM);
-    let window = AppWindow::new().map_err(|e| format!("cannot open the window: {e}"))?;
+    let window = AppWindow::new().map_err(|e| Failed::Window(e.to_string()))?;
     let ctl = Ctl::attach(&window, runner, Exec::Threads);
     if let Some(file) = crate::settings::file() {
         ctl.keep_settings(file);
@@ -806,9 +826,19 @@ pub fn run(start: crate::instance::Asked) -> Result<(), String> {
         }
         ctl.watch();
     }
-    let r = window
-        .run()
-        .map_err(|e| format!("the window ended with an error: {e}"));
+    let r = window.run().map_err(|e| Failed::Window(e.to_string()));
     ctl.end();
+    // A start in software (crate::deps) is the user's one window then.
+    ctl.instance.borrow_mut().take();
     r
+}
+
+/// Why [`run`] ended without its window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Failed {
+    /// No display to open it on (crate::deps::no_display).
+    NoDisplay(String),
+    /// The window did not open, or ended with an error.
+    Window(String),
+    Other(String),
 }

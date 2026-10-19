@@ -64,8 +64,10 @@ pub struct Places {
     pub icons: PathBuf,
     /// The system's default handlers.
     pub mimeapps: PathBuf,
-    /// Whether to tell the desktop's caches (update-desktop-database).
+    /// Whether to tell the desktop's caches.
     pub refresh: bool,
+    /// The program that does: update-desktop-database.
+    pub cache_tool: &'static str,
 }
 
 impl Places {
@@ -75,6 +77,7 @@ impl Places {
             icons: "/usr/local/share/icons/hicolor".into(),
             mimeapps: "/etc/xdg/mimeapps.list".into(),
             refresh: true,
+            cache_tool: "update-desktop-database",
         }
     }
 
@@ -85,6 +88,7 @@ impl Places {
             icons: root.join("usr/local/share/icons/hicolor"),
             mimeapps: root.join("etc/xdg/mimeapps.list"),
             refresh: false,
+            cache_tool: "update-desktop-database",
         }
     }
 
@@ -116,7 +120,13 @@ impl Places {
             "nerve:// links open in Nerve (the default in {})",
             self.mimeapps.display()
         ));
-        self.refresh();
+        // Installed all the same: the desktop reads the entry at the next
+        // login without the cache.
+        if let Some(missing) = self.refresh() {
+            did.push(format!(
+                "Warning: {missing} is not on this machine, so the desktop may not know yet that Nerve opens nerve:// links. Install desktop-file-utils, or log out and in."
+            ));
+        }
         Ok(did)
     }
 
@@ -165,7 +175,7 @@ impl Places {
             }
         }
         if !did.is_empty() {
-            self.refresh();
+            let _ = self.refresh();
         }
         // The cache update-desktop-database left, when it names no other
         // program's entry, and the folder that held only Nerve's.
@@ -181,12 +191,12 @@ impl Places {
 
     /// Tells the desktop about the change where its tools are there: the
     /// cache of which entry opens which links, and the icon theme's time,
-    /// which GTK checks.
-    fn refresh(&self) {
+    /// which GTK checks. The cache's tool when it is missing.
+    fn refresh(&self) -> Option<&'static str> {
         if !self.refresh {
-            return;
+            return None;
         }
-        let _ = std::process::Command::new("update-desktop-database")
+        let cached = std::process::Command::new(self.cache_tool)
             .arg("-q")
             .arg(&self.applications)
             .stdout(std::process::Stdio::null())
@@ -196,6 +206,9 @@ impl Places {
             .arg("--no-create")
             .arg(&self.icons)
             .status();
+        cached
+            .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
+            .then_some(self.cache_tool)
     }
 }
 
@@ -702,6 +715,28 @@ mod tests {
             r#""C:\Program Files\Nerve\nerve-node-desktop.exe",0"#
         );
         assert!(!entry["Publisher"].is_empty());
+    }
+
+    /// Without update-desktop-database the install goes on, and says what
+    /// did not register.
+    #[cfg(not(windows))]
+    #[test]
+    fn a_missing_cache_tool_is_said_and_the_rest_installed() {
+        let d = tempfile::tempdir().unwrap();
+        let p = Places {
+            refresh: true,
+            cache_tool: "nerve-test-no-update-desktop-database",
+            ..Places::under(d.path())
+        };
+        let did = p.install(&d.path().join("nerve-node-desktop")).unwrap();
+        assert!(p.entry().exists() && p.mimeapps.exists());
+        let warning = did.iter().find(|l| l.starts_with("Warning:"));
+        assert!(
+            warning.is_some_and(|w| w.contains("nerve-test-no-update-desktop-database")
+                && w.contains("desktop-file-utils")),
+            "{did:?}"
+        );
+        assert!(p.uninstall().is_ok());
     }
 
     #[cfg(not(windows))]

@@ -245,9 +245,11 @@ fn the_app_drives_the_cli_end_to_end() {
     let work = root.join("work");
     std::fs::create_dir(&work).unwrap();
     let picked = work.clone();
-    ctl.set_chooser(Arc::new(move |c| match c {
-        Choose::Folder => Some(picked.clone()),
-        _ => None,
+    ctl.set_chooser(Arc::new(move |c| {
+        Ok(match c {
+            Choose::Folder => Some(picked.clone()),
+            _ => None,
+        })
     }));
     let perm = window.global::<Perm>();
     store.invoke_show(Page::Policy);
@@ -405,9 +407,19 @@ fn the_app_drives_the_cli_end_to_end() {
         node.centers.is_empty() && node.max_links.is_none(),
         "{node:?}"
     );
+    // Without the desktop portal no file dialog opens: the button says
+    // what to install instead of doing nothing.
+    let no_portal = nerve_node_desktop::deps::portal(Some((false, ""))).unwrap_err();
+    ctl.set_chooser(Arc::new(move |_| Err(no_portal.clone())));
+    prefs.invoke_backup_choose();
+    assert!(!prefs.get_backup_open());
+    assert!(store.get_missing_open());
+    assert_eq!(store.get_missing_title(), "No file dialog");
+    assert!(store.get_missing_text().contains("xdg-desktop-portal"));
+    store.set_missing_open(false);
     let backup = root.join("node.backup");
     let file = backup.clone();
-    ctl.set_chooser(Arc::new(move |_| Some(file.clone())));
+    ctl.set_chooser(Arc::new(move |_| Ok(Some(file.clone()))));
     prefs.invoke_backup_choose();
     assert!(prefs.get_backup_open());
     prefs.set_backup_pass("correct horse battery".into());

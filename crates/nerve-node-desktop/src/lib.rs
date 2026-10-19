@@ -9,6 +9,7 @@ pub mod app;
 pub mod broker;
 #[cfg(windows)]
 pub mod console;
+pub mod deps;
 pub mod headless;
 pub mod instance;
 pub mod parts;

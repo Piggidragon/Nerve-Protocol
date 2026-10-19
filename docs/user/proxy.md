@@ -44,6 +44,15 @@ nerve-node proxy set http://proxy.example:3128 --header 'X-Proxy-Token: abc'
 Write special characters of the password as `%XX`. `--header` can be given
 more than once.
 
+An argument shows in the process list while the command runs. To keep the
+secrets out of it, give the user name alone in the URL and the password on
+stdin, and the headers after it, one a line (the desktop app does this):
+
+```sh
+printf '%s\n' "$PASSWORD" 'X-Proxy-Token: abc' |
+  nerve-node proxy set http://user@proxy.example:3128 --password-stdin --headers-stdin
+```
+
 The values are secrets. The node keeps them in the system keyring (Keychain,
 Credential Manager, Secret Service), in one entry named `proxy:<config folder>`
 under the service `nerve`. `node.toml` keeps the URL without the login and the

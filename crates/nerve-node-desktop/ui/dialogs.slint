@@ -428,19 +428,28 @@ export component SudoDialog inherits Dialog {
 
 export component ProxyDialog inherits Dialog {
     title: "Proxy";
-    subtitle: "Every link to a center goes through it, a pairing too. Values of headers and a password in the URL go into the system keyring.";
+    subtitle: "Every link to a center goes through it, a pairing too. Header values and the password are kept apart from node.toml.";
     card-width: 560px;
     close => {
         Prefs.proxy-open = false;
     }
     Field {
         label: "Proxy";
-        hint: "http://host:port, http://user:password@host:port, or https://… for a relay.";
+        hint: "http://host:port, http://user@host:port when it wants a login, or https://… for a relay.";
         TextField {
             text <=> Prefs.proxy-new-url;
             mono: true;
             placeholder: "http://proxy.example:3128";
             label: "Proxy";
+        }
+    }
+    Field {
+        label: "Password";
+        hint: "Optional. The password of the user in the URL; it goes into the system keyring.";
+        TextField {
+            text <=> Prefs.proxy-new-password;
+            password: true;
+            label: "Password";
         }
     }
     Field {

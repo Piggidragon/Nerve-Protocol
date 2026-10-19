@@ -405,6 +405,12 @@ pub enum ProxyCmd {
         /// A header for the proxy, `Name: value`; can be given more than once. The value goes into the system keyring.
         #[arg(long = "header", value_name = "NAME: VALUE")]
         headers: Vec<String>,
+        /// Read the proxy's password from the first line of stdin, for a URL with a user name and no password (http://user@host:port); it never shows in the process list.
+        #[arg(long)]
+        password_stdin: bool,
+        /// Read headers from stdin, one `Name: value` a line, after the password with --password-stdin.
+        #[arg(long)]
+        headers_stdin: bool,
     },
     /// Reach centers directly again, and delete the proxy's values from the system keyring.
     Rm,
@@ -3189,7 +3195,22 @@ fn keyring_turns_commands_off(
 /// Nothing here prints, logs or audits a value.
 async fn proxy_cmd(paths: &NodePaths, c: ProxyCmd, out: &mut dyn Write) -> Result<(), String> {
     match c {
-        ProxyCmd::Set { url, pin, headers } => {
+        ProxyCmd::Set {
+            url,
+            pin,
+            mut headers,
+            password_stdin,
+            headers_stdin,
+        } => {
+            let mut stdin_password = None;
+            if password_stdin || headers_stdin {
+                let mut text = String::new();
+                std::io::Read::read_to_string(&mut std::io::stdin(), &mut text)
+                    .map_err(|e| format!("cannot read stdin: {e}"))?;
+                let (password, more) = stdin_secrets(&text, password_stdin, headers_stdin);
+                stdin_password = password;
+                headers.extend(more);
+            }
             let mut hs: Vec<(String, String)> = Vec::new();
             for (i, h) in headers.iter().enumerate() {
                 // Not echoed: without its colon the whole line may be the secret.
@@ -3202,7 +3223,18 @@ async fn proxy_cmd(paths: &NodePaths, c: ProxyCmd, out: &mut dyn Write) -> Resul
                 }
                 hs.push((k, v.trim().to_string()));
             }
-            let (url, login) = split_credentials(&url)?;
+            let (url, mut login) = split_credentials(&url)?;
+            if let Some(password) = stdin_password {
+                match &mut login {
+                    Some((_, p)) if p.is_empty() => *p = password,
+                    Some(_) => {
+                        return Err("the proxy URL has a password already; with --password-stdin give the user name alone, http://user@host:port".into());
+                    }
+                    None => {
+                        return Err("--password-stdin needs a proxy URL with a user name: http://user@host:port".into());
+                    }
+                }
+            }
             let https = url.to_ascii_lowercase().starts_with("https://");
             let (now, _) = read_config(paths).await?;
             let storage = now.machine.secret_storage;
@@ -3833,6 +3865,27 @@ fn keys_place(storage: SecretStorage) -> &'static str {
 /// Splits a user name and password off a proxy URL
 /// (`http://user:pass@host:port`), percent-escapes decoded. Errors never quote
 /// the URL once it holds an `@`.
+/// What `proxy set` reads from stdin: with `password`, the first line is
+/// the password; with `headers`, every other line that is not empty is a
+/// header.
+fn stdin_secrets(text: &str, password: bool, headers: bool) -> (Option<String>, Vec<String>) {
+    let mut lines = text.lines().map(|l| l.trim_end_matches('\r'));
+    let pw = if password {
+        Some(lines.next().unwrap_or_default().to_string())
+    } else {
+        None
+    };
+    let hs = if headers {
+        lines
+            .filter(|l| !l.trim().is_empty())
+            .map(str::to_string)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    (pw, hs)
+}
+
 fn split_credentials(url: &str) -> Result<(String, Option<(String, String)>), String> {
     let Some(at) = url.rfind('@') else {
         return Ok((url.to_string(), None));
@@ -3981,6 +4034,24 @@ fn table_at<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_secrets_come_from_stdin() {
+        let text = "s3cret pass\r\nProxy-Authorization: Bearer x\n\nX-Team: a\n";
+        assert_eq!(
+            stdin_secrets(text, true, true),
+            (
+                Some("s3cret pass".into()),
+                vec!["Proxy-Authorization: Bearer x".into(), "X-Team: a".into()]
+            )
+        );
+        assert_eq!(stdin_secrets("X-A: 1\nX-B: 2", false, true).1.len(), 2);
+        assert_eq!(
+            stdin_secrets("pw\nX-A: 1", true, false),
+            (Some("pw".into()), vec![])
+        );
+        assert_eq!(stdin_secrets("", true, false).0.as_deref(), Some(""));
+    }
 
     #[test]
     fn the_invoker_is_who_ran_sudo_or_pkexec() {

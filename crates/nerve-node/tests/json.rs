@@ -63,3 +63,79 @@ fn a_passphrase_on_stdin_is_taken_without_a_question() {
     assert!(!text.contains("Passphrase"), "{text}");
     assert!(file.is_file());
 }
+
+fn with_stdin(dir: &std::path::Path, args: &[&str], input: &str) -> (bool, serde_json::Value) {
+    use std::io::Write;
+    let mut child = Command::new(env!("CARGO_BIN_EXE_nerve-node"))
+        .arg("--config-dir")
+        .arg(dir.join("config"))
+        .arg("--state-dir")
+        .arg(dir.join("state"))
+        .arg("--json")
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let text = String::from_utf8(out.stdout).unwrap();
+    let v = serde_json::from_str(&text).unwrap_or_else(|e| panic!("{e}: {text:?}"));
+    (out.status.success(), v)
+}
+
+/// A proxy's password comes on stdin, never as an argument that every
+/// process could read. (An https:// proxy's: the node keeps it with its own
+/// keys, so no system keyring is asked here.)
+#[test]
+fn a_proxy_password_comes_on_stdin() {
+    let d = tempfile::tempdir().unwrap();
+    let (ok, v) = with_stdin(
+        d.path(),
+        &[
+            "proxy",
+            "set",
+            "https://relay.example:7490",
+            "--password-stdin",
+        ],
+        "s3cret\n",
+    );
+    assert!(!ok);
+    assert!(v["error"].as_str().unwrap().contains("user name"), "{v}");
+    let (ok, v) = with_stdin(
+        d.path(),
+        &[
+            "proxy",
+            "set",
+            "https://laptop:x@relay.example:7490",
+            "--password-stdin",
+        ],
+        "s3cret\n",
+    );
+    assert!(!ok);
+    assert!(
+        v["error"].as_str().unwrap().contains("password already"),
+        "{v}"
+    );
+    let (ok, v) = with_stdin(
+        d.path(),
+        &[
+            "proxy",
+            "set",
+            "https://laptop@relay.example:7490",
+            "--password-stdin",
+        ],
+        "s3cret\n",
+    );
+    assert!(ok, "{v}");
+    let (_, ls) = node(d.path(), &["proxy", "ls"]);
+    assert!(ls.to_string().contains("laptop"), "{ls}");
+    assert!(!ls.to_string().contains("s3cret"), "{ls}");
+    let config = std::fs::read_to_string(d.path().join("config/node.toml")).unwrap();
+    assert!(!config.contains("s3cret"), "{config}");
+}

@@ -24,7 +24,7 @@ center is paired.
 | `center ls` | List centers, their mode and grant | [pairing](pairing.md) |
 | `center pause`, `center resume` | Stop or restart the link to a center | [stop](stop.md#pause) |
 | `center grant settings write\|off` | Let a center change settings | [settings grant](settings-grant.md) |
-| `proxy set <url> [--pin P] [--header 'N: v']`, `proxy ls`, `proxy rm` | Dial centers through a proxy or a relay | [proxy](proxy.md) |
+| `proxy set <url> [--pin P] [--header 'N: v'] [--password-stdin] [--headers-stdin]`, `proxy ls`, `proxy rm` | Dial centers through a proxy or a relay | [proxy](proxy.md) |
 | `relay set <ip:port>`, `relay off` | Let other nodes reach this node's centers through it | [relay](relay.md) |
 | `relay add <name> [--center C]`, `relay rm <name>`, `relay ls` | Give a node a relay token, take it away, see who is connected | [relay](relay.md) |
 | `relay set-centers <name> [--center C]` | Change which centers a relayed node may reach | [relay](relay.md#limit-a-node-to-some-centers) |
@@ -106,5 +106,8 @@ one JSON value from stdout:
 
 When stdin is no terminal, nothing waits for typing: a password (`sudo on`, the
 account's on Windows) or a passphrase (`backup`, `restore`) is the first line
-of stdin, or of the file `--passphrase-file` names. `setup` reads its answers
+of stdin, or of the file `--passphrase-file` names. `proxy set
+http://user@host:port --password-stdin` takes the proxy's password from the
+first line of stdin, and `--headers-stdin` the headers from the lines after
+it, one `Name: value` each, so neither shows in the process list. `setup` reads its answers
 from stdin one line each. `center add` needs `--yes`.

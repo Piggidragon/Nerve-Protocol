@@ -127,31 +127,53 @@ impl Ctl {
             p.set_proxy_new_url(p.get_proxy());
             p.set_proxy_new_pin(p.get_proxy_pin());
             p.set_proxy_new_headers(SharedString::new());
+            p.set_proxy_new_password(SharedString::new());
             p.set_proxy_error(SharedString::new());
             p.set_proxy_open(true);
         });
     }
 
     fn proxy_set(self: &Rc<Self>) {
-        let Some((url, pin, headers)) = self.with_prefs(|p| {
+        let Some((url, pin, headers, password)) = self.with_prefs(|p| {
             (
                 p.get_proxy_new_url().trim().to_string(),
                 p.get_proxy_new_pin().trim().to_string(),
                 p.get_proxy_new_headers().to_string(),
+                p.get_proxy_new_password().to_string(),
             )
         }) else {
             return;
         };
+        // The password and the header values go on stdin, never as
+        // arguments, which every process of the machine can read.
+        let (url, password) = view::proxy_login(&url, &password);
         let mut args = vec!["proxy".into(), "set".into(), url];
         if !pin.is_empty() {
             args.push("--pin".into());
             args.push(pin);
         }
-        args.extend(view::header_args(&headers));
-        self.command(args, None, |c, answer| {
+        let headers: Vec<&str> = headers
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        let mut input = Vec::new();
+        if let Some(pw) = password {
+            args.push("--password-stdin".into());
+            input.push(pw);
+        }
+        if !headers.is_empty() {
+            args.push("--headers-stdin".into());
+            input.extend(headers.iter().map(|h| h.to_string()));
+        }
+        let input = (!input.is_empty()).then(|| input.join("\n"));
+        self.command(args, input, |c, answer| {
             match answer {
                 Ok(v) => {
-                    c.with_prefs(|p| p.set_proxy_open(false));
+                    c.with_prefs(|p| {
+                        p.set_proxy_open(false);
+                        p.set_proxy_new_password(SharedString::new());
+                    });
                     c.toast(messages(&v), Tone::Ok);
                 }
                 Err(e) => {

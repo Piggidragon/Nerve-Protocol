@@ -436,14 +436,49 @@ pub fn setting(v: &Value) -> String {
     }
 }
 
-/// The `--header` arguments of `proxy set` from the lines of the headers
-/// field.
-pub fn header_args(text: &str) -> Vec<String> {
-    text.lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty())
-        .flat_map(|l| ["--header".to_string(), l.to_string()])
-        .collect()
+/// A proxy URL and the password the owner typed, as `proxy set` takes them
+/// with `--password-stdin`: a password in the URL (`user:password@`) moves
+/// out of it, unless one was typed. `None`: no password.
+pub fn proxy_login(url: &str, typed: &str) -> (String, Option<String>) {
+    let mut url = url.to_string();
+    let mut password = (!typed.is_empty()).then(|| typed.to_string());
+    if let Some(scheme) = url.find("://")
+        && let Some(at) = url.rfind('@')
+        && at > scheme
+        && let Some(colon) = url[scheme + 3..at].find(':').map(|c| c + scheme + 3)
+    {
+        let given = url[colon + 1..at].to_string();
+        url.replace_range(colon..at, "");
+        // A password in a URL is %-escaped; on stdin it is taken as it is.
+        if password.is_none() {
+            password = Some(pct_decode(&given));
+        }
+    }
+    (url, password)
+}
+
+/// `%XX` escapes undone; a broken one stays as it is.
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        let hex = (b[i] == b'%')
+            .then(|| std::str::from_utf8(b.get(i + 1..i + 3)?).ok())
+            .flatten()
+            .and_then(|h| u8::from_str_radix(h, 16).ok());
+        match hex {
+            Some(x) => {
+                out.push(x);
+                i += 3;
+            }
+            None => {
+                out.push(b[i]);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// A time ahead, in words.
@@ -954,9 +989,22 @@ mod tests {
         let c = json!({"mode": "user", "until": NOW + 90 * 60_000});
         assert_eq!(mode_until(&c, NOW), "Back to allowlist mode in 1 h.");
         assert_eq!(mode_until(&json!({"mode": "user"}), NOW), "");
+        let login = |u: &str, t: &str| proxy_login(u, t);
         assert_eq!(
-            header_args("A: 1\n\n B: 2 \n"),
-            ["--header", "A: 1", "--header", "B: 2"]
+            login("http://p.example:3128", ""),
+            ("http://p.example:3128".into(), None)
+        );
+        assert_eq!(
+            login("http://alice:s%40cret@p.example:3128", ""),
+            ("http://alice@p.example:3128".into(), Some("s@cret".into()))
+        );
+        assert_eq!(
+            login("http://alice@p.example:3128", "typed"),
+            ("http://alice@p.example:3128".into(), Some("typed".into()))
+        );
+        assert_eq!(
+            login("http://alice:old@p.example:3128", "typed"),
+            ("http://alice@p.example:3128".into(), Some("typed".into()))
         );
     }
 

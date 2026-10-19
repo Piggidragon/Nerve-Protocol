@@ -481,6 +481,19 @@ fn the_app_drives_the_cli_end_to_end() {
     });
     store.invoke_show(Page::Overview);
 
+    // A proxy's password goes to the CLI on stdin, out of the URL it was
+    // typed in, and never into node.toml.
+    prefs.invoke_proxy_edit();
+    prefs.set_proxy_new_url("https://laptop:s3cret@relay.example:7490".into());
+    prefs.invoke_proxy_set();
+    assert!(!prefs.get_proxy_open(), "{}", prefs.get_proxy_error());
+    let file = std::fs::read_to_string(paths.config_file()).unwrap();
+    assert!(
+        file.contains("laptop") && !file.contains("s3cret"),
+        "{file}"
+    );
+    prefs.invoke_proxy_remove();
+
     // A service command goes through the broker too, and says when it
     // cannot be done: here no service is installed.
     store.invoke_service("stop".into());

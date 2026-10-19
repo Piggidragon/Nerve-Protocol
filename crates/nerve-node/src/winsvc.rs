@@ -396,7 +396,7 @@ fn remove_node_alone(
         if gone {
             ""
         } else {
-            " (Windows holds the old file, as the Event Log read it; it deletes it at its next start)"
+            " (Windows holds the old file, as when the Event Log read it or it runs; Windows deletes it at its next start)"
         }
     ));
     Ok(())

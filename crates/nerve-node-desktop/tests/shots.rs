@@ -636,7 +636,7 @@ fn every_page_light_and_dark() {
         "put Nerve in Apps & features, where Uninstall removes it",
         "registered the service nerve-node, which runs as nerve and starts with the machine",
         "registered the source nerve-node in the Windows Event Log (Application): the service's start, stop and failures go there as well as to C:\\ProgramData\\Nerve\\state\\log.jsonl",
-        "removed C:\\Program Files\\Nerve\\nerve-node.exe, the node installed alone: C:\\Program Files\\Nerve\\nerve-node-desktop.exe is the node now (Windows holds the old file, as the Event Log read it; it deletes it at its next start). For a terminal, download the CLI edition nerve-node.exe on its own",
+        "removed C:\\Program Files\\Nerve\\nerve-node.exe, the node installed alone: C:\\Program Files\\Nerve\\nerve-node-desktop.exe is the node now (Windows holds the old file, as when the Event Log read it or it runs; Windows deletes it at its next start). For a terminal, download the CLI edition nerve-node.exe on its own",
         "the service nerve-node runs",
     ]));
     shots.take("installer-node-only-done-windows");

@@ -9,6 +9,9 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 fn main() {
+    // This program is the desktop app's edition of the node: installed as
+    // nerve-node-desktop, with its menu entry and link handler.
+    nerve_node::edition::set(&nerve_node_desktop::parts::EDITION);
     // Not `args()`: a path for the CLI need not be UTF-8.
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     let words: Vec<Option<&str>> = args.iter().map(|a| a.to_str()).collect();

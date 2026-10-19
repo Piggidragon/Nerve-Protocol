@@ -100,8 +100,8 @@ fn message_table() -> Vec<u8> {
 }
 
 /// One resource of a `.res` file: its header with the type and the name as
-/// ordinals, then `data`.
-fn entry(out: &mut Vec<u8>, kind: u16, name: u16, language: u16, data: &[u8]) {
+/// ordinals, then `data`. The desktop app's build adds its icon with it.
+pub fn entry(out: &mut Vec<u8>, kind: u16, name: u16, language: u16, data: &[u8]) {
     out.extend_from_slice(&(data.len() as u32).to_le_bytes());
     out.extend_from_slice(&32u32.to_le_bytes());
     for ordinal in [kind, name] {

@@ -50,6 +50,8 @@ pub struct Layout {
     /// Where `update` finds the programs of the latest release and their
     /// `SHA256SUMS`.
     pub release: String,
+    /// The program installed: the node, or the desktop app with its parts.
+    pub edition: &'static crate::edition::Edition,
 }
 
 impl Layout {
@@ -58,6 +60,13 @@ impl Layout {
     /// service is registered with the service control manager, so there is
     /// no unit file ([`crate::winsvc`]).
     pub fn system() -> Layout {
+        Layout::of(crate::edition::get())
+    }
+
+    /// [`Layout::system`] for `edition`: the program is named after it,
+    /// `/usr/local/bin/nerve-node-desktop` for the desktop app.
+    pub fn of(edition: &'static crate::edition::Edition) -> Layout {
+        let program = edition.program;
         let release = concat!(env!("CARGO_PKG_REPOSITORY"), "/releases/latest/download").into();
         if cfg!(windows) {
             let var = |k: &str, or: &str| {
@@ -70,23 +79,31 @@ impl Layout {
                 unit: PathBuf::new(),
                 bin: var("ProgramFiles", "C:\\Program Files")
                     .join("Nerve")
-                    .join("nerve-node.exe"),
+                    .join(format!("{program}.exe")),
                 paths: NodePaths::new(data.join("config"), data.join("state")),
                 home: data,
                 release,
+                edition,
             };
         }
         Layout {
             unit: PathBuf::from("/etc/systemd/system").join(UNIT_NAME),
-            bin: "/usr/local/bin/nerve-node".into(),
+            bin: PathBuf::from("/usr/local/bin").join(program),
             home: "/var/lib/nerve".into(),
             paths: NodePaths::new("/etc/nerve", "/var/lib/nerve/state"),
             release,
+            edition,
         }
     }
 
     /// Whether `install` put the node here: its unit is in place, or on
     /// Windows its service is registered.
+    /// Whether the unit file is in place: [`Layout::installed`] on Linux,
+    /// for a layout of any folders (the tests').
+    fn installed_at_unit(&self) -> bool {
+        self.unit.is_file()
+    }
+
     pub fn installed(&self) -> bool {
         #[cfg(windows)]
         {
@@ -207,6 +224,9 @@ pub trait System {
     fn wait_running(&self, paths: &NodePaths) -> Result<(), String>;
     /// What `<program> --version` prints, run as `account`.
     fn version_of(&self, program: &Path, account: &Account) -> Result<String, String>;
+    /// The state of the installed unit: running, stopped, starting,
+    /// stopping or failed, and whether it starts with the machine.
+    fn unit_state(&self) -> Result<ServiceState, String>;
     /// Ends the session a system keyring gave `name` (`loginctl
     /// enable-linger`, [`crate::keyring_setup`]), so that the user can go;
     /// `Ok(false)` when it had none.
@@ -365,6 +385,17 @@ impl System for Host {
 
     fn give(&self, path: &Path, uid: u32, gid: u32) -> Result<(), String> {
         chown_tree(path, uid, gid)
+    }
+
+    fn unit_state(&self) -> Result<ServiceState, String> {
+        let o = std::process::Command::new("systemctl")
+            .args(["show", "--property=ActiveState,UnitFileState", UNIT_NAME])
+            .output()
+            .map_err(|e| format!("systemctl: {e}"))?;
+        if !o.status.success() {
+            return Err(format!("systemctl show {UNIT_NAME}: {}", failure(&o)));
+        }
+        Ok(unit_state_of(&String::from_utf8_lossy(&o.stdout)))
     }
 
     fn wait_running(&self, paths: &NodePaths) -> Result<(), String> {
@@ -718,6 +749,7 @@ fn install_steps(
         write_file(&layout.bin, &program, 0o755)?;
         steps.did(format!("put the program at {}", layout.bin.display()));
     }
+    install_parts(layout, steps)?;
     // A node whose keys are in the system keyring does not start without
     // one that answers for its user; the installed program asks it.
     if in_keyring {
@@ -1022,6 +1054,7 @@ fn uninstall_steps(
         }
         None => {}
     }
+    uninstall_parts(layout, steps)?;
     if layout.bin.exists() {
         std::fs::remove_file(&layout.bin).map_err(|e| format!("{}: {e}", layout.bin.display()))?;
         steps.did(format!("removed the program {}", layout.bin.display()));
@@ -1034,8 +1067,16 @@ fn uninstall_steps(
 pub struct Version(u64, u64, u64);
 
 impl Version {
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn parse(said: &str) -> Option<Version> {
         Version::parse_of("nerve-node", said)
+    }
+
+    /// The version `layout`'s program says it has: the desktop app's line
+    /// starts with its own name, so neither program takes the other's place
+    /// in an update.
+    pub(crate) fn of_program(layout: &Layout, said: &str) -> Option<Version> {
+        Version::parse_of(layout.edition.program, said)
     }
 
     /// A version as `<program> --version` prints it, for another program of
@@ -1088,6 +1129,7 @@ async fn update_steps(
     from: Option<&Path>,
     steps: &mut Steps<'_>,
 ) -> Result<(), String> {
+    let program = layout.edition.program;
     let account = sys
         .account(USER)?
         .filter(|a| a.comment == USER_MARK)
@@ -1101,7 +1143,7 @@ async fn update_steps(
             b
         }
         None => {
-            let asset = asset_name()?;
+            let asset = asset_name(layout.edition.program)?;
             let b = fetch_release(&layout.release, &asset).await?;
             steps.did(format!(
                 "downloaded {asset} from {} and checked it against its SHA256SUMS",
@@ -1117,21 +1159,23 @@ async fn update_steps(
     }
     // Staged beside the program, so the rename that puts it in place does
     // not cross file systems.
-    let staged = layout.bin.with_file_name(".nerve-node.new");
+    let staged = layout
+        .bin
+        .with_file_name(format!(".{}.new", layout.edition.program));
     write_file(&staged, &new, 0o755)?;
     let checked = (|| {
         let said = sys.version_of(&staged, &account)?;
-        let new_v = Version::parse(&said)
-            .ok_or_else(|| format!("the new program is not nerve-node: it says {said:?}"))?;
+        let new_v = Version::of_program(layout, &said)
+            .ok_or_else(|| format!("the new program is not {program}: it says {said:?}"))?;
         let old_v = sys
             .version_of(&layout.bin, &account)
             .ok()
-            .and_then(|s| Version::parse(&s));
+            .and_then(|s| Version::of_program(layout, &s));
         if let Some(o) = old_v
             && new_v < o
         {
             return Err(format!(
-                "the new program is nerve-node {new_v}, older than the installed {o}; nothing changed"
+                "the new program is {program} {new_v}, older than the installed {o}; nothing changed"
             ));
         }
         Ok((old_v, new_v))
@@ -1145,7 +1189,7 @@ async fn update_steps(
     };
     std::fs::rename(&staged, &layout.bin).map_err(|e| format!("{}: {e}", layout.bin.display()))?;
     let old_v = old_v.map_or_else(|| "?".to_string(), |v| v.to_string());
-    steps.did(format!("replaced nerve-node {old_v} with {new_v}"));
+    steps.did(format!("replaced {program} {old_v} with {new_v}"));
     let started = sys
         .systemctl(&["restart", UNIT_NAME])
         .and_then(|()| sys.wait_running(&layout.paths));
@@ -1154,7 +1198,7 @@ async fn update_steps(
         let back = sys
             .systemctl(&["restart", UNIT_NAME])
             .and_then(|()| sys.wait_running(&layout.paths));
-        steps.did(format!("put nerve-node {old_v} back"));
+        steps.did(format!("put {program} {old_v} back"));
         return Err(match back {
             Ok(()) => format!("the new program did not start ({e}); the old one runs again"),
             Err(e2) => format!(
@@ -1163,18 +1207,172 @@ async fn update_steps(
         });
     }
     steps.did(format!("restarted the service {UNIT_NAME}"));
+    install_parts(layout, steps)
+}
+
+/// The release file of `program` for this machine. The desktop app comes
+/// for x86_64 only.
+pub(crate) fn asset_name(program: &str) -> Result<String, String> {
+    let node = program == crate::edition::NODE.program;
+    match std::env::consts::ARCH {
+        "x86_64" if cfg!(windows) => Ok(format!("{program}-x86_64-windows.exe")),
+        "x86_64" if !cfg!(windows) => Ok(format!("{program}-x86_64-linux")),
+        "aarch64" if !cfg!(windows) && node => Ok(format!("{program}-aarch64-linux")),
+        other => Err(format!(
+            "the releases have no {program} for {other}; build one (docs/dev/building.md) and give it with --from"
+        )),
+    }
+}
+
+/// Puts the parts of `layout`'s program beside it ([`crate::edition::Parts`]),
+/// once the program is in place.
+pub(crate) fn install_parts(layout: &Layout, steps: &mut Steps) -> Result<(), String> {
+    if let Some(parts) = layout.edition.parts {
+        for step in parts.install(&layout.bin)? {
+            steps.did(step);
+        }
+    }
     Ok(())
 }
 
-/// The release file of this machine's program.
-pub(crate) fn asset_name() -> Result<String, String> {
-    match std::env::consts::ARCH {
-        "x86_64" if cfg!(windows) => Ok("nerve-node-x86_64-windows.exe".into()),
-        arch @ ("x86_64" | "aarch64") if !cfg!(windows) => Ok(format!("nerve-node-{arch}-linux")),
-        other => Err(format!(
-            "the releases have no program for {other}; build one (docs/dev/building.md) and give it with --from"
-        )),
+/// Removes them again, before the program goes.
+pub(crate) fn uninstall_parts(layout: &Layout, steps: &mut Steps) -> Result<(), String> {
+    if let Some(parts) = layout.edition.parts {
+        for step in parts.uninstall(&layout.bin)? {
+            steps.did(step);
+        }
     }
+    Ok(())
+}
+
+/// What `service` does to the installed service.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceAction {
+    Start,
+    Stop,
+    Restart,
+}
+
+impl ServiceAction {
+    pub fn word(self) -> &'static str {
+        match self {
+            ServiceAction::Start => "start",
+            ServiceAction::Stop => "stop",
+            ServiceAction::Restart => "restart",
+        }
+    }
+}
+
+/// The installed service, as `service status` says it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceState {
+    /// running, stopped, starting, stopping or failed.
+    pub state: String,
+    /// Whether it starts with the machine, when the system says.
+    pub enabled: Option<bool>,
+}
+
+/// systemd's words for a unit, from `systemctl show`, as [`ServiceState`].
+fn unit_state_of(shown: &str) -> ServiceState {
+    let field = |k: &str| {
+        shown
+            .lines()
+            .find_map(|l| l.strip_prefix(k)?.strip_prefix('='))
+            .unwrap_or_default()
+            .trim()
+            .to_string()
+    };
+    let state = match field("ActiveState").as_str() {
+        "active" | "reloading" | "refreshing" => "running",
+        "activating" => "starting",
+        "deactivating" => "stopping",
+        "failed" => "failed",
+        _ => "stopped",
+    };
+    let enabled = match field("UnitFileState").as_str() {
+        "" => None,
+        s => Some(s == "enabled" || s == "enabled-runtime"),
+    };
+    ServiceState {
+        state: state.into(),
+        enabled,
+    }
+}
+
+/// `service status`: whether the node is installed as a service here, its
+/// state (`None`: not installed), and the program it runs with its version.
+/// Anyone may ask; the program says its version as the one who asks.
+pub fn service_status(layout: &Layout, state: Option<&ServiceState>) -> serde_json::Value {
+    let version = layout
+        .bin
+        .is_file()
+        .then(|| {
+            std::process::Command::new(&layout.bin)
+                .arg("--version")
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()
+        })
+        .flatten()
+        .filter(|o| o.status.success())
+        .and_then(|o| Version::of_program(layout, &String::from_utf8_lossy(&o.stdout)))
+        .map(|v| v.to_string());
+    serde_json::json!({
+        "installed": state.is_some(),
+        "state": state.map(|s| s.state.as_str()),
+        "enabled": state.and_then(|s| s.enabled),
+        "program": layout.bin.display().to_string(),
+        "present": layout.bin.is_file(),
+        "version": version,
+    })
+}
+
+/// The state of the unit, `None` when the node is not installed here.
+pub fn unit_status(layout: &Layout, sys: &dyn System) -> Result<Option<ServiceState>, String> {
+    if !layout.installed_at_unit() {
+        return Ok(None);
+    }
+    sys.unit_state().map(Some)
+}
+
+/// `service start`, `stop` and `restart`: the installed service, as
+/// systemctl does it, waiting until a node that starts answers.
+pub fn control(
+    layout: &Layout,
+    sys: &dyn System,
+    action: ServiceAction,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    supported(sys, &format!("service {}", action.word()))?;
+    if !layout.installed_at_unit() {
+        return Err(
+            "the node is not installed as a service here; `sudo nerve-node install` installs it"
+                .into(),
+        );
+    }
+    sys.systemctl(&[action.word(), UNIT_NAME])?;
+    let said = match action {
+        ServiceAction::Stop => {
+            let again = if sys.unit_state()?.enabled == Some(true) {
+                "; it starts again with the machine"
+            } else {
+                ""
+            };
+            format!("stopped the service {UNIT_NAME}: the node ended its links{again}")
+        }
+        ServiceAction::Start | ServiceAction::Restart => {
+            sys.wait_running(&layout.paths)?;
+            let did = if action == ServiceAction::Start {
+                "started"
+            } else {
+                "restarted"
+            };
+            format!("{did} the service {UNIT_NAME}, and the node answers")
+        }
+    };
+    let _ = writeln!(out, "{said}");
+    Ok(())
 }
 
 /// Downloads `asset` from the release at `base` and checks it against the
@@ -1663,6 +1861,24 @@ pub(crate) mod tests {
                 .push(format!("systemctl {}", args.join(" ")));
             Ok(())
         }
+        /// Running after the last start or restart, until a stop.
+        fn unit_state(&self) -> Result<ServiceState, String> {
+            let calls = self.calls.borrow();
+            let last = calls.iter().rev().find_map(|c| {
+                let c = c.strip_prefix("systemctl ")?;
+                if c.starts_with("start") || c.starts_with("restart") {
+                    Some("running")
+                } else if c.starts_with("stop") || c.starts_with("disable --now") {
+                    Some("stopped")
+                } else {
+                    None
+                }
+            });
+            Ok(ServiceState {
+                state: last.unwrap_or("stopped").into(),
+                enabled: Some(calls.iter().any(|c| c.starts_with("systemctl enable"))),
+            })
+        }
         /// The test may give files to itself only; giving them to anyone
         /// else is recorded.
         fn give(&self, path: &Path, uid: u32, gid: u32) -> Result<(), String> {
@@ -1704,6 +1920,7 @@ pub(crate) mod tests {
             home: root.join("var/lib/nerve"),
             paths: NodePaths::new(root.join("etc/nerve"), root.join("var/lib/nerve/state")),
             release: "http://127.0.0.1:1/none".into(),
+            edition: &crate::edition::NODE,
         }
     }
 
@@ -2396,6 +2613,9 @@ pub(crate) mod tests {
             fn version_of(&self, _: &Path, _: &Account) -> Result<String, String> {
                 unreachable!()
             }
+            fn unit_state(&self) -> Result<ServiceState, String> {
+                unreachable!()
+            }
         }
         for (what, e) in [
             (
@@ -2409,6 +2629,10 @@ pub(crate) mod tests {
                 ),
             ),
             ("uninstall", uninstall(&l, &NotRoot, false, &mut Vec::new())),
+            (
+                "service stop",
+                control(&l, &NotRoot, ServiceAction::Stop, &mut Vec::new()),
+            ),
         ] {
             assert_eq!(
                 e.unwrap_err(),
@@ -2647,7 +2871,7 @@ pub(crate) mod tests {
         use nerve_transport::http::{Response, read_request};
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
-        let asset = asset_name().unwrap();
+        let asset = asset_name("nerve-node").unwrap();
         tokio::spawn(async move {
             while let Ok((mut io, _)) = listener.accept().await {
                 let req = read_request(&mut io, 0).await.unwrap();
@@ -2708,7 +2932,7 @@ pub(crate) mod tests {
         let sys = Fake::new();
         let mut l = installed(d.path(), &sys, "1.0.0");
         let program: &[u8] = b"nerve-node 1.3.0\n";
-        let asset = asset_name().unwrap();
+        let asset = asset_name("nerve-node").unwrap();
         l.release = release(
             program,
             format!("{}  other\n{} *{asset}\n", sha(b"x"), sha(program)),
@@ -2756,5 +2980,168 @@ pub(crate) mod tests {
         let (at, target) = split_url("http://127.0.0.1:8080?q").unwrap();
         assert_eq!((at.port, target.as_str()), (8080, "/?q"));
         assert!(split_url("ftp://x/y").is_err());
+    }
+
+    /// The desktop app's parts, as a file beside the program.
+    struct Entry;
+
+    impl crate::edition::Parts for Entry {
+        fn install(&self, bin: &Path) -> Result<Vec<String>, String> {
+            std::fs::write(bin.with_file_name("menu-entry"), "Exec").map_err(|e| e.to_string())?;
+            Ok(vec!["put the menu entry in place".into()])
+        }
+        fn uninstall(&self, bin: &Path) -> Result<Vec<String>, String> {
+            let entry = bin.with_file_name("menu-entry");
+            if !entry.exists() {
+                return Ok(Vec::new());
+            }
+            std::fs::remove_file(entry).map_err(|e| e.to_string())?;
+            Ok(vec!["removed the menu entry".into()])
+        }
+    }
+
+    static DESKTOP: crate::edition::Edition = crate::edition::Edition {
+        program: "nerve-node-desktop",
+        parts: Some(&Entry),
+    };
+
+    #[tokio::test]
+    async fn the_desktop_app_installs_updates_and_uninstalls_its_parts_with_the_node() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = Layout {
+            bin: d.path().join("usr/local/bin/nerve-node-desktop"),
+            edition: &DESKTOP,
+            ..layout(d.path())
+        };
+        let entry = l.bin.with_file_name("menu-entry");
+        let exe = d.path().join("Downloads/nerve-node-desktop-x86_64-linux");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "nerve-node-desktop 1.0.0\n").unwrap();
+        let mut out = Vec::new();
+        install(&l, &sys, &exe, "alice", &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("put the menu entry in place"), "{out}");
+        assert!(entry.exists());
+        assert!(
+            std::fs::read_to_string(&l.unit)
+                .unwrap()
+                .contains(&format!("ExecStart={} --config-dir", l.bin.display())),
+        );
+        let step = |event: &str| {
+            audit_events(&l)
+                .iter()
+                .rev()
+                .find(|e| e["event"] == event)
+                .unwrap()
+                .to_string()
+        };
+        assert!(step("install").contains("menu entry"));
+
+        // The node's program is not the app's, and the app's own goes in,
+        // its parts put back.
+        let new = d.path().join("new");
+        std::fs::write(&new, "nerve-node 1.1.0\n").unwrap();
+        let e = update(&l, &sys, Some(&new), &mut Vec::new())
+            .await
+            .unwrap_err();
+        assert!(e.contains("is not nerve-node-desktop"), "{e}");
+        std::fs::remove_file(&entry).unwrap();
+        std::fs::write(&new, "nerve-node-desktop 1.1.0\n").unwrap();
+        let mut out = Vec::new();
+        update(&l, &sys, Some(&new), &mut out).await.unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("replaced nerve-node-desktop 1.0.0 with 1.1.0"),
+            "{out}"
+        );
+        assert!(entry.exists(), "{out}");
+        assert!(!l.bin.with_file_name(".nerve-node-desktop.new").exists());
+
+        let mut out = Vec::new();
+        uninstall(&l, &sys, false, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("removed the menu entry"), "{out}");
+        assert!(!entry.exists() && !l.bin.exists());
+    }
+
+    #[test]
+    fn the_desktop_app_has_a_place_and_a_release_file_of_its_own() {
+        let l = Layout::of(&DESKTOP);
+        assert_eq!(l.bin, Path::new("/usr/local/bin/nerve-node-desktop"));
+        assert_eq!(l.paths, Layout::system().paths);
+        assert_eq!(Layout::system().bin, Path::new("/usr/local/bin/nerve-node"));
+        if std::env::consts::ARCH == "x86_64" {
+            assert_eq!(
+                asset_name("nerve-node-desktop").unwrap(),
+                "nerve-node-desktop-x86_64-linux"
+            );
+        }
+        assert_eq!(
+            Version::of_program(&l, "nerve-node-desktop 0.2.0\n"),
+            Some(Version(0, 2, 0))
+        );
+        assert_eq!(Version::of_program(&l, "nerve-node 0.2.0"), None);
+    }
+
+    #[test]
+    fn service_starts_stops_and_restarts_the_installed_unit() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = layout(d.path());
+        assert_eq!(unit_status(&l, &sys).unwrap(), None);
+        let e = control(&l, &sys, ServiceAction::Start, &mut Vec::new()).unwrap_err();
+        assert!(e.contains("not installed as a service"), "{e}");
+        let l = installed(d.path(), &sys, "1.0.0");
+        let mut out = Vec::new();
+        control(&l, &sys, ServiceAction::Stop, &mut out).unwrap();
+        assert_eq!(
+            sys.calls().last().unwrap(),
+            &format!("systemctl stop {UNIT_NAME}")
+        );
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("it starts again with the machine")
+        );
+        let state = unit_status(&l, &sys).unwrap().unwrap();
+        assert_eq!(state.state, "stopped");
+        assert_eq!(state.enabled, Some(true));
+        let v = service_status(&l, Some(&state));
+        assert_eq!(v["installed"], true);
+        assert_eq!(v["state"], "stopped");
+        assert_eq!(v["present"], true);
+        assert_eq!(v["program"], l.bin.display().to_string());
+        for (action, call) in [
+            (ServiceAction::Start, "start"),
+            (ServiceAction::Restart, "restart"),
+        ] {
+            let mut out = Vec::new();
+            control(&l, &sys, action, &mut out).unwrap();
+            assert_eq!(
+                sys.calls().last().unwrap(),
+                &format!("systemctl {call} {UNIT_NAME}")
+            );
+            assert!(String::from_utf8(out).unwrap().contains("the node answers"));
+            assert_eq!(unit_status(&l, &sys).unwrap().unwrap().state, "running");
+        }
+        // A node that does not come up is said.
+        sys.starts.set(false);
+        assert!(control(&l, &sys, ServiceAction::Restart, &mut Vec::new()).is_err());
+        let none = service_status(&layout(&d.path().join("elsewhere")), None);
+        assert_eq!(none["installed"], false);
+        assert_eq!(none["state"], serde_json::Value::Null);
+        assert_eq!(none["present"], false);
+    }
+
+    #[test]
+    fn systemd_states_read_as_the_service_states() {
+        let s = unit_state_of("ActiveState=active\nUnitFileState=enabled\n");
+        assert_eq!((s.state.as_str(), s.enabled), ("running", Some(true)));
+        let s = unit_state_of("ActiveState=failed\nUnitFileState=disabled\n");
+        assert_eq!((s.state.as_str(), s.enabled), ("failed", Some(false)));
+        let s = unit_state_of("ActiveState=activating\n");
+        assert_eq!((s.state.as_str(), s.enabled), ("starting", None));
+        assert_eq!(unit_state_of("ActiveState=inactive").state, "stopped");
     }
 }

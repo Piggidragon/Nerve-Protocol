@@ -21,7 +21,8 @@ use nerve_policy::settings::SettingsStore;
 
 use crate::paths::NodePaths;
 use crate::service::{
-    Account, Layout, Steps, USER, USER_MARK, Version, asset_name, audit, fetch_release, write_file,
+    Account, Layout, ServiceAction, ServiceState, Steps, USER, USER_MARK, Version, asset_name,
+    audit, fetch_release, install_parts, uninstall_parts, write_file,
 };
 
 /// The name the service is registered under.
@@ -51,6 +52,9 @@ pub trait WinSystem {
     fn secure(&self, dir: &Path, owner: Option<&str>) -> Result<(), String>;
     /// The service: `None` when it is not registered, else whether it runs.
     fn service(&self) -> Result<Option<bool>, String>;
+    /// The service's state for `service status`; `None` when it is not
+    /// registered.
+    fn service_state(&self) -> Result<Option<ServiceState>, String>;
     /// Registers the service, or changes it: `layout.bin` with the folders,
     /// as `.\nerve` with `password`, started with the machine and again
     /// after a failure.
@@ -196,14 +200,20 @@ fn new_password() -> String {
     format!("Nn1-{}", nerve_transport::keys::random_token(28))
 }
 
+/// The program's name without `.exe`: `nerve-node`, or the desktop app's.
+fn stem(bin: &Path) -> String {
+    bin.file_stem()
+        .map_or_else(|| "nerve-node".into(), |s| s.to_string_lossy().into_owned())
+}
+
 /// Where `update` puts the new program before it replaces the old one, and
 /// where the old one waits until the new one runs.
 fn staged(bin: &Path) -> PathBuf {
-    bin.with_file_name("nerve-node.new.exe")
+    bin.with_file_name(format!("{}.new.exe", stem(bin)))
 }
 
 fn previous(bin: &Path) -> PathBuf {
-    bin.with_file_name("nerve-node.old.exe")
+    bin.with_file_name(format!("{}.old.exe", stem(bin)))
 }
 
 /// Whether `what` can run here: as an elevated administrator.
@@ -319,6 +329,7 @@ fn install_steps(
         write_file(&layout.bin, &program, 0o755)?;
         steps.did(format!("put the program at {}", layout.bin.display()));
     }
+    install_parts(layout, steps)?;
     // What an update or an uninstall left behind when it ran from the
     // program it replaced or removed.
     let _ = std::fs::remove_file(previous(&layout.bin));
@@ -329,7 +340,7 @@ fn install_steps(
         for e in entries.flatten() {
             let name = e.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with("nerve-node.") && name.ends_with(".del") {
+            if name.starts_with(&format!("{}.", stem(&layout.bin))) && name.ends_with(".del") {
                 let _ = std::fs::remove_file(e.path());
             }
         }
@@ -560,6 +571,7 @@ fn uninstall_steps(
         }
         None => {}
     }
+    uninstall_parts(layout, steps)?;
     for left in [staged(&layout.bin), previous(&layout.bin)] {
         if left.exists() {
             sys.remove_program(&left)?;
@@ -611,6 +623,7 @@ async fn update_steps(
     from: Option<&Path>,
     steps: &mut Steps<'_>,
 ) -> Result<(), String> {
+    let program = layout.edition.program;
     sys.account(USER)?
         .filter(|a| a.comment == USER_MARK)
         .ok_or_else(|| {
@@ -627,7 +640,7 @@ async fn update_steps(
             b
         }
         None => {
-            let asset = asset_name()?;
+            let asset = asset_name(layout.edition.program)?;
             let b = fetch_release(&layout.release, &asset).await?;
             steps.did(format!(
                 "downloaded {asset} from {} and checked it against its SHA256SUMS",
@@ -646,14 +659,17 @@ async fn update_steps(
     write_file(&new_path, &new, 0o755)?;
     let checked = (|| {
         let said = sys.version_of(&new_path)?;
-        let new_v = Version::parse(&said)
-            .ok_or_else(|| format!("the new program is not nerve-node: it says {said:?}"))?;
-        let old_v = sys.version_of(bin).ok().and_then(|s| Version::parse(&s));
+        let new_v = Version::of_program(layout, &said)
+            .ok_or_else(|| format!("the new program is not {program}: it says {said:?}"))?;
+        let old_v = sys
+            .version_of(bin)
+            .ok()
+            .and_then(|s| Version::of_program(layout, &s));
         if let Some(o) = old_v
             && new_v < o
         {
             return Err(format!(
-                "the new program is nerve-node {new_v}, older than the installed {o}; nothing changed"
+                "the new program is {program} {new_v}, older than the installed {o}; nothing changed"
             ));
         }
         Ok((old_v, new_v))
@@ -689,7 +705,7 @@ async fn update_steps(
         return Err(e);
     }
     let old_v = old_v.map_or_else(|| "?".to_string(), |v| v.to_string());
-    steps.did(format!("replaced nerve-node {old_v} with {new_v}"));
+    steps.did(format!("replaced {program} {old_v} with {new_v}"));
     let started = sys.start().and_then(|()| sys.wait_running(layout));
     if let Err(e) = started {
         let _ = sys.stop();
@@ -698,7 +714,7 @@ async fn update_steps(
             .and_then(|()| sys.start())
             .and_then(|()| sys.wait_running(layout));
         let _ = std::fs::remove_file(&new_path);
-        steps.did(format!("put nerve-node {old_v} back"));
+        steps.did(format!("put {program} {old_v} back"));
         return Err(match back {
             Ok(()) => format!("the new program did not start ({e}); the old one runs again"),
             Err(e2) => format!(
@@ -710,6 +726,42 @@ async fn update_steps(
     // This command may run from the old program; then it goes at the next
     // restart, or with the next update or install.
     let _ = sys.remove_program(&old_path);
+    install_parts(layout, steps)
+}
+
+/// `service start`, `stop` and `restart` on Windows: the installed
+/// service, through the service control manager, waiting until a node that
+/// starts runs.
+pub fn control(
+    layout: &Layout,
+    sys: &dyn WinSystem,
+    action: ServiceAction,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    supported(sys, &format!("service {}", action.word()))?;
+    if sys.service()?.is_none() {
+        return Err(
+            "the node is not installed as a service here; `nerve-node install` installs it".into(),
+        );
+    }
+    if action != ServiceAction::Start {
+        sys.stop()?;
+    }
+    let said = if action == ServiceAction::Stop {
+        format!(
+            "stopped the service {SERVICE_NAME}: the node ended its links; it starts again with the machine"
+        )
+    } else {
+        sys.start()?;
+        sys.wait_running(layout)?;
+        let did = if action == ServiceAction::Start {
+            "started"
+        } else {
+            "restarted"
+        };
+        format!("{did} the service {SERVICE_NAME}, and the node runs")
+    };
+    let _ = writeln!(out, "{said}");
     Ok(())
 }
 
@@ -843,6 +895,12 @@ pub(crate) mod tests {
         }
         fn service(&self) -> Result<Option<bool>, String> {
             Ok(self.service.get())
+        }
+        fn service_state(&self) -> Result<Option<ServiceState>, String> {
+            Ok(self.service.get().map(|runs| ServiceState {
+                state: if runs { "running" } else { "stopped" }.into(),
+                enabled: Some(true),
+            }))
         }
         fn put_service(&self, layout: &Layout, _: &str) -> Result<(), String> {
             self.call(format!("put {}", layout.bin.display()));
@@ -1013,6 +1071,7 @@ pub(crate) mod tests {
             paths: NodePaths::new(data.join("config"), data.join("state")),
             home: data,
             release: "http://127.0.0.1:1/none".into(),
+            edition: &crate::edition::NODE,
         }
     }
 
@@ -1803,6 +1862,87 @@ pub(crate) mod tests {
                 .to_string()
                 .contains("put nerve-node 1.2.0 back")
         );
+    }
+
+    /// The desktop app's parts, as a file beside the program.
+    struct Entry;
+
+    impl crate::edition::Parts for Entry {
+        fn install(&self, bin: &Path) -> Result<Vec<String>, String> {
+            std::fs::write(bin.with_file_name("Nerve.lnk"), "link").map_err(|e| e.to_string())?;
+            Ok(vec!["put the Start menu entry in place".into()])
+        }
+        fn uninstall(&self, bin: &Path) -> Result<Vec<String>, String> {
+            std::fs::remove_file(bin.with_file_name("Nerve.lnk")).map_err(|e| e.to_string())?;
+            Ok(vec!["removed the Start menu entry".into()])
+        }
+    }
+
+    static DESKTOP: crate::edition::Edition = crate::edition::Edition {
+        program: "nerve-node-desktop",
+        parts: Some(&Entry),
+    };
+
+    #[tokio::test]
+    async fn the_desktop_app_comes_and_goes_with_its_parts_and_controls_the_service() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = Layout {
+            bin: d.path().join("Program Files/Nerve/nerve-node-desktop.exe"),
+            edition: &DESKTOP,
+            ..layout(d.path())
+        };
+        let e = control(&l, &sys, ServiceAction::Start, &mut Vec::new()).unwrap_err();
+        assert!(e.contains("not installed as a service"), "{e}");
+        let link = l.bin.with_file_name("Nerve.lnk");
+        let exe = d
+            .path()
+            .join("Downloads/nerve-node-desktop-x86_64-windows.exe");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, "nerve-node-desktop 1.0.0\n").unwrap();
+        sys.types("alice's");
+        let mut out = Vec::new();
+        install(&l, &sys, &exe, "alice", &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("put the Start menu entry in place"), "{out}");
+        assert!(link.exists());
+
+        for (action, calls, state) in [
+            (ServiceAction::Stop, &["stop"][..], "stopped"),
+            (ServiceAction::Start, &["start"][..], "running"),
+            (ServiceAction::Restart, &["stop", "start"][..], "running"),
+        ] {
+            let before = sys.calls().len();
+            control(&l, &sys, action, &mut Vec::new()).unwrap();
+            assert_eq!(sys.calls()[before..], *calls, "{action:?}");
+            assert_eq!(sys.service_state().unwrap().unwrap().state, state);
+        }
+
+        std::fs::remove_file(&link).unwrap();
+        let new = d.path().join("new.exe");
+        std::fs::write(&new, "nerve-node-desktop 1.1.0\n").unwrap();
+        let mut out = Vec::new();
+        update(&l, &sys, Some(&new), &mut out).await.unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(
+            out.contains("replaced nerve-node-desktop 1.0.0 with 1.1.0"),
+            "{out}"
+        );
+        assert!(link.exists(), "{out}");
+        assert_eq!(
+            staged(&l.bin).file_name().unwrap(),
+            "nerve-node-desktop.new.exe"
+        );
+        assert!(!staged(&l.bin).exists() && !previous(&l.bin).exists());
+
+        let mut out = Vec::new();
+        uninstall(&l, &by_hand(d.path()), &sys, false, &mut out).unwrap();
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("removed the Start menu entry")
+        );
+        assert!(!link.exists());
     }
 
     #[tokio::test]

@@ -23,6 +23,7 @@ pub(super) fn own_form(cmd: &Cmd) -> bool {
             | Cmd::Proxy(ProxyCmd::Ls)
             | Cmd::Relay(RelayCmd::Ls)
             | Cmd::Sudo(SudoCmd::Status)
+            | Cmd::Service(ServiceCmd::Status)
     )
 }
 
@@ -46,6 +47,7 @@ pub(super) async fn command(
 ) -> Result<(), String> {
     let v = match cmd {
         Cmd::Status => status(paths).await?,
+        Cmd::Service(ServiceCmd::Status) => service_status(&Layout::system())?,
         Cmd::Audit {
             follow,
             denied,

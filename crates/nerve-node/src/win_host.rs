@@ -40,17 +40,19 @@ use windows_sys::Win32::System::Registry::{
 };
 use windows_sys::Win32::System::Services::{
     ChangeServiceConfig2W, ChangeServiceConfigW, CloseServiceHandle, ControlService,
-    CreateServiceW, DeleteService, OpenSCManagerW, OpenServiceW, QueryServiceStatusEx, SC_ACTION,
-    SC_ACTION_NONE, SC_ACTION_RESTART, SC_HANDLE, SC_MANAGER_CONNECT, SC_MANAGER_CREATE_SERVICE,
-    SC_STATUS_PROCESS_INFO, SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CONFIG_DESCRIPTION,
+    CreateServiceW, DeleteService, OpenSCManagerW, OpenServiceW, QUERY_SERVICE_CONFIGW,
+    QueryServiceConfigW, QueryServiceStatusEx, SC_ACTION, SC_ACTION_NONE, SC_ACTION_RESTART,
+    SC_HANDLE, SC_MANAGER_CONNECT, SC_MANAGER_CREATE_SERVICE, SC_STATUS_PROCESS_INFO,
+    SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CONFIG_DESCRIPTION,
     SERVICE_CONFIG_FAILURE_ACTIONS, SERVICE_CONFIG_REQUIRED_PRIVILEGES_INFO, SERVICE_CONTROL_STOP,
-    SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_FAILURE_ACTIONSW, SERVICE_QUERY_STATUS,
-    SERVICE_REQUIRED_PRIVILEGES_INFOW, SERVICE_RUNNING, SERVICE_STATUS, SERVICE_STATUS_PROCESS,
+    SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_FAILURE_ACTIONSW, SERVICE_QUERY_CONFIG,
+    SERVICE_QUERY_STATUS, SERVICE_REQUIRED_PRIVILEGES_INFOW, SERVICE_RUNNING,
+    SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOP_PENDING,
     SERVICE_STOPPED, SERVICE_WIN32_OWN_PROCESS, StartServiceW,
 };
 
 use crate::eventlog::{SOURCE, SOURCE_KEY};
-use crate::service::{Account, Layout, USER, USER_MARK};
+use crate::service::{Account, Layout, ServiceState, USER, USER_MARK};
 use crate::win_user::{self, wide};
 use crate::winsvc::{SERVICE_NAME, WinSystem};
 
@@ -491,6 +493,47 @@ impl WinSystem for WinHost {
             return Ok(None);
         };
         Ok(Some(s.status()?.dwCurrentState != SERVICE_STOPPED))
+    }
+
+    fn service_state(&self) -> Result<Option<ServiceState>, String> {
+        let access = SERVICE_QUERY_STATUS | SERVICE_QUERY_CONFIG;
+        let Some(s) = Scm::open(SC_MANAGER_CONNECT)?.service(access)? else {
+            return Ok(None);
+        };
+        let st = s.status()?;
+        let state = match st.dwCurrentState {
+            SERVICE_RUNNING => "running",
+            SERVICE_START_PENDING => "starting",
+            SERVICE_STOP_PENDING => "stopping",
+            // A service that ended with an error of its own failed.
+            SERVICE_STOPPED if st.dwWin32ExitCode != 0 => "failed",
+            SERVICE_STOPPED => "stopped",
+            _ => "running",
+        };
+        // The configuration's size first, then the configuration.
+        let mut need = 0u32;
+        // SAFETY: a query of the size only, with no buffer.
+        unsafe { QueryServiceConfigW(s.0, std::ptr::null_mut(), 0, &mut need) };
+        // u64s, so the buffer is aligned for the struct.
+        let mut buf = vec![0u64; (need as usize).div_ceil(8).max(1)];
+        // SAFETY: a buffer of at least `need` bytes.
+        let ok = unsafe {
+            QueryServiceConfigW(
+                s.0,
+                buf.as_mut_ptr().cast::<QUERY_SERVICE_CONFIGW>(),
+                (buf.len() * 8) as u32,
+                &mut need,
+            )
+        };
+        let enabled = (ok != 0).then(|| {
+            // SAFETY: the call filled the struct at the buffer's start.
+            let config = unsafe { &*buf.as_ptr().cast::<QUERY_SERVICE_CONFIGW>() };
+            config.dwStartType == SERVICE_AUTO_START
+        });
+        Ok(Some(ServiceState {
+            state: state.into(),
+            enabled,
+        }))
     }
 
     fn put_service(&self, layout: &Layout, password: &str) -> Result<(), String> {

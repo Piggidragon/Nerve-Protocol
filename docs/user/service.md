@@ -188,6 +188,21 @@ taken if the node can use it. `nerve`, an account that could open the
 node's folders, and a name other than a-z, 0-9, `_` and `-` are refused
 before anything changes. `--create-user` works on an installed node only.
 
+## Start and stop
+
+```sh
+sudo nerve-node service stop      # the node ends its links; nothing runs
+sudo nerve-node service start
+sudo nerve-node service restart   # takes every change in node.toml
+nerve-node service status         # needs no sudo
+```
+
+`service` does what `systemctl stop|start|restart nerve-node` does (on
+Windows, the service control manager), and waits until a node that starts
+answers. A stopped service starts again with the machine. `service status`
+says whether the node is installed as a service, whether it runs, whether it
+starts with the machine, and the installed program with its version.
+
 ## Update
 
 ```sh

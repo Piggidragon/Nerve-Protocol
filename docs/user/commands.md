@@ -65,6 +65,8 @@ center is paired.
 | `setup` | Name the node, choose the account commands run as, choose where the keys are, pair the first center, choose its mode | [service](service.md#setup) |
 | `setup --create-user <name>` | Make an account only the node uses, and run commands as it (Linux, installed node) | [service](service.md#setup) |
 | `update [--from FILE]` | Put the latest release in place and restart the service | [service](service.md#update) |
+| `service start\|stop\|restart` | Start, stop or restart the installed service | [service](service.md#start-and-stop) |
+| `service status` | Show whether the node is installed as a service, whether it runs, and its program and version | [service](service.md#start-and-stop) |
 | `uninstall [--purge]` | Remove the service, its user and the program | [service](service.md#uninstall) |
 | `backup <file> [--include-keyring] [--overwrite] [--passphrase-file F]` | Write the config and keys to a file that a passphrase protects | [backup](backup.md) |
 | `restore <file> [--replace] [--secret-storage file\|keyring] [--without-proxy] [--passphrase-file F]` | Put a backup in place of this node's, or on another machine | [backup](backup.md#restore) |
@@ -86,10 +88,15 @@ one JSON value from stdout:
 
 - The read commands print their data: `status`, `center ls`, `folder ls`,
   `rule ls`, `cap ls` (with `known`, what `cap set` switches), `config get`,
-  `proxy ls`, `relay ls`, `sudo status`, and `audit` and `log`
+  `proxy ls`, `relay ls`, `sudo status`, `service status`, and `audit` and `log`
   (`{"entries": [...]}`, the lines as the file holds them; with `--follow`
   one a line). `status` has `"daemon"`:
   `"running"`, with what the running node says, or `"not running"`.
+  `service status` has `"installed"`, `"state"` (`"running"`, `"stopped"`,
+  `"starting"`, `"stopping"` or `"failed"`; `null` when not installed),
+  `"enabled"` (it starts with the machine), `"program"` (where the program
+  is installed), `"present"` (whether it is there) and `"version"`. It needs
+  no root.
 - `center add` without `--yes` prints what you would confirm
   (`{"paired": false, "preview": {...}}`) and pairs nothing; with `--yes` it
   pairs.

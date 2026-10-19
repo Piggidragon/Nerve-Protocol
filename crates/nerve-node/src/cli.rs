@@ -123,6 +123,9 @@ pub enum Cmd {
         #[arg(long, value_name = "FILE")]
         from: Option<PathBuf>,
     },
+    /// Start, stop or restart the installed service, or show its state.
+    #[command(subcommand)]
+    Service(ServiceCmd),
     /// Stop and remove the service, its user and the program; the config and state folders stay.
     Uninstall {
         /// Delete the config and state folders too: the keys, the pairings and the audit log.
@@ -286,6 +289,18 @@ pub enum CapCmd {
         #[command(flatten)]
         center: CenterArg,
     },
+}
+
+#[derive(Debug, Subcommand, Clone, Copy)]
+pub enum ServiceCmd {
+    /// Start the installed service (Linux as root, Windows as administrator).
+    Start,
+    /// Stop it: the node ends its links and runs nothing until it starts again, at the latest with the machine.
+    Stop,
+    /// Stop it and start it again, so the node takes every change in node.toml.
+    Restart,
+    /// Show whether the node is installed as a service, whether it runs, and the program it runs with its version.
+    Status,
 }
 
 #[derive(Debug, Subcommand)]
@@ -484,6 +499,7 @@ const SECTIONS: &[(&str, &str, &[&[&str]])] = &[
         "Run the node as a service under a user of its own (Linux with sudo, Windows as administrator), set it up, keep it current, and back it up or move it.",
         &[
             &["install", "uninstall"],
+            &["service"],
             &["setup"],
             &["update"],
             &["backup", "restore"],
@@ -1231,7 +1247,7 @@ impl Cmd {
     fn is_service(&self) -> bool {
         matches!(
             self,
-            Cmd::Install | Cmd::Update { .. } | Cmd::Uninstall { .. }
+            Cmd::Install | Cmd::Update { .. } | Cmd::Uninstall { .. } | Cmd::Service(_)
         )
     }
 }
@@ -1274,6 +1290,19 @@ pub fn service_log(cli: &Cli) -> Option<PathBuf> {
     }
     let paths = NodePaths::from_args(cli.config_dir.clone(), cli.state_dir.clone());
     crate::service::is_service_node(&paths).then(|| paths.log_file())
+}
+
+/// `service status` as JSON (crate::service::service_status): the
+/// installed service's state as this machine's service manager says it.
+pub(crate) fn service_status(layout: &Layout) -> Result<serde_json::Value, String> {
+    #[cfg(windows)]
+    let state = {
+        use crate::winsvc::WinSystem;
+        crate::win_host::WinHost.service_state()?
+    };
+    #[cfg(not(windows))]
+    let state = crate::service::unit_status(layout, &Host)?;
+    Ok(crate::service::service_status(layout, state.as_ref()))
 }
 
 /// The rule of the other owner commands (docs/dev/spec/node-local.md §5):
@@ -1879,6 +1908,42 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                 .await;
             #[cfg(not(windows))]
             crate::service::update(&layout, &Host, from.as_deref(), out).await
+        }
+        Cmd::Service(ServiceCmd::Status) => {
+            let v = service_status(&Layout::system())?;
+            let state = match v["state"].as_str() {
+                None => "not installed as a service".to_string(),
+                Some(state) => {
+                    let boot = match v["enabled"].as_bool() {
+                        Some(true) => ", starts with the machine",
+                        Some(false) => ", does not start with the machine",
+                        None => "",
+                    };
+                    format!("{state}{boot}")
+                }
+            };
+            let version = v["version"]
+                .as_str()
+                .map_or_else(String::new, |v| format!(" (version {v})"));
+            let program = if v["present"] == true {
+                format!("{}{version}", v["program"].as_str().unwrap_or_default())
+            } else {
+                format!("none at {}", v["program"].as_str().unwrap_or_default())
+            };
+            writeln!(out, "service: {state}\nprogram: {program}").map_err(|e| e.to_string())
+        }
+        Cmd::Service(c) => {
+            let action = match c {
+                ServiceCmd::Start => crate::service::ServiceAction::Start,
+                ServiceCmd::Stop => crate::service::ServiceAction::Stop,
+                _ => crate::service::ServiceAction::Restart,
+            };
+            let layout = Layout::system();
+            owner_check(&[&layout.paths]).await?;
+            #[cfg(windows)]
+            return crate::winsvc::control(&layout, &crate::win_host::WinHost, action, out);
+            #[cfg(not(windows))]
+            crate::service::control(&layout, &Host, action, out)
         }
         Cmd::Uninstall { purge } => {
             let layout = Layout::system();

@@ -3,7 +3,7 @@
 //! program with a window: started with arguments it runs this, so both
 //! binaries behave alike.
 
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 
 /// Runs the program with the process's arguments; the exit code.
 pub fn main() -> i32 {
@@ -33,7 +33,14 @@ pub fn main() -> i32 {
     // Events go to stderr. The daemon adds the log file in the state folder and
     // takes its level from `node.toml`.
     nerve_transport::log::install(nerve_transport::log::Level::Info, true);
-    let cli = crate::cli::Cli::parse();
+    // Named after this program, so `--version` and the usage say which one
+    // it is (crate::edition).
+    let program = crate::edition::get().program;
+    let matches = crate::cli::Cli::command()
+        .name(program)
+        .bin_name(program)
+        .get_matches();
+    let cli = crate::cli::Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     // The installed node on Windows runs under the service control manager,
     // which takes the main thread.
     #[cfg(windows)]

@@ -195,6 +195,7 @@ component CenterCard inherits Card {
 }
 
 export component CentersPage inherits PageFrame {
+    property <bool> stale: Store.status-load == Load.failed;
     gap: 0;
     PageHeader {
         title: "Centers";
@@ -245,15 +246,35 @@ export component CentersPage inherits PageFrame {
         }
     }
 
+    // When the node does not answer (a node.toml it refuses, say), the
+    // cards are what it said last: greyed, and their buttons wait.
     Reveal {
         shown: Store.centers.length > 0;
         gap: Space.xxl;
         VerticalLayout {
-            spacing: Space.xxl;
-            for c in Store.centers: Fit {
-                CenterCard {
-                    item: c;
+            Reveal {
+                shown: root.stale;
+                Text {
+                    text: "What the node said before. Nothing here changes until it answers again.";
+                    color: Theme.text-muted;
+                    font-size: Type.small;
+                    wrap: word-wrap;
                 }
+                Rectangle {
+                    height: Space.md;
+                }
+            }
+            Rectangle {
+                opacity: root.stale ? 0.45 : 1;
+                VerticalLayout {
+                    spacing: Space.xxl;
+                    for c in Store.centers: Fit {
+                        CenterCard {
+                            item: c;
+                        }
+                    }
+                }
+                if root.stale: TouchArea { }
             }
         }
     }

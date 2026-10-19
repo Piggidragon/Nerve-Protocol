@@ -6,7 +6,7 @@ Run them as a normal user on the machine, or with `sudo` when the node is
 `nerve-node <command> --help` list the same. The center's web UI has a Help
 page with them too.
 
-On Windows, `nerve-node-gui.exe` is the desktop app. It runs these commands
+On Windows, `nerve-node-desktop.exe` is the desktop app. It runs these commands
 itself, but a terminal does not wait for it: in a terminal use `nerve-node.exe`.
 
 Every command takes `--config-dir` and `--state-dir`

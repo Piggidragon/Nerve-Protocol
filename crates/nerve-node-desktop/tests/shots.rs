@@ -5,7 +5,7 @@
 //! desktop. The software renderer draws no shadows; the app on a desktop
 //! does. Long pages also come whole, as `<page>-full`.
 //!
-//! `NERVE_GUI_SHOTS=<folder> cargo test -p nerve-node-gui --test shots -- --ignored`
+//! `NERVE_DESKTOP_SHOTS=<folder> cargo test -p nerve-node-desktop --test shots -- --ignored`
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -13,11 +13,11 @@ use std::time::Duration;
 
 use nerve_conformance::fake_center::FakeCenter;
 use nerve_node::{Daemon, NodeOptions, NodePaths};
-use nerve_node_gui::app::{Choose, Ctl, Exec};
-use nerve_node_gui::broker::Launch;
-use nerve_node_gui::headless::Screen;
-use nerve_node_gui::runner::Runner;
-use nerve_node_gui::{AppWindow, Load, Logs, NodeStatus, Page, Perm, Prefs, Store};
+use nerve_node_desktop::app::{Choose, Ctl, Exec};
+use nerve_node_desktop::broker::Launch;
+use nerve_node_desktop::headless::Screen;
+use nerve_node_desktop::runner::Runner;
+use nerve_node_desktop::{AppWindow, Load, Logs, NodeStatus, Page, Perm, Prefs, Store};
 use slint::{ComponentHandle, Model};
 
 const WIDTH: u32 = 1180;
@@ -115,10 +115,10 @@ fn until(ctl: &Ctl, done: impl Fn() -> bool) {
 }
 
 #[test]
-#[ignore = "writes screenshots; NERVE_GUI_SHOTS names the folder"]
+#[ignore = "writes screenshots; NERVE_DESKTOP_SHOTS names the folder"]
 fn every_page_light_and_dark() {
-    let Some(out) = std::env::var_os("NERVE_GUI_SHOTS").map(PathBuf::from) else {
-        eprintln!("NERVE_GUI_SHOTS is not set");
+    let Some(out) = std::env::var_os("NERVE_DESKTOP_SHOTS").map(PathBuf::from) else {
+        eprintln!("NERVE_DESKTOP_SHOTS is not set");
         return;
     };
     std::fs::create_dir_all(&out).unwrap();
@@ -132,7 +132,7 @@ fn every_page_light_and_dark() {
     let root: &Path = dir.path();
     let paths = NodePaths::new(root.join("config"), root.join("state"));
     let runner = Runner::new(
-        env!("CARGO_BIN_EXE_nerve-node-gui").into(),
+        env!("CARGO_BIN_EXE_nerve-node-desktop").into(),
         Some(paths.config_dir.clone()),
         Some(paths.state_dir.clone()),
     );
@@ -331,7 +331,7 @@ fn every_page_light_and_dark() {
     let mut opts = NodeOptions::new(paths.clone());
     opts.home = root.to_path_buf();
     opts.full_rights = Some(false);
-    opts.exe = Some(env!("CARGO_BIN_EXE_nerve-node-gui").into());
+    opts.exe = Some(env!("CARGO_BIN_EXE_nerve-node-desktop").into());
     opts.cgroups = Some(Err(
         "the node runs outside a cgroup it may manage; start it as the installed service, or under systemd-run --user --scope -p Delegate=yes".into(),
     ));

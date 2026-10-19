@@ -28,9 +28,9 @@ use serde_json::{Value, json};
 use crate::runner::{Follow, Output, follow_process, run_process};
 
 /// The argument that starts this program as the broker.
-pub const ARG: &str = "__gui-broker";
+pub const ARG: &str = "__desktop-broker";
 
-const HELLO: &str = "nerve-node-gui broker";
+const HELLO: &str = "nerve-node-desktop broker";
 
 type Out = Arc<Mutex<Box<dyn Write + Send>>>;
 
@@ -351,7 +351,7 @@ fn launch_stdio(exe: &Path, how: Launch) -> Result<Arc<Client>, String> {
     Client::start(Box::new(input), Box::new(output), Some(child))
 }
 
-/// The broker's start: `__gui-broker`, on Windows with the pipe's name and
+/// The broker's start: `__desktop-broker`, on Windows with the pipe's name and
 /// the app's process id. The exit code.
 pub fn main(args: &[String]) -> i32 {
     let exe = match std::env::current_exe() {
@@ -505,7 +505,7 @@ mod win {
         let Ok(app) = pid.parse::<u32>() else {
             return 2;
         };
-        if !name.starts_with(r"\\.\pipe\nerve-gui-") {
+        if !name.starts_with(r"\\.\pipe\nerve-desktop-") {
             return 2;
         }
         let Ok(sid) = own_sid() else {
@@ -567,7 +567,7 @@ mod win {
     /// `elevated`, and talks to it over its pipes.
     pub fn launch(exe: &Path, elevated: bool) -> Result<Arc<Client>, String> {
         let name = format!(
-            r"\\.\pipe\nerve-gui-{}",
+            r"\\.\pipe\nerve-desktop-{}",
             nerve_transport::keys::random_token(24)
         );
         let args = format!("{} {name} {}", super::ARG, std::process::id());

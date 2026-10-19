@@ -84,7 +84,7 @@ jobs:
             ~/.cargo/git/db
             target
           key: cargo-${{ runner.os }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
-      # The desktop app (crates/nerve-node-gui) links the system's fontconfig.
+      # The desktop app (crates/nerve-node-desktop) links the system's fontconfig.
       - name: Build dependencies of the desktop app
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libfontconfig1-dev
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings

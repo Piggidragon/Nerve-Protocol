@@ -9,11 +9,11 @@ use std::time::Duration;
 
 use nerve_conformance::fake_center::FakeCenter;
 use nerve_node::NodePaths;
-use nerve_node_gui::app::{Choose, Ctl, Exec};
-use nerve_node_gui::broker::Launch;
-use nerve_node_gui::headless::Screen;
-use nerve_node_gui::runner::Runner;
-use nerve_node_gui::{AppWindow, Load, Logs, Page, Perm, Prefs, Store};
+use nerve_node_desktop::app::{Choose, Ctl, Exec};
+use nerve_node_desktop::broker::Launch;
+use nerve_node_desktop::headless::Screen;
+use nerve_node_desktop::runner::Runner;
+use nerve_node_desktop::{AppWindow, Load, Logs, Page, Perm, Prefs, Store};
 use nerve_policy::NodeConfig;
 use serde_json::Value;
 use slint::{ComponentHandle, Model};
@@ -82,7 +82,7 @@ fn the_app_drives_the_cli_end_to_end() {
     let root: &Path = dir.path();
     let paths = NodePaths::new(root.join("config"), root.join("state"));
     let runner = Runner::new(
-        env!("CARGO_BIN_EXE_nerve-node-gui").into(),
+        env!("CARGO_BIN_EXE_nerve-node-desktop").into(),
         Some(paths.config_dir.clone()),
         Some(paths.state_dir.clone()),
     );
@@ -415,7 +415,7 @@ fn the_app_drives_the_cli_end_to_end() {
 
     // An error of the CLI is said, and the window stays as it was.
     store.invoke_center_pause("nobody".into(), true);
-    assert_eq!(store.get_toast_tone(), nerve_node_gui::Tone::Danger);
+    assert_eq!(store.get_toast_tone(), nerve_node_desktop::Tone::Danger);
     assert!(
         store.get_toast().contains("center"),
         "{}",

@@ -1,5 +1,5 @@
 [package]
-name = "nerve-node-gui"
+name = "nerve-node-desktop"
 description = "The Nerve node with its desktop app: the node, its CLI and a window that drives the CLI."
 version.workspace = true
 edition.workspace = true
@@ -9,7 +9,7 @@ rust-version = "1.92"
 publish = false
 
 [[bin]]
-name = "nerve-node-gui"
+name = "nerve-node-desktop"
 path = "src/main.rs"
 
 [dependencies]

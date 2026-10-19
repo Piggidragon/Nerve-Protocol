@@ -173,7 +173,7 @@ jobs:
           path: notes/changelog.md
           if-no-files-found: error
       - run: cargo fmt --check
-      # The desktop app (crates/nerve-node-gui) links the system's fontconfig.
+      # The desktop app (crates/nerve-node-desktop) links the system's fontconfig.
       - name: Build dependencies of the desktop app
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libfontconfig1-dev
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings

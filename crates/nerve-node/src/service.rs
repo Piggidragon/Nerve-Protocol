@@ -104,6 +104,17 @@ impl Layout {
         self.unit.is_file()
     }
 
+    /// The polkit rule that lets the owners start and stop the service
+    /// (crate::owner): `/etc/polkit-1/rules.d`, beside the unit's `/etc`.
+    pub fn polkit_rule(&self) -> PathBuf {
+        self.unit
+            .ancestors()
+            .nth(3)
+            .unwrap_or(Path::new("/etc"))
+            .join("polkit-1/rules.d")
+            .join(POLKIT_RULE)
+    }
+
     pub fn installed(&self) -> bool {
         #[cfg(windows)]
         {
@@ -125,7 +136,8 @@ impl Layout {
     /// (`Delegate=`): each command runs in one of its own below it, held to
     /// its limits (crate::cgroup). A command the kernel kills for its memory
     /// leaves the node running (`OOMPolicy=`, which `Delegate=` defaults to
-    /// already).
+    /// already). systemd makes the node's runtime folder, where its owners
+    /// reach it (crate::owner); every account may enter it.
     pub fn unit_text(&self) -> String {
         format!(
             "# Written by `nerve-node install`; `nerve-node uninstall` removes it.
@@ -145,6 +157,8 @@ Delegate=cpu memory pids
 OOMPolicy=continue
 ExecStart={bin} --config-dir {config} --state-dir {state} run
 ExecReload=kill -HUP $MAINPID
+RuntimeDirectory={runtime}
+RuntimeDirectoryMode=0755
 Restart=on-failure
 RestartSec=5
 UMask=0077
@@ -157,8 +171,52 @@ WantedBy=multi-user.target
             bin = self.bin.display(),
             config = self.paths.config_dir.display(),
             state = self.paths.state_dir.display(),
+            runtime = Path::new(crate::owner::RUNTIME_DIR)
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy(),
         )
     }
+}
+
+/// The file name of the polkit rule ([`Layout::polkit_rule`]).
+pub const POLKIT_RULE: &str = "50-nerve-node.rules";
+
+/// The polkit rule: the owners may start, stop and restart the node's
+/// service, and nothing else. systemd names the unit and the verb of each
+/// request (`org.freedesktop.systemd1.manage-units`).
+pub fn polkit_rule_text() -> String {
+    format!(
+        "// Written by `nerve-node install`; `nerve-node uninstall` removes it.
+// The members of {group}, the owners of the Nerve node, may start, stop and
+// restart its service {UNIT_NAME} from their own session at this machine,
+// and nothing else. A program outside a session, such as a command the
+// node runs, is asked for an administrator's password as before.
+polkit.addRule(function(action, subject) {{
+    if (action.id == \"org.freedesktop.systemd1.manage-units\" &&
+        action.lookup(\"unit\") == \"{UNIT_NAME}\" &&
+        subject.isInGroup(\"{group}\") &&
+        subject.local && subject.active) {{
+        var verb = action.lookup(\"verb\");
+        if (verb == \"start\" || verb == \"stop\" || verb == \"restart\") {{
+            return polkit.Result.YES;
+        }}
+    }}
+}});
+",
+        group = crate::owner::GROUP
+    )
+}
+
+/// What polkit on this machine takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Polkit {
+    /// Rules in JavaScript (polkit 0.106 and later).
+    Rules,
+    /// polkit without them (0.105, Ubuntu 22.04): it asks an administrator.
+    Old,
+    /// No polkit.
+    Missing,
 }
 
 /// Whether a node on `paths` is the installed service, however it was
@@ -232,6 +290,26 @@ pub trait System {
     /// `Ok(false)` when it had none.
     fn end_session(&self, _name: &str) -> Result<bool, String> {
         Ok(false)
+    }
+    /// Whether the group `name` is there.
+    fn has_group(&self, _name: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+    /// Makes the system group `name`.
+    fn add_group(&self, name: &str) -> Result<(), String> {
+        Err(format!("cannot make the group {name} here"))
+    }
+    /// Puts the account `user` in the group `group`.
+    fn add_to_group(&self, user: &str, group: &str) -> Result<(), String> {
+        Err(format!("cannot put {user} in the group {group} here"))
+    }
+    /// Removes the group `name`.
+    fn remove_group(&self, name: &str) -> Result<(), String> {
+        Err(format!("cannot remove the group {name} here"))
+    }
+    /// What polkit takes here; the rules go to `rule`'s folder.
+    fn polkit(&self, _rule: &Path) -> Polkit {
+        Polkit::Missing
     }
 }
 
@@ -403,7 +481,14 @@ impl System for Host {
         {
             use std::io::{BufRead, BufReader};
             let ask = || -> std::io::Result<bool> {
-                let mut s = std::os::unix::net::UnixStream::connect(paths.ctl_socket())?;
+                let mut s = match std::os::unix::net::UnixStream::connect(paths.ctl_socket()) {
+                    // An owner without root, after `service start`: the
+                    // owner socket says that the node runs too.
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                        std::os::unix::net::UnixStream::connect(crate::owner::socket())?
+                    }
+                    r => r?,
+                };
                 s.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
                 // The node answers a request with the token it wrote at
                 // its start, which root can read.
@@ -467,6 +552,41 @@ impl System for Host {
         }
         let _ = run("loginctl", &["terminate-user", name]);
         Ok(true)
+    }
+
+    fn has_group(&self, name: &str) -> Result<bool, String> {
+        #[cfg(unix)]
+        return Ok(crate::owner::group_id(name).is_some());
+        #[cfg(not(unix))]
+        {
+            let _ = name;
+            Ok(false)
+        }
+    }
+
+    fn add_group(&self, name: &str) -> Result<(), String> {
+        run("groupadd", &["--system", name])
+    }
+
+    fn add_to_group(&self, user: &str, group: &str) -> Result<(), String> {
+        run("usermod", &["--append", "--groups", group, "--", user])
+    }
+
+    fn remove_group(&self, name: &str) -> Result<(), String> {
+        run("groupdel", &[name])
+    }
+
+    fn polkit(&self, rule: &Path) -> Polkit {
+        let rules = rule.parent().unwrap_or(Path::new("/etc/polkit-1/rules.d"));
+        // polkit 0.106 and later read rules from both folders; the one in
+        // /usr is the package's, there whether or not /etc has one yet.
+        if rules.is_dir() || Path::new("/usr/share/polkit-1/rules.d").is_dir() {
+            Polkit::Rules
+        } else if Path::new("/etc/polkit-1").is_dir() || Path::new("/usr/bin/pkexec").exists() {
+            Polkit::Old
+        } else {
+            Polkit::Missing
+        }
     }
 }
 
@@ -549,11 +669,16 @@ impl Steps<'_> {
 
 /// Whether `what` can run here: Linux, root and systemd.
 fn supported(sys: &dyn System, what: &str) -> Result<(), String> {
+    if !sys.is_root() && cfg!(target_os = "linux") {
+        return Err(format!("{what} needs root: run `sudo nerve-node {what}`"));
+    }
+    supported_without_root(sys, what)
+}
+
+/// Whether `what` can run here: Linux and systemd.
+fn supported_without_root(sys: &dyn System, what: &str) -> Result<(), String> {
     if !cfg!(target_os = "linux") {
         return Err(format!("{what} {LINUX_ONLY}"));
-    }
-    if !sys.is_root() {
-        return Err(format!("{what} needs root: run `sudo nerve-node {what}`"));
     }
     if !sys.has_systemd() {
         return Err(format!(
@@ -759,6 +884,7 @@ fn install_steps(
             "the node's keys are in the system keyring of {USER}, and it answers"
         ));
     }
+    put_owners(layout, sys, invoker, true, steps)?;
     write_file(&layout.unit, layout.unit_text().as_bytes(), 0o644)?;
     steps.did(format!("wrote the service unit {}", layout.unit.display()));
     sys.systemctl(&["daemon-reload"])?;
@@ -768,6 +894,74 @@ fn install_steps(
     steps.did(format!(
         "the service {UNIT_NAME} runs as {USER} and starts with the machine"
     ));
+    Ok(())
+}
+
+/// The owners' parts (crate::owner): the group, `invoker` in it, and the
+/// polkit rule for the service. `invoker` joins at install
+/// (`always`), and at an update only when the group is made then: an
+/// install from before the owners had none.
+fn put_owners(
+    layout: &Layout,
+    sys: &dyn System,
+    invoker: &str,
+    always: bool,
+    steps: &mut Steps,
+) -> Result<(), String> {
+    let group = crate::owner::GROUP;
+    let made = !sys.has_group(group)?;
+    if made {
+        sys.add_group(group)?;
+        steps.did(format!("made the group {group} of the node's owners"));
+    }
+    let program = layout.edition.program;
+    if always || made {
+        match sys.account(invoker)? {
+            Some(a) if a.uid != 0 => {
+                sys.add_to_group(invoker, group)?;
+                steps.did(format!(
+                    "{invoker} is an owner of the node ({group}): `{program}` changes its settings and starts and stops it without sudo"
+                ));
+            }
+            _ => steps.did(format!(
+                "no owner besides root: `sudo usermod --append --groups {group} NAME` makes NAME one"
+            )),
+        }
+    }
+    let rule = layout.polkit_rule();
+    match sys.polkit(&rule) {
+        Polkit::Rules => {
+            let text = polkit_rule_text();
+            if std::fs::read_to_string(&rule).ok().as_deref() != Some(text.as_str()) {
+                write_file(&rule, text.as_bytes(), 0o644)?;
+                steps.did(format!(
+                    "wrote the polkit rule {}: the owners start, stop and restart the service without a password",
+                    rule.display()
+                ));
+            }
+        }
+        Polkit::Old => steps.did(
+            "Warning: polkit here is older than 0.106 and takes no rules: starting and stopping the service asks for an administrator's password",
+        ),
+        Polkit::Missing => {
+            steps.did("Warning: polkit is not installed: starting and stopping the service needs sudo")
+        }
+    }
+    Ok(())
+}
+
+/// Removes the owners' parts again: the polkit rule and the group.
+fn remove_owners(layout: &Layout, sys: &dyn System, steps: &mut Steps) -> Result<(), String> {
+    let rule = layout.polkit_rule();
+    if rule.exists() {
+        std::fs::remove_file(&rule).map_err(|e| format!("{}: {e}", rule.display()))?;
+        steps.did(format!("removed the polkit rule {}", rule.display()));
+    }
+    let group = crate::owner::GROUP;
+    if sys.has_group(group)? {
+        sys.remove_group(group)?;
+        steps.did(format!("removed the group {group} of the node's owners"));
+    }
     Ok(())
 }
 
@@ -1038,6 +1232,7 @@ fn uninstall_steps(
             layout.paths.state_dir.display()
         ));
     }
+    remove_owners(layout, sys, steps)?;
     match sys.account(USER)? {
         Some(a) if a.comment == USER_MARK => {
             if sys.end_session(USER)? {
@@ -1107,6 +1302,7 @@ pub async fn update(
     layout: &Layout,
     sys: &dyn System,
     from: Option<&Path>,
+    invoker: &str,
     out: &mut dyn Write,
 ) -> Result<(), String> {
     supported(sys, "update")?;
@@ -1120,7 +1316,7 @@ pub async fn update(
         done: Vec::new(),
         out,
     };
-    let r = update_steps(layout, sys, from, &mut steps).await;
+    let r = update_steps(layout, sys, from, invoker, &mut steps).await;
     audit(&layout.paths, "update", &steps.done, &r, steps.out);
     r
 }
@@ -1129,6 +1325,7 @@ async fn update_steps(
     layout: &Layout,
     sys: &dyn System,
     from: Option<&Path>,
+    invoker: &str,
     steps: &mut Steps<'_>,
 ) -> Result<(), String> {
     let program = layout.edition.program;
@@ -1192,6 +1389,18 @@ async fn update_steps(
     std::fs::rename(&staged, &layout.bin).map_err(|e| format!("{}: {e}", layout.bin.display()))?;
     let old_v = old_v.map_or_else(|| "?".to_string(), |v| v.to_string());
     steps.did(format!("replaced {program} {old_v} with {new_v}"));
+    // The unit of this version (the owners' runtime folder) and the owners'
+    // parts an earlier install did not make; what is there stays.
+    let unit = layout.unit_text();
+    if std::fs::read_to_string(&layout.unit).ok().as_deref() != Some(unit.as_str()) {
+        write_file(&layout.unit, unit.as_bytes(), 0o644)?;
+        sys.systemctl(&["daemon-reload"])?;
+        steps.did(format!(
+            "wrote the service unit {} of this version",
+            layout.unit.display()
+        ));
+    }
+    put_owners(layout, sys, invoker, false, steps)?;
     let started = sys
         .systemctl(&["restart", UNIT_NAME])
         .and_then(|()| sys.wait_running(&layout.paths));
@@ -1499,7 +1708,9 @@ pub fn control(
     action: ServiceAction,
     out: &mut dyn Write,
 ) -> Result<(), String> {
-    supported(sys, &format!("service {}", action.word()))?;
+    // Without root, systemctl asks polkit, whose rule lets the owners do it
+    // (crate::owner); it refuses everyone else.
+    supported_without_root(sys, &format!("service {}", action.word()))?;
     if !layout.installed_at_unit() {
         return Err(
             "the node is not installed as a service here; `sudo nerve-node install` installs it"
@@ -1928,6 +2139,10 @@ pub(crate) mod tests {
         sudo_without_password: RefCell<Vec<String>>,
         /// Whether the node's user keeps a session (a keyring's linger).
         lingers: std::cell::Cell<bool>,
+        /// The groups and their members.
+        pub(crate) groups: RefCell<Vec<(String, Vec<String>)>>,
+        /// What polkit takes here.
+        pub(crate) polkit: std::cell::Cell<Polkit>,
     }
 
     impl Fake {
@@ -1941,7 +2156,18 @@ pub(crate) mod tests {
                 root_groups: RefCell::new(Vec::new()),
                 sudo_without_password: RefCell::new(Vec::new()),
                 lingers: std::cell::Cell::new(false),
+                groups: RefCell::new(Vec::new()),
+                polkit: std::cell::Cell::new(Polkit::Rules),
             }
+        }
+
+        /// The members of `group`, `None` when it is not there.
+        pub(crate) fn members(&self, group: &str) -> Option<Vec<String>> {
+            self.groups
+                .borrow()
+                .iter()
+                .find(|(g, _)| g == group)
+                .map(|(_, m)| m.clone())
         }
 
         pub(crate) fn calls(&self) -> Vec<String> {
@@ -2083,6 +2309,38 @@ pub(crate) mod tests {
                 .push(format!("loginctl disable-linger {name}"));
             Ok(true)
         }
+
+        fn has_group(&self, name: &str) -> Result<bool, String> {
+            Ok(self.members(name).is_some())
+        }
+
+        fn add_group(&self, name: &str) -> Result<(), String> {
+            self.calls.borrow_mut().push(format!("groupadd {name}"));
+            self.groups.borrow_mut().push((name.into(), Vec::new()));
+            Ok(())
+        }
+
+        fn add_to_group(&self, user: &str, group: &str) -> Result<(), String> {
+            self.calls
+                .borrow_mut()
+                .push(format!("usermod {user} {group}"));
+            for (g, m) in self.groups.borrow_mut().iter_mut() {
+                if g == group && !m.iter().any(|u| u == user) {
+                    m.push(user.into());
+                }
+            }
+            Ok(())
+        }
+
+        fn remove_group(&self, name: &str) -> Result<(), String> {
+            self.calls.borrow_mut().push(format!("groupdel {name}"));
+            self.groups.borrow_mut().retain(|(g, _)| g != name);
+            Ok(())
+        }
+
+        fn polkit(&self, _rule: &Path) -> Polkit {
+            self.polkit.get()
+        }
     }
 
     fn layout(root: &Path) -> Layout {
@@ -2150,11 +2408,30 @@ pub(crate) mod tests {
             sys.calls(),
             [
                 format!("useradd nerve {}", l.home.display()),
+                "groupadd nerve-admin".into(),
+                "usermod alice nerve-admin".into(),
                 "systemctl daemon-reload".into(),
                 format!("systemctl enable {UNIT_NAME}"),
                 format!("systemctl restart {UNIT_NAME}"),
             ]
         );
+        // The one who installed is an owner, and polkit lets the owners
+        // start and stop this unit only.
+        assert_eq!(
+            sys.members(crate::owner::GROUP),
+            Some(vec!["alice".to_string()])
+        );
+        assert!(
+            out.contains("alice is an owner of the node (nerve-admin)"),
+            "{out}"
+        );
+        let rule = l.polkit_rule();
+        assert_eq!(
+            rule,
+            d.path().join("etc/polkit-1/rules.d/50-nerve-node.rules")
+        );
+        assert_eq!(std::fs::read_to_string(&rule).unwrap(), polkit_rule_text());
+        assert_eq!(mode(&rule), 0o644);
         // The program, the unit, and the folders, private to the user.
         assert_eq!(std::fs::read(&l.bin).unwrap(), b"nerve-node 1.0.0\n");
         assert_eq!(mode(&l.bin), 0o755);
@@ -2172,6 +2449,11 @@ pub(crate) mod tests {
         // The cgroup of the service is the node's, for one per command.
         assert!(unit.contains("\nDelegate=cpu memory pids\n"), "{unit}");
         assert!(unit.contains("\nOOMPolicy=continue\n"), "{unit}");
+        // The owners' socket's folder, which every account may enter.
+        assert!(
+            unit.contains("\nRuntimeDirectory=nerve-node\nRuntimeDirectoryMode=0755\n"),
+            "{unit}"
+        );
         assert!(
             unit.contains(&format!(
                 "\nExecStart={} --config-dir {} --state-dir {} run\n",
@@ -2189,7 +2471,7 @@ pub(crate) mod tests {
         assert_eq!(a.len(), 1);
         assert_eq!(a[0]["event"], "install");
         assert!(a[0].get("error").is_none());
-        assert_eq!(a[0]["steps"].as_array().unwrap().len(), 6, "{}", a[0]);
+        assert_eq!(a[0]["steps"].as_array().unwrap().len(), 9, "{}", a[0]);
         // Again: the user is reused, the program replaced, the service
         // restarted, the account kept.
         std::fs::write(&exe, "nerve-node 1.0.1\n").unwrap();
@@ -2801,16 +3083,16 @@ pub(crate) mod tests {
                 ),
             ),
             ("uninstall", uninstall(&l, &NotRoot, false, &mut Vec::new())),
-            (
-                "service stop",
-                control(&l, &NotRoot, ServiceAction::Stop, &mut Vec::new()),
-            ),
         ] {
             assert_eq!(
                 e.unwrap_err(),
                 format!("{what} needs root: run `sudo nerve-node {what}`")
             );
         }
+        // Starting and stopping is polkit's to allow (the owners' rule), so
+        // it is not refused for want of root here.
+        let e = control(&l, &NotRoot, ServiceAction::Stop, &mut Vec::new()).unwrap_err();
+        assert!(e.contains("not installed as a service"), "{e}");
     }
 
     #[test]
@@ -2828,11 +3110,14 @@ pub(crate) mod tests {
                 format!("systemctl disable --now {UNIT_NAME}"),
                 "systemctl daemon-reload".into(),
                 format!("systemctl reset-failed {UNIT_NAME}"),
+                "groupdel nerve-admin".into(),
                 "userdel nerve".into(),
             ]),
             "{:?}",
             sys.calls()
         );
+        assert!(!l.polkit_rule().exists());
+        assert_eq!(sys.members(crate::owner::GROUP), None);
         // The config and state stay, and the audit log has both commands.
         assert_eq!(
             std::fs::read_to_string(l.paths.config_file()).unwrap(),
@@ -2945,6 +3230,90 @@ pub(crate) mod tests {
         std::fs::write(l.paths.config_key(), "mac key").unwrap();
     }
 
+    /// An install from before the owners gets them at its update: the
+    /// group with the one who updates in it, the polkit rule and the unit
+    /// with the owners' runtime folder. An update after that changes no
+    /// owner.
+    #[tokio::test]
+    async fn an_update_gives_an_earlier_install_its_owners() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = installed(d.path(), &sys, "1.0.0");
+        // As an install before them left it.
+        sys.groups.borrow_mut().clear();
+        std::fs::remove_file(l.polkit_rule()).unwrap();
+        let old_unit = l.unit_text().replace(
+            "RuntimeDirectory=nerve-node\nRuntimeDirectoryMode=0755\n",
+            "",
+        );
+        std::fs::write(&l.unit, &old_unit).unwrap();
+        let new = d.path().join("new");
+        std::fs::write(&new, "nerve-node 1.2.0\n").unwrap();
+        let mut out = Vec::new();
+        update(&l, &sys, Some(&new), "alice", &mut out)
+            .await
+            .unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(std::fs::read_to_string(&l.unit).unwrap(), l.unit_text());
+        assert!(out.contains("wrote the service unit"), "{out}");
+        assert_eq!(
+            sys.members(crate::owner::GROUP),
+            Some(vec!["alice".to_string()])
+        );
+        assert_eq!(
+            std::fs::read_to_string(l.polkit_rule()).unwrap(),
+            polkit_rule_text()
+        );
+        // The unit is read again before the restart that takes it.
+        let calls = sys.calls();
+        let reload = calls.iter().rposition(|c| c == "systemctl daemon-reload");
+        let restart = calls
+            .iter()
+            .rposition(|c| *c == format!("systemctl restart {UNIT_NAME}"));
+        assert!(reload < restart, "{calls:?}");
+        // The next update keeps the owners as they are.
+        let before = sys.calls().len();
+        std::fs::write(&new, "nerve-node 1.3.0\n").unwrap();
+        let mut out = Vec::new();
+        update(&l, &sys, Some(&new), "root", &mut out)
+            .await
+            .unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(!out.contains("owner"), "{out}");
+        assert!(!out.contains("polkit"), "{out}");
+        assert!(
+            !sys.calls()[before..]
+                .iter()
+                .any(|c| c.starts_with("usermod") || c.starts_with("groupadd")),
+            "{:?}",
+            sys.calls()
+        );
+    }
+
+    /// Without polkit rules the owners are told that starting and stopping
+    /// asks for a password; root alone installing makes no owner.
+    #[test]
+    fn install_says_what_polkit_and_the_owners_are_here() {
+        for (polkit, said) in [
+            (Polkit::Old, "Warning: polkit here is older than 0.106"),
+            (Polkit::Missing, "Warning: polkit is not installed"),
+        ] {
+            let d = tempfile::tempdir().unwrap();
+            let sys = Fake::new();
+            sys.polkit.set(polkit);
+            let l = layout(d.path());
+            let exe = d.path().join("nerve-node-x86_64-linux");
+            std::fs::write(&exe, "nerve-node 1.0.0\n").unwrap();
+            let mut out = Vec::new();
+            install(&l, &sys, &exe, "root", &mut out).unwrap();
+            let out = String::from_utf8(out).unwrap();
+            assert!(out.contains(said), "{out}");
+            assert!(!l.polkit_rule().exists());
+            assert!(out.contains("no owner besides root"), "{out}");
+            assert_eq!(sys.members(crate::owner::GROUP), Some(Vec::new()));
+        }
+    }
+
     #[tokio::test]
     async fn update_replaces_the_program_and_keeps_config_keys_and_audit() {
         let d = tempfile::tempdir().unwrap();
@@ -2955,7 +3324,9 @@ pub(crate) mod tests {
         let new = d.path().join("new");
         std::fs::write(&new, "nerve-node 1.2.0\n").unwrap();
         let mut out = Vec::new();
-        update(&l, &sys, Some(&new), &mut out).await.unwrap();
+        update(&l, &sys, Some(&new), "alice", &mut out)
+            .await
+            .unwrap();
         let out = String::from_utf8(out).unwrap();
         assert!(
             out.contains("replaced nerve-node 1.0.0 with 1.2.0"),
@@ -2982,7 +3353,9 @@ pub(crate) mod tests {
         // The same program again changes nothing.
         let calls = sys.calls().len();
         let mut out = Vec::new();
-        update(&l, &sys, Some(&new), &mut out).await.unwrap();
+        update(&l, &sys, Some(&new), "alice", &mut out)
+            .await
+            .unwrap();
         assert!(
             String::from_utf8(out)
                 .unwrap()
@@ -3002,7 +3375,7 @@ pub(crate) mod tests {
             ("something else\n", "is not nerve-node"),
         ] {
             std::fs::write(&new, text).unwrap();
-            let e = update(&l, &sys, Some(&new), &mut Vec::new())
+            let e = update(&l, &sys, Some(&new), "alice", &mut Vec::new())
                 .await
                 .unwrap_err();
             assert!(e.contains(why), "{e}");
@@ -3011,7 +3384,7 @@ pub(crate) mod tests {
         }
         std::fs::write(&new, "nerve-node 2.0.0\n").unwrap();
         sys.starts.set(false);
-        let e = update(&l, &sys, Some(&new), &mut Vec::new())
+        let e = update(&l, &sys, Some(&new), "alice", &mut Vec::new())
             .await
             .unwrap_err();
         assert!(e.contains("did not start"), "{e}");
@@ -3031,7 +3404,7 @@ pub(crate) mod tests {
     async fn update_needs_an_installed_node() {
         let d = tempfile::tempdir().unwrap();
         let sys = Fake::new();
-        let e = update(&layout(d.path()), &sys, None, &mut Vec::new())
+        let e = update(&layout(d.path()), &sys, None, "alice", &mut Vec::new())
             .await
             .unwrap_err();
         assert!(e.contains("not installed"), "{e}");
@@ -3111,7 +3484,7 @@ pub(crate) mod tests {
         )
         .await;
         let mut out = Vec::new();
-        update(&l, &sys, None, &mut out).await.unwrap();
+        update(&l, &sys, None, "alice", &mut out).await.unwrap();
         let out = String::from_utf8(out).unwrap();
         assert!(out.contains("checked it against its SHA256SUMS"), "{out}");
         assert_eq!(std::fs::read(&l.bin).unwrap(), program);
@@ -3119,12 +3492,16 @@ pub(crate) mod tests {
         // A program that does not match its line is refused.
         let mut l2 = installed(&d.path().join("two"), &sys, "1.0.0");
         l2.release = release(program, format!("{}  {asset}\n", sha(b"other"))).await;
-        let e = update(&l2, &sys, None, &mut Vec::new()).await.unwrap_err();
+        let e = update(&l2, &sys, None, "alice", &mut Vec::new())
+            .await
+            .unwrap_err();
         assert!(e.contains("does not match"), "{e}");
         assert_eq!(std::fs::read(&l2.bin).unwrap(), b"nerve-node 1.0.0\n");
         // So is a release that does not list it.
         l2.release = release(program, format!("{}  other\n", sha(program))).await;
-        let e = update(&l2, &sys, None, &mut Vec::new()).await.unwrap_err();
+        let e = update(&l2, &sys, None, "alice", &mut Vec::new())
+            .await
+            .unwrap_err();
         assert!(e.contains("lists no"), "{e}");
     }
 
@@ -3214,14 +3591,16 @@ pub(crate) mod tests {
         // its parts put back.
         let new = d.path().join("new");
         std::fs::write(&new, "nerve-node 1.1.0\n").unwrap();
-        let e = update(&l, &sys, Some(&new), &mut Vec::new())
+        let e = update(&l, &sys, Some(&new), "alice", &mut Vec::new())
             .await
             .unwrap_err();
         assert!(e.contains("is not nerve-node-desktop"), "{e}");
         std::fs::remove_file(&entry).unwrap();
         std::fs::write(&new, "nerve-node-desktop 1.1.0\n").unwrap();
         let mut out = Vec::new();
-        update(&l, &sys, Some(&new), &mut out).await.unwrap();
+        update(&l, &sys, Some(&new), "alice", &mut out)
+            .await
+            .unwrap();
         let out = String::from_utf8(out).unwrap();
         assert!(
             out.contains("replaced nerve-node-desktop 1.0.0 with 1.1.0"),
@@ -3272,7 +3651,9 @@ pub(crate) mod tests {
         assert!(!String::from_utf8(out).unwrap().contains("is a link"));
         let new = d.path().join("new");
         std::fs::write(&new, "nerve-node-desktop 1.1.0\n").unwrap();
-        update(&l, &sys, Some(&new), &mut Vec::new()).await.unwrap();
+        update(&l, &sys, Some(&new), "alice", &mut Vec::new())
+            .await
+            .unwrap();
         assert_eq!(
             std::fs::read_to_string(&node.bin).unwrap(),
             "nerve-node-desktop 1.1.0\n"

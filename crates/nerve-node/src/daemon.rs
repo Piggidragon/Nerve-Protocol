@@ -55,11 +55,16 @@ pub struct NodeOptions {
     /// How long a dropped link is kept for the center to resume it
     /// (nerve_proto::resume::GRACE). A test shortens it.
     pub resume_grace: Duration,
+    /// Where the node takes its owners' commands, besides the control
+    /// socket (crate::owner): the installed node's, unless a test gives
+    /// one. Served only with `ctl`.
+    pub owners: Option<crate::owner::Endpoint>,
 }
 
 impl NodeOptions {
     pub fn new(paths: NodePaths) -> NodeOptions {
         NodeOptions {
+            owners: crate::owner::Endpoint::of_service(&paths),
             paths,
             exe: None,
             home: home_dir(),
@@ -866,6 +871,8 @@ pub struct Daemon {
     supervisor: JoinHandle<()>,
     relay: JoinHandle<()>,
     ctl: Option<JoinHandle<()>>,
+    /// The owner endpoint's task and its socket (crate::owner).
+    owner: Option<(JoinHandle<()>, PathBuf)>,
     /// Held while the node runs: a CLI moves the keys only while no node
     /// reads them.
     _keys: crate::secrets::KeysLock,
@@ -1031,6 +1038,21 @@ impl Daemon {
         } else {
             None
         };
+        // A node whose owner endpoint cannot be made runs on without it:
+        // its owners then need root, as before there was one.
+        let owner = match opts.owners.filter(|_| opts.ctl) {
+            Some(e) => {
+                let at = e.at.clone();
+                match crate::owner::serve(shared.clone(), e).await {
+                    Ok(task) => Some((task, at)),
+                    Err(e) => {
+                        tracing::error!("{e}; the node's owners need root to change it");
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
         let supervisor = tokio::spawn(supervise(shared.clone()));
         let relay = tokio::spawn(crate::relay::run(shared.clone()));
         tracing::info!(
@@ -1059,6 +1081,7 @@ impl Daemon {
             supervisor,
             relay,
             ctl,
+            owner,
             _keys: keys,
         })
     }
@@ -1126,6 +1149,11 @@ impl Daemon {
             let socket = self.shared.paths.ctl_socket();
             let _ = std::fs::remove_file(nerve_transport::ctl::token_file(&socket));
             let _ = std::fs::remove_file(socket);
+        }
+        if let Some((task, _at)) = self.owner {
+            task.abort();
+            #[cfg(unix)]
+            let _ = std::fs::remove_file(_at);
         }
         tracing::info!("node daemon stopped");
     }
@@ -1523,7 +1551,11 @@ pub(crate) fn control(
                     "machine.sudo changes only through nerve-node sudo on|off".into(),
                 );
             }
+            // Who made it, as the CLI names its user (crate::cli::invoker):
+            // only the owner's programs hold the token.
+            store.set_user(str_of("user"));
             let r = store.set_local(new, if_version);
+            store.set_user(None);
             drop(store);
             match r {
                 Ok(v) => {
@@ -1556,7 +1588,13 @@ pub(crate) fn control(
             }
         }
         "config.accept" => {
-            let r = lock(&shared.store).accept();
+            let r = {
+                let mut store = lock(&shared.store);
+                store.set_user(str_of("user"));
+                let r = store.accept();
+                store.set_user(None);
+                r
+            };
             match r {
                 Ok(v) => {
                     shared.settle_sudo();

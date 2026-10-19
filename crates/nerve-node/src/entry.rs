@@ -41,6 +41,11 @@ pub fn main() -> i32 {
         .bin_name(program)
         .get_matches();
     let cli = crate::cli::Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    // An owner of the installed node, who may not open its folders, has
+    // the running node run the command (crate::owner).
+    if let Some(code) = crate::owner::forward_if_needed(&cli) {
+        return code;
+    }
     // The installed node on Windows runs under the service control manager,
     // which takes the main thread.
     #[cfg(windows)]

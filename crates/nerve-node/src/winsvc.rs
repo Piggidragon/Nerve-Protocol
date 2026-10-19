@@ -108,6 +108,50 @@ pub trait WinSystem {
         paths: &crate::paths::NodePaths,
         node_ids: &[String],
     ) -> crate::grants::Synced;
+    /// The account that installs, as an owner of the node (crate::owner):
+    /// its SID and its name. The desktop app's user when its broker names
+    /// one, else the account this runs as.
+    fn owner_sid(&self) -> Option<(String, String)>;
+    /// The owners' SIDs the service's registry key lists.
+    fn owners(&self) -> Result<Vec<String>, String>;
+    /// Writes `sids` as the owners, and gives them the right to start,
+    /// stop and ask the service ([`service_dacl`]).
+    fn put_owners(&self, sids: &[String]) -> Result<(), String>;
+}
+
+/// The service's DACL in SDDL: what Windows gives a new service (SYSTEM,
+/// the administrators, read for the interactive and service users), and to
+/// each owner the right to start, stop and ask it, nothing more.
+pub fn service_dacl(owners: &[String]) -> String {
+    let mut s = String::from(
+        "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)",
+    );
+    for o in owners {
+        s.push_str(&format!("(A;;CCLCSWRPWPLOCRRC;;;{o})"));
+    }
+    s
+}
+
+/// The owners (crate::owner): the account that installs joins them at
+/// install (`always`), and at an update only when there are none, as after
+/// an install from before them.
+fn put_owners(sys: &dyn WinSystem, always: bool, steps: &mut Steps) -> Result<(), String> {
+    let mut owners = sys.owners()?;
+    if !always && !owners.is_empty() {
+        return Ok(());
+    }
+    let Some((sid, name)) = sys.owner_sid() else {
+        steps.did("no owner besides the administrators");
+        return Ok(());
+    };
+    if !owners.contains(&sid) {
+        owners.push(sid);
+    }
+    sys.put_owners(&owners)?;
+    steps.did(format!(
+        "{name} is an owner of the node: the app and `nerve-node` change its settings, and start and stop its service, without administrator rights"
+    ));
+    Ok(())
 }
 
 /// Takes the folder grants of the node at `paths` off, for uninstall.
@@ -360,6 +404,7 @@ fn install_steps(
         crate::eventlog::SOURCE,
         layout.paths.log_file().display()
     ));
+    put_owners(sys, true, steps)?;
     // Now that the service and the Event Log name this program.
     remove_node_alone(layout, sys, steps)?;
     sys.start()?;
@@ -675,6 +720,7 @@ async fn update_steps(
     // and one whose source points elsewhere gets it back; it is the same
     // program path after the update.
     sys.put_event_source(layout)?;
+    put_owners(sys, false, steps)?;
     let new = match from {
         Some(f) => {
             let b = std::fs::read(f).map_err(|e| format!("{}: {e}", f.display()))?;
@@ -780,7 +826,8 @@ pub fn control(
     action: ServiceAction,
     out: &mut dyn Write,
 ) -> Result<(), String> {
-    supported(sys, &format!("service {}", action.word()))?;
+    // The service's DACL decides: the administrators and the owners may
+    // (crate::owner).
     if sys.service()?.is_none() {
         return Err(
             "the node is not installed as a service here; `nerve-node install` installs it".into(),
@@ -850,6 +897,10 @@ pub(crate) mod tests {
         /// The state folders of nodes that run: their containers' profiles
         /// stay.
         running: RefCell<Vec<PathBuf>>,
+        /// The account that installs, by SID and name.
+        pub(crate) installer: RefCell<Option<(String, String)>>,
+        /// The owners the service's key lists.
+        pub(crate) owner_list: RefCell<Vec<String>>,
     }
 
     impl Fake {
@@ -876,6 +927,8 @@ pub(crate) mod tests {
                 removed: RefCell::new(Vec::new()),
                 held: RefCell::new(Vec::new()),
                 running: RefCell::new(Vec::new()),
+                installer: RefCell::new(Some(("S-1-5-21-1-2-3-1001".into(), "alice".into()))),
+                owner_list: RefCell::new(Vec::new()),
             }
         }
 
@@ -976,6 +1029,8 @@ pub(crate) mod tests {
         fn delete_service(&self) -> Result<(), String> {
             self.call("delete");
             self.service.set(None);
+            // The service's key and DACL go with it.
+            self.owner_list.borrow_mut().clear();
             Ok(())
         }
         fn put_event_source(&self, layout: &Layout) -> Result<(), String> {
@@ -1069,6 +1124,24 @@ pub(crate) mod tests {
             std::fs::remove_file(path).map_err(|e| e.to_string())?;
             Ok(true)
         }
+        fn owner_sid(&self) -> Option<(String, String)> {
+            self.installer.borrow().clone()
+        }
+
+        fn owners(&self) -> Result<Vec<String>, String> {
+            // They go with the service.
+            if self.service.get().is_none() {
+                return Ok(Vec::new());
+            }
+            Ok(self.owner_list.borrow().clone())
+        }
+
+        fn put_owners(&self, sids: &[String]) -> Result<(), String> {
+            self.call(format!("owners {}", sids.join(",")));
+            *self.owner_list.borrow_mut() = sids.to_vec();
+            Ok(())
+        }
+
         fn remove_grants(&self, paths: &NodePaths, node_ids: &[String]) -> crate::grants::Synced {
             // The record is in the state folder, which a purge deletes.
             let recorded = crate::grants::record_file(paths).exists();
@@ -1245,9 +1318,13 @@ pub(crate) mod tests {
                 "logon alice".into(),
                 format!("put {}", l.bin.display()),
                 "event source".into(),
+                "owners S-1-5-21-1-2-3-1001".into(),
                 "start".into(),
             ]
         );
+        // The one who installed is an owner: the service lets that SID
+        // start and stop it.
+        assert!(out.contains("alice is an owner of the node"), "{out}");
         // The Event Log takes the text of the node's entries from the
         // installed program.
         assert_eq!(*sys.event_source.borrow(), Some(l.bin.clone()));
@@ -1275,7 +1352,7 @@ pub(crate) mod tests {
         assert_eq!(a.len(), 1);
         assert_eq!(a[0]["event"], "install");
         assert!(a[0].get("error").is_none());
-        assert_eq!(a[0]["steps"].as_array().unwrap().len(), 7, "{}", a[0]);
+        assert_eq!(a[0]["steps"].as_array().unwrap().len(), 8, "{}", a[0]);
         // Again, as another administrator: the account is reset, the
         // service stopped and started, the account of the commands and its
         // stored password kept without a question.
@@ -1827,6 +1904,59 @@ pub(crate) mod tests {
         );
         assert_eq!(sys.calls()[calls..], ["event source"]);
         assert_eq!(*sys.event_source.borrow(), Some(l.bin.clone()));
+    }
+
+    /// An install from before the owners gets the one who updates as its
+    /// owner; an update after that changes none.
+    #[tokio::test]
+    async fn an_update_gives_an_earlier_install_its_owner() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        let l = installed(d.path(), &sys, "1.0.0");
+        sys.owner_list.borrow_mut().clear();
+        *sys.installer.borrow_mut() = Some(("S-1-5-21-1-2-3-1002".into(), "bob".into()));
+        let new = d.path().join("new.exe");
+        std::fs::write(&new, "nerve-node 1.2.0\n").unwrap();
+        let mut out = Vec::new();
+        update(&l, &sys, Some(&new), &mut out).await.unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("bob is an owner of the node"), "{out}");
+        assert_eq!(*sys.owner_list.borrow(), ["S-1-5-21-1-2-3-1002"]);
+        // The owners are set before the service starts again.
+        let calls = sys.calls();
+        let owners = calls.iter().position(|c| c.starts_with("owners"));
+        let start = calls.iter().rposition(|c| c == "start");
+        assert!(owners < start, "{calls:?}");
+        *sys.installer.borrow_mut() = Some(("S-1-5-21-1-2-3-1004".into(), "dave".into()));
+        std::fs::write(&new, "nerve-node 1.3.0\n").unwrap();
+        let mut out = Vec::new();
+        update(&l, &sys, Some(&new), &mut out).await.unwrap();
+        assert!(!String::from_utf8(out).unwrap().contains("owner"));
+        assert_eq!(*sys.owner_list.borrow(), ["S-1-5-21-1-2-3-1002"]);
+    }
+
+    /// The service's DACL gives each owner start, stop and asking, and
+    /// keeps what Windows gives everyone else.
+    #[test]
+    fn the_service_lets_its_owners_start_and_stop_it() {
+        let d = service_dacl(&["S-1-5-21-1-2-3-1001".into()]);
+        assert!(
+            d.starts_with("D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)"),
+            "{d}"
+        );
+        assert!(
+            d.ends_with("(A;;CCLCSWRPWPLOCRRC;;;S-1-5-21-1-2-3-1001)"),
+            "{d}"
+        );
+        // No change of its config, its DACL or its removal for an owner.
+        let owner = d.rsplit("(A;;").next().unwrap();
+        for right in ["DC", "SD", "WD", "WO", "DT"] {
+            assert!(
+                !owner.split(";;").next().unwrap().contains(right),
+                "{right}"
+            );
+        }
+        assert_eq!(service_dacl(&[]).matches("(A;").count(), 4);
     }
 
     #[tokio::test]

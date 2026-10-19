@@ -844,9 +844,15 @@ pub async fn edit_saved(
                 Err(e) if e == nerve_transport::ctl::NOT_RUNNING => break,
                 Err(e) => return Err(e),
             };
-            let mut cfg = NodeConfig::parse(read["config"].as_str().unwrap_or_default())?;
+            let old = NodeConfig::parse(read["config"].as_str().unwrap_or_default())?;
+            let mut cfg = old.clone();
             f(&mut cfg)?;
-            let params = json!({"config": cfg.to_toml(), "if_version": read["version"]});
+            crate::owner::check_change(&old, &cfg)?;
+            let params = json!({
+                "config": cfg.to_toml(),
+                "if_version": read["version"],
+                "user": changed_by(),
+            });
             match nerve_transport::ctl::call(&sock, "config.write", params).await {
                 Ok(_) => {
                     return Ok(Saved {
@@ -872,7 +878,12 @@ pub async fn edit_saved(
         Box::new(crate::secrets::NodeSecrets::for_cli(paths)),
         AuditLog::new(paths.audit_log()),
     )?;
-    match store.update(f) {
+    store.set_user(Some(changed_by()));
+    let old = store.config().clone();
+    match store.update(|c| {
+        f(c)?;
+        crate::owner::check_change(&old, c)
+    }) {
         Ok(_) => {
             let cfg = store.config().clone();
             // No daemon took the change, so the folder grants of Windows
@@ -1281,7 +1292,7 @@ async fn said(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), Str
 impl Cmd {
     /// install, update and uninstall: they work on the installed node, as
     /// root.
-    fn is_service(&self) -> bool {
+    pub(crate) fn is_service(&self) -> bool {
         matches!(
             self,
             Cmd::Install | Cmd::Update { .. } | Cmd::Uninstall { .. } | Cmd::Service(_)
@@ -1296,6 +1307,8 @@ impl Cmd {
 /// node's. install, update and uninstall keep root; setup keeps it as its
 /// saved id, to make the account of the commands when the owner asks.
 pub fn settle_user(cli: &Cli) -> Result<(), String> {
+    #[cfg(unix)]
+    STARTED_AS.get_or_init(own_real_uid);
     if cli.cmd.is_service() {
         return Ok(());
     }
@@ -1326,8 +1339,12 @@ pub const DESKTOP_USER_SID: &str = "NERVE_DESKTOP_USER_SID";
 
 /// The account that ran this command through sudo, else root. On Windows
 /// the account this command runs as, or the desktop app's user for the
-/// app's broker ([`DESKTOP_USER_SID`]).
-fn invoker() -> String {
+/// app's broker ([`DESKTOP_USER_SID`]). A command the node runs for one of
+/// its owners is that owner's (crate::owner).
+pub(crate) fn invoker() -> String {
+    if let Some(owner) = crate::owner::owner_running() {
+        return owner;
+    }
     #[cfg(windows)]
     if let Some(name) = windows_invoker(std::env::var(DESKTOP_USER_SID).ok()) {
         return name;
@@ -1337,6 +1354,32 @@ fn invoker() -> String {
         std::env::var("PKEXEC_UID").ok(),
         crate::account::name_of,
     )
+}
+
+/// Who makes a change, for the audit: the [`invoker`], and without sudo or
+/// pkexec the account that started this command, which is root only when
+/// it was.
+pub(crate) fn changed_by() -> String {
+    let who = invoker();
+    #[cfg(unix)]
+    if who == "root" {
+        let uid = *STARTED_AS.get_or_init(own_real_uid);
+        if uid != 0 {
+            return crate::account::name_of(uid).unwrap_or_else(|| format!("uid {uid}"));
+        }
+    }
+    who
+}
+
+/// The real user id this process started with, before
+/// [`settle_user`] made it the node's user.
+#[cfg(unix)]
+static STARTED_AS: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+
+#[cfg(unix)]
+fn own_real_uid() -> u32 {
+    // SAFETY: a plain getter.
+    unsafe { libc::getuid() }
 }
 
 /// [`invoker`] on Windows: the desktop app's user when its broker names
@@ -2005,7 +2048,7 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             return crate::winsvc::update(&layout, &crate::win_host::WinHost, from.as_deref(), out)
                 .await;
             #[cfg(not(windows))]
-            crate::service::update(&layout, &Host, from.as_deref(), out).await
+            crate::service::update(&layout, &Host, from.as_deref(), &invoker(), out).await
         }
         Cmd::Service(ServiceCmd::Status) => {
             let v = service_status(&Layout::system())?;
@@ -2037,7 +2080,12 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                 _ => crate::service::ServiceAction::Restart,
             };
             let layout = Layout::system();
-            owner_check(&[&layout.paths]).await?;
+            // An owner without root does not reach the control socket; the
+            // service manager lets the owner's own session only, not a
+            // command of the node, start and stop it (crate::owner).
+            if crate::rights::full_rights() {
+                owner_check(&[&layout.paths]).await?;
+            }
             #[cfg(windows)]
             return crate::winsvc::control(&layout, &crate::win_host::WinHost, action, out);
             #[cfg(not(windows))]
@@ -4071,7 +4119,13 @@ async fn accept(paths: &NodePaths) -> Result<u64, String> {
         ));
     }
     #[cfg(unix)]
-    match nerve_transport::ctl::call(&paths.ctl_socket(), "config.accept", json!({})).await {
+    match nerve_transport::ctl::call(
+        &paths.ctl_socket(),
+        "config.accept",
+        json!({"user": changed_by()}),
+    )
+    .await
+    {
         Ok(v) => return Ok(v["version"].as_u64().unwrap_or_default()),
         Err(e) if e != nerve_transport::ctl::NOT_RUNNING => return Err(e),
         Err(_) => {}

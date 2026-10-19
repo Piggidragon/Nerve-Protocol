@@ -356,16 +356,28 @@ mod unix {
         F: Fn(CtlRequest, Peer) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = Reply> + Send + 'static,
     {
-        serve_limited(listener, handler, IDLE, MAX_CONNECTIONS).await
+        serve_limited(listener, handler, IDLE, MAX_CONNECTIONS, false).await
+    }
+
+    /// [`serve_on`] for a socket any account may reach ([`bind_open`]): the
+    /// handler gets every caller and decides by its [`Peer`] itself.
+    pub async fn serve_anyone<F, Fut>(listener: UnixListener, handler: F) -> std::io::Result<()>
+    where
+        F: Fn(CtlRequest, Peer) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Reply> + Send + 'static,
+    {
+        serve_limited(listener, handler, IDLE, MAX_CONNECTIONS, true).await
     }
 
     /// [`serve_on`], with `idle` as the time a connection may wait for its
-    /// request and `max` connections served at once.
+    /// request and `max` connections served at once; with `anyone`, a caller
+    /// of any account is served.
     async fn serve_limited<F, Fut>(
         listener: UnixListener,
         handler: F,
         idle: std::time::Duration,
         max: usize,
+        anyone: bool,
     ) -> std::io::Result<()>
     where
         F: Fn(CtlRequest, Peer) -> Fut + Send + Sync + 'static,
@@ -410,7 +422,7 @@ mod unix {
                     },
                     Err(_) => return,
                 };
-                if peer.uid != me && peer.uid != 0 {
+                if !anyone && peer.uid != me && peer.uid != 0 {
                     return;
                 }
                 let _ = serve_stream_within(stream, peer, handler, idle).await;
@@ -451,6 +463,26 @@ mod unix {
         let listener = UnixListener::bind(path)?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(listener)
+    }
+
+    /// Binds `path` for every account, mode 0666, in a folder that is there
+    /// already: a socket whose server checks each caller itself
+    /// ([`serve_anyone`]). A stale socket file is replaced; a live one is an
+    /// error.
+    pub async fn bind_open(path: &Path) -> std::io::Result<UnixListener> {
+        if path.exists() {
+            if UnixStream::connect(path).await.is_ok() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::AddrInUse,
+                    format!("{} is in use: is the node running already?", path.display()),
+                ));
+            }
+            std::fs::remove_file(path)?;
+        }
+        let listener = UnixListener::bind(path)?;
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))?;
         Ok(listener)
     }
 
@@ -785,6 +817,7 @@ mod unix {
                 |_, _| async { Reply::Ok(json!("up")) },
                 std::time::Duration::from_millis(200),
                 MAX_CONNECTIONS,
+                false,
             ));
             let mut idle = UnixStream::connect(&p).await.unwrap();
             let mut byte = [0u8; 1];
@@ -808,6 +841,7 @@ mod unix {
                 |_, _| async { Reply::Ok(json!("up")) },
                 std::time::Duration::from_secs(30),
                 2,
+                false,
             ));
             // Two places held without a word; a call over them is told the
             // node is busy, with the request written or not.
@@ -1068,8 +1102,8 @@ mod unix {
 
 #[cfg(unix)]
 pub use unix::{
-    CANNOT_CONNECT, NO_ANSWER, bind, call, follow, node_is_there, request_line, serve, serve_on,
-    token_ok, write_token,
+    CANNOT_CONNECT, NO_ANSWER, bind, bind_open, call, follow, node_is_there, request_line, serve,
+    serve_anyone, serve_on, token_ok, write_token,
 };
 
 #[cfg(test)]

@@ -46,9 +46,10 @@ use windows_sys::Win32::System::Services::{
     SERVICE_ALL_ACCESS, SERVICE_AUTO_START, SERVICE_CONFIG_DESCRIPTION,
     SERVICE_CONFIG_FAILURE_ACTIONS, SERVICE_CONFIG_REQUIRED_PRIVILEGES_INFO, SERVICE_CONTROL_STOP,
     SERVICE_DESCRIPTIONW, SERVICE_ERROR_NORMAL, SERVICE_FAILURE_ACTIONSW, SERVICE_QUERY_CONFIG,
-    SERVICE_QUERY_STATUS, SERVICE_REQUIRED_PRIVILEGES_INFOW, SERVICE_RUNNING,
-    SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOP_PENDING,
-    SERVICE_STOPPED, SERVICE_WIN32_OWN_PROCESS, StartServiceW,
+    SERVICE_QUERY_STATUS, SERVICE_REQUIRED_PRIVILEGES_INFOW, SERVICE_RUNNING, SERVICE_START,
+    SERVICE_START_PENDING, SERVICE_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOP,
+    SERVICE_STOP_PENDING, SERVICE_STOPPED, SERVICE_WIN32_OWN_PROCESS, SetServiceObjectSecurity,
+    StartServiceW,
 };
 
 use crate::eventlog::{SOURCE, SOURCE_KEY};
@@ -176,9 +177,58 @@ impl Scm {
 
 /// The node's service with every right; an error when it is not there.
 fn the_service() -> Result<Scm, String> {
+    the_service_for(SERVICE_ALL_ACCESS)
+}
+
+/// The node's service with the rights `access` only, which an owner has
+/// for starting and stopping it (crate::owner).
+fn the_service_for(access: u32) -> Result<Scm, String> {
     Scm::open(SC_MANAGER_CONNECT)?
-        .service(SERVICE_ALL_ACCESS)?
+        .service(access)?
         .ok_or_else(|| format!("the service {SERVICE_NAME} is not registered"))
+}
+
+/// The service's registry key, where its owners are listed.
+fn parameters_key() -> String {
+    format!("SYSTEM\\CurrentControlSet\\Services\\{SERVICE_NAME}\\Parameters")
+}
+
+/// The owners' SIDs the service's key lists (crate::owner): none when the
+/// value or the service is not there.
+pub fn owners() -> Result<Vec<String>, String> {
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA};
+    use windows_sys::Win32::System::Registry::{RRF_RT_REG_MULTI_SZ, RegGetValueW};
+    let key = wide(parameters_key());
+    let value = wide(crate::owner::OWNERS_VALUE);
+    let mut buf = vec![0u16; 1024];
+    loop {
+        let mut len = (buf.len() * 2) as u32;
+        // SAFETY: NUL-terminated names and a buffer of the size given.
+        let r = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                key.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_MULTI_SZ,
+                std::ptr::null_mut(),
+                buf.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        match r {
+            0 => {
+                let n = (len as usize / 2).min(buf.len());
+                return Ok(String::from_utf16_lossy(&buf[..n])
+                    .split('\0')
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect());
+            }
+            ERROR_FILE_NOT_FOUND => return Ok(Vec::new()),
+            ERROR_MORE_DATA => buf.resize(len as usize / 2 + 1, 0),
+            e => return Err(format!("cannot read the owners of the service: {}", os(e))),
+        }
+    }
 }
 
 /// The SID of the local account `name`.
@@ -674,7 +724,7 @@ impl WinSystem for WinHost {
     }
 
     fn start(&self) -> Result<(), String> {
-        let s = the_service()?;
+        let s = the_service_for(SERVICE_START)?;
         // SAFETY: an open service; no arguments.
         if unsafe { StartServiceW(s.0, 0, std::ptr::null()) } == 0
             // SAFETY: plain getter, right after the call.
@@ -689,7 +739,7 @@ impl WinSystem for WinHost {
     }
 
     fn stop(&self) -> Result<(), String> {
-        let s = the_service()?;
+        let s = the_service_for(SERVICE_STOP | SERVICE_QUERY_STATUS)?;
         // SAFETY: plain data that the call fills.
         let mut st: SERVICE_STATUS = unsafe { std::mem::zeroed() };
         // SAFETY: an open service and a place for its status.
@@ -708,6 +758,76 @@ impl WinSystem for WinHost {
                 ));
             }
             std::thread::sleep(Duration::from_millis(250));
+        }
+        Ok(())
+    }
+
+    fn owner_sid(&self) -> Option<(String, String)> {
+        // The app's broker names its user; the name says the SID is one.
+        if let Ok(sid) = std::env::var(crate::cli::DESKTOP_USER_SID)
+            && let Ok(name) = win_user::name_of_sid(&sid)
+        {
+            return Some((sid, name));
+        }
+        let sid = win_user::own_sid().ok()?;
+        let sid = sid_text(&sid).ok()?;
+        let name = win_user::current_user().ok()?;
+        Some((sid, name))
+    }
+
+    fn owners(&self) -> Result<Vec<String>, String> {
+        owners()
+    }
+
+    fn put_owners(&self, sids: &[String]) -> Result<(), String> {
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+        use windows_sys::Win32::System::Registry::REG_MULTI_SZ;
+        // A list of strings, each ended by a NUL, and one NUL more.
+        let data: Vec<u16> = sids
+            .iter()
+            .flat_map(|s| s.encode_utf16().chain(Some(0)))
+            .chain(Some(0))
+            .collect();
+        // SAFETY: NUL-terminated names and data of the size given; the key
+        // is made when it is missing.
+        let r = unsafe {
+            RegSetKeyValueW(
+                HKEY_LOCAL_MACHINE,
+                wide(parameters_key()).as_ptr(),
+                wide(crate::owner::OWNERS_VALUE).as_ptr(),
+                REG_MULTI_SZ,
+                data.as_ptr().cast(),
+                (data.len() * 2) as u32,
+            )
+        };
+        if r != 0 {
+            return Err(format!("cannot write the owners of the service: {}", os(r)));
+        }
+        let s = the_service()?;
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: a NUL-terminated SDDL string; the descriptor is freed
+        // below.
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                wide(crate::winsvc::service_dacl(sids)).as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(format!("cannot make the service's DACL: {}", last()));
+        }
+        // SAFETY: an open service and a valid descriptor, freed once.
+        let ok = unsafe { SetServiceObjectSecurity(s.0, DACL_SECURITY_INFORMATION, sd) };
+        let e = last();
+        // SAFETY: the descriptor from the conversion.
+        unsafe { windows_sys::Win32::Foundation::LocalFree(sd) };
+        if ok == 0 {
+            return Err(format!("cannot set the service's DACL: {e}"));
         }
         Ok(())
     }
@@ -773,7 +893,7 @@ impl WinSystem for WinHost {
     }
 
     fn wait_running(&self, layout: &Layout) -> Result<(), String> {
-        let s = the_service()?;
+        let s = the_service_for(SERVICE_QUERY_STATUS)?;
         let until = Instant::now() + Duration::from_secs(60);
         loop {
             let st = s.status()?;

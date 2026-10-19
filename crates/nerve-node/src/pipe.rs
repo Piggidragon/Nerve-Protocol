@@ -70,6 +70,8 @@ fn trusted_owner<S: PartialEq>(owner: &S, system: &S, admins: &S, node: Option<&
 }
 
 #[cfg(windows)]
+pub(crate) use sys::{Descriptor, check_owner, client_pid, instance};
+#[cfg(windows)]
 pub use sys::{call, serve};
 
 #[cfg(windows)]
@@ -105,7 +107,7 @@ mod sys {
     use crate::win_user::{well_known_sid, wide};
 
     /// A security descriptor made from SDDL, freed when dropped.
-    struct Descriptor(PSECURITY_DESCRIPTOR);
+    pub(crate) struct Descriptor(PSECURITY_DESCRIPTOR);
 
     // SAFETY: the descriptor is plain memory that is only read once made.
     unsafe impl Send for Descriptor {}
@@ -113,7 +115,7 @@ mod sys {
     unsafe impl Sync for Descriptor {}
 
     impl Descriptor {
-        fn from_sddl(sddl: &str) -> io::Result<Descriptor> {
+        pub(crate) fn from_sddl(sddl: &str) -> io::Result<Descriptor> {
             let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
             // SAFETY: a NUL-terminated SDDL string; the descriptor is freed
             // on drop.
@@ -141,7 +143,11 @@ mod sys {
 
     /// One instance of the pipe `name` with the node's DACL; the first one
     /// only where no pipe of that name is.
-    fn instance(name: &str, sd: &Descriptor, first: bool) -> io::Result<NamedPipeServer> {
+    pub(crate) fn instance(
+        name: &str,
+        sd: &Descriptor,
+        first: bool,
+    ) -> io::Result<NamedPipeServer> {
         let mut sa = SECURITY_ATTRIBUTES {
             nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: sd.0,
@@ -158,7 +164,7 @@ mod sys {
     }
 
     /// The id of the process at the other end of a connected instance.
-    fn client_pid(pipe: &NamedPipeServer) -> Option<u32> {
+    pub(crate) fn client_pid(pipe: &NamedPipeServer) -> Option<u32> {
         let mut pid = 0u32;
         // SAFETY: a connected pipe instance and a place for the id.
         let ok =
@@ -323,6 +329,17 @@ mod sys {
                 Err(e) => return Err(format!("cannot reach the running node: {e}")),
             }
         };
+        check_owner(paths, &client, &name)?;
+        nerve_transport::ctl::call_on(client, method, params).await
+    }
+
+    /// Talks to the pipe `name` that `client` is open on only when SYSTEM,
+    /// the administrators or the node's account own it.
+    pub(crate) fn check_owner(
+        paths: &NodePaths,
+        client: &tokio::net::windows::named_pipe::NamedPipeClient,
+        name: &str,
+    ) -> Result<(), String> {
         let owner = owner_of(client.as_raw_handle() as HANDLE)
             .map_err(|e| format!("cannot check the control pipe {name}: {e}"))?;
         let system = well_known_sid(WinLocalSystemSid).map_err(|e| e.to_string())?;
@@ -334,7 +351,7 @@ mod sys {
                 "{NOT_THE_NODES}: {name} belongs to {who}, so nothing was sent to it. Another process made it before the node started, and the node runs without its pipe: end that process and restart the node (docs/user/troubleshooting.md, \"The control pipe is not the node's\"). With the node stopped, folder changes go to node.toml"
             ));
         }
-        nerve_transport::ctl::call_on(client, method, params).await
+        Ok(())
     }
 }
 

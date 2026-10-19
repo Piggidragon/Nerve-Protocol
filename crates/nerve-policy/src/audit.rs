@@ -235,13 +235,29 @@ impl AuditLog {
 
     /// A settings change; `by` is `local` or `center <name>`.
     pub fn settings(&self, by: &str, version: u64, changes: &[Change]) -> std::io::Result<()> {
-        self.append(&json!({
+        self.settings_by(by, None, version, changes)
+    }
+
+    /// [`AuditLog::settings`], with the account of the person who made a
+    /// local change (`user`), when it is known.
+    pub fn settings_by(
+        &self,
+        by: &str,
+        user: Option<&str>,
+        version: u64,
+        changes: &[Change],
+    ) -> std::io::Result<()> {
+        let mut entry = json!({
             "ts": nerve_proto::msg::now_ms(),
             "kind": "settings",
             "by": by,
             "version": version,
             "changes": changes,
-        }))
+        });
+        if let Some(u) = user {
+            entry["user"] = json!(u);
+        }
+        self.append(&entry)
     }
 
     /// Something that happened to the config file itself: `refused` (it was

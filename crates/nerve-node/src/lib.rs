@@ -29,6 +29,7 @@ pub mod grants;
 mod job;
 pub mod keyring_setup;
 mod link;
+pub mod owner;
 pub mod pair;
 pub mod paths;
 pub mod prompt;

@@ -61,7 +61,7 @@ fn main() {
             match deps::after_window_error(&e, chosen.as_deref()) {
                 deps::Next::Software => {
                     eprintln!(
-                        "nerve-node-desktop: the GPU renderer did not start ({e}); drawing in software"
+                        "nerve-node-desktop: the window did not open ({e}); trying once more, drawing in software without OpenGL"
                     );
                     std::process::exit(deps::rerun_in_software());
                 }

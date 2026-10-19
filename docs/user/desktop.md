@@ -129,7 +129,7 @@ When a part is missing, the app says so:
 | Missing | What happens |
 |---|---|
 | A display | The app does not start. It prints `no display: …` and shows it as a desktop notification where it can |
-| OpenGL | The app starts again drawing in software, and prints that it does. If that fails too, it prints `the window did not open …` |
+| OpenGL | The app starts once more drawing in software, and prints that it does. If that fails too, it prints `the window did not open …` |
 | `pkexec` | Instead of the system's question: "There is no pkexec on this machine …", with the package to install |
 | The polkit agent | Instead of the system's question: "No polkit authentication agent is running …", with agents to install |
 | The portal | The button that opens a file or folder dialog says "No file dialog: …" and names the portal packages |

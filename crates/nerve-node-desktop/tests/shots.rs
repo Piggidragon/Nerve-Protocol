@@ -545,6 +545,29 @@ fn every_page_light_and_dark() {
     install.set_program("/usr/local/bin/nerve-node-desktop".into());
     install.set_node_only(true);
     shots.take("installer-node-only");
+    install.set_action("install".into());
+    install.set_step("done".into());
+    install.set_did(lines(&[
+        "the user nerve is there already",
+        "put the program at /usr/local/bin/nerve-node-desktop",
+        "put Nerve in the application menu (/usr/local/share/applications/nerve-node-desktop.desktop), with its icon",
+        "nerve:// links open in Nerve (the default in /etc/xdg/mimeapps.list)",
+        "/usr/local/bin/nerve-node is a link to /usr/local/bin/nerve-node-desktop now, so the command nerve-node runs it",
+        "the service nerve-node.service runs as nerve and starts with the machine",
+    ]));
+    shots.take("installer-node-only-done");
+    install.set_windows(true);
+    install.set_did(lines(&[
+        "put the program at C:\\Program Files\\Nerve\\nerve-node-desktop.exe",
+        "put Nerve in the Start menu (C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Nerve.lnk)",
+        "nerve:// links open in Nerve (HKEY_LOCAL_MACHINE\\Software\\Classes\\nerve)",
+        "put Nerve in Apps & features, where Uninstall removes it",
+        "C:\\Program Files\\Nerve\\nerve-node.exe is a link to C:\\Program Files\\Nerve\\nerve-node-desktop.exe now, so the command nerve-node runs it",
+        "the service nerve-node runs",
+    ]));
+    shots.take("installer-node-only-done-windows");
+    install.set_windows(false);
+    install.set_did(lines(&[]));
     install.set_node_only(false);
     install.set_action("install".into());
     install.set_step("working".into());
@@ -585,6 +608,7 @@ fn every_page_light_and_dark() {
         "removed the service unit /etc/systemd/system/nerve-node.service",
         "deleted /etc/nerve",
         "removed the user nerve",
+        "removed the link /usr/local/bin/nerve-node",
         "removed Nerve from the application menu",
         "removed the program /usr/local/bin/nerve-node-desktop",
     ]));

@@ -358,7 +358,7 @@ export component InstallerView inherits Rectangle {
                             StepHead {
                                 title: Install.node-only ? "Add the app to the node on this machine" : "Install Nerve on this machine";
                                 text: Install.node-only
-                                    ? "The node is installed as a service already. Installing adds the app, and the service runs the app's program from then on."
+                                    ? "The node is installed as a service already. Installing adds the app: the service runs the app's program from then on, and the command nerve-node becomes a link to it."
                                     : "Nerve links this machine to your Nerve centers, and lets them do only what you allow.";
                             }
                             VerticalLayout {
@@ -373,7 +373,7 @@ export component InstallerView inherits Rectangle {
                                 WhatRow {
                                     icon: @image-url("icons/window.svg");
                                     title: "The app";
-                                    text: "In " + Install.program + ", with Nerve in the " + (Install.windows ? "Start menu." : "application menu.");
+                                    text: "In " + Install.program + ", with Nerve in the " + (Install.windows ? "Start menu and in Apps & features." : "application menu.");
                                 }
                                 WhatRow {
                                     icon: @image-url("icons/link.svg");

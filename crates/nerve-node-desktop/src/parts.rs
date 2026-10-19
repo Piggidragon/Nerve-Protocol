@@ -127,6 +127,14 @@ impl Places {
         if gone {
             did.push("removed Nerve from the application menu".to_string());
         }
+        // The icon's folders, when nothing else is in them.
+        let mut dir = self.icon().parent().map(Path::to_path_buf);
+        while let Some(d) = dir {
+            if d == self.icons.parent().unwrap_or(&self.icons) || std::fs::remove_dir(&d).is_err() {
+                break;
+            }
+            dir = d.parent().map(Path::to_path_buf);
+        }
         if let Ok(before) = std::fs::read_to_string(&self.mimeapps) {
             let after = without_default(&before, MIME, &format!("{PROGRAM}.desktop"));
             if after != before {
@@ -596,6 +604,7 @@ mod tests {
         let did = p.uninstall().unwrap();
         assert_eq!(did.len(), 2, "{did:?}");
         assert!(!p.entry().exists() && !p.icon().exists() && !p.mimeapps.exists());
+        assert!(!p.icons.exists());
         // Nothing left says nothing.
         assert!(p.uninstall().unwrap().is_empty());
     }

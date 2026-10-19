@@ -227,10 +227,9 @@ impl Ctl {
             return;
         };
         let mut args = vec!["update".to_string()];
+        // The installer updates with itself: the program its commands run.
         let from = if shown {
-            std::env::current_exe()
-                .ok()
-                .map(|p| p.display().to_string())
+            Some(self.runner().exe().display().to_string())
         } else {
             (source == 1).then_some(file)
         };

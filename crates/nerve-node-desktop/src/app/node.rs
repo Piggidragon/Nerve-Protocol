@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use slint::{ComponentHandle, SharedString};
 
-use super::{Ctl, messages};
+use super::Ctl;
 use crate::broker;
 use crate::{Store, Tone};
 
@@ -33,6 +33,32 @@ impl Ctl {
                         s.set_service_enabled(v["enabled"] == true);
                     });
                 }
+            },
+        );
+    }
+
+    /// Restarts the installed service for the changes that wait for it
+    /// ([`Ctl::restart_for`]).
+    pub(super) fn restart_service(self: &Rc<Self>) {
+        self.with_store(|s| s.set_busy("service-restart".into()));
+        self.command(
+            vec!["service".into(), "restart".into()],
+            None,
+            |c, answer| {
+                c.with_store(|s| s.set_busy(SharedString::new()));
+                match answer {
+                    Ok(_) => {
+                        c.with_store(|s| s.set_restart_due(false));
+                        c.toast("The node restarted and took the change.", Tone::Ok);
+                    }
+                    // The Overview still offers the restart.
+                    Err(e) => c.toast(
+                        format!("The node did not restart: {e}. Restart it on the Overview."),
+                        Tone::Danger,
+                    ),
+                }
+                c.refresh_service();
+                c.refresh_status();
             },
         );
     }
@@ -167,8 +193,10 @@ impl Ctl {
         self.with_store(|s| s.set_setup_busy(true));
         self.command(args, None, move |c, answer| match answer {
             Ok(v) => {
-                if say && !messages(&v).is_empty() {
+                if say && !super::said_of(&v).is_empty() {
                     c.done(&v, "");
+                } else {
+                    c.restart_for(&v);
                 }
                 c.setup_go(next)
             }
@@ -230,12 +258,16 @@ impl Ctl {
                 self.setup_run(args, 4, false);
             }
             _ => {
-                let stopped = self
-                    .with_store(|s| s.get_service_state() == "stopped")
-                    .unwrap_or(false);
+                let (state, due) = self
+                    .with_store(|s| (s.get_service_state().to_string(), s.get_restart_due()))
+                    .unwrap_or_default();
                 self.with_store(|s| s.set_setup_open(false));
-                if stopped {
-                    self.service_action("start");
+                // The service takes the steps' changes when it starts: it
+                // starts, or starts again.
+                match state.as_str() {
+                    "stopped" => self.service_action("start"),
+                    "running" if due => self.service_action("restart"),
+                    _ => {}
                 }
             }
         }

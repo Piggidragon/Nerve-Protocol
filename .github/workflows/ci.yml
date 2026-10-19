@@ -91,6 +91,14 @@ jobs:
       # The whole workspace, with the end-to-end tests that start the real
       # programs (Unix only). `--no-fail-fast` shows every failing test at once.
       - run: cargo test --locked --workspace --no-fail-fast
+      # Root's backup and restore on a node of another user open the file as
+      # the user who asked (crates/nerve-node/src/caller_file.rs). That test
+      # needs root, and the run above skips it where the runner gives no user
+      # namespace; here only the test program runs as root, not cargo.
+      - name: Root's backup file, as root
+        env:
+          CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo -E
+        run: cargo test --locked -p nerve-node --test backup_caller
 
   # The released Linux programs are static, built against musl
   # (release.yml), and the standard library differs there: it drops O_PATH

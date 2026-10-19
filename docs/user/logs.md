@@ -28,7 +28,8 @@ The file is readable by its owner only. At 5 MiB the program moves it to
 10 MiB. The node writes it while `nerve-node run` is running.
 
 `nerve-node log` shows the node's log, `--last 50` the newest 50 lines,
-`--follow` the new lines as they come. The center's [web UI](web-ui.md#log) shows its log, and its **Download the
+`--follow` the new lines as they come, `--problems` only the errors and
+warnings (with `--last 50` the newest 50 of them). The center's [web UI](web-ui.md#log) shows its log, and its **Download the
 file** link gives you `log.jsonl.1` and `log.jsonl` as one file. Both programs
 also print every line on stderr.
 

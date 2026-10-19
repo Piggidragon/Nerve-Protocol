@@ -8,6 +8,14 @@
 //! while the command has one thread, does that for the command: it reads
 //! the backup at once, or waits for the backup the command makes and writes
 //! it.
+//!
+//! Where the user who ran `sudo` may not open the file, it is opened as the
+//! owner of its folder: `sudo` gave that user root, and a root shell
+//! (`sudo -i`) keeps `SUDO_UID`, so root's own folders stay root's to
+//! write, and the node's state folder the node's user's, as before. The
+//! desktop app's broker (pkexec) gets no such second try: it runs node
+//! commands, not whatever its user may not do. An asker whose account
+//! cannot be found is refused, never taken for root.
 
 use std::path::{Path, PathBuf};
 
@@ -22,8 +30,11 @@ pub enum Job {
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use std::ffi::CString;
     use std::io::{Read, Write};
     use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::MetadataExt;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
@@ -46,19 +57,46 @@ mod linux {
 
     static KEPT: Mutex<Option<Kept>> = Mutex::new(None);
 
-    /// The user who asked root for the command: `sudo`'s, else pkexec's
-    /// (the desktop app's broker), with that user's group. `None` for root
-    /// itself.
-    fn caller() -> Option<(u32, u32)> {
-        let id = |k: &str| std::env::var(k).ok()?.trim().parse::<u32>().ok();
-        let (uid, gid) = match (id("SUDO_UID"), id("SUDO_GID")) {
-            (Some(u), Some(g)) => (u, g),
-            _ => {
-                let uid = id("PKEXEC_UID")?;
-                (uid, group_of(uid)?)
-            }
+    /// The user who asked root for the command.
+    #[derive(Clone, Copy)]
+    struct Caller {
+        uid: u32,
+        gid: u32,
+        /// Through `sudo`, which gave that user root; else through pkexec,
+        /// for the desktop app's broker.
+        sudo: bool,
+    }
+
+    /// The user who asked root for the command: `sudo`'s, else pkexec's,
+    /// with that user's group. `None` for root itself; an error for an
+    /// asker whose account cannot be found.
+    fn caller() -> Result<Option<Caller>, String> {
+        let (var, sudo) = if std::env::var_os("SUDO_UID").is_some() {
+            ("SUDO_UID", true)
+        } else if std::env::var_os("PKEXEC_UID").is_some() {
+            ("PKEXEC_UID", false)
+        } else {
+            return Ok(None);
         };
-        (uid != 0).then_some((uid, gid))
+        let id = |k: &str| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.trim().parse::<u32>().ok())
+        };
+        let uid = id(var).ok_or_else(|| format!("{var} is not a user id"))?;
+        if uid == 0 {
+            return Ok(None);
+        }
+        let (group, _) = account(uid).ok_or_else(|| {
+            format!(
+                "cannot open the file as the user who asked ({var} {uid}): no account has that id here"
+            )
+        })?;
+        let gid = match sudo.then(|| std::env::var_os("SUDO_GID")).flatten() {
+            Some(_) => id("SUDO_GID").ok_or("SUDO_GID is not a group id")?,
+            None => group,
+        };
+        Ok(Some(Caller { uid, gid, sudo }))
     }
 
     /// The group of `uid` in the account database, and its name.
@@ -78,14 +116,10 @@ mod linux {
         }
     }
 
-    fn group_of(uid: u32) -> Option<u32> {
-        account(uid).map(|(g, _)| g)
-    }
-
     /// Becomes `uid` with `gid` and the user's other groups (none for a uid
     /// the account database does not know), for good: real, effective and
     /// saved ids.
-    fn become_caller(uid: u32, gid: u32) -> Result<(), String> {
+    fn become_user(uid: u32, gid: u32) -> Result<(), String> {
         let name = account(uid).map(|(_, n)| n);
         // SAFETY: plain calls; `name` lives across initgroups.
         let failed = unsafe {
@@ -103,6 +137,158 @@ mod linux {
             ));
         }
         Ok(())
+    }
+
+    /// The folder `path` is in.
+    fn folder(path: &Path) -> &Path {
+        match path.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d,
+            _ => Path::new("."),
+        }
+    }
+
+    /// Whether this process may not open `path` as `job` needs: read it, or
+    /// make a file in its folder. Only a refusal counts; any other error is
+    /// the reading's or writing's to say.
+    fn refused(path: &Path, write: bool) -> bool {
+        let (at, mode) = if write {
+            (folder(path), libc::W_OK | libc::X_OK)
+        } else {
+            (path, libc::R_OK)
+        };
+        let Ok(c) = CString::new(at.as_os_str().as_bytes()) else {
+            return false;
+        };
+        // SAFETY: a plain check of a path that lives across the call.
+        let failed = unsafe { libc::access(c.as_ptr(), mode) } != 0;
+        failed && std::io::Error::last_os_error().raw_os_error() == Some(libc::EACCES)
+    }
+
+    /// What became of the file in one try.
+    enum Tried {
+        Done(Result<Vec<u8>, String>),
+        /// The user may not open it; why.
+        Refused(String),
+    }
+
+    /// Reads the file of `job`, or writes `bytes` to it, in this process.
+    fn open(job: &Job, bytes: &[u8]) -> Result<Vec<u8>, String> {
+        match job {
+            Job::Read(path) => nerve_transport::backup::read_file(path),
+            Job::Write { path, overwrite } => {
+                nerve_transport::backup::write_file(path, bytes, *overwrite).map(|()| Vec::new())
+            }
+        }
+    }
+
+    /// Opens the file of `job` in a process that is `uid` with `gid` for
+    /// good. With `check`, a file that user may not open is refused before
+    /// it is touched.
+    fn try_as(uid: u32, gid: u32, job: &Job, bytes: &[u8], check: bool) -> Tried {
+        let (mut answer_in, answer_out) = match pipe() {
+            Ok(p) => p,
+            Err(e) => return Tried::Done(Err(e)),
+        };
+        // SAFETY: this process has one thread (the one `prepare` forked);
+        // the child runs this module's code and leaves with _exit.
+        let pid = unsafe { libc::fork() };
+        if pid < 0 {
+            return Tried::Done(Err(format!(
+                "cannot start the process that opens the file: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        if pid == 0 {
+            drop(answer_in);
+            let mut out = answer_out;
+            let (path, write) = match job {
+                Job::Read(p) => (p, false),
+                Job::Write { path, .. } => (path, true),
+            };
+            let tried = match become_user(uid, gid) {
+                Err(e) => Tried::Done(Err(e)),
+                Ok(()) if check && refused(path, write) => {
+                    let who = account(uid).map_or(format!("uid {uid}"), |(_, n)| {
+                        format!("{} (uid {uid})", n.to_string_lossy())
+                    });
+                    Tried::Refused(if write {
+                        format!(
+                            "cannot write {}: it is written as the user who asked, {who}, who may not write in {}",
+                            path.display(),
+                            folder(path).display()
+                        )
+                    } else {
+                        format!(
+                            "cannot read {}: it is read as the user who asked, {who}, who may not read it",
+                            path.display()
+                        )
+                    })
+                }
+                Ok(()) => Tried::Done(open(job, bytes)),
+            };
+            match tried {
+                Tried::Done(r) => send(&mut out, r),
+                Tried::Refused(e) => {
+                    let _ = out.write_all(&[b"2".as_slice(), e.as_bytes()].concat());
+                }
+            }
+            drop(out);
+            // SAFETY: leaves the child without running the parent's exit
+            // handlers.
+            unsafe { libc::_exit(0) };
+        }
+        drop(answer_out);
+        let mut frame = Vec::new();
+        let read = answer_in.read_to_end(&mut frame);
+        wait(pid);
+        if let Err(e) = read {
+            return Tried::Done(Err(format!("the file's process: {e}")));
+        }
+        match frame.split_first() {
+            Some((b'2', e)) => Tried::Refused(String::from_utf8_lossy(e).into_owned()),
+            _ => Tried::Done(decode(&frame)),
+        }
+    }
+
+    /// What the process forked by [`prepare`] does: opens the file of
+    /// `job` as `caller`, or as the owner of its folder where `sudo`'s user
+    /// may not, or as root where nobody else asked. `None` when nothing is
+    /// to be written (the command made no backup).
+    fn for_caller(
+        caller: Option<Caller>,
+        job: &Job,
+        bytes_in: Option<std::fs::File>,
+    ) -> Option<Result<Vec<u8>, String>> {
+        let mut bytes = Vec::new();
+        if let Some(mut from) = bytes_in {
+            // Nothing came: the command failed before it had a backup, and
+            // no file is made.
+            if from.read_to_end(&mut bytes).is_err() || bytes.is_empty() {
+                return None;
+            }
+        }
+        let Some(c) = caller else {
+            return Some(open(job, &bytes));
+        };
+        let path = match job {
+            Job::Read(p) => p,
+            Job::Write { path, .. } => path,
+        };
+        Some(match try_as(c.uid, c.gid, job, &bytes, true) {
+            Tried::Done(r) => r,
+            Tried::Refused(e) if !c.sudo => Err(e),
+            Tried::Refused(e) => match std::fs::metadata(folder(path)) {
+                Err(_) => Err(e),
+                Ok(m) if m.uid() == 0 => open(job, &bytes),
+                Ok(m) => {
+                    let gid = account(m.uid()).map_or(m.gid(), |(g, _)| g);
+                    match try_as(m.uid(), gid, job, &bytes, false) {
+                        Tried::Done(r) => r,
+                        Tried::Refused(e) => Err(e),
+                    }
+                }
+            },
+        })
     }
 
     fn pipe() -> Result<(std::fs::File, std::fs::File), String> {
@@ -139,6 +325,10 @@ mod linux {
         let mut frame = Vec::new();
         from.read_to_end(&mut frame)
             .map_err(|e| format!("the file's process: {e}"))?;
+        decode(&frame)
+    }
+
+    fn decode(frame: &[u8]) -> Result<Vec<u8>, String> {
         match frame.split_first() {
             Some((b'0', bytes)) => Ok(bytes.to_vec()),
             Some((_, e)) => Err(String::from_utf8_lossy(e).into_owned()),
@@ -153,7 +343,7 @@ mod linux {
     }
 
     pub fn prepare(job: Job) -> Result<(), String> {
-        let caller = caller();
+        let caller = caller()?;
         let (mut answer_in, answer_out) = pipe()?;
         let (bytes_in, bytes_out) = match &job {
             Job::Read(_) => (None, None),
@@ -175,24 +365,8 @@ mod linux {
             drop(answer_in);
             drop(bytes_out);
             let mut out = answer_out;
-            let r = caller.map_or(Ok(()), |(u, g)| become_caller(u, g));
-            match (job, r) {
-                (_, Err(e)) => send(&mut out, Err(e)),
-                (Job::Read(path), Ok(())) => {
-                    send(&mut out, nerve_transport::backup::read_file(&path));
-                }
-                (Job::Write { path, overwrite }, Ok(())) => {
-                    let mut bytes = Vec::new();
-                    let read = bytes_in
-                        .expect("a pipe for the bytes")
-                        .read_to_end(&mut bytes);
-                    // Nothing came: the command failed before it had a
-                    // backup, and no file is made.
-                    if read.is_ok() && !bytes.is_empty() {
-                        let r = nerve_transport::backup::write_file(&path, &bytes, overwrite);
-                        send(&mut out, r.map(|()| Vec::new()));
-                    }
-                }
+            if let Some(r) = for_caller(caller, &job, bytes_in) {
+                send(&mut out, r);
             }
             drop(out);
             // SAFETY: leaves the child without running the parent's exit

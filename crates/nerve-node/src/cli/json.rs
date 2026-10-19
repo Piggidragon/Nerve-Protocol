@@ -27,12 +27,42 @@ pub(super) fn own_form(cmd: &Cmd) -> bool {
     )
 }
 
-/// The lines a command without a form of its own printed, as
-/// `{"messages": [...]}`.
-pub(super) fn lines(text: &[u8], out: &mut dyn Write) -> Result<(), String> {
-    let text = String::from_utf8_lossy(text);
+tokio::task_local! {
+    /// What a command without a form of its own says as data besides its
+    /// lines ([`also`]).
+    static ALSO: std::cell::RefCell<serde_json::Map<String, Value>>;
+}
+
+/// Adds `key` to the `--json` answer of the command that runs, for what its
+/// lines say to people and a program needs as data (a token, what a
+/// restore did); nothing without `--json`.
+pub(super) fn also(key: &str, value: Value) {
+    let _ = ALSO.try_with(|m| m.borrow_mut().insert(key.into(), value));
+}
+
+/// Runs a command without a form of its own: the lines it prints as
+/// `{"messages": [...]}`, with `"next_start": true` when one of them says
+/// that the node takes the change only at its next start
+/// ([`takes_at_next_start`]), and what it added with [`also`].
+pub(super) async fn changed(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), String> {
+    let mut text = Vec::new();
+    let (r, fields) = ALSO
+        .scope(std::cell::RefCell::default(), async {
+            let r = said(paths, cmd, &mut text).await;
+            (r, ALSO.with(|m| m.take()))
+        })
+        .await;
+    r?;
+    let text = String::from_utf8_lossy(&text);
     let messages: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-    print(out, json!({ "messages": messages }))
+    let mut v = json!({ "messages": messages });
+    if messages.iter().any(|l| takes_at_next_start(l)) {
+        v["next_start"] = json!(true);
+    }
+    for (k, f) in fields {
+        v[k] = f;
+    }
+    print(out, v)
 }
 
 fn print(out: &mut dyn Write, v: Value) -> Result<(), String> {
@@ -53,7 +83,11 @@ pub(super) async fn command(
             denied,
             last,
         } => return audit(paths, follow, denied, last, true, out).await,
-        Cmd::Log { follow, last } => return log_cmd(paths, follow, last, true, out).await,
+        Cmd::Log {
+            follow,
+            last,
+            problems,
+        } => return log_cmd(paths, follow, last, problems, true, out).await,
         Cmd::Center(CenterCmd::Ls) => centers(paths).await?,
         Cmd::Center(CenterCmd::Add { link, name, yes }) => {
             pair(paths, &link, name.as_deref(), yes).await?
@@ -255,11 +289,12 @@ async fn pair(
     }
     let before = std::fs::read(paths.config_file()).ok();
     let e = crate::pair::pair(paths, &link, name).await?;
-    let mut messages = Vec::new();
+    let mut v = json!({ "paired": true, "name": e.name, "url": e.url, "messages": [] });
     if std::fs::read(paths.config_file()).ok() != before && !daemon_answers(paths, false).await {
-        messages.push(format!("the change is in node.toml; it {NEXT_START}"));
+        v["messages"] = json!([format!("the change is in node.toml; it {NEXT_START}")]);
+        v["next_start"] = json!(true);
     }
-    Ok(json!({ "paired": true, "name": e.name, "url": e.url, "messages": messages }))
+    Ok(v)
 }
 
 /// `proxy ls`: the proxy, its pin and login, the names of its headers, and

@@ -9,6 +9,8 @@
 - The audit page has allow, allow as wildcard, deny and deny as wildcard on each entry, which write the same rule as `nerve-node rule add --action` ([#23](https://github.com/Piggidragon/Nerve-Protocol/issues/23)).
 - The downloaded file installs itself: the program, the node as a service under its own user (as `nerve-node install`), the menu or Start menu entry with its icon, and the `nerve://` handler, after the system's question for the rights (pkexec, UAC). Started again, it offers to open, update or uninstall Nerve. Settings update it (from the latest release, checked against `SHA256SUMS`, or a file) and uninstall it, keeping or deleting the node's data. On Windows it is in **Apps & features**, whose **Uninstall** opens the app's uninstall.
 - A node installed with `nerve-node` is taken over: the service runs the desktop app's program, and `nerve-node` (`nerve-node.exe` on Windows) becomes a link to it, so the terminal command keeps working and there is one program to update; `--version` through it says `nerve-node-desktop`. On Windows the app has no console, so a terminal waits for it only as `docs/user/desktop.md` says. Uninstall removes the link.
+- A change the running service takes only when it starts again (on Windows every change but a folder's, a pairing too) makes the app restart the service, two seconds after the last one, and say so. A restore stops the service and starts it again.
+- On Windows a standard user can install and use the app with an administrator's name and password in the UAC prompt; the commands still run as that user.
 - On Linux the app says what the desktop lacks instead of failing silently: no display, no `pkexec` or polkit agent, no desktop portal for the file dialogs, no `update-desktop-database`; without OpenGL it draws in software. `docs/user/desktop.md` lists what each desktop needs.
 - The release has `nerve-node-desktop-x86_64-linux` and `nerve-node-desktop-x86_64-windows.exe`, with their checksums in `SHA256SUMS`.
 - The `NOTICE` file holds the licence of the Lucide icons, which the app and the center's web UI use. The app is built with Slint under its Royalty-free license 2.0.
@@ -18,13 +20,14 @@
 - `--json` on the read commands (`status`, `center ls`, `folder ls`, `rule ls`, `cap ls`, `config get`, `proxy ls`, `relay ls`, `sudo status`, `service status`, `audit`, `log`), and `{"messages": [...]}` or `{"error": ...}` from every other command (`docs/user/commands.md`).
 - No command waits for typing when stdin is no terminal: passwords and passphrases come from the first line of stdin or `--passphrase-file`, and `center add` needs `--yes`. `proxy set --password-stdin --headers-stdin` takes the proxy's password and headers from stdin.
 - `rule add` and `rule rm` take `--action`, the rule of an audit entry. `audit --last N` shows the newest entries only.
-- `nerve-node log [--last N] [--follow]` shows the node's log.
+- `nerve-node log [--problems] [--last N] [--follow]` shows the node's log, with `--problems` its errors and warnings only.
+- With `--json` a change says `"next_start": true` when the node takes it only at its next start; `relay add` and `relay token` give the token as data (`"token"`), and `restore` what it did (`"restored"`).
 - `nerve-node service start|stop|restart|status` controls the installed service; `status` needs no root.
 - `cap ls --json` lists the switchable capabilities (`known`).
 - Commands run through `pkexec` take the user who ran it as the account of the commands at `install`, as with `sudo`.
 - On Windows, the text `status` asks the running service through the control pipe, as `status --json` does.
 - `setup --create-user <name> --account-only` chooses the account of the commands and asks nothing else. `config get machine.secret_storage --json` says whether the keyring can hold the keys here (`"keyring"`).
-- On the installed node, `sudo nerve-node backup` and `restore` open the backup file as the user who ran `sudo` (or `pkexec`), so a backup in your own folders works and is yours; the command itself still runs as `nerve`.
+- Changed: on the installed node, `sudo nerve-node backup` and `restore` open the backup file as the user who ran `sudo` (or `pkexec`), so a backup in your own folders works and is yours; the command itself still runs as `nerve`. Where that user may not open the file, the owner of its folder does, as before: a root shell (`sudo -i`) writes to root's folders as root, and `sudo nerve-node backup /var/lib/nerve/state/…` writes as `nerve`. Through `pkexec` (the desktop app) a file its user may not open is refused, and so is an asker without an account.
 
 ## 0.0.5
 

@@ -41,6 +41,21 @@ fn foot_is_background(pixels: &SharedPixelBuffer<Rgba8Pixel>) -> bool {
         .all(|row| row[..w - 24].iter().all(|p| *p == background))
 }
 
+/// The window once nothing moves in it any more: a page that just opened
+/// fades its parts in.
+fn settled(screen: &Screen) -> SharedPixelBuffer<Rgba8Pixel> {
+    let mut last = screen.draw();
+    for _ in 0..60 {
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let now = screen.draw();
+        if now.as_slice() == last.as_slice() {
+            return now;
+        }
+        last = now;
+    }
+    panic!("the window keeps moving");
+}
+
 #[test]
 fn every_installer_step_and_dialog_fits_a_small_screen() {
     let screen = Screen::install(APP.0, APP.1, 1.0).unwrap();
@@ -188,5 +203,27 @@ fn every_installer_step_and_dialog_fits_a_small_screen() {
     assert!(
         screen.draw().as_slice() != one.as_slice(),
         "the chosen center's name is not drawn among ten centers"
+    );
+
+    // Windows, no account chosen yet (a password mistyped at install): the
+    // card has the password field all the same, for the app's user. Drawn
+    // with a password typed and without, the window differs only if the
+    // field is there.
+    // Set before the page is made, as the app sets them at its start.
+    screen.resize(APP.0, 3000);
+    let install = window.global::<Install>();
+    install.set_windows(true);
+    install.set_account("alice".into());
+    store.set_page(Page::Overview);
+    screen.draw();
+    store.set_page(Page::Settings);
+    prefs.set_load(Load::Ready);
+    prefs.set_account("".into());
+    prefs.set_account_password("".into());
+    let empty = settled(&screen);
+    prefs.set_account_password("s3cret".into());
+    assert!(
+        settled(&screen).as_slice() != empty.as_slice(),
+        "no password field for the account on Windows"
     );
 }

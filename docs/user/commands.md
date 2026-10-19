@@ -57,7 +57,7 @@ center is paired.
 | `run` | Run the node in the foreground | [pairing](pairing.md) |
 | `status` | Show whether it runs, the links, the confinement and the [limits per command](limits.md) | [troubleshooting](troubleshooting.md) |
 | `audit [--denied] [--last N] [--follow]` | Show what was allowed and refused | [audit](audit.md) |
-| `log [--last N] [--follow]` | Show the node's log | [logs](logs.md) |
+| `log [--problems] [--last N] [--follow]` | Show the node's log | [logs](logs.md) |
 | `panic`, `unlock` | Stop everything, then allow it again | [stop](stop.md#panic) |
 
 ## Install and set up
@@ -106,7 +106,15 @@ one JSON value from stdout:
 - `center add` without `--yes` prints what you would confirm
   (`{"paired": false, "preview": {...}}`) and pairs nothing; with `--yes` it
   pairs.
-- Every other command prints the lines it shows as `{"messages": [...]}`.
+- Every other command prints the lines it shows as `{"messages": [...]}`,
+  with `"next_start": true` when the node takes the change only at its next
+  start (it does not run, or it is the installed node on Windows, which
+  takes only folder changes while it runs); `center add --yes` says it the
+  same way. `relay add` and `relay token` add `"token"` (`node`, `token`,
+  `proxy`, the address the other node sets with `proxy set`, and `pin`), and
+  `restore` adds `"restored"` (`centers`, `kept`, `no_key`, and `notes`,
+  each with `text` and, when it asks you to set something again, `fix`:
+  `proxy`, `sudo`, `sudo-file`, `pin` with its `center`, or `relay`).
 - An error is `{"error": "..."}`, and the exit code is 1. stderr carries the
   log's events, so read the error from stdout.
 

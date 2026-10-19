@@ -183,8 +183,9 @@ pub async fn on(
     }
     let _ = writeln!(
         out,
-        "sudo: on (only commands the sudo allow list names run with sudo)\n{}\n`Restart-Service {SERVICE_NAME}` lets the running service take it.",
-        warning(&a.name)
+        "sudo: on (only commands the sudo allow list names run with sudo)\n{}\nthe change {}: `Restart-Service {SERVICE_NAME}` lets the running service take it.",
+        warning(&a.name),
+        crate::cli::NEXT_START
     );
     Ok(())
 }
@@ -325,6 +326,8 @@ mod tests {
             "{out}"
         );
         assert!(out.contains("Restart-Service nerve-node"), "{out}");
+        // A program learns it as data (`"next_start": true` with --json).
+        assert!(out.lines().any(crate::cli::takes_at_next_start), "{out}");
         assert!(!out.contains("bob's"), "{out}");
         let blob = std::fs::read(&file).unwrap();
         assert!(!blob.windows(5).any(|w| w == b"bob's"));

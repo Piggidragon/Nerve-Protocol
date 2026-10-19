@@ -31,7 +31,8 @@ use windows_sys::Win32::NetworkManagement::NetManagement::{
     NetUserGetInfo, NetUserGetLocalGroups, USER_INFO_23,
 };
 use windows_sys::Win32::Security::Authorization::{
-    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+    ConvertStringSidToSidW, SDDL_REVISION_1,
 };
 use windows_sys::Win32::Security::Cryptography::{
     CRYPT_INTEGER_BLOB, CRYPTPROTECT_LOCAL_MACHINE, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData,
@@ -185,6 +186,23 @@ pub(crate) fn well_known_sid(kind: WELL_KNOWN_SID_TYPE) -> io::Result<Vec<u8>> {
     }
     sid.truncate(len as usize);
     Ok(sid)
+}
+
+/// The name of the account whose SID is `text` (`S-1-5-21-…`).
+pub fn name_of_sid(text: &str) -> Result<String, String> {
+    let mut sid: PSID = std::ptr::null_mut();
+    // SAFETY: a NUL-terminated string; the SID Windows allocates is copied
+    // and freed.
+    let bytes = unsafe {
+        if ConvertStringSidToSidW(wide(text).as_ptr(), &mut sid) == 0 {
+            return Err(format!("{text} is not a SID: {}", last()));
+        }
+        let bytes =
+            std::slice::from_raw_parts(sid as *const u8, GetLengthSid(sid) as usize).to_vec();
+        LocalFree(sid as _);
+        bytes
+    };
+    sid_name(&bytes).map_err(|e| format!("no account has the SID {text}: {e}"))
 }
 
 /// The name an account or group has on this machine, by its SID.
@@ -1211,4 +1229,28 @@ pub fn run_capture(
     let out = reader.join().unwrap_or_default();
     let _ = drain.join();
     Ok((code, out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The account of a SID as text, which the desktop app's broker hands
+    /// to the commands (crate::cli::DESKTOP_USER_SID): this process's own.
+    #[test]
+    fn a_sid_names_its_account() {
+        let sid = own_sid().unwrap();
+        let mut text: *mut u16 = std::ptr::null_mut();
+        // SAFETY: a valid SID; the string Windows allocates is read and
+        // freed.
+        let text = unsafe {
+            assert_ne!(ConvertSidToStringSidW(sid.as_ptr() as PSID, &mut text), 0);
+            let s = from_wide(text);
+            LocalFree(text as _);
+            s
+        };
+        assert_eq!(name_of_sid(&text).unwrap(), current_user().unwrap());
+        assert!(name_of_sid("S-1-5-21-1-2-3-999999").is_err());
+        assert!(name_of_sid("nobody").is_err());
+    }
 }

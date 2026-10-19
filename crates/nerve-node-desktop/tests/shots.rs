@@ -408,6 +408,12 @@ fn every_page_light_and_dark() {
     // A change the running service takes only when it starts again.
     store.set_restart_due(true);
     shots.take("overview-restart-due");
+    // A change the app restarts the service for.
+    store.set_toast("home is paused: its link ends until you resume it.\nThe node restarts in a moment to take it.".into());
+    store.set_toast_tone(nerve_node_desktop::Tone::Ok);
+    store.set_toast_shown(true);
+    shots.take("overview-restart-soon");
+    store.set_toast_shown(false);
     store.set_restart_due(false);
     store.invoke_show(Page::Centers);
     shots.take("centers");
@@ -556,6 +562,36 @@ fn every_page_light_and_dark() {
     prefs.set_restore_in_files(true);
     shots.take("settings-restore");
     prefs.set_restore_open(false);
+    // What a restore did, in the app's words.
+    let restored = serde_json::json!({"restored": {
+        "centers": ["home", "lab"], "kept": [], "no_key": ["lab"],
+        "notes": [
+            {"text": "", "fix": "sudo", "center": null},
+            {"text": "", "fix": "proxy", "center": null},
+            {"text": "the node key for home was rotated after the backup was made: the restore keeps the rotated key here, which the center holds, not the backup's older one", "fix": null, "center": null},
+        ],
+    }});
+    prefs.set_once_title("The backup is restored".into());
+    prefs.set_once_text(
+        nerve_node_desktop::view::restored(
+            &restored,
+            "The node started again, with what is restored.",
+        )
+        .into(),
+    );
+    prefs.set_once_open(true);
+    shots.take("settings-restored");
+    prefs.set_once_open(false);
+    // Windows, no account yet (a password mistyped at install): the card
+    // takes the password of the app's user.
+    let install = window.global::<Install>();
+    let account = prefs.get_account();
+    install.set_windows(true);
+    install.set_account("alex".into());
+    prefs.set_account("".into());
+    shots.take("settings-account-windows");
+    prefs.set_account(account);
+    install.set_windows(false);
 
     // Settings' update and uninstall.
     let install = window.global::<Install>();

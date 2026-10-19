@@ -104,6 +104,9 @@ pub enum Cmd {
         /// Show only the newest N lines (with --follow, then the new ones).
         #[arg(long, value_name = "N")]
         last: Option<usize>,
+        /// Show only errors and warnings (with --last, the newest N of them).
+        #[arg(long)]
+        problems: bool,
     },
     /// Stop everything at once; nothing runs until `unlock`.
     Panic,
@@ -1188,7 +1191,7 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
 }
 
 /// When a change that only the file holds counts.
-const NEXT_START: &str = "takes effect at the next start of the node";
+pub(crate) const NEXT_START: &str = "takes effect at the next start of the node";
 
 /// Runs one command line, writing what it shows to `out`. A change made
 /// while no daemon answers on the control socket (none runs, or Windows,
@@ -1216,9 +1219,16 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
     if json::own_form(&cli.cmd) {
         return json::command(&paths, cli.cmd, out).await;
     }
-    let mut lines = Vec::new();
-    said(paths, cli.cmd, &mut lines).await?;
-    json::lines(&lines, out)
+    json::changed(paths, cli.cmd, out).await
+}
+
+/// Whether a line a change printed says that the node takes it only at its
+/// next start: a node that does not run, the installed node on Windows for
+/// anything but folders, a relay change on Windows. `--json` says it as
+/// `"next_start": true`; the desktop app shows such a line in words of its
+/// own.
+pub fn takes_at_next_start(line: &str) -> bool {
+    line.contains(NEXT_START) || line == RELAY_AT_NEXT_START
 }
 
 /// [`execute`] with the text output, and what it says when a change is
@@ -1290,12 +1300,27 @@ pub fn settle_user(cli: &Cli) -> Result<(), String> {
     crate::service::become_owner(&paths, matches!(cli.cmd, Cmd::Setup { .. }))
 }
 
+/// Set by the desktop app's broker on Windows for the commands it runs: the
+/// SID of the app's user. The broker runs as the administrator who answered
+/// the UAC prompt, who is another account when the app's user is a standard
+/// user.
+pub const DESKTOP_USER_SID: &str = "NERVE_DESKTOP_USER_SID";
+
 /// The account that ran this command through sudo, else root. On Windows
-/// the account this command runs as.
+/// the account this command runs as, or the desktop app's user for the
+/// app's broker ([`DESKTOP_USER_SID`]).
 fn invoker() -> String {
     #[cfg(windows)]
-    if let Ok(me) = crate::win_user::current_user() {
-        return me;
+    {
+        if let Some(name) = std::env::var(DESKTOP_USER_SID)
+            .ok()
+            .and_then(|sid| crate::win_user::name_of_sid(&sid).ok())
+        {
+            return name;
+        }
+        if let Ok(me) = crate::win_user::current_user() {
+            return me;
+        }
     }
     invoker_of(
         std::env::var("SUDO_USER").ok(),
@@ -1822,7 +1847,11 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             denied,
             last,
         } => audit(&paths, follow, denied, last, false, out).await,
-        Cmd::Log { follow, last } => log_cmd(&paths, follow, last, false, out).await,
+        Cmd::Log {
+            follow,
+            last,
+            problems,
+        } => log_cmd(&paths, follow, last, problems, false, out).await,
         Cmd::Proxy(c) => proxy_cmd(&paths, c, out).await,
         Cmd::Relay(c) => relay_cmd(&paths, c, out).await,
         Cmd::Sudo(c) => sudo_cmd(&paths, c, out).await,
@@ -1874,6 +1903,7 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             };
             let r = crate::backup::restore(&paths, &parsed, &opts)?;
             crate::backup::print_restore(&r, &parsed, out);
+            json::also("restored", crate::backup::restore_data(&r, &parsed));
             Ok(())
         }
         Cmd::Install => {
@@ -2938,6 +2968,7 @@ async fn log_cmd(
     paths: &NodePaths,
     follow: bool,
     last: Option<usize>,
+    problems: bool,
     json: bool,
     out: &mut dyn Write,
 ) -> Result<(), String> {
@@ -2965,10 +2996,12 @@ async fn log_cmd(
         .map_or(0, |i| i + 1);
     bytes.extend_from_slice(&current[..whole]);
     let mut rest: Vec<u8> = current[whole..].to_vec();
+    // --problems: errors and warnings only, before --last counts them.
     let parse = |bytes: &[u8]| -> Vec<Value> {
         String::from_utf8_lossy(bytes)
             .lines()
             .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .filter(|v| !problems || matches!(v["level"].as_str(), Some("error" | "warn")))
             .collect()
     };
     let mut lines = parse(&bytes);
@@ -3568,6 +3601,18 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
                 out,
                 format!("  nerve-node proxy set 'https://{name}:{token}@{at}' --pin {pin}"),
             );
+            json::also(
+                "token",
+                json!({
+                    "node": name,
+                    "token": token,
+                    "proxy": format!("https://{name}:{token}@{at}"),
+                    "pin": pin,
+                    "reach": reach_of(&centers),
+                    "new_pin": made && now.relay.pin.is_some(),
+                    "relay_off": cfg.relay.listen.is_none(),
+                }),
+            );
             if cfg.relay.listen.is_none() {
                 w(
                     out,
@@ -3661,6 +3706,18 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
             w(
                 out,
                 format!("  nerve-node proxy set 'https://{name}:{token}@{at}' --pin {pin}"),
+            );
+            json::also(
+                "token",
+                json!({
+                    "node": name,
+                    "token": token,
+                    "proxy": format!("https://{name}:{token}@{at}"),
+                    "pin": pin,
+                    "reach": reach_of(&node.centers),
+                    "new_pin": made && now.relay.pin.is_some(),
+                    "relay_off": cfg.relay.listen.is_none(),
+                }),
             );
             if cfg.relay.listen.is_none() {
                 w(
@@ -5127,8 +5184,10 @@ mod tests {
     }
 
     /// `setup --create-user NAME --account-only`, the desktop app's way to
-    /// the account: the account and nothing else, asking nothing, also with
-    /// keys stated in a keyring that does not answer.
+    /// the account: the account and nothing else, asking nothing. With the
+    /// keys in a keyring that does not answer it changes nothing, since the
+    /// config cannot be read or signed then, and neither offers a keyring
+    /// nor makes the account.
     #[cfg(target_os = "linux")]
     #[test]
     fn setup_chooses_only_the_account_when_told() {
@@ -5139,6 +5198,21 @@ mod tests {
             account_only: true,
         };
         let keyring = crate::keyring_setup::tests::FakeKeyring::new(false);
+        run(
+            &paths,
+            &["config", "set", "machine.secret_storage", "keyring"],
+        )
+        .unwrap();
+        crate::secrets::store::set_unreachable(true);
+        let (r, out) = setup_keyring(&paths, Some(&sys), told, &keyring, "");
+        crate::secrets::store::set_unreachable(false);
+        let e = r.unwrap_err();
+        assert!(e.contains("cannot be reached"), "{e}");
+        assert!(!out.contains("Install it now"), "{out}");
+        assert!(keyring.installed.borrow().is_empty());
+        assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+        run(&paths, &["config", "set", "machine.secret_storage", "file"]).unwrap();
+
         let (r, out) = setup_keyring(&paths, Some(&sys), told, &keyring, "");
         r.unwrap();
         assert!(out.contains("commands run as carol"), "{out}");
@@ -7293,7 +7367,29 @@ mod tests {
         let m = v["messages"].as_array().unwrap();
         assert_eq!(m[0], "home: mode user", "{v}");
         assert!(m[1].as_str().unwrap().contains(NEXT_START), "{v}");
+        // As data too, for a program that offers the restart.
+        assert_eq!(v["next_start"], true, "{v}");
         assert_eq!(load(&paths).center("home").unwrap().policy.mode, Mode::User);
+        // The same again changes nothing, and says no such thing.
+        let v = json_of(&paths, &["mode", "set", "user"]);
+        assert!(v.get("next_start").is_none(), "{v}");
+
+        // A relay token: the lines, and what the other node needs as data.
+        run(&paths, &["relay", "set", "0.0.0.0:7491"]).unwrap();
+        let v = json_of(&paths, &["relay", "add", "lab-pc"]);
+        let t = &v["token"];
+        let token = t["token"].as_str().unwrap();
+        assert_eq!(t["node"], "lab-pc", "{v}");
+        assert_eq!(t["pin"], json!(load(&paths).relay.pin), "{v}");
+        assert!(
+            t["proxy"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("https://lab-pc:{token}@")),
+            "{v}"
+        );
+        let v = json_of(&paths, &["relay", "token", "lab-pc"]);
+        assert_ne!(v["token"]["token"].as_str().unwrap(), token, "{v}");
     }
 
     /// Without --yes, `center add --json` shows what the owner confirms and
@@ -7530,6 +7626,20 @@ mod tests {
         let v = json_of(&paths, &["log", "--last", "2"]);
         assert_eq!(v["entries"][0]["msg"], "link dropped", "{v}");
         assert_eq!(v["entries"].as_array().unwrap().len(), 2, "{v}");
+        // The problems only, the newest first counted: the warning that
+        // came before more lines than --last is still found.
+        std::fs::write(
+            paths.log_file(),
+            logged(2, "warn", "link dropped")
+                + &logged(3, "info", "linked")
+                + &logged(4, "info", "linked again"),
+        )
+        .unwrap();
+        let v = json_of(&paths, &["log", "--problems", "--last", "1"]);
+        assert_eq!(v["entries"].as_array().unwrap().len(), 1, "{v}");
+        assert_eq!(v["entries"][0]["msg"], "link dropped", "{v}");
+        let out = run(&paths, &["log", "--problems"]).unwrap();
+        assert_eq!(out, "2  warn  link dropped\n");
         // No log yet is no error.
         let empty = NodePaths::new(d.path().join("c2"), d.path().join("s2"));
         assert_eq!(json_of(&empty, &["log"]), json!({"entries": []}));
@@ -7555,7 +7665,7 @@ mod tests {
         append(logged(1, "info", "first"));
         let seen = Seen::default();
         let mut out = seen.clone();
-        let follow = log_cmd(&paths, true, Some(5), true, &mut out);
+        let follow = log_cmd(&paths, true, Some(5), false, true, &mut out);
         let writer = async {
             seen.until("first").await;
             append(logged(2, "info", "before-the-move"));
@@ -7608,7 +7718,7 @@ mod tests {
         append(start);
         let seen = Seen::default();
         let mut out = seen.clone();
-        let follow = log_cmd(&paths, true, None, true, &mut out);
+        let follow = log_cmd(&paths, true, None, false, true, &mut out);
         let writer = async {
             seen.until("first").await;
             append(end);

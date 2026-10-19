@@ -121,6 +121,8 @@ pub struct Ctl {
     /// Which reading of the Permissions page is the latest: an answer for
     /// an earlier one (another center picked meanwhile) is dropped.
     perm_asked: Cell<u64>,
+    /// Restarts the service a moment after a change it takes only then.
+    restart_timer: slint::Timer,
 }
 
 thread_local! {
@@ -170,22 +172,43 @@ fn lines(v: &Value) -> impl Iterator<Item = &str> {
         .filter_map(Value::as_str)
 }
 
-/// Whether a line says that the node takes a change only at its next start:
-/// the installed node on Windows takes nothing but folder changes while it
+/// Whether the node takes what a change made only at its next start: the
+/// installed node on Windows takes nothing but folder changes while it
 /// runs, and a node that does not run takes everything when it starts
-/// (`said` in nerve-node's cli.rs, and its relay changes).
-fn next_start(line: &str) -> bool {
-    line.contains("takes effect at the next start of the node")
-        || line.contains("takes this change only at its next start")
+/// (`"next_start"` of nerve-node's `--json`).
+fn waits_for_start(v: &Value) -> bool {
+    v["next_start"] == true
 }
 
 /// What a change said, without the line about the next start, which
 /// [`Ctl::done`] says in words of its own.
 fn said_of(v: &Value) -> String {
     lines(v)
-        .filter(|l| !next_start(l))
+        .filter(|l| !nerve_node::cli::takes_at_next_start(l))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// `said`, then `then` on a line of its own.
+fn and_then(said: String, then: &str) -> String {
+    if said.is_empty() {
+        then.to_string()
+    } else {
+        format!("{said}\n{then}")
+    }
+}
+
+/// What the app does about a change the node takes only at its next start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Restart {
+    /// The node took it, or it changed nothing.
+    No,
+    /// The service runs: the app restarts it in a moment.
+    Soon,
+    /// The service runs, and the first-run steps restart it at their end.
+    AtEnd,
+    /// The node does not run, and takes it when it starts.
+    AtStart,
 }
 
 impl Ctl {
@@ -218,6 +241,7 @@ impl Ctl {
             link: RefCell::new(None),
             first_run: Cell::new(false),
             perm_asked: Cell::new(0),
+            restart_timer: slint::Timer::default(),
         });
         CURRENT.with(|c| *c.borrow_mut() = Some(ctl.clone()));
         window.global::<Type>().set_mono(mono_font().into());
@@ -231,6 +255,14 @@ impl Ctl {
         let install = window.global::<Install>();
         install.set_version(env!("CARGO_PKG_VERSION").into());
         install.set_windows(cfg!(windows));
+        // The account install takes for the commands, when none is chosen
+        // yet: the user of the app.
+        install.set_account(
+            std::env::var("USERNAME")
+                .or_else(|_| std::env::var("USER"))
+                .unwrap_or_default()
+                .into(),
+        );
 
         let c = ctl.clone();
         store.on_show(move |page| c.show(page));
@@ -404,38 +436,78 @@ impl Ctl {
     }
 
     /// Says that a change is made: `said`, or what the command said when
-    /// `said` is empty. When the command said the node takes the change
-    /// only at its next start, the toast says so and, while the service
-    /// runs, the Overview offers the restart, instead of a plain "done".
-    fn done(&self, v: &Value, said: impl Into<String>) {
+    /// `said` is empty. When the node takes the change only at its next
+    /// start, the app restarts the running service for it (a person who
+    /// changed a setting expects it to count), and says so; a node that
+    /// does not run takes it when it starts.
+    fn done(self: &Rc<Self>, v: &Value, said: impl Into<String>) {
         let mut said = said.into();
         if said.is_empty() {
             said = said_of(v);
         }
-        if !lines(v).any(next_start) {
-            // A warning that came with it, such as folder mode running no
-            // command once the keys are in the keyring, is no plain "done".
-            let warned = lines(v)
-                .any(|l| l.starts_with("Warning") || l.starts_with("folder mode runs no command"));
-            self.toast(said, if warned { Tone::Warn } else { Tone::Ok });
-            return;
+        // A warning that came with it, such as folder mode running no
+        // command once the keys are in the keyring, is no plain "done".
+        let warned = lines(v)
+            .any(|l| l.starts_with("Warning") || l.starts_with("folder mode runs no command"));
+        let tone = if warned { Tone::Warn } else { Tone::Ok };
+        match self.restart_for(v) {
+            Restart::No | Restart::AtEnd => self.toast(said, tone),
+            Restart::Soon => {
+                self.toast(
+                    and_then(said, "The node restarts in a moment to take it."),
+                    tone,
+                );
+                self.restart_soon();
+            }
+            Restart::AtStart => self.toast(
+                and_then(said, "The node takes it when it starts."),
+                Tone::Warn,
+            ),
         }
-        let running = self
-            .with_store(|s| s.get_service_state() == "running")
-            .unwrap_or(false);
-        let then = if running {
-            "The node takes it when it starts again: restart it on the Overview."
-        } else {
-            "The node takes it when it starts."
+    }
+
+    /// What a change's answer `v` asks of the running service: when the
+    /// node takes it only at its next start, a restart, [`Ctl::restart_soon`]
+    /// after the change is said, or at the end of the first-run steps while
+    /// they are open. Until it restarts, the Overview says that changes wait
+    /// for it.
+    fn restart_for(&self, v: &Value) -> Restart {
+        if !waits_for_start(v) {
+            return Restart::No;
+        }
+        let Some((running, steps)) =
+            self.with_store(|s| (s.get_service_state() == "running", s.get_setup_open()))
+        else {
+            return Restart::No;
         };
-        let text = if said.is_empty() {
-            then.to_string()
-        } else {
-            format!("{said}\n{then}")
-        };
-        self.toast(text, Tone::Warn);
-        if running {
-            self.with_store(|s| s.set_restart_due(true));
+        if !running {
+            return Restart::AtStart;
+        }
+        self.with_store(|s| s.set_restart_due(true));
+        if steps {
+            return Restart::AtEnd;
+        }
+        Restart::Soon
+    }
+
+    /// Restarts the service a moment after the last change that needs it,
+    /// so that a few changes in a row restart it once.
+    fn restart_soon(self: &Rc<Self>) {
+        match self.exec {
+            // No timers without the event loop.
+            Exec::Inline => self.restart_service(),
+            Exec::Threads => {
+                let c = Rc::downgrade(self);
+                self.restart_timer.start(
+                    slint::TimerMode::SingleShot,
+                    Duration::from_secs(2),
+                    move || {
+                        if let Some(c) = c.upgrade() {
+                            c.restart_service();
+                        }
+                    },
+                );
+            }
         }
     }
 
@@ -625,11 +697,13 @@ impl Ctl {
                     let steps = c.with_store(|s| s.get_setup_open()).unwrap_or(false);
                     c.with_store(|s| s.set_pair_open(false));
                     if steps {
+                        // The service links to it when the steps end.
+                        c.restart_for(&v);
                         c.setup_paired(&name);
                     } else {
-                        c.toast(
+                        c.done(
+                            &v,
                             format!("Paired with {name}. It may do nothing until you allow it."),
-                            Tone::Ok,
                         );
                     }
                     c.refresh_status();

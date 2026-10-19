@@ -303,6 +303,90 @@ pub fn new_key(name: &str, said: &Value, ended: Option<Result<Value, String>>) -
     format!("{}\n{then}", key.join("\n"))
 }
 
+/// The token of `relay add` or `relay token` (`said["token"]`), in the
+/// app's words: what the other node needs, and where it enters it.
+pub fn relay_token(said: &Value) -> String {
+    let t = &said["token"];
+    let (node, proxy, pin) = (s(&t["node"]), s(&t["proxy"]), s(&t["pin"]));
+    let mut text = format!(
+        "{node} may use this relay now; it may reach {}. Its token is in the proxy address below, shown only now.\n\nProxy: {proxy}\nPin: {pin}",
+        s(&t["reach"])
+    );
+    if proxy.contains("<address of this machine>") {
+        text.push_str(
+            "\n\nPut the address under which the other node reaches this machine in place of <address of this machine>.",
+        );
+    }
+    text.push_str(&format!(
+        "\n\nOn {node}, enter both in the Nerve app under Settings, Proxy; on a node without the app, in a terminal there:\nnerve-node proxy set '{proxy}' --pin {pin}"
+    ));
+    if t["new_pin"] == true {
+        text.push_str(
+            "\n\nThe relay has a new certificate: the other nodes behind it need its new pin too.",
+        );
+    }
+    if t["relay_off"] == true {
+        text.push_str("\n\nThe relay is off: turn it on here under Settings, Relay.");
+    }
+    text
+}
+
+/// What `restore` did (`said["restored"]`), in the app's words: the
+/// centers, what to pair again, and what to set again and where. `started`
+/// says what became of the node: the app started it again, or it waits.
+pub fn restored(said: &Value, started: &str) -> String {
+    let r = &said["restored"];
+    let names = |k: &str| -> Vec<&str> {
+        r[k].as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect()
+    };
+    let centers = names("centers");
+    let mut lines = vec![if centers.is_empty() {
+        "The node's settings and keys are restored; it is paired with no center.".to_string()
+    } else {
+        format!(
+            "The node's settings and keys are restored, with the pairing of {}.",
+            centers.join(", ")
+        )
+    }];
+    for c in names("no_key") {
+        lines.push(format!(
+            "{c}: its key was not in the backup. Unpair {c} on the Centers page and pair it again."
+        ));
+    }
+    let mut said = Vec::new();
+    for n in r["notes"].as_array().into_iter().flatten() {
+        let center = s(&n["center"]);
+        let line = match s(&n["fix"]) {
+            "proxy" => "The proxy is not restored whole: set it again under Settings, Proxy.".into(),
+            "sudo" => "Sudo is off: its password is in no backup. Turn it on again on the Permissions page.".into(),
+            "sudo-file" => "Sudo is off, but the administrator's password it kept could not be deleted: turn sudo on and off again on the Permissions page.".into(),
+            "pin" => format!("The pin of {center} here differed from the backup's, and the restore took the backup's. If the node does not link to {center}, set center.{center}.pin under Settings, Any setting."),
+            "relay" => "The relay's TLS key was not in the backup: turn the relay on again under Settings, Relay; the nodes behind it need its new pin.".into(),
+            _ => full_sentence(s(&n["text"])),
+        };
+        // Several notes can ask for the same: it is said once.
+        if !said.contains(&line) {
+            said.push(line);
+        }
+    }
+    lines.extend(said);
+    lines.push(started.to_string());
+    lines.join("\n")
+}
+
+/// `text` as a sentence: its first letter up, a full stop at its end.
+fn full_sentence(text: &str) -> String {
+    let mut out = sentence(text);
+    if !out.ends_with('.') {
+        out.push('.');
+    }
+    out
+}
+
 /// Whether a rule typed for the allow or deny list is in the pattern form
 /// for files and other actions (`fs.read:~/notes/*`, `fs:~/private/*`),
 /// which `rule add` refuses as a command and `config add` takes: the test of
@@ -870,6 +954,58 @@ pub fn rule_args(e: &Value, list: &str, wildcard: bool) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// The relay's token in the app's words: no line sends the owner of
+    /// this machine to a terminal; the command is there for the other node,
+    /// which may have no app.
+    #[test]
+    fn a_relay_token_says_where_the_other_node_enters_it() {
+        let v = json!({"messages": ["on lab-pc, run:"], "token": {
+            "node": "lab-pc", "token": "t0k", "pin": "p1n",
+            "proxy": "https://lab-pc:t0k@<address of this machine>:7491",
+            "reach": "every https center of this node", "new_pin": false, "relay_off": true,
+        }});
+        let text = relay_token(&v);
+        assert!(text.contains("Proxy: https://lab-pc:t0k@"), "{text}");
+        assert!(text.contains("Pin: p1n"), "{text}");
+        assert!(
+            text.contains("in place of <address of this machine>"),
+            "{text}"
+        );
+        assert!(text.contains("under Settings, Relay"), "{text}");
+        assert!(!text.contains('`'), "{text}");
+    }
+
+    /// A restore in the app's words: the CLI's commands become the places
+    /// in the app, and a note without one is kept as a sentence.
+    #[test]
+    fn a_restore_says_what_to_do_in_the_app() {
+        let v = json!({"messages": ["Start the node. … (docs/user/backup.md)"], "restored": {
+            "centers": ["home", "lab"], "kept": [], "no_key": ["lab"],
+            "notes": [
+                {"text": "the sudo switch is off: `nerve-node sudo on` turns it on", "fix": "sudo", "center": null},
+                {"text": "the pin of center home here …: `nerve-node config set center.home.pin <pin>`", "fix": "pin", "center": "home"},
+                {"text": "run `nerve-node proxy set` again", "fix": "proxy", "center": null},
+                {"text": "run `nerve-node proxy set` again", "fix": "proxy", "center": null},
+                {"text": "the node key for home was rotated after the backup was made", "fix": null, "center": null},
+            ],
+        }});
+        let text = restored(&v, "The node started again.");
+        assert!(text.contains("pairing of home, lab"), "{text}");
+        assert!(text.contains("Unpair lab on the Centers page"), "{text}");
+        assert!(text.contains("on the Permissions page"), "{text}");
+        assert!(
+            text.contains("set center.home.pin under Settings, Any setting"),
+            "{text}"
+        );
+        assert_eq!(text.matches("Settings, Proxy").count(), 1, "{text}");
+        assert!(
+            text.contains("The node key for home was rotated after the backup was made."),
+            "{text}"
+        );
+        assert!(text.ends_with("The node started again."), "{text}");
+        assert!(!text.contains('`') && !text.contains("docs/user"), "{text}");
+    }
+
     use super::*;
     use serde_json::json;
     use slint::Model;

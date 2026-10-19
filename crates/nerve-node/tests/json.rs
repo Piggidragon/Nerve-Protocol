@@ -163,3 +163,44 @@ fn where_the_keys_go_says_whether_the_keyring_can_hold_them() {
     assert!(["no-answer", "old-landlock"].contains(&reason), "{v}");
     assert!(!v["keyring"]["why"].as_str().unwrap().is_empty());
 }
+
+/// What a restore did comes as data too, with the notes that ask for
+/// something to be set again marked, for a program that says so in its own
+/// words: here the proxy, left out on purpose.
+#[test]
+fn a_restore_says_what_it_did_as_data() {
+    let d = tempfile::tempdir().unwrap();
+    let (ok, v) = with_stdin(
+        d.path(),
+        &[
+            "proxy",
+            "set",
+            "https://laptop@relay.example:7490",
+            "--password-stdin",
+        ],
+        "s3cret\n",
+    );
+    assert!(ok, "{v}");
+    let file = d.path().join("node.backup");
+    let file = file.to_str().unwrap();
+    let (ok, v) = with_stdin(d.path(), &["backup", file], "correct horse battery\n");
+    assert!(ok, "{v}");
+    let (ok, v) = with_stdin(
+        d.path(),
+        &["restore", file, "--replace", "--without-proxy"],
+        "correct horse battery\n",
+    );
+    assert!(ok, "{v}");
+    let r = &v["restored"];
+    assert_eq!(r["centers"], serde_json::json!([]), "{v}");
+    assert_eq!(r["no_key"], serde_json::json!([]), "{v}");
+    let notes = r["notes"].as_array().unwrap();
+    assert!(
+        notes
+            .iter()
+            .any(|n| n["fix"] == "proxy" && n["text"].as_str().unwrap().contains("proxy")),
+        "{v}"
+    );
+    // The lines for people are there as before.
+    assert!(!v["messages"].as_array().unwrap().is_empty(), "{v}");
+}

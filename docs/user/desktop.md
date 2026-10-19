@@ -52,8 +52,12 @@ Installing changes the system, so the system asks for an administrator's
 password next: polkit's dialog on Linux, the UAC prompt on Windows. On
 Windows the installer first asks for your own Windows password: commands
 from your centers run as you, and the service needs your password to start
-them ([Windows](service.md#the-account-commands-run-as-on-windows)). On Linux
-they run as the user who installed.
+them ([Windows](service.md#the-account-commands-run-as-on-windows)). That
+holds when you are a standard user and an administrator types their name and
+password into the UAC prompt: the commands still run as you, not as the
+administrator. If your password was mistyped, enter it again under
+**Settings**, **Account for commands**. On Linux they run as the user who
+installed.
 
 When it is done, **Open Nerve** opens the app. Its first-run steps name the
 machine, choose where the keys live, pair the first center and choose its
@@ -118,22 +122,28 @@ machine. In a terminal this is `nerve-node service stop|start|restart`
 ([service](service.md#start-and-stop)).
 
 On Windows the running service takes folder changes at once and every other
-change when it starts again. The app says so after such a change, and the
-Overview offers **Restart**.
+change only when it starts again, a pairing too. So after such a change the
+app restarts the service itself, two seconds after the last one, and says
+so; the first-run steps restart it once, at their end. The node's links come
+back at once, but a command a center runs at that moment ends. If the
+restart fails, the Overview says that changes wait and offers **Restart**.
 
 ## Settings
 
 - **Account for commands**: the account commands from your centers run as.
   On Linux, name another one to use it; one that is not there is made, as
   `setup --create-user` makes it. On Windows, enter its new password there
-  when it changed: the service needs it to start commands.
+  when it changed, or your own when no account is chosen yet: the service
+  needs it to start commands.
 - **Keys**: in files, or in the system keyring where one can hold them. Where
   it cannot (the installed node on Windows, Linux below 7.1, no keyring
   answering for the account the node runs as), the app says why and keeps
   them in files.
 - **Backup…** and **Restore…** write and read the file as you, in your own
-  folders. **Keep its keys in files here** restores the backup of a machine
-  that kept them in a keyring onto one without.
+  folders. A restore never goes under a running node: the app stops the
+  service for it and starts it again after. **Keep its keys in files here**
+  restores the backup of a machine that kept them in a keyring onto one
+  without.
 - **Any setting**: shows and sets any setting, and **Add** and **Remove**
   change a list, such as `policy.protected.allow`. On **Permissions**, a
   pattern for files (`fs.read:~/notes/*`) goes on the allow or deny list as

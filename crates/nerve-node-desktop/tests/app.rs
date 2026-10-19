@@ -66,6 +66,10 @@ fn logged(paths: &NodePaths, msg: &str) {
 }
 
 fn logged_at(paths: &NodePaths, ts: u64, msg: &str) {
+    logged_level(paths, ts, "warn", msg);
+}
+
+fn logged_level(paths: &NodePaths, ts: u64, level: &str, msg: &str) {
     use std::io::Write;
     std::fs::create_dir_all(&paths.state_dir).unwrap();
     let mut f = std::fs::OpenOptions::new()
@@ -77,7 +81,7 @@ fn logged_at(paths: &NodePaths, ts: u64, msg: &str) {
     // sees half of one.
     let line = format!(
         "{}\n",
-        serde_json::json!({"ts": ts, "level": "warn", "msg": msg})
+        serde_json::json!({"ts": ts, "level": level, "msg": msg})
     );
     f.write_all(line.as_bytes()).unwrap();
 }
@@ -136,8 +140,12 @@ fn the_app_drives_the_cli_end_to_end() {
     assert!(config(&paths).centers.is_empty());
     store.invoke_pair_confirm();
     assert!(!store.get_pair_open(), "{}", store.get_pair_error());
+    // No node runs: it links when it starts, which the app says too.
     assert!(
-        store.get_toast().contains("Paired with home"),
+        store.get_toast().contains("Paired with home")
+            && store
+                .get_toast()
+                .contains("The node takes it when it starts."),
         "{}",
         store.get_toast()
     );
@@ -179,15 +187,39 @@ fn the_app_drives_the_cli_end_to_end() {
         store.get_toast()
     );
     assert!(!store.get_restart_due());
+    // With the service running, the app restarts it for such a change. The
+    // service here is none, so the restart fails, and the Overview goes on
+    // offering it.
     store.set_service_state("running".into());
     store.invoke_center_pause("home".into(), true);
     assert!(store.get_restart_due());
     assert!(
-        store.get_toast().contains("restart it on the Overview"),
+        store.get_toast().starts_with("The node did not restart")
+            && store.get_toast().contains("Restart it on the Overview"),
         "{}",
         store.get_toast()
     );
     store.invoke_center_pause("home".into(), false);
+    // The first-run steps restart it once, at their end: a new name waits
+    // for it meanwhile.
+    store.set_restart_due(false);
+    store.invoke_setup_start();
+    store.set_setup_name("boxy".into());
+    store.invoke_setup_next();
+    assert_eq!(store.get_setup_step(), 1, "{}", store.get_setup_error());
+    assert!(store.get_restart_due());
+    store.set_toast("".into());
+    store.invoke_setup_skip();
+    store.invoke_setup_skip();
+    store.invoke_setup_next();
+    assert!(!store.get_setup_open());
+    // The service's restart ran (and failed: there is none).
+    assert_eq!(store.get_toast_tone(), nerve_node_desktop::Tone::Danger);
+    assert!(
+        store.get_toast().contains("--config-dir"),
+        "{}",
+        store.get_toast()
+    );
     store.set_service_state("".into());
     store.set_restart_due(false);
     let settings = audit(&paths)
@@ -445,6 +477,19 @@ fn the_app_drives_the_cli_end_to_end() {
     logs.invoke_more();
     assert_eq!(logs.get_limit(), 1000);
     until(&ctl, "every line", || logs.get_rows().row_count() == 3);
+    // The problems come from the whole log: a warning shows behind newer
+    // lines that are none, more than the page shows.
+    logged_level(&paths, now, "info", "linked");
+    logged_level(&paths, now, "info", "linked again");
+    logs.set_limit(1);
+    logs.invoke_filter(true);
+    until(&ctl, "the newest problem", || {
+        logs.get_rows()
+            .row_data(0)
+            .is_some_and(|r| r.msg == "link up")
+    });
+    assert_eq!(logs.get_rows().row_count(), 1);
+    logs.invoke_filter(false);
 
     // Settings: the name, any setting, a relay node's token, a backup and
     // its restore, the passphrase piped in.
@@ -495,8 +540,11 @@ fn the_app_drives_the_cli_end_to_end() {
     prefs.set_relay_new_node("laptop-2".into());
     prefs.invoke_relay_add();
     assert!(prefs.get_once_open());
+    // In the app's words: the proxy and pin laptop-2 enters, and where.
     assert!(
-        prefs.get_once_text().contains("laptop-2"),
+        prefs.get_once_text().contains("Proxy: https://laptop-2:")
+            && prefs.get_once_text().contains("under Settings, Proxy")
+            && !prefs.get_once_text().contains("on laptop-2, run:"),
         "{}",
         prefs.get_once_text()
     );
@@ -577,6 +625,16 @@ fn the_app_drives_the_cli_end_to_end() {
     prefs.set_restore_pass("correct horse battery".into());
     prefs.invoke_restore_confirm();
     assert!(!prefs.get_restore_open(), "{}", prefs.get_restore_error());
+    // What it did, in the app's words, without the CLI's next steps.
+    assert!(
+        prefs
+            .get_once_text()
+            .starts_with("The node's settings and keys are restored, with the pairing of home.")
+            && !prefs.get_once_text().contains("docs/user")
+            && !prefs.get_once_text().contains('`'),
+        "{}",
+        prefs.get_once_text()
+    );
     prefs.set_once_open(false);
 
     // Panic and unlock.

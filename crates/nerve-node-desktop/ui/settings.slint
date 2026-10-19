@@ -124,7 +124,9 @@ export component SettingsPage inherits PageFrame {
         // One block: a hidden part takes no room, nor the space around it.
         VerticalLayout {
             Text {
-                text: Prefs.account != "" ? "Commands run as " + Prefs.account + "." : "No account yet: the node runs no command until one is chosen.";
+                text: Prefs.account != "" ? "Commands run as " + Prefs.account + "."
+                    : Install.windows ? "No account yet: the node runs no command until the service has the password of yours, " + Install.account + ", which commands then run as."
+                    : "No account yet: the node runs no command until one is chosen.";
                 color: Theme.text;
                 font-size: Type.small;
                 wrap: word-wrap;
@@ -158,12 +160,15 @@ export component SettingsPage inherits PageFrame {
                     }
                 }
             }
+            // Also without an account, as after a mistyped password at
+            // install: then it is the password of the app's user.
             Reveal {
-                shown: Install.windows && Prefs.account != "";
+                shown: Install.windows;
                 gap: Space.lg;
                 Field {
-                    label: "Its password";
-                    hint: "When the password of " + Prefs.account + " changes, commands fail until the service has the new one.";
+                    label: Prefs.account != "" ? "Its password" : "Your Windows password";
+                    hint: Prefs.account != "" ? "When the password of " + Prefs.account + " changes, commands fail until the service has the new one."
+                        : "The password of " + Install.account + ", not a PIN of Windows Hello.";
                     HorizontalLayout {
                         spacing: Space.md;
                         TextField {

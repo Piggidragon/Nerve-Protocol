@@ -372,6 +372,20 @@ pub struct RestoreReport {
     pub kept: Vec<String>,
     /// Things the owner should know, one line each.
     pub notes: Vec<String>,
+    /// The notes that ask the owner to set something again, by their
+    /// index in `notes`: what (`proxy`, `sudo`, `sudo-file`, `pin`,
+    /// `relay`) and for which center. A program words these itself, with
+    /// its own way to do it (`restore --json`).
+    pub fixes: Vec<(usize, &'static str, Option<String>)>,
+}
+
+impl RestoreReport {
+    /// The last note asks for `what` to be set again.
+    fn fix(&mut self, what: &'static str, center: Option<&str>) {
+        if let Some(i) = self.notes.len().checked_sub(1) {
+            self.fixes.push((i, what, center.map(str::to_string)));
+        }
+    }
 }
 
 /// What the folders hold before a restore.
@@ -492,6 +506,7 @@ pub fn restore(paths: &NodePaths, b: &Parsed, opts: &RestoreOpts) -> Result<Rest
         report.notes.push(
             "the proxy is left out of the restored config, with its pin, password and header values: set it again on this machine with `nerve-node proxy set`, which needs the address, the `--pin` of an https:// proxy and its login. For a relay, `nerve-node relay token <name>` on the relay prints the command with a new token and the pin".into(),
         );
+        report.fix("proxy", None);
     }
     // The password of the sudo switch is in no backup and never at rest on
     // Linux: a node restored with the switch on would claim it.
@@ -500,6 +515,7 @@ pub fn restore(paths: &NodePaths, b: &Parsed, opts: &RestoreOpts) -> Result<Rest
         report.notes.push(
             "the sudo switch is off: its password is not in a backup. `nerve-node sudo on` turns it on".into(),
         );
+        report.fix("sudo", None);
     }
     // A pairing whose keys were rotated after the backup was made: the config
     // here is further along (it counts more rotations) and names the keys
@@ -556,6 +572,7 @@ pub fn restore(paths: &NodePaths, b: &Parsed, opts: &RestoreOpts) -> Result<Rest
                     "the pin of center {} here is another one than the backup's: the restore takes the backup's. If the node cannot link, set the center's pin with `nerve-node config set center.{}.pin <pin>`",
                     e.name, e.name
                 ));
+                report.fix("pin", Some(&e.name));
             } else if h.pin_rotations == e.pin_rotations
                 && h.pin == e.pin
                 && let Some(backed_up) = &e.old_pin
@@ -634,10 +651,13 @@ pub fn restore(paths: &NodePaths, b: &Parsed, opts: &RestoreOpts) -> Result<Rest
                 "{} is deleted: the sudo switch is off, so the administrator's password it held is not kept",
                 crate::winsudo::SUDO_FILE
             )),
-            Err(e) => report.notes.push(format!(
-                "the sudo switch is off, but the administrator's password it held could not be deleted ({e}): delete {}, or run `nerve-node sudo on` and `sudo off`",
-                crate::winsudo::SUDO_FILE
-            )),
+            Err(e) => {
+                report.notes.push(format!(
+                    "the sudo switch is off, but the administrator's password it held could not be deleted ({e}): delete {}, or run `nerve-node sudo on` and `sudo off`",
+                    crate::winsudo::SUDO_FILE
+                ));
+                report.fix("sudo-file", None);
+            }
         }
     }
     let _ = AuditLog::new(paths.audit_log()).config(
@@ -738,9 +758,12 @@ fn write_keys<'a>(
             match here(Key::RelayTls, &fits) {
                 Some((place, text)) if place != to => put(Key::RelayTls, &text)?,
                 Some(_) => {}
-                None => report.notes.push(
-                    "the relay's TLS key is not in the backup and not here: the relay does not listen until `nerve-node relay set <address>` makes a new key and pin, which the nodes behind it must take".into(),
-                ),
+                None => {
+                    report.notes.push(
+                        "the relay's TLS key is not in the backup and not here: the relay does not listen until `nerve-node relay set <address>` makes a new key and pin, which the nodes behind it must take".into(),
+                    );
+                    report.fix("relay", None);
+                }
             }
         }
         (None, None) => {}
@@ -801,6 +824,7 @@ fn write_keys<'a>(
                 } else {
                     "the proxy's password is not in the backup and not here: run `nerve-node proxy set` again".into()
                 });
+                report.fix("proxy", None);
             }
         }
         (None, None) => {}
@@ -854,13 +878,20 @@ fn write_keys<'a>(
                 report.notes.push(
                     "the proxy's header values here are not for the proxy and header names that the restored config names, so they were deleted: run `nerve-node proxy set` again".into(),
                 );
+                report.fix("proxy", None);
             }
-            Some(_) => report.notes.push(
-                "the proxy's header values were left out of the backup (they are in the keyring), and the ones here lack a value the restored config names: run `nerve-node proxy set` again".into(),
-            ),
-            None => report.notes.push(
-                "the proxy's header values were left out of the backup (they are in the keyring); if this machine's keyring lacks them too, run `nerve-node proxy set` again".into(),
-            ),
+            Some(_) => {
+                report.notes.push(
+                    "the proxy's header values were left out of the backup (they are in the keyring), and the ones here lack a value the restored config names: run `nerve-node proxy set` again".into(),
+                );
+                report.fix("proxy", None);
+            }
+            None => {
+                report.notes.push(
+                    "the proxy's header values were left out of the backup (they are in the keyring); if this machine's keyring lacks them too, run `nerve-node proxy set` again".into(),
+                );
+                report.fix("proxy", None);
+            }
         }
     }
     if let Some(map) = &b.proxy_headers {
@@ -954,6 +985,31 @@ pub fn print_backup(r: &BackupReport, file: &Path, out: &mut dyn std::io::Write)
         out,
         "The file is encrypted with your passphrase. Keep both; nobody can recover the file without it."
     );
+}
+
+/// What a restore did, as data: the centers, the keys kept or missing,
+/// and each note with what it asks to be set again (`fix`, `center`).
+pub fn restore_data(r: &RestoreReport, b: &Parsed) -> serde_json::Value {
+    let notes: Vec<serde_json::Value> = r
+        .notes
+        .iter()
+        .enumerate()
+        .map(|(i, text)| {
+            let fix = r.fixes.iter().find(|f| f.0 == i);
+            serde_json::json!({
+                "text": text,
+                "fix": fix.map(|f| f.1),
+                "center": fix.and_then(|f| f.2.clone()),
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "centers": r.centers,
+        "kept": r.kept,
+        "no_key": r.no_key,
+        "notes": notes,
+        "program": b.program,
+    })
 }
 
 /// Says what a restore did and what comes next.

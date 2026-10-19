@@ -300,7 +300,23 @@ impl Ctl {
     fn relay_token_shown(self: &Rc<Self>, args: Vec<String>, title: String) {
         self.command(args, None, move |c, answer| {
             match answer {
-                Ok(v) => c.show_once(&title, &messages(&v)),
+                Ok(v) => {
+                    let mut text = view::relay_token(&v);
+                    let restart = c.restart_for(&v);
+                    match restart {
+                        super::Restart::Soon | super::Restart::AtEnd => text.push_str(
+                            "\n\nThe node restarts in a moment, so that the relay takes the token.",
+                        ),
+                        super::Restart::AtStart => {
+                            text.push_str("\n\nThe relay takes the token when the node starts.")
+                        }
+                        super::Restart::No => {}
+                    }
+                    c.show_once(&title, &text);
+                    if restart == super::Restart::Soon {
+                        c.restart_soon();
+                    }
+                }
                 Err(e) => c.toast(e, Tone::Danger),
             }
             c.with_prefs(|p| p.set_relay_new_node(SharedString::new()));
@@ -394,8 +410,11 @@ impl Ctl {
         if password.is_empty() {
             return;
         }
+        // No account yet: install takes the user of the app, as at install.
         let account = self
             .with_prefs(|p| p.get_account().to_string())
+            .filter(|a| !a.is_empty())
+            .or_else(|| self.with_install(|i| i.get_account().to_string()))
             .unwrap_or_default();
         self.account_change(
             vec!["install".into()],
@@ -540,24 +559,95 @@ impl Ctl {
         if in_files {
             args.extend(["--secret-storage".into(), "file".into()]);
         }
+        // A restore never goes under a running node: the app stops the
+        // service for it and starts it again after, also when the restore
+        // failed.
+        let running = self
+            .with_store(|s| s.get_service_state() == "running")
+            .unwrap_or(false);
         self.with_prefs(|p| p.set_restore_busy(true));
-        self.command(args, Some(pass), |c, answer| {
-            c.with_prefs(|p| {
-                p.set_restore_busy(false);
-                p.set_restore_pass(SharedString::new());
-            });
-            match answer {
-                Ok(v) => {
-                    c.with_prefs(|p| p.set_restore_open(false));
-                    c.show_once("The backup is restored", &messages(&v));
-                }
+        if !running {
+            return self.restore_run(args, pass, false);
+        }
+        self.command(
+            vec!["service".into(), "stop".into()],
+            None,
+            move |c, answer| match answer {
+                Ok(_) => c.restore_run(args, pass, true),
                 Err(e) => {
-                    c.with_prefs(|p| p.set_restore_error(e.into()));
+                    c.with_prefs(|p| {
+                        p.set_restore_busy(false);
+                        p.set_restore_error(
+                            format!("The node did not stop for the restore: {e}").into(),
+                        );
+                    });
+                    c.refresh_service();
                 }
+            },
+        );
+    }
+
+    /// The restore itself, then the start of the service when `start`.
+    fn restore_run(self: &Rc<Self>, args: Vec<String>, pass: String, start: bool) {
+        self.command(args, Some(pass), move |c, answer| {
+            c.with_prefs(|p| p.set_restore_pass(SharedString::new()));
+            if !start {
+                let stopped = c
+                    .with_store(|s| s.get_service_state() == "stopped")
+                    .unwrap_or(false);
+                let then = if stopped {
+                    "Start the node on the Overview: it works with what is restored once it runs."
+                } else {
+                    "The node works with what is restored once it starts."
+                };
+                return c.restored(answer, then.into(), false);
             }
-            c.refresh_status();
-            c.prefs_load();
+            c.command(
+                vec!["service".into(), "start".into()],
+                None,
+                move |c, started| {
+                    let then = match started {
+                        Ok(_) => {
+                            c.with_store(|s| s.set_restart_due(false));
+                            "The node started again, with what is restored.".to_string()
+                        }
+                        Err(e) => {
+                            format!("The node did not start again: {e}. Start it on the Overview.")
+                        }
+                    };
+                    c.restored(answer, then, true);
+                },
+            );
         });
+    }
+
+    /// Shows what a restore did, or why it did not, with what became of
+    /// the node (`then`); after an error that only when the app stopped
+    /// and started it (`said_start`).
+    fn restored(
+        self: &Rc<Self>,
+        answer: Result<serde_json::Value, String>,
+        then: String,
+        said_start: bool,
+    ) {
+        self.with_prefs(|p| p.set_restore_busy(false));
+        match answer {
+            Ok(v) => {
+                self.with_prefs(|p| p.set_restore_open(false));
+                self.show_once("The backup is restored", &view::restored(&v, &then));
+            }
+            Err(e) => {
+                let e = if said_start {
+                    format!("{e}\n{then}")
+                } else {
+                    e
+                };
+                self.with_prefs(|p| p.set_restore_error(e.into()));
+            }
+        }
+        self.refresh_service();
+        self.refresh_status();
+        self.prefs_load();
     }
 }
 

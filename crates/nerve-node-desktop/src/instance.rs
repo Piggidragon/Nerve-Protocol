@@ -243,6 +243,7 @@ mod win {
         FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_READ_ATTRIBUTES, PIPE_ACCESS_INBOUND, READ_CONTROL,
         SECURITY_IDENTIFICATION, SECURITY_SQOS_PRESENT,
     };
+    use windows_sys::Win32::System::IO::CancelSynchronousIo;
     use windows_sys::Win32::System::Pipes::{
         ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeServerProcessId, PIPE_READMODE_BYTE,
         PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
@@ -258,11 +259,53 @@ mod win {
         s.encode_utf16().chain(Some(0)).collect()
     }
 
-    /// The first instance of the pipe, and its name and owner.
+    /// The first instance of the pipe, and its name and owner; the thread
+    /// that takes the starts once it listens. Dropped, it lets the name go:
+    /// the next start of the app is the first (crate::instance::Instance).
     pub struct Pipe {
         name: String,
         sid: String,
         first: std::sync::Mutex<Option<isize>>,
+        listening: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for Pipe {
+        fn drop(&mut self) {
+            use std::sync::atomic::Ordering;
+            if let Some(h) = self
+                .first
+                .get_mut()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            {
+                // SAFETY: the instance this process made, which nothing
+                // listens on.
+                unsafe { CloseHandle(h as _) };
+            }
+            let Some(t) = self
+                .listening
+                .get_mut()
+                .unwrap_or_else(|p| p.into_inner())
+                .take()
+            else {
+                return;
+            };
+            self.stop.store(true, Ordering::SeqCst);
+            // The thread waits for a start in ConnectNamedPipe, or reads
+            // one: its wait is cancelled until it sees `stop`, closes its
+            // instances of the pipe and ends. Cancelled again and again, as
+            // it may not be waiting yet.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+            while !t.is_finished() && std::time::Instant::now() < deadline {
+                // SAFETY: the thread's handle, which lives as long as `t`.
+                unsafe { CancelSynchronousIo(t.as_raw_handle() as HANDLE) };
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            if t.is_finished() {
+                let _ = t.join();
+            }
+        }
     }
 
     /// An instance of the pipe, owned by this user and open to this user
@@ -327,6 +370,8 @@ mod win {
                     name: name.to_string(),
                     sid: sid.to_string(),
                     first: std::sync::Mutex::new(Some(h)),
+                    listening: std::sync::Mutex::default(),
+                    stop: std::sync::Arc::default(),
                 }),
                 note: None,
             });
@@ -413,7 +458,8 @@ mod win {
                 return;
             };
             let (name, sid) = (self.name.clone(), self.sid.clone());
-            std::thread::spawn(move || {
+            let stop = self.stop.clone();
+            let t = std::thread::spawn(move || {
                 loop {
                     // SAFETY: an instance of the pipe this process made.
                     let ok = unsafe { ConnectNamedPipe(h as _, std::ptr::null_mut()) } != 0
@@ -421,6 +467,12 @@ mod win {
                         // ERROR_NO_DATA: and has gone already, its line
                         // still there to read.
                         || matches!(unsafe { GetLastError() }, 535 | 232);
+                    // The window let the name go (Drop for Pipe).
+                    if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                        // SAFETY: the instance this process made.
+                        unsafe { CloseHandle(h as _) };
+                        return;
+                    }
                     // The next instance first, so the name stays this app's.
                     let next = make(&name, &sid, false);
                     if ok {
@@ -440,6 +492,7 @@ mod win {
                     }
                 }
             });
+            *self.listening.lock().unwrap_or_else(|p| p.into_inner()) = Some(t);
         }
     }
 }
@@ -602,6 +655,31 @@ mod win_tests {
         let got = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
         let _ = end.send(());
         assert_eq!(got, "", "the pipe got {got}");
+    }
+
+    /// A window that lets its claim go, listening or not, lets the next
+    /// start be the first, as the start in software after a window error
+    /// and the app the installer opens must be (review issue-10 r2).
+    #[test]
+    fn a_claim_let_go_makes_the_next_start_the_first() {
+        let name = format!(
+            r"\\.\pipe\nerve-node-desktop-test-{}",
+            nerve_transport::keys::random_token(12)
+        );
+        let sid = crate::broker::win::own_sid().unwrap();
+        for listening in [false, true] {
+            let Claimed::First(first) = win::claim_at(&name, &sid, &Asked::default()) else {
+                panic!("the first start is the first");
+            };
+            if listening {
+                first.listen(|_| {});
+            }
+            drop(first);
+            let Claimed::First(next) = win::claim_at(&name, &sid, &Asked::default()) else {
+                panic!("a start after the window let go went to it (listening: {listening})");
+            };
+            drop(next);
+        }
     }
 
     /// On the user's own pipe: run where the app is not open.

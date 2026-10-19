@@ -610,7 +610,8 @@ export component BackupDialog inherits Dialog {
 
 export component RestoreDialog inherits Dialog {
     title: "Restore a backup";
-    subtitle: "The backup's config and keys take the place of this node's. The node must not run.";
+    subtitle: Store.service-state == "running" ? "The backup's config and keys take the place of this node's. The node stops while it is restored, and starts again after."
+        : "The backup's config and keys take the place of this node's.";
     card-width: 540px;
     close => {
         Prefs.restore-open = false;

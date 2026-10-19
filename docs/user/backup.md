@@ -245,9 +245,15 @@ live link per node, so stop the old node before the new one connects.
 The command runs as the user `nerve` after `sudo` (see [service](service.md)),
 but it opens the backup file as you, the user who ran `sudo`: name one in
 your own folders, such as `~/nerve.bak`. A backup written there is yours,
-readable by you only. Run as root without `sudo`, it opens the file as root.
-The file `--passphrase-file` names is read as `nerve`; typing the passphrase
-needs no file. The desktop app works the same way with the files you pick.
+readable by you only. Where you may not open the file, the owner of its
+folder opens it: in a root shell (`sudo -i`, which still knows who ran
+`sudo`) a file in `/root` is root's, and one in `/var/lib/nerve/state` is
+written as `nerve`, as before 0.0.6. Run as root without `sudo`, it opens
+the file as root. The file `--passphrase-file` names is read as `nerve`;
+typing the passphrase needs no file.
+
+The desktop app works the same way with the files you pick, without the
+second try: a file you may not open is refused there.
 
 ## On a center installed as a service
 

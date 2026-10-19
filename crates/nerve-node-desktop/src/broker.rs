@@ -434,16 +434,16 @@ fn shut_out_the_user() -> Result<(), String> {
     Ok(())
 }
 
-/// The broker's start: `__desktop-broker`, on Windows with the pipe's name and
-/// the app's process id. The exit code.
+/// The broker's start: `__desktop-broker`, on Windows with the pipe's name,
+/// the app's process id and the SID of the app's user. The exit code.
 pub fn main(args: &[String]) -> i32 {
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(_) => return 1,
     };
     #[cfg(windows)]
-    if let [name, pid] = args {
-        return win::serve_pipe(name, pid, exe);
+    if let [name, pid, sid] = args {
+        return win::serve_pipe(name, pid, sid, exe);
     }
     if !args.is_empty() {
         return 2;
@@ -455,7 +455,7 @@ pub fn main(args: &[String]) -> i32 {
 /// The broker over a named pipe on Windows, where the UAC prompt starts a
 /// program without handing it the app's stdin and stdout.
 #[cfg(windows)]
-pub(crate) mod win {
+pub mod win {
     use std::os::windows::io::FromRawHandle;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -555,10 +555,10 @@ pub(crate) mod win {
     }
 
     /// One end of the broker: a pipe one way, open to SYSTEM, the
-    /// administrators and this user alone, connected to the app's process
-    /// (`app`) only. Each way has a pipe of its own: a synchronous pipe
-    /// handle reads and writes one at a time, so a read that waits would
-    /// hold up every write.
+    /// administrators and the app's user (`sid`) alone, connected to the
+    /// app's process (`app`) only, which must run as that user. Each way has
+    /// a pipe of its own: a synchronous pipe handle reads and writes one at
+    /// a time, so a read that waits would hold up every write.
     fn serve_end(name: &str, sid: &str, inbound: bool, app: u32) -> Option<std::fs::File> {
         let sddl = wide(&format!("D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;{sid})"));
         // SAFETY: the descriptor Windows makes from the SDDL is freed after
@@ -604,7 +604,10 @@ pub(crate) mod win {
                 return None;
             }
             let mut client = 0u32;
-            if GetNamedPipeClientProcessId(h, &mut client) == 0 || client != app {
+            if GetNamedPipeClientProcessId(h, &mut client) == 0
+                || client != app
+                || sid_of(client).as_deref() != Ok(sid)
+            {
                 CloseHandle(h);
                 return None;
             }
@@ -614,23 +617,38 @@ pub(crate) mod win {
         Some(unsafe { std::fs::File::from_raw_handle(handle as _) })
     }
 
-    /// The broker over its two pipes, `<name>-in` and `<name>-out`.
-    pub fn serve_pipe(name: &str, pid: &str, exe: PathBuf) -> i32 {
+    /// The broker over its two pipes, `<name>-in` and `<name>-out`, for the
+    /// app's process `pid` of the user `sid`. That user is not this
+    /// process's when the app runs as a standard user: the UAC prompt then
+    /// takes an administrator's name and password, and the broker runs as
+    /// that administrator.
+    pub fn serve_pipe(name: &str, pid: &str, sid: &str, exe: PathBuf) -> i32 {
         let Ok(app) = pid.parse::<u32>() else {
             return 2;
         };
-        if !name.starts_with(r"\\.\pipe\nerve-desktop-") {
+        if !name.starts_with(r"\\.\pipe\nerve-desktop-") || !sid.starts_with("S-1-") {
             return 2;
         }
-        let Ok(sid) = own_sid() else {
+        // An app that never comes leaves no broker behind.
+        let connected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waited = connected.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            if !waited.load(std::sync::atomic::Ordering::SeqCst) {
+                std::process::exit(1);
+            }
+        });
+        let Some(requests) = serve_end(&format!("{name}-in"), sid, true, app) else {
             return 1;
         };
-        let Some(requests) = serve_end(&format!("{name}-in"), &sid, true, app) else {
+        let Some(answers) = serve_end(&format!("{name}-out"), sid, false, app) else {
             return 1;
         };
-        let Some(answers) = serve_end(&format!("{name}-out"), &sid, false, app) else {
-            return 1;
-        };
+        connected.store(true, std::sync::atomic::Ordering::SeqCst);
+        // The commands' `install` takes the app's user for the account of
+        // the commands, not the administrator (nerve_node::cli::invoker).
+        // SAFETY: the other thread only sleeps and reads its flag.
+        unsafe { std::env::set_var(nerve_node::cli::DESKTOP_USER_SID, sid) };
         super::serve(requests, Box::new(answers), exe);
         0
     }
@@ -680,14 +698,26 @@ pub(crate) mod win {
         Ok(file)
     }
 
-    /// Starts this program as the broker, with the UAC prompt when
-    /// `elevated`, and talks to it over its pipes.
-    pub fn launch(exe: &Path, elevated: bool) -> Result<Arc<Client>, String> {
+    /// A new name for the broker's pipes, and the arguments that start this
+    /// program as the broker on them for this process.
+    pub fn broker_args() -> Result<(String, String), String> {
         let name = format!(
             r"\\.\pipe\nerve-desktop-{}",
             nerve_transport::keys::random_token(24)
         );
-        let args = format!("{} {name} {}", super::ARG, std::process::id());
+        let args = format!(
+            "{} {name} {} {}",
+            super::ARG,
+            std::process::id(),
+            own_sid()?
+        );
+        Ok((name, args))
+    }
+
+    /// Starts this program as the broker, with the UAC prompt when
+    /// `elevated`, and talks to it over its pipes.
+    pub fn launch(exe: &Path, elevated: bool) -> Result<Arc<Client>, String> {
+        let (name, args) = broker_args()?;
         let (process, child) = if elevated {
             let params = wide(&args);
             let file = wide(&exe.display().to_string());
@@ -720,7 +750,7 @@ pub(crate) mod win {
             use std::os::windows::io::AsRawHandle;
             use std::process::{Command, Stdio};
             let child = Command::new(exe)
-                .args([super::ARG, &name, &std::process::id().to_string()])
+                .args(args.split(' '))
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
@@ -728,6 +758,22 @@ pub(crate) mod win {
                 .map_err(|e| format!("cannot start the broker: {e}"))?;
             (child.as_raw_handle() as HANDLE, Some(child))
         };
+        // SAFETY: the broker's process handle, of the child or given away.
+        let (requests, answers) = unsafe { connect(&name, process, child.is_none())? };
+        Client::start(Box::new(answers), Box::new(requests), child)
+    }
+
+    /// Opens the pipes `name` of the broker `process` (its handle, closed
+    /// here when `close`) once it serves them: requests, then answers.
+    ///
+    /// # Safety
+    /// `process` is a handle to a process, open until this returns, or
+    /// given away when `close`.
+    pub unsafe fn connect(
+        name: &str,
+        process: HANDLE,
+        close: bool,
+    ) -> Result<(std::fs::File, std::fs::File), String> {
         // SAFETY: queries on the broker's process handle, which lives until
         // it is closed below (or, for a child, with the child).
         let broker = unsafe { GetProcessId(process) };
@@ -738,11 +784,11 @@ pub(crate) mod win {
                 open_end(&format!("{name}-out"), false, broker, &running)?,
             ))
         });
-        if child.is_none() {
+        if close {
+            // SAFETY: the handle the caller gave away.
             unsafe { CloseHandle(process) };
         }
-        let (requests, answers) = ends?;
-        Client::start(Box::new(answers), Box::new(requests), child)
+        ends
     }
 }
 

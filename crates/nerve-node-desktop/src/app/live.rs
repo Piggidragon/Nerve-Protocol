@@ -98,13 +98,22 @@ impl Ctl {
             l.set_load(Load::Loading);
             l.set_rows(ModelRc::default());
         }
-        let last = self
+        let (last, problems) = self
             .window
             .upgrade()
-            .map(|w| w.global::<Logs>().get_limit())
-            .unwrap_or_default()
-            .to_string();
-        self.start_follow(vec!["log", "--follow", "--last", &last]);
+            .map(|w| {
+                let l = w.global::<Logs>();
+                (l.get_limit(), l.get_problems_only())
+            })
+            .unwrap_or_default();
+        let last = last.to_string();
+        let mut args = vec!["log", "--follow", "--last", &last];
+        // The CLI picks the problems from the whole log, so that the newest
+        // of them show, not those among the newest lines.
+        if problems {
+            args.push("--problems");
+        }
+        self.start_follow(args);
     }
 
     fn page(&self) -> Option<Page> {
@@ -238,13 +247,11 @@ impl Ctl {
     }
 
     /// Shows the log again, all of it or its problems.
-    pub(super) fn log_filter(&self, problems: bool) {
-        let rows = view::log_rows(&self.log.borrow(), problems, now_ms());
+    pub(super) fn log_filter(self: &Rc<Self>, problems: bool) {
         if let Some(w) = self.window.upgrade() {
-            let l = w.global::<Logs>();
-            l.set_problems_only(problems);
-            l.set_rows(ModelRc::new(VecModel::from(rows)));
+            w.global::<Logs>().set_problems_only(problems);
         }
+        self.follow_log();
     }
 }
 

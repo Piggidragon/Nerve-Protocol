@@ -227,6 +227,7 @@ async fn status(paths: &NodePaths) -> Result<Value, String> {
         "daemon": "not running",
         "version": cfg.version,
         "locked": cfg.locked,
+        "account": cfg.machine.user,
         "sudo": if sudo_is_on(paths).await? { "on" } else { "off" },
         "command_limits": crate::cgroup::status(
             &cfg.limits.command,

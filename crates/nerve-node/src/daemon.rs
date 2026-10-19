@@ -792,6 +792,9 @@ impl Shared {
         json!({
             "version": cfg.version,
             "locked": cfg.locked,
+            // The account commands run as (the desktop app warns when it is
+            // its own user's: crate::owner).
+            "account": cfg.machine.user,
             "confinement": self.confinement.describe(),
             "running": self.running.load(Ordering::Relaxed),
             "sudo": if self.sudo_on() { "on" } else { "off" },

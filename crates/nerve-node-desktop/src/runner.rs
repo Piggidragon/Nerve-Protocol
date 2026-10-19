@@ -2,7 +2,9 @@
 //! behaves as `nerve-node` (src/main.rs), with `--json`, and reads its
 //! answer (docs/user/commands.md). The app never parses text meant for
 //! people, and has the CLI's checks because it runs the CLI. On a node
-//! installed as a service the commands go through the elevated broker
+//! installed as a service the CLI of an owner has the running node run the
+//! command (nerve_node::owner); a command that needs an administrator, or
+//! any for a user who is no owner, goes through the elevated broker
 //! (crate::broker) instead, which runs the same program the same way.
 
 use std::io::{BufRead, BufReader, Write};

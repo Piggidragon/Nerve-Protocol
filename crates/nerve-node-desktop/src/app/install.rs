@@ -140,12 +140,17 @@ impl Ctl {
         *self.launcher.borrow_mut() = launcher;
     }
 
-    /// Runs `then` once the commands have the rights: at once when they
-    /// have them or need none, else after the system's question.
-    fn with_rights(self: &Rc<Self>, then: impl FnOnce(&Rc<Ctl>) + Send + 'static) {
-        let how = match self.elevate.get() {
-            Some(how) if !self.runner.borrow().elevated() => how,
-            _ => return then(self),
+    /// Runs `then` with a runner that has the rights `args` needs: the
+    /// app's own when it needs none or has them, else one through a broker
+    /// started after the system's question, which ends with that runner.
+    fn with_rights(
+        self: &Rc<Self>,
+        args: &[String],
+        then: impl FnOnce(&Rc<Ctl>, Runner) + Send + 'static,
+    ) {
+        let Some(how) = self.admin_for(args) else {
+            let r = self.runner();
+            return then(self, r);
         };
         let exe = self.runner().exe().clone();
         self.with_install(|i| {
@@ -159,12 +164,7 @@ impl Ctl {
                 match launched {
                     Ok(b) => {
                         let r = c.runner().through(b);
-                        *c.runner.borrow_mut() = r;
-                        c.with_store(|s| {
-                            s.set_elevate_needed(false);
-                            s.set_elevate_open(false);
-                        });
-                        then(c);
+                        then(c, r);
                     }
                     Err(e) => c.failed(e),
                 }
@@ -202,31 +202,35 @@ impl Ctl {
             i.set_did(ModelRc::default());
             i.set_warnings(ModelRc::default());
         });
-        self.with_rights(move |c| {
+        self.with_rights(&args.clone(), move |c, runner| {
             c.with_install(|i| i.set_step("working".into()));
-            c.command(args, input, |c, answer| match answer {
-                Ok(v) => {
-                    let (did, warn) = steps(&v);
-                    c.with_install(|i| {
-                        i.set_password(SharedString::new());
-                        i.set_did(shared(did));
-                        i.set_warnings(shared(warn));
-                    });
-                    c.command(vec!["service".into(), "status".into()], None, |c, v| {
-                        let version = v
-                            .ok()
-                            .and_then(|v| v["version"].as_str().map(str::to_string))
-                            .unwrap_or_default();
+            c.job_on(
+                runner,
+                move |r| r.run_with(&super::strings(&args), input.as_deref()),
+                |c, answer| match answer {
+                    Ok(v) => {
+                        let (did, warn) = steps(&v);
                         c.with_install(|i| {
-                            if i.get_action() != "uninstall" {
-                                i.set_installed_version(version.into());
-                            }
-                            i.set_step("done".into());
+                            i.set_password(SharedString::new());
+                            i.set_did(shared(did));
+                            i.set_warnings(shared(warn));
                         });
-                    });
-                }
-                Err(e) => c.failed(e),
-            });
+                        c.command(vec!["service".into(), "status".into()], None, |c, v| {
+                            let version = v
+                                .ok()
+                                .and_then(|v| v["version"].as_str().map(str::to_string))
+                                .unwrap_or_default();
+                            c.with_install(|i| {
+                                if i.get_action() != "uninstall" {
+                                    i.set_installed_version(version.into());
+                                }
+                                i.set_step("done".into());
+                            });
+                        });
+                    }
+                    Err(e) => c.failed(e),
+                },
+            );
         });
     }
 

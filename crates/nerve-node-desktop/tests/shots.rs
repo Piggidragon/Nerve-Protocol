@@ -415,6 +415,11 @@ fn every_page_light_and_dark() {
     shots.take_as_is("overview-restart-soon");
     store.set_toast_shown(false);
     store.set_restart_due(false);
+    // Commands run as the app's user, an owner of the node.
+    store.set_commands_as_you(true);
+    store.set_commands_account("alex".into());
+    shots.take("overview-commands-as-you");
+    store.set_commands_as_you(false);
     store.invoke_show(Page::Centers);
     shots.take("centers");
     store.invoke_center_unpair(OFFICE.into());

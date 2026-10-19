@@ -225,7 +225,7 @@ export component AppWindow inherits Window {
                         Banner {
                             tone: Tone.accent;
                             title: "The node is installed as a service";
-                            text: "Its settings belong to the system. Give the app administrator rights to see and change them.";
+                            text: "You are not one of its owners. Give the app administrator rights to see and change it.";
                             action: "Continue…";
                             acted => {
                                 Store.elevate-open = true;

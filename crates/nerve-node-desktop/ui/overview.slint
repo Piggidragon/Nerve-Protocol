@@ -214,6 +214,20 @@ export component OverviewPage inherits PageFrame {
     }
 
     Reveal {
+        shown: Store.commands-as-you;
+        gap: Space.lg;
+        Banner {
+            tone: Tone.warn;
+            title: "Commands run as you";
+            text: "Commands from centers run as " + Store.commands-account + ", who changes Nerve without a password. A command could change its settings too. Give commands an account of their own.";
+            action: "Separate account";
+            acted => {
+                Store.separate-account();
+            }
+        }
+    }
+
+    Reveal {
         shown: Store.status.warnings.length > 0;
         gap: Space.xxl;
         VerticalLayout {

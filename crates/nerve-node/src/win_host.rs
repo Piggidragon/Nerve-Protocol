@@ -258,7 +258,11 @@ pub(crate) fn sid_of(name: &str) -> Result<Vec<u8>, String> {
     if ok == 0 {
         return Err(format!("cannot find the SID of {name}: {}", last()));
     }
-    sid.truncate(len as usize);
+    // The call leaves `len` at the buffer's size when the SID fits, so the
+    // SID's own length cuts it: a SID compared as bytes must have no tail.
+    // SAFETY: a valid SID the call wrote.
+    let real = unsafe { windows_sys::Win32::Security::GetLengthSid(sid.as_ptr() as PSID) };
+    sid.truncate((real as usize).min(len as usize));
     Ok(sid)
 }
 

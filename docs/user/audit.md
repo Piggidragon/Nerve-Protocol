@@ -30,9 +30,11 @@ reason ([limits](limits.md)):
 1791834531877  lab  exec.run  make -j8  killed: the command went past its memory limit of 4096 MiB and was killed
 ```
 
-Settings changes are lines like `1791834068828  settings v1 by local`. They
-show the new version and who changed it: `local` for `nerve-node`, or the name
-of a center. The log holds the old and the new value of each setting.
+Settings changes are lines like `1791834068828  settings v1 by local (alice)`.
+They show the new version and who changed it: `local` for `nerve-node`, with
+the account that ran it (the user behind `sudo`, or an owner of the installed
+node, [administrator rights](desktop.md#administrator-rights)), or the name of
+a center. The log holds the old and the new value of each setting.
 
 `install`, `setup`, `update` and `uninstall` are lines like
 `1791834068828  update: replaced nerve-node <old> with <new>; restarted the service nerve-node.service`,

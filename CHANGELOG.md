@@ -14,6 +14,7 @@
 - On Linux the app says what the desktop lacks instead of failing silently: no display, no `pkexec` or polkit agent, no desktop portal for the file dialogs, no `update-desktop-database`; without OpenGL it draws in software. `docs/user/desktop.md` lists what each desktop needs.
 - The release has `nerve-node-desktop-x86_64-linux` and `nerve-node-desktop-x86_64-windows.exe`, with their checksums in `SHA256SUMS`.
 - The `NOTICE` file holds the licence of the Lucide icons, which the app and the center's web UI use. The app is built with Slint under its Royalty-free license 2.0.
+- Rights once, like an installed program: the user who installs becomes the node's owner, and opens the app, changes settings, pairs, edits rules and starts, stops and restarts the service without a question. The administrator's password is asked only for update, uninstall, sudo on, the account commands run as, backup, restore and the `machine.*` settings that pick that account, each time for that action. The session-long administrator broker is gone for owners. The Overview warns when commands run as the app's own user and offers an account of their own.
 
 ### Commands
 
@@ -23,6 +24,7 @@
 - `nerve-node log [--problems] [--last N] [--follow]` shows the node's log, with `--problems` its errors and warnings only.
 - With `--json` a change says `"next_start": true` when the node takes it only at its next start; `relay add` and `relay token` give the token as data (`"token"`), `backup` what it wrote (`"backup"`), `center rotate-key` the new key (`"public_key"`), and `restore` what it did (`"restored"`).
 - `nerve-node service start|stop|restart|status` controls the installed service; `status` needs no root.
+- On the installed node its owners need no `sudo` (on Windows no administrator's terminal): the members of the group `nerve-admin`, which `install` makes with the user who ran it (on Windows the SIDs `install` records). The running node runs their command as `nerve` over its owner socket (`/run/nerve-node/owner.sock`; a pipe on Windows) with the CLI's checks; `install`, `update`, `uninstall`, `setup`, `sudo on`, `backup`, `restore` and the `machine.*` settings that pick the commands' account stay root's. A polkit rule (Linux) and the service's DACL (Windows) let the owners start, stop and restart the service. `update` gives an install from before them their owner and the new unit; `uninstall` removes the group, the rule and the rights. Settings changes in the audit name the account that made them (`"user"`, text `by local (alice)`); `status --json` says the account commands run as (`"account"`).
 - `cap ls --json` lists the switchable capabilities (`known`).
 - Commands run through `pkexec` take the user who ran it as the account of the commands at `install`, as with `sudo`.
 - On Windows, the text `status` asks the running service through the control pipe, as `status --json` does.

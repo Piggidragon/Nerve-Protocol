@@ -1,10 +1,13 @@
-//! The elevated broker: on a node installed as a service the node's files
-//! are root's (the administrators' on Windows), so every command needs the
-//! rights the owner gives in a terminal with `sudo`. The app asks for them
-//! once, the way the desktop does (polkit's `pkexec` on Linux, the UAC
-//! prompt on Windows), and starts this program elevated as the broker. The
-//! broker runs the app's commands as `nerve-node --json …` (this program,
-//! nothing else) and sends back what each answered, until the app ends.
+//! The elevated broker: on a node installed as a service some commands need
+//! the rights the owner gives in a terminal with `sudo` (install, update,
+//! uninstall, sudo on and the others of `nerve_node::owner::needs_admin`),
+//! and every command does for a user who is no owner of the node. The app
+//! asks for them the way the desktop does (polkit's `pkexec` on Linux, the
+//! UAC prompt on Windows), and starts this program elevated as the broker.
+//! The broker runs the app's commands as `nerve-node --json …` (this
+//! program, nothing else) and sends back what each answered, until the app
+//! lets go of it: after that one command for an owner, at its end for
+//! anyone else.
 //!
 //! The app and the broker speak JSON lines. A request is
 //! `{"id", "args", "input", "follow"}` or `{"id", "cancel": true}`; the
@@ -18,8 +21,9 @@
 //! named pipe the broker makes, open to the app's user only, which it
 //! serves to the app's process alone (`win`).
 //!
-//! The broker lives as long as the app: the owner gives the rights once
-//! each time the app opens. A secret in each request would add nothing on
+//! For a user who is no owner, the broker lives as long as the app: the
+//! rights are given once each time the app opens. A secret in each request
+//! would add nothing on
 //! Linux: it would travel over the same pipe, which any process that can
 //! open it at all can also read.
 

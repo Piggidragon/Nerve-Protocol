@@ -694,7 +694,7 @@ export component RestoreDialog inherits Dialog {
 // Why the app asks for administrator rights, before the system asks.
 export component ElevateDialog inherits Dialog {
     title: "Administrator rights";
-    subtitle: "The node on this machine is installed as a service. Its settings, keys and logs belong to the system, so reading and changing them takes administrator rights, as nerve-node with sudo (on Windows, as administrator) does in a terminal.";
+    subtitle: "The node on this machine is installed as a service, and you are not one of its owners. Reading and changing it takes administrator rights, as nerve-node with sudo (on Windows, as administrator) does in a terminal.";
     card-width: 520px;
     close => {
         Store.elevate-open = false;

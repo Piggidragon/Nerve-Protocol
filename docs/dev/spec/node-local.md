@@ -1235,6 +1235,32 @@ on the pipe, but they can still change `node.toml` itself. On Windows, allow
 commands only to centers you would also give `settings = write`, or install
 the node as a service.
 
+### The owner endpoint
+
+The installed node also takes commands from its owners, who are no root: on
+Linux the members of the group `nerve-admin`, looked up by name at each
+request; on Windows the SIDs in the service's registry value
+`Parameters\Owners`. It serves them `/run/nerve-node/owner.sock` (0666 in the
+unit's runtime folder) or the pipe `\\.\pipe\nerve-node-owner` (DACL: SYSTEM, the
+administrators, the owners; first instance; no remote clients), with the same
+lines and two methods:
+
+| Method | Params | |
+|---|---|---|
+| `status` | | `{"running": true}`, to anyone |
+| `cli` | `args`, `cwd` | runs `nerve-node --config-dir … --state-dir … <args>` as the node's user, with `NERVE_OWNER=<owner>`; then `{"ok": {}}`, the program's output as `{"out"}` and `{"err"}` lines and `{"exit": code}`; the caller sends `{"in": text}` and `{"eof": true}` |
+
+`cli` is refused to a caller below a command the node runs, with
+`no_new_privs` (Linux), in a command's job (Windows), who is no owner, with
+`--config-dir` or `--state-dir`, and for `run`, `install`, `update`,
+`uninstall`, `service`, `setup`, `sudo on`, `backup` and `restore`. A program
+with `NERVE_OWNER` refuses a change of `machine.user`, `machine.allow_root`,
+`machine.sudo_path` and `machine.shell`, and names the owner in the audit's
+settings entries (`"user"`). Starting and stopping the service is the service
+manager's: a polkit rule for `nerve-admin` in a local active session (Linux),
+the service's DACL (Windows). Where `machine.user` is an owner, a command that
+gets a process outside the node's tree and sandbox (as above) is that owner.
+
 ## 6. Audit log
 
 `<state>/audit.jsonl`, one JSON line per event: settings changes (with old

@@ -56,9 +56,13 @@ pub fn socket() -> PathBuf {
     Path::new(RUNTIME_DIR).join(SOCKET_NAME)
 }
 
-/// The owner pipe of the node at `paths` on Windows.
-pub fn pipe_name(paths: &NodePaths) -> String {
-    format!("{}-owner", paths.ctl_pipe())
+/// The owner pipe of the installed node on Windows. Its name is fixed, not
+/// made from the state folder as the control pipe's is: an owner who is no
+/// administrator cannot open that folder to learn its real path. The node
+/// makes it first, and the CLI talks to it only when the node's account
+/// owns it.
+pub fn pipe_name() -> String {
+    r"\\.\pipe\nerve-node-owner".into()
 }
 
 /// The settings that decide which account and which programs a command
@@ -148,7 +152,14 @@ pub fn refused(cmd: &Cmd) -> Option<String> {
             "setup",
             "it chooses the account commands run as, and can make one",
         ),
-        Cmd::Sudo(SudoCmd::On) => ("sudo on", "it lets commands run as root"),
+        Cmd::Sudo(SudoCmd::On) => (
+            "sudo on",
+            if cfg!(windows) {
+                "it lets commands run with an administrator's rights"
+            } else {
+                "it lets commands run as root"
+            },
+        ),
         Cmd::Backup { .. } => (
             "backup",
             "its file is written as you, which only root can do for the node",
@@ -164,6 +175,51 @@ pub fn refused(cmd: &Cmd) -> Option<String> {
         admin(),
         with_rights(&format!("{what} …"))
     ))
+}
+
+/// Whether a program that runs `cmd` on the installed node needs an
+/// administrator's rights, even for an owner: what the node refuses its
+/// owners ([`refused`]), and a change of a setting of [`ROOT_ONLY`]. Starting
+/// and stopping the service does not: the service manager lets the owners.
+pub fn needs_admin(cmd: &Cmd) -> bool {
+    use crate::cli::ConfigCmd;
+    match cmd {
+        Cmd::Service(_) => false,
+        Cmd::Config(
+            ConfigCmd::Set { key, .. }
+            | ConfigCmd::Unset { key }
+            | ConfigCmd::Add { key, .. }
+            | ConfigCmd::Remove { key, .. },
+        ) => ROOT_ONLY.contains(&key.as_str()),
+        c => refused(c).is_some(),
+    }
+}
+
+/// [`needs_admin`] for a command line without the program's name; one that
+/// does not parse needs none (it does nothing).
+pub fn args_need_admin(args: &[String]) -> bool {
+    use clap::Parser;
+    let argv = std::iter::once("nerve-node").chain(args.iter().map(String::as_str));
+    Cli::try_parse_from(argv).is_ok_and(|cli| needs_admin(&cli.cmd))
+}
+
+/// Whether the account running this is an owner of the installed node: in
+/// [`GROUP`] on Linux, among the service's owners on Windows.
+pub fn is_owner_here() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: a plain getter.
+        in_group(unsafe { libc::getuid() }, GROUP)
+    }
+    #[cfg(windows)]
+    {
+        let me = crate::win_user::own_sid()
+            .ok()
+            .and_then(|s| crate::win_host::sid_text(&s).ok());
+        me.is_some_and(|me| crate::win_host::owners().is_ok_and(|o| o.contains(&me)))
+    }
+    #[cfg(not(any(unix, windows)))]
+    false
 }
 
 /// Whether the CLI sends `cli`'s command to the owner endpoint: the node is
@@ -204,7 +260,25 @@ pub fn forward_if_needed(cli: &Cli) -> Option<i32> {
         .ok()
         .map(|d| d.display().to_string());
     let paths = NodePaths::from_args(None, None);
-    Some(rt.block_on(forward(&paths, args, cwd, cli.json)))
+    let input = reads_input(&cli.cmd);
+    Some(rt.block_on(forward(&paths, args, cwd, input, cli.json)))
+}
+
+/// Whether `cmd` reads this process's input: the question of `center add`
+/// without `--yes`, and what `proxy set` takes from stdin. Only then is the
+/// input passed to the node; for any other command it stays unread, as a
+/// script that pipes lines into a loop of commands expects.
+pub fn reads_input(cmd: &Cmd) -> bool {
+    use crate::cli::{CenterCmd, ProxyCmd};
+    match cmd {
+        Cmd::Center(CenterCmd::Add { yes, .. }) => !yes,
+        Cmd::Proxy(ProxyCmd::Set {
+            password_stdin,
+            headers_stdin,
+            ..
+        }) => *password_stdin || *headers_stdin,
+        _ => false,
+    }
 }
 
 /// Says `e` as `main` says an error; exit code 1.
@@ -283,19 +357,31 @@ fn not_reached(e: &str) -> String {
 
 /// Sends `args` to the owner endpoint of the node at `paths`, passes this
 /// process's input to it and its output here; the command's exit code.
-async fn forward(paths: &NodePaths, args: Vec<String>, cwd: Option<String>, json: bool) -> i32 {
+async fn forward(
+    paths: &NodePaths,
+    args: Vec<String>,
+    cwd: Option<String>,
+    input: bool,
+    json: bool,
+) -> i32 {
     let conn = match connect(paths).await {
         Ok(c) => c,
         Err(e) => return fail(json, &not_reached(&e)),
     };
-    match session(conn, args, cwd).await {
+    match session(conn, args, cwd, input).await {
         Ok(code) => code,
         Err(e) => fail(json, &e),
     }
 }
 
-/// The client's side of one `cli` request on `conn`.
-async fn session<S>(conn: S, args: Vec<String>, cwd: Option<String>) -> Result<i32, String>
+/// The client's side of one `cli` request on `conn`; this process's input
+/// goes along when `input`.
+async fn session<S>(
+    conn: S,
+    args: Vec<String>,
+    cwd: Option<String>,
+    input: bool,
+) -> Result<i32, String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite,
 {
@@ -319,7 +405,11 @@ where
     // The input goes on its own thread: a read of a terminal blocks, and the
     // command may never ask for it.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(16);
-    std::thread::spawn(move || read_input(std::io::stdin(), &tx));
+    if input {
+        std::thread::spawn(move || read_input(std::io::stdin(), &tx));
+    } else {
+        let _ = tx.send(json!({"eof": true})).await;
+    }
     let feeding = async move {
         while let Some(v) = rx.recv().await {
             let line = format!("{v}\n");
@@ -464,7 +554,7 @@ impl Endpoint {
                 return None;
             }
             Some(Endpoint {
-                at: pipe_name(paths).into(),
+                at: pipe_name().into(),
                 owners: Owners::Sids(sids),
                 program: std::env::current_exe().ok()?,
             })
@@ -472,6 +562,17 @@ impl Endpoint {
         #[cfg(not(any(target_os = "linux", windows)))]
         None
     }
+}
+
+/// The owner pipe's DACL in SDDL (Windows): SYSTEM, the administrators, the
+/// node's own account (`own`, which makes the pipe's further instances) and
+/// the owners. No AppContainer gets in: no entry names a package.
+pub fn dacl_text(own: &str, owners: &[String]) -> String {
+    let mut s = crate::pipe::dacl_text(own);
+    for o in owners {
+        s.push_str(&format!("(A;;GA;;;{o})"));
+    }
+    s
 }
 
 /// Whether the account `uid` is in `group`, as the account database says
@@ -599,10 +700,11 @@ async fn run_for(
             return Reply::Err(why);
         }
     }
+    // The command's words only: a value can be a secret (a proxy URL).
     let words: Vec<&str> = args
         .iter()
         .map(String::as_str)
-        .take_while(|a| !a.starts_with('-'))
+        .filter(|a| !a.starts_with('-'))
         .take(2)
         .collect();
     tracing::info!("{who} runs `{name} {}` as an owner", words.join(" "));
@@ -824,16 +926,6 @@ mod win {
     use super::{Endpoint, NodePaths, Owners, answer, not_an_owner, pipe_name};
     use crate::pipe::{Descriptor, client_pid, instance};
 
-    /// The owner pipe's DACL in SDDL: SYSTEM, the administrators and the
-    /// owners. No AppContainer gets in: no entry names a package.
-    pub fn dacl_text(owners: &[String]) -> String {
-        let mut s = String::from("D:P(A;;GA;;;SY)(A;;GA;;;BA)");
-        for o in owners {
-            s.push_str(&format!("(A;;GA;;;{o})"));
-        }
-        s
-    }
-
     /// The SID of the client of the connected `pipe`, read at
     /// identification level after its request was read.
     fn client_sid(pipe: HANDLE) -> Option<String> {
@@ -886,7 +978,11 @@ mod win {
             return Err("the owner pipe takes owners by SID".into());
         };
         let name = endpoint.at.display().to_string();
-        let sd = Descriptor::from_sddl(&dacl_text(&owners))
+        let own = crate::win_user::own_sid()
+            .map_err(|e| e.to_string())
+            .and_then(|s| crate::win_host::sid_text(&s))
+            .map_err(|e| format!("the owner pipe: cannot read this account's SID: {e}"))?;
+        let sd = Descriptor::from_sddl(&super::dacl_text(&own, &owners))
             .map_err(|e| format!("the owner pipe: cannot make its DACL: {e}"))?;
         let first =
             instance(&name, &sd, true).map_err(|e| format!("the owner pipe {name}: {e}"))?;
@@ -963,7 +1059,7 @@ mod win {
     /// and only when the node's account (or SYSTEM, the administrators) owns
     /// it.
     pub(super) async fn connect(paths: &NodePaths) -> Result<NamedPipeClient, String> {
-        let name = pipe_name(paths);
+        let name = pipe_name();
         let mut busy = 0;
         let client = loop {
             match ClientOptions::new()
@@ -988,9 +1084,6 @@ mod win {
         Ok(client)
     }
 }
-
-#[cfg(windows)]
-pub use win::dacl_text;
 
 #[cfg(test)]
 mod tests {
@@ -1035,6 +1128,32 @@ mod tests {
             &["proxy", "rm"],
         ] {
             assert_eq!(refused(&cli(args).cmd), None, "{args:?}");
+        }
+    }
+
+    /// A program asks for an administrator for what the node refuses its
+    /// owners and for the settings that stay root's, not for the service.
+    #[test]
+    fn what_needs_an_administrator() {
+        for args in [
+            &["sudo", "on"][..],
+            &["update"],
+            &["uninstall"],
+            &["backup", "/tmp/b"],
+            &["setup", "--create-user", "x", "--account-only"],
+            &["config", "set", "machine.user", "bob"],
+            &["config", "unset", "machine.shell"],
+        ] {
+            assert!(needs_admin(&cli(args).cmd), "{args:?}");
+        }
+        for args in [
+            &["service", "restart"][..],
+            &["service", "status"],
+            &["config", "set", "log.level", "debug"],
+            &["rule", "add", "deny", "rm"],
+            &["sudo", "off"],
+        ] {
+            assert!(!needs_admin(&cli(args).cmd), "{args:?}");
         }
     }
 
@@ -1098,6 +1217,40 @@ mod tests {
             forwarded_args(&cli(&given), os(&given), None).unwrap(),
             given
         );
+    }
+
+    /// Only the commands that read the input get it.
+    #[test]
+    fn only_a_command_that_asks_reads_the_input() {
+        assert!(reads_input(&cli(&["center", "add", "nerve://pair?x"]).cmd));
+        assert!(!reads_input(
+            &cli(&["center", "add", "nerve://pair?x", "--yes"]).cmd
+        ));
+        assert!(reads_input(
+            &cli(&["proxy", "set", "http://u@h:1", "--password-stdin"]).cmd
+        ));
+        assert!(!reads_input(&cli(&["proxy", "set", "http://h:1"]).cmd));
+        for args in [
+            &["status"][..],
+            &["rule", "add", "allow", "ls"],
+            &["log", "--follow"],
+        ] {
+            assert!(!reads_input(&cli(args).cmd), "{args:?}");
+        }
+    }
+
+    /// The owner pipe lets in SYSTEM, the administrators, the node's account,
+    /// which makes its instances, and the owners; no one else.
+    #[test]
+    fn the_owner_pipe_names_the_owners_and_the_nodes_account() {
+        let d = dacl_text("S-1-5-21-1-2-3-1057", &["S-1-5-21-1-2-3-1056".into()]);
+        assert_eq!(
+            d,
+            "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GA;;;S-1-5-21-1-2-3-1057)(A;;GA;;;S-1-5-21-1-2-3-1056)"
+        );
+        for other in ["WD", "BU", "AU", "IU", "AC", "S-1-15-"] {
+            assert!(!d.contains(other), "{other}");
+        }
     }
 
     /// A character cut between two reads waits for its other bytes.

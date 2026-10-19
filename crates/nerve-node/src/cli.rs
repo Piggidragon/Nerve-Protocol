@@ -2888,7 +2888,16 @@ fn audit_line(v: &Value) -> String {
         other => other.to_string(),
     };
     if v.get("changes").is_some() {
-        return format!("{}  settings v{} by {}", s("ts"), s("version"), s("by"));
+        // A local change names the account that made it, when known.
+        let user = v["user"]
+            .as_str()
+            .map_or_else(String::new, |u| format!(" ({u})"));
+        return format!(
+            "{}  settings v{} by {}{user}",
+            s("ts"),
+            s("version"),
+            s("by")
+        );
     }
     if v["kind"] == "node" {
         let steps: Vec<String> = v["steps"]

@@ -100,8 +100,17 @@ export global Store {
     in-out property <bool> keyring-usable;
     in-out property <string> keyring-why;
 
-    // Elevation: an installed node's files are the system's, so the app asks
-    // for administrator rights once, and says why first.
+    // The installed node runs commands as the app's own user (src/app.rs,
+    // Ctl::show_status): a center's command could then change the node's
+    // settings as its owner. The Overview warns and offers an account of
+    // their own for the commands.
+    in-out property <bool> commands-as-you;
+    in-out property <string> commands-account;
+    callback separate-account();
+
+    // Elevation: an installed node's files are the system's; an owner is
+    // asked only for what needs an administrator, anyone else once, and the
+    // app says why first.
     in-out property <bool> elevate-needed;
     in-out property <bool> elevate-open;
     in-out property <bool> elevate-busy;

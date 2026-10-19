@@ -153,6 +153,41 @@ which serves `status`, `folder.add`, `folder.set` and `folder.rm` only
 change the CLI signs `node.toml` itself, and the change applies at the next
 start.
 
+## The owners' way in
+
+The installed node has owners besides root: on Linux the members of the group
+`nerve-admin`, on Windows the SIDs in the service's registry value
+`Parameters\Owners`. `install` adds the user who ran it; `update` adds the
+one who updates where there was none; `uninstall` removes the group (and the
+polkit rule), and on Windows the service with its key. Membership is looked
+up by name at each request, so it counts without a new login.
+
+The running node serves them a second endpoint (`crate::owner`): on Linux
+`/run/nerve-node/owner.sock`, mode 0666 in the unit's `RuntimeDirectory=`
+(0755), the account decided by the peer's credentials; on Windows the pipe
+`\\.\pipe\nerve-node-owner`, whose DACL names SYSTEM, the administrators and the
+owners, read at the node's start. It takes `status` (anyone: `{"running":
+true}`) and `cli {args, cwd}`: the node refuses a caller below a command it
+runs, one with `no_new_privs` (Linux; every confined command keeps it) or in a
+command's job (Windows), anyone who is no owner, and the commands that stay
+root's (`run`, `install`, `update`, `uninstall`, `service`, `setup`,
+`sudo on`, `backup`, `restore`). Then it runs its own program with
+`--config-dir`, `--state-dir` and those arguments as its own user, with
+`NERVE_OWNER=<name>`, and passes the caller's input and the program's output
+and exit code through the connection (`{"in"}`/`{"eof"}` up, `{"out"}`,
+`{"err"}`, `{"exit"}` down). The program is the CLI after `become_owner`: it
+holds the token, its changes go through the store as any, and with
+`NERVE_OWNER` set it refuses a change of `machine.user`, `machine.allow_root`,
+`machine.sudo_path` or `machine.shell`, and names the owner in the audit
+(`"user"` beside `"by": "local"`). The CLI forwards there by itself when the
+node is installed and it may not open its folders.
+
+The owners' commands are as safe as the owners' accounts. A center's command
+that runs as an owner's account (`machine.user` is the owner's, as `install`
+sets it by default) and gets a process started outside the node's tree and
+sandbox (`systemd-run --user`, tmux, the task scheduler) is that owner; the
+desktop app warns about it.
+
 ## The log level
 
 `log.level` (`error`, `warn`, `info`, `debug`; `info` unless set) is a machine

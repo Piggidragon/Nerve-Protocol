@@ -913,7 +913,12 @@ fn audit_row(e: &Value, index: usize, centers: &[String], now_ms: u64) -> AuditR
         row.title = "Settings changed".into();
         row.badge = format!("version {}", shown(&e["version"])).into();
         row.center = SharedString::new();
-        row.detail = format!("By {}. {}", shown(&e["by"]), changes.join("; ")).into();
+        // A local change names the account that made it, when known.
+        let by = match e["user"].as_str() {
+            Some(user) => user.to_string(),
+            None => shown(&e["by"]),
+        };
+        row.detail = format!("By {by}. {}", changes.join("; ")).into();
         return row;
     }
     match s(&e["kind"]) {

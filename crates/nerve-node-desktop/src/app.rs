@@ -115,8 +115,13 @@ pub struct Ctl {
     settings: RefCell<Option<PathBuf>>,
     /// This window's claim as the user's one window (crate::instance).
     instance: RefCell<Option<crate::instance::Instance>>,
-    /// How the broker starts when the node is installed as a service.
+    /// How the broker starts when the node is installed as a service: for
+    /// one command that needs an administrator (`nerve_node::owner`), or,
+    /// with `session_rights`, for every command of the session.
     elevate: Cell<Option<Launch>>,
+    /// Whether every command needs the broker: the app's user is no owner
+    /// of the installed node.
+    session_rights: Cell<bool>,
     /// A `nerve://` link the app was opened with, paired once it can be.
     link: RefCell<Option<String>>,
     /// Open the first-run steps when nothing is paired yet.
@@ -159,6 +164,19 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or_default()
+}
+
+/// The account the app runs as, by name.
+pub fn app_user() -> String {
+    std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_default()
+}
+
+/// Whether the command `args` needs an administrator even for an owner of
+/// the installed node (nerve_node::owner::needs_admin).
+pub fn needs_admin(args: &[String]) -> bool {
+    nerve_node::owner::args_need_admin(args)
 }
 
 fn strings(args: &[String]) -> Vec<&str> {
@@ -239,6 +257,7 @@ impl Ctl {
             settings: RefCell::new(None),
             instance: RefCell::new(None),
             elevate: Cell::new(None),
+            session_rights: Cell::new(false),
             link: RefCell::new(None),
             first_run: Cell::new(false),
             perm_asked: Cell::new(0),
@@ -319,10 +338,20 @@ impl Ctl {
         *self.chooser.borrow_mut() = chooser;
     }
 
-    /// The node is installed as a service: the app needs the rights to read
-    /// it, says why, and asks with `how` when the owner goes on.
+    /// The node is installed as a service, and its owners change it without
+    /// a question: `how` asks for an administrator only for a command that
+    /// needs one ([`nerve_node::owner::needs_admin`]), each time, and the
+    /// broker ends with that command.
+    pub fn admin_rights(&self, how: Launch) {
+        self.elevate.set(Some(how));
+    }
+
+    /// The node is installed as a service and the app's user is no owner:
+    /// the app needs the rights to read it, says why, and asks with `how`
+    /// when the owner goes on.
     pub fn needs_rights(&self, how: Launch) {
         self.elevate.set(Some(how));
+        self.session_rights.set(true);
         self.with_store(|s| {
             s.set_elevate_needed(true);
             s.set_elevate_open(true);
@@ -389,7 +418,17 @@ impl Ctl {
     /// Whether the commands cannot run yet: the node is the system's and the
     /// app has no rights for it.
     fn waiting_for_rights(&self) -> bool {
-        self.elevate.get().is_some() && !self.runner.borrow().elevated()
+        self.session_rights.get() && !self.runner.borrow().elevated()
+    }
+
+    /// How to ask for an administrator for `args` alone: when the command
+    /// needs one and the commands do not have the rights already.
+    fn admin_for(&self, args: &[String]) -> Option<Launch> {
+        let how = self.elevate.get()?;
+        if self.runner.borrow().elevated() || !needs_admin(args) {
+            return None;
+        }
+        Some(how)
     }
 
     /// Runs `work` with the runner, then `done` with its result on the
@@ -399,7 +438,16 @@ impl Ctl {
         work: impl FnOnce(&Runner) -> R + Send + 'static,
         done: impl FnOnce(&Rc<Ctl>, R) + Send + 'static,
     ) {
-        let runner = self.runner();
+        self.job_on(self.runner(), work, done);
+    }
+
+    /// [`Ctl::job`] with `runner` instead of the app's.
+    fn job_on<R: Send + 'static>(
+        self: &Rc<Self>,
+        runner: Runner,
+        work: impl FnOnce(&Runner) -> R + Send + 'static,
+        done: impl FnOnce(&Rc<Ctl>, R) + Send + 'static,
+    ) {
         match self.exec {
             Exec::Inline => {
                 let r = work(&runner);
@@ -426,6 +474,20 @@ impl Ctl {
         input: Option<String>,
         done: impl FnOnce(&Rc<Ctl>, Result<Value, String>) + Send + 'static,
     ) {
+        // What only an administrator may do asks for the rights this once:
+        // the broker ends with the command.
+        if let Some(how) = self.admin_for(&args) {
+            let exe = self.runner().exe().clone();
+            self.job(
+                move |r| {
+                    let broker = crate::broker::launch(&exe, how)?;
+                    r.through(broker)
+                        .run_with(&strings(&args), input.as_deref())
+                },
+                done,
+            );
+            return;
+        }
         self.job(
             move |r| r.run_with(&strings(&args), input.as_deref()),
             move |c, answer| {
@@ -544,7 +606,7 @@ impl Ctl {
         });
     }
 
-    fn show(self: &Rc<Self>, page: Page) {
+    pub(super) fn show(self: &Rc<Self>, page: Page) {
         self.with_store(|s| s.set_page(page));
         // Only the page that shows it keeps a command running.
         if !matches!(page, Page::Audit | Page::Log) {
@@ -591,8 +653,14 @@ impl Ctl {
                 let names: Vec<String> = centers.iter().map(|c| c.name.to_string()).collect();
                 let first = self.status.borrow().is_null();
                 *self.centers.borrow_mut() = names.clone();
+                // Commands that run as the app's user on the installed node
+                // can use its owner's way in (nerve_node::owner).
+                let account = v["account"].as_str().unwrap_or_default().to_string();
+                let as_you = self.service.get() && !account.is_empty() && account == app_user();
                 *self.status.borrow_mut() = v;
                 self.with_store(|s| {
+                    s.set_commands_as_you(as_you);
+                    s.set_commands_account(account.into());
                     s.set_status(status);
                     s.set_centers(ModelRc::new(VecModel::from(centers)));
                     s.set_status_load(Load::Ready);
@@ -1002,8 +1070,14 @@ pub fn run(start: crate::instance::Asked) -> Result<(), Failed> {
             .global::<Store>()
             .set_installed(layout.installed() && paths == layout.paths);
         ctl.watch_service(paths == layout.paths, &layout.bin);
-        // The CLI says itself whether this user may open the node's files.
-        if nerve_node::service::check_access(&paths).is_err() {
+        // An owner changes the installed node without a question, and is
+        // asked only for what needs an administrator; anyone else for the
+        // whole session (nerve_node::owner).
+        if paths == layout.paths && layout.installed() {
+            ctl.admin_rights(Launch::Elevated);
+        }
+        if nerve_node::service::check_access(&paths).is_err() && !nerve_node::owner::is_owner_here()
+        {
             ctl.needs_rights(Launch::Elevated);
         }
         match start.link {

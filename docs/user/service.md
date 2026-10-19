@@ -71,15 +71,24 @@ Nothing else is written. `journalctl -u nerve-node` shows the node's output.
 ## Use the commands
 
 When the node is installed, `nerve-node` without `--config-dir` and
-`--state-dir` works on the installed node. Run the commands with `sudo`:
+`--state-dir` works on the installed node. Its owners, the members of the
+group `nerve-admin` (`install` puts the user who ran `sudo` there), run the
+commands without `sudo`:
 
 ```sh
-sudo nerve-node status
-sudo nerve-node rule add allow 'git status'
+nerve-node status
+nerve-node rule add allow 'git status'
+nerve-node service restart
 ```
 
-A command that root runs on these folders runs as `nerve`, so every file it
-writes stays the node's. Another user gets a message that says to use `sudo`.
+The running node runs an owner's command as `nerve`, with the CLI's checks,
+and audits it with the owner's name ([who may change the
+node](desktop.md#administrator-rights)). These stay root's, with `sudo`:
+`install`, `update`, `uninstall`, `setup`, `sudo on`, `backup`, `restore`,
+and `machine.user`, `machine.allow_root`, `machine.sudo_path` and
+`machine.shell`. While the node is stopped, only root changes it. A command
+that root runs on these folders runs as `nerve`, so every file it writes
+stays the node's. Another user gets a message that says to use `sudo`.
 
 ## The account commands run as
 
@@ -194,15 +203,19 @@ desktop app does that in Settings, **Account for commands**.
 ## Start and stop
 
 ```sh
-sudo nerve-node service stop      # the node ends its links; nothing runs
-sudo nerve-node service start
-sudo nerve-node service restart   # takes every change in node.toml
-nerve-node service status         # needs no sudo
+nerve-node service stop      # the node ends its links; nothing runs
+nerve-node service start
+nerve-node service restart   # takes every change in node.toml
+nerve-node service status    # anyone may ask
 ```
 
 `service` does what `systemctl stop|start|restart nerve-node` does (on
 Windows, the service control manager), and waits until a node that starts
-answers. A stopped service starts again with the machine. `service status`
+answers. An owner needs no `sudo` for it at the machine: the polkit rule
+`/etc/polkit-1/rules.d/50-nerve-node.rules`, which `install` writes, lets the
+members of `nerve-admin` start, stop and restart this service from their own
+local session, and nothing else. Over SSH, and with polkit older than 0.106
+(Ubuntu 22.04), which takes no rules, it needs `sudo`. A stopped service starts again with the machine. `service status`
 says whether the node is installed as a service, whether it runs, whether it
 starts with the machine, and the installed program with its version.
 
@@ -222,10 +235,11 @@ The config, the keys and the audit log are not touched. `update` refuses a
 file that is not `nerve-node` and a program older than the installed one. If
 the new program does not start, the old one is put back and started again.
 
-`update` does not write the unit. After an update from a version without
-[limits per command](limits.md), run `sudo nerve-node install` once more: it
-writes the unit with `Delegate=` and restarts the node. Until then
-`nerve-node status` says that commands run without their limits.
+`update` writes the unit of the new version when it differs, so the node
+gets what a newer version needs ([limits per command](limits.md), the owners'
+runtime folder). A node installed before there were owners gets them: the
+group `nerve-admin` with the user who updates, and the polkit rule. An
+update changes no owner that is there.
 
 ## Uninstall
 
@@ -234,8 +248,9 @@ sudo nerve-node uninstall           # keeps the config and state folders
 sudo nerve-node uninstall --purge   # deletes them too
 ```
 
-`uninstall` stops and disables the service, removes the unit, the user
-`nerve` and `/usr/local/bin/nerve-node`. A session that a keyring gave
+`uninstall` stops and disables the service, removes the unit, the polkit
+rule, the group `nerve-admin`, the user `nerve` and
+`/usr/local/bin/nerve-node`. A session that a keyring gave
 `nerve` is ended first. Without `--purge`, `/etc/nerve` and
 `/var/lib/nerve` stay and belong to root from then on, so no later user with
 the old uid gets the keys. The account of the commands stays, also one that
@@ -286,10 +301,24 @@ Restart-Service nerve-node
 The service writes its log to `C:\ProgramData\Nerve\state\log.jsonl`. When
 it does not start, the Event Viewer says why, and the log has the rest.
 
+`install` also makes the user who ran it an owner of the node: its SID goes
+into the service's registry key
+(`HKLM\SYSTEM\CurrentControlSet\Services\nerve-node\Parameters`, value
+`Owners`), and the service lets it start, stop and restart the service. An
+owner runs the other commands in an ordinary terminal; the service runs them
+as `nerve` over a pipe open to the owners only, and audits them with the
+owner's name ([who may change the node](desktop.md#administrator-rights)).
+`install`, `update`, `uninstall`, `setup`, `sudo on`, `backup`, `restore` and
+the `machine.*` settings that pick the account still need an administrator's
+terminal. `update` gives a node installed before there were owners the user
+who updates as its owner; `uninstall` removes the service, and the owners and
+their rights with it.
+
 The other commands work on the installed node from an administrator's
-terminal. The service takes `folder add`, `folder set` and `folder rm` at
-once over its [control pipe](platforms.md#the-control-pipe), and every other
-change at its next start: `Restart-Service nerve-node`. `setup` asks no
+terminal, or an owner's. The service takes `folder add`, `folder set` and
+`folder rm` at once over its [control pipe](platforms.md#the-control-pipe),
+and every other change at its next start: `Restart-Service nerve-node`, or
+`nerve-node service restart`. `setup` asks no
 account there, and `--create-user` is refused.
 
 The installed node on Windows keeps its keys in files. The service runs as

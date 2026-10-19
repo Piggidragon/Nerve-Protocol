@@ -6,7 +6,11 @@ use std::rc::Rc;
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use super::{Choose, Ctl, Pending};
-use crate::{Load, Pick, Prefs, Tone, view};
+use crate::{Load, Page, Pick, Prefs, Store, Tone, view};
+
+/// The account the Overview offers for the commands, as the CLI's hint
+/// names it (nerve_node::account::CREATE_USER_HINT).
+const SEPARATE_ACCOUNT: &str = "nerve-work";
 
 impl Ctl {
     pub(super) fn prefs_load(self: &Rc<Self>) {
@@ -401,6 +405,19 @@ impl Ctl {
         self.account_change(args, None, format!("Commands run as {name}"));
     }
 
+    /// The Overview's offer when commands run as the app's user: on Linux
+    /// an account of their own at once (`setup --create-user`, which asks
+    /// for an administrator); on Windows, whose account needs a password,
+    /// the account card in Settings.
+    pub(super) fn separate_account(self: &Rc<Self>) {
+        if cfg!(windows) {
+            self.show(Page::Settings);
+            return;
+        }
+        self.with_prefs(|p| p.set_account_new(SEPARATE_ACCOUNT.into()));
+        self.account_use();
+    }
+
     /// `install` again with the account's new password on stdin: on
     /// Windows the service starts commands with it.
     fn account_password_save(self: &Rc<Self>) {
@@ -714,6 +731,10 @@ pub(super) fn wire(ctl: &Rc<Ctl>, window: &crate::AppWindow) {
     p.on_raw_add(move || c.raw_change("add"));
     let c = ctl.clone();
     p.on_account_use(move || c.account_use());
+    let c = ctl.clone();
+    window
+        .global::<Store>()
+        .on_separate_account(move || c.separate_account());
     let c = ctl.clone();
     p.on_account_password_save(move || c.account_password_save());
     let c = ctl.clone();

@@ -49,7 +49,9 @@ The first start shows the app's installer. It says what it installs, and
 - `nerve://` links, so a pairing link from a center's web UI opens in Nerve.
 
 Installing changes the system, so the system asks for an administrator's
-password next: polkit's dialog on Linux, the UAC prompt on Windows. On
+password next: polkit's dialog on Linux, the UAC prompt on Windows. You
+become the node's owner: from then on the app needs it only for update,
+uninstall and a few more ([administrator rights](#administrator-rights)). On
 Windows the installer first asks for your own Windows password: commands
 from your centers run as you, and the service needs your password to start
 them ([Windows](service.md#the-account-commands-run-as-on-windows)). That
@@ -84,19 +86,65 @@ over to the app's uninstall, so it removes the app too
 
 ## Administrator rights
 
-The node's settings and logs belong to the system, so the app asks for
-administrator rights once each time it opens, with the same system dialog,
-and says why first. It keeps them while it is open. Every change still runs as
-a `nerve-node` command.
+Like any installed program, Nerve asks for an administrator's password at
+install, and later only for what changes the system or gives root. The user
+who installs it becomes its **owner**. An owner opens the app, reads the node,
+changes its settings, pairs centers, edits rules, and starts, stops and
+restarts the service without a question, right after the install, without
+logging in again.
 
-The app's link to the rights is its own: on Linux the app closes itself to
-the other processes of your user once it asks (they can neither open that
-link nor trace the app), and its file dialogs then run in a process of
-their own, which the desktop portal answers; on Windows the link is open
-to the app's process alone. On Windows the app also loads the system's
-DLLs from System32 only, never from the folder it was downloaded to.
+The system's dialog (polkit on Linux, the UAC prompt on Windows) comes for
+these only, each time, for that one action, and the app says why first:
+update, uninstall, turning sudo on, the account commands run as, backup and
+restore, and the settings `machine.user`, `machine.allow_root`,
+`machine.sudo_path` and `machine.shell`, which decide which account and
+program commands run as. The rights end with the action.
 
-What this does not cover, while the app is open with the rights:
+Who changes the node's settings without a password:
+
+- **Linux:** root, and the members of the group `nerve-admin`. `install` puts
+  the user who ran it there (`sudo`, or the app's polkit dialog); `sudo
+  usermod --append --groups nerve-admin NAME` adds another,
+  `sudo gpasswd --delete NAME nerve-admin` takes one out. It counts at once.
+  The same members start, stop and restart the service from their own
+  session at the machine (the desktop, a console), through a polkit rule for
+  that service alone; over SSH, or from a program outside a session, polkit
+  asks for an administrator's password as before. polkit older than 0.106
+  (Ubuntu 22.04) takes no such rule: there starting and stopping asks for the
+  administrator's password, and `install` says so.
+- **Windows:** the administrators, and the user who installed (by SID, in the
+  service's registry key `Parameters\Owners`). The service lets that user
+  start, stop and restart it.
+
+How: the running node takes an owner's command over a socket of its own
+(`/run/nerve-node/owner.sock`; on Windows a named pipe open to the owners
+only), checks who asks, and runs the command as its own user, exactly as
+`sudo nerve-node …` does. Every change keeps the CLI's checks and is in the
+[audit log](audit.md) with the owner's name. While the node is stopped, only
+an administrator changes it: start it first.
+
+**Commands that run as you.** `install` runs commands from centers as the
+user who installed, unless an account was chosen before. Then a center's
+command runs as an owner. The node refuses its owners' way in to a process
+of a command it runs and to a confined program, but a command that has a
+program of yours start another for it, outside the node (your systemd user
+manager, a tmux server, the task scheduler on Windows), runs as you,
+unconfined: it can change the node's settings, and start and stop the
+service. The Overview warns about it. **Separate account** gives the
+commands an account of their own that is no owner: on Linux it makes
+`nerve-work` (with the administrator's password) and runs commands as it; on
+Windows it opens **Settings**, **Account for commands**, where you name an
+account of its own and give its password.
+
+The app's link to an administrator's rights, while an action has them, is its
+own: on Linux the app closes itself to the other processes of your user once
+it asks (they can neither open that link nor trace the app), and its file
+dialogs then run in a process of their own, which the desktop portal
+answers; on Windows the link is open to the app's process alone. On Windows
+the app also loads the system's DLLs from System32 only, never from the
+folder it was downloaded to.
+
+What this does not cover, while an action has the rights:
 
 - On Windows, any program that runs as you may reach into the app's
   process and act through it: Windows does not keep a user's programs
@@ -110,8 +158,8 @@ What this does not cover, while the app is open with the rights:
   update from, lies in your folders, which any program that runs as you
   may change before the node reads it.
 
-So the rights are as safe as your desktop session. Close the app when you
-are done; that gives them back.
+A user who is no owner is asked for the rights once each time the app opens,
+and the app keeps them until it closes.
 
 ## Start and stop
 

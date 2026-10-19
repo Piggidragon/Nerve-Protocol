@@ -141,7 +141,7 @@ impl Ctl {
 
     /// The broker ended (the owner's session, a crash): the app asks again.
     pub(super) fn rights_gone(&self) {
-        if self.elevate.get().is_none() {
+        if !self.session_rights.get() {
             return;
         }
         let plain = self.runner().direct();

@@ -232,10 +232,11 @@ jobs:
 
   # The desktop app for Linux (crates/nerve-node-desktop): the node with its
   # window in one program. It links the system's fontconfig and glibc, so it
-  # is not static; built on Ubuntu 24.04, it runs where glibc is 2.39 or newer.
+  # is not static. It is built on the oldest runner GitHub has, Ubuntu 22.04,
+  # so it runs where glibc is 2.35 or newer (Debian 12, Ubuntu 22.04).
   desktop-linux:
     needs: check
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-22.04
     env:
       SUFFIX: x86_64-linux
     steps:
@@ -408,7 +409,7 @@ jobs:
               prerelease=true
               ;;
           esac
-          footer="Static Linux binaries (x86_64, aarch64) and Windows x86_64 programs of \`nerve-center\` and \`nerve-node\`, and the desktop app \`nerve-node-desktop\` for Linux x86_64 (glibc 2.39 or newer) and Windows x86_64, built from $SHA. SHA256SUMS lists their checksums. They are not signed; \`nerve-node update\` and the desktop app's update check the one they download against SHA256SUMS (docs/user/service.md, docs/user/desktop.md)."
+          footer="Static Linux binaries (x86_64, aarch64) and Windows x86_64 programs of \`nerve-center\` and \`nerve-node\`, and the desktop app \`nerve-node-desktop\` for Linux x86_64 (glibc 2.35 or newer) and Windows x86_64, built from $SHA. SHA256SUMS lists their checksums. They are not signed; \`nerve-node update\` and the desktop app's update check the one they download against SHA256SUMS (docs/user/service.md, docs/user/desktop.md)."
           # A pre-release's body is the footer alone.
           if [ "$KIND" = release ]; then
             { cat notes/changelog.md; echo; echo "$footer"; } > release-notes.md

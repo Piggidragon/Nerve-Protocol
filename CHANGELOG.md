@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### The desktop app
+
+- `nerve-node-desktop` is the node with a window, for Linux x86_64 (GNOME or KDE Plasma, Wayland or X11; glibc 2.35 or newer) and Windows x86_64 ([#10](https://github.com/Piggidragon/Nerve-Protocol/issues/10)). It is one program: started with arguments it is `nerve-node`, started without any it opens the window. The window runs the CLI for every action, so it has the CLI's checks and audit records. See `docs/user/desktop.md`.
+- Its pages: overview (the node's state, panic and unlock, and the service's start, stop and restart); centers with pairing (also from a `nerve://` link), pause, resume and key rotation; permissions (mode, folders, rules, capability switches, sudo); audit; log; settings (config, proxy, relay, backup and restore); help; and the About dialog. A first-run setup names the node and pairs its first center. Light and dark follow the system, or the choice saved in the app.
+- The audit page has allow, allow as wildcard, deny and deny as wildcard on each entry, which write the same rule as `nerve-node rule add --action` ([#23](https://github.com/Piggidragon/Nerve-Protocol/issues/23)).
+- The downloaded file installs itself: the program, the node as a service under its own user (as `nerve-node install`), the menu or Start menu entry with its icon, and the `nerve://` handler, after the system's question for the rights (pkexec, UAC). Started again, it offers to open, update or uninstall Nerve. Settings update it (from the latest release, checked against `SHA256SUMS`, or a file) and uninstall it, keeping or deleting the node's data. On Windows it is in **Apps & features**, whose **Uninstall** opens the app's uninstall.
+- A node installed with `nerve-node` is taken over: the service runs the desktop app's program, and `nerve-node` (`nerve-node.exe` on Windows) becomes a link to it, so the terminal command keeps working. Uninstall removes the link.
+- The release has `nerve-node-desktop-x86_64-linux` and `nerve-node-desktop-x86_64-windows.exe`, with their checksums in `SHA256SUMS`.
+- The `NOTICE` file holds the licence of the Lucide icons, which the app and the center's web UI use. The app is built with Slint under its Royalty-free license 2.0.
+
+### Commands
+
+- `--json` on the read commands (`status`, `center ls`, `folder ls`, `rule ls`, `cap ls`, `config get`, `proxy ls`, `relay ls`, `sudo status`, `service status`, `audit`, `log`), and `{"messages": [...]}` or `{"error": ...}` from every other command (`docs/user/commands.md`).
+- No command waits for typing when stdin is no terminal: passwords and passphrases come from the first line of stdin or `--passphrase-file`, and `center add` needs `--yes`. `proxy set --password-stdin --headers-stdin` takes the proxy's password and headers from stdin.
+- `rule add` and `rule rm` take `--action`, the rule of an audit entry. `audit --last N` shows the newest entries only.
+- `nerve-node log [--last N] [--follow]` shows the node's log.
+- `nerve-node service start|stop|restart|status` controls the installed service; `status` needs no root.
+- `cap ls --json` lists the switchable capabilities (`known`).
+- Commands run through `pkexec` take the user who ran it as the account of the commands at `install`, as with `sudo`.
+- On Windows, the text `status` asks the running service through the control pipe, as `status --json` does.
+
 ## 0.0.5
 
 ### The action checker

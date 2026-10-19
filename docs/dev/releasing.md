@@ -41,8 +41,8 @@ workflow from" on `main` and fill in:
    runtime). Each Linux binary must be static. Each binary must print its
    version from `--version`, and it must equal the one given.
    It also builds the desktop app `nerve-node-desktop`: for Linux x86_64 on
-   Ubuntu 24.04 (it links glibc and fontconfig, so it runs where glibc is 2.39
-   or newer; the run's summary says the glibc it needs) and for Windows x86_64
+   Ubuntu 22.04, the oldest runner (it links glibc and fontconfig, so it runs
+   where glibc is 2.35 or newer; the run's summary says the glibc it needs) and for Windows x86_64
    (static C runtime). It must print `nerve-node-desktop <version>`.
 3. Runs the conformance suite (`cargo test -p nerve-conformance`) against the
    Linux binaries that were just built, the ones to be released, with
@@ -76,10 +76,12 @@ run again.
 
 1. Set the version in the workspace `Cargo.toml`, in the `version` of the path
    dependencies in `[workspace.dependencies]`, and in `Cargo.lock` (run
-   `cargo build`). Write the `## <version>` section of `CHANGELOG.md`.
+   `cargo build`). Rename the `## Unreleased` section of `CHANGELOG.md`, where
+   the changes since the last release collect, to `## <version>`.
 2. Merge that to `main`.
 3. Run the workflow with kind `release` and that version.
 
 After a release, raise the version in `Cargo.toml` and `Cargo.lock` with the
 first change toward the next one. Until then the workflow refuses a pre-release
-of the released version.
+of the released version. That change also starts a new `## Unreleased` section
+at the top of `CHANGELOG.md`.

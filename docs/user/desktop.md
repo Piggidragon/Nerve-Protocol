@@ -14,7 +14,7 @@ From [Releases](https://github.com/Piggidragon/Nerve-Protocol/releases):
 
 | System | File |
 |---|---|
-| Linux, x86_64 | `nerve-node-desktop-x86_64-linux` (needs glibc 2.39 or newer: Ubuntu 24.04, Fedora 40, Debian 13 and later) |
+| Linux, x86_64 | `nerve-node-desktop-x86_64-linux` (needs glibc 2.35 or newer: Ubuntu 22.04, Debian 12, Fedora 36 and later) |
 | Windows, x86_64 | `nerve-node-desktop-x86_64-windows.exe` |
 
 Check it against `SHA256SUMS` ([install](install.md#download)).

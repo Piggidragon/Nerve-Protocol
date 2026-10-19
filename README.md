@@ -11,6 +11,11 @@ Two programs:
 | `nerve-center` | The center. A harness starts it as an MCP server. It pairs machines, keeps their links, gives the harness their tools and serves a web UI |
 | `nerve-node` | The node. A daemon on each machine, plus a CLI for pairing, rules and the audit log |
 
+On a machine with a desktop (Linux x86_64 with GNOME or KDE, Windows x86_64),
+`nerve-node-desktop` is the node with an app: download it, open it, and it
+installs itself with the node as a service. Everything the CLI does is in its
+window ([desktop app](docs/user/desktop.md)).
+
 ## Quick install
 
 On a Linux machine the agent may use, install the node as a service (use

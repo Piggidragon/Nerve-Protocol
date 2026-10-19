@@ -11,6 +11,10 @@ Two programs make it work:
 | `nerve-center` | the machine where the harness runs | Pairs machines, keeps their links, gives the harness their tools over MCP, serves the web UI |
 | `nerve-node` | every machine the agent may use | Links to a center and decides each call by the rules you set |
 
+On a machine with a desktop, `nerve-node-desktop` is the node with an app
+that installs itself and does what the CLI does in a window
+([desktop app](desktop.md)).
+
 The node always dials the center. A machine behind NAT or a firewall needs no
 open port.
 
@@ -20,7 +24,8 @@ open port.
 2. [Run the center](center.md) and [connect a harness](harness.md).
 3. [Pair a machine](pairing.md), or [install the node as a
    service](service.md) and run `nerve-node setup` (with `sudo` on Linux,
-   as administrator on Windows).
+   as administrator on Windows), or on a desktop open the
+   [desktop app](desktop.md).
 4. Allow something with a [mode](modes.md) or a [rule](rules.md). Until you do,
    every call is refused.
 
@@ -33,6 +38,7 @@ open port.
 | [harness.md](harness.md) | Connect an MCP harness, the tools it gets |
 | [pairing.md](pairing.md) | Pair a machine, start the node, unpair |
 | [service.md](service.md) | Install the node as a service, set it up, update and uninstall it |
+| [desktop.md](desktop.md) | The desktop app: install it by opening it, start and stop the node, update and uninstall it |
 | [modes.md](modes.md) | `allowlist`, `folder` and `user` mode, folders and their rights |
 | [rules.md](rules.md) | Allow and deny rules, wildcards, switching capabilities off |
 | [protected-paths.md](protected-paths.md) | The files that stay closed in every mode |

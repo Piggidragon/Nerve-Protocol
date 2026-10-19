@@ -20,6 +20,15 @@ in `ui/theme.slint`. Screenshots of every page, light and dark:
 NERVE_DESKTOP_SHOTS=/tmp/shots cargo test -p nerve-node-desktop --test shots -- --ignored
 ```
 
+Started from `target/`, the app shows its installer: it opens its pages only
+from its installed place. `tests/real.rs` installs, controls, updates and
+removes it through the app's code; run it on a test machine only, as root (on
+Windows as an elevated administrator):
+
+```sh
+NERVE_DESKTOP_REAL=/path/to/nerve-node-desktop cargo test -p nerve-node-desktop --test real -- --ignored
+```
+
 ## Checks
 
 ```sh

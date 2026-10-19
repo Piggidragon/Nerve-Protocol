@@ -183,11 +183,20 @@ pub async fn on(
     }
     let _ = writeln!(
         out,
-        "sudo: on (only commands the sudo allow list names run with sudo)\n{}\nthe change {}: `Restart-Service {SERVICE_NAME}` lets the running service take it.",
+        "sudo: on (only commands the sudo allow list names run with sudo)\n{}\n{}",
         warning(&a.name),
-        crate::cli::NEXT_START
+        next_start_line()
     );
+    crate::cli::waits_for_next_start();
     Ok(())
+}
+
+/// The last line of `sudo on`: the running service takes it at its start.
+pub(crate) fn next_start_line() -> String {
+    format!(
+        "the change {}: `Restart-Service {SERVICE_NAME}` lets the running service take it.",
+        crate::cli::NEXT_START
+    )
 }
 
 /// `nerve-node sudo off`: removes the kept password, which the running

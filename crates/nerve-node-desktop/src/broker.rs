@@ -64,8 +64,26 @@ fn output_of(v: &Value) -> Output {
 }
 
 /// The broker's side: answers the requests on `input` with `exe`, the
-/// program itself, until `input` ends; then ends what still runs.
-pub fn serve(input: impl Read, output: Box<dyn Write + Send>, exe: PathBuf) {
+/// program itself, until `input` ends; then ends what still runs. With the
+/// SID of the app's user (Windows), its commands take that user as the one
+/// who asked ([`nerve_node::cli::DESKTOP_USER_SID`]).
+pub fn serve(
+    input: impl Read,
+    output: Box<dyn Write + Send>,
+    exe: PathBuf,
+    app_user_sid: Option<&str>,
+) {
+    let env: Arc<Vec<(String, String)>> = Arc::new(
+        app_user_sid
+            .map(|sid| {
+                (
+                    nerve_node::cli::DESKTOP_USER_SID.to_string(),
+                    sid.to_string(),
+                )
+            })
+            .into_iter()
+            .collect(),
+    );
     let out: Out = Arc::new(Mutex::new(output));
     if !send(&out, &json!({ "hello": HELLO })) {
         return;
@@ -103,12 +121,13 @@ pub fn serve(input: impl Read, output: Box<dyn Write + Send>, exe: PathBuf) {
             continue;
         }
         let input = req["input"].as_str().map(str::to_string);
-        let (out, exe) = (out.clone(), exe.clone());
+        let (out, exe, env) = (out.clone(), exe.clone(), env.clone());
         if req["follow"] == true {
             let (o1, o2) = (out.clone(), out.clone());
             let follow = follow_process(
                 &exe,
                 &args,
+                &env,
                 Box::new(move |line| {
                     send(&o1, &json!({ "id": id, "line": line }));
                 }),
@@ -134,7 +153,7 @@ pub fn serve(input: impl Read, output: Box<dyn Write + Send>, exe: PathBuf) {
             continue;
         }
         std::thread::spawn(move || {
-            let o = run_process(&exe, &args, input.as_deref()).unwrap_or_else(|e| Output {
+            let o = run_process(&exe, &args, &env, input.as_deref()).unwrap_or_else(|e| Output {
                 stderr: e.into_bytes(),
                 ..Output::default()
             });
@@ -448,7 +467,7 @@ pub fn main(args: &[String]) -> i32 {
     if !args.is_empty() {
         return 2;
     }
-    serve(std::io::stdin(), Box::new(std::io::stdout()), exe);
+    serve(std::io::stdin(), Box::new(std::io::stdout()), exe, None);
     0
 }
 
@@ -648,9 +667,7 @@ pub mod win {
         connected.store(true, std::sync::atomic::Ordering::SeqCst);
         // The commands' `install` takes the app's user for the account of
         // the commands, not the administrator (nerve_node::cli::invoker).
-        // SAFETY: the other thread only sleeps and reads its flag.
-        unsafe { std::env::set_var(nerve_node::cli::DESKTOP_USER_SID, sid) };
-        super::serve(requests, Box::new(answers), exe);
+        super::serve(requests, Box::new(answers), exe, Some(sid));
         0
     }
 
@@ -823,6 +840,7 @@ mod tests {
                 req_r,
                 Box::new(ans_w),
                 PathBuf::from("/nonexistent/program"),
+                None,
             )
         });
         writeln!(req_w, "{}", json!({"id": 7, "args": ["__exec-shim", "x"]})).unwrap();
@@ -840,6 +858,55 @@ mod tests {
                 .unwrap()
                 .contains("commands only")
         );
+    }
+
+    /// The broker's commands, run once or followed, take the app's user as
+    /// the one who asked when the broker was given that user's SID (the
+    /// broker on Windows, which may run as another account), and only
+    /// then. The program here prints what it got.
+    #[cfg(unix)]
+    #[test]
+    fn the_commands_carry_the_apps_user() {
+        let d = tempfile::tempdir().unwrap();
+        let exe = d.path().join("node");
+        let mut sh = std::process::Command::new("/bin/sh")
+            .args(["-c", "cat > \"$0\" && chmod 755 \"$0\""])
+            .arg(&exe)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = sh.stdin.take().unwrap();
+        let var = nerve_node::cli::DESKTOP_USER_SID;
+        input
+            .write_all(format!("#!/bin/sh\necho \"${{{var}-none}}\"\n").as_bytes())
+            .unwrap();
+        drop(input);
+        assert!(sh.wait().unwrap().success());
+        let got = |sid: Option<&'static str>| {
+            let (req_r, mut req_w) = pipe();
+            let (ans_r, ans_w) = pipe();
+            let exe = exe.clone();
+            let t = std::thread::spawn(move || serve(req_r, Box::new(ans_w), exe, sid));
+            let mut said = Vec::new();
+            let mut lines = BufReader::new(ans_r).lines();
+            lines.next();
+            writeln!(req_w, "{}", json!({"id": 1, "args": ["--json", "x"]})).unwrap();
+            let done = serde_json::from_str::<Value>(&lines.next().unwrap().unwrap()).unwrap();
+            said.push(done["done"]["stdout"].as_str().unwrap().trim().to_string());
+            writeln!(
+                req_w,
+                "{}",
+                json!({"id": 2, "args": ["--json", "x"], "follow": true})
+            )
+            .unwrap();
+            let line = serde_json::from_str::<Value>(&lines.next().unwrap().unwrap()).unwrap();
+            said.push(line["line"].as_str().unwrap().to_string());
+            drop(req_w);
+            t.join().unwrap();
+            said
+        };
+        assert_eq!(got(Some("S-1-5-21-1-2-3-1001")), ["S-1-5-21-1-2-3-1001"; 2]);
+        assert_eq!(got(None), ["none"; 2]);
     }
 
     /// pkexec runs, and what it says when it does not start the broker

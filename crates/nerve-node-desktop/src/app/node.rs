@@ -10,9 +10,17 @@ use crate::broker;
 use crate::{Store, Tone};
 
 impl Ctl {
-    /// The app ends: so does what follows the audit or the log.
-    pub fn end(&self) {
+    /// The app ends: so does what follows the audit or the log. A restart
+    /// the app said would come runs now, while the app still has the rights
+    /// for it, or the service would go on without the change; its answer,
+    /// `None` when none waited.
+    pub fn end(&self) -> Option<Result<(), String>> {
         self.stop_follow();
+        if !self.restart_waits.replace(false) {
+            return None;
+        }
+        self.restart_timer.stop();
+        Some(self.runner().run(&["service", "restart"]).map(|_| ()))
     }
 
     /// The installed service's state, from `service status`, which needs no
@@ -40,6 +48,8 @@ impl Ctl {
     /// Restarts the installed service for the changes that wait for it
     /// ([`Ctl::restart_for`]).
     pub(super) fn restart_service(self: &Rc<Self>) {
+        self.restart_waits.set(false);
+        self.restart_timer.stop();
         self.with_store(|s| s.set_busy("service-restart".into()));
         self.command(
             vec!["service".into(), "restart".into()],
@@ -71,6 +81,10 @@ impl Ctl {
             "stop" => "The service stopped: the node ended its links.",
             _ => "The service restarted, and the node answers.",
         };
+        // The owner's own start, stop or restart replaces one the app
+        // planned: a stopped service stays stopped.
+        self.restart_waits.set(false);
+        self.restart_timer.stop();
         self.with_store(|s| s.set_busy(key.as_str().into()));
         self.command(
             vec!["service".into(), what.to_string()],
@@ -279,6 +293,20 @@ impl Ctl {
         self.setup_go(3);
     }
 
+    /// The steps closed before their end, with × or Escape: the restart
+    /// their changes wait for runs now, as at their end.
+    fn setup_close(self: &Rc<Self>) {
+        let (running, due) = self
+            .with_store(|s| {
+                s.set_setup_open(false);
+                (s.get_service_state() == "running", s.get_restart_due())
+            })
+            .unwrap_or_default();
+        if running && due {
+            self.restart_service();
+        }
+    }
+
     fn setup_skip(&self) {
         let step = self.with_store(|s| s.get_setup_step()).unwrap_or(0);
         // Without a center there is no mode to choose.
@@ -298,4 +326,6 @@ pub(super) fn wire(ctl: &Rc<Ctl>, window: &crate::AppWindow) {
     store.on_setup_next(move || c.setup_next());
     let c = ctl.clone();
     store.on_setup_skip(move || c.setup_skip());
+    let c = ctl.clone();
+    store.on_setup_close(move || c.setup_close());
 }

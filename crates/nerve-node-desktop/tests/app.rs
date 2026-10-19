@@ -187,19 +187,37 @@ fn the_app_drives_the_cli_end_to_end() {
         store.get_toast()
     );
     assert!(!store.get_restart_due());
-    // With the service running, the app restarts it for such a change. The
-    // service here is none, so the restart fails, and the Overview goes on
-    // offering it.
+    // With the service running, the app restarts it for such a change, a
+    // moment later. The service here is none, so the restart fails, and
+    // the Overview goes on offering it.
     store.set_service_state("running".into());
     store.invoke_center_pause("home".into(), true);
     assert!(store.get_restart_due());
+    assert!(
+        store
+            .get_toast()
+            .ends_with("The node restarts in a moment to take it."),
+        "{}",
+        store.get_toast()
+    );
+    ctl.tick();
     assert!(
         store.get_toast().starts_with("The node did not restart")
             && store.get_toast().contains("Restart it on the Overview"),
         "{}",
         store.get_toast()
     );
+    assert!(store.get_restart_due());
+    assert_eq!(ctl.end(), None, "the restart ran");
+    // The app ends before that moment: its end restarts the service, or
+    // the change would wait for the next start of the machine.
     store.invoke_center_pause("home".into(), false);
+    let ended = ctl.end();
+    assert!(
+        matches!(&ended, Some(Err(e)) if e.contains("--config-dir")),
+        "{ended:?}"
+    );
+    assert_eq!(ctl.end(), None, "once");
     // The first-run steps restart it once, at their end: a new name waits
     // for it meanwhile.
     store.set_restart_due(false);
@@ -217,6 +235,22 @@ fn the_app_drives_the_cli_end_to_end() {
     assert_eq!(store.get_toast_tone(), nerve_node_desktop::Tone::Danger);
     assert!(
         store.get_toast().contains("--config-dir"),
+        "{}",
+        store.get_toast()
+    );
+    // Closed with × or Escape before their end, the steps restart it all
+    // the same.
+    store.set_restart_due(false);
+    store.invoke_setup_start();
+    store.set_setup_name("boxy-2".into());
+    store.invoke_setup_next();
+    assert!(store.get_restart_due(), "{}", store.get_setup_error());
+    store.set_toast("".into());
+    store.invoke_setup_close();
+    assert!(!store.get_setup_open());
+    assert!(
+        store.get_toast_tone() == nerve_node_desktop::Tone::Danger
+            && store.get_toast().contains("--config-dir"),
         "{}",
         store.get_toast()
     );
@@ -785,7 +819,13 @@ fn the_app_drives_the_cli_end_to_end() {
     // It has no uninstall dialog of its own to open.
     ctl.started_again(uninstall);
     assert!(!install.get_uninstall_open());
-    if install.get_step() == "welcome" {
+    // Install works on the machine's own places, whatever `bin` says: with
+    // root or an elevated token (GitHub's Windows runner has one) it would
+    // install this test's build as the machine's Nerve, or take over the
+    // node installed there. Such a run leaves it out.
+    if nerve_node::rights::full_rights() {
+        eprintln!("not pressing Install: this test runs with the rights to install");
+    } else if install.get_step() == "welcome" {
         install.invoke_install();
         assert_eq!(install.get_step(), "welcome");
         assert!(

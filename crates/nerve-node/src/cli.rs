@@ -934,6 +934,7 @@ async fn rotate_key(
         return Ok(());
     }
     let days = nerve_proto::ROTATE_GRACE_MS / 86_400_000;
+    json::also("public_key", json!(key));
     let _ = writeln!(
         out,
         "center {name} took this machine's new key:\n  {key}\nThe old key is deleted here. The center takes it for {days} more days, unless you end that now with `nerve-node center rotate-key --end-grace --center {name}`."
@@ -1222,13 +1223,29 @@ pub async fn execute(cli: Cli, out: &mut dyn Write) -> Result<(), String> {
     json::changed(paths, cli.cmd, out).await
 }
 
-/// Whether a line a change printed says that the node takes it only at its
-/// next start: a node that does not run, the installed node on Windows for
-/// anything but folders, a relay change on Windows. `--json` says it as
-/// `"next_start": true`; the desktop app shows such a line in words of its
-/// own.
+/// Whether `line` is one a change prints to say that the node takes it
+/// only at its next start: a node that does not run, the installed node on
+/// Windows for anything but folders, a relay change or sudo on Windows. The
+/// desktop app shows such a line in words of its own. Only the whole line
+/// counts: a change also prints what others chose (a rule a center's
+/// command became), and such text could hold the same words.
 pub fn takes_at_next_start(line: &str) -> bool {
-    line.contains(NEXT_START) || line == RELAY_AT_NEXT_START
+    line == in_file_line()
+        || line == RELAY_AT_NEXT_START
+        || line == crate::winsudo::next_start_line()
+}
+
+/// What a change says when only node.toml holds it.
+fn in_file_line() -> String {
+    format!("the change is in node.toml; it {NEXT_START}")
+}
+
+/// Says, as `"next_start": true` with `--json`, that the node takes the
+/// change only at its next start: called where the line that says so is
+/// written, so a program learns it from what the command did and not from
+/// its text.
+pub(crate) fn waits_for_next_start() {
+    json::also("next_start", json!(true));
 }
 
 /// [`execute`] with the text output, and what it says when a change is
@@ -1255,7 +1272,8 @@ async fn said(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), Str
         && std::fs::read(paths.config_file()).ok() != before
         && !daemon_answers(&paths, folders).await
     {
-        let _ = writeln!(out, "the change is in node.toml; it {NEXT_START}");
+        let _ = writeln!(out, "{}", in_file_line());
+        waits_for_next_start();
     }
     r
 }
@@ -1311,22 +1329,23 @@ pub const DESKTOP_USER_SID: &str = "NERVE_DESKTOP_USER_SID";
 /// app's broker ([`DESKTOP_USER_SID`]).
 fn invoker() -> String {
     #[cfg(windows)]
-    {
-        if let Some(name) = std::env::var(DESKTOP_USER_SID)
-            .ok()
-            .and_then(|sid| crate::win_user::name_of_sid(&sid).ok())
-        {
-            return name;
-        }
-        if let Ok(me) = crate::win_user::current_user() {
-            return me;
-        }
+    if let Some(name) = windows_invoker(std::env::var(DESKTOP_USER_SID).ok()) {
+        return name;
     }
     invoker_of(
         std::env::var("SUDO_USER").ok(),
         std::env::var("PKEXEC_UID").ok(),
         crate::account::name_of,
     )
+}
+
+/// [`invoker`] on Windows: the desktop app's user when its broker names
+/// one by SID (`app_user`), else the account this command runs as.
+#[cfg(windows)]
+fn windows_invoker(app_user: Option<String>) -> Option<String> {
+    app_user
+        .and_then(|sid| crate::win_user::name_of_sid(&sid).ok())
+        .or_else(|| crate::win_user::current_user().ok())
 }
 
 /// [`invoker`] from `SUDO_USER`, else `PKEXEC_UID`: polkit's pkexec, with
@@ -1873,6 +1892,7 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             };
             let r = crate::backup::backup(&paths, &cfg, &file, &pass, &opts)?;
             crate::backup::print_backup(&r, &file, out);
+            json::also("backup", crate::backup::backup_data(&r, &file));
             Ok(())
         }
         Cmd::Restore {
@@ -3871,6 +3891,7 @@ async fn relay_in_force(paths: &NodePaths, out: &mut dyn Write, now: Option<&str
         }
     } else if cfg!(windows) {
         let _ = writeln!(out, "{RELAY_AT_NEXT_START}");
+        waits_for_next_start();
     }
 }
 
@@ -4175,6 +4196,26 @@ mod tests {
         assert_eq!(invoker_of(None, Some("1001".into()), alice), "root");
         assert_eq!(invoker_of(None, Some("0".into()), alice), "root");
         assert_eq!(invoker_of(None, None, alice), "root");
+    }
+
+    /// On Windows the desktop app's broker names the app's user by SID, and
+    /// that user is the one who asked, not the account the broker runs as
+    /// (an administrator who answered the UAC prompt).
+    #[cfg(windows)]
+    #[test]
+    fn the_invoker_on_windows_is_the_apps_user_the_broker_names() {
+        // LOCAL SERVICE: an account that never runs this test.
+        let other = "S-1-5-19";
+        let name = crate::win_user::name_of_sid(other).unwrap();
+        let me = crate::win_user::current_user().unwrap();
+        assert_ne!(name, me);
+        assert_eq!(windows_invoker(Some(other.into())), Some(name));
+        assert_eq!(windows_invoker(None), Some(me.clone()));
+        // A SID without an account names nobody: then this command's user.
+        assert_eq!(
+            windows_invoker(Some("S-1-5-21-1-2-3-4242".into())),
+            Some(me)
+        );
     }
 
     /// A folder in a home the node's user may not look into (the installed
@@ -7373,6 +7414,17 @@ mod tests {
         // The same again changes nothing, and says no such thing.
         let v = json_of(&paths, &["mode", "set", "user"]);
         assert!(v.get("next_start").is_none(), "{v}");
+        // A change prints what others chose, such as a command a center
+        // sent: the same words in it are no such thing either.
+        let odd = format!("echo {NEXT_START}");
+        run(&paths, &["rule", "add", "deny", &odd]).unwrap();
+        let v = json_of(&paths, &["rule", "add", "deny", &odd]);
+        assert!(
+            v["messages"][0].as_str().unwrap().contains(NEXT_START),
+            "{v}"
+        );
+        assert!(v.get("next_start").is_none(), "{v}");
+        assert!(!takes_at_next_start(v["messages"][0].as_str().unwrap()));
 
         // A relay token: the lines, and what the other node needs as data.
         run(&paths, &["relay", "set", "0.0.0.0:7491"]).unwrap();

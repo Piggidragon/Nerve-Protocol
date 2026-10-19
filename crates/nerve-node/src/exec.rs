@@ -3463,18 +3463,30 @@ mod windows_tests {
     struct Subst(String);
 
     impl Subst {
+        /// `None` when no letter is free. Tests that run at the same time
+        /// can find the same letter free and both take it: the one that
+        /// comes second ("Drive already SUBSTed") tries the next.
         fn new(base: &Path) -> Option<Subst> {
-            let letter = ('R'..='Z')
-                .rev()
-                .find(|c| !Path::new(&format!("{c}:\\")).exists())?;
-            let drive = format!("{letter}:");
-            let made = std::process::Command::new("subst")
-                .arg(&drive)
-                .arg(base)
-                .output()
-                .unwrap();
-            assert!(made.status.success(), "{made:?}");
-            Some(Subst(drive))
+            let mut failed = None;
+            for letter in ('R'..='Z').rev() {
+                let drive = format!("{letter}:");
+                if Path::new(&format!("{drive}\\")).exists() {
+                    continue;
+                }
+                let made = std::process::Command::new("subst")
+                    .arg(&drive)
+                    .arg(base)
+                    .output()
+                    .unwrap();
+                if made.status.success() {
+                    return Some(Subst(drive));
+                }
+                failed = Some(made);
+            }
+            if let Some(made) = failed {
+                panic!("no free letter took the drive: {made:?}");
+            }
+            None
         }
 
         /// A path on the drive.
@@ -3489,6 +3501,26 @@ mod windows_tests {
                 .args([self.0.as_str(), "/d"])
                 .output();
         }
+    }
+
+    /// A letter that looks free can be taken: by a test that took it
+    /// meanwhile, or by a drive whose folder is gone, as here. A new drive
+    /// goes to the next letter instead of failing.
+    #[test]
+    fn a_subst_drive_takes_the_next_letter_when_one_is_taken() {
+        let d = tempfile::tempdir().unwrap();
+        let gone = d.path().join("gone");
+        std::fs::create_dir(&gone).unwrap();
+        let Some(taken) = Subst::new(&gone) else {
+            return;
+        };
+        std::fs::remove_dir(&gone).unwrap();
+        assert!(!Path::new(&format!("{}\\", taken.0)).exists());
+        let Some(next) = Subst::new(d.path()) else {
+            return;
+        };
+        assert_ne!(next.0, taken.0);
+        assert!(Path::new(&format!("{}\\", next.0)).exists());
     }
 
     /// A symlink to a volume root (`\\?\Volume{guid}\…`) is walked as the

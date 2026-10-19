@@ -64,7 +64,51 @@ pub struct BackupReport {
     /// The keys in the file, as a message names them.
     pub saved: Vec<String>,
     /// What was not taken, and why.
-    pub left_out: Vec<String>,
+    pub left_out: Vec<LeftOut>,
+}
+
+/// A key a backup did not take.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeftOut {
+    /// The key, as a message names it.
+    pub what: String,
+    pub why: Why,
+}
+
+/// Why a backup did not take a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Why {
+    /// It does not fit the config.
+    DoesNotFit,
+    /// It is in the system keyring, and the backup was not told to take it.
+    Keyring,
+    /// This node has none.
+    Missing,
+}
+
+impl Why {
+    /// Its name in `backup --json`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Why::DoesNotFit => "does-not-fit",
+            Why::Keyring => "keyring",
+            Why::Missing => "missing",
+        }
+    }
+}
+
+impl std::fmt::Display for LeftOut {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let what = &self.what;
+        match self.why {
+            Why::DoesNotFit => write!(f, "{what} (it does not fit the config, so it was left out)"),
+            Why::Keyring => write!(
+                f,
+                "{what} (it is in the system keyring; --include-keyring takes it out)"
+            ),
+            Why::Missing => write!(f, "{what} (this node has none)"),
+        }
+    }
 }
 
 /// Writes the backup of the node `cfg` describes at `paths` to `file`.
@@ -127,13 +171,18 @@ fn collect(
                 files.insert(name, t);
                 report.saved.push(what);
             }
-            Fetch::Text(_) => report.left_out.push(format!(
-                "{what} (it does not fit the config, so it was left out)"
-            )),
-            Fetch::Keyring => report.left_out.push(format!(
-                "{what} (it is in the system keyring; --include-keyring takes it out)"
-            )),
-            Fetch::Missing => report.left_out.push(format!("{what} (this node has none)")),
+            Fetch::Text(_) => report.left_out.push(LeftOut {
+                what,
+                why: Why::DoesNotFit,
+            }),
+            Fetch::Keyring => report.left_out.push(LeftOut {
+                what,
+                why: Why::Keyring,
+            }),
+            Fetch::Missing => report.left_out.push(LeftOut {
+                what,
+                why: Why::Missing,
+            }),
         }
     };
 
@@ -987,6 +1036,22 @@ pub fn print_backup(r: &BackupReport, file: &Path, out: &mut dyn std::io::Write)
     );
 }
 
+/// What a backup did, as data: the file, the centers, the keys it took,
+/// and the ones it left out with why.
+pub fn backup_data(r: &BackupReport, file: &Path) -> serde_json::Value {
+    let left_out: Vec<serde_json::Value> = r
+        .left_out
+        .iter()
+        .map(|l| serde_json::json!({"what": l.what, "why": l.why.as_str()}))
+        .collect();
+    serde_json::json!({
+        "file": file.display().to_string(),
+        "centers": r.centers,
+        "saved": r.saved,
+        "left_out": left_out,
+    })
+}
+
 /// What a restore did, as data: the centers, the keys kept or missing,
 /// and each note with what it asks to be set again (`fix`, `center`).
 pub fn restore_data(r: &RestoreReport, b: &Parsed) -> serde_json::Value {
@@ -1257,7 +1322,7 @@ mod tests {
         assert!(report.saved.is_empty(), "{report:?}");
         assert_eq!(report.left_out.len(), 1);
         assert!(
-            report.left_out[0].contains("--include-keyring"),
+            report.left_out[0].to_string().contains("--include-keyring"),
             "{report:?}"
         );
         assert!(parsed.keys.is_empty());
@@ -2254,7 +2319,10 @@ mod tests {
         set("http://proxy-a.example:3128", &["Proxy-Authorization"]);
         let (_f, parsed, report) = roundtrip(&n, false);
         assert!(
-            report.left_out.iter().any(|l| l.contains("header values")),
+            report
+                .left_out
+                .iter()
+                .any(|l| l.what.contains("header values")),
             "{report:?}"
         );
 
@@ -2932,7 +3000,7 @@ mod tests {
             report
                 .left_out
                 .iter()
-                .any(|l| l.contains("header values") && l.contains("--include-keyring")),
+                .any(|l| l.what.contains("header values") && l.why == Why::Keyring),
             "{report:?}"
         );
         assert!(without.proxy_headers.is_none());

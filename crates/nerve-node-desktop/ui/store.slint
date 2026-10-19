@@ -121,6 +121,8 @@ export global Store {
     callback setup-start();
     callback setup-next();
     callback setup-skip();
+    // The steps closed before their end (× or Escape).
+    callback setup-close();
 }
 
 // The Permissions page: what one center may do.

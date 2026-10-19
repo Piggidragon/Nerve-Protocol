@@ -2,7 +2,10 @@
 
 Releases are made by the `Release` workflow (`.github/workflows/release.yml`).
 The owner starts it by hand: **Actions, Release, Run workflow**. Leave "Use
-workflow from" on `main` and fill in:
+workflow from" on `main` and fill in the inputs below. A pre-release of a
+branch that changes the release workflow itself picks that branch under "Use
+workflow from" too: GitHub takes the workflow file from there, not from
+`branch`.
 
 | Input | Meaning |
 |---|---|

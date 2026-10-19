@@ -1,10 +1,11 @@
 # Linux and Windows
 
-Both programs run on Linux (x86_64, aarch64) and Windows (x86_64). The node
-behaves the same except where this page says so. The Linux programs are
-static and run on any distribution; the [desktop app](desktop.md) is not, and
-needs glibc 2.35 or newer (Ubuntu 22.04, Debian 12, Fedora 36 and later) and
-fontconfig.
+The center and the node run on Linux (x86_64, aarch64) and Windows (x86_64),
+the [desktop app](desktop.md) (`nerve-node-desktop`, the node with an app) on
+Linux x86_64 and Windows x86_64. The node behaves the same except where this
+page says so. The Linux programs are static and run on any distribution; the
+desktop app is not, and needs glibc 2.35 or newer (Ubuntu 22.04, Debian 12,
+Fedora 36 and later) and fontconfig.
 
 | | Linux | Windows |
 |---|---|---|

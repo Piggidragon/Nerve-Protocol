@@ -44,6 +44,27 @@ fn chown(path: &Path, id: u32) {
     assert!(status.success());
 }
 
+/// Whether root in a namespace of `unshare` may give a file to another
+/// user, as the test does. That a namespace opens is not enough: Ubuntu
+/// 24.04 (GitHub's runner) gives one under AppArmor's restriction of
+/// unprivileged user namespaces, and its root, without capabilities there,
+/// gets EPERM from `chown`.
+fn namespace_root_may_chown(unshare: &[&str]) -> bool {
+    let Ok(d) = tempfile::tempdir() else {
+        return false;
+    };
+    let probe = d.path().join("probe");
+    if std::fs::write(&probe, "").is_err() {
+        return false;
+    }
+    Command::new("unshare")
+        .args(unshare)
+        .args(["chown", &format!("{NODE}:{NODE}")])
+        .arg(&probe)
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
 fn mode(path: &Path, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
@@ -96,14 +117,9 @@ fn the_backup_file_is_opened_as_the_user_who_asked() {
             "not root in the namespace"
         );
         let unshare = ["--map-root-user", "--map-auto"];
-        let can = Command::new("unshare")
-            .args(unshare)
-            .arg("true")
-            .output()
-            .is_ok_and(|o| o.status.success());
-        if !can {
+        if !namespace_root_may_chown(&unshare) {
             eprintln!(
-                "skipped: needs root, or a user namespace (unshare --map-root-user --map-auto)"
+                "skipped: needs root, or a user namespace whose root may change owners (unshare --map-root-user --map-auto)"
             );
             return;
         }

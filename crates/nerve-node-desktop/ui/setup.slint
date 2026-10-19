@@ -23,7 +23,7 @@ export component SetupDialog inherits Dialog {
         : "The node links this machine to its centers. Its pages show what it does.";
     card-width: 580px;
     close => {
-        Store.setup-open = false;
+        Store.setup-close();
     }
 
     // One step at a time; every step stays in place (see Reveal). The last

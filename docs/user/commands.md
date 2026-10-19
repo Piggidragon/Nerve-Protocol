@@ -9,8 +9,10 @@ page with them too.
 On Windows, `nerve-node-desktop.exe` is the desktop app. It runs these commands
 itself, but a terminal does not wait for it: in a terminal use `nerve-node.exe`
 from the release. Where the app took over the installed node, the installed
-`nerve-node.exe` is a link to the app; see [the desktop app](desktop.md#in-a-terminal)
-for how a terminal waits for it.
+`nerve-node.exe` is removed, so download `nerve-node-x86_64-windows.exe` from the
+release for a terminal; it works on the node the app installed
+([the desktop app](desktop.md#in-a-terminal)). On Linux the installed
+`nerve-node` stays a link to the app, and works in a terminal as before.
 
 Every command takes `--config-dir` and `--state-dir`
 ([where files live](install.md#where-files-live)). A command that works on
@@ -111,7 +113,10 @@ one JSON value from stdout:
   start (it does not run, or it is the installed node on Windows, which
   takes only folder changes while it runs); `center add --yes` says it the
   same way. `relay add` and `relay token` add `"token"` (`node`, `token`,
-  `proxy`, the address the other node sets with `proxy set`, and `pin`), and
+  `proxy`, the address the other node sets with `proxy set`, and `pin`),
+  `backup` adds `"backup"` (`file`, `centers`, `saved`, and `left_out`, each
+  with `what` and `why`: `keyring`, `does-not-fit` or `missing`),
+  `center rotate-key` adds `"public_key"`, the new key, and
   `restore` adds `"restored"` (`centers`, `kept`, `no_key`, and `notes`,
   each with `text` and, when it asks you to set something again, `fix`:
   `proxy`, `sudo`, `sudo-file`, `pin` with its `center`, or `relay`).

@@ -4,16 +4,15 @@ Nerve lets an agent harness use your machines: read and write files and run
 commands. On each machine you decide what is allowed. Everything else is
 refused.
 
-Two programs make it work:
+Three programs make it work:
 
 | Program | Runs on | Job |
 |---|---|---|
 | `nerve-center` | the machine where the harness runs | Pairs machines, keeps their links, gives the harness their tools over MCP, serves the web UI |
-| `nerve-node` | every machine the agent may use | Links to a center and decides each call by the rules you set |
+| `nerve-node` | each machine the agent may use, without a desktop or run from a terminal | Links to a center and decides each call by the rules you set; its CLI sets them |
+| `nerve-node-desktop` | each machine the agent may use that has a desktop (Linux x86_64 with GNOME or KDE Plasma, Windows x86_64) | The same node, with an app that installs itself and does what the CLI does in a window ([desktop app](desktop.md)) |
 
-On a machine with a desktop, `nerve-node-desktop` is the node with an app
-that installs itself and does what the CLI does in a window
-([desktop app](desktop.md)).
+A machine runs one node: `nerve-node` or `nerve-node-desktop`.
 
 The node always dials the center. A machine behind NAT or a firewall needs no
 open port.

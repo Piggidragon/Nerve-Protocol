@@ -185,6 +185,11 @@ fn a_restore_says_what_it_did_as_data() {
     let file = file.to_str().unwrap();
     let (ok, v) = with_stdin(d.path(), &["backup", file], "correct horse battery\n");
     assert!(ok, "{v}");
+    // The backup says what it wrote as data too, for the desktop app.
+    let b = &v["backup"];
+    assert_eq!(b["file"], file, "{v}");
+    assert_eq!(b["centers"], serde_json::json!([]), "{v}");
+    assert!(b["saved"].is_array() && b["left_out"].is_array(), "{v}");
     let (ok, v) = with_stdin(
         d.path(),
         &["restore", file, "--replace", "--without-proxy"],

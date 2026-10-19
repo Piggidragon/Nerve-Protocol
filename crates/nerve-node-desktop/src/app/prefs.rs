@@ -5,7 +5,7 @@ use std::rc::Rc;
 
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
-use super::{Choose, Ctl, Pending, messages};
+use super::{Choose, Ctl, Pending};
 use crate::{Load, Pick, Prefs, Tone, view};
 
 impl Ctl {
@@ -528,7 +528,7 @@ impl Ctl {
             match answer {
                 Ok(v) => {
                     c.with_prefs(|p| p.set_backup_open(false));
-                    c.show_once("The backup is written", "", &messages(&v), "");
+                    c.show_once("The backup is written", "", &view::backup_written(&v), "");
                 }
                 Err(e) => {
                     c.with_prefs(|p| p.set_backup_error(e.into()));
@@ -606,15 +606,11 @@ impl Ctl {
                 vec!["service".into(), "start".into()],
                 None,
                 move |c, started| {
-                    let then = match started {
-                        Ok(_) => {
-                            c.with_store(|s| s.set_restart_due(false));
-                            "The node started again, with what is restored.".to_string()
-                        }
-                        Err(e) => {
-                            format!("The node did not start again: {e}. Start it on the Overview.")
-                        }
-                    };
+                    if started.is_ok() {
+                        c.with_store(|s| s.set_restart_due(false));
+                    }
+                    let started = started.as_ref().map(|_| ()).map_err(String::as_str);
+                    let then = view::started_after_restore(answer.is_ok(), started);
                     c.restored(answer, then, true);
                 },
             );

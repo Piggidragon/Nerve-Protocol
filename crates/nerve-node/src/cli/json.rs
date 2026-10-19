@@ -41,9 +41,9 @@ pub(super) fn also(key: &str, value: Value) {
 }
 
 /// Runs a command without a form of its own: the lines it prints as
-/// `{"messages": [...]}`, with `"next_start": true` when one of them says
-/// that the node takes the change only at its next start
-/// ([`takes_at_next_start`]), and what it added with [`also`].
+/// `{"messages": [...]}`, and what it added with [`also`], such as
+/// `"next_start": true` when the node takes the change only at its next
+/// start ([`waits_for_next_start`]).
 pub(super) async fn changed(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), String> {
     let mut text = Vec::new();
     let (r, fields) = ALSO
@@ -56,9 +56,6 @@ pub(super) async fn changed(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> 
     let text = String::from_utf8_lossy(&text);
     let messages: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
     let mut v = json!({ "messages": messages });
-    if messages.iter().any(|l| takes_at_next_start(l)) {
-        v["next_start"] = json!(true);
-    }
     for (k, f) in fields {
         v[k] = f;
     }
@@ -291,7 +288,7 @@ async fn pair(
     let e = crate::pair::pair(paths, &link, name).await?;
     let mut v = json!({ "paired": true, "name": e.name, "url": e.url, "messages": [] });
     if std::fs::read(paths.config_file()).ok() != before && !daemon_answers(paths, false).await {
-        v["messages"] = json!([format!("the change is in node.toml; it {NEXT_START}")]);
+        v["messages"] = json!([in_file_line()]);
         v["next_start"] = json!(true);
     }
     Ok(v)

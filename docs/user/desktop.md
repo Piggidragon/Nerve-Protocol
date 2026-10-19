@@ -124,7 +124,8 @@ machine. In a terminal this is `nerve-node service stop|start|restart`
 On Windows the running service takes folder changes at once and every other
 change only when it starts again, a pairing too. So after such a change the
 app restarts the service itself, two seconds after the last one, and says
-so; the first-run steps restart it once, at their end. The node's links come
+so; closed before then, the app restarts it as it closes. The first-run
+steps restart it once, at their end, also when you close them early. The node's links come
 back at once, but a command a center runs at that moment ends. If the
 restart fails, the Overview says that changes wait and offers **Restart**.
 

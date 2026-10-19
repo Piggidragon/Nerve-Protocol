@@ -1,7 +1,9 @@
 # Install
 
-Put `nerve-center` on the machine where your agent harness runs. Put
-`nerve-node` on every machine the agent may use. They can share a machine.
+Put `nerve-center` on the machine where your agent harness runs. Put a node
+on every machine the agent may use: `nerve-node`, or on a machine with a
+desktop `nerve-node-desktop`, the node with an app
+([desktop app](desktop.md)). A center and a node can share a machine.
 
 ## Download
 

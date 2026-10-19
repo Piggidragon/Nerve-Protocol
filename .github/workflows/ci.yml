@@ -94,7 +94,8 @@ jobs:
       # Root's backup and restore on a node of another user open the file as
       # the user who asked (crates/nerve-node/src/caller_file.rs). That test
       # needs root, and the run above skips it where the runner gives no user
-      # namespace; here only the test program runs as root, not cargo.
+      # namespace whose root may change owners (ubuntu-24.04 restricts them
+      # with AppArmor); here only the test program runs as root, not cargo.
       - name: Root's backup file, as root
         env:
           CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER: sudo -E

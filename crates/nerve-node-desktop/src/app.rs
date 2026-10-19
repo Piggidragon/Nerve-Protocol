@@ -126,6 +126,9 @@ pub struct Ctl {
     perm_asked: Cell<u64>,
     /// Restarts the service a moment after a change it takes only then.
     restart_timer: slint::Timer,
+    /// A restart the app said would come and that has not run yet; the
+    /// app's end runs it ([`Ctl::end`]).
+    restart_waits: Cell<bool>,
 }
 
 thread_local! {
@@ -160,11 +163,6 @@ fn now_ms() -> u64 {
 
 fn strings(args: &[String]) -> Vec<&str> {
     args.iter().map(String::as_str).collect()
-}
-
-/// The lines a change said (`{"messages": [...]}`), as one text.
-fn messages(v: &Value) -> String {
-    lines(v).collect::<Vec<_>>().join("\n")
 }
 
 fn lines(v: &Value) -> impl Iterator<Item = &str> {
@@ -245,6 +243,7 @@ impl Ctl {
             first_run: Cell::new(false),
             perm_asked: Cell::new(0),
             restart_timer: slint::Timer::default(),
+            restart_waits: Cell::new(false),
         });
         CURRENT.with(|c| *c.borrow_mut() = Some(ctl.clone()));
         window.global::<Type>().set_mono(mono_font().into());
@@ -494,23 +493,30 @@ impl Ctl {
     }
 
     /// Restarts the service a moment after the last change that needs it,
-    /// so that a few changes in a row restart it once.
+    /// so that a few changes in a row restart it once. Should the app end
+    /// before, its end runs it ([`Ctl::end`]).
     fn restart_soon(self: &Rc<Self>) {
-        match self.exec {
-            // No timers without the event loop.
-            Exec::Inline => self.restart_service(),
-            Exec::Threads => {
-                let c = Rc::downgrade(self);
-                self.restart_timer.start(
-                    slint::TimerMode::SingleShot,
-                    Duration::from_secs(2),
-                    move || {
-                        if let Some(c) = c.upgrade() {
-                            c.restart_service();
-                        }
-                    },
-                );
-            }
+        self.restart_waits.set(true);
+        // No timers without the event loop: tests call [`Ctl::tick`].
+        if self.exec == Exec::Threads {
+            let c = Rc::downgrade(self);
+            self.restart_timer.start(
+                slint::TimerMode::SingleShot,
+                Duration::from_secs(2),
+                move || {
+                    if let Some(c) = c.upgrade() {
+                        c.restart_service();
+                    }
+                },
+            );
+        }
+    }
+
+    /// What the timers do when their moment comes, for tests, which have no
+    /// event loop: the restart that waits.
+    pub fn tick(self: &Rc<Self>) {
+        if self.restart_waits.get() {
+            self.restart_service();
         }
     }
 
@@ -834,16 +840,13 @@ impl Ctl {
                     match answer {
                         Ok(v) if at_once => c.command(end_grace, None, move |c, answer| {
                             c.with_store(|s| s.set_busy(SharedString::new()));
-                            c.show_once(
-                                &title,
-                                KEY_NOTE,
-                                "",
-                                &view::new_key(&name, &v, Some(answer)),
-                            );
+                            let (text, key) = view::new_key(&name, &v, Some(answer));
+                            c.show_once(&title, "", &text, &key);
                         }),
                         Ok(v) => {
                             c.with_store(|s| s.set_busy(SharedString::new()));
-                            c.show_once(&title, KEY_NOTE, "", &view::new_key(&name, &v, None));
+                            let (text, key) = view::new_key(&name, &v, None);
+                            c.show_once(&title, "", &text, &key);
                         }
                         Err(e) => {
                             c.with_store(|s| s.set_busy(SharedString::new()));
@@ -1011,7 +1014,9 @@ pub fn run(start: crate::instance::Asked) -> Result<(), Failed> {
         ctl.watch();
     }
     let r = window.run().map_err(|e| Failed::Window(e.to_string()));
-    ctl.end();
+    if let Some(Err(e)) = ctl.end() {
+        eprintln!("The node did not restart for the last change: {e}");
+    }
     // A start in software (crate::deps) is the user's one window then.
     ctl.instance.borrow_mut().take();
     r

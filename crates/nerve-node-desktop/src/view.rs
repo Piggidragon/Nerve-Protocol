@@ -281,18 +281,12 @@ pub fn no_keyring(reason: &str) -> &'static str {
     }
 }
 
-/// What the app says after `center rotate-key` gave the center `name` a new
-/// key (`said`): the key as the CLI showed it, and, in the app's words
-/// instead of the CLI's command line, whether the center still takes the
-/// old one, after `--end-grace` (`ended`) or without it.
-pub fn new_key(name: &str, said: &Value, ended: Option<Result<Value, String>>) -> String {
-    let key: Vec<&str> = said["messages"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .take(2)
-        .collect();
+/// What the app shows after `center rotate-key` gave `name` this machine's
+/// new key (`said["public_key"]`): that the center has it, and, in the
+/// app's words instead of the CLI's command line, whether the center still
+/// takes the old one, after `--end-grace` (`ended`) or without it; and the
+/// key apart, to compare with what the center shows.
+pub fn new_key(name: &str, said: &Value, ended: Option<Result<Value, String>>) -> (String, String) {
     let then = match ended {
         None => format!("The old key is deleted here. {name} takes it for 7 more days."),
         Some(Ok(_)) => format!("The old key is deleted here, and {name} no longer takes it."),
@@ -300,7 +294,82 @@ pub fn new_key(name: &str, said: &Value, ended: Option<Result<Value, String>>) -
             format!("The old key is deleted here, but {name} still takes it for 7 more days: {e}")
         }
     };
-    format!("{}\n{then}", key.join("\n"))
+    (
+        format!("{name} has this machine's new key: nothing needs to be copied.\n\n{then}"),
+        s(&said["public_key"]).to_string(),
+    )
+}
+
+/// What `backup` wrote (`said["backup"]`), in the app's words: where, what
+/// it holds, and what it left out and why; for keys in the keyring the
+/// backup dialog's own choice, not the CLI's flag.
+pub fn backup_written(said: &Value) -> String {
+    let b = &said["backup"];
+    let names = |v: &Value| -> Vec<String> {
+        v.as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(str::to_string)
+            .collect()
+    };
+    let centers = names(&b["centers"]);
+    let pairing = match centers.len() {
+        0 => ", paired with no center".to_string(),
+        _ => format!(", with the pairing of {}", and_list(&centers)),
+    };
+    let saved = names(&b["saved"]);
+    let keys = match saved.len() {
+        0 => String::new(),
+        _ => format!(", and {}", and_list(&saved)),
+    };
+    let mut text = format!(
+        "The backup is in {}.\n\nIt holds the node's settings{pairing}{keys}.",
+        s(&b["file"])
+    );
+    let left = |why: &str| -> Vec<String> {
+        b["left_out"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|l| l["why"] == why)
+            .map(|l| s(&l["what"]).to_string())
+            .collect()
+    };
+    for (why, one, more) in [
+        (
+            "keyring",
+            "is in the system keyring, so it is not in the file. To take it too, back up again with \"Take the keys in the system keyring too\".",
+            "are in the system keyring, so they are not in the file. To take them too, back up again with \"Take the keys in the system keyring too\".",
+        ),
+        (
+            "does-not-fit",
+            "does not fit the node's settings, so it is not in the file.",
+            "do not fit the node's settings, so they are not in the file.",
+        ),
+        (
+            "missing",
+            "is not in the file: this node has none.",
+            "are not in the file: this node has none.",
+        ),
+    ] {
+        let what = left(why);
+        let said = if what.len() > 1 { more } else { one };
+        if !what.is_empty() {
+            text.push_str(&format!("\n{} {said}", sentence(&and_list(&what))));
+        }
+    }
+    text.push_str("\n\nThe file is sealed with your passphrase. Keep both: without the passphrase nobody can open the file, you included.");
+    text
+}
+
+/// `a`, `a and b`, `a, b and c`.
+fn and_list(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 /// The token of `relay add` or `relay token` (`said["token"]`), in the
@@ -381,6 +450,20 @@ pub fn restored(said: &Value, started: &str) -> String {
         text.push_str(&lines[1..].join("\n"));
     }
     format!("{text}\n\n{started}")
+}
+
+/// What became of the service the app stopped for a restore and started
+/// again (`started`): with what is restored, or, after a restore that
+/// failed, which then put everything back, as it was.
+pub fn started_after_restore(restored: bool, started: Result<(), &str>) -> String {
+    match (restored, started) {
+        (true, Ok(())) => "The node started again, with what is restored.".into(),
+        (false, Ok(())) => "Nothing is restored: the node started again as it was.".into(),
+        (true, Err(e)) => format!("The node did not start again: {e}. Start it on the Overview."),
+        (false, Err(e)) => format!(
+            "Nothing is restored, and the node did not start again: {e}. Start it on the Overview."
+        ),
+    }
 }
 
 /// `text` as a sentence: its first letter up, a full stop at its end.
@@ -1025,15 +1108,81 @@ mod tests {
             "center lab took this machine's new key:",
             "  ed25519:AAAA",
             "The old key is deleted here. The center takes it for 7 more days, unless you end that now with `nerve-node center rotate-key --end-grace --center lab`.",
-        ]});
-        let text = new_key("lab", &said, None);
-        assert!(text.starts_with("center lab took this machine's new key:\n  ed25519:AAAA\n"));
+        ], "public_key": "ed25519:AAAA"});
+        let (text, copy) = new_key("lab", &said, None);
+        // The key apart, and no prose in it; nothing to copy to another node.
+        assert_eq!(copy, "ed25519:AAAA");
+        assert!(text.starts_with("lab has this machine's new key: nothing needs"));
+        assert!(
+            !text.contains("AAAA") && !text.contains("other node"),
+            "{text}"
+        );
         assert!(text.ends_with("lab takes it for 7 more days."), "{text}");
         assert!(!text.contains("nerve-node"), "{text}");
-        let ended = new_key("lab", &said, Some(Ok(json!({}))));
+        let (ended, _) = new_key("lab", &said, Some(Ok(json!({}))));
         assert!(ended.ends_with("lab no longer takes it."), "{ended}");
-        let failed = new_key("lab", &said, Some(Err("the link dropped".into())));
+        let (failed, _) = new_key("lab", &said, Some(Err("the link dropped".into())));
         assert!(failed.contains("still takes it") && failed.contains("the link dropped"));
+    }
+
+    /// After a restore that failed, the node the app started again runs
+    /// as it was, and the app says so instead of "with what is restored".
+    #[test]
+    fn a_failed_restore_says_the_node_runs_as_it_was() {
+        assert_eq!(
+            started_after_restore(true, Ok(())),
+            "The node started again, with what is restored."
+        );
+        let failed = started_after_restore(false, Ok(()));
+        assert!(
+            failed.starts_with("Nothing is restored") && !failed.contains("with what is restored"),
+            "{failed}"
+        );
+        let neither = started_after_restore(false, Err("it timed out"));
+        assert!(
+            neither.starts_with("Nothing is restored") && neither.contains("it timed out"),
+            "{neither}"
+        );
+        assert!(started_after_restore(true, Err("x")).contains("did not start again: x"));
+    }
+
+    /// What a backup wrote, in the app's words: a key the keyring kept
+    /// names the dialog's choice, never the CLI's flag.
+    #[test]
+    fn a_backup_says_what_it_holds_in_the_apps_words() {
+        // What `backup --json` says (cli.rs; backup::backup_data).
+        let said = json!({"messages": ["backed up to /home/alex/n.backup", "  left out: the node key for lab (it is in the system keyring; --include-keyring takes it out)"],
+            "backup": {"file": "/home/alex/n.backup", "centers": ["home", "lab"],
+                "saved": ["the node key for home"],
+                "left_out": [{"what": "the node key for lab", "why": "keyring"}]}});
+        let text = backup_written(&said);
+        assert!(
+            text.starts_with("The backup is in /home/alex/n.backup."),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "It holds the node's settings, with the pairing of home and lab, and the node key for home."
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("The node key for lab is in the system keyring")
+                && text.contains("\"Take the keys in the system keyring too\""),
+            "{text}"
+        );
+        assert!(!text.contains("--") && !text.contains("  "), "{text}");
+        let none = json!({"backup": {"file": "/b", "centers": [], "saved": [],
+            "left_out": [{"what": "the node key for a", "why": "missing"}, {"what": "the node key for b", "why": "missing"}]}});
+        let text = backup_written(&none);
+        assert!(
+            text.contains("It holds the node's settings, paired with no center."),
+            "{text}"
+        );
+        assert!(
+            text.contains("The node key for a and the node key for b are not in the file"),
+            "{text}"
+        );
     }
 
     #[test]

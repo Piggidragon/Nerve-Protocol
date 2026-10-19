@@ -339,7 +339,7 @@ impl Ctl {
 
     fn close_app(&self) {
         self.with_install(|i| i.set_closed(true));
-        self.end();
+        let _ = self.end();
         if self.exec == Exec::Threads {
             let _ = slint::quit_event_loop();
         }

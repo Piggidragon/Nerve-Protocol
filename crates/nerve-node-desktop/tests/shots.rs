@@ -583,6 +583,23 @@ fn every_page_light_and_dark() {
     );
     prefs.set_once_open(true);
     shots.take("settings-restored");
+    // What a backup wrote, in the app's words.
+    let written = serde_json::json!({"backup": {
+        "file": "/home/alex/nerve-node.backup", "centers": ["home", "lab"],
+        "saved": ["the node key for home", "the config key"],
+        "left_out": [{"what": "the node key for lab", "why": "keyring"}],
+    }});
+    prefs.set_once_title("The backup is written".into());
+    prefs.set_once_text(nerve_node_desktop::view::backup_written(&written).into());
+    shots.take("settings-backup-written");
+    // A new key: the center has it; the key apart, to compare.
+    let rotated = serde_json::json!({"public_key": "9f2c4be81d07a3c56e0b1f48d2a97c3e5b60f1a2d8c4e7b9031f6a5d2c8e4b17"});
+    let (text, key) = nerve_node_desktop::view::new_key(OFFICE, &rotated, None);
+    prefs.set_once_title(format!("New key for {OFFICE}").into());
+    prefs.set_once_text(text.into());
+    prefs.set_once_copy(key.into());
+    shots.take("centers-new-key-done");
+    prefs.set_once_copy("".into());
     prefs.set_once_open(false);
     // Windows, no account yet (a password mistyped at install): the card
     // takes the password of the app's user.
@@ -696,9 +713,14 @@ fn every_page_light_and_dark() {
     install.set_step("welcome".into());
     install.set_node_only(false);
     shots.take("installer-welcome");
-    // The system refuses (here: no root); the step says why.
-    install.invoke_install();
-    shots.take("installer-failed");
+    // The system refuses (here: no root); the step says why. With the
+    // rights, Install would install this build on the machine (tests/app.rs).
+    if nerve_node::rights::full_rights() {
+        eprintln!("installer-failed left out: this run has the rights to install");
+    } else {
+        install.invoke_install();
+        shots.take("installer-failed");
+    }
     install.set_error(no_agent.into());
     shots.take("installer-no-polkit-agent");
     install.set_error("".into());

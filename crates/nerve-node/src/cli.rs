@@ -96,6 +96,15 @@ pub enum Cmd {
         #[arg(long, value_name = "N")]
         last: Option<usize>,
     },
+    /// Show the node's log: its starts and stops, its links, and what went wrong.
+    Log {
+        /// Keep running and print new lines as they arrive.
+        #[arg(long)]
+        follow: bool,
+        /// Show only the newest N lines (with --follow, then the new ones).
+        #[arg(long, value_name = "N")]
+        last: Option<usize>,
+    },
     /// Stop everything at once; nothing runs until `unlock`.
     Panic,
     /// Let the node work again after `panic`.
@@ -500,7 +509,13 @@ const SECTIONS: &[(&str, &str, &[&[&str]])] = &[
     (
         "Run and watch",
         "Start the node, see what it did, and stop it.",
-        &[&["run"], &["status"], &["audit"], &["panic", "unlock"]],
+        &[
+            &["run"],
+            &["status"],
+            &["audit"],
+            &["log"],
+            &["panic", "unlock"],
+        ],
     ),
 ];
 
@@ -1737,6 +1752,7 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             denied,
             last,
         } => audit(&paths, follow, denied, last, false, out).await,
+        Cmd::Log { follow, last } => log_cmd(&paths, follow, last, false, out).await,
         Cmd::Proxy(c) => proxy_cmd(&paths, c, out).await,
         Cmd::Relay(c) => relay_cmd(&paths, c, out).await,
         Cmd::Sudo(c) => sudo_cmd(&paths, c, out).await,
@@ -2777,6 +2793,103 @@ async fn audit(
         let _ = out.flush();
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+/// `log`: the node's log file, the moved-aside one first (docs/user/logs.md).
+/// `--follow` looks again every 500 ms and reads what was added to the file,
+/// or the new file from its start once the old one was moved aside. With
+/// `json` the lines are as the file holds them: one list, or with `follow`
+/// one JSON line each.
+async fn log_cmd(
+    paths: &NodePaths,
+    follow: bool,
+    last: Option<usize>,
+    json: bool,
+    out: &mut dyn Write,
+) -> Result<(), String> {
+    let file = paths.log_file();
+    let read = |p: &Path| match std::fs::read(p) {
+        Ok(b) => Ok(b),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(e) => Err(format!("{}: {e}", p.display())),
+    };
+    let mut old = file.clone().into_os_string();
+    old.push(".1");
+    let mut bytes = read(Path::new(&old))?;
+    let current = read(&file)?;
+    let mut at = current.len();
+    // The file's first bytes tell it from the one that replaces it, which
+    // can be as long already.
+    let head = |b: &[u8]| b[..b.len().min(64)].to_vec();
+    let mut first = head(&current);
+    bytes.extend_from_slice(&current);
+    let parse = |bytes: &[u8]| -> Vec<Value> {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .collect()
+    };
+    let mut lines = parse(&bytes);
+    if let Some(n) = last {
+        lines.drain(..lines.len().saturating_sub(n));
+    }
+    let show = |out: &mut dyn Write, v: &Value| {
+        let _ = if json {
+            writeln!(out, "{v}")
+        } else {
+            writeln!(out, "{}", log_line(v))
+        };
+    };
+    if json && !follow {
+        let _ = writeln!(out, "{}", json!({ "entries": lines }));
+        return Ok(());
+    }
+    for v in &lines {
+        show(out, v);
+    }
+    // A line still being written waits for its end.
+    let mut rest: Vec<u8> = Vec::new();
+    if !follow {
+        return Ok(());
+    }
+    loop {
+        let _ = out.flush();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let now = read(&file)?;
+        if now.len() < at || !now.starts_with(&first) {
+            // Moved aside: what the old file got after the last look, then
+            // the new file from its start.
+            let moved = read(Path::new(&old))?;
+            rest.extend_from_slice(moved.get(at..).unwrap_or_default());
+            at = 0;
+        }
+        if first.len() < 64 {
+            first = head(&now);
+        }
+        rest.extend_from_slice(&now[at..]);
+        at = now.len();
+        let Some(end) = rest.iter().rposition(|b| *b == b'\n') else {
+            continue;
+        };
+        let done: Vec<u8> = rest.drain(..=end).collect();
+        for v in parse(&done) {
+            show(out, &v);
+        }
+    }
+}
+
+/// One line of the log for people: the time, the level, the message.
+fn log_line(v: &Value) -> String {
+    let mut line = format!(
+        "{}  {}  {}",
+        v["ts"].as_u64().unwrap_or_default(),
+        v["level"].as_str().unwrap_or_default(),
+        v["msg"].as_str().unwrap_or_default()
+    );
+    if let Some(n) = v["node"].as_str() {
+        line.push_str(&format!(" ({n})"));
+    }
+    line
 }
 
 /// Where `audit --follow` is: the last line it looked at, how many copies
@@ -7110,5 +7223,114 @@ mod tests {
         )
         .unwrap_err();
         assert!(e.contains("cut"), "{e}");
+    }
+
+    fn logged(ts: u64, level: &str, msg: &str) -> String {
+        format!("{}\n", json!({"ts": ts, "level": level, "msg": msg}))
+    }
+
+    #[test]
+    fn log_shows_the_moved_file_first_and_the_newest_with_last() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("c"), d.path().join("s"));
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        std::fs::write(
+            paths.state_dir.join("log.jsonl.1"),
+            logged(1, "info", "node started"),
+        )
+        .unwrap();
+        std::fs::write(
+            paths.log_file(),
+            logged(2, "warn", "link dropped") + &logged(3, "error", "cannot connect"),
+        )
+        .unwrap();
+        let out = run(&paths, &["log"]).unwrap();
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(
+            lines,
+            [
+                "1  info  node started",
+                "2  warn  link dropped",
+                "3  error  cannot connect"
+            ]
+        );
+        let v = json_of(&paths, &["log", "--last", "2"]);
+        assert_eq!(v["entries"][0]["msg"], "link dropped", "{v}");
+        assert_eq!(v["entries"].as_array().unwrap().len(), 2, "{v}");
+        // No log yet is no error.
+        let empty = NodePaths::new(d.path().join("c2"), d.path().join("s2"));
+        assert_eq!(json_of(&empty, &["log"]), json!({"entries": []}));
+    }
+
+    /// `log --follow` goes on with the new file once the old one is moved
+    /// aside, the lines written to the old one before that included.
+    #[tokio::test]
+    async fn log_follow_goes_on_after_the_file_is_moved_aside() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("c"), d.path().join("s"));
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        let file = paths.log_file();
+        let append = |line: String| {
+            use std::io::Write as _;
+            let mut f = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&file)
+                .unwrap();
+            f.write_all(line.as_bytes()).unwrap();
+        };
+        append(logged(1, "info", "first"));
+        let seen = Seen::default();
+        let mut out = seen.clone();
+        let follow = log_cmd(&paths, true, Some(5), true, &mut out);
+        let writer = async {
+            seen.until("first").await;
+            append(logged(2, "info", "before-the-move"));
+            std::fs::rename(&file, paths.state_dir.join("log.jsonl.1")).unwrap();
+            append(logged(3, "info", "after-the-move"));
+            seen.until("after-the-move").await;
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+        };
+        tokio::select! {
+            r = follow => panic!("follow ended: {r:?}"),
+            () = writer => {}
+        }
+        let text = seen.text();
+        let msgs: Vec<String> = text
+            .lines()
+            .map(|l| {
+                serde_json::from_str::<Value>(l).unwrap()["msg"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            msgs,
+            ["first", "before-the-move", "after-the-move"],
+            "{text}"
+        );
+    }
+
+    /// `cap ls --json` names what `cap set` switches, so the app need not.
+    #[test]
+    fn cap_ls_json_names_the_switchable_capabilities() {
+        let (_d, paths) = setup(&["home"]);
+        run(&paths, &["cap", "set", "exec", "off"]).unwrap();
+        let v = json_of(&paths, &["cap", "ls"]);
+        let known = &v["known"];
+        assert!(
+            known["fs"].as_array().unwrap().contains(&json!("read")),
+            "{v}"
+        );
+        assert!(
+            known["exec"].as_array().unwrap().contains(&json!("run")),
+            "{v}"
+        );
+        assert!(
+            known.get("settings").is_none() && known.get("node").is_none(),
+            "{v}"
+        );
+        assert_eq!(v["caps"], json!({"exec": "off"}));
     }
 }

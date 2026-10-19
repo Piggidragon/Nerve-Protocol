@@ -14,6 +14,7 @@ pub(super) fn own_form(cmd: &Cmd) -> bool {
         cmd,
         Cmd::Status
             | Cmd::Audit { .. }
+            | Cmd::Log { .. }
             | Cmd::Center(CenterCmd::Ls | CenterCmd::Add { .. })
             | Cmd::Folder(FolderCmd::Ls { .. })
             | Cmd::Rule(RuleCmd::Ls { .. })
@@ -50,6 +51,7 @@ pub(super) async fn command(
             denied,
             last,
         } => return audit(paths, follow, denied, last, true, out).await,
+        Cmd::Log { follow, last } => return log_cmd(paths, follow, last, true, out).await,
         Cmd::Center(CenterCmd::Ls) => centers(paths).await?,
         Cmd::Center(CenterCmd::Add { link, name, yes }) => {
             pair(paths, &link, name.as_deref(), yes).await?
@@ -100,7 +102,13 @@ pub(super) async fn command(
                 .iter()
                 .map(|(cap, s)| (cap.clone(), json!(enum_str(s))))
                 .collect();
-            json!({ "center": name, "caps": caps })
+            // What `cap set` switches here, so a program need not know it.
+            let known: serde_json::Map<String, Value> =
+                crate::descriptor::switchable(&cfg, cfg.center(&name).expect("picked"))
+                    .into_iter()
+                    .map(|(cap, actions)| (cap, json!(actions)))
+                    .collect();
+            json!({ "center": name, "caps": caps, "known": known })
         }
         Cmd::Config(ConfigCmd::Get { key }) => {
             let (cfg, _) = read_config(paths).await?;

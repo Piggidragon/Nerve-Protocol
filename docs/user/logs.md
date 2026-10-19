@@ -27,7 +27,8 @@ The file is readable by its owner only. At 5 MiB the program moves it to
 `log.jsonl.1`, which replaces the older copy, so a log takes at most about
 10 MiB. The node writes it while `nerve-node run` is running.
 
-The center's [web UI](web-ui.md#log) shows its log, and its **Download the
+`nerve-node log` shows the node's log, `--last 50` the newest 50 lines,
+`--follow` the new lines as they come. The center's [web UI](web-ui.md#log) shows its log, and its **Download the
 file** link gives you `log.jsonl.1` and `log.jsonl` as one file. Both programs
 also print every line on stderr.
 

@@ -54,6 +54,7 @@ center is paired.
 | `run` | Run the node in the foreground | [pairing](pairing.md) |
 | `status` | Show whether it runs, the links, the confinement and the [limits per command](limits.md) | [troubleshooting](troubleshooting.md) |
 | `audit [--denied] [--last N] [--follow]` | Show what was allowed and refused | [audit](audit.md) |
+| `log [--last N] [--follow]` | Show the node's log | [logs](logs.md) |
 | `panic`, `unlock` | Stop everything, then allow it again | [stop](stop.md#panic) |
 
 ## Install and set up
@@ -84,9 +85,10 @@ A program that drives `nerve-node`, such as a script, adds `--json` and reads
 one JSON value from stdout:
 
 - The read commands print their data: `status`, `center ls`, `folder ls`,
-  `rule ls`, `cap ls`, `config get`, `proxy ls`, `relay ls`, `sudo status`
-  and `audit` (`{"entries": [...]}`, the entries as the audit log holds
-  them; with `--follow` one entry a line). `status` has `"daemon"`:
+  `rule ls`, `cap ls` (with `known`, what `cap set` switches), `config get`,
+  `proxy ls`, `relay ls`, `sudo status`, and `audit` and `log`
+  (`{"entries": [...]}`, the lines as the file holds them; with `--follow`
+  one a line). `status` has `"daemon"`:
   `"running"`, with what the running node says, or `"not running"`.
 - `center add` without `--yes` prints what you would confirm
   (`{"paired": false, "preview": {...}}`) and pairs nothing; with `--yes` it

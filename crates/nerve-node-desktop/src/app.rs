@@ -111,6 +111,8 @@ pub struct Ctl {
     program: RefCell<PathBuf>,
     /// The app's own settings file (crate::settings), when it keeps one.
     settings: RefCell<Option<PathBuf>>,
+    /// This window's claim as the user's one window (crate::instance).
+    instance: RefCell<Option<crate::instance::Instance>>,
     /// How the broker starts when the node is installed as a service.
     elevate: Cell<Option<Launch>>,
     /// A `nerve://` link the app was opened with, paired once it can be.
@@ -189,6 +191,7 @@ impl Ctl {
             launcher: RefCell::new(install::system_launcher()),
             program: RefCell::new(PathBuf::new()),
             settings: RefCell::new(None),
+            instance: RefCell::new(None),
             elevate: Cell::new(None),
             link: RefCell::new(None),
             first_run: Cell::new(false),
@@ -699,6 +702,34 @@ impl Ctl {
         self.change("node", vec![args.into()], said.into());
     }
 
+    /// Makes this window the user's one window: what a later start asks
+    /// comes here.
+    pub fn take_starts(&self, instance: crate::instance::Instance) {
+        instance.listen(|asked| {
+            let _ = slint::invoke_from_event_loop(move || {
+                if let Some(c) = CURRENT.with(|c| c.borrow().clone()) {
+                    c.started_again(asked);
+                }
+            });
+        });
+        *self.instance.borrow_mut() = Some(instance);
+    }
+
+    /// Another start of the app: this window comes to the front, and the
+    /// app opens the link it was given.
+    pub fn started_again(self: &Rc<Self>, asked: crate::instance::Asked) {
+        if let Some(w) = self.window.upgrade() {
+            let _ = w.show();
+            w.window().set_minimized(false);
+        }
+        let installer = self.with_install(|i| i.get_shown()).unwrap_or(false);
+        if let Some(link) = asked.link
+            && !installer
+        {
+            self.open_link(link);
+        }
+    }
+
     /// Keeps the app's settings in `file`, and takes the appearance saved
     /// there.
     pub fn keep_settings(&self, file: PathBuf) {
@@ -733,6 +764,11 @@ impl Ctl {
 /// opens the app, with `link` when it was opened with a `nerve://` link;
 /// any other copy of it, such as the file just downloaded, the installer.
 pub fn run(link: Option<String>) -> Result<(), String> {
+    // A window of this user's is open already: it takes this start.
+    let instance = match crate::instance::claim(link.as_deref()) {
+        crate::instance::Claimed::Forwarded => return Ok(()),
+        crate::instance::Claimed::First(i) => i,
+    };
     let runner = Runner::this_program()?;
     let layout = nerve_node::service::Layout::system();
     let here = std::env::current_exe().and_then(std::fs::canonicalize).ok();
@@ -745,6 +781,7 @@ pub fn run(link: Option<String>) -> Result<(), String> {
     if let Some(file) = crate::settings::file() {
         ctl.keep_settings(file);
     }
+    ctl.take_starts(instance);
     if here.is_none() || here != installed {
         ctl.installer(Launch::Elevated, &layout.bin);
     } else {

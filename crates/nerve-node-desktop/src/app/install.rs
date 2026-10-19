@@ -293,6 +293,9 @@ impl Ctl {
     fn open_app(self: &Rc<Self>) {
         let bin = self.program.borrow().clone();
         let launcher = self.launcher.borrow().clone();
+        // The new window is the user's one window from its start; this one
+        // lets go first.
+        self.instance.borrow_mut().take();
         match launcher(&bin) {
             Ok(()) => self.close_app(),
             Err(e) => {

@@ -10,6 +10,7 @@ pub mod broker;
 #[cfg(windows)]
 pub mod console;
 pub mod headless;
+pub mod instance;
 pub mod parts;
 pub mod runner;
 pub mod settings;

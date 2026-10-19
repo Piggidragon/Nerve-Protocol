@@ -372,7 +372,7 @@ pub fn main(args: &[String]) -> i32 {
 /// The broker over a named pipe on Windows, where the UAC prompt starts a
 /// program without handing it the app's stdin and stdout.
 #[cfg(windows)]
-mod win {
+pub(crate) mod win {
     use std::os::windows::io::FromRawHandle;
     use std::path::{Path, PathBuf};
     use std::sync::Arc;
@@ -412,7 +412,7 @@ mod win {
     }
 
     /// The SID of the user this process runs as, as text.
-    fn own_sid() -> Result<String, String> {
+    pub(crate) fn own_sid() -> Result<String, String> {
         // SAFETY: the token of this process, read into a buffer of the size
         // Windows asks for; the strings it allocates are freed.
         unsafe {

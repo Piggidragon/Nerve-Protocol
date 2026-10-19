@@ -67,7 +67,10 @@ fn install_control_update_and_uninstall_on_this_machine() {
     assert_eq!(s["present"], true, "{s}");
     assert!(layout.bin.is_file());
     install.invoke_open_app();
-    assert_eq!(opened.lock().unwrap().as_slice(), [layout.bin.clone()]);
+    assert_eq!(
+        opened.lock().unwrap().as_slice(),
+        std::slice::from_ref(&layout.bin)
+    );
 
     // Started again from the download: Nerve is installed.
     ctl.installer(Launch::Plain, &layout.bin);

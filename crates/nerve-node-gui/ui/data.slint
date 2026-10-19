@@ -64,3 +64,58 @@ export struct PairPreview {
     pin: string,
     name: string,
 }
+
+// A folder a center may use, with its rights.
+export struct FolderRow {
+    path: string,
+    read: bool,
+    write: bool,
+    execute: bool,
+}
+
+// A capability or one of its actions, and its switch: 0 on, 1 off, 2 hidden.
+export struct CapRow {
+    name: string,
+    // An action, shown under its capability.
+    action: bool,
+    setting: int,
+    // Set for this center, not the default.
+    set: bool,
+}
+
+export struct LogRow {
+    tone: Tone,
+    level: string,
+    msg: string,
+    when: string,
+    when-exact: string,
+}
+
+export struct HelpArg {
+    name: string,
+    about: string,
+}
+
+export struct HelpVerb {
+    usage: string,
+    about: string,
+    args: [HelpArg],
+}
+
+export struct HelpCard {
+    name: string,
+    about: string,
+    verbs: [HelpVerb],
+}
+
+export struct HelpSection {
+    name: string,
+    about: string,
+    cards: [HelpCard],
+}
+
+export struct RelayNodeRow {
+    name: string,
+    reach: string,
+    limits: string,
+}

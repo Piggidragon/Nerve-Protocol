@@ -1,20 +1,24 @@
 //! Screenshots of every page of the app, light and dark, drawn without a
 //! screen by Slint's software renderer, for judging the look: a node of its
-//! own under a temporary folder, paired with fake centers through the app,
-//! its daemon running, and the app asking it as it does on a desktop. The
-//! software renderer draws no shadows; the app on a desktop does.
+//! own under a temporary folder, set up and paired with fake centers through
+//! the app, its daemon running, and the app asking it as it does on a
+//! desktop. The software renderer draws no shadows; the app on a desktop
+//! does. Long pages also come whole, as `<page>-full`.
 //!
 //! `NERVE_GUI_SHOTS=<folder> cargo test -p nerve-node-gui --test shots -- --ignored`
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Duration;
 
 use nerve_conformance::fake_center::FakeCenter;
 use nerve_node::{Daemon, NodeOptions, NodePaths};
-use nerve_node_gui::app::{Ctl, Exec};
+use nerve_node_gui::app::{Choose, Ctl, Exec};
+use nerve_node_gui::broker::Launch;
 use nerve_node_gui::headless::Screen;
 use nerve_node_gui::runner::Runner;
-use nerve_node_gui::{AppWindow, Load, NodeStatus, Page, Store};
-use slint::ComponentHandle;
+use nerve_node_gui::{AppWindow, Load, Logs, NodeStatus, Page, Perm, Prefs, Store};
+use slint::{ComponentHandle, Model};
 
 const WIDTH: u32 = 1180;
 const HEIGHT: u32 = 780;
@@ -48,6 +52,19 @@ impl Shots<'_> {
             eprintln!("wrote {}", path.display());
         }
     }
+
+    /// The page `height` logical pixels high, as `<name>-full`.
+    fn take_full(&self, name: &str, height: u32) {
+        self.screen.resize(
+            (WIDTH as f32 * SCALE) as u32,
+            (height as f32 * SCALE) as u32,
+        );
+        self.take(&format!("{name}-full"));
+        self.screen.resize(
+            (WIDTH as f32 * SCALE) as u32,
+            (HEIGHT as f32 * SCALE) as u32,
+        );
+    }
 }
 
 fn decided(
@@ -77,6 +94,17 @@ fn decided(
             reason: reason.map(str::to_string),
         })
         .unwrap();
+}
+
+/// Waits for a command that keeps answering to bring what `done` looks for.
+fn until(ctl: &Ctl, done: impl Fn() -> bool) {
+    for _ in 0..80 {
+        ctl.pump();
+        if done() {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 #[test]
@@ -112,6 +140,8 @@ fn every_page_light_and_dark() {
     window.show().unwrap();
     let ctl = Ctl::attach(&window, runner, Exec::Inline);
     let store = window.global::<Store>();
+    let perm = window.global::<Perm>();
+    let prefs = window.global::<Prefs>();
     let shots = Shots {
         screen,
         window: &window,
@@ -129,31 +159,79 @@ fn every_page_light_and_dark() {
     store.invoke_show(Page::Centers);
     shots.take("centers-empty");
 
-    // Pairing through the app.
+    // The first-run steps, as the app opens them on a new node.
     let home = rt.block_on(FakeCenter::start(true)).unwrap();
+    store.invoke_setup_start();
+    store.set_setup_name("studio".into());
+    shots.take("setup-name");
+    store.invoke_setup_next();
+    shots.take("setup-keys");
+    store.invoke_setup_next();
+    store.set_pair_link(home.link().render().into());
+    store.set_pair_name("home".into());
+    shots.take("setup-center");
+    store.invoke_setup_next();
+    shots.take("setup-confirm");
+    store.invoke_setup_next();
+    store.set_setup_mode("folder".into());
+    shots.take("setup-mode");
+    store.invoke_setup_next();
+    shots.take("setup-done");
+    store.set_setup_open(false);
+
+    // Pairing from the Centers page.
     let lab = rt.block_on(FakeCenter::start(false)).unwrap();
     let office = rt.block_on(FakeCenter::start(false)).unwrap();
     store.invoke_pair_start();
-    let link = home.link().render();
+    let link = lab.link().render();
     store.set_pair_link(link.clone().into());
-    store.set_pair_name("home".into());
+    store.set_pair_name("lab".into());
     shots.take("pair-link");
-    store.invoke_pair_check(link.into(), "home".into());
+    store.invoke_pair_check(link.into(), "lab".into());
     shots.take("pair-confirm");
     store.invoke_pair_confirm();
-    for (c, name) in [(&lab, "lab"), (&office, "office")] {
-        run(&["center", "add", &c.link().render(), "--name", name, "--yes"]);
-    }
-    run(&["mode", "set", "folder", "--center", "home"]);
+    run(&[
+        "center",
+        "add",
+        &office.link().render(),
+        "--name",
+        "office",
+        "--yes",
+    ]);
     run(&["center", "grant", "settings", "write", "--center", "home"]);
     run(&["mode", "set", "user", "--for", "8", "--center", "lab"]);
     run(&["center", "pause", "--center", "office"]);
     // lab's center went away.
     run(&["config", "set", "center.lab.url", "http://127.0.0.1:9"]);
     drop(lab);
+    // home's folders and rules.
+    for (folder, rights) in [
+        ("alex/projects/site", vec!["+r", "+w", "+x"]),
+        ("alex/Documents", vec!["+r"]),
+        ("alex/scratch", vec!["+r", "+w"]),
+    ] {
+        let p = root.join(folder);
+        std::fs::create_dir_all(&p).unwrap();
+        let p = p.display().to_string();
+        let mut args = vec!["folder", "add", &p];
+        args.extend(rights);
+        args.extend(["--center", "home"]);
+        run(&args);
+    }
+    for (list, rule) in [
+        ("allow", "git status"),
+        ("allow", "cargo test --workspace"),
+        ("deny", "git push --force origin main"),
+        ("deny", "rm -rf /"),
+        ("sudo", "sudo systemctl restart nginx"),
+    ] {
+        run(&["rule", "add", list, rule, "--center", "home"]);
+    }
+    run(&["cap", "set", "exec.signal", "off", "--center", "home"]);
+    run(&["relay", "add", "laptop-2"]);
 
     // Calls the centers made, as the node records them.
-    let home_dir = "/home/alex";
+    let alex = root.join("alex").display().to_string();
     decided(
         &paths,
         3 * 86_400_000,
@@ -167,15 +245,15 @@ fn every_page_light_and_dark() {
         26 * 3_600_000,
         "office",
         ("fs", "list"),
-        &format!("{home_dir}/Documents"),
-        Some("no allow rule matches /home/alex/Documents"),
+        &format!("{alex}/Documents"),
+        Some(&format!("no allow rule matches {alex}/Documents")),
     );
     decided(
         &paths,
         3 * 3_600_000,
         "home",
         ("fs", "read"),
-        &format!("{home_dir}/projects/site/README.md"),
+        &format!("{alex}/projects/site/README.md"),
         None,
     );
     decided(
@@ -184,7 +262,9 @@ fn every_page_light_and_dark() {
         "home",
         ("exec", "run"),
         "git push --force origin main",
-        Some("the command \"git push --force origin main\" is denied (exec.run:git push --force*)"),
+        Some(
+            "the command \"git push --force origin main\" is denied (exec.run:git push --force origin main)",
+        ),
     );
     decided(
         &paths,
@@ -199,7 +279,7 @@ fn every_page_light_and_dark() {
         5 * 60_000,
         "home",
         ("fs", "write"),
-        &format!("{home_dir}/projects/site/dist/index.html"),
+        &format!("{alex}/projects/site/dist/index.html"),
         None,
     );
     decided(
@@ -207,15 +287,17 @@ fn every_page_light_and_dark() {
         2 * 60_000,
         "home",
         ("exec", "run"),
-        "cargo test --workspace",
-        Some("no allow rule matches the command \"cargo test --workspace\""),
+        "npm run build",
+        Some("no allow rule matches the command \"npm run build\""),
     );
 
     // The node runs, and links to home; lab cannot be reached, office waits.
+    // The node writes its log, which the Log page shows.
+    nerve_transport::log::install(nerve_transport::log::Level::Info, false);
     let mut opts = NodeOptions::new(paths.clone());
     opts.home = root.to_path_buf();
-    opts.exe = Some(env!("CARGO_BIN_EXE_nerve-node-gui").into());
     opts.full_rights = Some(false);
+    opts.exe = Some(env!("CARGO_BIN_EXE_nerve-node-gui").into());
     opts.cgroups = Some(Err(
         "the node runs outside a cgroup it may manage; start it as the installed service, or under systemd-run --user --scope -p Delegate=yes".into(),
     ));
@@ -233,7 +315,7 @@ fn every_page_light_and_dark() {
         if up("home") && up("lab") {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(Duration::from_millis(100));
     }
 
     store.invoke_show(Page::Overview);
@@ -245,40 +327,95 @@ fn every_page_light_and_dark() {
     store.set_confirm_open(false);
 
     store.invoke_show(Page::Audit);
+    until(&ctl, || store.get_audit().row_count() >= 7);
     shots.take("audit");
     let rows = store.get_audit();
-    let push = (0..slint::Model::row_count(&rows))
-        .find(|i| slint::Model::row_data(&rows, *i).unwrap().target == "cargo test --workspace")
+    let build = (0..rows.row_count())
+        .find(|i| rows.row_data(*i).unwrap().target == "npm run build")
         .unwrap();
-    store.invoke_audit_rule(push as i32, "allow".into(), true);
+    store.invoke_audit_rule(build as i32, "allow".into(), true);
+    until(&ctl, || {
+        store
+            .get_audit()
+            .row_data(0)
+            .is_some_and(|r| r.kind == "settings")
+    });
     shots.take_as_is("audit-rule-added");
-    store.set_toast_shown(false);
     store.invoke_audit_filter(true);
+    until(&ctl, || {
+        let r = store.get_audit();
+        r.row_count() > 0 && r.iter().all(|e| e.badge == "Refused")
+    });
     shots.take("audit-refused");
     store.invoke_audit_filter(false);
 
     store.invoke_panic();
     store.invoke_show(Page::Overview);
-    store.set_toast_shown(false);
     shots.take("overview-locked");
     store.invoke_unlock();
-    store.set_toast_shown(false);
 
-    for (page, name) in [
-        (Page::Policy, "policy"),
-        (Page::Log, "log"),
-        (Page::Settings, "settings"),
-        (Page::Help, "help"),
-    ] {
-        store.invoke_show(page);
-        shots.take(name);
-    }
+    // Permissions of home.
+    store.invoke_show(Page::Policy);
+    perm.invoke_pick(0);
+    shots.take("permissions");
+    shots.take_full("permissions", 2050);
+    perm.invoke_mode_pick("user".into());
+    perm.set_mode_timed(true);
+    shots.take("permissions-mode");
+    perm.set_mode_open(false);
+    let picked = root.join("alex/projects/api");
+    std::fs::create_dir_all(&picked).unwrap();
+    ctl.set_chooser(Arc::new(move |c| {
+        (c == Choose::Folder).then(|| picked.clone())
+    }));
+    perm.invoke_folder_choose();
+    perm.set_folder_write(true);
+    shots.take("permissions-folder");
+    perm.set_folder_open(false);
+    perm.invoke_sudo_ask();
+    perm.set_sudo_password("hunter2hunter2".into());
+    shots.take("permissions-sudo");
+    perm.set_sudo_open(false);
+
+    // The log the running node wrote.
+    store.invoke_show(Page::Log);
+    until(&ctl, || window.global::<Logs>().get_rows().row_count() >= 3);
+    ctl.feed_ready();
+    shots.take("log");
+
+    store.invoke_show(Page::Settings);
+    shots.take("settings");
+    shots.take_full("settings", 1900);
+    prefs.invoke_proxy_edit();
+    prefs.set_proxy_new_url("http://proxy.example:3128".into());
+    prefs.set_proxy_new_headers("Proxy-Authorization: Bearer …".into());
+    shots.take("settings-proxy");
+    prefs.set_proxy_open(false);
+    prefs.invoke_relay_token("laptop-2".into());
+    shots.take("settings-relay-token");
+    prefs.set_once_open(false);
+    let backup = root.join("nerve-node.backup");
+    ctl.set_chooser(Arc::new(move |_| Some(backup.clone())));
+    prefs.invoke_backup_choose();
+    prefs.set_backup_pass("correct horse battery".into());
+    prefs.set_backup_pass2("correct horse".into());
+    shots.take("settings-backup");
+    prefs.set_backup_open(false);
+
+    store.invoke_show(Page::Help);
+    shots.take("help");
     store.invoke_show(Page::Overview);
     store.set_about_open(true);
     shots.take("about");
     store.set_about_open(false);
 
+    // An installed node: why the app asks for administrator rights.
+    ctl.needs_rights(Launch::Plain);
+    shots.take("elevate");
+    store.invoke_elevate_allow();
+
     // A node.toml changed by hand: the CLI refuses it, and the app says so.
+    ctl.end();
     rt.block_on(node.stop());
     let file = paths.config_file();
     let text = std::fs::read_to_string(&file).unwrap();

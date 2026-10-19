@@ -57,6 +57,8 @@ windows-sys = "0.61"
 # license 2.0: the app shows Slint's AboutSlint in its About dialog.
 slint = { version = "1.18", default-features = false, features = ["std", "compat-1-2", "backend-winit", "renderer-femtovg", "renderer-software", "software-renderer-systemfonts", "accessibility"] }
 slint-build = "1.18"
+# The desktop app's file and folder dialogs.
+rfd = "0.17"
 
 [profile.release]
 lto = "thin"

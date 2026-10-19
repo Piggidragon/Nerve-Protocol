@@ -3,10 +3,10 @@
 
 import { AboutSlint } from "std-widgets.slint";
 import { Theme, Type, Space, Radius, Tone } from "theme.slint";
-import { Store } from "store.slint";
+import { Store, Perm, Prefs } from "store.slint";
 import {
     Button, ButtonKind, Banner, Dialog, DialogButtons, Field, TextField, InfoRow, Divider, Code,
-    Icon,
+    Icon, CheckBox, Segmented, TextArea, CopyText, OptionTile, Steps,
 } from "widgets.slint";
 
 export component PairDialog inherits Dialog {
@@ -266,5 +266,412 @@ export component AboutDialog inherits Dialog {
     Divider { }
     AboutSlint {
         preferred-height: self.min-height;
+    }
+}
+
+export component ModeDialog inherits Dialog {
+    title: Perm.mode-choice == "folder" ? "Folder mode for " + Perm.center : "User mode for " + Perm.center;
+    subtitle: Perm.mode-choice == "folder"
+        ? "The center may do what each of its folders allows, in that folder."
+        : "The center may do anything you could do yourself on this machine, its protected files aside. Use it for a while, not for good.";
+    card-width: 480px;
+    close => {
+        Perm.mode-open = false;
+    }
+    VerticalLayout {
+        spacing: Space.md;
+        Segmented {
+            options: ["Until I change it", "For a time"];
+            current: Perm.mode-timed ? 1 : 0;
+            chosen(i) => {
+                Perm.mode-timed = i == 1;
+            }
+        }
+        if Perm.mode-timed: Field {
+            label: "Hours";
+            hint: "Then the center goes back to allowlist mode by itself.";
+            TextField {
+                text <=> Perm.mode-hours;
+                label: "Hours";
+                accepted => {
+                    Perm.mode-apply();
+                }
+            }
+        }
+    }
+    if Perm.mode-error != "": Banner {
+        tone: Tone.danger;
+        text: Perm.mode-error;
+    }
+    DialogButtons {
+        Button {
+            text: "Cancel";
+            kind: ButtonKind.ghost;
+            clicked => {
+                Perm.mode-open = false;
+            }
+        }
+        Button {
+            text: "Switch";
+            kind: ButtonKind.primary;
+            clicked => {
+                Perm.mode-apply();
+            }
+        }
+    }
+}
+
+export component FolderDialog inherits Dialog {
+    title: "Add a folder";
+    subtitle: "What may " + Perm.center + " do in it? A folder's rights count in folder mode.";
+    card-width: 520px;
+    close => {
+        Perm.folder-open = false;
+    }
+    Code {
+        text: Perm.folder-path;
+    }
+    VerticalLayout {
+        spacing: Space.md;
+        CheckBox {
+            text: "Read";
+            detail: "List, read and search its files.";
+            checked: Perm.folder-read;
+            toggled(on) => {
+                Perm.folder-read = on;
+            }
+        }
+        CheckBox {
+            text: "Write";
+            detail: "Change, add and delete files in it.";
+            checked: Perm.folder-write;
+            toggled(on) => {
+                Perm.folder-write = on;
+            }
+        }
+        CheckBox {
+            text: "Run commands";
+            detail: "Run commands in it, confined to the folders that allow it.";
+            checked: Perm.folder-execute;
+            toggled(on) => {
+                Perm.folder-execute = on;
+            }
+        }
+    }
+    if Perm.folder-error != "": Banner {
+        tone: Tone.danger;
+        text: Perm.folder-error;
+    }
+    DialogButtons {
+        Button {
+            text: "Cancel";
+            kind: ButtonKind.ghost;
+            clicked => {
+                Perm.folder-open = false;
+            }
+        }
+        Button {
+            text: "Add";
+            kind: ButtonKind.primary;
+            enabled: Perm.folder-read || Perm.folder-write || Perm.folder-execute;
+            clicked => {
+                Perm.folder-add();
+            }
+        }
+    }
+}
+
+export component SudoDialog inherits Dialog {
+    title: "Turn sudo on";
+    subtitle: "Your sudo password, which the running node keeps in memory only and forgets when sudo goes off or the node stops. On Windows, the password of the account commands run as.";
+    card-width: 480px;
+    close => {
+        Perm.sudo-open = false;
+    }
+    Field {
+        label: "Password";
+        TextField {
+            text <=> Perm.sudo-password;
+            password: true;
+            label: "Password";
+            enabled: !Perm.sudo-busy;
+            accepted => {
+                Perm.sudo-confirm();
+            }
+            init => {
+                self.focus();
+            }
+        }
+    }
+    if Perm.sudo-error != "": Banner {
+        tone: Tone.danger;
+        text: Perm.sudo-error;
+    }
+    DialogButtons {
+        Button {
+            text: "Cancel";
+            kind: ButtonKind.ghost;
+            clicked => {
+                Perm.sudo-open = false;
+            }
+        }
+        Button {
+            text: "Turn on";
+            kind: ButtonKind.primary;
+            enabled: Perm.sudo-password != "";
+            busy: Perm.sudo-busy;
+            clicked => {
+                Perm.sudo-confirm();
+            }
+        }
+    }
+}
+
+export component ProxyDialog inherits Dialog {
+    title: "Proxy";
+    subtitle: "Every link to a center goes through it, a pairing too. Values of headers and a password in the URL go into the system keyring.";
+    card-width: 560px;
+    close => {
+        Prefs.proxy-open = false;
+    }
+    Field {
+        label: "Proxy";
+        hint: "http://host:port, http://user:password@host:port, or https://… for a relay.";
+        TextField {
+            text <=> Prefs.proxy-new-url;
+            mono: true;
+            placeholder: "http://proxy.example:3128";
+            label: "Proxy";
+        }
+    }
+    Field {
+        label: "Pin";
+        hint: "Optional. The pin of an https:// proxy's certificate; a relay shows its own.";
+        TextField {
+            text <=> Prefs.proxy-new-pin;
+            mono: true;
+            label: "Pin";
+        }
+    }
+    Field {
+        label: "Headers";
+        hint: "Optional. One a line, as Name: value.";
+        TextArea {
+            text <=> Prefs.proxy-new-headers;
+            mono: true;
+            label: "Headers";
+            placeholder: "Proxy-Authorization: Bearer …";
+        }
+    }
+    if Prefs.proxy-error != "": Banner {
+        tone: Tone.danger;
+        text: Prefs.proxy-error;
+    }
+    DialogButtons {
+        Button {
+            text: "Cancel";
+            kind: ButtonKind.ghost;
+            clicked => {
+                Prefs.proxy-open = false;
+            }
+        }
+        Button {
+            text: "Save";
+            kind: ButtonKind.primary;
+            enabled: Prefs.proxy-new-url != "";
+            clicked => {
+                Prefs.proxy-set();
+            }
+        }
+    }
+}
+
+// A token shown once, with what the node said to do with it.
+export component OnceDialog inherits Dialog {
+    title: Prefs.once-title;
+    subtitle: "It is shown only now: copy it to the other node.";
+    card-width: 620px;
+    close => {
+        Prefs.once-open = false;
+    }
+    CopyText {
+        text: Prefs.once-text;
+    }
+    DialogButtons {
+        Button {
+            text: "Done";
+            kind: ButtonKind.primary;
+            clicked => {
+                Prefs.once-open = false;
+            }
+        }
+    }
+}
+
+export component BackupDialog inherits Dialog {
+    title: "Back up this node";
+    subtitle: "The config and the keys go into the file, sealed with the passphrase. Without it the file is no use to anyone, you included.";
+    card-width: 540px;
+    close => {
+        Prefs.backup-open = false;
+    }
+    Code {
+        text: Prefs.backup-file;
+    }
+    Field {
+        label: "Passphrase";
+        hint: "At least 12 characters.";
+        TextField {
+            text <=> Prefs.backup-pass;
+            password: true;
+            label: "Passphrase";
+            init => {
+                self.focus();
+            }
+        }
+    }
+    Field {
+        label: "The passphrase again";
+        TextField {
+            text <=> Prefs.backup-pass2;
+            password: true;
+            label: "The passphrase again";
+            invalid: Prefs.backup-pass2 != "" && Prefs.backup-pass2 != Prefs.backup-pass;
+            accepted => {
+                Prefs.backup-confirm();
+            }
+        }
+    }
+    CheckBox {
+        text: "Take the keys in the system keyring too";
+        detail: "Without it, keys kept in the keyring stay there and are left out of the file.";
+        checked: Prefs.backup-keyring;
+        toggled(on) => {
+            Prefs.backup-keyring = on;
+        }
+    }
+    if Prefs.backup-error != "": Banner {
+        tone: Tone.danger;
+        text: Prefs.backup-error;
+    }
+    DialogButtons {
+        Button {
+            text: "Cancel";
+            kind: ButtonKind.ghost;
+            clicked => {
+                Prefs.backup-open = false;
+            }
+        }
+        Button {
+            text: "Back up";
+            kind: ButtonKind.primary;
+            busy: Prefs.backup-busy;
+            enabled: Prefs.backup-pass != "" && Prefs.backup-pass == Prefs.backup-pass2;
+            clicked => {
+                Prefs.backup-confirm();
+            }
+        }
+    }
+}
+
+export component RestoreDialog inherits Dialog {
+    title: "Restore a backup";
+    subtitle: "The backup's config and keys take the place of this node's. The node must not run.";
+    card-width: 540px;
+    close => {
+        Prefs.restore-open = false;
+    }
+    Code {
+        text: Prefs.restore-file;
+    }
+    Field {
+        label: "Passphrase";
+        TextField {
+            text <=> Prefs.restore-pass;
+            password: true;
+            label: "Passphrase";
+            accepted => {
+                Prefs.restore-confirm();
+            }
+            init => {
+                self.focus();
+            }
+        }
+    }
+    CheckBox {
+        text: "It is the backup of another node";
+        detail: "Replace the node here with it. Without this a backup of another node is refused.";
+        checked: Prefs.restore-replace;
+        toggled(on) => {
+            Prefs.restore-replace = on;
+        }
+    }
+    CheckBox {
+        text: "Leave its proxy out";
+        detail: "This machine reaches its centers in its own way; set a proxy here later.";
+        checked: Prefs.restore-without-proxy;
+        toggled(on) => {
+            Prefs.restore-without-proxy = on;
+        }
+    }
+    if Prefs.restore-error != "": Banner {
+        tone: Tone.danger;
+        text: Prefs.restore-error;
+    }
+    DialogButtons {
+        Button {
+            text: "Cancel";
+            kind: ButtonKind.ghost;
+            clicked => {
+                Prefs.restore-open = false;
+            }
+        }
+        Button {
+            text: "Restore";
+            kind: ButtonKind.danger;
+            busy: Prefs.restore-busy;
+            enabled: Prefs.restore-pass != "";
+            clicked => {
+                Prefs.restore-confirm();
+            }
+        }
+    }
+}
+
+// Why the app asks for administrator rights, before the system asks.
+export component ElevateDialog inherits Dialog {
+    title: "Administrator rights";
+    subtitle: "The node on this machine is installed as a service. Its settings, keys and logs belong to the system, so reading and changing them takes administrator rights, as nerve-node with sudo (on Windows, as administrator) does in a terminal.";
+    card-width: 520px;
+    close => {
+        Store.elevate-open = false;
+    }
+    Text {
+        text: "The system asks you once, and the app keeps the rights while it is open. Every change still runs as a nerve-node command, with its checks and audit records.";
+        color: Theme.text-muted;
+        font-size: Type.small;
+        wrap: word-wrap;
+    }
+    if Store.elevate-error != "": Banner {
+        tone: Tone.danger;
+        text: Store.elevate-error;
+    }
+    DialogButtons {
+        Button {
+            text: "Not now";
+            kind: ButtonKind.ghost;
+            clicked => {
+                Store.elevate-open = false;
+            }
+        }
+        Button {
+            text: "Continue";
+            icon: @image-url("icons/shield.svg");
+            kind: ButtonKind.primary;
+            busy: Store.elevate-busy;
+            clicked => {
+                Store.elevate-allow();
+            }
+        }
     }
 }

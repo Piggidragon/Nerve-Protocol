@@ -2,16 +2,29 @@
 
 import { Palette } from "std-widgets.slint";
 import { Theme, Type, Space, Radius, Size, Tone } from "theme.slint";
-import { Page, Load, NodeStatus, CenterRow, AuditRow, PairPreview } from "data.slint";
-import { Store } from "store.slint";
-import { NavItem, StatusDot, Toast } from "widgets.slint";
+import {
+    Page, Load, NodeStatus, CenterRow, AuditRow, PairPreview, FolderRow, CapRow, LogRow,
+    HelpSection, HelpCard, HelpVerb, HelpArg, RelayNodeRow,
+} from "data.slint";
+import { Store, Perm, Logs, Manual, Prefs } from "store.slint";
+import { NavItem, StatusDot, Toast, Banner } from "widgets.slint";
 import { OverviewPage } from "overview.slint";
 import { CentersPage } from "centers.slint";
 import { AuditPage } from "audit.slint";
-import { PolicyPage, LogPage, SettingsPage, HelpPage } from "planned.slint";
-import { PairDialog, ConfirmDialog, AboutDialog } from "dialogs.slint";
+import { PermissionsPage } from "permissions.slint";
+import { LogPage } from "log.slint";
+import { SettingsPage } from "settings.slint";
+import { HelpPage } from "help.slint";
+import { SetupDialog } from "setup.slint";
+import {
+    PairDialog, ConfirmDialog, AboutDialog, ModeDialog, FolderDialog, SudoDialog, ProxyDialog,
+    OnceDialog, BackupDialog, RestoreDialog, ElevateDialog,
+} from "dialogs.slint";
 
-export { Store, Type, Tone, Page, Load, NodeStatus, CenterRow, AuditRow, PairPreview }
+export {
+    Store, Perm, Logs, Manual, Prefs, Type, Tone, Page, Load, NodeStatus, CenterRow, AuditRow,
+    PairPreview, FolderRow, CapRow, LogRow, HelpSection, HelpCard, HelpVerb, HelpArg, RelayNodeRow,
+}
 
 component Sidebar inherits Rectangle {
     width: Size.sidebar;
@@ -185,42 +198,49 @@ export component AppWindow inherits Window {
 
     HorizontalLayout {
         Sidebar { }
-        Rectangle {
+        VerticalLayout {
             horizontal-stretch: 1;
-            if Store.page == Page.overview: OverviewPage {
-                width: parent.width;
-                height: parent.height;
+            // On an installed node every page needs the rights the app asks
+            // for; until it has them, this says why and how.
+            if Store.elevate-needed: Rectangle {
+                background: Theme.window;
+                VerticalLayout {
+                    padding-left: Space.page;
+                    padding-right: Space.page;
+                    padding-top: Space.lg;
+                    Banner {
+                        tone: Tone.accent;
+                        title: "The node is installed as a service";
+                        text: "Its settings belong to the system. Give the app administrator rights to see and change them.";
+                        action: "Continue…";
+                        acted => {
+                            Store.elevate-open = true;
+                        }
+                    }
+                }
             }
-            if Store.page == Page.centers: CentersPage {
-                width: parent.width;
-                height: parent.height;
-            }
-            if Store.page == Page.policy: PolicyPage {
-                width: parent.width;
-                height: parent.height;
-            }
-            if Store.page == Page.audit: AuditPage {
-                width: parent.width;
-                height: parent.height;
-            }
-            if Store.page == Page.log: LogPage {
-                width: parent.width;
-                height: parent.height;
-            }
-            if Store.page == Page.settings: SettingsPage {
-                width: parent.width;
-                height: parent.height;
-            }
-            if Store.page == Page.help: HelpPage {
-                width: parent.width;
-                height: parent.height;
-            }
+            if Store.page == Page.overview: OverviewPage { }
+            if Store.page == Page.centers: CentersPage { }
+            if Store.page == Page.policy: PermissionsPage { }
+            if Store.page == Page.audit: AuditPage { }
+            if Store.page == Page.log: LogPage { }
+            if Store.page == Page.settings: SettingsPage { }
+            if Store.page == Page.help: HelpPage { }
         }
     }
 
     if Store.pair-open: PairDialog { }
     if Store.confirm-open: ConfirmDialog { }
     if Store.about-open: AboutDialog { }
+    if Perm.mode-open: ModeDialog { }
+    if Perm.folder-open: FolderDialog { }
+    if Perm.sudo-open: SudoDialog { }
+    if Prefs.proxy-open: ProxyDialog { }
+    if Prefs.once-open: OnceDialog { }
+    if Prefs.backup-open: BackupDialog { }
+    if Prefs.restore-open: RestoreDialog { }
+    if Store.setup-open: SetupDialog { }
+    if Store.elevate-open: ElevateDialog { }
 
     if Store.toast-shown: Toast {
         text: Store.toast;

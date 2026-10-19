@@ -564,6 +564,8 @@ export component TextField {
     in-out property <string> text;
     in property <string> placeholder;
     in property <bool> mono;
+    // A password or passphrase: shown as dots.
+    in property <bool> password;
     in property <bool> invalid;
     in property <bool> enabled: true;
     in property <string> label;
@@ -587,9 +589,12 @@ export component TextField {
         Rectangle {
             clip: true;
             input := TextInput {
+                width: parent.width;
+                height: parent.height;
                 text <=> root.text;
                 enabled: root.enabled;
                 single-line: true;
+                input-type: root.password ? InputType.password : InputType.text;
                 color: Theme.text;
                 font-size: Type.body;
                 font-family: root.mono ? Type.mono : "";
@@ -604,6 +609,8 @@ export component TextField {
                 }
             }
             Text {
+                width: parent.width;
+                height: parent.height;
                 text: root.placeholder;
                 visible: root.text == "";
                 color: Theme.text-faint;
@@ -921,5 +928,287 @@ export component Planned inherits Rectangle {
                 tone: Tone.neutral;
             }
         }
+    }
+}
+
+// A box to tick, with its label.
+export component CheckBox {
+    in property <bool> checked;
+    in property <string> text;
+    in property <string> detail;
+    in property <bool> enabled: true;
+    callback toggled(bool);
+    accessible-role: checkbox;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    accessible-label: root.text;
+    accessible-action-default => {
+        root.toggled(!root.checked);
+    }
+    opacity: root.enabled ? 1 : 0.45;
+    HorizontalLayout {
+        spacing: 10px;
+        VerticalLayout {
+            alignment: start;
+            padding-top: 1px;
+            Rectangle {
+                width: 18px;
+                height: 18px;
+                border-radius: 5px;
+                background: root.checked ? Theme.accent : Theme.surface;
+                border-width: root.checked ? 0 : 1.5px;
+                border-color: touch.has-hover ? Theme.accent : Theme.border-strong;
+                animate background { duration: 110ms; }
+                if root.checked: Icon {
+                    source: @image-url("icons/check.svg");
+                    colorize: Theme.on-accent;
+                    size: 13px;
+                }
+            }
+        }
+        VerticalLayout {
+            spacing: 2px;
+            Text {
+                text: root.text;
+                color: Theme.text;
+                font-size: Type.body;
+                wrap: word-wrap;
+            }
+            if root.detail != "": Text {
+                text: root.detail;
+                color: Theme.text-muted;
+                font-size: Type.caption;
+                wrap: word-wrap;
+            }
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: MouseCursor.pointer;
+        clicked => {
+            root.toggled(!root.checked);
+        }
+    }
+}
+
+// A text of several lines to type in.
+export component TextArea {
+    in-out property <string> text;
+    in property <string> placeholder;
+    in property <bool> mono;
+    in property <string> label;
+    in property <length> lines-high: 76px;
+    forward-focus: input;
+    height: root.lines-high;
+    accessible-role: text-input;
+    accessible-label: root.label;
+    accessible-value: root.text;
+    Rectangle {
+        background: Theme.surface;
+        border-radius: Radius.md;
+        border-width: input.has-focus ? 2px : 1px;
+        border-color: input.has-focus ? Theme.accent : Theme.border-strong;
+    }
+    Rectangle {
+        x: 12px;
+        y: 9px;
+        width: parent.width - 24px;
+        height: parent.height - 18px;
+        clip: true;
+        input := TextInput {
+            width: parent.width;
+            height: parent.height;
+            text <=> root.text;
+            single-line: false;
+            wrap: word-wrap;
+            color: Theme.text;
+            font-size: Type.small;
+            font-family: root.mono ? Type.mono : "";
+            selection-background-color: Theme.accent.transparentize(0.6);
+            selection-foreground-color: Theme.text;
+        }
+        Text {
+            x: 0;
+            y: 0;
+            width: parent.width;
+            text: root.placeholder;
+            visible: root.text == "";
+            color: Theme.text-faint;
+            font-size: Type.small;
+            font-family: root.mono ? Type.mono : "";
+            wrap: word-wrap;
+        }
+    }
+}
+
+// Text the owner copies, such as a token shown once: selectable, not
+// editable.
+export component CopyText inherits Rectangle {
+    in property <string> text;
+    background: Theme.inset;
+    border-radius: Radius.md;
+    border-width: 1px;
+    border-color: Theme.border;
+    min-height: shown.preferred-height + 20px;
+    shown := TextInput {
+        x: 12px;
+        y: 10px;
+        width: parent.width - 24px;
+        text: root.text;
+        read-only: true;
+        single-line: false;
+        wrap: char-wrap;
+        color: Theme.text;
+        font-size: Type.small;
+        font-family: Type.mono;
+        selection-background-color: Theme.accent.transparentize(0.6);
+        selection-foreground-color: Theme.text;
+    }
+}
+
+// One of a few choices, as a tile: the mode of a center, where keys live.
+export component OptionTile inherits Rectangle {
+    in property <image> icon;
+    in property <string> title;
+    in property <string> text;
+    in property <bool> selected;
+    in property <string> badge;
+    in property <bool> enabled: true;
+    callback clicked();
+    horizontal-stretch: 1;
+    preferred-width: 160px;
+    border-radius: Radius.lg;
+    background: root.selected ? Theme.accent-soft : touch.has-hover ? Theme.surface-alt : Theme.surface;
+    border-width: root.selected ? 2px : 1px;
+    border-color: root.selected ? Theme.accent : touch.has-hover ? Theme.border-strong : Theme.border;
+    accessible-role: radio-button;
+    accessible-checkable: true;
+    accessible-checked: root.selected;
+    accessible-label: root.title;
+    accessible-description: root.text;
+    accessible-action-default => {
+        root.clicked();
+    }
+    opacity: root.enabled ? 1 : 0.5;
+    animate background { duration: 110ms; }
+    VerticalLayout {
+        padding: Space.lg;
+        spacing: Space.sm;
+        HorizontalLayout {
+            spacing: Space.sm;
+            VerticalLayout {
+                alignment: center;
+                Icon {
+                    source: root.icon;
+                    colorize: root.selected ? Theme.accent : Theme.text-muted;
+                    size: Size.icon-lg;
+                }
+            }
+            Text {
+                text: root.title;
+                color: Theme.text;
+                font-size: Type.body;
+                font-weight: Type.semibold;
+                vertical-alignment: center;
+            }
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+            if root.badge != "": VerticalLayout {
+                alignment: center;
+                Pill {
+                    text: root.badge;
+                    tone: Tone.accent;
+                }
+            }
+        }
+        Text {
+            text: root.text;
+            color: Theme.text-muted;
+            font-size: Type.caption;
+            wrap: word-wrap;
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: MouseCursor.pointer;
+        clicked => {
+            root.clicked();
+        }
+    }
+}
+
+// A small toggle with a letter or a word: a right on a folder.
+export component Chip inherits Rectangle {
+    in property <string> text;
+    in property <bool> on;
+    in property <string> label;
+    in property <bool> enabled: true;
+    callback toggled(bool);
+    height: 26px;
+    min-width: 30px;
+    horizontal-stretch: 0;
+    border-radius: Radius.sm;
+    background: root.on ? Theme.accent-soft : touch.has-hover ? Theme.hover : transparent;
+    border-width: 1px;
+    border-color: root.on ? Theme.accent.transparentize(0.4) : Theme.border;
+    accessible-role: checkbox;
+    accessible-checkable: true;
+    accessible-checked: root.on;
+    accessible-label: root.label;
+    accessible-action-default => {
+        root.toggled(!root.on);
+    }
+    opacity: root.enabled ? 1 : 0.45;
+    HorizontalLayout {
+        padding-left: 9px;
+        padding-right: 9px;
+        Text {
+            text: root.text;
+            color: root.on ? Theme.accent-text : Theme.text-faint;
+            font-size: Type.caption;
+            font-weight: Type.semibold;
+            vertical-alignment: center;
+            horizontal-alignment: center;
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: MouseCursor.pointer;
+        clicked => {
+            root.toggled(!root.on);
+        }
+    }
+}
+
+// Where a series of steps is: dots and the current step's name.
+export component Steps {
+    in property <int> count;
+    in property <int> current;
+    HorizontalLayout {
+        spacing: 6px;
+        alignment: start;
+        for i in root.count: Rectangle {
+            width: i == root.current ? 22px : 8px;
+            height: 8px;
+            border-radius: 4px;
+            background: i <= root.current ? Theme.accent : Theme.border-strong;
+            animate width { duration: 160ms; }
+        }
+    }
+}
+
+// A row of a list inside a card: its content, and a line above all but the
+// first.
+export component ListRow inherits VerticalLayout {
+    in property <bool> first;
+    if !root.first: Divider { }
+    HorizontalLayout {
+        padding-left: Space.xl;
+        padding-right: Space.lg;
+        padding-top: 10px;
+        padding-bottom: 10px;
+        spacing: Space.md;
+        @children
     }
 }

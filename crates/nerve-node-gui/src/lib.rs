@@ -6,6 +6,7 @@
 slint::include_modules!();
 
 pub mod app;
+pub mod broker;
 #[cfg(windows)]
 pub mod console;
 pub mod headless;

@@ -6,7 +6,10 @@
 use serde_json::Value;
 use slint::{ModelRc, SharedString, VecModel};
 
-use crate::{AuditRow, CenterRow, NodeStatus, Tone};
+use crate::{
+    AuditRow, CapRow, CenterRow, FolderRow, HelpArg, HelpCard, HelpSection, HelpVerb, LogRow,
+    NodeStatus, RelayNodeRow, Tone,
+};
 
 /// The most audit entries the page shows (crate::app asks for as many).
 pub const AUDIT_SHOWN: usize = 200;
@@ -24,8 +27,9 @@ fn text_model(items: Vec<String>) -> ModelRc<SharedString> {
     ))
 }
 
-/// The node's status and its centers, from `status --json`.
-pub fn status(v: &Value, now_ms: u64) -> (NodeStatus, Vec<CenterRow>) {
+/// The node's status and its centers, from `status --json`. `here`: the
+/// app started the node itself, so it ends with the app.
+pub fn status(v: &Value, now_ms: u64, here: bool) -> (NodeStatus, Vec<CenterRow>) {
     let running = v["daemon"] == "running";
     let locked = v["locked"] == true;
     let centers: Vec<CenterRow> = v["centers"]
@@ -47,6 +51,12 @@ pub fn status(v: &Value, now_ms: u64) -> (NodeStatus, Vec<CenterRow>) {
             "A panic ended every link. No center reaches this machine and no command runs until you unlock it.",
             Tone::Danger,
         ),
+        (false, true) if here => (
+            "running",
+            "The node is running",
+            "This app started it, and it runs while the app is open. Install it as a service to keep it running.",
+            Tone::Ok,
+        ),
         (false, true) => (
             "running",
             "The node is running",
@@ -56,7 +66,7 @@ pub fn status(v: &Value, now_ms: u64) -> (NodeStatus, Vec<CenterRow>) {
         (false, false) => (
             "stopped",
             "The node is not running",
-            "No center reaches this machine. Start the node as a service or with nerve-node run; what you change here counts from its next start.",
+            "No center reaches this machine. What you change here counts from the node's next start.",
             Tone::Warn,
         ),
     };
@@ -216,6 +226,233 @@ fn center(c: &Value, running: bool, now_ms: u64) -> CenterRow {
     }
 }
 
+/// When a center's folder or user mode ends, in words; nothing without an
+/// end.
+pub fn mode_until(c: &Value, now_ms: u64) -> String {
+    match c["until"].as_u64() {
+        Some(until) if until > now_ms && c["mode"] != "allowlist" => {
+            format!("Back to allowlist mode {}.", ahead(until - now_ms))
+        }
+        _ => String::new(),
+    }
+}
+
+/// The folders of `folder ls --json`.
+pub fn folders(v: &Value) -> Vec<FolderRow> {
+    v["folders"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|f| FolderRow {
+            path: s(&f["path"]).into(),
+            read: f["read"] == true,
+            write: f["write"] == true,
+            execute: f["execute"] == true,
+        })
+        .collect()
+}
+
+/// The rights `folder set` takes for a folder: `=rwx`, the letters that
+/// are on.
+pub fn rights(read: bool, write: bool, execute: bool) -> String {
+    let mut r = String::from("=");
+    for (on, c) in [(read, 'r'), (write, 'w'), (execute, 'x')] {
+        if on {
+            r.push(c);
+        }
+    }
+    r
+}
+
+/// One list of `rule ls --json`.
+pub fn rule_list_of(v: &Value, list: &str) -> Vec<SharedString> {
+    v[list]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(SharedString::from)
+        .collect()
+}
+
+/// The capability switches of `cap ls --json`: each capability the node
+/// knows, then its actions, with what is set (on when nothing is).
+pub fn caps(v: &Value) -> Vec<CapRow> {
+    let setting = |name: &str| match v["caps"][name].as_str() {
+        Some("off") => (1, true),
+        Some("hidden") => (2, true),
+        Some(_) => (0, true),
+        None => (0, false),
+    };
+    let mut rows = Vec::new();
+    for (cap, actions) in v["known"].as_object().into_iter().flatten() {
+        let (s, set) = setting(cap);
+        rows.push(CapRow {
+            name: cap.as_str().into(),
+            action: false,
+            setting: s,
+            set,
+        });
+        for a in actions
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            let name = format!("{cap}.{a}");
+            let (s, set) = setting(&name);
+            rows.push(CapRow {
+                name: name.into(),
+                action: true,
+                setting: s,
+                set,
+            });
+        }
+    }
+    rows
+}
+
+/// The word `cap set` takes for a switch.
+pub fn cap_word(setting: i32) -> &'static str {
+    match setting {
+        1 => "off",
+        2 => "hidden",
+        _ => "on",
+    }
+}
+
+/// The lines of the log to show, from `newest` first: all of them, or the
+/// errors and warnings only.
+pub fn log_rows(newest: &[Value], problems_only: bool, now_ms: u64) -> Vec<LogRow> {
+    newest
+        .iter()
+        .filter(|e| !problems_only || matches!(s(&e["level"]), "error" | "warn"))
+        .map(|e| {
+            let ts = e["ts"].as_u64().unwrap_or_default();
+            let level = s(&e["level"]);
+            let mut msg = s(&e["msg"]).to_string();
+            if let Some(n) = e["node"].as_str() {
+                msg = format!("{msg} ({n})");
+            }
+            LogRow {
+                tone: match level {
+                    "error" => Tone::Danger,
+                    "warn" => Tone::Warn,
+                    "info" => Tone::Accent,
+                    _ => Tone::Neutral,
+                },
+                level: match level {
+                    "error" => "Error",
+                    "warn" => "Warning",
+                    "info" => "Info",
+                    "debug" => "Debug",
+                    other => other,
+                }
+                .into(),
+                msg: msg.into(),
+                when: ago(ts, now_ms).into(),
+                when_exact: exact(ts).into(),
+            }
+        })
+        .collect()
+}
+
+/// The command list of `nerve-node --help`, read from the CLI's own
+/// definition, as the Help page shows it.
+pub fn help(h: &nerve_node::cli::Help) -> Vec<HelpSection> {
+    fn model<T: Clone + 'static>(v: Vec<T>) -> ModelRc<T> {
+        ModelRc::new(VecModel::from(v))
+    }
+    h.sections
+        .iter()
+        .map(|s| HelpSection {
+            name: s.name.as_str().into(),
+            about: s.about.as_str().into(),
+            cards: model(
+                s.cards
+                    .iter()
+                    .map(|c| HelpCard {
+                        name: c.name.as_str().into(),
+                        about: c.about.as_str().into(),
+                        verbs: model(
+                            c.verbs
+                                .iter()
+                                .map(|v| HelpVerb {
+                                    usage: v.usage.as_str().into(),
+                                    about: v.about.as_str().into(),
+                                    args: model(
+                                        v.args
+                                            .iter()
+                                            .map(|a| HelpArg {
+                                                name: a.name.as_str().into(),
+                                                about: a.about.as_str().into(),
+                                            })
+                                            .collect(),
+                                    ),
+                                })
+                                .collect(),
+                        ),
+                    })
+                    .collect(),
+            ),
+        })
+        .collect()
+}
+
+/// The nodes of `relay ls --json` that may use the relay.
+pub fn relay_nodes(v: &Value) -> Vec<RelayNodeRow> {
+    v["nodes"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|n| {
+            let centers: Vec<&str> = n["centers"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            RelayNodeRow {
+                name: s(&n["name"]).into(),
+                reach: if centers.is_empty() {
+                    "may reach every https center of this node".to_string()
+                } else {
+                    format!("may reach {}", centers.join(", "))
+                }
+                .into(),
+                limits: if n["own_limits"] == true {
+                    format!(
+                        "its own limits: {} tunnels at once, {} opened a minute",
+                        n["max_links"], n["max_opens_per_minute"]
+                    )
+                } else {
+                    String::new()
+                }
+                .into(),
+            }
+        })
+        .collect()
+}
+
+/// A setting's value as `config get --json` gave it, for people: a text as
+/// it is, anything else as JSON.
+pub fn setting(v: &Value) -> String {
+    match v {
+        Value::String(s) => s.clone(),
+        other => serde_json::to_string_pretty(other).unwrap_or_default(),
+    }
+}
+
+/// The `--header` arguments of `proxy set` from the lines of the headers
+/// field.
+pub fn header_args(text: &str) -> Vec<String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .flat_map(|l| ["--header".to_string(), l.to_string()])
+        .collect()
+}
+
 /// A time ahead, in words.
 fn ahead(ms: u64) -> String {
     let min = ms / 60_000;
@@ -349,13 +586,11 @@ fn short(v: &Value) -> String {
     }
 }
 
-/// The audit entries to show, newest first, at most [`AUDIT_SHOWN`], from
-/// the entries `audit --json` gave (oldest first). `centers` are the paired
-/// ones, whose entries take rule buttons.
-pub fn audit(entries: &[Value], centers: &[String], now_ms: u64) -> Vec<AuditRow> {
-    entries
+/// The audit entries to show, at most [`AUDIT_SHOWN`], from the `newest`
+/// first. `centers` are the paired ones, whose entries take rule buttons.
+pub fn audit(newest: &[Value], centers: &[String], now_ms: u64) -> Vec<AuditRow> {
+    newest
         .iter()
-        .rev()
         .take(AUDIT_SHOWN)
         .enumerate()
         .map(|(i, e)| audit_row(e, i, centers, now_ms))
@@ -540,7 +775,7 @@ mod tests {
                 {"name": "old", "url": "x", "status": "connecting", "mode": "allowlist", "revoked": true},
             ],
         });
-        let (st, centers) = status(&v, NOW);
+        let (st, centers) = status(&v, NOW, false);
         assert_eq!(st.state, "running");
         assert_eq!(st.tone, Tone::Ok);
         assert_eq!((st.centers, st.connected), (3, 1));
@@ -576,14 +811,14 @@ mod tests {
         let v = json!({"daemon": "not running", "locked": false, "sudo": "off",
             "command_limits": {"off": "the node does not run"},
             "centers": [{"name": "home", "url": "u", "status": null, "mode": "allowlist", "paused": true}]});
-        let (st, centers) = status(&v, NOW);
+        let (st, centers) = status(&v, NOW, false);
         assert_eq!((st.state.as_str(), st.tone), ("stopped", Tone::Warn));
         // Not running is said once, not as a missing limit too.
         assert_eq!(st.warnings.row_count(), 0);
         assert_eq!(centers[0].link, "Paused");
         let v = json!({"daemon": "running", "locked": true, "centers": [],
             "folder_commands_off": "commands cannot be confined on this machine"});
-        let (st, _) = status(&v, NOW);
+        let (st, _) = status(&v, NOW, false);
         assert_eq!(st.state, "locked");
         assert_eq!(st.warnings.row_count(), 1);
     }
@@ -600,7 +835,7 @@ mod tests {
             "a".repeat(nerve_policy::audit::TARGET_MAX_CHARS),
             n = nerve_policy::audit::TARGET_MAX_CHARS
         );
-        let entries = vec![
+        let entries = [
             call("git status", "allowed", "home"),
             json!({"ts": NOW, "kind": "settings", "by": "local", "version": 4,
                 "changes": [{"key": "center.home.policy.mode", "old": "allowlist", "new": "user"}]}),
@@ -608,7 +843,8 @@ mod tests {
             call(&cut, "forbidden", "home"),
             json!({"ts": NOW, "center": "home", "cap": "fs", "action": "read", "target": "/etc/shadow", "decision": "forbidden", "reason": "protected path"}),
         ];
-        let rows = audit(&entries, &centers, NOW);
+        let newest: Vec<Value> = entries.iter().rev().cloned().collect();
+        let rows = audit(&newest, &centers, NOW);
         assert_eq!(rows.len(), 5);
         assert_eq!(rows[0].title, "fs.read");
         assert_eq!(
@@ -667,6 +903,74 @@ mod tests {
             rule_args(&e, "deny", false)[3..6],
             ["/srv/a", "--action", "fs.write"]
         );
+    }
+
+    #[test]
+    fn the_permissions_of_a_center() {
+        let f = folders(
+            &json!({"folders": [{"path": "/srv/a", "read": true, "write": false, "execute": true}]}),
+        );
+        assert_eq!(
+            (f[0].path.as_str(), f[0].read, f[0].write, f[0].execute),
+            ("/srv/a", true, false, true)
+        );
+        assert_eq!(rights(true, false, true), "=rx");
+        assert_eq!(rights(false, false, false), "=");
+        let rows = caps(&json!({"caps": {"exec.run": "off", "fs": "hidden"},
+            "known": {"exec": ["run", "signal"], "fs": ["read"]}}));
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, ["exec", "exec.run", "exec.signal", "fs", "fs.read"]);
+        assert_eq!((rows[0].setting, rows[0].set), (0, false));
+        assert_eq!(
+            (rows[1].setting, rows[1].set, rows[1].action),
+            (1, true, true)
+        );
+        assert_eq!(rows[3].setting, 2);
+        assert_eq!(cap_word(2), "hidden");
+        let c = json!({"mode": "user", "until": NOW + 90 * 60_000});
+        assert_eq!(mode_until(&c, NOW), "Back to allowlist mode in 1 h.");
+        assert_eq!(mode_until(&json!({"mode": "user"}), NOW), "");
+        assert_eq!(
+            header_args("A: 1\n\n B: 2 \n"),
+            ["--header", "A: 1", "--header", "B: 2"]
+        );
+    }
+
+    #[test]
+    fn the_log_newest_first_or_its_problems() {
+        let lines = [
+            json!({"ts": NOW, "level": "error", "msg": "cannot connect"}),
+            json!({"ts": NOW, "level": "info", "msg": "node started"}),
+            json!({"ts": NOW, "level": "warn", "msg": "link dropped", "node": "web-1"}),
+        ];
+        let rows = log_rows(&lines, false, NOW);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            (rows[0].level.as_str(), rows[0].tone),
+            ("Error", Tone::Danger)
+        );
+        let rows = log_rows(&lines, true, NOW);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].msg, "link dropped (web-1)");
+    }
+
+    #[test]
+    fn help_is_the_clis_own() {
+        let sections = help(&nerve_node::cli::help());
+        let names: Vec<String> = sections.iter().map(|s| s.name.to_string()).collect();
+        assert!(names.contains(&"Pair and connect".to_string()), "{names:?}");
+        let all: Vec<String> = sections
+            .iter()
+            .flat_map(|s| s.cards.iter().collect::<Vec<_>>())
+            .flat_map(|c| {
+                c.verbs
+                    .iter()
+                    .map(|v| v.usage.to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert!(all.iter().any(|u| u.contains("audit")), "{all:?}");
+        assert!(all.iter().any(|u| u.contains("log")), "{all:?}");
     }
 
     #[test]

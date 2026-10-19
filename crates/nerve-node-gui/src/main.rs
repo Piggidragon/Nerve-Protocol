@@ -9,12 +9,35 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 fn main() {
-    if std::env::args_os().len() > 1 {
+    // Not `args()`: a path for the CLI need not be UTF-8.
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let words: Vec<Option<&str>> = args.iter().map(|a| a.to_str()).collect();
+    // The elevated broker of the app (nerve_node_gui::broker), started by
+    // the app itself.
+    if words.first() == Some(&Some(nerve_node_gui::broker::ARG)) {
+        let rest: Vec<String> = args[1..]
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        std::process::exit(nerve_node_gui::broker::main(&rest));
+    }
+    // A nerve:// link alone, which the desktop hands to the app when one is
+    // opened (no command of nerve-node): the app goes straight to pairing.
+    if let [Some(link)] = words.as_slice()
+        && link.to_ascii_lowercase().starts_with("nerve://")
+    {
+        if let Err(e) = nerve_node_gui::app::run(Some(link.to_string())) {
+            eprintln!("nerve-node-gui: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if !args.is_empty() {
         #[cfg(windows)]
         nerve_node_gui::console::attach();
         std::process::exit(nerve_node::entry::main());
     }
-    if let Err(e) = nerve_node_gui::app::run() {
+    if let Err(e) = nerve_node_gui::app::run(None) {
         eprintln!("nerve-node-gui: {e}");
         std::process::exit(1);
     }

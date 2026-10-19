@@ -40,6 +40,12 @@ impl Screen {
         Ok(Screen { window })
     }
 
+    /// Makes the window `width` by `height` pixels: a long page in one
+    /// picture.
+    pub fn resize(&self, width: u32, height: u32) {
+        self.window.set_size(PhysicalSize::new(width, height));
+    }
+
     /// Draws what the window shows now.
     pub fn draw(&self) -> SharedPixelBuffer<Rgba8Pixel> {
         slint::platform::update_timers_and_animations();

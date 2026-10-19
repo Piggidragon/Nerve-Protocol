@@ -88,23 +88,43 @@ export component OverviewPage inherits PageFrame {
             }
             VerticalLayout {
                 alignment: center;
-                if Store.status.state == "locked": Button {
-                    text: "Unlock";
-                    icon: @image-url("icons/unlock.svg");
-                    kind: ButtonKind.primary;
-                    busy: Store.busy == "node";
-                    clicked => {
-                        Store.unlock();
+                HorizontalLayout {
+                    spacing: Space.sm;
+                    if Store.status.state == "stopped" && !Store.installed: Button {
+                        text: "Start the node";
+                        icon: @image-url("icons/play.svg");
+                        kind: ButtonKind.primary;
+                        busy: Store.busy == "run";
+                        clicked => {
+                            Store.node-start();
+                        }
                     }
-                }
-                if Store.status.state != "locked": Button {
-                    text: "Panic";
-                    icon: @image-url("icons/octagon.svg");
-                    kind: ButtonKind.danger-soft;
-                    busy: Store.busy == "node";
-                    why-disabled: "Ends every link and runs nothing until you unlock";
-                    clicked => {
-                        Store.panic();
+                    if Store.status.state == "running" && Store.started-here: Button {
+                        text: "Stop";
+                        icon: @image-url("icons/pause.svg");
+                        busy: Store.busy == "run";
+                        clicked => {
+                            Store.node-stop();
+                        }
+                    }
+                    if Store.status.state == "locked": Button {
+                        text: "Unlock";
+                        icon: @image-url("icons/unlock.svg");
+                        kind: ButtonKind.primary;
+                        busy: Store.busy == "node";
+                        clicked => {
+                            Store.unlock();
+                        }
+                    }
+                    if Store.status.state != "locked": Button {
+                        text: "Panic";
+                        icon: @image-url("icons/octagon.svg");
+                        kind: ButtonKind.danger-soft;
+                        busy: Store.busy == "node";
+                        why-disabled: "Ends every link and runs nothing until you unlock";
+                        clicked => {
+                            Store.panic();
+                        }
                     }
                 }
             }
@@ -168,6 +188,13 @@ export component OverviewPage inherits PageFrame {
                     font-size: Type.body;
                     wrap: word-wrap;
                     vertical-alignment: center;
+                }
+                Button {
+                    text: "Set up…";
+                    kind: ButtonKind.ghost;
+                    clicked => {
+                        Store.setup-start();
+                    }
                 }
                 Button {
                     text: "Pair a center";

@@ -1,20 +1,56 @@
 //! Runs `nerve-node` for the app: this same program with arguments, which
 //! behaves as `nerve-node` (src/main.rs), with `--json`, and reads its
 //! answer (docs/user/commands.md). The app never parses text meant for
-//! people, and has the CLI's checks because it runs the CLI.
+//! people, and has the CLI's checks because it runs the CLI. On a node
+//! installed as a service the commands go through the elevated broker
+//! (crate::broker) instead, which runs the same program the same way.
 
-use std::ffi::OsString;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use serde_json::Value;
 
-/// Starts the CLI: which program, and the folders it is given.
-#[derive(Debug, Clone)]
+use crate::broker;
+
+/// Starts the CLI: which program, the folders it is given, and whether it
+/// goes through the broker.
+#[derive(Clone)]
 pub struct Runner {
     exe: PathBuf,
-    dirs: Vec<OsString>,
+    dirs: Vec<String>,
+    broker: Option<Arc<broker::Client>>,
+}
+
+/// What a run of the program gave back.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Output {
+    pub ok: bool,
+    pub code: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+/// A command that keeps running and gives a line at a time (`audit
+/// --follow`); it ends when this is dropped.
+pub struct Follow {
+    stop: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl Follow {
+    pub fn new(stop: Box<dyn FnOnce() + Send>) -> Follow {
+        Follow { stop: Some(stop) }
+    }
+}
+
+impl Drop for Follow {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            stop();
+        }
+    }
 }
 
 impl Runner {
@@ -31,13 +67,49 @@ impl Runner {
         let mut dirs = Vec::new();
         if let Some(c) = config_dir {
             dirs.push("--config-dir".into());
-            dirs.push(c.into());
+            dirs.push(c.display().to_string());
         }
         if let Some(s) = state_dir {
             dirs.push("--state-dir".into());
-            dirs.push(s.into());
+            dirs.push(s.display().to_string());
         }
-        Runner { exe, dirs }
+        Runner {
+            exe,
+            dirs,
+            broker: None,
+        }
+    }
+
+    pub fn exe(&self) -> &PathBuf {
+        &self.exe
+    }
+
+    /// The same runner, its commands going through `broker`.
+    pub fn through(&self, broker: Arc<broker::Client>) -> Runner {
+        Runner {
+            broker: Some(broker),
+            ..self.clone()
+        }
+    }
+
+    /// The same runner, its commands run directly again.
+    pub fn direct(&self) -> Runner {
+        Runner {
+            broker: None,
+            ..self.clone()
+        }
+    }
+
+    /// Whether the commands go through the broker.
+    pub fn elevated(&self) -> bool {
+        self.broker.is_some()
+    }
+
+    fn args(&self, args: &[&str]) -> Vec<String> {
+        let mut all = self.dirs.clone();
+        all.push("--json".into());
+        all.extend(args.iter().map(|a| a.to_string()));
+        all
     }
 
     /// Runs `nerve-node --json <args>` and returns its answer, or the error
@@ -50,35 +122,148 @@ impl Runner {
     /// password or a passphrase: never an argument, which every process of
     /// the user could read.
     pub fn run_with(&self, args: &[&str], input: Option<&str>) -> Result<Value, String> {
-        let mut cmd = Command::new(&self.exe);
-        cmd.args(&self.dirs)
-            .arg("--json")
-            .args(args)
-            .stdin(if input.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("cannot start {}: {e}", self.exe.display()))?;
-        if let Some(text) = input {
-            let mut stdin = child.stdin.take().expect("piped");
-            // A command that ends before it reads leaves its own answer.
-            let _ = stdin.write_all(format!("{text}\n").as_bytes());
-        }
-        let out = child
-            .wait_with_output()
-            .map_err(|e| format!("nerve-node did not end: {e}"))?;
-        answer(
-            out.status.success(),
-            out.status.code(),
-            &out.stdout,
-            &out.stderr,
-        )
+        let args = self.args(args);
+        let out = match &self.broker {
+            Some(b) => b.run(args, input)?,
+            None => run_process(&self.exe, &args, input)?,
+        };
+        answer(out.ok, out.code, &out.stdout, &out.stderr)
     }
+
+    /// Runs `nerve-node --json <args>` that keeps answering (`--follow`):
+    /// `each` gets every entry, or the error that ended it.
+    pub fn follow(
+        &self,
+        args: &[&str],
+        each: impl FnMut(Result<Value, String>) + Send + 'static,
+    ) -> Result<Follow, String> {
+        let args = self.args(args);
+        let each = Arc::new(Mutex::new(each));
+        let on_line = {
+            let each = each.clone();
+            move |line: String| {
+                if let Some(v) = entry(&line) {
+                    (each.lock().unwrap_or_else(|p| p.into_inner()))(v);
+                }
+            }
+        };
+        let on_end = move |out: Output| {
+            if !out.ok
+                && let Err(e) = answer(out.ok, out.code, b"", &out.stderr)
+            {
+                (each.lock().unwrap_or_else(|p| p.into_inner()))(Err(e));
+            }
+        };
+        match &self.broker {
+            Some(b) => b.follow(args, Box::new(on_line), Box::new(on_end)),
+            None => follow_process(&self.exe, &args, Box::new(on_line), Box::new(on_end)),
+        }
+    }
+
+    /// Starts `nerve-node run` for a node the app runs itself; never through
+    /// the broker (an installed node is the service's).
+    pub fn start_node(&self) -> Result<Child, String> {
+        Command::new(&self.exe)
+            .args(&self.dirs)
+            .arg("run")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("cannot start the node: {e}"))
+    }
+}
+
+/// One line of a command that keeps answering: an entry, or the error it
+/// ended with. Anything else is no answer.
+fn entry(line: &str) -> Option<Result<Value, String>> {
+    let v: Value = serde_json::from_str(line.trim()).ok()?;
+    match v["error"].as_str() {
+        Some(e) if v.as_object().is_some_and(|o| o.len() == 1) => Some(Err(e.to_string())),
+        _ => Some(Ok(v)),
+    }
+}
+
+/// Runs `exe` with `args`, `input` as the first line of stdin, and waits.
+pub fn run_process(exe: &PathBuf, args: &[String], input: Option<&str>) -> Result<Output, String> {
+    let mut child = Command::new(exe)
+        .args(args)
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot start {}: {e}", exe.display()))?;
+    if let Some(text) = input {
+        let mut stdin = child.stdin.take().expect("piped");
+        // A command that ends before it reads leaves its own answer.
+        let _ = stdin.write_all(format!("{text}\n").as_bytes());
+    }
+    let out = child
+        .wait_with_output()
+        .map_err(|e| format!("nerve-node did not end: {e}"))?;
+    Ok(Output {
+        ok: out.status.success(),
+        code: out.status.code(),
+        stdout: out.stdout,
+        stderr: out.stderr,
+    })
+}
+
+/// Starts `exe` with `args` and gives each line it prints to `on_line`, then
+/// how it ended to `on_end`, unless it was ended on purpose. The returned
+/// [`Follow`] ends it.
+pub fn follow_process(
+    exe: &PathBuf,
+    args: &[String],
+    mut on_line: Box<dyn FnMut(String) + Send>,
+    on_end: Box<dyn FnOnce(Output) + Send>,
+) -> Result<Follow, String> {
+    let mut child = Command::new(exe)
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot start {}: {e}", exe.display()))?;
+    let stdout = child.stdout.take().expect("piped");
+    let mut stderr = child.stderr.take().expect("piped");
+    let child = Arc::new(Mutex::new(child));
+    let stopped = Arc::new(AtomicBool::new(false));
+    {
+        let (child, stopped) = (child.clone(), stopped.clone());
+        std::thread::spawn(move || {
+            let err = std::thread::spawn(move || {
+                let mut b = Vec::new();
+                let _ = std::io::Read::read_to_end(&mut stderr, &mut b);
+                b
+            });
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if stopped.load(Ordering::SeqCst) {
+                    break;
+                }
+                on_line(line);
+            }
+            let status = child.lock().unwrap_or_else(|p| p.into_inner()).wait();
+            let stderr = err.join().unwrap_or_default();
+            if !stopped.load(Ordering::SeqCst) {
+                on_end(Output {
+                    ok: status.as_ref().is_ok_and(|s| s.success()),
+                    code: status.ok().and_then(|s| s.code()),
+                    stdout: Vec::new(),
+                    stderr,
+                });
+            }
+        });
+    }
+    Ok(Follow::new(Box::new(move || {
+        stopped.store(true, Ordering::SeqCst);
+        let _ = child.lock().unwrap_or_else(|p| p.into_inner()).kill();
+    })))
 }
 
 /// What a run of the CLI answered: its JSON, or its error. A run that gave
@@ -137,5 +322,17 @@ mod tests {
         assert!(e.contains("stopped"), "{e}");
         // Success without JSON is no answer either.
         assert!(answer(true, Some(0), b"text\n", b"").is_err());
+    }
+
+    #[test]
+    fn a_followed_line_is_an_entry_or_the_error() {
+        assert_eq!(
+            entry("{\"ts\":1,\"msg\":\"x\"}").unwrap().unwrap()["msg"],
+            "x"
+        );
+        assert_eq!(entry("{\"error\":\"gone\"}").unwrap().unwrap_err(), "gone");
+        // An entry may have a field named error.
+        assert!(entry("{\"ts\":1,\"error\":\"e\"}").unwrap().is_ok());
+        assert!(entry("not json").is_none());
     }
 }

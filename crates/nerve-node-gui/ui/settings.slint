@@ -1,0 +1,466 @@
+// Settings: this machine's node, how it reaches its centers, its backups,
+// any setting by its name, and the app's own look.
+
+import { Theme, Type, Space, Radius, Size, Tone } from "theme.slint";
+import { Load, RelayNodeRow } from "data.slint";
+import { Store, Prefs } from "store.slint";
+import {
+    Button, ButtonKind, Card, Pill, Banner, PageHeader, PageFrame, Planned, Segmented, Divider,
+    TextField, Field, InfoRow, ListRow, Icon, IconTile,
+} from "widgets.slint";
+
+// A setting card: its icon, title and sentence on top, its controls below.
+component Group inherits Card {
+    in property <image> icon;
+    in property <string> title;
+    in property <string> text;
+    pad: Space.xl;
+    gap: Space.lg;
+    HorizontalLayout {
+        spacing: Space.lg;
+        VerticalLayout {
+            alignment: start;
+            IconTile {
+                icon: root.icon;
+                tone: Tone.accent;
+            }
+        }
+        VerticalLayout {
+            spacing: 4px;
+            horizontal-stretch: 1;
+            Text {
+                text: root.title;
+                color: Theme.text;
+                font-size: Type.heading;
+                font-weight: Type.semibold;
+            }
+            Text {
+                text: root.text;
+                color: Theme.text-muted;
+                font-size: Type.small;
+                wrap: word-wrap;
+            }
+        }
+    }
+    @children
+}
+
+export component SettingsPage inherits PageFrame {
+    PageHeader {
+        title: "Settings";
+        subtitle: "This machine's node, how it reaches its centers, its backups, and the app.";
+    }
+
+    if Prefs.load == Load.failed: Banner {
+        tone: Tone.danger;
+        title: "The settings could not be read";
+        text: Prefs.error;
+    }
+
+    Group {
+        icon: @image-url("icons/edit.svg");
+        title: "This machine";
+        text: "The name centers see, and where the node keeps its keys.";
+        HorizontalLayout {
+            spacing: Space.md;
+            Field {
+                horizontal-stretch: 1;
+                label: "Name";
+                hint: "Centers show this machine by it. Empty: the host name, " + Prefs.name-shown + ".";
+                TextField {
+                    text <=> Prefs.name;
+                    placeholder: Prefs.name-shown;
+                    label: "Name";
+                    accepted => {
+                        Prefs.name-save(Prefs.name);
+                    }
+                }
+            }
+            VerticalLayout {
+                alignment: start;
+                padding-top: 22px;
+                Button {
+                    text: "Save";
+                    clicked => {
+                        Prefs.name-save(Prefs.name);
+                    }
+                }
+            }
+        }
+        Divider { }
+        HorizontalLayout {
+            spacing: Space.lg;
+            VerticalLayout {
+                spacing: 4px;
+                horizontal-stretch: 1;
+                Text {
+                    text: "Keys";
+                    color: Theme.text;
+                    font-size: Type.small;
+                    font-weight: Type.semibold;
+                }
+                Text {
+                    text: Prefs.storage == 0 ? "In files of the config folder, readable by the node's account only." : "In the system keyring, unlocked with your session.";
+                    color: Theme.text-muted;
+                    font-size: Type.caption;
+                    wrap: word-wrap;
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                Segmented {
+                    options: ["Files", "System keyring"];
+                    current: Prefs.storage;
+                    chosen(i) => {
+                        Prefs.storage-set(i);
+                    }
+                }
+            }
+        }
+    }
+
+    Group {
+        icon: @image-url("icons/globe.svg");
+        title: "Proxy";
+        text: "The node reaches its centers directly, or through an HTTP proxy or a relay. Header values and a password go into the system keyring, never into node.toml.";
+        if Prefs.proxy == "": HorizontalLayout {
+            spacing: Space.md;
+            Text {
+                horizontal-stretch: 1;
+                text: "Direct: no proxy.";
+                color: Theme.text-muted;
+                font-size: Type.small;
+                vertical-alignment: center;
+            }
+            Button {
+                text: "Set a proxy…";
+                small: true;
+                clicked => {
+                    Prefs.proxy-edit();
+                }
+            }
+        }
+        if Prefs.proxy != "": VerticalLayout {
+            spacing: Space.sm;
+            InfoRow {
+                label: "Proxy";
+                value: Prefs.proxy;
+                mono: true;
+            }
+            if Prefs.proxy-pin != "": InfoRow {
+                label: "Pin";
+                value: Prefs.proxy-pin;
+                mono: true;
+            }
+            if Prefs.proxy-login != "": InfoRow {
+                label: "Login";
+                value: Prefs.proxy-login;
+            }
+            if Prefs.proxy-headers != "": InfoRow {
+                label: "Headers";
+                value: Prefs.proxy-headers;
+                mono: true;
+            }
+            if Prefs.proxy-problem != "": Banner {
+                tone: Tone.warn;
+                text: Prefs.proxy-problem;
+            }
+            HorizontalLayout {
+                alignment: end;
+                spacing: Space.sm;
+                Button {
+                    text: "Change…";
+                    small: true;
+                    clicked => {
+                        Prefs.proxy-edit();
+                    }
+                }
+                Button {
+                    text: "Remove";
+                    kind: ButtonKind.danger-soft;
+                    small: true;
+                    clicked => {
+                        Prefs.proxy-remove();
+                    }
+                }
+            }
+        }
+    }
+
+    Group {
+        icon: @image-url("icons/plug.svg");
+        title: "Relay";
+        text: "Let nodes that cannot reach a center themselves reach this node's centers through it. Each such node gets a token of its own.";
+        if Prefs.relay-listen == "": HorizontalLayout {
+            spacing: Space.md;
+            Field {
+                horizontal-stretch: 1;
+                label: "Listen on";
+                hint: "An address and port of this machine the other nodes reach.";
+                TextField {
+                    text <=> Prefs.relay-address;
+                    mono: true;
+                    label: "Listen on";
+                }
+            }
+            VerticalLayout {
+                alignment: start;
+                padding-top: 22px;
+                Button {
+                    text: "Turn on";
+                    clicked => {
+                        Prefs.relay-on();
+                    }
+                }
+            }
+        }
+        if Prefs.relay-listen != "": VerticalLayout {
+            spacing: Space.md;
+            HorizontalLayout {
+                spacing: Space.md;
+                VerticalLayout {
+                    alignment: center;
+                    Pill {
+                        text: "On";
+                        tone: Tone.ok;
+                        dot: true;
+                    }
+                }
+                Text {
+                    horizontal-stretch: 1;
+                    text: Prefs.relay-listen + (Prefs.relay-status != "" ? "  ·  " + Prefs.relay-status : "");
+                    color: Theme.text;
+                    font-size: Type.small;
+                    font-family: Type.mono;
+                    vertical-alignment: center;
+                }
+                Button {
+                    text: "Turn off";
+                    small: true;
+                    clicked => {
+                        Prefs.relay-off();
+                    }
+                }
+            }
+            if Prefs.relay-pin != "": InfoRow {
+                label: "Its pin";
+                value: Prefs.relay-pin;
+                mono: true;
+            }
+        }
+        if Prefs.relay-nodes.length > 0: Rectangle {
+            border-radius: Radius.md;
+            border-width: 1px;
+            border-color: Theme.border;
+            VerticalLayout {
+                for n[i] in Prefs.relay-nodes: ListRow {
+                    first: i == 0;
+                    VerticalLayout {
+                        horizontal-stretch: 1;
+                        spacing: 2px;
+                        Text {
+                            text: n.name;
+                            color: Theme.text;
+                            font-size: Type.small;
+                            font-weight: Type.semibold;
+                        }
+                        Text {
+                            text: n.reach + (n.limits != "" ? "; " + n.limits : "");
+                            color: Theme.text-muted;
+                            font-size: Type.caption;
+                            wrap: word-wrap;
+                        }
+                    }
+                    Button {
+                        text: "New token";
+                        small: true;
+                        kind: ButtonKind.ghost;
+                        clicked => {
+                            Prefs.relay-token(n.name);
+                        }
+                    }
+                    Button {
+                        text: "Remove";
+                        small: true;
+                        kind: ButtonKind.danger-soft;
+                        clicked => {
+                            Prefs.relay-remove(n.name);
+                        }
+                    }
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: Space.md;
+            TextField {
+                horizontal-stretch: 1;
+                text <=> Prefs.relay-new-node;
+                placeholder: "name of a node, like laptop-2";
+                label: "Name of a node";
+            }
+            Button {
+                text: "Add a node";
+                icon: @image-url("icons/plus.svg");
+                enabled: Prefs.relay-new-node != "";
+                clicked => {
+                    Prefs.relay-add();
+                }
+            }
+        }
+    }
+
+    Group {
+        icon: @image-url("icons/archive.svg");
+        title: "Backup";
+        text: "Write the config and the keys to a file a passphrase protects, to keep it or to move the node to another machine, and put a backup back.";
+        HorizontalLayout {
+            alignment: end;
+            spacing: Space.sm;
+            Button {
+                text: "Restore…";
+                clicked => {
+                    Prefs.restore-choose();
+                }
+            }
+            Button {
+                text: "Back up…";
+                kind: ButtonKind.primary;
+                clicked => {
+                    Prefs.backup-choose();
+                }
+            }
+        }
+    }
+
+    Group {
+        icon: @image-url("icons/sliders.svg");
+        title: "Any setting";
+        text: "Every setting of node.toml by its dotted name, like log.level or center.<name>.policy.mode. The node checks each change as it checks the command line's.";
+        HorizontalLayout {
+            spacing: Space.md;
+            TextField {
+                horizontal-stretch: 1;
+                text <=> Prefs.raw-key;
+                mono: true;
+                placeholder: "node.name";
+                label: "Setting";
+                accepted => {
+                    Prefs.raw-get();
+                }
+            }
+            Button {
+                text: "Show";
+                enabled: Prefs.raw-key != "";
+                clicked => {
+                    Prefs.raw-get();
+                }
+            }
+        }
+        if Prefs.raw-shown != "": VerticalLayout {
+            spacing: Space.sm;
+            Text {
+                text: "Now";
+                color: Theme.text-faint;
+                font-size: Type.caption;
+                font-weight: Type.semibold;
+            }
+            Text {
+                text: Prefs.raw-shown;
+                color: Theme.text;
+                font-size: Type.small;
+                font-family: Type.mono;
+                wrap: char-wrap;
+            }
+        }
+        HorizontalLayout {
+            spacing: Space.md;
+            TextField {
+                horizontal-stretch: 1;
+                text <=> Prefs.raw-value;
+                mono: true;
+                placeholder: "new value";
+                label: "New value";
+                accepted => {
+                    Prefs.raw-set();
+                }
+            }
+            Button {
+                text: "Set";
+                enabled: Prefs.raw-key != "" && Prefs.raw-value != "";
+                clicked => {
+                    Prefs.raw-set();
+                }
+            }
+            Button {
+                text: "Unset";
+                kind: ButtonKind.ghost;
+                enabled: Prefs.raw-key != "";
+                clicked => {
+                    Prefs.raw-unset();
+                }
+            }
+        }
+        if Prefs.raw-error != "": Banner {
+            tone: Tone.danger;
+            text: Prefs.raw-error;
+        }
+        Divider { }
+        HorizontalLayout {
+            spacing: Space.md;
+            Text {
+                horizontal-stretch: 1;
+                text: "node.toml changed by hand is refused until you take it as it is. Read the file first.";
+                color: Theme.text-muted;
+                font-size: Type.caption;
+                wrap: word-wrap;
+                vertical-alignment: center;
+            }
+            Button {
+                text: "Take node.toml as it is…";
+                small: true;
+                clicked => {
+                    Prefs.accept-file();
+                }
+            }
+        }
+    }
+
+    Card {
+        pad: Space.xl;
+        HorizontalLayout {
+            spacing: Space.lg;
+            VerticalLayout {
+                spacing: 6px;
+                horizontal-stretch: 1;
+                Text {
+                    text: "Appearance";
+                    color: Theme.text;
+                    font-size: Type.heading;
+                    font-weight: Type.semibold;
+                }
+                Text {
+                    text: "Light or dark, or as the system is set.";
+                    color: Theme.text-muted;
+                    font-size: Type.small;
+                    wrap: word-wrap;
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                Segmented {
+                    options: ["System", "Light", "Dark"];
+                    current: Store.appearance;
+                    chosen(i) => {
+                        Store.set-appearance(i);
+                    }
+                }
+            }
+        }
+    }
+
+    Planned {
+        icon: @image-url("icons/plug.svg");
+        title: "Service";
+        text: "Install the node as a service that starts with the machine, update it and remove it, and this app with it.";
+    }
+}

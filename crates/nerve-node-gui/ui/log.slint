@@ -1,0 +1,95 @@
+// Log: what the node did, newest first, as `nerve-node log --follow` gives
+// it while the page is open.
+
+import { Theme, Type, Space, Radius, Tone } from "theme.slint";
+import { Load, LogRow } from "data.slint";
+import { Logs } from "store.slint";
+import {
+    Button, ButtonKind, Card, Pill, Banner, Loading, PageHeader, PageFrame, EmptyState, Segmented,
+    ListRow, StatusDot,
+} from "widgets.slint";
+
+export component LogPage inherits PageFrame {
+    PageHeader {
+        title: "Log";
+        subtitle: "What the node did: its starts and stops, its links, and what went wrong. New lines come in as they are written.";
+        Segmented {
+            options: ["All", "Problems"];
+            current: Logs.problems-only ? 1 : 0;
+            chosen(i) => {
+                Logs.filter(i == 1);
+            }
+        }
+    }
+
+    if Logs.load == Load.loading && Logs.rows.length == 0: Loading {
+        text: "Reading the log…";
+    }
+
+    if Logs.load == Load.failed: Banner {
+        tone: Tone.danger;
+        title: "The log could not be read";
+        text: Logs.error;
+    }
+
+    if Logs.load == Load.ready && Logs.rows.length == 0: Card {
+        EmptyState {
+            icon: @image-url("icons/log.svg");
+            title: Logs.problems-only ? "No problems" : "Nothing logged yet";
+            text: Logs.problems-only
+                ? "No error or warning in the log. Everything else is under All."
+                : "The node writes its log while it runs. Start it, and its lines show here.";
+        }
+    }
+
+    if Logs.rows.length > 0: Card {
+        pad: 0;
+        gap: 0;
+        for row[i] in Logs.rows: ListRow {
+            first: i == 0;
+            VerticalLayout {
+                alignment: start;
+                padding-top: 3px;
+                StatusDot {
+                    tone: row.tone;
+                }
+            }
+            VerticalLayout {
+                spacing: 3px;
+                horizontal-stretch: 1;
+                HorizontalLayout {
+                    spacing: Space.sm;
+                    Text {
+                        text: row.level;
+                        color: row.tone == Tone.neutral ? Theme.text-muted : Theme.tone(row.tone);
+                        font-size: Type.caption;
+                        font-weight: Type.semibold;
+                        vertical-alignment: center;
+                    }
+                    Rectangle {
+                        horizontal-stretch: 1;
+                    }
+                    Text {
+                        text: row.when;
+                        color: Theme.text-faint;
+                        font-size: Type.caption;
+                        accessible-label: row.when-exact;
+                    }
+                }
+                Text {
+                    text: row.msg;
+                    color: Theme.text;
+                    font-size: Type.small;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+
+    if Logs.rows.length >= 300: Text {
+        text: "The newest " + Logs.rows.length + " lines. `nerve-node log` shows them all.";
+        color: Theme.text-faint;
+        font-size: Type.caption;
+        horizontal-alignment: center;
+    }
+}

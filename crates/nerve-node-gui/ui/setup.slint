@@ -1,0 +1,187 @@
+// The first-run steps, as `nerve-node setup` asks them in a terminal: the
+// machine's name, where the keys live, the first center and its mode. Each
+// step runs its own command when the owner goes on, so the steps can stop
+// anywhere and be taken again.
+
+import { Theme, Type, Space, Radius, Tone } from "theme.slint";
+import { Store } from "store.slint";
+import {
+    Button, ButtonKind, Banner, Dialog, Field, TextField, InfoRow, OptionTile, Steps,
+} from "widgets.slint";
+
+export component SetupDialog inherits Dialog {
+    title: Store.setup-step == 0 ? "Set up this machine"
+        : Store.setup-step == 1 ? "Where the keys live"
+        : Store.setup-step == 2 ? "Pair your first center"
+        : Store.setup-step == 3 ? "What may " + Store.setup-center + " do?"
+        : "This machine is set up";
+    subtitle: Store.setup-step == 0 ? "A few steps, each saved when you go on. The name is how centers show this machine."
+        : Store.setup-step == 1 ? "The node keeps a key for each center, and the key of its config. Keep them in files unless you use the system keyring for such things."
+        : Store.setup-step == 2 ? "In the center's web UI press Pair a machine, and paste the link it shows. Nothing is paired until you confirm."
+        : Store.setup-step == 3 ? "You can change it any time under Permissions, and add folders and rules there."
+        : Store.installed ? "The service runs the node. Its pages show what it does."
+        : "Start the node to link this machine to its centers. It runs while this window is open.";
+    card-width: 580px;
+    close => {
+        Store.setup-open = false;
+    }
+
+    if Store.setup-step == 0: Field {
+        label: "Name";
+        hint: "Leave it as it is to take the host name.";
+        TextField {
+            text <=> Store.setup-name;
+            label: "Name";
+            accepted => {
+                Store.setup-next();
+            }
+        }
+    }
+
+    if Store.setup-step == 1: HorizontalLayout {
+        spacing: Space.md;
+        OptionTile {
+            icon: @image-url("icons/archive.svg");
+            title: "Files";
+            text: "In the config folder, readable by the node's account only.";
+            selected: Store.setup-storage == 0;
+            clicked => {
+                Store.setup-storage = 0;
+            }
+        }
+        OptionTile {
+            icon: @image-url("icons/key.svg");
+            title: "System keyring";
+            text: "In the keyring of your session, which must be unlocked for the node to start.";
+            selected: Store.setup-storage == 1;
+            clicked => {
+                Store.setup-storage = 1;
+            }
+        }
+    }
+
+    if Store.setup-step == 2 && Store.pair-step == 0: VerticalLayout {
+        spacing: Space.lg;
+        Field {
+            label: "Pairing link";
+            TextField {
+                text <=> Store.pair-link;
+                placeholder: "nerve://pair?center=…";
+                mono: true;
+                label: "Pairing link";
+                invalid: Store.pair-error != "";
+                accepted => {
+                    Store.setup-next();
+                }
+            }
+        }
+        Field {
+            label: "Name on this machine";
+            hint: "Optional. Leave it empty to take the center's own name.";
+            TextField {
+                text <=> Store.pair-name;
+                placeholder: "home-lab";
+                label: "Name on this machine";
+            }
+        }
+    }
+
+    if Store.setup-step == 2 && Store.pair-step == 1: Rectangle {
+        background: Theme.surface-alt;
+        border-radius: Radius.lg;
+        border-width: 1px;
+        border-color: Theme.border;
+        VerticalLayout {
+            padding: Space.lg;
+            spacing: Space.md;
+            InfoRow {
+                label: "Center";
+                value: Store.pair-preview.center;
+                mono: true;
+            }
+            InfoRow {
+                label: "Certificate";
+                value: !Store.pair-preview.tls ? "None: plain http, nothing on the way is encrypted"
+                    : Store.pair-preview.pin != "" ? "Pinned: " + Store.pair-preview.pin
+                    : "Checked against the system's roots";
+                mono: Store.pair-preview.tls && Store.pair-preview.pin != "";
+                tone: Store.pair-preview.tls ? Tone.neutral : Tone.danger;
+            }
+        }
+    }
+
+    if Store.setup-step == 2 && Store.pair-error != "": Banner {
+        tone: Tone.danger;
+        text: Store.pair-error;
+    }
+
+    if Store.setup-step == 3: HorizontalLayout {
+        spacing: Space.md;
+        OptionTile {
+            icon: @image-url("icons/shield.svg");
+            title: "Allowlist";
+            text: "Only what an allow rule names. Nothing yet.";
+            selected: Store.setup-mode == "allowlist";
+            clicked => {
+                Store.setup-mode = "allowlist";
+            }
+        }
+        OptionTile {
+            icon: @image-url("icons/folder.svg");
+            title: "Folder";
+            text: "What each folder you add allows, in it.";
+            selected: Store.setup-mode == "folder";
+            clicked => {
+                Store.setup-mode = "folder";
+            }
+        }
+        OptionTile {
+            icon: @image-url("icons/key.svg");
+            title: "User";
+            text: "Anything you could do yourself, protected files aside.";
+            selected: Store.setup-mode == "user";
+            clicked => {
+                Store.setup-mode = "user";
+            }
+        }
+    }
+
+    if Store.setup-step != 2 && Store.setup-error != "": Banner {
+        tone: Tone.danger;
+        text: Store.setup-error;
+    }
+
+    HorizontalLayout {
+        spacing: Space.sm;
+        padding-top: Space.xs;
+        VerticalLayout {
+            alignment: center;
+            Steps {
+                count: 5;
+                current: Store.setup-step;
+            }
+        }
+        Rectangle {
+            horizontal-stretch: 1;
+        }
+        if Store.setup-step < 4: Button {
+            text: Store.setup-step == 2 ? "Not now" : "Skip";
+            kind: ButtonKind.ghost;
+            enabled: !Store.setup-busy && !Store.pair-busy;
+            clicked => {
+                Store.setup-skip();
+            }
+        }
+        Button {
+            text: Store.setup-step == 4 ? (!Store.installed && Store.status.state == "stopped" ? "Start the node" : "Done")
+                : Store.setup-step == 2 && Store.pair-step == 1 ? "Pair"
+                : "Continue";
+            kind: ButtonKind.primary;
+            busy: Store.setup-busy || Store.pair-busy;
+            enabled: Store.setup-step != 2 || Store.pair-link != "";
+            clicked => {
+                Store.setup-next();
+            }
+        }
+    }
+}

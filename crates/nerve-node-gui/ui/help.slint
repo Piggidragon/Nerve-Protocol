@@ -1,0 +1,104 @@
+// Help: every nerve-node command by what it is for, read from the CLI's own
+// definition (nerve_node::cli::help), the same list the center's help page
+// shows. Each action in the app runs one of them.
+
+import { Theme, Type, Space, Radius, Tone } from "theme.slint";
+import { HelpSection, HelpCard } from "data.slint";
+import { Manual } from "store.slint";
+import { Card, PageHeader, PageFrame, Divider, Code, Banner } from "widgets.slint";
+
+component CommandCard inherits Card {
+    in property <HelpCard> card;
+    pad: 0;
+    gap: 0;
+    VerticalLayout {
+        padding-left: Space.xl;
+        padding-right: Space.xl;
+        padding-top: Space.lg;
+        padding-bottom: Space.md;
+        spacing: 4px;
+        Text {
+            text: root.card.name;
+            color: Theme.text;
+            font-size: Type.body;
+            font-weight: Type.semibold;
+            font-family: Type.mono;
+        }
+        if root.card.about != "": Text {
+            text: root.card.about;
+            color: Theme.text-muted;
+            font-size: Type.small;
+            wrap: word-wrap;
+        }
+    }
+    for v[i] in root.card.verbs: VerticalLayout {
+        Divider { }
+        VerticalLayout {
+            padding-left: Space.xl;
+            padding-right: Space.xl;
+            padding-top: Space.md;
+            padding-bottom: Space.md;
+            spacing: 6px;
+            Code {
+                text: v.usage;
+            }
+            Text {
+                text: v.about;
+                color: Theme.text;
+                font-size: Type.small;
+                wrap: word-wrap;
+            }
+            for a in v.args: HorizontalLayout {
+                spacing: Space.md;
+                Text {
+                    width: 200px;
+                    text: a.name;
+                    color: Theme.text-muted;
+                    font-size: Type.caption;
+                    font-family: Type.mono;
+                    wrap: char-wrap;
+                }
+                Text {
+                    horizontal-stretch: 1;
+                    text: a.about;
+                    color: Theme.text-muted;
+                    font-size: Type.caption;
+                    wrap: word-wrap;
+                }
+            }
+        }
+    }
+}
+
+export component HelpPage inherits PageFrame {
+    PageHeader {
+        title: "Help";
+        subtitle: "Every action in this app runs one of these nerve-node commands, with the same checks and audit records. In a terminal they do the same.";
+    }
+    Banner {
+        tone: Tone.accent;
+        text: "Every command takes --config-dir and --state-dir; one that works on a center takes --center <name> when more than one is paired. The user guide is in docs/user/ of the project.";
+    }
+    for s in Manual.sections: VerticalLayout {
+        spacing: Space.md;
+        VerticalLayout {
+            spacing: 4px;
+            padding-top: Space.sm;
+            Text {
+                text: s.name;
+                color: Theme.text;
+                font-size: Type.heading;
+                font-weight: Type.semibold;
+            }
+            if s.about != "": Text {
+                text: s.about;
+                color: Theme.text-muted;
+                font-size: Type.small;
+                wrap: word-wrap;
+            }
+        }
+        for c in s.cards: CommandCard {
+            card: c;
+        }
+    }
+}

@@ -20,16 +20,31 @@ serde_json.workspace = true
 # Which list an audit button puts a sudo command on, and whether a target
 # was cut: the node's own rules.
 nerve-policy.workspace = true
+# The name of the broker's pipe on Windows (src/broker.rs).
+nerve-transport.workspace = true
+# Native file and folder dialogs: the desktop portal on Linux, so they work
+# on Wayland too.
+rfd.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 # The CLI takes the console of the terminal it was started from
-# (src/console.rs).
+# (src/console.rs); the broker is started with the UAC prompt and talks over
+# a named pipe that only the app's user may open (src/broker.rs).
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
+    "Win32_System_Pipes",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(unix)'.dependencies]
+# Asks a node the app started to end, as Ctrl+C would (src/app/node.rs).
+libc.workspace = true
 
 [build-dependencies]
 slint-build.workspace = true

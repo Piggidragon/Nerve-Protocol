@@ -3,7 +3,10 @@
 // `nerve-node` commands; nothing here decides anything about the node.
 
 import { Tone } from "theme.slint";
-import { Page, Load, NodeStatus, CenterRow, AuditRow, PairPreview } from "data.slint";
+import {
+    Page, Load, NodeStatus, CenterRow, AuditRow, PairPreview, FolderRow, CapRow, LogRow,
+    HelpSection, RelayNodeRow,
+} from "data.slint";
 
 export global Store {
     in-out property <Page> page: Page.overview;
@@ -60,9 +63,179 @@ export global Store {
     callback center-pause(string, bool);
     callback center-grant(string, bool);
     callback center-unpair(string);
+    callback center-rotate(string);
     callback confirm-accepted();
 
     callback panic();
     callback unlock();
     callback set-appearance(int);
+
+    // The node on this machine: installed as a service, or run by the app
+    // (which ends it when the app ends).
+    in-out property <bool> installed;
+    in-out property <bool> started-here;
+    callback node-start();
+    callback node-stop();
+
+    // Elevation: an installed node's files are the system's, so the app asks
+    // for administrator rights once, and says why first.
+    in-out property <bool> elevate-needed;
+    in-out property <bool> elevate-open;
+    in-out property <bool> elevate-busy;
+    in-out property <string> elevate-error;
+    callback elevate-allow();
+
+    // The first-run steps: 0 the name, 1 the keys, 2 the first center, 3 its
+    // mode, 4 done.
+    in-out property <bool> setup-open;
+    in-out property <int> setup-step;
+    in-out property <string> setup-name;
+    in-out property <int> setup-storage;
+    in-out property <string> setup-center;
+    in-out property <string> setup-mode: "allowlist";
+    in-out property <bool> setup-busy;
+    in-out property <string> setup-error;
+    callback setup-start();
+    callback setup-next();
+    callback setup-skip();
+}
+
+// The Permissions page: what one center may do.
+export global Perm {
+    in-out property <[string]> centers;
+    in-out property <int> current;
+    in-out property <string> center;
+    in-out property <Load> load: Load.loading;
+    in-out property <string> error;
+    in-out property <string> mode;
+    in-out property <string> mode-until;
+    in-out property <[FolderRow]> folders;
+    in-out property <[string]> allow;
+    in-out property <[string]> deny;
+    in-out property <[string]> sudo-list;
+    // 0 allow, 1 deny, 2 sudo.
+    in-out property <int> list;
+    in-out property <string> rule-text;
+    in-out property <bool> rule-wildcard;
+    in-out property <[CapRow]> caps;
+    in-out property <bool> sudo-on;
+
+    in-out property <bool> mode-open;
+    in-out property <string> mode-choice;
+    in-out property <bool> mode-timed;
+    in-out property <string> mode-hours: "8";
+    in-out property <string> mode-error;
+
+    in-out property <bool> folder-open;
+    in-out property <string> folder-path;
+    in-out property <bool> folder-read: true;
+    in-out property <bool> folder-write;
+    in-out property <bool> folder-execute;
+    in-out property <string> folder-error;
+
+    in-out property <bool> sudo-open;
+    in-out property <string> sudo-password;
+    in-out property <string> sudo-error;
+    in-out property <bool> sudo-busy;
+
+    callback pick(int);
+    callback refresh();
+    callback mode-pick(string);
+    callback mode-apply();
+    callback folder-choose();
+    callback folder-add();
+    callback folder-set(string, bool, bool, bool);
+    callback folder-remove(string);
+    callback rule-add();
+    callback rule-remove(int, string);
+    callback cap-set(string, int);
+    callback sudo-ask();
+    callback sudo-confirm();
+    callback sudo-off();
+}
+
+// The Log page.
+export global Logs {
+    in-out property <Load> load: Load.loading;
+    in-out property <string> error;
+    in-out property <[LogRow]> rows;
+    in-out property <bool> problems-only;
+    callback filter(bool);
+}
+
+// The Help page: the CLI's own command list.
+export global Manual {
+    in-out property <[HelpSection]> sections;
+}
+
+// The Settings page.
+export global Prefs {
+    in-out property <Load> load: Load.loading;
+    in-out property <string> error;
+
+    in-out property <string> name;
+    in-out property <string> name-shown;
+    in-out property <int> storage;
+    callback name-save(string);
+    callback storage-set(int);
+
+    in-out property <string> proxy;
+    in-out property <string> proxy-pin;
+    in-out property <string> proxy-login;
+    in-out property <string> proxy-headers;
+    in-out property <string> proxy-problem;
+    in-out property <bool> proxy-open;
+    in-out property <string> proxy-new-url;
+    in-out property <string> proxy-new-pin;
+    in-out property <string> proxy-new-headers;
+    in-out property <string> proxy-error;
+    callback proxy-edit();
+    callback proxy-set();
+    callback proxy-remove();
+
+    in-out property <string> relay-listen;
+    in-out property <string> relay-status;
+    in-out property <string> relay-pin;
+    in-out property <[RelayNodeRow]> relay-nodes;
+    in-out property <string> relay-address: "0.0.0.0:7490";
+    in-out property <string> relay-new-node;
+    callback relay-on();
+    callback relay-off();
+    callback relay-add();
+    callback relay-token(string);
+    callback relay-remove(string);
+
+    // A token or a key shown once, with what to do with it.
+    in-out property <bool> once-open;
+    in-out property <string> once-title;
+    in-out property <string> once-text;
+
+    in-out property <string> raw-key;
+    in-out property <string> raw-value;
+    in-out property <string> raw-shown;
+    in-out property <string> raw-error;
+    callback raw-get();
+    callback raw-set();
+    callback raw-unset();
+    callback accept-file();
+
+    in-out property <bool> backup-open;
+    in-out property <string> backup-file;
+    in-out property <string> backup-pass;
+    in-out property <string> backup-pass2;
+    in-out property <bool> backup-keyring;
+    in-out property <string> backup-error;
+    in-out property <bool> backup-busy;
+    callback backup-choose();
+    callback backup-confirm();
+
+    in-out property <bool> restore-open;
+    in-out property <string> restore-file;
+    in-out property <string> restore-pass;
+    in-out property <bool> restore-replace;
+    in-out property <bool> restore-without-proxy;
+    in-out property <string> restore-error;
+    in-out property <bool> restore-busy;
+    callback restore-choose();
+    callback restore-confirm();
 }

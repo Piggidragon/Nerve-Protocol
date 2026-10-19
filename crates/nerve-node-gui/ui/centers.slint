@@ -72,6 +72,16 @@ component CenterCard inherits Card {
                     }
                 }
                 Button {
+                    text: "New key…";
+                    icon: @image-url("icons/key.svg");
+                    kind: ButtonKind.ghost;
+                    small: true;
+                    enabled: !root.waiting;
+                    clicked => {
+                        Store.center-rotate(root.item.name);
+                    }
+                }
+                Button {
                     text: "Unpair";
                     icon: @image-url("icons/unlink.svg");
                     kind: ButtonKind.danger-soft;

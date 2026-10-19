@@ -70,12 +70,15 @@ export global Store {
     callback unlock();
     callback set-appearance(int);
 
-    // The node on this machine: installed as a service, or run by the app
-    // (which ends it when the app ends).
+    // Whether the node's folders are the installed service's.
     in-out property <bool> installed;
-    in-out property <bool> started-here;
-    callback node-start();
-    callback node-stop();
+    // The installed service, from `nerve-node service status`: "" before
+    // the first answer, "none" when the node is not installed as a
+    // service, else running, stopped, starting, stopping or failed.
+    in-out property <string> service-state;
+    in-out property <bool> service-enabled;
+    // start, stop or restart.
+    callback service(string);
 
     // Elevation: an installed node's files are the system's, so the app asks
     // for administrator rights once, and says why first.
@@ -238,4 +241,57 @@ export global Prefs {
     in-out property <bool> restore-busy;
     callback restore-choose();
     callback restore-confirm();
+}
+
+// Installing, updating and removing the app with the node: the installer
+// window, which a program that is not the installed one shows, and the
+// update and uninstall of Settings.
+export global Install {
+    // The window is the installer.
+    in-out property <bool> shown;
+    // welcome: what will be installed; installed: it is, from another
+    // file; choose: what goes with an uninstall, or where an update comes
+    // from; working; done.
+    in-out property <string> step: "welcome";
+    // What runs or ran: install, update or uninstall.
+    in-out property <string> action: "install";
+    // This program's version, the installed one's ("" when none), and
+    // whether this one is newer.
+    in-out property <string> version;
+    in-out property <string> installed-version;
+    in-out property <bool> newer;
+    // The node is installed as a service already, without the app.
+    in-out property <bool> node-only;
+    // Where the app goes, or is.
+    in-out property <string> program;
+    in-out property <bool> windows;
+    // Windows: the account commands run as, and its password, which the
+    // service needs to start them.
+    in-out property <string> account;
+    in-out property <string> password;
+    // Uninstall: delete the node's data too.
+    in-out property <bool> purge;
+    // Update: 0 the latest release, 1 a file.
+    in-out property <int> source;
+    in-out property <string> file;
+    // The system's question for the rights is open.
+    in-out property <bool> asking;
+    in-out property <string> error;
+    // What the command did, and what it warned about.
+    in-out property <[string]> did;
+    in-out property <[string]> warnings;
+    // Settings' dialogs.
+    in-out property <bool> update-open;
+    in-out property <bool> uninstall-open;
+    // The app closes: set when it is gone, for the tests.
+    in-out property <bool> closed;
+
+    callback install();
+    callback update();
+    callback choose-file();
+    callback uninstall();
+    callback ask-update();
+    callback ask-uninstall();
+    callback open-app();
+    callback close();
 }

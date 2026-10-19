@@ -3,9 +3,9 @@
 
 import { Theme, Type, Space, Radius, Size, Tone } from "theme.slint";
 import { Load, RelayNodeRow } from "data.slint";
-import { Store, Prefs } from "store.slint";
+import { Store, Prefs, Install } from "store.slint";
 import {
-    Button, ButtonKind, Card, Pill, Banner, PageHeader, PageFrame, Planned, Segmented, Divider,
+    Button, ButtonKind, Card, Pill, Banner, PageHeader, PageFrame, Segmented, Divider,
     TextField, Field, InfoRow, ListRow, Icon, IconTile, Reveal,
 } from "widgets.slint";
 
@@ -500,9 +500,69 @@ export component SettingsPage inherits PageFrame {
         }
     }
 
-    Planned {
-        icon: @image-url("icons/plug.svg");
-        title: "Service";
-        text: "Install the node as a service that starts with the machine, update it and remove it, and this app with it.";
+    Group {
+        icon: @image-url("icons/window.svg");
+        title: "Nerve on this machine";
+        text: "The app and the node's service are one program" + (Install.program != "" ? ", " + Install.program : "") + ". Update both, or remove them.";
+        HorizontalLayout {
+            spacing: Space.lg;
+            VerticalLayout {
+                spacing: 4px;
+                horizontal-stretch: 1;
+                Text {
+                    text: "Version " + Install.version;
+                    color: Theme.text;
+                    font-size: Type.small;
+                    font-weight: Type.semibold;
+                }
+                Text {
+                    text: "An update comes from the latest release on GitHub or from a file, and restarts the service.";
+                    color: Theme.text-muted;
+                    font-size: Type.caption;
+                    wrap: word-wrap;
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                Button {
+                    text: "Update…";
+                    icon: @image-url("icons/download.svg");
+                    clicked => {
+                        Install.ask-update();
+                    }
+                }
+            }
+        }
+        Divider { }
+        HorizontalLayout {
+            spacing: Space.lg;
+            VerticalLayout {
+                spacing: 4px;
+                horizontal-stretch: 1;
+                Text {
+                    text: "Uninstall";
+                    color: Theme.danger;
+                    font-size: Type.small;
+                    font-weight: Type.semibold;
+                }
+                Text {
+                    text: "Removes the service, its user, the program and its menu entry, and closes this window. You choose whether the node's settings, pairings and keys stay.";
+                    color: Theme.text-muted;
+                    font-size: Type.caption;
+                    wrap: word-wrap;
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                Button {
+                    text: "Uninstall…";
+                    icon: @image-url("icons/trash.svg");
+                    kind: ButtonKind.danger-soft;
+                    clicked => {
+                        Install.ask-uninstall();
+                    }
+                }
+            }
+        }
     }
 }

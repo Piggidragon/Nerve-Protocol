@@ -13,7 +13,7 @@ use nerve_node_desktop::app::{Choose, Ctl, Exec};
 use nerve_node_desktop::broker::Launch;
 use nerve_node_desktop::headless::Screen;
 use nerve_node_desktop::runner::Runner;
-use nerve_node_desktop::{AppWindow, Load, Logs, Page, Perm, Prefs, Store};
+use nerve_node_desktop::{AppWindow, Install, Load, Logs, Page, Perm, Prefs, Store};
 use nerve_policy::NodeConfig;
 use serde_json::Value;
 use slint::{ComponentHandle, Model};
@@ -422,8 +422,7 @@ fn the_app_drives_the_cli_end_to_end() {
         store.get_toast()
     );
 
-    // The first-run steps: a name, the keys, a new center, its mode, and
-    // the node started by the app, which ends with it.
+    // The first-run steps: a name, the keys, a new center, its mode.
     let second = rt.block_on(FakeCenter::start(true)).unwrap();
     store.invoke_setup_start();
     assert!(store.get_setup_open());
@@ -449,15 +448,6 @@ fn the_app_drives_the_cli_end_to_end() {
     );
     store.invoke_setup_next();
     assert!(!store.get_setup_open());
-    assert!(store.get_started_here());
-    until(&ctl, "the node the app started", || {
-        ctl.refresh_status();
-        store.get_status().state == "running"
-    });
-    store.invoke_node_stop();
-    assert!(!store.get_started_here());
-    ctl.refresh_status();
-    assert_eq!(store.get_status().state, "stopped");
 
     // A nerve:// link goes straight to the pairing's confirmation.
     let third = rt.block_on(FakeCenter::start(false)).unwrap();
@@ -490,6 +480,32 @@ fn the_app_drives_the_cli_end_to_end() {
         store.get_audit().row_count() == 3
     });
     store.invoke_show(Page::Overview);
+
+    // A service command goes through the broker too, and says when it
+    // cannot be done: here no service is installed.
+    store.invoke_service("stop".into());
+    assert_eq!(store.get_toast_tone(), nerve_node_desktop::Tone::Danger);
+    assert!(store.get_busy().is_empty());
+
+    // The installer, as a downloaded copy shows it: what it installs, and
+    // why it did not when the system refused (here: no root).
+    let install = window.global::<Install>();
+    let bin = root.join("usr/local/bin/nerve-node-desktop");
+    ctl.installer(Launch::Plain, &bin);
+    assert!(install.get_shown());
+    assert_eq!(install.get_program(), bin.display().to_string());
+    if install.get_step() == "welcome" {
+        install.invoke_install();
+        assert_eq!(install.get_step(), "welcome");
+        assert!(
+            install.get_error().contains("install"),
+            "{}",
+            install.get_error()
+        );
+        assert!(!bin.exists());
+    }
+    install.invoke_close();
+    assert!(install.get_closed());
     ctl.end();
     drop((rt, second, third));
 }

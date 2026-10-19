@@ -96,23 +96,6 @@ export component OverviewPage inherits PageFrame {
                     alignment: center;
                     HorizontalLayout {
                         spacing: Space.sm;
-                        if Store.status.state == "stopped" && !Store.installed: Button {
-                            text: "Start the node";
-                            icon: @image-url("icons/play.svg");
-                            kind: ButtonKind.primary;
-                            busy: Store.busy == "run";
-                            clicked => {
-                                Store.node-start();
-                            }
-                        }
-                        if Store.status.state == "running" && Store.started-here: Button {
-                            text: "Stop";
-                            icon: @image-url("icons/pause.svg");
-                            busy: Store.busy == "run";
-                            clicked => {
-                                Store.node-stop();
-                            }
-                        }
                         if Store.status.state == "locked": Button {
                             text: "Unlock";
                             icon: @image-url("icons/unlock.svg");
@@ -135,6 +118,97 @@ export component OverviewPage inherits PageFrame {
                     }
                 }
             }
+        }
+    }
+
+    // The installed service: its state, and starting and stopping it.
+    Reveal {
+        shown: Store.service-state != "" && Store.service-state != "none";
+        gap: Space.lg;
+        Card {
+            pad: Space.xl;
+            HorizontalLayout {
+                spacing: Space.lg;
+                VerticalLayout {
+                    alignment: center;
+                    IconTile {
+                        icon: @image-url("icons/server.svg");
+                        tone: Store.service-state == "running" ? Tone.ok
+                            : Store.service-state == "failed" ? Tone.danger
+                            : Store.service-state == "stopped" ? Tone.warn
+                            : Tone.accent;
+                    }
+                }
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    alignment: center;
+                    spacing: 2px;
+                    Text {
+                        text: Store.service-state == "running" ? "The service runs"
+                            : Store.service-state == "failed" ? "The service stopped with an error"
+                            : Store.service-state == "stopped" ? "The service is stopped"
+                            : Store.service-state == "starting" ? "The service starts…"
+                            : "The service stops…";
+                        color: Theme.text;
+                        font-size: Type.body;
+                        font-weight: Type.semibold;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: Store.service-state == "running" ? (Store.service-enabled ? "The node runs in the background as the user nerve, and starts with the machine." : "The node runs in the background as the user nerve.")
+                            : Store.service-state == "failed" ? "The Log page says why. Start it again once that is fixed."
+                            : Store.service-state == "stopped" ? (Store.service-enabled ? "Start it to link this machine to its centers. It starts again with the machine." : "Start it to link this machine to its centers.")
+                            : "One moment.";
+                        color: Theme.text-muted;
+                        font-size: Type.small;
+                        wrap: word-wrap;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    HorizontalLayout {
+                        spacing: Space.sm;
+                        if Store.service-state == "stopped" || Store.service-state == "failed": Button {
+                            text: "Start";
+                            icon: @image-url("icons/play.svg");
+                            kind: ButtonKind.primary;
+                            busy: Store.busy == "service-start";
+                            clicked => {
+                                Store.service("start");
+                            }
+                        }
+                        if Store.service-state == "running": Button {
+                            text: "Restart";
+                            icon: @image-url("icons/refresh.svg");
+                            kind: ButtonKind.ghost;
+                            busy: Store.busy == "service-restart";
+                            enabled: Store.busy != "service-stop";
+                            clicked => {
+                                Store.service("restart");
+                            }
+                        }
+                        if Store.service-state == "running": Button {
+                            text: "Stop";
+                            icon: @image-url("icons/stop.svg");
+                            busy: Store.busy == "service-stop";
+                            enabled: Store.busy != "service-restart";
+                            clicked => {
+                                Store.service("stop");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Reveal {
+        shown: Store.service-state == "none";
+        gap: Space.lg;
+        Banner {
+            tone: Tone.warn;
+            title: "The node is not installed as a service";
+            text: "The app is here, but the service is gone. Open the downloaded nerve-node-desktop again and install, or run nerve-node-desktop install as root (on Windows, as administrator).";
         }
     }
 

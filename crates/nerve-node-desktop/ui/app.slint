@@ -6,7 +6,7 @@ import {
     Page, Load, NodeStatus, CenterRow, AuditRow, PairPreview, FolderRow, CapRow, LogRow,
     HelpSection, HelpCard, HelpVerb, HelpArg, RelayNodeRow,
 } from "data.slint";
-import { Store, Perm, Logs, Manual, Prefs } from "store.slint";
+import { Store, Perm, Logs, Manual, Prefs, Install } from "store.slint";
 import { NavItem, StatusDot, Toast, Banner, Reveal } from "widgets.slint";
 import { OverviewPage } from "overview.slint";
 import { CentersPage } from "centers.slint";
@@ -18,11 +18,12 @@ import { HelpPage } from "help.slint";
 import { SetupDialog } from "setup.slint";
 import {
     PairDialog, ConfirmDialog, AboutDialog, ModeDialog, FolderDialog, SudoDialog, ProxyDialog,
-    OnceDialog, BackupDialog, RestoreDialog, ElevateDialog,
+    OnceDialog, BackupDialog, RestoreDialog, ElevateDialog, UpdateDialog, UninstallDialog,
 } from "dialogs.slint";
+import { InstallerView } from "installer.slint";
 
 export {
-    Store, Perm, Logs, Manual, Prefs, Type, Tone, Page, Load, NodeStatus, CenterRow, AuditRow,
+    Store, Perm, Logs, Manual, Prefs, Install, Type, Tone, Page, Load, NodeStatus, CenterRow, AuditRow,
     PairPreview, FolderRow, CapRow, LogRow, HelpSection, HelpCard, HelpVerb, HelpArg, RelayNodeRow,
 }
 
@@ -183,10 +184,11 @@ component Sidebar inherits Rectangle {
 export component AppWindow inherits Window {
     title: "Nerve";
     icon: @image-url("icons/app.svg");
-    preferred-width: 1180px;
-    preferred-height: 780px;
-    min-width: 900px;
-    min-height: 580px;
+    // The installer is a smaller window than the app.
+    preferred-width: Install.shown ? 760px : 1180px;
+    preferred-height: Install.shown ? 640px : 780px;
+    min-width: Install.shown ? 560px : 900px;
+    min-height: Install.shown ? 480px : 580px;
     background: Theme.window;
     default-font-size: Type.body;
 
@@ -199,7 +201,9 @@ export component AppWindow inherits Window {
         Palette.color-scheme = ColorScheme.unknown;
     }
 
-    HorizontalLayout {
+    if Install.shown: InstallerView { }
+
+    if !Install.shown: HorizontalLayout {
         Sidebar { }
         VerticalLayout {
             horizontal-stretch: 1;
@@ -247,6 +251,8 @@ export component AppWindow inherits Window {
     if Prefs.restore-open: RestoreDialog { }
     if Store.setup-open: SetupDialog { }
     if Store.elevate-open: ElevateDialog { }
+    if Install.update-open: UpdateDialog { }
+    if Install.uninstall-open: UninstallDialog { }
 
     if Store.toast-shown: Toast {
         text: Store.toast;

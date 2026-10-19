@@ -27,9 +27,8 @@ fn text_model(items: Vec<String>) -> ModelRc<SharedString> {
     ))
 }
 
-/// The node's status and its centers, from `status --json`. `here`: the
-/// app started the node itself, so it ends with the app.
-pub fn status(v: &Value, now_ms: u64, here: bool) -> (NodeStatus, Vec<CenterRow>) {
+/// The node's status and its centers, from `status --json`.
+pub fn status(v: &Value, now_ms: u64) -> (NodeStatus, Vec<CenterRow>) {
     let running = v["daemon"] == "running";
     let locked = v["locked"] == true;
     let centers: Vec<CenterRow> = v["centers"]
@@ -50,12 +49,6 @@ pub fn status(v: &Value, now_ms: u64, here: bool) -> (NodeStatus, Vec<CenterRow>
             "Locked: nothing runs",
             "A panic ended every link. No center reaches this machine and no command runs until you unlock it.",
             Tone::Danger,
-        ),
-        (false, true) if here => (
-            "running",
-            "The node is running",
-            "This app started it, and it runs while the app is open. Install it as a service to keep it running.",
-            Tone::Ok,
         ),
         (false, true) => (
             "running",
@@ -806,7 +799,7 @@ mod tests {
                 {"name": "old", "url": "x", "status": "connecting", "mode": "allowlist", "revoked": true},
             ],
         });
-        let (st, centers) = status(&v, NOW, false);
+        let (st, centers) = status(&v, NOW);
         assert_eq!(st.state, "running");
         assert_eq!(st.tone, Tone::Ok);
         assert_eq!((st.centers, st.connected), (3, 1));
@@ -842,14 +835,14 @@ mod tests {
         let v = json!({"daemon": "not running", "locked": false, "sudo": "off",
             "command_limits": {"off": "the node does not run"},
             "centers": [{"name": "home", "url": "u", "status": null, "mode": "allowlist", "paused": true}]});
-        let (st, centers) = status(&v, NOW, false);
+        let (st, centers) = status(&v, NOW);
         assert_eq!((st.state.as_str(), st.tone), ("stopped", Tone::Warn));
         // Not running is said once, not as a missing limit too.
         assert_eq!(st.warnings.row_count(), 0);
         assert_eq!(centers[0].link, "Paused");
         let v = json!({"daemon": "running", "locked": true, "centers": [],
             "folder_commands_off": "commands cannot be confined on this machine"});
-        let (st, _) = status(&v, NOW, false);
+        let (st, _) = status(&v, NOW);
         assert_eq!(st.state, "locked");
         assert_eq!(st.warnings.row_count(), 1);
     }

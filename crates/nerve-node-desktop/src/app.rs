@@ -14,8 +14,11 @@ use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 use crate::broker::Launch;
 use crate::runner::{Follow, Runner};
-use crate::{AppWindow, Load, Manual, Page, PairPreview, Perm, Prefs, Store, Tone, Type, view};
+use crate::{
+    AppWindow, Install, Load, Manual, Page, PairPreview, Perm, Prefs, Store, Tone, Type, view,
+};
 
+mod install;
 mod live;
 mod node;
 mod perm;
@@ -39,10 +42,15 @@ pub enum Choose {
     SaveBackup,
     /// The backup to restore.
     OpenBackup,
+    /// The program an update takes.
+    Program,
 }
 
 /// Shows the system's dialog for a [`Choose`]; tests answer for it.
 pub type Chooser = Arc<dyn Fn(Choose) -> Option<PathBuf> + Send + Sync>;
+
+/// Starts the installed app, as the menu entry does; tests answer for it.
+pub type Launcher = Arc<dyn Fn(&std::path::Path) -> Result<(), String> + Send + Sync>;
 
 /// The system's own dialogs: the desktop portal on Linux, so they work on
 /// Wayland and look like the desktop's.
@@ -56,6 +64,7 @@ fn system_chooser() -> Chooser {
                 .set_file_name("nerve-node.backup")
                 .save_file(),
             Choose::OpenBackup => d.set_title("Restore a backup").pick_file(),
+            Choose::Program => d.set_title("The new nerve-node-desktop").pick_file(),
         }
     })
 }
@@ -93,8 +102,13 @@ pub struct Ctl {
     feed: Arc<AtomicU64>,
     pumping: Arc<AtomicBool>,
     settle: slint::Timer,
-    /// A node this app started, which ends with the app.
-    node: RefCell<Option<node::NodeProcess>>,
+    /// Whether the node is the installed service's, whose state the app
+    /// asks for, and whether it is asking now.
+    service: Cell<bool>,
+    asking_service: Cell<bool>,
+    /// Starts the installed app (src/app/install.rs), which is there.
+    launcher: RefCell<Launcher>,
+    program: RefCell<PathBuf>,
     /// How the broker starts when the node is installed as a service.
     elevate: Cell<Option<Launch>>,
     /// A `nerve://` link the app was opened with, paired once it can be.
@@ -168,7 +182,10 @@ impl Ctl {
             feed: Arc::default(),
             pumping: Arc::default(),
             settle: slint::Timer::default(),
-            node: RefCell::new(None),
+            service: Cell::new(false),
+            asking_service: Cell::new(false),
+            launcher: RefCell::new(install::system_launcher()),
+            program: RefCell::new(PathBuf::new()),
             elevate: Cell::new(None),
             link: RefCell::new(None),
             first_run: Cell::new(false),
@@ -182,6 +199,9 @@ impl Ctl {
             ))));
         let store = window.global::<Store>();
         store.set_version(env!("CARGO_PKG_VERSION").into());
+        window
+            .global::<Install>()
+            .set_version(env!("CARGO_PKG_VERSION").into());
 
         let c = ctl.clone();
         store.on_show(move |page| c.show(page));
@@ -227,6 +247,7 @@ impl Ctl {
         perm::wire(&ctl, window);
         prefs::wire(&ctl, window);
         live::wire(&ctl, window);
+        install::wire(&ctl, window);
         ctl
     }
 
@@ -267,7 +288,6 @@ impl Ctl {
             Duration::from_secs(3),
             move || {
                 if let Some(c) = c.upgrade() {
-                    c.check_node();
                     c.refresh_status();
                 }
             },
@@ -284,6 +304,12 @@ impl Ctl {
         let w = self.window.upgrade()?;
         let p = w.global::<Perm>();
         Some(f(&p))
+    }
+
+    fn with_install<R>(&self, f: impl FnOnce(&Install<'_>) -> R) -> Option<R> {
+        let w = self.window.upgrade()?;
+        let i = w.global::<Install>();
+        Some(f(&i))
     }
 
     fn with_prefs<R>(&self, f: impl FnOnce(&Prefs<'_>) -> R) -> Option<R> {
@@ -377,6 +403,7 @@ impl Ctl {
     }
 
     pub fn refresh_status(self: &Rc<Self>) {
+        self.refresh_service();
         if self.waiting_for_rights() {
             self.with_store(|s| {
                 s.set_status_load(Load::Failed);
@@ -400,8 +427,7 @@ impl Ctl {
     fn show_status(self: &Rc<Self>, answer: Result<Value, String>) {
         match answer {
             Ok(v) => {
-                let here = self.node.borrow().is_some();
-                let (status, centers) = view::status(&v, now_ms(), here);
+                let (status, centers) = view::status(&v, now_ms());
                 let names: Vec<String> = centers.iter().map(|c| c.name.to_string()).collect();
                 let first = self.status.borrow().is_null();
                 *self.centers.borrow_mut() = names.clone();
@@ -411,7 +437,6 @@ impl Ctl {
                     s.set_centers(ModelRc::new(VecModel::from(centers)));
                     s.set_status_load(Load::Ready);
                     s.set_status_error(SharedString::new());
-                    s.set_started_here(here);
                 });
                 self.perm_centers(&names);
                 if first {
@@ -684,27 +709,38 @@ impl Ctl {
     }
 }
 
-/// Opens the window and runs until it is closed; a node the app started
-/// ends with it. `link`: the app was opened with a `nerve://` link.
+/// Opens the window and runs until it is closed. The installed program
+/// opens the app, with `link` when it was opened with a `nerve://` link;
+/// any other copy of it, such as the file just downloaded, the installer.
 pub fn run(link: Option<String>) -> Result<(), String> {
     let runner = Runner::this_program()?;
+    let layout = nerve_node::service::Layout::system();
+    let here = std::env::current_exe().and_then(std::fs::canonicalize).ok();
+    let installed = std::fs::canonicalize(&layout.bin).ok();
+    // The window's name on Wayland and X11, by which the desktop finds its
+    // menu entry (crate::parts).
+    let _ = slint::set_xdg_app_id(crate::parts::PROGRAM);
     let window = AppWindow::new().map_err(|e| format!("cannot open the window: {e}"))?;
     let ctl = Ctl::attach(&window, runner, Exec::Threads);
-    // The node's default folders: the service's when it is installed.
-    let paths = nerve_node::NodePaths::from_args(None, None);
-    let layout = nerve_node::service::Layout::system();
-    window
-        .global::<Store>()
-        .set_installed(layout.installed() && paths == layout.paths);
-    // The CLI says itself whether this user may open the node's files.
-    if nerve_node::service::check_access(&paths).is_err() {
-        ctl.needs_rights(Launch::Elevated);
+    if here.is_none() || here != installed {
+        ctl.installer(Launch::Elevated, &layout.bin);
+    } else {
+        // The node's default folders: the service's when it is installed.
+        let paths = nerve_node::NodePaths::from_args(None, None);
+        window
+            .global::<Store>()
+            .set_installed(layout.installed() && paths == layout.paths);
+        ctl.watch_service(paths == layout.paths, &layout.bin);
+        // The CLI says itself whether this user may open the node's files.
+        if nerve_node::service::check_access(&paths).is_err() {
+            ctl.needs_rights(Launch::Elevated);
+        }
+        match link {
+            Some(link) => ctl.open_link(link),
+            None => ctl.offer_setup(),
+        }
+        ctl.watch();
     }
-    match link {
-        Some(link) => ctl.open_link(link),
-        None => ctl.offer_setup(),
-    }
-    ctl.watch();
     let r = window
         .run()
         .map_err(|e| format!("the window ended with an error: {e}"));

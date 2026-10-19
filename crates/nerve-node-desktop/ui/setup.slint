@@ -19,8 +19,8 @@ export component SetupDialog inherits Dialog {
         : Store.setup-step == 1 ? "The node keeps a key for each center, and the key of its config. Keep them in files unless you use the system keyring for such things."
         : Store.setup-step == 2 ? "In the center's web UI press Pair a machine, and paste the link it shows. Nothing is paired until you confirm."
         : Store.setup-step == 3 ? "You can change it any time under Permissions, and add folders and rules there."
-        : Store.installed ? "The service runs the node. Its pages show what it does."
-        : "Start the node to link this machine to its centers. It runs while this window is open.";
+        : Store.service-state == "stopped" ? "The service is stopped: start it to link this machine to its centers."
+        : "The node links this machine to its centers. Its pages show what it does.";
     card-width: 580px;
     close => {
         Store.setup-open = false;
@@ -202,7 +202,7 @@ export component SetupDialog inherits Dialog {
                 }
             }
             Button {
-                text: Store.setup-step == 4 ? (!Store.installed && Store.status.state == "stopped" ? "Start the node" : "Done")
+                text: Store.setup-step == 4 ? (Store.service-state == "stopped" ? "Start the service" : "Done")
                     : Store.setup-step == 2 && Store.pair-step == 1 ? "Pair"
                     : "Continue";
                 kind: ButtonKind.primary;

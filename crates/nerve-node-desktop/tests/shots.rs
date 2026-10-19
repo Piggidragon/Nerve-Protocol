@@ -17,12 +17,14 @@ use nerve_node_desktop::app::{Choose, Ctl, Exec};
 use nerve_node_desktop::broker::Launch;
 use nerve_node_desktop::headless::Screen;
 use nerve_node_desktop::runner::Runner;
-use nerve_node_desktop::{AppWindow, Load, Logs, NodeStatus, Page, Perm, Prefs, Store};
+use nerve_node_desktop::{AppWindow, Install, Load, Logs, NodeStatus, Page, Perm, Prefs, Store};
 use slint::{ComponentHandle, Model};
 
 const WIDTH: u32 = 1180;
 const HEIGHT: u32 = 780;
 const SCALE: f32 = 2.0;
+/// The installer's window.
+const INSTALLER: (u32, u32) = (760, 640);
 /// Long values, so the shots show how they fit.
 const OFFICE: &str = "office-workstation-second-floor";
 const LAB_URL: &str =
@@ -160,7 +162,9 @@ fn every_page_light_and_dark() {
     store.set_status_load(Load::Loading);
     shots.take("overview-loading");
 
-    // A new node: not running, nothing paired.
+    // A new node: its service stopped, nothing paired.
+    store.set_service_state("stopped".into());
+    store.set_service_enabled(true);
     ctl.refresh_status();
     shots.take("overview-new");
     store.invoke_show(Page::Centers);
@@ -353,7 +357,11 @@ fn every_page_light_and_dark() {
     }
 
     store.invoke_show(Page::Overview);
+    store.set_service_state("running".into());
     shots.take("overview");
+    store.set_busy("service-restart".into());
+    shots.take("overview-service-restarting");
+    store.set_busy("".into());
     store.invoke_show(Page::Centers);
     shots.take("centers");
     store.invoke_center_unpair(OFFICE.into());
@@ -418,6 +426,9 @@ fn every_page_light_and_dark() {
     ctl.feed_ready();
     shots.take("log");
 
+    window
+        .global::<Install>()
+        .set_program("/usr/local/bin/nerve-node-desktop".into());
     store.invoke_show(Page::Settings);
     shots.take("settings");
     shots.take_full("settings", 1900);
@@ -436,6 +447,51 @@ fn every_page_light_and_dark() {
     prefs.set_backup_pass2("correct horse".into());
     shots.take("settings-backup");
     prefs.set_backup_open(false);
+
+    // Settings' update and uninstall.
+    let install = window.global::<Install>();
+    install.set_program("/usr/local/bin/nerve-node-desktop".into());
+    install.invoke_ask_update();
+    shots.take("settings-update");
+    let new = root.join("Downloads/nerve-node-desktop-x86_64-linux");
+    std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+    ctl.set_chooser(Arc::new(move |_| Some(new.clone())));
+    install.invoke_choose_file();
+    shots.take("settings-update-file");
+    install.set_step("working".into());
+    shots.take("settings-update-working");
+    install.set_step("done".into());
+    install.set_installed_version("0.0.6".into());
+    install.set_did(lines(&[
+        "read the new program from /home/alex/Downloads/nerve-node-desktop-x86_64-linux",
+        "replaced nerve-node-desktop 0.0.5 with 0.0.6",
+        "restarted the service nerve-node.service",
+        "put Nerve in the application menu (/usr/local/share/applications/nerve-node-desktop.desktop), with its icon",
+        "nerve:// links open in Nerve (the default in /etc/xdg/mimeapps.list)",
+    ]));
+    shots.take("settings-update-done");
+    install.set_update_open(false);
+    install.set_did(lines(&[]));
+    install.invoke_ask_uninstall();
+    shots.take("settings-uninstall");
+    install.set_purge(true);
+    install.set_error("uninstall needs root: run `sudo nerve-node uninstall`".into());
+    shots.take("settings-uninstall-failed");
+    install.set_error("".into());
+    install.set_step("done".into());
+    install.set_did(lines(&[
+        "stopped the service nerve-node.service",
+        "removed the service unit /etc/systemd/system/nerve-node.service",
+        "deleted /etc/nerve",
+        "deleted /var/lib/nerve",
+        "removed the user nerve",
+        "removed Nerve from the application menu",
+        "nerve:// links no longer open in Nerve",
+        "removed the program /usr/local/bin/nerve-node-desktop",
+    ]));
+    shots.take("settings-uninstall-done");
+    install.set_uninstall_open(false);
+    install.set_purge(false);
 
     store.invoke_show(Page::Help);
     shots.take("help");
@@ -457,5 +513,90 @@ fn every_page_light_and_dark() {
     std::fs::write(&file, text.replace("mode = \"folder\"", "mode = \"user\"")).unwrap();
     store.invoke_show(Page::Centers);
     shots.take("centers-error");
+
+    // The installer, as the downloaded file shows it, in its own size.
+    shots.screen.resize(
+        (INSTALLER.0 as f32 * SCALE) as u32,
+        (INSTALLER.1 as f32 * SCALE) as u32,
+    );
+    let install = window.global::<Install>();
+    let bin = root.join("usr/local/bin/nerve-node-desktop");
+    ctl.installer(Launch::Plain, &bin);
+    install.set_program("/usr/local/bin/nerve-node-desktop".into());
+    install.set_step("welcome".into());
+    install.set_node_only(false);
+    shots.take("installer-welcome");
+    // The system refuses (here: no root); the step says why.
+    install.invoke_install();
+    shots.take("installer-failed");
+    install.set_error("".into());
+    install.set_windows(true);
+    install.set_account("alex".into());
+    install.set_program("C:\\Program Files\\Nerve\\nerve-node-desktop.exe".into());
+    install.set_password("hunter2hunter2".into());
+    shots.take("installer-welcome-windows");
+    install.set_windows(false);
+    install.set_program("/usr/local/bin/nerve-node-desktop".into());
+    install.set_node_only(true);
+    shots.take("installer-node-only");
+    install.set_node_only(false);
+    install.set_action("install".into());
+    install.set_step("working".into());
+    install.set_asking(true);
+    shots.take("installer-asking");
+    install.set_asking(false);
+    shots.take("installer-working");
+    install.set_step("done".into());
+    install.set_did(lines(&[
+        "made the user nerve (uid 991)",
+        "/etc/nerve and /var/lib/nerve/state belong to nerve",
+        "commands run as alex, who ran install",
+        "put the program at /usr/local/bin/nerve-node-desktop",
+        "put Nerve in the application menu (/usr/local/share/applications/nerve-node-desktop.desktop), with its icon",
+        "nerve:// links open in Nerve (the default in /etc/xdg/mimeapps.list)",
+        "wrote the service unit /etc/systemd/system/nerve-node.service",
+        "the service nerve-node.service runs as nerve and starts with the machine",
+    ]));
+    install.set_warnings(lines(&[
+        "Warning: alex is the account that ran sudo, and a person logs in as it: a command from a center can do what you can. `sudo nerve-node setup --create-user nerve-work` makes an account only the node uses.",
+    ]));
+    shots.take("installer-done");
+    install.set_warnings(lines(&[]));
+    install.set_step("installed".into());
+    install.set_installed_version("0.0.4".into());
+    install.set_newer(true);
+    shots.take("installer-installed");
+    install.set_installed_version(install.get_version());
+    install.set_newer(false);
+    shots.take("installer-installed-same");
+    install.invoke_ask_uninstall();
+    shots.take("installer-uninstall");
+    install.set_purge(true);
+    shots.take("installer-uninstall-purge");
+    install.set_step("done".into());
+    install.set_did(lines(&[
+        "stopped the service nerve-node.service",
+        "removed the service unit /etc/systemd/system/nerve-node.service",
+        "deleted /etc/nerve",
+        "removed the user nerve",
+        "removed Nerve from the application menu",
+        "removed the program /usr/local/bin/nerve-node-desktop",
+    ]));
+    shots.take("installer-removed");
+    install.set_action("update".into());
+    install.set_installed_version("0.0.6".into());
+    install.set_did(lines(&[
+        "replaced nerve-node-desktop 0.0.5 with 0.0.6",
+        "restarted the service nerve-node.service",
+    ]));
+    shots.take("installer-updated");
     drop((home, office));
+}
+
+fn lines(l: &[&str]) -> slint::ModelRc<slint::SharedString> {
+    slint::ModelRc::new(slint::VecModel::from(
+        l.iter()
+            .map(|s| slint::SharedString::from(*s))
+            .collect::<Vec<_>>(),
+    ))
 }

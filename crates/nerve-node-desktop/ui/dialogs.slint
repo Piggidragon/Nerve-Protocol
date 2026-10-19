@@ -3,7 +3,8 @@
 
 import { AboutSlint } from "std-widgets.slint";
 import { Theme, Type, Space, Radius, Tone } from "theme.slint";
-import { Store, Perm, Prefs } from "store.slint";
+import { Store, Perm, Prefs, Install } from "store.slint";
+import { Working, DidList, UninstallChoice, UpdateChoice } from "installer.slint";
 import {
     Button, ButtonKind, Banner, Dialog, DialogButtons, Field, TextField, InfoRow, Divider, Code,
     Icon, CheckBox, Segmented, TextArea, CopyText, OptionTile, Steps, Reveal,
@@ -657,6 +658,143 @@ export component ElevateDialog inherits Dialog {
             busy: Store.elevate-busy;
             clicked => {
                 Store.elevate-allow();
+            }
+        }
+    }
+}
+
+// Settings: update the app and the node, from the latest release or a file.
+export component UpdateDialog inherits Dialog {
+    title: Install.step == "done" ? "Nerve is updated to " + Install.installed-version : "Update Nerve";
+    subtitle: Install.step == "done" ? (Install.installed-version == Install.version ? "Nerve was up to date: the program is the one that is installed." : "The service runs the new version. Restart Nerve to use it here too.")
+        : Install.step == "working" ? ""
+        : "Version " + Install.version + " is installed. An update replaces the program, puts its menu entry back and restarts the service. The node's settings, keys and audit log stay.";
+    card-width: 560px;
+    close => {
+        if (Install.step != "working") {
+            Install.update-open = false;
+        }
+    }
+    VerticalLayout {
+        Reveal {
+            shown: Install.step == "choose";
+            VerticalLayout {
+                spacing: Space.xl;
+                UpdateChoice { }
+                DialogButtons {
+                    error: Install.error;
+                    error-title: "The update did not finish";
+                    Button {
+                        text: "Cancel";
+                        kind: ButtonKind.ghost;
+                        clicked => {
+                            Install.update-open = false;
+                        }
+                    }
+                    Button {
+                        text: "Update";
+                        icon: @image-url("icons/download.svg");
+                        kind: ButtonKind.primary;
+                        enabled: Install.source == 0 || Install.file != "";
+                        clicked => {
+                            Install.update();
+                        }
+                    }
+                }
+            }
+        }
+        Reveal {
+            shown: Install.step == "working";
+            Working { }
+        }
+        Reveal {
+            shown: Install.step == "done";
+            VerticalLayout {
+                spacing: Space.xl;
+                DidList { }
+                DialogButtons {
+                    Button {
+                        text: "Later";
+                        kind: ButtonKind.ghost;
+                        clicked => {
+                            Install.update-open = false;
+                        }
+                    }
+                    Button {
+                        text: "Restart Nerve";
+                        icon: @image-url("icons/refresh.svg");
+                        kind: ButtonKind.primary;
+                        clicked => {
+                            Install.open-app();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+// Settings: remove the node, the app and, if chosen, the node's data.
+export component UninstallDialog inherits Dialog {
+    title: Install.step == "done" ? "Nerve is removed"
+        : Install.step == "working" ? "Uninstall Nerve"
+        : "Uninstall Nerve?";
+    subtitle: Install.step == "done" ? (Install.purge ? "The node, the app and the node's data are gone from this machine." : "The node and the app are gone. The node's data stays; install Nerve again, and the node takes it up.")
+        : Install.step == "working" ? ""
+        : "The service, its user nerve, the program and its menu entry go, and this window closes. Choose what happens to the node's data.";
+    card-width: 600px;
+    close => {
+        if (Install.step == "done") {
+            Install.close();
+        } else if (Install.step != "working") {
+            Install.uninstall-open = false;
+        }
+    }
+    VerticalLayout {
+        Reveal {
+            shown: Install.step == "choose";
+            VerticalLayout {
+                spacing: Space.xl;
+                UninstallChoice { }
+                DialogButtons {
+                    error: Install.error;
+                    error-title: "Uninstalling did not finish";
+                    Button {
+                        text: "Cancel";
+                        kind: ButtonKind.ghost;
+                        clicked => {
+                            Install.uninstall-open = false;
+                        }
+                    }
+                    Button {
+                        text: Install.purge ? "Uninstall and delete the data" : "Uninstall";
+                        icon: @image-url("icons/trash.svg");
+                        kind: ButtonKind.danger;
+                        clicked => {
+                            Install.uninstall();
+                        }
+                    }
+                }
+            }
+        }
+        Reveal {
+            shown: Install.step == "working";
+            Working { }
+        }
+        Reveal {
+            shown: Install.step == "done";
+            VerticalLayout {
+                spacing: Space.xl;
+                DidList { }
+                DialogButtons {
+                    Button {
+                        text: "Close Nerve";
+                        kind: ButtonKind.primary;
+                        clicked => {
+                            Install.close();
+                        }
+                    }
+                }
             }
         }
     }

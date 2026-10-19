@@ -1,16 +1,7 @@
-//! The node itself: starting and stopping one the app runs, the rights the
-//! app asks for when the node is installed as a service, and the first-run
-//! steps.
-//!
-//! A node the app starts (`nerve-node run`, on a node not installed as a
-//! service) ends with the app, as a desktop user expects of what a window
-//! started; the overview says so, and the service keeps one running.
+//! The node itself: the rights the app asks for when the node is installed
+//! as a service, the service's start and stop, and the first-run steps.
 
-use std::io::BufRead;
-use std::process::Child;
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use slint::{ComponentHandle, SharedString};
 
@@ -18,130 +9,56 @@ use super::Ctl;
 use crate::broker;
 use crate::{Store, Tone};
 
-/// A node the app started: its process, and the last line it said, which
-/// is why it ended when it did.
-pub(super) struct NodeProcess {
-    child: Child,
-    said: Arc<Mutex<String>>,
-}
-
-impl NodeProcess {
-    /// Asks the node to end, as Ctrl+C would, so it says goodbye to its
-    /// centers; ends it when it does not within a few seconds.
-    fn end(mut self) {
-        #[cfg(unix)]
-        {
-            // SAFETY: a signal to the process this app started and holds.
-            unsafe { libc::kill(self.child.id() as libc::pid_t, libc::SIGTERM) };
-            for _ in 0..50 {
-                if matches!(self.child.try_wait(), Ok(Some(_))) {
-                    return;
-                }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-        }
-        // Windows has no signal for a process without a console.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
 impl Ctl {
-    fn node_start(self: &Rc<Self>) {
-        if self.node.borrow().is_some() {
-            return;
-        }
-        let mut child = match self.runner().start_node() {
-            Ok(c) => c,
-            Err(e) => {
-                self.toast(e, Tone::Danger);
-                return;
-            }
-        };
-        let said = Arc::new(Mutex::new(String::new()));
-        if let Some(err) = child.stderr.take() {
-            let said = said.clone();
-            std::thread::spawn(move || {
-                for line in std::io::BufReader::new(err).lines().map_while(Result::ok) {
-                    if !line.trim().is_empty() {
-                        *said.lock().unwrap_or_else(|p| p.into_inner()) = line;
-                    }
-                }
-            });
-        }
-        *self.node.borrow_mut() = Some(NodeProcess { child, said });
-        self.with_store(|s| {
-            s.set_started_here(true);
-            s.set_busy("run".into());
-        });
-        // It answers once its control socket is up.
-        let c = Rc::downgrade(self);
-        slint::Timer::single_shot(Duration::from_millis(1200), move || {
-            if let Some(c) = c.upgrade() {
-                c.with_store(|s| s.set_busy(SharedString::new()));
-                c.check_node();
-                c.refresh_status();
-            }
-        });
+    /// The app ends: so does what follows the audit or the log.
+    pub fn end(&self) {
+        self.stop_follow();
     }
 
-    /// Whether the node the app started still runs; one that ended says why.
-    pub(super) fn check_node(&self) {
-        let ended = {
-            let mut n = self.node.borrow_mut();
-            match n.as_mut().map(|p| p.child.try_wait()) {
-                Some(Ok(Some(status))) => {
-                    let said = n
-                        .take()
-                        .map(|p| p.said.lock().map(|s| s.clone()).unwrap_or_default());
-                    Some((status, said.unwrap_or_default()))
-                }
-                _ => None,
-            }
-        };
-        if let Some((status, said)) = ended {
-            self.with_store(|s| s.set_started_here(false));
-            if !status.success() {
-                let why = said
-                    .strip_prefix("nerve-node: ")
-                    .unwrap_or(&said)
-                    .to_string();
-                self.toast(
-                    if why.is_empty() {
-                        "The node ended.".to_string()
-                    } else {
-                        format!("The node ended: {why}")
-                    },
-                    Tone::Danger,
-                );
-            }
-        }
-    }
-
-    fn node_stop(self: &Rc<Self>) {
-        let Some(p) = self.node.borrow_mut().take() else {
+    /// The installed service's state, from `service status`, which needs no
+    /// rights; asked only for the node of the service's folders.
+    pub(super) fn refresh_service(self: &Rc<Self>) {
+        if !self.service.get() || self.asking_service.replace(true) {
             return;
-        };
-        self.with_store(|s| s.set_busy("run".into()));
-        self.job(
-            move |_| p.end(),
-            |c, ()| {
-                c.with_store(|s| {
-                    s.set_busy(SharedString::new());
-                    s.set_started_here(false);
-                });
-                c.toast("The node stopped.", Tone::Ok);
-                c.refresh_status();
+        }
+        self.command(
+            vec!["service".into(), "status".into()],
+            None,
+            |c, answer| {
+                c.asking_service.set(false);
+                if let Ok(v) = answer {
+                    let state = v["state"].as_str().unwrap_or("none").to_string();
+                    c.with_store(|s| {
+                        s.set_service_state(state.into());
+                        s.set_service_enabled(v["enabled"] == true);
+                    });
+                }
             },
         );
     }
 
-    /// The app ends: so do the node it started and what follows the log.
-    pub fn end(&self) {
-        self.stop_follow();
-        if let Some(p) = self.node.borrow_mut().take() {
-            p.end();
-        }
+    /// Starts, stops or restarts the installed service.
+    fn service_action(self: &Rc<Self>, what: &str) {
+        let key = format!("service-{what}");
+        let said = match what {
+            "start" => "The service started, and the node answers.",
+            "stop" => "The service stopped: the node ended its links.",
+            _ => "The service restarted, and the node answers.",
+        };
+        self.with_store(|s| s.set_busy(key.as_str().into()));
+        self.command(
+            vec!["service".into(), what.to_string()],
+            None,
+            move |c, answer| {
+                c.with_store(|s| s.set_busy(SharedString::new()));
+                match answer {
+                    Ok(_) => c.toast(said, Tone::Ok),
+                    Err(e) => c.toast(e, Tone::Danger),
+                }
+                c.refresh_service();
+                c.refresh_status();
+            },
+        );
     }
 
     /// Starts the broker with the rights the owner gives, after the app said
@@ -300,11 +217,11 @@ impl Ctl {
             }
             _ => {
                 let stopped = self
-                    .with_store(|s| !s.get_installed() && s.get_status().state == "stopped")
+                    .with_store(|s| s.get_service_state() == "stopped")
                     .unwrap_or(false);
                 self.with_store(|s| s.set_setup_open(false));
                 if stopped {
-                    self.node_start();
+                    self.service_action("start");
                 }
             }
         }
@@ -326,9 +243,7 @@ impl Ctl {
 pub(super) fn wire(ctl: &Rc<Ctl>, window: &crate::AppWindow) {
     let store = window.global::<Store>();
     let c = ctl.clone();
-    store.on_node_start(move || c.node_start());
-    let c = ctl.clone();
-    store.on_node_stop(move || c.node_stop());
+    store.on_service(move |what| c.service_action(&what));
     let c = ctl.clone();
     store.on_elevate_allow(move || c.elevate_allow());
     let c = ctl.clone();

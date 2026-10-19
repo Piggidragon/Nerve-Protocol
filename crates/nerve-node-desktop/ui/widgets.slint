@@ -1074,52 +1074,6 @@ export component StatTile inherits Rectangle {
     }
 }
 
-// A part of a page that is not built yet: what it will hold.
-export component Planned inherits Rectangle {
-    in property <string> title;
-    in property <string> text;
-    in property <image> icon;
-    background: Theme.surface;
-    border-radius: Radius.lg;
-    border-width: 1px;
-    border-color: Theme.border;
-    HorizontalLayout {
-        padding: Space.xl;
-        spacing: Space.lg;
-        VerticalLayout {
-            alignment: start;
-            IconTile {
-                icon: root.icon;
-                tone: Tone.neutral;
-            }
-        }
-        VerticalLayout {
-            spacing: 6px;
-            horizontal-stretch: 1;
-            Text {
-                text: root.title;
-                color: Theme.text;
-                font-size: Type.heading;
-                font-weight: Type.semibold;
-            }
-            Text {
-                text: root.text;
-                color: Theme.text-muted;
-                font-size: Type.small;
-                wrap: word-wrap;
-            }
-            @children
-        }
-        VerticalLayout {
-            alignment: start;
-            Pill {
-                text: "Coming next";
-                tone: Tone.neutral;
-            }
-        }
-    }
-}
-
 // A box to tick, with its label.
 export component CheckBox {
     in property <bool> checked;

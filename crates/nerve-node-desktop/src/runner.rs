@@ -7,7 +7,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -158,19 +158,6 @@ impl Runner {
             Some(b) => b.follow(args, Box::new(on_line), Box::new(on_end)),
             None => follow_process(&self.exe, &args, Box::new(on_line), Box::new(on_end)),
         }
-    }
-
-    /// Starts `nerve-node run` for a node the app runs itself; never through
-    /// the broker (an installed node is the service's).
-    pub fn start_node(&self) -> Result<Child, String> {
-        Command::new(&self.exe)
-            .args(&self.dirs)
-            .arg("run")
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("cannot start the node: {e}"))
     }
 }
 

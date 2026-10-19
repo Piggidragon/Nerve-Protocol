@@ -22,7 +22,7 @@ use nerve_policy::settings::SettingsStore;
 use crate::paths::NodePaths;
 use crate::service::{
     Account, Layout, ServiceAction, ServiceState, Steps, USER, USER_MARK, Version, asset_name,
-    audit, fetch_release, install_parts, uninstall_parts, write_file,
+    audit, fetch_release, node_beside, put_parts, uninstall_parts, write_file,
 };
 
 /// The name the service is registered under.
@@ -201,6 +201,10 @@ fn new_password() -> String {
 }
 
 /// The program's name without `.exe`: `nerve-node`, or the desktop app's.
+/// The start of the name a program gets when it moves aside, held by
+/// Windows, until it goes at the next start ([`WinSystem::remove_program`]).
+pub(crate) const ASIDE: &str = "nerve-node.";
+
 fn stem(bin: &Path) -> String {
     bin.file_stem()
         .map_or_else(|| "nerve-node".into(), |s| s.to_string_lossy().into_owned())
@@ -329,10 +333,10 @@ fn install_steps(
         write_file(&layout.bin, &program, 0o755)?;
         steps.did(format!("put the program at {}", layout.bin.display()));
     }
-    // The Event Log may hold the program of a node installed alone.
-    install_parts(layout, steps, &|p| sys.remove_program(p).map(drop))?;
+    put_parts(layout, steps)?;
     // What an update or an uninstall left behind when it ran from the
-    // program it replaced or removed.
+    // program it replaced or removed, or moved aside because the Event Log
+    // held it: a name of [`ASIDE`].
     let _ = std::fs::remove_file(previous(&layout.bin));
     let _ = std::fs::remove_file(staged(&layout.bin));
     if let Some(dir) = layout.bin.parent()
@@ -341,7 +345,7 @@ fn install_steps(
         for e in entries.flatten() {
             let name = e.file_name();
             let name = name.to_string_lossy();
-            if name.starts_with(&format!("{}.", stem(&layout.bin))) && name.ends_with(".del") {
+            if name.starts_with(ASIDE) && name.ends_with(".del") {
                 let _ = std::fs::remove_file(e.path());
             }
         }
@@ -356,9 +360,45 @@ fn install_steps(
         crate::eventlog::SOURCE,
         layout.paths.log_file().display()
     ));
+    // Now that the service and the Event Log name this program.
+    remove_node_alone(layout, sys, steps)?;
     sys.start()?;
     sys.wait_running(layout)?;
     steps.did(format!("the service {SERVICE_NAME} runs"));
+    Ok(())
+}
+
+/// When the desktop app takes over a node installed with `nerve-node`, the
+/// old `nerve-node.exe` goes: the app's program is the node now, and it
+/// cannot be the terminal's command, as a link to it would make it, since
+/// a shell does not wait for a GUI program. A terminal takes the CLI edition,
+/// downloaded on its own. The Event Log may still hold the old program as
+/// the message file it read before; it then moves aside and goes at the
+/// next start ([`WinSystem::remove_program`]).
+fn remove_node_alone(
+    layout: &Layout,
+    sys: &dyn WinSystem,
+    steps: &mut Steps,
+) -> Result<(), String> {
+    let Some(node) = node_beside(layout) else {
+        return Ok(());
+    };
+    // A file only: a link to the app, as an earlier install made, goes with
+    // the uninstall.
+    if !std::fs::symlink_metadata(&node).is_ok_and(|m| m.is_file()) {
+        return Ok(());
+    }
+    let gone = sys.remove_program(&node)?;
+    steps.did(format!(
+        "removed {}, the node installed alone: {} is the node now{}. For a terminal, download the CLI edition nerve-node.exe on its own",
+        node.display(),
+        layout.bin.display(),
+        if gone {
+            ""
+        } else {
+            " (Windows holds the old file, as the Event Log read it; it deletes it at its next start)"
+        }
+    ));
     Ok(())
 }
 
@@ -727,7 +767,7 @@ async fn update_steps(
     // This command may run from the old program; then it goes at the next
     // restart, or with the next update or install.
     let _ = sys.remove_program(&old_path);
-    install_parts(layout, steps, &|p| sys.remove_program(p).map(drop))
+    put_parts(layout, steps)
 }
 
 /// `service start`, `stop` and `restart` on Windows: the installed
@@ -803,6 +843,9 @@ pub(crate) mod tests {
         event_source: RefCell<Option<PathBuf>>,
         /// The programs removed, in order.
         removed: RefCell<Vec<PathBuf>>,
+        /// The programs Windows holds, as the Event Log holds the one it
+        /// read: they move aside.
+        held: RefCell<Vec<PathBuf>>,
         /// The state folders of nodes that run: their containers' profiles
         /// stay.
         running: RefCell<Vec<PathBuf>>,
@@ -830,6 +873,7 @@ pub(crate) mod tests {
                 away: RefCell::new(Vec::new()),
                 event_source: RefCell::new(None),
                 removed: RefCell::new(Vec::new()),
+                held: RefCell::new(Vec::new()),
                 running: RefCell::new(Vec::new()),
             }
         }
@@ -1016,6 +1060,11 @@ pub(crate) mod tests {
         }
         fn remove_program(&self, path: &Path) -> Result<bool, String> {
             self.removed.borrow_mut().push(path.to_path_buf());
+            if self.held.borrow().iter().any(|p| p == path) {
+                let aside = path.with_file_name(format!("{ASIDE}held.del"));
+                std::fs::rename(path, aside).map_err(|e| e.to_string())?;
+                return Ok(false);
+            }
             std::fs::remove_file(path).map_err(|e| e.to_string())?;
             Ok(true)
         }
@@ -1946,40 +1995,67 @@ pub(crate) mod tests {
         assert!(!link.exists());
     }
 
-    /// On Windows a test as an administrator, who may make a symbolic link.
     #[tokio::test]
-    async fn the_app_makes_the_node_installed_alone_a_link_to_it() {
+    async fn the_app_removes_the_node_installed_alone() {
         let d = tempfile::tempdir().unwrap();
         let sys = Fake::new();
+        // A node installed with nerve-node.exe, whose entries the Event Log
+        // read: it holds the program.
+        let node = installed(d.path(), &sys, "1.0.0").bin;
+        sys.held.borrow_mut().push(node.clone());
         let l = Layout {
             bin: d.path().join("Program Files/Nerve/nerve-node-desktop.exe"),
             edition: &DESKTOP,
             ..layout(d.path())
         };
-        let node = l.bin.with_file_name("nerve-node.exe");
         assert_eq!(crate::service::node_beside(&l).as_ref(), Some(&node));
-        std::fs::create_dir_all(node.parent().unwrap()).unwrap();
-        std::fs::write(&node, "nerve-node 1.0.0\n").unwrap();
+        // What an earlier uninstall moved aside goes with this install.
+        let earlier = l.bin.with_file_name("nerve-node.x1y2.del");
+        std::fs::write(&earlier, "old").unwrap();
         let exe = d.path().join("Downloads/nerve-node-desktop.exe");
-        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
         std::fs::write(&exe, "nerve-node-desktop 1.0.0\n").unwrap();
-        sys.types("alice's");
         let mut out = Vec::new();
         install(&l, &sys, &exe, "alice", &mut out).unwrap();
         let out = String::from_utf8(out).unwrap();
-        assert!(out.contains("nerve-node.exe is a link to"), "{out}");
-        // The old program went the way Windows lets it (the Event Log may
-        // hold it).
-        assert!(sys.removed.borrow().contains(&node));
-        assert_eq!(std::fs::read_link(&node).unwrap(), l.bin);
-        assert_eq!(
-            std::fs::read_to_string(&node).unwrap(),
-            "nerve-node-desktop 1.0.0\n"
+        assert!(
+            out.contains("nerve-node.exe, the node installed alone") && out.contains("CLI edition"),
+            "{out}"
         );
+        assert!(out.contains("deletes it at its next start"), "{out}");
+        assert!(!out.contains("is a link"), "{out}");
+        // No link: the old program moved aside, as Windows lets it, once the
+        // service and the Event Log name the app's.
+        assert!(std::fs::symlink_metadata(&node).is_err());
+        assert!(l.bin.with_file_name("nerve-node.held.del").exists());
+        assert!(!earlier.exists());
+        assert_eq!(*sys.program.borrow(), Some(l.bin.clone()));
+        assert_eq!(*sys.event_source.borrow(), Some(l.bin.clone()));
+
+        // Again, and after an update: nothing more to remove.
+        let mut out = Vec::new();
+        install(&l, &sys, &exe, "alice", &mut out).unwrap();
+        assert!(!String::from_utf8(out).unwrap().contains("installed alone"));
+        let new = d.path().join("new.exe");
+        std::fs::write(&new, "nerve-node-desktop 1.1.0\n").unwrap();
+        update(&l, &sys, Some(&new), &mut Vec::new()).await.unwrap();
+
         let mut out = Vec::new();
         uninstall(&l, &by_hand(d.path()), &sys, false, &mut out).unwrap();
-        assert!(String::from_utf8(out).unwrap().contains("removed the link"));
-        assert!(std::fs::symlink_metadata(&node).is_err());
+        assert!(!l.bin.exists() && std::fs::symlink_metadata(&node).is_err());
+
+        // A link an earlier build made stays at install and goes with the
+        // uninstall.
+        #[cfg(unix)]
+        {
+            install(&l, &sys, &exe, "alice", &mut Vec::new()).unwrap();
+            std::os::unix::fs::symlink(&l.bin, &node).unwrap();
+            install(&l, &sys, &exe, "alice", &mut Vec::new()).unwrap();
+            assert_eq!(std::fs::read_link(&node).unwrap(), l.bin);
+            let mut out = Vec::new();
+            uninstall(&l, &by_hand(d.path()), &sys, false, &mut out).unwrap();
+            assert!(String::from_utf8(out).unwrap().contains("removed the link"));
+            assert!(std::fs::symlink_metadata(&node).is_err());
+        }
     }
 
     #[tokio::test]

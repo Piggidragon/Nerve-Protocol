@@ -4,6 +4,7 @@
 // when Nerve is installed already, opens it, updates it from this file or
 // removes it. Its parts also serve Settings' update and uninstall dialogs.
 
+import { ScrollView } from "std-widgets.slint";
 import { Theme, Type, Space, Radius, Size, Tone } from "theme.slint";
 import { Install } from "store.slint";
 import {
@@ -78,8 +79,11 @@ export component Working {
     }
 }
 
-// What the command did, one step a line, and what it warned about.
+// What the command did, one step a line, and what it warned about. The
+// steps scroll beyond `max-steps`, so a long list leaves the buttons below
+// it in the window.
 export component DidList {
+    in property <length> max-steps: 200px;
     VerticalLayout {
         spacing: Space.md;
         Reveal {
@@ -95,31 +99,39 @@ export component DidList {
         Reveal {
             shown: Install.did.length > 0;
             Rectangle {
+                height: min(steps.preferred-height, root.max-steps);
                 background: Theme.surface-alt;
                 border-radius: Radius.lg;
                 border-width: 1px;
                 border-color: Theme.border;
-                VerticalLayout {
-                    padding: Space.lg;
-                    spacing: Space.sm;
-                    for step in Install.did: Fit {
-                        HorizontalLayout {
-                            spacing: Space.sm;
-                            VerticalLayout {
-                                alignment: start;
-                                padding-top: 1px;
-                                Icon {
-                                    source: @image-url("icons/check.svg");
-                                    colorize: Theme.ok;
-                                    size: 14px;
+                list := ScrollView {
+                    width: parent.width;
+                    height: parent.height;
+                    content-width: self.visible-width;
+                    content-height: steps.preferred-height;
+                    steps := VerticalLayout {
+                        width: list.visible-width;
+                        padding: Space.lg;
+                        spacing: Space.sm;
+                        for step in Install.did: Fit {
+                            HorizontalLayout {
+                                spacing: Space.sm;
+                                VerticalLayout {
+                                    alignment: start;
+                                    padding-top: 1px;
+                                    Icon {
+                                        source: @image-url("icons/check.svg");
+                                        colorize: Theme.ok;
+                                        size: 14px;
+                                    }
                                 }
-                            }
-                            Text {
-                                horizontal-stretch: 1;
-                                text: step;
-                                color: Theme.text-muted;
-                                font-size: Type.caption;
-                                wrap: word-wrap;
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: step;
+                                    color: Theme.text-muted;
+                                    font-size: Type.caption;
+                                    wrap: word-wrap;
+                                }
                             }
                         }
                     }
@@ -168,6 +180,7 @@ export component UpdateChoice {
                 clicked => {
                     Install.source = 0;
                     Install.error = "";
+                    Install.error-title = "";
                 }
             }
             OptionTile {
@@ -308,254 +321,266 @@ component Spacer inherits Rectangle {
 
 export component InstallerView inherits Rectangle {
     background: Theme.window;
-    property <length> column: min(620px, root.width - 2 * Space.page);
+    property <length> column: min(620px, scroll.visible-width - 2 * Space.page);
     property <bool> working: Install.step == "working";
 
-    VerticalLayout {
-        alignment: center;
-        padding-top: Space.xxl;
-        padding-bottom: Space.xxl;
-        HorizontalLayout {
+    // In the middle of the window, or scrolling when the window is too low
+    // for a step: the window never needs to be higher than the screen.
+    scroll := ScrollView {
+        width: root.width;
+        height: root.height;
+        content-width: self.visible-width;
+        content-height: page.height;
+        page := VerticalLayout {
+            width: scroll.visible-width;
+            height: max(scroll.visible-height, self.preferred-height);
             alignment: center;
-            VerticalLayout {
-                width: root.column;
-                spacing: Space.xl;
+            padding-top: Space.xxl;
+            padding-bottom: Space.xxl;
+            HorizontalLayout {
+                alignment: center;
+                VerticalLayout {
+                    width: root.column;
+                    spacing: Space.xl;
 
-                HorizontalLayout {
-                    spacing: Space.md;
-                    padding-left: Space.xs;
-                    Image {
-                        source: @image-url("icons/app.svg");
-                        width: 40px;
-                        height: 40px;
-                    }
-                    VerticalLayout {
-                        alignment: center;
-                        spacing: 1px;
-                        Text {
-                            text: "Nerve";
-                            color: Theme.text;
-                            font-size: Type.lead;
-                            font-weight: Type.bold;
+                    HorizontalLayout {
+                        spacing: Space.md;
+                        padding-left: Space.xs;
+                        Image {
+                            source: @image-url("icons/app.svg");
+                            width: 40px;
+                            height: 40px;
                         }
-                        Text {
-                            text: "Version " + Install.version;
-                            color: Theme.text-muted;
-                            font-size: Type.caption;
-                        }
-                    }
-                }
-
-                Card {
-                    pad: Space.xxl;
-                    gap: 0;
-
-                    // What will be installed.
-                    Reveal {
-                        shown: Install.step == "welcome";
                         VerticalLayout {
-                            spacing: Space.xl;
-                            StepHead {
-                                title: Install.node-only ? "Add the app to the node on this machine" : "Install Nerve on this machine";
-                                text: Install.node-only
-                                    ? "The node is installed as a service already. Installing adds the app: the service runs the app's program from then on, and the command nerve-node becomes a link to it."
-                                    : "Nerve links this machine to your Nerve centers, and lets them do only what you allow.";
+                            alignment: center;
+                            spacing: 1px;
+                            Text {
+                                text: "Nerve";
+                                color: Theme.text;
+                                font-size: Type.lead;
+                                font-weight: Type.bold;
                             }
+                            Text {
+                                text: "Version " + Install.version;
+                                color: Theme.text-muted;
+                                font-size: Type.caption;
+                            }
+                        }
+                    }
+
+                    Card {
+                        pad: Space.xxl;
+                        gap: 0;
+
+                        // What will be installed.
+                        Reveal {
+                            shown: Install.step == "welcome";
                             VerticalLayout {
-                                spacing: Space.lg;
-                                WhatRow {
-                                    icon: @image-url("icons/server.svg");
-                                    title: "The node, as a service";
+                                spacing: Space.xl;
+                                StepHead {
+                                    title: Install.node-only ? "Add the app to the node on this machine" : "Install Nerve on this machine";
                                     text: Install.node-only
-                                        ? "It keeps its settings, pairings, keys and audit log."
-                                        : "Runs in the background under a user of its own, nerve, and starts with the machine.";
+                                        ? (Install.windows
+                                            ? "The node is installed as a service already. Installing adds the app: the service runs the app's program from then on, and nerve-node.exe is removed. For a terminal, download the CLI edition of nerve-node on its own."
+                                            : "The node is installed as a service already. Installing adds the app: the service runs the app's program from then on, and the command nerve-node becomes a link to it.")
+                                        : "Nerve links this machine to your Nerve centers, and lets them do only what you allow.";
                                 }
-                                WhatRow {
-                                    icon: @image-url("icons/window.svg");
-                                    title: "The app";
-                                    text: "In " + Install.program + ", with Nerve in the " + (Install.windows ? "Start menu and in Apps & features." : "application menu.");
+                                VerticalLayout {
+                                    spacing: Space.lg;
+                                    WhatRow {
+                                        icon: @image-url("icons/server.svg");
+                                        title: "The node, as a service";
+                                        text: Install.node-only
+                                            ? "It keeps its settings, pairings, keys and audit log."
+                                            : "Runs in the background under a user of its own, nerve, and starts with the machine.";
+                                    }
+                                    WhatRow {
+                                        icon: @image-url("icons/window.svg");
+                                        title: "The app";
+                                        text: "In " + Install.program + ", with Nerve in the " + (Install.windows ? "Start menu and in Apps & features." : "application menu.");
+                                    }
+                                    WhatRow {
+                                        icon: @image-url("icons/link.svg");
+                                        title: "nerve:// links";
+                                        text: "A pairing link from a center's web UI opens in Nerve.";
+                                    }
                                 }
-                                WhatRow {
-                                    icon: @image-url("icons/link.svg");
-                                    title: "nerve:// links";
-                                    text: "A pairing link from a center's web UI opens in Nerve.";
-                                }
-                            }
-                            Reveal {
-                                shown: Install.windows && !Install.node-only;
-                                Field {
-                                    label: "Your Windows password";
-                                    hint: "Commands from your centers run as you, " + Install.account + ". The service needs your password to start them, and keeps it encrypted for this machine.";
-                                    TextField {
-                                        text <=> Install.password;
-                                        password: true;
+                                Reveal {
+                                    shown: Install.windows && !Install.node-only;
+                                    Field {
                                         label: "Your Windows password";
-                                        accepted => {
+                                        hint: "Commands from your centers run as you, " + Install.account + ". The service needs your password to start them, and keeps it encrypted for this machine.";
+                                        TextField {
+                                            text <=> Install.password;
+                                            password: true;
+                                            label: "Your Windows password";
+                                            accepted => {
+                                                Install.install();
+                                            }
+                                        }
+                                    }
+                                }
+                                StepFoot {
+                                    note: "Installing changes the system, so the system asks for an administrator's password next.";
+                                    note-icon: @image-url("icons/shield.svg");
+                                    Spacer { }
+                                    Button {
+                                        text: "Close";
+                                        kind: ButtonKind.ghost;
+                                        clicked => {
+                                            Install.close();
+                                        }
+                                    }
+                                    Button {
+                                        text: Install.node-only ? "Add the app" : "Install";
+                                        icon: @image-url("icons/shield.svg");
+                                        kind: ButtonKind.primary;
+                                        enabled: !Install.windows || Install.node-only || Install.password != "";
+                                        clicked => {
                                             Install.install();
                                         }
                                     }
                                 }
                             }
-                            StepFoot {
-                                note: "Installing changes the system, so the system asks for an administrator's password next.";
-                                note-icon: @image-url("icons/shield.svg");
-                                Spacer { }
-                                Button {
-                                    text: "Close";
-                                    kind: ButtonKind.ghost;
-                                    clicked => {
-                                        Install.close();
+                        }
+
+                        // Installed already: open, update or remove it.
+                        Reveal {
+                            shown: Install.step == "installed";
+                            VerticalLayout {
+                                spacing: Space.xl;
+                                StepHead {
+                                    icon: @image-url("icons/ok.svg");
+                                    tone: Tone.ok;
+                                    title: "Nerve is installed";
+                                    text: Install.newer ? "This file is a newer version. Update Nerve with it, or open the installed one."
+                                        : Install.installed-version == Install.version ? "This file is the version that is installed. Open Nerve from here or from the " + (Install.windows ? "Start menu." : "application menu.")
+                                        : "The installed Nerve is newer than this file. Open it from here or from the " + (Install.windows ? "Start menu." : "application menu.");
+                                }
+                                Rectangle {
+                                    background: Theme.surface-alt;
+                                    border-radius: Radius.lg;
+                                    border-width: 1px;
+                                    border-color: Theme.border;
+                                    VerticalLayout {
+                                        padding: Space.lg;
+                                        spacing: Space.md;
+                                        InfoRow {
+                                            label: "Installed";
+                                            value: Install.installed-version != "" ? "Version " + Install.installed-version : "Version unknown";
+                                        }
+                                        InfoRow {
+                                            label: "This file";
+                                            value: "Version " + Install.version;
+                                            tone: Install.newer ? Tone.accent : Tone.neutral;
+                                        }
+                                        InfoRow {
+                                            label: "Program";
+                                            value: Install.program;
+                                            mono: true;
+                                        }
                                     }
                                 }
-                                Button {
-                                    text: Install.node-only ? "Add the app" : "Install";
-                                    icon: @image-url("icons/shield.svg");
-                                    kind: ButtonKind.primary;
-                                    enabled: !Install.windows || Install.node-only || Install.password != "";
-                                    clicked => {
-                                        Install.install();
+                                StepFoot {
+                                    Button {
+                                        text: "Uninstall…";
+                                        icon: @image-url("icons/trash.svg");
+                                        kind: ButtonKind.danger-soft;
+                                        clicked => {
+                                            Install.ask-uninstall();
+                                        }
+                                    }
+                                    Spacer { }
+                                    // Opening the installed one comes first, unless this
+                                    // file is newer: then the update does.
+                                    Button {
+                                        text: "Open Nerve";
+                                        kind: Install.newer ? ButtonKind.secondary : ButtonKind.primary;
+                                        clicked => {
+                                            Install.open-app();
+                                        }
+                                    }
+                                    if Install.newer: Button {
+                                        text: "Update to " + Install.version;
+                                        icon: @image-url("icons/download.svg");
+                                        kind: ButtonKind.primary;
+                                        clicked => {
+                                            Install.update();
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    // Installed already: open, update or remove it.
-                    Reveal {
-                        shown: Install.step == "installed";
-                        VerticalLayout {
-                            spacing: Space.xl;
-                            StepHead {
-                                icon: @image-url("icons/ok.svg");
-                                tone: Tone.ok;
-                                title: "Nerve is installed";
-                                text: Install.newer ? "This file is a newer version. Update Nerve with it, or open the installed one."
-                                    : Install.installed-version == Install.version ? "This file is the version that is installed. Open Nerve from here or from the " + (Install.windows ? "Start menu." : "application menu.")
-                                    : "The installed Nerve is newer than this file. Open it from here or from the " + (Install.windows ? "Start menu." : "application menu.");
-                            }
-                            Rectangle {
-                                background: Theme.surface-alt;
-                                border-radius: Radius.lg;
-                                border-width: 1px;
-                                border-color: Theme.border;
-                                VerticalLayout {
-                                    padding: Space.lg;
-                                    spacing: Space.md;
-                                    InfoRow {
-                                        label: "Installed";
-                                        value: Install.installed-version != "" ? "Version " + Install.installed-version : "Version unknown";
-                                    }
-                                    InfoRow {
-                                        label: "This file";
-                                        value: "Version " + Install.version;
-                                        tone: Install.newer ? Tone.accent : Tone.neutral;
-                                    }
-                                    InfoRow {
-                                        label: "Program";
-                                        value: Install.program;
-                                        mono: true;
-                                    }
+                        // What goes with an uninstall.
+                        Reveal {
+                            shown: Install.step == "choose";
+                            VerticalLayout {
+                                spacing: Space.xl;
+                                StepHead {
+                                    title: "Uninstall Nerve?";
+                                    text: "The service, its user nerve, the program and its menu entry go. Choose what happens to the node's data.";
                                 }
-                            }
-                            StepFoot {
-                                Button {
-                                    text: "Uninstall…";
-                                    icon: @image-url("icons/trash.svg");
-                                    kind: ButtonKind.danger-soft;
-                                    clicked => {
-                                        Install.ask-uninstall();
+                                UninstallChoice { }
+                                StepFoot {
+                                    note: "Removing Nerve changes the system, so the system asks for an administrator's password next.";
+                                    note-icon: @image-url("icons/shield.svg");
+                                    Spacer { }
+                                    Button {
+                                        text: "Back";
+                                        kind: ButtonKind.ghost;
+                                        clicked => {
+                                            Install.error = "";
+                                            Install.step = "installed";
+                                        }
                                     }
-                                }
-                                Spacer { }
-                                // Opening the installed one comes first, unless this
-                                // file is newer: then the update does.
-                                Button {
-                                    text: "Open Nerve";
-                                    kind: Install.newer ? ButtonKind.secondary : ButtonKind.primary;
-                                    clicked => {
-                                        Install.open-app();
-                                    }
-                                }
-                                if Install.newer: Button {
-                                    text: "Update to " + Install.version;
-                                    icon: @image-url("icons/download.svg");
-                                    kind: ButtonKind.primary;
-                                    clicked => {
-                                        Install.update();
+                                    Button {
+                                        text: Install.purge ? "Uninstall and delete the data" : "Uninstall";
+                                        kind: ButtonKind.danger;
+                                        clicked => {
+                                            Install.uninstall();
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
 
-                    // What goes with an uninstall.
-                    Reveal {
-                        shown: Install.step == "choose";
-                        VerticalLayout {
-                            spacing: Space.xl;
-                            StepHead {
-                                title: "Uninstall Nerve?";
-                                text: "The service, its user nerve, the program and its menu entry go. Choose what happens to the node's data.";
-                            }
-                            UninstallChoice { }
-                            StepFoot {
-                                note: "Removing Nerve changes the system, so the system asks for an administrator's password next.";
-                                note-icon: @image-url("icons/shield.svg");
-                                Spacer { }
-                                Button {
-                                    text: "Back";
-                                    kind: ButtonKind.ghost;
-                                    clicked => {
-                                        Install.error = "";
-                                        Install.step = "installed";
-                                    }
-                                }
-                                Button {
-                                    text: Install.purge ? "Uninstall and delete the data" : "Uninstall";
-                                    kind: ButtonKind.danger;
-                                    clicked => {
-                                        Install.uninstall();
-                                    }
-                                }
-                            }
+                        Reveal {
+                            shown: root.working;
+                            Working { }
                         }
-                    }
 
-                    Reveal {
-                        shown: root.working;
-                        Working { }
-                    }
-
-                    // Done.
-                    Reveal {
-                        shown: Install.step == "done";
-                        VerticalLayout {
-                            spacing: Space.xl;
-                            StepHead {
-                                icon: @image-url("icons/ok.svg");
-                                tone: Tone.ok;
-                                title: Install.action == "update" ? "Nerve is updated to " + Install.installed-version
-                                    : Install.action == "uninstall" ? "Nerve is removed"
-                                    : "Nerve is installed";
-                                text: Install.action == "update" ? "The service runs the new version. Open Nerve to go on."
-                                    : Install.action == "uninstall" ? (Install.purge ? "The node, the app and the node's data are gone from this machine." : "The node and the app are gone. The node's data stays; install Nerve again, and the node takes it up.")
-                                    : "The node runs as a service and starts with the machine. Open Nerve to name this machine and pair it with its first center.";
-                            }
-                            DidList { }
-                            StepFoot {
-                                Spacer { }
-                                Button {
-                                    text: "Close";
-                                    kind: Install.action == "uninstall" ? ButtonKind.primary : ButtonKind.ghost;
-                                    clicked => {
-                                        Install.close();
-                                    }
+                        // Done.
+                        Reveal {
+                            shown: Install.step == "done";
+                            VerticalLayout {
+                                spacing: Space.xl;
+                                StepHead {
+                                    icon: @image-url("icons/ok.svg");
+                                    tone: Tone.ok;
+                                    title: Install.action == "update" ? "Nerve is updated to " + Install.installed-version
+                                        : Install.action == "uninstall" ? "Nerve is removed"
+                                        : "Nerve is installed";
+                                    text: Install.action == "update" ? "The service runs the new version. Open Nerve to go on."
+                                        : Install.action == "uninstall" ? (Install.purge ? "The node, the app and the node's data are gone from this machine." : "The node and the app are gone. The node's data stays; install Nerve again, and the node takes it up.")
+                                        : "The node runs as a service and starts with the machine. Open Nerve to name this machine and pair it with its first center.";
                                 }
-                                if Install.action != "uninstall": Button {
-                                    text: "Open Nerve";
-                                    kind: ButtonKind.primary;
-                                    clicked => {
-                                        Install.open-app();
+                                DidList { }
+                                StepFoot {
+                                    Spacer { }
+                                    Button {
+                                        text: "Close";
+                                        kind: Install.action == "uninstall" ? ButtonKind.primary : ButtonKind.ghost;
+                                        clicked => {
+                                            Install.close();
+                                        }
+                                    }
+                                    if Install.action != "uninstall": Button {
+                                        text: "Open Nerve";
+                                        kind: ButtonKind.primary;
+                                        clicked => {
+                                            Install.open-app();
+                                        }
                                     }
                                 }
                             }

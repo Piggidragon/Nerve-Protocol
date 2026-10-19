@@ -876,6 +876,8 @@ export component Dialog inherits Rectangle {
     }
     card := Rectangle {
         width: min(root.card-width, root.width - 48px);
+        // As high as its content, up to the window's height less a margin:
+        // a longer content scrolls, so a dialog fits a small screen.
         height: min(body.preferred-height, root.height - 48px);
         x: (root.width - self.width) / 2;
         y: max(24px, (root.height - self.height) * 0.42);
@@ -888,46 +890,52 @@ export component Dialog inherits Rectangle {
         drop-shadow-color: #0000004d;
         accessible-role: groupbox;
         accessible-label: root.title;
-        body := VerticalLayout {
+        scroll := ScrollView {
             width: card.width;
-            padding: Space.xxl;
-            spacing: Space.xl;
-            HorizontalLayout {
-                spacing: Space.md;
-                VerticalLayout {
-                    horizontal-stretch: 1;
-                    Text {
-                        text: root.title;
-                        color: Theme.text;
-                        font-size: 18px;
-                        font-weight: Type.semibold;
-                        wrap: word-wrap;
-                    }
-                    Reveal {
-                        shown: root.subtitle != "";
-                        gap: 6px;
+            height: card.height;
+            content-width: self.visible-width;
+            content-height: body.preferred-height;
+            body := VerticalLayout {
+                width: scroll.visible-width;
+                padding: Space.xxl;
+                spacing: Space.xl;
+                HorizontalLayout {
+                    spacing: Space.md;
+                    VerticalLayout {
+                        horizontal-stretch: 1;
                         Text {
-                            text: root.subtitle;
-                            color: Theme.text-muted;
-                            font-size: Type.body;
+                            text: root.title;
+                            color: Theme.text;
+                            font-size: 18px;
+                            font-weight: Type.semibold;
                             wrap: word-wrap;
                         }
+                        Reveal {
+                            shown: root.subtitle != "";
+                            gap: 6px;
+                            Text {
+                                text: root.subtitle;
+                                color: Theme.text-muted;
+                                font-size: Type.body;
+                                wrap: word-wrap;
+                            }
+                        }
                     }
-                }
-                VerticalLayout {
-                    alignment: start;
-                    Button {
-                        icon: @image-url("icons/x.svg");
-                        kind: ButtonKind.ghost;
-                        small: true;
-                        accessible-label: "Close";
-                        clicked => {
-                            root.close();
+                    VerticalLayout {
+                        alignment: start;
+                        Button {
+                            icon: @image-url("icons/x.svg");
+                            kind: ButtonKind.ghost;
+                            small: true;
+                            accessible-label: "Close";
+                            clicked => {
+                                root.close();
+                            }
                         }
                     }
                 }
+                @children
             }
-            @children
         }
     }
 }

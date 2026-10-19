@@ -163,6 +163,7 @@ impl Ctl {
                 _ => "welcome",
             };
             i.set_error(e.into());
+            i.set_error_title(SharedString::new());
             i.set_step(back.into());
         });
     }
@@ -178,6 +179,7 @@ impl Ctl {
         self.with_install(|i| {
             i.set_action(action.into());
             i.set_error(SharedString::new());
+            i.set_error_title(SharedString::new());
             i.set_did(ModelRc::default());
             i.set_warnings(ModelRc::default());
         });
@@ -268,6 +270,7 @@ impl Ctl {
             i.set_source(0);
             i.set_file(SharedString::new());
             i.set_error(SharedString::new());
+            i.set_error_title(SharedString::new());
             i.set_step("choose".into());
             i.set_update_open(true);
         });
@@ -278,9 +281,13 @@ impl Ctl {
         self.job(
             move |_| chooser(Choose::Program),
             |c, picked: Result<Option<PathBuf>, String>| match picked {
-                // The update dialog is open: it says why.
+                // The update dialog is open: it says why, under its own
+                // heading, since the update did not start.
                 Err(e) => {
-                    c.with_install(|i| i.set_error(e.into()));
+                    c.with_install(|i| {
+                        i.set_error(e.into());
+                        i.set_error_title("No file dialog".into());
+                    });
                 }
                 Ok(None) => {}
                 Ok(Some(p)) => {
@@ -288,6 +295,7 @@ impl Ctl {
                         i.set_source(1);
                         i.set_file(p.display().to_string().into());
                         i.set_error(SharedString::new());
+                        i.set_error_title(SharedString::new());
                     });
                 }
             },

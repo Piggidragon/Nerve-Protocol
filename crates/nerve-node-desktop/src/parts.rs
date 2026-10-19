@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use nerve_node::edition::{Edition, Parts};
 
 /// The program's name, and the id of its menu entry and icon.
-pub const PROGRAM: &str = "nerve-node-desktop";
+pub const PROGRAM: &str = nerve_node::edition::DESKTOP_PROGRAM;
 
 /// This program: the node with the desktop app.
 pub static EDITION: Edition = Edition {

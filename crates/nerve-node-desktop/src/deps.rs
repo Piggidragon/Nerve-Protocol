@@ -98,16 +98,35 @@ pub fn notify(title: &str, text: &str) {
 }
 
 /// Whether pkexec can ask for root here: `pkexec` is the program found, if
-/// any; `agent` whether an authentication agent of the desktop runs, which
-/// shows pkexec's question. Without one pkexec fails at once.
-pub fn polkit(pkexec: Option<&Path>, agent: bool) -> Result<(), String> {
+/// any. Whether an authentication agent answers shows when pkexec runs
+/// ([`pkexec_failed`]).
+pub fn polkit(pkexec: Option<&Path>) -> Result<(), String> {
     if pkexec.is_none() {
         return Err("There is no pkexec on this machine, so the app cannot ask for administrator rights. Install polkit (the package polkit, or policykit-1 on older Debian and Ubuntu), then try again.".into());
     }
-    if !agent {
-        return Err("No polkit authentication agent is running, so nobody can be asked for the administrator password. Install and start one for your desktop, for example polkit-gnome or polkit-kde-agent-1 (GNOME and KDE Plasma bring theirs), then try again.".into());
-    }
     Ok(())
+}
+
+/// What the app says when no polkit authentication agent answered pkexec.
+pub fn no_agent() -> String {
+    "No polkit authentication agent is running, so nobody can be asked for the administrator password. Install and start one for your desktop, for example polkit-gnome or polkit-kde-agent-1 (GNOME and KDE Plasma bring theirs), then try again.".into()
+}
+
+/// What pkexec says on stderr when no authentication agent answered, in
+/// polkit 0.105 (Ubuntu 22.04) to 127 alike: its own words, and those of the
+/// text agent it tries in a terminal instead unless told not to.
+const NO_AGENT_SAID: [&str; 3] = [
+    "No authentication agent found",
+    "Error creating textual authentication agent",
+    "Error registering local authentication agent",
+];
+
+/// Why pkexec did not start the program, from its exit code and what it
+/// said on stderr, when that was a missing authentication agent: pkexec
+/// exits with 127 then (as when the owner is not authorized; 126 when they
+/// dismissed the question), so its words tell which.
+pub fn pkexec_failed(code: Option<i32>, said: &str) -> Option<String> {
+    (code == Some(127) && NO_AGENT_SAID.iter().any(|s| said.contains(s))).then(no_agent)
 }
 
 /// `program` in the folders of `path` (`PATH`), or in `/usr/bin`.
@@ -120,53 +139,13 @@ pub fn find_program(program: &str, path: Option<&str>) -> Option<PathBuf> {
         .find(|p| p.is_file())
 }
 
-/// Whether one of `programs` (the names this user's processes were started
-/// as) is a polkit authentication agent: one of polkit's own (polkit-gnome,
-/// polkit-kde-agent, lxpolkit, polkit-mate, hyprpolkitagent, lxqt-policykit
-/// …), or a desktop shell that has one built in.
-pub fn agent_among<S: AsRef<str>>(programs: impl IntoIterator<Item = S>) -> bool {
-    const SHELLS: [&str; 4] = ["gnome-shell", "gnome-flashback", "cinnamon", "phosh"];
-    programs.into_iter().any(|p| {
-        let name = Path::new(p.as_ref())
-            .file_name()
-            .map(|n| n.to_string_lossy().to_ascii_lowercase())
-            .unwrap_or_default();
-        // polkit's daemon and pkexec's helper are no agent.
-        let polkit = (name.contains("polkit") || name.contains("policykit"))
-            && !matches!(
-                name.as_str(),
-                "polkitd" | "pkexec" | "polkit-agent-helper-1"
-            );
-        polkit || SHELLS.contains(&name.as_str())
-    })
-}
-
-/// The names this user's processes were started as (Linux, from /proc).
-#[cfg(target_os = "linux")]
-fn own_programs() -> Vec<String> {
-    use std::os::unix::fs::MetadataExt;
-    // SAFETY: getuid has no preconditions.
-    let me = unsafe { libc::getuid() };
-    let Ok(procs) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    procs
-        .flatten()
-        .filter(|e| e.metadata().is_ok_and(|m| m.uid() == me))
-        .filter_map(|e| std::fs::read(e.path().join("cmdline")).ok())
-        .filter_map(|c| {
-            let first = c.split(|b| *b == 0).next()?;
-            (!first.is_empty()).then(|| String::from_utf8_lossy(first).into_owned())
-        })
-        .collect()
-}
-
-/// [`polkit`] on this machine, before the app asks.
-#[cfg(target_os = "linux")]
-pub fn polkit_here() -> Result<(), String> {
+/// pkexec on this machine, before the app asks ([`polkit`]).
+#[cfg(unix)]
+pub fn pkexec_here() -> Result<PathBuf, String> {
     let path = std::env::var("PATH").ok();
     let pkexec = find_program("pkexec", path.as_deref());
-    polkit(pkexec.as_deref(), agent_among(own_programs()))
+    polkit(pkexec.as_deref())?;
+    Ok(pkexec.unwrap_or_default())
 }
 
 /// The interface of the portal that opens the file dialogs.
@@ -270,31 +249,38 @@ mod tests {
     }
 
     #[test]
-    fn pkexec_needs_the_program_and_an_agent() {
-        let pk = Path::new("/usr/bin/pkexec");
-        assert_eq!(polkit(Some(pk), true), Ok(()));
-        assert!(polkit(None, true).unwrap_err().contains("Install polkit"));
-        let e = polkit(Some(pk), false).unwrap_err();
-        assert!(e.contains("No polkit authentication agent"), "{e}");
-        assert!(
-            e.contains("polkit-gnome") && e.contains("polkit-kde-agent"),
-            "{e}"
-        );
+    fn pkexec_needs_the_program_and_says_when_no_agent_answered() {
+        assert_eq!(polkit(Some(Path::new("/usr/bin/pkexec"))), Ok(()));
+        assert!(polkit(None).unwrap_err().contains("Install polkit"));
 
-        assert!(agent_among(["/usr/bin/gnome-shell"]));
-        assert!(agent_among([
-            "/usr/lib/x86_64-linux-gnu/libexec/polkit-kde-authentication-agent-1"
-        ]));
-        assert!(agent_among([
-            "/usr/libexec/polkit-gnome-authentication-agent-1"
-        ]));
-        assert!(agent_among(["lxqt-policykit-agent"]));
-        assert!(!agent_among([
-            "/usr/bin/bash",
-            "/usr/lib/polkit-1/polkitd",
-            "pkexec"
-        ]));
-        assert!(!agent_among(Vec::<String>::new()));
+        // What pkexec of polkit 0.105 to 127 says, with its exit code.
+        let none = "Error executing command as another user: No authentication agent found.\n";
+        let no_tty = "Error creating textual authentication agent: Error opening current controlling terminal for the process (`/dev/tty'): No such device or address\n";
+        for said in [none, no_tty] {
+            let e = pkexec_failed(Some(127), said).unwrap();
+            assert!(e.contains("No polkit authentication agent"), "{e}");
+            assert!(
+                e.contains("polkit-gnome") && e.contains("polkit-kde-agent"),
+                "{e}"
+            );
+        }
+        // Dismissed, refused, or ended otherwise: no rights, but an agent
+        // asked.
+        assert_eq!(
+            pkexec_failed(
+                Some(126),
+                "Error executing command as another user: Request dismissed\n"
+            ),
+            None
+        );
+        assert_eq!(
+            pkexec_failed(
+                Some(127),
+                "Error executing command as another user: Not authorized\n\nThis incident has been reported.\n"
+            ),
+            None
+        );
+        assert_eq!(pkexec_failed(None, none), None);
 
         let d = tempfile::tempdir().unwrap();
         std::fs::write(d.path().join("pkexec-test"), "").unwrap();

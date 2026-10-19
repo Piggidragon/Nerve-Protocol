@@ -21,10 +21,32 @@ use nerve_node_desktop::{AppWindow, Install, Load, Logs, NodeStatus, Page, Perm,
 use slint::{ComponentHandle, Model};
 
 const WIDTH: u32 = 1180;
-const HEIGHT: u32 = 780;
+const HEIGHT: u32 = 700;
 const SCALE: f32 = 2.0;
 /// The installer's window.
 const INSTALLER: (u32, u32) = (760, 640);
+/// A small screen, which the installer and the dialogs fit, the window
+/// filling it.
+const SMALL: (u32, u32) = (1280, 800);
+/// The shots also taken on [`SMALL`], as `<name>-1280x800`: the installer's
+/// steps and the dialogs.
+const ALSO_SMALL: [&str; 15] = [
+    "setup-",
+    "pair-",
+    "centers-unpair",
+    "permissions-mode",
+    "permissions-folder",
+    "permissions-sudo",
+    "settings-proxy",
+    "settings-relay-",
+    "settings-backup",
+    "settings-no-file-dialog",
+    "settings-update",
+    "settings-uninstall",
+    "about",
+    "elevate",
+    "installer-",
+];
 /// Long values, so the shots show how they fit.
 const OFFICE: &str = "office-workstation-second-floor";
 const LAB_URL: &str =
@@ -37,13 +59,31 @@ struct Shots<'a> {
     screen: Screen,
     window: &'a AppWindow,
     out: PathBuf,
+    /// The window's size in logical pixels.
+    size: std::cell::Cell<(u32, u32)>,
 }
 
 impl Shots<'_> {
-    /// Saves the window as `<name>-light.png` and `<name>-dark.png`.
+    /// Makes the window `width` by `height` logical pixels.
+    fn resize(&self, (width, height): (u32, u32)) {
+        self.size.set((width, height));
+        self.screen.resize(
+            (width as f32 * SCALE) as u32,
+            (height as f32 * SCALE) as u32,
+        );
+    }
+
+    /// Saves the window as `<name>-light.png` and `<name>-dark.png`, and
+    /// the installer and the dialogs on [`SMALL`] too.
     fn take(&self, name: &str) {
         self.window.global::<Store>().set_toast_shown(false);
         self.take_as_is(name);
+        if ALSO_SMALL.iter().any(|s| name.starts_with(s)) {
+            let size = self.size.get();
+            self.resize(SMALL);
+            self.take_as_is(&format!("{name}-1280x800"));
+            self.resize(size);
+        }
     }
 
     /// [`Shots::take`] with the note in the corner, if one shows.
@@ -64,15 +104,9 @@ impl Shots<'_> {
 
     /// The page `height` logical pixels high, as `<name>-full`.
     fn take_full(&self, name: &str, height: u32) {
-        self.screen.resize(
-            (WIDTH as f32 * SCALE) as u32,
-            (height as f32 * SCALE) as u32,
-        );
+        self.resize((WIDTH, height));
         self.take(&format!("{name}-full"));
-        self.screen.resize(
-            (WIDTH as f32 * SCALE) as u32,
-            (HEIGHT as f32 * SCALE) as u32,
-        );
+        self.resize((WIDTH, HEIGHT));
     }
 }
 
@@ -155,6 +189,7 @@ fn every_page_light_and_dark() {
         screen,
         window: &window,
         out,
+        size: std::cell::Cell::new((WIDTH, HEIGHT)),
     };
 
     // Asking: the first moment of the app.
@@ -471,9 +506,12 @@ fn every_page_light_and_dark() {
     ctl.set_chooser(Arc::new(move |_| Ok(Some(new.clone()))));
     install.invoke_choose_file();
     shots.take("settings-update-file");
-    install.set_error(no_portal.clone().into());
+    let e = no_portal.clone();
+    ctl.set_chooser(Arc::new(move |_| Err(e.clone())));
+    install.invoke_choose_file();
     shots.take("settings-update-no-file-dialog");
     install.set_error("".into());
+    install.set_error_title("".into());
     install.set_step("working".into());
     shots.take("settings-update-working");
     install.set_step("done".into());
@@ -506,6 +544,20 @@ fn every_page_light_and_dark() {
         "removed the program /usr/local/bin/nerve-node-desktop",
     ]));
     shots.take("settings-uninstall-done");
+    install.set_did(lines(&[
+        "stopped and removed the service nerve-node",
+        "took the folder grants of the commands off: none were left",
+        "removed the source nerve-node from the Windows Event Log; its entries stay",
+        "deleted C:\\ProgramData\\Nerve\\config",
+        "deleted C:\\ProgramData\\Nerve",
+        "deleted C:\\ProgramData\\Nerve\\state",
+        "removed the user nerve and its profile",
+        "removed Nerve from the Start menu",
+        "nerve:// links no longer open in Nerve",
+        "removed Nerve from Apps & features",
+        "removed the program C:\\Program Files\\Nerve\\nerve-node-desktop.exe; Windows holds it (this command runs from it, or the Event Log reads it), so Windows deletes the file at its next start",
+    ]));
+    shots.take("settings-uninstall-done-windows");
     install.set_uninstall_open(false);
     install.set_purge(false);
 
@@ -521,8 +573,7 @@ fn every_page_light_and_dark() {
     shots.take("elevate");
     // Without a polkit agent to ask (crate::deps), the dialog says what to
     // install instead of asking.
-    let no_agent =
-        nerve_node_desktop::deps::polkit(Some(Path::new("/usr/bin/pkexec")), false).unwrap_err();
+    let no_agent = nerve_node_desktop::deps::no_agent();
     store.set_elevate_error(no_agent.clone().into());
     shots.take("elevate-no-polkit-agent");
     store.set_elevate_error("".into());
@@ -538,10 +589,7 @@ fn every_page_light_and_dark() {
     shots.take("centers-error");
 
     // The installer, as the downloaded file shows it, in its own size.
-    shots.screen.resize(
-        (INSTALLER.0 as f32 * SCALE) as u32,
-        (INSTALLER.1 as f32 * SCALE) as u32,
-    );
+    shots.resize(INSTALLER);
     let install = window.global::<Install>();
     let bin = root.join("usr/local/bin/nerve-node-desktop");
     ctl.installer(Launch::Plain, &bin);
@@ -560,9 +608,14 @@ fn every_page_light_and_dark() {
     install.set_program("C:\\Program Files\\Nerve\\nerve-node-desktop.exe".into());
     install.set_password("hunter2hunter2".into());
     shots.take("installer-welcome-windows");
+    // Longer than the window: it scrolls.
+    install.set_error("the service nerve-node did not start: the node did not answer on its control pipe within 30 seconds; the Windows Event Log (Application, source nerve-node) and C:\\ProgramData\\Nerve\\state\\log.jsonl say why".into());
+    shots.take("installer-welcome-windows-failed");
+    install.set_error("".into());
+    install.set_node_only(true);
+    shots.take("installer-node-only-windows");
     install.set_windows(false);
     install.set_program("/usr/local/bin/nerve-node-desktop".into());
-    install.set_node_only(true);
     shots.take("installer-node-only");
     install.set_action("install".into());
     install.set_step("done".into());
@@ -581,7 +634,9 @@ fn every_page_light_and_dark() {
         "put Nerve in the Start menu (C:\\ProgramData\\Microsoft\\Windows\\Start Menu\\Programs\\Nerve.lnk)",
         "nerve:// links open in Nerve (HKEY_LOCAL_MACHINE\\Software\\Classes\\nerve)",
         "put Nerve in Apps & features, where Uninstall removes it",
-        "C:\\Program Files\\Nerve\\nerve-node.exe is a link to C:\\Program Files\\Nerve\\nerve-node-desktop.exe now, so the command nerve-node runs it",
+        "registered the service nerve-node, which runs as nerve and starts with the machine",
+        "registered the source nerve-node in the Windows Event Log (Application): the service's start, stop and failures go there as well as to C:\\ProgramData\\Nerve\\state\\log.jsonl",
+        "removed C:\\Program Files\\Nerve\\nerve-node.exe, the node installed alone: C:\\Program Files\\Nerve\\nerve-node-desktop.exe is the node now (Windows holds the old file, as the Event Log read it; it deletes it at its next start). For a terminal, download the CLI edition nerve-node.exe on its own",
         "the service nerve-node runs",
     ]));
     shots.take("installer-node-only-done-windows");
@@ -636,6 +691,23 @@ fn every_page_light_and_dark() {
         "removed the program /usr/local/bin/nerve-node-desktop",
     ]));
     shots.take("installer-removed");
+    // What an uninstall on Windows says, more than fits: the steps scroll.
+    install.set_windows(true);
+    install.set_did(lines(&[
+        "stopped and removed the service nerve-node",
+        "took the folder grants of the commands off: none were left",
+        "removed the source nerve-node from the Windows Event Log; its entries stay",
+        "deleted C:\\ProgramData\\Nerve\\config",
+        "deleted C:\\ProgramData\\Nerve",
+        "deleted C:\\ProgramData\\Nerve\\state",
+        "removed the user nerve and its profile",
+        "removed Nerve from the Start menu",
+        "nerve:// links no longer open in Nerve",
+        "removed Nerve from Apps & features",
+        "removed the program C:\\Program Files\\Nerve\\nerve-node-desktop.exe; Windows holds it (this command runs from it, or the Event Log reads it), so Windows deletes the file at its next start",
+    ]));
+    shots.take("installer-removed-windows");
+    install.set_windows(false);
     install.set_action("update".into());
     install.set_installed_version("0.0.6".into());
     install.set_did(lines(&[

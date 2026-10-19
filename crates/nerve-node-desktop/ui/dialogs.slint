@@ -713,7 +713,7 @@ export component UpdateDialog inherits Dialog {
                 UpdateChoice { }
                 DialogButtons {
                     error: Install.error;
-                    error-title: "The update did not finish";
+                    error-title: Install.error-title != "" ? Install.error-title : "The update did not finish";
                     Button {
                         text: "Cancel";
                         kind: ButtonKind.ghost;

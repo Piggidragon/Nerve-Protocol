@@ -40,6 +40,11 @@ pub const NODE: Edition = Edition {
     parts: None,
 };
 
+/// The desktop app's name. The node alone knows it to find the app beside
+/// it: a node the app took over is the app's to uninstall
+/// ([`crate::service::app_beside`]).
+pub const DESKTOP_PROGRAM: &str = "nerve-node-desktop";
+
 static EDITION: OnceLock<&'static Edition> = OnceLock::new();
 
 /// Makes this program `edition`; once, at its start, before any command.

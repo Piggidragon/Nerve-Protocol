@@ -241,6 +241,9 @@ the old uid gets the keys. The account of the commands stays, also one that
 comes back with its pairings, rules and audit log. `--purge` deletes them,
 keys and audit log included. The [desktop app](desktop.md)'s uninstall also
 removes its menu entry, its link handler and the `nerve-node` link it made.
+Where the app took over the node, `nerve-node uninstall` of the downloaded
+CLI edition hands over to the app's (`nerve-node-desktop uninstall`, with
+`--purge` if given), so the app goes with the node.
 
 ## Windows
 
@@ -365,6 +368,12 @@ source `nerve-node` again. A node installed by a program that did not
 register it yet gets it from the installed program:
 `& "C:\Program Files\Nerve\nerve-node.exe" install`, or the next `update`.
 
+When the [desktop app](desktop.md) takes over a node installed with
+`nerve-node.exe`, its `install` removes `C:\Program Files\Nerve\nerve-node.exe`
+once the service and the Event Log source name the app's program, or moves it
+aside when the Event Log still holds it, as above. The app's program has no
+console; the CLI edition, downloaded on its own, is the one for a terminal.
+
 `uninstall` stops and removes the service, the source `nerve-node` of the
 Event Log (its entries stay), the user `nerve` and its profile, and the
 program. It also takes off the folder grants of `folder` mode that a node
@@ -377,7 +386,10 @@ password goes, so sudo is off after a later `install`. A later `install`
 takes them up again.
 `--purge` deletes them. Run from the installed program, `uninstall` cannot
 delete that file at once: it moves it aside, and Windows deletes it at its
-next start. Where Windows
+next start. Where the [desktop app](desktop.md) took over the node,
+`nerve-node.exe uninstall` hands over to the app's uninstall, which also
+removes the app, its Start menu entry, its link handler and its entry in Apps
+& features. Where Windows
 still holds the profile of `nerve` (Windows Search can), `uninstall` says how
 to remove it after a restart.
 

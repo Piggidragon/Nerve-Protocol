@@ -750,7 +750,7 @@ fn install_steps(
         steps.did(format!("put the program at {}", layout.bin.display()));
     }
     // The old program goes over at once: a running one keeps its file.
-    install_parts(layout, steps, &|_| Ok(()))?;
+    install_parts(layout, steps)?;
     // A node whose keys are in the system keyring does not start without
     // one that answers for its user; the installed program asks it.
     if in_keyring {
@@ -1208,7 +1208,7 @@ async fn update_steps(
         });
     }
     steps.did(format!("restarted the service {UNIT_NAME}"));
-    install_parts(layout, steps, &|_| Ok(()))
+    install_parts(layout, steps)
 }
 
 /// The release file of `program` for this machine. The desktop app comes
@@ -1226,19 +1226,22 @@ pub(crate) fn asset_name(program: &str) -> Result<String, String> {
 }
 
 /// Puts the parts of `layout`'s program beside it ([`crate::edition::Parts`]),
-/// once the program is in place, and makes the node alone that was installed
-/// before it a link to it ([`link_node`]).
-pub(crate) fn install_parts(
-    layout: &Layout,
-    steps: &mut Steps,
-    set_aside: &dyn Fn(&Path) -> Result<(), String>,
-) -> Result<(), String> {
+/// once the program is in place.
+pub(crate) fn put_parts(layout: &Layout, steps: &mut Steps) -> Result<(), String> {
     if let Some(parts) = layout.edition.parts {
         for step in parts.install(&layout.bin)? {
             steps.did(step);
         }
     }
-    link_node(layout, steps, set_aside)
+    Ok(())
+}
+
+/// [`put_parts`], and the node alone that was installed before the program
+/// becomes a link to it ([`link_node`]); Linux. On Windows that program goes
+/// instead (crate::winsvc).
+pub(crate) fn install_parts(layout: &Layout, steps: &mut Steps) -> Result<(), String> {
+    put_parts(layout, steps)?;
+    link_node(layout, steps)
 }
 
 /// Removes them again, and that link, before the program goes.
@@ -1259,26 +1262,87 @@ pub fn node_beside(layout: &Layout) -> Option<PathBuf> {
     if layout.edition.program == node {
         return None;
     }
-    let mut p = layout.bin.with_file_name(node);
+    Some(beside(layout, node))
+}
+
+/// The program `program` in `layout`'s folder, with its extension.
+fn beside(layout: &Layout, program: &str) -> PathBuf {
+    let mut p = layout.bin.with_file_name(program);
     if let Some(ext) = layout.bin.extension() {
         p.set_extension(ext);
     }
-    Some(p)
+    p
+}
+
+/// The desktop app's program beside `layout`'s, when the app is installed
+/// there and `layout` is the node alone's: the app took the node over, so
+/// the service, the parts and the program are the app's, and only its own
+/// uninstall removes them all ([`hand_over_uninstall`]).
+pub fn app_beside(layout: &Layout) -> Option<PathBuf> {
+    if layout.edition.program != crate::edition::NODE.program {
+        return None;
+    }
+    Some(beside(layout, crate::edition::DESKTOP_PROGRAM)).filter(|p| p.is_file())
+}
+
+/// `uninstall` of the node alone where the desktop app took the node over:
+/// the app's program at `app` runs its own `uninstall`, which removes the
+/// service, the app's parts and both programs, and what it says is passed
+/// on. Its log and errors go to stderr as they come.
+pub fn hand_over_uninstall(app: &Path, purge: bool, out: &mut dyn Write) -> Result<(), String> {
+    use std::io::BufReader;
+    use std::process::{Command, Stdio};
+    let _ = writeln!(
+        out,
+        "the desktop app is installed ({}): its uninstall removes the node with the app",
+        app.display()
+    );
+    let mut cmd = Command::new(app);
+    cmd.arg("uninstall");
+    if purge {
+        cmd.arg("--purge");
+    }
+    // Pipes, not this console: on Windows the app is a GUI program, which
+    // keeps what it is given (nerve-node-desktop's console.rs).
+    let mut child = cmd
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{}: {e}", app.display()))?;
+    let stderr = child.stderr.take().expect("piped");
+    let said = std::thread::spawn(move || {
+        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            eprintln!("{line}");
+        }
+    });
+    for line in BufReader::new(child.stdout.take().expect("piped"))
+        .lines()
+        .map_while(Result::ok)
+    {
+        let _ = writeln!(out, "{line}");
+    }
+    let status = child
+        .wait()
+        .map_err(|e| format!("{}: {e}", app.display()))?;
+    let _ = said.join();
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{} uninstall` did not finish ({status}); what it said is above",
+            app.display()
+        ))
+    }
 }
 
 /// A node installed with `nerve-node` and then taken over by the desktop
-/// app keeps its terminal command: the old program becomes a link to the
-/// app's, which runs the CLI as `nerve-node` does, so one program stays and
-/// it is never an older one. The edition comes from the program the link
-/// leads to (crate::edition), so `nerve-node update` through it updates the
-/// app. Nothing is made where no node alone was installed. `set_aside` moves
-/// the old program out of the way when it cannot be replaced at once (on
-/// Windows, while the Event Log holds it).
-fn link_node(
-    layout: &Layout,
-    steps: &mut Steps,
-    set_aside: &dyn Fn(&Path) -> Result<(), String>,
-) -> Result<(), String> {
+/// app keeps its terminal command on Linux: the old program becomes a link
+/// to the app's, which runs the CLI as `nerve-node` does, so one program
+/// stays and it is never an older one. The edition comes from the program
+/// the link leads to (crate::edition), so `nerve-node update` through it
+/// updates the app. Nothing is made where no node alone was installed.
+fn link_node(layout: &Layout, steps: &mut Steps) -> Result<(), String> {
     let Some(node) = node_beside(layout) else {
         return Ok(());
     };
@@ -1294,11 +1358,8 @@ fn link_node(
         .map_or_else(Default::default, |n| n.to_string_lossy());
     let tmp = node.with_file_name(format!(".{name}.link"));
     let _ = std::fs::remove_file(&tmp);
-    #[cfg(unix)]
-    std::os::unix::fs::symlink(&layout.bin, &tmp).map_err(at)?;
-    #[cfg(windows)]
-    std::os::windows::fs::symlink_file(&layout.bin, &tmp).map_err(at)?;
-    let r = set_aside(&node).and_then(|()| std::fs::rename(&tmp, &node).map_err(at));
+    symlink(&layout.bin, &tmp).map_err(at)?;
+    let r = std::fs::rename(&tmp, &node).map_err(at);
     if r.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -1310,6 +1371,17 @@ fn link_node(
         crate::edition::NODE.program
     ));
     Ok(())
+}
+
+#[cfg(unix)]
+fn symlink(target: &Path, at: &Path) -> std::io::Result<()> {
+    std::os::unix::fs::symlink(target, at)
+}
+
+// Windows removes the node alone's program instead (crate::winsvc).
+#[cfg(not(unix))]
+fn symlink(_: &Path, _: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::other("the link is made on Linux only"))
 }
 
 /// Removes the link [`link_node`] made, and no other.
@@ -3204,6 +3276,56 @@ pub(crate) mod tests {
         install(&l, &sys, &exe, "alice", &mut Vec::new()).unwrap();
         uninstall(&l, &sys, false, &mut Vec::new()).unwrap();
         assert_eq!(std::fs::read_link(&node.bin).unwrap(), other);
+    }
+
+    /// `nerve-node uninstall` of the node alone, after the app took the
+    /// node over: the app's program, here a script that says what it was
+    /// asked, does the uninstall, and what it says comes through.
+    #[cfg(unix)]
+    #[test]
+    fn the_node_alone_hands_the_uninstall_of_a_takeover_to_the_app() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let node = layout(d.path());
+        let app = Layout {
+            bin: node.bin.with_file_name("nerve-node-desktop"),
+            edition: &DESKTOP,
+            ..layout(d.path())
+        };
+        assert_eq!(app_beside(&node), None);
+        std::fs::create_dir_all(app.bin.parent().unwrap()).unwrap();
+        let script = |code: u8| {
+            std::fs::write(
+                &app.bin,
+                format!(
+                    "#!/bin/sh\necho \"removed the program, asked: $*\"\necho \"a log line\" >&2\nexit {code}\n"
+                ),
+            )
+            .unwrap();
+            std::fs::set_permissions(&app.bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        script(0);
+        assert_eq!(app_beside(&node).as_ref(), Some(&app.bin));
+        // The app itself does its uninstall.
+        assert_eq!(app_beside(&app), None);
+        let mut out = Vec::new();
+        hand_over_uninstall(&app_beside(&node).unwrap(), true, &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("the desktop app is installed"), "{out}");
+        assert!(
+            out.contains("removed the program, asked: uninstall --purge"),
+            "{out}"
+        );
+        let mut out = Vec::new();
+        hand_over_uninstall(&app.bin, false, &mut out).unwrap();
+        assert!(
+            String::from_utf8(out)
+                .unwrap()
+                .contains("asked: uninstall\n")
+        );
+        script(3);
+        let e = hand_over_uninstall(&app.bin, false, &mut Vec::new()).unwrap_err();
+        assert!(e.contains("did not finish"), "{e}");
     }
 
     #[test]

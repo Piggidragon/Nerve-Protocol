@@ -324,35 +324,80 @@ pub fn launch(exe: &Path, how: Launch) -> Result<Arc<Client>, String> {
 #[cfg(not(windows))]
 fn launch_stdio(exe: &Path, how: Launch) -> Result<Arc<Client>, String> {
     use std::process::{Command, Stdio};
-    let mut cmd = match how {
-        // pkexec hands its stdin and stdout to the program, and asks with
-        // the desktop's polkit agent.
-        Launch::Elevated => {
-            // Without pkexec, or an agent to ask, pkexec could only fail:
-            // the owner reads what to install instead.
-            #[cfg(target_os = "linux")]
-            crate::deps::polkit_here()?;
-            let mut c = Command::new("pkexec");
-            c.arg(exe);
-            c
-        }
-        Launch::Plain => Command::new(exe),
-    };
-    let mut child = cmd
+    if how == Launch::Elevated {
+        // Without pkexec there is nothing to ask with: the owner reads what
+        // to install instead.
+        return elevate(&crate::deps::pkexec_here()?, exe);
+    }
+    let mut child = Command::new(exe)
         .arg(ARG)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
-        .map_err(|e| match how {
-            Launch::Elevated => format!(
-                "cannot ask for administrator rights: pkexec did not start ({e}); is polkit installed?"
-            ),
-            Launch::Plain => format!("cannot start the broker: {e}"),
-        })?;
+        .map_err(|e| format!("cannot start the broker: {e}"))?;
     let input = child.stdout.take().expect("piped");
     let output = child.stdin.take().expect("piped");
     Client::start(Box::new(input), Box::new(output), Some(child))
+}
+
+/// Starts the broker with `pkexec`, which hands it its stdin and stdout and
+/// asks with the desktop's polkit agent. When no agent answers, pkexec says
+/// so on stderr and ends ([`crate::deps::pkexec_failed`]): the owner reads
+/// what to install. pkexec's own agent in a terminal is off, so the question
+/// is the desktop's, never one in a terminal behind the window.
+#[cfg(not(windows))]
+fn elevate(pkexec: &Path, exe: &Path) -> Result<Arc<Client>, String> {
+    use std::process::{Command, Stdio};
+    use std::time::{Duration, Instant};
+    let mut child = Command::new(pkexec)
+        .arg("--disable-internal-agent")
+        .arg(exe)
+        .arg(ARG)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("cannot ask for administrator rights: pkexec did not start ({e})"))?;
+    // What pkexec says, read to its end on a thread of its own: the broker
+    // keeps the pipe while it runs, and says nothing there.
+    let mut stderr = child.stderr.take().expect("piped");
+    let (tx, said) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut text = Vec::new();
+        let _ = (&mut stderr).take(16 * 1024).read_to_end(&mut text);
+        let _ = tx.send(String::from_utf8_lossy(&text).into_owned());
+        let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+    });
+    let input = child.stdout.take().expect("piped");
+    let output = child.stdin.take().expect("piped");
+    match Client::start(Box::new(input), Box::new(output), None) {
+        Ok(client) => {
+            *client._process.lock().unwrap_or_else(|p| p.into_inner()) = Some(child);
+            Ok(client)
+        }
+        Err(e) => {
+            // pkexec ended without the broker, or soon will.
+            let start = Instant::now();
+            let code = loop {
+                match child.try_wait() {
+                    Ok(Some(status)) => break status.code(),
+                    Ok(None) if start.elapsed() < Duration::from_secs(5) => {
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    _ => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break None;
+                    }
+                }
+            };
+            let said = said
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap_or_default();
+            Err(crate::deps::pkexec_failed(code, &said).unwrap_or(e))
+        }
+    }
 }
 
 /// The broker's start: `__desktop-broker`, on Windows with the pipe's name and
@@ -670,6 +715,51 @@ mod tests {
                 .unwrap()
                 .contains("commands only")
         );
+    }
+
+    /// pkexec runs, and what it says when it does not start the broker
+    /// tells a missing polkit agent from a refusal. Here pkexec is a script
+    /// that answers as pkexec does, and the broker one that says hello.
+    #[cfg(unix)]
+    #[test]
+    fn pkexec_runs_and_a_missing_agent_is_said() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let script = |name: &str, body: &str| {
+            let p = d.path().join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p
+        };
+        let broker = script(
+            "broker",
+            &format!("echo '{{\"hello\":\"{HELLO}\"}}'\ncat >/dev/null"),
+        );
+        let asked = d.path().join("asked");
+        let agent = script(
+            "pkexec-agent",
+            &format!("echo \"$*\" > '{}'\nshift\nexec \"$@\"", asked.display()),
+        );
+        let client = elevate(&agent, &broker).unwrap();
+        assert!(client.alive());
+        assert_eq!(
+            std::fs::read_to_string(&asked).unwrap().trim(),
+            format!("--disable-internal-agent {} {ARG}", broker.display())
+        );
+        drop(client);
+
+        let none = script(
+            "pkexec-none",
+            "echo 'Error executing command as another user: No authentication agent found.' >&2\nexit 127",
+        );
+        let e = elevate(&none, &broker).err().unwrap();
+        assert!(e.contains("No polkit authentication agent"), "{e}");
+        let dismissed = script(
+            "pkexec-dismissed",
+            "echo 'Error executing command as another user: Request dismissed' >&2\nexit 126",
+        );
+        let e = elevate(&dismissed, &broker).err().unwrap();
+        assert!(e.contains("not given"), "{e}");
     }
 
     #[test]

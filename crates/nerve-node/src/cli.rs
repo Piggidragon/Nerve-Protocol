@@ -1972,6 +1972,12 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
         }
         Cmd::Uninstall { purge } => {
             let layout = Layout::system();
+            // The desktop app took this node over: its service, parts and
+            // program are the app's, so the app's own uninstall removes it
+            // all, and its checks are its own.
+            if let Some(app) = crate::service::app_beside(&layout) {
+                return crate::service::hand_over_uninstall(&app, purge, out);
+            }
             owner_check(&[&layout.paths]).await?;
             // The node run by hand: the one named, or the one in this
             // user's default folders.

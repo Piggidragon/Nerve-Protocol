@@ -67,9 +67,14 @@ mode. The downloaded file is no longer needed.
 
 A node installed before with `nerve-node install` keeps its settings, pairings
 and keys: the installer adds the app, and the service runs the app's program
-from then on. The old program, `/usr/local/bin/nerve-node` (on Windows
-`C:\Program Files\Nerve\nerve-node.exe`), becomes a link to the app's, so the
-command `nerve-node` keeps working and there is one program to update.
+from then on, so there is one program to update. On Linux the old program,
+`/usr/local/bin/nerve-node`, becomes a link to the app's, so the command
+`nerve-node` keeps working. On Windows the old
+`C:\Program Files\Nerve\nerve-node.exe` is removed: the app replaces it, and
+for a terminal you download the CLI edition on its own
+([in a terminal](#in-a-terminal)). A plain `nerve-node uninstall` later hands
+over to the app's uninstall, so it removes the app too
+([uninstall](service.md#uninstall)).
 
 ## Administrator rights
 
@@ -104,8 +109,9 @@ opens the new version. Opening a newer downloaded file offers **Update** too.
 
 **Settings**, **Nerve on this machine**, **Uninstall…**. Choose whether the
 node's data (settings, pairings, keys, audit log) stays or goes. The service,
-its user, the program, the menu entry, the link handler and the `nerve-node`
-link go, and the window says "Nerve is removed" until you close it. Opening
+its user, the program, the menu entry, the link handler and, on Linux, the
+`nerve-node` link go, and the window says "Nerve is removed" until you close
+it. Opening
 the downloaded file again offers **Uninstall…** too, and on Windows so does
 **Uninstall** at Nerve in **Settings**, **Apps** (Apps & features): it opens
 the same in the app. Kept data comes back with the next install
@@ -131,7 +137,7 @@ When a part is missing, the app says so:
 | A display | The app does not start. It prints `no display: …` and shows it as a desktop notification where it can |
 | OpenGL | The app starts once more drawing in software, and prints that it does. If that fails too, it prints `the window did not open …` |
 | `pkexec` | Instead of the system's question: "There is no pkexec on this machine …", with the package to install |
-| The polkit agent | Instead of the system's question: "No polkit authentication agent is running …", with agents to install |
+| The polkit agent | pkexec says that no authentication agent answered, and the app shows instead: "No polkit authentication agent is running …", with agents to install |
 | The portal | The button that opens a file or folder dialog says "No file dialog: …" and names the portal packages |
 | `update-desktop-database` | Installing goes on, and its last step warns that the desktop may not know about the `nerve://` handler yet |
 
@@ -142,12 +148,16 @@ Windows needs nothing besides the app.
 On Linux, `nerve-node-desktop <command>` is `nerve-node <command>`, with
 `sudo` on the installed node; where the app took over a node installed with
 `nerve-node`, the command `nerve-node` runs the app's program, which says
-`nerve-node-desktop` for `--version`. On Windows the app has no console, so a
-terminal does not wait for it, also not for `nerve-node.exe` once it is a link
-to the app. A pipe makes the terminal wait: `"C:\Program Files\Nerve\nerve-node.exe" status | more`
-in cmd, `& "C:\Program Files\Nerve\nerve-node.exe" status | Out-Default` in
-PowerShell. A batch file waits for it as it is. The CLI edition `nerve-node.exe`
-from the release is a console program ([commands](commands.md)).
+`nerve-node-desktop` for `--version`.
+
+On Windows the app is the node's program, and it has no console, so a
+terminal does not wait for it. For a terminal, download the CLI edition
+`nerve-node-x86_64-windows.exe` from the release: it is a console program,
+and run from an administrator's terminal it works on the node the app
+installed ([commands](commands.md)). The app's program in a terminal needs a
+pipe to be waited for: `"C:\Program Files\Nerve\nerve-node-desktop.exe" status | more`
+in cmd, `& "C:\Program Files\Nerve\nerve-node-desktop.exe" status | Out-Default`
+in PowerShell. A batch file waits for it as it is.
 
 ## The app's own settings
 

@@ -296,6 +296,9 @@ export global Install {
     // The system's question for the rights is open.
     in-out property <bool> asking;
     in-out property <string> error;
+    // The heading of the error when it is not that the step did not finish:
+    // no file dialog could open.
+    in-out property <string> error-title;
     // What the command did, and what it warned about.
     in-out property <[string]> did;
     in-out property <[string]> warnings;

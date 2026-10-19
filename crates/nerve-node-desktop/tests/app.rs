@@ -417,6 +417,14 @@ fn the_app_drives_the_cli_end_to_end() {
     assert_eq!(store.get_missing_title(), "No file dialog");
     assert!(store.get_missing_text().contains("xdg-desktop-portal"));
     store.set_missing_open(false);
+    // The update's file the same: its dialog says it under a heading of
+    // its own, since no update ran.
+    let update = window.global::<Install>();
+    update.invoke_ask_update();
+    update.invoke_choose_file();
+    assert!(update.get_error().contains("xdg-desktop-portal"));
+    assert_eq!(update.get_error_title(), "No file dialog");
+    update.set_update_open(false);
     let backup = root.join("node.backup");
     let file = backup.clone();
     ctl.set_chooser(Arc::new(move |_| Ok(Some(file.clone()))));

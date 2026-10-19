@@ -891,7 +891,8 @@ impl WinSystem for WinHost {
             // is empty by then.
             Err(e) if e.raw_os_error() == Some(ERROR_ACCESS_DENIED as i32) => {
                 let aside = dir.join(format!(
-                    "nerve-node.{}.del",
+                    "{}{}.del",
+                    crate::winsvc::ASIDE,
                     nerve_transport::keys::random_token(8)
                 ));
                 std::fs::rename(path, &aside).map_err(at)?;

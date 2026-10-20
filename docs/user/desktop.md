@@ -120,18 +120,42 @@ Who changes the node's settings without a password:
 How: the running node takes an owner's command over a socket of its own
 (`/run/nerve-node/owner.sock`; on Windows a named pipe open to the owners
 only), checks who asks, and runs the command as its own user, exactly as
-`sudo nerve-node …` does. Every change keeps the CLI's checks and is in the
-[audit log](audit.md) with the owner's name. While the node is stopped, only
-an administrator changes it: start it first.
+`sudo nerve-node …` does. On Linux each request also carries the node's
+owner token, a new one at each start of the node in
+`/run/nerve-node/owner.token`, which only the node and the group
+`nerve-admin` may read; the app and `nerve-node` read it themselves (a
+session that began before you became an owner reads it through `sg
+nerve-admin`, so you need not log in again). Every change keeps the CLI's
+checks and is in the [audit log](audit.md) with the owner's name. While the
+node is stopped, only an administrator changes it: start it first.
 
 **Commands that run as you.** `install` runs commands from centers as the
 user who installed, unless an account was chosen before. Then a center's
-command runs as an owner. The node refuses its owners' way in to a process
-of a command it runs and to a confined program, but a command that has a
-program of yours start another for it, outside the node (your systemd user
-manager, a tmux server, the task scheduler on Windows), runs as you,
-unconfined: it can change the node's settings, and on Windows start and stop
-the service. The Overview says so in one card, "Center commands run as you",
+command runs as an owner, and the pairing's [mode](modes.md) decides what it
+can do with the node:
+
+- **`folder` mode:** the command cannot use the owners' way in. On Linux it
+  cannot read the owner token, whatever folders you give it (the token's
+  folder is in none of its sandbox's rules), so the node refuses its
+  requests however it connects. On Windows the owner pipe's permissions let
+  in no AppContainer, as your files are closed to one unless you grant them.
+- **`user` and `allowlist` mode:** the command runs as you, with your rights
+  and without a sandbox. It can read the owner token and change the node's
+  settings as you can, also through a program of yours outside the node
+  (your systemd user manager, a tmux server, the task scheduler on Windows),
+  and on Windows start and stop the service. That is your choice when you
+  give a center one of these modes, and yours to answer for. By default the
+  center's [blocklist and action checker](action-checker.md) and the node's
+  [guard](rules.md#the-guard-against-changing-the-node) catch a command that
+  tries it by mistake; they are no boundary.
+
+The node also refuses its owners' way in to a process it sees below a
+command it runs, and on Linux to one with `no_new_privs`, which every
+confined command keeps. That is a second check behind the token, which a
+command can get around; it does not hold alone. A command account that is
+no owner (below) keeps commands from the node's settings in every mode.
+
+The Overview says so in one card, "Center commands run as you",
 with what that gives them (all you can do, and root where your account is in
 a group such as `docker` or may use sudo). **Don't show again** hides the
 card until the account or those ways to root change; **Settings**,

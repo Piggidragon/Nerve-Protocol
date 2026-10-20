@@ -141,7 +141,7 @@ The node confines commands with Landlock:
 
 | A command can | Where |
 |---|---|
-| Read | the system folders (`/usr`, `/bin`, `/lib`, `/etc`, `/opt`, `/proc`, `/sys`, `/dev`, `/run` and similar) and the `r` folders |
+| Read | the system folders (`/usr`, `/bin`, `/lib`, `/etc`, `/opt`, `/proc`, `/sys`, `/dev`, `/run` but `/run/nerve-node`, and similar) and the `r` folders |
 | Write | the `w` folders and the null and terminal devices |
 | Run programs | the system folders and the `x` folders |
 
@@ -192,6 +192,13 @@ The node confines commands with Landlock:
   commands run as ([service](service.md#the-account-commands-run-as)), and
   what that account may not open stays closed as well. Landlock only takes
   away; it gives the account nothing it lacks.
+- That account is the user who installed, unless you chose another, so
+  the command runs as an owner of the node. It still cannot change the
+  node's settings through the owners' socket: the node answers only a
+  request with its owner token, and the token's folder `/run/nerve-node` is
+  in none of these sets, whatever folders you grant ([administrator
+  rights](desktop.md#administrator-rights)). In `user` and `allowlist` mode
+  that does not hold ([below](#user-mode)).
 
 Check that your kernel supports it, with the node running:
 
@@ -556,6 +563,20 @@ its state, unless that account can become root (root itself, or a member
 of a group such as `docker`; see
 [the account commands run as](service.md#the-account-commands-run-as)). In `folder` mode they are the same account, held to their
 folders.
+
+By default that account is the user who installed, an owner of the node.
+Then a `user` mode command, and a program an `allowlist` rule lets run, can
+change the node's settings as you can without a password: it runs as you
+without a sandbox, reads the node's owner token and uses the owners' socket
+(on Windows their pipe), as your own programs do. The node does not stop
+that; it is your choice of mode and account. The center's
+[blocklist and action checker](action-checker.md) and the node's
+[guard](rules.md#the-guard-against-changing-the-node) catch such a command
+when an agent tries it by mistake, and the node refuses a process it sees
+below one of its commands, but none of that is a boundary. Give the
+commands an account that is no owner (the app's **Create a separate
+account**, or `setup`) to keep them from the node's settings in every mode
+([administrator rights](desktop.md#administrator-rights)).
 
 ### Paths a command builds at run time
 

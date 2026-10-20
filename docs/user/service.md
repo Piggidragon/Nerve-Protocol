@@ -65,6 +65,7 @@ Running `install` again repairs what is missing and restarts the service.
 | Home of `nerve` | `/var/lib/nerve` |
 | The program | `/usr/local/bin/nerve-node` |
 | The unit | `/etc/systemd/system/nerve-node.service` |
+| The owners' socket and owner token, made at each start, gone at the stop | `/run/nerve-node` |
 
 Nothing else is written. `journalctl -u nerve-node` shows the node's output.
 

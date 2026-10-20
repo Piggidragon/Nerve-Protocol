@@ -7,6 +7,8 @@ use clap::{CommandFactory, FromArgMatches};
 
 /// Runs the program with the process's arguments; the exit code.
 pub fn main() -> i32 {
+    // Before any thread: it takes a variable out of the environment.
+    crate::owner::take_handed();
     // The exec shim is this same binary, started by the daemon for each
     // confined command. It is not a command the owner types, so it is checked
     // before clap (and stays out of `--help`).

@@ -520,18 +520,95 @@ pub fn request_line(
     format!("{request}\n")
 }
 
-/// The owner token this process sends: on Linux the node's, read from its
-/// file (`Err`: why it could not be read; the request goes without, and the
+/// The owner token this process sends: on Linux the node's, handed by the
+/// app that started this run ([`take_handed`]) or read from its file
+/// (`Err`: why it could not be read; the request goes without, and the
 /// node refuses it), on Windows none: the pipe lets in its owners only.
 fn own_token() -> Result<Option<String>, String> {
     #[cfg(unix)]
     {
-        read_token(&socket_here()).map(Some)
+        token_here(HANDED.get(), &socket_here(), &switch_to_group).map(Some)
     }
     #[cfg(not(unix))]
     {
         Ok(None)
     }
+}
+
+/// The token for a request to the owner socket `at`: the one the app
+/// `handed`, else read here, with `switch` when this process may not read
+/// the file ([`read_token_by`]). When the app handed none it read the file
+/// already, in the group if it had to, and a switch here would add one for
+/// every command it runs.
+#[cfg(unix)]
+fn token_here(
+    handed: Option<&Option<String>>,
+    at: &Path,
+    switch: &dyn Fn(&Path) -> Result<String, String>,
+) -> Result<String, String> {
+    match handed {
+        Some(Some(t)) => Ok(t.clone()),
+        Some(None) => read_token_by(at, &|_| {
+            // SAFETY: a plain getter.
+            let member = in_group(unsafe { libc::getuid() }, GROUP);
+            Err(if member { login_again() } else { String::new() })
+        }),
+        None => read_token_by(at, switch),
+    }
+}
+
+/// The variable that names the descriptor on which the app hands a run of
+/// its CLI the owner token: the descriptor's number, never the token, which
+/// every process of the user could read in the environment.
+pub const HANDED_VAR: &str = "NERVE_OWNER_TOKEN_FD";
+
+/// What the app handed this run on [`HANDED_VAR`]: `None` when it handed
+/// nothing, `Some(None)` when it had no token.
+#[cfg(unix)]
+static HANDED: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Takes the owner token the app handed this run, if it did, and removes
+/// [`HANDED_VAR`], so that nothing this run starts finds it. The app reads
+/// the token once for all its runs, so its user's session switches to the
+/// group [`GROUP`] (`sg`, which logs every switch) once per token, not
+/// once per command. Called first in `main`, before any thread runs.
+pub fn take_handed() {
+    #[cfg(unix)]
+    {
+        let Some(v) = std::env::var_os(HANDED_VAR) else {
+            return;
+        };
+        // SAFETY: called before any other thread runs, so none reads the
+        // environment meanwhile.
+        unsafe { std::env::remove_var(HANDED_VAR) };
+        let _ = HANDED.set(handed_from(&v));
+    }
+}
+
+/// The token on the pipe whose descriptor `v` names, which this process
+/// then closes; `None` when `v` names no pipe or the pipe holds nothing.
+#[cfg(unix)]
+fn handed_from(v: &std::ffi::OsStr) -> Option<String> {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    let fd: i32 = v.to_str()?.parse().ok().filter(|fd| *fd > 2)?;
+    // A pipe only: a wrong number might name any file this process has.
+    let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+    // SAFETY: fstat fills `st` for an open descriptor and fails for others.
+    if unsafe { libc::fstat(fd, st.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: filled by the successful fstat.
+    if unsafe { st.assume_init() }.st_mode & libc::S_IFMT != libc::S_IFIFO {
+        return None;
+    }
+    // SAFETY: an open pipe this process was given for this, which nothing
+    // else here uses; it is closed once read.
+    let pipe = unsafe { std::fs::File::from_raw_fd(fd) };
+    let mut t = String::new();
+    pipe.take(1024).read_to_string(&mut t).ok()?;
+    let t = t.trim();
+    (!t.is_empty()).then(|| t.to_string())
 }
 
 /// The owner token of the node on the owner socket `at`, from
@@ -543,20 +620,33 @@ fn own_token() -> Result<Option<String>, String> {
 /// `no_new_privs`, which every confined command keeps.
 #[cfg(unix)]
 pub fn read_token(at: &Path) -> Result<String, String> {
+    read_token_by(at, &switch_to_group)
+}
+
+/// The token file read in the group [`GROUP`] when the account database
+/// has this process's account in it; else what to add to why it could not
+/// be read.
+#[cfg(unix)]
+fn switch_to_group(file: &Path) -> Result<String, String> {
+    // SAFETY: a plain getter.
+    if !in_group(unsafe { libc::getuid() }, GROUP) {
+        return Err(String::new());
+    }
+    read_in_group(file).ok_or_else(login_again)
+}
+
+/// [`read_token`], with `switch` reading the file when this process may
+/// not: the token, or what to add to why it could not.
+#[cfg(unix)]
+pub fn read_token_by(
+    at: &Path,
+    switch: &dyn Fn(&Path) -> Result<String, String>,
+) -> Result<String, String> {
     let file = token_file(at);
     let token = match std::fs::read_to_string(&file) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
-            // SAFETY: a plain getter.
-            if !in_group(unsafe { libc::getuid() }, GROUP) {
-                return Err(format!("cannot read {}: {e}", file.display()));
-            }
-            read_in_group(&file).ok_or_else(|| {
-                format!(
-                    "cannot read {}: {e}; log out and in again, so that your session is in the group {GROUP}",
-                    file.display()
-                )
-            })?
+            switch(&file).map_err(|why| format!("cannot read {}: {e}{why}", file.display()))?
         }
         Err(e) => return Err(format!("cannot read {}: {e}", file.display())),
     };
@@ -565,6 +655,12 @@ pub fn read_token(at: &Path) -> Result<String, String> {
         return Err(format!("{} is empty", file.display()));
     }
     Ok(token.to_string())
+}
+
+/// What a session without the group [`GROUP`] is told to do.
+#[cfg(unix)]
+fn login_again() -> String {
+    format!("; log out and in again, so that your session is in the group {GROUP}")
 }
 
 /// `file` read through `sg` [`GROUP`], in a session of its own, so that
@@ -954,7 +1050,7 @@ pub fn take_text(pending: &mut Vec<u8>) -> String {
 /// The owner socket this process talks to: the installed node's, or the one
 /// `NERVE_OWNER_SOCKET` names.
 #[cfg(unix)]
-fn socket_here() -> PathBuf {
+pub fn socket_here() -> PathBuf {
     std::env::var_os("NERVE_OWNER_SOCKET").map_or_else(socket, PathBuf::from)
 }
 
@@ -2245,6 +2341,75 @@ mod tests {
         assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 1);
         std::fs::remove_file(&file).unwrap();
         assert!(read_token(&at).unwrap_err().contains("cannot read"));
+    }
+
+    /// A file this process may not read goes to the switch, which is asked
+    /// nothing while the file can be read here; the token the app hands a
+    /// run comes on a pipe, and nothing else is taken for one.
+    #[cfg(unix)]
+    #[test]
+    fn the_token_is_read_here_or_handed_on_a_pipe() {
+        use std::io::Write;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::unix::fs::PermissionsExt;
+        let d = tempfile::tempdir().unwrap();
+        let at = d.path().join("owner.sock");
+        let file = token_file(&at);
+        std::fs::write(&file, "abc\n").unwrap();
+        let asked = std::cell::Cell::new(0);
+        let switch = |_: &Path| -> Result<String, String> {
+            asked.set(asked.get() + 1);
+            Ok("from the group".into())
+        };
+        assert_eq!(read_token_by(&at, &switch).unwrap(), "abc");
+        assert_eq!(asked.get(), 0);
+        std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads it anyway.
+        if std::fs::read(&file).is_err() {
+            assert_eq!(read_token_by(&at, &switch).unwrap(), "from the group");
+            assert_eq!(asked.get(), 1);
+            let e = read_token_by(&at, &|_| Err("; why".into())).unwrap_err();
+            assert!(e.starts_with("cannot read ") && e.ends_with("; why"), "{e}");
+        }
+
+        // What a run sends: the token the app handed, else read here; when
+        // the app had none, this run does not switch either.
+        let handed = Some("handed".to_string());
+        assert_eq!(token_here(Some(&handed), &at, &switch).unwrap(), "handed");
+        if std::fs::read(&file).is_err() {
+            assert!(token_here(Some(&None), &at, &switch).is_err());
+            assert_eq!(asked.get(), 1);
+            assert_eq!(token_here(None, &at, &switch).unwrap(), "from the group");
+            assert_eq!(asked.get(), 2);
+        }
+
+        let pipe = |text: &str| {
+            let mut fds = [0; 2];
+            // SAFETY: two new descriptors.
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            // SAFETY: the write end, ours alone; closed here.
+            let mut w = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+            w.write_all(text.as_bytes()).unwrap();
+            fds[0]
+        };
+        let open = |fd: i32| {
+            // SAFETY: asks whether the descriptor is open.
+            unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
+        };
+        let fd = pipe("tok-1\n");
+        assert_eq!(
+            handed_from(fd.to_string().as_ref()).as_deref(),
+            Some("tok-1")
+        );
+        let fd = pipe("");
+        assert_eq!(handed_from(fd.to_string().as_ref()), None);
+        // A file is no pipe: it is left open and not read.
+        let f = std::fs::File::open("/dev/null").unwrap();
+        assert_eq!(handed_from(f.as_raw_fd().to_string().as_ref()), None);
+        assert!(open(f.as_raw_fd()));
+        for v in ["", "x", "-1", "0", "1", "2", "99999"] {
+            assert_eq!(handed_from(v.as_ref()), None, "{v:?}");
+        }
     }
 
     /// The owner's request carries the token it read, and none when it

@@ -128,10 +128,13 @@ pub fn serve(
         let (out, exe, env) = (out.clone(), exe.clone(), env.clone());
         if req["follow"] == true {
             let (o1, o2) = (out.clone(), out.clone());
+            // Root's commands need no owner token: they do not go to the
+            // owner socket.
             let follow = follow_process(
                 &exe,
                 &args,
                 &env,
+                None,
                 Box::new(move |line| {
                     send(&o1, &json!({ "id": id, "line": line }));
                 }),
@@ -157,10 +160,11 @@ pub fn serve(
             continue;
         }
         std::thread::spawn(move || {
-            let o = run_process(&exe, &args, &env, input.as_deref()).unwrap_or_else(|e| Output {
-                stderr: e.into_bytes(),
-                ..Output::default()
-            });
+            let o =
+                run_process(&exe, &args, &env, input.as_deref(), None).unwrap_or_else(|e| Output {
+                    stderr: e.into_bytes(),
+                    ..Output::default()
+                });
             send(&out, &json!({ "id": id, "done": done(&o) }));
         });
     }

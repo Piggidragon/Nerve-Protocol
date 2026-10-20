@@ -125,7 +125,12 @@ owner token, a new one at each start of the node in
 `/run/nerve-node/owner.token`, which only the node and the group
 `nerve-admin` may read; the app and `nerve-node` read it themselves (a
 session that began before you became an owner reads it through `sg
-nerve-admin`, so you need not log in again). Every change keeps the CLI's
+nerve-admin`, so you need not log in again). In that first session after
+`install`, `sg` notes each switch to the group in the system's auth log (two
+lines on Debian and Ubuntu): the app reads the token once and hands it to its
+commands, so that is once per start of the node while the app is open, not
+once for each command; `nerve-node` in a terminal switches for each command.
+Every change keeps the CLI's
 checks and is in the [audit log](audit.md) with the owner's name. While the
 node is stopped, only an administrator changes it: start it first.
 

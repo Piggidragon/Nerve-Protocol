@@ -67,6 +67,9 @@ fn build(pattern: &str, path: bool) -> Result<GlobMatcher, globset::Error> {
     GlobBuilder::new(&pattern)
         // NTFS ignores case; a Windows path rule must too.
         .case_insensitive(path && cfg!(windows))
+        // `{,.exe}` is "nothing or `.exe`", as a reader takes it; globset
+        // would drop the empty choice otherwise.
+        .empty_alternates(true)
         .build()
         .map(|g| g.compile_matcher())
 }
@@ -287,22 +290,32 @@ pub fn rule_for(cap: &str, action: &str, target: &str, wildcard: bool) -> Result
 
 /// The deny rules every new pairing gets, the guard against an agent that
 /// changes the node it runs on (owner's decision of 2026-10-20): a command
-/// line that names the node's programs (any path, `.exe`), its service, its
-/// socket and pipes (all named `nerve-node…`) or its config and state
-/// folders, and a write into those folders. They are on top of the node's
-/// own folders, which nothing releases (crate::protected). A deny rule
-/// matches the whole line, so they catch a confused agent, not one that
-/// builds the name at run time: the real protection is that commands run as
-/// an account of their own. The owner may remove any of them.
+/// that runs the node's programs (at the start of a command, after `sudo`,
+/// or by a path, `.exe` too), names its socket and pipes (all named
+/// `nerve-node…`) or its config and state folders, and a write into those
+/// folders. Only running the program counts, not its name anywhere: `cargo
+/// build -p nerve-node` and `journalctl -u nerve-node` stay allowed. They
+/// are on top of the node's own folders, which nothing releases
+/// (crate::protected). A deny rule matches the whole line, so they catch a
+/// confused agent, not one that builds the name at run time: the real
+/// protection is that commands run as an account of their own. The owner
+/// may remove any of them.
 pub const GUARD: &[&str] = &[
-    "exec.run:*nerve-node*",
-    "exec.run:*/etc/nerve*",
-    "exec.run:*/var/lib/nerve*",
-    "exec.run:*.config/nerve*",
-    "exec.run:*.local/state/nerve*",
+    // By name where a command starts: the line's start, after `;`, `&`,
+    // `|` or `(`, and after `sudo`; then the line's end, a space or a quote.
+    "exec.run:{,*[;&|(] ,*[;&|(],*sudo }nerve-node{,-desktop}{,.exe}{,[ \"']*}",
+    // By a path that ends in the program: `/usr/local/bin/nerve-node`,
+    // `C:\Program Files\Nerve\nerve-node-desktop.exe`.
+    "exec.run:*[/\\]nerve-node{,-desktop}{,.exe}{,[ \"']*}",
+    "exec.run:*/run/nerve-node{,/*,[ \"']*}",
+    "exec.run:*[/\\][/\\].[/\\]pipe[/\\]nerve-node*",
+    "exec.run:*/etc/nerve{,/*,[ \"']*}",
+    "exec.run:*/var/lib/nerve{,/*,[ \"']*}",
+    "exec.run:*.config/nerve{,/*,[ \"']*}",
+    "exec.run:*.local/state/nerve{,/*,[ \"']*}",
     // `C:\ProgramData\Nerve`, `%ProgramData%\Nerve`, `$env:ProgramData\Nerve`:
     // the line's `\` is matched as `/` on Windows.
-    "exec.run:*[Pp]rogram[Dd]ata*/[Nn]erve*",
+    "exec.run:*[Pp]rogram[Dd]ata*/[Nn]erve{,/*,[ \"']*}",
     "fs.write:~/.config/nerve/*",
     "fs.write:~/.local/state/nerve/*",
     "fs.write:/etc/nerve/*",
@@ -456,9 +469,18 @@ mod tests {
         let run = |c: &str| set.find("exec", "run", c).is_some();
         for c in [
             "nerve-node config set machine.user root",
+            "nerve-node",
             "sudo /usr/local/bin/nerve-node-desktop mode set user",
-            "systemctl stop nerve-node",
+            "sudo nerve-node rule rm deny 'rm *'",
+            "cd /tmp && nerve-node status",
+            "cd /tmp;nerve-node-desktop status",
+            "true | nerve-node audit",
+            "(nerve-node.exe panic)",
+            "./target/release/nerve-node-desktop mode set user",
+            "& 'C:/Program Files/Nerve/nerve-node-desktop.exe' config set node.name x",
             "socat - UNIX-CONNECT:/run/nerve-node/owner.sock",
+            "ls /run/nerve-node",
+            "echo x > //./pipe/nerve-node-owner",
             "cat /etc/nerve/node.toml",
             "rm -rf /var/lib/nerve/state",
             "sed -i s/a/b/ ~/.config/nerve/node.toml",
@@ -467,7 +489,18 @@ mod tests {
         ] {
             assert!(run(c), "should be refused: {c}");
         }
-        for c in ["ls ~/.config", "cargo build -p nerve-center", "git status"] {
+        for c in [
+            "ls ~/.config",
+            "cargo build -p nerve-node",
+            "cargo test -p nerve-node-desktop --test shots",
+            "journalctl -u nerve-node",
+            "grep -r nerve-node docs/",
+            "git commit -m 'run nerve-node status'",
+            "cargo build --manifest-path crates/nerve-node/Cargo.toml",
+            "cat ~/.config/nerve-node-desktop/settings.json",
+            "ls /etc/nervecenter",
+            "git status",
+        ] {
             assert!(!run(c), "should stay allowed: {c}");
         }
         let write = |p: &str| set.find("fs", "write", p).is_some();

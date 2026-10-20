@@ -1314,6 +1314,8 @@ mod tests {
         for cmd in [
             "grep -r nerve-node docs/",
             "cargo build -p nerve-node",
+            "cargo test -p nerve-node-desktop --test shots",
+            "journalctl -u nerve-node",
             "ls ~/.config/nerve-node-desktop",
             "ls /etc/nervecenter",
             "git commit -m 'run nerve-node status'",

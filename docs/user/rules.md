@@ -37,11 +37,13 @@ sandbox.
 ## The guard against changing the node
 
 Every new pairing starts with deny rules that keep its commands off this
-node itself: a command line that names `nerve-node` or `nerve-node-desktop`
-(any path, `.exe`), the service `nerve-node`, its socket or pipes, or the
-node's config and state folders (`/etc/nerve`, `/var/lib/nerve`,
-`~/.config/nerve`, `~/.local/state/nerve`, `%ProgramData%\Nerve`), and a write
-into those folders. `rule ls deny` shows them; remove any you do not want.
+node itself: a command that runs `nerve-node` or `nerve-node-desktop` (at
+the start of a command, after `sudo`, or by a path, `.exe` too), a command
+line that names the node's socket or pipes or its config and state folders
+(`/etc/nerve`, `/var/lib/nerve`, `~/.config/nerve`, `~/.local/state/nerve`,
+`%ProgramData%\Nerve`), and a write into those folders. The name alone is
+not refused: `cargo build -p nerve-node` and `journalctl -u nerve-node` run.
+`rule ls deny` shows them; remove any you do not want.
 
 ```sh
 nerve-node rule guard --center lab   # puts back the ones a pairing lacks

@@ -262,6 +262,10 @@ async fn an_owner_backs_up_and_restores_with_a_file_of_their_own() {
         .await
         .unwrap();
     assert_eq!(code, 0, "{said}");
+    assert!(
+        said.contains("The node starts again with it now."),
+        "{said}"
+    );
     up().await;
     let (out, _, _) = run(&at, &["config", "get", "log.level"], "").await.unwrap();
     assert!(out.contains("debug"), "{out}");

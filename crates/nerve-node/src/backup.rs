@@ -1115,9 +1115,16 @@ pub fn print_restore(r: &RestoreReport, b: &Parsed, out: &mut dyn std::io::Write
     for n in &r.notes {
         let _ = writeln!(out, "  {n}");
     }
+    // For an owner the node restores while it is stopped and starts again
+    // by itself (crate::owner).
+    let start = if crate::owner::owner_running().is_some() {
+        "The node starts again with it now."
+    } else {
+        "Start the node."
+    };
     let _ = writeln!(
         out,
-        "Start the node. It keeps the pins and the keys it had, so a center that still knows it takes it back; check the folders and the account that commands run as (docs/user/backup.md)."
+        "{start} It keeps the pins and the keys it had, so a center that still knows it takes it back; check the folders and the account that commands run as (docs/user/backup.md)."
     );
 }
 

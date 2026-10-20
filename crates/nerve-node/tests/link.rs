@@ -814,24 +814,33 @@ async fn folder_mode_gives_no_rule_where_a_command_linked_a_nested_folder() {
     node.stop().await;
 }
 
-/// A folder mode command that started with the keys in files is counted for as
-/// long as its `exec.run` runs: a move of the keys into the keyring is refused
-/// meanwhile and nothing moves, and the count is 0 again once the call
-/// answered. The count is checked before the move is asked for, so a node that
-/// does not count the command fails here without writing to the machine's
-/// keyring. The test, not a timer, ends the command, once the refusal was
-/// checked: a command that ended on its own before the move was asked for (a
-/// slow machine) would let the move go into the real keyring.
+/// Where Landlock keeps a command off socket files (ABI 9, the only place
+/// the keys may go into the keyring), a `folder` mode command never reaches
+/// the session bus, even with the runtime folder the bus is in among its
+/// folders: its sandbox does not change while it runs, and the keys may move
+/// into the keyring meanwhile. So it is not counted
+/// (`Shared::open_to_bus`), and a move need not wait for it. Nothing here
+/// moves the keys: the test would write to the machine's keyring.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread")]
-async fn the_keys_do_not_move_into_the_keyring_past_a_running_folder_command() {
-    let Some(abi) = nerve_sandbox::Confinement::detect().landlock_abi else {
-        eprintln!("skipped: Landlock is not available here");
+async fn a_running_folder_command_is_kept_off_the_session_bus() {
+    if !nerve_sandbox::Confinement::detect().keeps_sockets() {
+        eprintln!("skipped: no Landlock ABI 9 here");
         return;
-    };
-    // Below ABI 9 the keys never go into the keyring, whatever runs.
-    if abi < 9 {
-        eprintln!("skipped: Landlock ABI {abi} here, below 9, keeps the keys in files");
+    }
+    // SAFETY: a plain getter.
+    let uid = unsafe { libc::geteuid() };
+    let runtime = PathBuf::from(format!("/run/user/{uid}"));
+    if !runtime.join("bus").exists() {
+        eprintln!("skipped: no session bus at {}", runtime.display());
+        return;
+    }
+    if std::process::Command::new("python3")
+        .arg("-V")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipped: no python3");
         return;
     }
     let dir = tempdir();
@@ -841,24 +850,43 @@ async fn the_keys_do_not_move_into_the_keyring_past_a_running_folder_command() {
     let work = std::fs::canonicalize(&work).unwrap();
     let node = paired_node_with(dir.path(), &center, |p| {
         p.mode = nerve_policy::Mode::Folder;
-        p.folders.push(nerve_policy::config::Folder {
-            path: work.display().to_string(),
-            access: nerve_policy::config::Access::ALL,
-        });
+        for (path, access) in [(&work, "rwx"), (&runtime, "r")] {
+            p.folders.push(nerve_policy::config::Folder {
+                path: path.display().to_string(),
+                access: nerve_policy::config::Access::parse(access).unwrap(),
+            });
+        }
     })
     .await;
     let mut conn = linked(&mut center).await;
-    let paths = node.paths().clone();
-    // Waits for `release`, bounded to about 30 s so a broken test does not
-    // hang for good; it fails if it was not released.
-    let command = "sh -c 'echo > started; i=0; \
-                   while [ ! -e release ] && [ $i -lt 600 ]; do sleep 0.05; i=$((i+1)); done; \
-                   [ -e release ]'";
+    // It tries the bus, says how that went, and waits for `release`,
+    // bounded to about 30 s so a broken test does not hang for good.
+    std::fs::write(
+        work.join("bus.py"),
+        format!(
+            r#"import os, socket, time
+s = socket.socket(socket.AF_UNIX)
+try:
+    s.connect("{}")
+    said = "connected"
+except OSError as e:
+    said = "refused: " + e.strerror
+open("said", "w").write(said)
+os.replace("said", "started")
+for _ in range(600):
+    if os.path.exists("release"):
+        break
+    time.sleep(0.05)
+"#,
+            runtime.join("bus").display()
+        ),
+    )
+    .unwrap();
     let run = conn
         .request(
             "invoke",
             json!({"cap": "exec", "action": "run",
-                   "args": {"command": command, "cwd": work.display().to_string()}}),
+                   "args": {"command": "python3 bus.py", "cwd": work.display().to_string()}}),
         )
         .await
         .unwrap();
@@ -870,37 +898,9 @@ async fn the_keys_do_not_move_into_the_keyring_past_a_running_folder_command() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert!(started.exists(), "the command did not start");
-    assert_eq!(node.open_to_bus(), 1, "the running command is not counted");
-
-    let files = || {
-        [
-            paths.config_file(),
-            paths.config_key(),
-            paths.key_file("lab"),
-        ]
-        .map(|f| std::fs::read(f).unwrap())
-    };
-    let before = files();
-    let e = nerve_node::cli::edit(&paths, |c| {
-        c.machine.secret_storage = nerve_policy::config::SecretStorage::Keyring;
-        Ok(())
-    })
-    .await
-    .expect_err("the keys moved past a running command");
-    assert!(e.contains("1 folder mode command runs"), "{e}");
-    assert!(e.contains("nothing was changed"), "{e}");
-    assert_eq!(files(), before);
-    assert!(!paths.keys_moving().exists());
-    assert_eq!(
-        node.config().machine.secret_storage,
-        nerve_policy::config::SecretStorage::File
-    );
-
-    assert_eq!(
-        node.open_to_bus(),
-        1,
-        "the command ended before its release"
-    );
+    let said = std::fs::read_to_string(&started).unwrap();
+    assert_eq!(said, "refused: Permission denied");
+    assert_eq!(node.open_to_bus(), 0, "a command off the bus is counted");
 
     std::fs::write(work.join("release"), b"").unwrap();
     let mut others = Vec::new();
@@ -910,11 +910,6 @@ async fn the_keys_do_not_move_into_the_keyring_past_a_running_folder_command() {
         .unwrap()
         .expect("the command ran");
     assert_eq!(ran["exit_code"], 0, "{ran}");
-    assert_eq!(
-        node.open_to_bus(),
-        0,
-        "the command is counted after it ended"
-    );
     node.stop().await;
 }
 

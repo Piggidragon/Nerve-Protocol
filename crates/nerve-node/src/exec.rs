@@ -380,13 +380,37 @@ pub fn landlock_spec(
     own: &[PathBuf],
     writable: &[PathBuf],
 ) -> LandlockSpec {
+    folder_spec(policy, home, own, writable, None)
+}
+
+/// [`landlock_spec`], and where Landlock can keep a command off socket files
+/// (ABI 9) the connect rule as well, given the places besides `own` whose
+/// sockets it never reaches (`off`, crate::daemon::Shared::off_sockets): a
+/// command of `folder` mode connects only to the socket files in its own
+/// folders, whatever their flags. Programs of the owner's that run things on
+/// request (the systemd user manager, tmux, a container engine, the session
+/// bus) listen on socket files elsewhere: reaching one would take the
+/// command out of its sandbox.
+pub fn folder_spec(
+    policy: &CenterPolicy,
+    home: &Path,
+    own: &[PathBuf],
+    writable: &[PathBuf],
+    off: Option<&[PathBuf]>,
+) -> LandlockSpec {
     // Landlock is Linux's, so the list is the Unix one.
     let f = folder_sets(policy, home, own, &Platform::Unix, writable);
+    let connect = off.map(|off| {
+        leave_out(
+            &[&f.read[..], &f.write, &f.exec].concat(),
+            &[own, off].concat(),
+        )
+    });
     LandlockSpec {
         read: leave_out(&[nerve_sandbox::system_dirs(), f.read].concat(), own),
         write: leave_out(&[nerve_sandbox::system_writable(), f.write].concat(), own),
         exec: leave_out(&[nerve_sandbox::system_dirs(), f.exec].concat(), own),
-        connect: None,
+        connect,
     }
 }
 
@@ -557,15 +581,6 @@ fn real_checked(p: &Path) -> std::io::Result<PathBuf> {
     {
         Ok(c)
     }
-}
-
-/// Where a command of `folders` mode may connect to socket files while the
-/// node's keys are in the keyring: anywhere but the folders in `own`, which
-/// then hold the session bus the keyring answers on
-/// (crate::paths::keyring_places). With the files the rule is not set, and
-/// commands connect where they did.
-pub fn connect_rule(own: &[PathBuf]) -> Vec<PathBuf> {
-    leave_out(&[PathBuf::from("/")], own)
 }
 
 /// The configured folders where commands may write: the `w` folders of every
@@ -2427,22 +2442,54 @@ mod tests {
         assert!(e.message.contains("past timeout_ms"), "{}", e.message);
     }
 
-    /// With the keys in the keyring a command connects to socket files anywhere
-    /// but the node's own folders, the session bus's among them: no rule holds
-    /// those.
+    /// Where Landlock can keep a command off socket files, it connects to the
+    /// ones in its own folders alone, whatever their flags, and never to
+    /// one in the node's own folders or the session bus, even in a folder of
+    /// its own; not the system's, not the rest of the machine. Where it
+    /// cannot, no rule is asked for.
     #[test]
-    fn the_connect_rule_leaves_the_own_folders_out() {
+    fn the_connect_rule_is_the_commands_folders() {
         let d = tempfile::tempdir().unwrap();
         let w = std::fs::canonicalize(d.path()).unwrap();
-        for dir in ["run/user/1000", "run/user/1001", "run/lock"] {
+        for dir in ["r/sub", "r/own", "w", "x", "else"] {
             std::fs::create_dir_all(w.join(dir)).unwrap();
         }
-        let bus = w.join("run/user/1000");
-        let got = connect_rule(std::slice::from_ref(&bus));
-        assert!(got.contains(&w.join("run/user/1001")), "{got:?}");
-        assert!(got.contains(&w.join("run/lock")), "{got:?}");
-        assert!(!got.iter().any(|p| bus.starts_with(p)), "{got:?}");
-        assert!(!got.iter().any(|p| p.starts_with(&bus)), "{got:?}");
+        std::fs::write(w.join("w/bus"), "").unwrap();
+        std::fs::write(w.join("w/other"), "").unwrap();
+        let folder = |p: &str, access: &str| Folder {
+            path: w.join(p).display().to_string(),
+            access: Access::parse(access).unwrap(),
+        };
+        let policy = CenterPolicy {
+            mode: nerve_policy::Mode::Folder,
+            folders: vec![folder("r", "r"), folder("w", "w"), folder("x", "x")],
+            ..Default::default()
+        };
+        let (own, bus) = (w.join("r/own"), w.join("w/bus"));
+        let spec = folder_spec(
+            &policy,
+            &w,
+            std::slice::from_ref(&own),
+            &[],
+            Some(std::slice::from_ref(&bus)),
+        );
+        let connect = spec.connect.unwrap();
+        for p in ["r/sub", "w/other", "x"] {
+            assert!(connect.contains(&w.join(p)), "{connect:?}");
+        }
+        for out in [&own, &bus] {
+            assert!(!connect.iter().any(|p| out.starts_with(p)), "{connect:?}");
+            assert!(!connect.iter().any(|p| p.starts_with(out)), "{connect:?}");
+        }
+        assert!(
+            !connect
+                .iter()
+                .any(|p| w.join("else").starts_with(p) || p.starts_with("/run")),
+            "{connect:?}"
+        );
+        let own = std::slice::from_ref(&own);
+        assert_eq!(folder_spec(&policy, &w, own, &[], None).connect, None);
+        assert_eq!(landlock_spec(&policy, &w, own, &[]).connect, None);
     }
 
     #[test]

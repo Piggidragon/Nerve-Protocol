@@ -551,11 +551,16 @@ except OSError as e:
 s = socket.socket(socket.AF_UNIX)
 pid = os.fork()
 if pid == 0:
-    s.connect(at)
+    try:
+        s.connect(at)
+    except OSError as e:
+        print("cannot connect:", e.strerror, flush=True)
+        os._exit(1)
     os._exit(0)
-os.waitpid(pid, 0)
-s.sendall((json.dumps(req) + "\n").encode())
-print(s.makefile().readline())
+_, status = os.waitpid(pid, 0)
+if status == 0:
+    s.sendall((json.dumps(req) + "\n").encode())
+    print(s.makefile().readline())
 "#,
     )
     .unwrap();
@@ -588,10 +593,17 @@ print(s.makefile().readline())
     let r = run_command(&mut conn, &home, "python3 race.py").await;
     let said = format!("{}{}", r["stdout"], r["stderr"]);
     assert!(said.contains("no token"), "{said}");
-    assert!(
-        said.contains("does not carry the node's owner token"),
-        "{said}"
-    );
+    // Where Landlock keeps a command off socket files (ABI 9) it does not
+    // reach the socket at all, which lies in a sealed folder; elsewhere the
+    // token is what refuses it.
+    if nerve_sandbox::Confinement::detect().keeps_sockets() {
+        assert!(said.contains("cannot connect: Permission denied"), "{said}");
+    } else {
+        assert!(
+            said.contains("does not carry the node's owner token"),
+            "{said}"
+        );
+    }
     assert_eq!(
         node.config().center("lab").unwrap().policy.mode,
         nerve_policy::Mode::Folder,
@@ -607,5 +619,90 @@ print(s.makefile().readline())
         node.config().center("lab").unwrap().policy.mode,
         nerve_policy::Mode::Allowlist
     );
+    node.stop().await;
+}
+
+/// Where Landlock can keep a command off socket files (ABI 9, Linux 7.1), a
+/// `folder` mode command connects only to the socket files in its own
+/// folders: the owner's programs that run things on request (the systemd
+/// user manager, tmux, a container engine) listen elsewhere, and one of
+/// them would run a program outside the sandbox (review round 6, part B,
+/// finding 1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_folder_mode_command_connects_only_to_the_sockets_of_its_folders() {
+    if !nerve_sandbox::Confinement::detect().keeps_sockets() {
+        eprintln!("skipped: no Landlock ABI 9 here");
+        return;
+    }
+    if std::process::Command::new("python3")
+        .arg("-V")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipped: no python3");
+        return;
+    }
+    use nerve_conformance::fake_center::{self, FakeCenter};
+    let d = tempfile::tempdir().unwrap();
+    let mut center = FakeCenter::start(false).await.unwrap();
+    let (o, _) = options(d.path(), vec![uid()]);
+    nerve_node::pair::pair(&o.paths, &center.link(), Some("lab"))
+        .await
+        .unwrap();
+    let home = o.home.clone();
+    let work = home.join("work");
+    let elsewhere = home.join("elsewhere");
+    std::fs::create_dir(&work).unwrap();
+    std::fs::create_dir(&elsewhere).unwrap();
+    nerve_node::cli::edit(&o.paths, |c| {
+        let p = &mut c.centers[0].policy;
+        p.mode = nerve_policy::Mode::Folder;
+        p.deny.clear();
+        p.folders.push(nerve_policy::config::Folder {
+            path: work.display().to_string(),
+            access: nerve_policy::config::Access::ALL,
+        });
+        Ok(())
+    })
+    .await
+    .unwrap();
+    // Listening is all a connect needs; nothing is accepted.
+    let _inside = std::os::unix::net::UnixListener::bind(work.join("in.sock")).unwrap();
+    let _outside = std::os::unix::net::UnixListener::bind(elsewhere.join("out.sock")).unwrap();
+    // The paths are in the script, not on the command line, which the
+    // policy judges first.
+    std::fs::write(
+        work.join("connect.py"),
+        format!(
+            r#"import socket, sys
+at = {{"in": "{}", "out": "{}"}}[sys.argv[1]]
+s = socket.socket(socket.AF_UNIX)
+try:
+    s.connect(at)
+    print("connected")
+except OSError as e:
+    print("refused:", e.strerror)
+"#,
+            work.join("in.sock").display(),
+            elsewhere.join("out.sock").display()
+        ),
+    )
+    .unwrap();
+    let node = Daemon::start(o).await.unwrap();
+    let paired = center.paired().expect("paired");
+    let mut inc = center
+        .next_link(Duration::from_secs(15))
+        .await
+        .expect("the node dials");
+    fake_center::handshake(&mut inc.conn, &center.center_id, &paired)
+        .await
+        .expect("handshake");
+    let mut conn = inc.conn;
+    let said = |r: &Value| format!("{}{}", r["stdout"], r["stderr"]);
+
+    let r = run_command(&mut conn, &work, "python3 connect.py in").await;
+    assert!(said(&r).contains("connected"), "{r}");
+    let r = run_command(&mut conn, &work, "python3 connect.py out").await;
+    assert!(said(&r).contains("refused: Permission denied"), "{r}");
     node.stop().await;
 }

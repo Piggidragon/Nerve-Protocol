@@ -1888,13 +1888,16 @@ impl Link {
             // command gets rules for.
             let writable = exec::write_folders(cfg, &home);
             let sealed = self.shared.sealed(cfg);
-            let mut spec = exec::landlock_spec(&entry.policy, &home, &sealed, &writable);
-            // The keys in the keyring are behind the session bus, a socket
-            // file in the own folders then.
-            if cfg.machine.secret_storage == nerve_policy::config::SecretStorage::Keyring {
-                spec.connect = Some(exec::connect_rule(&own));
-            }
-            spec
+            // Where Landlock can, the command connects only to the socket
+            // files of its own folders, never to the session bus: the
+            // owner's programs that run things on request, and the keys in
+            // the keyring, are out of its reach.
+            let off = self
+                .shared
+                .confinement
+                .keeps_sockets()
+                .then(|| self.shared.off_sockets(cfg));
+            exec::folder_spec(&entry.policy, &home, &sealed, &writable, off.as_deref())
         });
         // Counted while it runs, so the keys do not move into the keyring
         // meanwhile, and not started when they moved after `cfg` was taken.

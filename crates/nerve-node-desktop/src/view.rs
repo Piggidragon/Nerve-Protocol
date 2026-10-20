@@ -265,6 +265,19 @@ pub fn rule_list_of(v: &Value, list: &str) -> Vec<SharedString> {
         .collect()
 }
 
+/// Whether the deny list of `rule ls --json` lacks a rule of the guard a
+/// new pairing gets (`nerve-node rule guard`).
+pub fn guard_missing(v: &Value) -> bool {
+    let deny: Vec<String> = v["deny"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect();
+    !nerve_policy::rules::guard_missing(&deny).is_empty()
+}
+
 /// Why the keys cannot go into the system keyring here, by the `reason` of
 /// `config get machine.secret_storage --json`.
 pub fn no_keyring(reason: &str) -> &'static str {

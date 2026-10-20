@@ -31,7 +31,8 @@ pub fn preview(link: &PairLink, name: Option<&str>) -> String {
     s.push_str(
         "Defaults for this center:\n  \
          mode allowlist (nothing is allowed until you add an allow rule or choose a mode)\n  \
-         settings off (the center cannot change this node's settings)\n",
+         settings off (the center cannot change this node's settings)\n  \
+         the guard (deny rules that keep its commands off this node itself)\n",
     );
     s
 }
@@ -114,7 +115,15 @@ pub async fn pair(
         key_rotations: 0,
         pin_rotations: 0,
         old_pin: None,
-        policy: CenterPolicy::default(),
+        // A new pairing starts with the guard against an agent that drives
+        // the node itself (nerve_policy::rules::GUARD).
+        policy: CenterPolicy {
+            deny: nerve_policy::rules::GUARD
+                .iter()
+                .map(|g| g.to_string())
+                .collect(),
+            ..CenterPolicy::default()
+        },
     };
 
     // The key goes first, where `machine.secret_storage` says: an entry

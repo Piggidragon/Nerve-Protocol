@@ -198,6 +198,10 @@ restart fails, the Overview says that changes wait and offers **Restart**.
   pattern for files (`fs.read:~/notes/*`) goes on the allow or deny list as
   it is.
 
+On **Permissions**, a center that lacks the guard against changing the node
+(a pairing from before it, or one you took a rule off) shows **Add the
+guard**, which runs `rule guard` ([rules](rules.md#the-guard-against-changing-the-node)).
+
 What stays with the terminal: restoring the keys straight into the keyring
 (`restore --secret-storage keyring`; restore, then switch **Keys** to the
 keyring), and the keyring `setup` installs for the node's account on a

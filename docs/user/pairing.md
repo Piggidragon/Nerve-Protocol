@@ -34,9 +34,11 @@ Pairing links a machine to a center. Do it once per machine and center.
    The machine shows as online in the web UI, and the pairing card there
    closes: the code is used up.
 
-The new pairing starts closed: mode `allowlist`, no rule, and the center may
-not change settings. Every call is refused until you allow something
-([modes](modes.md), [rules](rules.md)).
+The new pairing starts closed: mode `allowlist`, no allow rule, and the
+center may not change settings. Every call is refused until you allow
+something ([modes](modes.md), [rules](rules.md)). Its deny list holds the
+guard, which keeps commands off this node itself
+([rules](rules.md#the-guard-against-changing-the-node)).
 
 ## The code
 

@@ -172,6 +172,10 @@ export global Perm {
     in-out property <string> sudo-error;
     in-out property <bool> sudo-busy;
 
+    // The deny list lacks rules of the guard (nerve_policy::rules::GUARD).
+    in-out property <bool> guard-missing;
+    in-out property <bool> guard-busy;
+
     callback pick(int);
     callback refresh();
     callback mode-pick(string);
@@ -186,6 +190,7 @@ export global Perm {
     callback sudo-ask();
     callback sudo-confirm();
     callback sudo-off();
+    callback guard-add();
 }
 
 // The Log page.

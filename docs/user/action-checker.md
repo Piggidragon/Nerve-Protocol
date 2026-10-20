@@ -66,6 +66,14 @@ the wrong disk. It does not stop someone who writes commands on purpose to get
 past it; a list of patterns cannot. Against that, what counts is the machine's
 own policy: its mode, its deny rules and the folder sandbox.
 
+The same goes for the entries that keep an agent off the node it runs on
+(`nerve-node`, `nerve-node-desktop`, `nerve-node-socket`,
+`nerve-node-folders` and the `fs-nerve-…` writes): they refuse an agent that
+tries to change the node by mistake, not one that hides the name. The real
+protection is that the machine runs commands as an account of their own, which
+may not change the node. A new pairing on the machine has the same as deny
+rules ([rules](rules.md#the-guard-against-changing-the-node)).
+
 Entries are in the machine's own rule syntax, `<scope>:<pattern>`:
 
 - `exec.run:rm -rf /*` — a command. The program (in any letter case), then
@@ -104,7 +112,9 @@ filesystem or a home folder, `mkfs`, `dd` to a disk, fork bombs,
 `chmod -R 777 /`, dropping a database, a container that gives root on the host,
 running a downloaded script unseen (`curl … | sh`, `sh -c "$(curl …)"`,
 `bash <(curl …)`, and on Windows `irm … | iex` or `iex (… DownloadString …)`),
-force-pushing `main`, and the Windows equivalents (`Format-Volume`,
+force-pushing `main`, the node itself (running `nerve-node` or
+`nerve-node-desktop`, a command that names its socket, pipe, config or state
+folder, a write into those folders), and the Windows equivalents (`Format-Volume`,
 `format D:`, `rd /s /q C:\`, `Remove-Item -Recurse` of `~` or
 `C:\Users\<name>`, `vssadmin delete shadows`, disabling Defender, …) are
 blocked. The download entries also refuse a tool's official install one-liner;

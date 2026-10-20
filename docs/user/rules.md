@@ -34,6 +34,29 @@ A deny rule matches the whole command line. It does not see `rm` inside
 files. In `folder` and `user` mode it guards against mistakes. It is not a
 sandbox.
 
+## The guard against changing the node
+
+Every new pairing starts with deny rules that keep its commands off this
+node itself: a command line that names `nerve-node` or `nerve-node-desktop`
+(any path, `.exe`), the service `nerve-node`, its socket or pipes, or the
+node's config and state folders (`/etc/nerve`, `/var/lib/nerve`,
+`~/.config/nerve`, `~/.local/state/nerve`, `%ProgramData%\Nerve`), and a write
+into those folders. `rule ls deny` shows them; remove any you do not want.
+
+```sh
+nerve-node rule guard --center lab   # puts back the ones a pairing lacks
+```
+
+A pairing made before the guard has none: `rule guard` adds them, and the
+desktop app offers it on **Permissions**.
+
+The guard catches an agent's mistakes, such as an agent that tries to give
+itself more rights. It does not stop a command written to get around it (a
+name built at run time, a copy of the program). The real protection is that
+commands run as an account of their own, which may not change the node
+([service](service.md)), and the node's own folders, which no rule or mode
+opens ([protected paths](protected-paths.md)).
+
 ## List and remove rules
 
 ```sh

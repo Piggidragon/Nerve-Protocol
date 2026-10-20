@@ -47,6 +47,7 @@ center is paired.
 | `rule add allow\|deny\|sudo '<command>' [--wildcard] [--action A]` | Add a command rule, or with `--action` the rule of an audit entry | [rules](rules.md) |
 | `rule rm allow\|deny\|sudo '<command>' [--wildcard] [--action A]` | Remove a rule | [rules](rules.md#list-and-remove-rules) |
 | `rule ls [allow\|deny\|sudo]` | List rules | [rules](rules.md#list-and-remove-rules) |
+| `rule guard` | Put the guard's deny rules back that a pairing lacks | [rules](rules.md#the-guard-against-changing-the-node) |
 | `cap set <cap> on\|off\|hidden`, `cap ls` | Switch a capability or action | [rules](rules.md#switch-a-capability-off) |
 | `sudo on`, `sudo off`, `sudo status` | The sudo switch | [sudo](sudo.md) |
 | `config get\|set\|unset\|add\|remove <key> [value]` | Read or change any setting | [config](config.md) |

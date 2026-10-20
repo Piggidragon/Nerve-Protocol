@@ -277,6 +277,11 @@ pub enum RuleCmd {
         #[command(flatten)]
         center: CenterArg,
     },
+    /// Put the deny rules that keep a center's commands off this node itself (its programs, service, socket and folders) on the deny list, as a new pairing has them. They catch mistakes, not someone who hides the name.
+    Guard {
+        #[command(flatten)]
+        center: CenterArg,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1171,6 +1176,29 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
             .await?;
             let removed = removed.into_inner().unwrap();
             let _ = writeln!(out, "{name}: removed {removed:?} from the {}", list.label());
+        }
+        RuleCmd::Guard { center } => {
+            let added = std::sync::Mutex::new(0usize);
+            let name = edit_center(paths, &center, |e| {
+                let missing = nerve_policy::rules::guard_missing(&e.policy.deny);
+                if missing.is_empty() {
+                    return Err(format!(
+                        "{} has every deny rule of the guard already",
+                        e.name
+                    ));
+                }
+                *added.lock().unwrap() = missing.len();
+                e.policy
+                    .deny
+                    .extend(missing.into_iter().map(str::to_string));
+                Ok(())
+            })
+            .await?;
+            let added = added.into_inner().unwrap();
+            let _ = writeln!(
+                out,
+                "{name}: added {added} deny rules of the guard; commands that name this node's programs, service, socket or folders are forbidden"
+            );
         }
         RuleCmd::Ls { list, center } => {
             let (cfg, _) = read_config(paths).await?;
@@ -7570,6 +7598,40 @@ mod tests {
         let out = run(&paths, &["audit", "--last", "2"]).unwrap();
         assert_eq!(out.lines().count(), 2, "{out}");
         assert!(out.contains("fs.read  /c"), "{out}");
+    }
+
+    /// `rule guard` puts the guard's deny rules that a pairing lacks on its
+    /// deny list, keeps what is there, and says so when nothing is missing.
+    #[test]
+    fn rule_guard_adds_the_missing_deny_rules_of_the_guard() {
+        let (_d, paths) = setup(&["home"]);
+        let deny = || load(&paths).centers[0].policy.deny.clone();
+        run(&paths, &["rule", "add", "deny", "rm", "--wildcard"]).unwrap();
+        run(
+            &paths,
+            &[
+                "config",
+                "add",
+                "center.home.policy.deny",
+                nerve_policy::rules::GUARD[2],
+            ],
+        )
+        .unwrap();
+        let out = run(&paths, &["rule", "guard"]).unwrap();
+        let n = nerve_policy::rules::GUARD.len() - 1;
+        assert!(out.contains(&format!("added {n} deny rules")), "{out}");
+        let d = deny();
+        assert_eq!(d.len(), n + 2, "{d:?}");
+        assert_eq!(d[0], "exec.run:rm *");
+        for g in nerve_policy::rules::GUARD {
+            assert_eq!(d.iter().filter(|r| r == g).count(), 1, "{g}: {d:?}");
+        }
+        let e = run(&paths, &["rule", "guard", "--center", "home"]).unwrap_err();
+        assert!(
+            e.contains("has every deny rule of the guard already"),
+            "{e}"
+        );
+        assert_eq!(deny(), d);
     }
 
     /// `rule add --action` makes the rule an audit button makes for an entry

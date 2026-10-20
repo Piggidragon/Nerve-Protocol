@@ -285,6 +285,40 @@ pub fn rule_for(cap: &str, action: &str, target: &str, wildcard: bool) -> Result
     }
 }
 
+/// The deny rules every new pairing gets, the guard against an agent that
+/// changes the node it runs on (owner's decision of 2026-10-20): a command
+/// line that names the node's programs (any path, `.exe`), its service, its
+/// socket and pipes (all named `nerve-node…`) or its config and state
+/// folders, and a write into those folders. They are on top of the node's
+/// own folders, which nothing releases (crate::protected). A deny rule
+/// matches the whole line, so they catch a confused agent, not one that
+/// builds the name at run time: the real protection is that commands run as
+/// an account of their own. The owner may remove any of them.
+pub const GUARD: &[&str] = &[
+    "exec.run:*nerve-node*",
+    "exec.run:*/etc/nerve*",
+    "exec.run:*/var/lib/nerve*",
+    "exec.run:*.config/nerve*",
+    "exec.run:*.local/state/nerve*",
+    // `C:\ProgramData\Nerve`, `%ProgramData%\Nerve`, `$env:ProgramData\Nerve`:
+    // the line's `\` is matched as `/` on Windows.
+    "exec.run:*[Pp]rogram[Dd]ata*/[Nn]erve*",
+    "fs.write:~/.config/nerve/*",
+    "fs.write:~/.local/state/nerve/*",
+    "fs.write:/etc/nerve/*",
+    "fs.write:/var/lib/nerve/*",
+    "fs.write:/?/ProgramData/Nerve/*",
+];
+
+/// The rules of [`GUARD`] that `deny` lacks.
+pub fn guard_missing(deny: &[String]) -> Vec<&'static str> {
+    GUARD
+        .iter()
+        .copied()
+        .filter(|g| !deny.iter().any(|d| d == g))
+        .collect()
+}
+
 /// The sudo allow list entry for `command`: the command itself, or with
 /// `wildcard` its leading words up to the program that follows `sudo` and
 /// its flags, then anything after (`sudo apt *`). A bare `sudo *` would let
@@ -408,6 +442,46 @@ mod tests {
                 .find("exec", "run", "type C:\\x\\a.txt")
                 .is_some()
         );
+    }
+
+    /// The guard of a new pairing refuses what drives the node itself,
+    /// and leaves work near it alone.
+    #[test]
+    fn the_guard_refuses_the_node_itself() {
+        let home = Path::new("/home/alice");
+        let set = RuleSet::new(
+            &GUARD.iter().map(|g| g.to_string()).collect::<Vec<_>>(),
+            home,
+        );
+        let run = |c: &str| set.find("exec", "run", c).is_some();
+        for c in [
+            "nerve-node config set machine.user root",
+            "sudo /usr/local/bin/nerve-node-desktop mode set user",
+            "systemctl stop nerve-node",
+            "socat - UNIX-CONNECT:/run/nerve-node/owner.sock",
+            "cat /etc/nerve/node.toml",
+            "rm -rf /var/lib/nerve/state",
+            "sed -i s/a/b/ ~/.config/nerve/node.toml",
+            "ls $HOME/.local/state/nerve",
+            "type %ProgramData%/Nerve/config/node.toml",
+        ] {
+            assert!(run(c), "should be refused: {c}");
+        }
+        for c in ["ls ~/.config", "cargo build -p nerve-center", "git status"] {
+            assert!(!run(c), "should stay allowed: {c}");
+        }
+        let write = |p: &str| set.find("fs", "write", p).is_some();
+        assert!(write("/home/alice/.config/nerve/node.toml"));
+        assert!(write("/etc/nerve/keys/home.key"));
+        assert!(write("/var/lib/nerve/state/audit.jsonl"));
+        assert!(write("/c/ProgramData/Nerve/config/node.toml"));
+        assert!(!write("/home/alice/notes.md"));
+        assert!(set.find("fs", "read", "/etc/nerve/node.toml").is_none());
+        for g in GUARD {
+            validate(g).unwrap();
+        }
+        let have = vec![GUARD[0].to_string(), "exec.run:rm *".to_string()];
+        assert_eq!(guard_missing(&have), GUARD[1..].to_vec());
     }
 
     #[test]

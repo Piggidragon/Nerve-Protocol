@@ -26,10 +26,15 @@
 - `nerve-node service start|stop|restart|status` controls the installed service; `status` needs no root.
 - On the installed node its owners need no `sudo` (on Windows no administrator's terminal): the members of the group `nerve-admin`, which `install` makes with the user who ran it (on Windows the SIDs `install` records). The running node runs their command as `nerve` over its owner socket (`/run/nerve-node/owner.sock`; a pipe on Windows) with the CLI's checks; `install`, `update`, `uninstall`, `setup`, `sudo on`, `backup`, `restore` and the `machine.*` settings that pick the commands' account stay root's. A polkit rule (Linux) and the service's DACL (Windows) let the owners start, stop and restart the service. `update` gives an install from before them their owner and the new unit; `uninstall` removes the group, the rule and the rights. Settings changes in the audit name the account that made them (`"user"`, text `by local (alice)`); `status --json` says the account commands run as (`"account"`).
 - `cap ls --json` lists the switchable capabilities (`known`).
+- A new pairing starts with the guard: deny rules that refuse a command naming the node's programs, service, socket or config and state folders, and a write into those folders. `nerve-node rule guard` adds them to a pairing that lacks them; the desktop app offers that on **Permissions**. They catch an agent's mistakes; the real protection is a separate account for commands.
 - Commands run through `pkexec` take the user who ran it as the account of the commands at `install`, as with `sudo`.
 - On Windows, the text `status` asks the running service through the control pipe, as `status --json` does.
 - `setup --create-user <name> --account-only` chooses the account of the commands and asks nothing else. `config get machine.secret_storage --json` says whether the keyring can hold the keys here (`"keyring"`).
 - Changed: on the installed node, `sudo nerve-node backup` and `restore` open the backup file as the user who ran `sudo` (or `pkexec`), so a backup in your own folders works and is yours; the command itself still runs as `nerve`. Where that user may not open the file, the owner of its folder does, as before: a root shell (`sudo -i`) writes to root's folders as root, and `sudo nerve-node backup /var/lib/nerve/state/…` writes as `nerve`. Through `pkexec` (the desktop app) a file its user may not open is refused, and so is an asker without an account.
+
+### The action checker
+
+- New built-in blocklist entries keep an agent off the node it runs on: running `nerve-node` or `nerve-node-desktop`, a command that names the node's socket, pipe, config or state folder, and a write into those folders (ids `nerve-node`, `nerve-node-desktop`, `nerve-node-socket`, `nerve-node-folders`, `fs-nerve-…`). They catch mistakes, not commands written to get past them.
 
 ## 0.0.5
 

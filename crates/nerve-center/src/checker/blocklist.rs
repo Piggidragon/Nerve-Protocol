@@ -467,6 +467,19 @@ mod tests {
         ("fs", "write", "/etc/shadow"),
         ("fs", "write", "/etc/crontab"),
         ("fs", "write", "/etc/cron.d/job"),
+        ("exec", "run", "nerve-node status"),
+        (
+            "exec",
+            "run",
+            "/usr/local/bin/nerve-node-desktop mode set user",
+        ),
+        ("exec", "run", "ls /run/nerve-node"),
+        ("exec", "run", "cat /etc/nerve/node.toml"),
+        ("fs", "write", "/home/a/.config/nerve/node.toml"),
+        ("fs", "write", "/home/a/.local/state/nerve/audit.jsonl"),
+        ("fs", "write", "/etc/nerve/node.toml"),
+        ("fs", "write", "/var/lib/nerve/state/audit.jsonl"),
+        ("fs", "write", "/c/ProgramData/Nerve/config/node.toml"),
     ];
 
     /// Every default entry is hit by at least one representative call, and
@@ -1272,6 +1285,53 @@ mod tests {
         assert!(blocked("/etc/x/../passwd"));
         assert!(blocked("/c/Users/a/.SSH/authorized_keys"));
         assert!(!blocked("/etc/hosts"));
+    }
+
+    /// An agent that drives the node it runs on is refused: the node's
+    /// programs by any path, its socket, pipes and folders by name, and
+    /// writes into those folders (owner's decision of 2026-10-20). Work
+    /// that only comes near them is not.
+    #[test]
+    fn the_node_itself_is_refused() {
+        for cmd in [
+            "nerve-node config set machine.user root",
+            "sudo /usr/local/bin/nerve-node rule rm deny 'rm' --wildcard",
+            "./target/release/nerve-node-desktop mode set user",
+            "cd /tmp && nerve-node status",
+            r"& 'C:\Program Files\Nerve\nerve-node-desktop.exe' config set node.name x",
+            "socat - UNIX-CONNECT:/run/nerve-node/owner.sock",
+            r"[System.IO.Pipes.NamedPipeClientStream]::new('.', 'nerve-node-owner') # \\.\pipe\nerve-node-owner",
+            "cat /etc/nerve/node.toml",
+            "sed -i s/allowlist/user/ ~/.config/nerve/node.toml",
+            "rm -rf /var/lib/nerve/state",
+            "ls $HOME/.local/state/nerve",
+            r"Get-Content $env:ProgramData\Nerve\config\node.toml",
+            r"type %ProgramData%\Nerve\config\node.toml",
+            r"del C:\ProgramData\Nerve\state\audit.jsonl",
+        ] {
+            assert!(refused_by_defaults(cmd), "should be refused: {cmd}");
+        }
+        for cmd in [
+            "grep -r nerve-node docs/",
+            "cargo build -p nerve-node",
+            "ls ~/.config/nerve-node-desktop",
+            "ls /etc/nervecenter",
+            "git commit -m 'run nerve-node status'",
+        ] {
+            assert!(!refused_by_defaults(cmd), "should stay allowed: {cmd}");
+        }
+        let rules = defaults();
+        let blocked = |t: &str| rules.iter().any(|r| r.matches(&call("fs", "write", t)));
+        assert!(blocked("/home/alice/.config/nerve/node.toml"));
+        assert!(blocked("/home/alice/.local/state/nerve/run/ctl.sock"));
+        assert!(blocked("/etc/nerve/keys/home.key"));
+        assert!(blocked("/var/lib/nerve/state/audit.jsonl"));
+        assert!(blocked("/c/ProgramData/Nerve/config/node.toml"));
+        assert!(blocked("/d/programdata/nerve/state/x"));
+        assert!(!blocked(
+            "/home/alice/.config/nerve-node-desktop/settings.json"
+        ));
+        assert!(!blocked("/home/alice/src/nerve/README.md"));
     }
 
     #[test]

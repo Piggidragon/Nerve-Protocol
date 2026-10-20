@@ -27,7 +27,8 @@ node.
    `nerve://pair?center=<percent-encoded URL>&code=<code>&pin=<pin>`
 2. On the node: `nerve-node center add '<link>'`. The node parses the link
    strictly and shows the center's address, plus the policy the new pairing
-   starts with (mode `allowlist`, no rule, settings grant `off`). It stores
+   starts with (mode `allowlist`, no allow rule, the guard's deny rules
+   `nerve_policy::rules::GUARD`, settings grant `off`). It stores
    nothing before the owner confirms.
 3. The node makes a key pair for this center and sends
    `POST <center>/nerve/v0/pair` with `{code, name, platform, arch,

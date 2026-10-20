@@ -324,8 +324,11 @@ fn the_app_drives_the_cli_end_to_end() {
         policy.allow,
         [rule("exec", "run", "git push origin main", true)]
     );
+    // After the guard a new pairing gets.
+    let guard = nerve_policy::rules::GUARD.len();
+    assert_eq!(policy.deny[..guard], *nerve_policy::rules::GUARD);
     assert_eq!(
-        policy.deny,
+        policy.deny[guard..],
         [
             rule("fs", "write", "/srv/data/report.txt", true),
             rule("exec", "run", "git push origin main", false)
@@ -464,6 +467,21 @@ fn the_app_drives_the_cli_end_to_end() {
             .any(|c| c.name == "exec.run" && c.setting == 1 && c.set)
     );
     perm.invoke_cap_set("exec.run".into(), 0);
+
+    // A pairing without the whole guard (from before it, or the owner took
+    // a rule off) is offered it, in one click.
+    assert!(!perm.get_guard_missing());
+    perm.invoke_rule_remove(1, nerve_policy::rules::GUARD[3].into());
+    assert!(perm.get_guard_missing());
+    perm.invoke_guard_add();
+    let deny = config(&paths).centers[0].policy.deny.clone();
+    assert!(
+        nerve_policy::rules::guard_missing(&deny).is_empty(),
+        "{deny:?} {}",
+        store.get_toast()
+    );
+    assert!(!perm.get_guard_missing());
+    assert!(!perm.get_guard_busy());
 
     // Sudo takes the password on stdin; without a running node it says so
     // and waits for nothing.

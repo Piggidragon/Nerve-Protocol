@@ -741,7 +741,10 @@ async fn a_new_pairing_refuses_commands_that_drive_the_node_itself() {
             .await
             .unwrap();
         let e = r.expect_err(command);
-        assert!(e.to_string().contains("exec.run:*"), "{command}: {e}");
+        assert!(
+            e.to_string().contains("is denied (exec.run:"),
+            "{command}: {e}"
+        );
     }
     node.stop().await;
 }

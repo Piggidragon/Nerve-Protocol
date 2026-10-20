@@ -1806,6 +1806,15 @@ mod tests {
     #[test]
     fn forwarded_arguments_name_no_folders_of_the_callers() {
         let os = |a: &[&str]| a.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        // A whole path of this platform: `C:\home\a` on Windows.
+        let abs = |p: &str| {
+            if cfg!(windows) {
+                format!("C:{}", p.replace('/', "\\"))
+            } else {
+                p.to_string()
+            }
+        };
+        let home = PathBuf::from(abs("/home/a"));
         let given = ["--config-dir", "/etc/nerve", "--json", "status"];
         let c = cli(&given);
         assert_eq!(
@@ -1820,14 +1829,16 @@ mod tests {
             "+r",
         ];
         let c = cli(&given);
+        let whole = home.join("src");
         assert_eq!(
-            forwarded_args(&c, os(&given), Some("/home/a".into())).unwrap(),
-            ["folder", "add", "/home/a/src", "+r"]
+            forwarded_args(&c, os(&given), Some(home.clone())).unwrap(),
+            ["folder", "add", &*whole.to_string_lossy(), "+r"]
         );
         // Without a folder to make it whole, it is refused.
         assert!(forwarded_args(&c, os(&given), None).is_err());
         // A whole one goes as it is.
-        let given = ["folder", "rm", "/srv/x"];
+        let srv = abs("/srv/x");
+        let given = ["folder", "rm", srv.as_str()];
         assert_eq!(
             forwarded_args(&cli(&given), os(&given), None).unwrap(),
             given
@@ -1842,27 +1853,22 @@ mod tests {
             "--overwrite",
         ];
         let c = cli(&given);
+        let file = home.join("n.backup");
         assert_eq!(
-            forwarded_args(&c, os(&given), Some("/home/a".into())).unwrap(),
-            ["backup", "/home/a/n.backup", "--overwrite"]
+            forwarded_args(&c, os(&given), Some(home.clone())).unwrap(),
+            ["backup", &*file.to_string_lossy(), "--overwrite"]
         );
-        let job = FileJob::of(&c.cmd, Some("/home/a".into())).unwrap();
-        assert_eq!(job.path, Path::new("/home/a/n.backup"));
+        let job = FileJob::of(&c.cmd, Some(home.clone())).unwrap();
+        assert_eq!(job.path, file);
         assert_eq!(job.backup, Some(true));
-        assert_eq!(
-            job.passphrase_file.as_deref(),
-            Some(Path::new("/home/a/pass"))
-        );
-        let given = [
-            "restore",
-            "/srv/n.backup",
-            "--passphrase-file=/p",
-            "--replace",
-        ];
+        assert_eq!(job.passphrase_file, Some(home.join("pass")));
+        let backup = abs("/srv/n.backup");
+        let pass = format!("--passphrase-file={}", abs("/p"));
+        let given = ["restore", backup.as_str(), pass.as_str(), "--replace"];
         let c = cli(&given);
         assert_eq!(
             forwarded_args(&c, os(&given), None).unwrap(),
-            ["restore", "/srv/n.backup", "--replace"]
+            ["restore", backup.as_str(), "--replace"]
         );
         assert_eq!(FileJob::of(&c.cmd, None).unwrap().backup, None);
         assert!(FileJob::of(&cli(&["status"]).cmd, None).is_none());

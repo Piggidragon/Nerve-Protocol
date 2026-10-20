@@ -1,76 +1,180 @@
 // Help: short questions and answers on what people do with the app, its
-// keys, and behind its own part every nerve-node command by what it is for,
-// read from the CLI's own definition (nerve_node::cli::help), the same list
-// the center's help page shows. Each action in the app runs one of them.
+// keys, and the command reference: every nerve-node command by topic or
+// from A to Z, to filter, each one opening on its arguments, an example and
+// the place in the app that does the same (src/reference.rs). Each action in
+// the app runs one of these commands.
 
 import { Theme, Type, Space, Radius, Tone } from "theme.slint";
-import { HelpSection, HelpCard } from "data.slint";
-import { Manual } from "store.slint";
+import { Page, RefRow } from "data.slint";
+import { Manual, Store, Prefs } from "store.slint";
 import {
     Button, ButtonKind, Card, PageHeader, PageFrame, Divider, Code, Fit, Reveal, Expander, SectionTitle,
+    TextField, Segmented, Icon, Pill, FocusRing,
 } from "widgets.slint";
 
-component CommandCard inherits Card {
-    in property <HelpCard> card;
-    pad: 0;
-    gap: 0;
+// One command of the reference: its name and first sentence on a line;
+// open, the rest of what it does, how it is written, its arguments, an
+// example, and the button to the place in the app that does the same.
+component CommandRow inherits Rectangle {
+    in property <RefRow> item;
+    in property <bool> topic;
+    property <bool> open: Manual.ref-open == root.item.name;
+    background: root.open ? Theme.surface : Theme.surface-alt;
+    border-radius: Radius.md;
+    border-width: 1px;
+    border-color: root.open ? Theme.accent.transparentize(0.4) : Theme.border-strong;
+    height: self.preferred-height;
     VerticalLayout {
-        padding-left: Space.xl;
-        padding-right: Space.xl;
-        padding-top: Space.lg;
-        padding-bottom: Space.md;
-        Text {
-            text: root.card.name;
-            color: Theme.text;
-            font-size: Type.body;
-            font-weight: Type.semibold;
-            font-family: Type.mono;
+        Rectangle {
+            accessible-role: button;
+            accessible-label: root.item.name;
+            accessible-expandable: true;
+            accessible-expanded: root.open;
+            accessible-action-default => {
+                Manual.ref-open = root.open ? "" : root.item.name;
+            }
+            FocusRing {
+                x: -3px;
+                y: -3px;
+                width: parent.width + 6px;
+                height: parent.height + 6px;
+                shown: focus.has-focus;
+            }
+            HorizontalLayout {
+                padding-left: Space.lg;
+                padding-right: Space.md;
+                padding-top: 9px;
+                padding-bottom: 9px;
+                spacing: Space.md;
+                Text {
+                    width: 168px;
+                    text: root.item.name;
+                    color: Theme.accent-text;
+                    font-size: Type.small;
+                    font-weight: Type.semibold;
+                    font-family: Type.mono;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.item.line;
+                    color: Theme.text;
+                    font-size: Type.small;
+                    vertical-alignment: center;
+                    overflow: elide;
+                }
+                if root.topic: VerticalLayout {
+                    alignment: center;
+                    Pill {
+                        text: root.item.topic;
+                        tone: Tone.neutral;
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Icon {
+                        source: root.open ? @image-url("icons/chev.svg") : @image-url("icons/chev-right.svg");
+                        colorize: root.open ? Theme.accent-text : Theme.text-muted;
+                    }
+                }
+            }
+            TouchArea {
+                mouse-cursor: MouseCursor.pointer;
+                clicked => {
+                    Manual.ref-open = root.open ? "" : root.item.name;
+                }
+            }
+            focus := FocusScope {
+                focus-on-click: false;
+                key-pressed(event) => {
+                    if (event.text == " " || event.text == Key.Return) {
+                        Manual.ref-open = root.open ? "" : root.item.name;
+                        return accept;
+                    }
+                    reject
+                }
+            }
         }
         Reveal {
-            shown: root.card.about != "";
-            gap: 4px;
-            Text {
-                text: root.card.about;
-                color: Theme.text-muted;
-                font-size: Type.small;
-                wrap: word-wrap;
-            }
-        }
-    }
-    for v[i] in root.card.verbs: Fit {
-        Divider { }
-        VerticalLayout {
-            padding-left: Space.xl;
-            padding-right: Space.xl;
-            padding-top: Space.md;
-            padding-bottom: Space.md;
-            spacing: 6px;
-            Code {
-                text: v.usage;
-            }
-            Text {
-                text: v.about;
-                color: Theme.text;
-                font-size: Type.small;
-                wrap: word-wrap;
-            }
-            for a in v.args: Fit {
-                HorizontalLayout {
-                    spacing: Space.md;
+            shown: root.open;
+            VerticalLayout {
+                padding-left: Space.lg;
+                padding-right: Space.lg;
+                padding-bottom: Space.lg;
+                spacing: Space.md;
+                Divider { }
+                Reveal {
+                    shown: root.item.about != "";
                     Text {
-                        width: 200px;
-                        text: a.name;
-                        color: Theme.text-muted;
-                        font-size: Type.caption;
-                        font-family: Type.mono;
-                        wrap: char-wrap;
-                    }
-                    Text {
-                        horizontal-stretch: 1;
-                        text: a.about;
-                        color: Theme.text-muted;
-                        font-size: Type.caption;
+                        text: root.item.about;
+                        color: Theme.text;
+                        font-size: Type.small;
                         wrap: word-wrap;
+                    }
+                }
+                Code {
+                    text: root.item.usage;
+                }
+                Reveal {
+                    shown: root.item.args.length > 0;
+                    VerticalLayout {
+                        spacing: 6px;
+                        for a in root.item.args: Fit {
+                            HorizontalLayout {
+                                spacing: Space.md;
+                                Text {
+                                    width: 200px;
+                                    text: a.name;
+                                    color: Theme.text;
+                                    font-size: Type.caption;
+                                    font-family: Type.mono;
+                                    wrap: char-wrap;
+                                }
+                                Text {
+                                    horizontal-stretch: 1;
+                                    text: a.about;
+                                    color: Theme.text-muted;
+                                    font-size: Type.caption;
+                                    wrap: word-wrap;
+                                }
+                            }
+                        }
+                    }
+                }
+                VerticalLayout {
+                    spacing: 4px;
+                    Text {
+                        text: "Example";
+                        color: Theme.text-muted;
+                        font-size: Type.caption;
+                        font-weight: Type.semibold;
+                    }
+                    Code {
+                        text: root.item.example;
+                    }
+                }
+                HorizontalLayout {
+                    spacing: Space.sm;
+                    Text {
+                        text: root.item.in-app ? "In the app:"
+                            : root.item.place != "" ? root.item.place
+                            : "Not in the app: the service runs the node.";
+                        color: Theme.text-muted;
+                        font-size: Type.small;
+                        vertical-alignment: center;
+                    }
+                    if root.item.in-app: Button {
+                        text: root.item.place;
+                        icon: @image-url("icons/arrow-right.svg");
+                        kind: ButtonKind.secondary;
+                        small: true;
+                        clicked => {
+                            Manual.ref-go(root.item.page, root.item.tab);
+                        }
+                    }
+                    Rectangle {
+                        horizontal-stretch: 1;
                     }
                 }
             }
@@ -126,6 +230,16 @@ component KeyRow {
     }
 }
 
+// A question that opens on its answer; `index` is its place in Manual.open.
+component Question inherits Expander {
+    in property <int> index;
+    open: Manual.open == root.index;
+    toggled => {
+        Manual.open = Manual.open == root.index ? -1 : root.index;
+    }
+    @children
+}
+
 export component HelpPage inherits PageFrame {
     gap: Space.md;
     PageHeader {
@@ -147,102 +261,86 @@ export component HelpPage inherits PageFrame {
         text: "Questions";
         icon: @image-url("icons/help.svg");
     }
-    Expander {
+    Question {
+        index: 0;
         title: "How do I pair a center?";
-        open: Manual.open == 0;
-        toggled => {
-            Manual.open = Manual.open == 0 ? -1 : 0;
-        }
         Answer {
-            text: "In the center's web UI, press Pair a machine and copy the link. Here, press Pair a center on Centers and paste it. Check where it leads, then press Pair. A nerve:// link you click opens here too.";
+            text: "In the center's web UI, press Pair a machine and copy the link. Here, press Pair a center on Centers and paste it. The app checks the link, then you press Pair. A nerve:// link you click opens here too.";
         }
     }
-    Expander {
+    Question {
+        index: 1;
         title: "A new center may do nothing. How do I allow something?";
-        open: Manual.open == 1;
-        toggled => {
-            Manual.open = Manual.open == 1 ? -1 : 1;
-        }
         Answer {
             text: "On Permissions, pick the center. Add an allow rule for a command, give it folders and choose folder mode, or choose user mode for a while.";
         }
     }
-    Expander {
+    Question {
+        index: 2;
         title: "A call was refused. How do I allow it?";
-        open: Manual.open == 2;
-        toggled => {
-            Manual.open = Manual.open == 2 ? -1 : 2;
-        }
         Answer {
             text: "On Audit, choose Refused. Allow lets that call run from now on, Allow as wildcard the program with anything after it. Deny keeps it refused.";
         }
     }
-    Expander {
+    Question {
+        index: 3;
         title: "What do the modes mean?";
-        open: Manual.open == 3;
-        toggled => {
-            Manual.open = Manual.open == 3 ? -1 : 3;
-        }
         Answer {
             text: "Allowlist: only what an allow rule names. Folder: what each of the center's folders allows. User: anything you may do, protected files aside. Deny rules count in every mode.";
         }
     }
-    Expander {
+    Question {
+        index: 4;
         title: "How do I stop everything at once?";
-        open: Manual.open == 4;
-        toggled => {
-            Manual.open = Manual.open == 4 ? -1 : 4;
-        }
         Answer {
             text: "Press Panic on the Overview. Every link ends and nothing runs until you press Unlock.";
         }
     }
-    Expander {
+    Question {
+        index: 5;
         title: "How do I let a command run with sudo?";
-        open: Manual.open == 5;
-        toggled => {
-            Manual.open = Manual.open == 5 ? -1 : 5;
-        }
         Answer {
-            text: "Turn sudo on under Permissions with your password, and add the command to the center's Sudo list.";
+            text: "Turn sudo on under Permissions with your password, and add the command to the center's sudo list there.";
         }
     }
-    Expander {
-        title: "Why give commands an account of their own?";
-        open: Manual.open == 6;
-        toggled => {
-            Manual.open = Manual.open == 6 ? -1 : 6;
-        }
+    Question {
+        index: 6;
+        title: "Center commands run as me. What can they do?";
         Answer {
-            text: "Commands run as the account under Settings, General. If that is you, a command could change Nerve itself. An account of their own keeps them away from your files and from Nerve.";
+            text: "All you can: read and change your files, use your programs and your open sessions, and change Nerve's settings. In a group such as docker, or with sudo, a command can get root and Nerve's keys with it. An account of their own keeps them away from all that: Create a separate account, on the Overview or under Settings, General.";
         }
     }
-    Expander {
+    Question {
+        index: 7;
+        title: "Why do commands run without limits?";
+        Answer {
+            text: "Nerve holds each command to its memory, CPU and processes in a cgroup that systemd gives the service. Without one (a system without cgroup v2, or a controller turned off) commands run unlimited. Restart the service; if the warning stays, the Log's Problems say why. Windows does not limit commands yet.";
+        }
+    }
+    Question {
+        index: 8;
+        title: "This machine reaches no center. How do I go through another one?";
+        Answer {
+            text: "On a machine that reaches the center, open Relay, turn the relay on and press Add a node: it shows a link. Here, on Relay, press Connect and paste it.";
+        }
+    }
+    Question {
+        index: 9;
         title: "How do I move the node to another machine?";
-        open: Manual.open == 7;
-        toggled => {
-            Manual.open = Manual.open == 7 ? -1 : 7;
-        }
         Answer {
             text: "Under Settings, Backup: back it up here and restore it there. The passphrase protects the file.";
         }
     }
-    Expander {
+    Question {
+        index: 10;
         title: "The node does not run. What now?";
-        open: Manual.open == 8;
-        toggled => {
-            Manual.open = Manual.open == 8 ? -1 : 8;
-        }
         Answer {
             text: "Press Start on the Overview. If it stops again, the Log's Problems say why.";
         }
     }
-    Expander {
+    Question {
+        index: 11;
         title: "How do I update or uninstall Nerve?";
-        open: Manual.open == 9;
-        toggled => {
-            Manual.open = Manual.open == 9 ? -1 : 9;
-        }
         Answer {
             text: "Under Settings, App.";
         }
@@ -254,16 +352,13 @@ export component HelpPage inherits PageFrame {
         text: "Reference";
         icon: @image-url("icons/book.svg");
     }
-    Expander {
+    Question {
+        index: 20;
         title: "Keyboard shortcuts";
-        open: Manual.open == 10;
-        toggled => {
-            Manual.open = Manual.open == 10 ? -1 : 10;
-        }
         icon: @image-url("icons/keyboard.svg");
         KeyRow {
-            keys: "Ctrl+1 … Ctrl+7";
-            does: "Overview, Centers, Permissions, Audit, Log, Settings, Help";
+            keys: "Ctrl+1 … Ctrl+8";
+            does: "Overview, Centers, Relay, Permissions, Audit, Log, Settings, Help";
         }
         KeyRow {
             keys: "Ctrl+R, F5";
@@ -290,42 +385,82 @@ export component HelpPage inherits PageFrame {
             does: "Choose in a row of choices or tabs";
         }
     }
-    Expander {
+    Question {
+        index: 21;
         title: "Command reference";
-        open: Manual.open == 11;
-        toggled => {
-            Manual.open = Manual.open == 11 ? -1 : 11;
-        }
-        icon: @image-url("icons/book.svg");
+        icon: @image-url("icons/terminal.svg");
         Answer {
             text: "Every action here runs one of these nerve-node commands, with the same checks and audit records.";
         }
-        for s in Manual.sections: Fit {
+        HorizontalLayout {
+            spacing: Space.md;
+            padding-top: Space.xs;
+            TextField {
+                horizontal-stretch: 1;
+                text <=> Manual.ref-filter;
+                placeholder: "Filter: pair, folder, sudo…";
+                label: "Filter the commands";
+                edited => {
+                    Manual.ref-update();
+                }
+            }
             VerticalLayout {
-                spacing: Space.md;
-                padding-top: Space.md;
-                VerticalLayout {
-                    Text {
-                        text: s.name;
-                        color: Theme.text;
-                        font-size: Type.heading;
-                        font-weight: Type.semibold;
+                alignment: center;
+                Segmented {
+                    options: ["By topic", "A to Z"];
+                    current: Manual.ref-by-name ? 1 : 0;
+                    chosen(i) => {
+                        Manual.ref-by-name = i == 1;
+                        Manual.ref-update();
                     }
-                    Reveal {
-                        shown: s.about != "";
-                        gap: 4px;
+                }
+            }
+        }
+        Text {
+            text: "A command about one center takes --center <CENTER> when more than one is paired.";
+            color: Theme.text-muted;
+            font-size: Type.caption;
+            wrap: word-wrap;
+        }
+        Reveal {
+            shown: Manual.ref-groups.length == 0;
+            Text {
+                text: "No command matches.";
+                color: Theme.text-muted;
+                font-size: Type.small;
+            }
+        }
+        for g in Manual.ref-groups: Fit {
+            VerticalLayout {
+                spacing: 6px;
+                padding-top: Space.sm;
+                Reveal {
+                    shown: g.name != "";
+                    HorizontalLayout {
+                        spacing: Space.sm;
+                        padding-bottom: 2px;
                         Text {
-                            text: s.about;
-                            color: Theme.text-muted;
-                            font-size: Type.small;
-                            wrap: word-wrap;
+                            text: g.name;
+                            color: Theme.accent-text;
+                            font-size: Type.body;
+                            font-weight: Type.semibold;
+                            vertical-alignment: center;
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Pill {
+                                text: g.rows.length;
+                                tone: Tone.accent;
+                            }
+                        }
+                        Rectangle {
+                            horizontal-stretch: 1;
                         }
                     }
                 }
-                for c in s.cards: Fit {
-                    CommandCard {
-                        card: c;
-                    }
+                for r in g.rows: CommandRow {
+                    item: r;
+                    topic: g.name == "";
                 }
             }
         }

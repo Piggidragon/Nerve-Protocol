@@ -3217,6 +3217,7 @@ dependencies = [
  "nerve-conformance",
  "nerve-node",
  "nerve-policy",
+ "nerve-proto",
  "nerve-transport",
  "png",
  "rfd",

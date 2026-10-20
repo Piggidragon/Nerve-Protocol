@@ -4,12 +4,13 @@ import { Palette } from "std-widgets.slint";
 import { Theme, Type, Space, Radius, Size, Tone } from "theme.slint";
 import {
     Page, Load, NodeStatus, CenterRow, AuditRow, PairPreview, FolderRow, CapRow, LogRow,
-    HelpSection, HelpCard, HelpVerb, HelpArg, RelayNodeRow, Pick, Limit,
+    HelpArg, RefRow, RefGroup, RelayNodeRow, TunnelRow, Pick, Limit,
 } from "data.slint";
 import { Store, Perm, Logs, Manual, Prefs, Install } from "store.slint";
-import { NavItem, StatusDot, Toast, Banner, Reveal } from "widgets.slint";
+import { NavItem, StatusDot, Toast, Banner, Reveal, SchemeSwitch } from "widgets.slint";
 import { OverviewPage } from "overview.slint";
 import { CentersPage } from "centers.slint";
+import { RelayPage } from "relay.slint";
 import { AuditPage } from "audit.slint";
 import { PermissionsPage } from "permissions.slint";
 import { LogPage } from "log.slint";
@@ -19,13 +20,13 @@ import { SetupDialog } from "setup.slint";
 import {
     PairDialog, ConfirmDialog, AboutDialog, ModeDialog, FolderDialog, SudoDialog, ProxyDialog,
     OnceDialog, BackupDialog, RestoreDialog, ElevateDialog, UpdateDialog, UninstallDialog,
-    MissingDialog, RelayNodeDialog, OtherCopyDialog,
+    MissingDialog, RelayNodeDialog, OtherCopyDialog, RelayAddDialog, ConnectDialog,
 } from "dialogs.slint";
 import { InstallerView } from "installer.slint";
 
 export {
     Store, Perm, Logs, Manual, Prefs, Install, Type, Tone, Page, Load, NodeStatus, CenterRow, AuditRow,
-    PairPreview, FolderRow, CapRow, LogRow, HelpSection, HelpCard, HelpVerb, HelpArg, RelayNodeRow,
+    PairPreview, FolderRow, CapRow, LogRow, HelpArg, RefRow, RefGroup, RelayNodeRow, TunnelRow,
     Pick, Limit,
 }
 
@@ -82,6 +83,14 @@ component Sidebar inherits Rectangle {
             selected: Store.page == Page.centers;
             clicked => {
                 Store.show(Page.centers);
+            }
+        }
+        NavItem {
+            icon: @image-url("icons/route.svg");
+            text: "Relay";
+            selected: Store.page == Page.relay;
+            clicked => {
+                Store.show(Page.relay);
             }
         }
         NavItem {
@@ -181,6 +190,16 @@ component Sidebar inherits Rectangle {
                 }
             }
         }
+        // Light or dark, here at hand rather than in Settings.
+        Rectangle {
+            height: Space.sm;
+        }
+        SchemeSwitch {
+            current: Store.appearance;
+            chosen(i) => {
+                Store.set-appearance(i);
+            }
+        }
     }
 }
 
@@ -212,7 +231,7 @@ export component AppWindow inherits Window {
         || Perm.mode-open || Perm.folder-open || Perm.sudo-open || Prefs.proxy-open
         || Prefs.once-open || Prefs.relay-edit-open || Prefs.backup-open || Prefs.restore-open
         || Store.setup-open || Store.elevate-open || Install.update-open || Install.uninstall-open
-        || Store.missing-open;
+        || Store.missing-open || Prefs.relay-add-open || Prefs.connect-open || Install.other-open;
     changed dialog-open => {
         if (!self.dialog-open) {
             keys.focus();
@@ -222,7 +241,7 @@ export component AppWindow inherits Window {
         keys.focus();
     }
 
-    // The window's shortcuts: Ctrl+1 to Ctrl+7 open the pages in the
+    // The window's shortcuts: Ctrl+1 to Ctrl+8 open the pages in the
     // sidebar's order, Ctrl+R and F5 read the page again. They come here
     // from wherever the focus is, unless a field takes the key itself.
     keys := FocusScope {
@@ -247,32 +266,39 @@ export component AppWindow inherits Window {
             keys: @keys(Control + "3");
             enabled: keys.pages;
             activated => {
-                Store.show(Page.policy);
+                Store.show(Page.relay);
             }
         }
         KeyBinding {
             keys: @keys(Control + "4");
             enabled: keys.pages;
             activated => {
-                Store.show(Page.audit);
+                Store.show(Page.policy);
             }
         }
         KeyBinding {
             keys: @keys(Control + "5");
             enabled: keys.pages;
             activated => {
-                Store.show(Page.log);
+                Store.show(Page.audit);
             }
         }
         KeyBinding {
             keys: @keys(Control + "6");
             enabled: keys.pages;
             activated => {
-                Store.show(Page.settings);
+                Store.show(Page.log);
             }
         }
         KeyBinding {
             keys: @keys(Control + "7");
+            enabled: keys.pages;
+            activated => {
+                Store.show(Page.settings);
+            }
+        }
+        KeyBinding {
+            keys: @keys(Control + "8");
             enabled: keys.pages;
             activated => {
                 Store.show(Page.help);
@@ -323,6 +349,7 @@ export component AppWindow inherits Window {
                 }
                 if Store.page == Page.overview: OverviewPage { }
                 if Store.page == Page.centers: CentersPage { }
+                if Store.page == Page.relay: RelayPage { }
                 if Store.page == Page.policy: PermissionsPage { }
                 if Store.page == Page.audit: AuditPage { }
                 if Store.page == Page.log: LogPage { }
@@ -340,6 +367,8 @@ export component AppWindow inherits Window {
         if Prefs.proxy-open: ProxyDialog { }
         if Prefs.once-open: OnceDialog { }
         if Prefs.relay-edit-open: RelayNodeDialog { }
+        if Prefs.relay-add-open: RelayAddDialog { }
+        if Prefs.connect-open: ConnectDialog { }
         if Prefs.backup-open: BackupDialog { }
         if Prefs.restore-open: RestoreDialog { }
         if Store.setup-open: SetupDialog { }

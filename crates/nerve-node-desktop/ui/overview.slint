@@ -3,7 +3,7 @@
 
 import { Theme, Type, Space, Radius, Tone } from "theme.slint";
 import { Page, Load } from "data.slint";
-import { Store } from "store.slint";
+import { Store, Manual } from "store.slint";
 import {
     Button, ButtonKind, Card, Pill, StatusDot, IconTile, Banner, Loading, PageHeader,
     PageFrame, SectionTitle, StatTile, Divider, Icon, Reveal, Fit,
@@ -234,16 +234,100 @@ export component OverviewPage inherits PageFrame {
         }
     }
 
+    // Commands of the centers run as the app's own user: one card, one
+    // line on what that gives them, and the way out. Help has the rest.
     Reveal {
-        shown: Store.commands-as-you;
+        shown: Store.commands-as-you && !Store.commands-dismissed;
+        gap: Space.lg;
+        Rectangle {
+            background: Theme.warn-soft;
+            border-radius: Radius.lg;
+            border-width: 1px;
+            border-color: Theme.warn.transparentize(0.6);
+            HorizontalLayout {
+                padding: Space.lg;
+                padding-left: Space.xl;
+                spacing: Space.lg;
+                VerticalLayout {
+                    alignment: start;
+                    IconTile {
+                        icon: @image-url("icons/alert.svg");
+                        tone: Tone.warn;
+                        solid: true;
+                    }
+                }
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    alignment: center;
+                    spacing: 2px;
+                    Text {
+                        text: "Center commands run as you (" + Store.commands-account + ")";
+                        color: Theme.text;
+                        font-size: Type.body;
+                        font-weight: Type.semibold;
+                        wrap: word-wrap;
+                    }
+                    Text {
+                        text: Store.commands-root-via != ""
+                            ? "They can do all you can, and get root through " + Store.commands-root-via + "."
+                            : "They can do all you can, Nerve's settings too.";
+                        color: Theme.text;
+                        font-size: Type.small;
+                        wrap: word-wrap;
+                    }
+                    HorizontalLayout {
+                        alignment: start;
+                        spacing: Space.sm;
+                        padding-top: Space.md;
+                        Button {
+                            text: "Create a separate account";
+                            icon: @image-url("icons/shield.svg");
+                            kind: ButtonKind.primary;
+                            small: true;
+                            busy: Store.busy == "account";
+                            clicked => {
+                                Store.separate-account();
+                            }
+                        }
+                        Button {
+                            text: "Why?";
+                            kind: ButtonKind.ghost;
+                            small: true;
+                            clicked => {
+                                Store.show(Page.help);
+                                Manual.open = 6;
+                            }
+                        }
+                        Button {
+                            text: "Don't show again";
+                            kind: ButtonKind.ghost;
+                            small: true;
+                            clicked => {
+                                Store.commands-dismiss();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Commands run without their limits: one line and what helps.
+    Reveal {
+        shown: Store.status.limits-off != "";
         gap: Space.lg;
         Banner {
             tone: Tone.warn;
-            title: "Commands run as you";
-            text: "Commands from centers run as " + Store.commands-account + ", so one could change Nerve's settings. Give them an account of their own.";
-            action: "Separate account";
+            title: "Commands run without limits";
+            text: Store.status.limits-off;
+            action: Store.status.limits-restart && Store.service-state == "running" ? "Restart" : "Why?";
             acted => {
-                Store.separate-account();
+                if (Store.status.limits-restart && Store.service-state == "running") {
+                    Store.service("restart");
+                } else {
+                    Store.show(Page.help);
+                    Manual.open = 7;
+                }
             }
         }
     }

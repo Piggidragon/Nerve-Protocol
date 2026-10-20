@@ -14,9 +14,7 @@ use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 use crate::broker::Launch;
 use crate::runner::{Follow, Runner};
-use crate::{
-    AppWindow, Install, Load, Manual, Page, PairPreview, Perm, Prefs, Store, Tone, Type, view,
-};
+use crate::{AppWindow, Install, Load, Manual, Page, Perm, Prefs, Store, Tone, Type, view};
 
 mod install;
 mod live;
@@ -137,6 +135,13 @@ pub struct Ctl {
     /// Asks the desktop now and then whether it is dark, while the app
     /// follows it (crate::scheme).
     scheme_timer: slint::Timer,
+    /// Every command of the CLI, for the Help page's reference.
+    reference: Vec<crate::reference::Command>,
+    /// How a command run as an account gets root besides, by account, as
+    /// found once ([`root_via`]).
+    root_via: RefCell<Option<(String, String)>>,
+    /// Where a new relay link says this machine is, as `relay ls` guessed.
+    relay_address: RefCell<String>,
 }
 
 thread_local! {
@@ -174,6 +179,53 @@ pub fn app_user() -> String {
     std::env::var("USERNAME")
         .or_else(|_| std::env::var("USER"))
         .unwrap_or_default()
+}
+
+/// How a command run as `account` gets root besides all the account may do:
+/// through a group that gets root without a password (docker, lxd …), and
+/// through sudo when the account is in the group that may use it; in words,
+/// "" for none.
+pub fn root_via(account: &str) -> String {
+    #[cfg(unix)]
+    {
+        let Ok(Some(a)) = nerve_node::account::lookup(account) else {
+            return String::new();
+        };
+        let mut via = nerve_node::account::root_groups(&a);
+        let sudoers = std::process::Command::new("getent")
+            .args(["group", "sudo", "wheel", "admin"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+            .unwrap_or_default();
+        if in_a_group(&sudoers, &a.groups) {
+            via.push("sudo".into());
+        }
+        and_words(&via)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = account;
+        String::new()
+    }
+}
+
+/// Whether one of the `getent group` lines is a group of `gids`.
+pub fn in_a_group(lines: &str, gids: &[u32]) -> bool {
+    lines.lines().any(|l| {
+        l.split(':')
+            .nth(2)
+            .and_then(|g| g.parse::<u32>().ok())
+            .is_some_and(|g| gids.contains(&g))
+    })
+}
+
+/// `a`, `a and b`, `a, b and c`.
+fn and_words(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 /// Whether the command `args` needs an administrator even for an owner of
@@ -267,14 +319,23 @@ impl Ctl {
             restart_timer: slint::Timer::default(),
             restart_waits: Cell::new(false),
             scheme_timer: slint::Timer::default(),
+            reference: crate::reference::commands(&nerve_node::cli::help()),
+            root_via: RefCell::new(None),
+            relay_address: RefCell::new(String::new()),
         });
         CURRENT.with(|c| *c.borrow_mut() = Some(ctl.clone()));
         window.global::<Type>().set_mono(mono_font().into());
-        window
-            .global::<Manual>()
-            .set_sections(ModelRc::new(VecModel::from(view::help(
-                &nerve_node::cli::help(),
-            ))));
+        ctl.reference_shown();
+        let manual = window.global::<Manual>();
+        let c = ctl.clone();
+        manual.on_ref_update(move || c.reference_shown());
+        let c = ctl.clone();
+        manual.on_ref_go(move |page, tab| {
+            if tab >= 0 {
+                c.with_prefs(|p| p.set_tab(tab));
+            }
+            c.show(page);
+        });
         let store = window.global::<Store>();
         store.set_version(env!("CARGO_PKG_VERSION").into());
         let install = window.global::<Install>();
@@ -331,6 +392,10 @@ impl Ctl {
         store.on_unlock(move || c.lock(false));
         let c = ctl.clone();
         store.on_set_appearance(move |i| c.set_appearance(i));
+        let c = ctl.clone();
+        store.on_commands_dismiss(move || c.commands_dismiss(true));
+        let c = ctl.clone();
+        store.on_commands_show(move || c.commands_dismiss(false));
         node::wire(&ctl, window);
         perm::wire(&ctl, window);
         prefs::wire(&ctl, window);
@@ -677,9 +742,24 @@ impl Ctl {
                 self.refresh_status();
                 self.perm_load();
             }
-            Page::Settings => self.prefs_load(),
+            // The relay's state is read with the settings it shares.
+            Page::Settings | Page::Relay => {
+                self.refresh_status();
+                self.prefs_load();
+            }
             _ => self.refresh_status(),
         }
+    }
+
+    /// The command reference as the Help page's filter and order ask.
+    fn reference_shown(&self) {
+        let Some(w) = self.window.upgrade() else {
+            return;
+        };
+        let m = w.global::<Manual>();
+        let groups =
+            crate::reference::groups(&self.reference, &m.get_ref_filter(), m.get_ref_by_name());
+        m.set_ref_groups(ModelRc::new(VecModel::from(groups)));
     }
 
     pub fn refresh_status(self: &Rc<Self>) {
@@ -715,10 +795,22 @@ impl Ctl {
                 // can use its owner's way in (nerve_node::owner).
                 let account = v["account"].as_str().unwrap_or_default().to_string();
                 let as_you = self.service.get() && !account.is_empty() && account == app_user();
+                let via = if as_you {
+                    self.root_via_of(&account)
+                } else {
+                    String::new()
+                };
+                let dismissed = self
+                    .settings
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|f| crate::settings::dismissed(f, &account, &via));
                 *self.status.borrow_mut() = v;
                 self.with_store(|s| {
                     s.set_commands_as_you(as_you);
                     s.set_commands_account(account.into());
+                    s.set_commands_root_via(via.into());
+                    s.set_commands_dismissed(dismissed);
                     s.set_status(status);
                     s.set_centers(ModelRc::new(VecModel::from(centers)));
                     s.set_status_load(Load::Ready);
@@ -755,6 +847,14 @@ impl Ctl {
         let Some(link) = self.link.borrow_mut().take() else {
             return;
         };
+        // A relay's link: this node through that relay.
+        if nerve_proto::link::strip_prefix_ci(link.trim(), "nerve://relay").is_some() {
+            self.show(Page::Relay);
+            self.connect_start();
+            self.with_prefs(|p| p.set_connect_link(link.as_str().into()));
+            self.connect_read(&link);
+            return;
+        }
         self.pair_start();
         self.with_store(|s| s.set_pair_link(link.as_str().into()));
         self.pair(&link, "", false);
@@ -815,13 +915,7 @@ impl Ctl {
             c.with_store(|s| s.set_pair_busy(false));
             match answer {
                 Ok(v) if !yes => {
-                    let p = &v["preview"];
-                    let preview = PairPreview {
-                        center: p["center"].as_str().unwrap_or_default().into(),
-                        tls: p["tls"] == true,
-                        pin: p["pin"].as_str().unwrap_or_default().into(),
-                        name: p["name"].as_str().unwrap_or_default().into(),
-                    };
+                    let preview = view::pair_preview(&v);
                     c.with_store(|s| {
                         s.set_pair_preview(preview);
                         s.set_pair_step(1);
@@ -1065,6 +1159,43 @@ impl Ctl {
         let appearance = crate::settings::appearance(&file);
         *self.settings.borrow_mut() = Some(file);
         self.show_appearance(appearance);
+    }
+
+    /// How a command run as `account` gets root besides all the account
+    /// may do, in words ("docker and sudo"), found once for each account.
+    fn root_via_of(&self, account: &str) -> String {
+        if let Some((a, via)) = self.root_via.borrow().as_ref()
+            && a == account
+        {
+            return via.clone();
+        }
+        let via = root_via(account);
+        *self.root_via.borrow_mut() = Some((account.to_string(), via.clone()));
+        via
+    }
+
+    /// Hides the Overview's card on commands that run as the app's user, as
+    /// it stands now (`hide`), or shows it again; kept in the app's settings.
+    fn commands_dismiss(self: &Rc<Self>, hide: bool) {
+        let Some((account, via)) = self.with_store(|s| {
+            (
+                s.get_commands_account().to_string(),
+                s.get_commands_root_via().to_string(),
+            )
+        }) else {
+            return;
+        };
+        self.with_store(|s| s.set_commands_dismissed(hide));
+        if let Some(file) = self.settings.borrow().as_ref() {
+            let saved = if hide {
+                crate::settings::dismiss(file, &account, &via)
+            } else {
+                crate::settings::undismiss(file)
+            };
+            if let Err(e) = saved {
+                self.toast(format!("Not kept for the next start: {e}"), Tone::Danger);
+            }
+        }
     }
 
     fn set_appearance(self: &Rc<Self>, i: i32) {

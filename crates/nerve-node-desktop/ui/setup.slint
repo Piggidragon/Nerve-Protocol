@@ -18,6 +18,7 @@ export component SetupDialog inherits Dialog {
     subtitle: Store.setup-step == 0 ? "How centers show this machine. Each step is saved when you go on."
         : Store.setup-step == 1 ? "A key for each center, and one for the settings. Files are right unless you use a keyring for such things."
         : Store.setup-step == 2 && Store.pair-step == 1 ? "Check that this is your center."
+        : Store.setup-step == 2 && Store.pair-step == 2 ? ""
         : Store.setup-step == 2 ? "Paste the link the center's web UI shows under Pair a machine."
         : Store.setup-step == 3 ? "You can change it any time under Permissions."
         : Store.service-state == "stopped" ? "Start the service to link this machine to its centers."
@@ -27,7 +28,8 @@ export component SetupDialog inherits Dialog {
         Store.setup-close();
     }
     enter => {
-        if (!Store.setup-busy && !Store.pair-busy && (Store.setup-step != 2 || Store.pair-link != "")) {
+        if (!Store.setup-busy && !Store.pair-busy && (Store.setup-step != 2 || (Store.pair-step == 0 && Store.pair-link != "")
+            || (Store.pair-step == 1 && Store.pair-preview.ready) || Store.pair-step == 2)) {
             Store.setup-next();
         }
     }
@@ -112,6 +114,16 @@ export component SetupDialog inherits Dialog {
                 }
             }
 
+            // Back from the mode: the center is paired already.
+            Reveal {
+                shown: Store.setup-step == 2 && Store.pair-step == 2;
+                Banner {
+                    tone: Tone.ok;
+                    title: "Paired with " + Store.setup-center;
+                    text: "Continue to choose what it may do.";
+                }
+            }
+
             Reveal {
                 shown: Store.setup-step == 2 && Store.pair-step == 1;
                 Rectangle {
@@ -134,6 +146,11 @@ export component SetupDialog inherits Dialog {
                                 : "Checked by the system";
                             mono: Store.pair-preview.tls && Store.pair-preview.pin != "";
                             tone: Store.pair-preview.tls ? Tone.ok : Tone.danger;
+                        }
+                        InfoRow {
+                            label: "Check";
+                            value: Store.pair-preview.check;
+                            tone: Store.pair-preview.ready ? Tone.ok : Tone.danger;
                         }
                     }
                 }
@@ -202,6 +219,15 @@ export component SetupDialog inherits Dialog {
             Rectangle {
                 horizontal-stretch: 1;
             }
+            if Store.setup-step > 0: Button {
+                text: "Back";
+                icon: @image-url("icons/arrow-left.svg");
+                kind: ButtonKind.ghost;
+                enabled: !Store.setup-busy && !Store.pair-busy;
+                clicked => {
+                    Store.setup-back();
+                }
+            }
             if Store.setup-step < 4: Button {
                 text: Store.setup-step == 2 ? "Not now" : "Skip";
                 kind: ButtonKind.ghost;
@@ -216,7 +242,9 @@ export component SetupDialog inherits Dialog {
                     : "Continue";
                 kind: ButtonKind.primary;
                 busy: Store.setup-busy || Store.pair-busy;
-                enabled: Store.setup-step != 2 || Store.pair-link != "";
+                // Pair only when the check found that it can work.
+                enabled: Store.setup-step != 2 || (Store.pair-step == 0 && Store.pair-link != "")
+                    || (Store.pair-step == 1 && Store.pair-preview.ready) || Store.pair-step == 2;
                 clicked => {
                     Store.setup-next();
                 }

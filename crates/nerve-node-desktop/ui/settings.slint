@@ -10,7 +10,7 @@ import {
 } from "widgets.slint";
 
 // A setting card: its icon, title and sentence on top, its controls below.
-component Group inherits Card {
+export component Group inherits Card {
     in property <image> icon;
     in property <Tone> tone: Tone.accent;
     in property <string> title;
@@ -52,7 +52,7 @@ component Group inherits Card {
 
 // The limits of a group, one a line: what, its field, its unit. An empty
 // field shows the default, which a save puts back.
-component LimitRows {
+export component LimitRows {
     in property <[Limit]> rows;
     in property <string> group;
     VerticalLayout {
@@ -92,7 +92,7 @@ component LimitRows {
 }
 
 // The foot of a group of limits: its Save.
-component SaveRow {
+export component SaveRow {
     in property <string> group;
     HorizontalLayout {
         spacing: Space.md;
@@ -170,12 +170,31 @@ export component SettingsPage inherits PageFrame {
                 // One block: a hidden part takes no room, nor the space around it.
                 VerticalLayout {
                     Text {
-                        text: Prefs.account != "" ? "Commands run as " + Prefs.account + "."
+                        text: Store.commands-as-you
+                            ? "Commands run as you, " + Prefs.account + (Store.commands-root-via != "" ? ": they can do all you can, and get root through " + Store.commands-root-via + "." : ": they can do all you can.")
+                            : Prefs.account != "" ? "Commands run as " + Prefs.account + "."
                             : Install.windows ? "No account yet: with your Windows password, commands run as you, " + Install.account + "."
                             : "No account yet: no command runs.";
                         color: Theme.text;
                         font-size: Type.small;
                         wrap: word-wrap;
+                    }
+                    // The Overview's card, hidden by its owner, comes back
+                    // from here.
+                    Reveal {
+                        shown: Store.commands-as-you && Store.commands-dismissed;
+                        gap: Space.sm;
+                        HorizontalLayout {
+                            alignment: start;
+                            Button {
+                                text: "Show the warning on the Overview";
+                                kind: ButtonKind.ghost;
+                                small: true;
+                                clicked => {
+                                    Store.commands-show();
+                                }
+                            }
+                        }
                     }
                     Reveal {
                         shown: !Install.windows;
@@ -327,7 +346,7 @@ export component SettingsPage inherits PageFrame {
         }
     }
 
-    // Network: the proxy and the relay.
+    // Network: the proxy. (The relay has a page of its own.)
     Reveal {
         shown: Prefs.tab == 2;
         gap: Space.xl;
@@ -336,7 +355,7 @@ export component SettingsPage inherits PageFrame {
             Group {
                 icon: @image-url("icons/globe.svg");
                 title: "Proxy";
-                text: "How the node reaches its centers: directly, or through a proxy or a relay.";
+                text: "How the node reaches its centers: directly, or through a proxy. A relay is set on the Relay page.";
                 VerticalLayout {
                     Reveal {
                         shown: Prefs.proxy == "";
@@ -420,170 +439,6 @@ export component SettingsPage inherits PageFrame {
                                     }
                                 }
                             }
-                        }
-                    }
-                }
-            }
-
-            Group {
-                icon: @image-url("icons/plug.svg");
-                title: "Relay";
-                text: "Nodes that cannot reach a center themselves reach this node's centers through it.";
-                VerticalLayout {
-                    Reveal {
-                        shown: Prefs.relay-listen == "";
-                        Field {
-                            label: "Listen on";
-                            hint: "An address and port of this machine the other nodes reach.";
-                            HorizontalLayout {
-                                spacing: Space.md;
-                                TextField {
-                                    horizontal-stretch: 1;
-                                    text <=> Prefs.relay-address;
-                                    mono: true;
-                                    label: "Listen on";
-                                }
-                                Button {
-                                    text: "Turn on";
-                                    clicked => {
-                                        Prefs.relay-on();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Reveal {
-                        shown: Prefs.relay-listen != "";
-                        VerticalLayout {
-                            HorizontalLayout {
-                                spacing: Space.md;
-                                VerticalLayout {
-                                    alignment: center;
-                                    Pill {
-                                        text: "On";
-                                        tone: Tone.ok;
-                                        dot: true;
-                                    }
-                                }
-                                Text {
-                                    horizontal-stretch: 1;
-                                    text: Prefs.relay-listen + (Prefs.relay-status != "" ? "  ·  " + Prefs.relay-status : "");
-                                    color: Theme.text;
-                                    font-size: Type.small;
-                                    font-family: Type.mono;
-                                    vertical-alignment: center;
-                                    overflow: elide;
-                                }
-                                Button {
-                                    text: "Turn off";
-                                    small: true;
-                                    clicked => {
-                                        Prefs.relay-off();
-                                    }
-                                }
-                            }
-                            Reveal {
-                                shown: Prefs.relay-pin != "";
-                                gap: Space.md;
-                                InfoRow {
-                                    label: "Its pin";
-                                    value: Prefs.relay-pin;
-                                    mono: true;
-                                }
-                            }
-                        }
-                    }
-                    Reveal {
-                        shown: Prefs.relay-nodes.length > 0;
-                        gap: Space.lg;
-                        Rectangle {
-                            border-radius: Radius.md;
-                            border-width: 1px;
-                            border-color: Theme.border;
-                            VerticalLayout {
-                                for n[i] in Prefs.relay-nodes: ListRow {
-                                    first: i == 0;
-                                    VerticalLayout {
-                                        horizontal-stretch: 1;
-                                        spacing: 2px;
-                                        Text {
-                                            text: n.name;
-                                            color: Theme.text;
-                                            font-size: Type.small;
-                                            font-weight: Type.semibold;
-                                            overflow: elide;
-                                        }
-                                        Text {
-                                            text: n.reach + (n.limits != "" ? "; " + n.limits : "");
-                                            color: Theme.text-muted;
-                                            font-size: Type.caption;
-                                            wrap: word-wrap;
-                                        }
-                                    }
-                                    Button {
-                                        text: "Edit…";
-                                        small: true;
-                                        kind: ButtonKind.ghost;
-                                        clicked => {
-                                            Prefs.relay-edit(i);
-                                        }
-                                    }
-                                    Button {
-                                        text: "New token";
-                                        small: true;
-                                        kind: ButtonKind.ghost;
-                                        clicked => {
-                                            Prefs.relay-token(n.name);
-                                        }
-                                    }
-                                    Button {
-                                        text: "Remove";
-                                        small: true;
-                                        kind: ButtonKind.danger-soft;
-                                        clicked => {
-                                            Prefs.relay-remove(n.name);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                Reveal {
-                    shown: Prefs.relay-listen != "";
-                    VerticalLayout {
-                        spacing: Space.md;
-                        Divider { }
-                        Text {
-                            text: "Tunnels";
-                            color: Theme.text;
-                            font-size: Type.small;
-                            font-weight: Type.semibold;
-                        }
-                        LimitRows {
-                            group: "relay";
-                            rows: Prefs.limits-relay;
-                        }
-                        SaveRow {
-                            group: "relay";
-                        }
-                    }
-                }
-                Divider { }
-                HorizontalLayout {
-                    spacing: Space.md;
-                    TextField {
-                        horizontal-stretch: 1;
-                        text <=> Prefs.relay-new-node;
-                        placeholder: "a node's name, like laptop-2";
-                        label: "Name of a node";
-                    }
-                    Button {
-                        text: "Add a node";
-                        icon: @image-url("icons/plus.svg");
-                        enabled: Prefs.relay-new-node != "";
-                        clicked => {
-                            Prefs.relay-add();
                         }
                     }
                 }
@@ -675,26 +530,13 @@ export component SettingsPage inherits PageFrame {
         }
     }
 
-    // App: its look, its version and update, and removing Nerve.
+    // App: its version and update, and removing Nerve. (Light and dark are
+    // at the foot of the sidebar.)
     Reveal {
         shown: Prefs.tab == 5;
         gap: Space.xl;
         VerticalLayout {
             spacing: Space.xl;
-            Group {
-                icon: @image-url("icons/palette.svg");
-                title: "Appearance";
-                HorizontalLayout {
-                    alignment: start;
-                    Segmented {
-                        options: ["System", "Light", "Dark"];
-                        current: Store.appearance;
-                        chosen(i) => {
-                            Store.set-appearance(i);
-                        }
-                    }
-                }
-            }
             Group {
                 icon: @image-url("icons/window.svg");
                 title: "Nerve " + Install.version;

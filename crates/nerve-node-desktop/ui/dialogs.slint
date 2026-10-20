@@ -24,7 +24,7 @@ export component PairDialog inherits Dialog {
         }
         if (Store.pair-step == 0 && Store.pair-link != "") {
             Store.pair-check(Store.pair-link, Store.pair-name);
-        } else if (Store.pair-step == 1) {
+        } else if (Store.pair-step == 1 && Store.pair-preview.ready) {
             Store.pair-confirm();
         }
     }
@@ -119,6 +119,17 @@ export component PairDialog inherits Dialog {
                 }
             }
         }
+        // What the check before the pairing found: Pair only when it can
+        // work.
+        Reveal {
+            shown: Store.pair-preview.check != "";
+            gap: Space.lg;
+            Banner {
+                tone: Store.pair-preview.ready ? Tone.ok : Tone.danger;
+                title: Store.pair-preview.ready ? "Ready to pair" : "Pairing cannot work";
+                text: Store.pair-preview.check;
+            }
+        }
         Reveal {
             shown: !Store.pair-preview.tls;
             gap: Space.lg;
@@ -192,6 +203,7 @@ export component PairDialog inherits Dialog {
                 icon: @image-url("icons/link.svg");
                 kind: ButtonKind.primary;
                 busy: Store.pair-busy;
+                enabled: Store.pair-preview.ready;
                 clicked => {
                     Store.pair-confirm();
                 }
@@ -562,6 +574,7 @@ export component OnceDialog inherits Dialog {
         shown: Prefs.once-copy != "";
         CopyText {
             text: Prefs.once-copy;
+            copy-button: true;
         }
     }
     DialogButtons {
@@ -1088,6 +1101,221 @@ export component OtherCopyDialog inherits Dialog {
             kind: ButtonKind.primary;
             clicked => {
                 Install.other-update();
+            }
+        }
+    }
+}
+
+// A relayed node's link: a new node, or a new link for one (its old link
+// stops working). The link names where the other node reaches this machine.
+export component RelayAddDialog inherits Dialog {
+    title: Prefs.relay-add-for != "" ? "New link for " + Prefs.relay-add-for : "Add a node";
+    subtitle: Prefs.relay-add-for != "" ? "Its old link stops working; its centers and limits stay."
+        : "It gets a link to paste, which lets it reach this node's centers.";
+    card-width: 540px;
+    close => {
+        Prefs.relay-add-open = false;
+    }
+    enter => {
+        if (!Prefs.relay-add-busy && (Prefs.relay-add-for != "" || Prefs.relay-add-name != "")) {
+            Prefs.relay-add-confirm();
+        }
+    }
+    VerticalLayout {
+    Reveal {
+        shown: Prefs.relay-add-for == "";
+        VerticalLayout {
+        padding-bottom: Space.lg;
+        Field {
+            label: "Its name here";
+            hint: "1 to 32 of a-z, 0-9 and -, like laptop-2.";
+            TextField {
+                text <=> Prefs.relay-add-name;
+                mono: true;
+                placeholder: "laptop-2";
+                label: "Its name here";
+                accepted => {
+                    Prefs.relay-add-confirm();
+                }
+            }
+        }
+        }
+    }
+    Field {
+        label: "This machine, as the other node reaches it";
+        hint: "A host name or address, with :port when it is not the relay's.";
+        TextField {
+            text <=> Prefs.relay-add-address;
+            mono: true;
+            label: "This machine, as the other node reaches it";
+            accepted => {
+                Prefs.relay-add-confirm();
+            }
+        }
+    }
+    }
+    DialogButtons {
+        error: Prefs.relay-add-error;
+        Button {
+            text: "Cancel";
+            kind: ButtonKind.ghost;
+            clicked => {
+                Prefs.relay-add-open = false;
+            }
+        }
+        Button {
+            text: Prefs.relay-add-for != "" ? "Make a new link" : "Add";
+            kind: ButtonKind.primary;
+            enabled: Prefs.relay-add-for != "" || Prefs.relay-add-name != "";
+            busy: Prefs.relay-add-busy;
+            clicked => {
+                Prefs.relay-add-confirm();
+            }
+        }
+    }
+}
+
+// This node through a relay: the link the relay showed, or its parts.
+export component ConnectDialog inherits Dialog {
+    title: "Connect through a relay";
+    subtitle: "Paste the link the relay showed under Add a node.";
+    card-width: 580px;
+    close => {
+        Prefs.connect-open = false;
+    }
+    enter => {
+        if (!Prefs.connect-busy) {
+            Prefs.connect-save();
+        }
+    }
+    // One block: a hidden part takes no room, nor the space around it.
+    VerticalLayout {
+    Reveal {
+        shown: !Prefs.connect-apart;
+        VerticalLayout {
+            spacing: Space.md;
+            Field {
+                label: "Relay link";
+                TextField {
+                    text <=> Prefs.connect-link;
+                    mono: true;
+                    placeholder: "nerve://relay?address=…";
+                    label: "Relay link";
+                    invalid: Prefs.connect-error != "";
+                    edited(t) => {
+                        Prefs.connect-read(t);
+                    }
+                    accepted => {
+                        Prefs.connect-save();
+                    }
+                    init => {
+                        self.focus();
+                    }
+                }
+            }
+            Reveal {
+                shown: Prefs.connect-summary != "";
+                Banner {
+                    tone: Tone.accent;
+                    text: Prefs.connect-summary;
+                }
+            }
+            HorizontalLayout {
+                alignment: start;
+                Button {
+                    text: "Enter its parts instead";
+                    kind: ButtonKind.ghost;
+                    small: true;
+                    clicked => {
+                        Prefs.connect-apart = true;
+                    }
+                }
+            }
+        }
+    }
+    Reveal {
+        shown: Prefs.connect-apart;
+        VerticalLayout {
+            spacing: Space.md;
+            Field {
+                label: "Relay address";
+                hint: "Host name or address and port.";
+                TextField {
+                    text <=> Prefs.connect-address;
+                    mono: true;
+                    placeholder: "relay.example:7490";
+                    label: "Relay address";
+                }
+            }
+            HorizontalLayout {
+                spacing: Space.md;
+                Field {
+                    label: "This node's name there";
+                    TextField {
+                        text <=> Prefs.connect-node;
+                        mono: true;
+                        placeholder: "laptop-2";
+                        label: "This node's name there";
+                    }
+                }
+                Field {
+                    label: "Token";
+                    TextField {
+                        text <=> Prefs.connect-token;
+                        password: true;
+                        label: "Token";
+                    }
+                }
+            }
+            Field {
+                label: "Pin of the relay";
+                TextField {
+                    text <=> Prefs.connect-pin;
+                    mono: true;
+                    label: "Pin of the relay";
+                }
+            }
+            HorizontalLayout {
+                alignment: start;
+                Button {
+                    text: "Paste a link instead";
+                    kind: ButtonKind.ghost;
+                    small: true;
+                    clicked => {
+                        Prefs.connect-apart = false;
+                    }
+                }
+            }
+        }
+    }
+    Reveal {
+        shown: Prefs.proxy != "" && !Prefs.via-relay;
+        gap: Space.md;
+        Banner {
+            tone: Tone.warn;
+            text: "It takes the place of the proxy " + Prefs.proxy + ".";
+        }
+    }
+    }
+    DialogButtons {
+        error: Prefs.connect-error;
+        error-title: "Not connected";
+        Button {
+            text: "Cancel";
+            kind: ButtonKind.ghost;
+            clicked => {
+                Prefs.connect-open = false;
+            }
+        }
+        Button {
+            text: "Connect";
+            icon: @image-url("icons/link.svg");
+            kind: ButtonKind.primary;
+            busy: Prefs.connect-busy;
+            enabled: Prefs.connect-apart ? (Prefs.connect-address != "" && Prefs.connect-node != "" && Prefs.connect-token != "" && Prefs.connect-pin != "")
+                : Prefs.connect-link != "";
+            clicked => {
+                Prefs.connect-save();
             }
         }
     }

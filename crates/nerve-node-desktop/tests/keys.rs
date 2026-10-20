@@ -1,4 +1,4 @@
-//! The keyboard drives the app: Ctrl+1 to Ctrl+7 open the pages, Ctrl+R and
+//! The keyboard drives the app: Ctrl+1 to Ctrl+8 open the pages, Ctrl+R and
 //! F5 read the open page again, Escape closes a dialog and Enter takes its
 //! main button. A click on the tab of the page that is open reads nothing
 //! again (it flickered on Audit and Log); only Refresh does.
@@ -102,11 +102,13 @@ fn the_keyboard_drives_the_app_and_the_open_tab_stays() {
     press(Key::F5.into());
     assert!(started(&log).len() > ctrl_r, "F5 read nothing");
 
-    // Ctrl+1 to Ctrl+7: the pages in the sidebar's order.
+    // Ctrl+1 to Ctrl+8: the pages in the sidebar's order.
     for (key, page) in [
         ("2", Page::Centers),
-        ("6", Page::Settings),
-        ("7", Page::Help),
+        ("3", Page::Relay),
+        ("4", Page::Policy),
+        ("7", Page::Settings),
+        ("8", Page::Help),
         ("1", Page::Overview),
     ] {
         ctrl(key);
@@ -124,7 +126,7 @@ fn the_keyboard_drives_the_app_and_the_open_tab_stays() {
     );
     press(Key::Escape.into());
     assert!(!store.get_about_open(), "Escape left About open");
-    ctrl("7");
+    ctrl("8");
     assert_eq!(store.get_page(), Page::Help, "no shortcut after a dialog");
 
     // Enter takes the dialog's main button: the unpairing it asks about.

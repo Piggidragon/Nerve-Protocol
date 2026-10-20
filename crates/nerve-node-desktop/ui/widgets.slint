@@ -856,6 +856,86 @@ export component Segmented {
     }
 }
 
+// Light, dark or the system's: three small choices with an icon each, for
+// the foot of the sidebar. The arrow keys move between them.
+export component SchemeSwitch {
+    in property <int> current;
+    callback chosen(int);
+    property <[string]> names: ["System", "Light", "Dark"];
+    height: 30px;
+    forward-focus: focus;
+    accessible-role: tab-list;
+    accessible-label: "Appearance";
+    Rectangle {
+        background: Theme.inset;
+        border-radius: Radius.md;
+        border-width: 1px;
+        border-color: Theme.border;
+    }
+    FocusRing {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        shown: focus.has-focus;
+    }
+    HorizontalLayout {
+        padding: 2px;
+        spacing: 2px;
+        for name[i] in root.names: Rectangle {
+            horizontal-stretch: 1;
+            border-radius: Radius.sm;
+            background: i == root.current ? Theme.surface : t.has-hover ? Theme.hover : transparent;
+            border-width: i == root.current ? 1px : 0;
+            border-color: Theme.dark ? Theme.border-strong : Theme.border;
+            accessible-role: tab;
+            accessible-label: name;
+            accessible-item-selected: i == root.current;
+            HorizontalLayout {
+                alignment: center;
+                spacing: 4px;
+                VerticalLayout {
+                    alignment: center;
+                    Icon {
+                        size: 13px;
+                        source: i == 0 ? @image-url("icons/monitor.svg")
+                            : i == 1 ? @image-url("icons/sun.svg")
+                            : @image-url("icons/moon.svg");
+                        colorize: i == root.current ? Theme.accent-text : Theme.text-muted;
+                    }
+                }
+                Text {
+                    text: name;
+                    color: i == root.current ? Theme.accent-text : Theme.text-muted;
+                    font-size: Type.caption;
+                    font-weight: i == root.current ? Type.semibold : Type.medium;
+                    vertical-alignment: center;
+                }
+            }
+            t := TouchArea {
+                mouse-cursor: MouseCursor.pointer;
+                clicked => {
+                    root.chosen(i);
+                }
+            }
+        }
+    }
+    focus := FocusScope {
+        focus-on-click: false;
+        key-pressed(event) => {
+            if (event.text == Key.LeftArrow && root.current > 0) {
+                root.chosen(root.current - 1);
+                return accept;
+            }
+            if (event.text == Key.RightArrow && root.current < 2) {
+                root.chosen(root.current + 1);
+                return accept;
+            }
+            reject
+        }
+    }
+}
+
 // The tabs of a page: their names in a row on a line, the open one marked
 // in the accent. One stop of the Tab key; the arrow keys go to the next.
 export component TabBar {
@@ -1687,15 +1767,35 @@ export component TextArea {
 // editable.
 export component CopyText inherits Rectangle {
     in property <string> text;
+    // A Copy button in its corner, which puts the whole text on the
+    // clipboard.
+    in property <bool> copy-button;
+    property <bool> copied;
     background: Theme.inset;
     border-radius: Radius.md;
     border-width: 1px;
     border-color: Theme.border;
-    min-height: shown.preferred-height + 20px;
+    min-height: max(shown.preferred-height + 20px, root.copy-button ? 48px : 0px);
+    if root.copy-button: Button {
+        x: parent.width - self.width - 8px;
+        y: 8px;
+        text: root.copied ? "Copied" : "Copy";
+        icon: root.copied ? @image-url("icons/check.svg") : @image-url("icons/copy.svg");
+        small: true;
+        clicked => {
+            shown.select-all();
+            shown.copy();
+            shown.clear-selection();
+            root.copied = true;
+        }
+    }
+    changed text => {
+        root.copied = false;
+    }
     shown := TextInput {
         x: 12px;
         y: 10px;
-        width: parent.width - 24px;
+        width: parent.width - 24px - (root.copy-button ? 96px : 0px);
         text: root.text;
         read-only: true;
         single-line: false;

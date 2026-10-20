@@ -4,7 +4,7 @@
 //! scrolls inside the window.
 
 use nerve_node_desktop::headless::Screen;
-use nerve_node_desktop::{AppWindow, Install, Load, Page, Perm, Pick, Prefs, Store};
+use nerve_node_desktop::{AppWindow, Install, Load, Page, PairPreview, Perm, Pick, Prefs, Store};
 use slint::{ComponentHandle, ModelRc, Rgba8Pixel, SharedPixelBuffer, SharedString, VecModel};
 
 /// What a screen of 1280x800 leaves a window's content: less a panel (the
@@ -170,6 +170,42 @@ fn every_installer_step_and_dialog_fits_a_small_screen() {
         "a dialog longer than the window runs out of it"
     );
     prefs.set_relay_edit_open(false);
+    // The dialogs that are new with the relay's page and the pairing's
+    // check end above the window's foot too, with every part shown.
+    prefs.set_connect_apart(true);
+    prefs.set_proxy("http://proxy.example:3128".into());
+    prefs.set_connect_error("the relay link's address is not host:port".into());
+    prefs.set_connect_open(true);
+    assert!(
+        bottom(&screen.draw(), 26) == foot,
+        "the relay link's dialog does not fit the window"
+    );
+    prefs.set_connect_open(false);
+    prefs.set_relay_add_error(
+        "the relay knows a node laptop-2 already; take its link away first".into(),
+    );
+    prefs.set_relay_add_open(true);
+    assert!(
+        bottom(&screen.draw(), 26) == foot,
+        "the dialog of a node's link does not fit the window"
+    );
+    prefs.set_relay_add_open(false);
+    store.set_pair_preview(PairPreview {
+        center: "http://127.0.0.1:7480".into(),
+        tls: false,
+        pin: "".into(),
+        name: "home-lab".into(),
+        ready: false,
+        check: "A machine paired with this code already. Make a new link in the center's web UI."
+            .into(),
+    });
+    store.set_pair_step(1);
+    store.set_pair_open(true);
+    assert!(
+        bottom(&screen.draw(), 26) == foot,
+        "the pairing's confirmation does not fit the window"
+    );
+    store.set_pair_open(false);
 
     // Ten centers on the Permissions page: the chosen one is named in full,
     // not squeezed to an ellipsis with the others. Drawn with its name

@@ -3,7 +3,7 @@
 
 import { Tone } from "theme.slint";
 
-export enum Page { overview, centers, policy, audit, log, settings, help }
+export enum Page { overview, centers, relay, policy, audit, log, settings, help }
 
 // What the app knows of something it asks the node for.
 export enum Load { loading, ready, failed }
@@ -19,7 +19,11 @@ export struct NodeStatus {
     connected: int,
     sudo-on: bool,
     limits: string,
-    // What the owner should know: why commands do not run, a lost limit.
+    // Commands run without their limits: why, in one short line, and
+    // whether a restart of the service is what helps.
+    limits-off: string,
+    limits-restart: bool,
+    // What the owner should know: why commands do not run.
     warnings: [string],
 }
 
@@ -63,6 +67,10 @@ export struct PairPreview {
     tls: bool,
     pin: string,
     name: string,
+    // The check before the pairing (`center add` without --yes): whether it
+    // can work, and what it found in one line.
+    ready: bool,
+    check: string,
 }
 
 // A folder a center may use, with its rights.
@@ -96,28 +104,37 @@ export struct HelpArg {
     about: string,
 }
 
-export struct HelpVerb {
+// A command of the reference (src/reference.rs): its words, its first
+// sentence and the rest, how it is written, its arguments, an example, and
+// where the app does the same.
+export struct RefRow {
+    topic: string,
+    name: string,
+    line: string,
+    about: string,
     usage: string,
-    about: string,
     args: [HelpArg],
+    example: string,
+    in-app: bool,
+    page: Page,
+    // The tab of Settings, -1 for none.
+    tab: int,
+    place: string,
 }
 
-export struct HelpCard {
+// A topic of the reference and its commands; one without a name when the
+// list goes from A to Z.
+export struct RefGroup {
     name: string,
-    about: string,
-    verbs: [HelpVerb],
-}
-
-export struct HelpSection {
-    name: string,
-    about: string,
-    cards: [HelpCard],
+    rows: [RefRow],
 }
 
 export struct RelayNodeRow {
     name: string,
     reach: string,
     limits: string,
+    // Its tunnels open now, in words ("" for none).
+    live: string,
     // What its dialog starts from: the centers it may reach (none: every
     // https center), whether it has limits of its own, and the limits it
     // gets.
@@ -143,4 +160,13 @@ export struct Limit {
     value: string,
     was: string,
     default: string,
+}
+
+// A tunnel the relay carries now: whose, to which center, from where, and
+// since when.
+export struct TunnelRow {
+    node: string,
+    center: string,
+    from: string,
+    since: string,
 }

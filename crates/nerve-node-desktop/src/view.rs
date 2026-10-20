@@ -7,8 +7,8 @@ use serde_json::Value;
 use slint::{ModelRc, SharedString, VecModel};
 
 use crate::{
-    AuditRow, CapRow, CenterRow, FolderRow, HelpArg, HelpCard, HelpSection, HelpVerb, LogRow,
-    NodeStatus, RelayNodeRow, Tone,
+    AuditRow, CapRow, CenterRow, FolderRow, LogRow, NodeStatus, PairPreview, RelayNodeRow, Tone,
+    TunnelRow,
 };
 
 fn s(v: &Value) -> &str {
@@ -62,6 +62,8 @@ pub fn status(v: &Value, now_ms: u64) -> (NodeStatus, Vec<CenterRow>) {
     };
     let limits = &v["command_limits"];
     let mut warnings = Vec::new();
+    let (mut limits_off, mut limits_restart) = (String::new(), false);
+    let mut held = true;
     if running {
         if let Some(why) = v["folder_commands_off"].as_str() {
             warnings.push(format!("Folder mode runs no command: {why}."));
@@ -74,11 +76,12 @@ pub fn status(v: &Value, now_ms: u64) -> (NodeStatus, Vec<CenterRow>) {
             .collect();
         if !lost.is_empty() {
             warnings.push(format!(
-                "No command runs: {} turned off in the cgroup since the node started. Start the node again.",
+                "No command runs: the cgroup lost its {} control. Restart the service.",
                 lost.join(", ")
             ));
         } else if let Some(why) = limits["off"].as_str() {
-            warnings.push(format!("Commands run without their limits: {why}."));
+            held = false;
+            (limits_off, limits_restart) = limits_line(why);
         }
         if v["keyring_failed"] == true {
             warnings.push(
@@ -87,6 +90,16 @@ pub fn status(v: &Value, now_ms: u64) -> (NodeStatus, Vec<CenterRow>) {
         }
     }
     let n = |k: &str| limits[k].as_u64().unwrap_or_default();
+    let limits_text = if held || limits_restart || !limits_off.is_empty() {
+        format!(
+            "{} MiB · {} % · {}",
+            n("memory_mb"),
+            n("cpu_percent"),
+            n("processes")
+        )
+    } else {
+        "Not held here yet".to_string()
+    };
     let status = NodeStatus {
         state: state.into(),
         title: title.into(),
@@ -96,16 +109,60 @@ pub fn status(v: &Value, now_ms: u64) -> (NodeStatus, Vec<CenterRow>) {
         centers: centers.len() as i32,
         connected: connected as i32,
         sudo_on: v["sudo"] == "on",
-        limits: format!(
-            "{} MiB · {} % · {}",
-            n("memory_mb"),
-            n("cpu_percent"),
-            n("processes")
-        )
-        .into(),
+        limits: limits_text.into(),
+        limits_off: limits_off.into(),
+        limits_restart,
         warnings: text_model(warnings),
     };
     (status, centers)
+}
+
+/// Why commands run without their limits (`command_limits.off`), in one
+/// short line, and whether a restart of the service is what may help. A
+/// platform that holds none yet (Windows) is no warning: the Overview's
+/// tile says it.
+fn limits_line(why: &str) -> (String, bool) {
+    if why.contains("on this platform") {
+        return (String::new(), false);
+    }
+    if why.contains("no cgroup v2") {
+        return ("This machine has no cgroup v2 for them.".into(), false);
+    }
+    (
+        "The service has no cgroup of its own for them. Restart it; the Log says why if it stays."
+            .into(),
+        true,
+    )
+}
+
+/// The check before a pairing (`center add --json` without `--yes`), in the
+/// app's words: whether Pair can work, and why not.
+pub fn pair_preview(v: &Value) -> PairPreview {
+    let p = &v["preview"];
+    let c = &v["check"];
+    let ready = c["ready"] == true;
+    let check = if !ready {
+        match (s(&c["reach"]), s(&c["code"])) {
+            ("unreachable", _) => "The center does not answer. Check the network, or the proxy or relay this node uses.".to_string(),
+            ("certificate", _) if p["pin"].is_string() => "The center's certificate is not the one the link pins. Make a new link in the center's web UI.".to_string(),
+            ("certificate", _) => "The center's certificate is not one this machine trusts, and the link has no pin.".to_string(),
+            (_, "used") => "A machine paired with this code already. Make a new link in the center's web UI.".to_string(),
+            (_, "gone") => "The code expired or is out of tries. Make a new link in the center's web UI.".to_string(),
+            _ => sentence(s(&c["problem"])),
+        }
+    } else if c["code"] == "open" {
+        "The center answers and the code is valid.".to_string()
+    } else {
+        "The center answers. It did not say whether the code is still valid.".to_string()
+    };
+    PairPreview {
+        center: s(&p["center"]).into(),
+        tls: p["tls"] == true,
+        pin: s(&p["pin"]).into(),
+        name: s(&p["name"]).into(),
+        ready,
+        check: check.into(),
+    }
 }
 
 /// The first letter in upper case.
@@ -378,30 +435,26 @@ fn and_list(items: &[String]) -> String {
     }
 }
 
-/// The token of `relay add` or `relay token` (`said["token"]`), in the
-/// app's words: what the other node may do and where it enters the token,
-/// and what to copy to it (the proxy with the token, the pin, and the
-/// command for a node without the app).
+/// The link of `relay add` or `relay token` (`said["token"]`), in the
+/// app's words: what the other node may do and where it pastes the link,
+/// and the link to copy, which holds the relay's address, the node's name
+/// and token and the pin; a node without the app pastes it into `proxy set`.
 pub fn relay_token(said: &Value) -> (String, String) {
     let t = &said["token"];
-    let (node, proxy, pin) = (s(&t["node"]), s(&t["proxy"]), s(&t["pin"]));
+    let node = s(&t["node"]);
     let mut text = format!(
-        "{node} may use this relay now and reach {}. On {node}, enter the proxy and its pin under Settings, Network, Proxy, or run the command below.",
+        "{node} may reach {} through this relay. On {node}, paste this link under Relay, Connect.",
         s(&t["reach"])
     );
-    if proxy.contains("<address of this machine>") {
-        text.push_str(" Put this machine's address in place of <address of this machine>.");
-    }
     if t["new_pin"] == true {
         text.push_str(
-            " The relay has a new certificate: the other nodes behind it need its new pin too.",
+            " The relay has a new certificate: the other nodes behind it need a new link too.",
         );
     }
     if t["relay_off"] == true {
-        text.push_str(" The relay is off: turn it on under Settings, Network, Relay.");
+        text.push_str(" The relay is off: turn it on first.");
     }
-    let copy = format!("Proxy: {proxy}\nPin: {pin}\n\nnerve-node proxy set '{proxy}' --pin {pin}");
-    (text, copy)
+    (text, s(&t["link"]).to_string())
 }
 
 /// What `restore` did (`said["restored"]`), in the app's words: the
@@ -438,7 +491,7 @@ pub fn restored(said: &Value, started: &str) -> String {
             "sudo" => "Sudo is off: its password is in no backup. Turn it on again on the Permissions page.".into(),
             "sudo-file" => "Sudo is off, but the administrator's password it kept could not be deleted: turn sudo on and off again on the Permissions page.".into(),
             "pin" => format!("The pin of {center} here differed from the backup's, and the restore took the backup's. If the node does not link to {center}, set center.{center}.pin under Settings, Advanced."),
-            "relay" => "The relay's TLS key was not in the backup: turn the relay on again under Settings, Network, Relay; the nodes behind it need its new pin.".into(),
+            "relay" => "The relay's TLS key was not in the backup: turn the relay on again on the Relay page; the nodes behind it need new links.".into(),
             _ => full_sentence(s(&n["text"])),
         };
         // Several notes can ask for the same: it is said once.
@@ -572,44 +625,50 @@ pub fn log_rows(newest: &[Value], problems_only: bool, now_ms: u64) -> Vec<LogRo
         .collect()
 }
 
-/// The command list of `nerve-node --help`, read from the CLI's own
-/// definition, as the Help page shows it.
-pub fn help(h: &nerve_node::cli::Help) -> Vec<HelpSection> {
-    fn model<T: Clone + 'static>(v: Vec<T>) -> ModelRc<T> {
-        ModelRc::new(VecModel::from(v))
+/// Whether the proxy of `proxy ls --json` is a relay: https, with a pin
+/// and a login (its node's name); its address and that name.
+pub fn relay_of(proxy: &Value) -> (bool, String, String) {
+    let url = s(&proxy["proxy"]);
+    let login = s(&proxy["login"]);
+    match url.strip_prefix("https://") {
+        Some(rest) if proxy["pin"].is_string() && !login.is_empty() => (
+            true,
+            rest.trim_end_matches('/').to_string(),
+            login.to_string(),
+        ),
+        _ => (false, String::new(), String::new()),
     }
-    h.sections
-        .iter()
-        .map(|s| HelpSection {
-            name: s.name.as_str().into(),
-            about: s.about.as_str().into(),
-            cards: model(
-                s.cards
-                    .iter()
-                    .map(|c| HelpCard {
-                        name: c.name.as_str().into(),
-                        about: c.about.as_str().into(),
-                        verbs: model(
-                            c.verbs
-                                .iter()
-                                .map(|v| HelpVerb {
-                                    usage: v.usage.as_str().into(),
-                                    about: v.about.as_str().into(),
-                                    args: model(
-                                        v.args
-                                            .iter()
-                                            .map(|a| HelpArg {
-                                                name: a.name.as_str().into(),
-                                                about: a.about.as_str().into(),
-                                            })
-                                            .collect(),
-                                    ),
-                                })
-                                .collect(),
-                        ),
-                    })
-                    .collect(),
-            ),
+}
+
+/// An error of the CLI as a sentence.
+pub fn sentence_of(e: &str) -> String {
+    let mut t = sentence(e);
+    if !t.ends_with('.') {
+        t.push('.');
+    }
+    t
+}
+
+/// The tunnels of `relay ls --json` the relay carries now, each since when.
+pub fn tunnels(v: &Value, now_ms: u64) -> Vec<TunnelRow> {
+    v["tunnels"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|t| {
+            let since = t["since_ms"].as_u64().unwrap_or(now_ms);
+            TunnelRow {
+                node: s(&t["node"]).into(),
+                center: s(&t["center"]).into(),
+                from: s(&t["from"]).into(),
+                since: format!(
+                    "for {}",
+                    nerve_transport::log::span(std::time::Duration::from_millis(
+                        now_ms.saturating_sub(since)
+                    ))
+                )
+                .into(),
+            }
         })
         .collect()
 }
@@ -627,7 +686,19 @@ pub fn relay_nodes(v: &Value) -> Vec<RelayNodeRow> {
                 .flatten()
                 .filter_map(Value::as_str)
                 .collect();
+            let open = v["tunnels"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|t| t["node"] == n["name"])
+                .count();
             RelayNodeRow {
+                live: match open {
+                    0 => String::new(),
+                    1 => "1 link".into(),
+                    n => format!("{n} links"),
+                }
+                .into(),
                 centers: ModelRc::new(VecModel::from(
                     centers
                         .iter()
@@ -1051,26 +1122,76 @@ pub fn rule_args(e: &Value, list: &str, wildcard: bool) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    /// The relay's token in the app's words: no line sends the owner of
-    /// this machine to a terminal; the command is there for the other node,
-    /// which may have no app.
+    /// The relay's link in the app's words: where the other node pastes
+    /// it, and the link itself to copy; no line sends the owner of this
+    /// machine to a terminal.
     #[test]
-    fn a_relay_token_says_where_the_other_node_enters_it() {
+    fn a_relay_link_says_where_the_other_node_pastes_it() {
+        let link = "nerve://relay?address=relay.example%3A7491&node=lab-pc&token=t0k&pin=p1n";
         let v = json!({"messages": ["on lab-pc, run:"], "token": {
-            "node": "lab-pc", "token": "t0k", "pin": "p1n",
-            "proxy": "https://lab-pc:t0k@<address of this machine>:7491",
+            "node": "lab-pc", "token": "t0k", "pin": "p1n", "link": link,
+            "proxy": "https://lab-pc:t0k@relay.example:7491", "address": "relay.example:7491",
             "reach": "every https center of this node", "new_pin": false, "relay_off": true,
         }});
         let (text, copy) = relay_token(&v);
-        assert!(copy.starts_with("Proxy: https://lab-pc:t0k@"), "{copy}");
-        assert!(copy.contains("Pin: p1n"), "{copy}");
+        assert_eq!(copy, link);
         assert!(
-            text.contains("in place of <address of this machine>"),
+            text.contains("paste this link under Relay, Connect"),
             "{text}"
         );
-        assert!(text.contains("under Settings, Network, Proxy"), "{text}");
-        assert!(text.contains("under Settings, Network, Relay"), "{text}");
+        assert!(text.contains("The relay is off"), "{text}");
         assert!(!text.contains('`') && !copy.contains('`'), "{text}");
+    }
+
+    /// Why Pair cannot work, in words that say what to do; and when it can.
+    #[test]
+    fn the_check_before_pairing_says_why_pair_cannot_work() {
+        let preview = |check: Value| {
+            pair_preview(
+                &json!({"preview": {"center": "https://c", "tls": true, "pin": "p"}, "check": check}),
+            )
+        };
+        let p = preview(json!({"ready": true, "reach": "ok", "code": "open"}));
+        assert!(p.ready && p.check.contains("code is valid"), "{}", p.check);
+        let p = preview(json!({"ready": true, "reach": "ok", "code": "busy"}));
+        assert!(p.ready && p.check.contains("did not say"), "{}", p.check);
+        for (reach, code, says) in [
+            ("unreachable", Value::Null, "does not answer"),
+            ("certificate", Value::Null, "not the one the link pins"),
+            ("ok", json!("used"), "paired with this code already"),
+            ("ok", json!("gone"), "expired or is out of tries"),
+        ] {
+            let p = preview(json!({"ready": false, "reach": reach, "code": code, "problem": "x"}));
+            assert!(!p.ready && p.check.contains(says), "{reach}: {}", p.check);
+        }
+    }
+
+    /// Commands without their limits: one short line, and the restart
+    /// where that may help; none on a platform that holds none yet.
+    #[test]
+    fn commands_without_limits_get_one_line() {
+        let st = |off: &str| {
+            status(
+                &json!({"daemon": "running", "command_limits": {"memory_mb": 1, "off": off}}),
+                0,
+            )
+            .0
+        };
+        let s1 = st(
+            "the node runs outside a cgroup it may manage; start it as the installed service, or under systemd-run --user --scope -p Delegate=yes",
+        );
+        assert!(
+            s1.limits_restart && s1.limits_off.starts_with("The service has no cgroup"),
+            "{}",
+            s1.limits_off
+        );
+        assert!(s1.limits_off.len() < 100, "{}", s1.limits_off);
+        let s2 = st("this machine has no cgroup v2 (unified hierarchy)");
+        assert!(!s2.limits_restart && s2.limits_off.contains("no cgroup v2"));
+        let s3 = st("this node does not hold commands to their limits on this platform yet");
+        assert_eq!(s3.limits_off, "");
+        assert_eq!(s3.limits, "Not held here yet");
+        assert_eq!(s3.warnings.row_count(), 0);
     }
 
     /// A restore in the app's words: the CLI's commands become the places
@@ -1415,25 +1536,6 @@ mod tests {
         let rows = log_rows(&lines, true, NOW);
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1].msg, "link dropped (web-1)");
-    }
-
-    #[test]
-    fn help_is_the_clis_own() {
-        let sections = help(&nerve_node::cli::help());
-        let names: Vec<String> = sections.iter().map(|s| s.name.to_string()).collect();
-        assert!(names.contains(&"Pair and connect".to_string()), "{names:?}");
-        let all: Vec<String> = sections
-            .iter()
-            .flat_map(|s| s.cards.iter().collect::<Vec<_>>())
-            .flat_map(|c| {
-                c.verbs
-                    .iter()
-                    .map(|v| v.usage.to_string())
-                    .collect::<Vec<_>>()
-            })
-            .collect();
-        assert!(all.iter().any(|u| u.contains("audit")), "{all:?}");
-        assert!(all.iter().any(|u| u.contains("log")), "{all:?}");
     }
 
     #[test]

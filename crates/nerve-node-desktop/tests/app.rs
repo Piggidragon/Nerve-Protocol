@@ -137,6 +137,12 @@ fn the_app_drives_the_cli_end_to_end() {
     assert_eq!(store.get_pair_step(), 1);
     assert_eq!(store.get_pair_preview().center, center.url.to_string());
     assert!(!store.get_pair_preview().tls);
+    // The check found the center and its code open: Pair can work.
+    assert!(
+        store.get_pair_preview().ready,
+        "{}",
+        store.get_pair_preview().check
+    );
     assert!(config(&paths).centers.is_empty());
     store.invoke_pair_confirm();
     assert!(!store.get_pair_open(), "{}", store.get_pair_error());
@@ -154,6 +160,17 @@ fn the_app_drives_the_cli_end_to_end() {
     assert_eq!(cfg.centers[0].name, "home");
     assert!(center.paired().is_some());
     assert_eq!(store.get_centers().row_count(), 1);
+    // The same link again: its code is used, and the preview says so
+    // instead of offering Pair.
+    store.invoke_pair_start();
+    store.invoke_pair_check(center.link().render().into(), "".into());
+    let p = store.get_pair_preview();
+    assert!(
+        !p.ready && p.check.contains("paired with this code"),
+        "{}",
+        p.check
+    );
+    store.set_pair_open(false);
     assert_eq!(store.get_centers().row_data(0).unwrap().name, "home");
 
     // Pause, the settings grant, each as the CLI makes it, and audited.
@@ -440,18 +457,43 @@ fn the_app_drives_the_cli_end_to_end() {
             .allow
             .contains(&r.to_string())
     };
-    perm.set_list(0);
-    perm.set_rule_text("cargo build".into());
-    perm.set_rule_wildcard(true);
-    perm.invoke_rule_add();
+    perm.set_allow_text("cargo build".into());
+    perm.set_allow_wild(true);
+    perm.invoke_rule_add(0);
     assert!(allowed("exec.run:cargo *"));
-    assert_eq!(perm.get_rule_text(), "");
-    perm.invoke_rule_remove(0, "exec.run:cargo *".into());
+    assert_eq!(perm.get_allow_text(), "");
+    assert!(!perm.get_allow_wild());
+    // Edited in place, as one change in the audit.
+    let changes = || {
+        audit(&paths)
+            .iter()
+            .filter(|e| e["kind"] == "settings")
+            .count()
+    };
+    let before = changes();
+    let at = perm
+        .get_allow()
+        .iter()
+        .position(|r| r == "exec.run:cargo *")
+        .unwrap();
+    perm.set_edit_list(0);
+    perm.set_edit_index(at as i32);
+    perm.set_edit_text("cargo build --release".into());
+    perm.invoke_rule_edit_save();
+    assert!(
+        allowed("exec.run:cargo build --release"),
+        "{}",
+        store.get_toast()
+    );
     assert!(!allowed("exec.run:cargo *"));
+    assert_eq!(changes(), before + 1);
+    assert_eq!(perm.get_edit_list(), -1, "the row is shown again");
+    perm.invoke_rule_remove(0, "exec.run:cargo build --release".into());
+    assert!(!allowed("exec.run:cargo build --release"));
     // A pattern for files goes in as it is, as `config add` adds it, and
     // comes out as `rule ls` shows it.
-    perm.set_rule_text("fs.read:~/notes/*".into());
-    perm.invoke_rule_add();
+    perm.set_allow_text("fs.read:~/notes/*".into());
+    perm.invoke_rule_add(0);
     assert!(allowed("fs.read:~/notes/*"), "{}", store.get_toast());
     assert!(perm.get_allow().iter().any(|r| r == "fs.read:~/notes/*"));
     perm.invoke_rule_remove(0, "fs.read:~/notes/*".into());
@@ -589,21 +631,62 @@ fn the_app_drives_the_cli_end_to_end() {
     prefs.invoke_raw_remove();
     assert_eq!(prefs.get_raw_error(), "");
     assert!(!denied("fs:~/private/*"));
-    prefs.set_relay_new_node("laptop-2".into());
+    // A node of the relay: its name, and where it reaches this machine,
+    // which goes into its one link.
     prefs.invoke_relay_add();
+    assert!(prefs.get_relay_add_open());
+    prefs.set_relay_add_name("laptop-2".into());
+    prefs.set_relay_add_address("relay.example".into());
+    prefs.invoke_relay_add_confirm();
+    assert!(
+        !prefs.get_relay_add_open(),
+        "{}",
+        prefs.get_relay_add_error()
+    );
     assert!(prefs.get_once_open());
-    // In the app's words: the proxy and pin laptop-2 enters, and where.
+    let link = nerve_proto::link::RelayLink::parse(&prefs.get_once_copy()).unwrap();
+    assert_eq!(
+        (link.node.as_str(), link.address.as_str()),
+        ("laptop-2", "relay.example:7490")
+    );
     assert!(
         prefs
-            .get_once_copy()
-            .starts_with("Proxy: https://laptop-2:")
-            && prefs
-                .get_once_text()
-                .contains("under Settings, Network, Proxy")
-            && !prefs.get_once_text().contains("on laptop-2, run:"),
+            .get_once_text()
+            .contains("paste this link under Relay, Connect")
+            && !prefs.get_once_text().contains("run:"),
         "{}",
         prefs.get_once_text()
     );
+    // A node pastes it, and goes through the relay: its proxy is the relay
+    // with its name and the pin, its token kept with its keys. (This node
+    // itself here: the app is the same on the other one.)
+    let link_text = prefs.get_once_copy();
+    prefs.set_once_open(false);
+    prefs.invoke_connect_start();
+    prefs.set_connect_link(link_text.clone());
+    prefs.invoke_connect_read(link_text);
+    assert!(
+        prefs.get_connect_summary().contains("relay.example:7490"),
+        "{}",
+        prefs.get_connect_summary()
+    );
+    prefs.invoke_connect_save();
+    assert!(!prefs.get_connect_open(), "{}", prefs.get_connect_error());
+    let c = config(&paths).connection;
+    assert_eq!(c.proxy.as_deref(), Some("https://relay.example:7490"));
+    assert_eq!(c.login.as_deref(), Some("laptop-2"));
+    assert_eq!(c.pin.as_deref(), Some(link.pin.as_str()));
+    assert!(prefs.get_via_relay());
+    assert_eq!(prefs.get_via_address(), "relay.example:7490");
+    prefs.invoke_disconnect();
+    assert!(config(&paths).connection.proxy.is_none());
+    assert!(!prefs.get_via_relay());
+    // A link that is none: refused before anything runs.
+    prefs.invoke_connect_start();
+    prefs.set_connect_link("nerve://relay?address=x".into());
+    prefs.invoke_connect_save();
+    assert!(prefs.get_connect_open() && prefs.get_connect_error() != "");
+    prefs.set_connect_open(false);
     assert_eq!(prefs.get_relay_nodes().row_count(), 1);
     prefs.set_once_open(false);
     // Its centers and limits, in its dialog.
@@ -735,15 +818,33 @@ fn the_app_drives_the_cli_end_to_end() {
     store.invoke_setup_next();
     assert_eq!(store.get_setup_step(), 1, "{}", store.get_setup_error());
     assert_eq!(config(&paths).node.name.as_deref(), Some("studio"));
+    // Back, and on again.
+    store.invoke_setup_back();
+    assert_eq!(store.get_setup_step(), 0);
+    store.invoke_setup_back();
+    assert_eq!(store.get_setup_step(), 0, "the first step has no back");
+    store.invoke_setup_next();
+    assert_eq!(store.get_setup_step(), 1, "{}", store.get_setup_error());
     store.invoke_setup_next();
     assert_eq!(store.get_setup_step(), 2, "{}", store.get_setup_error());
     store.set_pair_link(second.link().render().into());
     store.set_pair_name("studio-center".into());
     store.invoke_setup_next();
     assert_eq!(store.get_pair_step(), 1, "{}", store.get_pair_error());
+    // Back from the confirmation to the link, and on.
+    store.invoke_setup_back();
+    assert_eq!((store.get_setup_step(), store.get_pair_step()), (2, 0));
+    store.invoke_setup_next();
+    assert_eq!(store.get_pair_step(), 1, "{}", store.get_pair_error());
     store.invoke_setup_next();
     assert_eq!(store.get_setup_step(), 3, "{}", store.get_pair_error());
     assert_eq!(store.get_setup_center(), "studio-center");
+    // Back from the mode: the center stays paired, and Continue goes on to
+    // its mode without pairing again.
+    store.invoke_setup_back();
+    assert_eq!((store.get_setup_step(), store.get_pair_step()), (2, 2));
+    store.invoke_setup_next();
+    assert_eq!(store.get_setup_step(), 3, "{}", store.get_pair_error());
     store.set_setup_mode("folder".into());
     store.invoke_setup_next();
     assert_eq!(store.get_setup_step(), 4, "{}", store.get_setup_error());
@@ -751,6 +852,10 @@ fn the_app_drives_the_cli_end_to_end() {
         config(&paths).center("studio-center").unwrap().policy.mode,
         nerve_policy::Mode::Folder
     );
+    store.invoke_setup_back();
+    assert_eq!(store.get_setup_step(), 3);
+    store.invoke_setup_next();
+    assert_eq!(store.get_setup_step(), 4, "{}", store.get_setup_error());
     store.invoke_setup_next();
     assert!(!store.get_setup_open());
 

@@ -266,6 +266,8 @@ impl Ctl {
                 ];
                 self.setup_run(args, 2, true);
             }
+            // Back from the mode: the center is paired, on to its mode.
+            2 if pair_step == 2 => self.setup_go(3),
             2 => self.pair(&link, &pair_name, pair_step == 1),
             3 => {
                 let args = vec!["mode".into(), "set".into(), mode, "--center".into(), center];
@@ -307,6 +309,36 @@ impl Ctl {
         }
     }
 
+    /// One step back. The pairing's confirmation goes back to its link; the
+    /// mode, to the center it paired, which stays paired; the end, to the
+    /// mode, or to the pairing when it was skipped.
+    fn setup_back(&self) {
+        let Some((step, pair_step, center)) = self.with_store(|s| {
+            (
+                s.get_setup_step(),
+                s.get_pair_step(),
+                s.get_setup_center().to_string(),
+            )
+        }) else {
+            return;
+        };
+        match step {
+            0 => {}
+            2 if pair_step == 1 => {
+                self.with_store(|s| {
+                    s.set_pair_error(SharedString::new());
+                    s.set_pair_step(0);
+                });
+            }
+            3 => {
+                self.with_store(|s| s.set_pair_step(2));
+                self.setup_go(2);
+            }
+            4 if center.is_empty() => self.setup_go(2),
+            _ => self.setup_go(step - 1),
+        }
+    }
+
     fn setup_skip(&self) {
         let step = self.with_store(|s| s.get_setup_step()).unwrap_or(0);
         // Without a center there is no mode to choose.
@@ -326,6 +358,8 @@ pub(super) fn wire(ctl: &Rc<Ctl>, window: &crate::AppWindow) {
     store.on_setup_next(move || c.setup_next());
     let c = ctl.clone();
     store.on_setup_skip(move || c.setup_skip());
+    let c = ctl.clone();
+    store.on_setup_back(move || c.setup_back());
     let c = ctl.clone();
     store.on_setup_close(move || c.setup_close());
 }

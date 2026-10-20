@@ -20,8 +20,11 @@ serde_json.workspace = true
 # Which list an audit button puts a sudo command on, and whether a target
 # was cut: the node's own rules.
 nerve-policy.workspace = true
-# The name of the broker's pipe on Windows (src/broker.rs).
+# The name of the broker's pipe on Windows (src/broker.rs), and the span
+# of a relay's tunnel in words.
 nerve-transport.workspace = true
+# A relay's link, read before it is used (src/app/prefs.rs).
+nerve-proto.workspace = true
 # Native file and folder dialogs: the desktop portal on Linux, so they work
 # on Wayland too.
 rfd.workspace = true

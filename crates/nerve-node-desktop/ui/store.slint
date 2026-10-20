@@ -5,7 +5,7 @@
 import { Tone } from "theme.slint";
 import {
     Page, Load, NodeStatus, CenterRow, AuditRow, PairPreview, FolderRow, CapRow, LogRow,
-    HelpSection, RelayNodeRow, Pick, Limit,
+    RefGroup, RelayNodeRow, TunnelRow, Pick, Limit,
 } from "data.slint";
 
 export global Store {
@@ -109,7 +109,15 @@ export global Store {
     // their own for the commands.
     in-out property <bool> commands-as-you;
     in-out property <string> commands-account;
+    // How a command gets root besides: through these groups and sudo, in
+    // words ("docker and sudo"); empty when it does not.
+    in-out property <string> commands-root-via;
+    // The owner said not to show the card again for this account and these
+    // ways to root (src/settings.rs); Settings, General brings it back.
+    in-out property <bool> commands-dismissed;
     callback separate-account();
+    callback commands-dismiss();
+    callback commands-show();
 
     // Elevation: an installed node's files are the system's; an owner is
     // asked only for what needs an administrator, anyone else once, and the
@@ -133,6 +141,8 @@ export global Store {
     callback setup-start();
     callback setup-next();
     callback setup-skip();
+    // One step back; the first step has none.
+    callback setup-back();
     // The steps closed before their end (× or Escape).
     callback setup-close();
 }
@@ -150,10 +160,22 @@ export global Perm {
     in-out property <[string]> allow;
     in-out property <[string]> deny;
     in-out property <[string]> sudo-list;
-    // 0 allow, 1 deny, 2 sudo.
-    in-out property <int> list;
-    in-out property <string> rule-text;
-    in-out property <bool> rule-wildcard;
+    // The new rule each list's field holds, and its Wildcard switch; the
+    // lists are 0 allow, 1 deny, 2 sudo.
+    in-out property <string> allow-text;
+    in-out property <bool> allow-wild;
+    in-out property <string> deny-text;
+    in-out property <bool> deny-wild;
+    in-out property <string> sudo-text;
+    in-out property <bool> sudo-wild;
+    // Allowlist mode: whether its exceptions (the deny rules) are open.
+    in-out property <bool> except-open;
+    // The rule being edited in place: its list (-1: none), its row, and
+    // what it becomes.
+    in-out property <int> edit-list: -1;
+    in-out property <int> edit-index;
+    in-out property <string> edit-text;
+    in-out property <bool> edit-busy;
     in-out property <[CapRow]> caps;
     in-out property <bool> sudo-on;
 
@@ -187,8 +209,9 @@ export global Perm {
     callback folder-add();
     callback folder-set(string, bool, bool, bool);
     callback folder-remove(string);
-    callback rule-add();
+    callback rule-add(int);
     callback rule-remove(int, string);
+    callback rule-edit-save();
     callback cap-set(string, int);
     callback sudo-ask();
     callback sudo-confirm();
@@ -208,11 +231,21 @@ export global Logs {
     callback more();
 }
 
-// The Help page: the CLI's own command list, and which of its parts is
-// open (-1: none). The keyboard's shortcuts are part 10, the commands 11.
+// The Help page: which of its parts is open (-1: none; the keyboard's
+// shortcuts are part 20, the commands 21), and the command reference
+// (src/reference.rs): what it shows for the filter and the order, and the
+// command that is open.
 export global Manual {
-    in-out property <[HelpSection]> sections;
     in-out property <int> open: -1;
+    in-out property <[RefGroup]> ref-groups;
+    in-out property <string> ref-filter;
+    in-out property <bool> ref-by-name;
+    in-out property <string> ref-open;
+    // The filter or the order changed.
+    callback ref-update();
+    // Opens the page, and the tab of Settings (-1: none), a command's work
+    // is done on.
+    callback ref-go(Page, int);
 }
 
 // The Settings page.
@@ -266,17 +299,52 @@ export global Prefs {
     callback proxy-set();
     callback proxy-remove();
 
+    // The Relay page. This node as a relay: where it listens, its state,
+    // its pin, the nodes it carries and their tunnels now.
     in-out property <string> relay-listen;
     in-out property <string> relay-status;
     in-out property <string> relay-pin;
     in-out property <[RelayNodeRow]> relay-nodes;
+    in-out property <[TunnelRow]> tunnels;
     in-out property <string> relay-address: "0.0.0.0:7490";
-    in-out property <string> relay-new-node;
     callback relay-on();
     callback relay-off();
+    callback relay-remove(string);
+    // A node's link: a new node (`relay add`), or a new link for the node
+    // `relay-add-for` names (`relay token`). Where the other node reaches
+    // this machine goes into it, as the relay's guess or the owner's.
+    in-out property <bool> relay-add-open;
+    in-out property <string> relay-add-for;
+    in-out property <string> relay-add-name;
+    in-out property <string> relay-add-address;
+    in-out property <string> relay-add-error;
+    in-out property <bool> relay-add-busy;
     callback relay-add();
     callback relay-token(string);
-    callback relay-remove(string);
+    callback relay-add-confirm();
+    // This node through a relay: its proxy is one (https, a pin and a
+    // login), at this address under this name, and how its links fare.
+    in-out property <bool> via-relay;
+    in-out property <string> via-address;
+    in-out property <string> via-node;
+    in-out property <string> via-state;
+    in-out property <Tone> via-tone: Tone.neutral;
+    // The dialog that takes a relay's link, or its parts apart.
+    in-out property <bool> connect-open;
+    in-out property <string> connect-link;
+    in-out property <bool> connect-apart;
+    in-out property <string> connect-address;
+    in-out property <string> connect-node;
+    in-out property <string> connect-token;
+    in-out property <string> connect-pin;
+    // What the link says, once it reads as one.
+    in-out property <string> connect-summary;
+    in-out property <string> connect-error;
+    in-out property <bool> connect-busy;
+    callback connect-start();
+    callback connect-read(string);
+    callback connect-save();
+    callback disconnect();
     // One relayed node's centers and limits, in its dialog: no center
     // ticked lets it reach every https center of this node.
     in-out property <bool> relay-edit-open;

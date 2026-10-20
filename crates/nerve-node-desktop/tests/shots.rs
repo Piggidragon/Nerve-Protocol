@@ -30,7 +30,7 @@ const INSTALLER: (u32, u32) = (760, 700);
 const SMALL: (u32, u32) = (1280, 800);
 /// The shots also taken on [`SMALL`], as `<name>-1280x800`: the installer's
 /// steps and the dialogs.
-const ALSO_SMALL: [&str; 18] = [
+const ALSO_SMALL: [&str; 22] = [
     "setup-",
     "pair-",
     "centers-unpair",
@@ -38,7 +38,11 @@ const ALSO_SMALL: [&str; 18] = [
     "permissions-folder",
     "permissions-sudo",
     "settings-proxy",
-    "settings-relay-",
+    "relay-add",
+    "relay-new-link",
+    "relay-link",
+    "relay-connect",
+    "relay-node",
     "settings-backup",
     "settings-restore",
     "centers-new-key",
@@ -235,6 +239,10 @@ fn every_page_light_and_dark() {
     store.invoke_setup_next();
     store.set_setup_mode("folder".into());
     shots.take("setup-mode");
+    // Back from the mode: the center is paired already.
+    store.invoke_setup_back();
+    shots.take("setup-back-paired");
+    store.invoke_setup_next();
     store.invoke_setup_next();
     shots.take("setup-done");
     store.set_setup_open(false);
@@ -247,9 +255,15 @@ fn every_page_light_and_dark() {
     store.set_pair_link(link.clone().into());
     store.set_pair_name("lab".into());
     shots.take("pair-link");
-    store.invoke_pair_check(link.into(), "lab".into());
+    store.invoke_pair_check(link.clone().into(), "lab".into());
     shots.take("pair-confirm");
     store.invoke_pair_confirm();
+    // The same link again: its code is used, so no Pair.
+    store.invoke_pair_start();
+    store.set_pair_link(link.clone().into());
+    store.invoke_pair_check(link.into(), "".into());
+    shots.take("pair-cannot");
+    store.set_pair_open(false);
     run(&[
         "center",
         "add",
@@ -419,8 +433,32 @@ fn every_page_light_and_dark() {
     // Commands run as the app's user, an owner of the node.
     store.set_commands_as_you(true);
     store.set_commands_account("alex".into());
+    store.set_commands_root_via("docker and sudo".into());
     shots.take("overview-commands-as-you");
+    store.set_commands_root_via("".into());
+    shots.take("overview-commands-as-you-plain");
+    // Hidden by its owner: Settings, General keeps the line.
+    store.invoke_show(Page::Settings);
+    prefs.set_tab(0);
+    // As the node's status says it, which reading the page asked anew.
+    store.set_commands_as_you(true);
+    store.set_commands_dismissed(true);
+    store.set_commands_root_via("docker and sudo".into());
+    prefs.set_account("alex".into());
+    shots.take("settings-general-commands-as-you");
+    store.invoke_show(Page::Overview);
+    store.set_commands_dismissed(false);
     store.set_commands_as_you(false);
+    // Commands without their limits: one line, and the restart.
+    let st = store.get_status();
+    let mut off = st.clone();
+    off.limits_off =
+        "The service has no cgroup of its own for them. Restart it; the Log says why if it stays."
+            .into();
+    off.limits_restart = true;
+    store.set_status(off);
+    shots.take("overview-limits-off");
+    store.set_status(st);
     store.invoke_show(Page::Centers);
     shots.take("centers");
     store.invoke_center_unpair(OFFICE.into());
@@ -471,6 +509,27 @@ fn every_page_light_and_dark() {
     perm.invoke_pick(0);
     shots.take("permissions");
     shots.take_full("permissions", 2050);
+    // A rule edited in place.
+    perm.set_edit_text(perm.get_deny().row_data(0).unwrap());
+    perm.set_edit_index(0);
+    perm.set_edit_list(1);
+    shots.take_full("permissions-edit", 2050);
+    perm.set_edit_list(-1);
+    // Allowlist mode: the allow list, the deny rules as its exceptions.
+    let office = perm.get_centers().iter().position(|c| c == OFFICE).unwrap();
+    for (list, rule) in [
+        ("allow", "git status"),
+        ("allow", "npm test"),
+        ("deny", "npm publish"),
+    ] {
+        run(&["rule", "add", list, rule, "--center", OFFICE]);
+    }
+    perm.invoke_pick(office as i32);
+    shots.take_full("permissions-allowlist", 2050);
+    perm.set_except_open(true);
+    shots.take_full("permissions-allowlist-exceptions", 2250);
+    perm.set_except_open(false);
+    perm.invoke_pick(0);
     perm.invoke_mode_pick("user".into());
     perm.set_mode_timed(true);
     shots.take("permissions-mode");
@@ -569,14 +628,65 @@ fn every_page_light_and_dark() {
     prefs.set_proxy_new_password("correct horse".into());
     shots.take("settings-proxy");
     prefs.set_proxy_open(false);
-    prefs.invoke_relay_token("laptop-2".into());
-    shots.take("settings-relay-token");
+    // The Relay page: this node direct, the relay off with one node.
+    store.invoke_show(Page::Relay);
+    shots.take("relay");
+    prefs.invoke_relay_add();
+    prefs.set_relay_add_name("build-agent-7".into());
+    shots.take("relay-add");
+    prefs.invoke_relay_add_confirm();
+    shots.take("relay-link");
     prefs.set_once_open(false);
+    prefs.invoke_relay_token("laptop-2".into());
+    shots.take("relay-new-link");
+    prefs.set_relay_add_open(false);
     prefs.invoke_relay_edit(0);
     prefs.invoke_relay_edit_pick(0, true);
     prefs.set_relay_edit_own(true);
-    shots.take("settings-relay-node");
+    shots.take("relay-node");
     prefs.set_relay_edit_open(false);
+    // On, carrying tunnels now (as `relay ls` of a running relay says).
+    prefs.set_relay_listen("0.0.0.0:7490".into());
+    prefs.set_relay_status("listening on 0.0.0.0:7490".into());
+    let relay = serde_json::json!({
+        "nodes": [
+            {"name": "laptop-2", "centers": [], "max_links": 4, "max_opens_per_minute": 30, "own_limits": false},
+            {"name": "build-agent-7", "centers": ["home"], "max_links": 12, "max_opens_per_minute": 300, "own_limits": true},
+        ],
+        "tunnels": [
+            {"node": "laptop-2", "from": "192.168.1.23:51544", "center": "home", "since_ms": nerve_node::now_ms() - 7_500_000},
+            {"node": "laptop-2", "from": "192.168.1.23:51562", "center": "lab", "since_ms": nerve_node::now_ms() - 420_000},
+        ],
+    });
+    prefs.set_relay_nodes(slint::ModelRc::new(slint::VecModel::from(
+        nerve_node_desktop::view::relay_nodes(&relay),
+    )));
+    prefs.set_tunnels(slint::ModelRc::new(slint::VecModel::from(
+        nerve_node_desktop::view::tunnels(&relay, nerve_node::now_ms()),
+    )));
+    shots.take("relay-on");
+    shots.take_full("relay-on", 1250);
+    // This node through a relay, and the dialog that takes the link.
+    prefs.set_via_relay(true);
+    prefs.set_via_address("relay.lab.example:7490".into());
+    prefs.set_via_node("laptop-2".into());
+    prefs.set_via_state("2 of 3 centers linked through it.".into());
+    prefs.set_via_tone(nerve_node_desktop::Tone::Warn);
+    shots.take("relay-via");
+    prefs.set_via_relay(false);
+    prefs.invoke_connect_start();
+    let pasted = "nerve://relay?address=relay.lab.example%3A7490&node=laptop-2&token=0123456789abcdefghijklmnopqrstuvwxyz0123456&pin=q1Q3tvgEmVkvsjsZTEOBtG9Rb12pM9iyCOVCTVwjz4A";
+    prefs.set_connect_link(pasted.into());
+    prefs.invoke_connect_read(pasted.into());
+    shots.take("relay-connect");
+    prefs.set_connect_apart(true);
+    prefs.set_connect_address("relay.lab.example:7490".into());
+    prefs.set_connect_node("laptop-2".into());
+    prefs.set_connect_token("0123456789abcdefghijklmnopqrstuvwxyz0123456".into());
+    shots.take("relay-connect-apart");
+    prefs.set_connect_open(false);
+    store.invoke_show(Page::Settings);
+    prefs.set_tab(2);
     let backup = root.join("nerve-node.backup");
     ctl.set_chooser(Arc::new(move |_| Ok(Some(backup.clone()))));
     prefs.invoke_backup_choose();
@@ -722,11 +832,24 @@ fn every_page_light_and_dark() {
     let manual = window.global::<nerve_node_desktop::Manual>();
     manual.set_open(0);
     shots.take("help-open");
-    manual.set_open(10);
-    shots.take_full("help-keys", 1250);
-    manual.set_open(11);
+    manual.set_open(20);
+    shots.take_full("help-keys", 1450);
+    // The command reference: by topic, one command open, filtered, A to Z.
+    manual.set_open(21);
     shots.take("help-commands");
-    shots.take_full("help-commands", 3200);
+    shots.take_full("help-commands", 3300);
+    manual.set_ref_open("center add".into());
+    shots.take_full("help-commands-open", 3500);
+    manual.set_ref_filter("relay".into());
+    manual.invoke_ref_update();
+    shots.take_full("help-commands-filter", 1700);
+    manual.set_ref_filter("".into());
+    manual.set_ref_by_name(true);
+    manual.invoke_ref_update();
+    shots.take_full("help-commands-az", 3300);
+    manual.set_ref_by_name(false);
+    manual.set_ref_open("".into());
+    manual.invoke_ref_update();
     manual.set_open(-1);
     store.invoke_show(Page::Overview);
     store.set_about_open(true);

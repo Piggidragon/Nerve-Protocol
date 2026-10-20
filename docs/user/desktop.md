@@ -63,7 +63,8 @@ installed.
 
 When it is done, **Open Nerve** opens the app. Its first-run steps name the
 machine, choose where the keys live, pair the first center and choose its
-mode. The downloaded file is no longer needed.
+mode; **Back** goes to the step before, **Skip** past one. The downloaded
+file is no longer needed.
 
 | What | Linux | Windows |
 |---|---|---|
@@ -130,7 +131,12 @@ of a command it runs and to a confined program, but a command that has a
 program of yours start another for it, outside the node (your systemd user
 manager, a tmux server, the task scheduler on Windows), runs as you,
 unconfined: it can change the node's settings, and on Windows start and stop
-the service. The Overview warns about it. **Separate account** gives the
+the service. The Overview says so in one card, "Center commands run as you",
+with what that gives them (all you can do, and root where your account is in
+a group such as `docker` or may use sudo). **Don't show again** hides the
+card until the account or those ways to root change; **Settings**,
+**General** keeps the line and shows the card again. **Create a separate
+account** gives the
 commands an account of their own that is no owner: on Linux it makes
 `nerve-work` (with the administrator's password) and runs commands as it; on
 Windows it opens **Settings**, **General**, where you name an
@@ -193,8 +199,8 @@ so the node checks a value as it checks the command line's.
   it cannot (the installed node on Windows, Linux below 7.1, no keyring
   answering for the account the node runs as), the app says why and keeps
   them in files.
-- **Network**: the **Proxy**, and the **Relay** with its nodes and its
-  tunnels (`relay.max_links`, `max_links_per_node`, `max_opens_per_minute`).
+- **Network**: the **Proxy**. The relay has a page of its own
+  ([Relay](#relay)).
 - **Limits**: what one command may use and the most a call may ask for
   (`limits.command`, [limits](limits.md)), how long a command runs
   (`limits.default_timeout_secs`, `max_timeout_secs`, in minutes), and the
@@ -206,7 +212,8 @@ so the node checks a value as it checks the command line's.
   administrator's restore the app stops and starts the service). **Keep its
   keys in files** restores the backup of a machine that kept them in a
   keyring onto one without.
-- **App**: the appearance, **Update…** and **Uninstall…**.
+- **App**: **Update…** and **Uninstall…**. Light, dark or the system's
+  look is chosen at the foot of the sidebar, on every page.
 - **Advanced**: **Any setting** shows and sets any setting of `node.toml`
   by its name, and **Add** and **Remove** change a list, such as
   `policy.protected.allow`; and taking a `node.toml` changed by hand. On
@@ -219,6 +226,14 @@ the installed one), `providers.allowed` ([providers](providers.md)), and
 `policy.protected` of a center ([protected paths](protected-paths.md)).
 A center's other settings are on **Centers** and **Permissions**.
 
+On **Permissions**, the commands that count in the center's mode come first:
+in allowlist mode its allowed commands, with the deny rules below them as
+**Exceptions** (closed until you open them); in folder and user mode its
+forbidden commands, and a line that the allow rules count only in allowlist
+mode. The sudo list is in **Sudo**, beside its switch. The pencil beside a
+rule edits it in place, as one change (`rule edit`), the rules of the guard
+too.
+
 On **Permissions**, a center that lacks the guard against changing the node
 (a pairing from before it, or one you took a rule off) shows **Add the
 guard**, which runs `rule guard` ([rules](rules.md#the-guard-against-changing-the-node)).
@@ -228,10 +243,28 @@ What stays with the terminal: restoring the keys straight into the keyring
 keyring), and the keyring `setup` installs for the node's account on a
 Linux without a desktop session for it.
 
+## Relay
+
+The **Relay** page has both sides of a [relay](relay.md). **This node
+through a relay**: for a machine that reaches no center itself, **Connect…**
+takes the link a relay showed (or its parts: the relay's address, this
+node's name there, its token and the relay's pin), and the page says through
+which relay the node goes and how many of its centers are linked.
+**Disconnect** reaches the centers directly again. **This machine as a
+relay**: its switch and address, its pin, the nodes that use it, each with
+**Centers and limits…**, **New link…** and remove, the tunnels it carries
+now, and its limits (`relay.max_links`, `max_links_per_node`,
+`max_opens_per_minute`). **Add a node…** asks for its name and where it
+reaches this machine, and shows its link once, with **Copy**. A
+`nerve://relay` link you click opens the Relay page with it.
+
 ## Pairing links
 
 A `nerve://` link opens in Nerve and goes straight to what the pairing would
-be. Nothing is paired until you confirm. Nerve has one window: opening it
+be. Before it offers **Pair**, the app checks the link: the center answers,
+its certificate is the pinned one, and the code is still valid. When one of
+these fails it says which, and what to do, and offers no **Pair**. Nothing
+is paired until you confirm. Nerve has one window: opening it
 again, or a link while it is open, goes to the window that is open. A link
 carries the pairing's code and pin, so it goes only to a window of your
 own: where the app cannot make sure of that (on Windows, when a program
@@ -308,7 +341,7 @@ in PowerShell. A batch file waits for it as it is.
 
 | Keys | Do |
 |---|---|
-| Ctrl+1 … Ctrl+7 | Open Overview, Centers, Permissions, Audit, Log, Settings, Help |
+| Ctrl+1 … Ctrl+8 | Open Overview, Centers, Relay, Permissions, Audit, Log, Settings, Help |
 | Ctrl+R, F5 | Read the page again |
 | Esc | Close a dialog |
 | Enter | The dialog's main button |
@@ -318,6 +351,13 @@ in PowerShell. A batch file waits for it as it is.
 
 A click on the page that is open reads nothing again; **Refresh** does.
 
+## Help
+
+**Help** answers short questions, lists these keys, and has the command
+reference: every `nerve-node` command by topic or from A to Z, with a filter.
+A command opens on its arguments, an example, and a button to the place in
+the app that does the same.
+
 ## The app's own settings
 
 With **System**, the app is light or dark as the desktop is. On Linux it asks
@@ -326,7 +366,8 @@ name of its GTK theme (a theme named `…-dark`, as on Zorin OS), and on KDE
 its colour scheme; it follows a change within a few seconds. **Light** and
 **Dark** win over the desktop.
 
-The appearance (system, light or dark) is kept in
+The appearance (system, light or dark), and the card on commands that run as
+you when you hid it, are kept in
 `~/.config/nerve-node-desktop/settings.json` on Linux and
 `%APPDATA%\nerve-node-desktop\settings.json` on Windows, apart from the
 node's settings.

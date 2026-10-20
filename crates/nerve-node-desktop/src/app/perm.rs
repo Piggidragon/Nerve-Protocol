@@ -111,6 +111,10 @@ impl Ctl {
         match all {
             Ok((f, r, k, s)) => {
                 self.with_perm(|p| {
+                    // A row being edited may be another one now.
+                    if !p.get_edit_busy() {
+                        p.set_edit_list(-1);
+                    }
                     p.set_folders(ModelRc::new(VecModel::from(view::folders(&f))));
                     p.set_allow(ModelRc::new(VecModel::from(view::rule_list_of(
                         &r, "allow",
@@ -291,25 +295,43 @@ impl Ctl {
         );
     }
 
-    fn rule_add(self: &Rc<Self>) {
-        let Some((list, text, wildcard)) = self.with_perm(|p| {
-            (
-                p.get_list(),
-                p.get_rule_text().trim().to_string(),
-                p.get_rule_wildcard(),
-            )
-        }) else {
+    /// What the field of `list` holds for a new rule, and its Wildcard.
+    fn new_rule(&self, list: i32) -> Option<(String, bool)> {
+        self.with_perm(|p| match list {
+            0 => (p.get_allow_text(), p.get_allow_wild()),
+            1 => (p.get_deny_text(), p.get_deny_wild()),
+            _ => (p.get_sudo_text(), p.get_sudo_wild()),
+        })
+        .map(|(t, w)| (t.trim().to_string(), w))
+    }
+
+    fn rule_add(self: &Rc<Self>, list: i32) {
+        let Some((text, wildcard)) = self.new_rule(list) else {
             return;
         };
         if text.is_empty() {
             return;
         }
         let word = LISTS[list.clamp(0, 2) as usize];
-        let cleared = |c: &Ctl| {
-            c.with_perm(|p| {
-                p.set_rule_text(SharedString::new());
-                p.set_rule_wildcard(false);
-            });
+        let cleared: fn(&Ctl) = match list {
+            0 => |c| {
+                c.with_perm(|p| {
+                    p.set_allow_text(SharedString::new());
+                    p.set_allow_wild(false);
+                });
+            },
+            1 => |c| {
+                c.with_perm(|p| {
+                    p.set_deny_text(SharedString::new());
+                    p.set_deny_wild(false);
+                });
+            },
+            _ => |c| {
+                c.with_perm(|p| {
+                    p.set_sudo_text(SharedString::new());
+                    p.set_sudo_wild(false);
+                });
+            },
         };
         // A pattern for files or another action goes into the list as it
         // is, as `config add` puts it there; `rule remove` takes it out
@@ -340,6 +362,56 @@ impl Ctl {
             format!("Added to the {word} list."),
             cleared,
             |c, e| c.toast(e, Tone::Danger),
+        );
+    }
+
+    /// `rule edit`: the rule in its row becomes what its field holds, in
+    /// one change.
+    fn rule_edit_save(self: &Rc<Self>) {
+        let Some((list, index, text)) = self.with_perm(|p| {
+            (
+                p.get_edit_list(),
+                p.get_edit_index(),
+                p.get_edit_text().trim().to_string(),
+            )
+        }) else {
+            return;
+        };
+        let rules = self.with_perm(|p| match list {
+            0 => p.get_allow(),
+            1 => p.get_deny(),
+            _ => p.get_sudo_list(),
+        });
+        let Some(old) = rules.and_then(|r| slint::Model::row_data(&r, index as usize)) else {
+            return;
+        };
+        if list < 0 || text.is_empty() || text == old.as_str() {
+            self.with_perm(|p| p.set_edit_list(-1));
+            return;
+        }
+        let word = LISTS[list.clamp(0, 2) as usize];
+        self.with_perm(|p| p.set_edit_busy(true));
+        let args = vec![
+            "rule".into(),
+            "edit".into(),
+            word.into(),
+            old.to_string(),
+            text,
+        ];
+        self.perm_change(
+            args,
+            None,
+            "The rule is changed.".into(),
+            |c| {
+                c.with_perm(|p| {
+                    p.set_edit_busy(false);
+                    p.set_edit_list(-1);
+                });
+            },
+            |c, e| {
+                c.with_perm(|p| p.set_edit_busy(false));
+                c.toast(e, Tone::Danger);
+            },
         );
     }
 
@@ -459,7 +531,9 @@ pub(super) fn wire(ctl: &Rc<Ctl>, window: &crate::AppWindow) {
     let c = ctl.clone();
     p.on_folder_remove(move |path| c.folder_remove(&path));
     let c = ctl.clone();
-    p.on_rule_add(move || c.rule_add());
+    p.on_rule_add(move |list| c.rule_add(list));
+    let c = ctl.clone();
+    p.on_rule_edit_save(move || c.rule_edit_save());
     let c = ctl.clone();
     p.on_rule_remove(move |list, rule| c.rule_remove(list, &rule));
     let c = ctl.clone();

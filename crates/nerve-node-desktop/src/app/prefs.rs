@@ -286,9 +286,15 @@ impl Ctl {
                             p.set_relay_nodes(ModelRc::new(VecModel::from(view::relay_nodes(
                                 &relay,
                             ))));
+                            p.set_tunnels(ModelRc::new(VecModel::from(view::tunnels(
+                                &relay,
+                                super::now_ms(),
+                            ))));
                             p.set_load(Load::Ready);
                             p.set_error(SharedString::new());
                         });
+                        *c.relay_address.borrow_mut() = s(&relay["address"]);
+                        c.via_relay(&proxy);
                     }
                     Err(e) => {
                         c.with_prefs(|p| {
@@ -299,6 +305,194 @@ impl Ctl {
                 }
             },
         );
+    }
+
+    /// Whether this node reaches its centers through a relay (its proxy is
+    /// one: https, with a pin and a login), where, and how its links fare.
+    fn via_relay(&self, proxy: &Value) {
+        let (via, address, node) = view::relay_of(proxy);
+        let st = self.status.borrow();
+        let running = st["daemon"] == "running";
+        let all = st["centers"].as_array().map_or(0, Vec::len);
+        let up = st["centers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|c| c["status"] == "connected")
+            .count();
+        let (state, tone) = if !running {
+            ("The node does not run.".to_string(), Tone::Warn)
+        } else if all == 0 {
+            ("No center paired yet.".to_string(), Tone::Neutral)
+        } else if up == all {
+            (
+                format!("{up} of {all} centers linked through it."),
+                Tone::Ok,
+            )
+        } else if up > 0 {
+            (
+                format!("{up} of {all} centers linked through it."),
+                Tone::Warn,
+            )
+        } else {
+            ("No center linked through it yet.".to_string(), Tone::Danger)
+        };
+        self.with_prefs(|p| {
+            p.set_via_relay(via);
+            p.set_via_address(address.into());
+            p.set_via_node(node.into());
+            p.set_via_state(state.into());
+            p.set_via_tone(tone);
+        });
+    }
+
+    /// Opens the dialog that takes a relay's link.
+    pub(super) fn connect_start(&self) {
+        self.with_prefs(|p| {
+            p.set_connect_link(SharedString::new());
+            p.set_connect_apart(false);
+            p.set_connect_address(SharedString::new());
+            p.set_connect_node(SharedString::new());
+            p.set_connect_token(SharedString::new());
+            p.set_connect_pin(SharedString::new());
+            p.set_connect_summary(SharedString::new());
+            p.set_connect_error(SharedString::new());
+            p.set_connect_busy(false);
+            p.set_connect_open(true);
+        });
+    }
+
+    /// What a pasted link says, once it reads as a relay's link.
+    pub(super) fn connect_read(&self, link: &str) {
+        let summary = match nerve_proto::link::RelayLink::parse(link) {
+            Ok(l) => format!("The relay at {}, this node as {} there.", l.address, l.node),
+            Err(_) => String::new(),
+        };
+        self.with_prefs(|p| {
+            p.set_connect_summary(summary.into());
+            p.set_connect_error(SharedString::new());
+        });
+    }
+
+    /// `proxy set` with the relay as the proxy: its address with this
+    /// node's name, and the pin as arguments, the token on stdin, never as
+    /// an argument, which every process of the machine can read.
+    fn connect_save(self: &Rc<Self>) {
+        let Some((apart, link, address, node, token, pin)) = self.with_prefs(|p| {
+            (
+                p.get_connect_apart(),
+                p.get_connect_link().trim().to_string(),
+                p.get_connect_address().trim().to_string(),
+                p.get_connect_node().trim().to_string(),
+                p.get_connect_token().trim().to_string(),
+                p.get_connect_pin().trim().to_string(),
+            )
+        }) else {
+            return;
+        };
+        let parsed = if apart {
+            // The parts as one link, so they are read as the link is.
+            nerve_proto::link::RelayLink::parse(
+                &nerve_proto::link::RelayLink {
+                    address,
+                    node,
+                    token,
+                    pin,
+                }
+                .render(),
+            )
+        } else {
+            nerve_proto::link::RelayLink::parse(&link)
+        };
+        let l = match parsed {
+            Ok(l) => l,
+            Err(e) => {
+                self.with_prefs(|p| p.set_connect_error(view::sentence_of(&e).into()));
+                return;
+            }
+        };
+        let args = vec![
+            "proxy".into(),
+            "set".into(),
+            format!("https://{}@{}", l.node, l.address),
+            "--pin".into(),
+            l.pin.clone(),
+            "--password-stdin".into(),
+        ];
+        self.with_prefs(|p| {
+            p.set_connect_busy(true);
+            p.set_connect_error(SharedString::new());
+        });
+        let address = l.address.clone();
+        self.command(args, Some(l.token), move |c, answer| {
+            c.with_prefs(|p| p.set_connect_busy(false));
+            match answer {
+                Ok(v) => {
+                    c.with_prefs(|p| {
+                        p.set_connect_open(false);
+                        p.set_connect_token(SharedString::new());
+                        p.set_connect_link(SharedString::new());
+                    });
+                    c.done(
+                        &v,
+                        format!("This node reaches its centers through {address} now."),
+                    );
+                }
+                Err(e) => {
+                    c.with_prefs(|p| p.set_connect_error(e.into()));
+                }
+            }
+            c.prefs_load();
+            c.refresh_status();
+        });
+    }
+
+    /// Opens the dialog that makes a node's link: a new node, or with
+    /// `token_for` a new link for that one. The address is the relay's
+    /// guess (`relay ls`), which the owner may change.
+    fn relay_add_start(&self, token_for: &str) {
+        let address = self.relay_address.borrow().clone();
+        self.with_prefs(|p| {
+            p.set_relay_add_for(token_for.into());
+            p.set_relay_add_name(SharedString::new());
+            p.set_relay_add_address(address.into());
+            p.set_relay_add_error(SharedString::new());
+            p.set_relay_add_busy(false);
+            p.set_relay_add_open(true);
+        });
+    }
+
+    /// `relay add` or `relay token` with the address, then the link once.
+    fn relay_add_confirm(self: &Rc<Self>) {
+        let Some((token_for, name, address)) = self.with_prefs(|p| {
+            (
+                p.get_relay_add_for().to_string(),
+                p.get_relay_add_name().trim().to_string(),
+                p.get_relay_add_address().trim().to_string(),
+            )
+        }) else {
+            return;
+        };
+        let (mut args, title) = if token_for.is_empty() {
+            (
+                vec!["relay".into(), "add".into(), name.clone()],
+                format!("Link for {name}"),
+            )
+        } else {
+            (
+                vec!["relay".into(), "token".into(), token_for.clone()],
+                format!("New link for {token_for}"),
+            )
+        };
+        if !address.is_empty() {
+            args.push("--address".into());
+            args.push(address);
+        }
+        self.with_prefs(|p| {
+            p.set_relay_add_busy(true);
+            p.set_relay_add_error(SharedString::new());
+        });
+        self.relay_token_shown(args, title);
     }
 
     /// A change on the Settings page: says `said` (or what the command
@@ -511,19 +705,21 @@ impl Ctl {
         });
     }
 
-    /// A relay change whose answer holds a token shown once.
+    /// A relay change whose answer holds a link shown once.
     fn relay_token_shown(self: &Rc<Self>, args: Vec<String>, title: String) {
         self.command(args, None, move |c, answer| {
+            c.with_prefs(|p| p.set_relay_add_busy(false));
             match answer {
                 Ok(v) => {
+                    c.with_prefs(|p| p.set_relay_add_open(false));
                     let (mut text, copy) = view::relay_token(&v);
                     let restart = c.restart_for(&v);
                     match restart {
                         super::Restart::Soon | super::Restart::AtEnd => text.push_str(
-                            " This node restarts in a moment, so that the relay takes the token.",
+                            " This node restarts in a moment, so that the relay takes it.",
                         ),
                         super::Restart::AtStart => {
-                            text.push_str(" The relay takes the token when this node starts.")
+                            text.push_str(" The relay takes it when this node starts.")
                         }
                         super::Restart::No => {}
                     }
@@ -532,9 +728,10 @@ impl Ctl {
                         c.restart_soon();
                     }
                 }
-                Err(e) => c.toast(e, Tone::Danger),
+                Err(e) => {
+                    c.with_prefs(|p| p.set_relay_add_error(e.into()));
+                }
             }
-            c.with_prefs(|p| p.set_relay_new_node(SharedString::new()));
             c.prefs_load();
         });
     }
@@ -1054,20 +1251,24 @@ pub(super) fn wire(ctl: &Rc<Ctl>, window: &crate::AppWindow) {
     let c = ctl.clone();
     p.on_relay_off(move || c.prefs_change(vec!["relay".into(), "off".into()], None, String::new()));
     let c = ctl.clone();
-    p.on_relay_add(move || {
-        let name = c
-            .with_prefs(|p| p.get_relay_new_node().trim().to_string())
-            .unwrap_or_default();
-        let title = format!("Token for {name}");
-        c.relay_token_shown(vec!["relay".into(), "add".into(), name], title);
-    });
+    p.on_relay_add(move || c.relay_add_start(""));
     let c = ctl.clone();
-    p.on_relay_token(move |name| {
-        let title = format!("New token for {name}");
-        c.relay_token_shown(
-            vec!["relay".into(), "token".into(), name.to_string()],
-            title,
-        );
+    p.on_relay_token(move |name| c.relay_add_start(&name));
+    let c = ctl.clone();
+    p.on_relay_add_confirm(move || c.relay_add_confirm());
+    let c = ctl.clone();
+    p.on_connect_start(move || c.connect_start());
+    let c = ctl.clone();
+    p.on_connect_read(move |link| c.connect_read(&link));
+    let c = ctl.clone();
+    p.on_connect_save(move || c.connect_save());
+    let c = ctl.clone();
+    p.on_disconnect(move || {
+        c.prefs_change(
+            vec!["proxy".into(), "rm".into()],
+            None,
+            "This node reaches its centers directly again.".into(),
+        )
     });
     let c = ctl.clone();
     p.on_relay_remove(move |name| {

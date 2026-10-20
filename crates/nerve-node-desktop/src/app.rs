@@ -33,6 +33,10 @@ pub enum Exec {
     Inline,
 }
 
+/// How the app asks the desktop whether it is dark (crate::scheme): none
+/// when it does not say.
+pub type SchemeSource = fn() -> Option<bool>;
+
 /// What the owner picks in one of the system's file dialogs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Choose {
@@ -135,6 +139,12 @@ pub struct Ctl {
     /// Asks the desktop now and then whether it is dark, while the app
     /// follows it (crate::scheme).
     scheme_timer: slint::Timer,
+    /// What the desktop said last of its light or dark: not asked yet, it
+    /// did not say (`Some(None)`), or whether it is dark.
+    desktop_dark: Cell<Option<Option<bool>>>,
+    /// How the desktop is asked (crate::scheme::dark_here); none in tests
+    /// and screenshots, which set the look themselves.
+    scheme_source: Cell<Option<SchemeSource>>,
     /// Every command of the CLI, for the Help page's reference.
     reference: Vec<crate::reference::Command>,
     /// The commands and topics of the reference the owner opened or closed.
@@ -322,6 +332,10 @@ impl Ctl {
             restart_timer: slint::Timer::default(),
             restart_waits: Cell::new(false),
             scheme_timer: slint::Timer::default(),
+            desktop_dark: Cell::new(None),
+            scheme_source: Cell::new(
+                (exec == Exec::Threads).then_some(crate::scheme::dark_here as SchemeSource),
+            ),
             reference: crate::reference::commands(&nerve_node::cli::help()),
             ref_opened: RefCell::default(),
             root_via: RefCell::new(None),
@@ -1229,6 +1243,11 @@ impl Ctl {
         }
     }
 
+    /// Shows the app light, dark, or (0) as the desktop is. Each change is
+    /// one step: choosing the desktop's look takes what the desktop said
+    /// last, and before it said anything the look stays as it is until it
+    /// does, never Slint's own reading in between, which may be light on a
+    /// dark desktop (a white flash).
     fn show_appearance(self: &Rc<Self>, i: i32) {
         let Some(w) = self.window.upgrade() else {
             return;
@@ -1238,7 +1257,11 @@ impl Ctl {
             1 => w.invoke_set_dark(false),
             2 => w.invoke_set_dark(true),
             _ => {
-                w.invoke_follow_system();
+                match self.desktop_dark.get() {
+                    Some(Some(dark)) => w.invoke_set_dark(dark),
+                    Some(None) => w.invoke_follow_system(),
+                    None => {}
+                }
                 self.follow_desktop();
             }
         }
@@ -1247,27 +1270,42 @@ impl Ctl {
         }
     }
 
+    /// Asks the desktop how it asks it ([`Ctl::set_scheme_source`]).
+    pub fn set_scheme_source(&self, source: Option<SchemeSource>) {
+        self.scheme_source.set(source);
+    }
+
+    /// What the desktop said of its look (none: it did not say), kept for
+    /// the next choice of the desktop's look, and shown while that is the
+    /// choice: dark or light at once, or Slint's own reading when the
+    /// desktop did not say.
+    pub fn desktop_said(&self, dark: Option<bool>) {
+        self.desktop_dark.set(Some(dark));
+        let Some(w) = self.window.upgrade() else {
+            return;
+        };
+        if w.global::<Store>().get_appearance() != 0 {
+            return;
+        }
+        match dark {
+            Some(dark) => w.invoke_set_dark(dark),
+            None => w.invoke_follow_system(),
+        }
+    }
+
     /// Follows the desktop's light or dark as the desktop keeps it
-    /// (crate::scheme), now and every few seconds, so a switch there shows
-    /// here too. Where the desktop does not say, Slint's own reading stays.
+    /// (crate::scheme), now and, with an event loop, every few seconds, so
+    /// a switch there shows here too.
     fn follow_desktop(self: &Rc<Self>) {
-        // No event loop, no timers: tests and the screenshots set the look.
+        let Some(source) = self.scheme_source.get() else {
+            return;
+        };
+        let ask = move |c: &Rc<Ctl>| c.job(move |_| source(), |c, dark| c.desktop_said(dark));
+        ask(self);
+        // No event loop, no timers.
         if self.exec != Exec::Threads {
             return;
         }
-        let ask = |c: &Rc<Ctl>| {
-            c.job(
-                |_| crate::scheme::dark_here(),
-                |c, dark| {
-                    let following = c.with_store(|s| s.get_appearance() == 0);
-                    if let (Some(true), Some(dark), Some(w)) = (following, dark, c.window.upgrade())
-                    {
-                        w.invoke_set_dark(dark);
-                    }
-                },
-            )
-        };
-        ask(self);
         let c = Rc::downgrade(self);
         self.scheme_timer.start(
             slint::TimerMode::Repeated,
@@ -1302,6 +1340,11 @@ pub fn run(start: crate::instance::Asked) -> Result<(), Failed> {
     if here != installed {
         start.program = here.as_ref().map(|p| p.display().to_string());
     }
+    // The desktop's look is asked at once, so the window opens in it and
+    // not light first on a dark desktop; it may take a moment, and is not
+    // waited for long.
+    let (said, look) = std::sync::mpsc::channel();
+    std::thread::spawn(move || said.send(crate::scheme::dark_here()));
     let instance = match crate::instance::claim(&start) {
         crate::instance::Claimed::Forwarded => return Ok(()),
         crate::instance::Claimed::First(i) => i,
@@ -1338,6 +1381,9 @@ pub fn run(start: crate::instance::Asked) -> Result<(), Failed> {
             None => ctl.offer_setup(),
         }
         ctl.watch();
+    }
+    if let Ok(dark) = look.recv_timeout(Duration::from_millis(400)) {
+        ctl.desktop_said(dark);
     }
     let r = window
         .show()

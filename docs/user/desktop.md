@@ -365,7 +365,8 @@ With **System**, the app is light or dark as the desktop is. On Linux it asks
 the desktop portal's `color-scheme`, then GNOME's `color-scheme` and the
 name of its GTK theme (a theme named `…-dark`, as on Zorin OS), and on KDE
 its colour scheme; it follows a change within a few seconds. **Light** and
-**Dark** win over the desktop.
+**Dark** win over the desktop. A change of the look comes in one step, with no
+light frame between two dark ones.
 
 The appearance (system, light or dark), and the card on commands that run as
 you when you hid it, are kept in

@@ -830,27 +830,31 @@ fn every_page_light_and_dark() {
     store.invoke_show(Page::Help);
     shots.take("help");
     let manual = window.global::<nerve_node_desktop::Manual>();
-    manual.set_open(0);
-    shots.take("help-open");
-    manual.set_open(20);
-    shots.take_full("help-keys", 1450);
-    // The command reference: by topic, one command open, filtered, A to Z.
-    manual.set_open(21);
-    shots.take("help-commands");
-    shots.take_full("help-commands", 3300);
-    manual.set_ref_open("center add".into());
-    shots.take_full("help-commands-open", 3500);
+    manual.set_keys_open(true);
+    shots.take_full("help-keys", 1000);
+    // The command reference beside the keys: by topic, two commands open,
+    // a topic closed, filtered, A to Z.
+    manual.set_commands_open(true);
+    shots.take("help-both");
+    shots.take_full("help-commands", 3600);
+    manual.invoke_ref_toggle("center add".into());
+    manual.invoke_ref_toggle("relay add".into());
+    manual.invoke_ref_group_toggle("Install".into());
+    shots.take_full("help-commands-open", 4400);
     manual.set_ref_filter("relay".into());
     manual.invoke_ref_update();
-    shots.take_full("help-commands-filter", 1700);
+    shots.take_full("help-commands-filter", 2200);
     manual.set_ref_filter("".into());
     manual.set_ref_by_name(true);
     manual.invoke_ref_update();
-    shots.take_full("help-commands-az", 3300);
+    shots.take_full("help-commands-az", 4200);
     manual.set_ref_by_name(false);
-    manual.set_ref_open("".into());
+    manual.invoke_ref_toggle("center add".into());
+    manual.invoke_ref_toggle("relay add".into());
+    manual.invoke_ref_group_toggle("Install".into());
     manual.invoke_ref_update();
-    manual.set_open(-1);
+    manual.set_keys_open(false);
+    manual.set_commands_open(false);
     store.invoke_show(Page::Overview);
     store.set_about_open(true);
     shots.take("about");

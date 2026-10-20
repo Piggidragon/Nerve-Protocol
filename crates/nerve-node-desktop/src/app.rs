@@ -137,6 +137,8 @@ pub struct Ctl {
     scheme_timer: slint::Timer,
     /// Every command of the CLI, for the Help page's reference.
     reference: Vec<crate::reference::Command>,
+    /// The commands and topics of the reference the owner opened or closed.
+    ref_opened: RefCell<crate::reference::Opened>,
     /// How a command run as an account gets root besides, by account, as
     /// found once ([`root_via`]).
     root_via: RefCell<Option<(String, String)>>,
@@ -321,6 +323,7 @@ impl Ctl {
             restart_waits: Cell::new(false),
             scheme_timer: slint::Timer::default(),
             reference: crate::reference::commands(&nerve_node::cli::help()),
+            ref_opened: RefCell::default(),
             root_via: RefCell::new(None),
             relay_address: RefCell::new(String::new()),
         });
@@ -330,6 +333,20 @@ impl Ctl {
         let manual = window.global::<Manual>();
         let c = ctl.clone();
         manual.on_ref_update(move || c.reference_shown());
+        let c = ctl.clone();
+        manual.on_ref_toggle(move |name| {
+            if let Some(w) = c.window.upgrade() {
+                let shown = w.global::<Manual>().get_ref_groups();
+                c.ref_opened.borrow_mut().toggle_command(&shown, &name);
+            }
+        });
+        let c = ctl.clone();
+        manual.on_ref_group_toggle(move |name| {
+            if let Some(w) = c.window.upgrade() {
+                let shown = w.global::<Manual>().get_ref_groups();
+                c.ref_opened.borrow_mut().toggle_topic(&shown, &name);
+            }
+        });
         let c = ctl.clone();
         manual.on_ref_go(move |page, tab| {
             if tab >= 0 {
@@ -758,8 +775,12 @@ impl Ctl {
             return;
         };
         let m = w.global::<Manual>();
-        let groups =
-            crate::reference::groups(&self.reference, &m.get_ref_filter(), m.get_ref_by_name());
+        let groups = crate::reference::groups(
+            &self.reference,
+            &m.get_ref_filter(),
+            m.get_ref_by_name(),
+            &self.ref_opened.borrow(),
+        );
         m.set_ref_groups(ModelRc::new(VecModel::from(groups)));
     }
 

@@ -120,6 +120,8 @@ export struct RefRow {
     // The tab of Settings, -1 for none.
     tab: int,
     place: string,
+    // It shows its arguments and example.
+    open: bool,
 }
 
 // A topic of the reference and its commands; one without a name when the
@@ -127,6 +129,8 @@ export struct RefRow {
 export struct RefGroup {
     name: string,
     rows: [RefRow],
+    // Its commands show; a list from A to Z (no name) is always open.
+    open: bool,
 }
 
 export struct RelayNodeRow {

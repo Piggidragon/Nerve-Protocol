@@ -4,7 +4,9 @@
 //! example and the place, is written here once per command; a test fails
 //! for a command that has none, so a new one cannot be left out.
 
-use slint::{ModelRc, SharedString, VecModel};
+use std::collections::BTreeSet;
+
+use slint::{Model, ModelRc, SharedString, VecModel};
 
 use crate::{HelpArg, Page, RefGroup, RefRow};
 
@@ -386,9 +388,52 @@ pub fn commands(h: &nerve_node::cli::Help) -> Vec<Command> {
     out
 }
 
+/// What of the reference the owner opened: commands by name, and the topics
+/// they closed (a topic is open until then). Each opens and closes on its
+/// own, and a new filter or order keeps them.
+#[derive(Debug, Default)]
+pub struct Opened {
+    pub commands: BTreeSet<String>,
+    pub shut_topics: BTreeSet<String>,
+}
+
+impl Opened {
+    /// Opens a shut command, or shuts an open one, also where `shown`
+    /// shows it now: in place, so the rest of the page stays as it is.
+    pub fn toggle_command(&mut self, shown: &ModelRc<RefGroup>, name: &str) {
+        let open = !self.commands.remove(name);
+        if open {
+            self.commands.insert(name.to_string());
+        }
+        for g in shown.iter() {
+            for (i, mut r) in g.rows.iter().enumerate() {
+                if r.name == name {
+                    r.open = open;
+                    g.rows.set_row_data(i, r);
+                }
+            }
+        }
+    }
+
+    /// [`Opened::toggle_command`] for a topic.
+    pub fn toggle_topic(&mut self, shown: &ModelRc<RefGroup>, name: &str) {
+        let open = self.shut_topics.remove(name);
+        if !open {
+            self.shut_topics.insert(name.to_string());
+        }
+        for (i, mut g) in shown.iter().enumerate() {
+            if g.name == name {
+                g.open = open;
+                shown.set_row_data(i, g);
+            }
+        }
+    }
+}
+
 /// What the reference shows for `filter`: by topic, or with `by_name` one
-/// list from A to Z; topics with no match left out.
-pub fn groups(all: &[Command], filter: &str, by_name: bool) -> Vec<RefGroup> {
+/// list from A to Z; topics with no match left out; open what `opened`
+/// says.
+pub fn groups(all: &[Command], filter: &str, by_name: bool, opened: &Opened) -> Vec<RefGroup> {
     let picked: Vec<&Command> = all.iter().filter(|c| c.matches(filter)).collect();
     let row = |c: &Command| RefRow {
         topic: c.topic.as_str().into(),
@@ -415,9 +460,11 @@ pub fn groups(all: &[Command], filter: &str, by_name: bool) -> Vec<RefGroup> {
         page: c.place.0.unwrap_or(Page::Help),
         tab: c.place.1,
         place: SharedString::from(c.place.2),
+        open: opened.commands.contains(&c.name),
     };
     let group = |name: &str, rows: Vec<&Command>| RefGroup {
         name: name.into(),
+        open: name.is_empty() || !opened.shut_topics.contains(name),
         rows: ModelRc::new(VecModel::from(
             rows.into_iter().map(row).collect::<Vec<_>>(),
         )),
@@ -445,7 +492,6 @@ pub fn groups(all: &[Command], filter: &str, by_name: bool) -> Vec<RefGroup> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use slint::Model;
 
     /// Every command of the CLI has its example and place here, and nothing
     /// here names a command the CLI has not.
@@ -472,7 +518,7 @@ mod tests {
     #[test]
     fn the_reference_filters_and_sorts() {
         let all = commands(&nerve_node::cli::help());
-        let topics = groups(&all, "", false);
+        let topics = groups(&all, "", false, &Opened::default());
         let names: Vec<String> = topics.iter().map(|g| g.name.to_string()).collect();
         assert_eq!(
             names,
@@ -500,7 +546,7 @@ mod tests {
         assert!(rotate.about.contains("7 more days"), "{}", rotate.about);
         // A filter: every word somewhere, in any case; the topics without a
         // match go.
-        let found = groups(&all, "PIN relay", false);
+        let found = groups(&all, "PIN relay", false, &Opened::default());
         assert_eq!(
             found.len(),
             1,
@@ -508,9 +554,9 @@ mod tests {
             found.iter().map(|g| g.name.to_string()).collect::<Vec<_>>()
         );
         assert!(found[0].rows.iter().any(|r| r.name == "proxy set"));
-        assert!(groups(&all, "no-such-thing", false).is_empty());
+        assert!(groups(&all, "no-such-thing", false, &Opened::default()).is_empty());
         // From A to Z: one list.
-        let az = groups(&all, "center", true);
+        let az = groups(&all, "center", true, &Opened::default());
         assert_eq!(az.len(), 1);
         let n: Vec<String> = az[0].rows.iter().map(|r| r.name.to_string()).collect();
         let mut sorted = n.clone();
@@ -518,5 +564,47 @@ mod tests {
         assert_eq!(n, sorted);
         assert!(n.contains(&"center add".to_string()));
         assert_eq!(first_line("Give a key; then more. And more."), "Give a key");
+    }
+
+    /// Commands and topics open and close each on their own, in place, and
+    /// stay so across a new filter or order.
+    #[test]
+    fn commands_and_topics_open_each_on_their_own() {
+        let all = commands(&nerve_node::cli::help());
+        let mut opened = Opened::default();
+        let shown = ModelRc::new(VecModel::from(groups(&all, "", false, &opened)));
+        let row = |shown: &ModelRc<RefGroup>, name: &str| {
+            shown
+                .iter()
+                .flat_map(|g| g.rows.iter().collect::<Vec<_>>())
+                .find(|r| r.name == name)
+                .unwrap()
+        };
+        let topic =
+            |shown: &ModelRc<RefGroup>, name: &str| shown.iter().find(|g| g.name == name).unwrap();
+        assert!(shown.iter().all(|g| g.open), "topics start open");
+        assert!(!row(&shown, "center add").open);
+        opened.toggle_command(&shown, "center add");
+        opened.toggle_command(&shown, "relay add");
+        assert!(row(&shown, "relay add").open);
+        assert!(
+            row(&shown, "center add").open,
+            "a second one closed the first"
+        );
+        opened.toggle_topic(&shown, "Install");
+        assert!(!topic(&shown, "Install").open);
+        assert!(topic(&shown, "Permissions").open);
+        // A new filter, and A to Z, keep what is open.
+        let again = ModelRc::new(VecModel::from(groups(&all, "add", false, &opened)));
+        assert!(row(&again, "center add").open && row(&again, "relay add").open);
+        assert!(!row(&again, "folder add").open);
+        let az = ModelRc::new(VecModel::from(groups(&all, "", true, &opened)));
+        assert!(az.row_data(0).unwrap().open, "the list from A to Z is open");
+        assert!(row(&az, "center add").open);
+        opened.toggle_command(&shown, "center add");
+        assert!(!row(&shown, "center add").open);
+        assert!(row(&shown, "relay add").open);
+        opened.toggle_topic(&shown, "Install");
+        assert!(topic(&shown, "Install").open);
     }
 }

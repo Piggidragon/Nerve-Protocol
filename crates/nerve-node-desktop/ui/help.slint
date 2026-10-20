@@ -1,14 +1,14 @@
-// Help: short questions and answers on what people do with the app, its
-// keys, and the command reference: every nerve-node command by topic or
-// from A to Z, to filter, each one opening on its arguments, an example and
-// the place in the app that does the same (src/reference.rs). Each action in
-// the app runs one of these commands.
+// Help: the app's keys and the command reference: every nerve-node command
+// by topic or from A to Z, to filter, each one opening on its arguments, an
+// example and the place in the app that does the same (src/reference.rs).
+// Each action in the app runs one of these commands. Every part opens and
+// closes on its own: opening one leaves the others as they are.
 
 import { Theme, Type, Space, Radius, Tone } from "theme.slint";
 import { Page, RefRow } from "data.slint";
 import { Manual, Store, Prefs } from "store.slint";
 import {
-    Button, ButtonKind, Card, PageHeader, PageFrame, Divider, Code, Fit, Reveal, Expander, SectionTitle,
+    Button, ButtonKind, Card, PageHeader, PageFrame, Divider, Code, Fit, Reveal, Expander,
     TextField, Segmented, Icon, Pill, FocusRing,
 } from "widgets.slint";
 
@@ -18,7 +18,7 @@ import {
 component CommandRow inherits Rectangle {
     in property <RefRow> item;
     in property <bool> topic;
-    property <bool> open: Manual.ref-open == root.item.name;
+    property <bool> open: root.item.open;
     background: root.open ? Theme.surface : Theme.surface-alt;
     border-radius: Radius.md;
     border-width: 1px;
@@ -31,7 +31,7 @@ component CommandRow inherits Rectangle {
             accessible-expandable: true;
             accessible-expanded: root.open;
             accessible-action-default => {
-                Manual.ref-open = root.open ? "" : root.item.name;
+                Manual.ref-toggle(root.item.name);
             }
             FocusRing {
                 x: -3px;
@@ -82,14 +82,14 @@ component CommandRow inherits Rectangle {
             TouchArea {
                 mouse-cursor: MouseCursor.pointer;
                 clicked => {
-                    Manual.ref-open = root.open ? "" : root.item.name;
+                    Manual.ref-toggle(root.item.name);
                 }
             }
             focus := FocusScope {
                 focus-on-click: false;
                 key-pressed(event) => {
                     if (event.text == " " || event.text == Key.Return) {
-                        Manual.ref-open = root.open ? "" : root.item.name;
+                        Manual.ref-toggle(root.item.name);
                         return accept;
                     }
                     reject
@@ -230,14 +230,72 @@ component KeyRow {
     }
 }
 
-// A question that opens on its answer; `index` is its place in Manual.open.
-component Question inherits Expander {
-    in property <int> index;
-    open: Manual.open == root.index;
-    toggled => {
-        Manual.open = Manual.open == root.index ? -1 : root.index;
+// The head of a topic of the reference: a click opens or closes its
+// commands.
+component GroupHead inherits Rectangle {
+    in property <string> name;
+    in property <int> count;
+    in property <bool> open;
+    callback toggled();
+    accessible-role: button;
+    accessible-label: root.name;
+    accessible-expandable: true;
+    accessible-expanded: root.open;
+    accessible-action-default => {
+        root.toggled();
     }
-    @children
+    FocusRing {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        shown: focus.has-focus;
+    }
+    HorizontalLayout {
+        spacing: Space.sm;
+        padding-top: 2px;
+        padding-bottom: 2px;
+        VerticalLayout {
+            alignment: center;
+            Icon {
+                source: root.open ? @image-url("icons/chev.svg") : @image-url("icons/chev-right.svg");
+                colorize: Theme.accent-text;
+            }
+        }
+        Text {
+            text: root.name;
+            color: Theme.accent-text;
+            font-size: Type.body;
+            font-weight: Type.semibold;
+            vertical-alignment: center;
+        }
+        VerticalLayout {
+            alignment: center;
+            Pill {
+                text: root.count;
+                tone: Tone.accent;
+            }
+        }
+        Rectangle {
+            horizontal-stretch: 1;
+        }
+    }
+    TouchArea {
+        mouse-cursor: MouseCursor.pointer;
+        clicked => {
+            root.toggled();
+        }
+    }
+    focus := FocusScope {
+        focus-on-click: false;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == Key.Return) {
+                root.toggled();
+                return accept;
+            }
+            reject
+        }
+    }
 }
 
 export component HelpPage inherits PageFrame {
@@ -257,104 +315,12 @@ export component HelpPage inherits PageFrame {
     Rectangle {
         height: Space.xs;
     }
-    SectionTitle {
-        text: "Questions";
-        icon: @image-url("icons/help.svg");
-    }
-    Question {
-        index: 0;
-        title: "How do I pair a center?";
-        Answer {
-            text: "In the center's web UI, press Pair a machine and copy the link. Here, press Pair a center on Centers and paste it. The app checks the link, then you press Pair. A nerve:// link you click opens here too.";
-        }
-    }
-    Question {
-        index: 1;
-        title: "A new center may do nothing. How do I allow something?";
-        Answer {
-            text: "On Permissions, pick the center. Add an allow rule for a command, give it folders and choose folder mode, or choose user mode for a while.";
-        }
-    }
-    Question {
-        index: 2;
-        title: "A call was refused. How do I allow it?";
-        Answer {
-            text: "On Audit, choose Refused. Allow lets that call run from now on, Allow as wildcard the program with anything after it. Deny keeps it refused.";
-        }
-    }
-    Question {
-        index: 3;
-        title: "What do the modes mean?";
-        Answer {
-            text: "Allowlist: only what an allow rule names. Folder: what each of the center's folders allows. User: anything you may do, protected files aside. Deny rules count in every mode.";
-        }
-    }
-    Question {
-        index: 4;
-        title: "How do I stop everything at once?";
-        Answer {
-            text: "Press Panic on the Overview. Every link ends and nothing runs until you press Unlock.";
-        }
-    }
-    Question {
-        index: 5;
-        title: "How do I let a command run with sudo?";
-        Answer {
-            text: "Turn sudo on under Permissions with your password, and add the command to the center's sudo list there.";
-        }
-    }
-    Question {
-        index: 6;
-        title: "Center commands run as me. What can they do?";
-        Answer {
-            text: "All you can: read and change your files, use your programs and your open sessions, and change Nerve's settings. In a group such as docker, or with sudo, a command can get root and Nerve's keys with it. An account of their own keeps them away from all that: Create a separate account, on the Overview or under Settings, General.";
-        }
-    }
-    Question {
-        index: 7;
-        title: "Why do commands run without limits?";
-        Answer {
-            text: "Nerve holds each command to its memory, CPU and processes in a cgroup that systemd gives the service. Without one (a system without cgroup v2, or a controller turned off) commands run unlimited. Restart the service; if the warning stays, the Log's Problems say why. Windows does not limit commands yet.";
-        }
-    }
-    Question {
-        index: 8;
-        title: "This machine reaches no center. How do I go through another one?";
-        Answer {
-            text: "On a machine that reaches the center, open Relay, turn the relay on and press Add a node: it shows a link. Here, on Relay, press Connect and paste it.";
-        }
-    }
-    Question {
-        index: 9;
-        title: "How do I move the node to another machine?";
-        Answer {
-            text: "Under Settings, Backup: back it up here and restore it there. The passphrase protects the file.";
-        }
-    }
-    Question {
-        index: 10;
-        title: "The node does not run. What now?";
-        Answer {
-            text: "Press Start on the Overview. If it stops again, the Log's Problems say why.";
-        }
-    }
-    Question {
-        index: 11;
-        title: "How do I update or uninstall Nerve?";
-        Answer {
-            text: "Under Settings, App.";
-        }
-    }
-    Rectangle {
-        height: Space.md;
-    }
-    SectionTitle {
-        text: "Reference";
-        icon: @image-url("icons/book.svg");
-    }
-    Question {
-        index: 20;
+    Expander {
         title: "Keyboard shortcuts";
+        open: Manual.keys-open;
+        toggled => {
+            Manual.keys-open = !Manual.keys-open;
+        }
         icon: @image-url("icons/keyboard.svg");
         KeyRow {
             keys: "Ctrl+1 … Ctrl+8";
@@ -385,9 +351,12 @@ export component HelpPage inherits PageFrame {
             does: "Choose in a row of choices or tabs";
         }
     }
-    Question {
-        index: 21;
+    Expander {
         title: "Command reference";
+        open: Manual.commands-open;
+        toggled => {
+            Manual.commands-open = !Manual.commands-open;
+        }
         icon: @image-url("icons/terminal.svg");
         Answer {
             text: "Every action here runs one of these nerve-node commands, with the same checks and audit records.";
@@ -432,35 +401,28 @@ export component HelpPage inherits PageFrame {
         }
         for g in Manual.ref-groups: Fit {
             VerticalLayout {
-                spacing: 6px;
                 padding-top: Space.sm;
                 Reveal {
                     shown: g.name != "";
-                    HorizontalLayout {
-                        spacing: Space.sm;
-                        padding-bottom: 2px;
-                        Text {
-                            text: g.name;
-                            color: Theme.accent-text;
-                            font-size: Type.body;
-                            font-weight: Type.semibold;
-                            vertical-alignment: center;
-                        }
-                        VerticalLayout {
-                            alignment: center;
-                            Pill {
-                                text: g.rows.length;
-                                tone: Tone.accent;
-                            }
-                        }
-                        Rectangle {
-                            horizontal-stretch: 1;
+                    GroupHead {
+                        name: g.name;
+                        count: g.rows.length;
+                        open: g.open;
+                        toggled => {
+                            Manual.ref-group-toggle(g.name);
                         }
                     }
                 }
-                for r in g.rows: CommandRow {
-                    item: r;
-                    topic: g.name == "";
+                Reveal {
+                    shown: g.open;
+                    gap: g.name != "" ? 6px : 0px;
+                    VerticalLayout {
+                        spacing: 6px;
+                        for r in g.rows: CommandRow {
+                            item: r;
+                            topic: g.name == "";
+                        }
+                    }
                 }
             }
         }

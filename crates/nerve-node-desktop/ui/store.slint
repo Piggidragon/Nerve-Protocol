@@ -231,16 +231,18 @@ export global Logs {
     callback more();
 }
 
-// The Help page: which of its parts is open (-1: none; the keyboard's
-// shortcuts are part 20, the commands 21), and the command reference
-// (src/reference.rs): what it shows for the filter and the order, and the
-// command that is open.
+// The Help page: whether its keys and its command reference are open, and
+// the reference (src/reference.rs): what it shows for the filter and the
+// order. Each part, topic and command opens and closes on its own.
 export global Manual {
-    in-out property <int> open: -1;
+    in-out property <bool> keys-open;
+    in-out property <bool> commands-open;
     in-out property <[RefGroup]> ref-groups;
     in-out property <string> ref-filter;
     in-out property <bool> ref-by-name;
-    in-out property <string> ref-open;
+    // A command (by its name) or a topic opens or closes.
+    callback ref-toggle(string);
+    callback ref-group-toggle(string);
     // The filter or the order changed.
     callback ref-update();
     // Opens the page, and the tab of Settings (-1: none), a command's work

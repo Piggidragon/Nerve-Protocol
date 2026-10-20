@@ -3,7 +3,7 @@
 
 import { Theme, Type, Space, Radius, Tone } from "theme.slint";
 import { Page, Load } from "data.slint";
-import { Store, Manual } from "store.slint";
+import { Store } from "store.slint";
 import {
     Button, ButtonKind, Card, Pill, StatusDot, IconTile, Banner, Loading, PageHeader,
     PageFrame, SectionTitle, StatTile, Divider, Icon, Reveal, Fit,
@@ -294,8 +294,7 @@ export component OverviewPage inherits PageFrame {
                             kind: ButtonKind.ghost;
                             small: true;
                             clicked => {
-                                Store.show(Page.help);
-                                Manual.open = 6;
+                                Platform.open-url("https://github.com/Piggidragon/Nerve-Protocol/blob/main/docs/user/desktop.md#administrator-rights");
                             }
                         }
                         Button {
@@ -325,8 +324,7 @@ export component OverviewPage inherits PageFrame {
                 if (Store.status.limits-restart && Store.service-state == "running") {
                     Store.service("restart");
                 } else {
-                    Store.show(Page.help);
-                    Manual.open = 7;
+                    Platform.open-url("https://github.com/Piggidragon/Nerve-Protocol/blob/main/docs/user/limits.md#where-the-limits-hold");
                 }
             }
         }

@@ -353,10 +353,11 @@ A click on the page that is open reads nothing again; **Refresh** does.
 
 ## Help
 
-**Help** answers short questions, lists these keys, and has the command
-reference: every `nerve-node` command by topic or from A to Z, with a filter.
-A command opens on its arguments, an example, and a button to the place in
-the app that does the same.
+**Help** lists these keys and has the command reference: every `nerve-node`
+command by topic or from A to Z, with a filter. A command opens on its
+arguments, an example, and a button to the place in the app that does the
+same. The keys, the reference, each topic and each command open and close on
+their own.
 
 ## The app's own settings
 

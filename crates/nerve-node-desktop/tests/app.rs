@@ -414,7 +414,7 @@ fn the_app_drives_the_cli_end_to_end() {
     // The answer of a reading the page asked for before its last one (the
     // owner picked another center meanwhile) comes late: it is dropped.
     let stale = ctl.perm_asked();
-    store.invoke_show(Page::Policy);
+    store.invoke_reload();
     assert!(ctl.perm_asked() > stale);
     let elsewhere = serde_json::json!({"center": "other", "folders": [
         {"path": "/elsewhere", "rights": "r--", "read": true, "write": false, "execute": false}
@@ -522,7 +522,7 @@ fn the_app_drives_the_cli_end_to_end() {
     assert_eq!(logs.get_rows().row_data(0).unwrap().when, "2 h ago");
     // The page shows the newest lines, and more when asked.
     logs.set_limit(2);
-    store.invoke_show(Page::Log);
+    store.invoke_reload();
     until(&ctl, "the two newest lines", || {
         logs.get_rows().row_count() == 2
     });
@@ -777,6 +777,8 @@ fn the_app_drives_the_cli_end_to_end() {
     store.invoke_panic();
     assert!(config(&paths).locked);
     store.invoke_unlock();
+    // Read again, also when the Audit page is the one open.
+    store.invoke_reload();
     store.invoke_show(Page::Audit);
     until(&ctl, "the audit through the broker", || {
         // The refused ones, as the page still shows.

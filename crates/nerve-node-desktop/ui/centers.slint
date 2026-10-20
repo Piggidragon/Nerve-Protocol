@@ -115,7 +115,7 @@ component CenterCard inherits Card {
                 alignment: start;
                 Text {
                     text: "Mode";
-                    color: Theme.text-faint;
+                    color: Theme.text-muted;
                     font-size: Type.caption;
                     font-weight: Type.semibold;
                 }
@@ -149,18 +149,18 @@ component CenterCard inherits Card {
                     horizontal-stretch: 1;
                     Text {
                         text: "Settings grant";
-                        color: Theme.text-faint;
+                        color: Theme.text-muted;
                         font-size: Type.caption;
                         font-weight: Type.semibold;
                     }
                     Text {
-                        text: root.item.settings-write ? "May change this machine's settings" : "Cannot change settings";
+                        text: root.item.settings-write ? "May change settings" : "Cannot change settings";
                         color: Theme.text;
                         font-size: Type.body;
                         font-weight: Type.medium;
                     }
                     Text {
-                        text: root.item.settings-write ? "Up to user mode and sudo, as you could yourself." : "Only you change what it may do, here or with nerve-node.";
+                        text: root.item.settings-write ? "Up to user mode and sudo." : "Only you change what it may do.";
                         color: Theme.text-muted;
                         font-size: Type.caption;
                         wrap: word-wrap;
@@ -198,8 +198,8 @@ export component CentersPage inherits PageFrame {
     property <bool> stale: Store.status-load == Load.failed;
     gap: 0;
     PageHeader {
+        icon: @image-url("icons/centers.svg");
         title: "Centers";
-        subtitle: "The centers this machine is paired with. A center's agents may do only what you allow it.";
         error-title: "The centers could not be read";
         error: Store.status-error;
         error-action: "Try again";
@@ -211,7 +211,7 @@ export component CentersPage inherits PageFrame {
             icon: @image-url("icons/refresh.svg");
             kind: ButtonKind.ghost;
             clicked => {
-                Store.refresh();
+                Store.reload();
             }
         }
         Button {
@@ -232,8 +232,8 @@ export component CentersPage inherits PageFrame {
         Card {
             EmptyState {
                 icon: @image-url("icons/link.svg");
-                title: "No center is paired yet";
-                text: "In the center's web UI, press Pair a machine and copy the link it shows. Paste it here: you see where it leads before anything is paired.";
+                title: "No center paired yet";
+                text: "In the center's web UI, press Pair a machine, copy the link and paste it here.";
                 Button {
                     text: "Pair a center";
                     icon: @image-url("icons/plus.svg");
@@ -255,7 +255,7 @@ export component CentersPage inherits PageFrame {
             Reveal {
                 shown: root.stale;
                 Text {
-                    text: "What the node said before. Nothing here changes until it answers again.";
+                    text: "Last known state: the node does not answer.";
                     color: Theme.text-muted;
                     font-size: Type.small;
                     wrap: word-wrap;

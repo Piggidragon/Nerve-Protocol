@@ -1,5 +1,5 @@
-// Overview: whether the node runs, its centers at a glance, and the switch
-// that stops everything (panic) or allows it again (unlock).
+// Overview: whether the node runs, its service, its centers at a glance,
+// and the switch that stops everything (panic) or allows it again (unlock).
 
 import { Theme, Type, Space, Radius, Tone } from "theme.slint";
 import { Page, Load } from "data.slint";
@@ -12,8 +12,8 @@ import {
 export component OverviewPage inherits PageFrame {
     gap: 0;
     PageHeader {
+        icon: @image-url("icons/overview.svg");
         title: "Overview";
-        subtitle: "How the node on this machine is doing.";
         error-title: "The node did not answer";
         error: Store.status-error;
         error-action: "Try again";
@@ -25,24 +25,30 @@ export component OverviewPage inherits PageFrame {
             icon: @image-url("icons/refresh.svg");
             kind: ButtonKind.ghost;
             clicked => {
-                Store.refresh();
+                Store.reload();
             }
         }
     }
 
     if Store.status-load == Load.loading && Store.status.state == "": Loading { }
 
+    // The node's state, in its colour.
     Reveal {
         shown: Store.status.state != "";
         gap: Space.xxl;
-        Card {
-            pad: Space.xxl;
+        Rectangle {
+            border-radius: Radius.lg;
+            border-width: 1px;
+            border-color: Theme.tone(Store.status.tone).transparentize(0.7);
+            background: @linear-gradient(90deg, Theme.tone-soft(Store.status.tone) 0%, Theme.surface 70%);
             HorizontalLayout {
+                padding: Space.xxl;
                 spacing: Space.xl;
                 VerticalLayout {
-                    alignment: start;
+                    alignment: center;
                     IconTile {
                         size: 52px;
+                        solid: true;
                         tone: Store.status.tone;
                         icon: Store.status.state == "locked" ? @image-url("icons/lock.svg")
                             : Store.status.state == "running" ? @image-url("icons/activity.svg")
@@ -54,37 +60,37 @@ export component OverviewPage inherits PageFrame {
                     alignment: center;
                     Text {
                         text: Store.status.title;
-                        color: Theme.text;
-                        font-size: 19px;
+                        color: Theme.tone(Store.status.tone);
+                        font-size: 20px;
                         font-weight: Type.semibold;
                         wrap: word-wrap;
                     }
                     Reveal {
                         shown: Store.status.detail != "";
-                        gap: 6px;
+                        gap: 4px;
                         Text {
                             text: Store.status.detail;
-                            color: Theme.text-muted;
+                            color: Theme.text;
                             font-size: Type.body;
                             wrap: word-wrap;
                         }
                     }
                     Reveal {
                         shown: Store.status.confinement != "";
-                        gap: 10px;
+                        gap: 8px;
                         HorizontalLayout {
                             spacing: 6px;
                             VerticalLayout {
                                 alignment: center;
                                 Icon {
                                     source: @image-url("icons/shield.svg");
-                                    colorize: Theme.text-faint;
+                                    colorize: Theme.text-muted;
                                     size: 14px;
                                 }
                             }
                             Text {
                                 text: "Confinement: " + Store.status.confinement;
-                                color: Theme.text-faint;
+                                color: Theme.text-muted;
                                 font-size: Type.caption;
                                 vertical-alignment: center;
                                 wrap: word-wrap;
@@ -143,22 +149,37 @@ export component OverviewPage inherits PageFrame {
                     horizontal-stretch: 1;
                     alignment: center;
                     spacing: 2px;
-                    Text {
-                        text: Store.service-state == "running" ? "The service runs"
-                            : Store.service-state == "failed" ? "The service stopped with an error"
-                            : Store.service-state == "stopped" ? "The service is stopped"
-                            : Store.service-state == "starting" ? "The service starts…"
-                            : "The service stops…";
-                        color: Theme.text;
-                        font-size: Type.body;
-                        font-weight: Type.semibold;
-                        wrap: word-wrap;
+                    HorizontalLayout {
+                        spacing: Space.sm;
+                        alignment: start;
+                        Text {
+                            text: "Service";
+                            color: Theme.text;
+                            font-size: Type.body;
+                            font-weight: Type.semibold;
+                            vertical-alignment: center;
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Pill {
+                                dot: true;
+                                text: Store.service-state == "running" ? "Running"
+                                    : Store.service-state == "failed" ? "Failed"
+                                    : Store.service-state == "stopped" ? "Stopped"
+                                    : Store.service-state == "starting" ? "Starting"
+                                    : "Stopping";
+                                tone: Store.service-state == "running" ? Tone.ok
+                                    : Store.service-state == "failed" ? Tone.danger
+                                    : Store.service-state == "stopped" ? Tone.warn
+                                    : Tone.accent;
+                            }
+                        }
                     }
                     Text {
-                        text: Store.service-state == "running" && Store.restart-due ? "Some changes wait for a restart: the node takes them when it starts again."
-                            : Store.service-state == "running" ? (Store.service-enabled ? "The node runs in the background as the user nerve, and starts with the machine." : "The node runs in the background as the user nerve.")
-                            : Store.service-state == "failed" ? "The Log page says why. Start it again once that is fixed."
-                            : Store.service-state == "stopped" ? (Store.service-enabled ? "Start it to link this machine to its centers. It starts again with the machine." : "Start it to link this machine to its centers.")
+                        text: Store.service-state == "running" && Store.restart-due ? "Restart it to apply your last changes."
+                            : Store.service-state == "running" ? (Store.service-enabled ? "Runs as the user nerve and starts with the machine." : "Runs as the user nerve.")
+                            : Store.service-state == "failed" ? "The Log says why."
+                            : Store.service-state == "stopped" ? "No center reaches this machine while it is stopped."
                             : "One moment.";
                         color: Theme.text-muted;
                         font-size: Type.small;
@@ -181,7 +202,7 @@ export component OverviewPage inherits PageFrame {
                         if Store.service-state == "running": Button {
                             text: "Restart";
                             icon: @image-url("icons/refresh.svg");
-                            kind: Store.restart-due ? ButtonKind.primary : ButtonKind.ghost;
+                            kind: Store.restart-due ? ButtonKind.primary : ButtonKind.secondary;
                             busy: Store.busy == "service-restart";
                             enabled: Store.busy != "service-stop";
                             clicked => {
@@ -208,8 +229,8 @@ export component OverviewPage inherits PageFrame {
         gap: Space.lg;
         Banner {
             tone: Tone.warn;
-            title: "The node is not installed as a service";
-            text: "The app is here, but the service is gone. Open the downloaded nerve-node-desktop again and install, or run nerve-node-desktop install as root (on Windows, as administrator).";
+            title: "The service is not installed";
+            text: "Open the downloaded nerve-node-desktop again to install it.";
         }
     }
 
@@ -219,7 +240,7 @@ export component OverviewPage inherits PageFrame {
         Banner {
             tone: Tone.warn;
             title: "Commands run as you";
-            text: "Commands from centers run as " + Store.commands-account + ", who changes Nerve without a password. A command could change its settings too. Give commands an account of their own.";
+            text: "Commands from centers run as " + Store.commands-account + ", so one could change Nerve's settings. Give them an account of their own.";
             action: "Separate account";
             acted => {
                 Store.separate-account();
@@ -229,7 +250,7 @@ export component OverviewPage inherits PageFrame {
 
     Reveal {
         shown: Store.status.warnings.length > 0;
-        gap: Space.xxl;
+        gap: Space.lg;
         VerticalLayout {
             spacing: Space.sm;
             for warning in Store.status.warnings: Banner {
@@ -247,24 +268,24 @@ export component OverviewPage inherits PageFrame {
             StatTile {
                 icon: @image-url("icons/centers.svg");
                 label: "Centers";
-                value: Store.status.centers == 0 ? "None paired"
-                    : Store.status.centers == 1 ? "1 paired" : Store.status.centers + " paired";
-                detail: Store.status.state != "running" ? "No link while the node does not run"
-                    : Store.status.connected + " of " + Store.status.centers + " connected";
-                tone: Store.status.connected > 0 ? Tone.ok : Tone.accent;
+                value: Store.status.centers == 0 ? "None"
+                    : Store.status.centers + " paired";
+                detail: Store.status.state != "running" || Store.status.centers == 0 ? "None linked"
+                    : Store.status.connected + " linked";
+                tone: Store.status.centers == 0 ? Tone.accent : Store.status.connected > 0 ? Tone.ok : Tone.warn;
             }
             StatTile {
                 icon: @image-url("icons/key.svg");
                 label: "Sudo";
                 value: Store.status.sudo-on ? "On" : "Off";
-                detail: Store.status.sudo-on ? "Commands on the sudo list run with sudo" : "No command runs with sudo";
-                tone: Store.status.sudo-on ? Tone.warn : Tone.accent;
+                detail: Store.status.sudo-on ? "Sudo list runs with sudo" : "Nothing runs with sudo";
+                tone: Store.status.sudo-on ? Tone.warn : Tone.ok;
             }
             StatTile {
                 icon: @image-url("icons/cpu.svg");
                 label: "Limits per command";
                 value: Store.status.limits;
-                detail: "Memory, CPU and processes of each command";
+                detail: "Memory · CPU · processes";
             }
         }
     }
@@ -275,6 +296,7 @@ export component OverviewPage inherits PageFrame {
         VerticalLayout {
             SectionTitle {
                 text: "Centers";
+                icon: @image-url("icons/centers.svg");
                 Button {
                     text: "Manage";
                     kind: ButtonKind.ghost;
@@ -292,7 +314,7 @@ export component OverviewPage inherits PageFrame {
                         spacing: Space.lg;
                         Text {
                             horizontal-stretch: 1;
-                            text: "No center is paired yet. Pair one to let its agents use this machine, with only what you allow.";
+                            text: "No center paired yet.";
                             color: Theme.text-muted;
                             font-size: Type.body;
                             wrap: word-wrap;
@@ -351,7 +373,7 @@ export component OverviewPage inherits PageFrame {
                                 }
                                 Text {
                                     text: c.url;
-                                    color: Theme.text-faint;
+                                    color: Theme.text-muted;
                                     font-size: Type.caption;
                                     font-family: Type.mono;
                                     overflow: elide;
@@ -367,9 +389,9 @@ export component OverviewPage inherits PageFrame {
                             Text {
                                 min-width: 120px;
                                 text: c.link;
-                                color: Theme.tone(c.link-tone);
+                                color: c.link-tone == Tone.neutral ? Theme.text-muted : Theme.tone(c.link-tone);
                                 font-size: Type.small;
-                                font-weight: Type.medium;
+                                font-weight: Type.semibold;
                                 vertical-alignment: center;
                                 horizontal-alignment: right;
                                 overflow: elide;

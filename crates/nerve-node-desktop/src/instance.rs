@@ -31,6 +31,9 @@ pub struct Asked {
     pub link: Option<String>,
     /// Its uninstall (crate::parts::UNINSTALL_ARG, from Apps & features).
     pub uninstall: bool,
+    /// The program that was started, when it is not the installed one:
+    /// the file just downloaded, say.
+    pub program: Option<String>,
 }
 
 impl Asked {
@@ -51,6 +54,9 @@ fn line(a: &Asked) -> String {
     if a.uninstall {
         v["uninstall"] = json!(true);
     }
+    if let Some(p) = &a.program {
+        v["program"] = json!(p);
+    }
     v.to_string()
 }
 
@@ -59,6 +65,7 @@ fn asked(line: &str) -> Option<Asked> {
     Some(Asked {
         link: v["link"].as_str().map(str::to_string),
         uninstall: v["uninstall"] == true,
+        program: v["program"].as_str().map(str::to_string),
     })
 }
 
@@ -249,6 +256,7 @@ mod win {
         PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
         WaitNamedPipeW,
     };
+    use windows_sys::Win32::UI::WindowsAndMessaging::AllowSetForegroundWindow;
 
     use super::*;
     use crate::broker::win::{own_sid, sid_text};
@@ -407,23 +415,33 @@ mod win {
             other => other,
         };
         match f {
-            Ok(mut f) => mine(&f, sid) && writeln!(f, "{}", line(start)).is_ok(),
+            Ok(mut f) => {
+                let Some(server) = mine(&f, sid) else {
+                    return false;
+                };
+                // This start came from the person, so it may hand the
+                // foreground on: the open window comes to the front.
+                // SAFETY: a plain call with the window's process id.
+                unsafe { AllowSetForegroundWindow(server) };
+                writeln!(f, "{}", line(start)).is_ok()
+            }
             Err(_) => false,
         }
     }
 
     /// Whether the pipe `f` is open to is this user's (`sid`): the process
     /// that serves it runs as this user, and the pipe's owner is this user,
-    /// which a program of another user cannot make it.
-    fn mine(f: &std::fs::File, sid: &str) -> bool {
+    /// which a program of another user cannot make it. Its process when so.
+    fn mine(f: &std::fs::File, sid: &str) -> Option<u32> {
         let h = f.as_raw_handle() as HANDLE;
         let mut server = 0u32;
         // SAFETY: a query on the open pipe.
         if unsafe { GetNamedPipeServerProcessId(h, &mut server) } == 0 {
-            return false;
+            return None;
         }
-        crate::broker::win::sid_of(server).as_deref() == Ok(sid)
-            && owner_of(h).as_deref() == Ok(sid)
+        (crate::broker::win::sid_of(server).as_deref() == Ok(sid)
+            && owner_of(h).as_deref() == Ok(sid))
+        .then_some(server)
     }
 
     /// The owner of the object `h` is open to, as a SID's text.
@@ -545,6 +563,10 @@ mod tests {
             none.clone(),
             Asked {
                 uninstall: true,
+                ..Asked::default()
+            },
+            Asked {
+                program: Some("/home/alex/Downloads/nerve-node-desktop".into()),
                 ..Asked::default()
             },
         ];

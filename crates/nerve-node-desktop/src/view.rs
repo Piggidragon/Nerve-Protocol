@@ -43,20 +43,20 @@ pub fn status(v: &Value, now_ms: u64) -> (NodeStatus, Vec<CenterRow>) {
     let (state, title, detail, tone) = match (locked, running) {
         (true, _) => (
             "locked",
-            "Locked: nothing runs",
-            "A panic ended every link. No center reaches this machine and no command runs until you unlock it.",
+            "Locked",
+            "Every link ended. Nothing runs until you unlock.",
             Tone::Danger,
         ),
         (false, true) => (
             "running",
-            "The node is running",
-            "It links this machine to its centers and decides each of their calls by your rules.",
+            "Running",
+            "Each call of a center is checked against your rules.",
             Tone::Ok,
         ),
         (false, false) => (
             "stopped",
-            "The node is not running",
-            "No center reaches this machine. What you change here counts from the node's next start.",
+            "Not running",
+            "No center reaches this machine.",
             Tone::Warn,
         ),
     };
@@ -82,7 +82,7 @@ pub fn status(v: &Value, now_ms: u64) -> (NodeStatus, Vec<CenterRow>) {
         }
         if v["keyring_failed"] == true {
             warnings.push(
-                "The node found no system keyring when it started, and keys kept there cannot be read. Start it again once the keyring runs.".into(),
+                "The node found no keyring at its start. Restart it once the keyring runs.".into(),
             );
         }
     }
@@ -124,15 +124,14 @@ fn center(c: &Value, running: bool, now_ms: u64) -> CenterRow {
         (
             "Revoked".to_string(),
             Tone::Danger,
-            "The center revoked this machine. Unpair it here; to use the center again, pair again."
-                .to_string(),
+            "The center revoked this machine. Unpair it, and pair again to use it.".to_string(),
             Tone::Danger,
         )
     } else if c["unknown"] == true {
         (
             "Not known".to_string(),
             Tone::Danger,
-            "The center does not know this machine any more, so the node stopped dialling it. Unpair it and pair again.".to_string(),
+            "The center no longer knows this machine. Unpair it and pair again.".to_string(),
             Tone::Danger,
         )
     } else if c["paused"] == true || link == "paused" {
@@ -144,7 +143,7 @@ fn center(c: &Value, running: bool, now_ms: u64) -> CenterRow {
         )
     } else if !running {
         (
-            "Node not running".to_string(),
+            "Not linked".to_string(),
             Tone::Neutral,
             String::new(),
             Tone::Neutral,
@@ -191,8 +190,8 @@ fn center(c: &Value, running: bool, now_ms: u64) -> CenterRow {
     };
     let mode = s(&c["mode"]);
     let mut detail = match mode {
-        "allowlist" => "Only what an allow rule names may run.".to_string(),
-        "folder" => "What each folder's rights allow.".to_string(),
+        "allowlist" => "Only what an allow rule names.".to_string(),
+        "folder" => "What each of its folders allows.".to_string(),
         "user" => "Anything you could do yourself, protected files aside.".to_string(),
         _ => String::new(),
     };

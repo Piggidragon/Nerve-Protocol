@@ -5,7 +5,7 @@
 import { Tone } from "theme.slint";
 import {
     Page, Load, NodeStatus, CenterRow, AuditRow, PairPreview, FolderRow, CapRow, LogRow,
-    HelpSection, RelayNodeRow, Pick,
+    HelpSection, RelayNodeRow, Pick, Limit,
 } from "data.slint";
 
 export global Store {
@@ -62,7 +62,10 @@ export global Store {
     // 0 follows the system, 1 light, 2 dark.
     in-out property <int> appearance;
 
+    // Opens a page; the page that is open stays as it is.
     callback show(Page);
+    // Reads the open page again (Refresh, Ctrl+R).
+    callback reload();
     callback refresh();
     callback refresh-audit();
     callback audit-more();
@@ -205,15 +208,42 @@ export global Logs {
     callback more();
 }
 
-// The Help page: the CLI's own command list.
+// The Help page: the CLI's own command list, and which of its parts is
+// open (-1: none). The keyboard's shortcuts are part 10, the commands 11.
 export global Manual {
     in-out property <[HelpSection]> sections;
+    in-out property <int> open: -1;
 }
 
 // The Settings page.
 export global Prefs {
     in-out property <Load> load: Load.loading;
     in-out property <string> error;
+    // Its tab: 0 General, 1 Keys, 2 Network, 3 Limits, 4 Backup, 5 App,
+    // 6 Advanced.
+    in-out property <int> tab;
+
+    // log.level: 0 error, 1 warn, 2 info, 3 debug.
+    in-out property <int> log-level: 2;
+    callback log-level-set(int);
+    // machine.shell, and the platform's shell it is without one.
+    in-out property <string> shell;
+    in-out property <string> shell-default;
+    callback shell-save();
+
+    // The limits, by group: what one command may use, how long it runs,
+    // the node's commands and output, and the relay's tunnels. A save sets
+    // the changed ones of a group; an empty field is the default again.
+    in-out property <[Limit]> limits-command;
+    in-out property <[Limit]> limits-time;
+    in-out property <[Limit]> limits-node;
+    in-out property <[Limit]> limits-relay;
+    in-out property <string> limits-error;
+    in-out property <string> limits-busy;
+    // A field of a group changed: the group (command, time, node, relay),
+    // its row and the text.
+    callback limit-edit(string, int, string);
+    callback limits-save(string);
 
     in-out property <string> name;
     in-out property <string> name-shown;
@@ -355,6 +385,15 @@ export global Install {
     in-out property <bool> uninstall-open;
     // The app closes: set when it is gone, for the tests.
     in-out property <bool> closed;
+
+    // Another copy of the program was opened while the app is open, such as
+    // the file just downloaded: the app offers what the installer offers
+    // for it. Its path, its version, and whether it is newer.
+    in-out property <bool> other-open;
+    in-out property <string> other-file;
+    in-out property <string> other-version;
+    in-out property <bool> other-newer;
+    callback other-update();
 
     callback install();
     callback update();

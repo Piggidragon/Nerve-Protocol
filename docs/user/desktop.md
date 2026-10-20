@@ -58,7 +58,7 @@ them ([Windows](service.md#the-account-commands-run-as-on-windows)). That
 holds when you are a standard user and an administrator types their name and
 password into the UAC prompt: the commands still run as you, not as the
 administrator. If your password was mistyped, enter it again under
-**Settings**, **Account for commands**. On Linux they run as the user who
+**Settings**, **General**, **Account for commands**. On Linux they run as the user who
 installed.
 
 When it is done, **Open Nerve** opens the app. Its first-run steps name the
@@ -133,7 +133,7 @@ unconfined: it can change the node's settings, and on Windows start and stop
 the service. The Overview warns about it. **Separate account** gives the
 commands an account of their own that is no owner: on Linux it makes
 `nerve-work` (with the administrator's password) and runs commands as it; on
-Windows it opens **Settings**, **Account for commands**, where you name an
+Windows it opens **Settings**, **General**, where you name an
 account of its own and give its password.
 
 The app's link to an administrator's rights, while an action has them, is its
@@ -179,25 +179,45 @@ restart fails, the Overview says that changes wait and offers **Restart**.
 
 ## Settings
 
-- **Account for commands**: the account commands from your centers run as.
-  On Linux, name another one to use it; one that is not there is made, as
-  `setup --create-user` makes it. On Windows, enter its new password there
-  when it changed, or your own when no account is chosen yet: the service
-  needs it to start commands.
+Settings has tabs. Each control runs the `config` command a terminal would,
+so the node checks a value as it checks the command line's.
+
+- **General**: the machine's **Name**; the **Account for commands**, the
+  account commands from your centers run as (on Linux, name another one to
+  use it; one that is not there is made, as `setup --create-user` makes it;
+  on Windows, enter its new password there when it changed, or your own
+  when no account is chosen yet: the service needs it to start commands);
+  the **Shell** that runs each command (`machine.shell`); and how much the
+  **Log** says (`log.level`).
 - **Keys**: in files, or in the system keyring where one can hold them. Where
   it cannot (the installed node on Windows, Linux below 7.1, no keyring
   answering for the account the node runs as), the app says why and keeps
   them in files.
-- **Backup…** and **Restore…** write and read the file as you, in your own
-  folders, and hand it to the node. A restore never goes under a running
-  node: the node stops for it and starts again after (for an administrator's
-  restore the app stops and starts the service). **Keep its keys in files here**
-  restores the backup of a machine that kept them in a keyring onto one
-  without.
-- **Any setting**: shows and sets any setting, and **Add** and **Remove**
-  change a list, such as `policy.protected.allow`. On **Permissions**, a
-  pattern for files (`fs.read:~/notes/*`) goes on the allow or deny list as
-  it is.
+- **Network**: the **Proxy**, and the **Relay** with its nodes and its
+  tunnels (`relay.max_links`, `max_links_per_node`, `max_opens_per_minute`).
+- **Limits**: what one command may use and the most a call may ask for
+  (`limits.command`, [limits](limits.md)), how long a command runs
+  (`limits.default_timeout_secs`, `max_timeout_secs`, in minutes), and the
+  node's commands at once and output kept of a command (`limits.max_running`,
+  `output_cap_bytes`, in MiB). An empty field is the default again.
+- **Backup**: **Back up…** and **Restore…** write and read the file as you,
+  in your own folders, and hand it to the node. A restore never goes under a
+  running node: the node stops for it and starts again after (for an
+  administrator's restore the app stops and starts the service). **Keep its
+  keys in files** restores the backup of a machine that kept them in a
+  keyring onto one without.
+- **App**: the appearance, **Update…** and **Uninstall…**.
+- **Advanced**: **Any setting** shows and sets any setting of `node.toml`
+  by its name, and **Add** and **Remove** change a list, such as
+  `policy.protected.allow`; and taking a `node.toml` changed by hand. On
+  **Permissions**, a pattern for files (`fs.read:~/notes/*`) goes on the
+  allow or deny list as it is.
+
+The settings without a control of their own are under **Advanced**:
+`machine.allow_root` and `machine.sudo_path` (for a node run by hand, not
+the installed one), `providers.allowed` ([providers](providers.md)), and
+`policy.protected` of a center ([protected paths](protected-paths.md)).
+A center's other settings are on **Centers** and **Permissions**.
 
 On **Permissions**, a center that lacks the guard against changing the node
 (a pairing from before it, or one you took a rule off) shows **Add the
@@ -221,15 +241,18 @@ opens a window of its own and says so.
 
 ## Update
 
-**Settings**, **Nerve on this machine**, **Update…**: from the latest release
+**Settings**, **App**, **Update…**: from the latest release
 on GitHub (checked against its `SHA256SUMS`), or from a file you downloaded.
 The update replaces the program, puts the menu entry back and restarts the
 service; the node's settings, keys and audit log stay. **Restart Nerve**
-opens the new version. Opening a newer downloaded file offers **Update** too.
+opens the new version. Opening a newer downloaded file offers **Update** too,
+also while the app is open: the open window comes to the front and says
+which version the file is (on Wayland, where no program may raise itself,
+the desktop says that Nerve wants your attention).
 
 ## Uninstall
 
-**Settings**, **Nerve on this machine**, **Uninstall…**. Choose whether the
+**Settings**, **App**, **Uninstall…**. Choose whether the
 node's data (settings, pairings, keys, audit log) stays or goes. The service,
 its user, the program, the menu entry, the link handler and, on Linux, the
 `nerve-node` link go, and the window says "Nerve is removed" until you close
@@ -281,7 +304,27 @@ pipe to be waited for: `"C:\Program Files\Nerve\nerve-node-desktop.exe" status |
 in cmd, `& "C:\Program Files\Nerve\nerve-node-desktop.exe" status | Out-Default`
 in PowerShell. A batch file waits for it as it is.
 
+## Keyboard
+
+| Keys | Do |
+|---|---|
+| Ctrl+1 … Ctrl+7 | Open Overview, Centers, Permissions, Audit, Log, Settings, Help |
+| Ctrl+R, F5 | Read the page again |
+| Esc | Close a dialog |
+| Enter | The dialog's main button |
+| Tab, Shift+Tab | The next or the last control |
+| Space | Press a button, tick a box |
+| ← → | Choose in a row of choices or tabs |
+
+A click on the page that is open reads nothing again; **Refresh** does.
+
 ## The app's own settings
+
+With **System**, the app is light or dark as the desktop is. On Linux it asks
+the desktop portal's `color-scheme`, then GNOME's `color-scheme` and the
+name of its GTK theme (a theme named `…-dark`, as on Zorin OS), and on KDE
+its colour scheme; it follows a change within a few seconds. **Light** and
+**Dark** win over the desktop.
 
 The appearance (system, light or dark) is kept in
 `~/.config/nerve-node-desktop/settings.json` on Linux and

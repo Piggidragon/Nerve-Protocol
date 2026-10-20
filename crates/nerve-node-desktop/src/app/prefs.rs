@@ -3,14 +3,192 @@
 
 use std::rc::Rc;
 
+use serde_json::{Value, json};
 use slint::{ComponentHandle, Model, ModelRc, SharedString, VecModel};
 
 use super::{Choose, Ctl, Pending};
-use crate::{Load, Page, Pick, Prefs, Store, Tone, view};
+use crate::{Limit, Load, Page, Pick, Prefs, Store, Tone, view};
 
 /// The account the Overview offers for the commands, as the CLI's hint
 /// names it (nerve_node::account::CREATE_USER_HINT).
 const SEPARATE_ACCOUNT: &str = "nerve-work";
+
+/// The words of `log.level`, as Settings' choice orders them.
+const LOG_LEVELS: [&str; 4] = ["error", "warn", "info", "debug"];
+
+/// A limit of Settings: its setting, its words, its unit, and how many of
+/// the setting's units make one of the field's (seconds in a minute).
+type LimitDef = (&'static str, &'static str, &'static str, u64);
+
+const MIB: u64 = 1024 * 1024;
+
+/// The limits of Settings by group, as `limits_save` names them.
+const LIMITS: [(&str, &[LimitDef]); 4] = [
+    (
+        "command",
+        &[
+            ("limits.command.memory_mb", "Memory", "MiB", 1),
+            (
+                "limits.command.memory_max_mb",
+                "Memory a call may ask for",
+                "MiB",
+                1,
+            ),
+            ("limits.command.cpu_percent", "CPU", "% of a CPU", 1),
+            (
+                "limits.command.cpu_max_percent",
+                "CPU a call may ask for",
+                "% of a CPU",
+                1,
+            ),
+            ("limits.command.processes", "Processes", "", 1),
+            (
+                "limits.command.processes_max",
+                "Processes a call may ask for",
+                "",
+                1,
+            ),
+        ],
+    ),
+    (
+        "time",
+        &[
+            (
+                "limits.default_timeout_secs",
+                "When the call names none",
+                "minutes",
+                60,
+            ),
+            ("limits.max_timeout_secs", "At most", "minutes", 60),
+        ],
+    ),
+    (
+        "node",
+        &[
+            ("limits.max_running", "Commands at once", "", 1),
+            (
+                "limits.output_cap_bytes",
+                "Output kept of a command",
+                "MiB",
+                MIB,
+            ),
+        ],
+    ),
+    (
+        "relay",
+        &[
+            ("relay.max_links", "Tunnels at once", "", 1),
+            ("relay.max_links_per_node", "Tunnels of one node", "", 1),
+            (
+                "relay.max_opens_per_minute",
+                "Tunnels one node opens",
+                "a minute",
+                1,
+            ),
+        ],
+    ),
+];
+
+/// The defaults of the limits, in the shape of the settings.
+fn limit_defaults() -> Value {
+    let l = nerve_policy::config::Limits::default();
+    let c = l.command;
+    let r = nerve_policy::config::Relay::default();
+    json!({
+        "limits": {
+            "max_running": l.max_running,
+            "output_cap_bytes": l.output_cap_bytes,
+            "default_timeout_secs": l.default_timeout_secs,
+            "max_timeout_secs": l.max_timeout_secs,
+            "command": {
+                "memory_mb": c.memory_mb,
+                "memory_max_mb": c.memory_max_mb,
+                "cpu_percent": c.cpu_percent,
+                "cpu_max_percent": c.cpu_max_percent,
+                "processes": c.processes,
+                "processes_max": c.processes_max,
+            },
+        },
+        "relay": {
+            "max_links": r.max_links,
+            "max_links_per_node": r.max_links_per_node,
+            "max_opens_per_minute": r.max_opens_per_minute,
+        },
+    })
+}
+
+/// The setting `key` of `v`, by its dotted name.
+fn at<'a>(v: &'a Value, key: &str) -> &'a Value {
+    key.split('.').fold(v, |v, k| &v[k])
+}
+
+/// `n` of the setting's units in the field's, whole when it is.
+pub(crate) fn in_unit(n: u64, scale: u64) -> String {
+    if n.is_multiple_of(scale) {
+        (n / scale).to_string()
+    } else {
+        let f = format!("{:.2}", n as f64 / scale as f64);
+        f.trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+}
+
+/// What a field holds in the setting's units, or why not.
+pub(crate) fn from_unit(text: &str, scale: u64, label: &str) -> Result<u64, String> {
+    let t = text.trim();
+    let n: f64 = t
+        .parse()
+        .ok()
+        .filter(|n: &f64| n.is_finite() && *n > 0.0)
+        .ok_or_else(|| format!("{label}: {t:?} is not a number above 0"))?;
+    Ok((n * scale as f64).round() as u64)
+}
+
+/// The rows of the group `defs`: each limit as `set` has it (the node's
+/// settings: `limits` and `relay`), else its default.
+pub(crate) fn limit_rows(defs: &[LimitDef], set: &Value) -> Vec<Limit> {
+    let defaults = limit_defaults();
+    defs.iter()
+        .map(|&(key, label, unit, scale)| {
+            let default = at(&defaults, key).as_u64().unwrap_or_default();
+            let value = at(set, key).as_u64().unwrap_or(default);
+            let shown: SharedString = in_unit(value, scale).into();
+            Limit {
+                key: key.into(),
+                label: label.into(),
+                unit: unit.into(),
+                value: shown.clone(),
+                was: shown,
+                default: in_unit(default, scale).into(),
+            }
+        })
+        .collect()
+}
+
+/// The commands that save what changed in `rows`: `config set`, or `config
+/// unset` for an emptied field, so the default counts again.
+pub(crate) fn limit_changes(rows: &[Limit]) -> Result<Vec<Vec<String>>, String> {
+    let mut out = Vec::new();
+    for row in rows {
+        if row.value == row.was {
+            continue;
+        }
+        let scale = LIMITS
+            .iter()
+            .flat_map(|(_, defs)| defs.iter())
+            .find(|d| d.0 == row.key.as_str())
+            .map_or(1, |d| d.3);
+        let key = row.key.to_string();
+        if row.value.trim().is_empty() {
+            if row.was != row.default {
+                out.push(vec!["config".into(), "unset".into(), key]);
+            }
+            continue;
+        }
+        let n = from_unit(&row.value, scale, &row.label)?;
+        out.push(vec!["config".into(), "set".into(), key, n.to_string()]);
+    }
+    Ok(out)
+}
 
 impl Ctl {
     pub(super) fn prefs_load(self: &Rc<Self>) {
@@ -22,17 +200,50 @@ impl Ctl {
             p.set_name_shown(host.as_str().into());
             p.set_load(Load::Loading);
         });
+        self.with_prefs(|p| {
+            p.set_shell_default(nerve_node::exec::shell_command(None, "").0.as_str().into())
+        });
         self.job(
             |r| {
                 (
-                    r.run(&["config", "get", "node.name"]),
-                    r.run(&["config", "get", "machine.secret_storage"]),
-                    r.run(&["proxy", "ls"]),
-                    r.run(&["relay", "ls"]),
-                    r.run(&["config", "get", "machine.user"]),
+                    (
+                        r.run(&["config", "get", "node.name"]),
+                        r.run(&["config", "get", "machine.secret_storage"]),
+                        r.run(&["proxy", "ls"]),
+                        r.run(&["relay", "ls"]),
+                        r.run(&["config", "get", "machine.user"]),
+                    ),
+                    (
+                        r.run(&["config", "get", "limits"]),
+                        r.run(&["config", "get", "log.level"]),
+                        r.run(&["config", "get", "machine.shell"]),
+                    ),
                 )
             },
-            |c, (name, storage, proxy, relay, account)| {
+            |c, ((name, storage, proxy, relay, account), (limits, level, shell))| {
+                // Not set: the default, which the CLI leaves out.
+                let value =
+                    |v: Result<Value, String>| v.map(|v| v["value"].clone()).unwrap_or_default();
+                let level = value(level);
+                let shell = value(shell);
+                let set = json!({
+                    "limits": value(limits),
+                    "relay": relay.as_ref().cloned().unwrap_or_default(),
+                });
+                c.with_prefs(|p| {
+                    let level = LOG_LEVELS.iter().position(|l| level == *l).unwrap_or(2);
+                    p.set_log_level(level as i32);
+                    p.set_shell(shell.as_str().unwrap_or_default().into());
+                    for (group, defs) in LIMITS {
+                        let rows = ModelRc::new(VecModel::from(limit_rows(defs, &set)));
+                        match group {
+                            "command" => p.set_limits_command(rows),
+                            "time" => p.set_limits_time(rows),
+                            "node" => p.set_limits_node(rows),
+                            _ => p.set_limits_relay(rows),
+                        }
+                    }
+                });
                 // A setting that is not set has its default: no name, keys
                 // in files.
                 let name = name
@@ -325,6 +536,95 @@ impl Ctl {
             }
             c.with_prefs(|p| p.set_relay_new_node(SharedString::new()));
             c.prefs_load();
+        });
+    }
+
+    fn log_level_set(self: &Rc<Self>, i: i32) {
+        let Some(level) = LOG_LEVELS.get(i as usize) else {
+            return;
+        };
+        let args = vec![
+            "config".into(),
+            "set".into(),
+            "log.level".into(),
+            (*level).into(),
+        ];
+        self.prefs_change(args, None, String::new());
+    }
+
+    fn shell_save(self: &Rc<Self>) {
+        let shell = self
+            .with_prefs(|p| p.get_shell().trim().to_string())
+            .unwrap_or_default();
+        let args = if shell.is_empty() {
+            vec!["config".into(), "unset".into(), "machine.shell".into()]
+        } else {
+            vec!["config".into(), "set".into(), "machine.shell".into(), shell]
+        };
+        self.prefs_change(args, None, String::new());
+    }
+
+    /// The model of the limits of `group`.
+    fn limits_of(&self, group: &str) -> Option<ModelRc<Limit>> {
+        self.with_prefs(|p| match group {
+            "command" => p.get_limits_command(),
+            "time" => p.get_limits_time(),
+            "node" => p.get_limits_node(),
+            _ => p.get_limits_relay(),
+        })
+    }
+
+    fn limit_edit(&self, group: &str, i: usize, text: SharedString) {
+        let Some(rows) = self.limits_of(group) else {
+            return;
+        };
+        if let Some(mut row) = rows.row_data(i) {
+            row.value = text;
+            rows.set_row_data(i, row);
+        }
+    }
+
+    /// Saves the changed limits of `group`, one command each, and stops at
+    /// the first the node refuses.
+    fn limits_save(self: &Rc<Self>, group: &str) {
+        let Some(rows) = self.limits_of(group) else {
+            return;
+        };
+        let rows: Vec<Limit> = rows.iter().collect();
+        let changes = match limit_changes(&rows) {
+            Ok(c) => c,
+            Err(e) => {
+                self.with_prefs(|p| p.set_limits_error(e.into()));
+                return;
+            }
+        };
+        self.with_prefs(|p| p.set_limits_error(SharedString::new()));
+        if changes.is_empty() {
+            return;
+        }
+        self.with_prefs(|p| p.set_limits_busy(group.into()));
+        self.limits_apply(changes, None);
+    }
+
+    fn limits_apply(self: &Rc<Self>, mut changes: Vec<Vec<String>>, last: Option<Value>) {
+        if changes.is_empty() {
+            self.with_prefs(|p| p.set_limits_busy(SharedString::new()));
+            if let Some(v) = last {
+                self.done(&v, "The limits are saved.");
+            }
+            self.prefs_load();
+            return;
+        }
+        let args = changes.remove(0);
+        self.command(args, None, move |c, answer| match answer {
+            Ok(v) => c.limits_apply(changes, Some(v)),
+            Err(e) => {
+                c.with_prefs(|p| {
+                    p.set_limits_busy(SharedString::new());
+                    p.set_limits_error(e.into());
+                });
+                c.prefs_load();
+            }
         });
     }
 
@@ -784,6 +1084,14 @@ pub(super) fn wire(ctl: &Rc<Ctl>, window: &crate::AppWindow) {
     let c = ctl.clone();
     p.on_relay_edit_save(move || c.relay_edit_save());
     let c = ctl.clone();
+    p.on_log_level_set(move |i| c.log_level_set(i));
+    let c = ctl.clone();
+    p.on_shell_save(move || c.shell_save());
+    let c = ctl.clone();
+    p.on_limit_edit(move |group, i, text| c.limit_edit(&group, i as usize, text));
+    let c = ctl.clone();
+    p.on_limits_save(move |group| c.limits_save(&group));
+    let c = ctl.clone();
     p.on_raw_get(move || c.raw_get());
     let c = ctl.clone();
     p.on_raw_set(move || c.raw_change("set"));
@@ -818,4 +1126,74 @@ pub(super) fn wire(ctl: &Rc<Ctl>, window: &crate::AppWindow) {
     p.on_restore_choose(move || c.backup_choose(true));
     let c = ctl.clone();
     p.on_restore_confirm(move || c.restore_confirm());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_limit_shows_in_the_fields_unit_and_its_default_when_unset() {
+        // As `config get limits` and `relay ls` answer on a new node, with
+        // one limit set.
+        let set = json!({
+            "limits": {"max_running": 16, "output_cap_bytes": 16777216, "max_timeout_secs": 5400},
+            "relay": {"max_links": 16, "max_links_per_node": 4, "max_opens_per_minute": 30},
+        });
+        let rows = |group: &str| {
+            let defs = LIMITS.iter().find(|(g, _)| *g == group).unwrap().1;
+            limit_rows(defs, &set)
+        };
+        let time = rows("time");
+        assert_eq!(time[0].value, "10");
+        assert_eq!(time[0].unit, "minutes");
+        assert_eq!(time[1].value, "90");
+        assert_eq!(time[1].default, "60");
+        let node = rows("node");
+        assert_eq!(
+            (node[1].value.as_str(), node[1].unit.as_str()),
+            ("16", "MiB")
+        );
+        let command = rows("command");
+        assert_eq!(command[0].value, "4096");
+        assert_eq!(command[0].key, "limits.command.memory_mb");
+        assert_eq!(rows("relay")[2].value, "30");
+        assert_eq!(in_unit(90, 60), "1.5");
+    }
+
+    #[test]
+    fn a_save_sets_what_changed_and_an_empty_field_unsets_it() {
+        let set = json!({"limits": {"max_timeout_secs": 5400}});
+        let defs = LIMITS.iter().find(|(g, _)| *g == "time").unwrap().1;
+        let mut rows = limit_rows(defs, &set);
+        assert_eq!(limit_changes(&rows).unwrap(), Vec::<Vec<String>>::new());
+        rows[0].value = "1.5".into();
+        rows[1].value = "".into();
+        assert_eq!(
+            limit_changes(&rows).unwrap(),
+            vec![
+                vec!["config", "set", "limits.default_timeout_secs", "90"],
+                vec!["config", "unset", "limits.max_timeout_secs"],
+            ]
+        );
+        // A field emptied while it shows the default changes nothing.
+        let mut rows = limit_rows(defs, &json!({}));
+        rows[1].value = "".into();
+        assert!(limit_changes(&rows).unwrap().is_empty());
+        rows[0].value = "a day".into();
+        let e = limit_changes(&rows).unwrap_err();
+        assert!(
+            e.contains("When the call names none") && e.contains("a day"),
+            "{e}"
+        );
+        rows[0].value = "0".into();
+        assert!(limit_changes(&rows).is_err());
+        let node = LIMITS.iter().find(|(g, _)| *g == "node").unwrap().1;
+        let mut rows = limit_rows(node, &json!({}));
+        rows[1].value = "8".into();
+        assert_eq!(
+            limit_changes(&rows).unwrap(),
+            vec![vec!["config", "set", "limits.output_cap_bytes", "8388608"]]
+        );
+    }
 }

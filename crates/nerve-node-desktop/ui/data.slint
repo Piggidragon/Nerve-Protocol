@@ -132,3 +132,15 @@ export struct Pick {
     name: string,
     on: bool,
 }
+
+// A limit of Settings: its setting, its words, and its value in the field's
+// unit, as set or else its default.
+export struct Limit {
+    key: string,
+    label: string,
+    unit: string,
+    // What the field shows, what the node said, and the default.
+    value: string,
+    was: string,
+    default: string,
+}

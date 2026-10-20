@@ -6,41 +6,59 @@ import { Theme, Type, Space, Radius, Size, Tone } from "theme.slint";
 import { Load, FolderRow, CapRow } from "data.slint";
 import { Store, Perm } from "store.slint";
 import {
-    Button, ButtonKind, Card, Pill, Banner, Loading, PageHeader, PageFrame, EmptyState, Divider,
+    Button, ButtonKind, Card, Pill, Banner, Loading, PageHeader, PageFrame, EmptyState, Divider, IconTile,
     Segmented, Picker, SectionTitle, OptionTile, Chip, ListRow, TextField, Switch, Icon, Code, Reveal,
     PathText,
 } from "widgets.slint";
 
+// A part of the page: its icon in its colour, its title, a line on it,
+// and its rows.
 component Section inherits Card {
+    in property <image> icon;
+    in property <Tone> tone: Tone.accent;
     in property <string> title;
     in property <string> text;
     pad: 0;
     gap: 0;
-    VerticalLayout {
+    HorizontalLayout {
         padding-left: Space.xl;
         padding-right: Space.xl;
         padding-top: Space.lg + 2px;
         padding-bottom: Space.md;
-        spacing: 4px;
-        Text {
-            text: root.title;
-            color: Theme.text;
-            font-size: Type.heading;
-            font-weight: Type.semibold;
+        spacing: Space.md;
+        VerticalLayout {
+            alignment: start;
+            IconTile {
+                icon: root.icon;
+                tone: root.tone;
+                size: 32px;
+            }
         }
-        Text {
-            text: root.text;
-            color: Theme.text-muted;
-            font-size: Type.small;
-            wrap: word-wrap;
+        VerticalLayout {
+            spacing: 2px;
+            horizontal-stretch: 1;
+            alignment: center;
+            Text {
+                text: root.title;
+                color: Theme.text;
+                font-size: Type.heading;
+                font-weight: Type.semibold;
+            }
+            Text {
+                text: root.text;
+                color: Theme.text-muted;
+                font-size: Type.small;
+                wrap: word-wrap;
+            }
         }
     }
     @children
 }
 
 component ModeSection inherits Section {
+    icon: @image-url("icons/sliders.svg");
     title: "Mode";
-    text: "How much " + Perm.center + " may do. A deny rule counts in every mode.";
+    text: "How much " + Perm.center + " may do. Deny rules count in every mode.";
     HorizontalLayout {
         padding-left: Space.xl;
         padding-right: Space.xl;
@@ -59,7 +77,7 @@ component ModeSection inherits Section {
         OptionTile {
             icon: @image-url("icons/folder.svg");
             title: "Folder";
-            text: "What each folder below allows, in it.";
+            text: "What each folder below allows.";
             selected: Perm.mode == "folder";
             badge: Perm.mode == "folder" ? "Now" : "";
             clicked => {
@@ -69,7 +87,7 @@ component ModeSection inherits Section {
         OptionTile {
             icon: @image-url("icons/key.svg");
             title: "User";
-            text: "Anything you could do yourself, protected files aside.";
+            text: "Anything you may do, protected files aside.";
             selected: Perm.mode == "user";
             badge: Perm.mode == "user" ? "Now" : "";
             clicked => {
@@ -92,8 +110,9 @@ component ModeSection inherits Section {
 }
 
 component FolderSection inherits Section {
+    icon: @image-url("icons/folder.svg");
     title: "Folders";
-    text: "The folders " + Perm.center + " may use in folder mode: read, write, and run commands in them.";
+    text: "What " + Perm.center + " may do in each, in folder mode.";
     Reveal {
         shown: Perm.mode != "folder" && Perm.folders.length > 0;
         HorizontalLayout {
@@ -102,7 +121,7 @@ component FolderSection inherits Section {
             padding-bottom: Space.md;
             Banner {
                 tone: Tone.neutral;
-                text: "Folders count in folder mode only; " + Perm.center + " is in " + Perm.mode + " mode now.";
+                text: "Folders count in folder mode only.";
             }
         }
     }
@@ -169,7 +188,7 @@ component FolderSection inherits Section {
             spacing: Space.md;
             if Perm.folders.length == 0: Text {
                 text: "No folder yet.";
-                color: Theme.text-faint;
+                color: Theme.text-muted;
                 font-size: Type.small;
                 vertical-alignment: center;
             }
@@ -189,10 +208,11 @@ component FolderSection inherits Section {
 }
 
 component RuleSection inherits Section {
+    icon: @image-url("icons/terminal.svg");
     title: "Commands";
-    text: Perm.list == 0 ? "Allow rules count in allowlist mode: a command that one names may run."
-        : Perm.list == 1 ? "A command a deny rule names never runs, in any mode."
-        : "While sudo is on, a sudo command this list names may run with sudo.";
+    text: Perm.list == 0 ? "In allowlist mode, a command an allow rule names may run."
+        : Perm.list == 1 ? "A command a deny rule names never runs."
+        : "With sudo on, the sudo commands named here may run.";
     HorizontalLayout {
         padding-left: Space.xl;
         padding-right: Space.xl;
@@ -277,8 +297,9 @@ component RuleSection inherits Section {
 }
 
 component CapSection inherits Section {
+    icon: @image-url("icons/plug.svg");
     title: "Capabilities";
-    text: "Switch a capability, or one action of it, off for " + Perm.center + ", or hide it: the center then does not know it is there.";
+    text: "Off: " + Perm.center + " may not use it. Hidden: it does not see it.";
     for c[i] in Perm.caps: ListRow {
         first: i == 0;
         HorizontalLayout {
@@ -316,8 +337,10 @@ component CapSection inherits Section {
 }
 
 component SudoSection inherits Section {
+    icon: @image-url("icons/key.svg");
+    tone: Perm.sudo-on ? Tone.warn : Tone.accent;
     title: "Sudo";
-    text: "For every center of this machine: while it is on, the commands on a center's sudo list run with sudo. The password stays in the running node's memory only (on Windows, the password of the account commands run as, kept with DPAPI).";
+    text: "For every center: while on, the commands of its sudo list run with sudo.";
     HorizontalLayout {
         padding-left: Space.xl;
         padding-right: Space.xl;
@@ -355,8 +378,8 @@ component SudoSection inherits Section {
 export component PermissionsPage inherits PageFrame {
     gap: 0;
     PageHeader {
+        icon: @image-url("icons/shield.svg");
         title: "Permissions";
-        subtitle: "What each center may do on this machine. A new center may do nothing until you allow it here.";
         error-title: "What " + Perm.center + " may do could not be read";
         error: Perm.error;
         error-action: "Try again";
@@ -368,7 +391,7 @@ export component PermissionsPage inherits PageFrame {
             icon: @image-url("icons/refresh.svg");
             kind: ButtonKind.ghost;
             clicked => {
-                Perm.refresh();
+                Store.reload();
             }
         }
     }
@@ -379,8 +402,8 @@ export component PermissionsPage inherits PageFrame {
         Card {
             EmptyState {
                 icon: @image-url("icons/shield.svg");
-                title: "No center is paired yet";
-                text: "Permissions belong to a center. Pair one, and choose here what it may do.";
+                title: "No center paired yet";
+                text: "Pair a center, then choose here what it may do.";
                 Button {
                     text: "Pair a center";
                     icon: @image-url("icons/plus.svg");
@@ -437,7 +460,7 @@ export component PermissionsPage inherits PageFrame {
             if Perm.guard-missing: Banner {
                 tone: Tone.warn;
                 title: "No guard against changing this node";
-                text: "Deny commands of " + Perm.center + " that name Nerve's own programs, service or folders. It catches an agent's mistakes; a separate account for commands is the real protection.";
+                text: "Deny commands of " + Perm.center + " that run Nerve or touch its folders. It catches mistakes; a separate account for commands is the real protection.";
                 action: Perm.guard-busy ? "" : "Add the guard";
                 acted => {
                     Perm.guard-add();

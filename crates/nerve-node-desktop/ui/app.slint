@@ -4,7 +4,7 @@ import { Palette } from "std-widgets.slint";
 import { Theme, Type, Space, Radius, Size, Tone } from "theme.slint";
 import {
     Page, Load, NodeStatus, CenterRow, AuditRow, PairPreview, FolderRow, CapRow, LogRow,
-    HelpSection, HelpCard, HelpVerb, HelpArg, RelayNodeRow, Pick,
+    HelpSection, HelpCard, HelpVerb, HelpArg, RelayNodeRow, Pick, Limit,
 } from "data.slint";
 import { Store, Perm, Logs, Manual, Prefs, Install } from "store.slint";
 import { NavItem, StatusDot, Toast, Banner, Reveal } from "widgets.slint";
@@ -19,15 +19,14 @@ import { SetupDialog } from "setup.slint";
 import {
     PairDialog, ConfirmDialog, AboutDialog, ModeDialog, FolderDialog, SudoDialog, ProxyDialog,
     OnceDialog, BackupDialog, RestoreDialog, ElevateDialog, UpdateDialog, UninstallDialog,
-    MissingDialog,
-    RelayNodeDialog,
+    MissingDialog, RelayNodeDialog, OtherCopyDialog,
 } from "dialogs.slint";
 import { InstallerView } from "installer.slint";
 
 export {
     Store, Perm, Logs, Manual, Prefs, Install, Type, Tone, Page, Load, NodeStatus, CenterRow, AuditRow,
     PairPreview, FolderRow, CapRow, LogRow, HelpSection, HelpCard, HelpVerb, HelpArg, RelayNodeRow,
-    Pick,
+    Pick, Limit,
 }
 
 component Sidebar inherits Rectangle {
@@ -64,7 +63,7 @@ component Sidebar inherits Rectangle {
                 }
                 Text {
                     text: "Node on this machine";
-                    color: Theme.text-muted;
+                    color: Theme.accent-text;
                     font-size: Type.caption;
                 }
             }
@@ -139,19 +138,20 @@ component Sidebar inherits Rectangle {
         Rectangle {
             height: Space.md;
         }
-        // The node's state, on every page.
-        Rectangle {
+        // The node's state, on every page, in its colour.
+        state := Rectangle {
+            property <Tone> tone: Store.status-load == Load.failed ? Tone.danger : Store.status.tone;
             border-radius: Radius.md;
-            background: Theme.dark ? #ffffff08 : #ffffff99;
+            background: Theme.tone-soft(self.tone);
             border-width: 1px;
-            border-color: Theme.border;
+            border-color: Theme.tone(self.tone).transparentize(0.75);
             HorizontalLayout {
                 padding: 10px;
                 spacing: 9px;
                 VerticalLayout {
                     alignment: center;
                     StatusDot {
-                        tone: Store.status-load == Load.failed ? Tone.danger : Store.status.tone;
+                        tone: state.tone;
                     }
                 }
                 VerticalLayout {
@@ -169,11 +169,11 @@ component Sidebar inherits Rectangle {
                     Text {
                         // What the node said last is stale once it does
                         // not answer.
-                        text: Store.status-load == Load.failed ? "Its state is unknown"
+                        text: Store.status-load == Load.failed ? "State unknown"
                             : Store.status.state == "" ? "One moment"
                             : Store.status.centers == 0 ? "No center paired"
-                            : Store.status.state != "running" ? "No link to its centers"
-                            : Store.status.connected + " of " + Store.status.centers + " centers connected";
+                            : Store.status.state != "running" ? "Not linked"
+                            : Store.status.connected + " of " + Store.status.centers + " centers linked";
                         color: Theme.text-muted;
                         font-size: Type.caption;
                         overflow: elide;
@@ -206,60 +206,149 @@ export component AppWindow inherits Window {
         Palette.color-scheme = ColorScheme.unknown;
     }
 
-    if Install.shown: InstallerView { }
+    // A dialog is open: the window's own shortcuts wait, and the focus comes
+    // back to the window when it closes.
+    property <bool> dialog-open: Store.pair-open || Store.confirm-open || Store.about-open
+        || Perm.mode-open || Perm.folder-open || Perm.sudo-open || Prefs.proxy-open
+        || Prefs.once-open || Prefs.relay-edit-open || Prefs.backup-open || Prefs.restore-open
+        || Store.setup-open || Store.elevate-open || Install.update-open || Install.uninstall-open
+        || Store.missing-open;
+    changed dialog-open => {
+        if (!self.dialog-open) {
+            keys.focus();
+        }
+    }
+    init => {
+        keys.focus();
+    }
 
-    if !Install.shown: HorizontalLayout {
-        Sidebar { }
-        VerticalLayout {
-            horizontal-stretch: 1;
-            // On an installed node every page needs the rights the app asks
-            // for; until it has them, this says why and how.
-            Reveal {
-                shown: Store.elevate-needed;
-                Rectangle {
-                    background: Theme.window;
-                    VerticalLayout {
-                        padding-left: Space.page;
-                        padding-right: Space.page;
-                        padding-top: Space.lg;
-                        Banner {
-                            tone: Tone.accent;
-                            title: "The node is installed as a service";
-                            text: "You are not one of its owners. Give the app administrator rights to see and change it.";
-                            action: "Continue…";
-                            acted => {
-                                Store.elevate-open = true;
+    // The window's shortcuts: Ctrl+1 to Ctrl+7 open the pages in the
+    // sidebar's order, Ctrl+R and F5 read the page again. They come here
+    // from wherever the focus is, unless a field takes the key itself.
+    keys := FocusScope {
+        width: 100%;
+        height: 100%;
+        property <bool> pages: !Install.shown && !root.dialog-open;
+        KeyBinding {
+            keys: @keys(Control + "1");
+            enabled: keys.pages;
+            activated => {
+                Store.show(Page.overview);
+            }
+        }
+        KeyBinding {
+            keys: @keys(Control + "2");
+            enabled: keys.pages;
+            activated => {
+                Store.show(Page.centers);
+            }
+        }
+        KeyBinding {
+            keys: @keys(Control + "3");
+            enabled: keys.pages;
+            activated => {
+                Store.show(Page.policy);
+            }
+        }
+        KeyBinding {
+            keys: @keys(Control + "4");
+            enabled: keys.pages;
+            activated => {
+                Store.show(Page.audit);
+            }
+        }
+        KeyBinding {
+            keys: @keys(Control + "5");
+            enabled: keys.pages;
+            activated => {
+                Store.show(Page.log);
+            }
+        }
+        KeyBinding {
+            keys: @keys(Control + "6");
+            enabled: keys.pages;
+            activated => {
+                Store.show(Page.settings);
+            }
+        }
+        KeyBinding {
+            keys: @keys(Control + "7");
+            enabled: keys.pages;
+            activated => {
+                Store.show(Page.help);
+            }
+        }
+        KeyBinding {
+            keys: @keys(Control + "r");
+            enabled: keys.pages;
+            activated => {
+                Store.reload();
+            }
+        }
+        KeyBinding {
+            keys: @keys(F5);
+            enabled: keys.pages;
+            activated => {
+                Store.reload();
+            }
+        }
+
+        if Install.shown: InstallerView { }
+
+        if !Install.shown: HorizontalLayout {
+            Sidebar { }
+            VerticalLayout {
+                horizontal-stretch: 1;
+                // On an installed node every page needs the rights the app
+                // asks for; until it has them, this says why and how.
+                Reveal {
+                    shown: Store.elevate-needed;
+                    Rectangle {
+                        background: Theme.window;
+                        VerticalLayout {
+                            padding-left: Space.page;
+                            padding-right: Space.page;
+                            padding-top: Space.lg;
+                            Banner {
+                                tone: Tone.accent;
+                                title: "Administrator rights needed";
+                                text: "You are not an owner of this node.";
+                                action: "Continue…";
+                                acted => {
+                                    Store.elevate-open = true;
+                                }
                             }
                         }
                     }
                 }
+                if Store.page == Page.overview: OverviewPage { }
+                if Store.page == Page.centers: CentersPage { }
+                if Store.page == Page.policy: PermissionsPage { }
+                if Store.page == Page.audit: AuditPage { }
+                if Store.page == Page.log: LogPage { }
+                if Store.page == Page.settings: SettingsPage { }
+                if Store.page == Page.help: HelpPage { }
             }
-            if Store.page == Page.overview: OverviewPage { }
-            if Store.page == Page.centers: CentersPage { }
-            if Store.page == Page.policy: PermissionsPage { }
-            if Store.page == Page.audit: AuditPage { }
-            if Store.page == Page.log: LogPage { }
-            if Store.page == Page.settings: SettingsPage { }
-            if Store.page == Page.help: HelpPage { }
         }
-    }
 
-    if Store.pair-open: PairDialog { }
-    if Store.confirm-open: ConfirmDialog { }
-    if Store.about-open: AboutDialog { }
-    if Perm.mode-open: ModeDialog { }
-    if Perm.folder-open: FolderDialog { }
-    if Perm.sudo-open: SudoDialog { }
-    if Prefs.proxy-open: ProxyDialog { }
-    if Prefs.once-open: OnceDialog { }
-    if Prefs.relay-edit-open: RelayNodeDialog { }
-    if Prefs.backup-open: BackupDialog { }
-    if Prefs.restore-open: RestoreDialog { }
-    if Store.setup-open: SetupDialog { }
-    if Store.elevate-open: ElevateDialog { }
-    if Install.update-open: UpdateDialog { }
-    if Install.uninstall-open: UninstallDialog { }
-    if Store.missing-open: MissingDialog { }
+        if Store.pair-open: PairDialog { }
+        if Store.confirm-open: ConfirmDialog { }
+        if Store.about-open: AboutDialog { }
+        if Perm.mode-open: ModeDialog { }
+        if Perm.folder-open: FolderDialog { }
+        if Perm.sudo-open: SudoDialog { }
+        if Prefs.proxy-open: ProxyDialog { }
+        if Prefs.once-open: OnceDialog { }
+        if Prefs.relay-edit-open: RelayNodeDialog { }
+        if Prefs.backup-open: BackupDialog { }
+        if Prefs.restore-open: RestoreDialog { }
+        if Store.setup-open: SetupDialog { }
+        if Store.elevate-open: ElevateDialog { }
+        if Install.update-open: UpdateDialog { }
+        if Install.uninstall-open: UninstallDialog { }
+        if Store.missing-open: MissingDialog { }
+        if Install.other-open: OtherCopyDialog { }
+    }
 
     if Store.toast-shown: Toast {
         text: Store.toast;

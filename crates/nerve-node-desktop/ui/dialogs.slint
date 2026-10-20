@@ -13,10 +13,20 @@ import {
 export component PairDialog inherits Dialog {
     title: Store.pair-step == 0 ? "Pair a center" : "Pair with this center?";
     subtitle: Store.pair-step == 0
-        ? "Paste the pairing link the center's web UI shows under Pair a machine. Nothing is paired until you confirm."
-        : "Check that this is the center you mean. It gets nothing yet: a new center may do nothing until you allow it.";
+        ? "Paste the link the center's web UI shows under Pair a machine."
+        : "Check that this is your center. It may do nothing until you allow it.";
     close => {
         Store.pair-open = false;
+    }
+    enter => {
+        if (Store.pair-busy) {
+            return;
+        }
+        if (Store.pair-step == 0 && Store.pair-link != "") {
+            Store.pair-check(Store.pair-link, Store.pair-name);
+        } else if (Store.pair-step == 1) {
+            Store.pair-confirm();
+        }
     }
 
     // One step at a time; both stay in place (see Reveal).
@@ -44,7 +54,7 @@ export component PairDialog inherits Dialog {
         }
         Field {
             label: "Name on this machine";
-            hint: "Optional. Leave it empty to take the center's own name.";
+            hint: "Optional. Empty: the center's own name.";
             TextField {
                 text <=> Store.pair-name;
                 placeholder: "home-lab";
@@ -97,11 +107,11 @@ export component PairDialog inherits Dialog {
                 }
                 InfoRow {
                     label: "Certificate";
-                    value: !Store.pair-preview.tls ? "None: plain http, nothing on the way is encrypted"
+                    value: !Store.pair-preview.tls ? "None: plain http"
                         : Store.pair-preview.pin != "" ? "Pinned: " + Store.pair-preview.pin
-                        : "Checked against the system's roots";
+                        : "Checked by the system";
                     mono: Store.pair-preview.tls && Store.pair-preview.pin != "";
-                    tone: Store.pair-preview.tls ? Tone.neutral : Tone.danger;
+                    tone: Store.pair-preview.tls ? Tone.ok : Tone.danger;
                 }
                 InfoRow {
                     label: "Name here";
@@ -114,8 +124,8 @@ export component PairDialog inherits Dialog {
             gap: Space.lg;
             Banner {
                 tone: Tone.warn;
-                title: "This link is not encrypted";
-                text: "Anyone on the way can read and change what goes between this machine and the center. Pair over plain http only on a network you trust.";
+                title: "Not encrypted";
+                text: "Anyone on the way can read and change the traffic. Use plain http only on a network you trust.";
             }
         }
         }
@@ -139,7 +149,7 @@ export component PairDialog inherits Dialog {
                     }
                 }
                 Text {
-                    text: "Allowlist mode: nothing is allowed until you add an allow rule or choose a mode.";
+                    text: "Allowlist mode: nothing allowed yet.";
                     color: Theme.text-muted;
                     font-size: Type.small;
                     wrap: word-wrap;
@@ -157,7 +167,7 @@ export component PairDialog inherits Dialog {
                     }
                 }
                 Text {
-                    text: "No settings grant: the center cannot change what it may do.";
+                    text: "No settings grant: it cannot change what it may do.";
                     color: Theme.text-muted;
                     font-size: Type.small;
                     wrap: word-wrap;
@@ -199,6 +209,10 @@ export component ConfirmDialog inherits Dialog {
     close => {
         Store.confirm-open = false;
     }
+    enter => {
+        Store.confirm-open = false;
+        Store.confirm-accepted();
+    }
     Reveal {
         shown: Store.confirm-option != "";
         CheckBox {
@@ -235,6 +249,9 @@ export component AboutDialog inherits Dialog {
     close => {
         Store.about-open = false;
     }
+    enter => {
+        Store.about-open = false;
+    }
     VerticalLayout {
         spacing: Space.sm;
         HorizontalLayout {
@@ -259,7 +276,7 @@ export component AboutDialog inherits Dialog {
             horizontal-alignment: center;
         }
         Text {
-            text: "The desktop app of the Nerve node. Every action runs nerve-node, so it has the command line's checks and writes the same audit records.";
+            text: "Every action runs nerve-node, with its checks and audit records.";
             color: Theme.text-muted;
             font-size: Type.small;
             wrap: word-wrap;
@@ -288,11 +305,14 @@ export component AboutDialog inherits Dialog {
 export component ModeDialog inherits Dialog {
     title: Perm.mode-choice == "folder" ? "Folder mode for " + Perm.center : "User mode for " + Perm.center;
     subtitle: Perm.mode-choice == "folder"
-        ? "The center may do what each of its folders allows, in that folder."
-        : "The center may do anything you could do yourself on this machine, its protected files aside. Use it for a while, not for good.";
+        ? "It may do what each of its folders allows."
+        : "It may do anything you may do, protected files aside. Best for a while, not for good.";
     card-width: 480px;
     close => {
         Perm.mode-open = false;
+    }
+    enter => {
+        Perm.mode-apply();
     }
     VerticalLayout {
         Segmented {
@@ -307,7 +327,7 @@ export component ModeDialog inherits Dialog {
             gap: Space.md;
             Field {
                 label: "Hours";
-                hint: "Then the center goes back to allowlist mode by itself.";
+                hint: "Then it goes back to allowlist mode.";
                 TextField {
                     text <=> Perm.mode-hours;
                     label: "Hours";
@@ -339,10 +359,15 @@ export component ModeDialog inherits Dialog {
 
 export component FolderDialog inherits Dialog {
     title: "Add a folder";
-    subtitle: "What may " + Perm.center + " do in it? A folder's rights count in folder mode.";
+    subtitle: "What may " + Perm.center + " do in it?";
     card-width: 520px;
     close => {
         Perm.folder-open = false;
+    }
+    enter => {
+        if (Perm.folder-read || Perm.folder-write || Perm.folder-execute) {
+            Perm.folder-add();
+        }
     }
     Code {
         text: Perm.folder-path;
@@ -351,7 +376,7 @@ export component FolderDialog inherits Dialog {
         spacing: Space.md;
         CheckBox {
             text: "Read";
-            detail: "List, read and search its files.";
+            detail: "List, read and search files.";
             checked: Perm.folder-read;
             toggled(on) => {
                 Perm.folder-read = on;
@@ -359,7 +384,7 @@ export component FolderDialog inherits Dialog {
         }
         CheckBox {
             text: "Write";
-            detail: "Change, add and delete files in it.";
+            detail: "Change, add and delete files.";
             checked: Perm.folder-write;
             toggled(on) => {
                 Perm.folder-write = on;
@@ -367,7 +392,7 @@ export component FolderDialog inherits Dialog {
         }
         CheckBox {
             text: "Run commands";
-            detail: "Run commands in it, confined to the folders that allow it.";
+            detail: "Run commands in it.";
             checked: Perm.folder-execute;
             toggled(on) => {
                 Perm.folder-execute = on;
@@ -396,10 +421,15 @@ export component FolderDialog inherits Dialog {
 
 export component SudoDialog inherits Dialog {
     title: "Turn sudo on";
-    subtitle: "Your sudo password, which the running node keeps in memory only and forgets when sudo goes off or the node stops. On Windows, the password of the account commands run as.";
+    subtitle: "Your sudo password, kept in the node's memory only. On Windows, the password of the commands' account.";
     card-width: 480px;
     close => {
         Perm.sudo-open = false;
+    }
+    enter => {
+        if (Perm.sudo-password != "" && !Perm.sudo-busy) {
+            Perm.sudo-confirm();
+        }
     }
     Field {
         label: "Password";
@@ -439,14 +469,19 @@ export component SudoDialog inherits Dialog {
 
 export component ProxyDialog inherits Dialog {
     title: "Proxy";
-    subtitle: "Every link to a center goes through it, a pairing too. Header values and the password are kept apart from node.toml.";
+    subtitle: "Every link to a center goes through it.";
     card-width: 560px;
     close => {
         Prefs.proxy-open = false;
     }
+    enter => {
+        if (Prefs.proxy-new-url != "") {
+            Prefs.proxy-set();
+        }
+    }
     Field {
         label: "Proxy";
-        hint: "http://host:port, http://user@host:port when it wants a login, or https://… for a relay.";
+        hint: "http://host:port, http://user@host:port, or https://… for a relay.";
         TextField {
             text <=> Prefs.proxy-new-url;
             mono: true;
@@ -456,7 +491,7 @@ export component ProxyDialog inherits Dialog {
     }
     Field {
         label: "Password";
-        hint: "Optional. The password of the user in the URL; it is kept apart from node.toml.";
+        hint: "Optional. For the user in the URL.";
         TextField {
             text <=> Prefs.proxy-new-password;
             password: true;
@@ -465,7 +500,7 @@ export component ProxyDialog inherits Dialog {
     }
     Field {
         label: "Pin";
-        hint: "Optional. The pin of an https:// proxy's certificate; a relay shows its own.";
+        hint: "Optional. The pin of an https proxy's certificate.";
         TextField {
             text <=> Prefs.proxy-new-pin;
             mono: true;
@@ -474,7 +509,7 @@ export component ProxyDialog inherits Dialog {
     }
     Field {
         label: "Headers";
-        hint: "Optional. One a line, as Name: value.";
+        hint: "Optional. One a line: Name: value.";
         TextArea {
             text <=> Prefs.proxy-new-headers;
             mono: true;
@@ -511,6 +546,9 @@ export component OnceDialog inherits Dialog {
     close => {
         Prefs.once-open = false;
     }
+    enter => {
+        Prefs.once-open = false;
+    }
     Reveal {
         shown: Prefs.once-text != "";
         Text {
@@ -541,9 +579,12 @@ export component OnceDialog inherits Dialog {
 // what to install.
 export component MissingDialog inherits Dialog {
     title: Store.missing-title;
-    subtitle: "Nerve needs a part of the desktop for this that is not on this machine.";
+    subtitle: "A part of the desktop is missing.";
     card-width: 560px;
     close => {
+        Store.missing-open = false;
+    }
+    enter => {
         Store.missing-open = false;
     }
     DialogButtons {
@@ -560,10 +601,15 @@ export component MissingDialog inherits Dialog {
 
 export component BackupDialog inherits Dialog {
     title: "Back up this node";
-    subtitle: "The config and the keys go into the file, sealed with the passphrase. Without it the file is no use to anyone, you included.";
+    subtitle: "Sealed with the passphrase: without it nobody can use the file, you included.";
     card-width: 540px;
     close => {
         Prefs.backup-open = false;
+    }
+    enter => {
+        if (Prefs.backup-pass != "" && Prefs.backup-pass == Prefs.backup-pass2 && !Prefs.backup-busy) {
+            Prefs.backup-confirm();
+        }
     }
     Code {
         text: Prefs.backup-file;
@@ -593,8 +639,8 @@ export component BackupDialog inherits Dialog {
         }
     }
     CheckBox {
-        text: "Take the keys in the system keyring too";
-        detail: "Without it, keys kept in the keyring stay there and are left out of the file.";
+        text: "Include the keys in the system keyring";
+        detail: "Without it, they stay out of the file.";
         checked: Prefs.backup-keyring;
         toggled(on) => {
             Prefs.backup-keyring = on;
@@ -623,11 +669,16 @@ export component BackupDialog inherits Dialog {
 
 export component RestoreDialog inherits Dialog {
     title: "Restore a backup";
-    subtitle: Store.service-state == "running" ? "The backup's config and keys take the place of this node's. The node stops while it is restored, and starts again after."
-        : "The backup's config and keys take the place of this node's.";
+    subtitle: Store.service-state == "running" ? "Its settings and keys replace this node's. The node restarts for it."
+        : "Its settings and keys replace this node's.";
     card-width: 540px;
     close => {
         Prefs.restore-open = false;
+    }
+    enter => {
+        if (Prefs.restore-pass != "" && !Prefs.restore-busy) {
+            Prefs.restore-confirm();
+        }
     }
     Code {
         text: Prefs.restore-file;
@@ -647,8 +698,8 @@ export component RestoreDialog inherits Dialog {
         }
     }
     CheckBox {
-        text: "It is the backup of another node";
-        detail: "Replace the node here with it. Without this a backup of another node is refused.";
+        text: "It is another node's backup";
+        detail: "Replace this node with it.";
         checked: Prefs.restore-replace;
         toggled(on) => {
             Prefs.restore-replace = on;
@@ -656,15 +707,15 @@ export component RestoreDialog inherits Dialog {
     }
     CheckBox {
         text: "Leave its proxy out";
-        detail: "This machine reaches its centers in its own way; set a proxy here later.";
+        detail: "This machine reaches its centers its own way.";
         checked: Prefs.restore-without-proxy;
         toggled(on) => {
             Prefs.restore-without-proxy = on;
         }
     }
     CheckBox {
-        text: "Keep its keys in files here";
-        detail: "For a backup of a machine that kept them in the system keyring, when this one has none or may not use it, as the installed node on Windows.";
+        text: "Keep its keys in files";
+        detail: "When this machine cannot use the system keyring.";
         checked: Prefs.restore-in-files;
         toggled(on) => {
             Prefs.restore-in-files = on;
@@ -694,13 +745,18 @@ export component RestoreDialog inherits Dialog {
 // Why the app asks for administrator rights, before the system asks.
 export component ElevateDialog inherits Dialog {
     title: "Administrator rights";
-    subtitle: "The node on this machine is installed as a service, and you are not one of its owners. Reading and changing it takes administrator rights, as nerve-node with sudo (on Windows, as administrator) does in a terminal.";
+    subtitle: "You are not an owner of this node, so reading and changing it needs administrator rights.";
     card-width: 520px;
     close => {
         Store.elevate-open = false;
     }
+    enter => {
+        if (!Store.elevate-busy) {
+            Store.elevate-allow();
+        }
+    }
     Text {
-        text: "The system asks you once, and the app keeps the rights while it is open. Every change still runs as a nerve-node command, with its checks and audit records.";
+        text: "The system asks once; the app keeps them while it is open.";
         color: Theme.text-muted;
         font-size: Type.small;
         wrap: word-wrap;
@@ -729,13 +785,20 @@ export component ElevateDialog inherits Dialog {
 // Settings: update the app and the node, from the latest release or a file.
 export component UpdateDialog inherits Dialog {
     title: Install.step == "done" ? "Nerve is updated to " + Install.installed-version : "Update Nerve";
-    subtitle: Install.step == "done" ? (Install.installed-version == Install.version ? "Nerve was up to date: the program is the one that is installed." : "The service runs the new version. Restart Nerve to use it here too.")
+    subtitle: Install.step == "done" ? (Install.installed-version == Install.version ? "Nerve was up to date." : "The service runs it. Restart Nerve to use it here too.")
         : Install.step == "working" ? ""
-        : "Version " + Install.version + " is installed. An update replaces the program, puts its menu entry back and restarts the service. The node's settings, keys and audit log stay.";
+        : "Version " + Install.version + " is installed. Settings, keys and the audit log stay.";
     card-width: 560px;
     close => {
         if (Install.step != "working") {
             Install.update-open = false;
+        }
+    }
+    enter => {
+        if (Install.step == "choose" && (Install.source == 0 || Install.file != "")) {
+            Install.update();
+        } else if (Install.step == "done") {
+            Install.open-app();
         }
     }
     VerticalLayout {
@@ -802,15 +865,22 @@ export component UninstallDialog inherits Dialog {
     title: Install.step == "done" ? "Nerve is removed"
         : Install.step == "working" ? "Uninstall Nerve"
         : "Uninstall Nerve?";
-    subtitle: Install.step == "done" ? (Install.purge ? "The node, the app and the node's data are gone from this machine." : "The node and the app are gone. The node's data stays; install Nerve again, and the node takes it up.")
+    subtitle: Install.step == "done" ? (Install.purge ? "Nerve and its data are gone." : "Nerve is gone. Its data stays for a new install.")
         : Install.step == "working" ? ""
-        : "The service, its user nerve, the program, its menu entry and its link handler go. Choose what happens to the node's data.";
+        : "The service, its user, the app and its menu entry go.";
     card-width: 600px;
     close => {
         if (Install.step == "done") {
             Install.close();
         } else if (Install.step != "working") {
             Install.uninstall-open = false;
+        }
+    }
+    enter => {
+        if (Install.step == "choose") {
+            Install.uninstall();
+        } else if (Install.step == "done") {
+            Install.close();
         }
     }
     VerticalLayout {
@@ -867,14 +937,19 @@ export component UninstallDialog inherits Dialog {
 // and its own limits, for a relay behind this one that carries many nodes.
 export component RelayNodeDialog inherits Dialog {
     title: Prefs.relay-edit-name;
-    subtitle: "A node that reaches this node's centers through the relay.";
+    subtitle: "Reaches this node's centers through the relay.";
     card-width: 540px;
     close => {
         Prefs.relay-edit-open = false;
     }
+    enter => {
+        if (!Prefs.relay-edit-busy) {
+            Prefs.relay-edit-save();
+        }
+    }
     Field {
         label: "Centers it may reach";
-        hint: "None ticked: every https center of this node, also one paired later.";
+        hint: "None ticked: every https center, also one paired later.";
         VerticalLayout {
             spacing: Space.sm;
             for p[i] in Prefs.relay-edit-centers: CheckBox {
@@ -888,7 +963,7 @@ export component RelayNodeDialog inherits Dialog {
     }
     Field {
         label: "Limits";
-        hint: Prefs.relay-edit-own ? "For a relay behind this one, which carries many nodes." : "The limits every node of the relay has.";
+        hint: Prefs.relay-edit-own ? "For a relay behind this one, which carries many nodes." : "The relay's limits.";
         VerticalLayout {
             spacing: Space.md;
             HorizontalLayout {
@@ -938,6 +1013,79 @@ export component RelayNodeDialog inherits Dialog {
             busy: Prefs.relay-edit-busy;
             clicked => {
                 Prefs.relay-edit-save();
+            }
+        }
+    }
+}
+
+// Another copy of Nerve was opened while the app is open, such as the file
+// just downloaded: what the installer offers for it.
+export component OtherCopyDialog inherits Dialog {
+    title: "Nerve is installed";
+    subtitle: Install.other-newer ? "The file you opened is newer. Update Nerve with it?"
+        : Install.other-version == Install.version ? "The file you opened is the version that is installed."
+        : "The file you opened is older than the installed Nerve.";
+    card-width: 540px;
+    close => {
+        Install.other-open = false;
+    }
+    enter => {
+        if (Install.other-newer) {
+            Install.other-update();
+        } else {
+            Install.other-open = false;
+        }
+    }
+    Rectangle {
+        background: Theme.surface-alt;
+        border-radius: Radius.lg;
+        border-width: 1px;
+        border-color: Theme.border;
+        VerticalLayout {
+            padding: Space.lg;
+            spacing: Space.md;
+            InfoRow {
+                label: "Installed";
+                value: "Version " + Install.version;
+            }
+            InfoRow {
+                label: "The file";
+                value: Install.other-version != "" ? "Version " + Install.other-version : "Version unknown";
+                tone: Install.other-newer ? Tone.accent : Tone.neutral;
+            }
+            InfoRow {
+                label: "Its path";
+                value: Install.other-file;
+                mono: true;
+            }
+        }
+    }
+    DialogButtons {
+        Button {
+            text: "Uninstall…";
+            icon: @image-url("icons/trash.svg");
+            kind: ButtonKind.danger-soft;
+            clicked => {
+                Install.other-open = false;
+                Install.ask-uninstall();
+            }
+        }
+        Rectangle {
+            horizontal-stretch: 1;
+        }
+        Button {
+            text: "Close";
+            kind: Install.other-newer ? ButtonKind.ghost : ButtonKind.primary;
+            clicked => {
+                Install.other-open = false;
+            }
+        }
+        if Install.other-newer: Button {
+            text: "Update to " + Install.other-version;
+            icon: @image-url("icons/download.svg");
+            kind: ButtonKind.primary;
+            clicked => {
+                Install.other-update();
             }
         }
     }

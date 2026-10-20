@@ -29,6 +29,20 @@ pub(super) fn system_launcher() -> Launcher {
     })
 }
 
+/// The version of the program at `file`, from its `--version`
+/// (`nerve-node-desktop 0.0.6`); none when it does not say.
+pub fn version_of(file: &Path) -> Option<String> {
+    let out = std::process::Command::new(file)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8(out.stdout).ok()?;
+    let (name, version) = text.trim().split_once(' ')?;
+    (out.status.success() && name == crate::parts::PROGRAM).then(|| version.to_string())
+}
+
 /// Whether version `a` is newer than `b` (both `x.y.z`).
 pub fn newer(a: &str, b: &str) -> bool {
     let parse =
@@ -274,6 +288,39 @@ impl Ctl {
         self.run_service_command("uninstall", args, None);
     }
 
+    /// Another copy of the program was started while the app is open, such
+    /// as the file just downloaded: the app says which version it is and
+    /// offers the update with it, or the uninstall, as the installer would.
+    pub(super) fn offer_other(self: &Rc<Self>, file: PathBuf) {
+        let shown = file.display().to_string();
+        self.job(
+            move |_| version_of(&file),
+            move |c, version| {
+                c.with_install(|i| {
+                    let version = version.unwrap_or_default();
+                    i.set_other_newer(!version.is_empty() && newer(&version, &i.get_version()));
+                    i.set_other_version(version.into());
+                    i.set_other_file(shown.into());
+                    i.set_other_open(true);
+                });
+            },
+        );
+    }
+
+    /// The update with the other copy's program.
+    fn other_update(self: &Rc<Self>) {
+        let Some(file) = self.with_install(|i| i.get_other_file()) else {
+            return;
+        };
+        self.ask_update();
+        self.with_install(|i| {
+            i.set_other_open(false);
+            i.set_source(1);
+            i.set_file(file);
+        });
+        self.update_go();
+    }
+
     /// Opens the uninstall: keep or delete the node's data, then go.
     pub fn ask_uninstall(&self) {
         self.with_install(|i| {
@@ -362,6 +409,8 @@ pub(super) fn wire(ctl: &Rc<Ctl>, window: &crate::AppWindow) {
     i.on_ask_uninstall(move || c.ask_uninstall());
     let c = ctl.clone();
     i.on_ask_update(move || c.ask_update());
+    let c = ctl.clone();
+    i.on_other_update(move || c.other_update());
     let c = ctl.clone();
     i.on_choose_file(move || c.choose_file());
     let c = ctl.clone();

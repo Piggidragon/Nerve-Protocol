@@ -134,6 +134,9 @@ pub struct Ctl {
     /// A restart the app said would come and that has not run yet; the
     /// app's end runs it ([`Ctl::end`]).
     restart_waits: Cell<bool>,
+    /// Asks the desktop now and then whether it is dark, while the app
+    /// follows it (crate::scheme).
+    scheme_timer: slint::Timer,
 }
 
 thread_local! {
@@ -263,6 +266,7 @@ impl Ctl {
             perm_asked: Cell::new(0),
             restart_timer: slint::Timer::default(),
             restart_waits: Cell::new(false),
+            scheme_timer: slint::Timer::default(),
         });
         CURRENT.with(|c| *c.borrow_mut() = Some(ctl.clone()));
         window.global::<Type>().set_mono(mono_font().into());
@@ -287,6 +291,8 @@ impl Ctl {
 
         let c = ctl.clone();
         store.on_show(move |page| c.show(page));
+        let c = ctl.clone();
+        store.on_reload(move || c.reload());
         let c = ctl.clone();
         store.on_refresh(move || c.refresh_status());
         let c = ctl.clone();
@@ -641,12 +647,29 @@ impl Ctl {
         });
     }
 
+    /// Opens `page` and reads what it shows. The page that is open stays
+    /// as it is: a click on its tab reads nothing again, only Refresh does
+    /// ([`Ctl::reload`]).
     pub(super) fn show(self: &Rc<Self>, page: Page) {
+        if self.with_store(|s| s.get_page()) == Some(page) {
+            return;
+        }
         self.with_store(|s| s.set_page(page));
         // Only the page that shows it keeps a command running.
         if !matches!(page, Page::Audit | Page::Log) {
             self.stop_follow();
         }
+        self.load(page);
+    }
+
+    /// Reads the open page again: its Refresh button, Ctrl+R and F5.
+    pub(super) fn reload(self: &Rc<Self>) {
+        if let Some(page) = self.with_store(|s| s.get_page()) {
+            self.load(page);
+        }
+    }
+
+    fn load(self: &Rc<Self>, page: Page) {
         match page {
             Page::Audit => self.follow_audit(),
             Page::Log => self.follow_log(),
@@ -1024,8 +1047,7 @@ impl Ctl {
     /// app opens the link it was given, or its uninstall.
     pub fn started_again(self: &Rc<Self>, asked: crate::instance::Asked) {
         if let Some(w) = self.window.upgrade() {
-            let _ = w.show();
-            w.window().set_minimized(false);
+            bring_up(&w);
         }
         let installer = self.with_install(|i| i.get_shown()).unwrap_or(false);
         if installer {
@@ -1035,18 +1057,20 @@ impl Ctl {
             self.open_link(link);
         } else if asked.uninstall {
             self.ask_uninstall();
+        } else if let Some(program) = asked.program {
+            self.offer_other(program.into());
         }
     }
 
     /// Keeps the app's settings in `file`, and takes the appearance saved
     /// there.
-    pub fn keep_settings(&self, file: PathBuf) {
+    pub fn keep_settings(self: &Rc<Self>, file: PathBuf) {
         let appearance = crate::settings::appearance(&file);
         *self.settings.borrow_mut() = Some(file);
         self.show_appearance(appearance);
     }
 
-    fn set_appearance(&self, i: i32) {
+    fn set_appearance(self: &Rc<Self>, i: i32) {
         self.show_appearance(i);
         if let Some(file) = self.settings.borrow().as_ref()
             && let Err(e) = crate::settings::save_appearance(file, i)
@@ -1055,7 +1079,7 @@ impl Ctl {
         }
     }
 
-    fn show_appearance(&self, i: i32) {
+    fn show_appearance(self: &Rc<Self>, i: i32) {
         let Some(w) = self.window.upgrade() else {
             return;
         };
@@ -1063,8 +1087,47 @@ impl Ctl {
         match i {
             1 => w.invoke_set_dark(false),
             2 => w.invoke_set_dark(true),
-            _ => w.invoke_follow_system(),
+            _ => {
+                w.invoke_follow_system();
+                self.follow_desktop();
+            }
         }
+        if i != 0 {
+            self.scheme_timer.stop();
+        }
+    }
+
+    /// Follows the desktop's light or dark as the desktop keeps it
+    /// (crate::scheme), now and every few seconds, so a switch there shows
+    /// here too. Where the desktop does not say, Slint's own reading stays.
+    fn follow_desktop(self: &Rc<Self>) {
+        // No event loop, no timers: tests and the screenshots set the look.
+        if self.exec != Exec::Threads {
+            return;
+        }
+        let ask = |c: &Rc<Ctl>| {
+            c.job(
+                |_| crate::scheme::dark_here(),
+                |c, dark| {
+                    let following = c.with_store(|s| s.get_appearance() == 0);
+                    if let (Some(true), Some(dark), Some(w)) = (following, dark, c.window.upgrade())
+                    {
+                        w.invoke_set_dark(dark);
+                    }
+                },
+            )
+        };
+        ask(self);
+        let c = Rc::downgrade(self);
+        self.scheme_timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_secs(5),
+            move || {
+                if let Some(c) = c.upgrade() {
+                    ask(&c);
+                }
+            },
+        );
     }
 }
 
@@ -1078,19 +1141,23 @@ pub fn run(start: crate::instance::Asked) -> Result<(), Failed> {
     if let Some(e) = crate::deps::no_display_here() {
         return Err(Failed::NoDisplay(e));
     }
-    // A window of this user's is open already: it takes this start.
+    let layout = nerve_node::service::Layout::system();
+    let here = std::env::current_exe().and_then(std::fs::canonicalize).ok();
+    let installed = std::fs::canonicalize(&layout.bin).ok();
+    // A window of this user's is open already: it takes this start. A
+    // program that is not the installed one, such as the file just
+    // downloaded, says where it is, so the open app offers what the
+    // installer would.
+    let mut start = start;
+    if here != installed {
+        start.program = here.as_ref().map(|p| p.display().to_string());
+    }
     let instance = match crate::instance::claim(&start) {
         crate::instance::Claimed::Forwarded => return Ok(()),
         crate::instance::Claimed::First(i) => i,
     };
     let runner = Runner::this_program().map_err(Failed::Other)?;
-    let layout = nerve_node::service::Layout::system();
-    let here = std::env::current_exe().and_then(std::fs::canonicalize).ok();
-    let installed = std::fs::canonicalize(&layout.bin).ok();
-    // The window's name on Wayland and X11, by which the desktop finds its
-    // menu entry (crate::parts).
-    let _ = slint::set_xdg_app_id(crate::parts::PROGRAM);
-    let window = AppWindow::new().map_err(|e| Failed::Window(e.to_string()))?;
+    let window = new_window().map_err(Failed::Window)?;
     let ctl = Ctl::attach(&window, runner, Exec::Threads);
     if let Some(file) = crate::settings::file() {
         ctl.keep_settings(file);
@@ -1122,13 +1189,72 @@ pub fn run(start: crate::instance::Asked) -> Result<(), Failed> {
         }
         ctl.watch();
     }
-    let r = window.run().map_err(|e| Failed::Window(e.to_string()));
+    let r = window
+        .show()
+        .and_then(|()| {
+            dress(&window);
+            slint::run_event_loop()
+        })
+        .and_then(|()| window.hide())
+        .map_err(|e| Failed::Window(e.to_string()));
     if let Some(Err(e)) = ctl.end() {
         eprintln!("The node did not restart for the last change: {e}");
     }
     // A start in software (crate::deps) is the user's one window then.
     ctl.instance.borrow_mut().take();
     r
+}
+
+/// Makes the app's window, named for the desktop: on Wayland and X11 its
+/// name is the menu entry's (crate::parts), by which the dock and the task
+/// manager show the entry's icon. Slint takes the name only once its
+/// platform is there, which making the first window starts; asked before,
+/// it was lost.
+pub fn new_window() -> Result<AppWindow, String> {
+    let window = AppWindow::new().map_err(|e| e.to_string())?;
+    slint::set_xdg_app_id(crate::parts::PROGRAM)
+        .map_err(|e| format!("the window's name for the desktop: {e}"))?;
+    Ok(window)
+}
+
+/// What the window needs from the system once it is shown: on Windows the
+/// program's icon on the taskbar, which Slint does not set (it sets the
+/// small icon of the title bar only).
+fn dress(window: &AppWindow) {
+    #[cfg(windows)]
+    {
+        use slint::winit_030::WinitWindowAccessor;
+        use slint::winit_030::winit::platform::windows::{IconExtWindows, WindowExtWindows};
+        use slint::winit_030::winit::window::Icon;
+        window.window().with_winit_window(|w| {
+            // The program's icon group (build.rs).
+            if let Ok(icon) = Icon::from_resource(1, None) {
+                w.set_taskbar_icon(Some(icon));
+            }
+            if let Ok(icon) = Icon::from_resource(1, None) {
+                w.set_window_icon(Some(icon));
+            }
+        });
+    }
+    #[cfg(not(windows))]
+    let _ = window;
+}
+
+/// Brings `window` to the front: a later start of the app asked for it.
+/// Wayland lets no program raise itself, so there the desktop says that
+/// Nerve wants attention instead.
+fn bring_up(window: &AppWindow) {
+    use slint::winit_030::WinitWindowAccessor;
+    use slint::winit_030::winit::window::UserAttentionType;
+    let _ = window.show();
+    window.window().set_minimized(false);
+    window.window().with_winit_window(|w| {
+        w.set_minimized(false);
+        w.focus_window();
+        if !w.has_focus() {
+            w.request_user_attention(Some(UserAttentionType::Critical));
+        }
+    });
 }
 
 /// Why [`run`] ended without its window.

@@ -15,15 +15,20 @@ export component SetupDialog inherits Dialog {
         : Store.setup-step == 2 ? "Pair your first center"
         : Store.setup-step == 3 ? "What may " + Store.setup-center + " do?"
         : "This machine is set up";
-    subtitle: Store.setup-step == 0 ? "A few steps, each saved when you go on. The name is how centers show this machine."
-        : Store.setup-step == 1 ? "The node keeps a key for each center, and the key of its config. Keep them in files unless you use the system keyring for such things."
-        : Store.setup-step == 2 ? "In the center's web UI press Pair a machine, and paste the link it shows. Nothing is paired until you confirm."
-        : Store.setup-step == 3 ? "You can change it any time under Permissions, and add folders and rules there."
-        : Store.service-state == "stopped" ? "The service is stopped: start it to link this machine to its centers."
-        : "The node links this machine to its centers. Its pages show what it does.";
+    subtitle: Store.setup-step == 0 ? "How centers show this machine. Each step is saved when you go on."
+        : Store.setup-step == 1 ? "A key for each center, and one for the settings. Files are right unless you use a keyring for such things."
+        : Store.setup-step == 2 ? "Paste the link the center's web UI shows under Pair a machine."
+        : Store.setup-step == 3 ? "You can change it any time under Permissions."
+        : Store.service-state == "stopped" ? "Start the service to link this machine to its centers."
+        : "The node links this machine to its centers.";
     card-width: 580px;
     close => {
         Store.setup-close();
+    }
+    enter => {
+        if (!Store.setup-busy && !Store.pair-busy && (Store.setup-step != 2 || Store.pair-link != "")) {
+            Store.setup-next();
+        }
     }
 
     // One step at a time; every step stays in place (see Reveal). The last
@@ -35,7 +40,7 @@ export component SetupDialog inherits Dialog {
                 shown: Store.setup-step == 0;
                 Field {
                     label: "Name";
-                    hint: "Leave it as it is to take the host name.";
+                    hint: "Empty: the host name.";
                     TextField {
                         text <=> Store.setup-name;
                         label: "Name";
@@ -56,7 +61,7 @@ export component SetupDialog inherits Dialog {
                     OptionTile {
                         icon: @image-url("icons/archive.svg");
                         title: "Files";
-                        text: "In the config folder, readable by the node's account only.";
+                        text: "Only the node's account can read them.";
                         selected: Store.setup-storage == 0;
                         clicked => {
                             Store.setup-storage = 0;
@@ -66,7 +71,7 @@ export component SetupDialog inherits Dialog {
                         icon: @image-url("icons/key.svg");
                         title: "System keyring";
                         text: Store.keyring-usable || Store.setup-storage == 1
-                            ? "In the system keyring of the account the node runs as, which must answer whenever the node starts."
+                            ? "The keyring of the node's account. It must answer when the node starts."
                             : Store.keyring-why;
                         enabled: Store.keyring-usable || Store.setup-storage == 1;
                         selected: Store.setup-storage == 1;
@@ -96,7 +101,7 @@ export component SetupDialog inherits Dialog {
                     }
                     Field {
                         label: "Name on this machine";
-                        hint: "Optional. Leave it empty to take the center's own name.";
+                        hint: "Optional. Empty: the center's own name.";
                         TextField {
                             text <=> Store.pair-name;
                             placeholder: "home-lab";
@@ -123,11 +128,11 @@ export component SetupDialog inherits Dialog {
                         }
                         InfoRow {
                             label: "Certificate";
-                            value: !Store.pair-preview.tls ? "None: plain http, nothing on the way is encrypted"
+                            value: !Store.pair-preview.tls ? "None: plain http"
                                 : Store.pair-preview.pin != "" ? "Pinned: " + Store.pair-preview.pin
-                                : "Checked against the system's roots";
+                                : "Checked by the system";
                             mono: Store.pair-preview.tls && Store.pair-preview.pin != "";
-                            tone: Store.pair-preview.tls ? Tone.neutral : Tone.danger;
+                            tone: Store.pair-preview.tls ? Tone.ok : Tone.danger;
                         }
                     }
                 }
@@ -141,7 +146,7 @@ export component SetupDialog inherits Dialog {
                     OptionTile {
                         icon: @image-url("icons/shield.svg");
                         title: "Allowlist";
-                        text: "Only what an allow rule names. Nothing yet.";
+                        text: "Only what an allow rule names.";
                         selected: Store.setup-mode == "allowlist";
                         clicked => {
                             Store.setup-mode = "allowlist";
@@ -150,7 +155,7 @@ export component SetupDialog inherits Dialog {
                     OptionTile {
                         icon: @image-url("icons/folder.svg");
                         title: "Folder";
-                        text: "What each folder you add allows, in it.";
+                        text: "What each folder you add allows.";
                         selected: Store.setup-mode == "folder";
                         clicked => {
                             Store.setup-mode = "folder";
@@ -159,7 +164,7 @@ export component SetupDialog inherits Dialog {
                     OptionTile {
                         icon: @image-url("icons/key.svg");
                         title: "User";
-                        text: "Anything you could do yourself, protected files aside.";
+                        text: "Anything you may do, protected files aside.";
                         selected: Store.setup-mode == "user";
                         clicked => {
                             Store.setup-mode = "user";

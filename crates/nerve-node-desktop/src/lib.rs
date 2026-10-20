@@ -15,5 +15,6 @@ pub mod headless;
 pub mod instance;
 pub mod parts;
 pub mod runner;
+pub mod scheme;
 pub mod settings;
 pub mod view;

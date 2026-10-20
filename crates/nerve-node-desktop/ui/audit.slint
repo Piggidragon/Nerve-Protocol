@@ -154,8 +154,8 @@ component AuditEntry {
 export component AuditPage inherits PageFrame {
     gap: 0;
     PageHeader {
+        icon: @image-url("icons/audit.svg");
         title: "Audit";
-        subtitle: "What the node allowed and refused, newest first, and every change to its settings.";
         error-title: "The audit log could not be read";
         error: Store.audit-error;
         error-action: "Try again";
@@ -174,7 +174,7 @@ export component AuditPage inherits PageFrame {
             icon: @image-url("icons/refresh.svg");
             kind: ButtonKind.ghost;
             clicked => {
-                Store.refresh-audit();
+                Store.reload();
             }
         }
     }
@@ -191,8 +191,8 @@ export component AuditPage inherits PageFrame {
                 icon: @image-url("icons/audit.svg");
                 title: Store.audit-refused-only ? "Nothing was refused" : "Nothing decided yet";
                 text: Store.audit-refused-only
-                    ? "Every call so far was allowed. Refused calls show here, with buttons to allow them."
-                    : "When a center calls this machine, the node's decision shows here, and so does every change to its settings.";
+                    ? "Refused calls show here, with buttons to allow them."
+                    : "Each call of a center and each change of a setting shows here.";
             }
         }
     }
@@ -220,7 +220,7 @@ export component AuditPage inherits PageFrame {
         gap: Space.lg;
         MoreFoot {
             text: Store.audit-limit < 1000 ? "The newest " + Store.audit.length + " entries."
-                : "The newest " + Store.audit.length + " entries. The node keeps the older ones in its audit log.";
+                : "The newest " + Store.audit.length + " entries. Older ones stay in the audit log.";
             more: Store.audit-limit < 1000;
             clicked => {
                 Store.audit-more();

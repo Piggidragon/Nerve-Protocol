@@ -69,8 +69,8 @@ export component Working {
         }
         Text {
             text: Install.asking ? "Answer the system's question to go on."
-                : Install.action == "update" && Install.source == 0 ? "The latest release comes from GitHub, then the service restarts with it."
-                : "This takes a few seconds.";
+                : Install.action == "update" && Install.source == 0 ? "From GitHub. The service restarts with it."
+                : "A few seconds.";
             color: Theme.text-muted;
             font-size: Type.small;
             horizontal-alignment: center;
@@ -148,7 +148,7 @@ export component UninstallChoice {
         OptionTile {
             icon: @image-url("icons/archive.svg");
             title: "Keep the data";
-            text: "The node's settings, pairings, keys and audit log stay. Install Nerve again, and the node comes back with them.";
+            text: "Settings, pairings, keys and the audit log stay for a new install.";
             selected: !Install.purge;
             clicked => {
                 Install.purge = false;
@@ -157,7 +157,7 @@ export component UninstallChoice {
         OptionTile {
             icon: @image-url("icons/trash.svg");
             title: "Delete the data";
-            text: "Keys, pairings and the audit log are gone. To use this machine with a center again, pair it again.";
+            text: "Keys, pairings and the audit log go. A center must pair again.";
             selected: Install.purge;
             clicked => {
                 Install.purge = true;
@@ -175,7 +175,7 @@ export component UpdateChoice {
             OptionTile {
                 icon: @image-url("icons/download.svg");
                 title: "Latest release";
-                text: "From GitHub, checked against the release's SHA256SUMS.";
+                text: "From GitHub, checked against its SHA256SUMS.";
                 selected: Install.source == 0;
                 clicked => {
                     Install.source = 0;
@@ -186,7 +186,7 @@ export component UpdateChoice {
             OptionTile {
                 icon: @image-url("icons/archive.svg");
                 title: "A file";
-                text: "A nerve-node-desktop you downloaded and checked yourself.";
+                text: "A nerve-node-desktop you downloaded.";
                 selected: Install.source == 1;
                 clicked => {
                     Install.choose-file();
@@ -381,9 +381,9 @@ export component InstallerView inherits Rectangle {
                                     title: Install.node-only ? "Add the app to the node on this machine" : "Install Nerve on this machine";
                                     text: Install.node-only
                                         ? (Install.windows
-                                            ? "The node is installed as a service already. Installing adds the app: the service runs the app's program from then on, and nerve-node.exe is removed. For a terminal, download the CLI edition of nerve-node on its own."
-                                            : "The node is installed as a service already. Installing adds the app: the service runs the app's program from then on, and the command nerve-node becomes a link to it.")
-                                        : "Nerve links this machine to your Nerve centers, and lets them do only what you allow.";
+                                            ? "The node's service then runs the app's program, and nerve-node.exe is removed. For a terminal, download the CLI edition."
+                                            : "The node's service then runs the app's program, and the command nerve-node becomes a link to it.")
+                                        : "Nerve links this machine to your centers, and lets them do only what you allow.";
                                 }
                                 VerticalLayout {
                                     spacing: Space.lg;
@@ -391,25 +391,25 @@ export component InstallerView inherits Rectangle {
                                         icon: @image-url("icons/server.svg");
                                         title: "The node, as a service";
                                         text: Install.node-only
-                                            ? "It keeps its settings, pairings, keys and audit log."
-                                            : "Runs in the background under a user of its own, nerve, and starts with the machine.";
+                                            ? "Its settings, pairings, keys and audit log stay."
+                                            : "Runs as its own user, nerve, and starts with the machine.";
                                     }
                                     WhatRow {
                                         icon: @image-url("icons/window.svg");
                                         title: "The app";
-                                        text: "In " + Install.program + ", with Nerve in the " + (Install.windows ? "Start menu and in Apps & features." : "application menu.");
+                                        text: Install.program + ", in the " + (Install.windows ? "Start menu and Apps & features." : "application menu.");
                                     }
                                     WhatRow {
                                         icon: @image-url("icons/link.svg");
                                         title: "nerve:// links";
-                                        text: "A pairing link from a center's web UI opens in Nerve.";
+                                        text: "A center's pairing link opens in Nerve.";
                                     }
                                 }
                                 Reveal {
                                     shown: Install.windows && !Install.node-only;
                                     Field {
                                         label: "Your Windows password";
-                                        hint: "Commands from your centers run as you, " + Install.account + ". The service needs your password to start them, and keeps it encrypted for this machine.";
+                                        hint: "Commands from centers run as you, " + Install.account + ". The service needs your password to start them, and keeps it encrypted.";
                                         TextField {
                                             text <=> Install.password;
                                             password: true;
@@ -421,7 +421,7 @@ export component InstallerView inherits Rectangle {
                                     }
                                 }
                                 StepFoot {
-                                    note: "Installing changes the system, so the system asks for an administrator's password next.";
+                                    note: "The system asks for an administrator's password next.";
                                     note-icon: @image-url("icons/shield.svg");
                                     Spacer { }
                                     Button {
@@ -453,9 +453,9 @@ export component InstallerView inherits Rectangle {
                                     icon: @image-url("icons/ok.svg");
                                     tone: Tone.ok;
                                     title: "Nerve is installed";
-                                    text: Install.newer ? "This file is a newer version. Update Nerve with it, or open the installed one."
-                                        : Install.installed-version == Install.version ? "This file is the version that is installed. Open Nerve from here or from the " + (Install.windows ? "Start menu." : "application menu.")
-                                        : "The installed Nerve is newer than this file. Open it from here or from the " + (Install.windows ? "Start menu." : "application menu.");
+                                    text: Install.newer ? "This file is newer. Update Nerve with it, or open the installed one."
+                                        : Install.installed-version == Install.version ? "This file is the installed version."
+                                        : "The installed Nerve is newer than this file.";
                                 }
                                 Rectangle {
                                     background: Theme.surface-alt;
@@ -519,11 +519,11 @@ export component InstallerView inherits Rectangle {
                                 spacing: Space.xl;
                                 StepHead {
                                     title: "Uninstall Nerve?";
-                                    text: "The service, its user nerve, the program and its menu entry go. Choose what happens to the node's data.";
+                                    text: "The service, its user, the app and its menu entry go.";
                                 }
                                 UninstallChoice { }
                                 StepFoot {
-                                    note: "Removing Nerve changes the system, so the system asks for an administrator's password next.";
+                                    note: "The system asks for an administrator's password next.";
                                     note-icon: @image-url("icons/shield.svg");
                                     Spacer { }
                                     Button {
@@ -561,9 +561,9 @@ export component InstallerView inherits Rectangle {
                                     title: Install.action == "update" ? "Nerve is updated to " + Install.installed-version
                                         : Install.action == "uninstall" ? "Nerve is removed"
                                         : "Nerve is installed";
-                                    text: Install.action == "update" ? "The service runs the new version. Open Nerve to go on."
-                                        : Install.action == "uninstall" ? (Install.purge ? "The node, the app and the node's data are gone from this machine." : "The node and the app are gone. The node's data stays; install Nerve again, and the node takes it up.")
-                                        : "The node runs as a service and starts with the machine. Open Nerve to name this machine and pair it with its first center.";
+                                    text: Install.action == "update" ? "The service runs the new version."
+                                        : Install.action == "uninstall" ? (Install.purge ? "Nerve and its data are gone." : "Nerve is gone. Its data stays for a new install.")
+                                        : "The node runs and starts with the machine. Open Nerve to pair it with a center.";
                                 }
                                 DidList { }
                                 StepFoot {

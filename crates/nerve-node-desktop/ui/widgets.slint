@@ -11,6 +11,11 @@ export component Icon inherits Image {
     image-fit: contain;
 }
 
+export component Divider inherits Rectangle {
+    height: 1px;
+    background: Theme.border;
+}
+
 // Content that shows only sometimes, such as an error. Use it instead of an
 // `if` around anything with text that wraps: Slint measures the height of an
 // `if`'s content at its unwrapped width, so wrapped lines run out of the
@@ -56,6 +61,35 @@ export component Dots {
     }
 }
 
+// A ring that turns: something runs. It takes the place of a busy
+// button's icon.
+export component Spinner {
+    in property <length> size: Size.icon;
+    in property <color> colorize: Theme.accent;
+    width: root.size;
+    height: root.size;
+    Image {
+        width: root.size;
+        height: root.size;
+        image-fit: contain;
+        source: @image-url("icons/spinner.svg");
+        colorize: root.colorize;
+        transform-rotation: animation-tick() / 900ms * 360deg;
+    }
+}
+
+// The ring around a control that has the keyboard's focus, 3 px outside
+// it (each use places it so). A click does not leave it behind: the
+// controls take focus from the keyboard only.
+export component FocusRing inherits Rectangle {
+    in property <bool> shown;
+    in property <length> radius: Radius.md;
+    border-radius: root.radius + 3px;
+    border-width: 2px;
+    border-color: Theme.accent.transparentize(0.25);
+    visible: root.shown;
+}
+
 export enum ButtonKind { primary, secondary, ghost, danger, danger-soft }
 
 export component Button {
@@ -64,6 +98,8 @@ export component Button {
     in property <ButtonKind> kind: ButtonKind.secondary;
     in property <bool> small;
     in property <bool> enabled: true;
+    // A busy button waits for what it started: a spinner in place of its
+    // icon (or of its text, when it has none), the same size, and no click.
     in property <bool> busy;
     // Why the button does nothing now; shown below it by the page, read by
     // screen readers here.
@@ -73,6 +109,7 @@ export component Button {
     property <bool> active: root.enabled && !root.busy;
     property <bool> has-icon: root.icon.width > 0;
     property <length> pad: root.small ? 10px : 14px;
+    property <length> icon-size: root.small ? 14px : Size.icon;
 
     min-height: root.small ? Size.control-sm : Size.control;
     min-width: root.text == "" ? self.min-height : 0;
@@ -80,7 +117,7 @@ export component Button {
     vertical-stretch: 0;
     accessible-role: button;
     accessible-label: root.text;
-    accessible-description: root.why-disabled;
+    accessible-description: root.busy ? "Busy" : root.why-disabled;
     accessible-enabled: root.active;
     accessible-action-default => {
         if (root.active) {
@@ -116,16 +153,12 @@ export component Button {
         ]
     }
 
-    // Keyboard focus only: a click does not leave a ring behind.
-    Rectangle {
+    FocusRing {
         x: -3px;
         y: -3px;
         width: parent.width + 6px;
         height: parent.height + 6px;
-        border-radius: Radius.md + 3px;
-        border-width: 2px;
-        border-color: Theme.accent.transparentize(0.35);
-        visible: focus.has-focus;
+        shown: focus.has-focus;
     }
 
     property <color> fg: root.kind == ButtonKind.primary ? Theme.on-accent
@@ -138,17 +171,22 @@ export component Button {
         padding-right: root.text == "" ? 0 : root.pad;
         spacing: 7px;
         alignment: center;
-        opacity: root.enabled ? 1 : 0.45;
-        if root.busy: Dots {
-            color: root.fg;
-            dot: 5px;
-        }
-        if !root.busy && root.has-icon: VerticalLayout {
+        opacity: !root.enabled ? 0.45 : root.busy ? 0.85 : 1;
+        if root.has-icon: VerticalLayout {
             alignment: center;
-            Icon {
-                source: root.icon;
-                colorize: root.fg;
-                size: root.small ? 14px : Size.icon;
+            Rectangle {
+                width: root.icon-size;
+                height: root.icon-size;
+                Icon {
+                    source: root.icon;
+                    colorize: root.fg;
+                    size: root.icon-size;
+                    visible: !root.busy;
+                }
+                if root.busy: Spinner {
+                    colorize: root.fg;
+                    size: root.icon-size;
+                }
             }
         }
         if root.text != "": Text {
@@ -157,7 +195,15 @@ export component Button {
             font-size: root.small ? Type.small : Type.body;
             font-weight: Type.medium;
             vertical-alignment: center;
+            // Without an icon the spinner stands where the text was; the
+            // text keeps the button's width.
+            opacity: root.busy && !root.has-icon ? 0 : 1;
         }
+    }
+    if root.busy && !root.has-icon: Spinner {
+        colorize: root.fg;
+        size: root.icon-size;
+        opacity: 0.85;
     }
 
     touch := TouchArea {
@@ -251,13 +297,15 @@ export component IconTile inherits Rectangle {
     in property <image> icon;
     in property <Tone> tone: Tone.accent;
     in property <length> size: 36px;
+    // In the tone's full colour, for the one thing a card is about.
+    in property <bool> solid;
     width: root.size;
     height: root.size;
     border-radius: Radius.md;
-    background: Theme.tone-soft(root.tone);
+    background: root.solid ? Theme.tone(root.tone) : Theme.tone-soft(root.tone);
     Icon {
         source: root.icon;
-        colorize: Theme.tone(root.tone);
+        colorize: root.solid ? Theme.surface : Theme.tone(root.tone);
         size: root.size * 0.5;
     }
 }
@@ -402,9 +450,12 @@ export component Loading {
     }
 }
 
-// A page's title, what the page is for, its buttons, and below them what
-// went wrong when the node did not answer.
+// A page's title in its colour, a word on what the page is for when one is
+// needed, its buttons, and below them what went wrong when the node did not
+// answer.
 export component PageHeader {
+    in property <image> icon;
+    in property <Tone> tone: Tone.accent;
     in property <string> title;
     in property <string> subtitle;
     in property <string> error-title;
@@ -413,11 +464,19 @@ export component PageHeader {
     callback error-acted();
     VerticalLayout {
         HorizontalLayout {
-            spacing: Space.xl;
+            spacing: Space.lg;
+            if root.icon.width > 0: VerticalLayout {
+                alignment: center;
+                IconTile {
+                    icon: root.icon;
+                    tone: root.tone;
+                    size: 40px;
+                }
+            }
             VerticalLayout {
-                spacing: 6px;
+                spacing: 2px;
                 horizontal-stretch: 1;
-                alignment: start;
+                alignment: center;
                 Text {
                     text: root.title;
                     color: Theme.text;
@@ -425,15 +484,18 @@ export component PageHeader {
                     font-weight: Type.semibold;
                     accessible-role: AccessibleRole.text;
                 }
-                Text {
-                    text: root.subtitle;
-                    color: Theme.text-muted;
-                    font-size: Type.body;
-                    wrap: word-wrap;
+                Reveal {
+                    shown: root.subtitle != "";
+                    Text {
+                        text: root.subtitle;
+                        color: Theme.text-muted;
+                        font-size: Type.body;
+                        wrap: word-wrap;
+                    }
                 }
             }
             VerticalLayout {
-                alignment: start;
+                alignment: center;
                 HorizontalLayout {
                     spacing: Space.sm;
                     @children
@@ -442,7 +504,7 @@ export component PageHeader {
         }
         Reveal {
             shown: root.error != "";
-            gap: Space.xxl;
+            gap: Space.xl;
             Banner {
                 tone: Tone.danger;
                 title: root.error-title;
@@ -456,12 +518,22 @@ export component PageHeader {
     }
 }
 
-// The head of a group on a page.
+// The head of a group on a page, with its icon in the group's colour.
 export component SectionTitle {
     in property <string> text;
     in property <string> detail;
+    in property <image> icon;
+    in property <Tone> tone: Tone.accent;
     HorizontalLayout {
         spacing: Space.sm;
+        if root.icon.width > 0: VerticalLayout {
+            alignment: center;
+            Icon {
+                source: root.icon;
+                colorize: Theme.tone(root.tone);
+                size: Size.icon-lg;
+            }
+        }
         Text {
             text: root.text;
             color: Theme.text;
@@ -494,27 +566,43 @@ export component NavItem {
     accessible-action-default => {
         root.clicked();
     }
+    forward-focus: focus;
     Rectangle {
         border-radius: Radius.md;
-        background: root.selected ? Theme.selected : touch.has-hover ? Theme.hover : transparent;
-        border-width: root.selected && !Theme.dark ? 1px : 0;
-        border-color: Theme.border;
+        background: root.selected ? Theme.accent-soft : touch.has-hover ? Theme.hover : transparent;
         animate background { duration: 110ms; }
     }
+    // The page that is open has a bar of the accent at its edge.
+    Rectangle {
+        x: 0;
+        y: (parent.height - self.height) / 2;
+        width: 3px;
+        height: 18px;
+        border-radius: 1.5px;
+        background: Theme.accent;
+        visible: root.selected;
+    }
+    FocusRing {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        shown: focus.has-focus;
+    }
     HorizontalLayout {
-        padding-left: 11px;
+        padding-left: 12px;
         padding-right: 11px;
         spacing: 11px;
         VerticalLayout {
             alignment: center;
             Icon {
                 source: root.icon;
-                colorize: root.selected ? Theme.accent : Theme.text-muted;
+                colorize: root.selected ? Theme.accent-text : Theme.text-muted;
             }
         }
         Text {
             text: root.text;
-            color: root.selected ? Theme.text : Theme.text-muted;
+            color: root.selected ? Theme.accent-text : Theme.text;
             font-size: Type.body;
             font-weight: root.selected ? Type.semibold : Type.medium;
             vertical-alignment: center;
@@ -525,6 +613,16 @@ export component NavItem {
         mouse-cursor: MouseCursor.pointer;
         clicked => {
             root.clicked();
+        }
+    }
+    focus := FocusScope {
+        focus-on-click: false;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == Key.Return) {
+                root.clicked();
+                return accept;
+            }
+            reject
         }
     }
 }
@@ -571,6 +669,7 @@ export component Picker {
     accessible-action-default => {
         popup.show();
     }
+    forward-focus: focus;
 
     Rectangle {
         background: touch.has-hover ? Theme.hover : Theme.surface;
@@ -602,10 +701,27 @@ export component Picker {
             }
         }
     }
+    FocusRing {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        shown: focus.has-focus;
+    }
     touch := TouchArea {
         mouse-cursor: MouseCursor.pointer;
         clicked => {
             popup.show();
+        }
+    }
+    focus := FocusScope {
+        focus-on-click: false;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == Key.Return || event.text == Key.DownArrow) {
+                popup.show();
+                return accept;
+            }
+            reject
         }
     }
     popup := PopupWindow {
@@ -668,18 +784,27 @@ export component Picker {
     }
 }
 
-// A row of choices of which one is on.
+// A row of choices of which one is on. One stop of the Tab key; the arrow
+// keys choose.
 export component Segmented {
     in property <[string]> options;
     in property <int> current;
     callback chosen(int);
     horizontal-stretch: 0;
     height: Size.control;
+    forward-focus: focus;
     Rectangle {
         background: Theme.inset;
         border-radius: Radius.md;
         border-width: 1px;
         border-color: Theme.border;
+    }
+    FocusRing {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        shown: focus.has-focus;
     }
     HorizontalLayout {
         padding: 3px;
@@ -687,8 +812,8 @@ export component Segmented {
         for option[i] in root.options: Rectangle {
             border-radius: Radius.sm;
             background: i == root.current ? Theme.surface : t.has-hover ? Theme.hover : transparent;
-            border-width: i == root.current && !Theme.dark ? 1px : 0;
-            border-color: Theme.border;
+            border-width: i == root.current ? 1px : 0;
+            border-color: Theme.dark ? Theme.border-strong : Theme.border;
             accessible-role: tab;
             accessible-label: option;
             accessible-item-selected: i == root.current;
@@ -697,7 +822,7 @@ export component Segmented {
                 padding-right: 12px;
                 Text {
                     text: option;
-                    color: i == root.current ? Theme.text : Theme.text-muted;
+                    color: i == root.current ? Theme.accent-text : Theme.text-muted;
                     font-size: Type.small;
                     font-weight: i == root.current ? Type.semibold : Type.medium;
                     vertical-alignment: center;
@@ -712,6 +837,182 @@ export component Segmented {
                 clicked => {
                     root.chosen(i);
                 }
+            }
+        }
+    }
+    focus := FocusScope {
+        focus-on-click: false;
+        key-pressed(event) => {
+            if (event.text == Key.LeftArrow && root.current > 0) {
+                root.chosen(root.current - 1);
+                return accept;
+            }
+            if (event.text == Key.RightArrow && root.current < root.options.length - 1) {
+                root.chosen(root.current + 1);
+                return accept;
+            }
+            reject
+        }
+    }
+}
+
+// The tabs of a page: their names in a row on a line, the open one marked
+// in the accent. One stop of the Tab key; the arrow keys go to the next.
+export component TabBar {
+    in property <[string]> tabs;
+    in property <int> current;
+    callback chosen(int);
+    forward-focus: focus;
+    accessible-role: tab-list;
+    VerticalLayout {
+        HorizontalLayout {
+            spacing: 2px;
+            alignment: start;
+            for name[i] in root.tabs: Rectangle {
+                height: 38px;
+                accessible-role: tab;
+                accessible-label: name;
+                accessible-item-selected: i == root.current;
+                FocusRing {
+                    x: -3px;
+                    y: -3px;
+                    width: parent.width + 6px;
+                    height: parent.height + 6px;
+                    shown: focus.has-focus && i == root.current;
+                    radius: Radius.sm;
+                }
+                Rectangle {
+                    border-radius: Radius.sm;
+                    background: t.has-hover && i != root.current ? Theme.hover : transparent;
+                }
+                HorizontalLayout {
+                    padding-left: 12px;
+                    padding-right: 12px;
+                    Text {
+                        text: name;
+                        color: i == root.current ? Theme.accent-text : Theme.text-muted;
+                        font-size: Type.body;
+                        font-weight: i == root.current ? Type.semibold : Type.medium;
+                        vertical-alignment: center;
+                    }
+                }
+                Rectangle {
+                    y: parent.height - self.height;
+                    height: 3px;
+                    border-radius: 1.5px;
+                    background: Theme.accent;
+                    visible: i == root.current;
+                }
+                t := TouchArea {
+                    mouse-cursor: MouseCursor.pointer;
+                    clicked => {
+                        root.chosen(i);
+                    }
+                }
+            }
+        }
+        Divider { }
+    }
+    focus := FocusScope {
+        focus-on-click: false;
+        key-pressed(event) => {
+            if (event.text == Key.LeftArrow && root.current > 0) {
+                root.chosen(root.current - 1);
+                return accept;
+            }
+            if (event.text == Key.RightArrow && root.current < root.tabs.length - 1) {
+                root.chosen(root.current + 1);
+                return accept;
+            }
+            reject
+        }
+    }
+}
+
+// A part that opens on a click, such as a question and its answer: its head
+// stays, its body shows while it is open. The page keeps which is open.
+export component Expander inherits Rectangle {
+    in property <string> title;
+    in property <image> icon;
+    in property <bool> open;
+    callback toggled();
+    background: Theme.surface;
+    border-radius: Radius.lg;
+    border-width: 1px;
+    border-color: root.open ? Theme.accent.transparentize(0.55) : Theme.border;
+    height: self.preferred-height;
+    VerticalLayout {
+        Rectangle {
+            accessible-role: button;
+            accessible-label: root.title;
+            accessible-expandable: true;
+            accessible-expanded: root.open;
+            accessible-action-default => {
+                root.toggled();
+            }
+            FocusRing {
+                x: -3px;
+                y: -3px;
+                width: parent.width + 6px;
+                height: parent.height + 6px;
+                shown: focus.has-focus;
+                radius: Radius.lg;
+            }
+            HorizontalLayout {
+                padding-left: Space.xl;
+                padding-right: Space.lg;
+                padding-top: 13px;
+                padding-bottom: 13px;
+                spacing: Space.md;
+                if root.icon.width > 0: VerticalLayout {
+                    alignment: center;
+                    Icon {
+                        source: root.icon;
+                        colorize: Theme.accent-text;
+                    }
+                }
+                Text {
+                    horizontal-stretch: 1;
+                    text: root.title;
+                    color: Theme.text;
+                    font-size: Type.body;
+                    font-weight: Type.semibold;
+                    vertical-alignment: center;
+                    wrap: word-wrap;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Icon {
+                        source: root.open ? @image-url("icons/chev.svg") : @image-url("icons/chev-right.svg");
+                        colorize: root.open ? Theme.accent-text : Theme.text-muted;
+                    }
+                }
+            }
+            TouchArea {
+                mouse-cursor: MouseCursor.pointer;
+                clicked => {
+                    root.toggled();
+                }
+            }
+            focus := FocusScope {
+                focus-on-click: false;
+                key-pressed(event) => {
+                    if (event.text == " " || event.text == Key.Return) {
+                        root.toggled();
+                        return accept;
+                    }
+                    reject
+                }
+            }
+        }
+        Reveal {
+            shown: root.open;
+            VerticalLayout {
+                padding-left: Space.xl;
+                padding-right: Space.xl;
+                padding-bottom: Space.lg;
+                spacing: Space.sm;
+                @children
             }
         }
     }
@@ -734,7 +1035,16 @@ export component Switch {
     accessible-action-default => {
         root.toggled(!root.checked);
     }
+    forward-focus: focus;
     opacity: root.enabled ? 1 : 0.45;
+    FocusRing {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        shown: focus.has-focus;
+        radius: 11px;
+    }
     Rectangle {
         border-radius: self.height / 2;
         background: root.checked ? Theme.accent : Theme.border-strong;
@@ -754,6 +1064,17 @@ export component Switch {
         mouse-cursor: MouseCursor.pointer;
         clicked => {
             root.toggled(!root.checked);
+        }
+    }
+    focus := FocusScope {
+        focus-on-click: false;
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == Key.Return) {
+                root.toggled(!root.checked);
+                return accept;
+            }
+            reject
         }
     }
 }
@@ -990,96 +1311,104 @@ export component PathText {
     }
 }
 
-export component Divider inherits Rectangle {
-    height: 1px;
-    background: Theme.border;
-}
-
-// A window over the page; the page behind waits.
+// A window over the page; the page behind waits. Escape closes it and
+// Enter takes its main button (`enter`), wherever the focus is in it,
+// unless a field or a button takes the key itself.
 export component Dialog inherits Rectangle {
     in property <string> title;
     in property <string> subtitle;
     in property <length> card-width: Size.dialog;
     callback close();
+    callback enter();
     background: Theme.scrim;
     // Clicks do not reach the page behind.
     TouchArea { }
-    FocusScope {
+    keys := FocusScope {
+        width: 100%;
+        height: 100%;
         key-pressed(event) => {
             if (event.text == Key.Escape) {
                 root.close();
                 return accept;
             }
+            if (event.text == Key.Return) {
+                root.enter();
+                return accept;
+            }
             reject
         }
-    }
-    card := Rectangle {
-        width: min(root.card-width, root.width - 48px);
-        // As high as its content, up to the window's height less a margin:
-        // a longer content scrolls, so a dialog fits a small screen.
-        height: min(body.preferred-height, root.height - 48px);
-        x: (root.width - self.width) / 2;
-        y: max(24px, (root.height - self.height) * 0.42);
-        background: Theme.surface;
-        border-radius: Radius.xl;
-        border-width: 1px;
-        border-color: Theme.border;
-        drop-shadow-blur: 40px;
-        drop-shadow-offset-y: 14px;
-        drop-shadow-color: #0000004d;
-        accessible-role: groupbox;
-        accessible-label: root.title;
-        scroll := ScrollView {
-            width: card.width;
-            height: card.height;
-            content-width: self.visible-width;
-            content-height: body.preferred-height;
-            body := VerticalLayout {
-                width: scroll.visible-width;
-                padding: Space.xxl;
-                spacing: Space.xl;
-                HorizontalLayout {
-                    spacing: Space.md;
-                    VerticalLayout {
-                        horizontal-stretch: 1;
-                        Text {
-                            text: root.title;
-                            color: Theme.text;
-                            font-size: 18px;
-                            font-weight: Type.semibold;
-                            wrap: word-wrap;
-                        }
-                        Reveal {
-                            shown: root.subtitle != "";
-                            gap: 6px;
+        card := Rectangle {
+            width: min(root.card-width, root.width - 48px);
+            // As high as its content, up to the window's height less a margin:
+            // a longer content scrolls, so a dialog fits a small screen.
+            height: min(body.preferred-height, root.height - 48px);
+            x: (root.width - self.width) / 2;
+            y: max(24px, (root.height - self.height) * 0.42);
+            background: Theme.surface;
+            border-radius: Radius.xl;
+            border-width: 1px;
+            border-color: Theme.border;
+            drop-shadow-blur: 40px;
+            drop-shadow-offset-y: 14px;
+            drop-shadow-color: #0000004d;
+            accessible-role: groupbox;
+            accessible-label: root.title;
+            scroll := ScrollView {
+                width: card.width;
+                height: card.height;
+                content-width: self.visible-width;
+                content-height: body.preferred-height;
+                body := VerticalLayout {
+                    width: scroll.visible-width;
+                    padding: Space.xxl;
+                    spacing: Space.xl;
+                    HorizontalLayout {
+                        spacing: Space.md;
+                        VerticalLayout {
+                            horizontal-stretch: 1;
                             Text {
-                                text: root.subtitle;
-                                color: Theme.text-muted;
-                                font-size: Type.body;
+                                text: root.title;
+                                color: Theme.text;
+                                font-size: 18px;
+                                font-weight: Type.semibold;
                                 wrap: word-wrap;
                             }
+                            Reveal {
+                                shown: root.subtitle != "";
+                                gap: 6px;
+                                Text {
+                                    text: root.subtitle;
+                                    color: Theme.text-muted;
+                                    font-size: Type.body;
+                                    wrap: word-wrap;
+                                }
+                            }
                         }
-                    }
-                    VerticalLayout {
-                        alignment: start;
-                        Button {
-                            icon: @image-url("icons/x.svg");
-                            kind: ButtonKind.ghost;
-                            small: true;
-                            accessible-label: "Close";
-                            clicked => {
-                                root.close();
+                        VerticalLayout {
+                            alignment: start;
+                            Button {
+                                icon: @image-url("icons/x.svg");
+                                kind: ButtonKind.ghost;
+                                small: true;
+                                accessible-label: "Close";
+                                clicked => {
+                                    root.close();
+                                }
                             }
                         }
                     }
+                    @children
                 }
-                @children
             }
         }
     }
+    // The keys come to the dialog from the start; a field that wants the
+    // focus first takes it in its own `init`.
+    init => {
+        keys.focus();
+    }
 }
 
-// The buttons at the foot of a dialog, the main one last.
 // The buttons at the foot of a dialog, the main one last, and above them
 // what went wrong when the last try failed.
 export component DialogButtons inherits VerticalLayout {
@@ -1235,6 +1564,7 @@ export component CheckBox {
     accessible-action-default => {
         root.toggled(!root.checked);
     }
+    forward-focus: focus;
     opacity: root.enabled ? 1 : 0.45;
     HorizontalLayout {
         spacing: 10px;
@@ -1249,6 +1579,14 @@ export component CheckBox {
                 border-width: root.checked ? 0 : 1.5px;
                 border-color: touch.has-hover ? Theme.accent : Theme.border-strong;
                 animate background { duration: 110ms; }
+                FocusRing {
+                    x: -3px;
+                    y: -3px;
+                    width: parent.width + 6px;
+                    height: parent.height + 6px;
+                    shown: focus.has-focus;
+                    radius: 5px;
+                }
                 if root.checked: Icon {
                     source: @image-url("icons/check.svg");
                     colorize: Theme.on-accent;
@@ -1280,6 +1618,17 @@ export component CheckBox {
         mouse-cursor: MouseCursor.pointer;
         clicked => {
             root.toggled(!root.checked);
+        }
+    }
+    focus := FocusScope {
+        focus-on-click: false;
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if (event.text == " ") {
+                root.toggled(!root.checked);
+                return accept;
+            }
+            reject
         }
     }
 }
@@ -1384,6 +1733,15 @@ export component OptionTile inherits Rectangle {
     }
     opacity: root.enabled ? 1 : 0.5;
     animate background { duration: 110ms; }
+    forward-focus: focus;
+    FocusRing {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        shown: focus.has-focus;
+        radius: Radius.lg;
+    }
     // Tiles in a row share the tallest one's height; each starts at its top,
     // so their titles line up.
     VerticalLayout {
@@ -1434,6 +1792,17 @@ export component OptionTile inherits Rectangle {
             root.clicked();
         }
     }
+    focus := FocusScope {
+        focus-on-click: false;
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if (event.text == " " || event.text == Key.Return) {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+    }
 }
 
 // A small toggle with a letter or a word: a right on a folder.
@@ -1458,6 +1827,15 @@ export component Chip inherits Rectangle {
         root.toggled(!root.on);
     }
     opacity: root.enabled ? 1 : 0.45;
+    forward-focus: focus;
+    FocusRing {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        shown: focus.has-focus;
+        radius: Radius.sm;
+    }
     HorizontalLayout {
         padding-left: 9px;
         padding-right: 9px;
@@ -1475,6 +1853,17 @@ export component Chip inherits Rectangle {
         mouse-cursor: MouseCursor.pointer;
         clicked => {
             root.toggled(!root.on);
+        }
+    }
+    focus := FocusScope {
+        focus-on-click: false;
+        enabled: root.enabled;
+        key-pressed(event) => {
+            if (event.text == " ") {
+                root.toggled(!root.on);
+                return accept;
+            }
+            reject
         }
     }
 }

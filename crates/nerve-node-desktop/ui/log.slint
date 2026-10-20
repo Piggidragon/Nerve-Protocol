@@ -12,8 +12,8 @@ import {
 export component LogPage inherits PageFrame {
     gap: 0;
     PageHeader {
+        icon: @image-url("icons/log.svg");
         title: "Log";
-        subtitle: "What the node did: its starts and stops, its links, and what went wrong. New lines come in as they are written.";
         error-title: "The log could not be read";
         error: Logs.error;
         Segmented {
@@ -37,8 +37,8 @@ export component LogPage inherits PageFrame {
                 icon: @image-url("icons/log.svg");
                 title: Logs.problems-only ? "No problems" : "Nothing logged yet";
                 text: Logs.problems-only
-                    ? "No error or warning in the log. Everything else is under All."
-                    : "The node writes its log while it runs. Start it, and its lines show here.";
+                    ? "No error or warning in the log."
+                    : "The node writes its log while it runs.";
             }
         }
     }
@@ -96,7 +96,7 @@ export component LogPage inherits PageFrame {
         gap: Space.lg;
         MoreFoot {
             text: Logs.limit < 1000 ? "The newest " + Logs.rows.length + " lines."
-                : "The newest " + Logs.rows.length + " lines. The node keeps the older ones in its log file.";
+                : "The newest " + Logs.rows.length + " lines. Older ones stay in the log file.";
             more: Logs.limit < 1000;
             clicked => {
                 Logs.more();

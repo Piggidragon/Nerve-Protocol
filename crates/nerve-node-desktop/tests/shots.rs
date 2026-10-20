@@ -30,7 +30,7 @@ const INSTALLER: (u32, u32) = (760, 640);
 const SMALL: (u32, u32) = (1280, 800);
 /// The shots also taken on [`SMALL`], as `<name>-1280x800`: the installer's
 /// steps and the dialogs.
-const ALSO_SMALL: [&str; 17] = [
+const ALSO_SMALL: [&str; 18] = [
     "setup-",
     "pair-",
     "centers-unpair",
@@ -48,6 +48,7 @@ const ALSO_SMALL: [&str; 17] = [
     "about",
     "elevate",
     "installer-",
+    "other-copy",
 ];
 /// Long values, so the shots show how they fit.
 const OFFICE: &str = "office-workstation-second-floor";
@@ -519,19 +520,49 @@ fn every_page_light_and_dark() {
         .global::<Install>()
         .set_program("/usr/local/bin/nerve-node-desktop".into());
     store.invoke_show(Page::Settings);
-    shots.take("settings");
-    shots.take_full("settings", 2350);
-    // Where no keyring can hold the keys, and an account to choose.
+    // Each tab of Settings.
+    for (i, tab) in [
+        "general", "keys", "network", "limits", "backup", "app", "advanced",
+    ]
+    .iter()
+    .enumerate()
+    {
+        prefs.set_tab(i as i32);
+        shots.take(&format!("settings-{tab}"));
+    }
+    prefs.set_tab(3);
+    shots.take_full("settings-limits", 1150);
+    prefs.set_tab(0);
+    shots.take_full("settings-general", 1000);
+    // Where no keyring can hold the keys, an account to choose, a limit
+    // being saved and one refused, and a setting by its name.
+    prefs.set_account_new("nerve-work".into());
+    shots.take("settings-general-choices");
     store.set_keyring_usable(false);
     store.set_keyring_why(nerve_node_desktop::view::no_keyring("windows-service").into());
-    prefs.set_account_new("nerve-work".into());
+    prefs.set_tab(1);
+    shots.take("settings-keys-no-keyring");
+    prefs.set_tab(3);
+    prefs.invoke_limit_edit("command".into(), 0, "8192".into());
+    prefs.set_limits_busy("command".into());
+    shots.take("settings-limits-saving");
+    prefs.set_limits_busy("".into());
+    prefs.invoke_limit_edit("time".into(), 1, "a day".into());
+    prefs.invoke_limits_save("time".into());
+    shots.take("settings-limits-refused");
+    prefs.set_limits_error("".into());
+    prefs.set_tab(6);
     prefs.set_raw_key("center.home.policy.allow".into());
     prefs.set_raw_value("fs.read:~/notes/*".into());
-    shots.take_full("settings-choices", 2350);
+    shots.take("settings-advanced-filled");
+    prefs.set_tab(2);
     store.set_keyring_usable(usable);
     prefs.set_account_new("".into());
     prefs.set_raw_key("".into());
     prefs.set_raw_value("".into());
+    // The limits as they were: the edits above were only shown.
+    prefs.invoke_limit_edit("command".into(), 0, "4096".into());
+    prefs.invoke_limit_edit("time".into(), 1, "60".into());
     prefs.invoke_proxy_edit();
     prefs.set_proxy_new_url("http://proxy.example:3128".into());
     prefs.set_proxy_new_headers("Proxy-Authorization: Bearer …".into());
@@ -613,7 +644,11 @@ fn every_page_light_and_dark() {
     install.set_windows(true);
     install.set_account("alex".into());
     prefs.set_account("".into());
+    prefs.set_tab(0);
     shots.take("settings-account-windows");
+    install.set_windows(true);
+    prefs.set_tab(3);
+    shots.take("settings-limits-windows");
     prefs.set_account(account);
     install.set_windows(false);
 
@@ -684,10 +719,31 @@ fn every_page_light_and_dark() {
 
     store.invoke_show(Page::Help);
     shots.take("help");
+    let manual = window.global::<nerve_node_desktop::Manual>();
+    manual.set_open(0);
+    shots.take("help-open");
+    manual.set_open(10);
+    shots.take_full("help-keys", 1250);
+    manual.set_open(11);
+    shots.take("help-commands");
+    shots.take_full("help-commands", 3200);
+    manual.set_open(-1);
     store.invoke_show(Page::Overview);
     store.set_about_open(true);
     shots.take("about");
     store.set_about_open(false);
+    // The downloaded file opened while the app is open: a newer one, and
+    // the same version.
+    let install = window.global::<Install>();
+    install.set_other_file("/home/alex/Downloads/nerve-node-desktop-x86_64-linux".into());
+    install.set_other_version("0.0.7".into());
+    install.set_other_newer(true);
+    install.set_other_open(true);
+    shots.take("other-copy-newer");
+    install.set_other_version(install.get_version());
+    install.set_other_newer(false);
+    shots.take("other-copy-same");
+    install.set_other_open(false);
 
     // An installed node: why the app asks for administrator rights.
     ctl.needs_rights(Launch::Plain);

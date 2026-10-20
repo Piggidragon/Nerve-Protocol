@@ -294,4 +294,10 @@ pub(super) fn wire(ctl: &Rc<Ctl>, window: &crate::AppWindow) {
     window
         .global::<Logs>()
         .on_filter(move |problems| c.log_filter(problems));
+    let c = ctl.clone();
+    window.global::<Logs>().on_clear(move || c.ask_clear(true));
+    let c = ctl.clone();
+    window
+        .global::<crate::Store>()
+        .on_audit_clear(move || c.ask_clear(false));
 }

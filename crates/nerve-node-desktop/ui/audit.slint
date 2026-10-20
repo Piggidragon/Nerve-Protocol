@@ -30,6 +30,7 @@ component AuditEntry {
                     : root.entry.kind == "relay" ? @image-url("icons/globe.svg")
                     : root.entry.kind == "key" ? @image-url("icons/key.svg")
                     : root.entry.kind == "config" ? @image-url("icons/edit.svg")
+                    : root.entry.kind == "audit" ? @image-url("icons/trash.svg")
                     : @image-url("icons/info.svg");
             }
         }
@@ -175,6 +176,15 @@ export component AuditPage inherits PageFrame {
             kind: ButtonKind.ghost;
             clicked => {
                 Store.reload();
+            }
+        }
+        Button {
+            text: "Clear";
+            icon: @image-url("icons/trash.svg");
+            kind: ButtonKind.ghost;
+            busy: Store.busy == "audit-clear";
+            clicked => {
+                Store.audit-clear();
             }
         }
     }

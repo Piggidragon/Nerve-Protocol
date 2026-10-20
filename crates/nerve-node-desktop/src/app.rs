@@ -78,6 +78,8 @@ enum Pending {
     Unpair(String),
     RotateKey(String),
     Accept,
+    /// `audit clear`, or with `true` `log clear`.
+    Clear(bool),
 }
 
 /// What a command that keeps answering gave, until the window takes it.
@@ -1047,6 +1049,29 @@ impl Ctl {
         );
     }
 
+    /// Asks before the audit log (or with `log` the log) is cleared, and
+    /// says what stays.
+    pub(crate) fn ask_clear(&self, log: bool) {
+        if log {
+            self.confirm(
+                Pending::Clear(true),
+                "Clear the log?".into(),
+                "Every line goes, the older file's too. The new log starts with a line that you cleared it.".into(),
+                "Clear",
+            );
+        } else {
+            self.confirm(
+                Pending::Clear(false),
+                "Clear the audit log?".into(),
+                format!(
+                    "The page starts empty, with \"audit cleared by {}\". The entries so far stay in the file audit.jsonl.1, in place of the older copy, until the log moves aside again.",
+                    app_user()
+                ),
+                "Clear",
+            );
+        }
+    }
+
     fn ask_rotate(&self, name: &str) {
         self.confirm(
             Pending::RotateKey(name.to_string()),
@@ -1105,6 +1130,29 @@ impl Ctl {
                             c.with_store(|s| s.set_busy(SharedString::new()));
                             c.toast(e, Tone::Danger);
                         }
+                    }
+                });
+            }
+            Pending::Clear(log) => {
+                let (what, said) = if log {
+                    ("log", "The log is cleared.")
+                } else {
+                    (
+                        "audit",
+                        "The audit log is cleared. Its entries so far are in audit.jsonl.1.",
+                    )
+                };
+                self.with_store(|s| s.set_busy(format!("{what}-clear").into()));
+                self.command(vec![what.into(), "clear".into()], None, move |c, answer| {
+                    c.with_store(|s| s.set_busy(SharedString::new()));
+                    match answer {
+                        Ok(v) => c.done(&v, said),
+                        Err(e) => c.toast(e, Tone::Danger),
+                    }
+                    if log {
+                        c.follow_log();
+                    } else {
+                        c.follow_audit();
                     }
                 });
             }

@@ -1043,6 +1043,15 @@ fn audit_row(e: &Value, index: usize, centers: &[String], now_ms: u64) -> AuditR
             row.target = s(&e["file"]).into();
             row.detail = sentence(s(&e["reason"])).into();
         }
+        "audit" => {
+            row.kind = "audit".into();
+            row.title = "Audit log cleared".into();
+            row.detail = format!(
+                "By {}. The entries before are in the file audit.jsonl.1.",
+                shown(&e["user"])
+            )
+            .into();
+        }
         "key" => {
             row.kind = "key".into();
             row.title = format!("Key {}", s(&e["event"])).into();

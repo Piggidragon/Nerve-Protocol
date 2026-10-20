@@ -368,6 +368,31 @@ fn the_app_drives_the_cli_end_to_end() {
     });
     let rows = store.get_audit();
     assert!((0..3).all(|i| rows.row_data(i).unwrap().badge == "Refused"));
+    store.invoke_audit_filter(false);
+
+    // Clear, after a question that says what stays: the page starts with
+    // the clearing, and the entries so far are the older file.
+    let before = std::fs::read(paths.audit_log()).unwrap();
+    store.invoke_audit_clear();
+    assert!(store.get_confirm_open());
+    assert!(
+        store.get_confirm_text().contains("audit.jsonl.1"),
+        "{}",
+        store.get_confirm_text()
+    );
+    store.set_confirm_open(false);
+    store.invoke_confirm_accepted();
+    until(&ctl, "the cleared audit", || {
+        let rows = store.get_audit();
+        rows.row_count() == 1 && rows.row_data(0).unwrap().kind == "audit"
+    });
+    let audit_old = nerve_policy::audit::AuditLog::new(paths.audit_log()).old_path();
+    assert_eq!(std::fs::read(audit_old).unwrap(), before);
+    assert!(
+        store.get_toast().contains("audit log is cleared"),
+        "{}",
+        store.get_toast()
+    );
 
     // Permissions: the mode with a time, a folder from the system's
     // dialog (answered here), a rule, a capability switch.
@@ -584,6 +609,17 @@ fn the_app_drives_the_cli_end_to_end() {
     });
     assert_eq!(logs.get_rows().row_count(), 1);
     logs.invoke_filter(false);
+    // Clear, after its question: one line says who cleared it.
+    logs.invoke_clear();
+    assert!(store.get_confirm_open());
+    store.set_confirm_open(false);
+    store.invoke_confirm_accepted();
+    until(&ctl, "the cleared log", || {
+        logs.get_rows()
+            .row_data(0)
+            .is_some_and(|r| r.msg.starts_with("the log was cleared by"))
+    });
+    assert_eq!(logs.get_rows().row_count(), 1);
 
     // Settings: the name, any setting, a relay node's token, a backup and
     // its restore, the passphrase piped in.
@@ -888,8 +924,9 @@ fn the_app_drives_the_cli_end_to_end() {
     store.invoke_reload();
     store.invoke_show(Page::Audit);
     until(&ctl, "the audit through the broker", || {
-        // The refused ones, as the page still shows.
-        store.get_audit().row_count() == 3
+        // The clearing and the changes after it, panic and unlock last.
+        let rows = store.get_audit();
+        rows.row_count() > 2 && rows.row_data(0).unwrap().kind == "settings"
     });
     store.invoke_show(Page::Overview);
 

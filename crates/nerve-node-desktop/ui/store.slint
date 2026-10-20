@@ -70,6 +70,8 @@ export global Store {
     callback refresh-audit();
     callback audit-more();
     callback audit-filter(bool);
+    // Asks before `audit clear`.
+    callback audit-clear();
     callback audit-rule(int, string, bool);
 
     callback pair-start();
@@ -229,6 +231,8 @@ export global Logs {
     in-out property <int> limit: 300;
     callback filter(bool);
     callback more();
+    // Asks before `log clear`.
+    callback clear();
 }
 
 // The Help page: whether its keys and its command reference are open, and

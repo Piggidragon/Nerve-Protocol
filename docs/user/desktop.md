@@ -258,6 +258,13 @@ now, and its limits (`relay.max_links`, `max_links_per_node`,
 reaches this machine, and shows its link once, with **Copy**. A
 `nerve://relay` link you click opens the Relay page with it.
 
+## Audit and Log
+
+**Audit** and **Log** follow the node as it writes. **Clear** on either asks
+first, then runs `nerve-node audit clear` or `log clear`. A cleared audit log
+is not gone: its entries stay in `audit.jsonl.1` ([audit](audit.md#clear-it)),
+and the page starts with "Audit log cleared" and who did it.
+
 ## Pairing links
 
 A `nerve://` link opens in Nerve and goes straight to what the pairing would

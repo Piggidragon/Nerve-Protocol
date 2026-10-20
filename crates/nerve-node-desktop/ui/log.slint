@@ -3,7 +3,7 @@
 
 import { Theme, Type, Space, Radius, Tone } from "theme.slint";
 import { Load, LogRow } from "data.slint";
-import { Logs } from "store.slint";
+import { Logs, Store } from "store.slint";
 import {
     Button, ButtonKind, Card, Pill, Banner, Loading, PageHeader, PageFrame, EmptyState, Segmented,
     ListRow, StatusDot, Reveal, MoreFoot,
@@ -21,6 +21,15 @@ export component LogPage inherits PageFrame {
             current: Logs.problems-only ? 1 : 0;
             chosen(i) => {
                 Logs.filter(i == 1);
+            }
+        }
+        Button {
+            text: "Clear";
+            icon: @image-url("icons/trash.svg");
+            kind: ButtonKind.ghost;
+            busy: Store.busy == "log-clear";
+            clicked => {
+                Logs.clear();
             }
         }
     }

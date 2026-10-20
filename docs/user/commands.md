@@ -107,8 +107,12 @@ one JSON value from stdout:
   (`"windows-service"`, `"old-landlock"`, or `"no-answer"`: no keyring
   answers for the account the node runs as) and `"why"` in words.
 - `center add` without `--yes` prints what you would confirm
-  (`{"paired": false, "preview": {...}}`) and pairs nothing; with `--yes` it
-  pairs.
+  (`{"paired": false, "preview": {...}, "check": {...}}`) and pairs nothing;
+  with `--yes` it pairs. `"check"` says whether pairing can work: `"ready"`,
+  `"reach"` (`"ok"`, `"unreachable"` or `"certificate"`: not the pinned or a
+  trusted one), `"code"` (`"open"`, `"used"`, `"gone"`, `"busy"` or
+  `"unknown"`, or `null` when the center was not reached), `"problem"` in
+  words when it cannot, and `"said"`, the line for people.
 - Every other command prints the lines it shows as `{"messages": [...]}`,
   with `"next_start": true` when the node takes the change only at its next
   start (it does not run, or it is the installed node on Windows, which

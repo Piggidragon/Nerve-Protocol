@@ -12,7 +12,9 @@ use tokio::sync::mpsc;
 
 use nerve_proto::link::{CenterUrl, PairLink, PairRequest};
 use nerve_proto::msg::{self, Hello, method};
-use nerve_proto::{CONNECT_PATH, Message, NODE_HEADER, PAIR_PATH, PROTOCOL_VERSION, rpc::params};
+use nerve_proto::{
+    CONNECT_PATH, Message, NODE_HEADER, PAIR_CHECK_PATH, PAIR_PATH, PROTOCOL_VERSION, rpc::params,
+};
 use nerve_transport::http::{Request, Response, read_request};
 
 use crate::wire::{Conn, Recv};
@@ -113,6 +115,12 @@ async fn connection(
         let resp = pair(&req, &st, &center_id);
         return resp.write(&mut io).await.map_err(|e| e.to_string());
     }
+    if req.method == "POST" && req.path == PAIR_CHECK_PATH {
+        return check(&req, &st)
+            .write(&mut io)
+            .await
+            .map_err(|e| e.to_string());
+    }
     if req.method == "GET" && req.path == CONNECT_PATH && req.is_upgrade() {
         let header = req
             .header(&NODE_HEADER.to_ascii_lowercase())
@@ -149,6 +157,25 @@ async fn connection(
         .write(&mut io)
         .await
         .map_err(|e| e.to_string())
+}
+
+/// The check before pairing (protocol §3.2): what the code is, nothing used.
+fn check(req: &Request, st: &Mutex<State>) -> Response {
+    let code = serde_json::from_slice::<Value>(&req.body)
+        .ok()
+        .and_then(|v| v["code"].as_str().map(str::to_string));
+    let Some(code) = code else {
+        return Response::json(400, &json!({"error": "no code"}));
+    };
+    let s = st.lock().unwrap();
+    let word = if s.code.as_deref() == Some(code.as_str()) && s.tries < 10 {
+        "open"
+    } else if s.paired.is_some() {
+        "used"
+    } else {
+        "gone"
+    };
+    Response::json(200, &json!({ "code": word }))
 }
 
 fn pair(req: &Request, st: &Mutex<State>, center_id: &str) -> Response {

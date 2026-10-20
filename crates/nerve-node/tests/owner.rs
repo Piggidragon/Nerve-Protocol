@@ -106,18 +106,14 @@ async fn an_owner_changes_the_node_through_it_and_is_audited() {
     assert_eq!(last["user"], me.as_str());
 
     // The input reaches a command that asks, and its question comes before
-    // its line ends.
-    let (out, err, code) = run(
-        &at,
-        &[
-            "center",
-            "add",
-            "nerve://pair?center=https%3A%2F%2F127.0.0.1%3A9&code=abc123",
-        ],
-        "n\n",
-    )
-    .await
-    .unwrap();
+    // its line ends. (It asks only when the link can pair: a center that
+    // answers, with its code open.)
+    let center = nerve_conformance::fake_center::FakeCenter::start(false)
+        .await
+        .unwrap();
+    let (out, err, code) = run(&at, &["center", "add", &center.link().render()], "n\n")
+        .await
+        .unwrap();
     assert_eq!(code, 1);
     assert!(out.contains("Pair with this center? [y/N] "), "{out} {err}");
 

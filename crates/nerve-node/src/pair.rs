@@ -5,8 +5,8 @@ use serde_json::Value;
 
 use nerve_policy::config::{SettingsGrant, valid_center_name};
 use nerve_policy::{CenterEntry, CenterPolicy};
-use nerve_proto::PAIR_PATH;
 use nerve_proto::link::{PairLink, PairRequest, PairResponse};
+use nerve_proto::{PAIR_CHECK_PATH, PAIR_PATH};
 use nerve_transport::keys::NodeKey;
 
 use crate::paths::NodePaths;
@@ -35,6 +35,123 @@ pub fn preview(link: &PairLink, name: Option<&str>) -> String {
          the guard (deny rules that keep its commands off this node itself)\n",
     );
     s
+}
+
+/// What a check of a pairing link found before the owner says yes: whether
+/// the center answers on the way the pairing takes, whether its certificate
+/// is the one the link pins (or one the system trusts), and what the center
+/// says of the code (protocol §3.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Check {
+    /// `ok`, `unreachable` or `certificate`.
+    pub reach: &'static str,
+    /// The center's word for the code: `open`, `used`, `gone` or `busy`;
+    /// `unknown` when the center has no check (an older one) or did not
+    /// answer it; `None` when it was not reached.
+    pub code: Option<String>,
+    /// Why pairing cannot work now, in words; `None` when it can, or may.
+    pub problem: Option<String>,
+}
+
+impl Check {
+    /// Whether pairing can work: nothing stands in its way that the check
+    /// found. A code the center did not speak of may still pair.
+    pub fn ready(&self) -> bool {
+        self.problem.is_none()
+    }
+
+    /// The check in one sentence, for the preview.
+    pub fn said(&self) -> String {
+        if let Some(p) = &self.problem {
+            return format!("cannot pair: {p}");
+        }
+        match self.code.as_deref() {
+            Some("open") => "checked: the center answers and the code is valid".into(),
+            _ => {
+                "checked: the center answers; it did not say whether the code is still valid".into()
+            }
+        }
+    }
+
+    pub fn json(&self) -> Value {
+        serde_json::json!({
+            "ready": self.ready(),
+            "reach": self.reach,
+            "code": self.code,
+            "problem": self.problem,
+            "said": self.said(),
+        })
+    }
+}
+
+/// Checks `link` without pairing: it opens the way [`pair`] would (through
+/// the proxy or relay, with the link's pin) and asks the center whether the
+/// code is still open. The code is neither used up nor counted as a try.
+pub async fn check(paths: &NodePaths, link: &PairLink) -> Result<Check, String> {
+    nerve_transport::init_crypto();
+    let (cfg, _) = crate::cli::read_config(paths).await?;
+    let proxy = crate::link::proxy_for(paths, &cfg, &link.center)
+        .await
+        .map_err(|e| format!("bad proxy: {e}"))?;
+    let mut io =
+        match nerve_transport::net::open(&link.center, link.pin.as_deref(), proxy.as_ref()).await {
+            Ok(io) => io,
+            Err(e) => {
+                // A refused certificate says "TLS with <url>: …"; anything
+                // before it is the way there.
+                let reach = if e.starts_with("TLS with") {
+                    "certificate"
+                } else {
+                    "unreachable"
+                };
+                let problem = if reach == "certificate" {
+                    e
+                } else {
+                    format!("the center does not answer: {e}")
+                };
+                return Ok(Check {
+                    reach,
+                    code: None,
+                    problem: Some(problem),
+                });
+            }
+        };
+    let path = format!("{}{}", link.center.base, PAIR_CHECK_PATH);
+    let body = serde_json::json!({ "code": link.code });
+    let answer = nerve_transport::http::post_json(
+        &mut io,
+        &link.center.authority(),
+        &path,
+        &body,
+        RESPONSE_MAX,
+    )
+    .await;
+    let code = match answer {
+        Ok(r) if r.status == 200 => serde_json::from_slice::<Value>(&r.body)
+            .ok()
+            .and_then(|v| v["code"].as_str().map(str::to_string))
+            .filter(|c| ["open", "used", "gone", "busy"].contains(&c.as_str()))
+            .unwrap_or_else(|| "unknown".into()),
+        // A center from before the check (404), or one that failed it: the
+        // pairing itself will say.
+        _ => "unknown".into(),
+    };
+    let problem = match code.as_str() {
+        "used" => Some(
+            "the code is used: a machine paired with it. Make a new link in the center's web UI"
+                .into(),
+        ),
+        "gone" => Some(
+            "the code is expired, out of tries or unknown. Make a new link in the center's web UI"
+                .into(),
+        ),
+        _ => None,
+    };
+    Ok(Check {
+        reach: "ok",
+        code: Some(code),
+        problem,
+    })
 }
 
 /// Pairs with the center in `link` and stores the result: the node key

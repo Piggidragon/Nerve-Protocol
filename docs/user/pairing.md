@@ -48,6 +48,14 @@ guard, which keeps commands off this node itself
 - It allows 10 tries in all. After that make a new one.
 - A wrong code counts against every open code.
 
+Before it asks you, `center add` checks the link: the center answers (through
+your proxy or relay, if you use one), its certificate is the one the link
+pins, and the code is still valid. If one of these fails, it says why and asks
+nothing: make a new link, or fix the way to the center. The check uses
+nothing up and counts no try. A center that gets many checks with wrong codes
+stops saying whether a code is valid for a while; `center add` then asks all
+the same.
+
 ## Options of `center add`
 
 | Option | Does |

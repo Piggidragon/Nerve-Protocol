@@ -28,8 +28,15 @@ node.
 2. On the node: `nerve-node center add '<link>'`. The node parses the link
    strictly and shows the center's address, plus the policy the new pairing
    starts with (mode `allowlist`, no allow rule, the guard's deny rules
-   `nerve_policy::rules::GUARD`, settings grant `off`). It stores
-   nothing before the owner confirms.
+   `nerve_policy::rules::GUARD`, settings grant `off`). Before it asks, it
+   checks the link (`nerve_node::pair::check`): it opens the way the pairing
+   will (proxy or relay, pin) and sends `POST <center>/nerve/v0/pair/check`
+   `{code}`, which answers `open`, `used`, `gone` or `busy` without using the
+   code or counting a try (`nerve_center::pairing::Codes::probe`: a check
+   with a code that is not open costs one of 10 checks per 10 minutes, after
+   which every check gets `busy`, so it is no cheaper a way to guess). It
+   asks only when the pairing can work, and stores nothing before the owner
+   confirms.
 3. The node makes a key pair for this center and sends
    `POST <center>/nerve/v0/pair` with `{code, name, platform, arch,
    public_key}` over TLS, checked against the pin.

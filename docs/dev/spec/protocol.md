@@ -94,6 +94,18 @@ Unknown fields are refused. Answers:
   in all; a wrong code counts against every open code.
 - The center MUST compute `node_id` from `public_key` itself.
 
+Before it asks the owner, a node MAY check the code without using it:
+`POST <center>/nerve/v0/pair/check` with `{"code": "…"}`, over the same TLS
+(and pin) as the pair request. The answer is `200 {"code": "open" | "used" |
+"gone" | "busy"}`: it could pair now; a node paired with it; unknown,
+expired or out of tries; or the center says nothing now. A check MUST NOT use
+the code up or count as a try. A check with a code that is not open counts
+against a budget of the center's (10 in 10 minutes, for every code alike);
+once it is spent, the center answers `busy` to every check, a right code's
+too, until the window ends, so checks are no cheaper way to guess a code than
+pair requests. A center without the path answers `404`; the node then pairs
+without knowing.
+
 ### 3.3 Unpairing
 
 - The node owner unpairs: the node sends `bye {reason: "unpaired"}` if a link

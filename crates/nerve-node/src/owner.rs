@@ -1156,9 +1156,7 @@ async fn run_for(
 
 /// Whether `cmd` only reads: it changes nothing of the node.
 fn only_reads(cmd: &Cmd) -> bool {
-    use crate::cli::{
-        CapCmd, CenterCmd, ConfigCmd, ProxyCmd, RelayCmd, RuleCmd, ServiceCmd,
-    };
+    use crate::cli::{CapCmd, CenterCmd, ConfigCmd, ProxyCmd, RelayCmd, RuleCmd, ServiceCmd};
     matches!(
         cmd,
         Cmd::Status
@@ -1185,7 +1183,11 @@ fn words(args: &[String]) -> String {
         .map(String::as_str)
         .filter(|a| !a.starts_with('-'))
         .collect();
-    let n = if words.first() == Some(&"config") { 3 } else { 2 };
+    let n = if words.first() == Some(&"config") {
+        3
+    } else {
+        2
+    };
     words[..words.len().min(n)].join(" ")
 }
 
@@ -1770,7 +1772,10 @@ mod tests {
             assert!(!only_reads(&cli(args).cmd), "{args:?}");
         }
         let w = |a: &[&str]| words(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
-        assert_eq!(w(&["config", "set", "log.level", "debug"]), "config set log.level");
+        assert_eq!(
+            w(&["config", "set", "log.level", "debug"]),
+            "config set log.level"
+        );
         assert_eq!(
             w(&["proxy", "set", "https://n:secret@relay:7490", "--pin", "x"]),
             "proxy set"

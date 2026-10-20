@@ -275,6 +275,7 @@ async fn pair(
 ) -> Result<Value, String> {
     let link = PairLink::parse(link)?;
     if !yes {
+        let check = crate::pair::check(paths, &link).await?;
         return Ok(json!({
             "paired": false,
             "preview": {
@@ -283,6 +284,7 @@ async fn pair(
                 "pin": link.pin,
                 "name": name,
             },
+            "check": check.json(),
         }));
     }
     let before = std::fs::read(paths.config_file()).ok();

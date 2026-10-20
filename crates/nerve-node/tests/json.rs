@@ -4,6 +4,8 @@
 
 use std::process::Command;
 
+use serde_json::json;
+
 fn node(dir: &std::path::Path, args: &[&str]) -> (bool, serde_json::Value) {
     let out = Command::new(env!("CARGO_BIN_EXE_nerve-node"))
         .arg("--config-dir")
@@ -208,4 +210,63 @@ fn a_restore_says_what_it_did_as_data() {
     );
     // The lines for people are there as before.
     assert!(!v["messages"].as_array().unwrap().is_empty(), "{v}");
+}
+
+/// Before the owner says yes, `center add` checks the link: the center
+/// answers and its code is open, so it can pair; once used, the preview
+/// says why it cannot, and the terminal is not asked at all. The check uses
+/// nothing up: the pairing after it works.
+#[test]
+fn center_add_checks_the_link_before_it_asks() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let center = rt
+        .block_on(nerve_conformance::fake_center::FakeCenter::start(false))
+        .unwrap();
+    let link = center.link().render();
+    let d = tempfile::tempdir().unwrap();
+    for _ in 0..3 {
+        let (ok, v) = node(d.path(), &["center", "add", &link]);
+        assert!(ok, "{v}");
+        let c = &v["check"];
+        assert_eq!(
+            (&c["ready"], &c["code"]),
+            (&json!(true), &json!("open")),
+            "{v}"
+        );
+    }
+    let (ok, v) = node(d.path(), &["center", "add", &link, "--yes"]);
+    assert!(ok && v["paired"] == true, "{v}");
+    let (ok, v) = node(d.path(), &["center", "add", &link]);
+    assert!(ok, "{v}");
+    let c = &v["check"];
+    assert_eq!(
+        (&c["ready"], &c["code"]),
+        (&json!(false), &json!("used")),
+        "{v}"
+    );
+    assert!(c["problem"].as_str().unwrap().contains("used"), "{v}");
+    // The terminal: refused with the reason, before the question.
+    let out = Command::new(env!("CARGO_BIN_EXE_nerve-node"))
+        .arg("--config-dir")
+        .arg(d.path().join("config"))
+        .arg("--state-dir")
+        .arg(d.path().join("state"))
+        .args(["center", "add", &link])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    let text =
+        String::from_utf8_lossy(&out.stdout).to_string() + &String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{text}");
+    assert!(text.contains("cannot pair: the code is used"), "{text}");
+    assert!(!text.contains("[y/N]"), "{text}");
+    // A center nobody answers for: unreachable, nothing to pair with.
+    let gone = "nerve://pair?center=http%3A%2F%2F127.0.0.1%3A9&code=abc123";
+    let (ok, v) = node(d.path(), &["center", "add", gone]);
+    assert!(ok, "{v}");
+    assert_eq!(v["check"]["reach"], "unreachable", "{v}");
+    assert_eq!(v["check"]["ready"], false, "{v}");
 }

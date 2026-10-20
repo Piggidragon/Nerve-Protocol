@@ -1591,8 +1591,17 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
         Cmd::Center(CenterCmd::Add { link, name, yes }) => {
             let link = PairLink::parse(&link)?;
             w(out, crate::pair::preview(&link, name.as_deref()));
-            if !yes && !confirm(&mut std::io::stdin().lock(), out)? {
-                return Err("not paired".into());
+            if !yes {
+                // Asked only when the pairing can work: the center answers,
+                // its certificate is the pinned one and the code is open.
+                let check = crate::pair::check(&paths, &link).await?;
+                if !check.ready() {
+                    return Err(check.said());
+                }
+                w(out, check.said());
+                if !confirm(&mut std::io::stdin().lock(), out)? {
+                    return Err("not paired".into());
+                }
             }
             let e = crate::pair::pair(&paths, &link, name.as_deref()).await?;
             w(out, format!("paired with {} as {}", e.url, e.name));
@@ -7563,6 +7572,9 @@ mod tests {
         assert_eq!(v["preview"]["tls"], true, "{v}");
         assert_eq!(v["preview"]["pin"], "A".repeat(43), "{v}");
         assert_eq!(v["preview"]["name"], "lab", "{v}");
+        // The check found no center there: the app offers no Pair.
+        assert_eq!(v["check"]["ready"], false, "{v}");
+        assert!(v["check"]["problem"].is_string(), "{v}");
         assert_eq!(std::fs::read(paths.config_file()).unwrap(), before);
         let e = run(&paths, &["--json", "center", "add", "nerve://x"]).unwrap_err();
         assert!(e.contains("nerve://pair?"), "{e}");

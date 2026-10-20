@@ -300,11 +300,14 @@ fn spawn(
     exe: &std::path::Path,
     tokens: Option<&Tokens>,
 ) -> Result<std::process::Child, String> {
+    // No token file (the node is not up yet, or not at all): nothing is
+    // handed, and the run reads the token itself once it has connected, so
+    // a node that starts meanwhile is reached with its own token.
     #[cfg(unix)]
-    let _pipe = match tokens {
-        Some(t) => Some(
-            hand(&mut c, t.get()).map_err(|e| format!("cannot start {}: {e}", exe.display()))?,
-        ),
+    let _pipe = match tokens.and_then(|t| t.get()) {
+        Some(token) => {
+            Some(hand(&mut c, token).map_err(|e| format!("cannot start {}: {e}", exe.display()))?)
+        }
         None => None,
     };
     #[cfg(not(unix))]
@@ -314,7 +317,9 @@ fn spawn(
         .map_err(|e| format!("cannot start {}: {e}", exe.display()))
 }
 
-/// Gives `c` a pipe that holds `token` (nothing for none), its descriptor
+/// Gives `c` a pipe that holds `token` (nothing for one that could not be
+/// read: the run then reads the file without switching to the group, as
+/// the app tried that already), its descriptor
 /// named by [`nerve_node::owner::HANDED_VAR`]; the read end, which the
 /// caller keeps until `c` has started.
 #[cfg(unix)]
@@ -368,7 +373,8 @@ fn hand(c: &mut Command, token: Option<String>) -> std::io::Result<std::os::fd::
 /// user an owner reads it through `sg`, which logs each switch to the
 /// group (on Debian and Ubuntu two lines in the auth log): once per start
 /// of the node, not once for every command of the status poll. A file
-/// that is not there (no node, or a stopped one) is not read.
+/// that is not there (no node, or a stopped one) is not read, and nothing
+/// is handed for it.
 pub struct Tokens {
     file: PathBuf,
     read: Box<dyn Fn() -> Option<String> + Send + Sync>,
@@ -411,19 +417,20 @@ impl Tokens {
     }
 
     /// The token for a run now: the one read before while the file is the
-    /// same, else read now.
-    pub fn get(&self) -> Option<String> {
+    /// same, else read now; `Some(None)` when the file is there and could
+    /// not be read, `None` when there is no file.
+    pub fn get(&self) -> Option<Option<String>> {
         let stamp = stamp(&self.file)?;
         // Held while reading, so that runs started together read once.
         let mut last = self.last.lock().unwrap_or_else(|p| p.into_inner());
         if let Some((s, t)) = &*last
             && *s == stamp
         {
-            return t.clone();
+            return Some(t.clone());
         }
         let token = (self.read)();
         *last = Some((stamp, token.clone()));
-        token
+        Some(token)
     }
 }
 
@@ -519,9 +526,10 @@ mod tests {
         script(
             &cli,
             "#!/bin/sh\n\
-             t=$(cat \"/proc/self/fd/$NERVE_OWNER_TOKEN_FD\")\n\
+             t=unhanded; fd=3\n\
+             if [ -n \"$NERVE_OWNER_TOKEN_FD\" ]; then fd=$NERVE_OWNER_TOKEN_FD; t=$(cat \"/proc/self/fd/$fd\"); fi\n\
              n=0; [ -n \"$t\" ] && n=$(env | grep -c -F -- \"$t\")\n\
-             printf '{\"token\":\"%s\",\"env\":%s,\"fd\":%s,\"args\":\"%s\"}\\n' \"$t\" \"$n\" \"$NERVE_OWNER_TOKEN_FD\" \"$*\"\n",
+             printf '{\"token\":\"%s\",\"env\":%s,\"fd\":%s,\"args\":\"%s\"}\\n' \"$t\" \"$n\" \"$fd\" \"$*\"\n",
         );
         let reads = Arc::new(AtomicUsize::new(0));
         let tokens = {
@@ -568,9 +576,11 @@ mod tests {
         }
         assert_eq!(reads.load(Ordering::SeqCst), 2);
 
-        // The node stopped: no file, nothing read, an empty pipe handed.
+        // The node stopped: no file, nothing read, nothing handed, so the
+        // run reads the token after it connects, to a node that may have
+        // started meanwhile (review round 6, part A, finding 1).
         std::fs::remove_file(&file).unwrap();
-        assert_eq!(got(&runner), "");
+        assert_eq!(got(&runner), "unhanded");
         assert_eq!(reads.load(Ordering::SeqCst), 2);
 
         // A read that fails is not tried again for the same file.
@@ -582,6 +592,7 @@ mod tests {
                 None
             }))
         };
+        // An empty pipe: the run does not switch to the group again.
         let runner = runner.with_tokens(failing);
         for _ in 0..3 {
             assert_eq!(got(&runner), "");

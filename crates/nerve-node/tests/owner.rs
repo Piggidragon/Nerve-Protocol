@@ -474,6 +474,61 @@ async fn a_request_without_the_owner_token_is_refused() {
     daemon.stop().await;
 }
 
+/// The app reads the owner token before it starts a run of the CLI, so a run
+/// may carry the last start's token when the node started again in between:
+/// the node refuses it before it runs anything, and the run asks once more
+/// with the token it reads itself. A run the app handed nothing (there was
+/// no token file yet) reads it once it has connected (review round 6,
+/// part A, finding 1).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_run_handed_the_last_starts_token_asks_again_with_its_own() {
+    use nerve_node::owner::{Input, Io, ask_at};
+    let d = tempfile::tempdir().unwrap();
+    let (daemon, at) = node(d.path(), vec![uid()]).await;
+    let old = nerve_node::owner::read_token(&at).unwrap();
+    daemon.stop().await;
+    let (daemon, at) = node(d.path(), vec![uid()]).await;
+    assert_ne!(nerve_node::owner::read_token(&at).unwrap(), old);
+    let ask = |level: &str| -> Vec<String> {
+        ["config", "set", "log.level", level]
+            .iter()
+            .map(|a| a.to_string())
+            .collect()
+    };
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let mut io = Io {
+        out: &mut out,
+        err: &mut err,
+    };
+    let stale = Some(old);
+    let code = ask_at(
+        &at,
+        &ask("debug"),
+        Some("/".into()),
+        Input::None,
+        Some(&stale),
+        &mut io,
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(daemon.config().log.level.to_string(), "debug");
+    // Handed nothing: read here, after the connect.
+    let code = ask_at(
+        &at,
+        &ask("warn"),
+        Some("/".into()),
+        Input::None,
+        None,
+        &mut io,
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, 0);
+    assert_eq!(daemon.config().log.level.to_string(), "warn");
+    daemon.stop().await;
+}
+
 /// The command lines of `exec.run` in `cwd`, as a center sends them.
 async fn run_command(
     conn: &mut nerve_conformance::wire::Conn<tokio::net::TcpStream>,

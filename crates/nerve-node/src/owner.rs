@@ -310,6 +310,7 @@ pub fn forward_if_needed(cli: &Cli) -> Option<i32> {
 }
 
 /// What this process passes to the node's command as its input.
+#[derive(Clone)]
 pub enum Input {
     None,
     /// This process's own, as it comes.
@@ -471,28 +472,80 @@ async fn forward(
     input: Input,
     json: bool,
 ) -> i32 {
-    let mut conn = match connect(paths).await {
-        Ok(c) => c,
-        Err(e) => return fail(json, &not_reached(&e)),
-    };
-    let token = own_token();
-    let request = request_line(&args, cwd, false, token.as_ref().ok().cloned().flatten());
-    let sent = {
-        use tokio::io::AsyncWriteExt;
-        conn.write_all(request.as_bytes()).await
-    };
-    if let Err(e) = sent {
-        return fail(json, &format!("cannot reach the node: {e}"));
-    }
     let (mut out, mut err) = (std::io::stdout(), std::io::stderr());
     let mut io = Io {
         out: &mut out,
         err: &mut err,
     };
-    match session(conn, Vec::new(), input, None, &mut io).await {
-        Ok(code) => code,
-        Err(e) => fail(json, &without_token(e, &token)),
+    #[cfg(unix)]
+    let r = {
+        let _ = paths;
+        ask_at(&socket_here(), &args, cwd, input, HANDED.get(), &mut io).await
+    };
+    // The pipe lets in its owners only, and carries no token.
+    #[cfg(not(unix))]
+    let r = match connect(paths).await {
+        Ok(conn) => ask_once(conn, &args, cwd, input, Ok(None), &mut io).await,
+        Err(e) => Err(not_reached(&e)),
+    };
+    r.unwrap_or_else(|e| fail(json, &e))
+}
+
+/// An owner's `args` on the owner socket `at`, with the token the app
+/// `handed` this run ([`token_here`]): the command's exit code, or why it
+/// did not run. The app reads the token before it starts the run, so it may
+/// hand the last start's: the node started again in between. The node
+/// refuses that before it runs anything or reads any input, and the run
+/// asks once more with the token it reads itself, as a run from a terminal
+/// does (review round 6, part A, finding 1).
+#[cfg(unix)]
+pub async fn ask_at(
+    at: &Path,
+    args: &[String],
+    cwd: Option<String>,
+    input: Input,
+    handed: Option<&Option<String>>,
+    io: &mut Io<'_>,
+) -> Result<i32, String> {
+    let again = matches!(handed, Some(Some(_))).then(|| input.clone());
+    // The token is read once the node answers: one that starts meanwhile
+    // has written its own by then, and one that is down costs no `sg`.
+    let conn = connect_at(at).await.map_err(|e| not_reached(&e))?;
+    let token = token_here(handed, at, &switch_to_group).map(Some);
+    let r = ask_once(conn, args, cwd.clone(), input, token, io).await;
+    match (r, again) {
+        (Err(e), Some(input)) if e == NO_TOKEN => {
+            let conn = connect_at(at).await.map_err(|e| not_reached(&e))?;
+            let token = token_here(None, at, &switch_to_group).map(Some);
+            ask_once(conn, args, cwd, input, token, io).await
+        }
+        (r, _) => r,
     }
+}
+
+/// One request of [`forward`] on `conn` with `token`: the command's exit
+/// code, or why it did not run.
+async fn ask_once<S>(
+    mut conn: S,
+    args: &[String],
+    cwd: Option<String>,
+    input: Input,
+    token: Result<Option<String>, String>,
+    io: &mut Io<'_>,
+) -> Result<i32, String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let request = request_line(args, cwd, false, token.as_ref().ok().cloned().flatten());
+    {
+        use tokio::io::AsyncWriteExt;
+        conn.write_all(request.as_bytes())
+            .await
+            .map_err(|e| format!("cannot reach the node: {e}"))?;
+    }
+    session(conn, Vec::new(), input, None, io)
+        .await
+        .map_err(|e| without_token(e, &token))
 }
 
 /// The node's refusal `e`, with why this process sent no token when that is
@@ -539,11 +592,37 @@ fn own_token() -> Result<Option<String>, String> {
     }
 }
 
+/// Whether the app handed this run a token ([`take_handed`]).
+fn handed_token() -> bool {
+    #[cfg(unix)]
+    {
+        matches!(HANDED.get(), Some(Some(_)))
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+/// The owner token as this run reads it itself, whatever the app handed:
+/// in the group when it has to ([`read_token`]).
+fn read_here() -> Result<Option<String>, String> {
+    #[cfg(unix)]
+    {
+        token_here(None, &socket_here(), &switch_to_group).map(Some)
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(None)
+    }
+}
+
 /// The token for a request to the owner socket `at`: the one the app
 /// `handed`, else read here, with `switch` when this process may not read
-/// the file ([`read_token_by`]). When the app handed none it read the file
-/// already, in the group if it had to, and a switch here would add one for
-/// every command it runs.
+/// the file ([`read_token_by`]). When the app handed an empty pipe, its
+/// read of the file failed already, in the group if it had to, and a switch
+/// here would add one for every command it runs; when it found no file it
+/// hands nothing, and the run reads here as a run from a terminal does.
 #[cfg(unix)]
 fn token_here(
     handed: Option<&Option<String>>,
@@ -725,15 +804,23 @@ async fn forward_file(
         Ok(p) => p,
         Err(e) => return fail(json, &e),
     };
-    let conn = match connect(paths).await {
-        Ok(c) => c,
-        Err(e) => return fail(json, &not_reached(&e)),
-    };
-    let token = own_token();
-    let given = token.as_ref().ok().cloned().flatten();
-    match send_file(conn, &args, cwd, given, &file, pass.text(), &mut io).await {
-        Ok(code) => code,
-        Err(e) => fail(json, &without_token(e, &token)),
+    // As in [`forward`]: a handed token of the last start is asked again
+    // with this run's own; the node refused it before it took the file.
+    let mut again = handed_token();
+    let mut first = true;
+    loop {
+        let conn = match connect(paths).await {
+            Ok(c) => c,
+            Err(e) => return fail(json, &not_reached(&e)),
+        };
+        let token = if first { own_token() } else { read_here() };
+        first = false;
+        let given = token.as_ref().ok().cloned().flatten();
+        match send_file(conn, &args, cwd.clone(), given, &file, pass.text(), &mut io).await {
+            Ok(code) => return code,
+            Err(e) if e == NO_TOKEN && again => again = false,
+            Err(e) => return fail(json, &without_token(e, &token)),
+        }
     }
 }
 
@@ -1060,8 +1147,13 @@ pub fn socket_here() -> PathBuf {
 
 #[cfg(unix)]
 async fn connect(_paths: &NodePaths) -> Result<tokio::net::UnixStream, String> {
-    let at = socket_here();
-    tokio::net::UnixStream::connect(&at)
+    connect_at(&socket_here()).await
+}
+
+/// The owner socket at `at`, connected.
+#[cfg(unix)]
+async fn connect_at(at: &Path) -> Result<tokio::net::UnixStream, String> {
+    tokio::net::UnixStream::connect(at)
         .await
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {

@@ -7141,7 +7141,7 @@ mod tests {
         };
         let rule = card("rule");
         let rule_verbs: Vec<&str> = rule.verbs.iter().map(|v| v.name.as_str()).collect();
-        assert_eq!(rule_verbs, ["rule add", "rule rm", "rule ls"]);
+        assert_eq!(rule_verbs, ["rule add", "rule rm", "rule ls", "rule guard"]);
         assert_eq!(rule.holds, ["rule"]);
         assert!(
             rule.verbs[0].usage.contains("<LIST>"),

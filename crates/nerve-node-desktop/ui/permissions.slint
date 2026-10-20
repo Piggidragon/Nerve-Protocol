@@ -414,19 +414,26 @@ component RuleSection inherits Section {
                 }
             }
             // On a tint of their own, so they do not read as allow rules.
+            // Inside the card's line, its foot rounded as the card is.
             Reveal {
                 shown: Perm.except-open;
-                Rectangle {
-                    background: Theme.surface-alt;
-                    border-radius: Radius.lg;
-                    VerticalLayout {
-                        Divider { }
-                        RuleList {
-                            list: 1;
-                            rules: Perm.deny;
-                            placeholder: "git push --force";
-                            new-text <=> Perm.deny-text;
-                            new-wild <=> Perm.deny-wild;
+                VerticalLayout {
+                    padding-left: 1px;
+                    padding-right: 1px;
+                    padding-bottom: 1px;
+                    Rectangle {
+                        background: Theme.surface-alt;
+                        border-bottom-left-radius: Radius.lg - 1px;
+                        border-bottom-right-radius: Radius.lg - 1px;
+                        VerticalLayout {
+                            Divider { }
+                            RuleList {
+                                list: 1;
+                                rules: Perm.deny;
+                                placeholder: "git push --force";
+                                new-text <=> Perm.deny-text;
+                                new-wild <=> Perm.deny-wild;
+                            }
                         }
                     }
                 }

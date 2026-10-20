@@ -270,6 +270,13 @@ pub enum RuleCmd {
         #[command(flatten)]
         center: CenterArg,
     },
+    /// Show one list, or all three.
+    Ls {
+        /// The list; all three if left out.
+        list: Option<List>,
+        #[command(flatten)]
+        center: CenterArg,
+    },
     /// Change one entry of a list in place, as one change: the entry as `ls` shows it, and what it becomes.
     Edit {
         /// The list: `allow`, `deny` or `sudo`.
@@ -278,13 +285,6 @@ pub enum RuleCmd {
         entry: String,
         /// What it becomes: an entry as `ls` shows them (`exec.run:git status`, `fs.read:~/notes/*`; on the sudo list a sudo command's pattern), or a plain command line, which becomes the rule `add` makes of it.
         new: String,
-        #[command(flatten)]
-        center: CenterArg,
-    },
-    /// Show one list, or all three.
-    Ls {
-        /// The list; all three if left out.
-        list: Option<List>,
         #[command(flatten)]
         center: CenterArg,
     },
@@ -7329,7 +7329,10 @@ mod tests {
         };
         let rule = card("rule");
         let rule_verbs: Vec<&str> = rule.verbs.iter().map(|v| v.name.as_str()).collect();
-        assert_eq!(rule_verbs, ["rule add", "rule rm", "rule ls", "rule guard"]);
+        assert_eq!(
+            rule_verbs,
+            ["rule add", "rule rm", "rule ls", "rule edit", "rule guard"]
+        );
         assert_eq!(rule.holds, ["rule"]);
         assert!(
             rule.verbs[0].usage.contains("<LIST>"),

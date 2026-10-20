@@ -220,6 +220,7 @@ pub fn in_a_group(lines: &str, gids: &[u32]) -> bool {
 }
 
 /// `a`, `a and b`, `a, b and c`.
+#[cfg(unix)]
 fn and_words(items: &[String]) -> String {
     match items {
         [] => String::new(),

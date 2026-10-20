@@ -304,7 +304,7 @@ function pairingCard(p) {
       row("Command", command),
       row("Link", p.link)),
     el("p", { class: "meta" }, `The code is valid until ${when(p.expires_ms)} and works for one machine.`),
-    el("p", { class: "meta faint" }, p.pin ? "No QR code is offered." : "Plain HTTP on loopback, no certificate pin."));
+    p.pin ? null : el("p", { class: "meta faint" }, "Plain HTTP on loopback, no certificate pin."));
 }
 
 function nodeCard(n) {

@@ -289,8 +289,9 @@ function pageOverview() {
 
 function pairingCard(p) {
   const command = `nerve-node center add '${p.link}'`;
-  // One line per value, each with its own copy button: a person copies the
-  // part they need, not the whole block.
+  // The two ways a machine takes it, each with its own copy button: the
+  // command for a terminal, the bare link for the desktop app. The link
+  // holds the center, the code and the pin, so they are not shown apart.
   const row = (label, value) => el("div", { class: "pair-row" },
     el("span", { class: "pair-label" }, label),
     el("code", { class: "pair-value mono" }, value),
@@ -298,12 +299,10 @@ function pairingCard(p) {
   return el("div", { class: "card", id: "pairing" },
     el("div", { class: "card-top" }, icon("link"), el("span", { class: "name" }, "Pair a machine"),
       el("button", { type: "button", class: "btn ghost icon sm push", "aria-label": "Dismiss", onclick: () => { state.pairing = null; draw(true); } }, icon("x", "sm"))),
-    el("p", { class: "meta" }, "On the machine, run this command:"),
+    el("p", { class: "meta" }, "On the machine, run the command, or paste the link in the Nerve app (Centers, Pair a center)."),
     el("div", { class: "pair-rows" },
       row("Command", command),
-      row("Center", p.center),
-      row("Code", p.code),
-      p.pin ? row("Certificate pin", p.pin) : null),
+      row("Link", p.link)),
     el("p", { class: "meta" }, `The code is valid until ${when(p.expires_ms)} and works for one machine.`),
     el("p", { class: "meta faint" }, p.pin ? "No QR code is offered." : "Plain HTTP on loopback, no certificate pin."));
 }

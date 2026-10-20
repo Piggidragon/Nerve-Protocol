@@ -5,8 +5,9 @@ Pairing links a machine to a center. Do it once per machine and center.
 ## Steps
 
 1. Open the center's web UI (`http://127.0.0.1:7480`). On Overview, press
-   **Pair a machine**. It shows a command, the center's address, a code and a
-   certificate pin.
+   **Pair a machine**. It shows a command and the pairing link, each with a
+   Copy button. With the [desktop app](desktop.md), paste the link there
+   (Centers, **Pair a center**) and skip the command.
 2. On the machine, as a normal user, run the command it shows:
 
    ```sh

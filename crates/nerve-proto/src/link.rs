@@ -237,6 +237,117 @@ impl PairLink {
     }
 }
 
+/// `nerve://relay?address=<host:port>&node=<name>&token=<token>&pin=<pin>`:
+/// all a node needs to reach its centers through a relay, as `relay add`
+/// and `relay token` on the relay show it, in one piece to paste
+/// (docs/user/relay.md).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayLink {
+    /// Where the relayed node reaches the relay: a host name or address and
+    /// the port, `relay.example:7490`, `[2001:db8::7]:7490`.
+    pub address: String,
+    /// The relayed node's name on the relay, its proxy login.
+    pub node: String,
+    /// Its token, the proxy password.
+    pub token: String,
+    /// The pin of the relay's certificate.
+    pub pin: String,
+}
+
+impl RelayLink {
+    pub fn parse(s: &str) -> Result<RelayLink, String> {
+        let s = s.trim();
+        if s.len() > PAIR_LINK_BYTES {
+            return Err("the relay link is longer than 4 KiB".into());
+        }
+        let query = strip_prefix_ci(s, "nerve://relay?")
+            .or_else(|| strip_prefix_ci(s, "nerve://relay/?"))
+            .ok_or("a relay link starts with nerve://relay?")?;
+        if query.contains('#') {
+            return Err("no fragment allowed in the relay link".into());
+        }
+        let (mut address, mut node, mut token, mut pin) = (None, None, None, None);
+        for pair in query.split('&').filter(|p| !p.is_empty()) {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            let v = pct_decode(v).ok_or_else(|| format!("bad escape in {k}"))?;
+            let slot = match k {
+                "address" => &mut address,
+                "node" => &mut node,
+                "token" => &mut token,
+                "pin" => &mut pin,
+                _ => return Err(format!("unknown key {k:?} in the relay link")),
+            };
+            if slot.replace(v).is_some() {
+                return Err(format!("{k} given twice"));
+            }
+        }
+        let address = address.ok_or("the relay link has no address")?;
+        if !valid_host_port(&address) {
+            return Err("the relay link's address is not host:port".into());
+        }
+        let node = node.ok_or("the relay link has no node")?;
+        if !crate::valid_node_name(&node) {
+            return Err("the relay link's node is not a node name".into());
+        }
+        let token = token.ok_or("the relay link has no token")?;
+        if token.is_empty()
+            || token.len() > 128
+            || !token.bytes().all(|b| b.is_ascii_alphanumeric())
+        {
+            return Err("bad relay token".into());
+        }
+        let pin = pin.ok_or("the relay link has no pin")?;
+        if !valid_pin(&pin) {
+            return Err("bad pin: expected 43 base64url characters".into());
+        }
+        Ok(RelayLink {
+            address,
+            node,
+            token,
+            pin,
+        })
+    }
+
+    /// The link's text form; `parse` reads it back.
+    pub fn render(&self) -> String {
+        format!(
+            "nerve://relay?address={}&node={}&token={}&pin={}",
+            pct_encode(&self.address),
+            self.node,
+            self.token,
+            self.pin
+        )
+    }
+
+    /// The proxy URL a relayed node sets (`proxy set`): the relay over TLS,
+    /// the node's name and token as its login.
+    pub fn proxy_url(&self) -> String {
+        format!("https://{}:{}@{}", self.node, self.token, self.address)
+    }
+}
+
+/// `host:port`, with an IPv6 address in brackets: what a relay link's
+/// address may be.
+pub fn valid_host_port(s: &str) -> bool {
+    let Some((host, port)) = s.rsplit_once(':') else {
+        return false;
+    };
+    let port_ok = port.parse::<u16>().is_ok_and(|p| p > 0);
+    let host_ok = match host.strip_prefix('[') {
+        Some(v6) => v6
+            .strip_suffix(']')
+            .is_some_and(|a| a.parse::<std::net::Ipv6Addr>().is_ok()),
+        None => {
+            !host.is_empty()
+                && host.len() <= 253
+                && host
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+        }
+    };
+    port_ok && host_ok
+}
+
 /// Pairing codes: 1 to 64 ASCII letters and digits.
 pub fn valid_code(code: &str) -> bool {
     !code.is_empty() && code.len() <= 64 && code.chars().all(|c| c.is_ascii_alphanumeric())
@@ -365,5 +476,35 @@ mod tests {
             "x".repeat(5000)
         );
         assert!(PairLink::parse(&long).unwrap_err().contains("4 KiB"));
+    }
+
+    #[test]
+    fn relay_links() {
+        let pin = "q".repeat(43);
+        let l = RelayLink {
+            address: "[2001:db8::7]:7490".into(),
+            node: "lab-pc".into(),
+            token: "abc123".into(),
+            pin: pin.clone(),
+        };
+        let text = l.render();
+        assert!(text.starts_with("nerve://relay?address=%5B2001%3Adb8%3A%3A7%5D%3A7490&"));
+        assert_eq!(RelayLink::parse(&text).unwrap(), l);
+        assert_eq!(l.proxy_url(), "https://lab-pc:abc123@[2001:db8::7]:7490");
+        let ok =
+            format!("nerve://relay?address=relay.example:7490&node=lab-pc&token=t0k&pin={pin}");
+        assert_eq!(RelayLink::parse(&ok).unwrap().address, "relay.example:7490");
+        for bad in [
+            format!("nerve://relay?address=relay.example&node=lab-pc&token=t&pin={pin}"),
+            format!("nerve://relay?address=a@b:1&node=lab-pc&token=t&pin={pin}"),
+            format!("nerve://relay?address=r:7490&node=Lab&token=t&pin={pin}"),
+            format!("nerve://relay?address=r:7490&node=lab&token=t-t&pin={pin}"),
+            "nerve://relay?address=r:7490&node=lab&token=t&pin=short".into(),
+            format!("nerve://relay?address=r:7490&node=lab&token=t&pin={pin}&x=1"),
+            format!("nerve://relay?address=r:7490&node=lab&pin={pin}"),
+            format!("nerve://pair?address=r:7490&node=lab&token=t&pin={pin}"),
+        ] {
+            assert!(RelayLink::parse(&bad).is_err(), "{bad}");
+        }
     }
 }

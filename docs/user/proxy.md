@@ -18,12 +18,16 @@ Another node can be the proxy: see [relay](relay.md).
 ## A proxy over TLS
 
 An `https://` proxy is reached over TLS of its own, and the `CONNECT` and its
-login travel inside it. A relay is one; give the pin of its certificate, as
-`relay add` on the relay shows it:
+login travel inside it. A relay is one: paste the link `relay add` on the
+relay shows, which holds the relay's address, this node's name and token,
+and the pin of the relay's certificate:
 
 ```sh
-nerve-node proxy set 'https://lab-pc:<token>@relay.example:7490' --pin <pin>
+nerve-node proxy set 'nerve://relay?address=relay.example%3A7490&node=lab-pc&token=...&pin=...'
 ```
+
+It is the same as the URL with the login and the pin:
+`proxy set 'https://lab-pc:<token>@relay.example:7490' --pin <pin>`.
 
 Without `--pin` the proxy's certificate must be one this machine trusts. The
 user name and password of an `https://` proxy are kept with the node's own

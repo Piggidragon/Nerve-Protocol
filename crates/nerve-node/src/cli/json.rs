@@ -346,6 +346,8 @@ async fn relay(paths: &NodePaths) -> Result<Value, String> {
         .collect();
     Ok(json!({
         "listen": r.listen,
+        // Where a new link says the relay is, unless told otherwise.
+        "address": super::link_address(r.listen.as_deref(), None).ok(),
         "status": live.as_ref().map(|v| v["status"].clone()),
         "max_links": r.max_links,
         "max_links_per_node": r.max_links_per_node,

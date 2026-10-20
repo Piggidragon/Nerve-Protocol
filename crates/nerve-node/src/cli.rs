@@ -408,7 +408,7 @@ pub enum ConfigCmd {
 pub enum ProxyCmd {
     /// Reach centers through an HTTP proxy. Header values and a password are kept in the system keyring, never in node.toml; the installed node on Windows takes neither.
     Set {
-        /// The proxy, http://host:port, or http://user:password@host:port when it wants a login; https://... for a relay or another proxy reached over TLS.
+        /// The proxy, http://host:port, or http://user:password@host:port when it wants a login; https://... for another proxy reached over TLS; or the nerve://relay link a relay showed, which holds its address, pin and this node's token.
         url: String,
         /// The pin of an https:// proxy's certificate (a relay's: `nerve-node relay ls` there shows it); without it the system's roots check it.
         #[arg(long)]
@@ -447,13 +447,16 @@ pub enum RelayCmd {
     },
     /// Turn the relay off: stop listening and end every tunnel. The nodes and their tokens stay.
     Off,
-    /// Let a node use the relay: makes its token and shows it once. Without --center its tunnels may go to every https center of this node.
+    /// Let a node use the relay: makes its token and shows it once, in a link the other node pastes. Without --center its tunnels may go to every https center of this node.
     Add {
         /// The relayed node's name here, 1 to 32 of a-z, 0-9 and -.
         name: String,
         /// A center of this node the relayed node may reach; can be given more than once. Without it, every one.
         #[arg(long = "center", value_name = "CENTER")]
         centers: Vec<String>,
+        /// Where the other node reaches this machine, HOST or HOST:PORT, for its link (without it: the address the relay listens on, else this machine's host name).
+        #[arg(long, value_name = "HOST[:PORT]")]
+        address: Option<String>,
     },
     /// Change which centers of this node a relayed node may reach; without --center, every one. Its tunnels to others end.
     SetCenters {
@@ -474,10 +477,13 @@ pub enum RelayCmd {
         #[arg(long, value_name = "N")]
         max_opens_per_minute: Option<u32>,
     },
-    /// Give a relayed node a new token and end the tunnels of the old one; its centers and limits stay. Shows the token once.
+    /// Give a relayed node a new token and end the tunnels of the old one; its centers and limits stay. Shows the token once, in a link the other node pastes.
     Token {
         /// The relayed node's name.
         name: String,
+        /// Where the other node reaches this machine, HOST or HOST:PORT, for its link (as for `relay add`).
+        #[arg(long, value_name = "HOST[:PORT]")]
+        address: Option<String>,
     },
     /// Take a node's token away and end its tunnels.
     Rm {
@@ -3415,6 +3421,18 @@ async fn proxy_cmd(paths: &NodePaths, c: ProxyCmd, out: &mut dyn Write) -> Resul
                 stdin_password = password;
                 headers.extend(more);
             }
+            // A relay's link holds the proxy URL with this node's login and
+            // the pin: one paste (docs/user/relay.md).
+            let (url, pin) =
+                if nerve_proto::link::strip_prefix_ci(url.trim(), "nerve://relay").is_some() {
+                    let link = nerve_proto::link::RelayLink::parse(&url)?;
+                    if pin.as_ref().is_some_and(|p| *p != link.pin) {
+                        return Err("the relay link carries the pin; give no other --pin".into());
+                    }
+                    (link.proxy_url(), Some(link.pin))
+                } else {
+                    (url, pin)
+                };
             let mut hs: Vec<(String, String)> = Vec::new();
             for (i, h) in headers.iter().enumerate() {
                 // Not echoed: without its colon the whole line may be the secret.
@@ -3674,7 +3692,11 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
             .await;
             Ok(())
         }
-        RelayCmd::Add { name, centers } => {
+        RelayCmd::Add {
+            name,
+            centers,
+            address,
+        } => {
             if !nerve_proto::valid_node_name(&name) {
                 return Err(format!(
                     "{name:?} is not a relay node name: 1 to 32 characters of a-z, 0-9 and -"
@@ -3682,6 +3704,7 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
             }
             let (now, _) = read_config(paths).await?;
             relay_centers(&now, &centers)?;
+            let at = link_address(now.relay.listen.as_deref(), address.as_deref())?;
             let (pin, made) = relay_pin(paths, &now, now.relay.listen.as_deref())?;
             let (token, hash) = crate::relay::new_token();
             let cfg = edit(paths, |c| {
@@ -3710,29 +3733,23 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
                     ),
                 );
             }
-            let at = relay_address(cfg.relay.listen.as_deref());
             w(
                 out,
-                format!("relay node {name} added; its token, shown only now:"),
+                format!("relay node {name} added; its link, shown only now:"),
             );
-            w(out, format!("  {token}"));
+            relay_link(out, &name, &token, &at, &pin, address.is_none());
             w(out, format!("it may reach {}", reach_of(&centers)));
-            w(out, format!("on {name}, run:"));
-            w(
-                out,
-                format!("  nerve-node proxy set 'https://{name}:{token}@{at}' --pin {pin}"),
-            );
             json::also(
                 "token",
-                json!({
-                    "node": name,
-                    "token": token,
-                    "proxy": format!("https://{name}:{token}@{at}"),
-                    "pin": pin,
-                    "reach": reach_of(&centers),
-                    "new_pin": made && now.relay.pin.is_some(),
-                    "relay_off": cfg.relay.listen.is_none(),
-                }),
+                link_json(
+                    &name,
+                    &token,
+                    &at,
+                    &pin,
+                    &centers,
+                    made && now.relay.pin.is_some(),
+                    cfg.relay.listen.is_none(),
+                ),
             );
             if cfg.relay.listen.is_none() {
                 w(
@@ -3786,8 +3803,9 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
             relay_in_force(paths, out, None).await;
             Ok(())
         }
-        RelayCmd::Token { name } => {
+        RelayCmd::Token { name, address } => {
             let (now, _) = read_config(paths).await?;
+            let at = link_address(now.relay.listen.as_deref(), address.as_deref())?;
             let (pin, made) = relay_pin(paths, &now, now.relay.listen.as_deref())?;
             let (token, hash) = crate::relay::new_token();
             let cfg = edit(paths, |c| {
@@ -3813,32 +3831,26 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
                 );
             }
             let node = cfg.relay.node(&name).expect("set above");
-            let at = relay_address(cfg.relay.listen.as_deref());
             // Whether the old token is dead is the running node's to say
             // (`relay_in_force`): on Windows it takes the change at its next
             // start.
             w(
                 out,
-                format!("relay node {name} has a new token, shown only now:"),
+                format!("relay node {name} has a new token; its link, shown only now:"),
             );
-            w(out, format!("  {token}"));
+            relay_link(out, &name, &token, &at, &pin, address.is_none());
             w(out, format!("it may reach {}", reach_of(&node.centers)));
-            w(out, format!("on {name}, run:"));
-            w(
-                out,
-                format!("  nerve-node proxy set 'https://{name}:{token}@{at}' --pin {pin}"),
-            );
             json::also(
                 "token",
-                json!({
-                    "node": name,
-                    "token": token,
-                    "proxy": format!("https://{name}:{token}@{at}"),
-                    "pin": pin,
-                    "reach": reach_of(&node.centers),
-                    "new_pin": made && now.relay.pin.is_some(),
-                    "relay_off": cfg.relay.listen.is_none(),
-                }),
+                link_json(
+                    &name,
+                    &token,
+                    &at,
+                    &pin,
+                    &node.centers,
+                    made && now.relay.pin.is_some(),
+                    cfg.relay.listen.is_none(),
+                ),
             );
             if cfg.relay.listen.is_none() {
                 w(
@@ -4070,15 +4082,88 @@ fn relay_pin(
     Ok((id.pin(), true))
 }
 
-/// Where a relayed node finds the relay, for the line `relay add` shows:
-/// the listening address, or a placeholder where it listens on every
-/// address or is not set.
-fn relay_address(listen: Option<&str>) -> String {
-    match listen.and_then(|l| l.parse::<std::net::SocketAddr>().ok()) {
-        Some(a) if !a.ip().is_unspecified() => a.to_string(),
-        Some(a) => format!("<address of this machine>:{}", a.port()),
-        None => "<address of this machine>:<port>".into(),
+/// The port a relay link names when the relay has no address to listen on
+/// yet: the one docs/user/relay.md uses.
+const RELAY_PORT: u16 = 7490;
+
+/// Where a relayed node finds the relay, for its link: `given` (with the
+/// relay's port when it names none), else the address the relay listens on,
+/// else this machine's host name, at the port it listens on.
+pub fn link_address(listen: Option<&str>, given: Option<&str>) -> Result<String, String> {
+    use nerve_proto::link::valid_host_port;
+    let listen = listen.and_then(|l| l.parse::<std::net::SocketAddr>().ok());
+    let port = listen.map_or(RELAY_PORT, |a| a.port());
+    let at = match given.map(str::trim) {
+        Some(g) if valid_host_port(g) => g.to_string(),
+        Some(g) if g.parse::<std::net::Ipv6Addr>().is_ok() => format!("[{g}]:{port}"),
+        Some(g) => format!("{g}:{port}"),
+        None => match listen {
+            Some(a) if !a.ip().is_unspecified() => a.to_string(),
+            _ => format!("{}:{port}", crate::descriptor::host_name()),
+        },
+    };
+    if let Some(g) = given
+        && !valid_host_port(&at)
+    {
+        return Err(format!(
+            "--address {g:?}: a host name or address, with or without :PORT"
+        ));
     }
+    Ok(at)
+}
+
+/// The lines that hand a relayed node its link: the link, and how the other
+/// node takes it. `guessed`: the address is this program's guess, which the
+/// owner may need to give.
+fn relay_link(out: &mut dyn Write, name: &str, token: &str, at: &str, pin: &str, guessed: bool) {
+    let link = nerve_proto::link::RelayLink {
+        address: at.into(),
+        node: name.into(),
+        token: token.into(),
+        pin: pin.into(),
+    }
+    .render();
+    let _ = writeln!(out, "  {link}");
+    let _ = writeln!(
+        out,
+        "on {name}, paste it in the desktop app (Relay, Connect), or run:"
+    );
+    let _ = writeln!(out, "  nerve-node proxy set '{link}'");
+    if guessed {
+        let _ = writeln!(
+            out,
+            "the link reaches this machine as {at}; if {name} knows it by another name or address, make a new link with `relay token {name} --address <it>`"
+        );
+    }
+}
+
+/// What `relay add` and `relay token` give a program besides their lines.
+fn link_json(
+    name: &str,
+    token: &str,
+    at: &str,
+    pin: &str,
+    centers: &[String],
+    new_pin: bool,
+    relay_off: bool,
+) -> Value {
+    let link = nerve_proto::link::RelayLink {
+        address: at.into(),
+        node: name.into(),
+        token: token.into(),
+        pin: pin.into(),
+    };
+    json!({
+        "node": name,
+        "token": token,
+        "address": at,
+        "link": link.render(),
+        "proxy": link.proxy_url(),
+        "pin": pin,
+        "reach": reach_of(centers),
+        "new_pin": new_pin,
+        "relay_off": relay_off,
+    })
 }
 
 const PROXY_AUTHORIZATION: &str = "Proxy-Authorization";
@@ -6466,12 +6551,25 @@ mod tests {
         assert_eq!(load(&paths).relay.listen.as_deref(), Some("0.0.0.0:7491"));
 
         let out = run(&paths, &["relay", "add", "lab-pc"]).unwrap();
-        let token = out.lines().nth(1).unwrap().trim().to_string();
+        // One link holds all the other node needs: the relay's address (the
+        // host name here, as the relay listens on every address), the
+        // node's name and token, and the pin.
+        let link = out.lines().nth(1).unwrap().trim().to_string();
+        let parsed = nerve_proto::link::RelayLink::parse(&link).unwrap();
+        let token = parsed.token.clone();
         assert_eq!(token.len(), 43, "{out}");
+        assert_eq!(parsed.node, "lab-pc");
+        assert_eq!(parsed.pin, pin);
+        let host = crate::descriptor::host_name();
+        assert_eq!(parsed.address, format!("{host}:7491"));
         assert!(
             out.contains(&format!(
-                "it may reach every https center of this node\non lab-pc, run:\n  nerve-node proxy set 'https://lab-pc:{token}@<address of this machine>:7491' --pin {pin}\n"
+                "on lab-pc, paste it in the desktop app (Relay, Connect), or run:\n  nerve-node proxy set '{link}'\nthe link reaches this machine as {host}:7491;"
             )),
+            "{out}"
+        );
+        assert!(
+            out.contains("it may reach every https center of this node\n"),
             "{out}"
         );
         let file = std::fs::read_to_string(paths.config_file()).unwrap();
@@ -6566,9 +6664,17 @@ mod tests {
         // A new token keeps the node's centers and limits; the old one
         // stops working.
         let before = load(&paths).relay.node("lab-2").unwrap().clone();
-        let out = run(&paths, &["relay", "token", "lab-2"]).unwrap();
-        let token2 = out.lines().nth(1).unwrap().trim().to_string();
+        let out = run(
+            &paths,
+            &["relay", "token", "lab-2", "--address", "relay.example"],
+        )
+        .unwrap();
+        let link = nerve_proto::link::RelayLink::parse(out.lines().nth(1).unwrap()).unwrap();
+        let token2 = link.token.clone();
         assert_eq!(token2.len(), 43, "{out}");
+        // The address given, at the relay's port; no guess to warn about.
+        assert_eq!(link.address, "relay.example:7491");
+        assert!(!out.contains("make a new link"), "{out}");
         assert!(
             out.contains("it may reach the centers work, home, home-b\n"),
             "{out}"
@@ -7547,8 +7653,41 @@ mod tests {
                 .starts_with(&format!("https://lab-pc:{token}@")),
             "{v}"
         );
-        let v = json_of(&paths, &["relay", "token", "lab-pc"]);
+        let link = nerve_proto::link::RelayLink::parse(t["link"].as_str().unwrap()).unwrap();
+        assert_eq!(link.token, token, "{v}");
+        assert_eq!(t["address"], link.address.as_str(), "{v}");
+        let v = json_of(
+            &paths,
+            &["relay", "token", "lab-pc", "--address", "10.0.0.2:9000"],
+        );
         assert_ne!(v["token"]["token"].as_str().unwrap(), token, "{v}");
+        assert_eq!(v["token"]["address"], "10.0.0.2:9000", "{v}");
+        assert!(run(&paths, &["relay", "token", "lab-pc", "--address", "a b"]).is_err());
+        // The relayed node takes the link whole: the relay as its proxy,
+        // its login, and the pin.
+        let (_d2, other) = setup(&[]);
+        let out = run(
+            &other,
+            &["proxy", "set", v["token"]["link"].as_str().unwrap()],
+        )
+        .unwrap();
+        assert!(out.starts_with("proxy https://10.0.0.2:9000\n"), "{out}");
+        let c = load(&other).connection;
+        assert_eq!(c.proxy.as_deref(), Some("https://10.0.0.2:9000"));
+        assert_eq!(c.login.as_deref(), Some("lab-pc"));
+        assert_eq!(c.pin, load(&paths).relay.pin);
+        let e = run(
+            &other,
+            &[
+                "proxy",
+                "set",
+                v["token"]["link"].as_str().unwrap(),
+                "--pin",
+                &"B".repeat(43),
+            ],
+        )
+        .unwrap_err();
+        assert!(e.contains("carries the pin"), "{e}");
     }
 
     /// Without --yes, `center add --json` shows what the owner confirms and

@@ -25,6 +25,10 @@ export struct NodeStatus {
     limits-restart: bool,
     // What the owner should know: why commands do not run.
     warnings: [string],
+    // Some pairing runs commands without the sandbox (`user` or
+    // `allowlist` mode), so as an owner they can change Nerve's settings;
+    // a `folder` mode command cannot (docs/user/desktop.md).
+    unconfined: bool,
 }
 
 export struct CenterRow {

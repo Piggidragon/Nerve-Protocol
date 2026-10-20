@@ -161,8 +161,10 @@ command can get around; it does not hold alone. A command account that is
 no owner (below) keeps commands from the node's settings in every mode.
 
 The Overview says so in one card, "Center commands run as you",
-with what that gives them (all you can do, and root where your account is in
-a group such as `docker` or may use sudo). **Don't show again** hides the
+with what that gives them: all you can do, Nerve's settings too while a
+pairing is in `user` or `allowlist` mode, or all you can in their folders
+while every pairing is in `folder` mode; and root where your account is in a
+group such as `docker` or may use sudo. **Don't show again** hides the
 card until the account or those ways to root change; **Settings**,
 **General** keeps the line and shows the card again. **Create a separate
 account** gives the

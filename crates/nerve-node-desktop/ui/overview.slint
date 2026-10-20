@@ -267,10 +267,16 @@ export component OverviewPage inherits PageFrame {
                         font-weight: Type.semibold;
                         wrap: word-wrap;
                     }
+                    // Nerve's settings only through a pairing without the
+                    // sandbox: a folder mode command has no owner token.
                     Text {
-                        text: Store.commands-root-via != ""
-                            ? "They can do all you can, and get root through " + Store.commands-root-via + "."
-                            : "They can do all you can, Nerve's settings too.";
+                        text: Store.status.unconfined
+                            ? (Store.commands-root-via != ""
+                                ? "They can do all you can, and get root through " + Store.commands-root-via + "."
+                                : "They can do all you can, Nerve's settings too.")
+                            : (Store.commands-root-via != ""
+                                ? "They can do all you can in their folders, and get root through " + Store.commands-root-via + "."
+                                : "They can do all you can in the folders you give them.");
                         color: Theme.text;
                         font-size: Type.small;
                         wrap: word-wrap;

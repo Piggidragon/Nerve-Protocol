@@ -40,6 +40,13 @@ pub fn status(v: &Value, now_ms: u64) -> (NodeStatus, Vec<CenterRow>) {
         .flatten()
         .filter(|c| c["status"] == "connected")
         .count();
+    // A pairing whose commands run without the sandbox. One the center
+    // revoked runs none; a mode this app does not know counts.
+    let unconfined = v["centers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|c| c["revoked"] != true && c["mode"] != "folder");
     let (state, title, detail, tone) = match (locked, running) {
         (true, _) => (
             "locked",
@@ -113,6 +120,7 @@ pub fn status(v: &Value, now_ms: u64) -> (NodeStatus, Vec<CenterRow>) {
         limits_off: limits_off.into(),
         limits_restart,
         warnings: text_model(warnings),
+        unconfined,
     };
     (status, centers)
 }
@@ -1501,6 +1509,33 @@ mod tests {
             centers[1].mode_detail
         );
         assert_eq!(centers[2].link, "Revoked");
+    }
+
+    /// Commands as the app's user change Nerve's settings only through a
+    /// pairing without the sandbox: `user` or `allowlist` mode, unless the
+    /// center revoked it.
+    #[test]
+    fn a_pairing_without_the_sandbox_is_told_apart() {
+        let with = |centers: Value| {
+            status(&json!({"daemon": "running", "centers": centers}), NOW)
+                .0
+                .unconfined
+        };
+        assert!(!with(json!([])));
+        assert!(!with(
+            json!([{"name": "a", "mode": "folder"}, {"name": "b", "mode": "folder"}])
+        ));
+        assert!(with(
+            json!([{"name": "a", "mode": "folder"}, {"name": "b", "mode": "user"}])
+        ));
+        assert!(with(
+            json!([{"name": "a", "mode": "allowlist", "paused": true}])
+        ));
+        assert!(!with(
+            json!([{"name": "a", "mode": "folder"}, {"name": "b", "mode": "user", "revoked": true}])
+        ));
+        // A mode this app does not know is not taken for the sandbox.
+        assert!(with(json!([{"name": "a"}])));
     }
 
     #[test]

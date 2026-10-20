@@ -24,10 +24,22 @@
 //! itself. A restore runs while the node is stopped, which then starts again
 //! ([`crate::daemon::Daemon::run_until`]).
 //!
+//! On Linux a `cli` request also carries the owner token: a new one at
+//! each start of the node, in [`token_file`] beside the socket, which only
+//! the node's user and the group [`GROUP`] may read and which no `folder`
+//! mode command reads, as its folder is out of the command's Landlock rules
+//! (crate::daemon::Shared::sealed). So a confined command cannot use the
+//! socket however it connects; the checks of the caller's process (no
+//! `no_new_privs`, not below a command) are a second layer. On Windows the
+//! pipe's DACL keeps every AppContainer out, as it would keep one from a
+//! token file, so there is no token.
+//!
 //! What it does not stop: a command of a center that runs as an owner's
-//! account and gets a process outside the node's process tree and sandbox
-//! (the account's own `systemd --user`, a tmux server, the task scheduler)
-//! is that owner. The app warns when commands run as its user
+//! account without a sandbox (`user` and `allowlist` mode) reads the token
+//! as the owner does, and one that gets a process outside the node's process
+//! tree and sandbox (the account's own `systemd --user`, a tmux server, the
+//! task scheduler) is that owner. That is the owner's choice of mode and
+//! account; the app warns when commands run as its user
 //! (docs/user/desktop.md).
 
 use std::io::Write;
@@ -62,6 +74,14 @@ pub const OWNERS_VALUE: &str = "Owners";
 /// The owner socket of the installed node on Linux.
 pub fn socket() -> PathBuf {
     Path::new(RUNTIME_DIR).join(SOCKET_NAME)
+}
+
+/// The file name of the owner token, beside the owner socket.
+pub const TOKEN_NAME: &str = "owner.token";
+
+/// The file that holds the owner token of the owner socket `at`.
+pub fn token_file(at: &Path) -> PathBuf {
+    at.with_file_name(TOKEN_NAME)
 }
 
 /// The owner pipe of the installed node on Windows. Its name is fixed, not
@@ -451,7 +471,8 @@ async fn forward(
         Ok(c) => c,
         Err(e) => return fail(json, &not_reached(&e)),
     };
-    let request = request_line(&args, cwd, false);
+    let token = own_token();
+    let request = request_line(&args, cwd, false, token.as_ref().ok().cloned().flatten());
     let sent = {
         use tokio::io::AsyncWriteExt;
         conn.write_all(request.as_bytes()).await
@@ -466,18 +487,111 @@ async fn forward(
     };
     match session(conn, Vec::new(), input, None, &mut io).await {
         Ok(code) => code,
-        Err(e) => fail(json, &e),
+        Err(e) => fail(json, &without_token(e, &token)),
+    }
+}
+
+/// The node's refusal `e`, with why this process sent no token when that is
+/// what the node refused.
+fn without_token(e: String, token: &Result<Option<String>, String>) -> String {
+    match token {
+        Err(why) if e == NO_TOKEN => format!("{e}: {why}"),
+        _ => e,
     }
 }
 
 /// The `cli` request for `args` in `cwd`, as its line; `streamed` says that
-/// its file comes in the session ([`Handed::Streamed`]).
-pub fn request_line(args: &[String], cwd: Option<String>, streamed: bool) -> String {
+/// its file comes in the session ([`Handed::Streamed`]), and `token` is the
+/// owner token this process read ([`read_token`]).
+pub fn request_line(
+    args: &[String],
+    cwd: Option<String>,
+    streamed: bool,
+    token: Option<String>,
+) -> String {
     let mut params = json!({"args": args, "cwd": cwd});
     if streamed {
         params["file"] = json!(STREAMED);
     }
-    format!("{}\n", json!({"method": "cli", "params": params}))
+    let mut request = json!({"method": "cli", "params": params});
+    if let Some(t) = token {
+        request["token"] = json!(t);
+    }
+    format!("{request}\n")
+}
+
+/// The owner token this process sends: on Linux the node's, read from its
+/// file (`Err`: why it could not be read; the request goes without, and the
+/// node refuses it), on Windows none: the pipe lets in its owners only.
+fn own_token() -> Result<Option<String>, String> {
+    #[cfg(unix)]
+    {
+        read_token(&socket_here()).map(Some)
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(None)
+    }
+}
+
+/// The owner token of the node on the owner socket `at`, from
+/// [`token_file`], which is the node's user's and the group [`GROUP`]'s to
+/// read. A session that began before `install` made its account an owner
+/// does not hold the group yet, though the account database says it is in
+/// it: then `sg` reads the file in the group, as a new login would. `sg`
+/// asks no password of a member, and gives nothing to a process with
+/// `no_new_privs`, which every confined command keeps.
+#[cfg(unix)]
+pub fn read_token(at: &Path) -> Result<String, String> {
+    let file = token_file(at);
+    let token = match std::fs::read_to_string(&file) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+            // SAFETY: a plain getter.
+            if !in_group(unsafe { libc::getuid() }, GROUP) {
+                return Err(format!("cannot read {}: {e}", file.display()));
+            }
+            read_in_group(&file).ok_or_else(|| {
+                format!(
+                    "cannot read {}: {e}; log out and in again, so that your session is in the group {GROUP}",
+                    file.display()
+                )
+            })?
+        }
+        Err(e) => return Err(format!("cannot read {}: {e}", file.display())),
+    };
+    let token = token.trim();
+    if token.is_empty() {
+        return Err(format!("{} is empty", file.display()));
+    }
+    Ok(token.to_string())
+}
+
+/// `file` read through `sg` [`GROUP`], in a session of its own, so that
+/// `sg` has no terminal to ask a password on; `None` when that fails.
+#[cfg(unix)]
+fn read_in_group(file: &Path) -> Option<String> {
+    use std::os::unix::process::CommandExt;
+    let quoted = format!("'{}'", file.display().to_string().replace('\'', "'\\''"));
+    let mut c = std::process::Command::new("sg");
+    // Built-ins only: `sg` may run the shell without a PATH.
+    c.args([
+        GROUP,
+        "-c",
+        &format!("IFS= read -r t < {quoted} && printf %s \"$t\""),
+    ])
+    .stdin(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null());
+    // SAFETY: one plain system call between fork and exec.
+    unsafe {
+        c.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    let o = c.output().ok()?;
+    let t = String::from_utf8(o.stdout).ok()?;
+    (o.status.success() && !t.trim().is_empty()).then(|| t.trim().to_string())
 }
 
 /// Where a session's output goes: this process's own, or a test's.
@@ -515,9 +629,11 @@ async fn forward_file(
         Ok(c) => c,
         Err(e) => return fail(json, &not_reached(&e)),
     };
-    match send_file(conn, &args, cwd, &file, pass.text(), &mut io).await {
+    let token = own_token();
+    let given = token.as_ref().ok().cloned().flatten();
+    match send_file(conn, &args, cwd, given, &file, pass.text(), &mut io).await {
         Ok(code) => code,
-        Err(e) => fail(json, &e),
+        Err(e) => fail(json, &without_token(e, &token)),
     }
 }
 
@@ -525,19 +641,21 @@ async fn forward_file(
 /// opened as this process's user and handed to the node with the request
 /// (Linux: the descriptor; Windows: its bytes in the session), `passphrase`
 /// as the command's input, and a backup put in place once it is written.
-/// The command's exit code.
+/// `token` goes with the request ([`request_line`]). The command's exit
+/// code.
 #[cfg(unix)]
 pub async fn send_file(
     mut conn: tokio::net::UnixStream,
     args: &[String],
     cwd: Option<String>,
+    token: Option<String>,
     file: &FileJob,
     passphrase: &str,
     io: &mut Io<'_>,
 ) -> Result<i32, String> {
     use std::os::fd::AsFd;
     let opened = Opened::open(file)?;
-    let request = request_line(args, cwd, false);
+    let request = request_line(args, cwd, false, token);
     let sent =
         nerve_transport::ctl::send_files(&mut conn, request.as_bytes(), &[opened.file.as_fd()])
             .await
@@ -564,6 +682,7 @@ pub async fn send_file<S>(
     mut conn: S,
     args: &[String],
     cwd: Option<String>,
+    token: Option<String>,
     file: &FileJob,
     passphrase: &str,
     io: &mut Io<'_>,
@@ -583,7 +702,7 @@ where
         }
         Some(overwrite) => can_write(&file.path, overwrite)?,
     }
-    let request = request_line(args, cwd, true);
+    let request = request_line(args, cwd, true, token);
     conn.write_all(request.as_bytes())
         .await
         .map_err(|e| format!("cannot reach the node: {e}"))?;
@@ -832,9 +951,16 @@ pub fn take_text(pending: &mut Vec<u8>) -> String {
     text
 }
 
+/// The owner socket this process talks to: the installed node's, or the one
+/// `NERVE_OWNER_SOCKET` names.
+#[cfg(unix)]
+fn socket_here() -> PathBuf {
+    std::env::var_os("NERVE_OWNER_SOCKET").map_or_else(socket, PathBuf::from)
+}
+
 #[cfg(unix)]
 async fn connect(_paths: &NodePaths) -> Result<tokio::net::UnixStream, String> {
-    let at = std::env::var_os("NERVE_OWNER_SOCKET").map_or_else(socket, PathBuf::from);
+    let at = socket_here();
     tokio::net::UnixStream::connect(&at)
         .await
         .map_err(|e| match e.kind() {
@@ -978,6 +1104,55 @@ fn keeps_no_new_privs(pid: u32) -> bool {
 /// command.
 const FROM_A_COMMAND: &str = "refused: this request comes from a command the node runs for a center, or a program it started";
 
+/// Why the node refuses an owner request without the owner token.
+pub const NO_TOKEN: &str = "refused: this request does not carry the node's owner token, which only its owners' own programs can read";
+
+/// Writes a new owner token beside the owner socket `at` that [`serve`]
+/// makes next, for the node to compare requests with. The file is made
+/// whole and then put in place, so a reader never sees a part of it. It is
+/// the node's user's, and with the owners in a group, that group's to read
+/// (0640): the unit gives the node that group (`SupplementaryGroups=`), as
+/// only a member may give a file to it. Without the group it stays the
+/// node's alone (0600) and the node says why its owners cannot use it.
+#[cfg(unix)]
+fn write_token(at: &Path, owners: &Owners) -> std::io::Result<String> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let token = nerve_transport::keys::random_token(32);
+    let file = token_file(at);
+    let dir = file.parent().unwrap_or(Path::new("."));
+    let tmp = dir.join(format!(
+        ".{TOKEN_NAME}.{}.tmp",
+        nerve_transport::keys::random_token(8)
+    ));
+    let made = (|| {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        if let Owners::Group(g) = owners {
+            let given = group_id(g)
+                .ok_or_else(|| std::io::Error::other(format!("no group {g}")))
+                .and_then(|gid| std::os::unix::fs::fchown(&f, None, Some(gid)))
+                .and_then(|()| f.set_permissions(std::fs::Permissions::from_mode(0o640)));
+            if let Err(e) = given {
+                tracing::error!(
+                    "the owners cannot read the owner token {}: it cannot be given to the group {g} ({e}); they need root to change the node until it is (`sudo {} update` writes the unit that gives the node the group)",
+                    file.display(),
+                    crate::edition::get().program
+                );
+            }
+        }
+        f.write_all(format!("{token}\n").as_bytes())?;
+        f.sync_all()?;
+        std::fs::rename(&tmp, &file)
+    })();
+    if made.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    made.map(|()| token)
+}
+
 /// The backup file that came with an owner's request: opened by the
 /// owner's own program and handed over, so the node never opens a path in
 /// the owner's folders as itself.
@@ -1006,7 +1181,8 @@ const FILE_CHUNK: usize = 256 * 1024;
 
 /// One request on the owner endpoint from `who` (`None`: no owner):
 /// `status` answers anyone that the node runs; `cli` runs a command for an
-/// owner. `from_command` says whether the caller is a process of a
+/// owner whose request carries `token` (Linux; `None` on Windows, whose
+/// pipe has none). `from_command` says whether the caller is a process of a
 /// center's command, as far as the node can tell. `handed` is the file
 /// that came with it.
 pub(crate) async fn answer(
@@ -1014,6 +1190,7 @@ pub(crate) async fn answer(
     program: &Path,
     req: nerve_transport::ctl::CtlRequest,
     who: Option<String>,
+    token: Option<&str>,
     from_command: bool,
     handed: Handed,
 ) -> nerve_transport::ctl::Reply {
@@ -1023,12 +1200,23 @@ pub(crate) async fn answer(
         // restart` of an owner waits for it.
         "status" => Reply::Ok(json!({"running": true})),
         "cli" => {
-            if from_command {
-                return Reply::Err(FROM_A_COMMAND.into());
-            }
             let Some(who) = who else {
                 return Reply::Err(not_an_owner());
             };
+            // The token holds where the checks of the caller's process
+            // cannot: a confined command can hand its request over on a
+            // connection a process made that is gone by then.
+            #[cfg(unix)]
+            if let Some(t) = token
+                && !nerve_transport::ctl::token_ok(t, req.token.as_deref())
+            {
+                return Reply::Err(NO_TOKEN.into());
+            }
+            #[cfg(not(unix))]
+            let _ = token;
+            if from_command {
+                return Reply::Err(FROM_A_COMMAND.into());
+            }
             run_for(shared, program, &who, &req.params, handed).await
         }
         other => Reply::Err(format!("unknown method {other}")),
@@ -1485,12 +1673,24 @@ async fn feed(
 /// aborted. On Linux the socket is open to everyone, in a folder everyone
 /// may enter: who may run a command is decided by the account the kernel
 /// names for the caller, so an owner added a moment ago counts in a session
-/// that began before.
+/// that began before, and by the owner token the request carries
+/// ([`write_token`]), which a confined command cannot read.
 #[cfg(unix)]
 pub(crate) async fn serve(
     shared: std::sync::Arc<crate::daemon::Shared>,
     endpoint: Endpoint,
 ) -> Result<tokio::task::JoinHandle<()>, String> {
+    // The token comes before the socket, so that a client that connects
+    // finds this start's, but never over the token of a node that serves
+    // the socket now.
+    if tokio::net::UnixStream::connect(&endpoint.at).await.is_ok() {
+        return Err(format!(
+            "{} is in use: is the node running already?",
+            endpoint.at.display()
+        ));
+    }
+    let token = write_token(&endpoint.at, &endpoint.owners)
+        .map_err(|e| format!("{}: {e}", token_file(&endpoint.at).display()))?;
     let listener = nerve_transport::ctl::bind_open(&endpoint.at)
         .await
         .map_err(|e| format!("{}: {e}", endpoint.at.display()))?;
@@ -1501,6 +1701,7 @@ pub(crate) async fn serve(
             let s = shared.clone();
             let program = program.clone();
             let owners = owners.clone();
+            let token = token.clone();
             async move {
                 // Asked only for a command: the lookup runs programs.
                 let (who, from_command) = if req.method == "cli" {
@@ -1514,7 +1715,7 @@ pub(crate) async fn serve(
                 } else {
                     Handed::File(files.swap_remove(0))
                 };
-                answer(&s, &program, req, who, from_command, handed).await
+                answer(&s, &program, req, who, Some(&token), from_command, handed).await
             }
         })
         .await;
@@ -1538,7 +1739,9 @@ fn owner_name(owners: &Owners, uid: u32) -> Option<String> {
 
 /// Whether the caller `pid` is a process of a center's command: below one
 /// the node runs, or with `no_new_privs`, which a confined command keeps
-/// wherever its processes go. An unknown caller is one.
+/// wherever its processes go. An unknown caller is one. A second layer
+/// behind the owner token: `pid` is the process that connected, which may
+/// have ended before the request came on its connection.
 #[cfg(unix)]
 fn from_a_command(shared: &crate::daemon::Shared, pid: Option<u32>) -> bool {
     let Some(pid) = pid else {
@@ -1693,7 +1896,7 @@ mod win {
                         } else {
                             super::Handed::None
                         };
-                        answer(&s, &program, req, who, from_command, handed).await
+                        answer(&s, &program, req, who, None, from_command, handed).await
                     }
                 });
                 let _ = nerve_transport::ctl::serve_stream(conn, caller, handler).await;
@@ -1997,5 +2200,156 @@ mod tests {
         assert!(p.is_empty());
         let mut bad = vec![b'x', 0xff, b'y'];
         assert_eq!(take_text(&mut bad), "x\u{fffd}y");
+    }
+
+    /// The owner token is a new one each time, made whole before it is in
+    /// place, and the owners' group's to read when the owners are a group;
+    /// without the group (owners by uid, or a group that is not there) it
+    /// is the node's user's alone. The owner's side reads it back.
+    #[cfg(unix)]
+    #[test]
+    fn the_owner_token_is_the_owners_groups_to_read() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let d = tempfile::tempdir().unwrap();
+        let at = d.path().join("owner.sock");
+        let file = token_file(&at);
+        // A group this process is in: its own.
+        let o = std::process::Command::new("id")
+            .arg("-gn")
+            .output()
+            .unwrap();
+        let mine = String::from_utf8(o.stdout).unwrap().trim().to_string();
+        let gid = group_id(&mine).expect("the group of this process");
+
+        let first = write_token(&at, &Owners::Group(mine)).unwrap();
+        let meta = std::fs::metadata(&file).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o640);
+        assert_eq!(meta.gid(), gid);
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            format!("{first}\n")
+        );
+        assert_eq!(read_token(&at).unwrap(), first);
+
+        for owners in [
+            Owners::Uids(vec![0]),
+            Owners::Group("nerve-no-such-group-for-a-test".into()),
+        ] {
+            let next = write_token(&at, &owners).unwrap();
+            assert_ne!(next, first);
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "{owners:?}");
+            assert_eq!(read_token(&at).unwrap(), next);
+        }
+        // Nothing but the token is left beside the socket.
+        assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 1);
+        std::fs::remove_file(&file).unwrap();
+        assert!(read_token(&at).unwrap_err().contains("cannot read"));
+    }
+
+    /// The owner's request carries the token it read, and none when it
+    /// read none.
+    #[test]
+    fn a_request_carries_the_token() {
+        let line = request_line(&["status".into()], None, false, Some("abc".into()));
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["token"], "abc");
+        assert_eq!(v["method"], "cli");
+        let line = request_line(&["status".into()], None, false, None);
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert!(v.get("token").is_none(), "{v}");
+        let why = Err("cannot read it".to_string());
+        assert_eq!(
+            without_token(NO_TOKEN.into(), &why),
+            format!("{NO_TOKEN}: cannot read it")
+        );
+        assert_eq!(without_token("other".into(), &why), "other");
+    }
+
+    /// Windows: no AppContainer opens the owner pipe, whose DACL names no
+    /// package, while the owner, whose SID it names, does. A token file
+    /// would be held by the same check, so the pipe has none. A pipe that
+    /// also names every package lets the container in: the refusal is the
+    /// DACL's.
+    #[cfg(windows)]
+    #[test]
+    fn no_appcontainer_opens_the_owner_pipe() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let me = crate::win_user::own_sid()
+                .map_err(|e| e.to_string())
+                .and_then(|s| crate::win_host::sid_text(&s))
+                .unwrap();
+            let base = format!(r"\\.\pipe\nerve-test-owner-{}", std::process::id());
+            let (closed, open) = (format!("{base}-closed"), format!("{base}-open"));
+            let owners = dacl_text(&me, std::slice::from_ref(&me));
+            let sd = crate::pipe::Descriptor::from_sddl(&owners).unwrap();
+            let every =
+                crate::pipe::Descriptor::from_sddl(&format!("{owners}(A;;GA;;;S-1-15-2-1)"))
+                    .unwrap();
+            let _closed = crate::pipe::instance(&closed, &sd, true).unwrap();
+            let _open = crate::pipe::instance(&open, &every, true).unwrap();
+
+            let work = tempfile::tempdir().unwrap();
+            let name = format!("nerve.test.owner.{}", std::process::id());
+            nerve_sandbox::appcontainer::set(
+                work.path(),
+                &name,
+                Some(nerve_sandbox::acl::masks(true, true, true)),
+                false,
+            )
+            .unwrap();
+            let in_container = |pipe: &str| {
+                let out = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "owner::tests::helper_writes_to_a_pipe_in_a_container",
+                        "--ignored",
+                        "--nocapture",
+                    ])
+                    .env("NERVE_TEST_CONTAINER", &name)
+                    .env("NERVE_TEST_PIPE", pipe)
+                    .current_dir(work.path())
+                    .output()
+                    .unwrap();
+                String::from_utf8_lossy(&out.stdout).into_owned()
+            };
+            let said = in_container(&closed);
+            assert!(!said.contains("exit code: 0\n"), "{said}");
+            assert!(said.contains("exit code: "), "{said}");
+            let said = in_container(&open);
+            assert!(said.contains("exit code: 0\n"), "{said}");
+            // The owner's own program opens it.
+            let _second = crate::pipe::instance(&closed, &sd, false).unwrap();
+            tokio::net::windows::named_pipe::ClientOptions::new()
+                .open(&closed)
+                .expect("the owner opens the owner pipe");
+            nerve_sandbox::appcontainer::remove_profile(&name).unwrap();
+        });
+    }
+
+    /// Run by [`no_appcontainer_opens_the_owner_pipe`] in a process of its
+    /// own, in a folder granted to the container: writes a line to the pipe
+    /// from cmd in the container.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "a helper of no_appcontainer_opens_the_owner_pipe"]
+    fn helper_writes_to_a_pipe_in_a_container() {
+        let var = |k: &str| std::env::var(k).unwrap();
+        let args = [
+            "/C".to_string(),
+            format!("echo x> {}", var("NERVE_TEST_PIPE")),
+        ];
+        match nerve_sandbox::appcontainer::run(
+            Path::new("cmd.exe"),
+            &args,
+            &var("NERVE_TEST_CONTAINER"),
+        ) {
+            Ok(code) => println!("exit code: {code}"),
+            Err(e) => println!("exit code: {}\n{e}", u32::MAX),
+        }
     }
 }

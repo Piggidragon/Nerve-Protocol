@@ -1243,17 +1243,24 @@ request; on Windows the SIDs in the service's registry value
 `Parameters\Owners`. It serves them `/run/nerve-node/owner.sock` (0666 in the
 unit's runtime folder) or the pipe `\\.\pipe\nerve-node-owner` (DACL: SYSTEM, the
 administrators, the owners; first instance; no remote clients), with the same
-lines and two methods:
+lines and two methods. On Linux a `cli` request carries `"token"`: the
+content of `owner.token` beside the socket, a new random token at each start,
+0640 for the node's user and the group `nerve-admin`, which no `folder` mode
+command can read (its folder is out of every Landlock rule of a command).
+The pipe has no token: its DACL names no package, so no AppContainer opens
+it.
 
 | Method | Params | |
 |---|---|---|
 | `status` | | `{"running": true}`, to anyone |
 | `cli` | `args`, `cwd` | runs `nerve-node --config-dir … --state-dir … <args>` as the node's user, with `NERVE_OWNER=<owner>`; then `{"ok": {}}`, the program's output as `{"out"}` and `{"err"}` lines and `{"exit": code}`; the caller sends `{"in": text}` and `{"eof": true}` |
 
-`cli` is refused to a caller below a command the node runs, with
-`no_new_privs` (Linux), in a command's job (Windows), who is no owner, with
-`--config-dir` or `--state-dir`, and for `run`, `install`, `update`,
-`uninstall`, `service`, `setup` and `sudo on`.
+`cli` is refused to a caller who is no owner, without the token (Linux), below
+a command the node runs, with `no_new_privs` (Linux), in a command's job
+(Windows), with `--config-dir` or `--state-dir`, and for `run`, `install`,
+`update`, `uninstall`, `service`, `setup` and `sudo on`. The checks of the
+caller's process read the process that connected, which may have ended by
+the time the request comes: they are a second layer behind the token.
 
 `backup` and `restore` take the file the caller opened itself: on Linux its
 descriptor, sent with the request line (SCM_RIGHTS), which the program gets
@@ -1277,8 +1284,9 @@ own action `org.nerve-protocol.node.service-control`, which a polkit rule
 (or on polkit 0.105 a `.pkla` file) gives `nerve-admin` in a local active
 session; the rule also gives them systemd's `manage-units` for that unit and
 those verbs (never a `.pkla` file for it, which could not name the unit).
-On Windows the service's DACL. Where `machine.user` is an owner, a command that
-gets a process outside the node's tree and sandbox (as above) is that owner.
+On Windows the service's DACL. Where `machine.user` is an owner, a command
+without a sandbox (`user`, `allowlist`) reads the token and is that owner, as
+is one that gets a process outside the node's tree and sandbox (as above).
 
 ## 6. Audit log
 

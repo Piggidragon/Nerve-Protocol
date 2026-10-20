@@ -167,12 +167,32 @@ The running node serves them a second endpoint (`crate::owner`): on Linux
 (0755), the account decided by the peer's credentials; on Windows the pipe
 `\\.\pipe\nerve-node-owner`, whose DACL names SYSTEM, the administrators and the
 owners, read at the node's start. It takes `status` (anyone: `{"running":
-true}`) and `cli {args, cwd}`: the node refuses a caller below a command it
-runs, one with `no_new_privs` (Linux; every confined command keeps it) or in a
-command's job (Windows), anyone who is no owner, and the commands that stay
-root's (`run`, `install`, `update`, `uninstall`, `service`, `setup`,
-`sudo on`), and a `backup` or `restore` without the file the caller opened
-itself. Then it runs its own program with
+true}`) and `cli {args, cwd}`: the node refuses anyone who is no owner, on
+Linux a request without the owner token, a caller below a command it runs,
+one with `no_new_privs` (Linux; every confined command keeps it) or in a
+command's job (Windows), the commands that stay root's (`run`, `install`,
+`update`, `uninstall`, `service`, `setup`, `sudo on`), and a `backup` or
+`restore` without the file the caller opened itself.
+
+The owner token is the boundary against a `folder` mode command that runs as
+an owner: a new random one at each start, written whole and renamed into
+place as `owner.token` beside the socket before the socket is made, 0640
+`nerve:nerve-admin` (the unit's `SupplementaryGroups=nerve-admin` lets the
+node give the file to that group; without it the file is 0600 and the node
+logs why its owners cannot use it), compared in constant time, removed at
+the stop. The owner's CLI reads it after it connects and sends it as
+`"token"`; a session older than its owner's membership reads it through
+`sg nerve-admin` (`owner::read_token`). The socket's folder is in
+`Shared::sealed`, the folders a confined command gets no rule and no folder
+for, so Landlock keeps the file from the command however it builds the
+path, while `/run`'s other entries stay readable; it is not in the folders a
+command's account must not enter (`account::out_of_reach`), since every
+account enters it for the socket. The checks of the caller's process come
+after the token: they read `/proc/<pid>` of the process that connected,
+which may be gone by the time the request comes (a child connects and
+exits, the command sends on the connection), so they are a second layer
+only. On Windows the pipe's DACL names no package, so no AppContainer opens
+it, the same check a token file would get; the pipe has no token. Then it runs its own program with
 `--config-dir`, `--state-dir` and those arguments as its own user, with
 `NERVE_OWNER=<name>`, and passes the caller's input and the program's output
 and exit code through the connection (`{"in"}`/`{"eof"}` up, `{"out"}`,
@@ -189,9 +209,12 @@ may not open its folders.
 
 The owners' commands are as safe as the owners' accounts. A center's command
 that runs as an owner's account (`machine.user` is the owner's, as `install`
-sets it by default) and gets a process started outside the node's tree and
-sandbox (`systemd-run --user`, tmux, the task scheduler) is that owner; the
-desktop app warns about it.
+sets it by default) without a sandbox (`user` and `allowlist` mode) reads
+the token and is that owner, as is one that gets a process started outside
+the node's tree and sandbox (`systemd-run --user`, tmux, the task
+scheduler). That is the owner's choice of mode and account, documented and
+not enforced (the guard's deny rules and the center's checker catch
+mistakes only); the desktop app warns about it.
 
 ## The log level
 

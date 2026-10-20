@@ -168,7 +168,10 @@ impl Layout {
     /// its limits (crate::cgroup). A command the kernel kills for its memory
     /// leaves the node running (`OOMPolicy=`, which `Delegate=` defaults to
     /// already). systemd makes the node's runtime folder, where its owners
-    /// reach it (crate::owner); every account may enter it.
+    /// reach it (crate::owner); every account may enter it. The node holds
+    /// the owners' group besides its own, so that it can give them its owner
+    /// token to read, and nothing else: who is an owner is looked up in the
+    /// account database, which does not name the node's user.
     pub fn unit_text(&self) -> String {
         format!(
             "# Written by `nerve-node install`; `nerve-node uninstall` removes it.
@@ -182,6 +185,7 @@ After=network-online.target
 Type=simple
 User={USER}
 Group={USER}
+SupplementaryGroups={owners}
 Environment=HOME={home}
 AmbientCapabilities=CAP_SETUID CAP_SETGID
 Delegate=cpu memory pids
@@ -202,6 +206,7 @@ WantedBy=multi-user.target
             bin = self.bin.display(),
             config = self.paths.config_dir.display(),
             state = self.paths.state_dir.display(),
+            owners = crate::owner::GROUP,
             runtime = Path::new(crate::owner::RUNTIME_DIR)
                 .file_name()
                 .unwrap_or_default()
@@ -2727,9 +2732,14 @@ pub(crate) mod tests {
         // The cgroup of the service is the node's, for one per command.
         assert!(unit.contains("\nDelegate=cpu memory pids\n"), "{unit}");
         assert!(unit.contains("\nOOMPolicy=continue\n"), "{unit}");
-        // The owners' socket's folder, which every account may enter.
+        // The owners' socket's folder, which every account may enter, and
+        // their group, to give them the owner token.
         assert!(
             unit.contains("\nRuntimeDirectory=nerve-node\nRuntimeDirectoryMode=0755\n"),
+            "{unit}"
+        );
+        assert!(
+            unit.contains("\nGroup=nerve\nSupplementaryGroups=nerve-admin\n"),
             "{unit}"
         );
         assert!(
@@ -3510,8 +3520,8 @@ pub(crate) mod tests {
 
     /// An install from before the owners gets them at its update: the
     /// group with the one who updates in it, the polkit rule and the unit
-    /// with the owners' runtime folder. An update after that changes no
-    /// owner.
+    /// with the owners' runtime folder and their group for the owner token.
+    /// An update after that changes no owner.
     #[tokio::test]
     async fn an_update_gives_an_earlier_install_its_owners() {
         let d = tempfile::tempdir().unwrap();
@@ -3520,10 +3530,13 @@ pub(crate) mod tests {
         // As an install before them left it.
         sys.groups.borrow_mut().clear();
         std::fs::remove_file(l.polkit_rule()).unwrap();
-        let old_unit = l.unit_text().replace(
-            "RuntimeDirectory=nerve-node\nRuntimeDirectoryMode=0755\n",
-            "",
-        );
+        let old_unit = l
+            .unit_text()
+            .replace(
+                "RuntimeDirectory=nerve-node\nRuntimeDirectoryMode=0755\n",
+                "",
+            )
+            .replace("SupplementaryGroups=nerve-admin\n", "");
         std::fs::write(&l.unit, &old_unit).unwrap();
         let new = d.path().join("new");
         std::fs::write(&new, "nerve-node 1.2.0\n").unwrap();

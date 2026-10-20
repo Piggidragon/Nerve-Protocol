@@ -1601,10 +1601,10 @@ impl Link {
         )
     }
 
-    /// The folders no center reaches (Shared::own). Not called while the
+    /// The folders no center reaches (Shared::sealed). Not called while the
     /// store is locked: it reads the config.
     fn own(&self) -> Vec<std::path::PathBuf> {
-        self.shared.own(&self.shared.config())
+        self.shared.sealed(&self.shared.config())
     }
 
     /// This node's protected list with a center's options. On the
@@ -1887,7 +1887,8 @@ impl Link {
             // in place of a folder inside one leads nowhere the next
             // command gets rules for.
             let writable = exec::write_folders(cfg, &home);
-            let mut spec = exec::landlock_spec(&entry.policy, &home, &own, &writable);
+            let sealed = self.shared.sealed(cfg);
+            let mut spec = exec::landlock_spec(&entry.policy, &home, &sealed, &writable);
             // The keys in the keyring are behind the session bus, a socket
             // file in the own folders then.
             if cfg.machine.secret_storage == nerve_policy::config::SecretStorage::Keyring {

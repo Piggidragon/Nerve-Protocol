@@ -495,6 +495,9 @@ pub(crate) struct Shared {
     pub aside: Option<tokio::sync::mpsc::UnboundedSender<Aside>>,
     /// The relay for other nodes (crate::relay), and who is connected.
     pub relay: crate::relay::Relays,
+    /// Linux: the folder of the owner socket and its token, when the node
+    /// serves one (crate::owner).
+    pub owner_dir: Option<PathBuf>,
 }
 
 impl Shared {
@@ -635,6 +638,18 @@ impl Shared {
         #[cfg(not(target_os = "linux"))]
         let _ = cfg;
         own
+    }
+
+    /// The folders a confined command neither reads nor gets as a folder of
+    /// its own: [`Shared::own`], and the folder of the owner socket with its
+    /// token ([`Shared::owner_dir`]), which lies in `/run`, a system folder
+    /// every command reads otherwise. Not the folders a command's account
+    /// must not enter at all (crate::account::out_of_reach): every account
+    /// may enter that one, to reach the socket.
+    pub fn sealed(&self, cfg: &NodeConfig) -> Vec<PathBuf> {
+        let mut out = self.own(cfg);
+        out.extend(self.owner_dir.clone());
+        out
     }
 
     /// Whether commands of `folder` mode may run: confined (Landlock or an
@@ -1023,6 +1038,11 @@ impl Daemon {
         let cgroups = opts
             .cgroups
             .unwrap_or_else(|| crate::cgroup::Cgroups::find().map(Arc::new));
+        let owner_dir = opts
+            .owners
+            .as_ref()
+            .filter(|_| opts.ctl && cfg!(unix))
+            .and_then(|e| e.at.parent().map(std::path::Path::to_path_buf));
         let shared = Arc::new(Shared {
             paths: paths.clone(),
             service,
@@ -1051,6 +1071,7 @@ impl Daemon {
             providers: Default::default(),
             relay: Default::default(),
             aside: opts.aside,
+            owner_dir,
         });
         shared.tell_confinement(&cfg);
         // A file that says on starts off: on Linux the password lives in
@@ -1176,7 +1197,10 @@ impl Daemon {
         if let Some((task, _at)) = self.owner {
             task.abort();
             #[cfg(unix)]
-            let _ = std::fs::remove_file(_at);
+            {
+                let _ = std::fs::remove_file(crate::owner::token_file(&_at));
+                let _ = std::fs::remove_file(_at);
+            }
         }
         tracing::info!("node daemon stopped");
     }
@@ -1956,6 +1980,78 @@ mod tests {
             assert!(!set.iter().any(|r| keyrings.starts_with(r)), "{set:?}");
         }
         daemon.stop().await;
+    }
+
+    /// The owner socket's folder, with the owner token, is out of every rule
+    /// of a confined command and no folder of one, even with the whole home
+    /// it lies in among its folders; the account of a command may still
+    /// enter it, for the socket. In `/run`, a system folder, the rest of
+    /// `/run` stays readable.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn the_owner_sockets_folder_is_sealed_from_commands() {
+        let d = tempfile::tempdir().unwrap();
+        let home = std::fs::canonicalize(d.path()).unwrap();
+        let run = home.join("run");
+        std::fs::create_dir(&run).unwrap();
+        let paths = NodePaths::new(home.join("config"), home.join("state"));
+        let mut opts = NodeOptions::new(paths);
+        opts.home = home.clone();
+        opts.owners = Some(crate::owner::Endpoint {
+            at: run.join(crate::owner::SOCKET_NAME),
+            owners: crate::owner::Owners::Uids(Vec::new()),
+            program: "/bin/false".into(),
+        });
+        let daemon = Daemon::start(opts).await.unwrap();
+        let cfg = daemon.config();
+        let token = crate::owner::token_file(&run.join(crate::owner::SOCKET_NAME));
+        assert!(token.exists());
+        let sealed = daemon.shared.sealed(&cfg);
+        assert!(sealed.contains(&run), "{sealed:?}");
+        assert!(!daemon.shared.own(&cfg).contains(&run));
+        let policy = nerve_policy::CenterPolicy {
+            folders: vec![nerve_policy::config::Folder {
+                path: home.display().to_string(),
+                access: nerve_policy::config::Access::ALL,
+            }],
+            ..Default::default()
+        };
+        let spec = crate::exec::landlock_spec(&policy, &home, &sealed, &[]);
+        for set in [&spec.read, &spec.write, &spec.exec] {
+            assert!(!set.iter().any(|r| token.starts_with(r)), "{set:?}");
+        }
+        // The rest of the home is the command's.
+        std::fs::write(home.join("note.txt"), "x").unwrap();
+        let spec = crate::exec::landlock_spec(&policy, &home, &sealed, &[]);
+        assert!(
+            spec.read.contains(&home.join("note.txt")),
+            "{:?}",
+            spec.read
+        );
+        daemon.stop().await;
+        assert!(!token.exists());
+
+        // The installed node's, in /run.
+        let own = [PathBuf::from(crate::owner::RUNTIME_DIR)];
+        let spec = crate::exec::landlock_spec(&Default::default(), &home, &own, &[]);
+        let token = crate::owner::token_file(&crate::owner::socket());
+        assert!(
+            !spec.read.iter().any(|r| token.starts_with(r)),
+            "{:?}",
+            spec.read
+        );
+        for other in std::fs::read_dir("/run").unwrap().flatten() {
+            let p = other.path();
+            if p != std::path::Path::new(crate::owner::RUNTIME_DIR)
+                && !other.file_type().unwrap().is_symlink()
+            {
+                assert!(
+                    spec.read.iter().any(|r| p.starts_with(r)),
+                    "{p:?}: {:?}",
+                    spec.read
+                );
+            }
+        }
     }
 
     async fn daemon() -> (tempfile::TempDir, Daemon) {

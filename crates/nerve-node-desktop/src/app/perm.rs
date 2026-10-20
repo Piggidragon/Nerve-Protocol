@@ -1,5 +1,6 @@
-//! The Permissions page: what one center may do, read with `folder ls`,
-//! `rule ls`, `cap ls` and `sudo status`, changed with their siblings.
+//! The Permissions page: what one center may do, read with `folder ls`
+//! (with the sockets of `socket ls`), `rule ls`, `cap ls` and `sudo
+//! status`, changed with their siblings.
 
 use std::rc::Rc;
 
@@ -116,6 +117,7 @@ impl Ctl {
                         p.set_edit_list(-1);
                     }
                     p.set_folders(ModelRc::new(VecModel::from(view::folders(&f))));
+                    p.set_sockets(ModelRc::new(VecModel::from(view::sockets(&f))));
                     p.set_allow(ModelRc::new(VecModel::from(view::rule_list_of(
                         &r, "allow",
                     ))));
@@ -286,6 +288,36 @@ impl Ctl {
 
     fn folder_remove(self: &Rc<Self>, path: &str) {
         let args = vec!["folder".into(), "rm".into(), path.into()];
+        self.perm_change(
+            args,
+            None,
+            format!("{path} is removed."),
+            |_| {},
+            |c, e| c.toast(e, Tone::Danger),
+        );
+    }
+
+    fn socket_add(self: &Rc<Self>) {
+        let Some(path) = self.with_perm(|p| p.get_socket_text().trim().to_string()) else {
+            return;
+        };
+        if path.is_empty() {
+            return;
+        }
+        let args = vec!["socket".into(), "add".into(), path.clone()];
+        self.perm_change(
+            args,
+            None,
+            format!("{path} is allowed."),
+            |c| {
+                c.with_perm(|p| p.set_socket_text(SharedString::new()));
+            },
+            |c, e| c.toast(e, Tone::Danger),
+        );
+    }
+
+    fn socket_remove(self: &Rc<Self>, path: &str) {
+        let args = vec!["socket".into(), "rm".into(), path.into()];
         self.perm_change(
             args,
             None,
@@ -530,6 +562,11 @@ pub(super) fn wire(ctl: &Rc<Ctl>, window: &crate::AppWindow) {
     p.on_folder_set(move |path, r, w, x| c.folder_set(&path, r, w, x));
     let c = ctl.clone();
     p.on_folder_remove(move |path| c.folder_remove(&path));
+    p.set_sockets_here(cfg!(target_os = "linux"));
+    let c = ctl.clone();
+    p.on_socket_add(move || c.socket_add());
+    let c = ctl.clone();
+    p.on_socket_remove(move |path| c.socket_remove(&path));
     let c = ctl.clone();
     p.on_rule_add(move |list| c.rule_add(list));
     let c = ctl.clone();

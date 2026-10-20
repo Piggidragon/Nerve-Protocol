@@ -304,6 +304,13 @@ fn every_page_light_and_dark() {
         run(&["rule", "add", list, rule, "--center", "home"]);
     }
     run(&["cap", "set", "exec.signal", "off", "--center", "home"]);
+    run(&[
+        "socket",
+        "add",
+        "/run/user/1000/ssh-agent.socket",
+        "--center",
+        "home",
+    ]);
     run(&["relay", "add", "laptop-2"]);
 
     // Calls the centers made, as the node records them.
@@ -550,12 +557,12 @@ fn every_page_light_and_dark() {
     store.invoke_show(Page::Policy);
     perm.invoke_pick(0);
     shots.take("permissions");
-    shots.take_full("permissions", 2050);
+    shots.take_full("permissions", 2400);
     // A rule edited in place.
     perm.set_edit_text(perm.get_deny().row_data(0).unwrap());
     perm.set_edit_index(0);
     perm.set_edit_list(1);
-    shots.take_full("permissions-edit", 2050);
+    shots.take_full("permissions-edit", 2400);
     perm.set_edit_list(-1);
     // Allowlist mode: the allow list, the deny rules as its exceptions.
     let office = perm.get_centers().iter().position(|c| c == OFFICE).unwrap();
@@ -567,9 +574,9 @@ fn every_page_light_and_dark() {
         run(&["rule", "add", list, rule, "--center", OFFICE]);
     }
     perm.invoke_pick(office as i32);
-    shots.take_full("permissions-allowlist", 2050);
+    shots.take_full("permissions-allowlist", 2300);
     perm.set_except_open(true);
-    shots.take_full("permissions-allowlist-exceptions", 2250);
+    shots.take_full("permissions-allowlist-exceptions", 2500);
     perm.set_except_open(false);
     // Long lists: each scrolls in its own box, and the page stays short.
     for i in 0..18 {
@@ -590,7 +597,7 @@ fn every_page_light_and_dark() {
     }
     perm.invoke_pick(office as i32);
     shots.take("permissions-long");
-    shots.take_full("permissions-long", 2050);
+    shots.take_full("permissions-long", 2300);
     perm.invoke_pick(0);
     perm.invoke_mode_pick("user".into());
     perm.set_mode_timed(true);

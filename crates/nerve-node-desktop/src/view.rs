@@ -306,6 +306,17 @@ pub fn folders(v: &Value) -> Vec<FolderRow> {
         .collect()
 }
 
+/// The socket files of `folder ls --json` that a folder mode command may
+/// connect to outside its folders.
+pub fn sockets(v: &Value) -> Vec<SharedString> {
+    v["sockets"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|p| s(p).into())
+        .collect()
+}
+
 /// The rights `folder set` takes for a folder: `=rwx`, the letters that
 /// are on.
 pub fn rights(read: bool, write: bool, execute: bool) -> String {
@@ -1746,6 +1757,11 @@ mod tests {
             (f[0].path.as_str(), f[0].read, f[0].write, f[0].execute),
             ("/srv/a", true, false, true)
         );
+        assert_eq!(
+            sockets(&json!({"folders": [], "sockets": ["/run/a.sock"]})),
+            [SharedString::from("/run/a.sock")]
+        );
+        assert!(sockets(&json!({"folders": []})).is_empty());
         assert_eq!(rights(true, false, true), "=rx");
         assert_eq!(rights(false, false, false), "=");
         let rows = caps(&json!({"caps": {"exec.run": "off", "fs": "hidden"},

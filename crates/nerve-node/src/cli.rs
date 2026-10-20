@@ -59,6 +59,9 @@ pub enum Cmd {
     /// Choose the folders a center may use and what it may do in each.
     #[command(subcommand)]
     Folder(FolderCmd),
+    /// Let a center's commands in folder mode connect to a socket file outside its folders (Linux).
+    #[command(subcommand)]
+    Socket(SocketCmd),
     /// Choose how much a center may do: only what allow rules name, what each folder allows, or all you can do.
     #[command(subcommand)]
     Mode(ModeCmd),
@@ -396,6 +399,29 @@ pub enum FolderCmd {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum SocketCmd {
+    /// Let a center's commands in folder mode connect to this socket file. The socket of a program that runs commands for others (Docker, systemd, tmux) gives them all you can do.
+    Add {
+        /// The socket file, by its absolute path.
+        path: PathBuf,
+        #[command(flatten)]
+        center: CenterArg,
+    },
+    /// Take a socket file away from a center.
+    Rm {
+        /// The socket file.
+        path: PathBuf,
+        #[command(flatten)]
+        center: CenterArg,
+    },
+    /// Show the socket files a center's commands may connect to outside its folders.
+    Ls {
+        #[command(flatten)]
+        center: CenterArg,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum ConfigCmd {
     /// Print one setting.
     Get {
@@ -568,6 +594,7 @@ const SECTIONS: &[(&str, &str, &[&[&str]])] = &[
         &[
             &["mode"],
             &["folder"],
+            &["socket"],
             &["rule"],
             &["cap"],
             &["sudo"],
@@ -1196,6 +1223,75 @@ impl List {
             List::Sudo => rules::sudo_rule_for(&format!("sudo {}", command.trim()), wildcard),
         }
     }
+}
+
+/// `socket add|rm|ls`: the socket files outside its folders that a center's
+/// commands in folder mode may connect to (`CenterPolicy::sockets`).
+async fn socket_cmd(paths: &NodePaths, c: SocketCmd, out: &mut dyn Write) -> Result<(), String> {
+    match c {
+        SocketCmd::Add { path, center } => {
+            let given = socket_path(&path)?;
+            let name = edit_center(paths, &center, |e| {
+                if e.policy.sockets.contains(&given) {
+                    return Err(format!("{given} is allowed already"));
+                }
+                e.policy.sockets.push(given.clone());
+                Ok(())
+            })
+            .await?;
+            let _ = writeln!(
+                out,
+                "{name}: commands in folder mode may connect to {given}; one that runs programs for others (Docker, systemd, tmux) gives them all you can do"
+            );
+            if !path.exists() {
+                let _ = writeln!(
+                    out,
+                    "note: no socket file is there now; it counts once one is"
+                );
+            }
+            if !nerve_sandbox::Confinement::detect().keeps_sockets() {
+                let _ = writeln!(
+                    out,
+                    "note: this machine does not keep commands off socket files (that takes Landlock ABI 9, Linux 7.1): they reach every socket they can name"
+                );
+            }
+        }
+        SocketCmd::Rm { path, center } => {
+            let given = socket_path(&path)?;
+            let name = edit_center(paths, &center, |e| {
+                let before = e.policy.sockets.len();
+                e.policy.sockets.retain(|s| *s != given);
+                if e.policy.sockets.len() == before {
+                    return Err(format!("{given} is not allowed"));
+                }
+                Ok(())
+            })
+            .await?;
+            let _ = writeln!(out, "{name}: removed {given}");
+        }
+        SocketCmd::Ls { center } => {
+            let (cfg, _) = read_config(paths).await?;
+            let name = pick_center(&cfg, &center)?;
+            let sockets = &cfg.center(&name).expect("picked").policy.sockets;
+            if sockets.is_empty() {
+                let _ = writeln!(out, "{name}: no sockets");
+            }
+            for s in sockets {
+                let _ = writeln!(out, "{s}");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// A socket file's path as the policy keeps it: absolute, in the form of
+/// its folders (`CenterPolicy::validate` refuses the rest).
+fn socket_path(path: &Path) -> Result<String, String> {
+    let text = path.to_string_lossy();
+    if !path.is_absolute() {
+        return Err(format!("give the socket's absolute path, not {text:?}"));
+    }
+    nerve_policy::paths::normal_folder(&text)
 }
 
 /// `rule add|rm|ls`.
@@ -2008,6 +2104,7 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             }
             Ok(())
         }
+        Cmd::Socket(c) => socket_cmd(&paths, c, out).await,
         Cmd::Cap(CapCmd::Set {
             cap,
             setting,
@@ -7702,6 +7799,52 @@ mod tests {
                 "after-the-rotation  allowed"
             ],
             "{text}"
+        );
+    }
+
+    /// `socket add|rm|ls` keep the sockets a center's folder mode commands
+    /// may reach outside its folders, by absolute path, each once; `folder
+    /// ls --json` has them too, for the app's Permissions page.
+    #[cfg(unix)]
+    #[test]
+    fn the_socket_verbs_keep_the_allowed_sockets() {
+        let (d, paths) = setup(&["home"]);
+        let at = d.path().join("agent.sock");
+        let _l = std::os::unix::net::UnixListener::bind(&at).unwrap();
+        let at = at.display().to_string();
+        let gone = d.path().join("gone.sock").display().to_string();
+        let out = run(&paths, &["socket", "add", &at]).unwrap();
+        assert!(out.contains("gives them all you can do"), "{out}");
+        assert!(!out.contains("no socket file is there now"), "{out}");
+        let out = run(&paths, &["socket", "add", &gone]).unwrap();
+        assert!(out.contains("no socket file is there now"), "{out}");
+        let e = run(&paths, &["socket", "add", &at]).unwrap_err();
+        assert!(e.contains("allowed already"), "{e}");
+        let e = run(&paths, &["socket", "add", "agent.sock"]).unwrap_err();
+        assert!(e.contains("absolute path"), "{e}");
+        let policy = || load(&paths).center("home").unwrap().policy.clone();
+        assert_eq!(policy().sockets, [at.clone(), gone.clone()]);
+        assert_eq!(
+            run(&paths, &["socket", "ls"]).unwrap(),
+            format!("{at}\n{gone}\n")
+        );
+        assert_eq!(
+            json_of(&paths, &["socket", "ls"])["sockets"],
+            json!([at, gone])
+        );
+        assert_eq!(
+            json_of(&paths, &["folder", "ls"])["sockets"],
+            json!([at, gone])
+        );
+        run(&paths, &["socket", "rm", &gone]).unwrap();
+        let e = run(&paths, &["socket", "rm", &gone]).unwrap_err();
+        assert!(e.contains("is not allowed"), "{e}");
+        assert_eq!(policy().sockets, std::slice::from_ref(&at));
+        run(&paths, &["socket", "rm", &at]).unwrap();
+        assert!(
+            run(&paths, &["socket", "ls"])
+                .unwrap()
+                .contains("no sockets")
         );
     }
 

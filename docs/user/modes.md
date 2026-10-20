@@ -200,6 +200,37 @@ The node confines commands with Landlock:
   rights](desktop.md#administrator-rights)). In `user` and `allowlist` mode
   that does not hold ([below](#user-mode)).
 
+### Socket files
+
+From Linux 7.1 (Landlock ABI 9) a command connects only to the socket files
+in its folders, whatever their rights, and to the ones you allow for the
+pairing. The programs of yours that listen elsewhere and run things on
+request are out of its reach: your systemd session, a tmux server, the D-Bus
+session bus, Docker. The node's own sockets, `/run/nerve-node` and the
+session bus stay closed even in a folder you grant or when you allow them.
+
+A folder you grant gives the sockets in it too: `/tmp` holds tmux's
+(`/tmp/tmux-<uid>`), `/run/user/<uid>` your systemd session's
+(`systemd/private`). Grant such a folder only when that is fine.
+
+| Command | Does |
+|---|---|
+| `nerve-node socket add /run/user/1000/ssh-agent.socket` | Let the pairing's commands connect to this socket file. Give its absolute path; it counts once a socket is there |
+| `nerve-node socket rm <path>` | Take it away |
+| `nerve-node socket ls` | List the allowed sockets |
+
+In the app: Permissions › Sockets. Only you change the list: a center with
+the [settings grant](settings-grant.md) cannot.
+
+Allowing the socket of a program that runs commands for others gives the
+boundary up: Docker (`/run/docker.sock`), systemd
+(`/run/user/<uid>/systemd/private`), tmux, the server of a terminal or an
+editor. A command that reaches one runs programs outside the sandbox as that
+program's user, and as you it can do all you can, Nerve's settings too. An
+ssh-agent lets a command use your SSH keys, nothing more. With the keys in
+the system keyring no socket in your runtime folder (`/run/user/<uid>`) is
+reached, allowed or not.
+
 Check that your kernel supports it, with the node running:
 
 ```sh

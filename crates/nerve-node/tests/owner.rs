@@ -624,10 +624,10 @@ if status == 0:
 
 /// Where Landlock can keep a command off socket files (ABI 9, Linux 7.1), a
 /// `folder` mode command connects only to the socket files in its own
-/// folders: the owner's programs that run things on request (the systemd
-/// user manager, tmux, a container engine) listen elsewhere, and one of
-/// them would run a program outside the sandbox (review round 6, part B,
-/// finding 1).
+/// folders and to those the owner allowed it: the owner's programs that run
+/// things on request (the systemd user manager, tmux, a container engine)
+/// listen elsewhere, and one of them would run a program outside the
+/// sandbox (review round 6, part B, finding 1).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_folder_mode_command_connects_only_to_the_sockets_of_its_folders() {
     if !nerve_sandbox::Confinement::detect().keeps_sockets() {
@@ -662,6 +662,8 @@ async fn a_folder_mode_command_connects_only_to_the_sockets_of_its_folders() {
             path: work.display().to_string(),
             access: nerve_policy::config::Access::ALL,
         });
+        p.sockets
+            .push(elsewhere.join("allowed.sock").display().to_string());
         Ok(())
     })
     .await
@@ -669,13 +671,14 @@ async fn a_folder_mode_command_connects_only_to_the_sockets_of_its_folders() {
     // Listening is all a connect needs; nothing is accepted.
     let _inside = std::os::unix::net::UnixListener::bind(work.join("in.sock")).unwrap();
     let _outside = std::os::unix::net::UnixListener::bind(elsewhere.join("out.sock")).unwrap();
+    let _allowed = std::os::unix::net::UnixListener::bind(elsewhere.join("allowed.sock")).unwrap();
     // The paths are in the script, not on the command line, which the
     // policy judges first.
     std::fs::write(
         work.join("connect.py"),
         format!(
             r#"import socket, sys
-at = {{"in": "{}", "out": "{}"}}[sys.argv[1]]
+at = {{"in": "{}", "out": "{}", "allowed": "{}"}}[sys.argv[1]]
 s = socket.socket(socket.AF_UNIX)
 try:
     s.connect(at)
@@ -684,7 +687,8 @@ except OSError as e:
     print("refused:", e.strerror)
 "#,
             work.join("in.sock").display(),
-            elsewhere.join("out.sock").display()
+            elsewhere.join("out.sock").display(),
+            elsewhere.join("allowed.sock").display()
         ),
     )
     .unwrap();
@@ -704,5 +708,8 @@ except OSError as e:
     assert!(said(&r).contains("connected"), "{r}");
     let r = run_command(&mut conn, &work, "python3 connect.py out").await;
     assert!(said(&r).contains("refused: Permission denied"), "{r}");
+    // The one the owner allowed, beside it.
+    let r = run_command(&mut conn, &work, "python3 connect.py allowed").await;
+    assert!(said(&r).contains("connected"), "{r}");
     node.stop().await;
 }

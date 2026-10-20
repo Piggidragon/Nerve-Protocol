@@ -194,6 +194,21 @@ const COMMANDS: &[(&str, &str, Place)] = &[
         (Some(Page::Policy), -1, "Permissions › Folders"),
     ),
     (
+        "socket add",
+        "nerve-node socket add /run/user/1000/ssh-agent.socket --center lab",
+        (Some(Page::Policy), -1, "Permissions › Sockets › Allow"),
+    ),
+    (
+        "socket rm",
+        "nerve-node socket rm /run/user/1000/ssh-agent.socket --center lab",
+        (Some(Page::Policy), -1, "Permissions › Sockets"),
+    ),
+    (
+        "socket ls",
+        "nerve-node socket ls --center lab",
+        (Some(Page::Policy), -1, "Permissions › Sockets"),
+    ),
+    (
         "rule add",
         "nerve-node rule add allow 'git status' --center lab",
         (

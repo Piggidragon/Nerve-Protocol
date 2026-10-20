@@ -3823,8 +3823,10 @@ mod tests {
 
     /// With `connect` set, a command connects to the socket files below it and
     /// to none elsewhere, even in a folder it may read: the node's keys in the
-    /// keyring are behind the session bus, a socket file. Without it, socket
-    /// files are not limited. Skipped where the kernel has no ABI 9.
+    /// keyring are behind the session bus, a socket file, and programs that
+    /// run things on request listen on others. A rule may name a single
+    /// socket file. Without it, socket files are not limited. Skipped where
+    /// the kernel has no ABI 9.
     #[cfg(target_os = "linux")]
     #[test]
     fn landlock_keeps_a_command_off_socket_files_outside_connect() {
@@ -3852,5 +3854,14 @@ mod tests {
             ..spec.clone()
         };
         assert!(confined_connect(&before, &shut.join("s")));
+        // A rule can name one socket file (a socket the owner allows): its
+        // neighbour in the same folder stays shut.
+        let _c = std::os::unix::net::UnixListener::bind(shut.join("t")).unwrap();
+        let one = LandlockSpec {
+            connect: Some(vec![shut.join("t")]),
+            ..spec.clone()
+        };
+        assert!(confined_connect(&one, &shut.join("t")));
+        assert!(!confined_connect(&one, &shut.join("s")));
     }
 }

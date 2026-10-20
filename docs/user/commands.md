@@ -44,6 +44,7 @@ center is paired.
 | `folder add <path> +r +w +x` | Grant a folder | [modes](modes.md#folders) |
 | `folder set <path> -w` | Change a folder's rights | [modes](modes.md#folders) |
 | `folder rm <path>`, `folder ls` | Remove or list folders | [modes](modes.md#folders) |
+| `socket add <path>`, `socket rm <path>`, `socket ls` | Let `folder` mode commands connect to a socket file outside their folders (Linux) | [modes](modes.md#socket-files) |
 | `rule add allow\|deny\|sudo '<command>' [--wildcard] [--action A]` | Add a command rule, or with `--action` the rule of an audit entry | [rules](rules.md) |
 | `rule rm allow\|deny\|sudo '<command>' [--wildcard] [--action A]` | Remove a rule | [rules](rules.md#list-change-and-remove-rules) |
 | `rule edit allow\|deny\|sudo '<entry>' '<new>'` | Change a rule in place, as one change | [rules](rules.md#list-change-and-remove-rules) |
@@ -95,8 +96,8 @@ The center has five commands of its own, which a harness never runs:
 A program that drives `nerve-node`, such as a script, adds `--json` and reads
 one JSON value from stdout:
 
-- The read commands print their data: `status`, `center ls`, `folder ls`,
-  `rule ls`, `cap ls` (with `known`, what `cap set` switches), `config get`,
+- The read commands print their data: `status`, `center ls`, `folder ls`
+  (with the pairing's `sockets`), `socket ls`, `rule ls`, `cap ls` (with `known`, what `cap set` switches), `config get`,
   `proxy ls`, `relay ls`, `sudo status`, `service status`, and `audit` and `log`
   (`{"entries": [...]}`, the lines as the file holds them; with `--follow`
   one a line). `status` has `"daemon"`:

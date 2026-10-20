@@ -52,11 +52,13 @@ No grant lets a center change:
 A change that touches one of these is refused as a whole, and the refusal names
 the field.
 
-One more field is yours, and a change to it is not refused but dropped: the
-node's record of the folders it recorded at their real place (`places` in the
-policy, see [modes](modes.md#a-folder-keeps-the-place-you-added)). The
-settings document shows it, and a center that saves the document with another
-value there changes nothing; an entry goes only with its folder.
+Two more fields are yours, and a change to them is not refused but dropped:
+the node's record of the folders it recorded at their real place (`places` in
+the policy, see [modes](modes.md#a-folder-keeps-the-place-you-added)), and the
+socket files a `folder` mode command may connect to outside its folders
+(`sockets`, see [modes](modes.md#socket-files)). The settings document shows
+them, and a center that saves the document with other values there changes
+nothing; an entry of `places` goes only with its folder.
 
 ## Without the grant
 

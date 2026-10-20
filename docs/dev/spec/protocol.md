@@ -658,11 +658,13 @@ concurrently.
   folders, caps, command rules).
 - actions: `set {document, if_version}` → `{version}` (effect `write`); a stale
   `if_version` fails with `conflict`; a change to a client-only field refuses
-  the whole document with `forbidden` and names the field. One field of the
-  document is the owner's without being refused: `policy.places`, the node's
-  record of the folders it recorded at their real place. A `set` keeps it as
-  it was (less the entries of folders the document removes), whatever the
-  document says there. `pause {}` → `{}`.
+  the whole document with `forbidden` and names the field. Two fields of the
+  document are the owner's without being refused: `policy.places`, the node's
+  record of the folders it recorded at their real place, and
+  `policy.sockets`, the socket files a `folder` mode command may connect to
+  outside its folders. A `set` keeps them as they were (`places` less the
+  entries of folders the document removes), whatever the document says
+  there. `pause {}` → `{}`.
 - `get` key `sudo` → `{sudo: "on" | "off"}`: the node's sudo switch.
 - event (implicit): `changed {version}`.
 

@@ -387,7 +387,8 @@ pub fn landlock_spec(
 /// (ABI 9) the connect rule as well, given the places besides `own` whose
 /// sockets it never reaches (`off`, crate::daemon::Shared::off_sockets): a
 /// command of `folder` mode connects only to the socket files in its own
-/// folders, whatever their flags. Programs of the owner's that run things on
+/// folders, whatever their flags, and to those the owner allowed it by name
+/// (`CenterPolicy::sockets`). Programs of the owner's that run things on
 /// request (the systemd user manager, tmux, a container engine, the session
 /// bus) listen on socket files elsewhere: reaching one would take the
 /// command out of its sandbox.
@@ -400,11 +401,21 @@ pub fn folder_spec(
 ) -> LandlockSpec {
     // Landlock is Linux's, so the list is the Unix one.
     let f = folder_sets(policy, home, own, &Platform::Unix, writable);
+    // A rule for a file that is not there fails the whole sandbox, and a
+    // socket comes and goes with its program: one that is not there now is
+    // left out of this command's rule only.
+    let sockets = policy
+        .sockets
+        .iter()
+        .map(PathBuf::from)
+        .filter(|s| s.exists());
     let connect = off.map(|off| {
-        leave_out(
-            &[&f.read[..], &f.write, &f.exec].concat(),
-            &[own, off].concat(),
-        )
+        let mine: Vec<PathBuf> = [&f.read[..], &f.write, &f.exec]
+            .concat()
+            .into_iter()
+            .chain(sockets)
+            .collect();
+        leave_out(&mine, &[own, off].concat())
     });
     LandlockSpec {
         read: leave_out(&[nerve_sandbox::system_dirs(), f.read].concat(), own),
@@ -2443,10 +2454,11 @@ mod tests {
     }
 
     /// Where Landlock can keep a command off socket files, it connects to the
-    /// ones in its own folders alone, whatever their flags, and never to
-    /// one in the node's own folders or the session bus, even in a folder of
-    /// its own; not the system's, not the rest of the machine. Where it
-    /// cannot, no rule is asked for.
+    /// ones in its own folders, whatever their flags, and to the sockets the
+    /// owner allowed it, and never to one in the node's own folders or the
+    /// session bus, even in a folder of its own or allowed; not the
+    /// system's, not the rest of the machine. An allowed socket is no
+    /// folder to read. Where it cannot, no rule is asked for.
     #[test]
     fn the_connect_rule_is_the_commands_folders() {
         let d = tempfile::tempdir().unwrap();
@@ -2460,9 +2472,13 @@ mod tests {
             path: w.join(p).display().to_string(),
             access: Access::parse(access).unwrap(),
         };
+        std::fs::write(w.join("else/allowed"), "").unwrap();
+        let named = |p: &str| w.join(p).display().to_string();
         let policy = CenterPolicy {
             mode: nerve_policy::Mode::Folder,
             folders: vec![folder("r", "r"), folder("w", "w"), folder("x", "x")],
+            // The bus and a socket that is not there now are not taken.
+            sockets: vec![named("else/allowed"), named("w/bus"), named("else/gone")],
             ..Default::default()
         };
         let (own, bus) = (w.join("r/own"), w.join("w/bus"));
@@ -2474,9 +2490,10 @@ mod tests {
             Some(std::slice::from_ref(&bus)),
         );
         let connect = spec.connect.unwrap();
-        for p in ["r/sub", "w/other", "x"] {
+        for p in ["r/sub", "w/other", "x", "else/allowed"] {
             assert!(connect.contains(&w.join(p)), "{connect:?}");
         }
+        assert!(!connect.contains(&w.join("else/gone")), "{connect:?}");
         for out in [&own, &bus] {
             assert!(!connect.iter().any(|p| out.starts_with(p)), "{connect:?}");
             assert!(!connect.iter().any(|p| p.starts_with(out)), "{connect:?}");
@@ -2486,6 +2503,11 @@ mod tests {
                 .iter()
                 .any(|p| w.join("else").starts_with(p) || p.starts_with("/run")),
             "{connect:?}"
+        );
+        assert!(
+            !spec.read.contains(&w.join("else/allowed")),
+            "{:?}",
+            spec.read
         );
         let own = std::slice::from_ref(&own);
         assert_eq!(folder_spec(&policy, &w, own, &[], None).connect, None);

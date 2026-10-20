@@ -1448,6 +1448,7 @@ fn only_reads(cmd: &Cmd) -> bool {
             | Cmd::Log { clear: None, .. }
             | Cmd::Center(CenterCmd::Ls)
             | Cmd::Folder(FolderCmd::Ls { .. })
+            | Cmd::Socket(crate::cli::SocketCmd::Ls { .. })
             | Cmd::Rule(RuleCmd::Ls { .. })
             | Cmd::Cap(CapCmd::Ls { .. })
             | Cmd::Config(ConfigCmd::Get { .. })

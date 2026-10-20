@@ -17,6 +17,7 @@ pub(super) fn own_form(cmd: &Cmd) -> bool {
             | Cmd::Log { clear: None, .. }
             | Cmd::Center(CenterCmd::Ls | CenterCmd::Add { .. })
             | Cmd::Folder(FolderCmd::Ls { .. })
+            | Cmd::Socket(SocketCmd::Ls { .. })
             | Cmd::Rule(RuleCmd::Ls { .. })
             | Cmd::Cap(CapCmd::Ls { .. })
             | Cmd::Config(ConfigCmd::Get { .. })
@@ -91,13 +92,17 @@ pub(super) async fn command(
         Cmd::Center(CenterCmd::Add { link, name, yes }) => {
             pair(paths, &link, name.as_deref(), yes).await?
         }
+        Cmd::Socket(SocketCmd::Ls { center }) => {
+            let (cfg, _) = read_config(paths).await?;
+            let name = pick_center(&cfg, &center)?;
+            let sockets = &cfg.center(&name).expect("picked").policy.sockets;
+            json!({ "center": name, "sockets": sockets })
+        }
         Cmd::Folder(FolderCmd::Ls { center }) => {
             let (cfg, _) = read_config(paths).await?;
             let name = pick_center(&cfg, &center)?;
-            let folders: Vec<Value> = cfg
-                .center(&name)
-                .expect("picked")
-                .policy
+            let policy = &cfg.center(&name).expect("picked").policy;
+            let folders: Vec<Value> = policy
                 .folders
                 .iter()
                 .map(|f| {
@@ -110,7 +115,9 @@ pub(super) async fn command(
                     })
                 })
                 .collect();
-            json!({ "center": name, "folders": folders })
+            // The sockets a folder mode command reaches outside them, so
+            // the app reads the folders' part of the page in one run.
+            json!({ "center": name, "folders": folders, "sockets": policy.sockets })
         }
         Cmd::Rule(RuleCmd::Ls { list, center }) => {
             let (cfg, _) = read_config(paths).await?;

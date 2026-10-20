@@ -29,6 +29,7 @@ A pairing is a **center entry**. Its policy holds:
 | `until` | Optional end of `folder` or `user` mode. Then the entry is back in `allowlist` |
 | `folders` | A path and `access`: three independent flags `r`, `w`, `x` |
 | `places` | The folders (by path) `folder add` recorded at their real place. The owner's: a center's write keeps it |
+| `sockets` | Socket files outside the folders a `folder` mode command may connect to (Landlock ABI 9). The owner's: a center's write keeps it |
 | `caps` | `on`, `off` or `hidden`, per capability or action |
 | `allow`, `deny` | Rules for every action |
 | `sudo_allow` | Rules for `sudo` commands |

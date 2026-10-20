@@ -210,6 +210,79 @@ component FolderSection inherits Section {
     }
 }
 
+// The socket files outside its folders that the center's folder mode
+// commands may connect to, where Landlock keeps them off the others (Linux).
+component SocketSection inherits Section {
+    icon: @image-url("icons/plug.svg");
+    title: "Sockets";
+    text: "Socket files outside its folders that " + Perm.center + " may connect to, in folder mode.";
+    HorizontalLayout {
+        padding-left: Space.xl;
+        padding-right: Space.xl;
+        padding-bottom: Space.md;
+        Banner {
+            tone: Tone.warn;
+            text: "A program that runs commands for others (Docker, systemd, tmux) gives " + Perm.center + " all you can do.";
+        }
+    }
+    ScrollBox {
+        rows: Perm.sockets.length;
+        for s[i] in Perm.sockets: ListRow {
+            first: i == 0;
+            VerticalLayout {
+                alignment: center;
+                Icon {
+                    source: @image-url("icons/plug.svg");
+                    colorize: Theme.text-muted;
+                }
+            }
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                PathText {
+                    text: s;
+                }
+            }
+            Button {
+                icon: @image-url("icons/trash.svg");
+                kind: ButtonKind.ghost;
+                small: true;
+                accessible-label: "Remove " + s;
+                clicked => {
+                    Perm.socket-remove(s);
+                }
+            }
+        }
+    }
+    VerticalLayout {
+        if Perm.sockets.length > 0: Divider { }
+        HorizontalLayout {
+            padding: Space.lg;
+            padding-left: Space.xl;
+            spacing: Space.md;
+            TextField {
+                horizontal-stretch: 1;
+                text <=> Perm.socket-text;
+                mono: true;
+                label: "Socket file";
+                placeholder: "/run/user/1000/ssh-agent.socket";
+                accepted => {
+                    Perm.socket-add();
+                }
+            }
+            Button {
+                text: "Allow";
+                icon: @image-url("icons/plus.svg");
+                kind: ButtonKind.primary;
+                enabled: Perm.socket-text != "";
+                clicked => {
+                    Perm.socket-add();
+                }
+            }
+        }
+    }
+}
+
 // The rules of one list (0 allow, 1 deny, 2 sudo): each one to edit in
 // place or remove, and a field for a new one. The field's text and its
 // Wildcard switch are the list's own (Perm).
@@ -670,6 +743,7 @@ export component PermissionsPage inherits PageFrame {
             spacing: Space.xxl;
             ModeSection { }
             FolderSection { }
+            if Perm.sockets-here || Perm.sockets.length > 0: SocketSection { }
             RuleSection { }
             CapSection { }
             SudoSection { }

@@ -175,7 +175,10 @@ command's job (Windows), the commands that stay root's (`run`, `install`,
 `restore` without the file the caller opened itself.
 
 The owner token is the boundary against a `folder` mode command that runs as
-an owner: a new random one at each start, written whole and renamed into
+an owner, as far as the command is kept off the sockets of the owner's
+programs that run things on request (Landlock ABI 9, `exec::folder_spec`;
+below that, or through an allowed socket, such a program reads the token for
+it): a new random one at each start, written whole and renamed into
 place as `owner.token` beside the socket before the socket is made, 0640
 `nerve:nerve-admin` (the unit's `SupplementaryGroups=nerve-admin` lets the
 node give the file to that group; without it the file is 0600 and the node

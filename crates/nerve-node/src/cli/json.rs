@@ -242,6 +242,7 @@ async fn status(paths: &NodePaths) -> Result<Value, String> {
             &cfg.limits.command,
             &Err("the node does not run".into()),
         ),
+        "sockets_kept": crate::daemon::sockets_kept(&nerve_sandbox::Confinement::detect()),
         "centers": centers,
     }))
 }
@@ -257,6 +258,7 @@ fn center(paths: &NodePaths, c: &nerve_policy::CenterEntry, now: u64) -> Value {
         "paused": c.paused,
         "revoked": c.revoked,
         "unknown": c.unknown,
+        "sockets": c.policy.sockets,
     });
     // Which `nerve.*` profile is this pairing's (docs/user/modes.md).
     if cfg!(windows) {

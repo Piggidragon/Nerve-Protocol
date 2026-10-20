@@ -40,13 +40,17 @@ pub fn status(v: &Value, now_ms: u64) -> (NodeStatus, Vec<CenterRow>) {
         .flatten()
         .filter(|c| c["status"] == "connected")
         .count();
-    // A pairing whose commands run without the sandbox. One the center
-    // revoked runs none; a mode this app does not know counts.
-    let unconfined = v["centers"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .any(|c| c["revoked"] != true && c["mode"] != "folder");
+    // A pairing whose commands are not kept in their folders: one without
+    // the sandbox, or one in folder mode with sockets allowed outside them,
+    // which may run things for it. One the center revoked runs none; a mode
+    // this app does not know counts. Where the node says it cannot keep
+    // commands off socket files (Linux before 7.1), no folder mode holds
+    // against the programs of the account they run as.
+    let unconfined = v["sockets_kept"] == false
+        || v["centers"].as_array().into_iter().flatten().any(|c| {
+            c["revoked"] != true
+                && (c["mode"] != "folder" || c["sockets"].as_array().is_some_and(|s| !s.is_empty()))
+        });
     let (state, title, detail, tone) = match (locked, running) {
         (true, _) => (
             "locked",
@@ -1547,6 +1551,35 @@ mod tests {
         ));
         // A mode this app does not know is not taken for the sandbox.
         assert!(with(json!([{"name": "a"}])));
+        // Folder mode with a socket allowed outside the folders.
+        assert!(with(
+            json!([{"name": "a", "mode": "folder", "sockets": ["/run/docker.sock"]}])
+        ));
+        assert!(!with(
+            json!([{"name": "a", "mode": "folder", "sockets": []}])
+        ));
+        assert!(!with(
+            json!([{"name": "a", "mode": "folder", "sockets": ["/run/docker.sock"], "revoked": true}])
+        ));
+    }
+
+    /// What the node says it keeps commands from decides too: where it
+    /// cannot keep them off socket files, folder mode holds against nothing
+    /// the account runs on request. Windows says neither (`null`).
+    #[test]
+    fn a_node_that_cannot_keep_commands_off_sockets_is_told() {
+        let with = |kept: Value| {
+            let folder = json!([{"name": "a", "mode": "folder", "sockets": []}]);
+            status(
+                &json!({"daemon": "running", "sockets_kept": kept, "centers": folder}),
+                NOW,
+            )
+            .0
+            .unconfined
+        };
+        assert!(with(json!(false)));
+        assert!(!with(json!(true)));
+        assert!(!with(Value::Null));
     }
 
     #[test]

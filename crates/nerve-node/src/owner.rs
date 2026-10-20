@@ -29,8 +29,11 @@
 //! the node's user and the group [`GROUP`] may read and which no `folder`
 //! mode command reads, as its folder is out of the command's Landlock rules
 //! (crate::daemon::Shared::sealed). So a confined command cannot use the
-//! socket however it connects; the checks of the caller's process (no
-//! `no_new_privs`, not below a command) are a second layer. On Windows the
+//! socket itself, however it connects; the checks of the caller's process
+//! (no `no_new_privs`, not below a command) are a second layer. A program of
+//! the owner's that runs things on request reads the token for it, unless
+//! Landlock keeps the command off that program's socket (ABI 9,
+//! crate::exec::folder_spec). On Windows the
 //! pipe's DACL keeps every AppContainer out, as it would keep one from a
 //! token file, so there is no token.
 //!
@@ -38,7 +41,8 @@
 //! account without a sandbox (`user` and `allowlist` mode) reads the token
 //! as the owner does, and one that gets a process outside the node's process
 //! tree and sandbox (the account's own `systemd --user`, a tmux server, the
-//! task scheduler) is that owner. That is the owner's choice of mode and
+//! task scheduler; for a `folder` mode command below Landlock ABI 9 or
+//! through a socket the owner allowed) is that owner. That is the owner's choice of mode and
 //! account; the app warns when commands run as its user
 //! (docs/user/desktop.md).
 

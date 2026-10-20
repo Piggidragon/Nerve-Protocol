@@ -33,12 +33,16 @@ Fedora 36 and later) and fontconfig.
 - A `folder` mode command cannot read or change the node's settings through
   its control socket: the node answers only programs that can read its token
   in the state folder, which the mode's sandbox keeps from a command. This
-  holds as far as the sandbox does. While the commands run as the node's own
-  user, `folder` mode is no boundary against that user's other programs. A
-  command can ask any of them that runs commands for whoever connects to its
-  socket to run a program outside the sandbox: the user's systemd and D-Bus
-  session (`systemd-run --user`), a tmux or screen server, and others. Such a
-  program is the user's own process and reads the node's files and token.
+  holds as far as the sandbox does. From Linux 7.1 the sandbox also keeps a
+  command off the socket files outside its folders but those you allow
+  ([modes](modes.md#socket-files)). Before that, while the commands run as
+  the node's own user, `folder` mode is no boundary against that user's other
+  programs. A command can ask any of them that runs commands for whoever
+  connects to its socket to run a program outside the sandbox: the user's
+  systemd and D-Bus session (`systemd-run --user`), a tmux or screen server,
+  and others. Such a program is the user's own process and reads the node's
+  files and token. The same holds for a socket of such a program that you
+  allow, or that lies in a folder you grant.
 - A command of `allowlist` or `user` mode has no sandbox, so it can read the
   token and the node's files as the account it runs as can. The node refuses
   its requests only from processes that stay below the command, and a command

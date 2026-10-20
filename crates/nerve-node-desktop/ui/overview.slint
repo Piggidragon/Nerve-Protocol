@@ -267,8 +267,10 @@ export component OverviewPage inherits PageFrame {
                         font-weight: Type.semibold;
                         wrap: word-wrap;
                     }
-                    // Nerve's settings only through a pairing without the
-                    // sandbox: a folder mode command has no owner token.
+                    // Nerve's settings only where commands are not kept in
+                    // their folders (NodeStatus.unconfined): a kept folder
+                    // mode command has no owner token and reaches no
+                    // program that runs things for it.
                     Text {
                         text: Store.status.unconfined
                             ? (Store.commands-root-via != ""

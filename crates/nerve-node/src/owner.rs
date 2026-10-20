@@ -1080,9 +1080,12 @@ async fn run_for(
     // program says what is wrong with it.
     let name = crate::edition::get().program;
     let (mut backup, mut restore) = (false, false);
+    // A command that only reads: the app asks these every few seconds.
+    let mut reads = false;
     let mut handed = handed;
     match Cli::try_parse_from(std::iter::once(name.to_string()).chain(args.clone())) {
         Ok(cli) => {
+            reads = only_reads(&cli.cmd);
             if cli.config_dir.is_some() || cli.state_dir.is_some() {
                 return Reply::Err("the node runs its commands on its own folders".into());
             }
@@ -1113,14 +1116,14 @@ async fn run_for(
         }
         (_, false) => None,
     };
-    // The command's words only: a value can be a secret (a proxy URL).
-    let words: Vec<&str> = args
-        .iter()
-        .map(String::as_str)
-        .filter(|a| !a.starts_with('-'))
-        .take(2)
-        .collect();
-    tracing::info!("{who} runs `{name} {}` as an owner", words.join(" "));
+    // A change is the owner's to find in the log; the reads the app makes
+    // all the time would only bury it, so they are detail.
+    let line = format!("{who} runs `{name} {}` as an owner", words(&args));
+    if reads {
+        tracing::debug!("{line}");
+    } else {
+        tracing::info!("{line}");
+    }
     let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Value>(64);
     let (in_tx, in_rx) = tokio::sync::mpsc::channel::<Value>(16);
     let job = command(Job {
@@ -1149,6 +1152,41 @@ async fn run_for(
         out: out_rx,
         inbound: in_tx,
     }
+}
+
+/// Whether `cmd` only reads: it changes nothing of the node.
+fn only_reads(cmd: &Cmd) -> bool {
+    use crate::cli::{
+        CapCmd, CenterCmd, ConfigCmd, ProxyCmd, RelayCmd, RuleCmd, ServiceCmd,
+    };
+    matches!(
+        cmd,
+        Cmd::Status
+            | Cmd::Audit { .. }
+            | Cmd::Log { .. }
+            | Cmd::Center(CenterCmd::Ls)
+            | Cmd::Folder(FolderCmd::Ls { .. })
+            | Cmd::Rule(RuleCmd::Ls { .. })
+            | Cmd::Cap(CapCmd::Ls { .. })
+            | Cmd::Config(ConfigCmd::Get { .. })
+            | Cmd::Proxy(ProxyCmd::Ls)
+            | Cmd::Relay(RelayCmd::Ls)
+            | Cmd::Sudo(SudoCmd::Status)
+            | Cmd::Service(ServiceCmd::Status)
+    )
+}
+
+/// What the log says an owner ran: the command's words, and for `config`
+/// the setting's name, never a value, which can be a secret (a proxy URL, a
+/// pairing link).
+fn words(args: &[String]) -> String {
+    let words: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .filter(|a| !a.starts_with('-'))
+        .collect();
+    let n = if words.first() == Some(&"config") { 3 } else { 2 };
+    words[..words.len().min(n)].join(" ")
 }
 
 /// One command an owner asked for, with its session's ends.
@@ -1705,6 +1743,39 @@ mod tests {
 
     fn cli(args: &[&str]) -> Cli {
         Cli::try_parse_from(std::iter::once("nerve-node").chain(args.iter().copied())).unwrap()
+    }
+
+    /// The app reads the node every few seconds: those reads are no lines
+    /// at info, while every change is, with its words and no value.
+    #[test]
+    fn reads_are_told_apart_from_changes_for_the_log() {
+        for args in [
+            &["status"][..],
+            &["audit", "--last", "200"],
+            &["log", "--problems"],
+            &["center", "ls"],
+            &["rule", "ls", "--center", "home"],
+            &["config", "get", "log.level"],
+            &["relay", "ls"],
+            &["service", "status"],
+        ] {
+            assert!(only_reads(&cli(args).cmd), "{args:?}");
+        }
+        for args in [
+            &["config", "set", "log.level", "debug"][..],
+            &["rule", "add", "allow", "git status"],
+            &["center", "pause", "--center", "home"],
+            &["panic"],
+        ] {
+            assert!(!only_reads(&cli(args).cmd), "{args:?}");
+        }
+        let w = |a: &[&str]| words(&a.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert_eq!(w(&["config", "set", "log.level", "debug"]), "config set log.level");
+        assert_eq!(
+            w(&["proxy", "set", "https://n:secret@relay:7490", "--pin", "x"]),
+            "proxy set"
+        );
+        assert_eq!(w(&["--json", "status"]), "status");
     }
 
     /// What changes the program, the service, the accounts or the machine

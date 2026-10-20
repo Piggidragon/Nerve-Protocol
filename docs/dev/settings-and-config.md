@@ -180,8 +180,12 @@ and exit code through the connection (`{"in"}`/`{"eof"}` up, `{"out"}`,
 holds the token, its changes go through the store as any, and with
 `NERVE_OWNER` set it refuses a change of `machine.user`, `machine.allow_root`,
 `machine.sudo_path` or `machine.shell`, and names the owner in the audit
-(`"user"` beside `"by": "local"`). The CLI forwards there by itself when the
-node is installed and it may not open its folders.
+(`"user"` beside `"by": "local"`). The node's log has a line at info for
+each owner's command that can change something (its words, and for `config`
+the setting's name, never a value); the reads (`status`, `audit`, `log`, the
+`ls` and `get` commands), which the desktop app makes every few seconds, are
+at debug. The CLI forwards there by itself when the node is installed and it
+may not open its folders.
 
 The owners' commands are as safe as the owners' accounts. A center's command
 that runs as an owner's account (`machine.user` is the owner's, as `install`

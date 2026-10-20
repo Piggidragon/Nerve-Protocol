@@ -1060,7 +1060,9 @@ export component OtherCopyDialog inherits Dialog {
             }
         }
     }
-    DialogButtons {
+    HorizontalLayout {
+        spacing: Space.sm;
+        padding-top: Space.xs;
         Button {
             text: "Uninstall…";
             icon: @image-url("icons/trash.svg");

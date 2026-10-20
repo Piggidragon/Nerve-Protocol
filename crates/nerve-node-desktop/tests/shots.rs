@@ -24,7 +24,7 @@ const WIDTH: u32 = 1180;
 const HEIGHT: u32 = 700;
 const SCALE: f32 = 2.0;
 /// The installer's window.
-const INSTALLER: (u32, u32) = (760, 640);
+const INSTALLER: (u32, u32) = (760, 700);
 /// A small screen, which the installer and the dialogs fit, the window
 /// filling it.
 const SMALL: (u32, u32) = (1280, 800);
@@ -843,7 +843,8 @@ fn every_page_light_and_dark() {
         "the service nerve-node.service runs as nerve and starts with the machine",
     ]));
     install.set_warnings(lines(&[
-        "Warning: alex is the account that ran sudo, and a person logs in as it: a command from a center can do what you can. `sudo nerve-node setup --create-user nerve-work` makes an account only the node uses.",
+        "Warning: alex is your own account, the one you log in as: a command from a center can do what you can.",
+        "An account only the node uses is the boundary: Settings, General, Account for commands, makes one and runs commands as it.",
     ]));
     shots.take("installer-done");
     install.set_warnings(lines(&[

@@ -597,7 +597,9 @@ fn the_app_drives_the_cli_end_to_end() {
         prefs
             .get_once_copy()
             .starts_with("Proxy: https://laptop-2:")
-            && prefs.get_once_text().contains("under Settings, Proxy")
+            && prefs
+                .get_once_text()
+                .contains("under Settings, Network, Proxy")
             && !prefs.get_once_text().contains("on laptop-2, run:"),
         "{}",
         prefs.get_once_text()

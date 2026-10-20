@@ -22,7 +22,7 @@ fn lines(n: usize, text: &str) -> ModelRc<SharedString> {
 }
 
 /// The installer's window, as it opens.
-const INSTALLER: (u32, u32) = (760, 640);
+const INSTALLER: (u32, u32) = (760, 700);
 
 /// The bottom `rows` of the window. A dialog's card ends 24 pixels above
 /// the window's foot when its content scrolls, and higher when it fits.
@@ -87,7 +87,8 @@ fn every_installer_step_and_dialog_fits_a_small_screen() {
     install.set_step("welcome".into());
     install.set_action("install".into());
     install.set_error(
-        "the service did not start: a long reason from the system, which goes on for a while so that it wraps over more than one line of the step, and then some more, as Windows says it"
+        "the service did not start: a long reason from the system, which goes on for a while so that it wraps over more than one line of the step, and then some more, as Windows says it. ".repeat(3)
+            .trim_end()
             .into(),
     );
     assert!(

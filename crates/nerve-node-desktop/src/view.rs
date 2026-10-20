@@ -192,7 +192,7 @@ fn center(c: &Value, running: bool, now_ms: u64) -> CenterRow {
     let mut detail = match mode {
         "allowlist" => "Only what an allow rule names.".to_string(),
         "folder" => "What each of its folders allows.".to_string(),
-        "user" => "Anything you could do yourself, protected files aside.".to_string(),
+        "user" => "Anything you may do, protected files aside.".to_string(),
         _ => String::new(),
     };
     if mode != "allowlist"
@@ -281,15 +281,9 @@ pub fn guard_missing(v: &Value) -> bool {
 /// `config get machine.secret_storage --json`.
 pub fn no_keyring(reason: &str) -> &'static str {
     match reason {
-        "windows-service" => {
-            "Not on Windows: the service runs as its own account, and a keyring belongs to one account, so the service would not find its keys there."
-        }
-        "old-landlock" => {
-            "Not on this Linux: below version 7.1 it cannot keep commands away from the keyring."
-        }
-        _ => {
-            "No keyring answers for the account the node runs as. It has no desktop session of its own, so its keys stay in files."
-        }
+        "windows-service" => "Not on Windows: the service would not find them in a keyring.",
+        "old-landlock" => "Not on Linux below 7.1: it cannot keep commands away from the keyring.",
+        _ => "No keyring answers for the node's account.",
     }
 }
 
@@ -351,8 +345,8 @@ pub fn backup_written(said: &Value) -> String {
     for (why, one, more) in [
         (
             "keyring",
-            "is in the system keyring, so it is not in the file. To take it too, back up again with \"Take the keys in the system keyring too\".",
-            "are in the system keyring, so they are not in the file. To take them too, back up again with \"Take the keys in the system keyring too\".",
+            "is in the system keyring, so it is not in the file. To take it too, back up again with \"Include the keys in the system keyring\".",
+            "are in the system keyring, so they are not in the file. To take them too, back up again with \"Include the keys in the system keyring\".",
         ),
         (
             "does-not-fit",
@@ -392,13 +386,11 @@ pub fn relay_token(said: &Value) -> (String, String) {
     let t = &said["token"];
     let (node, proxy, pin) = (s(&t["node"]), s(&t["proxy"]), s(&t["pin"]));
     let mut text = format!(
-        "{node} may use this relay now; it may reach {}. On {node}, enter the proxy and its pin below in the Nerve app, under Settings, Proxy; on a node without the app, run the command below there.",
+        "{node} may use this relay now and reach {}. On {node}, enter the proxy and its pin under Settings, Network, Proxy, or run the command below.",
         s(&t["reach"])
     );
     if proxy.contains("<address of this machine>") {
-        text.push_str(
-            " Put the address under which it reaches this machine in place of <address of this machine>.",
-        );
+        text.push_str(" Put this machine's address in place of <address of this machine>.");
     }
     if t["new_pin"] == true {
         text.push_str(
@@ -406,7 +398,7 @@ pub fn relay_token(said: &Value) -> (String, String) {
         );
     }
     if t["relay_off"] == true {
-        text.push_str(" The relay is off: turn it on here under Settings, Relay.");
+        text.push_str(" The relay is off: turn it on under Settings, Network, Relay.");
     }
     let copy = format!("Proxy: {proxy}\nPin: {pin}\n\nnerve-node proxy set '{proxy}' --pin {pin}");
     (text, copy)
@@ -442,11 +434,11 @@ pub fn restored(said: &Value, started: &str) -> String {
     for n in r["notes"].as_array().into_iter().flatten() {
         let center = s(&n["center"]);
         let line = match s(&n["fix"]) {
-            "proxy" => "The proxy is not restored whole: set it again under Settings, Proxy.".into(),
+            "proxy" => "The proxy is not restored whole: set it again under Settings, Network, Proxy.".into(),
             "sudo" => "Sudo is off: its password is in no backup. Turn it on again on the Permissions page.".into(),
             "sudo-file" => "Sudo is off, but the administrator's password it kept could not be deleted: turn sudo on and off again on the Permissions page.".into(),
-            "pin" => format!("The pin of {center} here differed from the backup's, and the restore took the backup's. If the node does not link to {center}, set center.{center}.pin under Settings, Any setting."),
-            "relay" => "The relay's TLS key was not in the backup: turn the relay on again under Settings, Relay; the nodes behind it need its new pin.".into(),
+            "pin" => format!("The pin of {center} here differed from the backup's, and the restore took the backup's. If the node does not link to {center}, set center.{center}.pin under Settings, Advanced."),
+            "relay" => "The relay's TLS key was not in the backup: turn the relay on again under Settings, Network, Relay; the nodes behind it need its new pin.".into(),
             _ => full_sentence(s(&n["text"])),
         };
         // Several notes can ask for the same: it is said once.
@@ -1076,8 +1068,8 @@ mod tests {
             text.contains("in place of <address of this machine>"),
             "{text}"
         );
-        assert!(text.contains("under Settings, Proxy"), "{text}");
-        assert!(text.contains("under Settings, Relay"), "{text}");
+        assert!(text.contains("under Settings, Network, Proxy"), "{text}");
+        assert!(text.contains("under Settings, Network, Relay"), "{text}");
         assert!(!text.contains('`') && !copy.contains('`'), "{text}");
     }
 
@@ -1100,10 +1092,14 @@ mod tests {
         assert!(text.contains("Unpair lab on the Centers page"), "{text}");
         assert!(text.contains("on the Permissions page"), "{text}");
         assert!(
-            text.contains("set center.home.pin under Settings, Any setting"),
+            text.contains("set center.home.pin under Settings, Advanced"),
             "{text}"
         );
-        assert_eq!(text.matches("Settings, Proxy").count(), 1, "{text}");
+        assert_eq!(
+            text.matches("Settings, Network, Proxy").count(),
+            1,
+            "{text}"
+        );
         assert!(
             text.contains("The node key for home was rotated after the backup was made."),
             "{text}"
@@ -1185,7 +1181,7 @@ mod tests {
         );
         assert!(
             text.contains("The node key for lab is in the system keyring")
-                && text.contains("\"Take the keys in the system keyring too\""),
+                && text.contains("\"Include the keys in the system keyring\""),
             "{text}"
         );
         assert!(!text.contains("--") && !text.contains("  "), "{text}");

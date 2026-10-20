@@ -86,9 +86,9 @@ pub fn steps(v: &Value) -> (Vec<String>, Vec<String>) {
 
 /// Where the app chooses the account of the commands, for what a service
 /// command says of it.
-const ACCOUNT_HINT: &str = "An account only the node uses is the boundary: Settings, Account for commands, makes one and runs commands as it.";
-const CHOOSE_ACCOUNT: &str = "choose one in Settings, Account for commands";
-const ENTER_PASSWORD: &str = "enter its password in Settings, Account for commands";
+const ACCOUNT_HINT: &str = "An account only the node uses is the boundary: Settings, General, Account for commands, makes one and runs commands as it.";
+const CHOOSE_ACCOUNT: &str = "choose one in Settings, General, Account for commands";
+const ENTER_PASSWORD: &str = "enter its password in Settings, General, Account for commands";
 
 fn shared(lines: Vec<String>) -> ModelRc<SharedString> {
     ModelRc::new(VecModel::from(
@@ -446,12 +446,13 @@ mod tests {
             "{}",
             warn[0]
         );
-        assert!(warn[1].contains("Settings, Account for commands"));
+        assert!(warn[1].contains("Settings, General, Account for commands"));
         assert!(
             warn[2].starts_with("no account")
-                && warn[2].ends_with("enter its password in Settings, Account for commands")
+                && warn[2]
+                    .ends_with("enter its password in Settings, General, Account for commands")
         );
-        assert!(warn[3].ends_with("choose one in Settings, Account for commands"));
+        assert!(warn[3].ends_with("choose one in Settings, General, Account for commands"));
         // Nothing sends the owner to a terminal, nor says it ran sudo.
         for line in did.iter().chain(&warn) {
             assert!(!line.contains('`') && !line.contains("ran sudo"), "{line}");

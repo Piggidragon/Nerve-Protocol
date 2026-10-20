@@ -17,6 +17,7 @@ export component SetupDialog inherits Dialog {
         : "This machine is set up";
     subtitle: Store.setup-step == 0 ? "How centers show this machine. Each step is saved when you go on."
         : Store.setup-step == 1 ? "A key for each center, and one for the settings. Files are right unless you use a keyring for such things."
+        : Store.setup-step == 2 && Store.pair-step == 1 ? "Check that this is your center."
         : Store.setup-step == 2 ? "Paste the link the center's web UI shows under Pair a machine."
         : Store.setup-step == 3 ? "You can change it any time under Permissions."
         : Store.service-state == "stopped" ? "Start the service to link this machine to its centers."

@@ -910,7 +910,9 @@ impl Ctl {
         self.confirm(
             Pending::Unpair(name.to_string()),
             format!("Unpair {name}?"),
-            format!("{name} loses its link to this machine, and its key here is deleted. Its rules go too. To use it again, pair again."),
+            format!(
+                "{name} loses its link and its key here, and its rules go. Pair again to use it."
+            ),
             "Unpair",
         );
     }
@@ -919,17 +921,12 @@ impl Ctl {
         self.confirm(
             Pending::RotateKey(name.to_string()),
             format!("A new key for {name}?"),
-            format!("This machine makes a new key for {name} and sends it over the link; the old one is deleted here. {name} takes the old key for 7 more days. The node must run and be linked to {name}."),
+            format!("Made here and sent to {name} over the link, which must be up. {name} still takes the old key for 7 days."),
             "Make a new key",
         );
         self.with_store(|s| {
-            s.set_confirm_option("End the old key's 7 days at once".into());
-            s.set_confirm_option_detail(
-                format!(
-                    "For a key that may have leaked: {name} takes only the new key from then on."
-                )
-                .into(),
-            );
+            s.set_confirm_option("End the old key's 7 days now".into());
+            s.set_confirm_option_detail("For a key that may have leaked.".into());
         });
     }
 

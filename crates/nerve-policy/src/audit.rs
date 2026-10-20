@@ -325,6 +325,25 @@ impl AuditLog {
         }))
     }
 
+    /// Starts the log afresh (`nerve-node audit clear`): the current file
+    /// becomes the older one, as a full log's does, which the one before
+    /// gives way to, and the new file begins with an entry of who cleared
+    /// it (`user`). So nothing goes silently: the cleared entries stay in
+    /// the older file until the log moves aside again, and the readers
+    /// ([`AuditLog::lines`]) show only what came after the clearing.
+    pub fn clear(&self, user: &str) -> std::io::Result<()> {
+        match std::fs::rename(&self.path, self.old_path()) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
+            _ => {}
+        }
+        self.append(&json!({
+            "ts": nerve_proto::msg::now_ms(),
+            "kind": "audit",
+            "event": "cleared",
+            "user": user,
+        }))
+    }
+
     /// Every line, oldest first, the older file's included; lines that do
     /// not parse are skipped.
     pub fn read(&self) -> std::io::Result<Vec<Value>> {
@@ -337,6 +356,8 @@ impl AuditLog {
 
     /// Every whole line as it is written, oldest first: the older file's,
     /// then the current one's. A last line still being written is left out.
+    /// A log cleared ([`AuditLog::clear`]) begins at its clearing: the older
+    /// file is left out while the current one starts with it.
     pub fn lines(&self) -> std::io::Result<Vec<String>> {
         self.lines_with(|_| {})
     }
@@ -369,6 +390,9 @@ impl AuditLog {
             let again = read(&old_path)?;
             if again == old {
                 let mut out = Vec::new();
+                if current.as_deref().is_some_and(starts_cleared) {
+                    old = None;
+                }
                 for t in [old, current].into_iter().flatten() {
                     let whole = t.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
                     out.extend(
@@ -385,6 +409,13 @@ impl AuditLog {
             "the audit log kept moving while it was read",
         ))
     }
+}
+
+/// Whether a log file begins with the entry of a clearing.
+fn starts_cleared(text: &[u8]) -> bool {
+    let first = text.split(|b| *b == b'\n').next().unwrap_or_default();
+    serde_json::from_slice::<Value>(first)
+        .is_ok_and(|v| v["kind"] == "audit" && v["event"] == "cleared")
 }
 
 /// The leaves that differ between `old` and `new`, as dotted keys. Arrays
@@ -609,6 +640,50 @@ mod tests {
         assert!(
             versions.windows(2).all(|w| w[1] == w[0] + 1),
             "{versions:?}"
+        );
+    }
+
+    /// A clearing keeps the entries so far as the older file (the one
+    /// before gives way), starts the new file with who cleared it, and the
+    /// readers show only what came from then on, also once the log moved
+    /// aside after it.
+    #[test]
+    fn a_clearing_keeps_the_entries_as_the_older_file() {
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("audit.jsonl");
+        let log = AuditLog::new(&path);
+        // Clearing an empty log leaves the entry only.
+        log.clear("alice").unwrap();
+        let read = log.read().unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0]["kind"], "audit");
+        assert_eq!(read[0]["event"], "cleared");
+        assert_eq!(read[0]["user"], "alice");
+        log.settings("local", 1, &[]).unwrap();
+        std::fs::write(log.old_path(), "{\"kind\":\"settings\",\"version\":0}\n").unwrap();
+        log.settings("local", 2, &[]).unwrap();
+        let kept = std::fs::read(&path).unwrap();
+        log.clear("bob").unwrap();
+        assert_eq!(
+            std::fs::read(log.old_path()).unwrap(),
+            kept,
+            "the older file"
+        );
+        let read = log.read().unwrap();
+        assert_eq!(read.len(), 1, "{read:?}");
+        assert_eq!(read[0]["user"], "bob");
+        log.settings("local", 3, &[]).unwrap();
+        // The log moved aside by its size: from the clearing on still.
+        std::fs::rename(&path, log.old_path()).unwrap();
+        log.settings("local", 4, &[]).unwrap();
+        let read = log.read().unwrap();
+        let kinds: Vec<String> = read
+            .iter()
+            .map(|v| format!("{} {}", v["kind"], v["version"]))
+            .collect();
+        assert_eq!(
+            kinds,
+            [r#""audit" null"#, r#""settings" 3"#, r#""settings" 4"#]
         );
     }
 

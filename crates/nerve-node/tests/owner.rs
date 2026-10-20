@@ -105,6 +105,31 @@ async fn an_owner_changes_the_node_through_it_and_is_audited() {
     assert_eq!(last["by"], "local");
     assert_eq!(last["user"], me.as_str());
 
+    // An owner clears the audit and the log: the audit's entries so far stay
+    // as its older file, and both say who cleared them.
+    let log = AuditLog::new(paths.audit_log());
+    let before = std::fs::read(paths.audit_log()).unwrap();
+    let (out, err, code) = run(&at, &["audit", "clear"], "").await.unwrap();
+    assert_eq!(code, 0, "{out} {err}");
+    assert_eq!(std::fs::read(log.old_path()).unwrap(), before);
+    let entries = log.read().unwrap();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    assert_eq!(entries[0]["event"], "cleared");
+    assert_eq!(entries[0]["user"], me.as_str());
+    std::fs::write(
+        paths.log_file(),
+        "{\"ts\":1,\"level\":\"info\",\"msg\":\"node started\"}\n",
+    )
+    .unwrap();
+    let (out, err, code) = run(&at, &["log", "clear"], "").await.unwrap();
+    assert_eq!(code, 0, "{out} {err}");
+    let logged = std::fs::read_to_string(paths.log_file()).unwrap();
+    assert_eq!(logged.lines().collect::<Vec<_>>().len(), 1, "{logged}");
+    assert!(
+        logged.contains(&format!("the log was cleared by {me}")),
+        "{logged}"
+    );
+
     // The input reaches a command that asks, and its question comes before
     // its line ends. (It asks only when the link can pair: a center that
     // answers, with its code open.)

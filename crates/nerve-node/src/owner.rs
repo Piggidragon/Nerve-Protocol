@@ -1160,8 +1160,8 @@ fn only_reads(cmd: &Cmd) -> bool {
     matches!(
         cmd,
         Cmd::Status
-            | Cmd::Audit { .. }
-            | Cmd::Log { .. }
+            | Cmd::Audit { clear: None, .. }
+            | Cmd::Log { clear: None, .. }
             | Cmd::Center(CenterCmd::Ls)
             | Cmd::Folder(FolderCmd::Ls { .. })
             | Cmd::Rule(RuleCmd::Ls { .. })
@@ -1768,6 +1768,8 @@ mod tests {
             &["rule", "add", "allow", "git status"],
             &["center", "pause", "--center", "home"],
             &["panic"],
+            &["log", "clear"],
+            &["audit", "clear"],
         ] {
             assert!(!only_reads(&cli(args).cmd), "{args:?}");
         }

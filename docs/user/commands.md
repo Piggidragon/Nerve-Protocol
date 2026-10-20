@@ -61,7 +61,9 @@ center is paired.
 | `run` | Run the node in the foreground | [pairing](pairing.md) |
 | `status` | Show whether it runs, the links, the confinement and the [limits per command](limits.md) | [troubleshooting](troubleshooting.md) |
 | `audit [--denied] [--last N] [--follow]` | Show what was allowed and refused | [audit](audit.md) |
+| `audit clear` | Start the audit log afresh; the entries so far stay in its older file | [audit](audit.md#clear-it) |
 | `log [--problems] [--last N] [--follow]` | Show the node's log | [logs](logs.md) |
+| `log clear` | Empty the node's log | [logs](logs.md#clear-it) |
 | `panic`, `unlock` | Stop everything, then allow it again | [stop](stop.md#panic) |
 
 ## Install and set up

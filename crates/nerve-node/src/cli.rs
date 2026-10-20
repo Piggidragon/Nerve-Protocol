@@ -85,7 +85,10 @@ pub enum Cmd {
     /// Show whether the node runs and which centers it is paired with.
     Status,
     /// Show what the node allowed and refused.
+    #[command(args_conflicts_with_subcommands = true)]
     Audit {
+        #[command(subcommand)]
+        clear: Option<AuditCmd>,
         /// Keep running and print new entries as they arrive.
         #[arg(long)]
         follow: bool,
@@ -97,7 +100,10 @@ pub enum Cmd {
         last: Option<usize>,
     },
     /// Show the node's log: its starts and stops, its links, and what went wrong.
+    #[command(args_conflicts_with_subcommands = true)]
     Log {
+        #[command(subcommand)]
+        clear: Option<LogCmd>,
         /// Keep running and print new lines as they arrive.
         #[arg(long)]
         follow: bool,
@@ -323,6 +329,18 @@ pub enum ServiceCmd {
     Restart,
     /// Show whether the node is installed as a service, whether it runs, and the program it runs with its version.
     Status,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuditCmd {
+    /// Start the audit log afresh: the entries so far are kept as its one older file (audit.jsonl.1, which replaces the one before), and the new log begins with an entry of who cleared it.
+    Clear,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LogCmd {
+    /// Empty the node's log, its older file too; the new log begins with a line of who cleared it.
+    Clear,
 }
 
 #[derive(Debug, Subcommand)]
@@ -752,17 +770,27 @@ fn noun_cards(noun: &clap::Command, name: &str) -> Vec<Card> {
         .filter(|c| visible(c))
         .partition(|c| c.has_subcommands());
     let mut out = Vec::new();
+    // A noun that also runs on its own (`audit`, beside `audit clear`) is
+    // its card's first verb, and holds nothing.
+    let alone = !noun.is_subcommand_required_set();
+    let holds = if alone { Vec::new() } else { vec![name.into()] };
     if !leaves.is_empty() {
-        let verbs = leaves
-            .iter()
-            .map(|c| verb(c, &format!("{name} {}", c.get_name())))
+        let verbs = alone
+            .then(|| verb(noun, name))
+            .into_iter()
+            .chain(
+                leaves
+                    .iter()
+                    .map(|c| verb(c, &format!("{name} {}", c.get_name()))),
+            )
             .collect();
-        out.push(card(name, about_of(noun), vec![name.into()], verbs));
+        out.push(card(name, about_of(noun), holds, verbs));
     }
     for h in &holders {
         out.extend(noun_cards(h, &format!("{name} {}", h.get_name())));
     }
-    if !out.iter().any(|c| c.holds.iter().any(|h| h == name))
+    if !alone
+        && !out.iter().any(|c| c.holds.iter().any(|h| h == name))
         && let Some(first) = out.first_mut()
     {
         first.holds.insert(0, name.into());
@@ -772,9 +800,12 @@ fn noun_cards(noun: &clap::Command, name: &str) -> Vec<Card> {
 
 fn verb(sub: &clap::Command, name: &str) -> Verb {
     let usage = sub.clone().render_usage().to_string();
+    // A command that also holds others has their form on a second line:
+    // that is theirs.
+    let usage = usage.lines().next().unwrap_or_default();
     Verb {
         name: name.into(),
-        usage: usage.strip_prefix("Usage: ").unwrap_or(&usage).to_string(),
+        usage: usage.strip_prefix("Usage: ").unwrap_or(usage).to_string(),
         about: about_of(sub),
         args: sub
             .get_arguments()
@@ -2021,11 +2052,42 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             Ok(())
         }
         Cmd::Audit {
+            clear: Some(AuditCmd::Clear),
+            ..
+        } => {
+            // A command of a center must not wipe what it did from the
+            // owner's sight.
+            owner_check(&[&paths]).await?;
+            let who = changed_by();
+            AuditLog::new(paths.audit_log())
+                .clear(&who)
+                .map_err(|e| format!("{}: {e}", paths.audit_log().display()))?;
+            w(
+                out,
+                format!(
+                    "audit cleared; the entries so far are kept in {}",
+                    AuditLog::new(paths.audit_log()).old_path().display()
+                ),
+            );
+            Ok(())
+        }
+        Cmd::Audit {
+            clear: None,
             follow,
             denied,
             last,
         } => audit(&paths, follow, denied, last, false, out).await,
         Cmd::Log {
+            clear: Some(LogCmd::Clear),
+            ..
+        } => {
+            owner_check(&[&paths]).await?;
+            clear_log(&paths, &changed_by())?;
+            w(out, "log cleared".into());
+            Ok(())
+        }
+        Cmd::Log {
+            clear: None,
             follow,
             last,
             problems,
@@ -3062,6 +3124,9 @@ fn audit_line(v: &Value) -> String {
             s("reason")
         );
     }
+    if v["kind"] == "audit" {
+        return format!("{}  audit {} by {}", s("ts"), s("event"), s("user"));
+    }
     if v["kind"] == "key" {
         return format!(
             "{}  {}  key {}: {}",
@@ -3157,6 +3222,39 @@ async fn audit(
         let _ = out.flush();
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
+}
+
+/// `log clear`: the node's log and its moved-aside file emptied, and one
+/// line in it of who did it. The running node writes on at the end of the
+/// emptied file.
+fn clear_log(paths: &NodePaths, who: &str) -> Result<(), String> {
+    let file = paths.log_file();
+    let mut old = file.clone().into_os_string();
+    old.push(".1");
+    match std::fs::remove_file(&old) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(format!("{}: {e}", Path::new(&old).display()));
+        }
+        _ => {}
+    }
+    let line = nerve_transport::log::Entry {
+        ts: nerve_proto::msg::now_ms(),
+        level: nerve_transport::log::Level::Info,
+        node: None,
+        node_id: None,
+        msg: format!("the log was cleared by {who}"),
+    };
+    let mut line = serde_json::to_vec(&line).map_err(|e| e.to_string())?;
+    line.push(b'\n');
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).truncate(true);
+    match o.open(&file) {
+        Ok(mut f) => f.write_all(&line),
+        // No log yet: nothing to clear, and no line either.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+    .map_err(|e| format!("{}: {e}", file.display()))
 }
 
 /// `log`: the node's log file, the moved-aside one first (docs/user/logs.md).
@@ -8181,6 +8279,65 @@ mod tests {
         // No log yet is no error.
         let empty = NodePaths::new(d.path().join("c2"), d.path().join("s2"));
         assert_eq!(json_of(&empty, &["log"]), json!({"entries": []}));
+    }
+
+    /// `log clear` empties the log and its older file and says who did it;
+    /// `audit clear` keeps the entries so far as the older file, and the
+    /// audit shows only the entry of the clearing then. Neither takes
+    /// arguments of the reading form.
+    #[test]
+    fn log_and_audit_clear_start_afresh_and_say_who() {
+        let d = tempfile::tempdir().unwrap();
+        let paths = NodePaths::new(d.path().join("c"), d.path().join("s"));
+        std::fs::create_dir_all(&paths.state_dir).unwrap();
+        // No log yet: nothing to clear, and no error.
+        run(&paths, &["log", "clear"]).unwrap();
+        assert!(!paths.log_file().exists());
+        std::fs::write(
+            paths.state_dir.join("log.jsonl.1"),
+            logged(1, "info", "node started"),
+        )
+        .unwrap();
+        std::fs::write(paths.log_file(), logged(2, "warn", "link dropped")).unwrap();
+        let out = run(&paths, &["log", "clear"]).unwrap();
+        assert_eq!(out, "log cleared\n");
+        assert!(!paths.state_dir.join("log.jsonl.1").exists());
+        let v = json_of(&paths, &["log"]);
+        let entries = v["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{v}");
+        let who = changed_by();
+        assert_eq!(
+            entries[0]["msg"],
+            format!("the log was cleared by {who}"),
+            "{v}"
+        );
+
+        let log = AuditLog::new(paths.audit_log());
+        log.settings("local", 1, &[]).unwrap();
+        log.settings("local", 2, &[]).unwrap();
+        let before = std::fs::read(paths.audit_log()).unwrap();
+        let v = json_of(&paths, &["audit", "clear"]);
+        assert!(
+            v["messages"][0]
+                .as_str()
+                .unwrap()
+                .starts_with("audit cleared; the entries so far are kept in "),
+            "{v}"
+        );
+        assert_eq!(std::fs::read(log.old_path()).unwrap(), before);
+        let v = json_of(&paths, &["audit"]);
+        let entries = v["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1, "{v}");
+        assert_eq!(entries[0]["event"], "cleared");
+        assert_eq!(entries[0]["user"], who.as_str());
+        let out = run(&paths, &["audit"]).unwrap();
+        assert!(out.ends_with(&format!("audit cleared by {who}\n")), "{out}");
+        for args in [
+            &["audit", "clear", "--last", "2"][..],
+            &["log", "--follow", "clear"],
+        ] {
+            assert!(run(&paths, args).is_err(), "{args:?}");
+        }
     }
 
     /// `log --follow` goes on with the new file once the old one is moved

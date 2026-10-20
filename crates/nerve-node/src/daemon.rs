@@ -2602,6 +2602,56 @@ mod tests {
         daemon.stop().await;
     }
 
+    /// A command of a center must not wipe what it did from the owner's
+    /// sight: `log clear` and `audit clear` ask `owner.check` first.
+    #[tokio::test]
+    async fn clearing_the_log_and_the_audit_is_refused_from_below_a_command() {
+        use clap::Parser;
+        let (_d, daemon) = daemon().await;
+        let s = daemon.shared.clone();
+        let paths = daemon.paths().clone();
+        let run = |args: [&str; 2]| {
+            let mut argv: Vec<String> = vec![
+                "nerve-node".into(),
+                "--config-dir".into(),
+                paths.config_dir.display().to_string(),
+                "--state-dir".into(),
+                paths.state_dir.display().to_string(),
+            ];
+            argv.extend(args.map(String::from));
+            async move {
+                let cli = crate::cli::Cli::try_parse_from(argv).map_err(|e| e.to_string())?;
+                crate::cli::execute(cli, &mut Vec::new()).await
+            }
+        };
+        let log = AuditLog::new(paths.audit_log());
+        log.settings("local", 1, &[]).unwrap();
+        let audit = std::fs::read(paths.audit_log()).unwrap();
+        let logged = b"{\"ts\":1,\"level\":\"info\",\"msg\":\"node started\"}\n";
+        std::fs::write(paths.log_file(), logged).unwrap();
+        // This process stands in for a command the node started.
+        lock(&s.commands).insert(std::process::id(), "home".into());
+        for args in [["log", "clear"], ["audit", "clear"]] {
+            let e = run(args).await.unwrap_err();
+            assert!(e.starts_with("refused"), "{args:?}: {e}");
+        }
+        assert_eq!(std::fs::read(paths.audit_log()).unwrap(), audit);
+        assert!(!log.old_path().exists());
+        assert_eq!(std::fs::read(paths.log_file()).unwrap(), logged);
+        // The owner clears them while the node runs.
+        lock(&s.commands).clear();
+        run(["audit", "clear"]).await.unwrap();
+        run(["log", "clear"]).await.unwrap();
+        assert_eq!(std::fs::read(log.old_path()).unwrap(), audit);
+        let read = log.read().unwrap();
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0]["event"], "cleared");
+        let now = std::fs::read_to_string(paths.log_file()).unwrap();
+        assert_eq!(now.lines().count(), 1, "{now}");
+        assert!(now.contains("the log was cleared by"), "{now}");
+        daemon.stop().await;
+    }
+
     /// What `install`, `update` and `setup` run to wait for the node they
     /// restarted: with the token, and as `update` of 0.0.2 sent it, without.
     /// A node that does not answer them makes `update` put the old program

@@ -78,6 +78,19 @@ the log stays below about 20 MiB. A center that makes many refused calls cannot
 push out what the node allowed or changed: refusals take at most half of a full
 file, and the oldest refusals go first.
 
+## Clear it
+
+```sh
+nerve-node audit clear
+```
+
+starts the audit log afresh. Nothing goes silently: the entries so far become
+`audit.jsonl.1`, as at 10 MiB (the older copy gives way), and the new log
+begins with `audit cleared by <account>`. `nerve-node audit` and the app show
+the entries from there on; the cleared ones stay in `audit.jsonl.1` until the
+log moves aside again. Only the owner or root may clear it: never a center,
+and never a command a center runs (the node refuses it there).
+
 ## The audit log and the log
 
 The audit log is the node's record of its decisions. The [log](logs.md) is

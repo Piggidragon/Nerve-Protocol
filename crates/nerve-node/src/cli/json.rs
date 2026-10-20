@@ -13,8 +13,8 @@ pub(super) fn own_form(cmd: &Cmd) -> bool {
     matches!(
         cmd,
         Cmd::Status
-            | Cmd::Audit { .. }
-            | Cmd::Log { .. }
+            | Cmd::Audit { clear: None, .. }
+            | Cmd::Log { clear: None, .. }
             | Cmd::Center(CenterCmd::Ls | CenterCmd::Add { .. })
             | Cmd::Folder(FolderCmd::Ls { .. })
             | Cmd::Rule(RuleCmd::Ls { .. })
@@ -76,11 +76,13 @@ pub(super) async fn command(
         Cmd::Status => status(paths).await?,
         Cmd::Service(ServiceCmd::Status) => service_status(&Layout::system())?,
         Cmd::Audit {
+            clear: None,
             follow,
             denied,
             last,
         } => return audit(paths, follow, denied, last, true, out).await,
         Cmd::Log {
+            clear: None,
             follow,
             last,
             problems,

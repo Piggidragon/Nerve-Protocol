@@ -285,9 +285,19 @@ const COMMANDS: &[(&str, &str, Place)] = &[
         (Some(Page::Audit), -1, "Audit"),
     ),
     (
+        "audit clear",
+        "nerve-node audit clear",
+        (Some(Page::Audit), -1, "Audit › Clear"),
+    ),
+    (
         "log",
         "nerve-node log --problems",
         (Some(Page::Log), -1, "Log"),
+    ),
+    (
+        "log clear",
+        "nerve-node log clear",
+        (Some(Page::Log), -1, "Log › Clear"),
     ),
     (
         "panic",

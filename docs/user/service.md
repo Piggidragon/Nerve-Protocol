@@ -211,11 +211,16 @@ nerve-node service status    # anyone may ask
 
 `service` does what `systemctl stop|start|restart nerve-node` does (on
 Windows, the service control manager), and waits until a node that starts
-answers. An owner needs no `sudo` for it at the machine: the polkit rule
-`/etc/polkit-1/rules.d/50-nerve-node.rules`, which `install` writes, lets the
-members of `nerve-admin` start, stop and restart this service from their own
-local session, and nothing else. Over SSH, and with polkit older than 0.106
-(Ubuntu 22.04), which takes no rules, it needs `sudo`. A stopped service starts again with the machine. `service status`
+answers. An owner needs no `sudo` for it at the machine. `install` writes a
+helper, `/usr/local/lib/nerve-node/service-control`, that starts, stops or
+restarts `nerve-node.service` and does nothing else, with a polkit action of
+its own (`/usr/share/polkit-1/actions/org.nerve-protocol.node.service-control.policy`).
+`service` runs it through `pkexec`, and polkit lets the members of
+`nerve-admin` do that without a password from their own local session: by the
+rule `/etc/polkit-1/rules.d/50-nerve-node.rules` (which also lets them use
+`systemctl` for this service), or on polkit 0.105 (Ubuntu 22.04), which takes
+no rules, by `/etc/polkit-1/localauthority/50-local.d/50-nerve-node.pkla`.
+No file lets them manage other units. Over SSH it needs `sudo`. A stopped service starts again with the machine. `service status`
 says whether the node is installed as a service, whether it runs, whether it
 starts with the machine, and the installed program with its version.
 
@@ -238,8 +243,8 @@ the new program does not start, the old one is put back and started again.
 `update` writes the unit of the new version when it differs, so the node
 gets what a newer version needs ([limits per command](limits.md), the owners'
 runtime folder). A node installed before there were owners gets them: the
-group `nerve-admin` with the user who updates, and the polkit rule. An
-update changes no owner that is there.
+group `nerve-admin` with the user who updates, the polkit files and the
+helper. An update changes no owner that is there.
 
 ## Uninstall
 
@@ -249,7 +254,7 @@ sudo nerve-node uninstall --purge   # deletes them too
 ```
 
 `uninstall` stops and disables the service, removes the unit, the polkit
-rule, the group `nerve-admin`, the user `nerve` and
+files and the helper, the group `nerve-admin`, the user `nerve` and
 `/usr/local/bin/nerve-node`. A session that a keyring gave
 `nerve` is ended first. Without `--purge`, `/etc/nerve` and
 `/var/lib/nerve` stay and belong to root from then on, so no later user with

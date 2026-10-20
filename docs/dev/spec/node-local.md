@@ -1257,8 +1257,13 @@ lines and two methods:
 with `NERVE_OWNER` refuses a change of `machine.user`, `machine.allow_root`,
 `machine.sudo_path` and `machine.shell`, and names the owner in the audit's
 settings entries (`"user"`). Starting and stopping the service is the service
-manager's: a polkit rule for `nerve-admin` in a local active session (Linux),
-the service's DACL (Windows). Where `machine.user` is an owner, a command that
+manager's: on Linux the service helper (`/usr/local/lib/nerve-node/service-control`,
+`start|stop|restart` of the unit and nothing else) through `pkexec`, with its
+own action `org.nerve-protocol.node.service-control`, which a polkit rule
+(or on polkit 0.105 a `.pkla` file) gives `nerve-admin` in a local active
+session; the rule also gives them systemd's `manage-units` for that unit and
+those verbs (never a `.pkla` file for it, which could not name the unit).
+On Windows the service's DACL. Where `machine.user` is an owner, a command that
 gets a process outside the node's tree and sandbox (as above) is that owner.
 
 ## 6. Audit log

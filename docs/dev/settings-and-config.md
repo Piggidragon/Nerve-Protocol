@@ -159,7 +159,7 @@ The installed node has owners besides root: on Linux the members of the group
 `nerve-admin`, on Windows the SIDs in the service's registry value
 `Parameters\Owners`. `install` adds the user who ran it; `update` adds the
 one who updates where there was none; `uninstall` removes the group (and the
-polkit rule), and on Windows the service with its key. Membership is looked
+polkit files and the service helper), and on Windows the service with its key. Membership is looked
 up by name at each request, so it counts without a new login.
 
 The running node serves them a second endpoint (`crate::owner`): on Linux

@@ -107,11 +107,11 @@ Who changes the node's settings without a password:
   usermod --append --groups nerve-admin NAME` adds another,
   `sudo gpasswd --delete NAME nerve-admin` takes one out. It counts at once.
   The same members start, stop and restart the service from their own
-  session at the machine (the desktop, a console), through a polkit rule for
-  that service alone; over SSH, or from a program outside a session, polkit
-  asks for an administrator's password as before. polkit older than 0.106
-  (Ubuntu 22.04) takes no such rule: there starting and stopping asks for the
-  administrator's password, and `install` says so.
+  session at the machine (the desktop, a console), through a helper that
+  does only that for this service, and polkit lets them run it (by a rule, or
+  on polkit 0.105, as on Ubuntu 22.04, by a `.pkla` file); over SSH, or from a
+  program outside a session, polkit asks for an administrator's password as
+  before.
 - **Windows:** the administrators, and the user who installed (by SID, in the
   service's registry key `Parameters\Owners`). The service lets that user
   start, stop and restart it.

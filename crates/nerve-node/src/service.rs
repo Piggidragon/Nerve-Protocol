@@ -107,12 +107,43 @@ impl Layout {
     /// The polkit rule that lets the owners start and stop the service
     /// (crate::owner): `/etc/polkit-1/rules.d`, beside the unit's `/etc`.
     pub fn polkit_rule(&self) -> PathBuf {
-        self.unit
-            .ancestors()
-            .nth(3)
-            .unwrap_or(Path::new("/etc"))
-            .join("polkit-1/rules.d")
-            .join(POLKIT_RULE)
+        self.etc().join("polkit-1/rules.d").join(POLKIT_RULE)
+    }
+
+    /// The `/etc` the unit is in.
+    fn etc(&self) -> &Path {
+        self.unit.ancestors().nth(3).unwrap_or(Path::new("/etc"))
+    }
+
+    /// The helper that starts, stops and restarts the service and does
+    /// nothing else, which the owners run through pkexec
+    /// ([`service_helper_text`]): beside the program's `bin`, in
+    /// `/usr/local/lib/nerve-node`.
+    pub fn service_helper(&self) -> PathBuf {
+        let local = self
+            .bin
+            .parent()
+            .and_then(Path::parent)
+            .unwrap_or(Path::new("/usr/local"));
+        local.join("lib/nerve-node").join(SERVICE_HELPER)
+    }
+
+    /// The polkit action of [`Layout::service_helper`]: in
+    /// `/usr/share/polkit-1/actions`, the one folder polkit reads them from.
+    pub fn polkit_action(&self) -> PathBuf {
+        self.etc()
+            .parent()
+            .unwrap_or(Path::new("/"))
+            .join("usr/share/polkit-1/actions")
+            .join(format!("{POLKIT_ACTION}.policy"))
+    }
+
+    /// The `.pkla` file that lets the owners run the helper on a polkit
+    /// without rules (0.105).
+    pub fn polkit_pkla(&self) -> PathBuf {
+        self.etc()
+            .join("polkit-1/localauthority/50-local.d")
+            .join(POLKIT_PKLA)
     }
 
     pub fn installed(&self) -> bool {
@@ -182,9 +213,97 @@ WantedBy=multi-user.target
 /// The file name of the polkit rule ([`Layout::polkit_rule`]).
 pub const POLKIT_RULE: &str = "50-nerve-node.rules";
 
+/// The file name of the `.pkla` file ([`Layout::polkit_pkla`]).
+pub const POLKIT_PKLA: &str = "50-nerve-node.pkla";
+
+/// The polkit action of the service helper ([`Layout::service_helper`]).
+pub const POLKIT_ACTION: &str = "org.nerve-protocol.node.service-control";
+
+/// The file name of the service helper.
+pub const SERVICE_HELPER: &str = "service-control";
+
+/// The service helper: a script that starts, stops or restarts the
+/// installed unit and does nothing else. pkexec runs it as root for the
+/// owners without a password ([`polkit_action_text`]), also on polkit 0.105,
+/// which takes no rule that could limit systemd's own action to one unit.
+/// It takes one word and nothing from its environment: pkexec matches an
+/// action by the program's path only, never by its arguments.
+pub fn service_helper_text() -> String {
+    format!(
+        "#!/bin/sh
+# Written by `nerve-node install`; `nerve-node uninstall` removes it.
+# Starts, stops or restarts the Nerve node's service {UNIT_NAME}, and does
+# nothing else. The node's owners (the group {group}) run it through pkexec
+# without a password (polkit action {POLKIT_ACTION}).
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+if [ \"$#\" -ne 1 ]; then
+    echo \"usage: $0 start|stop|restart\" >&2
+    exit 2
+fi
+case \"$1\" in
+start | stop | restart) exec systemctl \"$1\" {UNIT_NAME} ;;
+*)
+    echo \"usage: $0 start|stop|restart\" >&2
+    exit 2
+    ;;
+esac
+",
+        group = crate::owner::GROUP
+    )
+}
+
+/// The polkit action of the service helper at `helper`: an administrator by
+/// default; the owners by the rule ([`polkit_rule_text`]) or the `.pkla`
+/// file ([`polkit_pkla_text`]).
+pub fn polkit_action_text(helper: &Path) -> String {
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<!-- Written by `nerve-node install`; `nerve-node uninstall` removes it. -->
+<policyconfig>
+  <vendor>Nerve</vendor>
+  <action id="{POLKIT_ACTION}">
+    <description>Start, stop or restart the Nerve node</description>
+    <message>Authentication is required to start, stop or restart the Nerve node</message>
+    <defaults>
+      <allow_any>auth_admin</allow_any>
+      <allow_inactive>auth_admin</allow_inactive>
+      <allow_active>auth_admin</allow_active>
+    </defaults>
+    <annotate key="org.freedesktop.policykit.exec.path">{helper}</annotate>
+  </action>
+</policyconfig>
+"#,
+        helper = helper.display()
+    )
+}
+
+/// The `.pkla` file for polkit 0.105: the owners may run the service
+/// helper without a password from their own session at this machine
+/// (`ResultActive`); anyone else, and an owner elsewhere, keeps the
+/// action's default. Never one for systemd's `manage-units`, which would
+/// let them manage every unit.
+pub fn polkit_pkla_text() -> String {
+    format!(
+        "# Written by `nerve-node install`; `nerve-node uninstall` removes it.
+# The members of {group}, the owners of the Nerve node, may start, stop and
+# restart its service through its helper from their own session at this
+# machine, and nothing else.
+[Nerve node: start, stop and restart]
+Identity=unix-group:{group}
+Action={POLKIT_ACTION}
+ResultActive=yes
+",
+        group = crate::owner::GROUP
+    )
+}
+
 /// The polkit rule: the owners may start, stop and restart the node's
-/// service, and nothing else. systemd names the unit and the verb of each
-/// request (`org.freedesktop.systemd1.manage-units`).
+/// service, and nothing else: through systemd, which names the unit and the
+/// verb of each request (`org.freedesktop.systemd1.manage-units`), or
+/// through the service helper ([`POLKIT_ACTION`]).
 pub fn polkit_rule_text() -> String {
     format!(
         "// Written by `nerve-node install`; `nerve-node uninstall` removes it.
@@ -193,15 +312,20 @@ pub fn polkit_rule_text() -> String {
 // and nothing else. A program outside a session, such as a command the
 // node runs, is asked for an administrator's password as before.
 polkit.addRule(function(action, subject) {{
+    if (!subject.isInGroup(\"{group}\") || !subject.local || !subject.active) {{
+        return polkit.Result.NOT_HANDLED;
+    }}
+    if (action.id == \"{POLKIT_ACTION}\") {{
+        return polkit.Result.YES;
+    }}
     if (action.id == \"org.freedesktop.systemd1.manage-units\" &&
-        action.lookup(\"unit\") == \"{UNIT_NAME}\" &&
-        subject.isInGroup(\"{group}\") &&
-        subject.local && subject.active) {{
+        action.lookup(\"unit\") == \"{UNIT_NAME}\") {{
         var verb = action.lookup(\"verb\");
         if (verb == \"start\" || verb == \"stop\" || verb == \"restart\") {{
             return polkit.Result.YES;
         }}
     }}
+    return polkit.Result.NOT_HANDLED;
 }});
 ",
         group = crate::owner::GROUP
@@ -213,10 +337,25 @@ polkit.addRule(function(action, subject) {{
 pub enum Polkit {
     /// Rules in JavaScript (polkit 0.106 and later).
     Rules,
-    /// polkit without them (0.105, Ubuntu 22.04): it asks an administrator.
+    /// polkit without them (0.105, Ubuntu 22.04): `.pkla` files.
     Old,
     /// No polkit.
     Missing,
+}
+
+/// Which polkit `pkaction --version` names (`pkaction version 0.105`,
+/// `pkaction version 124`); `None` when it names none. Rules came with
+/// 0.106; from 0.120 on the versions have one number.
+pub fn polkit_of_version(said: &str) -> Option<Polkit> {
+    let v = said.split_whitespace().last()?;
+    let mut parts = v.split('.').map(|p| p.parse::<u32>().ok());
+    let major = parts.next()??;
+    let minor = parts.next().flatten().unwrap_or(0);
+    Some(if major == 0 && minor < 106 {
+        Polkit::Old
+    } else {
+        Polkit::Rules
+    })
 }
 
 /// Whether a node on `paths` is the installed service, however it was
@@ -311,6 +450,29 @@ pub trait System {
     fn polkit(&self, _rule: &Path) -> Polkit {
         Polkit::Missing
     }
+    /// Whether `pkexec` is there.
+    fn has_pkexec(&self) -> bool {
+        false
+    }
+    /// Runs `program` with `args` as root through `pkexec`, which asks
+    /// polkit; never through a text agent in a terminal.
+    fn pkexec(&self, program: &Path, _args: &[&str]) -> Result<(), String> {
+        Err(format!(
+            "cannot run {} through pkexec here",
+            program.display()
+        ))
+    }
+}
+
+/// The `pkexec` of this machine: on `PATH`, else in `/usr/bin`.
+fn pkexec_program() -> Option<PathBuf> {
+    std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).collect::<Vec<_>>())
+        .unwrap_or_default()
+        .into_iter()
+        .chain([PathBuf::from("/usr/bin")])
+        .map(|d| d.join("pkexec"))
+        .find(|p| p.is_file())
 }
 
 /// This machine.
@@ -576,7 +738,54 @@ impl System for Host {
         run("groupdel", &[name])
     }
 
+    fn has_pkexec(&self) -> bool {
+        pkexec_program().is_some()
+    }
+
+    fn pkexec(&self, program: &Path, args: &[&str]) -> Result<(), String> {
+        let pkexec = pkexec_program().ok_or("pkexec is not installed")?;
+        let o = std::process::Command::new(pkexec)
+            .arg("--disable-internal-agent")
+            .arg(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .map_err(|e| format!("pkexec: {e}"))?;
+        match o.status.code() {
+            Some(0) => Ok(()),
+            // pkexec's own: not authorized (or no agent to ask), and
+            // dismissed.
+            Some(126 | 127) => Err(format!(
+                "polkit did not let you {}: the owners do it without a password from their own session at this machine; elsewhere `sudo {} service {}` does ({})",
+                args.join(" "),
+                crate::edition::get().program,
+                args.join(" "),
+                failure(&o)
+            )),
+            _ => Err(format!(
+                "{} {}: {}",
+                program.display(),
+                args.join(" "),
+                failure(&o)
+            )),
+        }
+    }
+
     fn polkit(&self, rule: &Path) -> Polkit {
+        // By its version: a polkit 0.105 has the rules folders too where a
+        // package put a rule there for newer ones (systemd's own does).
+        let said = std::process::Command::new("pkaction")
+            .arg("--version")
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output();
+        if let Some(p) = said
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| polkit_of_version(&String::from_utf8_lossy(&o.stdout)))
+        {
+            return p;
+        }
         let rules = rule.parent().unwrap_or(Path::new("/etc/polkit-1/rules.d"));
         // polkit 0.106 and later read rules from both folders; the one in
         // /usr is the package's, there whether or not /etc has one yet.
@@ -929,33 +1138,75 @@ fn put_owners(
         }
     }
     let rule = layout.polkit_rule();
-    match sys.polkit(&rule) {
-        Polkit::Rules => {
-            let text = polkit_rule_text();
-            if std::fs::read_to_string(&rule).ok().as_deref() != Some(text.as_str()) {
-                write_file(&rule, text.as_bytes(), 0o644)?;
-                steps.did(format!(
-                    "wrote the polkit rule {}: the owners start, stop and restart the service without a password",
-                    rule.display()
-                ));
-            }
+    let polkit = sys.polkit(&rule);
+    if polkit == Polkit::Missing {
+        steps.did("Warning: polkit is not installed: starting and stopping the service needs sudo");
+        return Ok(());
+    }
+    // The helper and its action on every polkit; what lets the owners run
+    // it is the rule, or on 0.105 the `.pkla` file, and only the one this
+    // polkit reads is kept.
+    let helper = layout.service_helper();
+    let mut wrote = false;
+    for (path, text, mode) in [
+        (helper.clone(), service_helper_text(), 0o755),
+        (layout.polkit_action(), polkit_action_text(&helper), 0o644),
+        if polkit == Polkit::Rules {
+            (rule.clone(), polkit_rule_text(), 0o644)
+        } else {
+            (layout.polkit_pkla(), polkit_pkla_text(), 0o644)
+        },
+    ] {
+        if std::fs::read_to_string(&path).ok().as_deref() != Some(text.as_str()) {
+            write_file(&path, text.as_bytes(), mode)?;
+            wrote = true;
         }
-        Polkit::Old => steps.did(
-            "Warning: polkit here is older than 0.106 and takes no rules: starting and stopping the service asks for an administrator's password",
-        ),
-        Polkit::Missing => {
-            steps.did("Warning: polkit is not installed: starting and stopping the service needs sudo")
-        }
+    }
+    let other = if polkit == Polkit::Rules {
+        layout.polkit_pkla()
+    } else {
+        rule
+    };
+    remove_if_there(&other)?;
+    if wrote {
+        let by = match polkit {
+            Polkit::Rules => format!("the rule {}", layout.polkit_rule().display()),
+            _ => format!("{} (polkit 0.105)", layout.polkit_pkla().display()),
+        };
+        steps.did(format!(
+            "polkit lets the owners start, stop and restart the service without a password, by {by} and the helper {}",
+            helper.display()
+        ));
     }
     Ok(())
 }
 
-/// Removes the owners' parts again: the polkit rule and the group.
+/// Removes the file at `path` when it is there.
+fn remove_if_there(path: &Path) -> Result<bool, String> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// Removes the owners' parts again: the polkit files, the service helper
+/// and the group.
 fn remove_owners(layout: &Layout, sys: &dyn System, steps: &mut Steps) -> Result<(), String> {
-    let rule = layout.polkit_rule();
-    if rule.exists() {
-        std::fs::remove_file(&rule).map_err(|e| format!("{}: {e}", rule.display()))?;
-        steps.did(format!("removed the polkit rule {}", rule.display()));
+    let helper = layout.service_helper();
+    for path in [
+        layout.polkit_rule(),
+        layout.polkit_pkla(),
+        layout.polkit_action(),
+        helper.clone(),
+    ] {
+        if remove_if_there(&path)? {
+            steps.did(format!("removed {}", path.display()));
+        }
+    }
+    // Its folder is the helper's alone.
+    if let Some(dir) = helper.parent() {
+        let _ = std::fs::remove_dir(dir);
     }
     let group = crate::owner::GROUP;
     if sys.has_group(group)? {
@@ -1708,8 +1959,9 @@ pub fn control(
     action: ServiceAction,
     out: &mut dyn Write,
 ) -> Result<(), String> {
-    // Without root, systemctl asks polkit, whose rule lets the owners do it
-    // (crate::owner); it refuses everyone else.
+    // Without root, the helper or systemctl asks polkit, whose rule or
+    // `.pkla` file lets the owners do it (crate::owner); it refuses everyone
+    // else.
     supported_without_root(sys, &format!("service {}", action.word()))?;
     if !layout.installed_at_unit() {
         return Err(
@@ -1717,7 +1969,14 @@ pub fn control(
                 .into(),
         );
     }
-    sys.systemctl(&[action.word(), UNIT_NAME])?;
+    let helper = layout.service_helper();
+    if !sys.is_root() && helper.is_file() && sys.has_pkexec() {
+        // Through the helper's own polkit action, which the owners have
+        // without a password on every polkit, 0.105 too.
+        sys.pkexec(&helper, &[action.word()])?;
+    } else {
+        sys.systemctl(&[action.word(), UNIT_NAME])?;
+    }
     let said = match action {
         ServiceAction::Stop => {
             let again = if sys.unit_state()?.enabled == Some(true) {
@@ -2143,6 +2402,9 @@ pub(crate) mod tests {
         pub(crate) groups: RefCell<Vec<(String, Vec<String>)>>,
         /// What polkit takes here.
         pub(crate) polkit: std::cell::Cell<Polkit>,
+        /// Whether the command runs as root, and whether pkexec is there.
+        pub(crate) root: std::cell::Cell<bool>,
+        pub(crate) pkexec_here: std::cell::Cell<bool>,
     }
 
     impl Fake {
@@ -2158,6 +2420,8 @@ pub(crate) mod tests {
                 lingers: std::cell::Cell::new(false),
                 groups: RefCell::new(Vec::new()),
                 polkit: std::cell::Cell::new(Polkit::Rules),
+                root: std::cell::Cell::new(true),
+                pkexec_here: std::cell::Cell::new(true),
             }
         }
 
@@ -2202,7 +2466,18 @@ pub(crate) mod tests {
 
     impl System for Fake {
         fn is_root(&self) -> bool {
-            true
+            self.root.get()
+        }
+        fn has_pkexec(&self) -> bool {
+            self.pkexec_here.get()
+        }
+        fn pkexec(&self, program: &Path, args: &[&str]) -> Result<(), String> {
+            self.calls.borrow_mut().push(format!(
+                "pkexec {} {}",
+                program.display(),
+                args.join(" ")
+            ));
+            Ok(())
         }
         fn has_systemd(&self) -> bool {
             true
@@ -2263,7 +2538,10 @@ pub(crate) mod tests {
         fn unit_state(&self) -> Result<ServiceState, String> {
             let calls = self.calls.borrow();
             let last = calls.iter().rev().find_map(|c| {
-                let c = c.strip_prefix("systemctl ")?;
+                // The helper's word is the last of a pkexec call.
+                let c = c
+                    .strip_prefix("systemctl ")
+                    .or_else(|| c.strip_prefix("pkexec ").and_then(|r| r.rsplit(' ').next()))?;
                 if c.starts_with("start") || c.starts_with("restart") {
                     Some("running")
                 } else if c.starts_with("stop") || c.starts_with("disable --now") {
@@ -3290,27 +3568,162 @@ pub(crate) mod tests {
         );
     }
 
-    /// Without polkit rules the owners are told that starting and stopping
-    /// asks for a password; root alone installing makes no owner.
+    /// Without polkit the owners are told that starting and stopping needs
+    /// sudo; root alone installing makes no owner.
     #[test]
     fn install_says_what_polkit_and_the_owners_are_here() {
-        for (polkit, said) in [
-            (Polkit::Old, "Warning: polkit here is older than 0.106"),
-            (Polkit::Missing, "Warning: polkit is not installed"),
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        sys.polkit.set(Polkit::Missing);
+        let l = layout(d.path());
+        let exe = d.path().join("nerve-node-x86_64-linux");
+        std::fs::write(&exe, "nerve-node 1.0.0\n").unwrap();
+        let mut out = Vec::new();
+        install(&l, &sys, &exe, "root", &mut out).unwrap();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.contains("Warning: polkit is not installed"), "{out}");
+        for f in [
+            l.polkit_rule(),
+            l.polkit_pkla(),
+            l.polkit_action(),
+            l.service_helper(),
         ] {
-            let d = tempfile::tempdir().unwrap();
-            let sys = Fake::new();
-            sys.polkit.set(polkit);
-            let l = layout(d.path());
-            let exe = d.path().join("nerve-node-x86_64-linux");
-            std::fs::write(&exe, "nerve-node 1.0.0\n").unwrap();
-            let mut out = Vec::new();
-            install(&l, &sys, &exe, "root", &mut out).unwrap();
-            let out = String::from_utf8(out).unwrap();
-            assert!(out.contains(said), "{out}");
-            assert!(!l.polkit_rule().exists());
-            assert!(out.contains("no owner besides root"), "{out}");
-            assert_eq!(sys.members(crate::owner::GROUP), Some(Vec::new()));
+            assert!(!f.exists(), "{}", f.display());
+        }
+        assert!(out.contains("no owner besides root"), "{out}");
+        assert_eq!(sys.members(crate::owner::GROUP), Some(Vec::new()));
+    }
+
+    /// On polkit 0.105, which takes no rules, the owners get the service
+    /// helper through its own action and a `.pkla` file for it, never one
+    /// for systemd's `manage-units`; on a newer polkit through the rule.
+    /// An update moves from one to the other, and uninstall removes them.
+    #[tokio::test]
+    async fn polkit_0105_gets_the_helper_and_a_pkla_file_and_newer_the_rule() {
+        let d = tempfile::tempdir().unwrap();
+        let sys = Fake::new();
+        sys.polkit.set(Polkit::Old);
+        let l = installed(d.path(), &sys, "1.0.0");
+        let helper = l.service_helper();
+        assert_eq!(
+            helper,
+            d.path().join("usr/local/lib/nerve-node/service-control")
+        );
+        assert_eq!(
+            std::fs::read_to_string(&helper).unwrap(),
+            service_helper_text()
+        );
+        assert_eq!(mode(&helper), 0o755);
+        let action = l.polkit_action();
+        assert_eq!(
+            action,
+            d.path()
+                .join("usr/share/polkit-1/actions/org.nerve-protocol.node.service-control.policy")
+        );
+        let policy = std::fs::read_to_string(&action).unwrap();
+        assert_eq!(policy, polkit_action_text(&helper));
+        assert!(
+            policy.contains(&format!(
+                "<annotate key=\"org.freedesktop.policykit.exec.path\">{}</annotate>",
+                helper.display()
+            )),
+            "{policy}"
+        );
+        assert!(policy.contains("<allow_active>auth_admin</allow_active>"));
+        let pkla = l.polkit_pkla();
+        assert_eq!(
+            pkla,
+            d.path()
+                .join("etc/polkit-1/localauthority/50-local.d/50-nerve-node.pkla")
+        );
+        let text = std::fs::read_to_string(&pkla).unwrap();
+        assert_eq!(text, polkit_pkla_text());
+        for line in [
+            "Identity=unix-group:nerve-admin",
+            "Action=org.nerve-protocol.node.service-control",
+            "ResultActive=yes",
+        ] {
+            assert!(text.lines().any(|l| l == line), "{line}: {text}");
+        }
+        assert!(!text.contains("manage-units") && !text.contains("ResultAny"));
+        assert!(!l.polkit_rule().exists());
+
+        // The machine got a newer polkit: the rule takes the .pkla file's
+        // place.
+        sys.polkit.set(Polkit::Rules);
+        let new = d.path().join("new");
+        std::fs::write(&new, "nerve-node 1.1.0\n").unwrap();
+        let mut out = Vec::new();
+        update(&l, &sys, Some(&new), "alice", &mut out)
+            .await
+            .unwrap();
+        let rule = std::fs::read_to_string(l.polkit_rule()).unwrap();
+        assert!(rule.contains(POLKIT_ACTION), "{rule}");
+        assert!(!pkla.exists());
+        assert!(helper.is_file() && action.is_file());
+
+        let mut out = Vec::new();
+        uninstall(&l, &sys, false, &mut out).unwrap();
+        for f in [l.polkit_rule(), pkla, action, helper.clone()] {
+            assert!(!f.exists(), "{}", f.display());
+        }
+        assert!(!helper.parent().unwrap().exists());
+    }
+
+    /// The helper does what it says and nothing else: one of the three
+    /// words, or it stops before systemctl.
+    #[cfg(unix)]
+    #[test]
+    fn the_service_helper_takes_three_words_only() {
+        let d = tempfile::tempdir().unwrap();
+        let helper = d.path().join("service-control");
+        std::fs::write(&helper, service_helper_text()).unwrap();
+        let sh = |args: &[&str]| {
+            std::process::Command::new("sh")
+                .arg(&helper)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let checked = std::process::Command::new("sh")
+            .arg("-n")
+            .arg(&helper)
+            .status()
+            .unwrap();
+        assert!(checked.success());
+        for args in [
+            &[][..],
+            &["status"][..],
+            &["start", "other.service"][..],
+            &["enable"][..],
+            &["start;id"][..],
+        ] {
+            let o = sh(args);
+            assert_eq!(o.status.code(), Some(2), "{args:?}");
+            assert!(
+                String::from_utf8_lossy(&o.stderr).contains("usage"),
+                "{args:?}"
+            );
+        }
+        let text = service_helper_text();
+        assert!(
+            text.contains(&format!("exec systemctl \"$1\" {UNIT_NAME}")),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn polkit_is_told_by_its_version() {
+        for (said, kind) in [
+            ("pkaction version 0.105\n", Some(Polkit::Old)),
+            ("pkaction version 0.106", Some(Polkit::Rules)),
+            ("pkaction version 0.116", Some(Polkit::Rules)),
+            ("pkaction version 124\n", Some(Polkit::Rules)),
+            ("pkaction version 122", Some(Polkit::Rules)),
+            ("", None),
+            ("pkaction version x", None),
+        ] {
+            assert_eq!(polkit_of_version(said), kind, "{said:?}");
         }
     }
 
@@ -3787,6 +4200,28 @@ pub(crate) mod tests {
             assert!(String::from_utf8(out).unwrap().contains("the node answers"));
             assert_eq!(unit_status(&l, &sys).unwrap().unwrap().state, "running");
         }
+        // An owner, not root, goes through the helper with pkexec; without
+        // pkexec through systemctl, which the rule allows on a newer polkit.
+        sys.root.set(false);
+        let helper = l.service_helper();
+        for (action, word) in [
+            (ServiceAction::Stop, "stop"),
+            (ServiceAction::Start, "start"),
+            (ServiceAction::Restart, "restart"),
+        ] {
+            control(&l, &sys, action, &mut Vec::new()).unwrap();
+            assert_eq!(
+                sys.calls().last().unwrap(),
+                &format!("pkexec {} {word}", helper.display())
+            );
+        }
+        sys.pkexec_here.set(false);
+        control(&l, &sys, ServiceAction::Restart, &mut Vec::new()).unwrap();
+        assert_eq!(
+            sys.calls().last().unwrap(),
+            &format!("systemctl restart {UNIT_NAME}")
+        );
+        sys.root.set(true);
         // A node that does not come up is said.
         sys.starts.set(false);
         assert!(control(&l, &sys, ServiceAction::Restart, &mut Vec::new()).is_err());

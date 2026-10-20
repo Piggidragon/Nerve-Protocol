@@ -7,7 +7,7 @@ import { Store, Perm, Prefs, Install } from "store.slint";
 import { Working, DidList, UninstallChoice, UpdateChoice } from "installer.slint";
 import {
     Button, ButtonKind, Banner, Dialog, DialogButtons, Field, TextField, InfoRow, Divider, Code,
-    Icon, CheckBox, Segmented, TextArea, CopyText, OptionTile, Steps, Reveal,
+    Icon, CheckBox, Segmented, TextArea, CopyText, OptionTile, Steps, Reveal, ScrollBox,
 } from "widgets.slint";
 
 export component PairDialog inherits Dialog {
@@ -965,11 +965,16 @@ export component RelayNodeDialog inherits Dialog {
         hint: "None ticked: every https center, also one paired later.";
         VerticalLayout {
             spacing: Space.sm;
-            for p[i] in Prefs.relay-edit-centers: CheckBox {
-                checked: p.on;
-                text: p.name;
-                toggled(on) => {
-                    Prefs.relay-edit-pick(i, on);
+            ScrollBox {
+                rows: Prefs.relay-edit-centers.length;
+                long-height: 300px;
+                spacing: Space.sm;
+                for p[i] in Prefs.relay-edit-centers: CheckBox {
+                    checked: p.on;
+                    text: p.name;
+                    toggled(on) => {
+                        Prefs.relay-edit-pick(i, on);
+                    }
                 }
             }
         }

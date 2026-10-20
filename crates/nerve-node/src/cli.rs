@@ -333,13 +333,13 @@ pub enum ServiceCmd {
 
 #[derive(Debug, Subcommand)]
 pub enum AuditCmd {
-    /// Start the audit log afresh: the entries so far are kept as its one older file (audit.jsonl.1, which replaces the one before), and the new log begins with an entry of who cleared it.
+    /// Start the audit log afresh. The entries so far become its one older file (audit.jsonl.1, in place of the one before), and the new log begins with an entry of who cleared it.
     Clear,
 }
 
 #[derive(Debug, Subcommand)]
 pub enum LogCmd {
-    /// Empty the node's log, its older file too; the new log begins with a line of who cleared it.
+    /// Empty the node's log and its older file. The new log begins with a line of who cleared it.
     Clear,
 }
 

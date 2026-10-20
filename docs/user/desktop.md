@@ -232,7 +232,9 @@ in allowlist mode its allowed commands, with the deny rules below them as
 forbidden commands, and a line that the allow rules count only in allowlist
 mode. The sudo list is in **Sudo**, beside its switch. The pencil beside a
 rule edits it in place, as one change (`rule edit`), the rules of the guard
-too.
+too. A list longer than some eight rows (rules, folders, capabilities, a
+relay's nodes, the centers on the Overview) scrolls in a box of its own, with
+its scroll bar beside it, so the page stays short.
 
 On **Permissions**, a center that lacks the guard against changing the node
 (a pairing from before it, or one you took a rule off) shows **Add the

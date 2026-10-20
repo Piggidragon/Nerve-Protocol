@@ -2005,3 +2005,69 @@ export component ListRow inherits Rectangle {
         }
     }
 }
+
+// A list that can grow long, in a box of its own: up to `max-rows` rows it
+// is as tall as they are; past them it is `long-height` tall (eight rows and
+// a half, so a cut row says there is more) and scrolls inside, with a scroll
+// bar that stays in sight beside the rows, so the page around stays short.
+// Whether it is long goes by the count of rows, not their height, so its
+// height never waits on its own width.
+export component ScrollBox {
+    in property <int> rows;
+    in property <int> max-rows: 8;
+    in property <length> long-height: 420px;
+    in property <length> spacing;
+    property <bool> long: root.rows > root.max-rows;
+    // The room the bar takes at the right.
+    property <length> gutter: root.long ? 14px : 0px;
+    height: root.long ? root.long-height : column.preferred-height;
+    flick := Flickable {
+        x: 0;
+        width: root.width - root.gutter;
+        height: root.height;
+        content-width: self.width;
+        content-height: column.preferred-height;
+        column := VerticalLayout {
+            width: flick.width;
+            alignment: start;
+            spacing: root.spacing;
+            @children
+        }
+    }
+    // The bar: a track with its thumb where the rows are; a press or a drag
+    // on it scrolls there.
+    if root.long: track := Rectangle {
+        property <length> span: max(0px, flick.content-height - flick.height);
+        x: root.width - root.gutter + 4px;
+        y: 4px;
+        width: root.gutter - 8px;
+        height: root.height - 8px;
+        border-radius: self.width / 2;
+        background: Theme.border;
+        thumb := Rectangle {
+            width: parent.width;
+            height: max(28px, parent.height * flick.height / max(1px, flick.content-height));
+            y: track.span > 0 ? (parent.height - self.height) * (-flick.content-y / track.span) : 0;
+            border-radius: self.width / 2;
+            background: drag.pressed ? Theme.accent : drag.has-hover ? Theme.text-muted : Theme.text-faint.transparentize(0.3);
+        }
+        drag := TouchArea {
+            mouse-cursor: MouseCursor.default;
+            function go() {
+                if (track.span > 0) {
+                    flick.content-y = -track.span * clamp((self.mouse-y - thumb.height / 2) / max(1px, track.height - thumb.height), 0, 1);
+                }
+            }
+            pointer-event(event) => {
+                if (event.kind == PointerEventKind.down) {
+                    self.go();
+                }
+            }
+            moved => {
+                if (self.pressed) {
+                    self.go();
+                }
+            }
+        }
+    }
+}

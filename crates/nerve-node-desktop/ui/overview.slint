@@ -6,7 +6,7 @@ import { Page, Load } from "data.slint";
 import { Store } from "store.slint";
 import {
     Button, ButtonKind, Card, Pill, StatusDot, IconTile, Banner, Loading, PageHeader,
-    PageFrame, SectionTitle, StatTile, Divider, Icon, Reveal, Fit,
+    PageFrame, SectionTitle, StatTile, Divider, Icon, Reveal, Fit, ScrollBox,
 } from "widgets.slint";
 
 export component OverviewPage inherits PageFrame {
@@ -426,57 +426,62 @@ export component OverviewPage inherits PageFrame {
                 Card {
                     pad: 0;
                     gap: 0;
-                    for c[i] in Store.centers: Fit {
-                        Divider {
-                            visible: i > 0;
-                            height: i > 0 ? 1px : 0;
-                        }
-                        HorizontalLayout {
-                            padding-left: Space.xl;
-                            padding-right: Space.xl;
-                            padding-top: 14px;
-                            padding-bottom: 14px;
-                            spacing: Space.md;
-                            VerticalLayout {
-                                alignment: center;
-                                StatusDot {
-                                    tone: c.link-tone;
-                                }
+                    ScrollBox {
+                        rows: Store.centers.length;
+                        // Taller rows: half of one more shows below the cut.
+                        long-height: 450px;
+                        for c[i] in Store.centers: Fit {
+                            Divider {
+                                visible: i > 0;
+                                height: i > 0 ? 1px : 0;
                             }
-                            VerticalLayout {
-                                spacing: 2px;
-                                horizontal-stretch: 1;
+                            HorizontalLayout {
+                                padding-left: Space.xl;
+                                padding-right: Space.xl;
+                                padding-top: 14px;
+                                padding-bottom: 14px;
+                                spacing: Space.md;
+                                VerticalLayout {
+                                    alignment: center;
+                                    StatusDot {
+                                        tone: c.link-tone;
+                                    }
+                                }
+                                VerticalLayout {
+                                    spacing: 2px;
+                                    horizontal-stretch: 1;
+                                    Text {
+                                        text: c.name;
+                                        color: Theme.text;
+                                        font-size: Type.body;
+                                        font-weight: Type.semibold;
+                                        overflow: elide;
+                                    }
+                                    Text {
+                                        text: c.url;
+                                        color: Theme.text-muted;
+                                        font-size: Type.caption;
+                                        font-family: Type.mono;
+                                        overflow: elide;
+                                    }
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    Pill {
+                                        text: c.mode;
+                                        tone: Tone.accent;
+                                    }
+                                }
                                 Text {
-                                    text: c.name;
-                                    color: Theme.text;
-                                    font-size: Type.body;
+                                    min-width: 120px;
+                                    text: c.link;
+                                    color: c.link-tone == Tone.neutral ? Theme.text-muted : Theme.tone(c.link-tone);
+                                    font-size: Type.small;
                                     font-weight: Type.semibold;
+                                    vertical-alignment: center;
+                                    horizontal-alignment: right;
                                     overflow: elide;
                                 }
-                                Text {
-                                    text: c.url;
-                                    color: Theme.text-muted;
-                                    font-size: Type.caption;
-                                    font-family: Type.mono;
-                                    overflow: elide;
-                                }
-                            }
-                            VerticalLayout {
-                                alignment: center;
-                                Pill {
-                                    text: c.mode;
-                                    tone: Tone.accent;
-                                }
-                            }
-                            Text {
-                                min-width: 120px;
-                                text: c.link;
-                                color: c.link-tone == Tone.neutral ? Theme.text-muted : Theme.tone(c.link-tone);
-                                font-size: Type.small;
-                                font-weight: Type.semibold;
-                                vertical-alignment: center;
-                                horizontal-alignment: right;
-                                overflow: elide;
                             }
                         }
                     }

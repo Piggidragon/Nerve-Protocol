@@ -8,7 +8,7 @@ import { Store, Perm } from "store.slint";
 import {
     Button, ButtonKind, Card, Pill, Banner, Loading, PageHeader, PageFrame, EmptyState, Divider, IconTile,
     Segmented, Picker, SectionTitle, OptionTile, Chip, ListRow, TextField, Switch, Icon, Code, Reveal,
-    PathText,
+    PathText, ScrollBox,
 } from "widgets.slint";
 
 // A part of the page: its icon in its colour, its title, a line on it,
@@ -125,58 +125,61 @@ component FolderSection inherits Section {
             }
         }
     }
-    for f[i] in Perm.folders: ListRow {
-        first: i == 0;
-        VerticalLayout {
-            alignment: center;
-            Icon {
-                source: @image-url("icons/folder.svg");
-                colorize: Theme.text-muted;
-            }
-        }
-        // A deep folder keeps its own name in sight.
-        VerticalLayout {
-            horizontal-stretch: 1;
-            alignment: center;
-            PathText {
-                text: f.path;
-            }
-        }
-        HorizontalLayout {
-            spacing: 4px;
-            alignment: center;
-            Chip {
-                text: "Read";
-                label: "Read " + f.path;
-                on: f.read;
-                toggled(on) => {
-                    Perm.folder-set(f.path, on, f.write, f.execute);
+    ScrollBox {
+        rows: Perm.folders.length;
+        for f[i] in Perm.folders: ListRow {
+            first: i == 0;
+            VerticalLayout {
+                alignment: center;
+                Icon {
+                    source: @image-url("icons/folder.svg");
+                    colorize: Theme.text-muted;
                 }
             }
-            Chip {
-                text: "Write";
-                label: "Write " + f.path;
-                on: f.write;
-                toggled(on) => {
-                    Perm.folder-set(f.path, f.read, on, f.execute);
+            // A deep folder keeps its own name in sight.
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                PathText {
+                    text: f.path;
                 }
             }
-            Chip {
-                text: "Run";
-                label: "Run commands in " + f.path;
-                on: f.execute;
-                toggled(on) => {
-                    Perm.folder-set(f.path, f.read, f.write, on);
+            HorizontalLayout {
+                spacing: 4px;
+                alignment: center;
+                Chip {
+                    text: "Read";
+                    label: "Read " + f.path;
+                    on: f.read;
+                    toggled(on) => {
+                        Perm.folder-set(f.path, on, f.write, f.execute);
+                    }
+                }
+                Chip {
+                    text: "Write";
+                    label: "Write " + f.path;
+                    on: f.write;
+                    toggled(on) => {
+                        Perm.folder-set(f.path, f.read, on, f.execute);
+                    }
+                }
+                Chip {
+                    text: "Run";
+                    label: "Run commands in " + f.path;
+                    on: f.execute;
+                    toggled(on) => {
+                        Perm.folder-set(f.path, f.read, f.write, on);
+                    }
                 }
             }
-        }
-        Button {
-            icon: @image-url("icons/trash.svg");
-            kind: ButtonKind.ghost;
-            small: true;
-            accessible-label: "Remove " + f.path;
-            clicked => {
-                Perm.folder-remove(f.path);
+            Button {
+                icon: @image-url("icons/trash.svg");
+                kind: ButtonKind.ghost;
+                small: true;
+                accessible-label: "Remove " + f.path;
+                clicked => {
+                    Perm.folder-remove(f.path);
+                }
             }
         }
     }
@@ -217,72 +220,75 @@ component RuleList {
     in-out property <string> new-text;
     in-out property <bool> new-wild;
     VerticalLayout {
-        for r[i] in root.rules: ListRow {
-            first: i == 0;
-            property <bool> editing: Perm.edit-list == root.list && Perm.edit-index == i;
-            VerticalLayout {
-                horizontal-stretch: 1;
-                alignment: center;
-                Reveal {
-                    shown: !editing;
-                    Text {
-                        text: r;
-                        color: Theme.text;
-                        font-size: Type.small;
-                        font-family: Type.mono;
-                        vertical-alignment: center;
-                        wrap: word-wrap;
+        ScrollBox {
+            rows: root.rules.length;
+            for r[i] in root.rules: ListRow {
+                first: i == 0;
+                property <bool> editing: Perm.edit-list == root.list && Perm.edit-index == i;
+                VerticalLayout {
+                    horizontal-stretch: 1;
+                    alignment: center;
+                    Reveal {
+                        shown: !editing;
+                        Text {
+                            text: r;
+                            color: Theme.text;
+                            font-size: Type.small;
+                            font-family: Type.mono;
+                            vertical-alignment: center;
+                            wrap: word-wrap;
+                        }
                     }
-                }
-                Reveal {
-                    shown: editing;
-                    TextField {
-                        text <=> Perm.edit-text;
-                        mono: true;
-                        label: "Rule";
-                        enabled: !Perm.edit-busy;
-                        accepted => {
-                            Perm.rule-edit-save();
+                    Reveal {
+                        shown: editing;
+                        TextField {
+                            text <=> Perm.edit-text;
+                            mono: true;
+                            label: "Rule";
+                            enabled: !Perm.edit-busy;
+                            accepted => {
+                                Perm.rule-edit-save();
+                            }
                         }
                     }
                 }
-            }
-            if !editing: Button {
-                icon: @image-url("icons/edit.svg");
-                kind: ButtonKind.ghost;
-                small: true;
-                accessible-label: "Edit " + r;
-                clicked => {
-                    Perm.edit-text = r;
-                    Perm.edit-index = i;
-                    Perm.edit-list = root.list;
+                if !editing: Button {
+                    icon: @image-url("icons/edit.svg");
+                    kind: ButtonKind.ghost;
+                    small: true;
+                    accessible-label: "Edit " + r;
+                    clicked => {
+                        Perm.edit-text = r;
+                        Perm.edit-index = i;
+                        Perm.edit-list = root.list;
+                    }
                 }
-            }
-            if !editing: Button {
-                icon: @image-url("icons/x.svg");
-                kind: ButtonKind.ghost;
-                small: true;
-                accessible-label: "Remove " + r;
-                clicked => {
-                    Perm.rule-remove(root.list, r);
+                if !editing: Button {
+                    icon: @image-url("icons/x.svg");
+                    kind: ButtonKind.ghost;
+                    small: true;
+                    accessible-label: "Remove " + r;
+                    clicked => {
+                        Perm.rule-remove(root.list, r);
+                    }
                 }
-            }
-            if editing: Button {
-                text: "Cancel";
-                kind: ButtonKind.ghost;
-                small: true;
-                clicked => {
-                    Perm.edit-list = -1;
+                if editing: Button {
+                    text: "Cancel";
+                    kind: ButtonKind.ghost;
+                    small: true;
+                    clicked => {
+                        Perm.edit-list = -1;
+                    }
                 }
-            }
-            if editing: Button {
-                text: "Save";
-                kind: ButtonKind.primary;
-                small: true;
-                busy: Perm.edit-busy;
-                enabled: Perm.edit-text != "" && Perm.edit-text != r;
-                clicked => {
-                    Perm.rule-edit-save();
+                if editing: Button {
+                    text: "Save";
+                    kind: ButtonKind.primary;
+                    small: true;
+                    busy: Perm.edit-busy;
+                    enabled: Perm.edit-text != "" && Perm.edit-text != r;
+                    clicked => {
+                        Perm.rule-edit-save();
+                    }
                 }
             }
         }
@@ -475,37 +481,40 @@ component CapSection inherits Section {
     icon: @image-url("icons/plug.svg");
     title: "Capabilities";
     text: "Off: " + Perm.center + " may not use it. Hidden: it does not see it.";
-    for c[i] in Perm.caps: ListRow {
-        first: i == 0;
-        HorizontalLayout {
-            horizontal-stretch: 1;
-            padding-left: c.action ? Space.xl : 0;
-            spacing: Space.sm;
-            Text {
-                text: c.name;
-                color: c.action ? Theme.text-muted : Theme.text;
-                font-size: Type.small;
-                font-weight: c.action ? Type.regular : Type.semibold;
-                font-family: Type.mono;
-                vertical-alignment: center;
-            }
-            if c.set: VerticalLayout {
-                alignment: center;
-                horizontal-stretch: 0;
-                Pill {
-                    text: "set here";
-                    tone: Tone.neutral;
+    ScrollBox {
+        rows: Perm.caps.length;
+        for c[i] in Perm.caps: ListRow {
+            first: i == 0;
+            HorizontalLayout {
+                horizontal-stretch: 1;
+                padding-left: c.action ? Space.xl : 0;
+                spacing: Space.sm;
+                Text {
+                    text: c.name;
+                    color: c.action ? Theme.text-muted : Theme.text;
+                    font-size: Type.small;
+                    font-weight: c.action ? Type.regular : Type.semibold;
+                    font-family: Type.mono;
+                    vertical-alignment: center;
+                }
+                if c.set: VerticalLayout {
+                    alignment: center;
+                    horizontal-stretch: 0;
+                    Pill {
+                        text: "set here";
+                        tone: Tone.neutral;
+                    }
+                }
+                Rectangle {
+                    horizontal-stretch: 1;
                 }
             }
-            Rectangle {
-                horizontal-stretch: 1;
-            }
-        }
-        Segmented {
-            options: ["On", "Off", "Hidden"];
-            current: c.setting;
-            chosen(s) => {
-                Perm.cap-set(c.name, s);
+            Segmented {
+                options: ["On", "Off", "Hidden"];
+                current: c.setting;
+                chosen(s) => {
+                    Perm.cap-set(c.name, s);
+                }
             }
         }
     }

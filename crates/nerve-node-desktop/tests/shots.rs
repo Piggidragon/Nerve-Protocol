@@ -417,6 +417,19 @@ fn every_page_light_and_dark() {
     store.invoke_show(Page::Overview);
     store.set_service_state("running".into());
     shots.take("overview");
+    // Many centers: their list scrolls in its own box.
+    let paired = store.get_centers();
+    let first = paired.row_data(0).unwrap();
+    let crowd: Vec<_> = (0..14)
+        .map(|i| {
+            let mut c = first.clone();
+            c.name = format!("center-{i:02}").into();
+            c
+        })
+        .collect();
+    store.set_centers(slint::ModelRc::new(slint::VecModel::from(crowd)));
+    shots.take_full("overview-long", 1700);
+    store.set_centers(paired);
     store.set_busy("service-restart".into());
     shots.take("overview-service-restarting");
     store.set_busy("".into());
@@ -543,6 +556,26 @@ fn every_page_light_and_dark() {
     perm.set_except_open(true);
     shots.take_full("permissions-allowlist-exceptions", 2250);
     perm.set_except_open(false);
+    // Long lists: each scrolls in its own box, and the page stays short.
+    for i in 0..18 {
+        run(&[
+            "rule",
+            "add",
+            "allow",
+            &format!("make target-{i}"),
+            "--center",
+            OFFICE,
+        ]);
+    }
+    for i in 0..14 {
+        let p = root.join(format!("alex/clients/client-{i:02}/repository"));
+        std::fs::create_dir_all(&p).unwrap();
+        let p = p.display().to_string();
+        run(&["folder", "add", &p, "+r", "+w", "--center", OFFICE]);
+    }
+    perm.invoke_pick(office as i32);
+    shots.take("permissions-long");
+    shots.take_full("permissions-long", 2050);
     perm.invoke_pick(0);
     perm.invoke_mode_pick("user".into());
     perm.set_mode_timed(true);
@@ -683,6 +716,27 @@ fn every_page_light_and_dark() {
     )));
     shots.take("relay-on");
     shots.take_full("relay-on", 1250);
+    // Many nodes and tunnels: each list in its own box.
+    let many: Vec<serde_json::Value> = (0..16)
+        .map(|i| serde_json::json!({"name": format!("build-agent-{i:02}"), "centers": [], "max_links": 4, "max_opens_per_minute": 30, "own_limits": false}))
+        .collect();
+    let tunnels: Vec<serde_json::Value> = (0..14)
+        .map(|i| serde_json::json!({"node": format!("build-agent-{i:02}"), "from": format!("10.0.4.{}:5154{}", 20 + i, i % 10), "center": "home", "since_ms": nerve_node::now_ms() - 60_000 * (i + 1)}))
+        .collect();
+    let crowd = serde_json::json!({"nodes": many, "tunnels": tunnels});
+    prefs.set_relay_nodes(slint::ModelRc::new(slint::VecModel::from(
+        nerve_node_desktop::view::relay_nodes(&crowd),
+    )));
+    prefs.set_tunnels(slint::ModelRc::new(slint::VecModel::from(
+        nerve_node_desktop::view::tunnels(&crowd, nerve_node::now_ms()),
+    )));
+    shots.take_full("relay-on-long", 1500);
+    prefs.set_relay_nodes(slint::ModelRc::new(slint::VecModel::from(
+        nerve_node_desktop::view::relay_nodes(&relay),
+    )));
+    prefs.set_tunnels(slint::ModelRc::new(slint::VecModel::from(
+        nerve_node_desktop::view::tunnels(&relay, nerve_node::now_ms()),
+    )));
     // This node through a relay, and the dialog that takes the link.
     prefs.set_via_relay(true);
     prefs.set_via_address("relay.lab.example:7490".into());

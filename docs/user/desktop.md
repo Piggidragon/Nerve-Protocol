@@ -129,8 +129,8 @@ command runs as an owner. The node refuses its owners' way in to a process
 of a command it runs and to a confined program, but a command that has a
 program of yours start another for it, outside the node (your systemd user
 manager, a tmux server, the task scheduler on Windows), runs as you,
-unconfined: it can change the node's settings, and start and stop the
-service. The Overview warns about it. **Separate account** gives the
+unconfined: it can change the node's settings, and on Windows start and stop
+the service. The Overview warns about it. **Separate account** gives the
 commands an account of their own that is no owner: on Linux it makes
 `nerve-work` (with the administrator's password) and runs commands as it; on
 Windows it opens **Settings**, **Account for commands**, where you name an

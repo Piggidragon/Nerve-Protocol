@@ -651,11 +651,31 @@ fn the_app_drives_the_cli_end_to_end() {
     });
     assert_eq!(logs.get_rows().row_count(), 1);
     logs.invoke_filter(false);
-    // Clear, after its question: one line says who cleared it.
+    // Clear, after its question: one line says who cleared it. The owner
+    // goes to the audit before the answer: the audit keeps its own entries,
+    // and the log's page follows again only when it is open again.
+    until(&ctl, "the whole log", || logs.get_load() == Load::Ready);
     logs.invoke_clear();
     assert!(store.get_confirm_open());
+    store.invoke_show(Page::Audit);
+    until(&ctl, "the audit", || store.get_audit_load() == Load::Ready);
+    let calls = || {
+        store
+            .get_audit()
+            .iter()
+            .filter(|r| r.kind == "call")
+            .count()
+    };
+    let before = calls();
     store.set_confirm_open(false);
     store.invoke_confirm_accepted();
+    assert_eq!(logs.get_load(), Load::Ready, "the log follows on the audit");
+    for _ in 0..20 {
+        ctl.pump();
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(calls(), before, "log lines came into the audit");
+    store.invoke_show(Page::Log);
     until(&ctl, "the cleared log", || {
         logs.get_rows()
             .row_data(0)

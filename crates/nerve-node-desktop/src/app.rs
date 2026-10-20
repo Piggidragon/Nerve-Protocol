@@ -1152,10 +1152,12 @@ impl Ctl {
                         Ok(v) => c.done(&v, said),
                         Err(e) => c.toast(e, Tone::Danger),
                     }
-                    if log {
-                        c.follow_log();
-                    } else {
-                        c.follow_audit();
+                    // The owner may have gone to another page meanwhile:
+                    // only the cleared page, still open, follows again.
+                    match c.with_store(|s| s.get_page()) {
+                        Some(Page::Log) if log => c.follow_log(),
+                        Some(Page::Audit) if !log => c.follow_audit(),
+                        _ => {}
                     }
                 });
             }

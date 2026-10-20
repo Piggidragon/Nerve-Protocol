@@ -321,7 +321,7 @@ pub enum CapCmd {
 
 #[derive(Debug, Subcommand, Clone, Copy)]
 pub enum ServiceCmd {
-    /// Start the installed service (Linux as root, Windows as administrator).
+    /// Start the installed service; an owner of the node needs no root or administrator for it.
     Start,
     /// Stop it: the node ends its links and runs nothing until it starts again, at the latest with the machine.
     Stop,
@@ -623,6 +623,11 @@ pub struct Verb {
     pub about: String,
     /// Its own arguments and flags, without the global and the shared ones.
     pub args: Vec<ArgHelp>,
+    /// Every argument and flag it takes but the global ones, the shared
+    /// ones too: for a page that shows one command on its own (the desktop
+    /// app's reference), where the card's and the page's are not in sight.
+    #[serde(skip)]
+    pub takes: Vec<ArgHelp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -803,15 +808,17 @@ fn verb(sub: &clap::Command, name: &str) -> Verb {
     // A command that also holds others has their form on a second line:
     // that is theirs.
     let usage = usage.lines().next().unwrap_or_default();
+    let args: Vec<ArgHelp> = sub
+        .get_arguments()
+        .filter(|a| !a.is_global_set() && !matches!(a.get_id().as_str(), "help" | "version"))
+        .map(arg_help)
+        .collect();
     Verb {
         name: name.into(),
         usage: usage.strip_prefix("Usage: ").unwrap_or(usage).to_string(),
         about: about_of(sub),
-        args: sub
-            .get_arguments()
-            .filter(|a| !a.is_global_set() && !matches!(a.get_id().as_str(), "help" | "version"))
-            .map(arg_help)
-            .collect(),
+        takes: args.clone(),
+        args,
     }
 }
 

@@ -53,7 +53,11 @@ const COMMANDS: &[(&str, &str, Place)] = &[
     (
         "setup",
         "sudo nerve-node setup",
-        (Some(Page::Overview), -1, "Overview › Set up"),
+        (
+            Some(Page::Overview),
+            -1,
+            "Overview › Set up, while no center is paired",
+        ),
     ),
     (
         "update",
@@ -103,7 +107,7 @@ const COMMANDS: &[(&str, &str, Place)] = &[
     (
         "center grant",
         "nerve-node center grant settings write --center lab",
-        (Some(Page::Centers), -1, "Centers › May change its rights"),
+        (Some(Page::Centers), -1, "Centers › Settings grant"),
     ),
     (
         "proxy set",
@@ -192,22 +196,38 @@ const COMMANDS: &[(&str, &str, Place)] = &[
     (
         "rule add",
         "nerve-node rule add allow 'git status' --center lab",
-        (Some(Page::Policy), -1, "Permissions › Commands › Add"),
+        (
+            Some(Page::Policy),
+            -1,
+            "Permissions › Allowed commands / Forbidden commands › Add",
+        ),
     ),
     (
         "rule rm",
         "nerve-node rule rm allow 'git status' --center lab",
-        (Some(Page::Policy), -1, "Permissions › Commands"),
+        (
+            Some(Page::Policy),
+            -1,
+            "Permissions › Allowed commands / Forbidden commands",
+        ),
     ),
     (
         "rule edit",
         "nerve-node rule edit allow 'exec.run:git status' 'git status --short'",
-        (Some(Page::Policy), -1, "Permissions › Commands › Edit"),
+        (
+            Some(Page::Policy),
+            -1,
+            "Permissions › Allowed commands / Forbidden commands › Edit",
+        ),
     ),
     (
         "rule ls",
         "nerve-node rule ls --center lab",
-        (Some(Page::Policy), -1, "Permissions › Commands"),
+        (
+            Some(Page::Policy),
+            -1,
+            "Permissions › Allowed commands / Forbidden commands",
+        ),
     ),
     (
         "rule guard",
@@ -269,8 +289,8 @@ const COMMANDS: &[(&str, &str, Place)] = &[
         "nerve-node config accept",
         (
             Some(Page::Settings),
-            -1,
-            "Settings, when the node refused node.toml",
+            6,
+            "Settings › Advanced › Take node.toml as it is",
         ),
     ),
     ("run", "nerve-node run", NOT_HERE),
@@ -377,10 +397,11 @@ pub fn commands(h: &nerve_node::cli::Help) -> Vec<Command> {
                     .find(|(n, _, _)| *n == v.name)
                     .map(|(_, e, p)| (e.to_string(), *p))
                     .unwrap_or((format!("nerve-node {}", v.name), NOT_HERE));
-                let args = c
-                    .shared_args
+                // Each row stands alone: what this command takes, not what
+                // its card's other commands take.
+                let args = v
+                    .takes
                     .iter()
-                    .chain(&v.args)
                     .map(|a| (a.name.clone(), a.about.clone()))
                     .collect();
                 out.push(Command {
@@ -522,6 +543,125 @@ mod tests {
                     || example.starts_with(&format!("sudo nerve-node {c}")),
                 "`{c}`: {example}"
             );
+        }
+    }
+
+    /// A row lists what its command takes, once each: not what the other
+    /// commands of its card take.
+    #[test]
+    fn a_row_has_the_arguments_of_its_command() {
+        let all = commands(&nerve_node::cli::help());
+        let args = |name: &str| -> Vec<String> {
+            let c = all.iter().find(|c| c.name == name).unwrap();
+            c.args.iter().map(|(n, _)| n.clone()).collect()
+        };
+        for c in &all {
+            let mut names: Vec<&str> = c.args.iter().map(|(n, _)| n.as_str()).collect();
+            names.sort();
+            let n = names.len();
+            names.dedup();
+            assert_eq!(names.len(), n, "`{}` lists an argument twice", c.name);
+            // What is written in place (`<NAME>`) is in the usage line of
+            // the command that takes it, `[NAME]` when it can be left out.
+            for (a, _) in &c.args {
+                if let Some(value) = a.strip_prefix('<').and_then(|a| a.strip_suffix('>')) {
+                    let left_out = format!("[{value}]");
+                    assert!(
+                        c.usage.contains(a.as_str()) || c.usage.contains(&left_out),
+                        "`{}`: {a}",
+                        c.name
+                    );
+                }
+            }
+        }
+        assert!(!args("relay ls").contains(&"<NAME>".to_string()));
+        assert!(!args("folder ls").contains(&"<PATH>".to_string()));
+        assert_eq!(args("rule ls").iter().filter(|a| *a == "<LIST>").count(), 1);
+        assert!(args("folder add").contains(&"<PATH>".to_string()));
+        // What many commands take is said on the row of each, too.
+        assert!(args("mode set").contains(&"--center <CENTER>".to_string()));
+        // The search finds what a command takes, and only that.
+        let found = groups(&all, "the folder.", false, &Opened::default());
+        assert!(
+            found
+                .iter()
+                .flat_map(|g| g.rows.iter().collect::<Vec<_>>())
+                .all(|r| r.name != "folder ls")
+        );
+    }
+
+    /// The texts of the app's pages, the string literals of ui/*.slint.
+    fn ui_texts() -> Vec<String> {
+        let files = [
+            include_str!("../ui/app.slint"),
+            include_str!("../ui/audit.slint"),
+            include_str!("../ui/centers.slint"),
+            include_str!("../ui/log.slint"),
+            include_str!("../ui/overview.slint"),
+            include_str!("../ui/permissions.slint"),
+            include_str!("../ui/relay.slint"),
+            include_str!("../ui/settings.slint"),
+        ];
+        let mut out = Vec::new();
+        for f in files {
+            for line in f.lines() {
+                let line = line.trim_start();
+                if line.starts_with("//") {
+                    continue;
+                }
+                let mut quoted = line.split('"');
+                quoted.next();
+                while let Some(text) = quoted.next() {
+                    out.push(text.trim().trim_end_matches('…').to_string());
+                    quoted.next();
+                }
+            }
+        }
+        out
+    }
+
+    /// Each step of a place in the app is a word the app shows there, and
+    /// a place in Settings names its tab, which "In the app" opens.
+    #[test]
+    fn every_place_in_the_app_is_there() {
+        let texts = ui_texts();
+        let settings = include_str!("../ui/settings.slint");
+        let tabs: Vec<&str> = settings
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("tabs: ["))
+            .unwrap()
+            .trim_end_matches("];")
+            .split(", ")
+            .map(|t| t.trim_matches('"'))
+            .collect();
+        let pages = [
+            (Page::Overview, "Overview"),
+            (Page::Centers, "Centers"),
+            (Page::Relay, "Relay"),
+            (Page::Policy, "Permissions"),
+            (Page::Audit, "Audit"),
+            (Page::Log, "Log"),
+            (Page::Settings, "Settings"),
+        ];
+        for (name, _, (page, tab, place)) in COMMANDS {
+            let Some(page) = page else { continue };
+            // What follows a comma says when, and is no step.
+            let place = place.split(", ").next().unwrap();
+            let steps: Vec<&str> = place.split(" › ").collect();
+            let label = pages.iter().find(|(p, _)| p == page).unwrap().1;
+            assert_eq!(steps[0], label, "`{name}`: {place}");
+            if *page == Page::Settings {
+                assert!(*tab >= 0, "`{name}` opens no tab");
+                assert_eq!(steps.get(1), tabs.get(*tab as usize), "`{name}`: {place}");
+            }
+            for step in &steps[1..] {
+                for word in step.split(" / ") {
+                    assert!(
+                        texts.iter().any(|t| t == word),
+                        "`{name}`: the app shows no \"{word}\""
+                    );
+                }
+            }
         }
     }
 

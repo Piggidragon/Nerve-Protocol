@@ -59,14 +59,22 @@ commands run as an account of their own, which may not change the node
 ([service](service.md)), and the node's own folders, which no rule or mode
 opens ([protected paths](protected-paths.md)).
 
-## List and remove rules
+## List, change and remove rules
 
 ```sh
 nerve-node rule ls            # all three lists
 nerve-node rule ls allow
+nerve-node rule edit allow 'exec.run:git status' 'git status --short'
 nerve-node rule rm allow 'git status'
 nerve-node rule rm allow 'git status' --wildcard
 ```
+
+`rule edit` changes one entry in its place, as one change in the audit: the
+entry as `rule ls` prints it, then what it becomes. That is an entry in the
+same form (`'exec.run:git *'`, `'fs.read:~/notes/*'`), or a plain command
+line, which becomes the rule `rule add` makes of it. It works on every list,
+and on the rules of the guard too. The desktop app's Permissions page edits a
+rule the same way (the pencil beside it).
 
 `rule rm` takes the same arguments as `rule add`. It also takes an entry as
 `rule ls` prints it, such as `'exec.run:git *'`. When the arguments could mean two entries on the list, `rule rm`

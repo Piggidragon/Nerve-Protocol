@@ -270,6 +270,17 @@ pub enum RuleCmd {
         #[command(flatten)]
         center: CenterArg,
     },
+    /// Change one entry of a list in place, as one change: the entry as `ls` shows it, and what it becomes.
+    Edit {
+        /// The list: `allow`, `deny` or `sudo`.
+        list: List,
+        /// The entry as `ls` shows it.
+        entry: String,
+        /// What it becomes: an entry as `ls` shows them (`exec.run:git status`, `fs.read:~/notes/*`; on the sudo list a sudo command's pattern), or a plain command line, which becomes the rule `add` makes of it.
+        new: String,
+        #[command(flatten)]
+        center: CenterArg,
+    },
     /// Show one list, or all three.
     Ls {
         /// The list; all three if left out.
@@ -1079,6 +1090,36 @@ impl List {
         self.command_rule(command, wildcard)
     }
 
+    /// What an edited entry becomes, for `rule edit`: an entry in the form
+    /// `ls` shows (a `cap.action:pattern` rule; on the sudo list a pattern
+    /// of a sudo command) as it is, a plain command line as `add` makes it.
+    fn edited(self, new: &str) -> Result<String, String> {
+        let new = new.trim();
+        if new.is_empty() {
+            return Err("the new entry is empty: `rule rm` takes an entry away".into());
+        }
+        match self {
+            List::Allow | List::Deny => match new.split_once(':') {
+                // A single letter before the `:` is a drive, not a
+                // capability (`C:\tools\x.exe`).
+                Some((scope, _)) if scope.len() > 1 && rules::valid_scope(scope) => {
+                    rules::validate(new)?;
+                    Ok(new.to_string())
+                }
+                _ => self.command_rule(new, false),
+            },
+            List::Sudo => {
+                let glob = if sudo_command(new).is_some() {
+                    new.to_string()
+                } else {
+                    format!("sudo {new}")
+                };
+                rules::validate_command_glob(&glob)?;
+                Ok(glob)
+            }
+        }
+    }
+
     /// The rule of an audit entry of `action` (`fs.read`) with `target`, as
     /// the audit buttons of the desktop app and of the center make it
     /// ([`rules::rule_for`]). The sudo list takes sudo commands only.
@@ -1182,6 +1223,38 @@ async fn rule_cmd(paths: &NodePaths, c: RuleCmd, out: &mut dyn Write) -> Result<
             .await?;
             let removed = removed.into_inner().unwrap();
             let _ = writeln!(out, "{name}: removed {removed:?} from the {}", list.label());
+        }
+        RuleCmd::Edit {
+            list,
+            entry,
+            new,
+            center,
+        } => {
+            let rule = list.edited(&new)?;
+            let name = edit_center(paths, &center, |e| {
+                let l = list.of(&mut e.policy);
+                let Some(at) = l.iter().position(|r| *r == entry) else {
+                    return Err(format!("{entry:?} is not on the {}", list.label()));
+                };
+                if rule == entry {
+                    return Err(format!("{entry:?} is that already"));
+                }
+                // In its place; a copy of the new entry elsewhere on the
+                // list goes, so the list holds each entry once.
+                l[at] = rule.clone();
+                let mut i = 0;
+                l.retain(|r| {
+                    i += 1;
+                    i - 1 == at || *r != rule
+                });
+                Ok(())
+            })
+            .await?;
+            let _ = writeln!(
+                out,
+                "{name}: the {} {entry:?} is {rule:?} now",
+                list.label()
+            );
         }
         RuleCmd::Guard { center } => {
             let added = std::sync::Mutex::new(0usize);
@@ -7790,6 +7863,133 @@ mod tests {
             "{e}"
         );
         assert_eq!(deny(), d);
+    }
+
+    /// `rule edit` changes one entry in its place, on any list and a rule of
+    /// the guard too, as one change in the audit.
+    #[test]
+    fn rule_edit_changes_an_entry_in_place_as_one_change() {
+        let (_d, paths) = setup(&["home"]);
+        let policy = || load(&paths).centers[0].policy.clone();
+        let changes = || {
+            nerve_policy::audit::AuditLog::new(paths.audit_log())
+                .read()
+                .unwrap()
+                .iter()
+                .filter(|e| e["kind"] == "settings")
+                .count()
+        };
+        for (list, rule) in [
+            ("allow", "git status"),
+            ("allow", "cargo test"),
+            ("allow", "ls"),
+            ("sudo", "sudo apt update"),
+        ] {
+            run(&paths, &["rule", "add", list, rule]).unwrap();
+        }
+        let before = changes();
+        // A plain command line becomes the rule `add` makes of it.
+        let out = run(
+            &paths,
+            &[
+                "rule",
+                "edit",
+                "allow",
+                "exec.run:cargo test",
+                "cargo test --workspace",
+            ],
+        )
+        .unwrap();
+        assert!(
+            out.contains("\"exec.run:cargo test\" is \"exec.run:cargo test --workspace\" now"),
+            "{out}"
+        );
+        assert_eq!(
+            policy().allow,
+            [
+                "exec.run:git status",
+                "exec.run:cargo test --workspace",
+                "exec.run:ls"
+            ]
+        );
+        assert_eq!(changes(), before + 1);
+        // An entry in the form `ls` shows goes as it is; one that is on the
+        // list already is not there twice.
+        run(
+            &paths,
+            &["rule", "edit", "allow", "exec.run:ls", "fs.read:/srv/*"],
+        )
+        .unwrap();
+        run(
+            &paths,
+            &[
+                "rule",
+                "edit",
+                "allow",
+                "fs.read:/srv/*",
+                "exec.run:git status",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            policy().allow,
+            ["exec.run:cargo test --workspace", "exec.run:git status"]
+        );
+        // The sudo list takes the command with or without its sudo.
+        run(
+            &paths,
+            &["rule", "edit", "sudo", "sudo apt update", "apt upgrade"],
+        )
+        .unwrap();
+        assert_eq!(policy().sudo_allow, ["sudo apt upgrade"]);
+        // A rule of the guard is edited like any other.
+        let guard = nerve_policy::rules::GUARD[0];
+        run(&paths, &["config", "add", "center.home.policy.deny", guard]).unwrap();
+        run(
+            &paths,
+            &["rule", "edit", "deny", guard, "exec.run:nerve-node *"],
+        )
+        .unwrap();
+        assert_eq!(policy().deny, ["exec.run:nerve-node *"]);
+        // What is not there, the same again, a bad pattern: refused, and
+        // nothing changes.
+        let now = policy();
+        let n = changes();
+        for (args, says) in [
+            (
+                &["rule", "edit", "allow", "exec.run:nope", "x"][..],
+                "is not on",
+            ),
+            (
+                &[
+                    "rule",
+                    "edit",
+                    "deny",
+                    "exec.run:nerve-node *",
+                    "exec.run:nerve-node *",
+                ],
+                "that already",
+            ),
+            (
+                &[
+                    "rule",
+                    "edit",
+                    "deny",
+                    "exec.run:nerve-node *",
+                    "fs.read:[z-a]",
+                ],
+                "fs.read:[z-a]",
+            ),
+            (
+                &["rule", "edit", "deny", "exec.run:nerve-node *", " "],
+                "empty",
+            ),
+        ] {
+            let e = run(&paths, args).unwrap_err();
+            assert!(e.contains(says), "{args:?}: {e}");
+        }
+        assert_eq!(policy(), now);
+        assert_eq!(changes(), n);
     }
 
     /// `rule add --action` makes the rule an audit button makes for an entry

@@ -45,8 +45,9 @@ center is paired.
 | `folder set <path> -w` | Change a folder's rights | [modes](modes.md#folders) |
 | `folder rm <path>`, `folder ls` | Remove or list folders | [modes](modes.md#folders) |
 | `rule add allow\|deny\|sudo '<command>' [--wildcard] [--action A]` | Add a command rule, or with `--action` the rule of an audit entry | [rules](rules.md) |
-| `rule rm allow\|deny\|sudo '<command>' [--wildcard] [--action A]` | Remove a rule | [rules](rules.md#list-and-remove-rules) |
-| `rule ls [allow\|deny\|sudo]` | List rules | [rules](rules.md#list-and-remove-rules) |
+| `rule rm allow\|deny\|sudo '<command>' [--wildcard] [--action A]` | Remove a rule | [rules](rules.md#list-change-and-remove-rules) |
+| `rule edit allow\|deny\|sudo '<entry>' '<new>'` | Change a rule in place, as one change | [rules](rules.md#list-change-and-remove-rules) |
+| `rule ls [allow\|deny\|sudo]` | List rules | [rules](rules.md#list-change-and-remove-rules) |
 | `rule guard` | Put the guard's deny rules back that a pairing lacks | [rules](rules.md#the-guard-against-changing-the-node) |
 | `cap set <cap> on\|off\|hidden`, `cap ls` | Switch a capability or action | [rules](rules.md#switch-a-capability-off) |
 | `sudo on`, `sudo off`, `sudo status` | The sudo switch | [sudo](sudo.md) |

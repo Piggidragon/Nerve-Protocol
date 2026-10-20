@@ -947,14 +947,131 @@ fn short(v: &Value) -> String {
     }
 }
 
-/// The audit entries to show, from the `newest` first (crate::app asks for
-/// as many as the page shows). `centers` are the paired ones, whose entries take rule buttons.
-pub fn audit(newest: &[Value], centers: &[String], now_ms: u64) -> Vec<AuditRow> {
-    newest
-        .iter()
-        .enumerate()
-        .map(|(i, e)| audit_row(e, i, centers, now_ms))
-        .collect()
+/// What the Audit page shows of the entries it read: the decision (0 all,
+/// 1 allowed calls, 2 refused calls and refused config files, 3 settings
+/// changes), one center and one action (empty: every one), words to find
+/// in the target and the reason (a change: its keys), and the order.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct AuditFilter {
+    pub decision: i32,
+    pub center: String,
+    pub action: String,
+    pub text: String,
+    pub oldest_first: bool,
+}
+
+impl AuditFilter {
+    pub fn is_set(&self) -> bool {
+        self.decision != 0
+            || !self.center.is_empty()
+            || !self.action.is_empty()
+            || !self.text.trim().is_empty()
+    }
+}
+
+/// The Audit page for a filter: the rows (at most `limit`), how many
+/// entries each decision has under the other filters, how many match
+/// them all, and the centers and actions there are to pick.
+#[derive(Debug, Default)]
+pub struct AuditView {
+    pub rows: Vec<AuditRow>,
+    pub counts: [usize; 4],
+    pub matches: usize,
+    pub centers: Vec<String>,
+    pub actions: Vec<String>,
+}
+
+/// The decision of an entry as the filter counts it (see [`AuditFilter`]);
+/// 0 for an entry that is none of the three.
+fn decision_of(e: &Value) -> i32 {
+    if e.get("changes").is_some() {
+        3
+    } else if e["decision"] == "forbidden" || (e["kind"] == "config" && e["event"] == "refused") {
+        2
+    } else if e["decision"] == "allowed" {
+        1
+    } else {
+        0
+    }
+}
+
+/// The center an entry is about: a call's, a key's, a relay tunnel's, or
+/// the one that changed the settings.
+fn center_of(e: &Value) -> &str {
+    match e["center"].as_str() {
+        Some(c) => c,
+        None => s(&e["by"]).strip_prefix("center ").unwrap_or_default(),
+    }
+}
+
+/// A call's capability and action, `exec.run`.
+fn action_of(e: &Value) -> Option<String> {
+    (e.get("changes").is_none() && e["cap"].is_string() && e["action"].is_string())
+        .then(|| format!("{}.{}", s(&e["cap"]), s(&e["action"])))
+}
+
+/// Whether every word of `text` is in the entry's target or reason (a
+/// change: its keys), in any case.
+fn finds(e: &Value, text: &str) -> bool {
+    let mut hay = format!("{} {} {}", s(&e["target"]), s(&e["reason"]), s(&e["file"]));
+    for c in e["changes"].as_array().into_iter().flatten() {
+        hay.push(' ');
+        hay.push_str(s(&c["key"]));
+    }
+    let hay = hay.to_lowercase();
+    text.split_whitespace()
+        .all(|w| hay.contains(&w.to_lowercase()))
+}
+
+/// The Audit page for `filter`, from the `newest` entries first; the
+/// rows keep their entry's index in `newest` for the buttons.
+pub fn audit_view(
+    newest: &[Value],
+    centers: &[String],
+    filter: &AuditFilter,
+    limit: usize,
+    now_ms: u64,
+) -> AuditView {
+    let mut view = AuditView::default();
+    let mut picked = Vec::new();
+    for (i, e) in newest.iter().enumerate() {
+        let center = center_of(e);
+        if !center.is_empty() && !view.centers.iter().any(|c| c == center) {
+            view.centers.push(center.to_string());
+        }
+        let action = action_of(e);
+        if let Some(a) = &action
+            && !view.actions.contains(a)
+        {
+            view.actions.push(a.clone());
+        }
+        let others = (filter.center.is_empty() || center == filter.center)
+            && (filter.action.is_empty() || action.as_deref() == Some(filter.action.as_str()))
+            && finds(e, &filter.text);
+        if !others {
+            continue;
+        }
+        let decision = decision_of(e);
+        view.counts[0] += 1;
+        if decision > 0 {
+            view.counts[decision as usize] += 1;
+        }
+        if filter.decision == 0 || filter.decision == decision {
+            picked.push(i);
+        }
+    }
+    view.centers.sort();
+    view.actions.sort();
+    view.matches = picked.len();
+    if filter.oldest_first {
+        picked.reverse();
+    }
+    view.rows = picked
+        .into_iter()
+        .take(limit)
+        .map(|i| audit_row(&newest[i], i, centers, now_ms))
+        .collect();
+    view
 }
 
 fn audit_row(e: &Value, index: usize, centers: &[String], now_ms: u64) -> AuditRow {
@@ -1424,7 +1541,8 @@ mod tests {
             json!({"ts": NOW, "center": "home", "cap": "fs", "action": "read", "target": "/etc/shadow", "decision": "forbidden", "reason": "protected path"}),
         ];
         let newest: Vec<Value> = entries.iter().rev().cloned().collect();
-        let rows = audit(&newest, &centers, NOW);
+        let all = AuditFilter::default();
+        let rows = audit_view(&newest, &centers, &all, 200, NOW).rows;
         assert_eq!(rows.len(), 5);
         assert_eq!(rows[0].title, "fs.read");
         assert_eq!(
@@ -1447,7 +1565,7 @@ mod tests {
         let whole = json!({"ts": NOW, "kind": "settings", "by": "local", "version": 5, "changes": [{"key": "center",
             "old": [{"name": "home", "policy": {"mode": "folder"}}, {"name": "lab", "paused": false}],
             "new": [{"name": "home", "policy": {"mode": "folder", "allow": ["exec.run:cargo *"]}}, {"name": "lab", "paused": true}, {"name": "new"}]}]});
-        let whole = audit(&[whole], &centers, NOW);
+        let whole = audit_view(&[whole], &centers, &all, 200, NOW).rows;
         assert_eq!(
             whole[0].detail,
             "By local. center.home.policy.allow + exec.run:cargo *; center.lab.paused: false → true; center.new added"
@@ -1455,6 +1573,105 @@ mod tests {
         assert!(!rows[3].rules);
         assert_eq!(rows[4].when, "2 min ago");
         assert_eq!(rows[4].index, 4);
+    }
+
+    /// The filters combine; each decision counts what the other filters
+    /// leave; the order turns; the rows keep their entry's index.
+    #[test]
+    fn the_audit_filters_combine_and_count() {
+        let paired = vec!["home".to_string(), "lab".to_string()];
+        let at = |mut v: Value, ts: u64| {
+            v["ts"] = json!(ts);
+            v
+        };
+        let oldest_first = [
+            at(call("git status", "allowed", "home"), 1),
+            at(call("rm -rf /srv", "forbidden", "lab"), 2),
+            json!({"ts": 3, "center": "home", "cap": "fs", "action": "read", "target": "/etc/shadow", "decision": "forbidden", "reason": "protected path"}),
+            json!({"ts": 4, "kind": "settings", "by": "center lab", "version": 2,
+                "changes": [{"key": "center.lab.policy.mode", "old": "allowlist", "new": "user"}]}),
+            json!({"ts": 5, "kind": "settings", "by": "local", "version": 3,
+                "changes": [{"key": "log.level", "old": "info", "new": "debug"}]}),
+            json!({"ts": 6, "kind": "config", "event": "refused", "file": "/etc/nerve/node.toml", "reason": "changed outside"}),
+            at(call("git push", "allowed", "lab"), 7),
+            json!({"ts": 8, "kind": "audit", "event": "cleared", "user": "alice"}),
+        ];
+        let newest: Vec<Value> = oldest_first.iter().rev().cloned().collect();
+        let view = |f: AuditFilter| audit_view(&newest, &paired, &f, 200, NOW);
+        let all = view(AuditFilter::default());
+        assert_eq!(all.counts, [8, 2, 3, 2]);
+        assert_eq!(all.matches, 8);
+        assert_eq!(all.rows.len(), 8);
+        assert_eq!(all.rows[0].kind, "audit");
+        assert_eq!(all.centers, ["home", "lab"]);
+        assert_eq!(all.actions, ["exec.run", "fs.read"]);
+        // Refused, at lab: the call and the change lab made are lab's, the
+        // config file nobody's.
+        let lab = view(AuditFilter {
+            center: "lab".into(),
+            ..Default::default()
+        });
+        assert_eq!(lab.counts, [3, 1, 1, 1]);
+        let refused_lab = view(AuditFilter {
+            center: "lab".into(),
+            decision: 2,
+            ..Default::default()
+        });
+        assert_eq!(refused_lab.matches, 1);
+        assert_eq!(refused_lab.rows[0].target, "rm -rf /srv");
+        assert_eq!(refused_lab.rows[0].index, 6);
+        assert!(refused_lab.rows[0].rules);
+        // An action: calls only.
+        let runs = view(AuditFilter {
+            action: "exec.run".into(),
+            ..Default::default()
+        });
+        assert_eq!(runs.counts, [3, 2, 1, 0]);
+        // Words in the target and the reason, any case, every one; a
+        // change's keys.
+        let found = view(AuditFilter {
+            text: "PROTECTED shadow".into(),
+            ..Default::default()
+        });
+        assert_eq!(found.matches, 1);
+        assert_eq!(found.rows[0].title, "fs.read");
+        let keys = view(AuditFilter {
+            text: "log.level".into(),
+            decision: 3,
+            ..Default::default()
+        });
+        assert_eq!(keys.matches, 1);
+        assert_eq!(
+            view(AuditFilter {
+                text: "nothing like it".into(),
+                ..Default::default()
+            })
+            .matches,
+            0
+        );
+        // Oldest first, and a limit that leaves the count.
+        let old = audit_view(
+            &newest,
+            &paired,
+            &AuditFilter {
+                oldest_first: true,
+                ..Default::default()
+            },
+            3,
+            NOW,
+        );
+        assert_eq!(old.matches, 8);
+        let targets: Vec<&str> = old.rows.iter().map(|r| r.target.as_str()).collect();
+        assert_eq!(targets, ["git status", "rm -rf /srv", "/etc/shadow"]);
+        assert_eq!(old.rows[0].index, 7);
+        assert!(!AuditFilter::default().is_set());
+        assert!(
+            AuditFilter {
+                text: " x ".into(),
+                ..Default::default()
+            }
+            .is_set()
+        );
     }
 
     #[test]

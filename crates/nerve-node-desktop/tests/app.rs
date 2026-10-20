@@ -361,14 +361,56 @@ fn the_app_drives_the_cli_end_to_end() {
         store.get_toast()
     );
 
-    // The refused only, as `audit --denied` gives them.
-    store.invoke_audit_filter(true);
-    until(&ctl, "the refused entries", || {
-        store.get_audit().row_count() == 3
-    });
+    // The filters combine, without asking the node again: refused, then
+    // words in the target, an action, the oldest first; the counts follow.
+    let read = store.get_audit_read();
+    // Unfiltered, a row's place is its entry's index.
+    let push = index_of("git push origin main");
+    store.set_audit_decision(2);
+    store.invoke_audit_filtered();
     let rows = store.get_audit();
-    assert!((0..3).all(|i| rows.row_data(i).unwrap().badge == "Refused"));
-    store.invoke_audit_filter(false);
+    assert_eq!(rows.row_count(), 3);
+    assert!(rows.iter().all(|r| r.badge == "Refused"));
+    let counts: Vec<i32> = store.get_audit_counts().iter().collect();
+    assert_eq!(counts[2], 3, "{counts:?}");
+    assert_eq!(counts[0], read, "{counts:?}");
+    store.set_audit_text("APT".into());
+    store.invoke_audit_filtered();
+    assert_eq!(store.get_audit().row_count(), 1);
+    assert_eq!(
+        store.get_audit_summary(),
+        format!("1 of {read} entries match.")
+    );
+    store.set_audit_text("".into());
+    let actions: Vec<String> = store
+        .get_audit_action_options()
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
+    assert_eq!(actions, ["Every action", "exec.run", "fs.write"]);
+    store.set_audit_action(2);
+    store.invoke_audit_filtered();
+    assert_eq!(store.get_audit().row_count(), 1);
+    assert_eq!(
+        store.get_audit().row_data(0).unwrap().target,
+        "/srv/data/report.txt"
+    );
+    store.set_audit_action(1);
+    store.set_audit_oldest(true);
+    store.invoke_audit_filtered();
+    let targets: Vec<String> = store
+        .get_audit()
+        .iter()
+        .map(|r| r.target.to_string())
+        .collect();
+    assert_eq!(targets, ["git push origin main", "sudo apt update"]);
+    // A button names its entry also in a filtered list.
+    assert_eq!(store.get_audit().row_data(0).unwrap().index, push);
+    store.set_audit_decision(0);
+    store.set_audit_action(0);
+    store.set_audit_oldest(false);
+    store.invoke_audit_filtered();
+    assert_eq!(store.get_audit().row_count() as i32, read);
 
     // Clear, after a question that says what stays: the page starts with
     // the clearing, and the entries so far are the older file.

@@ -90,8 +90,12 @@ pub struct Ctl {
     exec: Exec,
     window: slint::Weak<AppWindow>,
     chooser: RefCell<Chooser>,
-    /// The audit entries shown, newest first: what a button's index names.
+    /// The audit entries read, newest first: what a button's index names.
     audit: RefCell<Vec<Value>>,
+    /// What the Audit page shows of them, and the centers and actions its
+    /// pickers offer (after "every").
+    audit_filter: RefCell<view::AuditFilter>,
+    audit_options: RefCell<(Vec<String>, Vec<String>)>,
     /// The log lines shown, newest first.
     log: RefCell<Vec<Value>>,
     /// The names of the paired centers, and the status, as the node said
@@ -309,6 +313,8 @@ impl Ctl {
             window: window.as_weak(),
             chooser: RefCell::new(system_chooser()),
             audit: RefCell::new(Vec::new()),
+            audit_filter: RefCell::default(),
+            audit_options: RefCell::default(),
             log: RefCell::new(Vec::new()),
             centers: RefCell::new(Vec::new()),
             status: RefCell::new(Value::Null),
@@ -393,10 +399,7 @@ impl Ctl {
         let c = ctl.clone();
         store.on_refresh_audit(move || c.follow_audit());
         let c = ctl.clone();
-        store.on_audit_filter(move |refused| {
-            c.with_store(|s| s.set_audit_refused_only(refused));
-            c.follow_audit();
-        });
+        store.on_audit_filtered(move || c.show_audit());
         let c = ctl.clone();
         store.on_audit_rule(move |i, list, wildcard| c.audit_rule(i as usize, &list, wildcard));
         let c = ctl.clone();

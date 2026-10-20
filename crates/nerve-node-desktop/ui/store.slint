@@ -21,10 +21,28 @@ export global Store {
     in-out property <Load> audit-load: Load.loading;
     in-out property <string> audit-error;
     in-out property <[AuditRow]> audit;
-    in-out property <int> audit-total;
-    in-out property <bool> audit-refused-only;
-    // How many of the newest entries the page asks for (src/app/live.rs).
+    // How many entries the page read (the newest, src/app/live.rs), and how
+    // many of those it shows at most.
+    in-out property <int> audit-read;
     in-out property <int> audit-limit: 200;
+    // What the page shows of them (view::AuditFilter): the decision (0 all,
+    // 1 allowed, 2 refused, 3 settings changes), the order, words in the
+    // target and the reason, and a center and an action by their place in
+    // the options (0: every one).
+    in-out property <int> audit-decision;
+    in-out property <bool> audit-oldest;
+    in-out property <string> audit-text;
+    in-out property <int> audit-center;
+    in-out property <int> audit-action;
+    in-out property <[string]> audit-center-options: ["Every center"];
+    in-out property <[string]> audit-action-options: ["Every action"];
+    // The entries of each decision under the other filters, how many match
+    // them all, that in words, and the foot's line.
+    in-out property <[int]> audit-counts: [0, 0, 0, 0];
+    in-out property <int> audit-matches;
+    in-out property <string> audit-summary;
+    in-out property <string> audit-foot;
+    in-out property <bool> audit-more-left;
 
     // Pairing: the link, then what the owner confirms.
     in-out property <bool> pair-open;
@@ -69,7 +87,8 @@ export global Store {
     callback refresh();
     callback refresh-audit();
     callback audit-more();
-    callback audit-filter(bool);
+    // A filter or the order changed.
+    callback audit-filtered();
     // Asks before `audit clear`.
     callback audit-clear();
     callback audit-rule(int, string, bool);

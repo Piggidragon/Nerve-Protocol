@@ -260,7 +260,13 @@ reaches this machine, and shows its link once, with **Copy**. A
 
 ## Audit and Log
 
-**Audit** and **Log** follow the node as it writes. **Clear** on either asks
+**Audit** and **Log** follow the node as it writes. **Audit** reads the
+newest 1000 entries and filters them: **All**, **Allowed**, **Refused** or
+**Changes** (settings), a center, an action (`exec.run`, `fs.read`, …) and
+words to find in the target and the reason (in a change, its settings). The
+filters combine, each choice shows how many entries it has, and the line below
+says how many match. **Newest first** or **Oldest first** turns the list.
+**Clear** on either asks
 first, then runs `nerve-node audit clear` or `log clear`. A cleared audit log
 is not gone: its entries stay in `audit.jsonl.1` ([audit](audit.md#clear-it)),
 and the page starts with "Audit log cleared" and who did it.

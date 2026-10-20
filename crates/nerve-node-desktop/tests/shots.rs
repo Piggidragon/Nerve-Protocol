@@ -485,19 +485,33 @@ fn every_page_light_and_dark() {
             .is_some_and(|r| r.kind == "settings")
     });
     shots.take_as_is("audit-rule-added");
-    store.invoke_audit_filter(true);
-    until(&ctl, || {
-        let r = store.get_audit();
-        r.row_count() > 0 && r.iter().all(|e| e.badge == "Refused")
-    });
+    // The filters: refused; a center, an action and words; nothing left.
+    store.set_audit_decision(2);
+    store.invoke_audit_filtered();
     shots.take("audit-refused");
-    store.invoke_audit_filter(false);
-    // The newest few, and the button for more.
+    store.set_audit_decision(0);
+    store.set_audit_center(1);
+    store.set_audit_action(1);
+    store.set_audit_text("npm".into());
+    store.set_audit_oldest(true);
+    store.invoke_audit_filtered();
+    shots.take("audit-filtered");
+    store.set_audit_text("no such words".into());
+    store.invoke_audit_filtered();
+    shots.take("audit-no-match");
+    store.set_audit_center(0);
+    store.set_audit_action(0);
+    store.set_audit_text("".into());
+    store.set_audit_oldest(false);
+    // The first few, and the button for more.
     store.set_audit_limit(4);
-    store.invoke_refresh_audit();
-    until(&ctl, || store.get_audit().row_count() == 4);
+    store.invoke_audit_filtered();
     shots.take_full("audit-more", 1500);
     store.set_audit_limit(200);
+    store.invoke_audit_filtered();
+    store.invoke_audit_clear();
+    shots.take("audit-clear");
+    store.set_confirm_open(false);
 
     store.invoke_panic();
     store.invoke_show(Page::Overview);
@@ -574,6 +588,9 @@ fn every_page_light_and_dark() {
     until(&ctl, || window.global::<Logs>().get_rows().row_count() >= 3);
     ctl.feed_ready();
     shots.take("log");
+    window.global::<Logs>().invoke_clear();
+    shots.take("log-clear");
+    store.set_confirm_open(false);
 
     window
         .global::<Install>()

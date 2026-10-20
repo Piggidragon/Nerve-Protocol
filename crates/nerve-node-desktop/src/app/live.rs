@@ -16,6 +16,11 @@ use crate::{Load, Logs, Page, view};
 /// page lays out every row it holds.
 const MOST: i32 = 1000;
 
+/// The audit entries the Audit page reads, the newest: its filters and
+/// counts go over them, and it shows the first `Store.audit-limit` that
+/// match.
+const SCAN: usize = 1000;
+
 impl Ctl {
     pub(super) fn stop_follow(&self) {
         // A new start; what the old one still sends is left alone.
@@ -68,24 +73,106 @@ impl Ctl {
             return;
         }
         self.audit.borrow_mut().clear();
-        let refused = self
-            .with_store(|s| {
-                s.set_audit_load(Load::Loading);
-                s.set_audit(ModelRc::default());
-                s.get_audit_refused_only()
-            })
-            .unwrap_or(false);
-        let last = self
-            .with_store(|s| s.get_audit_limit())
-            .unwrap_or_default()
-            .to_string();
-        let mut args = vec!["audit", "--follow", "--last", &last];
-        if refused {
-            args.push("--denied");
-        }
+        self.with_store(|s| {
+            s.set_audit_load(Load::Loading);
+            s.set_audit(ModelRc::default());
+            s.set_audit_read(0);
+        });
+        let last = SCAN.to_string();
         // The rule buttons need the centers that are paired now.
         self.refresh_status();
-        self.start_follow(args);
+        self.start_follow(vec!["audit", "--follow", "--last", &last]);
+    }
+
+    /// Shows the entries read as the page's filters and order ask
+    /// (view::audit_view), at most `Store.audit-limit` of them, with their
+    /// counts. The pickers keep what is picked, also while the entries move.
+    pub(crate) fn show_audit(&self) {
+        let Some(w) = self.window.upgrade() else {
+            return;
+        };
+        let s = w.global::<crate::Store>();
+        let filter = {
+            let (centers, actions) = &*self.audit_options.borrow();
+            let named = |list: &[String], i: i32| {
+                usize::try_from(i - 1)
+                    .ok()
+                    .and_then(|i| list.get(i).cloned())
+                    .unwrap_or_default()
+            };
+            view::AuditFilter {
+                decision: s.get_audit_decision(),
+                center: named(centers, s.get_audit_center()),
+                action: named(actions, s.get_audit_action()),
+                text: s.get_audit_text().to_string(),
+                oldest_first: s.get_audit_oldest(),
+            }
+        };
+        let limit = s.get_audit_limit().max(0) as usize;
+        let audit = self.audit.borrow();
+        let mut v = view::audit_view(&audit, &self.centers.borrow(), &filter, limit, now_ms());
+        // A center or action picked stays one to pick.
+        for (list, picked) in [
+            (&mut v.centers, &filter.center),
+            (&mut v.actions, &filter.action),
+        ] {
+            if !picked.is_empty() && !list.contains(picked) {
+                list.push(picked.clone());
+                list.sort();
+            }
+        }
+        let options = |every: &str, list: &[String]| {
+            let all: Vec<SharedString> = std::iter::once(every.into())
+                .chain(list.iter().map(|c| c.as_str().into()))
+                .collect();
+            ModelRc::new(VecModel::from(all))
+        };
+        let place = |list: &[String], picked: &str| {
+            list.iter()
+                .position(|c| c == picked)
+                .map_or(0, |i| i as i32 + 1)
+        };
+        s.set_audit_center_options(options("Every center", &v.centers));
+        s.set_audit_action_options(options("Every action", &v.actions));
+        s.set_audit_center(place(&v.centers, &filter.center));
+        s.set_audit_action(place(&v.actions, &filter.action));
+        let counts: Vec<i32> = v.counts.iter().map(|n| *n as i32).collect();
+        s.set_audit_counts(ModelRc::new(VecModel::from(counts)));
+        s.set_audit_matches(v.matches as i32);
+        s.set_audit_read(audit.len() as i32);
+        let entries = |n: usize| if n == 1 { "entry" } else { "entries" };
+        s.set_audit_summary(
+            if filter.is_set() {
+                format!(
+                    "{} of {} {} match.",
+                    v.matches,
+                    audit.len(),
+                    entries(audit.len())
+                )
+            } else {
+                format!("{} {}.", audit.len(), entries(audit.len()))
+            }
+            .into(),
+        );
+        let mut foot = Vec::new();
+        if v.rows.len() < v.matches {
+            foot.push(format!(
+                "The first {} of {} shown.",
+                v.rows.len(),
+                v.matches
+            ));
+        }
+        if audit.len() >= SCAN {
+            foot.push(format!(
+                "Only the newest {SCAN} entries are read; older ones stay in the audit log."
+            ));
+        }
+        s.set_audit_foot(foot.join(" ").into());
+        s.set_audit_more_left(v.rows.len() < v.matches && limit < MOST as usize);
+        s.set_audit(ModelRc::new(VecModel::from(v.rows)));
+        drop(audit);
+        *self.audit_options.borrow_mut() = (v.centers, v.actions);
+        *self.audit_filter.borrow_mut() = filter;
     }
 
     pub(super) fn follow_log(self: &Rc<Self>) {
@@ -180,11 +267,11 @@ impl Ctl {
         let keep = if log {
             self.window
                 .upgrade()
-                .map(|w| w.global::<Logs>().get_limit())
+                .map(|w| w.global::<Logs>().get_limit().max(0) as usize)
         } else {
-            self.with_store(|s| s.get_audit_limit())
+            Some(SCAN)
         };
-        let keep = keep.unwrap_or_default().max(0) as usize;
+        let keep = keep.unwrap_or_default();
         for entry in batch {
             match entry {
                 Ok(v) => {
@@ -213,10 +300,8 @@ impl Ctl {
                 l.set_error(SharedString::new());
             }
         } else {
-            let rows = view::audit(&self.audit.borrow(), &self.centers.borrow(), now_ms());
+            self.show_audit();
             self.with_store(|s| {
-                s.set_audit_total(rows.len() as i32);
-                s.set_audit(ModelRc::new(VecModel::from(rows)));
                 s.set_audit_load(Load::Ready);
                 s.set_audit_error(SharedString::new());
             });
@@ -239,7 +324,17 @@ impl Ctl {
                 retime(&l.get_rows(), rows, |r| &r.when);
             }
             Some(Page::Audit) => {
-                let rows = view::audit(&self.audit.borrow(), &self.centers.borrow(), now);
+                let limit = self
+                    .with_store(|s| s.get_audit_limit().max(0) as usize)
+                    .unwrap_or_default();
+                let rows = view::audit_view(
+                    &self.audit.borrow(),
+                    &self.centers.borrow(),
+                    &self.audit_filter.borrow(),
+                    limit,
+                    now,
+                )
+                .rows;
                 self.with_store(|s| retime(&s.get_audit(), rows, |r| &r.when));
             }
             _ => {}
@@ -281,7 +376,7 @@ pub(super) fn wire(ctl: &Rc<Ctl>, window: &crate::AppWindow) {
     let c = ctl.clone();
     window.global::<crate::Store>().on_audit_more(move || {
         c.with_store(|s| s.set_audit_limit(MOST));
-        c.follow_audit();
+        c.show_audit();
     });
     let c = ctl.clone();
     window.global::<Logs>().on_more(move || {

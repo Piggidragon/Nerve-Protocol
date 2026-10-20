@@ -84,9 +84,10 @@ nerve-node service restart
 The running node runs an owner's command as `nerve`, with the CLI's checks,
 and audits it with the owner's name ([who may change the
 node](desktop.md#administrator-rights)). These stay root's, with `sudo`:
-`install`, `update`, `uninstall`, `setup`, `sudo on`, `backup`, `restore`,
-and `machine.user`, `machine.allow_root`, `machine.sudo_path` and
-`machine.shell`. While the node is stopped, only root changes it. A command
+`install`, `update`, `uninstall`, `setup`, `sudo on`, and `machine.user`,
+`machine.allow_root`, `machine.sudo_path` and `machine.shell`, also a
+`restore` that would change them. `backup` and `restore` open the file as the
+owner and hand it to the node ([backup](backup.md#on-a-node-installed-as-a-service)). While the node is stopped, only root changes it. A command
 that root runs on these folders runs as `nerve`, so every file it writes
 stays the node's. Another user gets a message that says to use `sudo`.
 
@@ -313,9 +314,9 @@ into the service's registry key
 owner runs the other commands in an ordinary terminal; the service runs them
 as `nerve` over a pipe open to the owners only, and audits them with the
 owner's name ([who may change the node](desktop.md#administrator-rights)).
-`install`, `update`, `uninstall`, `setup`, `sudo on`, `backup`, `restore` and
-the `machine.*` settings that pick the account still need an administrator's
-terminal. `update` gives a node installed before there were owners the user
+`install`, `update`, `uninstall`, `setup`, `sudo on` and the `machine.*`
+settings that pick the account (also a `restore` that would change them)
+still need an administrator's terminal. `update` gives a node installed before there were owners the user
 who updates as its owner; `uninstall` removes the service, and the owners and
 their rights with it.
 

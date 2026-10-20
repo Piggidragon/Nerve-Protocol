@@ -66,7 +66,7 @@ mod winsudo;
 #[cfg_attr(not(windows), allow(dead_code))]
 mod winsvc;
 
-pub use daemon::{Daemon, NodeOptions};
+pub use daemon::{Daemon, Event, NodeOptions};
 pub use paths::NodePaths;
 
 /// Milliseconds since the Unix epoch.

@@ -59,6 +59,21 @@ pub struct NodeOptions {
     /// socket (crate::owner): the installed node's, unless a test gives
     /// one. Served only with `ctl`.
     pub owners: Option<crate::owner::Endpoint>,
+    /// Where work goes that runs while the node is stopped, after which it
+    /// starts again: an owner's restore ([`Daemon::run_until`] sets it).
+    /// Without it the node refuses such work.
+    pub aside: Option<tokio::sync::mpsc::UnboundedSender<Aside>>,
+}
+
+/// Work the node runs while it is stopped ([`NodeOptions::aside`]).
+pub type Aside = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+/// What [`Daemon::run_until`] is told while the node runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Event {
+    /// Read the config again (SIGHUP).
+    Reload,
+    Stop,
 }
 
 impl NodeOptions {
@@ -74,6 +89,7 @@ impl NodeOptions {
             confinement: None,
             cgroups: None,
             resume_grace: resume::GRACE,
+            aside: None,
         }
     }
 }
@@ -474,6 +490,9 @@ pub(crate) struct Shared {
     pub grace: Duration,
     /// The capability providers attached now (crate::provider).
     pub providers: crate::provider::Providers,
+    /// Where work goes that runs while the node is stopped
+    /// ([`NodeOptions::aside`]).
+    pub aside: Option<tokio::sync::mpsc::UnboundedSender<Aside>>,
     /// The relay for other nodes (crate::relay), and who is connected.
     pub relay: crate::relay::Relays,
 }
@@ -1031,6 +1050,7 @@ impl Daemon {
             grace: opts.resume_grace,
             providers: Default::default(),
             relay: Default::default(),
+            aside: opts.aside,
         });
         shared.tell_confinement(&cfg);
         // A file that says on starts off: on Linux the password lives in
@@ -1163,34 +1183,77 @@ impl Daemon {
 
     /// Runs until SIGINT or SIGTERM; SIGHUP reloads the config.
     pub async fn run(opts: NodeOptions) -> Result<(), String> {
-        let d = Daemon::start(opts).await?;
+        let (tx, events) = tokio::sync::mpsc::unbounded_channel();
+        // The signals are taken for the whole run, on a task of their own: one
+        // that comes while the node is stopped for an owner's restore still
+        // counts after it.
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
             let mut term = signal(SignalKind::terminate()).map_err(|e| e.to_string())?;
             let mut hup = signal(SignalKind::hangup()).map_err(|e| e.to_string())?;
-            loop {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => break,
-                    _ = term.recv() => break,
-                    _ = hup.recv() => {
-                        let _ = d.reload();
+            tokio::spawn(async move {
+                loop {
+                    let e = tokio::select! {
+                        _ = tokio::signal::ctrl_c() => Event::Stop,
+                        _ = term.recv() => Event::Stop,
+                        _ = hup.recv() => Event::Reload,
+                    };
+                    if tx.send(e).is_err() {
+                        return;
                     }
                 }
-            }
+            });
         }
         // Under the service control manager, its stop request ends the node.
         #[cfg(windows)]
         {
             crate::win_service::running();
-            if crate::win_service::is_service() {
-                crate::win_service::stop_requested().await;
-            } else {
-                let _ = tokio::signal::ctrl_c().await;
-            }
+            tokio::spawn(async move {
+                if crate::win_service::is_service() {
+                    crate::win_service::stop_requested().await;
+                } else {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+                let _ = tx.send(Event::Stop);
+            });
         }
         #[cfg(not(any(unix, windows)))]
-        let _ = tokio::signal::ctrl_c().await;
+        tokio::spawn(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            let _ = tx.send(Event::Stop);
+        });
+        Daemon::run_until(opts, events).await
+    }
+
+    /// Runs the node until `events` says stop, or ends; a reload reads the
+    /// config again. Work for while the node is stopped
+    /// ([`NodeOptions::aside`]) stops it, runs, and starts it again; a
+    /// start that fails then ends this with its error, and the service
+    /// manager starts the node again.
+    pub async fn run_until(
+        mut opts: NodeOptions,
+        mut events: tokio::sync::mpsc::UnboundedReceiver<Event>,
+    ) -> Result<(), String> {
+        let (tx, mut asides) = tokio::sync::mpsc::unbounded_channel();
+        opts.aside = Some(tx);
+        let mut d = Daemon::start(opts.clone()).await?;
+        loop {
+            let job = tokio::select! {
+                e = events.recv() => match e {
+                    Some(Event::Reload) => {
+                        let _ = d.reload();
+                        continue;
+                    }
+                    Some(Event::Stop) | None => break,
+                },
+                Some(job) = asides.recv() => job,
+            };
+            tracing::info!("the node stops for an owner's restore, and starts again after it");
+            d.stop().await;
+            job.await;
+            d = Daemon::start(opts.clone()).await?;
+        }
         d.stop().await;
         Ok(())
     }

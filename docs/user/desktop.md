@@ -95,10 +95,10 @@ logging in again.
 
 The system's dialog (polkit on Linux, the UAC prompt on Windows) comes for
 these only, each time, for that one action, and the app says why first:
-update, uninstall, turning sudo on, the account commands run as, backup and
-restore, and the settings `machine.user`, `machine.allow_root`,
-`machine.sudo_path` and `machine.shell`, which decide which account and
-program commands run as. The rights end with the action.
+update, uninstall, turning sudo on, the account commands run as, and the
+settings `machine.user`, `machine.allow_root`, `machine.sudo_path` and
+`machine.shell`, which decide which account and program commands run as (also
+restoring a backup that would change them). The rights end with the action.
 
 Who changes the node's settings without a password:
 
@@ -189,8 +189,9 @@ restart fails, the Overview says that changes wait and offers **Restart**.
   answering for the account the node runs as), the app says why and keeps
   them in files.
 - **Backup…** and **Restore…** write and read the file as you, in your own
-  folders. A restore never goes under a running node: the app stops the
-  service for it and starts it again after. **Keep its keys in files here**
+  folders, and hand it to the node. A restore never goes under a running
+  node: the node stops for it and starts again after (for an administrator's
+  restore the app stops and starts the service). **Keep its keys in files here**
   restores the backup of a machine that kept them in a keyring onto one
   without.
 - **Any setting**: shows and sets any setting, and **Add** and **Remove**

@@ -457,6 +457,17 @@ fn inspect(paths: &NodePaths) -> Target {
     }
 }
 
+/// The first setting of [`crate::owner::ROOT_ONLY`] that restoring `b`
+/// would change at `paths`; a config here that cannot be read counts as
+/// none set.
+pub fn root_only_change(paths: &NodePaths, b: &Parsed) -> Option<&'static str> {
+    let here = match inspect(paths) {
+        Target::Node(c) => *c,
+        Target::Empty | Target::Unreadable(_) => NodeConfig::default(),
+    };
+    crate::owner::root_only_change(&here, &b.cfg)
+}
+
 /// The pairings of a config: which node it is, to the centers.
 fn pairings(cfg: &NodeConfig) -> BTreeSet<(&str, &str)> {
     cfg.centers

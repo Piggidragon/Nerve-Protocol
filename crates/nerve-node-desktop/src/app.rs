@@ -474,9 +474,44 @@ impl Ctl {
         input: Option<String>,
         done: impl FnOnce(&Rc<Ctl>, Result<Value, String>) + Send + 'static,
     ) {
+        let how = self.admin_for(&args);
+        self.command_through(how, args, input, done);
+    }
+
+    /// [`Ctl::command`] with an administrator's rights asked for this once,
+    /// whatever the command: an owner's restore that changes the account
+    /// commands run as.
+    fn command_with_rights(
+        self: &Rc<Self>,
+        args: Vec<String>,
+        input: Option<String>,
+        done: impl FnOnce(&Rc<Ctl>, Result<Value, String>) + Send + 'static,
+    ) {
+        let how = self
+            .elevate
+            .get()
+            .filter(|_| !self.runner.borrow().elevated());
+        self.command_through(how, args, input, done);
+    }
+
+    /// Whether this is an owner of the installed node, whose commands go to
+    /// the node without the administrator's rights (nerve_node::owner).
+    fn owner_path(&self) -> bool {
+        self.elevate.get().is_some() && !self.runner.borrow().elevated()
+    }
+
+    /// Runs `args`, through a broker for this one command when `how` says
+    /// how to start one.
+    fn command_through(
+        self: &Rc<Self>,
+        how: Option<Launch>,
+        args: Vec<String>,
+        input: Option<String>,
+        done: impl FnOnce(&Rc<Ctl>, Result<Value, String>) + Send + 'static,
+    ) {
         // What only an administrator may do asks for the rights this once:
         // the broker ends with the command.
-        if let Some(how) = self.admin_for(&args) {
+        if let Some(how) = how {
             let exe = self.runner().exe().clone();
             self.job(
                 move |r| {

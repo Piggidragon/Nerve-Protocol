@@ -434,6 +434,52 @@ mod linux {
     }
 }
 
+/// Set by the node for an owner's `backup` or `restore` (crate::owner): the
+/// file the owner's own program opened and handed over, as `fd:N` (Linux),
+/// or a file in the node's state folder that carries its bytes (Windows).
+pub const OWNER_FILE_ENV: &str = "NERVE_OWNER_FILE";
+
+/// The file handed over for a command that runs for an owner: `None` when
+/// it runs for none. One that runs for an owner without it is refused: the
+/// node never opens an owner's path as itself.
+fn handed(path: &Path, write: bool) -> Option<Result<std::fs::File, String>> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static TAKEN: AtomicBool = AtomicBool::new(false);
+    crate::owner::owner_running()?;
+    let missing = || {
+        format!(
+            "{} is opened by the program of the owner who asked, and none came with the command",
+            path.display()
+        )
+    };
+    let Some(given) = std::env::var(OWNER_FILE_ENV).ok().filter(|v| !v.is_empty()) else {
+        return Some(Err(missing()));
+    };
+    // Taken once: the descriptor is closed with the file.
+    if TAKEN.swap(true, Ordering::SeqCst) {
+        return Some(Err(missing()));
+    }
+    #[cfg(unix)]
+    if let Some(n) = given.strip_prefix("fd:") {
+        use std::os::fd::FromRawFd;
+        return Some(match n.parse::<i32>() {
+            // SAFETY: the node opened this descriptor for this program
+            // alone (crate::owner), and it is taken once.
+            Ok(n) if n > 2 => Ok(unsafe { std::fs::File::from_raw_fd(n) }),
+            _ => Err(missing()),
+        });
+    }
+    let at = Path::new(&given);
+    Some(
+        if write {
+            std::fs::File::create(at)
+        } else {
+            std::fs::File::open(at)
+        }
+        .map_err(|e| format!("{}: {e}", at.display())),
+    )
+}
+
 /// Opens the file of `job` as the user who asked, before `main` makes the
 /// command the node's user: reads it now, or starts the process that
 /// writes it later ([`write`]). Called while the process has one thread.
@@ -450,6 +496,9 @@ pub fn prepare(job: Job) -> Result<(), String> {
 /// The backup at `path`: what [`prepare`] read as the user who asked, else
 /// read now.
 pub fn read(path: &Path) -> Result<Vec<u8>, String> {
+    if let Some(file) = handed(path, false) {
+        return nerve_transport::backup::read_open(file?, &path.display().to_string());
+    }
     #[cfg(target_os = "linux")]
     if let Some(r) = linux::take_read(path) {
         return r;
@@ -460,6 +509,15 @@ pub fn read(path: &Path) -> Result<Vec<u8>, String> {
 /// Writes the backup to `path`: through the process [`prepare`] started as
 /// the user who asked, else here.
 pub fn write(path: &Path, bytes: &[u8], overwrite: bool) -> Result<(), String> {
+    if let Some(file) = handed(path, true) {
+        // The owner's program made it new, and puts it in place.
+        use std::io::Write;
+        let mut file = file?;
+        return file
+            .write_all(bytes)
+            .and_then(|()| file.sync_all())
+            .map_err(|e| format!("cannot write {}: {e}", path.display()));
+    }
     #[cfg(target_os = "linux")]
     if let Some(r) = linux::take_write(path, bytes, overwrite) {
         return r;

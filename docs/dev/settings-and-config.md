@@ -171,7 +171,8 @@ true}`) and `cli {args, cwd}`: the node refuses a caller below a command it
 runs, one with `no_new_privs` (Linux; every confined command keeps it) or in a
 command's job (Windows), anyone who is no owner, and the commands that stay
 root's (`run`, `install`, `update`, `uninstall`, `service`, `setup`,
-`sudo on`, `backup`, `restore`). Then it runs its own program with
+`sudo on`), and a `backup` or `restore` without the file the caller opened
+itself. Then it runs its own program with
 `--config-dir`, `--state-dir` and those arguments as its own user, with
 `NERVE_OWNER=<name>`, and passes the caller's input and the program's output
 and exit code through the connection (`{"in"}`/`{"eof"}` up, `{"out"}`,

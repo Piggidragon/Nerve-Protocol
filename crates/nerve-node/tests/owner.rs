@@ -132,7 +132,6 @@ async fn an_owner_changes_the_node_through_it_and_is_audited() {
         &["sudo", "on"][..],
         &["setup"],
         &["install"],
-        &["backup", "/tmp/x"],
         &["--config-dir", "/tmp", "status"],
     ] {
         let e = run(&at, args, "").await.unwrap_err();
@@ -141,7 +140,188 @@ async fn an_owner_changes_the_node_through_it_and_is_audited() {
             "{args:?}: {e}"
         );
     }
+    // A backup or restore only with the file the owner's program opened: the
+    // node never opens the path itself.
+    for args in [&["backup", "/tmp/x"][..], &["restore", "/tmp/x"]] {
+        let e = run(&at, args, "").await.unwrap_err();
+        assert!(e.contains("comes with the request"), "{args:?}: {e}");
+    }
     daemon.stop().await;
+}
+
+const PASS: &str = "correct horse battery";
+
+/// What a backup or restore through the owner socket at `at` did: its exit
+/// code and output. The node is told `path` (the file the command names),
+/// while `file` is the one this process opens and hands over.
+async fn with_file(
+    at: &Path,
+    args: &[&str],
+    file: nerve_node::owner::FileJob,
+) -> Result<(i32, String), String> {
+    let conn = UnixStream::connect(at).await.unwrap();
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let mut io = nerve_node::owner::Io {
+        out: &mut out,
+        err: &mut err,
+    };
+    let code =
+        nerve_node::owner::send_file(conn, &args, Some("/".into()), &file, PASS, &mut io).await?;
+    Ok((
+        code,
+        String::from_utf8_lossy(&out).into_owned() + &String::from_utf8_lossy(&err),
+    ))
+}
+
+fn job(path: &Path, backup: Option<bool>) -> nerve_node::owner::FileJob {
+    nerve_node::owner::FileJob {
+        path: path.to_path_buf(),
+        backup,
+        passphrase_file: None,
+    }
+}
+
+/// An owner backs up and restores without root: the file is opened by the
+/// owner's own program and handed to the node, which writes and reads only
+/// that (the path it is told leads nowhere). A restore stops the node,
+/// which starts again after it; one that would change a setting that stays
+/// root's is refused (owner's decision of 2026-10-20, item 14).
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owner_backs_up_and_restores_with_a_file_of_their_own() {
+    let d = tempfile::tempdir().unwrap();
+    let home = std::fs::canonicalize(d.path()).unwrap();
+    let paths = NodePaths::new(home.join("config"), home.join("state"));
+    let mut o = NodeOptions::new(paths.clone());
+    o.home = home.clone();
+    o.exe = Some(program());
+    o.cgroups = Some(Err("no cgroup for this test".into()));
+    let at = home.join("owner.sock");
+    o.owners = Some(Endpoint {
+        at: at.clone(),
+        owners: Owners::Uids(vec![uid()]),
+        program: program(),
+    });
+    let (stop, events) = tokio::sync::mpsc::unbounded_channel();
+    let node = tokio::spawn(Daemon::run_until(o, events));
+    let up = || async {
+        for _ in 0..200 {
+            if UnixStream::connect(&at).await.is_ok() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the node did not come up");
+    };
+    up().await;
+    let (_, _, code) = run(&at, &["config", "set", "log.level", "debug"], "")
+        .await
+        .unwrap();
+    assert_eq!(code, 0);
+
+    let mine = home.join("mine");
+    std::fs::create_dir(&mine).unwrap();
+    let file = mine.join("node.backup");
+    let nowhere = "/nonexistent-nerve-test/node.backup";
+    let (code, said) = with_file(&at, &["backup", nowhere], job(&file, Some(false)))
+        .await
+        .unwrap();
+    assert_eq!(code, 0, "{said}");
+    use std::os::unix::fs::PermissionsExt;
+    let meta = std::fs::metadata(&file).unwrap();
+    assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+    let first = std::fs::read(&file).unwrap();
+    assert_eq!(
+        nerve_transport::backup::kind_of(&first).unwrap(),
+        nerve_transport::backup::Kind::Node
+    );
+    // Not over a file that is there, unless asked; then through a new file
+    // and a rename, which leaves nothing beside it.
+    let e = with_file(&at, &["backup", nowhere], job(&file, Some(false)))
+        .await
+        .unwrap_err();
+    assert!(e.contains("exists already"), "{e}");
+    let (code, said) = with_file(
+        &at,
+        &["backup", nowhere, "--overwrite"],
+        job(&file, Some(true)),
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, 0, "{said}");
+    assert_ne!(std::fs::read(&file).unwrap(), first);
+    assert_eq!(std::fs::read_dir(&mine).unwrap().count(), 1);
+
+    // The restore: the node stops for it and comes back with what it put
+    // back.
+    let (_, _, code) = run(&at, &["config", "set", "log.level", "warn"], "")
+        .await
+        .unwrap();
+    assert_eq!(code, 0);
+    let (code, said) = with_file(&at, &["restore", nowhere], job(&file, None))
+        .await
+        .unwrap();
+    assert_eq!(code, 0, "{said}");
+    up().await;
+    let (out, _, _) = run(&at, &["config", "get", "log.level"], "").await.unwrap();
+    assert!(out.contains("debug"), "{out}");
+
+    // A backup that picks another shell for the commands is root's to
+    // restore; the node runs on.
+    let other = home.join("other");
+    let other_paths = NodePaths::new(other.join("config"), other.join("state"));
+    let opts = |a: &[&str]| {
+        let mut v = vec![
+            "nerve-node".to_string(),
+            "--config-dir".into(),
+            other_paths.config_dir.display().to_string(),
+            "--state-dir".into(),
+            other_paths.state_dir.display().to_string(),
+        ];
+        v.extend(a.iter().map(|s| s.to_string()));
+        <nerve_node::cli::Cli as clap::Parser>::try_parse_from(v).unwrap()
+    };
+    let pass_file = home.join("pass");
+    nerve_transport::files::write_private(&pass_file, format!("{PASS}\n").as_bytes()).unwrap();
+    let mut said = Vec::new();
+    nerve_node::cli::execute(
+        opts(&["config", "set", "machine.shell", "/bin/bash"]),
+        &mut said,
+    )
+    .await
+    .unwrap();
+    let shell_backup = mine.join("shell.backup");
+    nerve_node::cli::execute(
+        opts(&[
+            "backup",
+            shell_backup.to_str().unwrap(),
+            "--passphrase-file",
+            pass_file.to_str().unwrap(),
+        ]),
+        &mut said,
+    )
+    .await
+    .unwrap();
+    let (code, said) = with_file(
+        &at,
+        &["restore", nowhere, "--replace"],
+        job(&shell_backup, None),
+    )
+    .await
+    .unwrap();
+    assert_eq!(code, 1, "{said}");
+    assert!(
+        said.contains(nerve_node::owner::RESTORE_BY_ADMIN) && said.contains("machine.shell"),
+        "{said}"
+    );
+    up().await;
+    let (out, _, _) = run(&at, &["config", "get", "machine.shell"], "")
+        .await
+        .unwrap();
+    assert!(!out.contains("/bin/bash"), "{out}");
+
+    stop.send(nerve_node::Event::Stop).unwrap();
+    node.await.unwrap().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -18,6 +18,12 @@
 //! audit. So the commands keep every check of the CLI, and the CLI of an
 //! owner sends its command there by itself ([`forward_if_needed`]).
 //!
+//! `backup` and `restore` come with their file, opened by the owner's own
+//! program and handed over ([`send_file`]: the open file on Linux, its bytes
+//! on Windows), so the node never opens a path in the owner's folders as
+//! itself. A restore runs while the node is stopped, which then starts again
+//! ([`crate::daemon::Daemon::run_until`]).
+//!
 //! What it does not stop: a command of a center that runs as an owner's
 //! account and gets a process outside the node's process tree and sandbox
 //! (the account's own `systemd --user`, a tmux server, the task scheduler)
@@ -27,6 +33,8 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as B64;
 use serde_json::{Value, json};
 
 use crate::cli::{Cli, Cmd, FolderCmd, SudoCmd};
@@ -116,6 +124,20 @@ pub fn check_change(
     }
 }
 
+/// What the refusal of an owner's restore that would change a setting of
+/// [`ROOT_ONLY`] says; the desktop app then asks for an administrator.
+pub const RESTORE_BY_ADMIN: &str = "a backup that changes it is restored by";
+
+/// Why an owner may not restore a backup that changes `key` of
+/// [`ROOT_ONLY`].
+pub fn restore_needs_admin(key: &str) -> String {
+    format!(
+        "the backup sets {key} other than it is here, and {key} decides which account or program commands run as: {RESTORE_BY_ADMIN} {}; {}",
+        admin(),
+        with_rights("restore …")
+    )
+}
+
 /// Who may do what an owner may not.
 fn admin() -> &'static str {
     if cfg!(windows) {
@@ -159,14 +181,6 @@ pub fn refused(cmd: &Cmd) -> Option<String> {
             } else {
                 "it lets commands run as root"
             },
-        ),
-        Cmd::Backup { .. } => (
-            "backup",
-            "its file is written as you, which only root can do for the node",
-        ),
-        Cmd::Restore { .. } => (
-            "restore",
-            "it replaces the node's machine settings and its accounts' too",
         ),
         _ => return None,
     };
@@ -260,8 +274,65 @@ pub fn forward_if_needed(cli: &Cli) -> Option<i32> {
         .ok()
         .map(|d| d.display().to_string());
     let paths = NodePaths::from_args(None, None);
-    let input = reads_input(&cli.cmd);
+    if let Some(file) = FileJob::of(&cli.cmd, std::env::current_dir().ok()) {
+        return Some(rt.block_on(forward_file(&paths, args, cwd, file, cli.json)));
+    }
+    let input = if reads_input(&cli.cmd) {
+        Input::Stdin
+    } else {
+        Input::None
+    };
     Some(rt.block_on(forward(&paths, args, cwd, input, cli.json)))
+}
+
+/// What this process passes to the node's command as its input.
+pub enum Input {
+    None,
+    /// This process's own, as it comes.
+    Stdin,
+    /// This text, then its end.
+    Text(String),
+}
+
+/// The backup file of an owner's `backup` or `restore`, which this
+/// process opens itself and hands to the node with the request: the node
+/// never opens a path in the owner's folders as itself. The passphrase is
+/// asked here too, and goes to the node as the command's input.
+pub struct FileJob {
+    /// The file, made whole.
+    pub path: PathBuf,
+    /// `Some(overwrite)` for a backup, `None` for a restore.
+    pub backup: Option<bool>,
+    pub passphrase_file: Option<PathBuf>,
+}
+
+impl FileJob {
+    /// The file job of `cmd`, with a relative path made whole with `cwd`.
+    pub fn of(cmd: &Cmd, cwd: Option<PathBuf>) -> Option<FileJob> {
+        let (file, backup, passphrase_file) = match cmd {
+            Cmd::Backup {
+                file,
+                overwrite,
+                passphrase_file,
+                ..
+            } => (file, Some(*overwrite), passphrase_file),
+            Cmd::Restore {
+                file,
+                passphrase_file,
+                ..
+            } => (file, None, passphrase_file),
+            _ => return None,
+        };
+        let whole = |p: &Path| match &cwd {
+            Some(c) if p.is_relative() => c.join(p),
+            _ => p.to_path_buf(),
+        };
+        Some(FileJob {
+            path: whole(file),
+            backup,
+            passphrase_file: passphrase_file.as_deref().map(whole),
+        })
+    }
 }
 
 /// Whether `cmd` reads this process's input: the question of `center add`
@@ -303,8 +374,16 @@ pub fn forwarded_args(
         Cmd::Folder(
             FolderCmd::Add { path, .. } | FolderCmd::Set { path, .. } | FolderCmd::Rm { path, .. },
         ) if path.is_relative() => Some(path.clone()),
+        // Only a name to the node, which never opens it, but the one it
+        // says it wrote.
+        Cmd::Backup { file, .. } | Cmd::Restore { file, .. } if file.is_relative() => {
+            Some(file.clone())
+        }
         _ => None,
     };
+    // The passphrase comes from this process: the node may not read a file
+    // of the owner's.
+    let own_passphrase = FileJob::of(&cli.cmd, None).is_some();
     let mut out = Vec::new();
     let mut skip = false;
     let mut made_whole = false;
@@ -318,11 +397,15 @@ pub fn forwarded_args(
                 a.to_string_lossy()
             ));
         };
-        if s == "--config-dir" || s == "--state-dir" {
+        if s == "--config-dir" || s == "--state-dir" || (own_passphrase && s == "--passphrase-file")
+        {
             skip = true;
             continue;
         }
-        if s.starts_with("--config-dir=") || s.starts_with("--state-dir=") {
+        if s.starts_with("--config-dir=")
+            || s.starts_with("--state-dir=")
+            || (own_passphrase && s.starts_with("--passphrase-file="))
+        {
             continue;
         }
         if let Some(r) = &relative
@@ -361,36 +444,282 @@ async fn forward(
     paths: &NodePaths,
     args: Vec<String>,
     cwd: Option<String>,
-    input: bool,
+    input: Input,
     json: bool,
 ) -> i32 {
-    let conn = match connect(paths).await {
+    let mut conn = match connect(paths).await {
         Ok(c) => c,
         Err(e) => return fail(json, &not_reached(&e)),
     };
-    match session(conn, args, cwd, input).await {
+    let request = request_line(&args, cwd, false);
+    let sent = {
+        use tokio::io::AsyncWriteExt;
+        conn.write_all(request.as_bytes()).await
+    };
+    if let Err(e) = sent {
+        return fail(json, &format!("cannot reach the node: {e}"));
+    }
+    let (mut out, mut err) = (std::io::stdout(), std::io::stderr());
+    let mut io = Io {
+        out: &mut out,
+        err: &mut err,
+    };
+    match session(conn, Vec::new(), input, None, &mut io).await {
         Ok(code) => code,
         Err(e) => fail(json, &e),
     }
 }
 
-/// The client's side of one `cli` request on `conn`; this process's input
-/// goes along when `input`.
-async fn session<S>(
-    conn: S,
+/// The `cli` request for `args` in `cwd`, as its line; `streamed` says that
+/// its file comes in the session ([`Handed::Streamed`]).
+pub fn request_line(args: &[String], cwd: Option<String>, streamed: bool) -> String {
+    let mut params = json!({"args": args, "cwd": cwd});
+    if streamed {
+        params["file"] = json!(STREAMED);
+    }
+    format!("{}\n", json!({"method": "cli", "params": params}))
+}
+
+/// Where a session's output goes: this process's own, or a test's.
+pub struct Io<'a> {
+    pub out: &'a mut dyn Write,
+    pub err: &'a mut dyn Write,
+}
+
+/// An owner's `backup` or `restore` through the node at `paths`: the file
+/// opened here, as this user, handed over with the request, and the
+/// passphrase asked here; a backup is put in place here once the node's
+/// command made it.
+async fn forward_file(
+    paths: &NodePaths,
     args: Vec<String>,
     cwd: Option<String>,
-    input: bool,
+    file: FileJob,
+    json: bool,
+) -> i32 {
+    let (mut out, mut err) = (std::io::stdout(), std::io::stderr());
+    let mut io = Io {
+        out: &mut out,
+        err: &mut err,
+    };
+    let pass = crate::prompt::passphrase(
+        file.passphrase_file.as_deref(),
+        io.out,
+        file.backup.is_some(),
+    );
+    let pass = match pass {
+        Ok(p) => p,
+        Err(e) => return fail(json, &e),
+    };
+    let conn = match connect(paths).await {
+        Ok(c) => c,
+        Err(e) => return fail(json, &not_reached(&e)),
+    };
+    match send_file(conn, &args, cwd, &file, pass.text(), &mut io).await {
+        Ok(code) => code,
+        Err(e) => fail(json, &e),
+    }
+}
+
+/// The client's side of an owner's `backup` or `restore` on `conn`: `file`
+/// opened as this process's user and handed to the node with the request
+/// (Linux: the descriptor; Windows: its bytes in the session), `passphrase`
+/// as the command's input, and a backup put in place once it is written.
+/// The command's exit code.
+#[cfg(unix)]
+pub async fn send_file(
+    mut conn: tokio::net::UnixStream,
+    args: &[String],
+    cwd: Option<String>,
+    file: &FileJob,
+    passphrase: &str,
+    io: &mut Io<'_>,
+) -> Result<i32, String> {
+    use std::os::fd::AsFd;
+    let opened = Opened::open(file)?;
+    let request = request_line(args, cwd, false);
+    let sent =
+        nerve_transport::ctl::send_files(&mut conn, request.as_bytes(), &[opened.file.as_fd()])
+            .await
+            .map_err(|e| format!("cannot reach the node: {e}"));
+    let code = match sent {
+        Ok(()) => {
+            session(
+                conn,
+                Vec::new(),
+                Input::Text(format!("{passphrase}\n")),
+                None,
+                io,
+            )
+            .await
+        }
+        Err(e) => Err(e),
+    };
+    opened.finish(code)
+}
+
+/// [`send_file`] on Windows: the node's pipe carries the file's bytes.
+#[cfg(windows)]
+pub async fn send_file<S>(
+    mut conn: S,
+    args: &[String],
+    cwd: Option<String>,
+    file: &FileJob,
+    passphrase: &str,
+    io: &mut Io<'_>,
+) -> Result<i32, String>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    use tokio::io::AsyncWriteExt;
+    let mut first = Vec::new();
+    match file.backup {
+        None => {
+            let bytes = nerve_transport::backup::read_file(&file.path)?;
+            for chunk in bytes.chunks(FILE_CHUNK) {
+                first.push(json!({ "file": B64.encode(chunk) }));
+            }
+            first.push(json!({"file_end": true}));
+        }
+        Some(overwrite) => can_write(&file.path, overwrite)?,
+    }
+    let request = request_line(args, cwd, true);
+    conn.write_all(request.as_bytes())
+        .await
+        .map_err(|e| format!("cannot reach the node: {e}"))?;
+    let mut made = Vec::new();
+    let back = file.backup.is_some().then_some(&mut made);
+    let code = session(
+        conn,
+        first,
+        Input::Text(format!("{passphrase}\n")),
+        back,
+        io,
+    )
+    .await?;
+    if code == 0
+        && let Some(overwrite) = file.backup
+    {
+        nerve_transport::backup::write_file(&file.path, &made, overwrite)?;
+    }
+    Ok(code)
+}
+
+/// Whether a backup may go to `path`: its folder is there, and without
+/// `overwrite` no file is.
+fn can_write(path: &Path, overwrite: bool) -> Result<(), String> {
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        match std::fs::metadata(dir) {
+            Ok(m) if m.is_dir() => {}
+            Ok(_) => return Err(format!("{} is not a folder", dir.display())),
+            Err(e) => return Err(format!("cannot use the folder {}: {e}", dir.display())),
+        }
+    }
+    if !overwrite && std::fs::symlink_metadata(path).is_ok() {
+        return Err(format!(
+            "{} exists already; name another file or pass --overwrite",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+/// The file of a [`FileJob`], opened by this process (Linux).
+#[cfg(unix)]
+struct Opened {
+    file: std::fs::File,
+    /// A backup's new file, and where it goes once complete: the same path
+    /// (a new file), or the path it replaces (`--overwrite`).
+    made: Option<(PathBuf, PathBuf)>,
+}
+
+#[cfg(unix)]
+impl Opened {
+    fn open(job: &FileJob) -> Result<Opened, String> {
+        use std::os::unix::fs::OpenOptionsExt;
+        let name = job.path.display();
+        let Some(overwrite) = job.backup else {
+            let file =
+                std::fs::File::open(&job.path).map_err(|e| format!("cannot open {name}: {e}"))?;
+            let meta = file
+                .metadata()
+                .map_err(|e| format!("cannot read {name}: {e}"))?;
+            if !meta.is_file() {
+                return Err(format!("{name} is not a file"));
+            }
+            return Ok(Opened { file, made: None });
+        };
+        can_write(&job.path, overwrite)?;
+        // With --overwrite through a new file beside it and a rename, so
+        // the old backup stays whole until the new one is.
+        let at = if overwrite {
+            let dir = job.path.parent().unwrap_or(Path::new("."));
+            let base = job
+                .path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            dir.join(format!(
+                ".{base}.{}.tmp",
+                nerve_transport::keys::random_token(8)
+            ))
+        } else {
+            job.path.clone()
+        };
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&at)
+            .map_err(|e| {
+                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                    format!("{name} exists already; name another file or pass --overwrite")
+                } else {
+                    format!("cannot write {name}: {e}")
+                }
+            })?;
+        Ok(Opened {
+            file,
+            made: Some((at, job.path.clone())),
+        })
+    }
+
+    /// Puts a backup in place once the command wrote it, or takes away
+    /// what this process made when it did not.
+    fn finish(self, code: Result<i32, String>) -> Result<i32, String> {
+        let Some((at, path)) = self.made else {
+            return code;
+        };
+        drop(self.file);
+        match code {
+            Ok(0) if at == path => Ok(0),
+            Ok(0) => std::fs::rename(&at, &path).map(|()| 0).map_err(|e| {
+                let _ = std::fs::remove_file(&at);
+                format!("cannot write {}: {e}", path.display())
+            }),
+            other => {
+                let _ = std::fs::remove_file(&at);
+                other
+            }
+        }
+    }
+}
+
+/// The client's side of one `cli` request on `conn`, sent already: `before`
+/// goes to the node right after its answer, then the input; the output goes
+/// to `io`, and a streamed file the node gives back to `file`.
+async fn session<S>(
+    conn: S,
+    before: Vec<Value>,
+    input: Input,
+    mut file: Option<&mut Vec<u8>>,
+    io: &mut Io<'_>,
 ) -> Result<i32, String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite,
 {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
     let (r, mut w) = tokio::io::split(conn);
-    let request = json!({"method": "cli", "params": {"args": args, "cwd": cwd}});
-    w.write_all(format!("{request}\n").as_bytes())
-        .await
-        .map_err(|e| format!("cannot reach the node: {e}"))?;
     let mut lines = tokio::io::BufReader::new(r).lines();
     let first = lines
         .next_line()
@@ -402,13 +731,25 @@ where
     if let Some(e) = first["error"].as_str() {
         return Err(e.to_string());
     }
+    for v in before {
+        w.write_all(format!("{v}\n").as_bytes())
+            .await
+            .map_err(|e| format!("cannot reach the node: {e}"))?;
+    }
     // The input goes on its own thread: a read of a terminal blocks, and the
     // command may never ask for it.
     let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(16);
-    if input {
-        std::thread::spawn(move || read_input(std::io::stdin(), &tx));
-    } else {
-        let _ = tx.send(json!({"eof": true})).await;
+    match input {
+        Input::Stdin => {
+            std::thread::spawn(move || read_input(std::io::stdin(), &tx));
+        }
+        Input::Text(text) => {
+            let _ = tx.send(json!({ "in": text })).await;
+            let _ = tx.send(json!({"eof": true})).await;
+        }
+        Input::None => {
+            let _ = tx.send(json!({"eof": true})).await;
+        }
     }
     let feeding = async move {
         while let Some(v) = rx.recv().await {
@@ -426,11 +767,21 @@ where
                 continue;
             };
             if let Some(s) = v["out"].as_str() {
-                let mut o = std::io::stdout();
-                let _ = o.write_all(s.as_bytes());
-                let _ = o.flush();
+                let _ = io.out.write_all(s.as_bytes());
+                let _ = io.out.flush();
             } else if let Some(s) = v["err"].as_str() {
-                let _ = std::io::stderr().write_all(s.as_bytes());
+                let _ = io.err.write_all(s.as_bytes());
+            } else if let Some(chunk) = v["file"].as_str() {
+                let Some(file) = file.as_deref_mut() else {
+                    continue;
+                };
+                let bytes = B64
+                    .decode(chunk)
+                    .map_err(|_| "the node sent the backup in another form".to_string())?;
+                if file.len() + bytes.len() > FILE_MAX {
+                    return Err("the node sent more than a backup holds".into());
+                }
+                file.extend_from_slice(&bytes);
             } else if let Some(code) = v["exit"].as_i64() {
                 return Ok(code as i32);
             }
@@ -627,16 +978,44 @@ fn keeps_no_new_privs(pid: u32) -> bool {
 /// command.
 const FROM_A_COMMAND: &str = "refused: this request comes from a command the node runs for a center, or a program it started";
 
+/// The backup file that came with an owner's request: opened by the
+/// owner's own program and handed over, so the node never opens a path in
+/// the owner's folders as itself.
+pub(crate) enum Handed {
+    None,
+    /// Linux: the open file, sent with the request (SCM_RIGHTS).
+    #[cfg(unix)]
+    File(std::os::fd::OwnedFd),
+    /// Windows: its bytes come in the session, `{"file": base64}` lines and
+    /// then `{"file_end": true}`, and a backup's go back the same way before
+    /// the exit code. The request says `"file": "stream"`.
+    #[cfg_attr(unix, allow(dead_code))]
+    Streamed,
+}
+
+/// The `file` a request says for [`Handed::Streamed`].
+pub const STREAMED: &str = "stream";
+
+/// The largest backup a session carries, as `nerve_transport::backup`
+/// reads.
+const FILE_MAX: usize = nerve_transport::backup::MAX_FILE as usize;
+
+/// The bytes of a streamed file per line: well within a line's limit once
+/// in base64.
+const FILE_CHUNK: usize = 256 * 1024;
+
 /// One request on the owner endpoint from `who` (`None`: no owner):
 /// `status` answers anyone that the node runs; `cli` runs a command for an
 /// owner. `from_command` says whether the caller is a process of a
-/// center's command, as far as the node can tell.
+/// center's command, as far as the node can tell. `handed` is the file
+/// that came with it.
 pub(crate) async fn answer(
     shared: &std::sync::Arc<crate::daemon::Shared>,
     program: &Path,
     req: nerve_transport::ctl::CtlRequest,
     who: Option<String>,
     from_command: bool,
+    handed: Handed,
 ) -> nerve_transport::ctl::Reply {
     use nerve_transport::ctl::Reply;
     match req.method.as_str() {
@@ -650,7 +1029,7 @@ pub(crate) async fn answer(
             let Some(who) = who else {
                 return Reply::Err(not_an_owner());
             };
-            run_for(&shared.paths, program, &who, &req.params).await
+            run_for(shared, program, &who, &req.params, handed).await
         }
         other => Reply::Err(format!("unknown method {other}")),
     }
@@ -671,13 +1050,21 @@ fn not_an_owner() -> String {
     }
 }
 
+/// Whether `cmd` works on a backup file: `backup` and `restore`.
+fn takes_a_file(cmd: &Cmd) -> bool {
+    matches!(cmd, Cmd::Backup { .. } | Cmd::Restore { .. })
+}
+
 /// Runs the command `params` names (`args`, `cwd`) for the owner `who`: the
-/// node's own program, as the node's user, on the node's folders.
+/// node's own program, as the node's user, on the node's folders. A
+/// `restore` runs while the node is stopped, which then starts again
+/// ([`crate::daemon::NodeOptions::aside`]).
 async fn run_for(
-    paths: &NodePaths,
+    shared: &std::sync::Arc<crate::daemon::Shared>,
     program: &Path,
     who: &str,
     params: &Value,
+    handed: Handed,
 ) -> nerve_transport::ctl::Reply {
     use clap::Parser;
     use nerve_transport::ctl::Reply;
@@ -692,14 +1079,40 @@ async fn run_for(
     // here, before anything runs. One that does not parse runs, and the
     // program says what is wrong with it.
     let name = crate::edition::get().program;
-    if let Ok(cli) = Cli::try_parse_from(std::iter::once(name.to_string()).chain(args.clone())) {
-        if cli.config_dir.is_some() || cli.state_dir.is_some() {
-            return Reply::Err("the node runs its commands on its own folders".into());
+    let (mut backup, mut restore) = (false, false);
+    let mut handed = handed;
+    match Cli::try_parse_from(std::iter::once(name.to_string()).chain(args.clone())) {
+        Ok(cli) => {
+            if cli.config_dir.is_some() || cli.state_dir.is_some() {
+                return Reply::Err("the node runs its commands on its own folders".into());
+            }
+            if let Some(why) = refused(&cli.cmd) {
+                return Reply::Err(why);
+            }
+            if takes_a_file(&cli.cmd) && matches!(handed, Handed::None) {
+                return Reply::Err(format!(
+                    "the backup file comes with the request, opened by your own program: `{name}` does that"
+                ));
+            }
+            if !takes_a_file(&cli.cmd) {
+                handed = Handed::None;
+            }
+            backup = matches!(cli.cmd, Cmd::Backup { .. });
+            restore = matches!(cli.cmd, Cmd::Restore { .. });
         }
-        if let Some(why) = refused(&cli.cmd) {
-            return Reply::Err(why);
-        }
+        // Nothing to hand a file to.
+        Err(_) => handed = Handed::None,
     }
+    let aside = match (&shared.aside, restore) {
+        (Some(a), true) => Some(a.clone()),
+        (None, true) => {
+            return Reply::Err(
+                "this node cannot stop for a restore and start again by itself; stop it and restore as an administrator"
+                    .into(),
+            );
+        }
+        (_, false) => None,
+    };
     // The command's words only: a value can be a secret (a proxy URL).
     let words: Vec<&str> = args
         .iter()
@@ -708,34 +1121,29 @@ async fn run_for(
         .take(2)
         .collect();
     tracing::info!("{who} runs `{name} {}` as an owner", words.join(" "));
-    let cwd = params["cwd"].as_str().map(PathBuf::from);
-    let mut child = match spawn(paths, program, who, &args, cwd.as_deref()) {
-        Ok(c) => c,
-        Err(e) => return Reply::Err(format!("cannot run {name}: {e}")),
-    };
     let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Value>(64);
     let (in_tx, in_rx) = tokio::sync::mpsc::channel::<Value>(16);
-    let stdin = child.stdin.take();
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    tokio::spawn(async move {
-        let pumped = async {
-            tokio::join!(
-                pump(stdout, "out", out_tx.clone()),
-                pump(stderr, "err", out_tx.clone())
-            );
-            child.wait().await
-        };
-        let fed = feed(in_rx, stdin);
-        tokio::pin!(fed);
-        let status = tokio::select! {
-            s = pumped => s,
-            // The caller went: the command ends with it.
-            () = &mut fed => return,
-        };
-        let code = status.ok().and_then(|s| s.code()).unwrap_or(1);
-        let _ = out_tx.send(json!({ "exit": code })).await;
+    let job = command(Job {
+        paths: shared.paths.clone(),
+        program: program.to_path_buf(),
+        who: who.to_string(),
+        args,
+        cwd: params["cwd"].as_str().map(PathBuf::from),
+        handed,
+        backup,
+        out: out_tx,
+        input: in_rx,
     });
+    match aside {
+        Some(aside) => {
+            if aside.send(Box::pin(job)).is_err() {
+                return Reply::Err("the node is stopping".into());
+            }
+        }
+        None => {
+            tokio::spawn(job);
+        }
+    }
     Reply::Session {
         ok: json!({}),
         out: out_rx,
@@ -743,15 +1151,167 @@ async fn run_for(
     }
 }
 
+/// One command an owner asked for, with its session's ends.
+struct Job {
+    paths: NodePaths,
+    program: PathBuf,
+    who: String,
+    args: Vec<String>,
+    cwd: Option<PathBuf>,
+    handed: Handed,
+    /// A backup, whose streamed file goes back to the caller.
+    backup: bool,
+    out: tokio::sync::mpsc::Sender<Value>,
+    input: tokio::sync::mpsc::Receiver<Value>,
+}
+
+/// Runs `job`'s command and passes its output and input through, then its
+/// exit code. A streamed file is taken in first (a restore's), or given back
+/// before the exit code (a backup's).
+async fn command(job: Job) {
+    let Job {
+        paths,
+        program,
+        who,
+        args,
+        cwd,
+        handed,
+        backup,
+        out,
+        mut input,
+    } = job;
+    let name = crate::edition::get().program;
+    let failed = |e: String| {
+        let out = out.clone();
+        async move {
+            let _ = out.send(json!({ "err": format!("{name}: {e}\n") })).await;
+            let _ = out.send(json!({ "exit": 1 })).await;
+        }
+    };
+    // The bytes of a streamed file go through a file of the node's own, in
+    // its state folder, which only it may open.
+    let carried = match &handed {
+        Handed::Streamed => Some(paths.state_dir.join(format!(
+            "owner-file.{}",
+            nerve_transport::keys::random_token(8)
+        ))),
+        _ => None,
+    };
+    if let Some(at) = &carried
+        && !backup
+        && let Err(e) = take_streamed(&mut input, at).await
+    {
+        let _ = std::fs::remove_file(at);
+        return failed(e).await;
+    }
+    let file_env = match (&handed, &carried) {
+        #[cfg(unix)]
+        (Handed::File(_), _) => Some(format!("fd:{HANDED_FD}")),
+        (_, Some(at)) => Some(at.display().to_string()),
+        _ => None,
+    };
+    #[cfg(unix)]
+    let fd = match handed {
+        Handed::File(f) => Some(f),
+        _ => None,
+    };
+    #[cfg(not(unix))]
+    let fd: Option<()> = None;
+    let mut child = match spawn(&paths, &program, &who, &args, cwd.as_deref(), file_env, fd) {
+        Ok(c) => c,
+        Err(e) => {
+            if let Some(at) = &carried {
+                let _ = std::fs::remove_file(at);
+            }
+            return failed(format!("cannot run {name}: {e}")).await;
+        }
+    };
+    let stdin = child.stdin.take();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let pumped = async {
+        tokio::join!(
+            pump(stdout, "out", out.clone()),
+            pump(stderr, "err", out.clone())
+        );
+        child.wait().await
+    };
+    let fed = feed(input, stdin);
+    tokio::pin!(fed);
+    let status = tokio::select! {
+        s = pumped => s,
+        // The caller went: the command ends with it.
+        () = &mut fed => {
+            if let Some(at) = &carried {
+                let _ = std::fs::remove_file(at);
+            }
+            return;
+        }
+    };
+    let code = status.ok().and_then(|s| s.code()).unwrap_or(1);
+    if let Some(at) = &carried {
+        if backup && code == 0 {
+            match std::fs::read(at) {
+                Ok(bytes) => {
+                    for chunk in bytes.chunks(FILE_CHUNK) {
+                        let _ = out.send(json!({ "file": B64.encode(chunk) })).await;
+                    }
+                }
+                Err(e) => {
+                    let _ = std::fs::remove_file(at);
+                    return failed(format!("the backup the command wrote: {e}")).await;
+                }
+            }
+        }
+        let _ = std::fs::remove_file(at);
+    }
+    let _ = out.send(json!({ "exit": code })).await;
+}
+
+/// The descriptor a handed file has in the program the node runs.
+#[cfg(unix)]
+const HANDED_FD: i32 = 3;
+
+/// Takes a streamed file from the session into `at`: `{"file": base64}`
+/// lines until `{"file_end": true}`.
+async fn take_streamed(
+    input: &mut tokio::sync::mpsc::Receiver<Value>,
+    at: &Path,
+) -> Result<(), String> {
+    let mut bytes = Vec::new();
+    loop {
+        let v = input
+            .recv()
+            .await
+            .ok_or("the caller went before its file came")?;
+        if v["file_end"] == true {
+            break;
+        }
+        let chunk = v["file"]
+            .as_str()
+            .and_then(|c| B64.decode(c).ok())
+            .ok_or("the file came in another form than the node takes")?;
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() > FILE_MAX {
+            return Err("the file is larger than a Nerve backup".into());
+        }
+    }
+    nerve_transport::files::write_private(at, &bytes).map_err(|e| format!("{}: {e}", at.display()))
+}
+
 /// Starts the program for `who`: its output and input piped, ended when
 /// dropped. The caller's folder is its working folder when the node may
-/// enter it, else the root.
-fn spawn(
+/// enter it, else the root. A handed file is its descriptor
+/// [`HANDED_FD`] (Linux), named by `file_env` in
+/// [`crate::caller_file::OWNER_FILE_ENV`].
+fn spawn<F: HandedFd>(
     paths: &NodePaths,
     program: &Path,
     who: &str,
     args: &[String],
     cwd: Option<&Path>,
+    file_env: Option<String>,
+    fd: Option<F>,
 ) -> std::io::Result<tokio::process::Child> {
     let make = |dir: &Path| {
         let mut c = tokio::process::Command::new(program);
@@ -768,10 +1328,17 @@ fn spawn(
             .env_remove(crate::cli::DESKTOP_USER_SID)
             .env_remove("NERVE_CONFIG_DIR")
             .env_remove("NERVE_STATE_DIR")
+            .env_remove(crate::caller_file::OWNER_FILE_ENV)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
+        if let Some(v) = &file_env {
+            c.env(crate::caller_file::OWNER_FILE_ENV, v);
+        }
+        if let Some(f) = &fd {
+            f.give_to(&mut c);
+        }
         #[cfg(windows)]
         c.creation_flags(windows_sys::Win32::System::Threading::CREATE_NO_WINDOW);
         c
@@ -785,6 +1352,41 @@ fn spawn(
         // A folder the node may not enter fails the start: then the root.
         Some(d) => make(d).spawn().or_else(|_| make(&root).spawn()),
         None => make(&root).spawn(),
+    }
+}
+
+/// A file the program the node runs gets as a descriptor of its own.
+trait HandedFd {
+    fn give_to(&self, c: &mut tokio::process::Command);
+}
+
+#[cfg(not(unix))]
+impl HandedFd for () {
+    fn give_to(&self, _c: &mut tokio::process::Command) {}
+}
+
+#[cfg(unix)]
+impl HandedFd for std::os::fd::OwnedFd {
+    /// As [`HANDED_FD`], open in the program alone: the node's own copy
+    /// keeps closing on exec.
+    fn give_to(&self, c: &mut tokio::process::Command) {
+        use std::os::fd::AsRawFd;
+        let raw = self.as_raw_fd();
+        // SAFETY: between fork and exec only async-signal-safe calls (dup2,
+        // fcntl) on descriptors of this process.
+        unsafe {
+            c.pre_exec(move || {
+                if raw == HANDED_FD {
+                    let flags = libc::fcntl(raw, libc::F_GETFD);
+                    if flags < 0 || libc::fcntl(raw, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                } else if libc::dup2(raw, HANDED_FD) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
 }
 
@@ -855,7 +1457,7 @@ pub(crate) async fn serve(
     let task = tokio::spawn(async move {
         let program = endpoint.program.clone();
         let owners = endpoint.owners.clone();
-        let r = nerve_transport::ctl::serve_anyone(listener, move |req, peer| {
+        let r = nerve_transport::ctl::serve_anyone(listener, move |req, peer, mut files| {
             let s = shared.clone();
             let program = program.clone();
             let owners = owners.clone();
@@ -866,7 +1468,13 @@ pub(crate) async fn serve(
                 } else {
                     (None, false)
                 };
-                answer(&s, &program, req, who, from_command).await
+                // One file at most; any other is closed.
+                let handed = if files.is_empty() {
+                    Handed::None
+                } else {
+                    Handed::File(files.swap_remove(0))
+                };
+                answer(&s, &program, req, who, from_command, handed).await
             }
         })
         .await;
@@ -1040,7 +1648,12 @@ mod win {
                         } else {
                             (None, false)
                         };
-                        answer(&s, &program, req, who, from_command).await
+                        let handed = if req.params["file"] == super::STREAMED {
+                            super::Handed::Streamed
+                        } else {
+                            super::Handed::None
+                        };
+                        answer(&s, &program, req, who, from_command, handed).await
                     }
                 });
                 let _ = nerve_transport::ctl::serve_stream(conn, caller, handler).await;
@@ -1107,8 +1720,6 @@ mod tests {
             &["setup"],
             &["setup", "--create-user", "x", "--account-only"],
             &["sudo", "on"],
-            &["backup", "/tmp/b"],
-            &["restore", "/tmp/b"],
         ] {
             assert!(refused(&cli(args).cmd).is_some(), "{args:?}");
         }
@@ -1126,6 +1737,9 @@ mod tests {
             &["panic"],
             &["unlock"],
             &["proxy", "rm"],
+            // With the file the owner's program hands over (item 14).
+            &["backup", "/tmp/b"],
+            &["restore", "/tmp/b"],
         ] {
             assert_eq!(refused(&cli(args).cmd), None, "{args:?}");
         }
@@ -1139,7 +1753,6 @@ mod tests {
             &["sudo", "on"][..],
             &["update"],
             &["uninstall"],
-            &["backup", "/tmp/b"],
             &["setup", "--create-user", "x", "--account-only"],
             &["config", "set", "machine.user", "bob"],
             &["config", "unset", "machine.shell"],
@@ -1152,6 +1765,8 @@ mod tests {
             &["config", "set", "log.level", "debug"],
             &["rule", "add", "deny", "rm"],
             &["sudo", "off"],
+            &["backup", "/tmp/b", "--overwrite"],
+            &["restore", "/tmp/b"],
         ] {
             assert!(!needs_admin(&cli(args).cmd), "{args:?}");
         }
@@ -1217,6 +1832,40 @@ mod tests {
             forwarded_args(&cli(&given), os(&given), None).unwrap(),
             given
         );
+        // A backup's file is named whole, and its passphrase file stays
+        // here: this process reads it and hands the passphrase on.
+        let given = [
+            "backup",
+            "n.backup",
+            "--passphrase-file",
+            "pass",
+            "--overwrite",
+        ];
+        let c = cli(&given);
+        assert_eq!(
+            forwarded_args(&c, os(&given), Some("/home/a".into())).unwrap(),
+            ["backup", "/home/a/n.backup", "--overwrite"]
+        );
+        let job = FileJob::of(&c.cmd, Some("/home/a".into())).unwrap();
+        assert_eq!(job.path, Path::new("/home/a/n.backup"));
+        assert_eq!(job.backup, Some(true));
+        assert_eq!(
+            job.passphrase_file.as_deref(),
+            Some(Path::new("/home/a/pass"))
+        );
+        let given = [
+            "restore",
+            "/srv/n.backup",
+            "--passphrase-file=/p",
+            "--replace",
+        ];
+        let c = cli(&given);
+        assert_eq!(
+            forwarded_args(&c, os(&given), None).unwrap(),
+            ["restore", "/srv/n.backup", "--replace"]
+        );
+        assert_eq!(FileJob::of(&c.cmd, None).unwrap().backup, None);
+        assert!(FileJob::of(&cli(&["status"]).cmd, None).is_none());
     }
 
     /// Only the commands that read the input get it.

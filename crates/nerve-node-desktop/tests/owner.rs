@@ -13,7 +13,7 @@ use nerve_node_desktop::app::{Ctl, Exec};
 use nerve_node_desktop::broker::Launch;
 use nerve_node_desktop::headless::Screen;
 use nerve_node_desktop::runner::Runner;
-use nerve_node_desktop::{AppWindow, Load, Perm, Store};
+use nerve_node_desktop::{AppWindow, Load, Perm, Prefs, Store};
 use slint::ComponentHandle;
 
 /// How often the program was started as the broker, from its log.
@@ -31,13 +31,24 @@ fn an_owner_is_asked_only_for_what_needs_an_administrator() {
     let dir = tempfile::tempdir().unwrap();
     let root: &Path = dir.path();
     let paths = NodePaths::new(root.join("config"), root.join("state"));
-    // The program, which notes each start's first argument.
+    // The program, which notes each start's first argument. It stands in
+    // for the service's start and stop (no service is installed here), and
+    // refuses a restore as the node refuses an owner one that changes the
+    // account commands run as, while `refuse` is there.
     let log = root.join("starts");
+    let refuse = root.join("refuse");
     let wrapper = root.join("nerve-node-desktop");
     let script = format!(
-        "#!/bin/sh\necho \"$1\" >> '{}'\nexec '{}' \"$@\"\n",
-        log.display(),
-        env!("CARGO_BIN_EXE_nerve-node-desktop")
+        "#!/bin/sh\necho \"$1\" >> '{log}'\n\
+         case \" $* \" in\n\
+         *' service stop '* | *' service start '*) echo '{{\"messages\": [\"done\"]}}'; exit 0 ;;\n\
+         *' restore '*) if [ -e '{refuse}' ]; then echo '{{\"error\": \"the backup sets machine.user other than it is here: {by} root\"}}'; exit 1; fi ;;\n\
+         esac\n\
+         exec '{exe}' \"$@\"\n",
+        log = log.display(),
+        refuse = refuse.display(),
+        by = nerve_node::owner::RESTORE_BY_ADMIN,
+        exe = env!("CARGO_BIN_EXE_nerve-node-desktop")
     );
     // Written by a child, so no thread of this test holds it open for
     // writing when it runs (ETXTBSY).
@@ -107,4 +118,31 @@ fn an_owner_is_asked_only_for_what_needs_an_administrator() {
     // The Overview's offer of an account of their own asks too.
     store.invoke_separate_account();
     assert_eq!(brokers(&log), 2);
+
+    // Backup and restore go through the node for an owner: no question.
+    let prefs = window.global::<Prefs>();
+    let file = root.join("node.backup");
+    let pass = "correct horse battery";
+    prefs.set_backup_file(file.display().to_string().into());
+    prefs.set_backup_pass(pass.into());
+    prefs.set_backup_pass2(pass.into());
+    prefs.invoke_backup_confirm();
+    assert!(file.is_file(), "{}", prefs.get_backup_error());
+    assert_eq!(brokers(&log), 2);
+    store.set_service_state("running".into());
+    let restore = || {
+        prefs.set_restore_file(file.display().to_string().into());
+        prefs.set_restore_pass(pass.into());
+        prefs.set_restore_error("".into());
+        prefs.invoke_restore_confirm();
+        assert_eq!(prefs.get_restore_error(), "");
+        assert!(!prefs.get_restore_busy());
+    };
+    restore();
+    assert_eq!(brokers(&log), 2);
+    // One the node refuses an owner is restored the administrator's way:
+    // the rights are asked for it alone.
+    std::fs::write(&refuse, "").unwrap();
+    restore();
+    assert_eq!(brokers(&log), 3);
 }

@@ -89,6 +89,12 @@ impl Passphrase {
         Passphrase(text)
     }
 
+    /// The text, for a program that hands it on (an owner's CLI to the
+    /// node).
+    pub fn text(&self) -> &str {
+        &self.0
+    }
+
     /// Whether the passphrase is one a new backup may have.
     pub fn check_new(&self) -> Result<(), String> {
         if self.0.chars().count() < MIN_PASSPHRASE {
@@ -274,28 +280,39 @@ pub fn open(bytes: &[u8], pass: &Passphrase) -> Result<Contents, String> {
 /// Reads a backup file, refusing what is not a regular file or is larger than
 /// [`MAX_FILE`] before it is read into memory.
 pub fn read_file(path: &Path) -> Result<Vec<u8>, String> {
-    let name = path.display();
-    let check = |meta: &std::fs::Metadata| -> Result<(), String> {
-        if !meta.is_file() {
-            return Err(format!("{name} is not a file"));
-        }
-        if meta.len() > MAX_FILE {
-            return Err(format!(
-                "{name} is larger than {} MiB, so it is not a Nerve backup",
-                MAX_FILE / (1024 * 1024)
-            ));
-        }
-        Ok(())
-    };
+    let name = path.display().to_string();
     // Before it is opened: Windows refuses to open a folder, and the message
     // would be "Access is denied" instead of what is wrong.
-    check(&std::fs::metadata(path).map_err(|e| format!("cannot open {name}: {e}"))?)?;
+    check_file(
+        &name,
+        &std::fs::metadata(path).map_err(|e| format!("cannot open {name}: {e}"))?,
+    )?;
     let file = std::fs::File::open(path).map_err(|e| format!("cannot open {name}: {e}"))?;
-    // And again on the open file, which may be another one by now.
+    read_open(file, &name)
+}
+
+/// Whether `meta` is of a file that can be a backup.
+fn check_file(name: &str, meta: &std::fs::Metadata) -> Result<(), String> {
+    if !meta.is_file() {
+        return Err(format!("{name} is not a file"));
+    }
+    if meta.len() > MAX_FILE {
+        return Err(format!(
+            "{name} is larger than {} MiB, so it is not a Nerve backup",
+            MAX_FILE / (1024 * 1024)
+        ));
+    }
+    Ok(())
+}
+
+/// Reads the backup in `file`, opened already (by [`read_file`], or by an
+/// owner's own process that handed it over), named `name` in errors.
+pub fn read_open(file: std::fs::File, name: &str) -> Result<Vec<u8>, String> {
+    // Checked on the open file, which may be another one than was looked at.
     let meta = file
         .metadata()
         .map_err(|e| format!("cannot read {name}: {e}"))?;
-    check(&meta)?;
+    check_file(name, &meta)?;
     let mut bytes = Vec::with_capacity(meta.len() as usize);
     file.take(MAX_FILE + 1)
         .read_to_end(&mut bytes)

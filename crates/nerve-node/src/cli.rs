@@ -1987,6 +1987,13 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                 .transpose()?;
             let pass = crate::prompt::passphrase(passphrase_file.as_deref(), out, false)?;
             let parsed = crate::backup::open(&bytes, &pass)?;
+            // An owner restores what an owner may change, nothing that
+            // picks the account or program commands run as.
+            if crate::owner::owner_running().is_some()
+                && let Some(key) = crate::backup::root_only_change(&paths, &parsed)
+            {
+                return Err(crate::owner::restore_needs_admin(key));
+            }
             let opts = crate::backup::RestoreOpts {
                 replace,
                 secret_storage: storage,

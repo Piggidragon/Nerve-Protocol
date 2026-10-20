@@ -576,21 +576,77 @@ impl Ctl {
         if in_files {
             args.extend(["--secret-storage".into(), "file".into()]);
         }
-        // A restore never goes under a running node: the app stops the
-        // service for it and starts it again after, also when the restore
-        // failed.
         let running = self
             .with_store(|s| s.get_service_state() == "running")
             .unwrap_or(false);
         self.with_prefs(|p| p.set_restore_busy(true));
+        if self.owner_path() {
+            return self.restore_as_owner(args, pass, running);
+        }
+        self.restore_stopped(args, pass, running, false);
+    }
+
+    /// An owner's restore: through the running node, which stops for it
+    /// and starts again by itself (nerve_node::owner). A node that does not
+    /// run is started for it. A backup that changes the account commands
+    /// run as is an administrator's to restore: then the app asks for the
+    /// rights and restores the way an administrator does.
+    fn restore_as_owner(self: &Rc<Self>, args: Vec<String>, pass: String, running: bool) {
+        let restore = move |c: &Rc<Ctl>| {
+            let (again, pass_again) = (args.clone(), pass.clone());
+            c.command(args, Some(pass), move |c, answer| match answer {
+                Err(e) if e.contains(nerve_node::owner::RESTORE_BY_ADMIN) => {
+                    c.restore_stopped(again, pass_again, true, true)
+                }
+                answer => {
+                    c.with_prefs(|p| p.set_restore_pass(SharedString::new()));
+                    if answer.is_ok() {
+                        c.with_store(|s| s.set_restart_due(false));
+                    }
+                    let then = view::started_after_restore(answer.is_ok(), Ok(()));
+                    c.restored(answer, then, false);
+                }
+            });
+        };
+        if running {
+            return restore(self);
+        }
+        self.command(
+            vec!["service".into(), "start".into()],
+            None,
+            move |c, answer| match answer {
+                Ok(_) => restore(c),
+                Err(e) => {
+                    c.with_prefs(|p| {
+                        p.set_restore_busy(false);
+                        p.set_restore_error(
+                            format!("The node did not start for the restore: {e}").into(),
+                        );
+                    });
+                    c.refresh_service();
+                }
+            },
+        );
+    }
+
+    /// A restore under a stopped node, as an administrator does it: the
+    /// app stops the service for it and starts it again after, also when
+    /// the restore failed. `admin` asks for the rights for the restore.
+    fn restore_stopped(
+        self: &Rc<Self>,
+        args: Vec<String>,
+        pass: String,
+        running: bool,
+        admin: bool,
+    ) {
         if !running {
-            return self.restore_run(args, pass, false);
+            return self.restore_run(args, pass, false, admin);
         }
         self.command(
             vec!["service".into(), "stop".into()],
             None,
             move |c, answer| match answer {
-                Ok(_) => c.restore_run(args, pass, true),
+                Ok(_) => c.restore_run(args, pass, true, admin),
                 Err(e) => {
                     c.with_prefs(|p| {
                         p.set_restore_busy(false);
@@ -604,9 +660,10 @@ impl Ctl {
         );
     }
 
-    /// The restore itself, then the start of the service when `start`.
-    fn restore_run(self: &Rc<Self>, args: Vec<String>, pass: String, start: bool) {
-        self.command(args, Some(pass), move |c, answer| {
+    /// The restore itself, then the start of the service when `start`;
+    /// with the administrator's rights asked for it when `admin`.
+    fn restore_run(self: &Rc<Self>, args: Vec<String>, pass: String, start: bool, admin: bool) {
+        let done = move |c: &Rc<Ctl>, answer: Result<serde_json::Value, String>| {
             c.with_prefs(|p| p.set_restore_pass(SharedString::new()));
             if !start {
                 let stopped = c
@@ -631,7 +688,12 @@ impl Ctl {
                     c.restored(answer, then, true);
                 },
             );
-        });
+        };
+        if admin {
+            self.command_with_rights(args, Some(pass), done);
+        } else {
+            self.command(args, Some(pass), done);
+        }
     }
 
     /// Shows what a restore did, or why it did not, with what became of

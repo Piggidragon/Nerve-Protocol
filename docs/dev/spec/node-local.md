@@ -1253,7 +1253,21 @@ lines and two methods:
 `cli` is refused to a caller below a command the node runs, with
 `no_new_privs` (Linux), in a command's job (Windows), who is no owner, with
 `--config-dir` or `--state-dir`, and for `run`, `install`, `update`,
-`uninstall`, `service`, `setup`, `sudo on`, `backup` and `restore`. A program
+`uninstall`, `service`, `setup` and `sudo on`.
+
+`backup` and `restore` take the file the caller opened itself: on Linux its
+descriptor, sent with the request line (SCM_RIGHTS), which the program gets
+as descriptor 3; on Windows the request says `"file": "stream"` and the bytes
+come as `{"file": base64}` lines and `{"file_end": true}` before the input
+(restore), or go back as `{"file"}` lines before `{"exit"}` (backup), through
+a file in the node's state folder. The program finds it in
+`NERVE_OWNER_FILE` (`fd:3` or that file) and never opens the path it is
+given. The caller asks the passphrase and sends it as the input; a backup's
+new file is its own (`create_new`, 0600, a temporary name and a rename with
+`--overwrite`). A `restore` runs while the node is stopped: the daemon stops,
+runs it, and starts again (`Daemon::run_until`), and with `NERVE_OWNER` the
+program refuses a backup that would change one of the four `machine.*`
+settings above. A program
 with `NERVE_OWNER` refuses a change of `machine.user`, `machine.allow_root`,
 `machine.sudo_path` and `machine.shell`, and names the owner in the audit's
 settings entries (`"user"`). Starting and stopping the service is the service

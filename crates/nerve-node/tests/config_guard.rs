@@ -483,35 +483,21 @@ async fn a_command_cannot_read_the_config_over_the_control_socket() {
             .contains(CENTER_SHOWN)
     );
 
-    // The sandbox keeps the command from the config file. Where Landlock
-    // cannot keep it off socket files (below ABI 9) its rules do not stop
-    // a connection to the socket, and the command runs as the node's own
-    // user. It must get nothing from it.
+    // The sandbox keeps the command from the config file, but its rules do
+    // not stop a connection to the socket (with the keys in files they leave
+    // connecting alone), and the command runs as the node's own user. It
+    // must get nothing from it.
     let r = run_command(&mut conn, &work, &nerve(&o, "center ls")).await;
     let shown = format!("{}{}", r["stdout"], r["stderr"]);
     assert!(!shown.contains(CENTER_SHOWN), "{r}");
-    assert!(refused(&shown), "{r}");
+    assert!(shown.contains("refused"), "{r}");
     assert_ne!(r["exit_code"], 0, "{r}");
     // `status` is answered without the token, but only that a node runs.
     let r = run_command(&mut conn, &work, &nerve(&o, "status")).await;
     let shown = format!("{}{}", r["stdout"], r["stderr"]);
     assert!(!shown.contains(CENTER_SHOWN), "{r}");
-    assert!(shown.contains("running") || kept_off(&shown), "{r}");
+    assert!(shown.contains("running"), "{r}");
     node.stop().await;
-}
-
-/// Whether a command was kept off the control socket by Landlock: from ABI
-/// 9 on, a `folder` mode command connects to no socket file outside its own
-/// folders, and the socket is in the node's.
-fn kept_off(shown: &str) -> bool {
-    nerve_sandbox::Confinement::detect().keeps_sockets()
-        && shown.contains("cannot connect to the node's control socket: Permission denied")
-}
-
-/// Whether the node refused what a command asked on its control socket, or
-/// Landlock kept the command off it ([`kept_off`]).
-fn refused(shown: &str) -> bool {
-    shown.contains("refused") || kept_off(shown)
 }
 
 /// A command with no sandbox (`user` mode) can read the token file, as it can
@@ -615,7 +601,7 @@ async fn a_process_that_outlives_its_command_cannot_change_the_config() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
     assert!(
-        !text.contains("exit 0") && refused(&text),
+        !text.contains("exit 0") && text.contains("refused"),
         "the survivor changed the config: {text}"
     );
     assert_eq!(node.config(), before, "{text}");

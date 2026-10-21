@@ -192,32 +192,6 @@ pub fn keyring_places(
     out
 }
 
-/// The socket files of the D-Bus session of the user `uid`: `bus` in its
-/// runtime folders and the sockets its bus address names. A `folder` mode
-/// command never connects to them, whether the keys are in the keyring or
-/// in files: the bus hands the keyring's entries to whoever asks, it may
-/// hold the keys later (a command's sandbox does not change while it runs),
-/// and the user's service manager behind it starts programs on request.
-pub fn bus_places(uid: u32, var: impl Fn(&str) -> Option<OsString>) -> Vec<PathBuf> {
-    let mut out: Vec<PathBuf> = var("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .map(|d| d.join("bus"))
-        .into_iter()
-        .collect();
-    out.push(PathBuf::from(format!("/run/user/{uid}/bus")));
-    if let Some(address) = var("DBUS_SESSION_BUS_ADDRESS") {
-        out.extend(bus_sockets(&address.to_string_lossy()));
-    }
-    let mut seen = Vec::new();
-    out.retain(|p| {
-        let new = !seen.contains(p);
-        seen.push(p.clone());
-        new
-    });
-    out
-}
-
 /// The sockets a D-Bus address names (`unix:path=…`, `;` between the
 /// addresses tried in turn). An abstract socket has no path; Landlock keeps
 /// a command off those anyway.
@@ -518,31 +492,6 @@ mod tests {
         // A relative folder in the environment names nothing.
         let odd = |k: &str| (k == "XDG_RUNTIME_DIR").then(|| OsString::from("run"));
         assert_eq!(keyring_places(Path::new("/h"), 7, odd).len(), 2);
-    }
-
-    /// The session bus's sockets: `bus` in the runtime folders, and those its
-    /// address names, each once.
-    #[cfg(unix)]
-    #[test]
-    fn the_bus_places_are_the_session_buss_sockets() {
-        let env = |k: &str| {
-            match k {
-                "XDG_RUNTIME_DIR" => Some("/run/user/1000"),
-                "DBUS_SESSION_BUS_ADDRESS" => {
-                    Some("unix:path=/run/user/1000/bus;unix:path=/tmp/dbus%2dabc")
-                }
-                _ => None,
-            }
-            .map(OsString::from)
-        };
-        assert_eq!(
-            bus_places(1000, env),
-            [PathBuf::from("/run/user/1000/bus"), "/tmp/dbus-abc".into()]
-        );
-        assert_eq!(
-            bus_places(990, |_| None),
-            [PathBuf::from("/run/user/990/bus")]
-        );
     }
 
     /// The real known-folder read; only a Windows run reaches it.

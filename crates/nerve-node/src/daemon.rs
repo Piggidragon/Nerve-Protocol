@@ -652,21 +652,6 @@ impl Shared {
         out
     }
 
-    /// The places whose socket files a confined command never connects to:
-    /// [`Shared::sealed`], and on Linux the node's user's session bus
-    /// (crate::paths::bus_places). Asked only where Landlock keeps commands
-    /// off socket files.
-    pub fn off_sockets(&self, cfg: &NodeConfig) -> Vec<PathBuf> {
-        #[allow(unused_mut)]
-        let mut out = self.sealed(cfg);
-        #[cfg(target_os = "linux")]
-        out.extend(crate::paths::bus_places(
-            nerve_transport::net::euid(),
-            |k| std::env::var_os(k),
-        ));
-        out
-    }
-
     /// Whether commands of `folder` mode may run: confined (Landlock or an
     /// AppContainer, and the shim's host), and kept from the node's keys. With the keys in the
     /// keyring a command reaches them over the session bus, a socket file:

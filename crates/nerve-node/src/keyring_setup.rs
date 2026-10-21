@@ -558,7 +558,12 @@ pub(crate) mod tests {
 
     /// A `find` for [`Offer::for_system`] that finds `names` in /usr/bin.
     pub fn found(names: &'static [&'static str]) -> impl Fn(&str) -> Option<PathBuf> {
-        move |p| names.contains(&p).then(|| Path::new("/usr/bin").join(p))
+        // Written whole, so that it reads the same on Windows.
+        move |p| {
+            names
+                .contains(&p)
+                .then(|| PathBuf::from(format!("/usr/bin/{p}")))
+        }
     }
 
     pub fn nerve(home: &Path) -> Account {
@@ -626,7 +631,9 @@ pub(crate) mod tests {
         assert_eq!(Offer::for_system(found(&[])), None);
         assert_eq!(Offer::for_system(found(&["apt-get"])), None, "no loginctl");
         // The programs come from the system's own folders only.
-        assert!(system_program("sh").is_some_and(|p| p.is_absolute()));
+        if cfg!(unix) {
+            assert!(system_program("sh").is_some_and(|p| p.is_absolute()));
+        }
         assert_eq!(system_program("no-such-program-of-nerve"), None);
     }
 

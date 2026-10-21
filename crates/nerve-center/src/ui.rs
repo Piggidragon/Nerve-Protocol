@@ -1285,8 +1285,8 @@ mod tests {
     /// sat (review round 3, finding 1): after a list gained or lost an item,
     /// a position names the End, Remove or Disable of another item, and
     /// Enter acts on an item the user never picked. A control without a
-    /// `data-focus` key gets no restore; a key that is gone or not unique
-    /// sends the focus to the section's heading, which does nothing on
+    /// `data-focus` key, a key that is gone and a key that is not unique
+    /// all send the focus to the section's heading, which does nothing on
     /// Enter. (The browser check is `focus-identity.js` in the review tools.)
     #[test]
     fn the_focus_is_restored_by_identity_not_by_position() {
@@ -1301,8 +1301,13 @@ mod tests {
         let restore = &APP_JS[APP_JS.find("function restoreFocus(").unwrap()..];
         let restore = &restore[..restore.find("\n}\n").unwrap()];
         assert!(!restore.contains(".children["), "{restore}");
-        assert!(restore.contains("if (!spot.key) return;"), "{restore}");
-        assert!(restore.contains("focusTarget(spot.key)"), "{restore}");
+        // No early return for a spot without a key: it reaches the
+        // heading like a key that is gone (review round 5, finding 1).
+        assert!(!restore.contains("if (!spot.key)"), "{restore}");
+        assert!(
+            restore.contains("spot.key && focusTarget(spot.key)"),
+            "{restore}"
+        );
         assert!(restore.contains("querySelector(\"h3\")"), "{restore}");
         // The heading takes the focus but is not a stop for Tab.
         assert!(APP_JS.contains("el(\"h3\", { tabindex: \"-1\""));
@@ -1348,6 +1353,33 @@ mod tests {
         assert_eq!(unique.len(), ids.len());
         // A session's End is named by the session.
         assert!(APP_JS.contains("session:${s.id}:end"));
+    }
+
+    /// A text field that gets the focus back gets what was typed into it back
+    /// as well (review round 5, finding 2): the redraw builds the field from
+    /// the saved state, and the user would type on into an empty one. The
+    /// text is read from the old page when the focus is taken, only for a
+    /// field, and put back only into a field of the same kind. (The browser
+    /// check is part 5 of `focus-identity.js` in the review tools.)
+    #[test]
+    fn a_text_field_gets_back_what_was_typed_with_the_focus() {
+        let spot = &APP_JS[APP_JS.find("function focusSpot(").unwrap()..];
+        let spot = &spot[..spot.find("\n}\n").unwrap()];
+        assert!(spot.contains("isTextField(node)"), "{spot}");
+        assert!(spot.contains("node.value"), "{spot}");
+        assert!(spot.contains("node.selectionStart"), "{spot}");
+        let restore = &APP_JS[APP_JS.find("function restoreFocus(").unwrap()..];
+        let restore = &restore[..restore.find("\n}\n").unwrap()];
+        assert!(restore.contains("same.value = t.value"), "{restore}");
+        assert!(restore.contains("same.setSelectionRange("), "{restore}");
+        assert!(
+            restore.contains("same.type === spot.node.type"),
+            "{restore}"
+        );
+        // Buttons and switches are not text fields.
+        let kinds = &APP_JS[APP_JS.find("function isTextField(").unwrap()..];
+        let kinds = &kinds[..kinds.find("\n}\n").unwrap()];
+        assert!(kinds.contains("\"checkbox\""), "{kinds}");
     }
 
     /// The checker's text fields and the Audit page's buttons have a key too,

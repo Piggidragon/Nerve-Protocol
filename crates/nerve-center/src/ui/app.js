@@ -229,8 +229,10 @@ function act(fn) {
 // (a save redraws the whole page, the poll redraws a list); a control
 // without one does not. When the key is gone (the item was ended, removed)
 // or was not unique when the focus was taken or is not now, the focus goes
-// to the heading of the section the
-// control was in, which does nothing on Enter.
+// to the heading of the section the control was in, which does nothing on
+// Enter. A text field that gets the focus back gets what was typed into it
+// back too: the redraw builds the field anew, and the user would type on
+// into an empty one.
 let pendingFocus = null;
 
 function focusSpot(node) {
@@ -242,7 +244,15 @@ function focusSpot(node) {
   // on an item the user never picked. Such a control counts as one without a
   // key, so the focus falls back to its section's heading.
   const key = node.dataset.focus && focusTarget(node.dataset.focus) ? node.dataset.focus : null;
-  return { node, key, section: sec ? sec.dataset.focus : null, page: current() };
+  // What a text field holds is read now, from the old page: the new field is
+  // drawn from the saved state and has lost it.
+  const text = isTextField(node)
+    ? { value: node.value, start: node.selectionStart, end: node.selectionEnd } : null;
+  return { node, key, section: sec ? sec.dataset.focus : null, page: current(), text };
+}
+
+function isTextField(e) {
+  return e.tagName === "TEXTAREA" || (e.tagName === "INPUT" && !["checkbox", "radio", "button", "submit"].includes(e.type));
 }
 
 // The one element of the page that has this key.
@@ -257,9 +267,20 @@ function restoreFocus(spot) {
   const focus = (e) => { if (e && !e.disabled) e.focus({ preventScroll: true }); };
   // The very same element, put back by a page that keeps its parts.
   if (page.contains(spot.node)) return focus(spot.node);
-  if (!spot.key) return;
-  const same = focusTarget(spot.key);
-  if (same) return focus(same);
+  // A control without a usable key finds no element here and goes to the
+  // heading like one whose key is gone.
+  const same = spot.key && focusTarget(spot.key);
+  if (same) {
+    // Only the field that had the focus is carried over (a field the page
+    // clears on purpose, after Add, is not the one with the focus), and only
+    // into a field of the same kind.
+    const t = spot.text;
+    if (t && isTextField(same) && same.tagName === spot.node.tagName && same.type === spot.node.type && same.value !== t.value) {
+      same.value = t.value;
+      try { same.setSelectionRange(t.start, t.end); } catch (_) { /* a number field has no selection */ }
+    }
+    return focus(same);
+  }
   const sec = spot.section && focusTarget(spot.section);
   const heading = sec && sec.querySelector("h3");
   if (heading) focus(heading);

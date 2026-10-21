@@ -155,7 +155,7 @@ system keyring ([below](#where-the-node-keeps-its-keys)). A command that
 runs as you (in `user` mode) can reach it in either place. The check protects against
 `folder` mode commands and against centers, not against `user` mode. On a
 node installed as a service, commands run as another account
-([service](service.md#the-account-commands-run-as)) and cannot reach it.
+([service](service.md#the-accounts-commands-run-as)) and cannot reach it.
 
 ### An older file put back
 
@@ -202,8 +202,7 @@ The node has a key per center and the key for the MAC above.
   Not on the node installed as a service on Windows: it runs as `nerve`,
   whose Credential Manager the commands you run as an administrator cannot
   reach, so it keeps its keys in files
-  ([service](service.md#windows)). Nor on a Linux kernel with a Landlock
-  ABI below 9 ([below](#an-older-linux-kernel)).
+  ([service](service.md#windows)).
 
 ```sh
 nerve-node config set machine.secret_storage keyring
@@ -222,8 +221,11 @@ A keyring hands its entries to any program of the node's user that asks,
 through the user's D-Bus session. So with `keyring` on Linux the node keeps
 centers out of that session's folder (`/run/user/<uid>`) and out of GNOME
 Keyring's folder (`~/.local/share/keyrings`), as it does with its own
-folders. A `folder` mode command cannot connect to the session either: from
-Linux 7.1 on (Landlock ABI 9) Landlock refuses that.
+folders. On the node installed as a service the keyring is `nerve`'s, and
+no command runs as `nerve`: commands run as `nerve-run` or the owner, whose
+session is another, so no command of any mode reaches it, on any kernel. On
+a node you run yourself the keyring is yours, and `folder` mode runs no
+command while the keys are there.
 
 A command keeps the sandbox it started with. So while a `folder` mode
 command that started with the keys in files still runs, the keys do not go
@@ -237,9 +239,9 @@ and is not counted. If a center you do not trust had `folder`
 mode while the keys were in files, restart the machine before you set
 `keyring`.
 
-The keyring is kept from `folder` mode commands only. An `allowlist` or
-`user` mode command runs without Landlock, and a command that talks to the
-Secret Service needs no path to read the keys. With `keyring`, an allow
+On a node you run yourself, the keyring is kept from `folder` mode commands
+only. An `allowlist` or `user` mode command runs as you without Landlock, and
+a command that talks to the Secret Service needs no path to read the keys. With `keyring`, an allow
 rule for `secret-tool`, `busctl --user`, `gdbus`, `dbus-send` or the like
 hands a center every key of the node, which with `file` it could not read.
 Do not allow such a tool to a center, or keep the keys in files.
@@ -263,61 +265,43 @@ machine.secret_storage is "keyring", but the system keyring cannot be reached (e
 The node never falls back to the files. Start the keyring, or on a Linux
 without a desktop, let `setup` install one.
 
-### An older Linux kernel
-
-On a kernel whose Landlock ABI is below 9 the node keeps its keys in files.
-Landlock there cannot keep a command off the session bus the keyring
-answers on, so with the keys in the keyring a `folder` mode command could
-not run programs from its folders: the sandbox cannot grant the keyring's
-access and execute together. This holds whatever account runs the commands.
-So:
-
-- `config set machine.secret_storage keyring` is refused and changes nothing.
-- `setup` does not ask where the keys go. It warns with the reason, keeps
-  the keys in files, and moves keys it finds in the keyring into files.
-- `config accept` refuses a `node.toml` that says `keyring`. Change it to
-  `secret_storage = "file"` and accept it again.
-- `install` and the node's start refuse a `node.toml` that says `keyring`.
-  The message names the command that moves the keys into files on those
-  folders; run it with sudo for the installed node:
-
-  ```sh
-  sudo nerve-node --config-dir /etc/nerve --state-dir /var/lib/nerve/state config set machine.secret_storage file
-  ```
-
-`nerve-node status` shows the kernel's Landlock ABI (`confinement landlock
-v…`). Where Landlock is missing or off, its ABI cannot be read: `setup` then
-says so in a warning and still asks where the keys go. Keep the keys in
-files unless you know the kernel has ABI 9 or later.
-
 ### A keyring on a Linux without a desktop
 
 A server without a desktop usually has no keyring. When you choose `keyring`
-in `nerve-node setup` (on the installed node, `sudo nerve-node setup`), or
+in `nerve-node setup` (on the installed node too, without `sudo`), or
 the settings say `keyring` and no keyring answers, setup asks:
 
 ```
 No system keyring answers for nerve: ….
-nerve-node can install GNOME Keyring: `apt-get update`, `apt-get install -y gnome-keyring dbus-user-session`, `loginctl enable-linger nerve`, so that nerve keeps a session after a reboot, and a login keyring for nerve that opens without a password.
+nerve-node can install GNOME Keyring: `/usr/bin/apt-get update`, `/usr/bin/apt-get install -y --no-install-recommends gnome-keyring dbus-user-session`, `/usr/bin/loginctl enable-linger nerve`, so that nerve keeps a session after a reboot, and a login keyring for nerve that opens without a password.
 Without a desktop nobody types a password when the machine starts, so this keyring keeps the keys unencrypted in /var/lib/nerve/.local/share/keyrings, readable by nerve as the key files are; the node keeps centers out of it as it does out of the key files, except a command you let a center run outside folder mode that asks the keyring itself (secret-tool and the like). It becomes the default keyring of nerve: any other program of nerve that keeps a secret in the system keyring keeps it there, unencrypted too.
 Install it now? [y/N]
 ```
 
 Enter or `n` installs nothing, and the keys stay in their files (or the node
 keeps refusing, when the settings say `keyring`). `y` installs GNOME Keyring
-with the system's package manager (apt, dnf or pacman), keeps a session for
-the node's user from boot on, makes a login keyring for it without a
-password, and checks that it answers. `install` asks the same when an
-earlier install's settings say `keyring` and it runs in a terminal.
+and what it needs (nothing it only recommends) with the system's package
+manager (apt, dnf or pacman), keeps a session for the node's user from boot
+on, makes a login keyring for it without a password, and checks that it
+answers. These steps run as root: the programs from the system's own
+folders, by their full path, with a fixed environment, in `/`, and without
+your input. `install` asks the same when an earlier install's settings say
+`keyring` and it runs in a terminal.
+
+The question comes only when you run setup at a terminal. Answers piped
+into setup, or a setup without a terminal, get the refusal and install
+nothing, whatever they say; so does input that ends before the answer.
 
 Setup offers this only where the user has no desktop session. On a desktop,
 start the desktop's keyring instead (GNOME Keyring, or KWallet with its
 Secret Service on).
 
 A node that runs and found no keyring before does not look for one again
-until it restarts. After installing one, setup restarts the installed node.
-For a node you run yourself, setup stops and asks you to restart it, then to
-run setup again.
+until it restarts. After installing one, `sudo nerve-node setup` restarts
+the installed node. `nerve-node setup` without sudo runs inside the node, so
+it stops and asks you to run `nerve-node service restart`, then setup again;
+for a node you run yourself, it asks you to restart it, then to run setup
+again.
 
 Such a keyring survives a reboot, but as the question says, it keeps the
 keys unencrypted on disk, as safe as the files. Whether a server should

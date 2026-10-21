@@ -58,8 +58,9 @@ them ([Windows](service.md#the-account-commands-run-as-on-windows)). That
 holds when you are a standard user and an administrator types their name and
 password into the UAC prompt: the commands still run as you, not as the
 administrator. If your password was mistyped, enter it again under
-**Settings**, **General**, **Account for commands**. On Linux they run as the user who
-installed.
+**Settings**, **General**, **Account for commands**. On Linux `folder` and
+`allowlist` mode run them as `nerve-run`, an account of their own that
+install makes, and `user` mode as you ([modes](modes.md#the-account-nerve-run-linux)).
 
 When it is done, **Open Nerve** opens the app. Its first-run steps name the
 machine, choose where the keys live, pair the first center and choose its
@@ -96,88 +97,58 @@ logging in again.
 
 The system's dialog (polkit on Linux, the UAC prompt on Windows) comes for
 these only, each time, for that one action, and the app says why first:
-update, uninstall, turning sudo on, the account commands run as, and the
-settings `machine.user`, `machine.allow_root`, `machine.sudo_path` and
-`machine.shell`, which decide which account and program commands run as (also
-restoring a backup that would change them). The rights end with the action.
+update, uninstall, turning sudo on, and the settings `machine.allow_root`,
+`machine.sudo_path` and `machine.shell` (on Windows also `machine.user`, the
+account commands run as), which decide which account and program commands
+run as (also restoring a backup that would change them). The rights end with
+the action.
 
 Who changes the node's settings without a password:
 
-- **Linux:** root, and the members of the group `nerve-admin`. `install` puts
-  the user who ran it there (`sudo`, or the app's polkit dialog); `sudo
-  usermod --append --groups nerve-admin NAME` adds another,
-  `sudo gpasswd --delete NAME nerve-admin` takes one out. It counts at once.
-  The same members start, stop and restart the service from their own
-  session at the machine (the desktop, a console), through a helper that
-  does only that for this service, and polkit lets them run it (by a rule, or
-  on polkit 0.105, as on Ubuntu 22.04, by a `.pkla` file); over SSH, or from a
-  program outside a session, polkit asks for an administrator's password as
-  before.
+- **Linux:** root, and the owner, the account that ran `install` (`sudo`, or
+  the app's polkit dialog). The unit names it; there is one, and another
+  install by another account makes that one the owner. The owner starts,
+  stops and restarts the service from their own session at the machine (the
+  desktop, a console), through a helper that does only that for this
+  service, and polkit lets the owner run it (by a rule, or on polkit 0.105,
+  as on Ubuntu 22.04, by a `.pkla` file); over SSH, or from a program
+  outside a session, polkit asks for an administrator's password as before.
 - **Windows:** the administrators, and the user who installed (by SID, in the
   service's registry key `Parameters\Owners`). The service lets that user
   start, stop and restart it.
 
-How: the running node takes an owner's command over a socket of its own
+How: the running node takes the owner's command over a socket of its own
 (`/run/nerve-node/owner.sock`; on Windows a named pipe open to the owners
-only), checks who asks, and runs the command as its own user, exactly as
-`sudo nerve-node …` does. On Linux each request also carries the node's
-owner token, a new one at each start of the node in
-`/run/nerve-node/owner.token`, which only the node and the group
-`nerve-admin` may read; the app and `nerve-node` read it themselves (a
-session that began before you became an owner reads it through `sg
-nerve-admin`, so you need not log in again). In that first session after
-`install`, `sg` notes each switch to the group in the system's auth log (two
-lines on Debian and Ubuntu): the app reads the token once and hands it to its
-commands, so that is once per start of the node while the app is open, not
-once for each command; `nerve-node` in a terminal switches for each command.
-Every change keeps the CLI's
-checks and is in the [audit log](audit.md) with the owner's name. While the
-node is stopped, only an administrator changes it: start it first.
+only), checks who asks by the account the system names for the caller, and
+runs the command as its own user, exactly as `sudo nerve-node …` does. Every
+change keeps the CLI's checks and is in the [audit log](audit.md) with the
+owner's name. While the node is stopped, only an administrator changes it:
+start it first.
 
-**Commands that run as you.** `install` runs commands from centers as the
-user who installed, unless an account was chosen before. Then a center's
-command runs as an owner, and the pairing's [mode](modes.md) decides what it
-can do with the node:
+**Who a center's commands run as** (Linux):
 
-- **`folder` mode:** the command's own process stays in its folders and
-  cannot use the owners' way in. On Linux it cannot read the owner token,
-  whatever folders you give it (the token's folder is in none of its
-  sandbox's rules), so the node refuses its requests. On Windows the owner
-  pipe's permissions let in no AppContainer, and your files are closed to
-  one unless you grant them. But while it runs as you, `folder` mode is no
-  boundary against your own programs that run things on request: such a
-  program runs what the command asks outside the sandbox, as you, and then
-  the command can do all you can, Nerve's settings too. As in `user` mode,
-  that is yours to answer for. Folder mode under an account of its own is
-  planned ([#142](https://github.com/Piggidragon/Nerve-Protocol/issues/142));
-  until then a separate account (below) is the boundary.
-- **`user` and `allowlist` mode:** the command runs as you, with your rights
-  and without a sandbox. It can read the owner token and change the node's
-  settings as you can, also through a program of yours outside the node
-  (your systemd user manager, a tmux server, the task scheduler on Windows),
-  and on Windows start and stop the service. That is your choice when you
-  give a center one of these modes, and yours to answer for. By default the
-  center's [blocklist and action checker](action-checker.md) and the node's
-  [guard](rules.md#the-guard-against-changing-the-node) catch a command that
-  tries it by mistake; they are no boundary.
+- **`folder` mode, and `allowlist` mode:** as `nerve-run`. It is not you:
+  the owner socket refuses it, your session's programs (the service manager,
+  the session bus, tmux) take no requests from it, and it reaches your files
+  only where you gave it a folder. In `allowlist` mode **Run them as you**
+  under the mode runs the allowed commands as you instead; a click on the
+  mode's own tile leaves that as it is. Under **Folders** a center shows the
+  folders of its own that `nerve-run` did not get, and why.
+- **`user` mode:** as you, with your rights and without a sandbox. It can
+  change the node's settings as you can, also through a program of yours
+  outside the node (your systemd user manager, a tmux server). That is your
+  choice when you give a center this mode, and yours to answer for. By
+  default the center's [blocklist and action checker](action-checker.md) and
+  the node's [guard](rules.md#the-guard-against-changing-the-node) catch a
+  command that tries it by mistake; they are no boundary.
 
-The node also refuses its owners' way in to a process it sees below a
-command it runs, and on Linux to one with `no_new_privs`, which every
-confined command keeps. That is a second check behind the token, which a
-command can get around; it does not hold alone. A command account that is
-no owner (below) keeps commands from the node's settings in every mode.
+On Windows every command runs as you, `folder` mode in an AppContainer
+([modes](modes.md#what-a-command-can-reach-in-folder-mode-windows)); an
+account of their own there is planned.
 
-The Overview says so in one card, "Center commands run as you",
-with what that gives them in every mode: all you can do, Nerve's settings
-too, and root where your account is in a group such as `docker` or may use
-sudo. **Don't show again** hides the
-card until the account or those ways to root change; **Settings**,
-**General** keeps the line and shows the card again. **Create a separate
-account** gives the
-commands an account of their own that is no owner: on Linux it makes
-`nerve-work` (with the administrator's password) and runs commands as it; on
-Windows it opens **Settings**, **General**, where you name an
-account of its own and give its password.
+The node also refuses the owner socket to a process it sees below a command
+it runs, and on Linux to one with `no_new_privs`, which every confined
+command keeps. That catches mistakes, not a command that gets around it.
 
 The app's link to an administrator's rights, while an action has them, is its
 own: on Linux the app closes itself to the other processes of your user once
@@ -201,8 +172,8 @@ What this does not cover, while an action has the rights:
   update from, lies in your folders, which any program that runs as you
   may change before the node reads it.
 
-A user who is no owner is asked for the rights once each time the app opens,
-and the app keeps them until it closes.
+A user who is not the owner is asked for the rights once each time the app
+opens, and the app keeps them until it closes.
 
 ## Start and stop
 
@@ -225,15 +196,14 @@ restart fails, the Overview says that changes wait and offers **Restart**.
 Settings has tabs. Each control runs the `config` command a terminal would,
 so the node checks a value as it checks the command line's.
 
-- **General**: the machine's **Name**; the **Account for commands**, the
-  account commands from your centers run as (on Linux, name another one to
-  use it; one that is not there is made, as `setup --create-user` makes it;
-  on Windows, enter its new password there when it changed, or your own
-  when no account is chosen yet: the service needs it to start commands);
+- **General**: the machine's **Name**; the **Account for commands** (on
+  Linux it says who runs them: `nerve-run`, or you in `user` mode; on
+  Windows, enter its new password there when it changed, or your own when no
+  account is chosen yet: the service needs it to start commands);
   the **Shell** that runs each command (`machine.shell`); and how much the
   **Log** says (`log.level`).
 - **Keys**: in files, or in the system keyring where one can hold them. Where
-  it cannot (the installed node on Windows, Linux below 7.1, no keyring
+  it cannot (the installed node on Windows, no keyring
   answering for the account the node runs as), the app says why and keeps
   them in files.
 - **Network**: the **Proxy**. The relay has a page of its own
@@ -272,6 +242,24 @@ rule edits it in place, as one change (`rule edit`), the rules of the guard
 too. A list longer than some eight rows (rules, folders, capabilities, a
 relay's nodes, the centers on the Overview) scrolls in a box of its own, with
 its scroll bar beside it, so the page stays short.
+
+On **Permissions**, the **Mode** names who runs the commands: in folder
+mode `nerve-run`, in user mode you; in allowlist mode **Run them as you**
+switches between `nerve-run` and you (`mode set allowlist --as-owner`).
+Under **Folders**, the line **Always** names what `nerve-run` has besides
+the folders you give it: `/tmp`, `/var/tmp` and its home. A folder that
+`nerve-run` could not be given (a file system without ACLs, a folder of
+another account's on its way) shows above the list with the reason. Access
+`nerve-run` keeps although it should have lost it (a folder you removed
+whose entries the node could not take off) shows on every center whose
+commands run as `nerve-run`, as **nerve-run keeps access it should have
+lost**: none of its commands runs until that is fixed.
+
+Where the kernel has no Landlock, a center whose commands run as `nerve-run`
+shows **Without Landlock** under the mode, and **nerve-run can read more of
+your home** when your home is open to other accounts or a folder you gave
+lies in it ([modes](modes.md#your-home-and-other-accounts)). With Landlock
+neither shows.
 
 On **Permissions**, a center that lacks the guard against changing the node
 (a pairing from before it, or one you took a rule off) shows **Add the

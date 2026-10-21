@@ -22,23 +22,26 @@ for it.
    nerve-node rule add sudo 'apt update' --wildcard   # sudo apt, and anything after it
    ```
 
-2. Switch sudo on. The node must be running. It asks for the sudo password
-   of the account the commands run as: your own on a node you run yourself,
-   the account `install` took or `setup` chose on a node installed as a
-   [service](service.md#the-account-commands-run-as):
+2. Switch sudo on. The node must be running. It asks for your own sudo
+   password, which shows that you may run commands as root on this machine:
 
    ```sh
    nerve-node sudo on
    ```
 
-   On a node installed as a service, `install` takes the account that ran
-   `sudo`. That account is no boundary: its owner logs in as it, and a
-   command can reach what the owner does with sudo. If it has `NOPASSWD`
-   sudo, every command is root. `install` and `setup` warn about this and
-   suggest `sudo nerve-node setup --create-user nerve-work`. An account made
-   that way has no password and no sudoers entry, so `sudo on` does not work
-   for it until you give it both. A node-only account that needs a password
-   for sudo and gets root no other way is fine.
+   A sudo command is yours: it runs as root, in every mode, and the folders
+   do not hold it. Put on the sudo list only what you would run yourself.
+   Who raises it depends on the account the pairing's commands run as
+   ([service](service.md#the-accounts-commands-run-as)):
+
+   - **as you** (`user` mode, `allowlist` mode as you, a node you run
+     yourself): through your sudo, with your password.
+   - **as `nerve-run`** (`folder` mode and `allowlist` mode on the installed
+     Linux node): the node starts the command as root itself. `nerve-run`
+     has no sudo and no password of its own, and your password is not used
+     for it: the sudo list is the only way to root for it. Switching sudo on
+     still asks for your password: it shows that you, who give these
+     commands root, may run commands as root on this machine yourself.
 
 3. Look or turn it off:
 
@@ -53,9 +56,8 @@ for it.
 
 On Linux (Windows differs, see [sudo on Windows](#sudo-on-windows)):
 
-- It checks the password with `sudo -S -k -v`, run as the account the
-  commands run as, so sudo checks that account's password and its sudoers
-  entries. A wrong password is refused and the switch stays as it was.
+- It checks the password with `sudo -S -k -v`, run as you (the owner on the
+  installed node), so sudo checks your password and your sudoers entries. A wrong password is refused and the switch stays as it was.
 - It keeps the password in memory only. Turning sudo off drops it. A node that
   restarts has sudo off.
 - It never sends the password to a center. It replaces any copy in a frame or
@@ -70,10 +72,21 @@ On Linux (Windows differs, see [sudo on Windows](#sudo-on-windows)):
   `sudo net *` does not cover `sudo net start spooler`: add
   `nerve-node rule add sudo 'systemctl start nginx'` without `--wildcard`.
   The refusal names the character or word. This holds on Windows too.
-- It starts the command as that account, as `sudo -S -k -p <prompt> …`, so
-  sudo raises it from that account. It runs without the Landlock
-  sandbox, which would stop sudo from gaining privileges. It writes the
-  password only after sudo prints the prompt.
+- For a pairing whose commands run as you, it starts the command as you, as
+  `sudo -S -k -p <prompt> …`, so sudo raises it from your account. It runs
+  without the Landlock sandbox, which would stop sudo from gaining
+  privileges. It writes the password only after sudo prints the prompt.
+- For a pairing whose commands run as `nerve-run`, it starts the command as
+  root, with root's own group, through `/bin/sh`, in the command's working
+  folder, without the Landlock sandbox. The shell gets the allowed line and
+  nothing else, with a fixed environment (the system's `PATH`, root's
+  `HOME`); it reads the line as root, so `~` is root's home there. The node
+  enters the working folder for it as you, so a folder in your closed home
+  works. The sudo program and its sudoers rules play no part in it. So the
+  line takes no option of sudo: a leading `-n` and `--` are dropped, as
+  they change nothing here, and a command that starts with any other one,
+  such as `sudo -E …` or `sudo -u bob …`, is refused with the reason. Allow
+  and send it without the option.
 - Every other command runs with `no_new_privs`. A `sudo` later in a command
   line, or any setuid program, cannot gain privileges.
 

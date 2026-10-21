@@ -70,10 +70,10 @@ impl Shared {
         held && store.config().machine.sudo == Sudo::On && self.same_account(&store)
     }
 
-    /// Whether the account the commands run as is still the one the held
-    /// password was checked for: a password is one account's.
+    /// Whether the owner is still the account the held password was checked
+    /// for: a password is one account's.
     fn same_account(&self, store: &nerve_policy::SettingsStore) -> bool {
-        *lock(&self.sudo_for) == store.config().machine.user
+        *lock(&self.sudo_for) == self.owner_name(store.config())
     }
 
     /// The password for one allowed sudo command, while the switch is on.
@@ -131,11 +131,14 @@ impl Shared {
                 "the sudo password is empty or has a line break".into(),
             ));
         }
-        // The password is the one of the account the commands run as: sudo
-        // asks for that account's, since its commands start as it.
-        let checked_for = self.config().machine.user;
+        // The password is the owner's, and sudo checks it: it shows that the
+        // owner, who lets the sudo list run as root, may run commands as
+        // root here. The sudo commands of the owner's own pairings run
+        // through the owner's sudo with it; those of `nerve-run`'s pairings
+        // are started as root by the node and do not use it (crate::link).
+        let checked_for = self.owner_name(&self.config());
         let account = self
-            .command_account(&self.config())
+            .owner_account(&self.config())
             .map_err(SetError::Invalid)?;
         #[cfg(windows)]
         self.windows_check(account.as_ref(), &password).await?;

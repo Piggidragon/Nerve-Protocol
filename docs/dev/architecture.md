@@ -70,7 +70,7 @@ every call to them by the calling center's policy.
 | Where | What |
 |---|---|
 | Config folder | `node.toml`, signed. `keys/<name>.key`, one Ed25519 key per center, mode 0600; `keys/relay-tls.pem` (the relay's TLS key) and `keys/proxy-login.secret` (an `https://` proxy's password, a relay token), when there are. On Windows, DPAPI files: `command-account.dpapi` (the password of the account commands run as, on the installed node) and `sudo.dpapi` (the sudo password while sudo is on) |
-| State folder | `audit.jsonl`, `log.jsonl`, `run/ctl.sock`, `run/ctl.token`, `config.key` (the key of the config's MAC), `config.version` (the last version of `node.toml` the node saved or took), `keys.lock`, `keys.moving` (while the keys move between files and the keyring). On Windows, `grants.json` and `grants.json.lock`, the record of the folder grants |
+| State folder | `audit.jsonl`, `log.jsonl`, `run/ctl.sock`, `run/ctl.token`, `acl.json` (the installed Linux node: the folders' ACL entries it gave `nerve-run`, `crate::acl`), `config.key` (the key of the config's MAC), `config.version` (the last version of `node.toml` the node saved or took), `keys.lock`, `keys.moving` (while the keys move between files and the keyring). On Windows, `grants.json` and `grants.json.lock`, the record of the folder grants |
 | System keyring | With `machine.secret_storage = "keyring"`: the center keys, the config's key, the relay's TLS key and an `https://` proxy's password instead of their files. The proxy's header values, always (the installed node on Windows takes none, see node-local §2) |
 
 No call of any center reaches these two folders. See

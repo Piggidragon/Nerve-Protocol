@@ -1,7 +1,7 @@
-//! The owners of the installed node change it without root (crate::owner):
-//! the node runs their command as itself, with every check of the CLI, and
-//! refuses what stays root's, someone who is no owner, and a confined
-//! program.
+//! The owner of the installed node changes it without root (crate::owner):
+//! the node runs the owner's command as itself, with every check of the CLI,
+//! and refuses what stays root's, someone who is not the owner, and a
+//! confined program.
 
 #![cfg(target_os = "linux")]
 
@@ -53,25 +53,13 @@ async fn node(root: &Path, owners: Vec<u32>) -> (Daemon, PathBuf) {
     (Daemon::start(o).await.unwrap(), at)
 }
 
-/// What a `cli` request on `at` gave, with the owner token the owner's CLI
-/// reads beside the socket: the refusal, or the output, the error output
-/// and the exit code. `input` is sent first, then its end.
+/// What a `cli` request on `at` gave: the refusal, or the output, the error
+/// output and the exit code. `input` is sent first, then its end.
 async fn run(at: &Path, args: &[&str], input: &str) -> Result<(String, String, i64), String> {
-    let token = nerve_node::owner::read_token(at).unwrap();
-    run_with(at, args, input, Some(token)).await
-}
-
-/// [`run`] with `token`, or none.
-async fn run_with(
-    at: &Path,
-    args: &[&str],
-    input: &str,
-    token: Option<String>,
-) -> Result<(String, String, i64), String> {
     let s = UnixStream::connect(at).await.unwrap();
     let (r, mut w) = s.into_split();
     let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-    let req = nerve_node::owner::request_line(&args, Some("/".into()), false, token);
+    let req = nerve_node::owner::request_line(&args, Some("/".into()), false, false);
     w.write_all(req.as_bytes()).await.unwrap();
     let mut lines = BufReader::new(r).lines();
     let first: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
@@ -100,6 +88,40 @@ async fn run_with(
     });
     let code = wait.await.expect("the command ends");
     Ok((out, err, code))
+}
+
+/// What the owner's `args` on `at` gave when sent as the CLI's own
+/// forwarding sends them: the input it passes for that command
+/// (crate::owner::input_for), `typed` standing for what this process's input
+/// would hold. The output with the error output, and the exit code.
+async fn as_the_cli(
+    at: &Path,
+    args: &[&str],
+    terminal: bool,
+    typed: &str,
+) -> Result<(String, i32), String> {
+    use clap::Parser;
+    use nerve_node::owner::Input;
+    let cli = nerve_node::cli::Cli::try_parse_from(
+        std::iter::once("nerve-node").chain(args.iter().copied()),
+    )
+    .unwrap();
+    let input = match nerve_node::owner::input_for(&cli.cmd) {
+        Input::Stdin => Input::Text(typed.into()),
+        other => other,
+    };
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let mut io = nerve_node::owner::Io {
+        out: &mut out,
+        err: &mut err,
+    };
+    let code =
+        nerve_node::owner::ask_at(at, &args, Some("/".into()), input, terminal, &mut io).await?;
+    Ok((
+        String::from_utf8_lossy(&out).into_owned() + &String::from_utf8_lossy(&err),
+        code,
+    ))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -172,9 +194,17 @@ async fn an_owner_changes_the_node_through_it_and_is_audited() {
     assert_eq!(code, 1, "{out}");
     assert!(err.contains("machine.allow_root decides"), "{err}");
     assert!(!daemon.config().machine.allow_root);
+    // Setup runs for the owner, one question at a time, with the input the
+    // owner's own program passes it; its one step that needs root (a
+    // keyring) takes it by the service's rights.
+    let (out, code) = as_the_cli(&at, &["setup"], false, "lab-1\nfile\n\n")
+        .await
+        .unwrap();
+    assert_eq!(code, 0, "{out}");
+    assert!(out.contains("Set up this node"), "{out}");
+    assert_eq!(daemon.config().node.name.as_deref(), Some("lab-1"));
     for args in [
         &["sudo", "on"][..],
-        &["setup"],
         &["install"],
         &["--config-dir", "/tmp", "status"],
     ] {
@@ -189,6 +219,31 @@ async fn an_owner_changes_the_node_through_it_and_is_audited() {
     for args in [&["backup", "/tmp/x"][..], &["restore", "/tmp/x"]] {
         let e = run(&at, args, "").await.unwrap_err();
         assert!(e.contains("comes with the request"), "{args:?}: {e}");
+    }
+    daemon.stop().await;
+}
+
+/// The node tells the command it runs for the owner whether the owner's
+/// input is a terminal's, as the owner's program says, and nothing else
+/// does: setup asks to install a keyring as root only then (#142).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_command_is_told_whether_the_owner_is_at_a_terminal() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let (mut o, at) = options(d.path(), vec![uid()]);
+    // A program in the node's place that says what it was told.
+    let said = o.home.join("said");
+    std::fs::write(
+        &said,
+        "#!/bin/sh\nprintf 'terminal=%s\\n' \"$NERVE_OWNER_TERMINAL\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&said, std::fs::Permissions::from_mode(0o755)).unwrap();
+    o.owners.as_mut().unwrap().program = said;
+    let daemon = Daemon::start(o).await.unwrap();
+    for (terminal, want) in [(true, "terminal=1\n"), (false, "terminal=\n")] {
+        let (out, code) = as_the_cli(&at, &["setup"], terminal, "").await.unwrap();
+        assert_eq!((out.as_str(), code), (want, 0), "{terminal}");
     }
     daemon.stop().await;
 }
@@ -210,10 +265,8 @@ async fn with_file(
         out: &mut out,
         err: &mut err,
     };
-    let token = nerve_node::owner::read_token(at).ok();
     let code =
-        nerve_node::owner::send_file(conn, &args, Some("/".into()), token, &file, PASS, &mut io)
-            .await?;
+        nerve_node::owner::send_file(conn, &args, Some("/".into()), &file, PASS, &mut io).await?;
     Ok((
         code,
         String::from_utf8_lossy(&out).into_owned() + &String::from_utf8_lossy(&err),
@@ -369,21 +422,19 @@ async fn someone_who_is_no_owner_and_a_confined_program_are_refused() {
     let d = tempfile::tempdir().unwrap();
     let (daemon, at) = node(d.path(), Vec::new()).await;
     let e = run(&at, &["status"], "").await.unwrap_err();
-    assert!(e.contains("not in the group nerve-admin"), "{e}");
+    assert!(e.contains("not the owner of the installed node"), "{e}");
     // Anyone learns that the node runs, nothing more.
     let s = UnixStream::connect(&at).await.unwrap();
     let r = nerve_transport::ctl::call_on(s, "status", json!({})).await;
     assert_eq!(r, Ok(json!({"running": true})));
     daemon.stop().await;
 
-    // An owner's process with no_new_privs, as every confined command of
-    // the node keeps it, is refused, though it brings the owner token: the
-    // second layer behind the token.
+    // The owner's process with no_new_privs, as every confined command of
+    // the node keeps it, is refused: a guard against a command of user mode
+    // that changes the node by mistake.
     let d = tempfile::tempdir().unwrap();
     let (daemon, at) = node(d.path(), vec![uid()]).await;
-    let token = nerve_node::owner::read_token(&at).unwrap();
-    let request =
-        json!({"method": "cli", "params": {"args": ["status"]}, "token": token}).to_string();
+    let request = json!({"method": "cli", "params": {"args": ["status"]}}).to_string();
     let mut c = std::process::Command::new("python3");
     c.args([
         "-c",
@@ -415,252 +466,4 @@ async fn someone_who_is_no_owner_and_a_confined_program_are_refused() {
         Err(e) => eprintln!("skipped the confined caller: no python3 ({e})"),
     }
     daemon.stop().await;
-}
-
-/// An owner's request is answered only with the owner token, a new one at
-/// each start, which the owner's CLI reads beside the socket; without it or
-/// with another one it is refused (owner's decision of 2026-10-20 after
-/// review round 4).
-#[tokio::test(flavor = "multi_thread")]
-async fn a_request_without_the_owner_token_is_refused() {
-    let d = tempfile::tempdir().unwrap();
-    let (daemon, at) = node(d.path(), vec![uid()]).await;
-    let file = nerve_node::owner::token_file(&at);
-    assert_eq!(file, at.with_file_name("owner.token"));
-    use std::os::unix::fs::PermissionsExt;
-    // Owners by uid have no group to read it: the node's user's alone.
-    let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o600);
-    let token = nerve_node::owner::read_token(&at).unwrap();
-    assert_eq!(token.len(), 32);
-
-    let mut other = token.clone().into_bytes();
-    other[0] = if other[0] == b'a' { b'b' } else { b'a' };
-    let other = String::from_utf8(other).unwrap();
-    for given in [
-        None,
-        Some(String::new()),
-        Some(other),
-        Some(format!("{token}x")),
-    ] {
-        let e = run_with(
-            &at,
-            &["config", "set", "log.level", "debug"],
-            "",
-            given.clone(),
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(e, nerve_node::owner::NO_TOKEN, "{given:?}");
-    }
-    assert_ne!(daemon.config().log.level.to_string(), "debug");
-    // The owner's own, with the token, is answered.
-    let (out, err, code) = run(&at, &["config", "set", "log.level", "debug"], "")
-        .await
-        .unwrap();
-    assert_eq!(code, 0, "{out} {err}");
-    assert_eq!(daemon.config().log.level.to_string(), "debug");
-    daemon.stop().await;
-    assert!(!file.exists());
-
-    // The next start has a token of its own; the old one is refused.
-    let (daemon, at) = node(d.path(), vec![uid()]).await;
-    let next = nerve_node::owner::read_token(&at).unwrap();
-    assert_ne!(next, token);
-    let e = run_with(&at, &["status"], "", Some(token))
-        .await
-        .unwrap_err();
-    assert_eq!(e, nerve_node::owner::NO_TOKEN);
-    daemon.stop().await;
-}
-
-/// The app reads the owner token before it starts a run of the CLI, so a run
-/// may carry the last start's token when the node started again in between:
-/// the node refuses it before it runs anything, and the run asks once more
-/// with the token it reads itself. A run the app handed nothing (there was
-/// no token file yet) reads it once it has connected (review round 6,
-/// part A, finding 1).
-#[tokio::test(flavor = "multi_thread")]
-async fn a_run_handed_the_last_starts_token_asks_again_with_its_own() {
-    use nerve_node::owner::{Input, Io, ask_at};
-    let d = tempfile::tempdir().unwrap();
-    let (daemon, at) = node(d.path(), vec![uid()]).await;
-    let old = nerve_node::owner::read_token(&at).unwrap();
-    daemon.stop().await;
-    let (daemon, at) = node(d.path(), vec![uid()]).await;
-    assert_ne!(nerve_node::owner::read_token(&at).unwrap(), old);
-    let ask = |level: &str| -> Vec<String> {
-        ["config", "set", "log.level", level]
-            .iter()
-            .map(|a| a.to_string())
-            .collect()
-    };
-    let (mut out, mut err) = (Vec::new(), Vec::new());
-    let mut io = Io {
-        out: &mut out,
-        err: &mut err,
-    };
-    let stale = Some(old);
-    let code = ask_at(
-        &at,
-        &ask("debug"),
-        Some("/".into()),
-        Input::None,
-        Some(&stale),
-        &mut io,
-    )
-    .await
-    .unwrap();
-    assert_eq!(code, 0);
-    assert_eq!(daemon.config().log.level.to_string(), "debug");
-    // Handed nothing: read here, after the connect.
-    let code = ask_at(
-        &at,
-        &ask("warn"),
-        Some("/".into()),
-        Input::None,
-        None,
-        &mut io,
-    )
-    .await
-    .unwrap();
-    assert_eq!(code, 0);
-    assert_eq!(daemon.config().log.level.to_string(), "warn");
-    daemon.stop().await;
-}
-
-/// The command lines of `exec.run` in `cwd`, as a center sends them.
-async fn run_command(
-    conn: &mut nerve_conformance::wire::Conn<tokio::net::TcpStream>,
-    cwd: &Path,
-    command: &str,
-) -> Value {
-    conn.call(
-        "invoke",
-        json!({"cap": "exec", "action": "run", "args": {
-            "command": command, "cwd": cwd.display().to_string()}}),
-        Duration::from_secs(15),
-    )
-    .await
-    .unwrap()
-    .expect("the command runs")
-}
-
-/// A `folder` mode command of a center, run as an owner (as on the
-/// installed node, where commands run as the user who installed), with the
-/// whole home and the owner socket's folder in it among its folders: it
-/// cannot read the owner token, as Landlock keeps that folder out of its
-/// rules, and a request it hands over on a connection that a process of its
-/// own made and that is gone by then (which the checks of the caller's
-/// process do not see) is refused for want of the token. The center's mode
-/// stays as the owner set it (review round 4, part A, finding 1).
-#[tokio::test(flavor = "multi_thread")]
-async fn a_confined_command_has_no_owner_token_however_it_connects() {
-    if !nerve_sandbox::Confinement::detect().available() {
-        eprintln!("skipped: Landlock is not available here");
-        return;
-    }
-    if std::process::Command::new("python3")
-        .arg("-V")
-        .output()
-        .is_err()
-    {
-        eprintln!("skipped: no python3");
-        return;
-    }
-    use nerve_conformance::fake_center::{self, FakeCenter};
-    let d = tempfile::tempdir().unwrap();
-    let mut center = FakeCenter::start(false).await.unwrap();
-    let (o, at) = options(d.path(), vec![uid()]);
-    nerve_node::pair::pair(&o.paths, &center.link(), Some("lab"))
-        .await
-        .unwrap();
-    let home = o.home.clone();
-    nerve_node::cli::edit(&o.paths, |c| {
-        let p = &mut c.centers[0].policy;
-        p.mode = nerve_policy::Mode::Folder;
-        // What holds without the guard's deny rules, which catch mistakes
-        // only.
-        p.deny.clear();
-        p.folders.push(nerve_policy::config::Folder {
-            path: home.display().to_string(),
-            access: nerve_policy::config::Access::ALL,
-        });
-        Ok(())
-    })
-    .await
-    .unwrap();
-    std::fs::create_dir(home.join("work")).unwrap();
-    // A process of the command makes the connection and ends; the command
-    // sends its request on it, with the token if it could read one.
-    std::fs::write(
-        home.join("race.py"),
-        r#"import json, os, socket
-at = "r" + "un/owner.sock"
-req = {"method": "cli", "params": {"args": ["mode", "set", "user", "--center", "lab"], "cwd": "/"}}
-try:
-    req["token"] = open(os.path.join(os.path.dirname(at), "owner.token")).read().strip()
-    print("read the token")
-except OSError as e:
-    print("no token:", e.strerror)
-s = socket.socket(socket.AF_UNIX)
-pid = os.fork()
-if pid == 0:
-    s.connect(at)
-    os._exit(0)
-os.waitpid(pid, 0)
-s.sendall((json.dumps(req) + "\n").encode())
-print(s.makefile().readline())
-"#,
-    )
-    .unwrap();
-    let node = Daemon::start(o).await.unwrap();
-    let paired = center.paired().expect("paired");
-    let mut inc = center
-        .next_link(Duration::from_secs(15))
-        .await
-        .expect("the node dials");
-    fake_center::handshake(&mut inc.conn, &center.center_id, &paired)
-        .await
-        .expect("handshake");
-    let mut conn = inc.conn;
-    let token = nerve_node::owner::read_token(&at).unwrap();
-
-    // The node refuses a command line that names the folder; one that
-    // builds its path at run time, which that check does not see, is kept
-    // from the file by Landlock alone.
-    let r = run_command(&mut conn, &home, "cd \"$(printf r)un\" && cat owner.token").await;
-    assert_ne!(r["exit_code"], 0, "{r}");
-    assert!(!r["stdout"].as_str().unwrap().contains(&token), "{r}");
-    // It cannot list the folder either; the socket in it it reaches by its
-    // path only.
-    let r = run_command(&mut conn, &home, "ls \"$(printf r)un\"").await;
-    assert_ne!(r["exit_code"], 0, "{r}");
-    // And the home's other entries are the command's.
-    let r = run_command(&mut conn, &home, "cat race.py > work/copy.txt").await;
-    assert_eq!(r["exit_code"], 0, "{r}");
-
-    let r = run_command(&mut conn, &home, "python3 race.py").await;
-    let said = format!("{}{}", r["stdout"], r["stderr"]);
-    assert!(said.contains("no token"), "{said}");
-    assert!(
-        said.contains("does not carry the node's owner token"),
-        "{said}"
-    );
-    assert_eq!(
-        node.config().center("lab").unwrap().policy.mode,
-        nerve_policy::Mode::Folder,
-        "{said}"
-    );
-
-    // The owner's own program, outside any command, is answered.
-    let (out, err, code) = run(&at, &["mode", "set", "allowlist", "--center", "lab"], "")
-        .await
-        .unwrap();
-    assert_eq!(code, 0, "{out} {err}");
-    assert_eq!(
-        node.config().center("lab").unwrap().policy.mode,
-        nerve_policy::Mode::Allowlist
-    );
-    node.stop().await;
 }

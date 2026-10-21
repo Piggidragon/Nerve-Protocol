@@ -1,6 +1,5 @@
 //! The app's own settings, kept for each user apart from the node's: the
-//! appearance the owner chose (system, light or dark), and the Overview's
-//! card on commands that run as the user, when they hid it. A small JSON file in
+//! appearance the owner chose (system, light or dark). A small JSON file in
 //! the user's config folder, `nerve-node-desktop/settings.json`; the node's
 //! settings stay the node's (`nerve-node config`).
 
@@ -62,72 +61,9 @@ fn read(path: &Path) -> Option<Value> {
         .and_then(|b| serde_json::from_slice(&b).ok())
 }
 
-/// The ways to root in words ("docker, lxd and sudo"), one by one.
-fn ways(via: &str) -> Vec<String> {
-    via.replace(" and ", ", ")
-        .split(", ")
-        .filter(|w| !w.is_empty())
-        .map(str::to_string)
-        .collect()
-}
-
-/// Hides the card on commands that run as `account`, with root through
-/// `via`, until that changes.
-pub fn dismiss(path: &Path, account: &str, via: &str) -> Result<(), String> {
-    change(path, |v| {
-        v["commands_as_you_hidden"] = json!({ "account": account, "root_via": ways(via) });
-    })
-}
-
-/// Shows the card again.
-pub fn undismiss(path: &Path) -> Result<(), String> {
-    change(path, |v| {
-        if let Some(o) = v.as_object_mut() {
-            o.remove("commands_as_you_hidden");
-        }
-    })
-}
-
-/// Whether the card stays hidden: it was hidden for this account, and no
-/// way to root came since. Another account, or a new way, shows it again.
-pub fn dismissed(path: &Path, account: &str, via: &str) -> bool {
-    let Some(v) = read(path) else {
-        return false;
-    };
-    let h = &v["commands_as_you_hidden"];
-    let known: Vec<&str> = h["root_via"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect();
-    h["account"] == account && ways(via).iter().all(|w| known.contains(&w.as_str()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The hidden card stays hidden for the same account and ways to root,
-    /// and comes back for another account or a new way.
-    #[test]
-    fn the_hidden_card_comes_back_when_it_gets_worse() {
-        let d = tempfile::tempdir().unwrap();
-        let f = d.path().join("nerve-node-desktop/settings.json");
-        assert!(!dismissed(&f, "alex", ""));
-        save_appearance(&f, 2).unwrap();
-        dismiss(&f, "alex", "docker").unwrap();
-        assert!(dismissed(&f, "alex", "docker"));
-        assert!(dismissed(&f, "alex", ""), "fewer ways: still hidden");
-        assert!(!dismissed(&f, "alex", "docker and sudo"), "a new way");
-        assert!(!dismissed(&f, "sam", "docker"), "another account");
-        assert_eq!(appearance(&f), 2, "the rest stays");
-        dismiss(&f, "alex", "docker, lxd and sudo").unwrap();
-        assert!(dismissed(&f, "alex", "lxd and sudo"));
-        undismiss(&f).unwrap();
-        assert!(!dismissed(&f, "alex", "docker"));
-        assert_eq!(appearance(&f), 2);
-    }
 
     #[test]
     fn the_appearance_is_kept_and_the_rest_stays() {

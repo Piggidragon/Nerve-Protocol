@@ -11,29 +11,17 @@ fn paths(root: &std::path::Path) -> NodePaths {
     NodePaths::new(root.join("config"), root.join("state"))
 }
 
-/// The answer to setup's question where the keys go, Enter, or nothing
-/// where setup does not ask it: on a kernel whose Landlock ABI is below 9
-/// the keys stay in files (docs/user/config.md).
+/// The answer to setup's question where the keys go: Enter keeps them in
+/// files.
 fn storage_answer() -> &'static str {
-    match nerve_sandbox::Confinement::detect().landlock_abi {
-        Some(v) if v < 9 => "",
-        _ => "\n",
-    }
+    "\n"
 }
 
 async fn setup(paths: &NodePaths, answers: &str) -> Result<String, String> {
     let mut out = Vec::new();
     let mut input = std::io::Cursor::new(answers.as_bytes().to_vec());
     let keyring = nerve_node::keyring_setup::HostKeyring::this_program();
-    nerve_node::cli::setup(
-        paths,
-        None,
-        nerve_node::cli::Setup::default(),
-        &keyring,
-        &mut input,
-        &mut out,
-    )
-    .await?;
+    nerve_node::cli::setup(paths, None, &keyring, &mut input, true, &mut out).await?;
     Ok(String::from_utf8(out).unwrap())
 }
 

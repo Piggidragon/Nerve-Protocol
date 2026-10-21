@@ -35,9 +35,12 @@ Pairing links a machine to a center. Do it once per machine and center.
    The machine shows as online in the web UI, and the pairing card there
    closes: the code is used up.
 
-The new pairing starts closed: mode `allowlist`, no allow rule, and the
-center may not change settings. Every call is refused until you allow
-something ([modes](modes.md), [rules](rules.md)). Its deny list holds the
+The new pairing starts in mode `folder`, with no folder of yours, and the
+center may not change settings. On the node installed as a service its
+commands run as `nerve-run`, with `/tmp`, `/var/tmp` and its own home and
+nothing of yours until you give it a folder:
+`nerve-node folder add ~/project +r +w +x` ([modes](modes.md),
+[rules](rules.md)). Its deny list holds the
 guard, which keeps commands off this node itself
 ([rules](rules.md#the-guard-against-changing-the-node)).
 

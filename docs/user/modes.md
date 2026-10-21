@@ -2,11 +2,17 @@
 
 Every pairing has a mode. It sets how much that center may do on the machine.
 
-| Mode | What is allowed | Commands |
+| Mode | What is allowed | Commands on the installed Linux node |
 |---|---|---|
-| `allowlist` (default) | Only what an [allow rule](rules.md) names | Run as the rule says |
-| `folder` | Full access inside the folders you grant, by their rights | Confined to those folders |
-| `user` | Everything you could do yourself | Not confined |
+| `allowlist` | Only what an [allow rule](rules.md) names | As `nerve-run`, held to the folders you grant; or as you, if you say so |
+| `folder` (default for a new pairing) | Full access inside the folders you grant, by their rights | As `nerve-run`, held to those folders |
+| `user` | Everything you could do yourself | As you, not confined |
+
+From most to least locked down: `allowlist`, `folder`, `user`. On the node
+[installed as a service](service.md) on Linux, `folder` and `allowlist` mode
+run commands as `nerve-run`, an account of its own
+([below](#the-account-nerve-run-linux)). A node you run yourself, and
+Windows, run every command as the account that runs the node.
 
 [Deny rules](rules.md#deny-a-command) and [protected paths](protected-paths.md)
 apply in every mode. A call that nothing allows is refused at once. Nothing
@@ -31,6 +37,15 @@ nerve-node mode set user --for 2
 `--for` needs at least 1 and does not go with `allowlist`. Setting a mode
 again without `--for` removes an earlier limit.
 
+`allowlist` mode runs the allowed commands as `nerve-run`. To run them as
+you instead, outside the folders' sandbox:
+
+```sh
+nerve-node mode set allowlist --as-owner
+```
+
+Setting the mode again without `--as-owner` goes back to `nerve-run`.
+
 ## Folders
 
 A folder gives rights. Each right is its own flag:
@@ -45,7 +60,8 @@ The flags do not imply each other. A write needs `w` and not `r`. A read needs
 `r` and not `w`. A command needs `x` and not `r`. A folder covers everything
 below it. Where folders nest, the deepest one decides.
 
-Folders count in `folder` mode only.
+Folders count in `folder` mode. In `allowlist` mode as `nerve-run` they are
+the sandbox the allowed commands run in; the allow rules decide what runs.
 
 | Command | Does |
 |---|---|
@@ -149,21 +165,10 @@ The node confines commands with Landlock:
   command.
 - Landlock cannot run a file it may not read. So an `x` folder also lets a
   command read files there by name. It still cannot list the folder.
-- The node's own folders are in none of these sets. That keeps a command from
-  the node's files, but only as far as Landlock reaches. Landlock holds the
-  command's own processes, not the other programs of the account it runs
-  as: `folder` mode is no boundary against those of them that run things on
-  request (a session's service manager, a terminal multiplexer and the
-  like), which run what the command asks outside the sandbox, as that
-  account. While the commands run as the node's own user (a node you run
-  yourself, with no `machine.user`), such a program reads the node's files
-  and changes its settings through the control socket. Run the commands as
-  another account, one that only the node uses and that
-  gets root in no way without a password (not root, not in `docker` or a like
-  group, no `NOPASSWD` sudo, nobody works as it and uses sudo from it), to keep
-  them from the node's files and settings: see [Linux](platforms.md#linux).
-  The account that ran `install` is not such an account. A [sudo](sudo.md)
-  command is root and is not kept out.
+- The node's own folders are in none of these sets.
+- `/tmp`, `/var/tmp` and the home of `nerve-run` are in every set of a
+  `nerve-run` command, to read, write and run programs in
+  ([below](#the-account-nerve-run-linux)).
 - A command with `w` on a folder can put a link in place of a folder inside
   it, and a link would give that folder's rights in a place you never named.
   So a folder is left out of the sets, and the node logs a warning, when its
@@ -185,26 +190,92 @@ The node confines commands with Landlock:
     where no `w` folder is, and the folder of another pairing there follows
     it. Look for links in the folders you grant before you give a pairing one
     of those.
-- With the keys in the system keyring, the node's D-Bus session and GNOME
-  Keyring's folder count as its own, and a command cannot connect to a
-  socket there ([keys](config.md#where-the-node-keeps-its-keys)). That needs
-  Linux 7.1. On an older kernel the keys stay in files
-  ([keys](config.md#an-older-linux-kernel)).
-- On a node installed as a service the command runs as the account
-  commands run as ([service](service.md#the-account-commands-run-as)), and
-  what that account may not open stays closed as well. Landlock only takes
-  away; it gives the account nothing it lacks.
-- That account is the user who installed, unless you chose another, so
-  the command runs as an owner of the node. Its own processes cannot change
-  the node's settings through the owners' socket: the node answers only a
-  request with its owner token, and the token's folder `/run/nerve-node` is
-  in none of these sets, whatever folders you grant ([administrator
-  rights](desktop.md#administrator-rights)). A program of yours that runs
-  things on request is not held so (above): through one a command can do
-  all you can, Nerve's settings too, and the app's account card says so.
-  That is yours to answer for, as in `user` and `allowlist` mode
-  ([below](#user-mode)). Folder mode under an account of its own is planned
-  ([#142](https://github.com/Piggidragon/Nerve-Protocol/issues/142)).
+- On a node you run yourself, the command runs as you. Landlock holds the
+  command's own processes, not the other programs of your account: `folder`
+  mode there is no boundary against those of them that run things on
+  request (a session's service manager, a terminal multiplexer and the
+  like), which run what the command asks outside the sandbox, as you. Install
+  the node to run commands as `nerve-run`. With the node's keys in the system
+  keyring, `folder` mode on a node you run yourself runs no command: the
+  command could reach the keyring over your session bus.
+
+## The account `nerve-run` (Linux)
+
+The node installed as a service runs `folder` mode commands, and
+`allowlist` mode commands unless you set `--as-owner`, as `nerve-run`.
+`install` makes it, with a home of its own, `/var/lib/nerve-run`, no login
+and no other groups; `uninstall` removes both.
+
+- It is not you. Your session's programs (the service manager, the session
+  bus, tmux, a container engine) take requests from your own account only,
+  and your folders that others may not open stay closed to it. It cannot
+  change the node's settings: the owner socket refuses it.
+- It gets the folders you grant as POSIX ACL entries: the folder and
+  everything below it, with the rights of its flags, and a default entry, so
+  that what it makes there stays yours to use as well. A folder of yours
+  above a grant that others may not enter gets an entry that lets it pass
+  through it: with Landlock that is all it does there, without Landlock it
+  can then read what others may read inside that folder ([your
+  home](#your-home-and-other-accounts)). Removing the grant takes the entries
+  off your files again, and a default ACL of your own on a folder below it
+  (one you set with `setfacl -d`) is left as you had it, with an entry you
+  gave yourself there; a folder that had none has none again. `ls -l` shows a `+` on such files, and their group bits show
+  the ACL's mask. The account is one for all pairings, so its entries are the
+  union of the folders of every pairing whose commands run as `nerve-run`;
+  Landlock holds each command to its own pairing's. A pairing in `user` mode,
+  or in `allowlist` mode as you, gives `nerve-run` none of its folders.
+- What `nerve-run` made in a granted folder is its own, and keeps its entries
+  when you remove the grant: you cannot change another account's files, and
+  `nerve-run` may do anything with its own files whatever their entries say.
+  It can no longer get to them through your folders above, which lost its
+  entry, unless those folders are open to everyone ([your
+  home](#your-home-and-other-accounts)). Files you put into such a folder later get its entry from the
+  folder's default entries. `uninstall` takes every entry off, also those,
+  and gives what `nerve-run` made in your folders to you, as its account
+  goes. A file of it there with more than one name (a hard link) is left
+  as it is, since another name may lie outside your folders: `uninstall`
+  says how many, and they keep its old uid.
+- A grant that fails (a folder below it closed to you, a file system without
+  ACLs) is named by `folder add` and `folder set` and in `nerve-node status`,
+  also after a restart, and is tried again: at the node's start, with the
+  next change of the folders, and at most once a minute before a command.
+- It always has `/tmp`, `/var/tmp` and its home, to read, write and run
+  programs in. Its tools keep their caches and configs in its home: `HOME`
+  and the `XDG_*` folders point there.
+- git trusts the repositories it reaches (`safe.directory`), so it works in
+  your repositories although they are not its own.
+- It has no SSH keys or other credentials of yours, so `git push` and the
+  like fail unless you set that up for it. That is intended.
+- Tools you installed in your home (`~/.cargo`, `~/.rustup`, nvm, pyenv)
+  are not on its way. Install them system-wide, grant their folder with `r`
+  and `x`, or install them for `nerve-run` in its home.
+- The node changes only your own files: a file of another account below a
+  grant, a link, and what lies on another file system below the grant get no
+  entry. A file with a second name (a hard link) gets none either, and loses
+  one it had. A file system without ACLs refuses them, and `nerve-node
+  status` names the folder.
+- A link that is put on the way to a granted folder after you gave it, or in
+  place of a folder below it, is not followed: that grant fails until its
+  path is a plain folder again. Where you remove such a grant inside another
+  one you still give, the node takes its entries off by going through the
+  outer folder, wherever the inner one lies in it now. If the outer folder
+  holds another file system, or a folder you may not open, the node cannot
+  tell that it reached the inner one: its entries count as not taken off
+  (below) until its path is a plain folder again.
+- While the node cannot take an entry off that `nerve-run` should have lost,
+  no command of `nerve-run` runs, for any pairing: `folder rm`, `nerve-node
+  status` and the app (**nerve-run keeps access it should have lost**) name
+  the folder and why. Fix what stops it (a folder closed to you, a file
+  system without ACLs); the node tries again before the next command.
+- A file or folder a command makes private (mode 0600 or 0700) stays its
+  own: the ACL mask hides your entry then, and you cannot read it without
+  `sudo` (`sudo cat`, or `sudo chown` it to you). That is known and
+  accepted: most tools make their files 0644 and 0755, and `nerve-run`
+  keeps what it makes private to itself as any account does. If you narrow a file's group bits later
+  (`chmod g-w`), `nerve-run` loses that right too.
+- An allowed [sudo](sudo.md) command of a pairing whose commands run as
+  `nerve-run` runs as root, started by the node: the sudo list is its only
+  way to root, and your password is not used for it.
 
 Check that your kernel supports it, with the node running:
 
@@ -213,9 +284,45 @@ nerve-node status
 ```
 
 The first line reads `daemon: running (confinement landlock v…)`. With
-`confinement none` the node cannot confine commands, so `folder` mode refuses
-every command. A line `folder mode runs no command: …` says the same, and
-why.
+`confinement none` the kernel has no Landlock. The installed node then runs
+`folder` mode and `allowlist` mode commands as `nerve-run` without it: its
+account alone holds it back, so it reaches the folders you give it and
+whatever other accounts may reach ([your
+home](#your-home-and-other-accounts)), and each pairing's line in `status`
+says `as nerve-run, without Landlock` (the app says **Without Landlock**). What sets one pairing's folders apart from
+another's is then gone, as the account is one for all of them, and so is
+the narrower set Landlock gives (`w` without `r`, `x` without listing). A
+node you run yourself refuses every `folder` mode command without Landlock,
+and a line `folder mode runs no command: …` says why.
+
+### Your home and other accounts
+
+With Landlock, each command of `nerve-run` is held to its own pairing's
+folders, and nothing below is a concern.
+
+Without Landlock, `nerve-run` is an account like any other on the machine:
+in your home it may read every file that you let other accounts read (most
+are 644), not only the folders you give it. It gets into your home in two
+ways:
+
+- Your home is open to others (mode 755 or 711, `ls -ld ~`). `chmod 750 ~`
+  (or `700`) closes it.
+- You give it a folder in your home, such as `~/project`. Then it needs to
+  pass through your home to get there, and the node gives it a pass-through
+  entry on your home and on the folders on the way. With that it reaches
+  every folder and file below your home that others may read, by name,
+  whatever the mode of your home. Closing your home does not change that.
+
+`install` (once, before any folder is given), `nerve-node status` (`warning:
+Without Landlock, nerve-run can read every file in your home …`) and the app
+(**nerve-run can read more of your home**) say so, and say which of the two
+it is; where you give it your home itself, it says that. To keep it to its
+folders: give it folders outside your home (such as `/srv/work`), make your
+files readable by you and your group only (`umask 027` for new ones, `chmod
+-R o-rwx` for those there), or use a kernel with Landlock. The warning stays
+as long as you give it a folder in your home: the modes narrow what it can
+read there, but the node cannot tell which of your files are open to others,
+so only folders outside your home or Landlock end it.
 
 ## What a command can reach in `folder` mode (Windows)
 
@@ -451,8 +558,9 @@ In short: `folder` mode keeps the command's own files and the owners' pipe
 closed, but it is not shown to hold against every program of yours that
 runs things on request. One that opens itself to all AppContainers runs
 what the command asks as you, outside the container, and then a command
-can do all you can, Nerve's settings too. As on Linux, that is yours to
-answer for while commands run as you.
+can do all you can, Nerve's settings too. On Windows commands run as you, so
+that is yours to answer for; an account of their own, as on Linux, is
+planned.
 
 - **The network.** The container has the capabilities `internetClient`,
   `internetClientServer` and `privateNetworkClientServer` (code). Checked: a
@@ -568,28 +676,17 @@ answer for while commands run as you.
 confinement. A command can do what you can do, including changing the node's
 own state. Use it only for a center you would trust with a shell.
 
-On a node [installed as a service](service.md#the-account-commands-run-as)
-the node runs as its own user, `nerve`, and commands in every mode run as
-the account you chose at `install` or `setup` instead. In `user` mode they
-can do what that account can do, and cannot read the node's keys or change
-its state, unless that account can become root (root itself, or a member
-of a group such as `docker`; see
-[the account commands run as](service.md#the-account-commands-run-as)). In `folder` mode they are the same account, held to their
-folders.
-
-By default that account is the user who installed, an owner of the node.
-Then a `user` mode command, and a program an `allowlist` rule lets run, can
-change the node's settings as you can without a password: it runs as you
-without a sandbox, reads the node's owner token and uses the owners' socket
-(on Windows their pipe), as your own programs do. The node does not stop
-that; it is your choice of mode and account. The center's
-[blocklist and action checker](action-checker.md) and the node's
-[guard](rules.md#the-guard-against-changing-the-node) catch such a command
-when an agent tries it by mistake, and the node refuses a process it sees
-below one of its commands, but none of that is a boundary. Give the
-commands an account that is no owner (the app's **Create a separate
-account**, or `setup`) to keep them from the node's settings in every mode
-([administrator rights](desktop.md#administrator-rights)).
+On a node [installed as a service](service.md) the node runs as its own
+user, `nerve`, and `user` mode commands run as you, the owner, the account
+that ran `install`. They can do what you can do. They cannot read the node's
+keys, which are `nerve`'s, but they can change the node's settings as you
+can without a password, through the owner socket (on Windows the owners'
+pipe), as your own programs do. The node does not stop that: it is your
+choice of mode. The center's [blocklist and action checker](action-checker.md)
+and the node's [guard](rules.md#the-guard-against-changing-the-node) catch
+such a command when an agent tries it by mistake, and the node refuses a
+process it sees below one of its commands, but none of that is a boundary.
+The same holds for `allowlist` mode with `--as-owner`.
 
 ### Paths a command builds at run time
 
@@ -607,7 +704,9 @@ limit:
 - A `user` mode command runs as your user without a sandbox, so it reaches
   whatever you reach, protected paths and the node's own folders included. It
   is why `user` mode is for a center you would trust with a shell.
-- A program that an `allowlist` rule lets run is not sandboxed either
+- A program that an `allowlist` rule lets run is sandboxed only as
+  `nerve-run`, on the installed Linux node with Landlock; as you
+  (`--as-owner`, a node you run yourself, Windows) it is not
   ([rules](rules.md#what-a-wildcard-covers) keeps shell syntax out of a
   wildcard rule, not what a program does).
 - A [sudo](sudo.md) command runs as root without the sandbox, in `folder` mode
@@ -617,9 +716,10 @@ limit:
   commands ([Windows](#what-a-command-can-reach-in-folder-mode-windows)).
 
 And in `folder` mode while commands run as you (on a node you run yourself,
-or one installed with your account), a command can hand work to the programs
-of yours that run commands on request, which are outside the sandbox
-([Linux](#what-a-command-can-reach-in-folder-mode-linux)).
+or on Windows), a command can hand work to the programs of yours that run
+commands on request, which are outside the sandbox
+([Linux](#what-a-command-can-reach-in-folder-mode-linux)). As `nerve-run` it
+cannot: they do not take requests from another account.
 
 No rule closes these limits.
 
@@ -628,5 +728,5 @@ No rule closes these limits.
 | You want | Use |
 |---|---|
 | The agent may run a few known commands | `allowlist` with [rules](rules.md) |
-| The agent works freely in a project folder | `folder` with one folder `+r +w +x` |
+| The agent works freely in a project folder | `folder` (the default) with one folder `+r +w +x` |
 | The agent acts as you | `user`, maybe with `--for` |

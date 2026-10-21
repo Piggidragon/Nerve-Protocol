@@ -10,7 +10,7 @@ Fedora 36 and later) and fontconfig.
 | | Linux | Windows |
 |---|---|---|
 | Shell for commands | `/bin/sh -c` | Windows PowerShell 5.1 (`powershell.exe -NoProfile -Command`) |
-| `folder` mode runs commands | Yes, confined by Landlock | Yes, confined by an AppContainer; not yet on the [installed service](service.md#windows) |
+| `folder` mode runs commands | Yes, confined by Landlock; on the installed node as `nerve-run`, also where Landlock is missing | Yes, confined by an AppContainer; not yet on the [installed service](service.md#windows) |
 | `allowlist` and `user` mode run commands | Yes | Yes, in a Job Object, not confined to folders |
 | Sudo switch | Yes | On the [installed service](service.md#windows), with the administrator token of the account commands run as ([sudo on Windows](sudo.md#sudo-on-windows)) |
 | Control socket | Yes | A control pipe that takes folder changes only |
@@ -20,9 +20,22 @@ Fedora 36 and later) and fontconfig.
 
 ## Linux
 
-- `folder` mode needs Landlock in the kernel. With the node running,
-  `nerve-node status` shows `confinement landlock v…`, or `confinement none`
-  when it is missing. With `none`, `folder` mode refuses every command.
+- With the node running, `nerve-node status` shows `confinement landlock
+  v…`, or `confinement none` when the kernel has no Landlock (some
+  container hosts, older kernels). On the node installed as a service,
+  `folder` and `allowlist` mode then run their commands as `nerve-run`
+  without Landlock, held back by the account alone; `status` says `as
+  nerve-run, without Landlock`. A node you run yourself refuses every
+  `folder` mode command without Landlock.
+- Without Landlock, `nerve-run` reads in your home what any other account
+  may: when your home is open to others (`ls -ld ~` shows `drwxr-xr-x` or
+  `drwx--x--x`), and when you give it a folder in your home, which it passes
+  through. `install`, `status` and the app say so: for an open home until
+  you close it (`chmod 750 ~`), and for a folder in your home as long as it
+  is given. Give it folders outside your home, or use a kernel with
+  Landlock; `umask 027` only narrows what it can read. See
+  [modes](modes.md#your-home-and-other-accounts). With Landlock nothing is
+  said: it holds each command to its folders.
 - Commands run with `no_new_privs`, so setuid programs cannot gain privileges.
   Only a command on the [sudo list](sudo.md) runs without it.
 - When a call ends, the node kills the command's whole process group.
@@ -30,42 +43,30 @@ Fedora 36 and later) and fontconfig.
   processes ([limits](limits.md)), where systemd hands the node a cgroup: the
   installed service, or a node started with `systemd-run --user --scope -p
   Delegate=yes`. Windows does not hold commands to these limits yet.
-- A `folder` mode command cannot read or change the node's settings through
-  its control socket: the node answers only programs that can read its token
-  in the state folder, which the mode's sandbox keeps from a command. This
-  holds as far as the sandbox does, and the sandbox holds the command's own
-  processes only. While the commands run as the node's own user or as an
-  owner, `folder` mode is no boundary against that user's other programs:
-  one that runs things on request runs what the command asks outside the
-  sandbox, as the user's own process, which reads the node's files and
-  token. That is the owner's to answer for; a separate account (below) is
-  the boundary.
-- A command of `allowlist` or `user` mode has no sandbox, so it can read the
-  token and the node's files as the account it runs as can. The node refuses
-  its requests only from processes that stay below the command, and a command
-  can leave that tree at once (`( … & )`, `setsid -f`). The control socket is
-  no boundary against such a command.
-- A [sudo](sudo.md) command runs as root, whatever account the commands run
-  as. It reads the token and the node's files, passes the socket's uid check,
-  and can leave the tree the same way. The control socket is no boundary
-  against it, and neither is another account.
-- To keep the other commands from the node's files and socket, run them as
-  another account: `machine.user`, or [the installed service](service.md). The
-  account must be one that only the node uses, and it must get root in no way
-  without a password: it is not root, not in `docker`, `lxd`, `incus-admin`,
-  `libvirt` or `disk`, may not use sudo without a password (`NOPASSWD`), and
-  no person logs in as it and uses `sudo` or `su` from it; see [the account
-  commands run as](service.md#the-account-commands-run-as). A command can
-  leave `no_new_privs` and the sandbox through that account's own programs
-  (its systemd user session, a tmux or screen server), type into the tmux or
-  screen panes of a person who works as that account, where sudo has a live
-  ticket, and change what their shell runs. So for such an account every
-  command is root, not only the sudo commands. `install` takes the account
-  that ran `sudo`, the account its owner logs in as, so that default is no
-  boundary, whatever its sudo asks for; `install` and `setup` say so in a
-  warning and go on. Make an account for the node with
-  `sudo nerve-node setup --create-user nerve-work`. Sudo commands stay out of
-  this: they are root.
+- On the node [installed as a service](service.md), `folder` and `allowlist`
+  mode commands run as `nerve-run`, an account of its own with no other
+  groups and no way to root but the [sudo list](sudo.md)
+  ([modes](modes.md#the-account-nerve-run-linux)). It reaches your files only
+  where you grant a folder (POSIX ACLs), cannot open the node's files (a
+  sudo command runs as root and can), is refused by the owner socket, and your session's
+  programs (the service manager, the session bus, tmux) take no requests
+  from it, on every kernel. Landlock holds it to its own pairing's folders on
+  top, where the kernel has it.
+- A `user` mode command runs as you, the owner, without a sandbox: it can do
+  what you can, change the node's settings through the owner socket
+  included. That is the owner's choice of mode. The node refuses the owner
+  socket to processes it sees below a command, which a command can leave
+  (`( … & )`, `setsid -f`): that catches mistakes, it is no boundary. The
+  same holds for `allowlist` mode with `--as-owner`.
+- A node you run yourself runs every command as you. Its control socket
+  answers only programs that can read its token in the state folder, which
+  `folder` mode's sandbox keeps from a command, but the sandbox holds the
+  command's own processes only: one of your programs that runs things on
+  request runs what the command asks outside it, as you. Install the node to
+  run commands as `nerve-run`.
+- A [sudo](sudo.md) command runs as root, whatever account the other
+  commands run as. It reads the node's files and can change it. The sudo
+  list is yours to choose.
 - A node that runs as root is refused unless `machine.allow_root` is set
   ([root and administrator](#root-and-administrator)).
 
@@ -104,8 +105,8 @@ Fedora 36 and later) and fontconfig.
 ### Root and administrator
 
 A node with full rights hands those rights to every command a center runs:
-root on Linux, an elevated administrator token on Windows. On Linux a root
-node can run the commands as the account `machine.user` names instead; on
+root on Linux, an elevated administrator token on Windows. On Linux the
+installed node runs the commands as `nerve-run` or its owner instead; on
 Windows an elevated node cannot start a command as another account, so
 commands run with the node's own token (`machine.user` there is for the
 [installed service](service.md#windows)). So on both platforms it is refused
@@ -128,8 +129,9 @@ UAC-filtered session) is a normal user to the node, and needs no setting.
 When the node runs with full rights because you allowed it, it says so with a
 warning at start: in the stderr output and in the node's log file. The
 center's Log page shows the center's own log and does not carry it. Commands
-from a center then run with full rights on the machine (on Linux unless
-`machine.user` names another account for them), and you are responsible for
+from a center then run with full rights on the machine (on Linux unless the
+node is the installed one, which runs them as `nerve-run` or its owner), and
+you are responsible for
 what they do. On Windows, in `folder` mode, their AppContainer still holds
 them to their folders.
 

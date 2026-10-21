@@ -529,6 +529,15 @@ fn write(path: &Path, content: &[u8], if_match: Option<&str>) -> Result<Value, R
     Ok(json!({"etag": nerve_proto::msg::hex(h.as_ref()), "size": content.len()}))
 }
 
+/// The resolved folder `path`, opened a part at a time from `/` without
+/// following a link, as [`Dir`] opens one: a link swapped in after the
+/// policy judged the path fails the call instead of leading elsewhere
+/// (crate::exec::AsRoot).
+#[cfg(target_os = "linux")]
+pub fn open_folder(path: &Path) -> std::io::Result<std::os::fd::OwnedFd> {
+    Dir::open(path).map(|d| d.fd)
+}
+
 /// The folder a `read` or `write` works in. On Unix it is opened one
 /// component at a time from `/` without following a symlink, and every later
 /// step works relative to that handle, never through a symlink either: the

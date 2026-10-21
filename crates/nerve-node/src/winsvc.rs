@@ -1194,6 +1194,7 @@ pub(crate) mod tests {
             bin: root.join("Program Files/Nerve/nerve-node.exe"),
             paths: NodePaths::new(data.join("config"), data.join("state")),
             home: data,
+            run_home: PathBuf::new(),
             release: "http://127.0.0.1:1/none".into(),
             edition: &crate::edition::NODE,
         }

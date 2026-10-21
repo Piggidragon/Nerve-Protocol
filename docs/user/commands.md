@@ -1,8 +1,10 @@
 # `nerve-node` commands
 
-Run them as a normal user on the machine, or with `sudo` when the node is
-[installed as a service](service.md) (on Windows, in a terminal opened with
-"Run as administrator"). `nerve-node --help` and
+Run them as a normal user on the machine. On a node
+[installed as a service](service.md), the owner (the account that ran
+`install`) runs them without `sudo`; `install`, `update`, `uninstall` and
+`sudo on` need `sudo`, and on Windows `setup` too (there, a terminal opened
+with "Run as administrator"). `nerve-node --help` and
 `nerve-node <command> --help` list the same. The center's web UI has a Help
 page with them too.
 
@@ -40,7 +42,7 @@ center is paired.
 
 | Command | Does | Page |
 |---|---|---|
-| `mode set allowlist\|folder\|user [--for HOURS]` | Choose the mode | [modes](modes.md) |
+| `mode set allowlist\|folder\|user [--for HOURS] [--as-owner]` | Choose the mode; with allowlist, `--as-owner` runs the allowed commands as you instead of `nerve-run` | [modes](modes.md) |
 | `folder add <path> +r +w +x` | Grant a folder | [modes](modes.md#folders) |
 | `folder set <path> -w` | Change a folder's rights | [modes](modes.md#folders) |
 | `folder rm <path>`, `folder ls` | Remove or list folders | [modes](modes.md#folders) |
@@ -70,13 +72,12 @@ center is paired.
 
 | Command | Does | Page |
 |---|---|---|
-| `install` | Install the node as a service under its own user (Linux as root, Windows as administrator) | [service](service.md#install) |
-| `setup` | Name the node, choose the account commands run as, choose where the keys are, pair the first center, choose its mode | [service](service.md#setup) |
-| `setup --create-user <name> [--account-only]` | Make an account only the node uses, and run commands as it (Linux, installed node); with `--account-only` ask nothing else | [service](service.md#setup) |
+| `install` | Install the node as a service under its own user, make `nerve-run` and take you as the owner (Linux with sudo, Windows as administrator) | [service](service.md#install) |
+| `setup` | Name the node, choose where the keys are, pair the first center, choose its mode and a folder | [service](service.md#setup) |
 | `update [--from FILE]` | Put the latest release in place and restart the service | [service](service.md#update) |
 | `service start\|stop\|restart` | Start, stop or restart the installed service | [service](service.md#start-and-stop) |
 | `service status` | Show whether the node is installed as a service, whether it runs, and its program and version | [service](service.md#start-and-stop) |
-| `uninstall [--purge]` | Remove the service, its user and the program | [service](service.md#uninstall) |
+| `uninstall [--purge]` | Remove the service, `nerve-run` and its ACL entries, the node's user and the program | [service](service.md#uninstall) |
 | `backup <file> [--include-keyring] [--overwrite] [--passphrase-file F]` | Write the config and keys to a file that a passphrase protects | [backup](backup.md) |
 | `restore <file> [--replace] [--secret-storage file\|keyring] [--without-proxy] [--passphrase-file F]` | Put a backup in place of this node's, or on another machine | [backup](backup.md#restore) |
 
@@ -101,13 +102,25 @@ one JSON value from stdout:
   (`{"entries": [...]}`, the lines as the file holds them; with `--follow`
   one a line). `status` has `"daemon"`:
   `"running"`, with what the running node says, or `"not running"`.
+  It names the installed node's `"owner"`, each center's `"account"` (the
+  account its commands run as now, `null` on a node run by hand),
+  `"as_owner"` and `"landlock"` (whether Landlock holds its commands now),
+  the running Linux node's `"folder_grants"` (`"errors"`, `"stale"`,
+  `"failed"`, `"skipped"`: what giving `nerve-run` its folders left; a failed
+  grant is tried again; while `"stale"` names a folder, no command of
+  `nerve-run` runs) and `"home_warning"` (on a kernel without Landlock,
+  `{"home", "mode", "below", "warning"}` when `nerve-run` gets into the
+  owner's home: `"mode"` when the home is open to other accounts, else
+  `null`, `"below"` the folders given in it as you named them, the home
+  itself where you give it whole; `null` with Landlock or where neither is
+  so).
   `service status` has `"installed"`, `"state"` (`"running"`, `"stopped"`,
   `"starting"`, `"stopping"` or `"failed"`; `null` when not installed),
   `"enabled"` (it starts with the machine), `"program"` (where the program
   is installed), `"present"` (whether it is there) and `"version"`. It needs
   no root. `config get machine.secret_storage` also has `"keyring"`:
   `{"usable": true}`, or `"usable": false` with `"reason"`
-  (`"windows-service"`, `"old-landlock"`, or `"no-answer"`: no keyring
+  (`"windows-service"`, or `"no-answer"`: no keyring
   answers for the account the node runs as) and `"why"` in words.
 - `center add` without `--yes` prints what you would confirm
   (`{"paired": false, "preview": {...}, "check": {...}}`) and pairs nothing;
@@ -126,7 +139,11 @@ one JSON value from stdout:
   `"address"`, where a new link says the relay is,
   `backup` adds `"backup"` (`file`, `centers`, `saved`, and `left_out`, each
   with `what` and `why`: `keyring`, `does-not-fit` or `missing`),
-  `center rotate-key` adds `"public_key"`, the new key, and
+  `center rotate-key` adds `"public_key"`, the new key,
+  `folder add`, `folder set` and `folder rm` on the installed Linux node add
+  `"grant_errors"` (what giving `nerve-run` its folders left, each
+  `<path>: <why>`) and `"grant_stale"` (folders whose access `nerve-run`
+  keeps although it should have lost it) when there are any, and
   `restore` adds `"restored"` (`centers`, `kept`, `no_key`, and `notes`,
   each with `text` and, when it asks you to set something again, `fix`:
   `proxy`, `sudo`, `sudo-file`, `pin` with its `center`, or `relay`).
@@ -139,5 +156,17 @@ of stdin, or of the file `--passphrase-file` names. `proxy set
 http://user@host:port --password-stdin` takes the proxy's password from the
 first line of stdin, and `--headers-stdin` the headers from the lines after
 it, one `Name: value` each, so neither shows in the process list. `setup` reads its answers
-from stdin one line each; `setup --create-user <name> --account-only` asks
-nothing and chooses only that account. `center add` needs `--yes`.
+from stdin one line each. `center add` needs `--yes`.
+
+## What changed with the account nerve-run
+
+The node runs `folder` and `allowlist` mode commands as `nerve-run` on the
+installed Linux node (issue #142), so a few commands went or changed:
+
+| Before | Now |
+|---|---|
+| `setup --create-user <name> [--account-only]`, and setup's question for the account of the commands | gone: commands run as `nerve-run`, or as the owner |
+| `config set machine.user <name>` (Linux) | refused: Windows only |
+| an owner added with `sudo usermod -aG nerve-admin <name>` | gone: the owner is the account that ran `install` |
+| `mode set …` | `mode set allowlist --as-owner` added |
+| after `install`: `sudo nerve-node setup` | `nerve-node center add '<link>'`, then `nerve-node folder add <folder> +r +w +x`; setup is optional |

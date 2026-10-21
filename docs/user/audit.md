@@ -32,7 +32,7 @@ reason ([limits](limits.md)):
 
 Settings changes are lines like `1791834068828  settings v1 by local (alice)`.
 They show the new version and who changed it: `local` for `nerve-node`, with
-the account that ran it (the user behind `sudo`, or an owner of the installed
+the account that ran it (the user behind `sudo`, or the owner of the installed
 node, [administrator rights](desktop.md#administrator-rights)), or the name of
 a center. The log holds the old and the new value of each setting.
 

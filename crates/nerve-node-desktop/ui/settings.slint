@@ -167,63 +167,20 @@ export component SettingsPage inherits PageFrame {
             Group {
                 icon: @image-url("icons/shield.svg");
                 title: "Account for commands";
-                text: "Commands from centers run as this account. One of their own keeps them away from your files.";
+                text: Install.windows
+                    ? "Commands from centers run as this account."
+                    : "Folder and allowlist mode run commands as nerve-run, an account of their own that reaches only the folders you give it. User mode runs them as you.";
                 // One block: a hidden part takes no room, nor the space around it.
                 VerticalLayout {
-                    Text {
-                        text: Store.commands-as-you
-                            ? "Commands run as you, " + Prefs.account + (Store.commands-root-via != "" ? ": they can do all you can, and get root through " + Store.commands-root-via + "." : ": they can do all you can.")
-                            : Prefs.account != "" ? "Commands run as " + Prefs.account + "."
-                            : Install.windows ? "No account yet: with your Windows password, commands run as you, " + Install.account + "."
-                            : "No account yet: no command runs.";
-                        color: Theme.text;
-                        font-size: Type.small;
-                        wrap: word-wrap;
-                    }
-                    // The Overview's card, hidden by its owner, comes back
-                    // from here.
                     Reveal {
-                        shown: Store.commands-as-you && Store.commands-dismissed;
+                        shown: Install.windows;
                         gap: Space.sm;
-                        HorizontalLayout {
-                            alignment: start;
-                            Button {
-                                text: "Show the warning on the Overview";
-                                kind: ButtonKind.secondary;
-                                small: true;
-                                clicked => {
-                                    Store.commands-show();
-                                }
-                            }
-                        }
-                    }
-                    Reveal {
-                        shown: !Install.windows;
-                        gap: Space.lg;
-                        Field {
-                            label: "Another account";
-                            hint: "Made if it is not there, without a login. Not your own.";
-                            HorizontalLayout {
-                                spacing: Space.md;
-                                TextField {
-                                    horizontal-stretch: 1;
-                                    text <=> Prefs.account-new;
-                                    mono: true;
-                                    placeholder: "nerve-work";
-                                    label: "Another account";
-                                    accepted => {
-                                        Prefs.account-use();
-                                    }
-                                }
-                                Button {
-                                    text: "Use";
-                                    enabled: Prefs.account-new != "";
-                                    busy: Prefs.account-busy;
-                                    clicked => {
-                                        Prefs.account-use();
-                                    }
-                                }
-                            }
+                        Text {
+                            text: Prefs.account != "" ? "Commands run as " + Prefs.account + "."
+                                : "No account yet: with your Windows password, commands run as you, " + Install.account + ".";
+                            color: Theme.text;
+                            font-size: Type.small;
+                            wrap: word-wrap;
                         }
                     }
                     // Also without an account, as after a mistyped password at

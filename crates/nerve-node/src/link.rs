@@ -1529,6 +1529,10 @@ impl Link {
                 // account stops the call once it is decided and audited.
                 let account = self.shared.command_account(&cfg, &entry.policy);
                 let known = account.as_ref().ok().cloned().flatten();
+                // `nerve-run` sees the folders once their ACLs are on.
+                if self.shared.separate(&entry.policy) {
+                    self.acls_ready(&cfg).await?;
+                }
                 let call = {
                     let _as = act_as(known.as_ref())?;
                     FsCall::parse(a, &inv.args)?
@@ -1833,6 +1837,10 @@ impl Link {
             .clone();
         // `~` of the folders and rules: the owner's.
         let home = self.shared.rules_home(cfg);
+        // `nerve-run` sees the folders once their ACLs are on.
+        if self.shared.separate(&entry.policy) && !sudo_call {
+            self.acls_ready(cfg).await?;
+        }
         // The paths are looked at as the account (crate::account::FsAs).
         let rc = {
             let _as = act_as(known.as_ref())?;
@@ -1965,6 +1973,25 @@ impl Link {
 }
 
 impl Link {
+    /// Waits until the folders' ACLs for `nerve-run` follow `cfg`
+    /// (crate::acl), or says why its call does not run: an entry that should
+    /// have come off is still there. A change that takes long holds the call.
+    async fn acls_ready(&self, cfg: &NodeConfig) -> Result<(), RpcError> {
+        #[cfg(target_os = "linux")]
+        {
+            let (s, cfg) = (self.shared.clone(), cfg.clone());
+            let refusal = tokio::task::spawn_blocking(move || s.acls_refusal(&cfg))
+                .await
+                .map_err(|e| RpcError::internal(e.to_string()))?;
+            if let Some(why) = refusal {
+                return Err(RpcError::new(ErrorCode::Unavailable, why));
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = cfg;
+        Ok(())
+    }
+
     /// The AppContainer of the commands of this pairing (`entry`), once the
     /// folder grants follow `cfg` (crate::grants); `home` is the `~` of the
     /// rules. A grant of this pairing's container that its folders no longer

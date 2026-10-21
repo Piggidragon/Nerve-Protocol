@@ -1224,6 +1224,23 @@ fn uninstall_steps(
             layout.unit.display()
         ));
     }
+    // nerve-run's entries on the owner's folders come off before the
+    // account goes: a uid nobody has must not keep them, since the next
+    // account to get it would.
+    #[cfg(target_os = "linux")]
+    {
+        let record = crate::acl::record_file(&layout.paths);
+        if record.exists() {
+            let r = crate::acl::remove_all(&record);
+            if !r.stale.is_empty() {
+                return Err(format!(
+                    "the access of nerve-run to the folders given to it could not all be taken off, so it stays and so do the node's folders: {}; run `sudo nerve-node uninstall` again once that is fixed",
+                    r.errors.join("; ")
+                ));
+            }
+            steps.did("took nerve-run's access to the folders given to it off again");
+        }
+    }
     let folders = [
         &layout.paths.config_dir,
         &layout.home,

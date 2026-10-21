@@ -503,6 +503,10 @@ pub(crate) struct Shared {
     /// Linux: the installed node's owner ([`NodeOptions::owner`]).
     #[cfg_attr(windows, allow(dead_code))]
     pub owner: Option<String>,
+    /// Linux: what the last sync of the folders' ACLs for `nerve-run` left
+    /// (crate::acl); held while one runs, so that two never run at once.
+    #[cfg(target_os = "linux")]
+    pub acl: Mutex<crate::acl::Report>,
 }
 
 impl Shared {
@@ -556,6 +560,67 @@ impl Shared {
                 .extend(crate::account::built_in(&a.home));
         }
         entry
+    }
+
+    /// The accounts the folders' ACLs are for (crate::acl): `nerve-run` and
+    /// the owner, on the installed Linux node that has both; `None`
+    /// elsewhere, where no command runs as `nerve-run`.
+    #[cfg(target_os = "linux")]
+    fn acl_accounts(&self, cfg: &NodeConfig) -> Option<(crate::acl::Who, crate::service::Account)> {
+        if !self.service {
+            return None;
+        }
+        let run = self.account_as(cfg, false).ok().flatten()?;
+        let owner = self.owner_account(cfg).ok().flatten()?;
+        let who = crate::acl::Who {
+            run: run.uid,
+            owner: owner.uid,
+        };
+        Some((who, owner))
+    }
+
+    /// Brings the folders' ACLs in line with `cfg` (crate::acl), when the
+    /// record is behind it or `always`; blocks while it walks. What it left
+    /// is logged and kept for the commands and `status`.
+    #[cfg(target_os = "linux")]
+    pub fn sync_acls(&self, cfg: &NodeConfig, always: bool) {
+        let Some((who, owner)) = self.acl_accounts(cfg) else {
+            return;
+        };
+        let file = crate::acl::record_file(&self.paths);
+        // The folders are resolved as the owner sees them: the node's user
+        // may not look into the owner's home.
+        let want = match crate::account::FsAs::new(&owner) {
+            Ok(_as) => crate::acl::wanted(cfg, &self.paths, &owner.home),
+            Err(e) => {
+                tracing::warn!("folder grants: cannot act as {}: {e}", owner.name);
+                return;
+            }
+        };
+        let mut last = lock(&self.acl);
+        if !always && !crate::acl::behind(&file, &want, who) {
+            return;
+        }
+        let act_as = || {
+            crate::account::FsAs::new(&owner)
+                .map(Some)
+                .map_err(|e| format!("cannot act as {}: {e}", owner.name))
+        };
+        let report = crate::acl::sync(&file, &want, who, &act_as);
+        for e in &report.errors {
+            tracing::warn!("folder grants: {e}");
+        }
+        *last = report;
+    }
+
+    /// Why a command of `nerve-run` may not run now: the ACLs could not be
+    /// brought in line with `cfg`, and it may still reach a folder no longer
+    /// given ([`crate::acl::Report::refusal`]). Syncs first where they are
+    /// behind. Blocks.
+    #[cfg(target_os = "linux")]
+    pub fn acls_refusal(&self, cfg: &NodeConfig) -> Option<String> {
+        self.sync_acls(cfg, false);
+        lock(&self.acl).refusal()
     }
 
     /// The name of the installed node's owner: on Linux the account that
@@ -850,6 +915,19 @@ impl Shared {
 
     pub fn status(&self) -> Value {
         let cfg = self.config();
+        // What the last sync of the folders' ACLs left, on the installed
+        // Linux node (crate::acl).
+        #[cfg(target_os = "linux")]
+        let grants = {
+            let r = lock(&self.acl);
+            json!({
+                "errors": r.errors,
+                "stale": r.stale,
+                "skipped": r.skipped,
+            })
+        };
+        #[cfg(not(target_os = "linux"))]
+        let grants = Value::Null;
         let now = crate::now_ms();
         let centers: Vec<Value> = cfg
             .centers
@@ -894,6 +972,7 @@ impl Shared {
             "folder_commands_off": self.unconfined(&cfg),
             "command_limits": crate::cgroup::status(&cfg.limits.command, &self.cgroups),
             "providers": self.providers.status(),
+            "folder_grants": grants,
             "centers": centers,
             "relay": self.relay.status(&cfg),
         })
@@ -1113,6 +1192,8 @@ impl Daemon {
             relay: Default::default(),
             aside: opts.aside,
             owner: opts.owner,
+            #[cfg(target_os = "linux")]
+            acl: Mutex::default(),
         });
         shared.tell_confinement(&cfg);
         // A file that says on starts off: on Linux the password lives in
@@ -1330,6 +1411,8 @@ async fn supervise(shared: Arc<Shared>) {
     let mut stop = shared.stop.subscribe();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     let mut granted: Option<u64> = None;
+    #[cfg(target_os = "linux")]
+    let mut acl_synced: Option<u64> = None;
     loop {
         shared.settle_sudo();
         let cfg = shared.config();
@@ -1346,6 +1429,15 @@ async fn supervise(shared: Arc<Shared>) {
                     tracing::warn!("folder grants: {e}");
                 }
             });
+        }
+        // On the installed Linux node the folders' ACLs follow it so
+        // (crate::acl); a command of `nerve-run` syncs them as well before
+        // it runs.
+        #[cfg(target_os = "linux")]
+        if shared.service && acl_synced != Some(cfg.version) {
+            acl_synced = Some(cfg.version);
+            let (s, c) = (shared.clone(), cfg.clone());
+            tokio::task::spawn_blocking(move || s.sync_acls(&c, false));
         }
         // The level follows the config, whoever changed it and however.
         if let Some(log) = &shared.log {

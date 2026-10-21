@@ -474,7 +474,7 @@ fn proxy_tls_error(proxy: &Proxy, e: &std::io::Error) -> String {
             "TLS with the proxy {at}: its certificate does not carry the pinned key; if it is a relay, `nerve-node relay ls` there shows its pin"
         ),
         (true, false) => format!(
-            "TLS with the proxy {at}: its certificate is not one this machine trusts; give its pin with `nerve-node proxy set <url> --pin <pin>`"
+            "TLS with the proxy {at}: its certificate is not one this machine trusts; give its pin with `nerve-node proxy set <url> --pin=<pin>`"
         ),
         _ => format!("TLS with the proxy {at}: {e}"),
     }

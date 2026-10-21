@@ -215,7 +215,7 @@ pub async fn pair(
         .unwrap_or_else(|| local_name(&r.center_name));
     if !valid_center_name(&entry_name) {
         return Err(format!(
-            "{entry_name:?} is not a valid center name (1-64 of A-Z a-z 0-9 - _)"
+            "{entry_name:?} is not a valid center name (1-64 of A-Z a-z 0-9 - _, starting and ending with a letter or digit)"
         ));
     }
     let entry = CenterEntry {
@@ -284,7 +284,7 @@ fn local_name(center_name: &str) -> String {
         })
         .take(64)
         .collect();
-    let s = s.trim_matches('-').to_string();
+    let s = s.trim_matches(['-', '_']).to_string();
     if s.is_empty() { "center".into() } else { s }
 }
 
@@ -296,6 +296,7 @@ mod tests {
     fn local_names() {
         assert_eq!(local_name("Home Lab"), "Home-Lab");
         assert_eq!(local_name("  "), "center");
+        assert_eq!(local_name("_-x_"), "x");
         assert_eq!(local_name("conformance-center"), "conformance-center");
     }
 }

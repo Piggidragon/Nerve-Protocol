@@ -60,13 +60,13 @@ the same.
 
 | Option | Does |
 |---|---|
-| `--name <name>` | The name you use for this center on the machine. Default: the center's own name. Letters, digits, `-` and `_` |
+| `--name <name>` | The name you use for this center on the machine. Default: the center's own name. Letters, digits, `-` and `_`, starting and ending with a letter or digit |
 | `--yes` | Skip the question |
 
 ## Machine names
 
 A machine's name comes from its host name. It has 1 to 32 characters of `a-z`,
-`0-9` and `-`. To choose it, run `nerve-node config set node.name <name>`
+`0-9` and `-`, starting and ending with a letter or digit. To choose it, run `nerve-node config set node.name <name>`
 before `center add`. Later, the web UI can rename a machine (Rename). That name
 stays in the center.
 

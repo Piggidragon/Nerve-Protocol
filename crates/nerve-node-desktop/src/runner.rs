@@ -73,12 +73,10 @@ impl Runner {
     pub fn new(exe: PathBuf, config_dir: Option<PathBuf>, state_dir: Option<PathBuf>) -> Runner {
         let mut dirs = Vec::new();
         if let Some(c) = config_dir {
-            dirs.push("--config-dir".into());
-            dirs.push(c.display().to_string());
+            dirs.push(format!("--config-dir={}", c.display()));
         }
         if let Some(s) = state_dir {
-            dirs.push("--state-dir".into());
-            dirs.push(s.display().to_string());
+            dirs.push(format!("--state-dir={}", s.display()));
         }
         Runner {
             exe,

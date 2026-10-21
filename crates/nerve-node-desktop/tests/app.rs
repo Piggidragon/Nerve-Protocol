@@ -729,6 +729,35 @@ fn the_app_drives_the_cli_end_to_end() {
     prefs.invoke_raw_remove();
     assert_eq!(prefs.get_raw_error(), "");
     assert!(!denied("fs:~/private/*"));
+    // Typed values that start with `-` are values, not flags: a shell
+    // named `-sh` is saved as typed (the CLI does not mind it), and a node
+    // name `-lab` gets the CLI's own refusal instead of clap's.
+    prefs.set_shell("-sh".into());
+    prefs.invoke_shell_save();
+    assert_eq!(config(&paths).machine.shell.as_deref(), Some("-sh"));
+    prefs.set_raw_key("machine.shell".into());
+    prefs.set_raw_value("-bash".into());
+    prefs.invoke_raw_set();
+    assert_eq!(prefs.get_raw_error(), "");
+    assert_eq!(config(&paths).machine.shell.as_deref(), Some("-bash"));
+    prefs.set_raw_key("node.name".into());
+    prefs.set_raw_value("-lab".into());
+    prefs.invoke_raw_set();
+    assert!(
+        prefs.get_raw_error().contains("starting and ending"),
+        "{}",
+        prefs.get_raw_error()
+    );
+    prefs.set_raw_error("".into());
+    prefs.invoke_relay_add();
+    prefs.set_relay_add_name("-lab".into());
+    prefs.invoke_relay_add_confirm();
+    assert!(
+        prefs.get_relay_add_open() && prefs.get_relay_add_error().contains("starting and ending"),
+        "{}",
+        prefs.get_relay_add_error()
+    );
+    prefs.set_relay_add_open(false);
     // A node of the relay: its name, and where it reaches this machine,
     // which goes into its one link.
     prefs.invoke_relay_add();
@@ -785,6 +814,23 @@ fn the_app_drives_the_cli_end_to_end() {
     prefs.invoke_connect_save();
     assert!(prefs.get_connect_open() && prefs.get_connect_error() != "");
     prefs.set_connect_open(false);
+    // A pin is random base64url, so about one in 64 starts with `-`: the
+    // CLI must not read it as a flag. (This one is fixed, to be sure.)
+    let dashed = nerve_proto::link::RelayLink {
+        pin: "-AECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".into(),
+        ..link.clone()
+    };
+    prefs.invoke_connect_start();
+    prefs.set_connect_link(dashed.render().into());
+    prefs.invoke_connect_read(dashed.render().into());
+    prefs.invoke_connect_save();
+    assert!(!prefs.get_connect_open(), "{}", prefs.get_connect_error());
+    assert_eq!(
+        config(&paths).connection.pin.as_deref(),
+        Some(dashed.pin.as_str())
+    );
+    prefs.invoke_disconnect();
+    assert!(config(&paths).connection.proxy.is_none());
     assert_eq!(prefs.get_relay_nodes().row_count(), 1);
     prefs.set_once_open(false);
     // Its centers and limits, in its dialog.

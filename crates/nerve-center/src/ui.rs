@@ -1202,6 +1202,89 @@ mod tests {
         let draw = &APP_JS[APP_JS.find("function draw(").unwrap()..];
         let draw = &draw[..draw.find("\n}\n").unwrap()];
         assert_eq!(draw.matches(".filter((p) => p != null)").count(), 2);
+        // The same for the local model part, which three places redraw: the
+        // filter is in the function, not in each caller.
+        let parts = &APP_JS[APP_JS.find("function localInstallParts(").unwrap()..];
+        let parts = &parts[..parts.find("\n}\n").unwrap()];
+        assert!(parts.contains(".filter((p) => p != null)"), "{parts}");
+        assert_eq!(APP_JS.matches("...localInstallParts(").count(), 3);
+        assert!(!APP_JS.contains("...localInstallBlocks("));
+    }
+
+    /// A button's handler gets the event: the switches of the Action checker
+    /// read `ev.currentTarget.checked`, and without the event they threw
+    /// before they saved anything.
+    #[test]
+    fn a_button_action_gets_the_event() {
+        let act = &APP_JS[APP_JS.find("function act(").unwrap()..];
+        let act = &act[..act.find("\n}\n").unwrap()];
+        assert!(act.contains("await fn(ev)"), "{act}");
+        assert!(!act.contains("await fn()"), "{act}");
+        // Every handler that reads the event is one of the switches, which
+        // are wrapped in act.
+        let uses: Vec<_> = APP_JS
+            .lines()
+            .filter(|l| l.contains("act(async (ev) =>"))
+            .collect();
+        assert_eq!(uses.len(), 2, "{uses:?}");
+        assert!(uses.iter().all(|l| l.contains("ev.currentTarget.checked")));
+    }
+
+    /// The relative luminance of `#rrggbb`, as WCAG defines it.
+    fn luminance(hex: &str) -> f64 {
+        let c = |i: usize| {
+            let v = f64::from(u8::from_str_radix(&hex[1 + 2 * i..3 + 2 * i], 16).unwrap()) / 255.0;
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * c(0) + 0.7152 * c(1) + 0.0722 * c(2)
+    }
+
+    fn contrast(a: &str, b: &str) -> f64 {
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// The off track of a switch shows the state, so it needs 3:1 against
+    /// what it sits on (WCAG 1.4.11), in both themes, and the web UI and the
+    /// app take it from the same token.
+    #[test]
+    fn the_off_switch_has_the_contrast_of_a_control() {
+        let theme = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../nerve-node-desktop/ui/theme.slint"
+        ))
+        .unwrap();
+        let colours = slint_global(&theme, "Theme");
+        let pair = |name: &str| {
+            let (_, v) = colours.iter().find(|(n, _)| n == name).unwrap();
+            let (d, l) = v
+                .strip_prefix("dark ? ")
+                .unwrap()
+                .split_once(" : ")
+                .unwrap();
+            (d.to_string(), l.to_string())
+        };
+        let (off_dark, off_light) = pair("switch-off");
+        for surface in ["window", "surface", "surface-alt"] {
+            let (d, l) = pair(surface);
+            assert!(contrast(&off_dark, &d) >= 3.0, "dark {surface}");
+            assert!(contrast(&off_light, &l) >= 3.0, "light {surface}");
+        }
+        // The white knob has to show on the track as well.
+        assert!(contrast(&off_dark, "#ffffff") >= 3.0);
+        assert!(contrast(&off_light, "#ffffff") >= 3.0);
+        let widgets = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../nerve-node-desktop/ui/widgets.slint"
+        ))
+        .unwrap();
+        assert!(widgets.contains("root.checked ? Theme.accent : Theme.switch-off;"));
+        let css = without_comments(APP_CSS);
+        assert!(css_block(&css, ".switch input").contains("background: var(--switch-off);"));
     }
 
     #[test]

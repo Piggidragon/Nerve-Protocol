@@ -211,7 +211,7 @@ function act(fn) {
   return async (ev) => {
     const b = ev.currentTarget;
     setBusy(b, true);
-    try { await fn(); await tick(); draw(false); }
+    try { await fn(ev); await tick(); draw(false); }
     catch (e) { if (!e.auth) notify(e.message, "error"); }
     finally { setBusy(b, false); }
   };
@@ -1134,7 +1134,13 @@ const bar = (p) => {
   return el("div", { class: "pbar" }, el("div", { class: "pfill", style: `width:${pct}%` }), el("span", { class: "pct" }, `${pct}%`));
 };
 
+// What the local model part shows. The builders below leave a part out as
+// null, which replaceChildren would print as the word.
 function localInstallParts(meta) {
+  return localInstallBlocks(meta).filter((p) => p != null);
+}
+
+function localInstallBlocks(meta) {
   const pin = meta.models.find((m) => m.id === checkerPick) || meta.models[0];
   // One plain line per model, so the choice is informed: size, licence, and
   // the measured speed and quality.

@@ -23,6 +23,8 @@
   /* Lines. */
   --border: #e1e4ea;
   --border-strong: #c9ced7;
+  /* The off track of a switch: 3:1 against the surfaces. */
+  --switch-off: #78818f;
   /* The line of a selected segment: in dark the strong one. */
   --border-selected: #e1e4ea;
 
@@ -137,6 +139,7 @@
   --scrim: #000000a6;
   --border: #262a32;
   --border-strong: #363b46;
+  --switch-off: #656e7e;
   --border-selected: #363b46;
   --text: #eceef2;
   --text-muted: #b4bbc7;
@@ -183,6 +186,7 @@
     --scrim: #000000a6;
     --border: #262a32;
     --border-strong: #363b46;
+    --switch-off: #656e7e;
     --border-selected: #363b46;
     --text: #eceef2;
     --text-muted: #b4bbc7;
@@ -788,7 +792,7 @@ input[type="checkbox"] {
   flex: none;
   margin: 0;
   border-radius: 11px;
-  background: var(--border-strong);
+  background: var(--switch-off);
   appearance: none;
   cursor: pointer;
   transition: background-color var(--base);

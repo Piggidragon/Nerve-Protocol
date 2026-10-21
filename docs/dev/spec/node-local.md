@@ -26,7 +26,8 @@ as it. A command of `folder` mode, and of `allowlist` mode unless the
 pairing's `as_owner` is set, runs as `nerve-run`; one of `user` mode, or of
 `allowlist` mode with `as_owner`, runs as the owner, and so does a sudo
 command of such a pairing. An allowed sudo command of a pairing whose
-commands run as `nerve-run` runs as root, started by the node (§4). `install` makes `nerve-run` (a system account with its own group and
+commands run as `nerve-run` runs as root, started by the node (§4).
+`install` makes `nerve-run` (a system account with its own group and
 no other, no login shell, home `/var/lib/nerve-run`, comment
 `Nerve commands`) and takes the account that ran it (`SUDO_USER`,
 `PKEXEC_UID`) as the owner, which it writes into the unit
@@ -1045,8 +1046,12 @@ password is the owner's, and refuses a wrong one with `invalid_args`; the
 switch then stays as it was. An allowed sudo command of a pairing whose
 commands run as the owner runs through sudo as the owner, with that
 password; one of a pairing whose commands run as `nerve-run` runs as root,
-started by the node itself (`sh -c 'exec <the command>'`, root's group only,
-no Landlock), without the password or the sudo program. Turning it off drops the password. On Linux the password is kept
+started by the node itself (`sh -c "cd -- '<cwd>' && exec <the command>"`
+from `/`, root's group only, no Landlock), without the password or the sudo
+program. Its paths are looked at as the owner's, and its default folder is
+the owner's home: the node's child, which holds CAP_SETUID and CAP_SETGID
+only, has no right past a folder's mode until root's program runs, so root's
+shell enters the folder. Turning it off drops the password. On Linux the password is kept
 in memory only, whatever `secret_storage` says, so a restarted node, or
 a `node.toml` that says `on` without a password held, has the switch off. It
 never reaches a center: the node replaces every copy in an outgoing frame and

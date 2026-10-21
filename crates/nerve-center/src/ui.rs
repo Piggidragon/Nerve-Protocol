@@ -1268,21 +1268,133 @@ mod tests {
         let replace = &APP_JS[APP_JS.find("function replacePage(").unwrap()..];
         let replace = &replace[..replace.find("\n}\n").unwrap()];
         assert!(replace.contains("restoreFocus(spot)"), "{replace}");
-        assert!(
-            replace.contains("pendingFocus || focusSpot(document.activeElement)"),
-            "{replace}"
-        );
+        assert!(replace.contains("focusSpot(active)"), "{replace}");
         let act = &APP_JS[APP_JS.find("function act(").unwrap()..];
         let act = &act[..act.find("\n}\n").unwrap()];
         // Taken before the control is made busy: a disabled control may
         // already have lost the focus.
         assert!(
-            act.find("pendingFocus = focusSpot(b)").unwrap()
-                < act.find("setBusy(b, true)").unwrap(),
+            act.find("pendingFocus = spot").unwrap() < act.find("setBusy(b, true)").unwrap(),
             "{act}"
         );
         // The pages that are redrawn on a save go through replacePage.
         assert_eq!(APP_JS.matches("replacePage(").count(), 3);
+    }
+
+    /// The focus goes back to the control by what it is, never by where it
+    /// sat (review round 3, finding 1): after a list gained or lost an item,
+    /// a position names the End, Remove or Disable of another item, and
+    /// Enter acts on an item the user never picked. A control without a
+    /// `data-focus` key gets no restore; a key that is gone or not unique
+    /// sends the focus to the section's heading, which does nothing on
+    /// Enter. (The browser check is `focus-identity.js` in the review tools.)
+    #[test]
+    fn the_focus_is_restored_by_identity_not_by_position() {
+        let spot = &APP_JS[APP_JS.find("function focusSpot(").unwrap()..];
+        let spot = &spot[..spot.find("\n}\n").unwrap()];
+        assert!(!spot.contains("indexOf"), "{spot}");
+        assert!(!spot.contains("path"), "{spot}");
+        assert!(spot.contains("node.dataset.focus"), "{spot}");
+        let target = &APP_JS[APP_JS.find("function focusTarget(").unwrap()..];
+        let target = &target[..target.find("\n}\n").unwrap()];
+        assert!(target.contains("found.length === 1"), "{target}");
+        let restore = &APP_JS[APP_JS.find("function restoreFocus(").unwrap()..];
+        let restore = &restore[..restore.find("\n}\n").unwrap()];
+        assert!(!restore.contains(".children["), "{restore}");
+        assert!(restore.contains("if (!spot.key) return;"), "{restore}");
+        assert!(restore.contains("focusTarget(spot.key)"), "{restore}");
+        assert!(restore.contains("querySelector(\"h3\")"), "{restore}");
+        // The heading takes the focus but is not a stop for Tab.
+        assert!(APP_JS.contains("el(\"h3\", { tabindex: \"-1\""));
+        // Every control that acts on one item, without asking, has a key
+        // that names the item.
+        for (label, kind) in [
+            ("btn(\"End\"", ":end`"),
+            ("btn(n.disabled ?", ":disable`"),
+            (
+                "btn(\"Remove\", \"danger-soft\", act(async () => { cfg.",
+                ":remove`",
+            ),
+            ("btn(\"Switch on again\"", ":on`"),
+            ("btn(\"Delete\"", ":delete`"),
+        ] {
+            let lines: Vec<_> = APP_JS.lines().filter(|l| l.contains(label)).collect();
+            assert!(!lines.is_empty(), "{label}");
+            assert!(
+                lines.iter().all(|l| l.contains(kind) && l.contains("${")),
+                "{label}: {lines:?}"
+            );
+        }
+        // A blocklist or allow entry is named by its rule and scope, and by
+        // the list it is shown in (a machine's card repeats the entries).
+        assert!(APP_JS.contains("`block:${where}:${e.rule}|${e.node_id || \"\"}`"));
+        assert!(APP_JS.contains("`allow:${where}:${a.rule}|${a.node_id || \"\"}:remove`"));
+        // A session's End is named by the session.
+        assert!(APP_JS.contains("session:${s.id}:end"));
+    }
+
+    /// A save in flight pulls the focus back only while the focus is still
+    /// on the control that started it (or has fallen to the page because
+    /// that control was replaced), and only on the page it started on
+    /// (review round 3, finding 2).
+    #[test]
+    fn a_save_in_flight_does_not_pull_the_focus_back() {
+        let replace = &APP_JS[APP_JS.find("function replacePage(").unwrap()..];
+        let replace = &replace[..replace.find("\n}\n").unwrap()];
+        assert!(replace.contains("p.page === current()"), "{replace}");
+        assert!(replace.contains("active === p.node"), "{replace}");
+        assert!(replace.contains("document.body"), "{replace}");
+        let go = &APP_JS[APP_JS.find("function go(").unwrap()..];
+        let go = &go[..go.find("\n}\n").unwrap()];
+        assert!(go.contains("pendingFocus = null"), "{go}");
+        // A save no button started (a picker's) holds the focus the same way,
+        // and the holder lets go only of its own spot.
+        let quietly = &APP_JS[APP_JS.find("function quietly(").unwrap()..];
+        let quietly = &quietly[..quietly.find("\n}\n").unwrap()];
+        assert!(quietly.contains("pendingFocus = spot"), "{quietly}");
+        assert!(quietly.contains("if (pendingFocus === spot)"), "{quietly}");
+    }
+
+    /// The Action checker page saves one change at a time: each save posts
+    /// the whole working copy, so a second change made while the first runs
+    /// rides along, and would be saved although the first was refused and
+    /// taken back (review round 3, finding 3). The page's controls are off
+    /// from the start of a save until it has settled, and are on again
+    /// before the page is drawn anew (a disabled control cannot take the
+    /// focus). (The browser check is `focus-identity.js` in the review tools.)
+    #[test]
+    fn the_checker_page_saves_one_change_at_a_time() {
+        let save = &APP_JS[APP_JS.find("async function saveChecker(").unwrap()..];
+        let save = &save[..save.find("\n}\n").unwrap()];
+        assert!(
+            save.find("lockSaves(true)").unwrap() < save.find("await api(").unwrap(),
+            "{save}"
+        );
+        let catch = &save[save.find("catch (e)").unwrap()..];
+        assert!(
+            catch.find("endSave()").unwrap() < catch.find("draw(true)").unwrap(),
+            "{save}"
+        );
+        assert!(save.contains("await loadChecker(true)"), "{save}");
+        let fin = &save[save.find("finally").unwrap()..];
+        assert!(fin.contains("endSave()"), "{save}");
+        let load = &APP_JS[APP_JS.find("async function loadChecker(").unwrap()..];
+        let load = &load[..load.find("\n}\n").unwrap()];
+        assert!(
+            load.find("endSave()").unwrap() < load.find("draw(true)").unwrap(),
+            "{load}"
+        );
+        // A page drawn while a save runs is locked too.
+        let draw = &APP_JS[APP_JS.find("function draw(").unwrap()..];
+        let draw = &draw[..draw.find("\n}\n").unwrap()];
+        assert!(draw.contains("checkerSaving) lockSaves(true)"), "{draw}");
+        // Nothing else on the page posts the whole copy.
+        assert_eq!(
+            APP_JS
+                .matches("await api(\"POST\", \"/api/checker\",")
+                .count(),
+            1
+        );
     }
 
     /// The relative luminance of `#rrggbb`, as WCAG defines it.

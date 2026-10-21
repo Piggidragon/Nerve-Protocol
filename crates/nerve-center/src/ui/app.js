@@ -212,39 +212,64 @@ function act(fn) {
     const b = ev.currentTarget;
     // A busy control may lose the focus, and a page that is drawn anew
     // loses it for good: the page puts it back where it was.
-    pendingFocus = focusSpot(b);
+    const spot = focusSpot(b);
+    pendingFocus = spot;
     setBusy(b, true);
     try { await fn(ev); await tick(); draw(false); }
     catch (e) { if (!e.auth) notify(e.message, "error"); }
-    finally { setBusy(b, false); pendingFocus = null; }
+    finally { setBusy(b, false); if (pendingFocus === spot) pendingFocus = null; }
   };
 }
 
-// Where the keyboard focus is in the page, as a path of child positions
-// that names the same control in a page drawn anew (a save redraws the
-// whole page, and the page keeps its shape).
+// The control the keyboard focus is on, named by what it is for and not by
+// where it sits: a list that gains or loses an item moves its controls, and
+// a position would name the End, Remove or Disable of another item, which
+// Enter then acts on. A control with a stable `data-focus` key (its kind,
+// the item's id and what it does) gets the focus back in a page drawn anew
+// (a save redraws the whole page, the poll redraws a list); a control
+// without one does not. When the key is gone (the item was ended, removed)
+// or is not unique, the focus goes to the heading of the section the
+// control was in, which does nothing on Enter.
 let pendingFocus = null;
 
 function focusSpot(node) {
   const page = $("page");
   if (!node || node === page || !page.contains(node)) return null;
-  const path = [];
-  for (let n = node; n !== page; n = n.parentElement) path.unshift(Array.prototype.indexOf.call(n.parentElement.children, n));
-  return { path, tag: node.tagName };
+  const sec = node.closest("section[data-focus]");
+  return { node, key: node.dataset.focus || null, section: sec ? sec.dataset.focus : null, page: current() };
+}
+
+// The one element of the page that has this key.
+function focusTarget(key) {
+  const found = Array.from($("page").querySelectorAll("[data-focus]")).filter((e) => e.dataset.focus === key);
+  return found.length === 1 ? found[0] : null;
 }
 
 function restoreFocus(spot) {
   if (!spot) return;
-  let n = $("page");
-  for (const i of spot.path) { n = n && n.children[i]; }
-  if (n && n.tagName === spot.tag && !n.disabled) n.focus({ preventScroll: true });
+  const page = $("page");
+  const focus = (e) => { if (e && !e.disabled) e.focus({ preventScroll: true }); };
+  // The very same element, put back by a page that keeps its parts.
+  if (page.contains(spot.node)) return focus(spot.node);
+  if (!spot.key) return;
+  const same = focusTarget(spot.key);
+  if (same) return focus(same);
+  const sec = spot.section && focusTarget(spot.section);
+  const heading = sec && sec.querySelector("h3");
+  if (heading) focus(heading);
 }
 
-// Draws a page's parts in place of what is shown, and keeps the focus on
-// the same control.
+// Draws a page's parts in place of what is shown, and keeps the focus where
+// it is. A save that is still running holds the focus for the control that
+// started it only while the focus is still on that control (or has fallen
+// to the page because the control was replaced or disabled), and only on
+// the page it started on; the user's own move wins.
 function replacePage(parts) {
   const page = $("page");
-  const spot = pendingFocus || focusSpot(document.activeElement);
+  const active = document.activeElement;
+  const p = pendingFocus;
+  const held = p && p.page === current() && (active === p.node || !active || active === document.body);
+  const spot = held ? p : focusSpot(active);
   page.replaceChildren(...parts);
   restoreFocus(spot);
 }
@@ -273,9 +298,11 @@ function head(ic, title, sub, stats, actions) {
     actions ? el("div", { class: "head-actions" }, actions) : null);
 }
 
+// The heading can take the focus (but is not a stop for Tab): it is where
+// the focus goes when the control it was on is gone.
 function section(title, sub, action, ...kids) {
-  return el("section", { class: "sec" },
-    el("div", { class: "sec-head" }, el("div", {}, el("h3", {}, title), sub ? el("p", {}, sub) : null), action),
+  return el("section", { class: "sec", "data-focus": `section:${title}` },
+    el("div", { class: "sec-head" }, el("div", {}, el("h3", { tabindex: "-1", "data-focus": `heading:${title}` }, title), sub ? el("p", {}, sub) : null), action),
     kids);
 }
 
@@ -304,8 +331,10 @@ function pill(kind, text) {
   return el("span", { class: "pill " + kind }, text);
 }
 
-function btn(label, kind, onclick, ic) {
-  return el("button", { type: "button", class: "btn sm " + (kind || ""), onclick }, ic ? icon(ic, "sm") : null, label);
+// `key` names the button for the focus (see focusSpot): kind, item and what
+// it does.
+function btn(label, kind, onclick, ic, key) {
+  return el("button", { type: "button", class: "btn sm " + (kind || ""), onclick, "data-focus": key }, ic ? icon(ic, "sm") : null, label);
 }
 
 // ---- Help ----
@@ -472,7 +501,7 @@ function pageOverview() {
       [o.sessions.length, o.sessions.length === 1 ? "session" : "sessions"],
     ]),
     o.alerts.slice(-5).map((a) => banner("warn", "alert", `${when(a.ts)}: ${a.text}`)),
-    section("Machines", null, btn("Pair a machine", "primary", act(async () => { state.pairing = await api("POST", "/api/pair"); }), "plus"),
+    section("Machines", null, btn("Pair a machine", "primary", act(async () => { state.pairing = await api("POST", "/api/pair"); }), "plus", "pair"),
       state.pairing ? pairingCard(state.pairing) : null,
       o.nodes.length ? el("div", { class: "stack" }, o.nodes.map(nodeCard)) : empty("No machines yet. Pair one to get started.", "server")),
     section("Sessions", "Harnesses that are connected to this center.", null,
@@ -488,10 +517,10 @@ function pairingCard(p) {
   const row = (label, value) => el("div", { class: "pair-row" },
     el("span", { class: "pair-label" }, label),
     el("code", { class: "pair-value mono" }, value),
-    btn("Copy", "ghost", () => copy(value), "copy"));
+    btn("Copy", "ghost", () => copy(value), "copy", `pair:copy:${label}`));
   return el("div", { class: "card", id: "pairing" },
     el("div", { class: "card-top" }, itile("link", "accent"), el("span", { class: "name" }, "Pair a machine"),
-      el("button", { type: "button", class: "btn ghost icon sm push", "aria-label": "Dismiss", onclick: () => { state.pairing = null; draw(true); } }, icon("x", "sm"))),
+      el("button", { type: "button", class: "btn ghost icon sm push", "aria-label": "Dismiss", "data-focus": "pair:dismiss", onclick: () => { state.pairing = null; draw(true); } }, icon("x", "sm"))),
     el("p", { class: "meta" }, "On the machine, run the command, or paste the link in the Nerve app (Centers, Pair a center)."),
     el("div", { class: "pair-rows" },
       row("Command", command),
@@ -521,12 +550,12 @@ function nodeCard(n) {
       btn("Rename", "ghost", act(async () => {
         const name = await modal({ title: `Rename ${n.name}`, confirm: "Rename", field: { label: "New name (a-z, 0-9 and -, not starting or ending with -)", value: n.name, pattern: "[a-z0-9]([a-z0-9\\-]*[a-z0-9])?" } });
         if (name && name !== n.name) await api("POST", "/api/nodes/rename", { id: n.id, name });
-      }), "edit"),
-      btn(n.disabled ? "Enable" : "Disable", "ghost", act(() => api("POST", "/api/nodes/disable", { id: n.id, disabled: !n.disabled })), n.disabled ? "ok" : "ban"),
+      }), "edit", `node:${n.id}:rename`),
+      btn(n.disabled ? "Enable" : "Disable", "ghost", act(() => api("POST", "/api/nodes/disable", { id: n.id, disabled: !n.disabled })), n.disabled ? "ok" : "ban", `node:${n.id}:disable`),
       btn("Remove", "ghost", act(async () => {
         const yes = await modal({ title: `Remove ${n.name}?`, message: "It has to be paired again to come back.", confirm: "Remove", danger: true });
         if (yes) await api("POST", "/api/nodes/remove", { id: n.id });
-      }), "trash")));
+      }), "trash", `node:${n.id}:remove`)));
 }
 
 function sessionCard(s) {
@@ -536,7 +565,7 @@ function sessionCard(s) {
       // The action checker marks a session tainted once a call of it returned
       // content (issue #17).
       s.tainted ? pill("warn", "tainted") : null,
-      el("span", { class: "push" }, btn("End", "danger-soft", act(() => api("POST", "/api/sessions/end", { id: s.id }))))),
+      el("span", { class: "push" }, btn("End", "danger-soft", act(() => api("POST", "/api/sessions/end", { id: s.id })), null, `session:${s.id}:end`))),
     el("p", { class: "meta" }, `Since ${ago(s.started_ms)}, ${plural(s.calls, "call")}`),
     s.nodes.length ? el("div", { class: "chips" }, s.nodes.map((n) => el("span", { class: "chip" }, n))) : null,
     el("p", { class: "meta faint mono" }, s.id));
@@ -551,6 +580,7 @@ let pickers = 0;
 // the search field above a list of fixed height. The keys follow the combobox
 // pattern: Down opens it, Up and Down move, Enter picks, Escape closes.
 // `items` are { value, text }; `onpick` gets the value of the entry picked.
+// `key` names the button for the focus (see focusSpot).
 function picker(o) {
   const n = ++pickers;
   const ids = { label: `pick-${n}-label`, button: `pick-${n}-button`, list: `pick-${n}-list` };
@@ -562,7 +592,7 @@ function picker(o) {
 
   const current = el("span", {});
   const button = el("button", {
-    type: "button", class: "input picker-btn", id: ids.button, "aria-haspopup": "listbox", "aria-expanded": "false",
+    type: "button", class: "input picker-btn", id: ids.button, "data-focus": o.key, "aria-haspopup": "listbox", "aria-expanded": "false",
     "aria-controls": ids.list, "aria-labelledby": `${ids.label} ${ids.button}`,
   }, current, icon("chev", "sm chev"));
   const search = el("input", {
@@ -824,7 +854,10 @@ const SOURCES = [
 ];
 let checkerRun = 0;
 
-async function loadChecker() {
+// `endsSave`: this load ends the save that asked for it, so the page's
+// controls work again before the page is drawn anew (a disabled control
+// cannot take the focus back).
+async function loadChecker(endsSave) {
   const run = ++checkerRun;
   const [r, o] = await Promise.all([api("GET", "/api/checker"), api("GET", "/api/overview")]);
   if (run !== checkerRun) return;
@@ -833,13 +866,17 @@ async function loadChecker() {
   const cfg = r.config;
   cfg.nodes = cfg.nodes || {};
   state.checker = { cfg, saved: structuredClone(cfg), meta: r, nodes: o.nodes || [] };
+  if (endsSave) endSave();
   if (current() === "checker") draw(true);
 }
 
 // Runs a save that no button started (a picker's choice), with the error
-// shown as a button's would be.
+// shown as a button's would be, and the focus kept as a button's is.
 function quietly(fn) {
-  fn().catch((e) => { if (!e.auth) notify(e.message, "error"); });
+  const spot = focusSpot(document.activeElement);
+  pendingFocus = spot;
+  fn().catch((e) => { if (!e.auth) notify(e.message, "error"); })
+    .finally(() => { if (pendingFocus === spot) pendingFocus = null; });
 }
 
 function machineName(id) {
@@ -852,6 +889,24 @@ function machineItems() {
   return [{ value: "", text: "Every machine" }, ...((state.checker && state.checker.nodes) || []).map((n) => ({ value: n.id, text: n.name }))];
 }
 
+// A save posts the whole working copy, so a second change made while one
+// save runs would ride on the first, and be saved although the first was
+// refused (and its change taken back). Until a save has settled, the page's
+// buttons and switches are off: one save at a time.
+let checkerSaving = false;
+
+function lockSaves(on) {
+  for (const c of $("page").querySelectorAll("button, input[type=checkbox]")) {
+    if (on && !c.disabled) { c.disabled = true; c.dataset.locked = ""; }
+    else if (!on && "locked" in c.dataset) { c.disabled = false; delete c.dataset.locked; }
+  }
+}
+
+function endSave() {
+  checkerSaving = false;
+  lockSaves(false);
+}
+
 // Saves the working copy (or `next`, a copy a handler changed in place of
 // it), then reloads so the page shows what the center kept. A handler may
 // have changed the working copy before it saved. When the save fails, the
@@ -859,17 +914,24 @@ function machineItems() {
 // next save would otherwise send the change that was refused.
 async function saveChecker(next) {
   const c = state.checker;
+  checkerSaving = true;
+  lockSaves(true);
   try {
-    await api("POST", "/api/checker", { config: next || c.cfg });
-  } catch (e) {
-    if (!next && state.checker === c) {
-      c.cfg = structuredClone(c.saved);
-      if (current() === "checker") draw(true);
-      if (!e.auth) await loadChecker().catch(() => {});
+    try {
+      await api("POST", "/api/checker", { config: next || c.cfg });
+    } catch (e) {
+      if (!next && state.checker === c) {
+        c.cfg = structuredClone(c.saved);
+        endSave();
+        if (current() === "checker") draw(true);
+        if (!e.auth) await loadChecker().catch(() => {});
+      }
+      throw e;
     }
-    throw e;
+    await loadChecker(true);
+  } finally {
+    endSave();
   }
-  await loadChecker();
 }
 
 function pageChecker() {
@@ -882,9 +944,9 @@ function pageChecker() {
       [cfg.model_on ? "on" : "off", "model", cfg.model_on ? "ok" : ""],
     ]),
     section("Switches", "Each part has its own switch; a change takes effect for the next call.", null, el("div", { class: "card" },
-      checkerToggle("Blocklist (deterministic, on by default)", cfg.blocklist_on, (v) => { cfg.blocklist_on = v; }),
-      checkerToggle("Decision model (off by default)", cfg.model_on, (v) => { cfg.model_on = v; }),
-      checkerToggle("Taint marking (a session is tainted after a call returns content)", cfg.taint_on, (v) => { cfg.taint_on = v; }))),
+      checkerToggle("blocklist_on", "Blocklist (deterministic, on by default)", cfg.blocklist_on, (v) => { cfg.blocklist_on = v; }),
+      checkerToggle("model_on", "Decision model (off by default)", cfg.model_on, (v) => { cfg.model_on = v; }),
+      checkerToggle("taint_on", "Taint marking (a session is tainted after a call returns content)", cfg.taint_on, (v) => { cfg.taint_on = v; }))),
     c.meta.rejected && c.meta.rejected.length ? banner("warn", "alert", `Some rules do not parse and were left out: ${c.meta.rejected.join("; ")}`) : null,
     blocklistCard(cfg, c.meta),
     allowCard(cfg),
@@ -894,16 +956,20 @@ function pageChecker() {
 }
 
 // A switch that mutates the working copy and saves at once.
-function checkerToggle(label, on, apply) {
-  const input = el("input", { type: "checkbox", role: "switch", onchange: act(async (ev) => { apply(ev.currentTarget.checked); await saveChecker(); }) });
+function checkerToggle(field, label, on, apply) {
+  const input = el("input", { type: "checkbox", role: "switch", "data-focus": `switch:${field}`, onchange: act(async (ev) => { apply(ev.currentTarget.checked); await saveChecker(); }) });
   input.checked = !!on;
   return el("label", { class: "switch" }, input, el("span", {}, label));
 }
 
 // One blocklist entry: its switch, rule, scope (every machine, with the
-// machines it is switched off for, or one machine) and note.
-function blockRow(cfg, e, i) {
-  const t = el("input", { type: "checkbox", role: "switch", onchange: act(async (ev) => { cfg.blocklist[i].on = ev.currentTarget.checked; await saveChecker(); }) });
+// machines it is switched off for, or one machine) and note. `where` is the
+// list it is shown in (the blocklist, or a machine's card), so that its
+// controls are named once on the page; the entry is named by its rule, not
+// by its place in the list.
+function blockRow(cfg, e, i, where) {
+  const key = `block:${where}:${e.rule}|${e.node_id || ""}`;
+  const t = el("input", { type: "checkbox", role: "switch", "data-focus": `${key}:switch`, onchange: act(async (ev) => { cfg.blocklist[i].on = ev.currentTarget.checked; await saveChecker(); }) });
   t.checked = e.on;
   const off = e.off_for || [];
   return el("div", { class: "card entry" },
@@ -912,7 +978,7 @@ function blockRow(cfg, e, i) {
       e.builtin ? pill("", "default") : null,
       pill("", e.node_id ? `only ${machineName(e.node_id)}` : "every machine"),
       off.length ? pill("warn", `off for ${off.map(machineName).join(", ")}`) : null,
-      el("span", { class: "push" }, btn("Remove", "danger-soft", act(async () => { cfg.blocklist.splice(i, 1); await saveChecker(); }), "trash"))),
+      el("span", { class: "push" }, btn("Remove", "danger-soft", act(async () => { cfg.blocklist.splice(i, 1); await saveChecker(); }), "trash", `${key}:remove`))),
     e.note ? el("p", { class: "meta" }, e.note) : null);
 }
 
@@ -936,23 +1002,23 @@ function blocklistCard(cfg, meta) {
     cfg.blocklist = meta.default_blocklist.map((e) => ({ ...e }));
     await saveChecker();
   });
-  return section("Blocklist", "Exact commands or wildcards that are refused at once, in the machine's own rule syntax (exec.run:…, fs.write:…), for every machine or for one. A re: regex form is allowed where a glob is not enough. The blocklist wins over the allow rules and the model. An entry for every machine can be switched off for single machines under Per machine.", btn("Reset to defaults", "ghost", reset, "refresh"),
+  return section("Blocklist", "Exact commands or wildcards that are refused at once, in the machine's own rule syntax (exec.run:…, fs.write:…), for every machine or for one. A re: regex form is allowed where a glob is not enough. The blocklist wins over the allow rules and the model. An entry for every machine can be switched off for single machines under Per machine.", btn("Reset to defaults", "ghost", reset, "refresh", "blocklist:reset"),
     el("div", { class: "card" }, el("div", { class: "form-row" },
       el("label", { class: "field grow" }, el("span", { class: "label" }, "Add a rule"), ruleIn),
       el("label", { class: "field grow" }, el("span", { class: "label" }, "Note"), noteIn),
       nodePicker.root),
-      el("div", { class: "actions" }, el("button", { type: "button", class: "btn primary", onclick: add }, icon("plus", "sm"), "Add"))),
+      el("div", { class: "actions" }, el("button", { type: "button", class: "btn primary", "data-focus": "blocklist:add", onclick: add }, icon("plus", "sm"), "Add"))),
     el("p", { class: "meta" }, "What the matcher cannot see: shell variables, aliases, a script written then run, and base64. The decision model and the machine's policy are the next lines of defence."),
-    cfg.blocklist.length ? el("div", { class: "list" }, cfg.blocklist.map((e, i) => blockRow(cfg, e, i))) : empty("The blocklist is empty.", "shield"));
+    cfg.blocklist.length ? el("div", { class: "list" }, cfg.blocklist.map((e, i) => blockRow(cfg, e, i, "all"))) : empty("The blocklist is empty.", "shield"));
 }
 
 // One saved allow rule, with its scope.
-function allowRow(cfg, a, i) {
+function allowRow(cfg, a, i, where) {
   return el("div", { class: "card entry" },
     el("div", { class: "card-top" },
       el("code", { class: "mono" }, a.rule),
       pill("", a.node_id ? `only ${machineName(a.node_id)}` : "every machine"),
-      el("span", { class: "push" }, btn("Remove", "danger-soft", act(async () => { cfg.allow_rules.splice(i, 1); await saveChecker(); }), "trash"))));
+      el("span", { class: "push" }, btn("Remove", "danger-soft", act(async () => { cfg.allow_rules.splice(i, 1); await saveChecker(); }), "trash", `allow:${where}:${a.rule}|${a.node_id || ""}:remove`))));
 }
 
 function allowCard(cfg) {
@@ -972,8 +1038,8 @@ function allowCard(cfg) {
     el("div", { class: "card" }, el("div", { class: "form-row" },
       el("label", { class: "field grow" }, el("span", { class: "label" }, "Add a rule"), ruleIn),
       nodePicker.root),
-      el("div", { class: "actions" }, el("button", { type: "button", class: "btn primary", onclick: add }, icon("plus", "sm"), "Add"))),
-    cfg.allow_rules.length ? el("div", { class: "list" }, cfg.allow_rules.map((a, i) => allowRow(cfg, a, i))) : empty("No allow rules.", "shield"));
+      el("div", { class: "actions" }, el("button", { type: "button", class: "btn primary", "data-focus": "allow:add", onclick: add }, icon("plus", "sm"), "Add"))),
+    cfg.allow_rules.length ? el("div", { class: "list" }, cfg.allow_rules.map((a, i) => allowRow(cfg, a, i, "all"))) : empty("No allow rules.", "shield"));
 }
 
 // ---- Per machine: the switches, entries, exceptions and allow rules of
@@ -1019,7 +1085,7 @@ function machineCard(cfg, m) {
       { value: "off", text: "Off for this machine" },
     ];
     const p = picker({
-      label, search: "Search", none: "No match.",
+      label, search: "Search", none: "No match.", key: `node:${m.id}:${part}`,
       onpick: (v) => { p.set(items, v); cfg.nodes[m.id] = { ...own, [part]: v }; quietly(saveChecker); },
     });
     p.set(items, own[part] || "inherit");
@@ -1029,7 +1095,7 @@ function machineCard(cfg, m) {
   const exceptItems = [{ value: "", text: "Pick an entry for every machine" },
     ...others.map(([e, i]) => ({ value: String(i), text: e.note ? `${e.note}: ${e.rule}` : e.rule }))];
   const exceptPicker = picker({
-    label: "Switch off for this machine", search: "Search entries", none: "No entry matches.",
+    label: "Switch off for this machine", search: "Search entries", none: "No entry matches.", key: `node:${m.id}:except`,
     onpick: (v) => {
       exceptPicker.set(exceptItems, v);
       if (v === "") return;
@@ -1042,7 +1108,7 @@ function machineCard(cfg, m) {
   const offRow = ([e]) => el("div", { class: "card entry" },
     el("div", { class: "card-top" },
       el("code", { class: "mono" }, e.rule),
-      el("span", { class: "push" }, btn("Switch on again", "", act(async () => { e.off_for = (e.off_for || []).filter((id) => id !== m.id); await saveChecker(); })))),
+      el("span", { class: "push" }, btn("Switch on again", "", act(async () => { e.off_for = (e.off_for || []).filter((id) => id !== m.id); await saveChecker(); }), null, `off:${m.id}:${e.rule}:on`))),
     e.note ? el("p", { class: "meta" }, e.note) : null);
 
   const ruleIn = el("input", { class: "input mono", placeholder: "exec.run:terraform destroy*", "aria-label": `New blocklist rule for ${m.name}` });
@@ -1069,15 +1135,15 @@ function machineCard(cfg, m) {
       switchPicker("model", "Decision model", cfg.model_on)),
     el("p", { class: "meta" }, "The model on here uses the center's one model and its settings below. Taint is for every machine."),
     el("h4", { class: "sub-head" }, "Block entries for this machine only"),
-    entries.length ? el("div", { class: "list" }, entries.map(([e, i]) => blockRow(cfg, e, i))) : el("p", { class: "meta" }, "None."),
+    entries.length ? el("div", { class: "list" }, entries.map(([e, i]) => blockRow(cfg, e, i, m.id))) : el("p", { class: "meta" }, "None."),
     el("div", { class: "form-row" }, el("label", { class: "field grow" }, el("span", { class: "label" }, "Add a rule for this machine"), ruleIn)),
-    el("div", { class: "actions" }, el("button", { type: "button", class: "btn primary", onclick: add }, icon("plus", "sm"), "Add")),
+    el("div", { class: "actions" }, el("button", { type: "button", class: "btn primary", "data-focus": `node:${m.id}:add`, onclick: add }, icon("plus", "sm"), "Add")),
     el("h4", { class: "sub-head" }, "Entries for every machine, switched off here"),
     offs.length ? el("div", { class: "list" }, offs.map(offRow)) : el("p", { class: "meta" }, "None."),
     el("div", { class: "form-row" }, exceptPicker.root),
     el("h4", { class: "sub-head" }, "Allow rules for this machine only"),
-    allows.length ? el("div", { class: "list" }, allows.map(([a, i]) => allowRow(cfg, a, i))) : el("p", { class: "meta" }, "None. Add one under Allow rules."),
-    m.paired ? null : el("div", { class: "actions" }, btn("Forget its settings", "danger-soft", forget, "trash")));
+    allows.length ? el("div", { class: "list" }, allows.map(([a, i]) => allowRow(cfg, a, i, m.id))) : el("p", { class: "meta" }, "None. Add one under Allow rules."),
+    m.paired ? null : el("div", { class: "actions" }, btn("Forget its settings", "danger-soft", forget, "trash", `node:${m.id}:forget`)));
   const card = el("details", { class: "card", ontoggle: (ev) => { if (ev.currentTarget.open) checkerOpen.add(m.id); else checkerOpen.delete(m.id); } },
     el("summary", {}, el("span", { class: "name" }, m.name),
       m.paired ? null : pill("down", "not paired"),
@@ -1095,7 +1161,7 @@ function machineCard(cfg, m) {
 function modelCard(cfg, meta) {
   const m = cfg.model;
   let source = m.source;
-  const srcPicker = picker({ label: "Source", search: "Search", none: "No match.", onpick: (v) => { source = v; srcPicker.set(SOURCES, v); showSource(); } });
+  const srcPicker = picker({ label: "Source", search: "Search", none: "No match.", key: "model:source", onpick: (v) => { source = v; srcPicker.set(SOURCES, v); showSource(); } });
   srcPicker.set(SOURCES, source);
   const endpointUrl = el("input", { class: "input mono", value: m.endpoint_url, placeholder: "https://host:9931" });
   const endpointModel = el("input", { class: "input mono", value: m.endpoint_model, placeholder: "jev-latest (optional)" });
@@ -1103,9 +1169,9 @@ function modelCard(cfg, meta) {
   const threshold = el("input", { class: "input num", type: "number", min: "0", max: "1", step: "0.01", value: m.threshold });
   const timeout = el("input", { class: "input num", type: "number", min: "100", value: m.timeout_ms });
   let scope = m.scope;
-  const scopePicker = picker({ label: "Which calls the model sees", search: "Search", none: "No match.", onpick: (v) => { scope = v; scopePicker.set(SCOPES, v); } });
+  const scopePicker = picker({ label: "Which calls the model sees", search: "Search", none: "No match.", key: "model:scope", onpick: (v) => { scope = v; scopePicker.set(SCOPES, v); } });
   scopePicker.set(SCOPES, scope);
-  const failClosed = el("input", { type: "checkbox", role: "switch" }); failClosed.checked = m.fail_closed;
+  const failClosed = el("input", { type: "checkbox", role: "switch", "data-focus": "switch:fail_closed" }); failClosed.checked = m.fail_closed;
   const instr = el("textarea", { class: "json", rows: "4" }, m.instructions);
   const critTrue = el("input", { class: "input", value: m.criteria_true });
   const critFalse = el("input", { class: "input", value: m.criteria_false });
@@ -1134,7 +1200,7 @@ function modelCard(cfg, meta) {
   const epDiv = el("div", {},
     el("div", { class: "form-row" }, field("Endpoint URL", endpointUrl), field("Model name", endpointModel)),
     el("div", { class: "form-row" }, field("Bearer token (kept secret, never shown back)", token),
-      meta.has_token ? el("span", { class: "push" }, btn("Clear token", "ghost", act(async () => { await api("POST", "/api/checker/token", { token: null }); await loadChecker(); }), "trash")) : null));
+      meta.has_token ? el("span", { class: "push" }, btn("Clear token", "ghost", act(async () => { await api("POST", "/api/checker/token", { token: null }); await loadChecker(); }), "trash", "model:clear-token")) : null));
   const localDiv = el("div", {}, ...localInstall(meta));
   const showSource = () => { epDiv.hidden = source !== "endpoint"; localDiv.hidden = source !== "local"; };
   showSource();
@@ -1149,7 +1215,7 @@ function modelCard(cfg, meta) {
       el("div", { class: "form-row" }, field("Question (the command text is never put here; it goes only in the state sent to the model)", instr)),
       el("div", { class: "form-row" }, field("When true (dangerous)", critTrue), field("When false (safe)", critFalse)),
       el("div", { class: "actions" },
-        el("button", { type: "button", class: "btn primary", onclick: save }, "Save"),
+        el("button", { type: "button", class: "btn primary", "data-focus": "model:save", onclick: save }, "Save"),
         btn("Reset the question", "ghost", resetQuestion, "refresh"))));
 }
 
@@ -1212,7 +1278,7 @@ function localInstallBlocks(meta) {
       confirm: "Remove", danger: true,
     });
     if (yes) { await api("POST", "/api/checker/remove"); await loadChecker(); }
-  }), "trash");
+  }), "trash", "local:remove");
   if (installing) {
     const target = meta.models.find((m) => m.id === inst.model_id) || pin;
     return [line, el("div", { class: "card" },
@@ -1442,7 +1508,7 @@ function pageSettings() {
       el("div", { class: "form-row" }, levelPicker.root),
       el("p", { class: "meta" }, "Debug adds detail for tracking down a problem and makes the log file grow faster. What the log holds is on the Log page."),
       s.center.log_level_pinned ? el("p", { class: "meta" }, `The --log option (NERVE_LOG) sets the level at every start and wins over this setting. This run keeps the level ${s.center.log_level_now}.`) : null,
-      el("div", { class: "actions" }, el("button", { type: "button", class: "btn primary", onclick: act(async () => {
+      el("div", { class: "actions" }, el("button", { type: "button", class: "btn primary", "data-focus": "center:save", onclick: act(async () => {
         await api("POST", "/api/center", { name: name.value, retention_days: Number(days.value), pair_code_minutes: Number(pairMinutes.value), log_level: logLevel });
         notify("Saved.");
       }) }, "Save")))),
@@ -1481,14 +1547,14 @@ function centerKey(k) {
     el("p", { class: "meta" }, "Pin served now: ", el("code", { class: "mono" }, k.pin)),
     k.grace_until_ms ? el("p", { class: "meta" }, `A rotation is in its grace: the old key is served until ${when(k.grace_until_ms)}.`) : null,
     el("div", { class: "actions" }, k.grace_until_ms
-      ? btn("Serve the new key now", "danger-soft", finish, "key")
-      : btn("Rotate key", "", rotate, "key")));
+      ? btn("Serve the new key now", "danger-soft", finish, "key", "key:finish")
+      : btn("Rotate key", "", rotate, "key", "key:rotate")));
 }
 
 function tokenForm() {
   const label = el("input", { class: "input", type: "text", placeholder: "Label, for example the harness name", "aria-label": "Token label", maxlength: "64" });
   return el("div", { class: "form-row" }, el("label", { class: "field" }, el("span", { class: "label" }, "New token"), label),
-    el("button", { type: "button", class: "btn primary", onclick: act(async () => {
+    el("button", { type: "button", class: "btn primary", "data-focus": "token:create", onclick: act(async () => {
       const r = await api("POST", "/api/tokens/create", { label: label.value });
       label.value = "";
       state.newToken = r.token;
@@ -1510,7 +1576,7 @@ function drawTokens() {
       el("button", { type: "button", class: "btn ghost sm", "aria-label": "Hide", onclick: () => { state.newToken = null; drawTokens(); } }, icon("x", "sm"))) : null,
     s.tokens.length ? s.tokens.map((t) => el("div", { class: "card" }, el("div", { class: "card-top" },
       icon("key"), el("span", { class: "name" }, t.label || "(no label)"), el("span", { class: "meta push" }, `Created ${ago(t.created_ms)}`),
-      btn("Delete", "danger-soft", act(async () => { await api("POST", "/api/tokens/delete", { id: t.id }); await loadTokens(); }), "trash"))))
+      btn("Delete", "danger-soft", act(async () => { await api("POST", "/api/tokens/delete", { id: t.id }); await loadTokens(); }), "trash", `token:${t.id}:delete`))))
       : el("p", { class: "meta" }, "No tokens yet.")].flat().filter(Boolean));
 }
 
@@ -1631,7 +1697,12 @@ function signature(page) {
 function draw(force) {
   const page = current();
   if (page === "settings" || page === "checker") {
-    if (force) replacePage(PAGES[page].view().flat().filter((p) => p != null));
+    if (force) {
+      replacePage(PAGES[page].view().flat().filter((p) => p != null));
+      // A page drawn while a save runs (the user came back to it) has its
+      // controls off as well.
+      if (page === "checker" && checkerSaving) lockSaves(true);
+    }
     return;
   }
   const sig = signature(page);
@@ -1715,6 +1786,9 @@ function go() {
   setNav(false);
   state.newToken = null;
   lastSig = null;
+  // A save in flight holds the focus for its control on the page it started
+  // on, not on the one the user went to.
+  pendingFocus = null;
   if (page === "log" && !logFilter.live) setLogLive(true);
   const p = $("page");
   p.classList.remove("enter");

@@ -155,7 +155,10 @@ async fn a_command_of_nerve_run_has_its_home_and_the_temporary_folders() {
         eprintln!("skipped: Landlock is not available here");
         return;
     }
-    let d = tempfile::tempdir().unwrap();
+    // Outside `/tmp` and `/var/tmp`, as a real owner's home is: the owner's
+    // protected entries (`~/.ssh` and the like) inside `/tmp` would keep the
+    // command from making a file there, as from every folder that holds one.
+    let d = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let root = std::fs::canonicalize(d.path()).unwrap();
     let run_home = root.join("run-home");
     let work = root.join("owner/work");
@@ -174,7 +177,11 @@ async fn a_command_of_nerve_run_has_its_home_and_the_temporary_folders() {
     let account = me(&run_home);
     let mut o = opts(&policy, &account, &[]);
     // `~` of the folders and rules is the owner's, not the account's.
-    o.landlock = Some(exec::landlock_spec(&policy, &root.join("owner"), &[], &[]));
+    let spec = exec::landlock_spec(&policy, &root.join("owner"), &[], &[]);
+    for t in ["/tmp", "/var/tmp"] {
+        assert!(spec.write.iter().any(|w| w == Path::new(t)), "{spec:?}");
+    }
+    o.landlock = Some(spec);
     o.separate = true;
     let tmp = format!("/tmp/nerve-142-{}", std::process::id());
     let probe = format!(

@@ -1902,15 +1902,17 @@ impl Link {
         // which would keep sudo from rising.
         let mut rc = rc;
         let mut sudo = None;
+        let mut root = None;
         if let Some(args) = nerve_policy::sudo_command(&rc.command).filter(|_| as_root) {
             // The one simple command the sudo allow list named (the gate
-            // takes no other), as root, through the shell as sudo would
-            // have it.
+            // takes no other), as root, and nothing around it; it starts in
+            // the folder the gate judged, which the node opens as the
+            // owner (exec::AsRoot).
             if !self.shared.sudo_on() {
                 return Err(RpcError::forbidden("sudo is off on this node"));
             }
-            rc.command = exec::root_line(&rc.cwd, args);
-            rc.cwd = std::path::PathBuf::from("/");
+            root = Some(exec::AsRoot::open(&rc.cwd, looks_as.as_ref())?);
+            rc.command = args.to_string();
         } else if let Some(args) = nerve_policy::sudo_command(&rc.command) {
             let password = self
                 .shared
@@ -1958,6 +1960,7 @@ impl Link {
             account,
             separate,
             own,
+            root,
             limits: self
                 .shared
                 .cgroups

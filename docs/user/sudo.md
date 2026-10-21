@@ -77,10 +77,12 @@ On Linux (Windows differs, see [sudo on Windows](#sudo-on-windows)):
   without the Landlock sandbox, which would stop sudo from gaining
   privileges. It writes the password only after sudo prints the prompt.
 - For a pairing whose commands run as `nerve-run`, it starts the command as
-  root, with root's own group, through the shell (`sh -c 'exec …'`), in
-  the command's working folder, without the Landlock sandbox. The shell reads
-  the line as root, so `~` is root's home there. The sudo program and its
-  sudoers rules play no part in it.
+  root, with root's own group, through `/bin/sh`, in the command's working
+  folder, without the Landlock sandbox. The shell gets the allowed line and
+  nothing else, with a fixed environment (the system's `PATH`, root's
+  `HOME`); it reads the line as root, so `~` is root's home there. The node
+  enters the working folder for it as you, so a folder in your closed home
+  works. The sudo program and its sudoers rules play no part in it.
 - Every other command runs with `no_new_privs`. A `sudo` later in a command
   line, or any setuid program, cannot gain privileges.
 

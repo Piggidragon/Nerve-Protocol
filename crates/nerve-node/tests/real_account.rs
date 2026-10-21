@@ -7,7 +7,8 @@
 //! #142). Where the kernel has no Landlock, folder mode runs as nerve-run all
 //! the same, and the node says what that leaves of the owner's home open.
 //! The owner runs `setup` without sudo, its answers passed on. An allowed sudo
-//! command of nerve-run runs as root without the owner's password. For a
+//! command of nerve-run runs as root without the owner's password, in its
+//! folder even where only the owner may enter it. For a
 //! test machine only, as root: it installs the node as a service and removes
 //! it again, and gives the owner a password and sudo.
 //!
@@ -384,6 +385,17 @@ except OSError as e:
     pw("second-pass-142");
     let r = run(&mut conn, &proj, "sudo id -un").await.unwrap();
     assert_eq!(out(&r), "root\n", "{r}");
+    // It starts in its folder, here one closed to all but the owner, whose
+    // odd name stays a name.
+    let odd = proj.join("od d;$(touch ran)\n-x");
+    std::fs::create_dir(&odd).unwrap();
+    chown(&odd);
+    chmod(&odd, "700");
+    let (ok, said) = as_owner(&owner, &["rule", "add", "sudo", "pwd -P"]);
+    assert!(ok, "{said}");
+    let r = run(&mut conn, &odd, "sudo pwd -P").await.unwrap();
+    assert_eq!(out(&r), format!("{}\n", odd.display()), "{r}");
+    assert!(!proj.join("ran").exists() && !odd.join("ran").exists());
     let r = run(&mut conn, &proj, "sudo whoami").await;
     assert!(r.is_err(), "{r:?}");
     assert!(as_owner(&owner, &["sudo", "off"]).0);

@@ -1046,12 +1046,18 @@ password is the owner's, and refuses a wrong one with `invalid_args`; the
 switch then stays as it was. An allowed sudo command of a pairing whose
 commands run as the owner runs through sudo as the owner, with that
 password; one of a pairing whose commands run as `nerve-run` runs as root,
-started by the node itself (`sh -c "cd -- '<cwd>' && exec <the command>"`
-from `/`, root's group only, no Landlock), without the password or the sudo
-program. Its paths are looked at as the owner's, and its default folder is
-the owner's home: the node's child, which holds CAP_SETUID and CAP_SETGID
-only, has no right past a folder's mode until root's program runs, so root's
-shell enters the folder. Turning it off drops the password. On Linux the password is kept
+started by the node itself (`/bin/sh -c '<the command>'`, the allowed line
+and nothing around it, root's group only, no Landlock), without the password
+or the sudo program. Its environment is fixed: `PATH`
+`/usr/sbin:/usr/bin:/sbin:/bin`, and `HOME`, `USER` and `LOGNAME` of root;
+nothing of the node's. Its paths are looked at as the owner's, and its
+default folder is the owner's home. The node opens the working folder as
+the owner, a part at a time without following a link, so a link put there
+after the check fails the call; the child enters that open folder with the
+owner's file system ids (`fchdir`) and only then becomes root: it holds
+CAP_SETUID and CAP_SETGID only, so as root it has no right past a folder's
+mode until root's program runs. The folder's name never reaches the shell.
+Turning it off drops the password. On Linux the password is kept
 in memory only, whatever `secret_storage` says, so a restarted node, or
 a `node.toml` that says `on` without a password held, has the switch off. It
 never reaches a center: the node replaces every copy in an outgoing frame and

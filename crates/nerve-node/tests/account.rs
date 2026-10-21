@@ -43,6 +43,7 @@ fn opts(policy: &CenterPolicy, account: &Account, own: &[PathBuf]) -> RunOptions
         account: Some(account.clone()),
         separate: false,
         own: own.to_vec(),
+        root: None,
         limits: None,
     }
 }

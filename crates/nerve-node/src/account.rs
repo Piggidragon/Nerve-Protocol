@@ -481,7 +481,52 @@ pub struct Switch {
     gid: u32,
     groups: Vec<libc::gid_t>,
     cwd: Option<std::ffi::CString>,
+    enter: Option<Enter>,
     own: Vec<std::ffi::CString>,
+}
+
+/// A folder the node opened itself, which the child enters before it takes
+/// the account's ids, with the file system ids of the account it was opened
+/// as (`None`: the node's own): root in the node's child holds CAP_SETUID
+/// and CAP_SETGID only, so as root it has no right past a folder's mode
+/// until its program runs.
+#[cfg(target_os = "linux")]
+struct Enter {
+    folder: std::os::fd::OwnedFd,
+    by: Option<(u32, u32, Vec<libc::gid_t>)>,
+}
+
+#[cfg(target_os = "linux")]
+impl Enter {
+    /// Enters the folder; true when it changed the ids to do so, which the
+    /// switch then puts right.
+    fn apply(&self) -> std::io::Result<bool> {
+        use std::os::fd::AsRawFd;
+        let last = std::io::Error::last_os_error;
+        let mut changed = false;
+        // SAFETY: plain system calls with integers or memory this struct owns.
+        unsafe {
+            if let Some((uid, gid, groups)) = &self.by
+                && (libc::geteuid() != *uid || libc::getegid() != *gid)
+            {
+                changed = true;
+                if libc::setgroups(groups.len(), groups.as_ptr()) != 0 {
+                    return Err(last());
+                }
+                libc::setfsgid(*gid);
+                libc::setfsuid(*uid);
+                if libc::setfsuid(u32::MAX) as u32 != *uid
+                    || libc::setfsgid(u32::MAX) as u32 != *gid
+                {
+                    return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+                }
+            }
+            if libc::fchdir(self.folder.as_raw_fd()) != 0 {
+                return Err(last());
+            }
+        }
+        Ok(changed)
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -508,20 +553,50 @@ impl Switch {
             gid: account.gid,
             groups,
             cwd: cwd.map(c).transpose()?,
+            enter: None,
             own: own.iter().map(|p| c(p)).collect::<Result<_, _>>()?,
         })
     }
 
-    /// In the forked child, before exec: the account's groups and ids, no
-    /// capability left, a check that the node's own folders are out of its
-    /// reach (root aside, which the owner chose knowing), then its working
-    /// folder. Plain system calls only. A process that has the account's
-    /// ids already keeps its groups.
+    /// A switch to `account` that starts in `folder`, a folder the node
+    /// opened as `by` (crate::exec::AsRoot), entered with `by`'s file system
+    /// ids before the switch.
+    pub fn entering(
+        account: &Account,
+        folder: std::os::fd::OwnedFd,
+        by: Option<&Account>,
+        own: &[std::path::PathBuf],
+    ) -> std::io::Result<Switch> {
+        let mut s = Switch::new(account, None, own)?;
+        s.enter = Some(Enter {
+            folder,
+            by: by.map(|a| {
+                let mut groups = a.groups.clone();
+                if groups.is_empty() {
+                    groups.push(a.gid);
+                }
+                (a.uid, a.gid, groups)
+            }),
+        });
+        Ok(s)
+    }
+
+    /// In the forked child, before exec: the folder the node opened, if
+    /// any; the account's groups and ids, no capability left, a check that
+    /// the node's own folders are out of its reach (root aside, which the
+    /// owner chose knowing), then its working folder. Plain system calls
+    /// only. A process that has the account's ids already keeps its groups,
+    /// unless entering the folder changed them.
     pub fn apply(&self) -> std::io::Result<()> {
         let last = std::io::Error::last_os_error;
+        let entered = match &self.enter {
+            Some(e) => e.apply()?,
+            None => false,
+        };
         // SAFETY: plain system calls on memory this struct owns.
         unsafe {
-            let same = libc::getuid() == self.uid
+            let same = !entered
+                && libc::getuid() == self.uid
                 && libc::geteuid() == self.uid
                 && libc::getgid() == self.gid
                 && libc::getegid() == self.gid;
@@ -531,6 +606,14 @@ impl Switch {
                     || libc::setresuid(self.uid, self.uid, self.uid) != 0)
             {
                 return Err(last());
+            }
+            // The switch set the file system ids to the account's again;
+            // none of those the folder was entered with is left.
+            if entered
+                && (libc::setfsuid(u32::MAX) as u32 != self.uid
+                    || libc::setfsgid(u32::MAX) as u32 != self.gid)
+            {
+                return Err(std::io::Error::from_raw_os_error(libc::EPERM));
             }
         }
         if self.uid != 0 {

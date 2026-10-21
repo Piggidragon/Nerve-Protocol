@@ -63,6 +63,7 @@ fn opts() -> RunOptions {
         account: None,
         separate: false,
         own: Vec::new(),
+        root: None,
         limits: None,
     }
 }

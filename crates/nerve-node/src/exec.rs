@@ -1077,6 +1077,9 @@ pub struct RunOptions {
     pub separate: bool,
     /// The node's own folders, which the account must not reach.
     pub own: Vec<PathBuf>,
+    /// Set only for an allowed sudo command of `nerve-run`, which runs as
+    /// `account`, root: where it starts, and how ([`AsRoot`]).
+    pub root: Option<AsRoot>,
     /// Linux: the command runs in a cgroup of its own below these, held to
     /// these limits (crate::cgroup); `None` runs it without.
     pub limits: Option<(
@@ -1158,14 +1161,63 @@ pub fn sudo_line(sudo_path: &str, args: &str, prompt: &str) -> String {
     )
 }
 
-/// The line of an allowed sudo command that the node starts as root for a
-/// pairing of `nerve-run` (crate::link): `args`, run in `cwd`, which its
-/// shell enters. The node's child cannot: it holds CAP_SETUID and CAP_SETGID
-/// only, so as root it has no right past a folder's mode until the program
-/// runs and root gets its rights back, and the call's folder is often in
-/// the owner's closed home.
-pub fn root_line(cwd: &Path, args: &str) -> String {
-    format!("cd -- {} && exec {args}", sh_quote(&cwd.to_string_lossy()))
+/// An allowed sudo command of a pairing whose commands run as `nerve-run`,
+/// which the node starts as root itself (crate::link). Its shell gets only
+/// the line the sudo allow list named, and starts in `folder`: the call's
+/// working folder, opened by the node as `by` (the owner, whose sudo list
+/// let it run, or the node's own user for `None`) without following a link,
+/// so it is the folder the policy judged. The child enters it with `by`'s
+/// file system ids before it becomes root: it holds CAP_SETUID and
+/// CAP_SETGID only, so as root it has no right past a folder's mode until
+/// the shell runs, and the folder is often in the owner's closed home. The
+/// command gets a fixed environment ([`ROOT_PATH`]) and `/bin/sh`.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Clone)]
+pub struct AsRoot {
+    folder: std::sync::Arc<std::os::fd::OwnedFd>,
+    by: Option<crate::service::Account>,
+}
+
+/// [`AsRoot`]: Linux only.
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Clone)]
+pub enum AsRoot {}
+
+/// The `PATH` of a command the node starts as root: the system's own
+/// folders, never one the node's environment names.
+pub const ROOT_PATH: &str = crate::keyring_setup::SYSTEM_PATH;
+
+impl AsRoot {
+    /// Opens `cwd`, the resolved folder the policy judged, as `by`.
+    pub fn open(cwd: &Path, by: Option<&crate::service::Account>) -> Result<AsRoot, RpcError> {
+        #[cfg(target_os = "linux")]
+        {
+            let folder = {
+                let _as = by.map(crate::account::FsAs::new).transpose();
+                let _as = _as.map_err(|e| {
+                    RpcError::new(
+                        ErrorCode::Unavailable,
+                        format!("cannot act as {}: {e}", by.map_or("", |a| &a.name)),
+                    )
+                })?;
+                crate::fs::open_folder(cwd)
+            };
+            let folder = folder
+                .map_err(|e| crate::fs::bad_path(format!("cannot open {}: {e}", to_wire(cwd))))?;
+            Ok(AsRoot {
+                folder: std::sync::Arc::new(folder),
+                by: by.cloned(),
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (cwd, by);
+            Err(RpcError::new(
+                ErrorCode::Unavailable,
+                "only the installed Linux node starts commands as root",
+            ))
+        }
+    }
 }
 
 /// Checks `password` with `sudo -S -k -v`, which runs nothing and caches
@@ -1505,7 +1557,9 @@ pub async fn run(
     opts: &RunOptions,
     started: impl FnOnce(&Ender),
 ) -> Result<Value, RpcError> {
-    let (program, mut args) = shell_command(opts.shell.as_deref(), &call.command);
+    // Root's command runs in /bin/sh, whatever shell the others use.
+    let shell = opts.shell.as_deref().filter(|_| opts.root.is_none());
+    let (program, mut args) = shell_command(shell, &call.command);
     // PowerShell in a container would stand somewhere else than its folder.
     if opts.container.is_some()
         && powershell(&program)
@@ -1583,12 +1637,19 @@ pub async fn run(
     #[cfg(target_os = "linux")]
     {
         let join = cgroup.as_ref().map(crate::cgroup::CommandCgroup::procs_fd);
-        let switch = match &opts.account {
-            Some(a) => Some(
+        let switch = match (&opts.account, &opts.root) {
+            (Some(a), Some(r)) => Some(
+                r.folder
+                    .try_clone()
+                    .and_then(|f| crate::account::Switch::entering(a, f, r.by.as_ref(), &opts.own))
+                    .map_err(|e| RpcError::internal(e.to_string()))?,
+            ),
+            (Some(a), None) => Some(
                 crate::account::Switch::new(a, Some(&call.cwd), &opts.own)
                     .map_err(|e| RpcError::invalid_args(e.to_string()))?,
             ),
-            None => None,
+            (None, Some(_)) => return Err(RpcError::internal("a root command needs root")),
+            (None, None) => None,
         };
         // Root as the account (the owner chose it, warned) gets root's
         // rights back at exec, which no_new_privs would keep from it.
@@ -1611,6 +1672,10 @@ pub async fn run(
             });
         }
     }
+    #[cfg(not(target_os = "linux"))]
+    if let Some(r) = &opts.root {
+        match *r {}
+    }
     #[cfg(not(any(target_os = "linux", windows)))]
     if let Some(a) = &opts.account {
         return Err(RpcError::new(
@@ -1620,6 +1685,10 @@ pub async fn run(
     }
     match &opts.account {
         Some(a) => {
+            // Root's command gets nothing of the node's environment.
+            if opts.root.is_some() {
+                cmd.env_clear().env("PATH", ROOT_PATH);
+            }
             cmd.env("HOME", &a.home)
                 .env("USER", &a.name)
                 .env("LOGNAME", &a.name);
@@ -1982,6 +2051,7 @@ mod tests {
             account: None,
             separate: false,
             own: Vec::new(),
+            root: None,
             limits: None,
         }
     }
@@ -2367,20 +2437,6 @@ mod tests {
         assert_eq!(r["exit_code"], 0, "{r}");
         assert_eq!(r["stdout"], "", "{r}");
         assert_eq!(r["stderr"], "", "the prompt is left out: {r}");
-    }
-
-    #[cfg(not(windows))]
-    /// Root's shell enters the call's folder itself, quoted (#142).
-    #[test]
-    fn a_root_line_enters_the_folder_first() {
-        assert_eq!(
-            root_line(Path::new("/home/o/my proj"), "id -un"),
-            "cd -- '/home/o/my proj' && exec id -un"
-        );
-        assert_eq!(
-            root_line(Path::new("/x/a'b"), "true"),
-            "cd -- '/x/a'\\''b' && exec true"
-        );
     }
 
     #[test]
@@ -3360,6 +3416,7 @@ mod windows_tests {
             account: None,
             separate: false,
             own: Vec::new(),
+            root: None,
             limits: None,
         }
     }

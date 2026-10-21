@@ -463,8 +463,6 @@ mode = "allowlist"          # allowlist | folder | user (the default is allowlis
 until = 1790000000000  # optional, folder and user: ms since the epoch; then allowlist
 folders = [{ path = "/home/u/proj", access = "rwx" }]  # folder mode; r w x in any mix, "" for none
 places = ["/home/u/proj"]  # folders `folder add` recorded at their real place; the owner's, a center's write keeps it
-sockets = ["/run/user/1000/ssh-agent.socket"]  # folder mode: socket files outside the folders a command may
-                            # connect to (Landlock ABI 9); the owner's, a center's write keeps it
 caps = { "fs.write" = "off" }   # on | off | hidden
 protected = { extra = [], allow = [] }  # a center may add to extra; only the owner removes or releases,
                                         # also by a folder at or inside an entry

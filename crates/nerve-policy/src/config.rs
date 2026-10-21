@@ -893,15 +893,12 @@ pub struct CenterPolicy {
     /// is followed wherever its path leads.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub places: Vec<String>,
-    /// Socket files outside its folders that a command of `folder` mode may
-    /// connect to all the same, by absolute path, where Landlock keeps
-    /// commands off the others (`nerve-node` `exec::folder_spec`). Only the
-    /// owner changes the list: a center's settings keep it as it was. The
-    /// socket of a program that runs things on request (a container engine,
-    /// a service manager, a terminal multiplexer) gives such a command all
-    /// the owner may do.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub sockets: Vec<String>,
+    /// The `sockets` list of a pre-release of the desktop app (socket files a
+    /// `folder` mode command could reach outside its folders), which is gone:
+    /// read and dropped, so a file or a center's document that has it still
+    /// loads, and never written back.
+    #[serde(default, rename = "sockets", skip_serializing)]
+    pub dropped_sockets: serde::de::IgnoredAny,
     /// `cap` or `cap.action` → setting; `cap.action` wins over `cap`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub caps: BTreeMap<String, CapSetting>,
@@ -1298,19 +1295,6 @@ impl CenterPolicy {
             .map(|f| f.path.clone())
             .collect();
         self.folders = folders;
-        let mut sockets: Vec<String> = Vec::with_capacity(self.sockets.len());
-        for p in &self.sockets {
-            if !Path::new(p).is_absolute() || p.split('/').any(|seg| seg == "..") {
-                return Err(format!(
-                    "socket {p:?} is not an absolute path without \"..\""
-                ));
-            }
-            let p = crate::paths::normal_folder(p)?;
-            if !sockets.contains(&p) {
-                sockets.push(p);
-            }
-        }
-        self.sockets = sockets;
         for rule in self.allow.iter().chain(&self.deny) {
             crate::rules::validate(rule)?;
         }
@@ -1895,6 +1879,20 @@ sudo_allow = ["sudo apt update"]
         assert_eq!(NodeConfig::parse(&on.to_toml()).unwrap(), on);
     }
 
+    /// A pairing's `sockets` of a pre-release still loads, and is gone once
+    /// the file is written again.
+    #[test]
+    fn a_file_with_the_dropped_sockets_list_loads_without_it() {
+        let c = NodeConfig::parse(&center(
+            "mode = \"folder\"\nsockets = [\"/run/docker.sock\"]",
+        ))
+        .unwrap();
+        let p = &c.centers[0].policy;
+        assert_eq!(p.mode, Mode::Folder);
+        assert!(!c.to_toml().contains("sockets"), "{}", c.to_toml());
+        assert_eq!(NodeConfig::parse(&c.to_toml()).unwrap(), c);
+    }
+
     #[test]
     fn unknown_keys_and_values_are_errors() {
         for bad in [
@@ -2089,33 +2087,6 @@ sudo_allow = ["sudo apt update"]
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&path).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
-        }
-    }
-
-    /// The allowed sockets are absolute paths without `..`, kept once each in
-    /// the form the policy keeps folders in.
-    #[cfg(unix)]
-    #[test]
-    fn the_allowed_sockets_are_absolute_paths_kept_once() {
-        let mut p = CenterPolicy {
-            sockets: vec![
-                "/run/docker.sock".into(),
-                "/run//docker.sock".into(),
-                "/run/user/1000/ssh-agent.socket".into(),
-            ],
-            ..Default::default()
-        };
-        p.validate().unwrap();
-        assert_eq!(
-            p.sockets,
-            ["/run/docker.sock", "/run/user/1000/ssh-agent.socket"]
-        );
-        for bad in ["run/docker.sock", "/run/../home/u/s.sock", "~/s.sock"] {
-            let mut p = CenterPolicy {
-                sockets: vec![bad.into()],
-                ..Default::default()
-            };
-            assert!(p.validate().is_err(), "{bad}");
         }
     }
 }

@@ -673,11 +673,8 @@ impl SettingsStore {
             serde_json::from_value(document).map_err(|e| SetError::Invalid(e.to_string()))?;
         // The record of the folders' real places is the owner's: whatever the
         // document says, it stays as it was, less the folders the center
-        // removed (validation drops those). So are the sockets a folder mode
-        // command may reach outside its folders: one of them can be all the
-        // owner may do.
+        // removed (validation drops those).
         new.policy.places = entry.policy.places.clone();
-        new.policy.sockets = entry.policy.sockets.clone();
         new.policy
             .validate()
             .map_err(|e| SetError::Invalid(e.to_string()))?;
@@ -1106,53 +1103,6 @@ mod tests {
         s.set_center_document("home", new, v, |_| false, host)
             .unwrap();
         assert!(placed(&s).is_empty());
-    }
-
-    /// The sockets a folder mode command may reach outside its folders are
-    /// the owner's: a center with the `write` grant cannot add one, remove
-    /// one or rewrite the list, while the rest of its document goes through.
-    #[test]
-    fn a_center_cannot_change_the_allowed_sockets() {
-        let d = tempfile::tempdir().unwrap();
-        let mut s = store(d.path(), SettingsGrant::Write);
-        let path = |p: &Path| p.to_string_lossy().into_owned();
-        let agent = path(&at_home("run/agent.sock"));
-        s.update(|c| {
-            c.center_mut("home").unwrap().policy.sockets = vec![agent.clone()];
-            Ok(())
-        })
-        .unwrap();
-        let sockets = |s: &SettingsStore| s.config().center("home").unwrap().policy.sockets.clone();
-        assert_eq!(sockets(&s), std::slice::from_ref(&agent));
-        assert_eq!(doc(&s)["policy"]["sockets"], json!([agent]));
-        for given in [
-            Some(json!([])),
-            None,
-            Some(json!([agent, path(&at_home("run/systemd/private"))])),
-            Some(json!([path(&at_home("run/docker.sock"))])),
-        ] {
-            let mut new = doc(&s);
-            new["policy"]["caps"] = json!({"exec": "off"});
-            match given {
-                Some(p) => new["policy"]["sockets"] = p,
-                None => {
-                    new["policy"].as_object_mut().unwrap().remove("sockets");
-                }
-            }
-            let v = s.version();
-            s.set_center_document("home", new, v, |_| false, host)
-                .unwrap();
-            assert_eq!(sockets(&s), std::slice::from_ref(&agent));
-            assert_eq!(
-                s.config().center("home").unwrap().policy.caps.get("exec"),
-                Some(&crate::config::CapSetting::Off)
-            );
-            let mut new = doc(&s);
-            new["policy"]["caps"] = json!({});
-            let v = s.version();
-            s.set_center_document("home", new, v, |_| false, host)
-                .unwrap();
-        }
     }
 
     #[test]

@@ -280,11 +280,6 @@ too. A list longer than some eight rows (rules, folders, capabilities, a
 relay's nodes, the centers on the Overview) scrolls in a box of its own, with
 its scroll bar beside it, so the page stays short.
 
-On **Permissions** on Linux, **Sockets** lists the socket files outside its
-folders that the center's `folder` mode commands may connect to; **Allow**
-adds one (`socket add`). The socket of a program that runs commands for others
-gives the boundary up ([modes](modes.md#socket-files)).
-
 On **Permissions**, a center that lacks the guard against changing the node
 (a pairing from before it, or one you took a rule off) shows **Add the
 guard**, which runs `rule guard` ([rules](rules.md#the-guard-against-changing-the-node)).

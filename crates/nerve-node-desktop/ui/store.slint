@@ -212,13 +212,6 @@ export global Perm {
     in-out property <bool> folder-write;
     in-out property <bool> folder-execute;
     in-out property <string> folder-error;
-    // The socket files outside its folders the center's folder mode
-    // commands may connect to, and the field for a new one.
-    in-out property <[string]> sockets;
-    in-out property <string> socket-text;
-    // Whether the app runs where the node keeps folder mode commands off
-    // socket files at all (Linux).
-    in-out property <bool> sockets-here;
 
     in-out property <bool> sudo-open;
     in-out property <string> sudo-password;
@@ -237,8 +230,6 @@ export global Perm {
     callback folder-add();
     callback folder-set(string, bool, bool, bool);
     callback folder-remove(string);
-    callback socket-add();
-    callback socket-remove(string);
     callback rule-add(int);
     callback rule-remove(int, string);
     callback rule-edit-save();

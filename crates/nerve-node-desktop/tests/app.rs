@@ -495,22 +495,6 @@ fn the_app_drives_the_cli_end_to_end() {
     perm.invoke_folder_remove(path);
     assert!(config(&paths).centers[0].policy.folders.is_empty());
 
-    // A socket file outside the folders, allowed and taken away again
-    // (`socket add`, `socket rm`); the page reads it back.
-    assert_eq!(perm.get_sockets_here(), cfg!(target_os = "linux"));
-    let socket = root.join("agent.sock").display().to_string();
-    perm.set_socket_text(format!(" {socket} ").into());
-    perm.invoke_socket_add();
-    assert_eq!(
-        config(&paths).centers[0].policy.sockets,
-        std::slice::from_ref(&socket)
-    );
-    assert_eq!(perm.get_socket_text(), "");
-    assert_eq!(perm.get_sockets().row_data(0).unwrap(), socket.as_str());
-    perm.invoke_socket_remove(socket.into());
-    assert!(config(&paths).centers[0].policy.sockets.is_empty());
-    assert_eq!(perm.get_sockets().row_count(), 0);
-
     // The answer of a reading the page asked for before its last one (the
     // owner picked another center meanwhile) comes late: it is dropped.
     let stale = ctl.perm_asked();

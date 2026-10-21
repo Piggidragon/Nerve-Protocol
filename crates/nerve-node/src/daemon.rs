@@ -820,10 +820,6 @@ impl Shared {
                     "paused": c.paused,
                     "revoked": c.revoked,
                     "unknown": c.unknown,
-                    // Socket files its folder mode commands reach outside
-                    // their folders: one may run things for them as the
-                    // account they run as.
-                    "sockets": c.policy.sockets,
                 })
             })
             .collect();

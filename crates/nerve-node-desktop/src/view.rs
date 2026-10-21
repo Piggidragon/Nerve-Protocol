@@ -41,16 +41,16 @@ pub fn status(v: &Value, now_ms: u64) -> (NodeStatus, Vec<CenterRow>) {
         .filter(|c| c["status"] == "connected")
         .count();
     // A pairing whose commands are not kept in their folders: one without
-    // the sandbox, or one in folder mode with sockets allowed outside them,
-    // which may run things for it. One the center revoked runs none; a mode
-    // this app does not know counts. Where the node says it cannot keep
-    // commands off socket files (Linux before 7.1), no folder mode holds
-    // against the programs of the account they run as.
+    // the sandbox. One the center revoked runs none; a mode this app does
+    // not know counts. Where the node says it cannot keep commands off
+    // socket files (Linux before 7.1), no folder mode holds against the
+    // programs of the account they run as.
     let unconfined = v["sockets_kept"] == false
-        || v["centers"].as_array().into_iter().flatten().any(|c| {
-            c["revoked"] != true
-                && (c["mode"] != "folder" || c["sockets"].as_array().is_some_and(|s| !s.is_empty()))
-        });
+        || v["centers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|c| c["revoked"] != true && c["mode"] != "folder");
     let (state, title, detail, tone) = match (locked, running) {
         (true, _) => (
             "locked",
@@ -307,17 +307,6 @@ pub fn folders(v: &Value) -> Vec<FolderRow> {
             write: f["write"] == true,
             execute: f["execute"] == true,
         })
-        .collect()
-}
-
-/// The socket files of `folder ls --json` that a folder mode command may
-/// connect to outside its folders.
-pub fn sockets(v: &Value) -> Vec<SharedString> {
-    v["sockets"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .map(|p| s(p).into())
         .collect()
 }
 
@@ -1551,16 +1540,6 @@ mod tests {
         ));
         // A mode this app does not know is not taken for the sandbox.
         assert!(with(json!([{"name": "a"}])));
-        // Folder mode with a socket allowed outside the folders.
-        assert!(with(
-            json!([{"name": "a", "mode": "folder", "sockets": ["/run/docker.sock"]}])
-        ));
-        assert!(!with(
-            json!([{"name": "a", "mode": "folder", "sockets": []}])
-        ));
-        assert!(!with(
-            json!([{"name": "a", "mode": "folder", "sockets": ["/run/docker.sock"], "revoked": true}])
-        ));
     }
 
     /// What the node says it keeps commands from decides too: where it
@@ -1569,7 +1548,7 @@ mod tests {
     #[test]
     fn a_node_that_cannot_keep_commands_off_sockets_is_told() {
         let with = |kept: Value| {
-            let folder = json!([{"name": "a", "mode": "folder", "sockets": []}]);
+            let folder = json!([{"name": "a", "mode": "folder"}]);
             status(
                 &json!({"daemon": "running", "sockets_kept": kept, "centers": folder}),
                 NOW,
@@ -1790,11 +1769,6 @@ mod tests {
             (f[0].path.as_str(), f[0].read, f[0].write, f[0].execute),
             ("/srv/a", true, false, true)
         );
-        assert_eq!(
-            sockets(&json!({"folders": [], "sockets": ["/run/a.sock"]})),
-            [SharedString::from("/run/a.sock")]
-        );
-        assert!(sockets(&json!({"folders": []})).is_empty());
         assert_eq!(rights(true, false, true), "=rx");
         assert_eq!(rights(false, false, false), "=");
         let rows = caps(&json!({"caps": {"exec.run": "off", "fs": "hidden"},

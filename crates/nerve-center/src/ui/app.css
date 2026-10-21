@@ -2290,16 +2290,11 @@ details.cmd > .body {
   }
 
   .cmd-name {
-    flex-basis: auto;
-    max-width: 55%;
+    flex: 1 1 auto;
   }
 
   .cmd-line {
     display: none;
-  }
-
-  details.cmd > summary .pill {
-    margin-left: auto;
   }
 }
 

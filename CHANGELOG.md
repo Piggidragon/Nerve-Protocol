@@ -44,6 +44,7 @@
 
 ### The center
 
+- The web UI has the desktop app's design ([#137](https://github.com/Piggidragon/Nerve-Protocol/issues/137)): its colours in light and dark, type scale, spaces and controls, the menu with System, Light and Dark at its foot, and its animations of 100 to 200 ms, none when the system asks for less motion. A busy button shows a spinner. Help is built as the app's: the keyboard shortcuts and the command reference, by topic or A to Z, filtered, each part opening on its own. The center has the app's icon.
 - The pairing card of the web UI offers the command and the bare link (for the desktop app), each with Copy, without the center, code and pin apart.
 - `POST /nerve/v0/pair/check` tells a node whether a pairing code is still open without using it or counting a try; checks with codes that are not open have a budget of their own (10 in 10 minutes), after which the center answers `busy`.
 

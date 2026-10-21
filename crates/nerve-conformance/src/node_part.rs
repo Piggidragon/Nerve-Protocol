@@ -74,7 +74,7 @@ where
     let req = &paired.request;
     r.check(
         "2.2",
-        "the node name is 1 to 32 of a-z, 0-9 and -",
+        "the node name is 1 to 32 of a-z, 0-9 and -, starting and ending with a letter or digit",
         ensure(nerve_proto::valid_node_name(&req.name), req.name.clone()),
     );
 

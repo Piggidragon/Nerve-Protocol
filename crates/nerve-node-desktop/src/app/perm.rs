@@ -337,7 +337,7 @@ impl Ctl {
         // again as `rule ls` shows it.
         if word != "sudo" && view::pattern_rule(&text) {
             let key = format!("center.{}.policy.{word}", self.perm_center());
-            let args = vec!["config".into(), "add".into(), key, text];
+            let args = vec!["config".into(), "add".into(), "--".into(), key, text];
             self.command(args, None, move |c, answer| {
                 match answer {
                     Ok(v) => {

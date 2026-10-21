@@ -475,18 +475,27 @@ impl Ctl {
         };
         let (mut args, title) = if token_for.is_empty() {
             (
-                vec!["relay".into(), "add".into(), name.clone()],
+                vec!["relay".into(), "add".into()],
                 format!("Link for {name}"),
             )
         } else {
             (
-                vec!["relay".into(), "token".into(), token_for.clone()],
+                vec!["relay".into(), "token".into()],
                 format!("New link for {token_for}"),
             )
         };
         if !address.is_empty() {
             args.push(format!("--address={address}"));
         }
+        // The name is typed, so it goes behind `--`: no value reads as a flag.
+        args.extend([
+            "--".into(),
+            if token_for.is_empty() {
+                name
+            } else {
+                token_for
+            },
+        ]);
         self.with_prefs(|p| {
             p.set_relay_add_busy(true);
             p.set_relay_add_error(SharedString::new());
@@ -515,6 +524,7 @@ impl Ctl {
             vec![
                 "config".into(),
                 "set".into(),
+                "--".into(),
                 "node.name".into(),
                 name.into(),
             ]
@@ -662,17 +672,22 @@ impl Ctl {
         }) else {
             return;
         };
-        let mut set_centers = vec!["relay".into(), "set-centers".into(), name.clone()];
+        // The flags come first and the name behind `--`: a name that starts
+        // with `-` (the CLI refuses new ones, an old file may hold one) is
+        // then no flag.
+        let mut set_centers = vec!["relay".into(), "set-centers".into()];
         for c in centers {
             set_centers.push(format!("--center={c}"));
         }
-        let mut set_limits = vec!["relay".into(), "set-limits".into(), name.clone()];
+        set_centers.extend(["--".into(), name.clone()]);
+        let mut set_limits = vec!["relay".into(), "set-limits".into()];
         if own {
             set_limits.extend([
                 format!("--max-links={links}"),
                 format!("--max-opens-per-minute={opens}"),
             ]);
         }
+        set_limits.extend(["--".into(), name.clone()]);
         let failed = |c: &Rc<Ctl>, e: String| {
             c.with_prefs(|p| {
                 p.set_relay_edit_busy(false);
@@ -751,7 +766,13 @@ impl Ctl {
         let args = if shell.is_empty() {
             vec!["config".into(), "unset".into(), "machine.shell".into()]
         } else {
-            vec!["config".into(), "set".into(), "machine.shell".into(), shell]
+            vec![
+                "config".into(),
+                "set".into(),
+                "--".into(),
+                "machine.shell".into(),
+                shell,
+            ]
         };
         self.prefs_change(args, None, String::new());
     }
@@ -856,7 +877,7 @@ impl Ctl {
         }) else {
             return;
         };
-        let mut args = vec!["config".into(), verb.into(), key];
+        let mut args = vec!["config".into(), verb.into(), "--".into(), key];
         if verb != "unset" {
             args.push(value);
         }
@@ -1267,7 +1288,7 @@ pub(super) fn wire(ctl: &Rc<Ctl>, window: &crate::AppWindow) {
     let c = ctl.clone();
     p.on_relay_remove(move |name| {
         c.prefs_change(
-            vec!["relay".into(), "rm".into(), name.to_string()],
+            vec!["relay".into(), "rm".into(), "--".into(), name.to_string()],
             None,
             String::new(),
         )

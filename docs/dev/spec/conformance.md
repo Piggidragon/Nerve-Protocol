@@ -71,7 +71,7 @@ points the node at a fake `sudo` (`machine.sudo_path`) for this.
 | § | Check |
 |---|---|
 | 3.2 | the node pairs |
-| 2.2 | the node name is 1 to 32 of `a-z`, `0-9` and `-` |
+| 2.2 | the node name is 1 to 32 of `a-z`, `0-9` and `-`, starting and ending with a letter or digit |
 | 4.1 | the node dials the center |
 | 4.1 | the `Nerve-Node` header names the paired node id |
 | 4.2 | the hello is signed and names version "0" |

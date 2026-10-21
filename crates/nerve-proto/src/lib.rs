@@ -102,12 +102,17 @@ pub mod limits {
     pub const SEND_QUEUE: usize = 64;
 }
 
-/// Node names: 1 to 32 of `a-z0-9-` (docs/dev/spec/protocol.md §2.2).
+/// Node names: 1 to 32 of `a-z0-9-`, starting and ending with a letter or
+/// digit like a DNS label (docs/dev/spec/protocol.md §2.2). A name that
+/// starts with `-` would read as a flag wherever a command line takes it.
 pub fn valid_node_name(name: &str) -> bool {
+    let edge = |b: Option<&u8>| b.is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit());
     (1..=32).contains(&name.len())
         && name
             .bytes()
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+        && edge(name.as_bytes().first())
+        && edge(name.as_bytes().last())
 }
 
 /// A node name made from a host name: lowercased, other characters as `-`,
@@ -139,6 +144,11 @@ mod tests {
         assert!(!valid_node_name(""));
         assert!(!valid_node_name("Laptop"));
         assert!(!valid_node_name(&"a".repeat(33)));
+        assert!(valid_node_name("a"));
+        assert!(valid_node_name("2lab"));
+        for bad in ["-", "-lab", "lab-", "-lab-", "--", "-x"] {
+            assert!(!valid_node_name(bad), "{bad}");
+        }
         assert_eq!(node_name_from_host("My.Host_01"), "my-host-01");
         assert_eq!(node_name_from_host("..."), "node");
     }

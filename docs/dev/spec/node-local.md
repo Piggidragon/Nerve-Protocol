@@ -1333,7 +1333,8 @@ Only a program the owner names in `providers.allowed` (§2), by a name and the
 absolute path of its executable (`nerve-node config add providers.allowed
 '{ name = "desk", exe = "/usr/lib/nerve-desktop/nerve-desktop" }'`). None
 is allowed by default; only the owner changes the list, as no center document
-holds it. A name is 1 to 32 of `a-z`, `0-9` and `-`, and not `node`.
+holds it. A name is 1 to 32 of `a-z`, `0-9` and `-`, starting and ending with a letter
+or digit, and not `node`.
 
 The provider connects like the CLI: the socket's user check (its own user or
 root) and the token hold for it too, and so does the refusal of a process

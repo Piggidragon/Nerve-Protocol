@@ -478,7 +478,8 @@ pub enum RelayCmd {
     Off,
     /// Let a node use the relay: makes its token and shows it once, in a link the other node pastes. Without --center its tunnels may go to every https center of this node.
     Add {
-        /// The relayed node's name here, 1 to 32 of a-z, 0-9 and -.
+        /// The relayed node's name here, 1 to 32 of a-z, 0-9 and -, starting and
+        /// ending with a letter or digit.
         name: String,
         /// A center of this node the relayed node may reach; can be given more than once. Without it, every one.
         #[arg(long = "center", value_name = "CENTER")]
@@ -2471,7 +2472,7 @@ async fn setup_steps(
     if !name.is_empty() && name != current {
         if !nerve_proto::valid_node_name(&name) {
             return Err(format!(
-                "{name:?} is not a node name: 1 to 32 characters of a-z, 0-9 and -"
+                "{name:?} is not a node name: 1 to 32 characters of a-z, 0-9 and -, starting and ending with a letter or digit"
             ));
         }
         edit(paths, |c| {
@@ -3877,7 +3878,7 @@ async fn relay_cmd(paths: &NodePaths, c: RelayCmd, out: &mut dyn Write) -> Resul
         } => {
             if !nerve_proto::valid_node_name(&name) {
                 return Err(format!(
-                    "{name:?} is not a relay node name: 1 to 32 characters of a-z, 0-9 and -"
+                    "{name:?} is not a relay node name: 1 to 32 characters of a-z, 0-9 and -, starting and ending with a letter or digit"
                 ));
             }
             let (now, _) = read_config(paths).await?;

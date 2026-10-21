@@ -250,6 +250,7 @@ impl Ctl {
                     let args = vec![
                         "config".into(),
                         "set".into(),
+                        "--".into(),
                         "node.name".into(),
                         name.into(),
                     ];

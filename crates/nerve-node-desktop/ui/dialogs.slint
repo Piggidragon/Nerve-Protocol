@@ -817,6 +817,7 @@ export component UpdateDialog inherits Dialog {
     VerticalLayout {
         Reveal {
             shown: Install.step == "choose";
+            fade: true;
             VerticalLayout {
                 spacing: Space.xl;
                 UpdateChoice { }
@@ -844,10 +845,12 @@ export component UpdateDialog inherits Dialog {
         }
         Reveal {
             shown: Install.step == "working";
+            fade: true;
             Working { }
         }
         Reveal {
             shown: Install.step == "done";
+            fade: true;
             VerticalLayout {
                 spacing: Space.xl;
                 DidList { }
@@ -899,6 +902,7 @@ export component UninstallDialog inherits Dialog {
     VerticalLayout {
         Reveal {
             shown: Install.step == "choose";
+            fade: true;
             VerticalLayout {
                 spacing: Space.xl;
                 UninstallChoice { }
@@ -925,10 +929,12 @@ export component UninstallDialog inherits Dialog {
         }
         Reveal {
             shown: Install.step == "working";
+            fade: true;
             Working { }
         }
         Reveal {
             shown: Install.step == "done";
+            fade: true;
             VerticalLayout {
                 spacing: Space.xl;
                 DidList { }

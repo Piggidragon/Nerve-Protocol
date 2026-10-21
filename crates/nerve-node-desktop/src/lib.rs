@@ -13,6 +13,7 @@ pub mod deps;
 pub mod dialog;
 pub mod headless;
 pub mod instance;
+pub mod motion;
 pub mod parts;
 pub mod reference;
 pub mod runner;

@@ -785,6 +785,23 @@ fn the_app_drives_the_cli_end_to_end() {
     prefs.invoke_connect_save();
     assert!(prefs.get_connect_open() && prefs.get_connect_error() != "");
     prefs.set_connect_open(false);
+    // A pin is random base64url, so about one in 64 starts with `-`: the
+    // CLI must not read it as a flag. (This one is fixed, to be sure.)
+    let dashed = nerve_proto::link::RelayLink {
+        pin: "-AECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8".into(),
+        ..link.clone()
+    };
+    prefs.invoke_connect_start();
+    prefs.set_connect_link(dashed.render().into());
+    prefs.invoke_connect_read(dashed.render().into());
+    prefs.invoke_connect_save();
+    assert!(!prefs.get_connect_open(), "{}", prefs.get_connect_error());
+    assert_eq!(
+        config(&paths).connection.pin.as_deref(),
+        Some(dashed.pin.as_str())
+    );
+    prefs.invoke_disconnect();
+    assert!(config(&paths).connection.proxy.is_none());
     assert_eq!(prefs.get_relay_nodes().row_count(), 1);
     prefs.set_once_open(false);
     // Its centers and limits, in its dialog.

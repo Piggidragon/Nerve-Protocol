@@ -80,7 +80,8 @@ impl Ctl {
         self.perm_mode();
         self.job(
             move |r| {
-                let c = ["--center", center.as_str()];
+                let center = format!("--center={center}");
+                let c = [center.as_str()];
                 let ask = |what: &[&str]| r.run(&[what, &c[..]].concat());
                 (
                     ask(&["folder", "ls"]),
@@ -152,8 +153,7 @@ impl Ctl {
         close: fn(&Ctl),
         failed: fn(&Ctl, String),
     ) {
-        args.push("--center".into());
-        args.push(self.perm_center());
+        args.push(format!("--center={}", self.perm_center()));
         self.command(args, input, move |c, answer| {
             match answer {
                 Ok(v) => {
@@ -199,8 +199,7 @@ impl Ctl {
         };
         let mut args = vec!["mode".into(), "set".into(), mode.clone()];
         if timed {
-            args.push("--for".into());
-            args.push(hours.clone());
+            args.push(format!("--for={hours}"));
         }
         let center = self.perm_center();
         let said = if timed {

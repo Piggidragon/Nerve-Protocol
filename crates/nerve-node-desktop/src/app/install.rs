@@ -273,8 +273,7 @@ impl Ctl {
             (source == 1).then_some(file)
         };
         if let Some(from) = from {
-            args.push("--from".into());
-            args.push(from);
+            args.push(format!("--from={from}"));
         }
         self.run_service_command("update", args, None);
     }

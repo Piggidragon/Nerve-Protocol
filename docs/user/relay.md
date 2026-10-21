@@ -99,7 +99,7 @@ nerve-node center add 'nerve://pair?center=...&code=...&pin=...'
 ```
 
 The link is the relay as this node's proxy: the same as `proxy set
-'https://lab-pc:<token>@relay.example:7490' --pin <pin>`.
+'https://lab-pc:<token>@relay.example:7490' --pin=<pin>`.
 
 The pairing goes through the relay too. The center's URL in the pairing link
 must be the one the relay is paired with, the same host name or address and

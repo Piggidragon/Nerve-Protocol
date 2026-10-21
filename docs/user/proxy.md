@@ -27,7 +27,10 @@ nerve-node proxy set 'nerve://relay?address=relay.example%3A7490&node=lab-pc&tok
 ```
 
 It is the same as the URL with the login and the pin:
-`proxy set 'https://lab-pc:<token>@relay.example:7490' --pin <pin>`.
+`proxy set 'https://lab-pc:<token>@relay.example:7490' --pin=<pin>`.
+
+Give the pin as `--pin=<pin>`: a pin can start with `-`, which would be read
+as an option after a space.
 
 Without `--pin` the proxy's certificate must be one this machine trusts. The
 user name and password of an `https://` proxy are kept with the node's own

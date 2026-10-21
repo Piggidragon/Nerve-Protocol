@@ -137,7 +137,7 @@ fn the_keyboard_drives_the_app_and_the_open_tab_stays() {
     assert!(
         started(&log)
             .iter()
-            .any(|l| l.contains("center rm --center lab")),
+            .any(|l| l.contains("center rm --center=lab")),
         "Enter did not unpair: {:?}",
         started(&log)
     );

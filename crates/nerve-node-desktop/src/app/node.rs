@@ -270,7 +270,12 @@ impl Ctl {
             2 if pair_step == 2 => self.setup_go(3),
             2 => self.pair(&link, &pair_name, pair_step == 1),
             3 => {
-                let args = vec!["mode".into(), "set".into(), mode, "--center".into(), center];
+                let args = vec![
+                    "mode".into(),
+                    "set".into(),
+                    mode,
+                    format!("--center={center}"),
+                ];
                 self.setup_run(args, 4, false);
             }
             _ => {

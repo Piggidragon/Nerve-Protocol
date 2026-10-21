@@ -644,7 +644,7 @@ runs in, which may differ from the daemon's), with the same values, when the
 center is `https`; a proxy that fails stops the
 pairing and nothing is stored.
 
-`nerve-node proxy set https://<user>:<password>@<host>:<port> [--pin <pin>]`
+`nerve-node proxy set https://<user>:<password>@<host>:<port> [--pin=<pin>]`
 sets an `https://` proxy, a relay (§2, Relay) above all: the node reaches
 it over TLS checked against `connection.pin` (else the system's roots) and
 sends the `CONNECT` inside that TLS (protocol §4.7). Its password, the relay
@@ -685,7 +685,7 @@ turns it on, and a center reads and changes nothing of it, grant or not.
 - `nerve-node relay add <name> [--center <center>]...` makes a token for a
   relayed node: 43 characters of `a-z0-9`, shown once, with the line the
   relayed node runs,
-  `nerve-node proxy set 'https://<name>:<token>@<relay>:<port>' --pin <pin>`.
+  `nerve-node proxy set 'https://<name>:<token>@<relay>:<port>' --pin=<pin>`.
   `node.toml` keeps the token's SHA-256 only, and the log tells a change of
   `relay.node` without its values. `relay token <name>` gives a known node
   a new token, shown once with the same line, and keeps its centers and

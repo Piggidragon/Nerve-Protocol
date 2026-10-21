@@ -415,8 +415,8 @@ impl Ctl {
             "proxy".into(),
             "set".into(),
             format!("https://{}@{}", l.node, l.address),
-            "--pin".into(),
-            l.pin.clone(),
+            // `=`: a pin starting with `-` is no flag to the CLI then.
+            format!("--pin={}", l.pin),
             "--password-stdin".into(),
         ];
         self.with_prefs(|p| {
@@ -485,8 +485,7 @@ impl Ctl {
             )
         };
         if !address.is_empty() {
-            args.push("--address".into());
-            args.push(address);
+            args.push(format!("--address={address}"));
         }
         self.with_prefs(|p| {
             p.set_relay_add_busy(true);
@@ -565,8 +564,7 @@ impl Ctl {
         let (url, password) = view::proxy_login(&url, &password);
         let mut args = vec!["proxy".into(), "set".into(), url];
         if !pin.is_empty() {
-            args.push("--pin".into());
-            args.push(pin);
+            args.push(format!("--pin={pin}"));
         }
         let headers: Vec<&str> = headers
             .lines()
@@ -666,16 +664,13 @@ impl Ctl {
         };
         let mut set_centers = vec!["relay".into(), "set-centers".into(), name.clone()];
         for c in centers {
-            set_centers.push("--center".into());
-            set_centers.push(c);
+            set_centers.push(format!("--center={c}"));
         }
         let mut set_limits = vec!["relay".into(), "set-limits".into(), name.clone()];
         if own {
             set_limits.extend([
-                "--max-links".into(),
-                links,
-                "--max-opens-per-minute".into(),
-                opens,
+                format!("--max-links={links}"),
+                format!("--max-opens-per-minute={opens}"),
             ]);
         }
         let failed = |c: &Rc<Ctl>, e: String| {
@@ -895,8 +890,7 @@ impl Ctl {
         }
         let args = vec![
             "setup".into(),
-            "--create-user".into(),
-            name.clone(),
+            format!("--create-user={name}"),
             "--account-only".into(),
         ];
         self.account_change(args, None, format!("Commands run as {name}"));
@@ -1071,7 +1065,7 @@ impl Ctl {
             args.push("--without-proxy".into());
         }
         if in_files {
-            args.extend(["--secret-storage".into(), "file".into()]);
+            args.push("--secret-storage=file".into());
         }
         let running = self
             .with_store(|s| s.get_service_state() == "running")

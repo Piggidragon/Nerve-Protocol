@@ -1235,10 +1235,8 @@ pub fn rule_args(e: &Value, list: &str, wildcard: bool) -> Vec<String> {
         "add".into(),
         rule_list(e, list).into(),
         s(&e["target"]).into(),
-        "--action".into(),
-        format!("{}.{}", s(&e["cap"]), s(&e["action"])),
-        "--center".into(),
-        s(&e["center"]).into(),
+        format!("--action={}.{}", s(&e["cap"]), s(&e["action"])),
+        format!("--center={}", s(&e["center"])),
     ];
     if wildcard {
         args.push("--wildcard".into());
@@ -1684,10 +1682,8 @@ mod tests {
                 "add",
                 "allow",
                 "git status",
-                "--action",
-                "exec.run",
-                "--center",
-                "home",
+                "--action=exec.run",
+                "--center=home",
                 "--wildcard"
             ]
         );
@@ -1697,8 +1693,8 @@ mod tests {
         assert_eq!(rule_args(&e, "deny", false)[2], "deny");
         let e = json!({"center": "home", "cap": "fs", "action": "write", "target": "/srv/a"});
         assert_eq!(
-            rule_args(&e, "deny", false)[3..6],
-            ["/srv/a", "--action", "fs.write"]
+            rule_args(&e, "deny", false)[3..5],
+            ["/srv/a", "--action=fs.write"]
         );
     }
 

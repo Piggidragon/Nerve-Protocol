@@ -942,8 +942,7 @@ impl Ctl {
     fn pair(self: &Rc<Self>, link: &str, name: &str, yes: bool) {
         let mut args = vec!["center".to_string(), "add".into(), link.trim().to_string()];
         if !name.trim().is_empty() {
-            args.push("--name".into());
-            args.push(name.trim().into());
+            args.push(format!("--name={}", name.trim()));
         }
         if yes {
             args.push("--yes".into());
@@ -1006,7 +1005,7 @@ impl Ctl {
         } else {
             format!("{name} is resumed.")
         };
-        let args = vec!["center".into(), verb.into(), "--center".into(), name.into()];
+        let args = vec!["center".into(), verb.into(), format!("--center={name}")];
         self.change(name, args, said);
     }
 
@@ -1022,8 +1021,7 @@ impl Ctl {
             "grant".into(),
             "settings".into(),
             value.into(),
-            "--center".into(),
-            name.into(),
+            format!("--center={name}"),
         ];
         self.change(name, args, said);
     }
@@ -1094,12 +1092,7 @@ impl Ctl {
         };
         match p {
             Pending::Unpair(name) => {
-                let args = vec![
-                    "center".into(),
-                    "rm".into(),
-                    "--center".into(),
-                    name.clone(),
-                ];
+                let args = vec!["center".into(), "rm".into(), format!("--center={name}")];
                 self.change(&name, args, format!("Unpaired {name}."));
             }
             Pending::RotateKey(name) => {
@@ -1111,7 +1104,7 @@ impl Ctl {
                     if end {
                         a.push("--end-grace".into());
                     }
-                    a.extend(["--center".into(), name.clone()]);
+                    a.push(format!("--center={name}"));
                     a
                 };
                 let end_grace = args(true);

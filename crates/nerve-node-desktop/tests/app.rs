@@ -647,8 +647,8 @@ fn the_app_drives_the_cli_end_to_end() {
     );
     perm.invoke_cap_set("exec.run".into(), 0);
 
-    // A pairing without the whole guard (from before it, or the owner took
-    // a rule off) is offered it, in one click.
+    // A pairing without the whole guard (the owner took a rule off) is
+    // offered it, in one click.
     assert!(!perm.get_guard_missing());
     perm.invoke_rule_remove(1, nerve_policy::rules::GUARD[3].into());
     assert!(perm.get_guard_missing());

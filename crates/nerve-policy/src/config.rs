@@ -187,7 +187,7 @@ pub struct Limits {
     pub output_cap_bytes: u64,
     /// How long a command may run when its call gives no `timeout_ms`. A
     /// command past its limit is killed. Left out of the file while it is
-    /// the default, so an older node still reads a file nobody set it in.
+    /// the default, so the file holds what the owner set.
     #[serde(
         default = "d_default_timeout",
         skip_serializing_if = "is_default_timeout"
@@ -198,7 +198,7 @@ pub struct Limits {
     #[serde(default = "d_max_timeout", skip_serializing_if = "is_max_timeout")]
     pub max_timeout_secs: u64,
     /// What one command may use (a cgroup on Linux). Written only where
-    /// the owner changed it, so a node of before can read the file.
+    /// the owner changed it.
     #[serde(default, skip_serializing_if = "CommandLimits::is_default")]
     pub command: CommandLimits,
 }
@@ -1446,8 +1446,7 @@ sudo_allow = ["sudo apt update"]
         // One set, the other the default.
         let c = NodeConfig::parse("[limits]\nmax_timeout_secs = 90\n").unwrap();
         assert_eq!(c.limits.default_timeout_secs, 600);
-        // A file that never set them reads on an older node, which refuses
-        // keys it does not know: the defaults are not written.
+        // The defaults are not written.
         let plain = NodeConfig::parse(&sample()).unwrap().to_toml();
         assert!(!plain.contains("timeout"), "{plain}");
         let mut set = NodeConfig::default();
@@ -2060,7 +2059,7 @@ sudo_allow = ["sudo apt update"]
         // It is saved and read again as it is.
         assert_eq!(NodeConfig::parse(&cfg.to_toml()).unwrap(), cfg);
 
-        // A config from before the record has none, and writes none.
+        // A config without the record has none, and writes none.
         let old = center("folders = [{ path = \"/a/b\", access = \"r\" }]");
         let old = NodeConfig::parse(&old).unwrap();
         assert!(old.centers[0].policy.places.is_empty());

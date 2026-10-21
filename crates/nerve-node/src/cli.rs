@@ -1181,8 +1181,7 @@ impl List {
     /// The rule a command line stands for. The allow and deny lists hold
     /// `exec.run` rules; the sudo list holds the sudo command lines, and takes
     /// the command with or without the `sudo` in front. `rule rm` uses it
-    /// as it is, so the rules an older `rule add` made from the pattern form
-    /// can be removed with the arguments that made them.
+    /// as it is, so a rule is removed with the arguments that made it.
     fn command_rule(self, command: &str, wildcard: bool) -> Result<String, String> {
         match self {
             List::Allow if sudo_command(command).is_some() => {
@@ -6514,15 +6513,6 @@ mod tests {
         // A colon in a command that is not a scope stays a command.
         run(&paths, &["rule", "add", "allow", "C:\\tools\\x.exe"]).unwrap();
         run(&paths, &["rule", "rm", "allow", "C:\\tools\\x.exe"]).unwrap();
-        // The rule an older `rule add` made of the pattern form goes with the
-        // arguments that made it.
-        let broken = "exec.run:exec.run:echo [*]";
-        run(
-            &paths,
-            &["config", "add", "center.home.policy.allow", broken],
-        )
-        .unwrap();
-        run(&paths, &["rule", "rm", "allow", "exec.run:echo *"]).unwrap();
         assert_eq!(
             load(&paths).centers[0].policy.allow,
             ["exec.run:git status"]

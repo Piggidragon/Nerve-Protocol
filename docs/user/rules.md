@@ -49,8 +49,8 @@ not refused: `cargo build -p nerve-node` and `journalctl -u nerve-node` run.
 nerve-node rule guard --center lab   # puts back the ones a pairing lacks
 ```
 
-A pairing made before the guard has none: `rule guard` adds them, and the
-desktop app offers it on **Permissions**.
+A pairing that lacks some of them (you removed them) gets them back with
+`rule guard`, and the desktop app offers it on **Permissions**.
 
 The guard catches an agent's mistakes, such as an agent that tries to give
 itself more rights. It does not stop a command written to get around it (a

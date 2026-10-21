@@ -183,12 +183,11 @@ older copies are refused in turn.
 
 `config.version` is a number, in the state folder beside `config.key`, so it
 holds as far as the key does: a `user` mode command can delete it, a `folder`
-mode command cannot reach it. A node that has none (one from before the
-node kept it, or a state folder made new) takes `node.toml` as it is and
-records its version. If the file is damaged, the node does not start and says
-so: delete it, or take `node.toml` with `config accept`. Take care of the two
-folders together when you back them up and restore them: a config folder
-older than its state folder is refused.
+mode command cannot reach it. A node that has none (a state folder made new)
+takes `node.toml` as it is and records its version. If the file is damaged, the
+node does not start and says so: delete it, or take `node.toml` with
+`config accept`. Take care of the two folders together when you back them up and
+restore them: a config folder older than its state folder is refused.
 
 ## Where the node keeps its keys
 

@@ -70,9 +70,8 @@ machine then trusts the new key too. The center keeps serving the old key for
 those 7 days, then switches to the new one. **Serve the new key now** switches
 at once.
 
-- A machine that does not link during the 7 days, or runs a `nerve-node` older
-  than 0.0.4, does not learn the new key. After the switch it cannot connect
-  and has to be [paired again](pairing.md).
+- A machine that does not link during the 7 days does not learn the new key.
+  After the switch it cannot connect and has to be [paired again](pairing.md).
 - New pairing links carry the pin of the key the center serves.
 - The switch also changes the certificate of the web UI and the HTTP MCP
   endpoint when they use TLS. A browser asks to trust it again.

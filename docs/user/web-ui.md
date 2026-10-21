@@ -28,6 +28,13 @@ To reach a UI that listens on loopback from another machine, use an SSH tunnel:
 ssh -L 7480:127.0.0.1:7480 user@center-host
 ```
 
+## Look
+
+The web UI has the desktop app's design: the same colours, type, controls and
+motion. The switch at the foot of the menu picks **System**, **Light** or
+**Dark**; the choice stays in this browser. When the system asks for less
+motion, nothing moves. On a phone the menu opens from the button at the top.
+
 ## Pages
 
 ### Overview
@@ -145,9 +152,17 @@ the marked entry and **Escape** closes it.
 
 ### Help
 
-Lists the commands of `nerve-node` with what each does. The center reads the
-list from the node's own command definition, so it matches `nerve-node --help`
-of the same build.
+Built like the desktop app's Help: two parts that open and close on their own.
+
+- **Keyboard shortcuts.** The keys of the web UI.
+- **Command reference.** The commands of `nerve-node`, the program on each
+  machine. The center reads them from the node's own command definition, so
+  they match `nerve-node --help` of the same build. Type in the filter to keep
+  the commands whose name, explanation or arguments contain it, and list them
+  **By topic** or **A to Z**. A topic opens and closes its commands; a command
+  opens on what it does, how it is written and its arguments.
+
+**User guide** at the top opens these pages on GitHub.
 
 ### Settings
 

@@ -1069,6 +1069,471 @@ mod tests {
         assert_eq!(got["retention_days"], 5);
     }
 
+    /// The `/* … */` comments of a stylesheet, gone.
+    fn without_comments(css: &str) -> String {
+        let mut out = String::new();
+        let mut rest = css;
+        while let Some(at) = rest.find("/*") {
+            out.push_str(&rest[..at]);
+            rest = rest[at..]
+                .find("*/")
+                .map_or("", |end| &rest[at + end + 2..]);
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// The declarations of the first rule whose selector line is `head`.
+    fn css_block<'a>(css: &'a str, head: &str) -> &'a str {
+        let at = css
+            .find(&format!("{head} {{"))
+            .unwrap_or_else(|| panic!("no `{head}` rule"));
+        let body = &css[at..];
+        &body[..body.find('}').unwrap()]
+    }
+
+    /// `name: value` of each `out property` of a global of theme.slint.
+    fn slint_global(theme: &str, global: &str) -> Vec<(String, String)> {
+        let at = theme
+            .find(&format!("export global {global} {{"))
+            .unwrap_or_else(|| panic!("no global {global}"));
+        let body = &theme[at..];
+        let body = &body[..body.find("\n}").unwrap()];
+        body.lines()
+            .filter_map(|l| l.trim().strip_prefix("out property <"))
+            .filter_map(|l| {
+                let (_, rest) = l.split_once("> ")?;
+                let (name, value) = rest.split_once(": ")?;
+                Some((name.to_string(), value.trim_end_matches(';').to_string()))
+            })
+            .collect()
+    }
+
+    /// The web UI takes the desktop app's design tokens from its
+    /// theme.slint: every colour in light and dark, the type scale, the
+    /// spaces, the radii, the sizes and the motion, under the same names.
+    #[test]
+    fn the_web_ui_has_the_desktop_apps_tokens() {
+        let theme = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../nerve-node-desktop/ui/theme.slint"
+        ))
+        .unwrap();
+        let css = without_comments(APP_CSS);
+        let light = css_block(&css, ":root");
+        let dark = css_block(&css, ":root[data-theme=\"dark\"]");
+        // Without the theme script the system's scheme picks the dark set.
+        let system = css_block(&css, "  :root:not([data-theme])");
+        let colours = slint_global(&theme, "Theme");
+        let mut seen = 0;
+        for (name, value) in &colours {
+            // `dark ? #0f1116 : #f4f5f9`; `dark` itself is a bool.
+            let Some((d, l)) = value
+                .strip_prefix("dark ? ")
+                .and_then(|v| v.split_once(" : "))
+            else {
+                continue;
+            };
+            seen += 1;
+            assert!(light.contains(&format!("--{name}: {l};")), "light --{name}");
+            assert!(dark.contains(&format!("--{name}: {d};")), "dark --{name}");
+            assert!(
+                system.contains(&format!("--{name}: {d};")),
+                "system --{name}"
+            );
+        }
+        assert!(seen > 25, "{colours:?}");
+        // Lengths and times, each under its prefix; Motion's are those it
+        // has when motion is on.
+        let lengths = [
+            ("Type", "fs-"),
+            ("Space", "sp-"),
+            ("Radius", "r-"),
+            ("Size", ""),
+        ];
+        for (global, prefix) in lengths.into_iter().chain([("Motion", "")]) {
+            for (name, value) in slint_global(&theme, global) {
+                let value = value
+                    .strip_prefix("on ? ")
+                    .map_or(value.as_str(), |v| v.split(" : ").next().unwrap());
+                if !(value.ends_with("px") || value.ends_with("ms")) || name.starts_with("icon") {
+                    continue;
+                }
+                let name = if name == "sidebar" {
+                    "sidebar-width"
+                } else {
+                    &name
+                };
+                assert!(
+                    light.contains(&format!("--{prefix}{name}: {value};")),
+                    "--{prefix}{name}: {value}"
+                );
+            }
+        }
+        assert!(light.contains("--ease: cubic-bezier(0.25, 1, 0.5, 1);"));
+        // Less motion when the system asks for it: no time, no rise.
+        let reduce = &css[css.find("@media (prefers-reduced-motion: reduce)").unwrap()..];
+        let reduce = css_block(reduce, ":root");
+        for token in ["--quick", "--base", "--enter", "--leave"] {
+            assert!(reduce.contains(&format!("{token}: 0ms;")), "{token}");
+        }
+        assert!(reduce.contains("--rise: 0px;"));
+    }
+
+    /// Help is built as the desktop app's: the keys and the command
+    /// reference, each a part that opens and closes, the reference by topic
+    /// or from A to Z and filtered.
+    #[test]
+    fn help_is_built_as_the_desktop_apps() {
+        let help = &APP_JS[APP_JS.find("function buildHelp").unwrap()..];
+        let help = &help[..help.find("\n}\n").unwrap()];
+        for part in [
+            "expander(\"Keyboard shortcuts\"",
+            "expander(\"Command reference\"",
+            "[\"By topic\", \"A to Z\"]",
+            "\"Filter the commands\"",
+            "\"No command matches.\"",
+            "el(\"details\", { class: \"cmd\"",
+            "el(\"details\", { class: \"ref-group\" }",
+        ] {
+            assert!(help.contains(part), "Help has no {part}");
+        }
+        // A part a page leaves out (null) is not drawn as the word.
+        let draw = &APP_JS[APP_JS.find("function draw(").unwrap()..];
+        let draw = &draw[..draw.find("\n}\n").unwrap()];
+        assert_eq!(draw.matches(".filter((p) => p != null)").count(), 2);
+        // The same for the local model part, which three places redraw: the
+        // filter is in the function, not in each caller.
+        let parts = &APP_JS[APP_JS.find("function localInstallParts(").unwrap()..];
+        let parts = &parts[..parts.find("\n}\n").unwrap()];
+        assert!(parts.contains(".filter((p) => p != null)"), "{parts}");
+        assert_eq!(APP_JS.matches("...localInstallParts(").count(), 3);
+        assert!(!APP_JS.contains("...localInstallBlocks("));
+    }
+
+    /// A button's handler gets the event: the switches of the Action checker
+    /// read `ev.currentTarget.checked`, and without the event they threw
+    /// before they saved anything.
+    #[test]
+    fn a_button_action_gets_the_event() {
+        let act = &APP_JS[APP_JS.find("function act(").unwrap()..];
+        let act = &act[..act.find("\n}\n").unwrap()];
+        assert!(act.contains("await fn(ev)"), "{act}");
+        assert!(!act.contains("await fn()"), "{act}");
+        // Every handler that reads the event is one of the switches, which
+        // are wrapped in act.
+        let uses: Vec<_> = APP_JS
+            .lines()
+            .filter(|l| l.contains("act(async (ev) =>"))
+            .collect();
+        assert_eq!(uses.len(), 2, "{uses:?}");
+        assert!(uses.iter().all(|l| l.contains("ev.currentTarget.checked")));
+    }
+
+    /// The Action checker page changes its working copy and then saves it.
+    /// A refused save must not leave the change behind, or the next save
+    /// (of anything on the page) sends it: the copy goes back to what the
+    /// center kept, and the error still reaches the toast. The model form
+    /// changes a copy and not the working copy. (The browser check is
+    /// `checker-failed-save.js` in the review tools.)
+    #[test]
+    fn a_refused_checker_save_leaves_no_change_behind() {
+        let save = &APP_JS[APP_JS.find("async function saveChecker(").unwrap()..];
+        let save = &save[..save.find("\n}\n").unwrap()];
+        let catch = &save[save.find("catch (e)").unwrap()..];
+        assert!(catch.contains("c.cfg = structuredClone(c.saved)"), "{save}");
+        assert!(catch.contains("draw(true)"), "{save}");
+        assert!(catch.contains("throw e"), "{save}");
+        let load = &APP_JS[APP_JS.find("async function loadChecker(").unwrap()..];
+        let load = &load[..load.find("\n}\n").unwrap()];
+        assert!(load.contains("saved: structuredClone(cfg)"), "{load}");
+        let model = &APP_JS[APP_JS.find("function modelCard(").unwrap()..];
+        let model = &model[..model.find("\n}\n").unwrap()];
+        assert!(model.contains("await saveChecker(next)"), "{model}");
+        assert!(!model.contains("m.source ="), "{model}");
+        // The page saves in one place only.
+        assert_eq!(
+            APP_JS
+                .matches("await api(\"POST\", \"/api/checker\",")
+                .count(),
+            1
+        );
+    }
+
+    /// A save draws the page anew, and the focus is put back on the control
+    /// it was on: a keyboard user toggling switches goes on from there, and
+    /// does not start at the top of the page again.
+    #[test]
+    fn a_page_drawn_anew_keeps_the_focus() {
+        let replace = &APP_JS[APP_JS.find("function replacePage(").unwrap()..];
+        let replace = &replace[..replace.find("\n}\n").unwrap()];
+        assert!(replace.contains("restoreFocus(spot)"), "{replace}");
+        assert!(replace.contains("focusSpot(active)"), "{replace}");
+        let act = &APP_JS[APP_JS.find("function act(").unwrap()..];
+        let act = &act[..act.find("\n}\n").unwrap()];
+        // Taken before the control is made busy: a disabled control may
+        // already have lost the focus.
+        assert!(
+            act.find("pendingFocus = spot").unwrap() < act.find("setBusy(b, true)").unwrap(),
+            "{act}"
+        );
+        // The pages that are redrawn on a save go through replacePage.
+        assert_eq!(APP_JS.matches("replacePage(").count(), 3);
+    }
+
+    /// The focus goes back to the control by what it is, never by where it
+    /// sat (review round 3, finding 1): after a list gained or lost an item,
+    /// a position names the End, Remove or Disable of another item, and
+    /// Enter acts on an item the user never picked. A control without a
+    /// `data-focus` key, a key that is gone and a key that is not unique
+    /// all send the focus to the section's heading, which does nothing on
+    /// Enter. (The browser check is `focus-identity.js` in the review tools.)
+    #[test]
+    fn the_focus_is_restored_by_identity_not_by_position() {
+        let spot = &APP_JS[APP_JS.find("function focusSpot(").unwrap()..];
+        let spot = &spot[..spot.find("\n}\n").unwrap()];
+        assert!(!spot.contains("indexOf"), "{spot}");
+        assert!(!spot.contains("path"), "{spot}");
+        assert!(spot.contains("node.dataset.focus"), "{spot}");
+        let target = &APP_JS[APP_JS.find("function focusTarget(").unwrap()..];
+        let target = &target[..target.find("\n}\n").unwrap()];
+        assert!(target.contains("found.length === 1"), "{target}");
+        let restore = &APP_JS[APP_JS.find("function restoreFocus(").unwrap()..];
+        let restore = &restore[..restore.find("\n}\n").unwrap()];
+        assert!(!restore.contains(".children["), "{restore}");
+        // No early return for a spot without a key: it reaches the
+        // heading like a key that is gone (review round 5, finding 1).
+        assert!(!restore.contains("if (!spot.key)"), "{restore}");
+        assert!(
+            restore.contains("spot.key && focusTarget(spot.key)"),
+            "{restore}"
+        );
+        assert!(restore.contains("querySelector(\"h3\")"), "{restore}");
+        // The heading takes the focus but is not a stop for Tab.
+        assert!(APP_JS.contains("el(\"h3\", { tabindex: \"-1\""));
+        // Every control that acts on one item, without asking, has a key
+        // that names the item.
+        for (label, kind) in [
+            ("btn(\"End\"", ":end`"),
+            ("btn(n.disabled ?", ":disable`"),
+            (
+                "btn(\"Remove\", \"danger-soft\", act(async () => { cfg.",
+                ":remove`",
+            ),
+            ("btn(\"Switch on again\"", ":on`"),
+            ("btn(\"Delete\"", ":delete`"),
+        ] {
+            let lines: Vec<_> = APP_JS.lines().filter(|l| l.contains(label)).collect();
+            assert!(!lines.is_empty(), "{label}");
+            assert!(
+                lines.iter().all(|l| l.contains(kind) && l.contains("${")),
+                "{label}: {lines:?}"
+            );
+        }
+        // A blocklist or allow entry is named by what it is (a built-in by
+        // its id, an own entry by rule, scope and note), and by the list it
+        // is shown in (a machine's card repeats the entries).
+        assert!(APP_JS.contains("`block:${where}:${e.id ? `id=${e.id}` :"));
+        assert!(APP_JS.contains("`allow:${where}:${a.rule}|${a.node_id || \"\"}:remove`"));
+        assert!(APP_JS.contains("`off:${m.id}:${e.id ? `id=${e.id}` :"));
+        // A key the page holds twice (an own entry with a built-in's rule
+        // and note, a rule added twice) names no control: focusSpot drops
+        // it, so removing one of two does not hand the focus, and Enter, to
+        // the other.
+        assert!(spot.contains("focusTarget(node.dataset.focus)"), "{spot}");
+        // The built-in ids the keys rest on are there and differ.
+        let ids: Vec<_> = crate::checker::config::default_blocklist()
+            .into_iter()
+            .map(|e| e.id)
+            .collect();
+        assert!(ids.iter().all(|i| !i.is_empty()));
+        let mut unique = ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len());
+        // A session's End is named by the session.
+        assert!(APP_JS.contains("session:${s.id}:end"));
+    }
+
+    /// A text field that gets the focus back gets what was typed into it back
+    /// as well (review round 5, finding 2): the redraw builds the field from
+    /// the saved state, and the user would type on into an empty one. The
+    /// text is read from the old page when the focus is taken, only for a
+    /// field, and put back only into a field of the same kind. (The browser
+    /// check is part 5 of `focus-identity.js` in the review tools.)
+    #[test]
+    fn a_text_field_gets_back_what_was_typed_with_the_focus() {
+        let spot = &APP_JS[APP_JS.find("function focusSpot(").unwrap()..];
+        let spot = &spot[..spot.find("\n}\n").unwrap()];
+        assert!(spot.contains("isTextField(node)"), "{spot}");
+        assert!(spot.contains("node.value"), "{spot}");
+        assert!(spot.contains("node.selectionStart"), "{spot}");
+        let restore = &APP_JS[APP_JS.find("function restoreFocus(").unwrap()..];
+        let restore = &restore[..restore.find("\n}\n").unwrap()];
+        assert!(restore.contains("same.value = t.value"), "{restore}");
+        assert!(restore.contains("same.setSelectionRange("), "{restore}");
+        assert!(
+            restore.contains("same.type === spot.node.type"),
+            "{restore}"
+        );
+        // Buttons and switches are not text fields.
+        let kinds = &APP_JS[APP_JS.find("function isTextField(").unwrap()..];
+        let kinds = &kinds[..kinds.find("\n}\n").unwrap()];
+        assert!(kinds.contains("\"checkbox\""), "{kinds}");
+    }
+
+    /// The checker's text fields and the Audit page's buttons have a key too,
+    /// so a page drawn anew (the end of a save, the minute turning) keeps the
+    /// focus there and not on `<body>`. (The browser check is part 5 of
+    /// `focus-identity.js` in the review tools.)
+    #[test]
+    fn the_checkers_text_fields_and_audit_buttons_keep_the_focus() {
+        for field in [
+            "\"data-focus\": \"blocklist:rule\"",
+            "\"data-focus\": \"blocklist:note\"",
+            "\"data-focus\": \"allow:rule\"",
+            "\"data-focus\": `node:${m.id}:rule`",
+            "\"data-focus\": \"model:endpoint_url\"",
+            "\"data-focus\": \"model:endpoint_model\"",
+            "\"data-focus\": \"model:token\"",
+            "\"data-focus\": \"model:threshold\"",
+            "\"data-focus\": \"model:timeout\"",
+            "\"data-focus\": \"model:instructions\"",
+            "\"data-focus\": \"model:criteria_true\"",
+            "\"data-focus\": \"model:criteria_false\"",
+        ] {
+            assert!(APP_JS.contains(field), "{field}");
+        }
+        // A decision has no id: its time, machine and call name the buttons.
+        let audit = "`audit:${d.ts}:${d.node_id}:${d.cap}.${d.action}`";
+        assert_eq!(APP_JS.matches(audit).count(), 2);
+        assert!(
+            APP_JS.contains("btn(label, kind, rule(list, wildcard), ic, `${auditKey}:${label}`)")
+        );
+        assert!(APP_JS.contains("`${auditKey}:Allow as wildcard`"));
+    }
+
+    /// A save in flight pulls the focus back only while the focus is still
+    /// on the control that started it (or has fallen to the page because
+    /// that control was replaced), and only on the page it started on
+    /// (review round 3, finding 2).
+    #[test]
+    fn a_save_in_flight_does_not_pull_the_focus_back() {
+        let replace = &APP_JS[APP_JS.find("function replacePage(").unwrap()..];
+        let replace = &replace[..replace.find("\n}\n").unwrap()];
+        assert!(replace.contains("p.page === current()"), "{replace}");
+        assert!(replace.contains("active === p.node"), "{replace}");
+        assert!(replace.contains("document.body"), "{replace}");
+        let go = &APP_JS[APP_JS.find("function go(").unwrap()..];
+        let go = &go[..go.find("\n}\n").unwrap()];
+        assert!(go.contains("pendingFocus = null"), "{go}");
+        // A save no button started (a picker's) holds the focus the same way,
+        // and the holder lets go only of its own spot.
+        let quietly = &APP_JS[APP_JS.find("function quietly(").unwrap()..];
+        let quietly = &quietly[..quietly.find("\n}\n").unwrap()];
+        assert!(quietly.contains("pendingFocus = spot"), "{quietly}");
+        assert!(quietly.contains("if (pendingFocus === spot)"), "{quietly}");
+    }
+
+    /// The Action checker page saves one change at a time: each save posts
+    /// the whole working copy, so a second change made while the first runs
+    /// rides along, and would be saved although the first was refused and
+    /// taken back (review round 3, finding 3). The page's controls are off
+    /// from the start of a save until it has settled, and are on again
+    /// before the page is drawn anew (a disabled control cannot take the
+    /// focus). (The browser check is `focus-identity.js` in the review tools.)
+    #[test]
+    fn the_checker_page_saves_one_change_at_a_time() {
+        let save = &APP_JS[APP_JS.find("async function saveChecker(").unwrap()..];
+        let save = &save[..save.find("\n}\n").unwrap()];
+        assert!(
+            save.find("lockSaves(true)").unwrap() < save.find("await api(").unwrap(),
+            "{save}"
+        );
+        let catch = &save[save.find("catch (e)").unwrap()..];
+        assert!(
+            catch.find("endSave()").unwrap() < catch.find("draw(true)").unwrap(),
+            "{save}"
+        );
+        assert!(save.contains("await loadChecker(true)"), "{save}");
+        let fin = &save[save.find("finally").unwrap()..];
+        assert!(fin.contains("endSave()"), "{save}");
+        let load = &APP_JS[APP_JS.find("async function loadChecker(").unwrap()..];
+        let load = &load[..load.find("\n}\n").unwrap()];
+        assert!(
+            load.find("endSave()").unwrap() < load.find("draw(true)").unwrap(),
+            "{load}"
+        );
+        // A page drawn while a save runs is locked too.
+        let draw = &APP_JS[APP_JS.find("function draw(").unwrap()..];
+        let draw = &draw[..draw.find("\n}\n").unwrap()];
+        assert!(draw.contains("checkerSaving) lockSaves(true)"), "{draw}");
+        // Nothing else on the page posts the whole copy.
+        assert_eq!(
+            APP_JS
+                .matches("await api(\"POST\", \"/api/checker\",")
+                .count(),
+            1
+        );
+    }
+
+    /// The relative luminance of `#rrggbb`, as WCAG defines it.
+    fn luminance(hex: &str) -> f64 {
+        let c = |i: usize| {
+            let v = f64::from(u8::from_str_radix(&hex[1 + 2 * i..3 + 2 * i], 16).unwrap()) / 255.0;
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * c(0) + 0.7152 * c(1) + 0.0722 * c(2)
+    }
+
+    fn contrast(a: &str, b: &str) -> f64 {
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
+    /// The off track of a switch shows the state, so it needs 3:1 against
+    /// what it sits on (WCAG 1.4.11), in both themes, and the web UI and the
+    /// app take it from the same token.
+    #[test]
+    fn the_off_switch_has_the_contrast_of_a_control() {
+        let theme = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../nerve-node-desktop/ui/theme.slint"
+        ))
+        .unwrap();
+        let colours = slint_global(&theme, "Theme");
+        let pair = |name: &str| {
+            let (_, v) = colours.iter().find(|(n, _)| n == name).unwrap();
+            let (d, l) = v
+                .strip_prefix("dark ? ")
+                .unwrap()
+                .split_once(" : ")
+                .unwrap();
+            (d.to_string(), l.to_string())
+        };
+        let (off_dark, off_light) = pair("switch-off");
+        for surface in ["window", "surface", "surface-alt"] {
+            let (d, l) = pair(surface);
+            assert!(contrast(&off_dark, &d) >= 3.0, "dark {surface}");
+            assert!(contrast(&off_light, &l) >= 3.0, "light {surface}");
+        }
+        // The white knob has to show on the track as well.
+        assert!(contrast(&off_dark, "#ffffff") >= 3.0);
+        assert!(contrast(&off_light, "#ffffff") >= 3.0);
+        let widgets = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../nerve-node-desktop/ui/widgets.slint"
+        ))
+        .unwrap();
+        assert!(widgets.contains("root.checked ? Theme.accent : Theme.switch-off;"));
+        let css = without_comments(APP_CSS);
+        assert!(css_block(&css, ".switch input").contains("background: var(--switch-off);"));
+    }
+
     #[test]
     fn loopback_hosts() {
         assert!(host_is_loopback(Some("127.0.0.1:7480")));

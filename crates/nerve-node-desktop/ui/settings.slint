@@ -3,7 +3,7 @@
 
 import { Theme, Type, Space, Radius, Size, Tone } from "theme.slint";
 import { Load, RelayNodeRow, Limit } from "data.slint";
-import { Store, Prefs, Install } from "store.slint";
+import { Store, Prefs, Install, Perm } from "store.slint";
 import {
     Button, ButtonKind, Card, Pill, Banner, PageHeader, PageFrame, Segmented, Divider,
     TextField, Field, InfoRow, ListRow, Icon, IconTile, Reveal, TabBar,
@@ -169,6 +169,7 @@ export component SettingsPage inherits PageFrame {
                 title: "Account for commands";
                 text: Install.windows
                     ? "Commands from centers run as this account."
+                    : Perm.owner-is-root ? "Folder and allowlist mode run commands as nerve-run, an account of their own that reaches only the folders you give it. User mode runs them as root, the owner of this node, with every right on this machine."
                     : "Folder and allowlist mode run commands as nerve-run, an account of their own that reaches only the folders you give it. User mode runs them as you.";
                 // One block: a hidden part takes no room, nor the space around it.
                 VerticalLayout {

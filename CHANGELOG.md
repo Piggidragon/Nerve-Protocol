@@ -34,6 +34,12 @@
 - On Linux the owner runs `setup` without `sudo`: its questions take the owner's input through the owner socket, and its one step that needs root, installing a keyring for the node's user, takes root by the service's own rights, only after a yes at a terminal. That step runs the package manager and `loginctl` by their full paths from the system's folders, with a fixed environment, in `/`, without input, and installs GNOME Keyring without what it only recommends. Setup's folder step gives `+rwx` on Enter.
 - The desktop app's Permissions page says who runs the commands, offers **Run them as you** in allowlist mode, lists `nerve-run`'s built-in folders, and shows a folder grant that failed.
 
+### Root as the owner ([#151](https://github.com/Piggidragon/Nerve-Protocol/issues/151))
+
+- `install` run by root itself (a server where you log in as root) asks at a terminal whether root is to be the node's owner, after saying what it means; the answer is no unless you type `y` or `yes`, and without a terminal (piped input included) nothing is asked. `--owner=root --accept-root-owner` says yes without a terminal; either flag alone, or the flags through `sudo` by another account, is refused. The choice is each install's; `update` keeps it.
+- With root as the owner, `user` mode and `allowlist` mode with `--as-owner` run commands as root, which can do everything on the machine, Nerve and its keys included; `folder` mode and `allowlist` mode run as `nerve-run`, as before. `nerve`, `nerve-run`, another account with uid 0 and an account that reaches the node's folders are never the owner.
+- `status` says so (`"owner_is_root"` with `--json`), and so do the desktop app's Overview, Permissions (user mode and the chip say **as root**, a banner **Its commands run as root**) and Settings. Root gets no polkit files, and no center turns sudo on while root is the owner (`sudo -v` checks no password of root's).
+
 ### Commands
 
 - `--json` on the read commands (`status`, `center ls`, `folder ls`, `rule ls`, `cap ls`, `config get`, `proxy ls`, `relay ls`, `sudo status`, `service status`, `audit`, `log`), and `{"messages": [...]}` or `{"error": ...}` from every other command (`docs/user/commands.md`).

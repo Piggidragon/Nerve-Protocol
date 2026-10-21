@@ -688,6 +688,15 @@ such a command when an agent tries it by mistake, and the node refuses a
 process it sees below one of its commands, but none of that is a boundary.
 The same holds for `allowlist` mode with `--as-owner`.
 
+Where root is the owner (an install that root ran itself and confirmed,
+[service](service.md#root-as-the-owner)), `user` mode and `allowlist` mode
+with `--as-owner` run commands as root. They can do everything on the
+machine, read the node's keys and change the node itself. Nothing in Nerve
+holds them back: the guard, the action checker and the refusal of the owner
+socket only catch mistakes, and root needs none of them to get in. It is
+your choice, as root, when you answer yes at `install`. `folder` mode and
+`allowlist` mode without `--as-owner` still run as `nerve-run`.
+
 ### Paths a command builds at run time
 
 The node checks the paths a command line names plainly (an absolute path, or

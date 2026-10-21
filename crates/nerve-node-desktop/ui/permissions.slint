@@ -87,7 +87,7 @@ component ModeSection inherits Section {
         OptionTile {
             icon: @image-url("icons/key.svg");
             title: "User";
-            text: "Anything you may do, as you, protected files aside.";
+            text: Perm.owner-is-root ? "Anything on this machine, as root." : "Anything you may do, as you, protected files aside.";
             selected: Perm.mode == "user";
             badge: Perm.mode == "user" ? "Now" : "";
             clicked => {
@@ -104,8 +104,8 @@ component ModeSection inherits Section {
             padding-bottom: Space.lg;
             alignment: start;
             Chip {
-                text: "Run them as you";
-                label: "Run the allowed commands as you";
+                text: Perm.owner-is-root ? "Run them as root" : "Run them as you";
+                label: Perm.owner-is-root ? "Run the allowed commands as root" : "Run the allowed commands as you";
                 on: Perm.as-owner;
                 toggled(on) => {
                     Perm.as-owner-set(on);
@@ -122,6 +122,20 @@ component ModeSection inherits Section {
             Banner {
                 tone: Tone.accent;
                 text: Perm.mode-until;
+            }
+        }
+    }
+    // Root as the owner: what runs as the owner runs as root.
+    Reveal {
+        shown: Perm.owner-is-root && (Perm.mode == "user" || (Perm.mode == "allowlist" && Perm.as-owner));
+        HorizontalLayout {
+            padding-left: Space.xl;
+            padding-right: Space.xl;
+            padding-bottom: Space.lg;
+            Banner {
+                tone: Tone.warn;
+                title: "Its commands run as root";
+                text: "Root is the owner of this node, so " + Perm.center + "'s commands run as root here: they can do everything on this machine, Nerve and its keys included, and nothing in Nerve holds them back.";
             }
         }
     }

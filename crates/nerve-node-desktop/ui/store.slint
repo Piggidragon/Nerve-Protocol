@@ -172,6 +172,8 @@ export global Perm {
     in-out property <bool> separate;
     in-out property <string> account;
     in-out property <bool> as-owner;
+    // Root is the owner (#151): what runs as the owner runs as root.
+    in-out property <bool> owner-is-root;
     in-out property <string> built-in;
     in-out property <string> grant-errors;
     in-out property <string> stale;

@@ -72,7 +72,7 @@ center is paired.
 
 | Command | Does | Page |
 |---|---|---|
-| `install` | Install the node as a service under its own user, make `nerve-run` and take you as the owner (Linux with sudo, Windows as administrator) | [service](service.md#install) |
+| `install [--owner=root --accept-root-owner]` | Install the node as a service under its own user, make `nerve-run` and take you as the owner (Linux with sudo, Windows as administrator); run by root itself, make root the owner after its yes, or with the flags | [service](service.md#install) |
 | `setup` | Name the node, choose where the keys are, pair the first center, choose its mode and a folder | [service](service.md#setup) |
 | `update [--from FILE]` | Put the latest release in place and restart the service | [service](service.md#update) |
 | `service start\|stop\|restart` | Start, stop or restart the installed service | [service](service.md#start-and-stop) |
@@ -102,7 +102,8 @@ one JSON value from stdout:
   (`{"entries": [...]}`, the lines as the file holds them; with `--follow`
   one a line). `status` has `"daemon"`:
   `"running"`, with what the running node says, or `"not running"`.
-  It names the installed node's `"owner"`, each center's `"account"` (the
+  It names the installed node's `"owner"` and `"owner_is_root"` (root is the
+  owner, so `user` mode runs as root), each center's `"account"` (the
   account its commands run as now, `null` on a node run by hand),
   `"as_owner"` and `"landlock"` (whether Landlock holds its commands now),
   the running Linux node's `"folder_grants"` (`"errors"`, `"stale"`,

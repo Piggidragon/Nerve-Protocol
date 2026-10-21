@@ -113,6 +113,7 @@ impl Ctl {
             p.set_separate(separate);
             p.set_account(account.as_str().into());
             p.set_as_owner(c["as_owner"] == true);
+            p.set_owner_is_root(st["owner_is_root"] == true);
             p.set_built_in(built_in.as_str().into());
             p.set_grant_errors(errors.join("\n").into());
             p.set_stale(stale.join("\n").into());
@@ -133,9 +134,11 @@ impl Ctl {
     fn as_owner_set(self: &Rc<Self>, on: bool) {
         let center = self.perm_center();
         let mut args = vec!["mode".into(), "set".into(), "allowlist".into()];
+        let root = self.with_perm(|p| p.get_owner_is_root()).unwrap_or(false);
         let said = if on {
             args.push("--as-owner".into());
-            format!("{center}'s allowed commands run as you.")
+            let whom = if root { "root" } else { "you" };
+            format!("{center}'s allowed commands run as {whom}.")
         } else {
             format!("{center}'s allowed commands run as nerve-run.")
         };

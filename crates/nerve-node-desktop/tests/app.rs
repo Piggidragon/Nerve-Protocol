@@ -558,6 +558,16 @@ fn the_app_drives_the_cli_end_to_end() {
             assert_eq!(perm.get_built_in(), "");
         }
     }
+    // Root as the owner (#151): the page knows, so its texts say root.
+    let mut st = serde_json::json!({"daemon": "running", "owner": "root", "owner_is_root": true,
+        "centers": [{"name": "home", "mode": "user", "account": "root"}]});
+    ctl.show_status(Ok(st.clone()));
+    assert!(perm.get_owner_is_root());
+    assert_eq!(perm.get_account(), "root");
+    st["owner"] = serde_json::json!("alice");
+    st["owner_is_root"] = serde_json::json!(false);
+    ctl.show_status(Ok(st));
+    assert!(!perm.get_owner_is_root());
     ctl.refresh_status();
     until(&ctl, "the node's own status", || {
         perm.get_landlock() && perm.get_home_warning() == "" && perm.get_stale() == ""

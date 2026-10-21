@@ -32,7 +32,16 @@ no other, no login shell, home `/var/lib/nerve-run`, comment
 `Nerve commands`) and takes the account that ran it (`SUDO_USER`,
 `PKEXEC_UID`) as the owner, which it writes into the unit
 (`Environment=NERVE_NODE_OWNER=<name>`); the node reads it from there. No
-other account can be chosen. A command gets its account's ids and groups,
+other account can be chosen. Run by root itself (no `SUDO_USER`, or
+`SUDO_USER=root`), `install` makes root the owner only after a yes at a
+terminal (default no; input that is no terminal's answers nothing) or with
+`--owner=root --accept-root-owner`, and writes `NERVE_NODE_OWNER=root`; an
+install without either drops root as the owner. Then what runs as the owner
+runs as root (uid 0, root's groups, `HOME` root's, no `no_new_privs`, the
+capabilities of root's exec), and the account check below is skipped for
+it; `nerve-run`'s commands are unchanged. No other account with uid 0 is an
+owner. A center cannot turn sudo on while root is the owner (`forbidden`):
+`sudo -v` checks no password of root's. A command gets its account's ids and groups,
 `HOME`, `USER` and `LOGNAME` set to it, and its home as the working
 directory when the call names none; one of `nerve-run` also gets
 `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, `XDG_DATA_HOME` and `XDG_STATE_HOME`
@@ -43,7 +52,7 @@ command of `nerve-run` is confined by Landlock in `allowlist` mode as well
 (where the kernel has it), to its folders and the built-in `/tmp`,
 `/var/tmp` and its home (§Modes), and gets its pairing's folders as POSIX
 ACLs (§Folder ACLs). An account that is missing, `nerve-run` not made by
-`install` (another comment), root or `nerve` runs no command
+`install` (another comment), root (unless it is the owner) or `nerve` runs no command
 (`unavailable`), after its call was decided and audited; without an owner,
 no command that would run as the owner runs. Before a command starts, in
 the child, the node checks with `access()` that the account can neither list

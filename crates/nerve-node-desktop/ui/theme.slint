@@ -125,3 +125,35 @@ export global Size {
     out property <length> content-max: 980px;
     out property <length> dialog: 520px;
 }
+
+// How things move: every animation of the app takes its time from here, and
+// its curve from Curve below, so they are short and alike. Nothing moves (0 ms, the loops
+// stand still) until the app knows that the desktop does not ask for less
+// motion (src/motion.rs); the tests and the screenshots, which leave it off,
+// draw each state at once.
+export global Motion {
+    in-out property <bool> on;
+
+    // The colour of a hover or a press, a box ticked.
+    out property <duration> quick: on ? 100ms : 0ms;
+    // A switch, a section that opens, a toast, the steps' dots.
+    out property <duration> base: on ? 150ms : 0ms;
+    // A page or a dialog that comes in.
+    out property <duration> enter: on ? 200ms : 0ms;
+    // A dialog or a toast that goes: quicker than it came.
+    out property <duration> leave: on ? 120ms : 0ms;
+    // How far a page, a dialog or a toast rises while it comes in.
+    out property <length> rise: on ? 8px : 0px;
+
+    // One round of the loops that show waiting: the loading dots, the
+    // spinner.
+    out property <duration> pulse: 1100ms;
+    out property <duration> spin: 900ms;
+}
+
+// The curve of every animation, with the times of Motion: fast at first,
+// gentle at the end, so what comes in settles. A global of its own, as
+// Slint gives a curve no way to the Rust side, where Motion goes.
+export global Curve {
+    out property <easing> ease: ease-out-quart;
+}

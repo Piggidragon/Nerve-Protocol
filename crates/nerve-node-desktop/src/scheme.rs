@@ -25,7 +25,7 @@ pub fn dark_here() -> Option<bool> {
 }
 
 /// The output of `program args`, if it ran well within [`WAIT`].
-fn ask(program: &str, args: &[&str]) -> Option<String> {
+pub(crate) fn ask(program: &str, args: &[&str]) -> Option<String> {
     let mut child = std::process::Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())
@@ -53,7 +53,7 @@ fn ask(program: &str, args: &[&str]) -> Option<String> {
 }
 
 /// KDE's settings file of this user.
-fn kdeglobals() -> Option<PathBuf> {
+pub(crate) fn kdeglobals() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
@@ -82,18 +82,31 @@ pub fn detect(
 }
 
 /// The portal's `org.freedesktop.appearance color-scheme`: 1 dark, 2 light,
-/// 0 no preference (none here). `ReadOne` is the newer method, `Read` the
-/// one of older portals (Ubuntu 22.04); `busctl`, or `gdbus` without it.
+/// 0 no preference (none here).
 fn portal(ask: &dyn Fn(&str, &[&str]) -> Option<String>) -> Option<bool> {
+    match portal_number(ask, "org.freedesktop.appearance", "color-scheme") {
+        Some(1) => Some(true),
+        Some(2) => Some(false),
+        _ => None,
+    }
+}
+
+/// The number the desktop portal keeps as `key` of `namespace`, none when it
+/// does not answer. `ReadOne` is the newer method, `Read` the one of older
+/// portals (Ubuntu 22.04); `busctl`, or `gdbus` without it.
+pub(crate) fn portal_number(
+    ask: &dyn Fn(&str, &[&str]) -> Option<String>,
+    namespace: &str,
+    key: &str,
+) -> Option<u32> {
     let dest = "org.freedesktop.portal.Desktop";
     let path = "/org/freedesktop/portal/desktop";
     let iface = "org.freedesktop.portal.Settings";
-    let key = ["org.freedesktop.appearance", "color-scheme"];
     for method in ["ReadOne", "Read"] {
         let busctl = ask(
             "busctl",
             &[
-                "--user", "call", dest, path, iface, method, "ss", key[0], key[1],
+                "--user", "call", dest, path, iface, method, "ss", namespace, key,
             ],
         );
         let gdbus = || {
@@ -109,17 +122,13 @@ fn portal(ask: &dyn Fn(&str, &[&str]) -> Option<String>) -> Option<bool> {
                     path,
                     "--method",
                     &m,
-                    key[0],
-                    key[1],
+                    namespace,
+                    key,
                 ],
             )
         };
         if let Some(out) = busctl.or_else(gdbus) {
-            return match last_number(&out) {
-                Some(1) => Some(true),
-                Some(2) => Some(false),
-                _ => None,
-            };
+            return last_number(&out);
         }
     }
     None

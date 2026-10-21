@@ -2,7 +2,7 @@
 // from these only, so a button or a card looks the same everywhere.
 
 import { ScrollView } from "std-widgets.slint";
-import { Theme, Type, Space, Radius, Size, Tone } from "theme.slint";
+import { Theme, Type, Space, Radius, Size, Tone, Motion, Curve } from "theme.slint";
 
 export component Icon inherits Image {
     in property <length> size: Size.icon;
@@ -22,15 +22,36 @@ export component Divider inherits Rectangle {
 // box, while this is measured where it stands. Hidden, it takes no room;
 // shown, `gap` stands above it, so the layout around it needs no spacing of
 // its own for it.
+//
+// A `smooth` one opens and closes in a short slide (an expanding section, an
+// error that comes). One that takes turns with others in one place (the
+// steps of the installer, the tabs of a page) `fade`s in when its turn comes
+// and goes at once, so the two never stand there together. The others change
+// at once. Its height follows its content at once all the same: only the
+// opening moves.
 export component Reveal inherits Rectangle {
     in property <bool> shown;
     in property <length> gap;
-    visible: root.shown;
-    height: root.shown ? self.preferred-height : 0px;
+    in property <bool> smooth;
+    in property <bool> fade;
+    // How far it is open, 0 to 1.
+    property <float> open: root.shown ? 1 : 0;
+    animate open {
+        duration: root.smooth ? Motion.base : root.fade && root.shown ? Motion.enter : 0ms;
+        easing: Curve.ease;
+    }
+    property <bool> closing: !root.shown && self.open > 0;
+    visible: root.shown || self.closing;
+    height: root.fade ? (root.shown ? self.preferred-height : 0px) : self.preferred-height * self.open;
+    opacity: self.open;
+    clip: self.open < 1;
     VerticalLayout {
         padding-top: root.gap;
         @children
     }
+    // What is closing takes no more clicks: a second click meant for a
+    // button that is going does not press it again.
+    if root.closing: TouchArea { }
 }
 
 // A row of a `for` whose content wraps. Slint measures a repeated row
@@ -56,7 +77,8 @@ export component Dots {
             height: root.dot;
             border-radius: root.dot / 2;
             background: root.color;
-            opacity: 0.3 + 0.7 * Math.abs(Math.sin(animation-tick() / 1100ms * 180deg - i * 45deg));
+            // They stand still, at full colour, without motion.
+            opacity: Motion.on ? 0.3 + 0.7 * Math.abs(Math.sin(animation-tick() / Motion.pulse * 180deg - i * 45deg)) : 1;
         }
     }
 }
@@ -74,7 +96,7 @@ export component Spinner {
         image-fit: contain;
         source: @image-url("icons/spinner.svg");
         colorize: root.colorize;
-        transform-rotation: animation-tick() / 900ms * 360deg;
+        transform-rotation: Motion.on ? animation-tick() / Motion.spin * 360deg : 0deg;
     }
 }
 
@@ -135,7 +157,7 @@ export component Button {
         border-width: root.kind == ButtonKind.secondary ? 1px : 0;
         border-color: Theme.border-strong;
         background: transparent;
-        animate background { duration: 110ms; }
+        animate background, border-color { duration: Motion.quick; }
         states [
             filled-off when root.filled && root.off: {
                 background: Theme.surface-alt;
@@ -515,6 +537,7 @@ export component PageHeader {
         Reveal {
             shown: root.error != "";
             gap: Space.xl;
+            smooth: true;
             Banner {
                 tone: Tone.danger;
                 title: root.error-title;
@@ -580,17 +603,22 @@ export component NavItem {
     Rectangle {
         border-radius: Radius.md;
         background: root.selected ? Theme.accent-soft : touch.has-hover ? Theme.hover : transparent;
-        animate background { duration: 110ms; }
+        animate background { duration: Motion.quick; }
     }
-    // The page that is open has a bar of the accent at its edge.
+    // The page that is open has a bar of the accent at its edge; it grows
+    // from the middle when the page opens.
     Rectangle {
         x: 0;
         y: (parent.height - self.height) / 2;
         width: 3px;
-        height: 18px;
+        height: root.selected ? 18px : 0px;
+        animate height {
+            duration: Motion.base;
+            easing: Curve.ease;
+        }
         border-radius: 1.5px;
         background: Theme.accent;
-        visible: root.selected;
+        visible: self.height > 0;
     }
     FocusRing {
         x: -3px;
@@ -1030,6 +1058,7 @@ export component Expander inherits Rectangle {
     border-radius: Radius.lg;
     border-width: 1px;
     border-color: root.open ? Theme.accent.transparentize(0.55) : Theme.border;
+    animate border-color { duration: Motion.base; }
     height: self.preferred-height;
     VerticalLayout {
         Rectangle {
@@ -1097,6 +1126,7 @@ export component Expander inherits Rectangle {
         }
         Reveal {
             shown: root.open;
+            smooth: true;
             VerticalLayout {
                 padding-left: Space.xl;
                 padding-right: Space.xl;
@@ -1138,7 +1168,7 @@ export component Switch {
     Rectangle {
         border-radius: self.height / 2;
         background: root.checked ? Theme.accent : Theme.border-strong;
-        animate background { duration: 140ms; }
+        animate background { duration: Motion.base; }
         Rectangle {
             width: 18px;
             height: 18px;
@@ -1146,7 +1176,10 @@ export component Switch {
             x: root.checked ? parent.width - self.width - 2px : 2px;
             border-radius: 9px;
             background: #ffffff;
-            animate x { duration: 140ms; easing: ease-out; }
+            animate x {
+                duration: Motion.base;
+                easing: Curve.ease;
+            }
         }
     }
     TouchArea {
@@ -1401,16 +1434,26 @@ export component PathText {
     }
 }
 
-// A window over the page; the page behind waits. Escape closes it and
-// Enter takes its main button (`enter`), wherever the focus is in it,
-// unless a field or a button takes the key itself.
+// A window over the page; the page behind waits, under the window's veil
+// (app.slint). Escape closes it and Enter takes its main button (`enter`),
+// wherever the focus is in it, unless a field or a button takes the key
+// itself.
+//
+// It comes in rising a little and fading in. It goes at once, with the veil
+// lifting after it: a card that stayed while it fades would take a second
+// click meant for the page.
 export component Dialog inherits Rectangle {
     in property <string> title;
     in property <string> subtitle;
     in property <length> card-width: Size.dialog;
     callback close();
     callback enter();
-    background: Theme.scrim;
+    // How far it came in, 0 to 1.
+    property <float> came: 0;
+    animate came {
+        duration: Motion.enter;
+        easing: Curve.ease;
+    }
     // Clicks do not reach the page behind.
     TouchArea { }
     keys := FocusScope {
@@ -1433,7 +1476,8 @@ export component Dialog inherits Rectangle {
             // a longer content scrolls, so a dialog fits a small screen.
             height: min(body.preferred-height, root.height - 48px);
             x: (root.width - self.width) / 2;
-            y: max(24px, (root.height - self.height) * 0.42);
+            y: max(24px, (root.height - self.height) * 0.42) + (1 - root.came) * Motion.rise;
+            opacity: root.came;
             background: Theme.surface;
             border-radius: Radius.xl;
             border-width: 1px;
@@ -1492,10 +1536,11 @@ export component Dialog inherits Rectangle {
             }
         }
     }
-    // The keys come to the dialog from the start; a field that wants the
-    // focus first takes it in its own `init`.
+    // The keys come to the dialog from the start, while it still comes in;
+    // a field that wants the focus first takes it in its own `init`.
     init => {
         keys.focus();
+        root.came = 1;
     }
 }
 
@@ -1506,6 +1551,7 @@ export component DialogButtons inherits VerticalLayout {
     in property <string> error-title;
     Reveal {
         shown: root.error != "";
+        smooth: true;
         Banner {
             tone: Tone.danger;
             title: root.error-title;
@@ -1559,13 +1605,25 @@ export component Toast inherits Rectangle {
 }
 
 // A page: its content scrolls, at most Size.content-max wide, in the middle.
+// A page that opens rises a little and fades in.
 export component PageFrame {
     // The space between the page's parts; a page whose parts are Reveals
     // sets 0 and gives each its gap.
     in property <length> gap: Space.xxl;
     // The side margins grow on a wide window, so the content keeps its width.
     property <length> side: max(Space.page, (scroll.visible-width - Size.content-max) / 2);
+    // How far it came in, 0 to 1.
+    property <float> came: 0;
+    animate came {
+        duration: Motion.enter;
+        easing: Curve.ease;
+    }
+    init => {
+        root.came = 1;
+    }
     scroll := ScrollView {
+        y: (1 - root.came) * Motion.rise;
+        opacity: root.came;
         width: root.width;
         height: root.height;
         content-width: self.visible-width;
@@ -1668,7 +1726,7 @@ export component CheckBox {
                 background: root.checked ? Theme.accent : Theme.surface;
                 border-width: root.checked ? 0 : 1.5px;
                 border-color: touch.has-hover ? Theme.accent : Theme.border-strong;
-                animate background { duration: 110ms; }
+                animate background, border-color { duration: Motion.quick; }
                 FocusRing {
                     x: -3px;
                     y: -3px;
@@ -1842,7 +1900,7 @@ export component OptionTile inherits Rectangle {
         root.clicked();
     }
     opacity: root.enabled ? 1 : 0.5;
-    animate background { duration: 110ms; }
+    animate background, border-color { duration: Motion.quick; }
     forward-focus: focus;
     FocusRing {
         x: -3px;
@@ -1990,7 +2048,10 @@ export component Steps {
             height: 8px;
             border-radius: 4px;
             background: i <= root.current ? Theme.accent : Theme.border-strong;
-            animate width { duration: 160ms; }
+            animate width, background {
+                duration: Motion.base;
+                easing: Curve.ease;
+            }
         }
     }
 }

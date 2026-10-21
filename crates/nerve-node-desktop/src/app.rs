@@ -14,7 +14,7 @@ use slint::{ComponentHandle, ModelRc, SharedString, VecModel};
 
 use crate::broker::Launch;
 use crate::runner::{Follow, Runner};
-use crate::{AppWindow, Install, Load, Manual, Page, Perm, Prefs, Store, Tone, Type, view};
+use crate::{AppWindow, Install, Load, Manual, Motion, Page, Perm, Prefs, Store, Tone, Type, view};
 
 mod install;
 mod live;
@@ -36,6 +36,10 @@ pub enum Exec {
 /// How the app asks the desktop whether it is dark (crate::scheme): none
 /// when it does not say.
 pub type SchemeSource = fn() -> Option<bool>;
+
+/// How the app asks the desktop whether it wants less motion
+/// (crate::motion): none when it does not say.
+pub type MotionSource = fn() -> Option<bool>;
 
 /// What the owner picks in one of the system's file dialogs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +155,12 @@ pub struct Ctl {
     /// How the desktop is asked (crate::scheme::dark_here); none in tests
     /// and screenshots, which set the look themselves.
     scheme_source: Cell<Option<SchemeSource>>,
+    /// Asks the desktop now and then whether it wants less motion
+    /// (crate::motion).
+    motion_timer: slint::Timer,
+    /// How the desktop is asked (crate::motion::reduced_here); none in tests
+    /// and screenshots, which draw without motion.
+    motion_source: Cell<Option<MotionSource>>,
     /// Every command of the CLI, for the Help page's reference.
     reference: Vec<crate::reference::Command>,
     /// The commands and topics of the reference the owner opened or closed.
@@ -292,6 +302,10 @@ impl Ctl {
             desktop_dark: Cell::new(None),
             scheme_source: Cell::new(
                 (exec == Exec::Threads).then_some(crate::scheme::dark_here as SchemeSource),
+            ),
+            motion_timer: slint::Timer::default(),
+            motion_source: Cell::new(
+                (exec == Exec::Threads).then_some(crate::motion::reduced_here as MotionSource),
             ),
             reference: crate::reference::commands(&nerve_node::cli::help()),
             ref_opened: RefCell::default(),
@@ -870,8 +884,7 @@ impl Ctl {
     fn pair(self: &Rc<Self>, link: &str, name: &str, yes: bool) {
         let mut args = vec!["center".to_string(), "add".into(), link.trim().to_string()];
         if !name.trim().is_empty() {
-            args.push("--name".into());
-            args.push(name.trim().into());
+            args.push(format!("--name={}", name.trim()));
         }
         if yes {
             args.push("--yes".into());
@@ -934,7 +947,7 @@ impl Ctl {
         } else {
             format!("{name} is resumed.")
         };
-        let args = vec!["center".into(), verb.into(), "--center".into(), name.into()];
+        let args = vec!["center".into(), verb.into(), format!("--center={name}")];
         self.change(name, args, said);
     }
 
@@ -950,8 +963,7 @@ impl Ctl {
             "grant".into(),
             "settings".into(),
             value.into(),
-            "--center".into(),
-            name.into(),
+            format!("--center={name}"),
         ];
         self.change(name, args, said);
     }
@@ -1022,12 +1034,7 @@ impl Ctl {
         };
         match p {
             Pending::Unpair(name) => {
-                let args = vec![
-                    "center".into(),
-                    "rm".into(),
-                    "--center".into(),
-                    name.clone(),
-                ];
+                let args = vec!["center".into(), "rm".into(), format!("--center={name}")];
                 self.change(&name, args, format!("Unpaired {name}."));
             }
             Pending::RotateKey(name) => {
@@ -1039,7 +1046,7 @@ impl Ctl {
                     if end {
                         a.push("--end-grace".into());
                     }
-                    a.extend(["--center".into(), name.clone()]);
+                    a.push(format!("--center={name}"));
                     a
                 };
                 let end_grace = args(true);
@@ -1261,6 +1268,44 @@ impl Ctl {
             },
         );
     }
+
+    /// Asks the desktop how it asks it ([`Ctl::follow_motion`]).
+    pub fn set_motion_source(&self, source: Option<MotionSource>) {
+        self.motion_source.set(source);
+    }
+
+    /// Moves, or not, as the desktop said (none: it did not say, and the
+    /// app moves).
+    pub fn desktop_motion(&self, reduced: Option<bool>) {
+        if let Some(w) = self.window.upgrade() {
+            w.global::<Motion>().set_on(reduced != Some(true));
+        }
+    }
+
+    /// Follows whether the desktop wants less motion (crate::motion), now
+    /// and, with an event loop, every few seconds, so a change there shows
+    /// here too. Until it answered nothing moves.
+    pub fn follow_motion(self: &Rc<Self>) {
+        let Some(source) = self.motion_source.get() else {
+            return;
+        };
+        let ask = move |c: &Rc<Ctl>| c.job(move |_| source(), |c, r| c.desktop_motion(r));
+        ask(self);
+        // No event loop, no timers.
+        if self.exec != Exec::Threads {
+            return;
+        }
+        let c = Rc::downgrade(self);
+        self.motion_timer.start(
+            slint::TimerMode::Repeated,
+            Duration::from_secs(5),
+            move || {
+                if let Some(c) = c.upgrade() {
+                    ask(&c);
+                }
+            },
+        );
+    }
 }
 
 /// Opens the window and runs until it is closed. The installed program
@@ -1296,6 +1341,7 @@ pub fn run(start: crate::instance::Asked) -> Result<(), Failed> {
     let runner = Runner::this_program().map_err(Failed::Other)?;
     let window = new_window().map_err(Failed::Window)?;
     let ctl = Ctl::attach(&window, runner, Exec::Threads);
+    ctl.follow_motion();
     if let Some(file) = crate::settings::file() {
         ctl.keep_settings(file);
     }

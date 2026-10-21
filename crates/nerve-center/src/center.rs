@@ -750,7 +750,10 @@ impl Center {
             Err(e) => return err(400, &format!("bad pairing request: {e}")),
         };
         if !nerve_proto::valid_node_name(&req.name) {
-            return err(400, "a node name is 1 to 32 characters of a-z, 0-9 and -");
+            return err(
+                400,
+                "a node name is 1 to 32 characters of a-z, 0-9 and -, starting and ending with a letter or digit",
+            );
         }
         if req.platform.is_empty()
             || req.platform.len() > 32
@@ -1351,7 +1354,7 @@ impl Center {
 
     pub fn rename(&self, node_id: &str, name: &str) -> Result<(), String> {
         if !nerve_proto::valid_node_name(name) {
-            return Err("a node name is 1 to 32 characters of a-z, 0-9 and -".into());
+            return Err("a node name is 1 to 32 characters of a-z, 0-9 and -, starting and ending with a letter or digit".into());
         }
         let old = self.update(|s| {
             if s.nodes.values().any(|n| n.name == name && n.id != node_id) {

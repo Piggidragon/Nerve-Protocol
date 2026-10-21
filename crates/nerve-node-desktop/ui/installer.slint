@@ -375,6 +375,7 @@ export component InstallerView inherits Rectangle {
                         // What will be installed.
                         Reveal {
                             shown: Install.step == "welcome";
+                            fade: true;
                             VerticalLayout {
                                 spacing: Space.xl;
                                 StepHead {
@@ -447,6 +448,7 @@ export component InstallerView inherits Rectangle {
                         // Installed already: open, update or remove it.
                         Reveal {
                             shown: Install.step == "installed";
+                            fade: true;
                             VerticalLayout {
                                 spacing: Space.xl;
                                 StepHead {
@@ -515,6 +517,7 @@ export component InstallerView inherits Rectangle {
                         // What goes with an uninstall.
                         Reveal {
                             shown: Install.step == "choose";
+                            fade: true;
                             VerticalLayout {
                                 spacing: Space.xl;
                                 StepHead {
@@ -547,12 +550,15 @@ export component InstallerView inherits Rectangle {
 
                         Reveal {
                             shown: root.working;
+
+                            fade: true;
                             Working { }
                         }
 
                         // Done.
                         Reveal {
                             shown: Install.step == "done";
+                            fade: true;
                             VerticalLayout {
                                 spacing: Space.xl;
                                 StepHead {

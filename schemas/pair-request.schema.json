@@ -7,7 +7,7 @@
   "additionalProperties": false,
   "properties": {
     "code": {"type": "string", "pattern": "^[A-Za-z0-9]{1,64}$"},
-    "name": {"type": "string", "pattern": "^[a-z0-9-]{1,32}$"},
+    "name": {"type": "string", "pattern": "^[a-z0-9]([a-z0-9-]{0,30}[a-z0-9])?$"},
     "platform": {"type": "string"},
     "arch": {"type": "string"},
     "public_key": {"type": "string", "pattern": "^[0-9a-f]{64}$"}

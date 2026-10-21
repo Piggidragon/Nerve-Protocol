@@ -31,7 +31,7 @@ center is paired.
 | `center ls` | List centers, their mode and grant | [pairing](pairing.md) |
 | `center pause`, `center resume` | Stop or restart the link to a center | [stop](stop.md#pause) |
 | `center grant settings write\|off` | Let a center change settings | [settings grant](settings-grant.md) |
-| `proxy set <url> [--pin P] [--header 'N: v'] [--password-stdin] [--headers-stdin]`, `proxy ls`, `proxy rm` | Dial centers through a proxy, or a relay (`proxy set '<nerve://relay link>'`) | [proxy](proxy.md) |
+| `proxy set <url> [--pin=P] [--header 'N: v'] [--password-stdin] [--headers-stdin]`, `proxy ls`, `proxy rm` | Dial centers through a proxy, or a relay (`proxy set '<nerve://relay link>'`) | [proxy](proxy.md) |
 | `relay set <ip:port>`, `relay off` | Let other nodes reach this node's centers through it | [relay](relay.md) |
 | `relay add <name> [--center C] [--address HOST[:PORT]]`, `relay rm <name>`, `relay ls` | Give a node a relay link (its token in it), take it away, see who is connected | [relay](relay.md) |
 | `relay set-centers <name> [--center C]` | Change which centers a relayed node may reach | [relay](relay.md#limit-a-node-to-some-centers) |

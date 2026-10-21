@@ -326,7 +326,7 @@ function nodeCard(n) {
       : el("p", { class: "meta" }, "Offers nothing yet."),
     el("div", { class: "actions" },
       btn("Rename", "ghost", act(async () => {
-        const name = await modal({ title: `Rename ${n.name}`, confirm: "Rename", field: { label: "New name (a-z, 0-9 and -)", value: n.name, pattern: "[a-z0-9\\-]+" } });
+        const name = await modal({ title: `Rename ${n.name}`, confirm: "Rename", field: { label: "New name (a-z, 0-9 and -, not starting or ending with -)", value: n.name, pattern: "[a-z0-9]([a-z0-9\\-]*[a-z0-9])?" } });
         if (name && name !== n.name) await api("POST", "/api/nodes/rename", { id: n.id, name });
       }), "edit"),
       btn(n.disabled ? "Enable" : "Disable", "ghost", act(() => api("POST", "/api/nodes/disable", { id: n.id, disabled: !n.disabled })), n.disabled ? "ok" : "ban"),

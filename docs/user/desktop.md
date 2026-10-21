@@ -408,6 +408,16 @@ its colour scheme; it follows a change within a few seconds. **Light** and
 **Dark** win over the desktop. A change of the look comes in one step, with no
 light frame between two dark ones.
 
+Pages, dialogs, notes in the corner, sections that open, buttons and switches
+move briefly (up to 200 ms). When the desktop asks for less motion they do not,
+and the loading dots and spinners stand still: on GNOME **Reduce Animation**
+in the accessibility settings (`enable-animations`), on KDE an animation
+speed of **Instant** (`AnimationDurationFactor=0` in `kdeglobals`), on Windows
+**Animation effects** off (Accessibility, Visual effects). On Linux the app
+asks the desktop portal's `reduced-motion` first, and GTK's
+`gtk-enable-animations` on other desktops. It follows a change within a few
+seconds.
+
 The appearance (system, light or dark), and the card on commands that run as
 you when you hid it, are kept in
 `~/.config/nerve-node-desktop/settings.json` on Linux and

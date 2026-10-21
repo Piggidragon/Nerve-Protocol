@@ -49,7 +49,8 @@ working without it.
 - The **node id** is the lowercase base32 (RFC 4648 alphabet, no padding) of the
   first 16 bytes of SHA-256 of the 32-byte raw public key it paired with: 26
   characters. It stays when the key is rotated (§4.10).
-- A **node name** is 1 to 32 characters of `a-z`, `0-9` and `-`. The default is
+- A **node name** is 1 to 32 characters of `a-z`, `0-9` and `-`, starting and
+  ending with a letter or digit (like a DNS label). The default is
   derived from the host name.
 
 ## 3. Pairing

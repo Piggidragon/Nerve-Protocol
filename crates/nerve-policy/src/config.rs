@@ -88,7 +88,7 @@ pub struct AllowedProvider {
 }
 
 /// Whether `name` can name a provider: a node name's shape (1 to 32 of
-/// a-z, 0-9 and `-`), and not `node`, which stands for the node itself.
+/// a-z, 0-9 and `-`, starting and ending with a letter or digit), and not `node`, which stands for the node itself.
 pub fn valid_provider_name(name: &str) -> bool {
     nerve_proto::valid_node_name(name) && name != "node"
 }
@@ -521,7 +521,7 @@ impl Relay {
             }
             if !nerve_proto::valid_node_name(&n.name) {
                 return Err(format!(
-                    "relay.node name {:?}: 1 to 32 characters of a-z, 0-9 and -",
+                    "relay.node name {:?}: 1 to 32 characters of a-z, 0-9 and -, starting and ending with a letter or digit",
                     n.name
                 ));
             }
@@ -1077,7 +1077,7 @@ impl NodeConfig {
             && !nerve_proto::valid_node_name(n)
         {
             return Err(format!(
-                "node.name {n:?}: 1 to 32 characters of a-z, 0-9 and -"
+                "node.name {n:?}: 1 to 32 characters of a-z, 0-9 and -, starting and ending with a letter or digit"
             ));
         }
         if let Some(u) = &self.machine.user
@@ -1153,7 +1153,7 @@ impl NodeConfig {
         for p in &self.providers.allowed {
             if !valid_provider_name(&p.name) {
                 return Err(format!(
-                    "providers.allowed name {:?}: 1 to 32 characters of a-z, 0-9 and -, not node",
+                    "providers.allowed name {:?}: 1 to 32 characters of a-z, 0-9 and -, starting and ending with a letter or digit, not node",
                     p.name
                 ));
             }
@@ -1172,7 +1172,7 @@ impl NodeConfig {
         for c in &mut self.centers {
             if !valid_center_name(&c.name) {
                 return Err(format!(
-                    "center name {:?}: 1 to 64 characters of a-z, A-Z, 0-9, - and _",
+                    "center name {:?}: 1 to 64 characters of a-z, A-Z, 0-9, - and _, starting and ending with a letter or digit",
                     c.name
                 ));
             }
@@ -1262,11 +1262,16 @@ pub fn valid_login(s: &str) -> bool {
             .any(|c| c == ':' || c == '@' || c.is_whitespace() || c.is_control())
 }
 
-/// A center's name as the CLI and the key file name use it.
+/// A center's name as the CLI and the key file name use it: 1 to 64 of
+/// A-Z, a-z, 0-9, `-` and `_`, starting and ending with a letter or digit
+/// (a name that starts with `-` would read as a flag).
 pub fn valid_center_name(s: &str) -> bool {
+    let edge = |b: Option<&u8>| b.is_some_and(u8::is_ascii_alphanumeric);
     (1..=64).contains(&s.len())
         && s.bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        && edge(s.as_bytes().first())
+        && edge(s.as_bytes().last())
 }
 
 impl CenterPolicy {
@@ -1334,6 +1339,30 @@ impl CenterPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_start_and_end_with_a_letter_or_digit() {
+        for ok in ["lab", "Lab_2", "a", "a-b_c"] {
+            assert!(valid_center_name(ok), "{ok}");
+        }
+        for bad in ["", "-lab", "lab-", "_lab", "lab_", "-", "a b"] {
+            assert!(!valid_center_name(bad), "{bad}");
+        }
+        assert!(valid_provider_name("desk-2"));
+        for bad in ["-desk", "desk-", "node"] {
+            assert!(!valid_provider_name(bad), "{bad}");
+        }
+        for (key, toml) in [
+            ("node.name", "[node]\nname = \"-lab\"\n"),
+            (
+                "center name",
+                "[[center]]\nname = \"-home\"\nurl = \"https://c.example\"\ncenter_id = \"c\"\nnode_id = \"n\"\n",
+            ),
+        ] {
+            let e = NodeConfig::parse(toml).expect_err(key);
+            assert!(e.contains("starting and ending"), "{key}: {e}");
+        }
+    }
 
     const SAMPLE_TEMPLATE: &str = r#"
 [node]

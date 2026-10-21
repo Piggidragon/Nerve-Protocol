@@ -1230,6 +1230,61 @@ mod tests {
         assert!(uses.iter().all(|l| l.contains("ev.currentTarget.checked")));
     }
 
+    /// The Action checker page changes its working copy and then saves it.
+    /// A refused save must not leave the change behind, or the next save
+    /// (of anything on the page) sends it: the copy goes back to what the
+    /// center kept, and the error still reaches the toast. The model form
+    /// changes a copy and not the working copy. (The browser check is
+    /// `checker-failed-save.js` in the review tools.)
+    #[test]
+    fn a_refused_checker_save_leaves_no_change_behind() {
+        let save = &APP_JS[APP_JS.find("async function saveChecker(").unwrap()..];
+        let save = &save[..save.find("\n}\n").unwrap()];
+        let catch = &save[save.find("catch (e)").unwrap()..];
+        assert!(catch.contains("c.cfg = structuredClone(c.saved)"), "{save}");
+        assert!(catch.contains("draw(true)"), "{save}");
+        assert!(catch.contains("throw e"), "{save}");
+        let load = &APP_JS[APP_JS.find("async function loadChecker(").unwrap()..];
+        let load = &load[..load.find("\n}\n").unwrap()];
+        assert!(load.contains("saved: structuredClone(cfg)"), "{load}");
+        let model = &APP_JS[APP_JS.find("function modelCard(").unwrap()..];
+        let model = &model[..model.find("\n}\n").unwrap()];
+        assert!(model.contains("await saveChecker(next)"), "{model}");
+        assert!(!model.contains("m.source ="), "{model}");
+        // The page saves in one place only.
+        assert_eq!(
+            APP_JS
+                .matches("await api(\"POST\", \"/api/checker\",")
+                .count(),
+            1
+        );
+    }
+
+    /// A save draws the page anew, and the focus is put back on the control
+    /// it was on: a keyboard user toggling switches goes on from there, and
+    /// does not start at the top of the page again.
+    #[test]
+    fn a_page_drawn_anew_keeps_the_focus() {
+        let replace = &APP_JS[APP_JS.find("function replacePage(").unwrap()..];
+        let replace = &replace[..replace.find("\n}\n").unwrap()];
+        assert!(replace.contains("restoreFocus(spot)"), "{replace}");
+        assert!(
+            replace.contains("pendingFocus || focusSpot(document.activeElement)"),
+            "{replace}"
+        );
+        let act = &APP_JS[APP_JS.find("function act(").unwrap()..];
+        let act = &act[..act.find("\n}\n").unwrap()];
+        // Taken before the control is made busy: a disabled control may
+        // already have lost the focus.
+        assert!(
+            act.find("pendingFocus = focusSpot(b)").unwrap()
+                < act.find("setBusy(b, true)").unwrap(),
+            "{act}"
+        );
+        // The pages that are redrawn on a save go through replacePage.
+        assert_eq!(APP_JS.matches("replacePage(").count(), 3);
+    }
+
     /// The relative luminance of `#rrggbb`, as WCAG defines it.
     fn luminance(hex: &str) -> f64 {
         let c = |i: usize| {

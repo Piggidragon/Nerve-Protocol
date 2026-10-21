@@ -210,11 +210,43 @@ function setBusy(b, on) {
 function act(fn) {
   return async (ev) => {
     const b = ev.currentTarget;
+    // A busy control may lose the focus, and a page that is drawn anew
+    // loses it for good: the page puts it back where it was.
+    pendingFocus = focusSpot(b);
     setBusy(b, true);
     try { await fn(ev); await tick(); draw(false); }
     catch (e) { if (!e.auth) notify(e.message, "error"); }
-    finally { setBusy(b, false); }
+    finally { setBusy(b, false); pendingFocus = null; }
   };
+}
+
+// Where the keyboard focus is in the page, as a path of child positions
+// that names the same control in a page drawn anew (a save redraws the
+// whole page, and the page keeps its shape).
+let pendingFocus = null;
+
+function focusSpot(node) {
+  const page = $("page");
+  if (!node || node === page || !page.contains(node)) return null;
+  const path = [];
+  for (let n = node; n !== page; n = n.parentElement) path.unshift(Array.prototype.indexOf.call(n.parentElement.children, n));
+  return { path, tag: node.tagName };
+}
+
+function restoreFocus(spot) {
+  if (!spot) return;
+  let n = $("page");
+  for (const i of spot.path) { n = n && n.children[i]; }
+  if (n && n.tagName === spot.tag && !n.disabled) n.focus({ preventScroll: true });
+}
+
+// Draws a page's parts in place of what is shown, and keeps the focus on
+// the same control.
+function replacePage(parts) {
+  const page = $("page");
+  const spot = pendingFocus || focusSpot(document.activeElement);
+  page.replaceChildren(...parts);
+  restoreFocus(spot);
 }
 
 async function copy(text) {
@@ -800,7 +832,7 @@ async function loadChecker() {
   // The fields of per-machine settings are left out when empty.
   const cfg = r.config;
   cfg.nodes = cfg.nodes || {};
-  state.checker = { cfg, meta: r, nodes: o.nodes || [] };
+  state.checker = { cfg, saved: structuredClone(cfg), meta: r, nodes: o.nodes || [] };
   if (current() === "checker") draw(true);
 }
 
@@ -820,9 +852,23 @@ function machineItems() {
   return [{ value: "", text: "Every machine" }, ...((state.checker && state.checker.nodes) || []).map((n) => ({ value: n.id, text: n.name }))];
 }
 
-// Saves the working copy, then reloads so the page shows what the center kept.
-async function saveChecker() {
-  await api("POST", "/api/checker", { config: state.checker.cfg });
+// Saves the working copy (or `next`, a copy a handler changed in place of
+// it), then reloads so the page shows what the center kept. A handler may
+// have changed the working copy before it saved. When the save fails, the
+// center kept the old settings, so the working copy goes back to them: the
+// next save would otherwise send the change that was refused.
+async function saveChecker(next) {
+  const c = state.checker;
+  try {
+    await api("POST", "/api/checker", { config: next || c.cfg });
+  } catch (e) {
+    if (!next && state.checker === c) {
+      c.cfg = structuredClone(c.saved);
+      if (current() === "checker") draw(true);
+      if (!e.auth) await loadChecker().catch(() => {});
+    }
+    throw e;
+  }
   await loadChecker();
 }
 
@@ -1064,18 +1110,23 @@ function modelCard(cfg, meta) {
   const critTrue = el("input", { class: "input", value: m.criteria_true });
   const critFalse = el("input", { class: "input", value: m.criteria_false });
   const save = act(async () => {
-    m.source = source;
-    m.endpoint_url = endpointUrl.value.trim();
-    m.endpoint_model = endpointModel.value.trim();
-    m.threshold = Number(threshold.value);
-    m.timeout_ms = Number(timeout.value);
-    m.scope = scope;
-    m.fail_closed = failClosed.checked;
-    m.instructions = instr.value;
-    m.criteria_true = critTrue.value;
-    m.criteria_false = critFalse.value;
+    // The form's values go into a copy: a refused save leaves the working
+    // copy as it was, and the form keeps what was typed.
+    const next = { ...cfg, model: {
+      ...m,
+      source,
+      endpoint_url: endpointUrl.value.trim(),
+      endpoint_model: endpointModel.value.trim(),
+      threshold: Number(threshold.value),
+      timeout_ms: Number(timeout.value),
+      scope,
+      fail_closed: failClosed.checked,
+      instructions: instr.value,
+      criteria_true: critTrue.value,
+      criteria_false: critFalse.value,
+    } };
     if (token.value) { await api("POST", "/api/checker/token", { token: token.value }); token.value = ""; }
-    await saveChecker();
+    await saveChecker(next);
     notify("Saved.");
   });
   const resetQuestion = () => { instr.value = ""; critTrue.value = ""; critFalse.value = ""; notify("Cleared; Save to store the defaults."); };
@@ -1580,7 +1631,7 @@ function signature(page) {
 function draw(force) {
   const page = current();
   if (page === "settings" || page === "checker") {
-    if (force) $("page").replaceChildren(...PAGES[page].view().flat().filter((p) => p != null));
+    if (force) replacePage(PAGES[page].view().flat().filter((p) => p != null));
     return;
   }
   const sig = signature(page);
@@ -1592,7 +1643,7 @@ function draw(force) {
   // updated them in place: moving them would take the focus off the picker.
   const shown = Array.from($("page").children);
   if (parts.length === shown.length && parts.every((p, i) => p === shown[i])) return;
-  $("page").replaceChildren(...parts);
+  replacePage(parts);
 }
 
 // The pairing card shows a one-time code. Once the center no longer has it

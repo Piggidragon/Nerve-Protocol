@@ -2130,18 +2130,20 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
             owner_check(&[&paths, &layout.paths]).await?;
             let exe = std::env::current_exe().map_err(|e| format!("this program: {e}"))?;
             #[cfg(windows)]
-            {
-                if root == crate::service::RootOwner::Accepted {
-                    return Err("--owner=root is for Linux: on Windows the account that installs is the owner".into());
-                }
-                return crate::winsvc::install(
-                    &layout,
-                    &crate::win_host::WinHost,
-                    &exe,
-                    &invoker(),
-                    out,
+            if root == crate::service::RootOwner::Accepted {
+                return Err(
+                    "--owner=root is for Linux: on Windows the account that installs is the owner"
+                        .into(),
                 );
             }
+            #[cfg(windows)]
+            return crate::winsvc::install(
+                &layout,
+                &crate::win_host::WinHost,
+                &exe,
+                &invoker(),
+                out,
+            );
             #[cfg(not(windows))]
             {
                 use std::io::IsTerminal;

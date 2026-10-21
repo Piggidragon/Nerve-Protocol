@@ -2084,22 +2084,28 @@ fn describe_change(by: &str, version: u64, changes: &[Change]) -> String {
 /// The folders in `home` that the pairings whose commands run as
 /// `nerve-run` give it, as the owner named them (resolved, `~` the owner's
 /// home), not as they are split around the protected entries: `home` itself
-/// where it is given whole, also by a folder around it.
+/// where it is given whole, also by a folder around it. The home is
+/// resolved too, as the folders are: where its path runs through a link,
+/// the entries go on the real one (crate::acl), and a folder in it is told
+/// under the home as the account database names it.
 #[cfg(target_os = "linux")]
 fn given_in_home(cfg: &NodeConfig, home: &std::path::Path) -> Vec<PathBuf> {
     use nerve_policy::paths::within;
     let now = crate::now_ms();
+    let real = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
     let mut out: Vec<PathBuf> = Vec::new();
     for c in cfg.centers.iter().filter(|c| !c.policy.runs_as_owner(now)) {
         for f in &c.policy.folders {
             let Some(p) = nerve_policy::protected::expand(home, &f.path) else {
                 continue;
             };
+            // One that does not resolve (gone, or closed to the owner) is
+            // compared as it is named.
             let p = std::fs::canonicalize(&p).unwrap_or(p);
-            let p = if within(home, &p) {
+            let p = if within(&real, &p) || within(home, &p) {
                 home.to_path_buf()
-            } else if within(&p, home) {
-                p
+            } else if let Ok(inside) = p.strip_prefix(&real).or_else(|_| p.strip_prefix(home)) {
+                home.join(inside)
             } else {
                 continue;
             };
@@ -2501,11 +2507,12 @@ mod tests {
                     }),
                 ),
             );
-            let pairings = |folders: Vec<Folder>| {
+            // The folders of the folder pairing, then of the user pairing.
+            let pairings_each = |f: Vec<Folder>, u: Vec<Folder>| {
                 let mut cfg = s.config();
-                cfg.centers = [("f", Mode::Folder), ("u", Mode::User)]
+                cfg.centers = [("f", Mode::Folder, f), ("u", Mode::User, u)]
                     .into_iter()
-                    .map(|(name, mode)| nerve_policy::CenterEntry {
+                    .map(|(name, mode, folders)| nerve_policy::CenterEntry {
                         name: name.into(),
                         url: "https://center.example".into(),
                         pin: None,
@@ -2521,7 +2528,7 @@ mod tests {
                         old_pin: None,
                         policy: CenterPolicy {
                             mode,
-                            folders: folders.clone(),
+                            folders,
                             ..Default::default()
                         },
                     })
@@ -2533,6 +2540,11 @@ mod tests {
                     None,
                 );
                 assert!(matches!(r, nerve_transport::ctl::Reply::Ok(_)));
+            };
+            let pairings = |folders: Vec<Folder>| pairings_each(folders.clone(), folders);
+            let folder = |p: &std::path::Path, access: &str| Folder {
+                path: p.display().to_string(),
+                access: nerve_policy::config::Access::parse(access).unwrap(),
             };
             pairings(Vec::new());
             let st = daemon.status();
@@ -2581,6 +2593,58 @@ mod tests {
                 let w = st["home_warning"]["warning"].as_str().unwrap();
                 assert!(w.contains("as you give it your home itself."), "{w}");
                 assert!(!w.contains("more folders"), "{w}");
+            }
+            // A folder around the home gives the home whole too.
+            let around = home.parent().unwrap();
+            pairings_each(vec![folder(around, "r")], Vec::new());
+            let st = daemon.status();
+            assert_eq!(
+                st["home_warning"]["below"] == json!([home]),
+                told,
+                "{what}: {st}"
+            );
+            // Only the pairings whose commands run as nerve-run count: a
+            // folder in the home that only the user pairing has leaves
+            // nothing to say of the closed home.
+            let elsewhere = around.join("elsewhere");
+            std::fs::create_dir_all(&elsewhere).unwrap();
+            pairings_each(
+                vec![folder(&elsewhere, "rw")],
+                vec![folder(&home.join("proj"), "rw")],
+            );
+            let st = daemon.status();
+            assert_eq!(st["home_warning"], Value::Null, "{what}: {st}");
+            // A home whose path runs through a link: the folders resolve to
+            // the real home, and are told under the home as named.
+            let data = around.join("data");
+            std::fs::create_dir_all(data.join("alice/proj")).unwrap();
+            std::fs::set_permissions(data.join("alice"), std::fs::Permissions::from_mode(0o750))
+                .unwrap();
+            std::os::unix::fs::symlink(&data, around.join("linked")).unwrap();
+            let linked = around.join("linked/alice");
+            lock(&s.account_cache).insert(
+                "alice".into(),
+                (
+                    std::time::Instant::now(),
+                    Some(crate::service::Account {
+                        name: "alice".into(),
+                        uid: 4242,
+                        gid: 4242,
+                        comment: String::new(),
+                        home: linked.clone(),
+                        groups: vec![4242],
+                    }),
+                ),
+            );
+            pairings(vec![folder(&linked.join("proj"), "rw")]);
+            let st = daemon.status();
+            assert_eq!(
+                st["home_warning"]["below"] == json!([linked.join("proj")]),
+                told,
+                "{what}: {st}"
+            );
+            if told {
+                assert_eq!(st["home_warning"]["home"], json!(linked), "{st}");
             }
             daemon.stop().await;
         }

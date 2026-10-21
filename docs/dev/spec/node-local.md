@@ -1053,7 +1053,7 @@ or the sudo program. The line takes no option of sudo: a leading `-n` and
 is refused with `invalid_args` and the reason. Its environment is fixed: `PATH`
 `/usr/sbin:/usr/bin:/sbin:/bin`, and `HOME`, `USER` and `LOGNAME` of root;
 nothing of the node's. Its paths are looked at as the owner's, and its
-default folder is the owner's home. The node opens the working folder as
+default folder is the owner's home, resolved as the owner like a given one. The node opens the working folder as
 the owner, a part at a time without following a link, so a link put there
 after the check fails the call; the child enters that open folder with the
 owner's file system ids (`fchdir`) and only then becomes root: it holds

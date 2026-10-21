@@ -67,8 +67,10 @@ pub struct RunCall {
 
 impl RunCall {
     /// `cwd` defaults to `home`, the home of the account the command runs
-    /// as. On the installed node the folder is looked at as that account
-    /// (crate::account::FsAs).
+    /// as, resolved like a given one: the policy judges the real folder, and
+    /// a root start opens it without following a link (AsRoot), so a home
+    /// whose path runs through one would fail there. On the installed node
+    /// the folder is looked at as that account (crate::account::FsAs).
     pub fn parse(args: &Map<String, Value>, home: &Path) -> Result<RunCall, RpcError> {
         let a: RunArgs = params(args)?;
         if a.command.trim().is_empty() {
@@ -76,7 +78,8 @@ impl RunCall {
         }
         let cwd = match a.cwd {
             Some(c) => WirePath::parse(&c)?.real,
-            None => home.to_path_buf(),
+            // One that does not resolve is refused below as it is named.
+            None => nerve_policy::paths::resolve(home).unwrap_or_else(|_| home.to_path_buf()),
         };
         if !cwd.is_dir() {
             return Err(crate::fs::bad_path(format!(
@@ -3255,7 +3258,7 @@ mod tests {
         let home = std::env::temp_dir();
         let a = json!({"command": "ls"}).as_object().unwrap().clone();
         let c = RunCall::parse(&a, &home).unwrap();
-        assert_eq!(c.cwd, home);
+        assert_eq!(c.cwd, std::fs::canonicalize(&home).unwrap());
         let bad = json!({"command": "ls", "shell": "x"})
             .as_object()
             .unwrap()

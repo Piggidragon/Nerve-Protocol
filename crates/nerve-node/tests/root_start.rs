@@ -189,6 +189,28 @@ async fn a_root_command_runs_without_a_leading_n_and_is_refused_other_sudo_optio
     }
 }
 
+/// A call without a folder starts in the owner's home, resolved: where the
+/// home's path runs through a link (`/home` a link elsewhere), the root
+/// start opens the real folder instead of refusing the link on the way.
+#[tokio::test]
+async fn a_root_command_without_a_folder_starts_in_a_home_behind_a_link() {
+    let d = tempfile::tempdir().unwrap();
+    let base = std::fs::canonicalize(d.path()).unwrap();
+    let real = base.join("data/alice");
+    std::fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(base.join("data"), base.join("home")).unwrap();
+    let home = base.join("home/alice");
+    let args = serde_json::json!({"command": "pwd -P"});
+    let rc = RunCall::parse(args.as_object().unwrap(), &home).unwrap();
+    assert_eq!(rc.cwd, real);
+    let start = AsRoot::open(&rc.cwd, None).unwrap();
+    let r = exec::run(&rc, &opts(&me(&base), start), |_| {})
+        .await
+        .unwrap();
+    assert_eq!(r["exit_code"], 0, "{r}");
+    assert_eq!(r["stdout"], format!("{}\n", real.display()), "{r}");
+}
+
 #[test]
 fn a_root_command_does_not_start_behind_a_link() {
     let d = tempfile::tempdir().unwrap();

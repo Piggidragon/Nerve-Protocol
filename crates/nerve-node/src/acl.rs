@@ -47,7 +47,7 @@
 //! no tool is needed. A file system without ACLs refuses them, and the grant
 //! of that folder fails with that reason.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString, OsString};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
@@ -244,6 +244,12 @@ pub struct Record {
     /// again, also after the node started again (crate::daemon).
     #[serde(default)]
     pub failed: Vec<PathBuf>,
+    /// The folders below the grants whose default ACL was the owner's own
+    /// before the node added its entries to it: it stays when they come off
+    /// again. A folder made later below one of them got it from there, and
+    /// keeps it too.
+    #[serde(default)]
+    pub defaults: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -500,35 +506,66 @@ pub struct Who {
 /// Gives `who.run` on the opened `o` the access entry `perm` (`None` takes
 /// it off), and on a folder the default entries for it and the owner. On a
 /// folder that is not the owner's (`mine`), only taken off, the owner's
-/// default entry stays: it came from the default entries above. Says
-/// whether it changed anything.
-fn put(o: &Opened, who: Who, perm: Option<u16>, mine: bool) -> std::io::Result<bool> {
+/// default entry stays: it came from the default entries above.
+///
+/// A default ACL without an entry of `who.run` is not the node's, and is
+/// left as it is where nothing is to be given. Where the node's entries come
+/// off, what is left of it stays if it was the owner's own before (`keep`),
+/// as a default ACL of the plain entries still sets the rights new files
+/// get; one the node made goes. Says whether the folder has a default ACL
+/// of the owner's own ([`Record::defaults`]).
+fn put(o: &Opened, who: Who, perm: Option<u16>, mine: bool, keep: bool) -> std::io::Result<bool> {
     let at = o.at();
-    let mut changed = false;
     let mut acl = get(&at, ACCESS)?.unwrap_or_else(|| Acl::of_mode(o.m.mode()));
     if acl.user(who.run) != perm {
         acl.set_user(who.run, perm);
         set(&at, ACCESS, &acl)?;
-        changed = true;
     }
-    if o.m.is_dir() {
-        let before = get(&at, DEFAULT)?;
-        let mut d = before.clone().unwrap_or_else(|| Acl::of_mode(o.m.mode()));
-        d.set_user(who.run, perm);
-        if mine {
-            d.set_user(who.owner, perm.map(|_| R | W | X));
-        }
-        if !d.has_named() {
-            if before.is_some() {
-                remove(&at, DEFAULT)?;
-                changed = true;
-            }
-        } else if before.as_ref() != Some(&d) {
-            set(&at, DEFAULT, &d)?;
-            changed = true;
-        }
+    if !o.m.is_dir() {
+        return Ok(false);
     }
-    Ok(changed)
+    let before = get(&at, DEFAULT)?;
+    let theirs = before.as_ref().is_some_and(|b| b.user(who.run).is_none());
+    if perm.is_none() && (before.is_none() || theirs) {
+        return Ok(theirs);
+    }
+    let mut d = before.clone().unwrap_or_else(|| Acl::of_mode(o.m.mode()));
+    d.set_user(who.run, perm);
+    if mine {
+        d.set_user(who.owner, perm.map(|_| R | W | X));
+    }
+    if !d.has_named() && !keep {
+        if before.is_some() {
+            remove(&at, DEFAULT)?;
+        }
+    } else if before.as_ref() != Some(&d) {
+        set(&at, DEFAULT, &d)?;
+    }
+    Ok(theirs || (keep && before.is_some()))
+}
+
+/// Gives the opened `o`, which `who.run` owns, to `to` (uid, gid): what
+/// `nerve-run` made in a granted folder goes to the owner at `uninstall`,
+/// as its uid is freed next and the next account to get it must not own
+/// it. Through the descriptor (`AT_EMPTY_PATH`), so the file changed is the
+/// one checked, also a link.
+fn give(o: &Opened, to: (u32, u32)) -> std::io::Result<()> {
+    // SAFETY: an empty NUL-terminated path with AT_EMPTY_PATH on an open
+    // descriptor: the call changes that inode.
+    let r = unsafe {
+        libc::fchownat(
+            o.file.as_raw_fd(),
+            c"".as_ptr(),
+            to.0,
+            to.1,
+            libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 /// Gives or takes the pass-through entry (`--x`) of a folder above a grant.
@@ -574,10 +611,19 @@ thread_local! {
 
 /// Brings the entries below `root` in line with `all` (what every grant now
 /// gives there), walking it without following links or leaving its file
-/// system. Only the owner's files are changed; with `everyone` (root at
-/// `uninstall`, `all` empty) the entries of `who.run` come off anyone's.
-/// Errors go to `report`; the walk goes on. Says whether all went well.
-fn walk(root: &Path, all: &[Granted], who: Who, everyone: bool, report: &mut Report) -> bool {
+/// system. Only the owner's files are changed. With `everyone` (root at
+/// `uninstall`, `all` empty) the entries of `who.run` come off anyone's, and
+/// what `who.run` owns goes to `everyone` (uid, gid). `own` is the set of
+/// [`Record::defaults`], kept up to date. Errors go to `report`; the walk
+/// goes on. Says whether all went well.
+fn walk(
+    root: &Path,
+    all: &[Granted],
+    who: Who,
+    everyone: Option<(u32, u32)>,
+    own: &mut BTreeSet<PathBuf>,
+    report: &mut Report,
+) -> bool {
     let top = match open_path(root) {
         Ok(o) => o,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return true,
@@ -590,20 +636,21 @@ fn walk(root: &Path, all: &[Granted], who: Who, everyone: bool, report: &mut Rep
     let mut whole = true;
     // The entries of a folder are opened when their turn comes, from the
     // folder's descriptor, so only the folders on the way are held open.
-    let mut stack: Vec<(Rc<Opened>, OsString, PathBuf)> = Vec::new();
-    let mut next = Some((root.to_path_buf(), top));
+    // With each goes whether its folder kept a default ACL of the owner's.
+    let mut stack: Vec<(Rc<Opened>, OsString, PathBuf, bool)> = Vec::new();
+    let mut next = Some((root.to_path_buf(), top, false));
     loop {
-        let (path, o) = match next.take() {
+        let (path, o, above_own) = match next.take() {
             Some(n) => n,
             None => {
-                let Some((dir, name, path)) = stack.pop() else {
+                let Some((dir, name, path, above_own)) = stack.pop() else {
                     break;
                 };
                 let Ok(c) = CString::new(name.as_bytes()) else {
                     continue;
                 };
                 match open_in(dir.file.as_raw_fd(), &c) {
-                    Ok(o) => (path, o),
+                    Ok(o) => (path, o, above_own),
                     // Gone meanwhile.
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
                     Err(e) => {
@@ -615,12 +662,22 @@ fn walk(root: &Path, all: &[Granted], who: Who, everyone: bool, report: &mut Rep
             }
         };
         let ft = o.m.file_type();
+        if let Some(to) = everyone
+            && o.m.uid() == who.run
+            && o.m.dev() == dev
+            && let Err(e) = give(&o, to)
+        {
+            report.errors.push(failed(&path, &e));
+            whole = false;
+        }
         if ft.is_symlink() || o.m.dev() != dev || !(ft.is_dir() || ft.is_file()) {
             report.skipped += 1;
             continue;
         }
         let mine = o.m.uid() == who.owner;
-        if mine || everyone {
+        let keep = above_own || own.contains(&path);
+        let mut own_here = keep;
+        if mine || everyone.is_some() {
             // A file with a second name may lie outside the grant: it gets
             // no entry, and one it has comes off.
             let twin = ft.is_file() && o.m.nlink() > 1;
@@ -637,11 +694,22 @@ fn walk(root: &Path, all: &[Granted], who: Who, everyone: bool, report: &mut Rep
             if twin {
                 report.skipped += 1;
             }
-            if let Err(e) = put(&o, who, (perm != 0).then_some(perm), mine) {
-                report.errors.push(failed(&path, &e));
-                whole = false;
-                if e.raw_os_error() == Some(libc::EOPNOTSUPP) {
-                    return false;
+            match put(&o, who, (perm != 0).then_some(perm), mine, keep) {
+                Ok(theirs) if ft.is_dir() => {
+                    own_here = theirs;
+                    if theirs {
+                        own.insert(path.clone());
+                    } else {
+                        own.remove(&path);
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    report.errors.push(failed(&path, &e));
+                    whole = false;
+                    if e.raw_os_error() == Some(libc::EOPNOTSUPP) {
+                        return false;
+                    }
                 }
             }
         } else {
@@ -659,11 +727,11 @@ fn walk(root: &Path, all: &[Granted], who: Who, everyone: bool, report: &mut Rep
                     let dir = Rc::new(o);
                     for n in names {
                         let p = path.join(&n);
-                        stack.push((dir.clone(), n, p));
+                        stack.push((dir.clone(), n, p, own_here));
                     }
                 }
                 // Another account's folder the owner may not read.
-                Err(_) if !mine && !everyone => {}
+                Err(_) if !mine && everyone.is_none() => {}
                 Err(e) => {
                     report.errors.push(failed(&path, &e));
                     whole = false;
@@ -672,6 +740,14 @@ fn walk(root: &Path, all: &[Granted], who: Who, everyone: bool, report: &mut Rep
         }
     }
     whole
+}
+
+/// The grant among `all` nearest above `path`, which is no grant itself.
+fn granted_above<'a>(all: &'a [Granted], path: &Path) -> Option<&'a Path> {
+    all.iter()
+        .map(|g| g.path.as_path())
+        .filter(|g| *g != path && within(path, g))
+        .max_by_key(|g| g.components().count())
 }
 
 /// The folders above the grants of `all` that `who.run` must pass through:
@@ -747,6 +823,7 @@ pub fn sync(
         ..Record::default()
     };
     let mut missed: Vec<PathBuf> = Vec::new();
+    let mut own: BTreeSet<PathBuf> = before.defaults.iter().cloned().collect();
     {
         let _as = match act_as() {
             Ok(a) => a,
@@ -764,7 +841,7 @@ pub fn sync(
                 owner: before.owner,
             };
             for g in &before.grants {
-                if !walk(&g.path, &[], gone, false, &mut report) {
+                if !walk(&g.path, &[], gone, None, &mut own, &mut report) {
                     report.stale.push(g.path.clone());
                 }
             }
@@ -790,15 +867,29 @@ pub fn sync(
         for g in had.iter().filter(|g| !want.contains(g)) {
             roots.push(&g.path);
         }
+        let mut walked_above: Vec<&Path> = Vec::new();
         for root in roots {
-            if walk(root, want, who, false, &mut report) {
+            let errors = report.errors.len();
+            if walk(root, want, who, None, &mut own, &mut report) {
                 continue;
             }
             if want.iter().any(|g| g.path == root) {
                 missed.push(root.to_path_buf());
-            } else {
-                report.stale.push(root.to_path_buf());
+                continue;
             }
+            // A grant that went, inside one that is still given, may be
+            // out of reach by its path: a command may have put a link on
+            // the way there. The folder it was is inside the grant above,
+            // wherever it lies now, and a walk of that whole grant gives it
+            // that grant's entries and no more.
+            if let Some(up) = granted_above(want, root)
+                && (walked_above.contains(&up) || walk(up, want, who, None, &mut own, &mut report))
+            {
+                report.errors.truncate(errors);
+                walked_above.push(up);
+                continue;
+            }
+            report.stale.push(root.to_path_buf());
         }
         // What is still to come off stays in the record.
         kept.grants = want.to_vec();
@@ -852,6 +943,10 @@ pub fn sync(
     }
     missed.sort();
     missed.dedup();
+    kept.defaults = own
+        .into_iter()
+        .filter(|p| kept.grants.iter().any(|g| within(p, &g.path)))
+        .collect();
     kept.failed = missed.clone();
     report.failed = missed;
     if let Err(e) = write_record(file, &kept) {
@@ -878,9 +973,10 @@ pub fn behind(file: &Path, want: &[Granted], who: Who, retry: bool) -> bool {
 
 /// Takes every entry the record in `file` names off again: `uninstall`, as
 /// root, which may change any file. Also those on files `nerve-run` made
-/// there, which are its own: its uid is freed next, and the next account to
-/// get it must not have them. The record goes once all are off.
-pub fn remove_all(file: &Path) -> Report {
+/// there, which are its own, and those go to the owner, as `heir` names its
+/// uid and gid for the record's owner: its uid is freed next, and the next
+/// account to get it must not have them. The record goes once all are off.
+pub fn remove_all(file: &Path, heir: &dyn Fn(u32) -> (u32, u32)) -> Report {
     let mut report = Report::default();
     let r = match read_record(file) {
         Ok(Some(r)) => r,
@@ -894,8 +990,20 @@ pub fn remove_all(file: &Path) -> Report {
         run: r.uid,
         owner: r.owner,
     };
-    for g in &r.grants {
-        if !walk(&g.path, &[], who, true, &mut report) {
+    let heir = heir(r.owner);
+    let mut own: BTreeSet<PathBuf> = r.defaults.iter().cloned().collect();
+    // The outer grants first: a grant inside one that came off whole is
+    // done even where a link on its way keeps its own walk out.
+    let mut grants: Vec<&Granted> = r.grants.iter().collect();
+    grants.sort_by_key(|g| g.path.components().count());
+    let mut done: Vec<&Path> = Vec::new();
+    for g in grants {
+        let errors = report.errors.len();
+        if walk(&g.path, &[], who, Some(heir), &mut own, &mut report) {
+            done.push(&g.path);
+        } else if done.iter().any(|d| within(&g.path, d)) {
+            report.errors.truncate(errors);
+        } else {
             report.stale.push(g.path.clone());
         }
     }
@@ -921,6 +1029,11 @@ mod tests {
     fn uid() -> u32 {
         // SAFETY: a plain getter.
         unsafe { libc::geteuid() }
+    }
+
+    fn gid() -> u32 {
+        // SAFETY: a plain getter.
+        unsafe { libc::getegid() }
     }
 
     fn acl_of(p: &Path, name: &str) -> Option<Acl> {
@@ -1155,7 +1268,7 @@ mod tests {
                 .errors
                 .is_empty()
         );
-        let r = remove_all(&file);
+        let r = remove_all(&file, &|_| (uid(), gid()));
         assert!(r.errors.is_empty() && r.stale.is_empty(), "{r:?}");
         assert_eq!(rights(&work, RUN), None);
         assert_eq!(rights(&work.join("f"), RUN), None);
@@ -1305,7 +1418,7 @@ mod tests {
         let mut rec = read_record(&file).unwrap().unwrap();
         rec.owner = uid() + 1;
         write_record(&file, &rec).unwrap();
-        let r = remove_all(&file);
+        let r = remove_all(&file, &|_| (uid(), gid()));
         assert!(r.errors.is_empty() && r.stale.is_empty(), "{r:?}");
         for p in [&work, &made, &made.join("f")] {
             assert_eq!(rights(p, RUN), None, "{p:?}");
@@ -1314,6 +1427,172 @@ mod tests {
         // The default entry of the owner it came with stays on the folder.
         assert!(acl_of(&made, DEFAULT).and_then(|a| a.user(uid())).is_some());
         assert!(!file.exists());
+    }
+
+    fn set_default(p: &Path, text: &str) {
+        let mut a = Acl::of_mode(0);
+        for (tag, perm) in text.split(',').map(|e| e.split_once(':').unwrap()) {
+            let tag = match tag {
+                "u" => USER_OBJ,
+                "g" => GROUP_OBJ,
+                _ => OTHER,
+            };
+            let perm = perm
+                .chars()
+                .map(|c| match c {
+                    'r' => R,
+                    'w' => W,
+                    'x' => X,
+                    _ => 0,
+                })
+                .sum();
+            a.0.retain(|e| e.tag != tag);
+            a.0.push(Entry {
+                tag,
+                id: NO_ID,
+                perm,
+            });
+        }
+        set(&c_path(p).unwrap(), DEFAULT, &a).unwrap();
+    }
+
+    /// A default ACL of the owner's own without named entries (it keeps new
+    /// files private whatever the umask) is there again after a grant and a
+    /// revoke, on the folder and on one made below it meanwhile; a folder
+    /// that had none has none again (#142).
+    #[test]
+    fn a_default_acl_of_the_owners_own_stays_after_a_revoke() {
+        let Some(d) = tree() else { return };
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let work = root.join("work");
+        let private = work.join("private");
+        let plain = work.join("plain");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::create_dir_all(&plain).unwrap();
+        set_default(&private, "u:rwx,g:rx,o:");
+        let theirs = acl_of(&private, DEFAULT).unwrap();
+        let file = root.join("acl.json");
+        let r = sync(&file, &[grant(&work, "rw")], who(), &none);
+        assert!(r.errors.is_empty(), "{r:?}");
+        assert_eq!(
+            acl_of(&private, DEFAULT).unwrap().user(RUN),
+            Some(R | W | X)
+        );
+        // Made during the grant: it got the owner's default from above.
+        let later = private.join("later");
+        std::fs::create_dir(&later).unwrap();
+        let r = sync(&file, &[], who(), &none);
+        assert!(r.errors.is_empty(), "{r:?}");
+        assert_eq!(acl_of(&private, DEFAULT), Some(theirs.clone()));
+        assert_eq!(acl_of(&later, DEFAULT), Some(theirs));
+        assert_eq!(acl_of(&plain, DEFAULT), None);
+        assert_eq!(acl_of(&work, DEFAULT), None);
+        assert!(read_record(&file).unwrap().unwrap().defaults.is_empty());
+    }
+
+    /// `uninstall` leaves a default ACL alone that has no entry of the
+    /// account's: here one of another account's folder below a grant.
+    #[test]
+    fn remove_all_leaves_a_default_acl_without_the_accounts_entry() {
+        let Some(d) = tree() else { return };
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let work = root.join("work");
+        let shared = work.join("shared");
+        std::fs::create_dir_all(&shared).unwrap();
+        let file = root.join("acl.json");
+        assert!(
+            sync(&file, &[grant(&work, "r")], who(), &none)
+                .errors
+                .is_empty()
+        );
+        // Another account's folder now (the record names another owner),
+        // with a default ACL of its own and no entry of nerve-run's.
+        set_default(&shared, "u:rwx,g:rwx,o:");
+        let theirs = acl_of(&shared, DEFAULT);
+        let mut rec = read_record(&file).unwrap().unwrap();
+        rec.owner = uid() + 1;
+        write_record(&file, &rec).unwrap();
+        let r = remove_all(&file, &|_| (uid(), gid()));
+        assert!(r.errors.is_empty() && r.stale.is_empty(), "{r:?}");
+        assert!(theirs.is_some());
+        assert_eq!(acl_of(&shared, DEFAULT), theirs);
+    }
+
+    /// A command may swap a folder on the way to a grant inside another
+    /// grant for a link. Once the inner grant goes, the folder it was gets
+    /// the outer grant's entries by a walk of the outer one, and no command
+    /// is refused for it: neither a sync nor `uninstall` keeps it (#142).
+    #[test]
+    fn a_link_on_the_way_to_a_revoked_inner_grant_leaves_nothing_stale() {
+        let Some(d) = tree() else { return };
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let work = root.join("work");
+        let data = work.join("x/data");
+        let outside = root.join("outside");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::create_dir_all(outside.join("data")).unwrap();
+        std::fs::write(data.join("f"), "f").unwrap();
+        let file = root.join("acl.json");
+        let want = [grant(&work, "r"), grant(&data, "rw")];
+        assert!(sync(&file, &want, who(), &none).errors.is_empty());
+        assert_eq!(rights(&data.join("f"), RUN), Some(R | W));
+        std::fs::rename(work.join("x"), work.join("x.old")).unwrap();
+        std::os::unix::fs::symlink(&outside, work.join("x")).unwrap();
+        let r = sync(&file, &want[..1], who(), &none);
+        assert!(r.stale.is_empty() && r.errors.is_empty(), "{r:?}");
+        assert_eq!(r.refusal(), None);
+        // The folder it was, moved within the outer grant: its rights only.
+        assert_eq!(rights(&work.join("x.old/data/f"), RUN), Some(R));
+        assert_eq!(rights(&outside.join("data"), RUN), None);
+        // The same at `uninstall`, with both grants in the record.
+        assert!(sync(&file, &want, who(), &none).stale.is_empty());
+        let r = remove_all(&file, &|_| (uid(), gid()));
+        assert!(r.stale.is_empty() && r.errors.is_empty(), "{r:?}");
+        assert_eq!(rights(&work.join("x.old/data/f"), RUN), None);
+        assert!(!file.exists());
+    }
+
+    /// `uninstall` gives what `nerve-run` made in a grant to the owner, as
+    /// its uid is freed next. Needs root to make files of another uid: runs
+    /// as root only (the real test on a test machine, or a user namespace).
+    #[test]
+    fn remove_all_gives_what_nerve_run_made_to_the_owner() {
+        if uid() != 0 {
+            eprintln!("skipped: needs root");
+            return;
+        }
+        let Some(d) = tree() else { return };
+        let root = std::fs::canonicalize(d.path()).unwrap();
+        let work = root.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let file = root.join("acl.json");
+        assert!(
+            sync(&file, &[grant(&work, "rw")], who(), &none)
+                .errors
+                .is_empty()
+        );
+        // As if nerve-run made them: a folder, a file in it, and a link.
+        let made = work.join("made");
+        std::fs::create_dir(&made).unwrap();
+        std::fs::write(made.join("f"), "f").unwrap();
+        std::os::unix::fs::symlink("f", made.join("l")).unwrap();
+        for p in [&made, &made.join("f"), &made.join("l")] {
+            std::os::unix::fs::lchown(p, Some(RUN), Some(RUN)).unwrap();
+        }
+        let mine = work.join("mine");
+        std::fs::write(&mine, "m").unwrap();
+        let heir = (RUN + 1, RUN + 2);
+        let r = remove_all(&file, &|owner| {
+            assert_eq!(owner, uid());
+            heir
+        });
+        assert!(r.errors.is_empty() && r.stale.is_empty(), "{r:?}");
+        for p in [&made, &made.join("f"), &made.join("l")] {
+            let m = std::fs::symlink_metadata(p).unwrap();
+            assert_eq!((m.uid(), m.gid()), heir, "{p:?}");
+        }
+        // The owner's own stay as they were.
+        assert_eq!(std::fs::metadata(&mine).unwrap().uid(), uid());
     }
 
     /// A grant that failed (a folder below it closed) stays failed in the

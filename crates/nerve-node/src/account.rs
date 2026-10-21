@@ -179,6 +179,19 @@ fn lookup_nss(name: &str) -> Result<Option<Account>, String> {
     Ok(Some(a))
 }
 
+/// The account with `uid`, from the system's account database.
+#[cfg(not(windows))]
+pub fn of_uid(uid: u32) -> Option<Account> {
+    let o = plain("getent")
+        .args(["passwd", &uid.to_string()])
+        .output()
+        .ok()?;
+    if !o.status.success() {
+        return None;
+    }
+    parse_passwd(&String::from_utf8_lossy(&o.stdout)).filter(|a| a.uid == uid)
+}
+
 /// The name of the account with `uid`, from the system's account database.
 pub fn name_of(uid: u32) -> Option<String> {
     #[cfg(windows)]
@@ -187,18 +200,7 @@ pub fn name_of(uid: u32) -> Option<String> {
         None
     }
     #[cfg(not(windows))]
-    {
-        let o = plain("getent")
-            .args(["passwd", &uid.to_string()])
-            .output()
-            .ok()?;
-        if !o.status.success() {
-            return None;
-        }
-        parse_passwd(&String::from_utf8_lossy(&o.stdout))
-            .filter(|a| a.uid == uid)
-            .map(|a| a.name)
-    }
+    of_uid(uid).map(|a| a.name)
 }
 
 /// One line of `getent passwd`.

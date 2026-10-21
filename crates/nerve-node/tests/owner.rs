@@ -59,7 +59,7 @@ async fn run(at: &Path, args: &[&str], input: &str) -> Result<(String, String, i
     let s = UnixStream::connect(at).await.unwrap();
     let (r, mut w) = s.into_split();
     let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
-    let req = nerve_node::owner::request_line(&args, Some("/".into()), false);
+    let req = nerve_node::owner::request_line(&args, Some("/".into()), false, false);
     w.write_all(req.as_bytes()).await.unwrap();
     let mut lines = BufReader::new(r).lines();
     let first: Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
@@ -88,6 +88,40 @@ async fn run(at: &Path, args: &[&str], input: &str) -> Result<(String, String, i
     });
     let code = wait.await.expect("the command ends");
     Ok((out, err, code))
+}
+
+/// What the owner's `args` on `at` gave when sent as the CLI's own
+/// forwarding sends them: the input it passes for that command
+/// (crate::owner::input_for), `typed` standing for what this process's input
+/// would hold. The output with the error output, and the exit code.
+async fn as_the_cli(
+    at: &Path,
+    args: &[&str],
+    terminal: bool,
+    typed: &str,
+) -> Result<(String, i32), String> {
+    use clap::Parser;
+    use nerve_node::owner::Input;
+    let cli = nerve_node::cli::Cli::try_parse_from(
+        std::iter::once("nerve-node").chain(args.iter().copied()),
+    )
+    .unwrap();
+    let input = match nerve_node::owner::input_for(&cli.cmd) {
+        Input::Stdin => Input::Text(typed.into()),
+        other => other,
+    };
+    let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let mut io = nerve_node::owner::Io {
+        out: &mut out,
+        err: &mut err,
+    };
+    let code =
+        nerve_node::owner::ask_at(at, &args, Some("/".into()), input, terminal, &mut io).await?;
+    Ok((
+        String::from_utf8_lossy(&out).into_owned() + &String::from_utf8_lossy(&err),
+        code,
+    ))
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -160,10 +194,13 @@ async fn an_owner_changes_the_node_through_it_and_is_audited() {
     assert_eq!(code, 1, "{out}");
     assert!(err.contains("machine.allow_root decides"), "{err}");
     assert!(!daemon.config().machine.allow_root);
-    // Setup runs for the owner, one question at a time; its one step that
-    // needs root (a keyring) takes it by the service's rights.
-    let (out, err, code) = run(&at, &["setup"], "lab-1\nfile\n\n").await.unwrap();
-    assert_eq!(code, 0, "{out} {err}");
+    // Setup runs for the owner, one question at a time, with the input the
+    // owner's own program passes it; its one step that needs root (a
+    // keyring) takes it by the service's rights.
+    let (out, code) = as_the_cli(&at, &["setup"], false, "lab-1\nfile\n\n")
+        .await
+        .unwrap();
+    assert_eq!(code, 0, "{out}");
     assert!(out.contains("Set up this node"), "{out}");
     assert_eq!(daemon.config().node.name.as_deref(), Some("lab-1"));
     for args in [
@@ -182,6 +219,31 @@ async fn an_owner_changes_the_node_through_it_and_is_audited() {
     for args in [&["backup", "/tmp/x"][..], &["restore", "/tmp/x"]] {
         let e = run(&at, args, "").await.unwrap_err();
         assert!(e.contains("comes with the request"), "{args:?}: {e}");
+    }
+    daemon.stop().await;
+}
+
+/// The node tells the command it runs for the owner whether the owner's
+/// input is a terminal's, as the owner's program says, and nothing else
+/// does: setup asks to install a keyring as root only then (#142).
+#[tokio::test(flavor = "multi_thread")]
+async fn the_command_is_told_whether_the_owner_is_at_a_terminal() {
+    use std::os::unix::fs::PermissionsExt;
+    let d = tempfile::tempdir().unwrap();
+    let (mut o, at) = options(d.path(), vec![uid()]);
+    // A program in the node's place that says what it was told.
+    let said = o.home.join("said");
+    std::fs::write(
+        &said,
+        "#!/bin/sh\nprintf 'terminal=%s\\n' \"$NERVE_OWNER_TERMINAL\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&said, std::fs::Permissions::from_mode(0o755)).unwrap();
+    o.owners.as_mut().unwrap().program = said;
+    let daemon = Daemon::start(o).await.unwrap();
+    for (terminal, want) in [(true, "terminal=1\n"), (false, "terminal=\n")] {
+        let (out, code) = as_the_cli(&at, &["setup"], terminal, "").await.unwrap();
+        assert_eq!((out.as_str(), code), (want, 0), "{terminal}");
     }
     daemon.stop().await;
 }

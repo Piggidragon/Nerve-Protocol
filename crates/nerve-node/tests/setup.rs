@@ -21,7 +21,7 @@ async fn setup(paths: &NodePaths, answers: &str) -> Result<String, String> {
     let mut out = Vec::new();
     let mut input = std::io::Cursor::new(answers.as_bytes().to_vec());
     let keyring = nerve_node::keyring_setup::HostKeyring::this_program();
-    nerve_node::cli::setup(paths, None, &keyring, &mut input, &mut out).await?;
+    nerve_node::cli::setup(paths, None, &keyring, &mut input, true, &mut out).await?;
     Ok(String::from_utf8(out).unwrap())
 }
 

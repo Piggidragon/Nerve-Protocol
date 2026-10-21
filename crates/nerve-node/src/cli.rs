@@ -2235,7 +2235,11 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
                 },
                 None => crate::keyring_setup::HostKeyring::this_program(),
             };
-            setup(&paths, machine, &keyring, &mut input, out).await
+            // Asked whether to install a keyring as root only at a
+            // terminal: the owner's own, for a setup the node runs for its
+            // owner (crate::owner).
+            let terminal = crate::owner::at_terminal();
+            setup(&paths, machine, &keyring, &mut input, terminal, out).await
         }
         Cmd::Update { from } => {
             let layout = Layout::system();
@@ -2326,16 +2330,17 @@ async fn command(paths: NodePaths, cmd: Cmd, out: &mut dyn Write) -> Result<(), 
 /// done are audited. `machine` is there on the installed node, which setup
 /// restarts once a keyring it installed answers. Keys in the system keyring
 /// need one that answers; `keyring` checks it, and installs one when the
-/// owner says so ([`crate::keyring_setup`]).
+/// owner says yes to it at a terminal (`terminal`, [`crate::keyring_setup`]).
 pub async fn setup(
     paths: &NodePaths,
     machine: Option<&dyn crate::service::System>,
     keyring: &dyn crate::keyring_setup::Keyring,
     input: &mut dyn BufRead,
+    terminal: bool,
     out: &mut dyn Write,
 ) -> Result<(), String> {
     let mut steps = Vec::new();
-    let r = setup_steps(paths, machine, keyring, input, out, &mut steps).await;
+    let r = setup_steps(paths, machine, keyring, input, terminal, out, &mut steps).await;
     let log = AuditLog::new(paths.audit_log());
     if let Err(e) = log.node("setup", &steps, r.as_ref().err().map(String::as_str)) {
         let _ = writeln!(out, "the audit log cannot be written: {e}");
@@ -2355,7 +2360,10 @@ async fn after_keyring_answers(
 ) -> Result<(), String> {
     #[cfg(unix)]
     match nerve_transport::ctl::call(&paths.ctl_socket(), "status", json!({})).await {
-        Ok(status) => return restart_for_keyring(&status, paths, machine, out),
+        Ok(status) => {
+            let for_owner = crate::owner::owner_running().is_some();
+            return restart_for_keyring(&status, paths, machine, for_owner, out);
+        }
         Err(e) if e == nerve_transport::ctl::NOT_RUNNING => {}
         Err(e) => {
             let _ = writeln!(
@@ -2370,12 +2378,14 @@ async fn after_keyring_answers(
     Ok(())
 }
 
-/// What [`after_keyring_answers`] does with the running node's `status`.
+/// What [`after_keyring_answers`] does with the running node's `status`;
+/// `for_owner`: setup runs in the node, for its owner (crate::owner).
 #[cfg_attr(not(unix), allow(dead_code))]
 fn restart_for_keyring(
     status: &Value,
     paths: &NodePaths,
     machine: Option<&dyn crate::service::System>,
+    for_owner: bool,
     out: &mut dyn Write,
 ) -> Result<(), String> {
     if status["keyring_failed"] != true {
@@ -2383,7 +2393,7 @@ fn restart_for_keyring(
     }
     // Run by the node for its owner, setup would end with the node it runs
     // in.
-    if crate::owner::owner_running().is_some() {
+    if for_owner {
         return Err("the system keyring answers now, but the node found none when it started and does not look again until it is restarted; `nerve-node service restart`, then run `nerve-node setup` again".into());
     }
     let Some(sys) = machine else {
@@ -2403,6 +2413,7 @@ async fn setup_steps(
     machine: Option<&dyn crate::service::System>,
     keyring: &dyn crate::keyring_setup::Keyring,
     input: &mut dyn BufRead,
+    terminal: bool,
     out: &mut dyn Write,
     steps: &mut Vec<String>,
 ) -> Result<(), String> {
@@ -2415,7 +2426,7 @@ async fn setup_steps(
         && no_keyring != Some(crate::secrets::NoKeyring::WindowsService)
     {
         let me = crate::keyring_setup::me()?;
-        crate::keyring_setup::ensure(keyring, &me, Some(input), out)?;
+        crate::keyring_setup::ensure(keyring, &me, terminal.then_some(&mut *input), out)?;
         after_keyring_answers(paths, machine, out).await?;
     }
     let (cfg, _) = read_config(paths).await?;
@@ -2464,7 +2475,7 @@ async fn setup_steps(
     if storage != now {
         if storage == SecretStorage::Keyring {
             let me = crate::keyring_setup::me()?;
-            crate::keyring_setup::ensure(keyring, &me, Some(input), out)?;
+            crate::keyring_setup::ensure(keyring, &me, terminal.then_some(&mut *input), out)?;
             after_keyring_answers(paths, machine, out).await?;
         }
         let cfg = edit(paths, |c| {
@@ -2549,10 +2560,12 @@ async fn setup_steps(
             let rights = ask(
                 input,
                 out,
-                "What it may do there: +r reads, +w writes, +x runs commands, as in `+r +x` [+r]: ",
+                "What it may do there: +r reads, +w writes, +x runs commands, as in `+r +x` [+rwx]: ",
             )?;
+            // Folder mode runs a command only where it may run one, so
+            // Enter gives a folder commands can work in.
             let rights: Vec<String> = if rights.is_empty() {
-                vec!["+r".into()]
+                vec!["+rwx".into()]
             } else {
                 rights.split_whitespace().map(str::to_string).collect()
             };
@@ -5543,14 +5556,60 @@ mod tests {
         keyring: &dyn crate::keyring_setup::Keyring,
         answers: &str,
     ) -> (Result<(), String>, String) {
+        setup_at(paths, machine, keyring, answers, true)
+    }
+
+    /// Setup with `answers`, at a terminal (`terminal`) or not.
+    fn setup_at(
+        paths: &NodePaths,
+        machine: Option<&dyn crate::service::System>,
+        keyring: &dyn crate::keyring_setup::Keyring,
+        answers: &str,
+        terminal: bool,
+    ) -> (Result<(), String>, String) {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         let mut out = Vec::new();
         let mut input = std::io::Cursor::new(answers.as_bytes().to_vec());
-        let r = rt.block_on(super::setup(paths, machine, keyring, &mut input, &mut out));
+        let r = rt.block_on(super::setup(
+            paths, machine, keyring, &mut input, terminal, &mut out,
+        ));
         (r, String::from_utf8(out).unwrap())
+    }
+
+    /// Setup's folder step gives a folder commands can work in where the
+    /// owner presses Enter: `+rwx`, as folder mode runs a command only where
+    /// it may run one.
+    #[test]
+    fn setup_gives_a_folder_every_right_on_enter() {
+        let (d, paths) = setup(&["home"]);
+        let work = d.path().join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let (r, out) = setup_with(&paths, &format!("\n\n\nfolder\n{}\n\n", work.display()));
+        r.unwrap();
+        assert!(out.contains("[+rwx]: "), "{out}");
+        let folders = &load(&paths).centers[0].policy.folders;
+        assert_eq!(folders.len(), 1, "{folders:?}");
+        assert_eq!(folders[0].access, Access::parse("rwx").unwrap());
+    }
+
+    /// Only at a terminal is the owner asked whether to install a keyring
+    /// as root: piped answers, or a setup without a terminal, get the
+    /// refusal and install nothing, whatever they say.
+    #[test]
+    fn setup_offers_a_keyring_only_at_a_terminal() {
+        let (_d, paths) = setup(&[]);
+        crate::secrets::store::set_unreachable(true);
+        let k = crate::keyring_setup::tests::FakeKeyring::new(false);
+        let (r, out) = setup_at(&paths, None, &k, "\nkeyring\ny\n\n", false);
+        let e = r.unwrap_err();
+        assert!(e.contains("run in a terminal"), "{e}");
+        assert!(!out.contains("Install it now?"), "{out}");
+        assert!(k.installed.borrow().is_empty());
+        assert_eq!(load(&paths).machine.secret_storage, SecretStorage::File);
+        crate::secrets::store::set_unreachable(false);
     }
 
     /// Setup chooses no account: it has no flags, and asks for none.
@@ -5826,7 +5885,7 @@ mod tests {
         let failed = json!({"version": 1, "keyring_failed": true});
         let sys = crate::service::tests::Fake::new();
         let mut out = Vec::new();
-        restart_for_keyring(&failed, &paths, Some(&sys), &mut out).unwrap();
+        restart_for_keyring(&failed, &paths, Some(&sys), false, &mut out).unwrap();
         assert!(
             sys.calls()
                 .contains(&format!("systemctl restart {}", crate::service::UNIT_NAME)),
@@ -5834,16 +5893,25 @@ mod tests {
             sys.calls()
         );
         assert!(String::from_utf8_lossy(&out).contains("restarted the node"));
-        let e = restart_for_keyring(&failed, &paths, None, &mut out).unwrap_err();
+        let e = restart_for_keyring(&failed, &paths, None, false, &mut out).unwrap_err();
         assert!(
             e.contains("restart it, then run `nerve-node setup` again"),
             "{e}"
         );
         let sys = crate::service::tests::Fake::new();
         let fine = json!({"version": 1, "keyring_failed": false});
-        restart_for_keyring(&fine, &paths, Some(&sys), &mut out).unwrap();
-        restart_for_keyring(&fine, &paths, None, &mut out).unwrap();
+        restart_for_keyring(&fine, &paths, Some(&sys), false, &mut out).unwrap();
+        restart_for_keyring(&fine, &paths, None, false, &mut out).unwrap();
         assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+        // Run by the node for its owner, setup does not restart the node it
+        // runs in: it says how, and to run it again.
+        let e = restart_for_keyring(&failed, &paths, Some(&sys), true, &mut out).unwrap_err();
+        assert!(
+            e.contains("`nerve-node service restart`, then run `nerve-node setup` again"),
+            "{e}"
+        );
+        assert!(sys.calls().is_empty(), "{:?}", sys.calls());
+        restart_for_keyring(&fine, &paths, Some(&sys), true, &mut out).unwrap();
     }
 
     /// `status` shows the limits per command the owner set, and whether

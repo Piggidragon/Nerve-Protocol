@@ -59,49 +59,91 @@ pub fn probe_main() -> i32 {
 /// How a keyring would be installed here.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Offer {
-    /// The package manager's commands, run as root in this order.
+    /// The package manager's commands, run as root in this order, each
+    /// program by its absolute path.
     pub commands: Vec<Vec<String>>,
+    /// `loginctl`, by its absolute path.
+    pub loginctl: String,
+}
+
+/// The folders the programs of the root step are taken from, in this
+/// order, and the `PATH` they run with: the system's own, never one the
+/// caller or the service's environment names.
+pub const SYSTEM_PATH: &str = "/usr/sbin:/usr/bin:/sbin:/bin";
+
+/// The program `name` in the folders of [`SYSTEM_PATH`], by its absolute
+/// path.
+pub fn system_program(name: &str) -> Option<PathBuf> {
+    SYSTEM_PATH
+        .split(':')
+        .map(|d| Path::new(d).join(name))
+        .find(|p| p.is_file())
 }
 
 impl Offer {
-    /// The package commands for the package manager found in `bin` folders:
-    /// apt (Debian, Ubuntu), dnf (Fedora, RHEL) or pacman (Arch). On Debian
-    /// and Ubuntu the user's D-Bus session comes in a package of its own;
-    /// the others have it already.
-    pub fn for_system(has: impl Fn(&str) -> bool) -> Option<Offer> {
-        let cmds: &[&[&str]] = if has("apt-get") {
-            &[
-                &["apt-get", "update"],
+    /// The package commands for the package manager `find` finds (by its
+    /// absolute path): apt (Debian, Ubuntu), dnf (Fedora, RHEL) or pacman
+    /// (Arch), each installing GNOME Keyring and what it needs, nothing it
+    /// only recommends. On Debian and Ubuntu the user's D-Bus session comes
+    /// in a package of its own; the others have it already. `None` without
+    /// one of them or without `loginctl`.
+    pub fn for_system(find: impl Fn(&str) -> Option<PathBuf>) -> Option<Offer> {
+        let loginctl = find("loginctl")?.display().to_string();
+        let (program, cmds): (PathBuf, &[&[&str]]) = if let Some(p) = find("apt-get") {
+            (
+                p,
                 &[
-                    "apt-get",
+                    &["update"],
+                    &[
+                        "install",
+                        "-y",
+                        "--no-install-recommends",
+                        "gnome-keyring",
+                        "dbus-user-session",
+                    ],
+                ],
+            )
+        } else if let Some(p) = find("dnf") {
+            (
+                p,
+                &[&[
                     "install",
                     "-y",
+                    "--setopt=install_weak_deps=False",
                     "gnome-keyring",
-                    "dbus-user-session",
-                ],
-            ]
-        } else if has("dnf") {
-            &[&["dnf", "install", "-y", "gnome-keyring"]]
-        } else if has("pacman") {
-            &[&["pacman", "-S", "--needed", "--noconfirm", "gnome-keyring"]]
+                ]],
+            )
         } else {
-            return None;
+            (
+                find("pacman")?,
+                &[&["-S", "--needed", "--noconfirm", "gnome-keyring"]],
+            )
         };
+        let program = program.display().to_string();
         Some(Offer {
             commands: cmds
                 .iter()
-                .map(|c| c.iter().map(|s| s.to_string()).collect())
+                .map(|c| {
+                    std::iter::once(program.clone())
+                        .chain(c.iter().map(|s| s.to_string()))
+                        .collect()
+                })
                 .collect(),
+            loginctl,
         })
+    }
+
+    /// The command that keeps `who`'s session after a reboot.
+    fn linger(&self, who: &str) -> Vec<String> {
+        vec![self.loginctl.clone(), "enable-linger".into(), who.into()]
     }
 
     /// The commands as the question shows them.
     fn shown(&self, who: &str) -> String {
         self.commands
             .iter()
-            .map(|c| c.join(" "))
-            .chain([format!("loginctl enable-linger {who}")])
-            .map(|c| format!("`{c}`"))
+            .chain([&self.linger(who)])
+            .map(|c| format!("`{}`", c.join(" ")))
             .collect::<Vec<_>>()
             .join(", ")
     }
@@ -165,7 +207,8 @@ pub fn ensure(
         "Without a desktop nobody types a password when the machine starts, so this keyring keeps the keys unencrypted in {}, readable by {name} as the key files are; the node keeps centers out of it as it does out of the key files, except a command you let a center run outside folder mode that asks the keyring itself (secret-tool and the like). It becomes the default keyring of {name}: any other program of {name} that keeps a secret in the system keyring keeps it there, unencrypted too.",
         store.display()
     );
-    let yes = crate::cli::ask(input, out, "Install it now? [y/N] ")?;
+    // The end of the input, or no answer, is a no.
+    let yes = crate::cli::ask(input, out, "Install it now? [y/N] ").unwrap_or_default();
     if !matches!(yes.as_str(), "y" | "Y" | "yes") {
         return Err(refusal);
     }
@@ -254,11 +297,7 @@ impl Keyring for HostKeyring {
         if !cfg!(target_os = "linux") {
             return None;
         }
-        Offer::for_system(|p| {
-            ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
-                .iter()
-                .any(|d| Path::new(d).join(p).is_file())
-        })
+        Offer::for_system(system_program)
     }
 
     fn desktop(&self, who: &Account) -> bool {
@@ -298,7 +337,7 @@ impl Keyring for HostKeyring {
             let _ = writeln!(out, "running {}", cmd.join(" "));
             as_root(cmd)?;
         }
-        let linger = ["loginctl", "enable-linger", who.name.as_str()].map(String::from);
+        let linger = offer.linger(&who.name);
         let _ = writeln!(out, "running {}", linger.join(" "));
         as_root(&linger)?;
         wait_for_session(who)?;
@@ -332,13 +371,34 @@ fn graphical_type(t: &str) -> bool {
     matches!(t, "x11" | "wayland" | "mir")
 }
 
-/// Runs a system command as root: directly when this process is root; on
-/// the installed node, where setup keeps root as its saved id (run with
-/// sudo) or runs for the owner with the service's CAP_SETUID and CAP_SETGID
-/// (crate::owner), as root by those; elsewhere through `sudo`, which asks
-/// for the password.
-fn as_root(cmd: &[String]) -> Result<(), String> {
+/// `cmd` (its program by an absolute path) as a step that runs as root
+/// starts it: with a fixed `PATH` ([`SYSTEM_PATH`]) and the package
+/// managers' settings for running without questions, and nothing else of
+/// this process's environment, in `/`, with no input. So nothing of the
+/// caller's (its folders, its input, the service's `PATH`) reaches it.
+fn pinned(cmd: &[String]) -> Result<std::process::Command, String> {
     let (program, args) = cmd.split_first().ok_or("an empty command")?;
+    if !Path::new(program).is_absolute() {
+        return Err(format!("{program} is not an absolute path"));
+    }
+    let mut c = std::process::Command::new(program);
+    c.args(args)
+        .env_clear()
+        .env("PATH", SYSTEM_PATH)
+        .env("HOME", "/root")
+        .env("LC_ALL", "C")
+        .env("DEBIAN_FRONTEND", "noninteractive")
+        .current_dir("/")
+        .stdin(std::process::Stdio::null());
+    Ok(c)
+}
+
+/// Runs a system command ([`pinned`]) as root: directly when this process
+/// is root; on the installed node, where setup keeps root as its saved id
+/// (run with sudo) or runs for the owner with the service's CAP_SETUID and
+/// CAP_SETGID (crate::owner), as root by those; elsewhere through `sudo`,
+/// which asks for the password at the terminal.
+fn as_root(cmd: &[String]) -> Result<(), String> {
     let mut c;
     #[cfg(target_os = "linux")]
     {
@@ -347,9 +407,9 @@ fn as_root(cmd: &[String]) -> Result<(), String> {
         // SAFETY: getresuid writes the three ids it is given.
         unsafe { libc::getresuid(&mut r, &mut e, &mut s) };
         if e == 0 {
-            c = std::process::Command::new(program);
+            c = pinned(cmd)?;
         } else if s == 0 || crate::account::can_switch() {
-            c = std::process::Command::new(program);
+            c = pinned(cmd)?;
             // SAFETY: plain system calls between fork and exec.
             unsafe {
                 c.pre_exec(|| {
@@ -365,15 +425,16 @@ fn as_root(cmd: &[String]) -> Result<(), String> {
                 });
             }
         } else {
-            c = std::process::Command::new("sudo");
-            c.arg("--").arg(program);
+            let sudo = system_program("sudo").ok_or("there is no sudo to run it as root")?;
+            let mut with = vec![sudo.display().to_string(), "--".into()];
+            with.extend(cmd.iter().cloned());
+            c = pinned(&with)?;
         }
     }
     #[cfg(not(target_os = "linux"))]
     {
-        c = std::process::Command::new(program);
+        c = pinned(cmd)?;
     }
-    c.args(args);
     let status = c.status().map_err(|e| format!("{}: {e}", cmd.join(" ")))?;
     if status.success() {
         Ok(())
@@ -453,7 +514,7 @@ pub(crate) mod tests {
         pub fn new(answers: bool) -> FakeKeyring {
             FakeKeyring {
                 answers: Cell::new(answers),
-                offer: Offer::for_system(|p| p == "apt-get"),
+                offer: Offer::for_system(found(&["apt-get", "loginctl"])),
                 desktop: false,
                 installed: RefCell::new(Vec::new()),
             }
@@ -495,6 +556,11 @@ pub(crate) mod tests {
         }
     }
 
+    /// A `find` for [`Offer::for_system`] that finds `names` in /usr/bin.
+    pub fn found(names: &'static [&'static str]) -> impl Fn(&str) -> Option<PathBuf> {
+        move |p| names.contains(&p).then(|| Path::new("/usr/bin").join(p))
+    }
+
     pub fn nerve(home: &Path) -> Account {
         Account {
             name: "nerve".into(),
@@ -526,26 +592,83 @@ pub(crate) mod tests {
         assert!(out.is_empty(), "{out}");
     }
 
+    /// The offer names each program by the absolute path it was found at,
+    /// and installs the keyring's packages only, nothing they recommend.
     #[test]
     fn the_offer_names_each_package_manager_and_its_packages() {
-        let apt = Offer::for_system(|p| p == "apt-get").unwrap();
+        let apt = Offer::for_system(found(&["apt-get", "loginctl"])).unwrap();
         assert_eq!(
             apt.shown("nerve"),
-            "`apt-get update`, `apt-get install -y gnome-keyring dbus-user-session`, `loginctl enable-linger nerve`"
+            "`/usr/bin/apt-get update`, `/usr/bin/apt-get install -y --no-install-recommends gnome-keyring dbus-user-session`, `/usr/bin/loginctl enable-linger nerve`"
         );
-        let dnf = Offer::for_system(|p| p == "dnf").unwrap();
-        assert_eq!(dnf.commands, [["dnf", "install", "-y", "gnome-keyring"]]);
-        let pacman = Offer::for_system(|p| p == "pacman").unwrap();
+        let dnf = Offer::for_system(found(&["dnf", "loginctl"])).unwrap();
+        assert_eq!(
+            dnf.commands,
+            [[
+                "/usr/bin/dnf",
+                "install",
+                "-y",
+                "--setopt=install_weak_deps=False",
+                "gnome-keyring"
+            ]]
+        );
+        let pacman = Offer::for_system(found(&["pacman", "loginctl"])).unwrap();
         assert_eq!(
             pacman.commands,
-            [["pacman", "-S", "--needed", "--noconfirm", "gnome-keyring"]]
+            [[
+                "/usr/bin/pacman",
+                "-S",
+                "--needed",
+                "--noconfirm",
+                "gnome-keyring"
+            ]]
         );
-        assert_eq!(Offer::for_system(|_| false), None);
+        assert_eq!(Offer::for_system(found(&[])), None);
+        assert_eq!(Offer::for_system(found(&["apt-get"])), None, "no loginctl");
+        // The programs come from the system's own folders only.
+        assert!(system_program("sh").is_some_and(|p| p.is_absolute()));
+        assert_eq!(system_program("no-such-program-of-nerve"), None);
+    }
+
+    /// The root step's command runs by its absolute path, with a fixed
+    /// PATH and nothing else of this process's environment but the package
+    /// managers' settings, in `/`, with no input (#142). Here it runs as
+    /// this test's own account, which [`as_root`] does not change.
+    #[cfg(unix)]
+    #[test]
+    fn a_root_step_runs_pinned() {
+        let script = "pwd; readlink /proc/self/fd/0; env | cut -d= -f1 | sort | tr '\\n' ' '";
+        let sh = system_program("sh").unwrap().display().to_string();
+        // Spawned, not `output()`, which would give it no input itself.
+        let o = pinned(&[sh, "-c".into(), script.into()])
+            .unwrap()
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+            .wait_with_output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&o.stdout);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines[0], "/", "{text}");
+        if cfg!(target_os = "linux") {
+            assert_eq!(lines[1], "/dev/null", "{text}");
+        }
+        let names: Vec<&str> = lines[2]
+            .split_whitespace()
+            .filter(|n| !["PWD", "SHLVL", "_", "OLDPWD"].contains(n))
+            .collect();
+        assert_eq!(
+            names,
+            ["DEBIAN_FRONTEND", "HOME", "LC_ALL", "PATH"],
+            "{text}"
+        );
+        assert!(pinned(&["sh".into()]).is_err(), "a bare name is refused");
     }
 
     #[test]
     fn no_is_the_default_and_keeps_the_refusal() {
-        for typed in ["\n", "n\n", "no\n"] {
+        // No answer at all (the input ends) is a no too.
+        for typed in ["\n", "n\n", "no\n", ""] {
             let k = FakeKeyring::new(false);
             let (r, out) = run(&k, Some(typed));
             let err = r.unwrap_err();
@@ -554,10 +677,15 @@ pub(crate) mod tests {
             assert!(k.installed.borrow().is_empty());
             // The question says what it would do, and what that keyring is.
             assert!(
-                out.contains("apt-get install -y gnome-keyring dbus-user-session"),
+                out.contains(
+                    "/usr/bin/apt-get install -y --no-install-recommends gnome-keyring dbus-user-session"
+                ),
                 "{out}"
             );
-            assert!(out.contains("loginctl enable-linger nerve"), "{out}");
+            assert!(
+                out.contains("/usr/bin/loginctl enable-linger nerve"),
+                "{out}"
+            );
             let store = Path::new("/var/lib/nerve").join(".local/share/keyrings");
             assert!(
                 out.contains(&format!("unencrypted in {}", store.display())),
@@ -575,7 +703,7 @@ pub(crate) mod tests {
         assert_eq!(
             *k.installed.borrow(),
             [
-                "`apt-get update`, `apt-get install -y gnome-keyring dbus-user-session`, `loginctl enable-linger nerve` for nerve"
+                "`/usr/bin/apt-get update`, `/usr/bin/apt-get install -y --no-install-recommends gnome-keyring dbus-user-session`, `/usr/bin/loginctl enable-linger nerve` for nerve"
             ]
         );
         assert!(

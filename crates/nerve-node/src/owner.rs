@@ -49,6 +49,12 @@ pub const OWNER_VAR: &str = "NERVE_NODE_OWNER";
 /// root's ([`root_only_change`]).
 pub const OWNER_ENV: &str = "NERVE_OWNER";
 
+/// Set to `1` by the node for a command it runs for an owner whose own
+/// input is a terminal's: the input the command gets is the connection's,
+/// and only an owner at a terminal is asked what needs one (the keyring
+/// that `setup` installs as root, crate::keyring_setup).
+pub const TERMINAL_ENV: &str = "NERVE_OWNER_TERMINAL";
+
 /// The installed unit's runtime folder (`RuntimeDirectory=`), where the
 /// owner socket is.
 pub const RUNTIME_DIR: &str = "/run/nerve-node";
@@ -104,6 +110,17 @@ pub fn root_only_change(
 /// The owner a command runs for, when the node runs it for one.
 pub fn owner_running() -> Option<String> {
     std::env::var(OWNER_ENV).ok().filter(|o| !o.is_empty())
+}
+
+/// Whether the one who runs this command is at a terminal: its own input,
+/// or for a command the node runs for its owner, the owner's
+/// ([`TERMINAL_ENV`]).
+pub fn at_terminal() -> bool {
+    use std::io::IsTerminal;
+    if owner_running().is_some() {
+        return std::env::var(TERMINAL_ENV).is_ok_and(|v| v == "1");
+    }
+    std::io::stdin().is_terminal()
 }
 
 /// Refuses a change of the settings that stay root's when this command runs
@@ -295,12 +312,11 @@ pub fn forward_if_needed(cli: &Cli) -> Option<i32> {
     if let Some(file) = FileJob::of(&cli.cmd, std::env::current_dir().ok()) {
         return Some(rt.block_on(forward_file(&paths, args, cwd, file, cli.json)));
     }
-    let input = if reads_input(&cli.cmd) {
-        Input::Stdin
-    } else {
-        Input::None
-    };
-    Some(rt.block_on(forward(&paths, args, cwd, input, cli.json)))
+    let input = input_for(&cli.cmd);
+    // The command is told whether the input it gets is a terminal's.
+    let terminal =
+        !matches!(input, Input::None) && std::io::IsTerminal::is_terminal(&std::io::stdin());
+    Some(rt.block_on(forward(&paths, args, cwd, input, terminal, cli.json)))
 }
 
 /// What this process passes to the node's command as its input.
@@ -311,6 +327,15 @@ pub enum Input {
     Stdin,
     /// This text, then its end.
     Text(String),
+}
+
+/// The input [`forward_if_needed`] passes for `cmd`.
+pub fn input_for(cmd: &Cmd) -> Input {
+    if reads_input(cmd) {
+        Input::Stdin
+    } else {
+        Input::None
+    }
 }
 
 /// The backup file of an owner's `backup` or `restore`, which this
@@ -354,13 +379,15 @@ impl FileJob {
     }
 }
 
-/// Whether `cmd` reads this process's input: the question of `center add`
-/// without `--yes`, and what `proxy set` takes from stdin. Only then is the
-/// input passed to the node; for any other command it stays unread, as a
-/// script that pipes lines into a loop of commands expects.
+/// Whether `cmd` reads this process's input: the questions of `setup`, the
+/// question of `center add` without `--yes`, and what `proxy set` takes
+/// from stdin. Only then is the input passed to the node; for any other
+/// command it stays unread, as a script that pipes lines into a loop of
+/// commands expects.
 pub fn reads_input(cmd: &Cmd) -> bool {
     use crate::cli::{CenterCmd, ProxyCmd};
     match cmd {
+        Cmd::Setup => true,
         Cmd::Center(CenterCmd::Add { yes, .. }) => !yes,
         Cmd::Proxy(ProxyCmd::Set {
             password_stdin,
@@ -459,11 +486,13 @@ fn not_reached(e: &str) -> String {
 
 /// Sends `args` to the owner endpoint of the node at `paths`, passes this
 /// process's input to it and its output here; the command's exit code.
+/// `terminal`: the input is a terminal's ([`TERMINAL_ENV`]).
 async fn forward(
     paths: &NodePaths,
     args: Vec<String>,
     cwd: Option<String>,
     input: Input,
+    terminal: bool,
     json: bool,
 ) -> i32 {
     let (mut out, mut err) = (std::io::stdout(), std::io::stderr());
@@ -472,24 +501,25 @@ async fn forward(
         err: &mut err,
     };
     let r = match connect(paths).await {
-        Ok(conn) => ask_once(conn, &args, cwd, input, &mut io).await,
+        Ok(conn) => ask_once(conn, &args, cwd, input, terminal, &mut io).await,
         Err(e) => Err(not_reached(&e)),
     };
     r.unwrap_or_else(|e| fail(json, &e))
 }
 
 /// The owner's `args` on the owner socket `at`: the command's exit code, or
-/// why it did not run.
+/// why it did not run. `terminal`: the input is a terminal's.
 #[cfg(unix)]
 pub async fn ask_at(
     at: &Path,
     args: &[String],
     cwd: Option<String>,
     input: Input,
+    terminal: bool,
     io: &mut Io<'_>,
 ) -> Result<i32, String> {
     let conn = connect_at(at).await.map_err(|e| not_reached(&e))?;
-    ask_once(conn, args, cwd, input, io).await
+    ask_once(conn, args, cwd, input, terminal, io).await
 }
 
 /// One request of [`forward`] on `conn`: the command's exit code, or why it
@@ -499,12 +529,13 @@ async fn ask_once<S>(
     args: &[String],
     cwd: Option<String>,
     input: Input,
+    terminal: bool,
     io: &mut Io<'_>,
 ) -> Result<i32, String>
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    let request = request_line(args, cwd, false);
+    let request = request_line(args, cwd, false, terminal);
     {
         use tokio::io::AsyncWriteExt;
         conn.write_all(request.as_bytes())
@@ -515,11 +546,20 @@ where
 }
 
 /// The `cli` request for `args` in `cwd`, as its line; `streamed` says that
-/// its file comes in the session ([`Handed::Streamed`]).
-pub fn request_line(args: &[String], cwd: Option<String>, streamed: bool) -> String {
+/// its file comes in the session ([`Handed::Streamed`]), `terminal` that
+/// the input passed is a terminal's ([`TERMINAL_ENV`]).
+pub fn request_line(
+    args: &[String],
+    cwd: Option<String>,
+    streamed: bool,
+    terminal: bool,
+) -> String {
     let mut params = json!({"args": args, "cwd": cwd});
     if streamed {
         params["file"] = json!(STREAMED);
+    }
+    if terminal {
+        params["terminal"] = json!(true);
     }
     let request = json!({"method": "cli", "params": params});
     format!("{request}\n")
@@ -581,7 +621,7 @@ pub async fn send_file(
 ) -> Result<i32, String> {
     use std::os::fd::AsFd;
     let opened = Opened::open(file)?;
-    let request = request_line(args, cwd, false);
+    let request = request_line(args, cwd, false, false);
     let sent =
         nerve_transport::ctl::send_files(&mut conn, request.as_bytes(), &[opened.file.as_fd()])
             .await
@@ -627,7 +667,7 @@ where
         }
         Some(overwrite) => can_write(&file.path, overwrite)?,
     }
-    let request = request_line(args, cwd, true);
+    let request = request_line(args, cwd, true, false);
     conn.write_all(request.as_bytes())
         .await
         .map_err(|e| format!("cannot reach the node: {e}"))?;
@@ -1155,6 +1195,7 @@ async fn run_for(
         who: who.to_string(),
         args,
         cwd: params["cwd"].as_str().map(PathBuf::from),
+        terminal: params["terminal"] == true,
         handed,
         backup,
         out: out_tx,
@@ -1221,6 +1262,8 @@ struct Job {
     who: String,
     args: Vec<String>,
     cwd: Option<PathBuf>,
+    /// The caller's input is a terminal's ([`TERMINAL_ENV`]).
+    terminal: bool,
     handed: Handed,
     /// A backup, whose streamed file goes back to the caller.
     backup: bool,
@@ -1238,6 +1281,7 @@ async fn command(job: Job) {
         who,
         args,
         cwd,
+        terminal,
         handed,
         backup,
         out,
@@ -1273,6 +1317,13 @@ async fn command(job: Job) {
         (_, Some(at)) => Some(at.display().to_string()),
         _ => None,
     };
+    let mut env: Vec<(&str, String)> = Vec::new();
+    if let Some(v) = file_env {
+        env.push((crate::caller_file::OWNER_FILE_ENV, v));
+    }
+    if terminal {
+        env.push((TERMINAL_ENV, "1".into()));
+    }
     #[cfg(unix)]
     let fd = match handed {
         Handed::File(f) => Some(f),
@@ -1280,7 +1331,7 @@ async fn command(job: Job) {
     };
     #[cfg(not(unix))]
     let fd: Option<()> = None;
-    let mut child = match spawn(&paths, &program, &who, &args, cwd.as_deref(), file_env, fd) {
+    let mut child = match spawn(&paths, &program, &who, &args, cwd.as_deref(), &env, fd) {
         Ok(c) => c,
         Err(e) => {
             if let Some(at) = &carried {
@@ -1365,15 +1416,16 @@ async fn take_streamed(
 /// Starts the program for `who`: its output and input piped, ended when
 /// dropped. The caller's folder is its working folder when the node may
 /// enter it, else the root. A handed file is its descriptor
-/// [`HANDED_FD`] (Linux), named by `file_env` in
-/// [`crate::caller_file::OWNER_FILE_ENV`].
+/// [`HANDED_FD`] (Linux), named in `env` by
+/// [`crate::caller_file::OWNER_FILE_ENV`]; `env` also says whether the
+/// caller is at a terminal ([`TERMINAL_ENV`]).
 fn spawn<F: HandedFd>(
     paths: &NodePaths,
     program: &Path,
     who: &str,
     args: &[String],
     cwd: Option<&Path>,
-    file_env: Option<String>,
+    env: &[(&str, String)],
     fd: Option<F>,
 ) -> std::io::Result<tokio::process::Child> {
     let make = |dir: &Path| {
@@ -1392,13 +1444,12 @@ fn spawn<F: HandedFd>(
             .env_remove("NERVE_CONFIG_DIR")
             .env_remove("NERVE_STATE_DIR")
             .env_remove(crate::caller_file::OWNER_FILE_ENV)
+            .env_remove(TERMINAL_ENV)
+            .envs(env.iter().map(|(k, v)| (k, v)))
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
-        if let Some(v) = &file_env {
-            c.env(crate::caller_file::OWNER_FILE_ENV, v);
-        }
         if let Some(f) = &fd {
             f.give_to(&mut c);
         }
@@ -1999,6 +2050,10 @@ mod tests {
             &cli(&["proxy", "set", "http://u@h:1", "--password-stdin"]).cmd
         ));
         assert!(!reads_input(&cli(&["proxy", "set", "http://h:1"]).cmd));
+        // Setup asks its questions: its input goes to the node.
+        assert!(reads_input(&cli(&["setup"]).cmd));
+        assert!(matches!(input_for(&cli(&["setup"]).cmd), Input::Stdin));
+        assert!(matches!(input_for(&cli(&["status"]).cmd), Input::None));
         for args in [
             &["status"][..],
             &["rule", "add", "allow", "ls"],
@@ -2039,14 +2094,17 @@ mod tests {
     /// more.
     #[test]
     fn a_request_is_the_command_and_its_folder() {
-        let line = request_line(&["status".into()], Some("/w".into()), false);
+        let line = request_line(&["status".into()], Some("/w".into()), false, false);
         let v: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["method"], "cli");
         assert_eq!(v["params"]["args"], json!(["status"]));
         assert_eq!(v["params"]["cwd"], "/w");
         assert!(v.get("token").is_none(), "{v}");
-        let v: Value = serde_json::from_str(&request_line(&[], None, true)).unwrap();
+        let v: Value = serde_json::from_str(&request_line(&[], None, true, false)).unwrap();
         assert_eq!(v["params"]["file"], STREAMED);
+        assert!(v["params"].get("terminal").is_none(), "{v}");
+        let v: Value = serde_json::from_str(&request_line(&[], None, false, true)).unwrap();
+        assert_eq!(v["params"]["terminal"], true);
     }
 
     /// The owner of the unit is let in, and root; anyone else is not.

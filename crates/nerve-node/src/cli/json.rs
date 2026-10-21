@@ -235,7 +235,6 @@ async fn status(paths: &NodePaths) -> Result<Value, String> {
             &cfg.limits.command,
             &Err("the node does not run".into()),
         ),
-        "sockets_kept": crate::daemon::sockets_kept(&nerve_sandbox::Confinement::detect()),
         "centers": centers,
     }))
 }

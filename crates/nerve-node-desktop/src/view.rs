@@ -40,17 +40,6 @@ pub fn status(v: &Value, now_ms: u64) -> (NodeStatus, Vec<CenterRow>) {
         .flatten()
         .filter(|c| c["status"] == "connected")
         .count();
-    // A pairing whose commands are not kept in their folders: one without
-    // the sandbox. One the center revoked runs none; a mode this app does
-    // not know counts. Where the node says it cannot keep commands off
-    // socket files (Linux before 7.1), no folder mode holds against the
-    // programs of the account they run as.
-    let unconfined = v["sockets_kept"] == false
-        || v["centers"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .any(|c| c["revoked"] != true && c["mode"] != "folder");
     let (state, title, detail, tone) = match (locked, running) {
         (true, _) => (
             "locked",
@@ -124,7 +113,6 @@ pub fn status(v: &Value, now_ms: u64) -> (NodeStatus, Vec<CenterRow>) {
         limits_off: limits_off.into(),
         limits_restart,
         warnings: text_model(warnings),
-        unconfined,
     };
     (status, centers)
 }
@@ -1513,52 +1501,6 @@ mod tests {
             centers[1].mode_detail
         );
         assert_eq!(centers[2].link, "Revoked");
-    }
-
-    /// Commands as the app's user change Nerve's settings only through a
-    /// pairing without the sandbox: `user` or `allowlist` mode, unless the
-    /// center revoked it.
-    #[test]
-    fn a_pairing_without_the_sandbox_is_told_apart() {
-        let with = |centers: Value| {
-            status(&json!({"daemon": "running", "centers": centers}), NOW)
-                .0
-                .unconfined
-        };
-        assert!(!with(json!([])));
-        assert!(!with(
-            json!([{"name": "a", "mode": "folder"}, {"name": "b", "mode": "folder"}])
-        ));
-        assert!(with(
-            json!([{"name": "a", "mode": "folder"}, {"name": "b", "mode": "user"}])
-        ));
-        assert!(with(
-            json!([{"name": "a", "mode": "allowlist", "paused": true}])
-        ));
-        assert!(!with(
-            json!([{"name": "a", "mode": "folder"}, {"name": "b", "mode": "user", "revoked": true}])
-        ));
-        // A mode this app does not know is not taken for the sandbox.
-        assert!(with(json!([{"name": "a"}])));
-    }
-
-    /// What the node says it keeps commands from decides too: where it
-    /// cannot keep them off socket files, folder mode holds against nothing
-    /// the account runs on request. Windows says neither (`null`).
-    #[test]
-    fn a_node_that_cannot_keep_commands_off_sockets_is_told() {
-        let with = |kept: Value| {
-            let folder = json!([{"name": "a", "mode": "folder"}]);
-            status(
-                &json!({"daemon": "running", "sockets_kept": kept, "centers": folder}),
-                NOW,
-            )
-            .0
-            .unconfined
-        };
-        assert!(with(json!(false)));
-        assert!(!with(json!(true)));
-        assert!(!with(Value::Null));
     }
 
     #[test]

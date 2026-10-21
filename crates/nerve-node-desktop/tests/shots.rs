@@ -447,24 +447,9 @@ fn every_page_light_and_dark() {
     store.set_commands_as_you(true);
     store.set_commands_account("alex".into());
     store.set_commands_root_via("docker and sudo".into());
-    // A pairing in user mode: Nerve's settings too.
-    let st = store.get_status();
-    store.set_status(NodeStatus {
-        unconfined: true,
-        ..st.clone()
-    });
     shots.take("overview-commands-as-you");
     store.set_commands_root_via("".into());
     shots.take("overview-commands-as-you-plain");
-    // Every pairing in folder mode: their folders, not the settings.
-    store.set_status(NodeStatus {
-        unconfined: false,
-        ..st.clone()
-    });
-    shots.take("overview-commands-as-you-folder-plain");
-    store.set_commands_root_via("docker and sudo".into());
-    shots.take("overview-commands-as-you-folder");
-    store.set_status(st);
     // Hidden by its owner: Settings, General keeps the line.
     store.invoke_show(Page::Settings);
     prefs.set_tab(0);

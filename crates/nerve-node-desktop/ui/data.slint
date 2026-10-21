@@ -25,12 +25,6 @@ export struct NodeStatus {
     limits-restart: bool,
     // What the owner should know: why commands do not run.
     warnings: [string],
-    // Some pairing's commands are not kept in their folders (`user` or
-    // `allowlist` mode, or sockets allowed outside them), or the node
-    // cannot keep them off socket files (Linux before 7.1): as an owner
-    // they can change Nerve's settings. A `folder` mode command that is
-    // kept cannot (docs/user/desktop.md).
-    unconfined: bool,
 }
 
 export struct CenterRow {

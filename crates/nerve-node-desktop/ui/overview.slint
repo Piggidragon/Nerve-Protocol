@@ -267,18 +267,13 @@ export component OverviewPage inherits PageFrame {
                         font-weight: Type.semibold;
                         wrap: word-wrap;
                     }
-                    // Nerve's settings only where commands are not kept in
-                    // their folders (NodeStatus.unconfined): a kept folder
-                    // mode command has no owner token and reaches no
-                    // program that runs things for it.
+                    // Whatever the mode: under the owner's account folder
+                    // mode is no boundary against the owner's own programs
+                    // that run things on request (docs/user/desktop.md).
                     Text {
-                        text: Store.status.unconfined
-                            ? (Store.commands-root-via != ""
-                                ? "They can do all you can, and get root through " + Store.commands-root-via + "."
-                                : "They can do all you can, Nerve's settings too.")
-                            : (Store.commands-root-via != ""
-                                ? "They can do all you can in their folders, and get root through " + Store.commands-root-via + "."
-                                : "They can do all you can in the folders you give them.");
+                        text: Store.commands-root-via != ""
+                            ? "They can do all you can, and get root through " + Store.commands-root-via + "."
+                            : "They can do all you can, Nerve's settings too.";
                         color: Theme.text;
                         font-size: Type.small;
                         wrap: word-wrap;

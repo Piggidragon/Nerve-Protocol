@@ -839,25 +839,12 @@ impl Shared {
             // Why folder mode runs no command, which `confinement` alone
             // does not say once the keyring is the reason.
             "folder_commands_off": self.unconfined(&cfg),
-            "sockets_kept": sockets_kept(&self.confinement),
             "command_limits": crate::cgroup::status(&cfg.limits.command, &self.cgroups),
             "providers": self.providers.status(),
             "centers": centers,
             "relay": self.relay.status(&cfg),
         })
     }
-}
-
-/// The `sockets_kept` of `status`: on Linux, whether Landlock keeps a
-/// `folder` mode command off the socket files outside its folders (ABI 9,
-/// [`Shared::off_sockets`]). Where it does not, the command can ask a program
-/// of its account's that runs things on request (the systemd user manager,
-/// tmux, the session bus) to run one outside the sandbox, so folder mode is
-/// no boundary against that account's programs. `None` elsewhere: Windows
-/// has no such rule, and its AppContainer is not shown to hold against every
-/// program that runs things on request either (docs/user/modes.md).
-pub fn sockets_kept(confinement: &nerve_sandbox::Confinement) -> Option<bool> {
-    cfg!(target_os = "linux").then(|| confinement.keeps_sockets())
 }
 
 /// A command counted by [`Shared::open_to_bus`] while it runs.
@@ -2210,31 +2197,6 @@ mod tests {
         let mut o = options(&d, &log);
         o.full_rights = Some(false);
         Daemon::start(o).await.unwrap().stop().await;
-    }
-
-    /// The status says whether folder mode keeps commands off the socket
-    /// files outside their folders, by the Landlock it found: the app's
-    /// account card goes by it. Windows says neither.
-    #[tokio::test]
-    async fn the_status_says_whether_commands_are_kept_off_sockets() {
-        for (abi, kept) in [(Some(6), false), (Some(9), true), (None, false)] {
-            let log = Log::new(Level::Info);
-            let d = tempfile::tempdir().unwrap();
-            let mut o = options(&d, &log);
-            o.full_rights = Some(false);
-            o.confinement = Some(Confinement {
-                landlock_abi: abi,
-                appcontainer: false,
-            });
-            let daemon = Daemon::start(o).await.unwrap();
-            let want = if cfg!(target_os = "linux") {
-                json!(kept)
-            } else {
-                Value::Null
-            };
-            assert_eq!(daemon.status()["sockets_kept"], want, "{abi:?}");
-            daemon.stop().await;
-        }
     }
 
     /// With the keys moved into the keyring where Landlock cannot keep a

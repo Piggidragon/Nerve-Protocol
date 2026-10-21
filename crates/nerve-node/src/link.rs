@@ -1837,7 +1837,18 @@ impl Link {
             self.shared.command_account(cfg, &entry.policy)
         };
         let known = account.as_ref().ok().cloned().flatten();
-        let start_in = known
+        // The paths of a call are looked at as its account, but those of a
+        // sudo command that runs as root as the owner's, whose sudo list
+        // lets it run: the node's file system id 0 has no right past a
+        // folder's mode (it holds CAP_SETUID and CAP_SETGID only), so the
+        // owner's closed home would refuse it. Its default folder is the
+        // owner's home then.
+        let looks_as = if as_root {
+            self.shared.owner_account(cfg).ok().flatten()
+        } else {
+            known.clone()
+        };
+        let start_in = looks_as
             .as_ref()
             .map_or(&self.shared.home, |a| &a.home)
             .clone();
@@ -1849,7 +1860,7 @@ impl Link {
         }
         // The paths are looked at as the account (crate::account::FsAs).
         let rc = {
-            let _as = act_as(known.as_ref())?;
+            let _as = act_as(looks_as.as_ref())?;
             RunCall::parse(&inv.args, &start_in)?
         };
         // A call may ask for less than the owner's most, never for more.
@@ -1881,7 +1892,7 @@ impl Link {
             Some(&rc.command),
             Some(&rc.cwd),
             target,
-            known.as_ref(),
+            looks_as.as_ref(),
             unconfined,
         )?;
         let account = account.map_err(|e| RpcError::new(ErrorCode::Unavailable, e))?;
@@ -1898,7 +1909,8 @@ impl Link {
             if !self.shared.sudo_on() {
                 return Err(RpcError::forbidden("sudo is off on this node"));
             }
-            rc.command = format!("exec {args}");
+            rc.command = exec::root_line(&rc.cwd, args);
+            rc.cwd = std::path::PathBuf::from("/");
         } else if let Some(args) = nerve_policy::sudo_command(&rc.command) {
             let password = self
                 .shared

@@ -859,6 +859,10 @@ impl Shared {
                 return Value::Null;
             };
             let open = crate::account::home_open(&owner.home);
+            // The folders are resolved as the owner sees them, as a sync
+            // does: the node's user may not look into the owner's home. A
+            // node that cannot act as the owner resolves them as itself.
+            let _as = crate::account::FsAs::new(&owner).ok();
             let below: Vec<PathBuf> =
                 crate::acl::wanted(cfg, &self.paths, &owner.home, crate::now_ms())
                     .into_iter()

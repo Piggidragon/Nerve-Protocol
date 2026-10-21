@@ -1158,6 +1158,16 @@ pub fn sudo_line(sudo_path: &str, args: &str, prompt: &str) -> String {
     )
 }
 
+/// The line of an allowed sudo command that the node starts as root for a
+/// pairing of `nerve-run` (crate::link): `args`, run in `cwd`, which its
+/// shell enters. The node's child cannot: it holds CAP_SETUID and CAP_SETGID
+/// only, so as root it has no right past a folder's mode until the program
+/// runs and root gets its rights back, and the call's folder is often in
+/// the owner's closed home.
+pub fn root_line(cwd: &Path, args: &str) -> String {
+    format!("cd -- {} && exec {args}", sh_quote(&cwd.to_string_lossy()))
+}
+
 /// Checks `password` with `sudo -S -k -v`, which runs nothing and caches
 /// nothing; its output is discarded. It runs as `account`, the account the
 /// commands run as (crate::account), so sudo checks that account's
@@ -2360,6 +2370,19 @@ mod tests {
     }
 
     #[cfg(not(windows))]
+    /// Root's shell enters the call's folder itself, quoted (#142).
+    #[test]
+    fn a_root_line_enters_the_folder_first() {
+        assert_eq!(
+            root_line(Path::new("/home/o/my proj"), "id -un"),
+            "cd -- '/home/o/my proj' && exec id -un"
+        );
+        assert_eq!(
+            root_line(Path::new("/x/a'b"), "true"),
+            "cd -- '/x/a'\\''b' && exec true"
+        );
+    }
+
     #[test]
     fn sudo_line_quotes_the_program() {
         assert_eq!(
